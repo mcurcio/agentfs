@@ -40,6 +40,12 @@ nested repository detection. Also:
   fast whatever their size.
 - **Remotes:** several at once, from `[remote "<name>"]` in the history
   repository's own config. Each has its own push state and backoff.
+  Local paths and `file://` need nothing; `http://` and `https://` remotes
+  authenticate with a token file; SSH remotes with a private key file,
+  after their host key is verified against a known_hosts file (unknown or
+  changed host keys are refused, never learned). The files are re-read
+  when rotated. See the
+  [configuration reference](docs/configuration.md).
 - **Interval push:** only the volume's own refs, fast-forward only, never
   forced. A divergence saves the local head under
   `refs/agentfs/<volume>/diverged/<timestamp>` and keeps alarming.
@@ -75,8 +81,9 @@ lock and changes nothing, so it works beside a running daemon, and shows
 who holds the lock.
 
 Not built yet: LFS and the `fsync` class (phase 2), the patch queue
-(phase 3), the CSI driver (phase 4), SSH remotes, and asking a running
-mount to push now.
+(phase 3), the CSI driver (phase 4), and asking a running mount to push
+now. SSH remotes do not support ssh-agent, passphrase-protected keys or
+`@cert-authority` host certificates.
 
 ## Mounting
 
@@ -86,8 +93,8 @@ agentfs --state /data/state mount /data/backing /workspace
 ```
 
 The backing tree, the state area and the mount point must be separate
-directories, none inside another, and no remote's credentials file may be
-under the backing tree; `mount` refuses to start otherwise. It runs in the
+directories, none inside another, and no remote's credentials, SSH key or
+known_hosts file may be under the backing tree or the mount point; `mount` refuses to start otherwise. It runs in the
 foreground until SIGINT, SIGTERM or an unmount, then unmounts (lazily if
 files are still open), records what is still open, makes a final commit
 and exits. Paths whose record failed and could not be repaired by then are
@@ -215,19 +222,25 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 libgit2 is built from source, so a C compiler is needed. Local, `file://`
-and plain `http://` remotes work in the default build. Pushing to `https://`
-remotes needs the `https` feature, which links OpenSSL:
+and plain `http://` remotes work in the default build. Two features add
+transports; each links OpenSSL (`libssl-dev` and `pkg-config` on Debian
+and Ubuntu):
 
 ```sh
-cargo build -p agentfs --features https
+cargo build -p agentfs --features https      # https:// remotes
+cargo build -p agentfs --features ssh        # ssh:// and scp-like remotes (libssh2)
+cargo build -p agentfs --features https,ssh  # both
 ```
+
+A binary built without `ssh` reports SSH remotes as misconfigured and
+pushes its other remotes. SSH remotes need `agentfsSshKey` (an unencrypted
+private key) and `agentfsKnownHosts` (an OpenSSH known_hosts file listing
+every host key type the server has); see the
+[configuration reference](docs/configuration.md#ssh-remotes).
 
 The FUSE layer uses fuser's pure-Rust mount code, so building needs no
 libfuse or pkg-config; running a mount needs `/dev/fuse` (and `fusermount3`
 from the `fuse3` package for a non-root daemon).
-
-SSH remotes are not supported yet (credentials are username/password or
-token only).
 
 ## CI
 
@@ -243,7 +256,17 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   smart-HTTP server (nginx and `git http-backend`, [`ci/git-http-server.sh`](ci/git-http-server.sh))
   over http and https with basic auth. Covers credential files, auth failures
   that do not block other remotes, credential rotation picked up by a
-  running `agentfs run`, divergence, and TLS certificate verification.
+  running `agentfs run`, divergence, and TLS certificate verification (a
+  certificate for another host fails, and a self-signed one fails as
+  `untrusted_host`).
+- **e2e ssh remotes** ([`ci/e2e-ssh.sh`](ci/e2e-ssh.sh)): pushes to a real
+  OpenSSH server ([`ci/git-ssh-server.sh`](ci/git-ssh-server.sh): its own
+  sshd on 127.0.0.1:2222, key-only authentication, a `git-shell` user),
+  with a binary built with `--features ssh`. Covers Ed25519 OpenSSH and RSA
+  PEM keys, plain and hashed known_hosts, a wrong key that fails only its
+  own remote, unknown and changed host keys refused before the key is
+  offered (checked in the sshd log), a key rotated under a running
+  `agentfs run`, a clean SIGTERM, and divergence over SSH.
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](ci/e2e-telemetry.sh)): every
   metric, span and alarm log above must reach a real OpenTelemetry Collector,
   and a dead traces endpoint must produce the stderr warning and
@@ -275,5 +298,8 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 The e2e scripts run locally too: start the server with
 `ci/git-http-server.sh start <dir>` and source its output, run the
 collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run
+`ci/git-ssh-server.sh start <dir>` (it needs passwordless sudo and
+`openssh-server`: it creates a system user and runs a root sshd) and
+`ci/e2e-ssh.sh` with its output in the environment, or run
 `ci/fuse-tests.sh` and `ci/e2e-recovery.sh` on any Linux host with FUSE
 and passwordless sudo. `ci/e2e-runbooks.sh` needs only `git-filter-repo`.

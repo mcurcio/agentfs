@@ -52,7 +52,7 @@ A volume is three directories, side by side:
 |---|---|
 | the state area is inside the backing tree (or the reverse, or they are the same directory) | history, journal and credentials would be visible through the mount |
 | the mount point is inside the backing tree or the state area, or either is inside the mount point | the mount would recurse into itself, or the daemon would reach its own files through its own mount |
-| a remote's `agentfsCredentials` file is under the backing tree or the mount point | the workload could read the secret. This is an error, not an alarm |
+| a remote's `agentfsCredentials`, `agentfsSshKey` or `agentfsKnownHosts` file is under the backing tree or the mount point, for any `[remote]` section, valid or not | the workload could read the secret, or rewrite known_hosts to trust any host (a man in the middle). This is an error, not an alarm |
 | `--root` / `AGENTFS_ROOT` is set and is not the backing tree | the two would disagree about which tree is recorded |
 | the mount point is a stale FUSE mount (`ENOTCONN`) | a daemon died; see §10 |
 
@@ -73,6 +73,21 @@ git --git-dir /data/state/git config remote.origin.url https://github.com/acme/a
 git --git-dir /data/state/git config remote.origin.agentfsCredentials /run/secrets/agentfs/origin
 agentfs --state /data/state mount /data/backing /workspace
 ```
+
+Over SSH instead (a binary built with `--features ssh`), name a private key
+and a known_hosts file; both are required, and neither may be under the
+backing tree:
+
+```sh
+git --git-dir /data/state/git config remote.origin.url git@github.com:acme/agent-history.git
+git --git-dir /data/state/git config remote.origin.agentfsSshKey /run/secrets/agentfs/origin-ssh/ssh-privatekey
+git --git-dir /data/state/git config remote.origin.agentfsKnownHosts /run/secrets/agentfs/origin-ssh/known_hosts
+```
+
+The key must be unencrypted, and known_hosts must list every host key type
+the server has (`ssh-keyscan github.com`, fingerprints checked against the
+provider's). Every remote key is described in the
+[configuration reference](configuration.md).
 
 The daemon stays in the foreground. Its first line says what it mounted
 and how:
@@ -118,7 +133,8 @@ Telemetry is configured with the standard `OTEL_*` variables; see the
 
 Settings live in the history repository's own config,
 `<state>/git/config` (§4.3). The mount reads them when it starts; changing
-them takes a remount.
+them takes a remount. Every key, including the per-remote ones, is in the
+[configuration reference](configuration.md).
 
 | Setting | Default | Effect |
 |---|---|---|
@@ -307,7 +323,17 @@ spec:
 - The mount point is an `emptyDir` shared with Bidirectional propagation
   from the sidecar and HostToContainer in the workload.
 - Credentials come from a Secret volume outside the backing tree; rotated
-  Secrets are picked up without a restart (§11.1).
+  Secrets are picked up without a restart (§11.1). For an SSH remote the
+  `credentials` volume holds the private key and known_hosts instead:
+
+  ```yaml
+      - name: credentials
+        secret: { secretName: agentfs-origin-ssh, defaultMode: 0400 }   # keys ssh-privatekey, known_hosts
+  ```
+
+  with `agentfsSshKey = /run/secrets/agentfs/ssh-privatekey` and
+  `agentfsKnownHosts = /run/secrets/agentfs/known_hosts`
+  ([configuration reference](configuration.md#ssh-remotes)).
 - Workload containers should wait for the mount (a startup probe on the
   sidecar that checks `/proc/mounts`, or a check in the workload's
   entrypoint).

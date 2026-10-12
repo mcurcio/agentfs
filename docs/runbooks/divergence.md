@@ -35,6 +35,17 @@ Git needs its own credentials for `$URL` here (agentfs's credential file
 is not used by the `git` command): a credential helper, or a token in
 the URL for this session only.
 
+For an SSH remote, point `git` at a key with write access and at the
+remote's own known_hosts file, so this session trusts exactly the host
+agentfs trusts (`ci/e2e-ssh.sh` pushes as another writer this way):
+
+```sh
+URL=ssh://git@git.example.com/acme/agent-history.git
+export GIT_SSH_COMMAND="ssh -i /path/to/operator-key -o IdentitiesOnly=yes \
+  -o UserKnownHostsFile=/run/secrets/agentfs/origin-ssh/known_hosts \
+  -o StrictHostKeyChecking=yes"
+```
+
 ## 1. Inspect
 
 Fetch both lines into a scratch repository; nothing here changes the
