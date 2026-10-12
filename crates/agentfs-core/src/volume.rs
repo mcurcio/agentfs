@@ -31,6 +31,7 @@ use crate::checks::{Checks, Limits, Refusal};
 use crate::claims::PathClaims;
 use crate::config::{ConfigError, validate_name};
 use crate::events::{CheckStage, Event, Events};
+use crate::fsync_class::{self, FsyncClass, GroupMembers};
 use crate::history::{Committed, History, HistoryError};
 use crate::identity::{Context, IdentityRenderer};
 use crate::journal::{Journal, OpenReport};
@@ -544,6 +545,32 @@ impl Recorder {
         caller: Caller,
         inputs: Vec<Input>,
     ) -> Result<Recorded, VolumeError> {
+        self.record_with(trigger, caller, inputs, false)
+    }
+
+    /// Records an fsync-class group (design §8) as one all-or-nothing
+    /// record: like [`Recorder::record`], except that if any input is
+    /// refused, by the checks or by `agentfs.maxSize`, none is recorded and
+    /// the others are skipped with [`SkipReason::GroupRefused`]. The record
+    /// is journaled [`Draft::atomic`], so a refusal at commit time drops the
+    /// whole group too. Rule skips (a `-shm` file, a removal of an untracked
+    /// member) do not count as refusals.
+    pub fn record_group(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        inputs: Vec<Input>,
+    ) -> Result<Recorded, VolumeError> {
+        self.record_with(trigger, caller, inputs, true)
+    }
+
+    fn record_with(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        inputs: Vec<Input>,
+        atomic: bool,
+    ) -> Result<Recorded, VolumeError> {
         let start = Instant::now();
         // A record by an operation's actor is part of that operation (design
         // §15): trigger `restore`, made by the operator who asked for it.
@@ -563,7 +590,7 @@ impl Recorder {
             ]
         });
         let paths: Vec<RepoPath> = inputs.iter().map(|i| i.path().clone()).collect();
-        let result = self.record_inner(trigger, caller, inputs, operation);
+        let result = self.record_inner(trigger, caller, inputs, operation, atomic);
         match &result {
             Ok(recorded) => {
                 if let Some(seq) = recorded.seq {
@@ -598,6 +625,7 @@ impl Recorder {
         caller: Caller,
         inputs: Vec<Input>,
         operation: Option<Operation>,
+        atomic: bool,
     ) -> Result<Recorded, VolumeError> {
         let _claim = self.claims.claim(inputs.iter().map(Input::path));
         let mut kept = Vec::with_capacity(inputs.len());
@@ -635,6 +663,13 @@ impl Recorder {
                         // frozen copy's, which is what is journaled.
                         let attrs = self.rules.attributes(&path)?;
                         let on_disk = std::fs::metadata(&backing).map_or(0, |m| m.len());
+                        // `agentfs.maxSize` the same way: on disk, then
+                        // frozen.
+                        let max_size = self.rules.max_size(&path);
+                        if let Some(refusal) = over_max_size(on_disk, max_size) {
+                            self.refuse(&mut skipped, path, refusal);
+                            continue;
+                        }
                         if self.store_policy.decide(&path, on_disk, &attrs) == Store::Blob
                             && let Some(refusal) = self.checks.check_backing_size(&backing)
                         {
@@ -644,6 +679,12 @@ impl Recorder {
                         let (id, _) = self.pending.freeze(&backing)?;
                         frozen.push(id);
                         let frozen_size = std::fs::metadata(self.pending.path(id))?.len();
+                        if let Some(refusal) = over_max_size(frozen_size, max_size) {
+                            frozen.pop();
+                            self.pending.remove([id])?;
+                            self.refuse(&mut skipped, path, refusal);
+                            continue;
+                        }
                         let store = self.store_policy.decide(&path, frozen_size, &attrs);
                         if let Some(refusal) = self.checks.check_file_stored(
                             &path,
@@ -674,6 +715,24 @@ impl Recorder {
                 };
                 changes.push(change);
             }
+            if atomic
+                && let Some(member) = skipped
+                    .iter()
+                    .find(|s| matches!(s.reason, SkipReason::Refused(_)))
+                    .map(|s| s.path.clone())
+            {
+                // All or nothing: the refusal was reported; the rest of the
+                // group is skipped with it, and their copies dropped.
+                self.pending.remove(std::mem::take(&mut frozen))?;
+                for change in changes.drain(..) {
+                    skipped.push(Skipped {
+                        path: change.path().clone(),
+                        reason: SkipReason::GroupRefused {
+                            member: member.clone(),
+                        },
+                    });
+                }
+            }
             if changes.is_empty() {
                 return Ok(None);
             }
@@ -683,7 +742,7 @@ impl Recorder {
                 time_ms: now_ms(),
                 changes: changes.clone(),
                 operation,
-                atomic: false,
+                atomic,
             };
             Ok(Some(self.journal.record(draft)?))
         })();
@@ -806,6 +865,30 @@ impl Recorder {
     /// Where this volume's events go.
     pub fn events(&self) -> &Events {
         &self.events
+    }
+
+    /// The fsync-class settings for `path` (design §8), if it is in the
+    /// class.
+    pub fn fsync_class(&self, path: &RepoPath) -> Option<FsyncClass> {
+        self.rules.fsync_class(path)
+    }
+
+    /// Whether any path can be in the fsync class on this volume.
+    pub fn has_fsync_class(&self) -> bool {
+        self.rules.has_fsync_class()
+    }
+
+    /// The fsync-class group `path` belongs to, if it is in the class and
+    /// not a `-shm` file.
+    pub fn fsync_group(&self, path: &RepoPath) -> Option<GroupMembers> {
+        let class = self.rules.fsync_class(path)?;
+        fsync_class::group_members(path, &class, |p| self.rules.fsync_class(p))
+    }
+
+    /// Whether process `pid` is an actor of an operator operation now
+    /// (design §15).
+    pub fn in_operation(&self, pid: u32) -> bool {
+        self.operations.of_actor(pid).is_some()
     }
 
     fn decide(&self, input: &Input) -> Result<Decision, VolumeError> {
@@ -1049,6 +1132,7 @@ impl Committer {
         for record in group {
             let mut record = record.clone();
             let mut kept = Vec::with_capacity(record.draft.changes.len());
+            let mut refused_any = false;
             for change in record.draft.changes {
                 let refusal = match &change {
                     Change::Write {
@@ -1066,6 +1150,7 @@ impl Committer {
                     Change::Remove { .. } => None,
                 };
                 if let Some(reason) = refusal {
+                    refused_any = true;
                     rechecked.refused += 1;
                     self.events.emit(Event::PathRefused {
                         path: change.path().to_string(),
@@ -1083,6 +1168,10 @@ impl Committer {
                     continue;
                 }
                 kept.push(change);
+            }
+            // An fsync-class group is only consistent whole (design §8).
+            if refused_any && record.draft.atomic {
+                kept.clear();
             }
             record.draft.changes = kept;
             rechecked.records.push(record);
@@ -1176,6 +1265,13 @@ fn group_by_window(records: &[Record], window_ms: u64) -> Vec<&[Record]> {
         groups.push(&records[start..]);
     }
     groups
+}
+
+/// [`Refusal::MaxSize`] if `bytes` is over the path's `agentfs.maxSize`.
+fn over_max_size(bytes: u64, limit: Option<u64>) -> Option<Refusal> {
+    limit
+        .filter(|limit| bytes > *limit)
+        .map(|limit| Refusal::MaxSize { bytes, limit })
 }
 
 fn now_ms() -> u64 {
@@ -1961,6 +2057,217 @@ mod tests {
         assert_eq!(recorded.skipped.len(), 1);
         com.commit_pending().unwrap();
         assert_eq!(tree_paths(&com), ["ok"]);
+    }
+
+    #[test]
+    fn max_size_caps_a_path_whatever_the_store() {
+        let (dir, state) = setup();
+        set_lfs_threshold(&state, 2);
+        fs::write(
+            state.git().join("info/attributes"),
+            "big/* agentfs.maxSize=4\n",
+        )
+        .unwrap();
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![
+                    write(dir.path(), "big/a", "0123456789"),
+                    write(dir.path(), "big/b", "abc"),
+                    write(dir.path(), "free", "0123456789"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            recorded.skipped,
+            [Skipped {
+                path: RepoPath::new("big/a").unwrap(),
+                reason: SkipReason::Refused(Refusal::MaxSize {
+                    bytes: 10,
+                    limit: 4
+                }),
+            }]
+        );
+        assert!(matches!(
+            &sink.take()[..],
+            [Event::PathRefused { path, stage: CheckStage::Record, reason: Refusal::MaxSize { .. } }]
+                if path == "big/a"
+        ));
+        com.commit_pending().unwrap();
+        // `free` went to LFS, hence the managed .gitattributes.
+        assert_eq!(tree_paths(&com), [".gitattributes", "big/b", "free"]);
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+    }
+
+    const SQLITE_RULES: &str =
+        "*.db* agentfs.commit=fsync agentfs.group=sqlite agentfs.coalesce=2s\n";
+
+    #[test]
+    fn the_recorder_knows_fsync_groups() {
+        let (dir, state) = setup();
+        let (rec, _, _) = open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        assert!(!rec.has_fsync_class());
+        assert_eq!(rec.fsync_group(&RepoPath::new("a.db").unwrap()), None);
+        drop(rec);
+        fs::write(state.git().join("info/attributes"), SQLITE_RULES).unwrap();
+        let (rec, _, _) = open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        assert!(rec.has_fsync_class());
+        let p = |s: &str| RepoPath::new(s).unwrap();
+        let group = rec.fsync_group(&p("d/a.db-journal")).unwrap();
+        assert_eq!(
+            group.members,
+            [p("d/a.db"), p("d/a.db-journal"), p("d/a.db-wal")]
+        );
+        assert_eq!(group.coalesce, Duration::from_secs(2));
+        assert_eq!(rec.fsync_group(&p("d/a.db-shm")), None);
+        assert_eq!(rec.fsync_group(&p("a.txt")), None);
+        assert!(!rec.in_operation(CALLER.pid));
+    }
+
+    #[test]
+    fn bad_class_values_refuse_to_open() {
+        let (dir, state) = setup();
+        fs::write(
+            state.git().join("info/attributes"),
+            "*.db agentfs.commit=fsnc\n",
+        )
+        .unwrap();
+        let err = open(&state, dir.path(), context(), null(), &Telemetry::noop())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, VolumeError::Rules(RulesError::BadAttribute { .. })),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_group_is_recorded_whole_or_not_at_all() {
+        let (dir, state) = setup();
+        fs::write(
+            state.git().join("info/attributes"),
+            format!("{SQLITE_RULES}*.db-wal agentfs.maxSize=4\n"),
+        )
+        .unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let p = |s: &str| RepoPath::new(s).unwrap();
+        let recorded = rec
+            .record_group(
+                Trigger::Interval,
+                CALLER,
+                vec![
+                    write(dir.path(), "s.db", "db"),
+                    write(dir.path(), "s.db-wal", "0123456789"),
+                    Input::Remove {
+                        path: p("s.db-journal"),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, None);
+        assert_eq!(
+            recorded.skipped,
+            [
+                Skipped {
+                    path: p("s.db-journal"),
+                    reason: SkipReason::Untracked,
+                },
+                Skipped {
+                    path: p("s.db-wal"),
+                    reason: SkipReason::Refused(Refusal::MaxSize {
+                        bytes: 10,
+                        limit: 4
+                    }),
+                },
+                Skipped {
+                    path: p("s.db"),
+                    reason: SkipReason::GroupRefused {
+                        member: p("s.db-wal")
+                    },
+                },
+            ]
+        );
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+        assert_eq!(com.backlog(), 0);
+
+        let seq = rec
+            .record_group(
+                Trigger::Interval,
+                CALLER,
+                vec![
+                    write(dir.path(), "s.db", "db"),
+                    write(dir.path(), "s.db-wal", "wal"),
+                ],
+            )
+            .unwrap()
+            .seq;
+        assert_eq!(seq, Some(0));
+        let records = com.journal.uncommitted();
+        assert!(records[0].draft.atomic);
+        assert_eq!(records[0].draft.trigger, Trigger::Interval);
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["s.db", "s.db-wal"]);
+        // An ordinary record is not atomic.
+        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "x", "1")])
+            .unwrap();
+        assert!(!com.journal.uncommitted()[0].draft.atomic);
+    }
+
+    #[test]
+    fn an_atomic_record_refused_at_commit_is_dropped_whole() {
+        let (dir, state) = setup();
+        fs::write(state.git().join("info/attributes"), SQLITE_RULES).unwrap();
+        {
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "keep", "1")])
+                .unwrap();
+            com.commit_pending().unwrap();
+            rec.record_group(
+                Trigger::Fsync,
+                CALLER,
+                vec![
+                    write(dir.path(), "s.db", "0123456789"),
+                    write(dir.path(), "s.db-wal", "12"),
+                ],
+            )
+            .unwrap();
+            // Crash before committing; the remount brings a stricter remote.
+        }
+        set_remote_limit(&state, "r", 5);
+        let sink = Arc::new(MemorySink::new());
+        let (_, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        let report = com.commit_pending().unwrap();
+        assert_eq!((report.records, report.refused), (1, 1));
+        assert_eq!(tree_paths(&com), ["keep"]);
+        assert_eq!(com.backlog(), 0);
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+        let events = sink.take();
+        assert!(
+            matches!(
+                &events[..],
+                [Event::PathRefused { path, stage: CheckStage::Commit, .. }] if path == "s.db"
+            ),
+            "{events:?}"
+        );
     }
 
     #[test]

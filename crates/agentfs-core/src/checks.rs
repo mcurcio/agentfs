@@ -154,6 +154,12 @@ pub enum Refusal {
     GitmodulesTooLarge {
         bytes: u64,
     },
+    /// The content is over the path's `agentfs.maxSize` (design §4.2), an
+    /// operator cap that applies whatever the store.
+    MaxSize {
+        bytes: u64,
+        limit: u64,
+    },
 }
 
 impl Refusal {
@@ -175,6 +181,7 @@ impl Refusal {
             Self::GitmodulesPath { .. } => "gitmodules_path",
             Self::GitmodulesUpdate { .. } => "gitmodules_update",
             Self::GitmodulesTooLarge { .. } => "gitmodules_too_large",
+            Self::MaxSize { .. } => "max_size",
         }
     }
 
@@ -182,7 +189,10 @@ impl Refusal {
     pub fn fsck_id(&self) -> Option<&'static str> {
         match self {
             Self::InvalidPath(PathError::DotGit(_)) => Some("hasDotgit"),
-            Self::InvalidPath(_) | Self::PathTooLong { .. } | Self::BlobTooLarge { .. } => None,
+            Self::InvalidPath(_)
+            | Self::PathTooLong { .. }
+            | Self::BlobTooLarge { .. }
+            | Self::MaxSize { .. } => None,
             Self::SymlinkedSpecialFile { file } => Some(match file {
                 SpecialFile::Gitmodules => "gitmodulesSymlink",
                 SpecialFile::Gitattributes => "gitattributesSymlink",
@@ -269,6 +279,9 @@ impl fmt::Display for Refusal {
                     f,
                     ".gitmodules is {bytes} bytes, over {GITMODULES_MAX_SIZE}"
                 )
+            }
+            Self::MaxSize { bytes, limit } => {
+                write!(f, "{bytes} bytes is over agentfs.maxSize ({limit} bytes)")
             }
         }
     }
