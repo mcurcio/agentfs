@@ -27,8 +27,11 @@ Phase 1 in progress. See [docs/design.md](docs/design.md) and the
 
 Built so far, in `agentfs-core`: path checks, the journal (group commit,
 crash recovery), frozen copies (reflink, else copy), the commit builder,
-identity templates and settings. The `agentfs` command has `init`, `status`,
-`flush` and `record`; `record` stands in for the FUSE layer, which is next.
+identity templates and settings, and path rules: operator and (optionally)
+tree ignore and attribute rules with git's tracked/untracked behaviour, and
+nested repository detection. The `agentfs` command has `init`, `status`,
+`flush` and `record`; `record` stands in for the FUSE layer and reports the
+paths the rules skip, with the reason.
 
 ## Building
 

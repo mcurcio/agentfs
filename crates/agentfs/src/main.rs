@@ -2,7 +2,8 @@
 //!
 //! `mount` (the FUSE layer) is not built yet. Until it is, `record` records
 //! paths from a directory directly, through the same recorder the FUSE layer
-//! will use.
+//! will use, including its path rules: paths the rules exclude are reported
+//! as skipped, with the reason.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use clap::{Args, Parser, Subcommand};
 
 use agentfs_core::history::History;
 use agentfs_core::identity::Context;
-use agentfs_core::paths::RepoPath;
+use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::volume::{self, Input, StateDir};
 
@@ -22,6 +23,9 @@ struct Cli {
     /// The volume's state area.
     #[arg(long, global = true, env = "AGENTFS_STATE", default_value = ".")]
     state: PathBuf,
+    /// The backing tree that paths are relative to. Only `record` reads it.
+    #[arg(long, global = true, env = "AGENTFS_ROOT", default_value = ".")]
+    root: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
@@ -43,9 +47,6 @@ enum Command {
     Flush(Pod),
     /// Record the current state of PATHs under ROOT, then commit.
     Record {
-        /// The directory the paths are relative to.
-        #[arg(long)]
-        root: PathBuf,
         /// Paths relative to ROOT. A missing path is recorded as removed.
         #[arg(required = true)]
         paths: Vec<String>,
@@ -105,7 +106,7 @@ fn main() -> Result<()> {
             println!("initialised volume {volume} in {}", state.root().display());
         }
         Command::Status(pod) => {
-            let (_, committer, recovery) = open(&state, &pod)?;
+            let (_, committer, recovery) = open(&state, &cli.root, &pod)?;
             let history = committer.history();
             println!("volume:    {}", history.settings().volume);
             println!("branch:    {}", history.settings().branch_ref);
@@ -120,29 +121,43 @@ fn main() -> Result<()> {
             println!("backlog:   {} record(s)", committer.backlog());
         }
         Command::Flush(pod) => {
-            let (_, committer, _) = open(&state, &pod)?;
+            let (_, committer, _) = open(&state, &cli.root, &pod)?;
             let report = committer.commit_pending()?;
             println!(
                 "{} record(s) into {} commit(s)",
                 report.records, report.commits
             );
         }
-        Command::Record { root, paths, pod } => {
-            let (recorder, committer, _) = open(&state, &pod)?;
+        Command::Record { paths, pod } => {
+            let (recorder, committer, _) = open(&state, &cli.root, &pod)?;
             let caller = Caller {
                 uid: current_uid(),
                 gid: current_gid(),
                 pid: std::process::id(),
             };
             for path in paths {
-                let input = input_for(&root, &path)?;
+                let input = match input_for(&cli.root, &path) {
+                    Ok(input) => input,
+                    Err(e) => match e.downcast_ref::<PathError>() {
+                        Some(PathError::DotGit(_)) => {
+                            println!("skipped {path}: {e}");
+                            continue;
+                        }
+                        _ => return Err(e),
+                    },
+                };
                 let trigger = match input {
                     Input::Remove { .. } => Trigger::Unlink,
                     Input::Symlink { .. } => Trigger::Symlink,
                     Input::Write { .. } => Trigger::Close,
                 };
-                let seq = recorder.record(trigger, caller, vec![input])?;
-                println!("recorded {path} as seq {seq}");
+                let recorded = recorder.record(trigger, caller, vec![input])?;
+                if let Some(seq) = recorded.seq {
+                    println!("recorded {path} as seq {seq}");
+                }
+                for skipped in recorded.skipped {
+                    println!("skipped {}: {}", skipped.path, skipped.reason);
+                }
             }
             let report = committer.commit_pending()?;
             println!(
@@ -156,6 +171,7 @@ fn main() -> Result<()> {
 
 fn open(
     state: &StateDir,
+    root: &Path,
     pod: &Pod,
 ) -> Result<(volume::Recorder, volume::Committer, volume::Recovery)> {
     let volume = History::open(&state.git())
@@ -163,7 +179,7 @@ fn open(
         .settings()
         .volume
         .clone();
-    Ok(volume::open(state, pod.context(&volume))?)
+    Ok(volume::open(state, root, pod.context(&volume))?)
 }
 
 fn input_for(root: &Path, path: &str) -> Result<Input> {

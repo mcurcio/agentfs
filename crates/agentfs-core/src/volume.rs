@@ -5,6 +5,11 @@
 //! Opening a volume is also crash recovery (design §3.3): records already in
 //! history are dropped from the journal, the rest stay uncommitted, and
 //! frozen copies nothing refers to are removed.
+//!
+//! The recorder applies path rules (design §4, §5) before freezing anything:
+//! each input is recorded or skipped with a reason, and the set of tracked
+//! paths (branch head plus uncommitted records) is kept current so ignore
+//! rules only ever affect untracked paths.
 
 use std::collections::HashSet;
 use std::io;
@@ -18,6 +23,8 @@ use crate::journal::{Journal, OpenReport};
 use crate::paths::{PathError, RepoPath, must_not_be_symlink};
 use crate::pending::{PendingId, PendingStore};
 use crate::record::{Caller, Change, Draft, Record, Trigger};
+use crate::rules::{Decision, Rules, RulesError, SkipReason};
+use crate::tracked::Tracked;
 
 /// Layout of a state area (design §2.2).
 #[derive(Debug, Clone)]
@@ -57,6 +64,8 @@ pub enum VolumeError {
     Path(#[from] PathError),
     #[error("{0} must be a regular file, not a symlink")]
     SymlinkNotAllowed(RepoPath),
+    #[error(transparent)]
+    Rules(#[from] RulesError),
 }
 
 /// One path's new state, as the FUSE layer sees it.
@@ -75,6 +84,14 @@ pub enum Input {
     Remove {
         path: RepoPath,
     },
+}
+
+impl Input {
+    pub fn path(&self) -> &RepoPath {
+        match self {
+            Self::Write { path, .. } | Self::Symlink { path, .. } | Self::Remove { path } => path,
+        }
+    }
 }
 
 /// What [`open`] found.
@@ -97,9 +114,10 @@ pub fn init(state: &StateDir, volume: &str, branch: Option<&str>) -> Result<(), 
     Ok(())
 }
 
-/// Opens an existing state area.
+/// Opens an existing state area for the backing tree at `tree`.
 pub fn open(
     state: &StateDir,
+    tree: &Path,
     context: Context,
 ) -> Result<(Recorder, Committer, Recovery), VolumeError> {
     let history = History::open(&state.git())?;
@@ -122,6 +140,18 @@ pub fn open(
     let pruned_pending = pending.prune_except(&keep)?;
     pending.sync_dir()?;
 
+    let rules = Rules::load(&state.git(), tree, history.settings().into())?;
+    let head_tree = history
+        .head()?
+        .map(|c| c.tree())
+        .transpose()
+        .map_err(HistoryError::from)?;
+    let tracked = Tracked::from_tree(head_tree.as_ref()).map_err(HistoryError::from)?;
+    drop(head_tree);
+    for change in uncommitted.iter().flat_map(|r| &r.draft.changes) {
+        tracked.apply(change);
+    }
+
     let journal = Arc::new(journal);
     let recovery = Recovery {
         journal: report,
@@ -132,6 +162,8 @@ pub fn open(
     let recorder = Recorder {
         journal: journal.clone(),
         pending: pending.clone(),
+        rules: Arc::new(rules),
+        tracked: Arc::new(tracked),
     };
     let committer = Committer {
         history,
@@ -143,26 +175,70 @@ pub fn open(
     Ok((recorder, committer, recovery))
 }
 
+/// An input the path rules kept out of history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    pub path: RepoPath,
+    pub reason: SkipReason,
+}
+
+/// What one [`Recorder::record`] call did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    /// The record's sequence number, or `None` if every input was skipped
+    /// and nothing was journaled.
+    pub seq: Option<u64>,
+    pub skipped: Vec<Skipped>,
+}
+
 /// Records change boundaries. Cheap to clone; safe to share across threads.
 #[derive(Clone)]
 pub struct Recorder {
     journal: Arc<Journal>,
     pending: Arc<PendingStore>,
+    rules: Arc<Rules>,
+    tracked: Arc<Tracked>,
 }
 
 impl Recorder {
-    /// Durably records one change boundary, returning its sequence number
-    /// once it is safe to let the triggering call return.
+    /// Durably records one change boundary, once it is safe to let the
+    /// triggering call return.
+    ///
+    /// Each input is first checked against the path rules; skipped inputs
+    /// cost nothing (no copy is frozen) and are reported with their reason.
+    /// Removals are recorded only when something is tracked at or below the
+    /// path, and are never filtered by rules, so history always follows the
+    /// tree for tracked paths.
+    ///
+    /// The decision, the journal append and the tracked-set update are not
+    /// one atomic step. Two concurrent first writes to the same new path
+    /// while a rule file changes can therefore disagree; the FUSE layer's
+    /// per-inode serialisation narrows this further.
     pub fn record(
         &self,
         trigger: Trigger,
         caller: Caller,
         inputs: Vec<Input>,
-    ) -> Result<u64, VolumeError> {
-        let mut changes = Vec::with_capacity(inputs.len());
+    ) -> Result<Recorded, VolumeError> {
+        let mut kept = Vec::with_capacity(inputs.len());
+        let mut skipped = Vec::new();
+        for input in inputs {
+            match self.decide(&input)? {
+                Decision::Record => kept.push(input),
+                Decision::Skip(reason) => skipped.push(Skipped {
+                    path: input.path().clone(),
+                    reason,
+                }),
+            }
+        }
+        if kept.is_empty() {
+            return Ok(Recorded { seq: None, skipped });
+        }
+
+        let mut changes = Vec::with_capacity(kept.len());
         let mut frozen = Vec::new();
         let result = (|| {
-            for input in inputs {
+            for input in kept {
                 changes.push(match input {
                     Input::Write {
                         path,
@@ -190,15 +266,41 @@ impl Recorder {
                 trigger,
                 caller,
                 time_ms: now_ms(),
-                changes,
+                changes: changes.clone(),
             };
             Ok(self.journal.record(draft)?)
         })();
-        if result.is_err() {
-            // Copies frozen for a record that never became durable.
-            let _ = self.pending.remove(frozen);
+        match result {
+            Ok(seq) => {
+                for change in &changes {
+                    self.tracked.apply(change);
+                }
+                Ok(Recorded {
+                    seq: Some(seq),
+                    skipped,
+                })
+            }
+            Err(e) => {
+                // Copies frozen for a record that never became durable.
+                let _ = self.pending.remove(frozen);
+                Err(e)
+            }
         }
-        result
+    }
+
+    fn decide(&self, input: &Input) -> Result<Decision, VolumeError> {
+        Ok(match input {
+            Input::Remove { path } => {
+                if self.tracked.contains_or_under(path) {
+                    Decision::Record
+                } else {
+                    Decision::Skip(SkipReason::Untracked)
+                }
+            }
+            Input::Write { path, .. } | Input::Symlink { path, .. } => {
+                self.rules.decide(path, self.tracked.contains(path))?
+            }
+        })
     }
 }
 
@@ -294,6 +396,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::rules::RuleSource;
 
     const CALLER: Caller = Caller {
         uid: 10000,
@@ -345,7 +448,7 @@ mod tests {
     #[test]
     fn record_then_commit() {
         let (dir, state) = setup();
-        let (rec, com, recovery) = open(&state, context()).unwrap();
+        let (rec, com, recovery) = open(&state, dir.path(), context()).unwrap();
         assert_eq!(recovery.committed_through, None);
 
         rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
@@ -365,7 +468,7 @@ mod tests {
     #[test]
     fn content_is_what_it_was_at_the_boundary() {
         let (dir, state) = setup();
-        let (rec, com, _) = open(&state, context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
         let input = write(dir.path(), "a", "at close");
         rec.record(Trigger::Close, CALLER, vec![input]).unwrap();
         fs::write(dir.path().join("a"), "changed later").unwrap();
@@ -381,7 +484,7 @@ mod tests {
     fn recorded_but_uncommitted_survives_a_crash() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, context()).unwrap();
+            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
             rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             com.commit_pending().unwrap();
@@ -389,7 +492,7 @@ mod tests {
                 .unwrap();
             // Crash: the second record is durable but never committed.
         }
-        let (rec, com, recovery) = open(&state, context()).unwrap();
+        let (rec, com, recovery) = open(&state, dir.path(), context()).unwrap();
         assert_eq!(recovery.committed_through, Some(0));
         assert_eq!(recovery.uncommitted, 1);
 
@@ -398,15 +501,16 @@ mod tests {
         // New records continue after the recovered ones.
         let seq = rec
             .record(Trigger::Close, CALLER, vec![write(dir.path(), "c", "3")])
-            .unwrap();
-        assert_eq!(seq, 2);
+            .unwrap()
+            .seq;
+        assert_eq!(seq, Some(2));
     }
 
     #[test]
     fn crash_after_commit_before_truncate_does_not_duplicate() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, context()).unwrap();
+            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
             rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             // Commit without letting the committer truncate: simulates a crash
@@ -416,7 +520,7 @@ mod tests {
                 .commit(&records, &com.pending, &com.identities, &com.context)
                 .unwrap();
         }
-        let (_, com, recovery) = open(&state, context()).unwrap();
+        let (_, com, recovery) = open(&state, dir.path(), context()).unwrap();
         assert_eq!(recovery.committed_through, Some(0));
         assert_eq!(recovery.uncommitted, 0);
         assert_eq!(recovery.pruned_pending, 1);
@@ -428,7 +532,7 @@ mod tests {
     #[test]
     fn failed_record_leaves_no_frozen_copy() {
         let (dir, state) = setup();
-        let (rec, _, _) = open(&state, context()).unwrap();
+        let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
         let err = rec.record(
             Trigger::Close,
             CALLER,
@@ -468,5 +572,205 @@ mod tests {
             .collect();
         assert_eq!(groups, [vec![0, 1, 2], vec![3], vec![4]]);
         assert!(group_by_window(&[], 200).is_empty());
+    }
+
+    fn exclude(state: &StateDir, patterns: &str) {
+        fs::write(state.git().join("info").join("exclude"), patterns).unwrap();
+    }
+
+    fn remove(name: &str) -> Input {
+        Input::Remove {
+            path: RepoPath::new(name).unwrap(),
+        }
+    }
+
+    fn skipped(path: &str, reason: SkipReason) -> Skipped {
+        Skipped {
+            path: RepoPath::new(path).unwrap(),
+            reason,
+        }
+    }
+
+    #[test]
+    fn excluded_untracked_path_is_skipped_without_cost() {
+        let (dir, state) = setup();
+        exclude(&state, "*.log\n");
+        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "a.log", "x")],
+            )
+            .unwrap();
+        assert_eq!(
+            recorded,
+            Recorded {
+                seq: None,
+                skipped: vec![skipped(
+                    "a.log",
+                    SkipReason::Ignored {
+                        source: RuleSource::OperatorExclude,
+                        pattern: "*.log".into(),
+                    }
+                )],
+            }
+        );
+        assert_eq!(com.backlog(), 0);
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn rename_into_an_excluded_path_records_only_the_removal() {
+        let (dir, state) = setup();
+        exclude(&state, "ignored/\n");
+        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "src", "1")])
+            .unwrap();
+        com.commit_pending().unwrap();
+
+        let recorded = rec
+            .record(
+                Trigger::Rename,
+                CALLER,
+                vec![remove("src"), write(dir.path(), "ignored/dst", "1")],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, Some(1));
+        assert_eq!(recorded.skipped.len(), 1);
+        assert_eq!(recorded.skipped[0].path.as_str(), "ignored/dst");
+        com.commit_pending().unwrap();
+        assert!(tree_paths(&com).is_empty());
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn removals_need_something_tracked() {
+        let (dir, state) = setup();
+        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let recorded = rec
+            .record(Trigger::Unlink, CALLER, vec![remove("never")])
+            .unwrap();
+        assert_eq!(recorded.seq, None);
+        assert_eq!(recorded.skipped, [skipped("never", SkipReason::Untracked)]);
+        assert_eq!(com.backlog(), 0);
+
+        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "d/a", "1")])
+            .unwrap();
+        // Tracked as soon as it is durable, before any commit.
+        let recorded = rec
+            .record(Trigger::Rmdir, CALLER, vec![remove("d")])
+            .unwrap();
+        assert_eq!(recorded.seq, Some(1));
+        assert!(recorded.skipped.is_empty());
+        com.commit_pending().unwrap();
+        assert_eq!(
+            com.history().head().unwrap().unwrap().tree().unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn uncommitted_records_stay_tracked_across_recovery() {
+        let (dir, state) = setup();
+        {
+            let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "a.log", "1")],
+            )
+            .unwrap();
+            // Crash before committing.
+        }
+        exclude(&state, "*.log\n");
+        let (rec, com, recovery) = open(&state, dir.path(), context()).unwrap();
+        assert_eq!(recovery.uncommitted, 1);
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "a.log", "2")],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, Some(1));
+        assert!(recorded.skipped.is_empty());
+        // A new path is still excluded.
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "b.log", "3")],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, None);
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["a.log"]);
+    }
+
+    #[test]
+    fn committed_paths_stay_tracked_after_an_exclude() {
+        let (dir, state) = setup();
+        {
+            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "a.log", "1")],
+            )
+            .unwrap();
+            com.commit_pending().unwrap();
+        }
+        exclude(&state, "*.log\n");
+        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "a.log", "new")],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, Some(1));
+        com.commit_pending().unwrap();
+        let head = com.history().head().unwrap().unwrap();
+        let blob = head.tree().unwrap().get_name("a.log").unwrap().id();
+        let content = com.history().repo().find_blob(blob).unwrap();
+        assert_eq!(content.content(), b"new");
+    }
+
+    #[test]
+    fn nested_repositories_follow_the_setting() {
+        let (dir, state) = setup();
+        fs::create_dir_all(dir.path().join("sub/.git")).unwrap();
+        {
+            let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
+            let recorded = rec
+                .record(
+                    Trigger::Close,
+                    CALLER,
+                    vec![write(dir.path(), "sub/file", "1")],
+                )
+                .unwrap();
+            assert_eq!(recorded.seq, None);
+            assert!(matches!(
+                recorded.skipped[0].reason,
+                SkipReason::Nested { .. }
+            ));
+        }
+        git2::Config::open(&state.git().join("config"))
+            .unwrap()
+            .set_str("agentfs.nested", "working-tree")
+            .unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "sub/file", "1")],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, Some(0));
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["sub/file"]);
     }
 }

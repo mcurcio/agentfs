@@ -9,6 +9,8 @@ dependencies = [
  "agentfs-core",
  "anyhow",
  "clap",
+ "git2",
+ "tempfile",
 ]
 
 [[package]]

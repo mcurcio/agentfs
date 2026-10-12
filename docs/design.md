@@ -209,6 +209,11 @@ agentfs follows git's model: **ignore rules decide only whether new
 deleted, even if a rule later matches it.** Rules never decide where data
 lives; all data lives in the backing tree.
 
+As with git's index, a path is **tracked** if it is in the branch head or has
+been recorded and is awaiting commit, so this holds during commit lag and
+after crash recovery. A removal is recorded only if something is tracked at
+or below the path; removing a path that was never recorded is not journaled.
+
 ### 4.1 Where rules come from
 
 | Concern | Tracked (in the tree; edits are recorded) | Operator (in the git dir; iac sets them; invisible) |
