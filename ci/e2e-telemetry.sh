@@ -61,8 +61,9 @@ for name in agentfs.record agentfs.commit agentfs.push; do
   wait_for 20 grep -q "\"name\":\"$name\"" "$OTEL_OUT" || fail "span $name never arrived"
   pass "span $name"
 done
+# Alarms only: a successful push is not logged (README, Telemetry).
 for name in agentfs.path_refused agentfs.push_failed agentfs.diverged \
-  agentfs.remote_misconfigured agentfs.push_succeeded; do
+  agentfs.remote_misconfigured; do
   wait_for 20 grep -q "$name" "$OTEL_OUT" || fail "log $name never arrived"
   pass "log $name"
 done
