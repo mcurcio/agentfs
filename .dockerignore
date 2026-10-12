@@ -1,0 +1,5 @@
+# An allowlist: only what the build needs reaches the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/

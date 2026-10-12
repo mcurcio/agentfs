@@ -1,0 +1,61 @@
+name: image
+
+# The container image (Dockerfile) and the Kubernetes deployment
+# (deploy/sidecar): built on every push and pull request, tested in a kind
+# cluster, and published to ghcr.io/mcurcio/agentfs from main once the
+# test passes (docs/deployment.md).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: render the manifests
+        run: |
+          kubectl version --client
+          kubectl kustomize deploy/sidecar >/dev/null
+          kubectl kustomize ci/k8s >/dev/null
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/mcurcio/agentfs
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          tags: |
+            agentfs:ci
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=docker,dest=${{ runner.temp }}/agentfs-image.tar
+          cache-from: type=gha,scope=agentfs-image
+          cache-to: type=gha,scope=agentfs-image,mode=max
+          provenance: false
+      - name: inspect
+        run: |
+          docker load -i "$RUNNER_TEMP/agentfs-image.tar"
+          docker image ls agentfs
+          docker run --rm agentfs:ci --version
+          docker run --rm --entrypoint sh agentfs:ci -c 'id; fusermount3 -V; git --version'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agentfs-image
+          path: ${{ runner.temp }}/agentfs-image.tar
+          retention-days: 1
