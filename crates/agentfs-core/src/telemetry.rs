@@ -529,7 +529,10 @@ impl EventSink for TelemetrySink {
             | Event::PatchApplied { .. }
             | Event::PatchBlocked { .. }
             | Event::PatchIgnored { .. }
-            | Event::PatchFetchFailed { .. } => {}
+            | Event::PatchFetchFailed { .. }
+            | Event::HistoryServiceUnavailable { .. }
+            | Event::HistoryServiceRestored { .. }
+            | Event::IdentityFallback { .. } => {}
         }
         if event.is_alarm()
             && let Some(alarms) = &inner.alarms
@@ -572,6 +575,9 @@ fn event_name(event: &Event) -> &'static str {
         Event::PatchBlocked { .. } => "agentfs.patch_blocked",
         Event::PatchIgnored { .. } => "agentfs.patch_ignored",
         Event::PatchFetchFailed { .. } => "agentfs.patch_fetch_failed",
+        Event::HistoryServiceUnavailable { .. } => "agentfs.history_service_unavailable",
+        Event::HistoryServiceRestored { .. } => "agentfs.history_service_restored",
+        Event::IdentityFallback { .. } => "agentfs.identity_fallback",
     }
 }
 
@@ -713,6 +719,17 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             out.push(("agentfs.kind", AnyValue::from(kind.as_str())));
             out.push(("agentfs.message", s(message)));
         }
+        Event::HistoryServiceUnavailable { address, error } => {
+            out.push(("agentfs.history_service", s(address)));
+            out.push(("agentfs.error", s(error)));
+        }
+        Event::HistoryServiceRestored { address } => {
+            out.push(("agentfs.history_service", s(address)));
+        }
+        Event::IdentityFallback { replica, error } => {
+            out.push(("agentfs.replica", s(replica)));
+            out.push(("agentfs.error", s(error)));
+        }
     }
     out
 }
@@ -721,8 +738,12 @@ impl<L: Logger + Send + Sync> AlarmLog for OtelAlarmLog<L> {
     fn log(&self, event: &Event) {
         let (severity, text) = match event {
             Event::PathRefused { .. } => (Severity::Warn, "WARN"),
-            Event::PushSucceeded { .. } | Event::PatchApplied { .. } => (Severity::Info, "INFO"),
-            Event::PatchFetchFailed { .. } | Event::PatchIgnored { .. } => (Severity::Warn, "WARN"),
+            Event::PushSucceeded { .. }
+            | Event::PatchApplied { .. }
+            | Event::HistoryServiceRestored { .. } => (Severity::Info, "INFO"),
+            Event::PatchFetchFailed { .. }
+            | Event::PatchIgnored { .. }
+            | Event::IdentityFallback { .. } => (Severity::Warn, "WARN"),
             _ => (Severity::Error, "ERROR"),
         };
         let name = event_name(event);

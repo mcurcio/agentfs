@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::identity::Context;
 use crate::lfs::Store;
 use crate::paths::RepoPath;
 use crate::pending::PendingId;
@@ -173,6 +174,49 @@ pub struct Operation {
     pub author: Option<PatchAuthor>,
 }
 
+/// The pod whose front recorded a change (design §9, §14): its committer
+/// identity and pod trailers. Journaled with each record a history service
+/// receives from a front, so a replay after a crash commits with the same
+/// committer. Single-process mode journals none: the committer is the
+/// process's own.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Origin {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pod: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pod_uid: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node: String,
+    pub replica: String,
+}
+
+impl Origin {
+    /// The pod part of `context` (everything but the volume).
+    pub fn from_context(context: &Context) -> Self {
+        Self {
+            namespace: context.namespace.clone(),
+            pod: context.pod.clone(),
+            pod_uid: context.pod_uid.clone(),
+            node: context.node.clone(),
+            replica: context.replica.clone(),
+        }
+    }
+
+    /// The identity context of this pod on `volume`.
+    pub fn context(&self, volume: &str) -> Context {
+        Context {
+            volume: volume.to_owned(),
+            namespace: self.namespace.clone(),
+            pod: self.pod.clone(),
+            pod_uid: self.pod_uid.clone(),
+            node: self.node.clone(),
+            replica: self.replica.clone(),
+        }
+    }
+}
+
 /// A change boundary as given to the journal, before it has a sequence number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
@@ -191,6 +235,10 @@ pub struct Draft {
     /// consistent together (design §8). Absent from older journals.
     #[serde(default, skip_serializing_if = "is_false")]
     pub atomic: bool,
+    /// The front that recorded it, set by the history service (design
+    /// §14); `None` in single-process mode, whose journals carry no field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -279,6 +327,7 @@ mod tests {
             changes: vec![],
             operation: None,
             atomic: false,
+            origin: None,
         };
         let plain = serde_json::to_string(&draft).unwrap();
         assert!(!plain.contains("atomic"), "{plain}");
@@ -288,5 +337,67 @@ mod tests {
         let atomic = serde_json::to_string(&draft).unwrap();
         assert!(atomic.ends_with(r#","atomic":true}"#), "{atomic}");
         assert_eq!(serde_json::from_str::<Draft>(&atomic).unwrap(), draft);
+    }
+
+    fn origin() -> Origin {
+        Origin {
+            namespace: "agent".into(),
+            pod: "hermes-a".into(),
+            pod_uid: "0b6f".into(),
+            node: "hawking".into(),
+            replica: "hermes-0".into(),
+        }
+    }
+
+    #[test]
+    fn the_origin_is_journaled_only_when_set() {
+        let mut draft = Draft {
+            trigger: Trigger::Close,
+            caller: Caller {
+                uid: 1,
+                gid: 1,
+                pid: 1,
+            },
+            time_ms: 5,
+            changes: vec![],
+            operation: None,
+            atomic: false,
+            origin: None,
+        };
+        // Single-process journals are byte for byte what they were.
+        let single = serde_json::to_string(&draft).unwrap();
+        assert_eq!(
+            single,
+            r#"{"trigger":"close","caller":{"uid":1,"gid":1,"pid":1},"time_ms":5,"changes":[]}"#
+        );
+        assert_eq!(serde_json::from_str::<Draft>(&single).unwrap(), draft);
+        draft.origin = Some(origin());
+        let front = serde_json::to_string(&draft).unwrap();
+        assert!(
+            front.ends_with(
+                r#","origin":{"namespace":"agent","pod":"hermes-a","pod_uid":"0b6f","node":"hawking","replica":"hermes-0"}}"#
+            ),
+            "{front}"
+        );
+        assert_eq!(serde_json::from_str::<Draft>(&front).unwrap(), draft);
+        // Empty fields are left out and read back empty.
+        draft.origin = Some(Origin {
+            replica: "r".into(),
+            namespace: String::new(),
+            pod: String::new(),
+            pod_uid: String::new(),
+            node: String::new(),
+        });
+        let bare = serde_json::to_string(&draft).unwrap();
+        assert!(bare.ends_with(r#","origin":{"replica":"r"}}"#), "{bare}");
+        assert_eq!(serde_json::from_str::<Draft>(&bare).unwrap(), draft);
+    }
+
+    #[test]
+    fn an_origin_round_trips_through_a_context() {
+        let context = origin().context("vol");
+        assert_eq!(context.volume, "vol");
+        assert_eq!(context.pod_uid, "0b6f");
+        assert_eq!(Origin::from_context(&context), origin());
     }
 }

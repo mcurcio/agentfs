@@ -213,13 +213,31 @@ pub enum Event {
         kind: PushFailureKind,
         message: String,
     },
+    /// A front could not reach its volume's history service, or the
+    /// service did not answer in time or refused it (design §14, §3.5):
+    /// the boundary failed with `EIO`. Raised once per outage, at its
+    /// first failure; [`Event::HistoryServiceRestored`] ends it.
+    HistoryServiceUnavailable { address: String, error: String },
+    /// A front reached its history service again after an outage. Not an
+    /// alarm.
+    HistoryServiceRestored { address: String },
+    /// Records from a front whose pod no longer renders with the identity
+    /// templates in force (they changed across a restart of the history
+    /// service) are committed with the service's own committer, keeping
+    /// the pod's trailers (design §9, §14). A warning, once per pod.
+    IdentityFallback { replica: String, error: String },
 }
 
 impl Event {
-    /// True for alarm conditions: everything except a successful push and
-    /// an applied patch.
+    /// True for alarm conditions: everything except a successful push, an
+    /// applied patch and a restored history service.
     pub fn is_alarm(&self) -> bool {
-        !matches!(self, Self::PushSucceeded { .. } | Self::PatchApplied { .. })
+        !matches!(
+            self,
+            Self::PushSucceeded { .. }
+                | Self::PatchApplied { .. }
+                | Self::HistoryServiceRestored { .. }
+        )
     }
 
     /// A stable name for logs and metrics.
@@ -237,6 +255,9 @@ impl Event {
             Self::PatchBlocked { .. } => "patch_blocked",
             Self::PatchIgnored { .. } => "patch_ignored",
             Self::PatchFetchFailed { .. } => "patch_fetch_failed",
+            Self::HistoryServiceUnavailable { .. } => "history_service_unavailable",
+            Self::HistoryServiceRestored { .. } => "history_service_restored",
+            Self::IdentityFallback { .. } => "identity_fallback",
         }
     }
 }
@@ -351,6 +372,19 @@ impl fmt::Display for Event {
             } => write!(
                 f,
                 "fetching the patch queue from {remote} failed ({kind}): {message}"
+            ),
+            Self::HistoryServiceUnavailable { address, error } => write!(
+                f,
+                "history service {address} is unavailable: {error}; changes fail with EIO \
+                 until it is back"
+            ),
+            Self::HistoryServiceRestored { address } => {
+                write!(f, "history service {address} is reachable again")
+            }
+            Self::IdentityFallback { replica, error } => write!(
+                f,
+                "the committer of front {replica} no longer renders ({error}); its records are \
+                 committed with the history service's own committer"
             ),
         }
     }

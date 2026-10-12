@@ -1133,6 +1133,17 @@ Agentfs-Pid: 4711
 
 - **Phase 1** gets pod metadata from the downward API.
 - **The CSI driver** gets it from `podInfoOnMount`.
+- **Fronts of a history service** (§14): each record a service receives
+  from a front is journaled with that front's `origin` (namespace, pod,
+  pod UID, node, replica), so a replay after a crash commits it with the
+  same committer. The service renders the volume's templates once per
+  origin; a commit never mixes origins, and its committer and pod
+  trailers are that pod's. A front whose pod does not render is refused
+  when it connects. If the templates change across a restart of the
+  service so that a journaled origin no longer renders, its records are
+  committed with the service's own committer and keep the pod's trailers,
+  with an `IdentityFallback` warning (§13), so the commit loop never
+  stalls. Single-process journals carry no `origin` and are unchanged.
 - **Grouped commits** carry one `Agentfs-Uid` and `Agentfs-Pid` line per
   distinct writer. A pid of 0 (an operator outside the daemon's pid
   namespace, §15) is unknown and gets no `Agentfs-Pid` line.

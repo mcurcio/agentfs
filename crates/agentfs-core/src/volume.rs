@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::KeyValue;
@@ -41,7 +41,7 @@ use crate::operations::{ActorBusy, OperationGuard, Operations};
 use crate::paths::{PathError, RepoPath};
 use crate::pending::{PendingId, PendingStore};
 use crate::record::{
-    Caller, Change, Draft, Operation, OperationKind, PatchAuthor, Record, Trigger,
+    Caller, Change, Draft, Operation, OperationKind, Origin, PatchAuthor, Record, Trigger,
 };
 use crate::rules::{Decision, Rules, RulesError, SkipReason};
 use crate::telemetry::{Telemetry, spans};
@@ -439,6 +439,7 @@ pub fn open(
         lfs: Arc::new(ObjectCache::open(state.lfs())?),
         identities,
         context,
+        origins: Mutex::new(HashMap::new()),
         checks,
         rules,
         tree_known: true,
@@ -797,6 +798,7 @@ impl Recorder {
                 changes: changes.clone(),
                 operation,
                 atomic,
+                origin: None,
             };
             Ok(Some(self.journal.record(draft)?))
         })();
@@ -957,6 +959,11 @@ impl Recorder {
         self.operations.of_actor(pid).is_some()
     }
 
+    #[cfg(test)]
+    fn journal_for_tests(&self) -> &Journal {
+        &self.journal
+    }
+
     fn decide(&self, input: &Input) -> Result<Decision, VolumeError> {
         Ok(match input {
             Input::Remove { path } => {
@@ -982,6 +989,10 @@ pub struct Committer {
     lfs: Arc<ObjectCache>,
     identities: IdentityRenderer,
     context: Context,
+    /// Each front's identity (design §9, §14), rendered once per origin;
+    /// `None` when the origin no longer renders with the templates in
+    /// force, so the service's own committer is used instead.
+    origins: Mutex<HashMap<Origin, Option<IdentityRenderer>>>,
     checks: Arc<Checks>,
     rules: Arc<Rules>,
     /// Whether `rules.tree()` is the real backing tree.
@@ -1071,6 +1082,41 @@ impl Committer {
         self.history.settings().commit_window.as_millis() as u64
     }
 
+    /// The committer identity and trailer context for records from
+    /// `origin` (design §9, §14): the process's own without one, else the
+    /// front's pod rendered with the volume's templates. A front's origin
+    /// that no longer renders (the templates changed across a restart of
+    /// the history service) keeps its pod trailers but gets the service's
+    /// own identity, with [`Event::IdentityFallback`] once, so the commit
+    /// loop never stalls on it.
+    fn identity_for(&self, origin: Option<&Origin>) -> (IdentityRenderer, Context) {
+        let Some(origin) = origin else {
+            return (self.identities.clone(), self.context.clone());
+        };
+        let context = origin.context(&self.context.volume);
+        // Poisoning needs a panic while the lock is held; nothing in the
+        // critical section panics.
+        let mut origins = self
+            .origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let renderer =
+            origins.entry(origin.clone()).or_insert_with(|| {
+                match IdentityRenderer::new(self.history.settings().identity.clone(), &context) {
+                    Ok(renderer) => Some(renderer),
+                    Err(e) => {
+                        self.events.emit(Event::IdentityFallback {
+                            replica: origin.replica.clone(),
+                            error: e.to_string(),
+                        });
+                        None
+                    }
+                }
+            });
+        let identities = renderer.clone().unwrap_or_else(|| self.identities.clone());
+        (identities, context)
+    }
+
     /// Commits `groups`, a prefix of `records` split into runs.
     fn commit_groups(
         &self,
@@ -1122,13 +1168,15 @@ impl Committer {
                     break;
                 }
             };
+            // A group never mixes origins (`group_by_window`).
+            let (identities, context) = self.identity_for(group[0].draft.origin.as_ref());
             match self.history.commit(
                 &checked,
                 &self.pending,
                 &self.lfs,
                 &self.checks,
-                &self.identities,
-                &self.context,
+                &identities,
+                &context,
             ) {
                 Ok(Committed {
                     commit,
@@ -1324,14 +1372,17 @@ fn in_tree(tree: Option<&git2::Tree<'_>>, path: &RepoPath) -> Result<bool, Volum
 /// run's first record. Records of an operator operation (design §15) form
 /// runs of their own, however long the operation takes; workload records
 /// interleaved with them (a live restore) split them, since commits
-/// follow the journal's order.
+/// follow the journal's order. Records from different fronts of a history
+/// service (design §14) never share a run either: a run is one origin's,
+/// so its commit carries that pod's committer.
 fn group_by_window(records: &[Record], window_ms: u64) -> Vec<&[Record]> {
     let op = |r: &Record| r.draft.operation.as_ref().map(|o| o.id);
     let mut groups = Vec::new();
     let mut start = 0;
     for i in 1..records.len() {
         let first = &records[start];
-        let split = if op(&records[i]) != op(first) {
+        let split = if op(&records[i]) != op(first) || records[i].draft.origin != first.draft.origin
+        {
             true
         } else if op(first).is_some() {
             false
@@ -2458,6 +2509,7 @@ mod tests {
                 changes: vec![change.clone()],
                 operation: None,
                 atomic: false,
+                origin: None,
             })
             .unwrap();
         rec.tracked.apply(&change);
@@ -2647,6 +2699,7 @@ mod tests {
                     changes: vec![],
                     operation,
                     atomic: false,
+                    origin: None,
                 },
             });
         }
@@ -2887,6 +2940,7 @@ mod tests {
                 changes: vec![],
                 operation: None,
                 atomic: false,
+                origin: None,
             },
         };
         let records = [
@@ -2902,6 +2956,188 @@ mod tests {
             .collect();
         assert_eq!(groups, [vec![0, 1, 2], vec![3], vec![4]]);
         assert!(group_by_window(&[], 200).is_empty());
+    }
+
+    fn pod(name: &str) -> Origin {
+        Origin {
+            namespace: "agents".into(),
+            pod: name.into(),
+            pod_uid: format!("{name}-uid"),
+            node: "node-1".into(),
+            replica: name.into(),
+        }
+    }
+
+    #[test]
+    fn grouping_never_mixes_origins() {
+        let rec = |seq, time_ms, origin: Option<Origin>| Record {
+            seq,
+            draft: Draft {
+                trigger: Trigger::Close,
+                caller: CALLER,
+                time_ms,
+                changes: vec![],
+                operation: None,
+                atomic: false,
+                origin,
+            },
+        };
+        let (a, b) = (Some(pod("a")), Some(pod("b")));
+        let records = [
+            rec(0, 0, a.clone()),
+            rec(1, 1, a.clone()),
+            rec(2, 2, b.clone()),
+            rec(3, 3, a.clone()),
+            rec(4, 4, None),
+            rec(5, 5, None),
+        ];
+        let groups: Vec<Vec<u64>> = group_by_window(&records, 200)
+            .into_iter()
+            .map(|g| g.iter().map(|r| r.seq).collect())
+            .collect();
+        assert_eq!(groups, [vec![0, 1], vec![2], vec![3], vec![4, 5]]);
+    }
+
+    /// Journals a write of `name` holding `content` as if a front of
+    /// `origin` had sent it, the way the history service does.
+    fn journal_from(rec: &Recorder, dir: &Path, origin: &Origin, name: &str, content: &str) {
+        let Input::Write { path, backing, .. } = write(dir, name, content) else {
+            unreachable!()
+        };
+        let (id, _) = rec.pending.freeze(&backing).unwrap();
+        rec.journal_for_tests()
+            .record(Draft {
+                trigger: Trigger::Close,
+                caller: CALLER,
+                time_ms: now_ms(),
+                changes: vec![Change::Write {
+                    path,
+                    pending: id,
+                    executable: false,
+                    store: Store::Blob,
+                }],
+                operation: None,
+                atomic: false,
+                origin: Some(origin.clone()),
+            })
+            .unwrap();
+    }
+
+    /// Every commit on the branch, oldest first: committer name and email,
+    /// and message.
+    fn commits(com: &Committer) -> Vec<(String, String, String)> {
+        let repo = com.history().repo();
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(com.history().head().unwrap().unwrap().id())
+            .unwrap();
+        walk.set_sorting(git2::Sort::REVERSE | git2::Sort::TOPOLOGICAL)
+            .unwrap();
+        walk.map(|id| {
+            let c = repo.find_commit(id.unwrap()).unwrap();
+            let committer = c.committer();
+            (
+                committer.name().unwrap().to_owned(),
+                committer.email().unwrap().to_owned(),
+                c.message().unwrap().to_owned(),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn records_from_fronts_commit_with_their_pods_committer() {
+        let (dir, state) = setup();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        journal_from(&rec, dir.path(), &pod("pod-a"), "a1", "1");
+        journal_from(&rec, dir.path(), &pod("pod-b"), "b1", "2");
+        journal_from(&rec, dir.path(), &pod("pod-a"), "a2", "3");
+        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "own", "4")])
+            .unwrap();
+        let report = com.commit_pending().unwrap();
+        assert_eq!((report.records, report.commits), (4, 4));
+        let commits = commits(&com);
+        let who: Vec<(&str, &str)> = commits
+            .iter()
+            .map(|(name, email, _)| (name.as_str(), email.as_str()))
+            .collect();
+        assert_eq!(
+            who,
+            [
+                ("pod-a", "pod-a-uid@vol.agentfs.invalid"),
+                ("pod-b", "pod-b-uid@vol.agentfs.invalid"),
+                ("pod-a", "pod-a-uid@vol.agentfs.invalid"),
+                ("pod-0", "u@vol.agentfs.invalid"),
+            ]
+        );
+        let message = &commits[1].2;
+        for trailer in [
+            "Agentfs-Namespace: agents\n",
+            "Agentfs-Pod: pod-b\n",
+            "Agentfs-Pod-Uid: pod-b-uid\n",
+            "Agentfs-Node: node-1\n",
+        ] {
+            assert!(message.contains(trailer), "{trailer}: {message}");
+        }
+        assert!(!commits[3].2.contains("Agentfs-Pod:"), "{}", commits[3].2);
+        // One renderer per origin, kept.
+        assert_eq!(com.origins.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_replay_keeps_each_fronts_committer() {
+        let (dir, state) = setup();
+        {
+            let (rec, _com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+            journal_from(&rec, dir.path(), &pod("pod-a"), "a", "1");
+            journal_from(&rec, dir.path(), &pod("pod-b"), "b", "2");
+            // Crash: journaled, never committed.
+        }
+        let (_rec, com, recovery) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        assert_eq!(recovery.uncommitted, 2);
+        com.commit_pending().unwrap();
+        let names: Vec<String> = commits(&com).into_iter().map(|c| c.0).collect();
+        assert_eq!(names, ["pod-a", "pod-b"]);
+    }
+
+    #[test]
+    fn an_origin_that_no_longer_renders_falls_back_to_the_services_committer() {
+        let (dir, state) = setup();
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        // A replica name git cannot hold in a committer header.
+        let bad = Origin {
+            replica: "evil <x>".into(),
+            ..pod("pod-c")
+        };
+        journal_from(&rec, dir.path(), &bad, "c", "1");
+        journal_from(&rec, dir.path(), &bad, "d", "2");
+        com.commit_pending().unwrap();
+        let commits = commits(&com);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].0, "pod-0");
+        assert!(
+            commits[0].2.contains("Agentfs-Pod: pod-c\n"),
+            "{}",
+            commits[0].2
+        );
+        let fallbacks: Vec<Event> = sink
+            .take()
+            .into_iter()
+            .filter(|e| matches!(e, Event::IdentityFallback { .. }))
+            .collect();
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(fallbacks[0].is_alarm());
+        assert!(fallbacks[0].to_string().contains("evil <x>"));
     }
 
     fn exclude(state: &StateDir, patterns: &str) {
