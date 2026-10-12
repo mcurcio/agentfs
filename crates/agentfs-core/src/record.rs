@@ -25,6 +25,9 @@ pub enum Trigger {
     Release,
     /// Recorded late, by the periodic sweep of files that stay open.
     Sweep,
+    /// Recorded by an fsync-class group's trailing timer, at most one
+    /// `agentfs.coalesce` after its last change (design §8).
+    Interval,
     /// An operator restore (design §15).
     Restore,
 }
@@ -42,6 +45,7 @@ impl Trigger {
             Self::Fsync => "fsync",
             Self::Release => "release",
             Self::Sweep => "sweep",
+            Self::Interval => "interval",
             Self::Restore => "restore",
         }
     }
@@ -145,6 +149,15 @@ pub struct Draft {
     /// older journals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<Operation>,
+    /// All or nothing: if any change is refused when committed, the whole
+    /// record is dropped. Set for fsync-class groups, whose files are only
+    /// consistent together (design §8). Absent from older journals.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub atomic: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A durable journal record.
@@ -187,5 +200,29 @@ mod tests {
             serde_json::from_str::<Change>(&lfs).unwrap(),
             write(Store::Lfs)
         );
+    }
+
+    #[test]
+    fn atomic_is_journaled_only_when_set() {
+        let mut draft = Draft {
+            trigger: Trigger::Interval,
+            caller: Caller {
+                uid: 1,
+                gid: 1,
+                pid: 1,
+            },
+            time_ms: 5,
+            changes: vec![],
+            operation: None,
+            atomic: false,
+        };
+        let plain = serde_json::to_string(&draft).unwrap();
+        assert!(!plain.contains("atomic"), "{plain}");
+        assert!(plain.contains(r#""trigger":"interval""#), "{plain}");
+        assert_eq!(serde_json::from_str::<Draft>(&plain).unwrap(), draft);
+        draft.atomic = true;
+        let atomic = serde_json::to_string(&draft).unwrap();
+        assert!(atomic.ends_with(r#","atomic":true}"#), "{atomic}");
+        assert_eq!(serde_json::from_str::<Draft>(&atomic).unwrap(), draft);
     }
 }

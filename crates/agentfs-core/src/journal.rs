@@ -371,6 +371,7 @@ mod tests {
                 path: RepoPath::new(path).unwrap(),
             }],
             operation: None,
+            atomic: false,
         }
     }
 

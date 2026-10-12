@@ -683,6 +683,7 @@ impl Recorder {
                 time_ms: now_ms(),
                 changes: changes.clone(),
                 operation,
+                atomic: false,
             };
             Ok(Some(self.journal.record(draft)?))
         })();
@@ -2067,6 +2068,7 @@ mod tests {
                 time_ms,
                 changes: vec![change.clone()],
                 operation: None,
+                atomic: false,
             })
             .unwrap();
         rec.tracked.apply(&change);
@@ -2253,6 +2255,7 @@ mod tests {
                     time_ms: time,
                     changes: vec![],
                     operation,
+                    atomic: false,
                 },
             });
         }
@@ -2492,6 +2495,7 @@ mod tests {
                 time_ms,
                 changes: vec![],
                 operation: None,
+                atomic: false,
             },
         };
         let records = [

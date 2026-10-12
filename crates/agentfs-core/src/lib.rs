@@ -15,6 +15,7 @@ pub mod config;
 pub mod confined;
 pub mod credentials;
 pub mod events;
+pub mod fsync_class;
 pub mod gitmodules;
 pub mod history;
 pub mod identity;

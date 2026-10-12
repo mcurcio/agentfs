@@ -37,6 +37,7 @@ use gix_ignore::search::Ignore;
 
 use crate::checks::Refusal;
 use crate::config::{Nested, Settings};
+use crate::fsync_class::{self, FsyncClass};
 use crate::nested::{self, NestedKind};
 use crate::paths::RepoPath;
 use crate::probe;
@@ -48,6 +49,15 @@ pub enum RulesError {
         path: PathBuf,
         #[source]
         source: io::Error,
+    },
+    /// An `agentfs.*` value in `info/attributes` that is not valid (design
+    /// §4.2): the volume refuses to open rather than guess.
+    #[error("info/attributes line {line}: {name}={value}: {reason}")]
+    BadAttribute {
+        line: usize,
+        name: String,
+        value: String,
+        reason: String,
     },
 }
 
@@ -113,6 +123,12 @@ pub enum SkipReason {
     /// git's fsck or a remote's limit would refuse the path (design §3.4,
     /// [`crate::checks`]).
     Refused(Refusal),
+    /// A SQLite shared-memory file (`<stem>-shm`) of an fsync-class
+    /// database: SQLite rebuilds it, so it is never recorded (design §8).
+    SharedMemory,
+    /// Another member of the path's fsync-class group was refused, and a
+    /// group is recorded whole or not at all (design §8).
+    GroupRefused { member: RepoPath },
 }
 
 impl fmt::Display for SkipReason {
@@ -125,6 +141,13 @@ impl fmt::Display for SkipReason {
             }
             Self::Untracked => f.write_str("nothing tracked at this path"),
             Self::Refused(refusal) => write!(f, "refused: {refusal}"),
+            Self::SharedMemory => f.write_str("SQLite shared memory of an fsync-class database"),
+            Self::GroupRefused { member } => {
+                write!(
+                    f,
+                    "group member {member} was refused, so the group is not recorded"
+                )
+            }
         }
     }
 }
@@ -150,6 +173,11 @@ pub enum AttrState {
 pub struct Attributes(BTreeMap<String, AttrState>);
 
 impl Attributes {
+    /// Attributes from a map, as tests and policy code build them.
+    pub fn from_map(map: BTreeMap<String, AttrState>) -> Self {
+        Self(map)
+    }
+
     pub fn get(&self, name: &str) -> Option<&AttrState> {
         self.0.get(name)
     }
@@ -171,6 +199,9 @@ pub struct Rules {
     operator_ignore: gix_ignore::Search,
     operator_attrs: gix_attributes::Search,
     operator_macros: MetadataCollection,
+    /// Whether any operator line mentions `agentfs.commit=fsync`, so callers
+    /// can skip class lookups on volumes without databases.
+    fsync_class: bool,
 }
 
 impl fmt::Debug for Rules {
@@ -218,6 +249,9 @@ impl Rules {
             operator_ignore,
             operator_attrs,
             operator_macros,
+            fsync_class: info_attributes
+                .windows(FSYNC_LINE.len())
+                .any(|w| w == FSYNC_LINE),
         }
     }
 
@@ -238,7 +272,54 @@ impl Rules {
         };
         let exclude = read("exclude")?;
         let attributes = read("attributes")?;
+        validate_operator_attributes(&attributes)?;
         Ok(Self::new(tree, options, &exclude, &attributes))
+    }
+
+    /// Whether any operator line mentions `agentfs.commit=fsync`. When
+    /// false, no path is in the fsync class.
+    pub fn has_fsync_class(&self) -> bool {
+        self.fsync_class
+    }
+
+    /// The fsync-class settings for `path` (design §8), from operator rules
+    /// only: tree files can never set `agentfs.*`.
+    pub fn fsync_class(&self, path: &RepoPath) -> Option<FsyncClass> {
+        if !self.fsync_class {
+            return None;
+        }
+        FsyncClass::from_attributes(&self.operator_attrs_of(path))
+    }
+
+    /// `agentfs.maxSize` for `path`: the largest content recorded there
+    /// (design §4.2), from operator rules only.
+    pub fn max_size(&self, path: &RepoPath) -> Option<u64> {
+        fsync_class::max_size(&self.operator_attrs_of(path))
+    }
+
+    fn operator_attrs_of(&self, path: &RepoPath) -> Attributes {
+        Attributes(
+            self.operator_attributes(path)
+                .into_iter()
+                .filter_map(|(name, state)| Some((name, state?)))
+                .collect(),
+        )
+    }
+
+    /// Whether `path` is the `-shm` file of a database in the fsync class:
+    /// the path itself has the class, or the file it is the shared memory
+    /// of does.
+    fn is_class_shm(&self, path: &RepoPath, raw: &RawAttrs) -> bool {
+        if !self.fsync_class || !fsync_class::is_shm(path.file_name().as_bytes()) {
+            return false;
+        }
+        let own =
+            raw.get(fsync_class::COMMIT_ATTR) == Some(&Some(AttrState::Value("fsync".into())));
+        own || {
+            let name = path.as_str();
+            let stem = &name[..name.len() - "-shm".len()];
+            RepoPath::new(stem).is_ok_and(|stem| self.fsync_class(&stem).is_some())
+        }
     }
 
     /// The backing tree the rules read.
@@ -252,13 +333,18 @@ impl Rules {
 
     /// Whether a write to `path` (a file or symlink) is recorded.
     ///
-    /// In order: an operator `-agentfs` always skips; otherwise a tracked
+    /// In order: an operator `-agentfs` always skips, and so does the
+    /// `-shm` file of an fsync-class database; otherwise a tracked
     /// path is recorded; otherwise nested repositories and ignore rules may
     /// skip it. Tree `.gitattributes` are never read here, since they cannot
     /// set `agentfs.*`.
     pub fn decide(&self, path: &RepoPath, tracked: bool) -> Result<Decision, RulesError> {
-        if self.operator_attributes(path).get("agentfs") == Some(&Some(AttrState::Unset)) {
+        let raw = self.operator_attributes(path);
+        if raw.get("agentfs") == Some(&Some(AttrState::Unset)) {
             return Ok(Decision::Skip(SkipReason::NeverRecord));
+        }
+        if self.is_class_shm(path, &raw) {
+            return Ok(Decision::Skip(SkipReason::SharedMemory));
         }
         if tracked {
             return Ok(Decision::Record);
@@ -444,6 +530,64 @@ impl Rules {
         let path = self.tree.join(rel);
         probe::read_regular(&path, probe::RULE_FILE).map_err(io_error(path))
     }
+}
+
+/// What [`Rules::has_fsync_class`] looks for in `info/attributes`.
+const FSYNC_LINE: &[u8] = b"agentfs.commit=fsync";
+
+/// Checks every `agentfs.commit`, `agentfs.coalesce` and `agentfs.maxSize`
+/// assignment in the operator's `info/attributes`, macro definitions
+/// included ([`fsync_class::validate_value`]). A bad value is an error so a
+/// typo never silently records a database on close.
+pub fn validate_operator_attributes(bytes: &[u8]) -> Result<(), RulesError> {
+    for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Skip the pattern: quoted (C-style escapes) or up to whitespace.
+        let rest = if let Some(quoted) = line.strip_prefix('"') {
+            let mut escaped = false;
+            let end = quoted.char_indices().find_map(|(j, c)| {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    return Some(j + 1);
+                }
+                None
+            });
+            match end {
+                Some(end) => &quoted[end..],
+                None => continue,
+            }
+        } else {
+            match line.find(char::is_whitespace) {
+                Some(end) => &line[end..],
+                None => continue,
+            }
+        };
+        for token in rest.split_whitespace() {
+            if token.starts_with('-') || token.starts_with('!') {
+                continue;
+            }
+            let (name, value) = match token.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (token, None),
+            };
+            fsync_class::validate_value(name, value).map_err(|reason| {
+                RulesError::BadAttribute {
+                    line: i + 1,
+                    name: name.to_owned(),
+                    value: value.unwrap_or("").to_owned(),
+                    reason,
+                }
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -846,6 +990,93 @@ mod tests {
     }
 
     #[test]
+    fn fsync_class_comes_from_operator_rules_only() {
+        let f = Fixture::new();
+        f.file(".gitattributes", "*.db agentfs.commit=fsync\n");
+        assert!(!f.rules(true, "", "").has_fsync_class());
+        assert_eq!(f.rules(true, "", "").fsync_class(&p("a.db")), None);
+        let r = f.rules(
+            true,
+            "",
+            "[attr]sqlite agentfs.commit=fsync agentfs.group=sqlite agentfs.coalesce=5s\n\
+             *.db sqlite\n*.db-wal sqlite\n*.db-shm sqlite\nbig/* agentfs.maxSize=1k\n",
+        );
+        assert!(r.has_fsync_class());
+        assert_eq!(
+            r.fsync_class(&p("d/a.db-wal")),
+            Some(FsyncClass {
+                coalesce: std::time::Duration::from_secs(5),
+                group: Some("sqlite".into())
+            })
+        );
+        assert_eq!(r.fsync_class(&p("a.txt")), None);
+        assert_eq!(r.max_size(&p("big/x")), Some(1024));
+        assert_eq!(r.max_size(&p("x")), None);
+    }
+
+    #[test]
+    fn shared_memory_of_a_class_database_is_never_recorded() {
+        let f = Fixture::new();
+        let shm = Decision::Skip(SkipReason::SharedMemory);
+        // The -shm itself has the class.
+        let r = f.rules(false, "", "*.db* agentfs.commit=fsync\n");
+        assert_eq!(decide(&r, "a.db-shm"), shm);
+        assert_eq!(r.decide(&p("a.db-shm"), true).unwrap(), shm);
+        assert_eq!(decide(&r, "a.db-wal"), Decision::Record);
+        // Only the database has it.
+        let r = f.rules(false, "", "*.db agentfs.commit=fsync\n");
+        assert_eq!(decide(&r, "d/a.db-shm"), shm);
+        // Without the class a -shm file is just a file.
+        let r = f.rules(false, "", "*.db agentfs.commit=close\n");
+        assert_eq!(decide(&r, "a.db-shm"), Decision::Record);
+        // -agentfs still reads as itself.
+        let r = f.rules(false, "", "*.db agentfs.commit=fsync\n*-shm -agentfs\n");
+        assert_eq!(
+            decide(&r, "a.db-shm"),
+            Decision::Skip(SkipReason::NeverRecord)
+        );
+    }
+
+    #[test]
+    fn load_refuses_bad_class_values() {
+        let f = Fixture::new();
+        let git = f.tree().join("git");
+        fs::create_dir_all(git.join("info")).unwrap();
+        for (text, line, name) in [
+            ("*.db agentfs.commit=always\n", 1, "agentfs.commit"),
+            (
+                "# c\n*.db agentfs.commit=fsync agentfs.coalesce=10ms\n",
+                2,
+                "agentfs.coalesce",
+            ),
+            ("[attr]db agentfs.commit\n", 1, "agentfs.commit"),
+            ("\"a b\" agentfs.maxSize=lots\n", 1, "agentfs.maxSize"),
+        ] {
+            fs::write(git.join("info/attributes"), text).unwrap();
+            match Rules::load(&git, f.tree(), RuleOptions::default()) {
+                Err(RulesError::BadAttribute {
+                    line: l, name: n, ..
+                }) => {
+                    assert_eq!((l, n.as_str()), (line, name), "{text}");
+                }
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+        fs::write(
+            git.join("info/attributes"),
+            "*.db agentfs.commit=fsync agentfs.coalesce=2s agentfs.maxSize=64m\n\
+             x -agentfs.commit !agentfs.coalesce\n\"q\\\" r\" agentfs.commit=close\n",
+        )
+        .unwrap();
+        Rules::load(&git, f.tree(), RuleOptions::default()).unwrap();
+        let err = validate_operator_attributes(b"*.db agentfs.coalesce=0s\n").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "info/attributes line 1: agentfs.coalesce=0s: expected a duration of at least 1s (e.g. 5s, 30s, 2m)"
+        );
+    }
+
+    #[test]
     fn reasons_read_well() {
         let cases = [
             (
@@ -874,6 +1105,16 @@ mod tests {
                 "inside nested repository sub (.git directory)",
             ),
             (SkipReason::Untracked, "nothing tracked at this path"),
+            (
+                SkipReason::SharedMemory,
+                "SQLite shared memory of an fsync-class database",
+            ),
+            (
+                SkipReason::GroupRefused {
+                    member: p("a.db-wal"),
+                },
+                "group member a.db-wal was refused, so the group is not recorded",
+            ),
         ];
         for (reason, text) in cases {
             assert_eq!(reason.to_string(), text);

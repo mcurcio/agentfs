@@ -833,6 +833,7 @@ mod tests {
                     time_ms: 1_700_000_000_000,
                     changes,
                     operation: None,
+                    atomic: false,
                 },
             };
             self.seq += 1;

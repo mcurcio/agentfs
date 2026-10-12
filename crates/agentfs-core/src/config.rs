@@ -613,6 +613,25 @@ pub fn parse_duration(value: &str) -> Option<Duration> {
     }
 }
 
+/// Parses a positive byte count with an optional `k`, `m` or `g` suffix
+/// (powers of 1024, either case), as git reads sizes: `512k`, `100m`, `2g`.
+/// Zero is not a size.
+pub fn parse_size(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (number, shift) = match value.as_bytes().last()? {
+        b'k' | b'K' => (&value[..value.len() - 1], 10),
+        b'm' | b'M' => (&value[..value.len() - 1], 20),
+        b'g' | b'G' => (&value[..value.len() - 1], 30),
+        _ => (value, 0),
+    };
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = number.parse().ok()?;
+    let n = n.checked_mul(1u64 << shift)?;
+    (n > 0).then_some(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +1035,17 @@ mod tests {
         assert_eq!(names, ["a", "b"]);
         for bad in &s.invalid_remotes {
             assert!(bad.error.starts_with("lfs.url:"), "{}", bad.error);
+        }
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("100"), Some(100));
+        assert_eq!(parse_size("512k"), Some(512 << 10));
+        assert_eq!(parse_size("64M"), Some(64 << 20));
+        assert_eq!(parse_size("2g"), Some(2 << 30));
+        for bad in ["", "0", "0k", "k", "-1", "1.5m", "1t", "big", " m"] {
+            assert_eq!(parse_size(bad), None, "{bad:?}");
         }
     }
 
