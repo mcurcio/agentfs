@@ -145,6 +145,7 @@ step "a volume with a remote"
 sudo "$AGENTFS_BIN" --state "$STATE" init --volume demo >/dev/null
 sgit config agentfs.commitWindow 200ms
 sgit config agentfs.sweepInterval 1s
+sgit config agentfs.pushInterval 1s
 sudo git init -q --bare "$REMOTE"
 sgit config remote.origin.url "$REMOTE"
 
@@ -262,15 +263,21 @@ start_service
 wait_history durable.txt durable
 assert_eq pod-b "$(committer_of durable.txt)" "replayed with pod-b's committer"
 
+step "the service pushes"
+wait_for 30 sh -c "[ \"\$(sudo git --git-dir '$REMOTE' rev-parse refs/heads/agentfs/demo 2>/dev/null)\" = \"\$(sudo git --git-dir '$STATE/git' rev-parse refs/heads/agentfs/demo)\" ]" ||
+  fail "the remote never got the local head"
+pass "the remote has the local head"
+
 step "stop the fronts, then the service"
 stop_front "$A_PID" pod-a
 A_PID=
 stop_front "$B_PID" pod-b
 B_PID=
 stop_service
-HEAD=$(head_of)
-assert_eq "$HEAD" "$(sudo git --git-dir "$REMOTE" rev-parse refs/heads/agentfs/demo)" \
-  "the remote has the local head"
+# The final commit may add commits after the last push.
+sudo "$AGENTFS_BIN" --state "$STATE" push >/dev/null
+assert_eq "$(head_of)" "$(sudo git --git-dir "$REMOTE" rev-parse refs/heads/agentfs/demo)" \
+  "after a push, the remote has the final head"
 
 step "per-close cost: single-process mount, then a front"
 N=${BOUNDARY_N:-1000}
