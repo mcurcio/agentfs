@@ -1818,6 +1818,11 @@ lock-coordinated database must be written from one pod. If two pods hit
 one path at the same instant, the race between freeze and journal can
 leave HEAD on the earlier pod's state until that path's next boundary;
 per-path freeze stamps are a follow-up.
+Each front learns of another front's renames and removals only at its
+next lookup (entries are cached 1 s); a name a front knew that no longer
+leads to the file it looks up (moved away, or its inode number reused by
+the filesystem) is dropped then, so opens and records use the current
+name.
 
 **Measured cost per boundary** (open question §19.2 item 2, single node).
 These numbers are indicative: the CI runners are shared, and nothing

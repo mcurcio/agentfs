@@ -662,6 +662,33 @@ fn stale_backing_inodes_are_detected() {
 }
 
 #[test]
+fn names_another_process_moved_away_are_dropped_at_lookup() {
+    // Another front of the same backing tree (design §14) renames a file
+    // this mount knows by its old name.
+    let fx = Fx::new();
+    fx.put("old", "1");
+    let id = fx.id("old");
+    fs::rename(fx.backing().join("old"), fx.backing().join("new")).unwrap();
+    assert_eq!(fx.id("new"), id);
+    // The old name is gone from the node: it opens, and records, by the
+    // new one.
+    let fh = fx.open("new", O_WRONLY | O_TRUNC);
+    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.close(fh);
+    assert_eq!(fx.history().get("new"), Some(&file("2")));
+    // A real hard link keeps both names.
+    fs::hard_link(fx.backing().join("new"), fx.backing().join("link")).unwrap();
+    assert_eq!(fx.id("link"), id);
+    assert_eq!(fx.id("new"), id);
+    let fh = fx.open("new", O_WRONLY | O_TRUNC);
+    fx.ops.write(fh, 0, b"3", C).unwrap();
+    fx.close(fh);
+    let history = fx.history();
+    assert_eq!(history.get("new"), Some(&file("3")), "{history:?}");
+    assert_eq!(history.get("link"), Some(&file("3")), "{history:?}");
+}
+
+#[test]
 fn symlinked_components_never_escape() {
     let fx = Fx::new();
     fs::write(fx.dir.path().join("outside"), "secret").unwrap();

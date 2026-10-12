@@ -764,9 +764,57 @@ impl Ops {
         let id = self
             .table()
             .lookup(parent, name, dev, ino, Kind::from_mode(mode_of(st)));
+        self.prune_stale_names(id, parent, name, (dev, ino));
         Entry {
             id,
             attr: attr(id, st),
+        }
+    }
+
+    /// Drops the names of node `id`, other than `parent/name`, that no
+    /// longer lead to its backing inode. Another process changed the
+    /// backing tree under them: a second front of the same tree (design
+    /// §14) renamed or removed the file, and the filesystem may since have
+    /// reused its inode number for the file just looked up. Left alone, a
+    /// stale first name would be the node's path: opens would fail and
+    /// records would name the wrong path. Only nodes with several names
+    /// pay the extra lookups.
+    fn prune_stale_names(&self, id: u64, parent: u64, name: &[u8], inode: (u64, u64)) {
+        let others: Vec<(u64, Vec<u8>, Vec<u8>)> = {
+            let table = self.table();
+            let Some(node) = table.get(id) else {
+                return;
+            };
+            if node.links().len() < 2 {
+                return;
+            }
+            node.links()
+                .iter()
+                .filter(|(p, n)| !(*p == parent && n == name))
+                .filter_map(|(p, n)| Some((*p, n.clone(), join(&table.path(*p)?, n))))
+                .collect()
+        };
+        let stale: Vec<(u64, Vec<u8>)> = others
+            .into_iter()
+            .filter(|(_, _, path)| match self.backing.open_path(path) {
+                Ok(fd) => rustix::fs::fstat(&fd).is_ok_and(|st| dev_ino(&st) != inode),
+                Err(e) => matches!(
+                    e.raw_os_error(),
+                    Some(libc_errno) if libc_errno == Errno::ENOENT.code()
+                        || libc_errno == Errno::ENOTDIR.code()
+                        || libc_errno == Errno::ELOOP.code()
+                ),
+            })
+            .map(|(p, n, _)| (p, n))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let mut table = self.table();
+        for (p, n) in stale {
+            if table.child(p, &n) == Some(id) {
+                table.remove_link(p, &n);
+            }
         }
     }
 
