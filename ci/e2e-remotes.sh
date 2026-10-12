@@ -71,8 +71,8 @@ agentfs record b.txt
 HEAD=$(local_head demo)
 set_password alice pw2 # the server rotates; the volume still has pw1
 LOG=$VOL/run.log
-agentfs run >"$LOG" 2>&1 &
-RUN=$!
+agentfs_start "$LOG" run
+RUN=$AGENTFS_PID
 wait_for 30 grep -q "auth" "$LOG" || { cat "$LOG"; fail "run never reported the auth failure"; }
 pass "run reports the stale credential"
 printf 'username=alice\npassword=pw2\n' >"$CREDS/alice.new" && mv "$CREDS/alice.new" "$CREDS/alice"

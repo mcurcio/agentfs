@@ -44,6 +44,15 @@ agentfs() {
     "$AGENTFS_BIN" "$@"
 }
 
+# Starts agentfs in the background with output to $1, setting AGENTFS_PID to
+# the binary's own PID (so signals reach it, not a subshell).
+agentfs_start() { # log args...
+  local log=$1; shift
+  AGENTFS_STATE=$STATE AGENTFS_ROOT=$TREE AGENTFS_POD=${AGENTFS_POD:-ci-0} \
+    "$AGENTFS_BIN" "$@" >"$log" 2>&1 &
+  AGENTFS_PID=$!
+}
+
 # Sets keys in the volume's history repository config.
 volume_config() { # key value
   git --git-dir "$STATE/git" config "$1" "$2"

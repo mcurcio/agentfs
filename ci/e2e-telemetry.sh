@@ -18,7 +18,9 @@ REMOTE=$(mktemp -d)/remote.git
 git init -q --bare "$REMOTE"
 volume_config remote.good.url "$REMOTE"
 volume_config remote.gone.url "$VOL/does-not-exist.git"
-volume_config remote.small.url "$REMOTE"
+SMALL=$(mktemp -d)/small.git
+git init -q --bare "$SMALL"
+volume_config remote.small.url "$SMALL"
 volume_config remote.small.agentfsMaxBlobSize 8
 volume_config remote.broken.url "$REMOTE"
 volume_config remote.broken.agentfsMaxBlobSize lots
@@ -40,8 +42,8 @@ git -C "$OTHER/c" push -q origin w:refs/heads/agentfs/telem
 echo more >"$TREE/more.txt"
 agentfs record more.txt
 LOG=$VOL/run.log
-agentfs run >"$LOG" 2>&1 &
-RUN=$!
+agentfs_start "$LOG" run
+RUN=$AGENTFS_PID
 sleep 4 # several metric export intervals and push attempts
 kill -TERM "$RUN"
 wait "$RUN" || { cat "$LOG"; fail "run did not exit cleanly"; }
