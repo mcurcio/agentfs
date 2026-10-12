@@ -1365,28 +1365,31 @@ fn a_member_over_max_size_refuses_the_whole_group() {
     let (_, wal) = fx.create("s.db-wal");
     fx.ops.write(db, 0, b"db", C).unwrap();
     fx.ops.write(wal, 0, b"0123456789", C).unwrap();
-    // A refusal is not a failure: close succeeds, nothing is recorded,
-    // and the group is clean.
+    // A refusal is not a failure: the last close succeeds, nothing is
+    // recorded, and the group is clean.
     fx.close(db);
+    fx.close(wal);
     assert_eq!(fx.backlog(), 0);
     assert_eq!(fx.refused(), ["s.db-wal"]);
     assert_eq!(fx.later(60), 0);
-    fx.close(wal);
 }
 
 #[test]
-fn a_restore_actor_captures_namespace_changes_at_once() {
+fn a_restore_actor_s_changes_are_captured_whole_at_the_operation_s_end() {
     use agentfs_core::record::OperationKind;
     let fx = Fx::with_attributes(SQLITE);
     fx.put("s.db", "v1");
     fx.put("s.db-journal", "j");
     fx.history();
+    let records = fx.journal().len();
     let operator = Caller {
         uid: 0,
         gid: 0,
         pid: 999,
     };
     let actor = Caller { pid: 4321, ..C };
+    // The workload holds the database open meanwhile (a forced restore).
+    let workload = fx.open("s.db", O_RDONLY);
     let guard = fx
         .ops
         .boundary()
@@ -1399,10 +1402,150 @@ fn a_restore_actor_captures_namespace_changes_at_once() {
             &[actor.pid],
         )
         .unwrap();
+    // The actor removes the journal and rewrites the database, as a
+    // restore does, one member at a time.
     fx.ops.unlink(ROOT, b"s.db-journal", actor).unwrap();
+    let id = fx.id("s.db");
+    let (fh, _) = fx.ops.open(id, O_WRONLY | O_TRUNC, actor).unwrap();
+    fx.ops.write(fh, 0, b"v0", actor).unwrap();
+    // No trigger records the half-restored group: not the timer, not an
+    // fsync, not the actor's close or release.
+    assert_eq!(fx.later(600), 0);
+    fx.ops.fsync(workload, false).unwrap();
+    fx.ops.flush(fh, actor).unwrap();
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.journal().len(), records);
+    // The operation's end records it whole, as part of the operation.
+    assert_eq!(fx.ops.capture_operation().unwrap(), 1);
     guard.finish();
-    let last = fx.journal().pop().unwrap();
+    let journal = fx.journal();
+    assert_eq!(journal.len(), records + 1);
+    let last = journal.last().unwrap();
     assert_eq!(last.draft.trigger, Trigger::Restore);
+    assert_eq!(last.draft.caller, operator);
     assert!(last.draft.atomic);
-    assert_eq!(fx.history(), map(&[("s.db", file("v1"))]));
+    assert!(last.draft.operation.is_some());
+    assert_eq!(fx.history(), map(&[("s.db", file("v0"))]));
+    // Clean afterwards: nothing for the timer or the last close.
+    assert_eq!(fx.later(600), 0);
+    fx.close(workload);
+    assert_eq!(fx.backlog(), 0);
+}
+
+#[test]
+fn closing_one_member_while_another_is_open_does_not_capture() {
+    // SQLite in DELETE mode opens, writes, fsyncs and closes (or unlinks)
+    // the -journal on every transaction while the database stays open:
+    // the close must not capture, or the rate is unbounded.
+    let fx = Fx::with_attributes(SQLITE);
+    let (_, db) = fx.create("s.db");
+    fx.ops.write(db, 0, b"db0", C).unwrap();
+    fx.ops.fsync(db, false).unwrap();
+    assert_eq!(fx.journal().len(), 1, "the first fsync captures");
+    for i in 1..=5 {
+        let (_, journal) = fx.create("s.db-journal");
+        fx.ops.write(journal, 0, b"hot", C).unwrap();
+        fx.ops.fsync(journal, false).unwrap();
+        fx.close(journal);
+        fx.ops.write(db, 0, format!("db{i}").as_bytes(), C).unwrap();
+        fx.ops.fsync(db, false).unwrap();
+        fx.ops.unlink(ROOT, b"s.db-journal", C).unwrap();
+    }
+    // Five transactions inside one interval: still one capture.
+    assert_eq!(fx.journal().len(), 1);
+    // A reader opening and closing the database does not capture either.
+    let reader = fx.open("s.db", O_RDONLY);
+    fx.close(reader);
+    assert_eq!(fx.journal().len(), 1);
+    // The trailing timer, one interval on, records the last state...
+    assert_eq!(fx.later(6), 1);
+    assert_eq!(fx.history(), map(&[("s.db", file("db5"))]));
+    // ...and the last handle's close what changed after it.
+    fx.ops.write(db, 0, b"db6", C).unwrap();
+    fx.close(db);
+    assert_eq!(fx.journal().last().unwrap().draft.trigger, Trigger::Close);
+    assert_eq!(fx.history(), map(&[("s.db", file("db6"))]));
+}
+
+#[test]
+fn a_failed_fsync_capture_returns_ok_and_leaves_the_group_changed() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("root ignores the permission this test takes away: skipped");
+        return;
+    }
+    let fx = Fx::with_attributes(SQLITE);
+    let (_, db) = fx.create("s.db");
+    fx.ops.write(db, 0, b"db1", C).unwrap();
+    let pending = fx.state().pending();
+    let mode = fs::metadata(&pending).unwrap().permissions();
+    fs::set_permissions(&pending, fs::Permissions::from_mode(0o500)).unwrap();
+    // The data reached the disk: the fsync succeeds whatever the capture.
+    fx.ops.fsync(db, false).unwrap();
+    assert_eq!(fx.backlog(), 0);
+    let group = fx.ops.groups().dirty().pop().expect("still changed");
+    assert!(group.state().last_attempt.is_some());
+    assert!(
+        fx.sink
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, Event::RecordFailed { .. }))
+    );
+    fs::set_permissions(&pending, mode).unwrap();
+    // The timer retries it one interval later.
+    assert_eq!(fx.later(6), 1);
+    assert_eq!(fx.history(), map(&[("s.db", file("db1"))]));
+    fx.close(db);
+}
+
+#[test]
+fn a_database_whose_directory_moved_is_captured_at_its_new_path() {
+    let fx = Fx::with_attributes(SQLITE);
+    fx.mkdir("d");
+    let (_, db) = fx.create("d/s.db");
+    fx.ops.write(db, 0, b"v1", C).unwrap();
+    fx.rename("d", "e", 0).unwrap();
+    // Writes through the handle opened before the rename change the group
+    // at the new path.
+    fx.ops.write(db, 0, b"v2", C).unwrap();
+    assert_eq!(fx.later(6), 1);
+    assert_eq!(fx.history(), map(&[("e/s.db", file("v2"))]));
+    fx.ops.write(db, 0, b"v3", C).unwrap();
+    assert_eq!(fx.later(12), 1);
+    assert_eq!(fx.history(), map(&[("e/s.db", file("v3"))]));
+    // The handle counts in its new group: its close is the last one.
+    fx.ops.write(db, 0, b"v4", C).unwrap();
+    fx.close(db);
+    assert_eq!(fx.history(), map(&[("e/s.db", file("v4"))]));
+    assert!(fx.ops.groups().dirty().is_empty());
+}
+
+#[test]
+fn a_member_the_rules_leave_out_refuses_the_whole_group() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("backing")).unwrap();
+    let state = StateDir::new(dir.path().join("state"));
+    volume::init(&state, "vol", None).unwrap();
+    fs::write(state.git().join("info/attributes"), SQLITE).unwrap();
+    fs::write(state.git().join("info/exclude"), "*-wal\n").unwrap();
+    let fx = Fx::open_on(
+        dir,
+        OpsConfig {
+            granularity_ns: 0,
+            chunk: RENAME_CHUNK,
+        },
+    );
+    let (_, db) = fx.create("s.db");
+    let (_, wal) = fx.create("s.db-wal");
+    fx.ops.write(db, 0, b"db", C).unwrap();
+    fx.ops.write(wal, 0, b"frames", C).unwrap();
+    fx.close(db);
+    fx.close(wal);
+    // Without its WAL the database could be torn: nothing is recorded,
+    // and the refusal is raised.
+    assert_eq!(fx.backlog(), 0);
+    assert_eq!(fx.refused(), ["s.db-wal"]);
+    // A database with no WAL is recorded.
+    fx.ops.unlink(ROOT, b"s.db-wal", C).unwrap();
+    assert_eq!(fx.later(6), 1);
+    assert_eq!(fx.history(), map(&[("s.db", file("db"))]));
 }

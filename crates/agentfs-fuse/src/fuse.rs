@@ -921,12 +921,7 @@ mod tests {
 
     fn handle(fx: &Fx, node: u64) -> Handle {
         let fd: OwnedFd = std::fs::File::open(&fx.file).unwrap().into();
-        Handle {
-            node,
-            fd,
-            write: false,
-            group: None,
-        }
+        Handle::new(node, fd, false, None, 0)
     }
 
     fn refuse(_: &Handle) -> io::Result<BackingId> {

@@ -23,8 +23,16 @@
 //!   the last capture, and never sooner than `agentfs.coalesce` after the
 //!   last attempt ([`GroupState::due_at`]), so a change is recorded at most
 //!   one interval late (plus the capture itself);
-//! - at the close of a member, the release of the group's last handle, and
-//!   unmount, whenever it changed.
+//! - at the close of the group's last open handle, its release, and
+//!   unmount, whenever it changed. Closing one member while another stays
+//!   open (SQLite's `-journal` in DELETE mode, every transaction) leaves
+//!   the change to the two rules above, so the rate stays bounded.
+//!
+//! **Operator operations** (a restore or revert through the mount, design
+//! §15): a change made by an operation's actor marks the group
+//! ([`GroupState::actor`]). While the operation runs, no trigger but the
+//! operation's own capture ([`Groups::in_operation`]) records the group, so
+//! history never holds a group half restored.
 //!
 //! A capture that fails leaves the group changed: the timer retries it one
 //! interval later. A capture the recorder refuses (a member over a limit)
@@ -41,6 +49,10 @@ use agentfs_core::record::Caller;
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
+
+/// Whether a process id is an actor of an operator operation now
+/// ([`agentfs_core::volume::Recorder::in_operation`]).
+pub type IsActor = Arc<dyn Fn(u32) -> bool + Send + Sync>;
 
 /// Holds writes to a group's members out while it is captured. Writers
 /// ([`Gate::hold`]) share it; a capture ([`Gate::freeze`]) has it alone,
@@ -138,6 +150,9 @@ pub struct GroupState {
     pub caller: Option<Caller>,
     /// Handles open on members.
     pub handles: usize,
+    /// The operator operation's actor that changed the group (design §15):
+    /// while it is one, only the operation's own capture records the group.
+    pub actor: Option<Caller>,
 }
 
 impl GroupState {
@@ -176,6 +191,7 @@ impl GroupState {
         self.last_attempt = Some(now);
         if done && self.generation == generation {
             self.dirty_since = None;
+            self.actor = None;
         }
     }
 }
@@ -204,6 +220,7 @@ pub struct Group {
     /// One capture at a time.
     capturing: Mutex<()>,
     kick: Arc<Kick>,
+    is_actor: IsActor,
 }
 
 impl fmt::Debug for Group {
@@ -245,10 +262,14 @@ impl Group {
     /// is for changes made with no hold (a rename, which `names` orders
     /// against captures).
     pub fn changed(&self, caller: Caller) {
+        let actor = (self.is_actor)(caller.pid);
         let was_clean = {
             let mut s = self.state();
             let was_clean = !s.is_dirty();
             s.changed(Instant::now(), caller);
+            if actor {
+                s.actor = Some(caller);
+            }
             was_clean
         };
         if was_clean {
@@ -260,6 +281,13 @@ impl Group {
 
     pub fn state(&self) -> MutexGuard<'_, GroupState> {
         lock(&self.state)
+    }
+
+    /// The actor of the operator operation whose changes the group holds,
+    /// while that operation runs: no other capture may record it.
+    pub fn deferred(&self) -> Option<Caller> {
+        let actor = self.state().actor?;
+        (self.is_actor)(actor.pid).then_some(actor)
     }
 
     /// Serializes captures of this group.
@@ -281,13 +309,30 @@ impl Group {
 
 /// Every group the mount knows. A group is kept while it is dirty or
 /// anything holds it; [`Groups::prune`] drops the rest.
-#[derive(Default)]
 pub struct Groups {
     map: Mutex<HashMap<GroupKey, Arc<Group>>>,
     kick: Arc<Kick>,
+    is_actor: IsActor,
+}
+
+impl Default for Groups {
+    /// Groups no operator operation ever changes.
+    fn default() -> Self {
+        Self::new(Arc::new(|_| false))
+    }
 }
 
 impl Groups {
+    /// No groups yet; `is_actor` tells which processes are actors of a
+    /// running operator operation.
+    pub fn new(is_actor: IsActor) -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            kick: Arc::new(Kick::default()),
+            is_actor,
+        }
+    }
+
     /// The group `members` describes, made on first use.
     pub fn get(&self, members: GroupMembers) -> Arc<Group> {
         let mut map = lock(&self.map);
@@ -305,6 +350,7 @@ impl Groups {
                     state: Mutex::new(GroupState::default()),
                     capturing: Mutex::new(()),
                     kick: self.kick.clone(),
+                    is_actor: self.is_actor.clone(),
                 })
             })
             .clone()
@@ -319,19 +365,38 @@ impl Groups {
             .collect()
     }
 
-    /// The groups the timer captures at `now`.
+    /// The groups the timer captures at `now`: never one a running
+    /// operator operation changed.
     pub fn due(&self, now: Instant) -> Vec<Arc<Group>> {
         lock(&self.map)
             .values()
             .filter(|g| g.state().due_at(g.coalesce).is_some_and(|at| at <= now))
+            .filter(|g| g.deferred().is_none())
             .cloned()
             .collect()
     }
 
-    /// When the next group is due, if any is dirty.
+    /// Every group a running operator operation changed, with the actor
+    /// that changed it.
+    pub fn in_operation(&self) -> Vec<(Arc<Group>, Caller)> {
+        lock(&self.map)
+            .values()
+            .filter_map(|g| g.deferred().map(|actor| (g.clone(), actor)))
+            .collect()
+    }
+
+    /// Wakes [`Groups::wait`], so it works out the next deadline again.
+    pub fn wake(&self) {
+        lock(&self.kick.state).kicked = true;
+        self.kick.cv.notify_all();
+    }
+
+    /// When the next group is due, if any is dirty and not held back by a
+    /// running operator operation.
     pub fn next_due(&self) -> Option<Instant> {
         lock(&self.map)
             .values()
+            .filter(|g| g.deferred().is_none())
             .filter_map(|g| g.state().due_at(g.coalesce))
             .min()
     }
@@ -524,5 +589,35 @@ mod tests {
         assert!(groups.wait(Some(Instant::now() + Duration::from_millis(10))));
         groups.stop();
         assert!(!groups.wait(None));
+    }
+
+    #[test]
+    fn a_running_operation_holds_its_groups_back_from_the_timer() {
+        let running = Arc::new(AtomicBool::new(true));
+        let groups = {
+            let running = running.clone();
+            Groups::new(Arc::new(move |pid| {
+                pid == 7 && running.load(Ordering::SeqCst)
+            }))
+        };
+        let a = groups.get(members("a.db"));
+        let b = groups.get(members("b.db"));
+        let actor = Caller { pid: 7, ..C };
+        a.changed(actor);
+        b.changed(C);
+        assert_eq!(a.deferred(), Some(actor));
+        assert_eq!(b.deferred(), None);
+        let far = Instant::now() + 60 * S;
+        // Only b is the timer's; a is the operation's.
+        assert_eq!(groups.due(far).len(), 1);
+        assert!(Arc::ptr_eq(&groups.due(far)[0], &b));
+        let ops = groups.in_operation();
+        assert_eq!(ops.len(), 1);
+        assert!(Arc::ptr_eq(&ops[0].0, &a));
+        // Once the operation ends, a left changed is the timer's again.
+        running.store(false, Ordering::SeqCst);
+        assert_eq!(a.deferred(), None);
+        assert_eq!(groups.due(far).len(), 2);
+        assert!(groups.in_operation().is_empty());
     }
 }

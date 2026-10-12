@@ -704,6 +704,14 @@ impl MountView {
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
     }
+
+    /// Records every fsync-class group the running operator operation
+    /// changed, each whole (design §8, §15). Call it after the operation's
+    /// last write, before it ends: until then no other trigger records
+    /// those groups. Returns how many captures were journaled.
+    pub fn capture_operation(&self) -> Result<usize, agentfs_core::volume::VolumeError> {
+        self.ops.capture_operation()
+    }
 }
 
 impl agentfs_core::restore::Liveness for MountView {

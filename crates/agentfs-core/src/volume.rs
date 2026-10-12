@@ -633,6 +633,22 @@ impl Recorder {
         for input in inputs {
             match self.decide(&input)? {
                 Decision::Record => kept.push(input),
+                // A group member the rules leave out (other than `-shm`)
+                // would be missing from the capture: a database without
+                // its WAL. The group is refused instead (design §8).
+                Decision::Skip(reason)
+                    if atomic
+                        && !matches!(input, Input::Remove { .. })
+                        && reason != SkipReason::SharedMemory =>
+                {
+                    self.refuse(
+                        &mut skipped,
+                        input.path().clone(),
+                        Refusal::GroupMemberSkipped {
+                            reason: reason.to_string(),
+                        },
+                    );
+                }
                 Decision::Skip(reason) => skipped.push(Skipped {
                     path: input.path().clone(),
                     reason,

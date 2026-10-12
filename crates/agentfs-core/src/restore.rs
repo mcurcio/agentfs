@@ -208,6 +208,8 @@ pub struct Plan {
     pub kind: OperationKind,
     /// The commit restored from, or reverted.
     pub source: Oid,
+    /// The branch head the plan was made against.
+    pub head: Oid,
     /// The commit subject for the operation.
     pub summary: String,
     pub steps: Vec<Step>,
@@ -538,6 +540,7 @@ pub fn plan(repo: &Repository, branch_ref: &str, request: &Request) -> Result<Pl
             Ok(Plan {
                 kind: OperationKind::Restore,
                 source: commit.id(),
+                head: head.id(),
                 summary: format!("restore {spec} from {}", short(&commit)),
                 steps,
                 changed_since: Vec::new(),
@@ -588,6 +591,7 @@ pub fn plan(repo: &Repository, branch_ref: &str, request: &Request) -> Result<Pl
             Ok(Plan {
                 kind: OperationKind::Revert,
                 source: commit.id(),
+                head: head.id(),
                 summary: format!("revert {}: {subject}", short(&commit)),
                 steps,
                 changed_since,
@@ -619,9 +623,20 @@ pub trait RecordPolicy {
     /// The checks for a file of `size` bytes whose content is not read (an
     /// LFS object), stored in `store`.
     fn check_size(&self, path: &RepoPath, size: u64, store: Store) -> Option<Refusal>;
+    /// Every member of the fsync-class group `path` belongs to (design
+    /// §8), `path` included; empty when it is in no group.
+    fn group_of(&self, _path: &RepoPath) -> Vec<RepoPath> {
+        Vec::new()
+    }
 }
 
 impl RecordPolicy for crate::volume::Recorder {
+    fn group_of(&self, path: &RepoPath) -> Vec<RepoPath> {
+        self.fsync_group(path)
+            .map(|g| g.members)
+            .unwrap_or_default()
+    }
+
     fn refuses(&self, path: &RepoPath, symlink_target: Option<&str>) -> io::Result<Option<String>> {
         self.would_record(path, symlink_target)
             .map(|r| r.map(|reason: SkipReason| reason.to_string()))
@@ -721,6 +736,71 @@ fn ancestors(path: &str) -> Vec<&str> {
     path.match_indices('/').map(|(i, _)| &path[..i]).collect()
 }
 
+/// Brings every member of an fsync-class group (design §8) a step touches
+/// into the plan, with its state in the same commit: a restore of
+/// `app.db` restores `app.db-wal` and `app.db-journal` with it, and a
+/// revert of a commit that changed one member puts every member back to
+/// the parent's version, so the tree never pairs one version's database
+/// with another's `-wal` or `-journal`. A member that has changed since
+/// the reverted commit counts as changed since (`--force`). A member
+/// neither history nor the target has is still checked: an untracked
+/// file there (a hot journal) refuses the plan.
+fn expand_groups(
+    mut plan: Plan,
+    repo: &Repository,
+    policy: &dyn RecordPolicy,
+) -> Result<Plan, RestoreError> {
+    let have: BTreeSet<RepoPath> = plan.steps.iter().map(|s| s.path.clone()).collect();
+    let extra: BTreeSet<RepoPath> = plan
+        .steps
+        .iter()
+        .flat_map(|s| policy.group_of(&s.path))
+        .filter(|m| !have.contains(m))
+        .collect();
+    if extra.is_empty() {
+        return Ok(plan);
+    }
+    let head_tree = repo.find_commit(plan.head)?.tree()?;
+    let source = repo.find_commit(plan.source)?;
+    let (target_tree, after_tree) = match plan.kind {
+        OperationKind::Restore => (Some(source.tree()?), None),
+        OperationKind::Revert => {
+            let parent = match source.parent_count() {
+                0 => None,
+                _ => Some(source.parent(0)?.tree()?),
+            };
+            (parent, Some(source.tree()?))
+        }
+    };
+    let managed = |tree: &git2::Tree<'_>| attributes::managed_paths(repo, tree);
+    let head_managed = managed(&head_tree)?;
+    let target_managed = match &target_tree {
+        Some(t) => managed(t)?,
+        None => BTreeSet::new(),
+    };
+    for path in extra {
+        let current = entry_at(repo, &head_tree, &head_managed, path.as_str())?;
+        let target = match &target_tree {
+            Some(t) => entry_at(repo, t, &target_managed, path.as_str())?,
+            None => None,
+        };
+        if let Some(after_tree) = &after_tree {
+            let after = entry_at(repo, after_tree, &managed(after_tree)?, path.as_str())?;
+            if current != after && current != target {
+                plan.changed_since.push(path.clone());
+            }
+        }
+        plan.steps.push(Step {
+            path,
+            current,
+            target,
+        });
+    }
+    plan.steps.sort_by(|a, b| a.path.cmp(&b.path));
+    plan.changed_since.sort();
+    Ok(plan)
+}
+
 /// Runs every check of `plan` against the tree before anything is
 /// written, and returns it without the steps the tree already matches.
 /// Every LFS object a step writes is made available in the cache first
@@ -734,6 +814,7 @@ pub fn check(
     live: &dyn Liveness,
     force: bool,
 ) -> Result<Plan, RestoreError> {
+    let plan = expand_groups(plan, repo, policy)?;
     let removed: BTreeSet<String> = plan
         .steps
         .iter()

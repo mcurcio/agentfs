@@ -29,8 +29,11 @@
 //! database and its `-wal` and `-journal`) is held against captures and
 //! marks the group changed; the whole group is then captured as one record
 //! at `fsync` (at most once per `agentfs.coalesce`), by the trailing timer,
-//! at close, at the release of its last handle and at unmount. `-shm` files
-//! are never recorded. Class files never use kernel passthrough.
+//! at the close and release of the group's last handle and at unmount.
+//! `-shm` files are never recorded. Class files never use kernel
+//! passthrough. While a restore or revert through the mount changes a
+//! group, only the operation records it, whole, at its end
+//! ([`Ops::capture_operation`]).
 //!
 //! **Permissions** (design §6) are checked by the kernel
 //! (`default_permissions`) before a request arrives; the daemon then acts
@@ -57,7 +60,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Instant;
 
 use agentfs_core::record::{Caller, Trigger};
@@ -113,17 +116,46 @@ pub struct Handle {
     pub node: u64,
     pub fd: OwnedFd,
     pub write: bool,
-    /// The fsync-class group of the file, when it was opened at a path in
-    /// the class (design §8): its writes are held during captures.
-    pub group: Option<Arc<Group>>,
+    /// The fsync-class group of the file (design §8): its writes are held
+    /// during captures. Found when the file is opened at a path in the
+    /// class, and again after any rename on the mount ([`Ops::rename`]), so
+    /// a database whose directory moved is captured at its new path.
+    group: Mutex<HandleGroup>,
+    /// Opened at a path in the class: never kernel passthrough.
+    daemon_only: bool,
+}
+
+/// A handle's group, as of the mount's rename count `renames`.
+#[derive(Debug)]
+struct HandleGroup {
+    renames: u64,
+    group: Option<Arc<Group>>,
 }
 
 impl Handle {
+    /// A handle on node `node` in fsync-class group `group`, found when
+    /// the mount had made `renames` renames.
+    pub fn new(
+        node: u64,
+        fd: OwnedFd,
+        write: bool,
+        group: Option<Arc<Group>>,
+        renames: u64,
+    ) -> Self {
+        Self {
+            node,
+            fd,
+            write,
+            daemon_only: group.is_some(),
+            group: Mutex::new(HandleGroup { renames, group }),
+        }
+    }
+
     /// Whether reads and writes must go through the daemon, never kernel
     /// passthrough: an fsync-class file, whose writes the daemon must see
     /// to hold them during a capture.
     pub fn daemon_only(&self) -> bool {
-        self.group.is_some()
+        self.daemon_only
     }
 }
 
@@ -173,11 +205,17 @@ pub struct SweepReport {
     pub still_queued: usize,
 }
 
-/// When [`Ops::capture`] captures a group.
+/// When [`Ops::capture`] captures a group. Every rule but `Operation` and
+/// `Unmount` leaves a group alone while a running operator operation
+/// changes it ([`Group::deferred`]).
 #[derive(Debug, Clone, Copy)]
 enum When {
     /// If it changed since its last capture.
     Changed,
+    /// The end of the operator operation that changed it.
+    Operation,
+    /// Unmount: if it changed, whatever else.
+    Unmount,
     /// If an `fsync` at this instant is due ([`crate::groups::GroupState::fsync_due`]).
     Fsync(Instant),
     /// If the trailing timer is due by this instant.
@@ -208,6 +246,8 @@ pub struct Ops {
     dirs: Mutex<HashMap<u64, Arc<Vec<DirEntry>>>>,
     next_fh: AtomicU64,
     names: RwLock<()>,
+    /// Renames made so far: a handle finds its group again after one.
+    renames: AtomicU64,
     boundary: Boundary,
     /// fsync-class groups (design §8).
     groups: Groups,
@@ -328,8 +368,12 @@ impl Ops {
             dirs: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             names: RwLock::new(()),
+            renames: AtomicU64::new(0),
+            groups: {
+                let recorder = recorder.clone();
+                Groups::new(Arc::new(move |pid| recorder.in_operation(pid)))
+            },
             boundary: Boundary::new(recorder, tree),
-            groups: Groups::default(),
             config,
             chown_new: Privileges::current().can_chown_new(),
             euid: rustix::process::geteuid().as_raw(),
@@ -353,8 +397,8 @@ impl Ops {
         self.boundary.group_of(raw).map(|m| self.groups.get(m))
     }
 
-    /// The fsync-class group of node `id`: of its open handles, or else of
-    /// the first of its current paths in the class.
+    /// The fsync-class group of node `id`: of the first of its current
+    /// paths in the class, or else (no name left) of its open handles.
     fn node_group(&self, id: u64) -> Option<Arc<Group>> {
         if !self.boundary.recorder().has_fsync_class() {
             return None;
@@ -364,14 +408,57 @@ impl Ops {
             let node = table.get(id)?;
             (node.group.clone(), table.paths(id))
         };
-        cached.or_else(|| paths.iter().find_map(|p| self.group_at(p)))
+        if paths.is_empty() {
+            return cached;
+        }
+        paths.iter().find_map(|p| self.group_at(p))
+    }
+
+    /// The group of handle `h` now. A handle opened in the class finds its
+    /// group again after any rename on the mount, from its node's current
+    /// paths (design §8): a database whose directory was renamed is
+    /// captured at its new path from its next change on. A file with no
+    /// name left keeps the group it had.
+    fn handle_group(&self, h: &Handle) -> Option<Arc<Group>> {
+        if !h.daemon_only {
+            return None;
+        }
+        let renames = self.renames.load(Ordering::Acquire);
+        let mut hg = h.group.lock().unwrap_or_else(PoisonError::into_inner);
+        if hg.renames == renames {
+            return hg.group.clone();
+        }
+        hg.renames = renames;
+        let paths = self.table().paths(h.node);
+        if paths.is_empty() {
+            return hg.group.clone();
+        }
+        let now = paths.iter().find_map(|p| self.group_at(p));
+        let same = match (&hg.group, &now) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            if let Some(old) = &hg.group {
+                old.released();
+            }
+            if let Some(new) = &now {
+                new.opened();
+            }
+            if let Some(node) = self.table().get_mut(h.node) {
+                node.group = now.clone();
+            }
+            hg.group = now.clone();
+        }
+        now
     }
 
     /// Records `changes` as one record, except changes at fsync-class paths
     /// (design §8): those mark their group changed instead, to be captured
-    /// whole later; when `caller` is an operator operation's actor (a
-    /// restore, design §15), at once, so the operation's changes stay its
-    /// own. The caller holds `names` for reading and no group hold.
+    /// whole later (by an operator operation's actor, at the operation's
+    /// end: [`Ops::capture_operation`]). The caller holds `names` for
+    /// reading and no group hold.
     fn record(
         &self,
         trigger: Trigger,
@@ -381,39 +468,31 @@ impl Ops {
         if !self.boundary.recorder().has_fsync_class() {
             return self.boundary.record(trigger, caller, changes);
         }
-        let mut groups: Vec<Arc<Group>> = Vec::new();
         let changes: Vec<Change> = changes
             .into_iter()
             .filter(|c| match self.group_at(&c.path) {
                 Some(g) => {
                     g.changed(caller);
-                    if !groups.iter().any(|x| Arc::ptr_eq(x, &g)) {
-                        groups.push(g);
-                    }
                     false
                 }
                 None => true,
             })
             .collect();
-        let mut recorded = if changes.is_empty() {
-            false
-        } else {
-            self.boundary.record(trigger, caller, changes)?
-        };
-        if !groups.is_empty() && self.boundary.recorder().in_operation(caller.pid) {
-            for g in groups {
-                recorded |= self.capture(&g, trigger, Some(caller), When::Changed)?;
-            }
+        if changes.is_empty() {
+            return Ok(false);
         }
-        Ok(recorded)
+        self.boundary.record(trigger, caller, changes)
     }
 
     /// Captures `group` (design §8) if `when` says it is due: freezes its
     /// gate, so no member changes meanwhile, and records every member's
     /// current state (content, or removal) as one all-or-nothing record.
     /// `caller` defaults to whoever changed the group last. Returns whether
-    /// anything was journaled. The caller holds `names` for reading, so no
-    /// member is renamed meanwhile, and no hold on any group.
+    /// anything was journaled. A member that cannot be read (anything but
+    /// a missing file) fails the capture, leaving the group changed. The
+    /// caller holds `names` for reading, so no member is renamed meanwhile
+    /// (and so a capture holds back renames on the whole mount for the
+    /// length of its copy), and no hold on any group.
     fn capture(
         &self,
         group: &Group,
@@ -422,10 +501,14 @@ impl Ops {
         when: When,
     ) -> Result<bool, VolumeError> {
         let _one = group.capturing();
+        let deferred =
+            !matches!(when, When::Operation | When::Unmount) && group.deferred().is_some();
         {
             let s = group.state();
             let due = match when {
-                When::Changed => s.is_dirty(),
+                // A running operator operation records it at its end.
+                _ if deferred => false,
+                When::Changed | When::Operation | When::Unmount => s.is_dirty(),
                 When::Fsync(now) => s.fsync_due(now, group.coalesce()),
                 When::Timer(now) => s.due_at(group.coalesce()).is_some_and(|at| at <= now),
             };
@@ -440,18 +523,103 @@ impl Ops {
         };
         let caller = caller.or(last).unwrap_or(NOBODY);
         let mut fds = Vec::new();
-        let changes: Vec<Change> = group
-            .members()
-            .iter()
-            .filter_map(|m| self.leaf_change(m, &mut fds))
-            .collect();
-        let result = self.boundary.record_group(trigger, caller, changes);
+        let mut changes = Vec::with_capacity(group.members().len());
+        let mut result = Ok(false);
+        for member in group.members() {
+            match self.member_change(member, &mut fds) {
+                Ok(Some(change)) => changes.push(change),
+                Ok(None) => {}
+                Err(e) => {
+                    result = Err(self.capture_failed(trigger, group, member, e));
+                    break;
+                }
+            }
+        }
+        if result.is_ok() {
+            result = self.boundary.record_group(trigger, caller, changes);
+        }
         drop(fds);
         drop(frozen);
         group
             .state()
             .captured(generation, Instant::now(), result.is_ok());
         result
+    }
+
+    /// The current state of fsync-class member `rel` for a capture: like
+    /// [`Ops::leaf_change`], except that only a missing file (`ENOENT`,
+    /// `ENOTDIR`) is a removal. Any other failure (`EMFILE`, `ENOMEM`) must
+    /// not record the database as deleted: it fails the capture.
+    fn member_change(&self, rel: &[u8], fds: &mut Vec<OwnedFd>) -> io::Result<Option<Change>> {
+        let fd = match self.backing.open_path(rel) {
+            Ok(fd) => fd,
+            Err(e)
+                if [rustix::io::Errno::NOENT, rustix::io::Errno::NOTDIR]
+                    .iter()
+                    .any(|n| e.raw_os_error() == Some(n.raw_os_error())) =>
+            {
+                return Ok(Some(Change::removed(rel.to_vec())));
+            }
+            Err(e) => return Err(e),
+        };
+        let st = rustix::fs::fstat(&fd)?;
+        let mode = mode_of(&st);
+        let state = match Kind::from_mode(mode) {
+            Kind::File => {
+                let backing = proc_path(&fd);
+                fds.push(fd);
+                State::File {
+                    backing,
+                    executable: executable(mode),
+                }
+            }
+            Kind::Symlink => State::Symlink {
+                target: rustix::fs::readlinkat(&fd, "", Vec::new())?.into_bytes(),
+            },
+            // A directory at a member's name is no member.
+            Kind::Dir => return Ok(None),
+            Kind::Other => State::Removed,
+        };
+        Ok(Some(Change {
+            path: rel.to_vec(),
+            state,
+        }))
+    }
+
+    /// A capture of `group` could not read `member`: raises
+    /// `RecordFailed` (design §13) and returns the error.
+    fn capture_failed(
+        &self,
+        trigger: Trigger,
+        group: &Group,
+        member: &[u8],
+        error: io::Error,
+    ) -> VolumeError {
+        let paths = group
+            .members()
+            .iter()
+            .filter_map(|m| {
+                std::str::from_utf8(m)
+                    .ok()
+                    .and_then(|m| agentfs_core::paths::RepoPath::new(m).ok())
+            })
+            .collect();
+        let error = io::Error::new(
+            error.kind(),
+            format!(
+                "reading {} for a capture: {error}",
+                String::from_utf8_lossy(member)
+            ),
+        );
+        self.boundary
+            .recorder()
+            .events()
+            .emit(agentfs_core::events::Event::RecordFailed {
+                trigger,
+                paths,
+                error: error.to_string(),
+            });
+        VolumeError::Io(error)
     }
 
     /// Captures every group the trailing timer has due at `now` (design
@@ -469,13 +637,35 @@ impl Ops {
         n
     }
 
+    /// Captures every group the running operator operation changed, each
+    /// whole as one record of the operation (design §8, §15): called by
+    /// the operation before it ends. Returns how many captures were
+    /// journaled, or the first failure (the others are still tried).
+    pub fn capture_operation(&self) -> Result<usize, VolumeError> {
+        let mut n = 0;
+        let mut failed = None;
+        for (group, actor) in self.groups.in_operation() {
+            let _names = self.read_names();
+            match self.capture(&group, Trigger::Restore, Some(actor), When::Operation) {
+                Ok(true) => n += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        // A group left changed is the timer's once the operation ends.
+        self.groups.wake();
+        failed.map_or(Ok(n), Err)
+    }
+
     /// Captures every changed group now, whatever its schedule: at unmount.
     /// Returns how many captures were journaled.
     pub fn capture_all(&self) -> usize {
         let mut n = 0;
         for group in self.groups.dirty() {
             let _names = self.read_names();
-            if let Ok(true) = self.capture(&group, Trigger::Sweep, None, When::Changed) {
+            if let Ok(true) = self.capture(&group, Trigger::Sweep, None, When::Unmount) {
                 n += 1;
             }
         }
@@ -607,7 +797,7 @@ impl Ops {
         // held until the change is made; [`Ops::record`] marks the group.
         let group = if kind == Kind::File && (set.size.is_some() || set.mode.is_some()) {
             match &fd {
-                NodeFd::Handle(h) if h.group.is_some() => h.group.clone(),
+                NodeFd::Handle(h) if h.daemon_only() => self.handle_group(h),
                 _ => self.node_group(id),
             }
         } else {
@@ -1053,6 +1243,8 @@ impl Ops {
         }
         self.table()
             .rename(parent, name, newparent, newname, exchange);
+        // Open fsync-class handles find their group again (design §8).
+        self.renames.fetch_add(1, Ordering::AcqRel);
         drop(names);
 
         let _names = self.read_names();
@@ -1254,12 +1446,15 @@ impl Ops {
         group: Option<Arc<Group>>,
     ) -> (u64, Arc<Handle>) {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        let handle = Arc::new(Handle {
-            node: id,
+        // The caller holds `names`, so no rename runs since `group` was
+        // found.
+        let handle = Arc::new(Handle::new(
+            id,
             fd,
             write,
-            group: group.clone(),
-        });
+            group.clone(),
+            self.renames.load(Ordering::Acquire),
+        ));
         if let Some(group) = &group {
             group.opened();
         }
@@ -1386,7 +1581,8 @@ impl Ops {
         if let Some(node) = self.table().get_mut(h.node) {
             node.dirty.arm(caller);
         }
-        let hold = h.group.as_ref().map(|g| g.hold());
+        let group = self.handle_group(&h);
+        let hold = group.as_ref().map(|g| g.hold());
         let mut done = 0;
         let result = loop {
             if done >= data.len() {
@@ -1410,11 +1606,17 @@ impl Ops {
     pub fn flush(&self, fh: u64, caller: Caller) -> OpResult<()> {
         let h = self.handle(fh)?;
         let _names = self.read_names();
-        if let Some(group) = &h.group {
-            // An fsync-class file: its whole group, if it changed (design
-            // §8).
+        if let Some(group) = self.handle_group(&h) {
+            // An fsync-class file (design §8): its whole group, if it
+            // changed and this is the group's last open handle. Closing one
+            // member while another stays open (SQLite's `-journal` in
+            // DELETE mode, every transaction) leaves the change to the
+            // rate-limited fsync rule and the trailing timer.
+            if group.state().handles > 1 {
+                return Ok(());
+            }
             return self
-                .capture(group, Trigger::Close, Some(caller), When::Changed)
+                .capture(&group, Trigger::Close, Some(caller), When::Changed)
                 .map(|_| ())
                 .map_err(|_| Errno::EIO);
         }
@@ -1485,7 +1687,8 @@ impl Ops {
         let Some(h) = self.handles().remove(&fh) else {
             return Err(Errno::EBADF);
         };
-        let last_in_group = h.group.as_ref().is_some_and(|g| g.released() == 0);
+        let group = self.handle_group(&h);
+        let last_in_group = group.as_ref().is_some_and(|g| g.released() == 0);
         let (last_writer, check) = {
             let mut table = self.table();
             let Some(node) = table.get_mut(h.node) else {
@@ -1501,10 +1704,10 @@ impl Ops {
             (
                 node.dirty.last_writer.unwrap_or(NOBODY),
                 // An fsync-class handle never records its node alone.
-                h.group.is_none() && node.write_handles == 0 && node.dirty.armed,
+                group.is_none() && node.write_handles == 0 && node.dirty.armed,
             )
         };
-        if let Some(group) = &h.group
+        if let Some(group) = &group
             && last_in_group
         {
             // The group's last handle: capture it if it changed. A failure
@@ -1543,12 +1746,12 @@ impl Ops {
         } else {
             rustix::fs::fsync(&h.fd).eno()?;
         }
-        if let Some(group) = &h.group {
+        if let Some(group) = self.handle_group(&h) {
             // At most once per `agentfs.coalesce` (design §8). A failed
             // capture does not fail the fsync, which did reach the disk:
             // the group stays changed and the timer retries it.
             let _names = self.read_names();
-            let _ = self.capture(group, Trigger::Fsync, None, When::Fsync(Instant::now()));
+            let _ = self.capture(&group, Trigger::Fsync, None, When::Fsync(Instant::now()));
         }
         Ok(())
     }
@@ -1565,7 +1768,8 @@ impl Ops {
         if let Some(node) = self.table().get_mut(h.node) {
             node.dirty.arm(caller);
         }
-        let hold = h.group.as_ref().map(|g| g.hold());
+        let group = self.handle_group(&h);
+        let hold = group.as_ref().map(|g| g.hold());
         let result = rustix::fs::fallocate(
             &h.fd,
             rustix::fs::FallocateFlags::from_bits_retain(mode as u32),
@@ -1611,7 +1815,8 @@ impl Ops {
         let mut off_in = offset_in;
         let mut off_out = offset_out;
         let len = usize::try_from(len.min(u64::from(u32::MAX))).unwrap_or(usize::MAX);
-        let hold = output.group.as_ref().map(|g| g.hold());
+        let group = self.handle_group(&output);
+        let hold = group.as_ref().map(|g| g.hold());
         let n = rustix::fs::copy_file_range(
             &input.fd,
             Some(&mut off_in),

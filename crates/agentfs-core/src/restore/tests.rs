@@ -34,6 +34,8 @@ struct Policy {
     /// Content over this size would be stored as LFS.
     lfs_over: Option<u64>,
     checks: crate::checks::Checks,
+    /// fsync-class groups (design §8), each listed whole.
+    groups: Vec<&'static [&'static str]>,
 }
 
 /// No LFS object is available.
@@ -49,6 +51,14 @@ impl LfsObjects for NoLfs {
 }
 
 impl RecordPolicy for Policy {
+    fn group_of(&self, path: &RepoPath) -> Vec<RepoPath> {
+        self.groups
+            .iter()
+            .find(|g| g.contains(&path.as_str()))
+            .map(|g| g.iter().map(|p| RepoPath::new(*p).unwrap()).collect())
+            .unwrap_or_default()
+    }
+
     fn refuses(&self, path: &RepoPath, _: Option<&str>) -> io::Result<Option<String>> {
         Ok(self
             .refuse
@@ -1289,4 +1299,106 @@ mod lfs {
         l.check_with(&l.fx.restore(".", c1), &limited(Some(3)), &l.cache)
             .unwrap();
     }
+}
+
+const DB: &[&str] = &["d/s.db", "d/s.db-journal", "d/s.db-wal"];
+
+/// Plan and check with the database group `DB` (design §8).
+fn check_db(fx: &Fixture, request: &Request, force: bool) -> Result<Plan, RestoreError> {
+    let policy = Policy {
+        groups: vec![DB],
+        ..Policy::default()
+    };
+    check(
+        fx.plan(request)?,
+        &fx.repo,
+        &policy,
+        &NoLfs,
+        &fx.dir(),
+        &NotLive,
+        force,
+    )
+}
+
+#[test]
+fn restoring_one_member_restores_its_whole_group() {
+    let fx = Fixture::new();
+    let c1 = fx.commit(
+        &[
+            ("d/s.db", File("v1")),
+            ("d/s.db-wal", File("w1")),
+            ("d/x", File("x")),
+        ],
+        "v1",
+    );
+    let head = [
+        ("d/s.db", File("v2")),
+        ("d/s.db-journal", File("j2")),
+        ("d/x", File("y")),
+    ];
+    fx.commit(&head, "v2");
+    fx.checkout(&head);
+    // Asked for the database alone: its -wal comes back and its -journal
+    // goes, from the same commit; the unrelated file is left alone.
+    let plan = check_db(&fx, &fx.restore("d/s.db", c1), false).unwrap();
+    assert_eq!(
+        paths(&plan.steps),
+        [
+            ("d/s.db", "write"),
+            ("d/s.db-journal", "remove"),
+            ("d/s.db-wal", "write")
+        ]
+    );
+    apply(&plan, &fx.repo, &NoLfs, &fx.dir(), &NotLive, false).unwrap();
+    assert_eq!(
+        fx.read_tree(),
+        tree_of(&[
+            ("d/s.db", File("v1")),
+            ("d/s.db-wal", File("w1")),
+            ("d/x", File("y"))
+        ])
+    );
+}
+
+#[test]
+fn an_untracked_member_in_the_tree_refuses_a_group_restore() {
+    let fx = Fixture::new();
+    let c1 = fx.commit(&[("d/s.db", File("v1"))], "v1");
+    fx.commit(&[("d/s.db", File("v2"))], "v2");
+    // A hot journal history never saw: restoring the database under it
+    // would hand SQLite another version's journal.
+    fx.checkout(&[("d/s.db", File("v2")), ("d/s.db-journal", File("hot"))]);
+    let err = check_db(&fx, &fx.restore("d/s.db", c1), false).unwrap_err();
+    assert!(
+        matches!(err, RestoreError::InTheWay { ref path, .. } if path == "d/s.db-journal"),
+        "{err}"
+    );
+}
+
+#[test]
+fn reverting_one_member_reverts_its_whole_group() {
+    let fx = Fixture::new();
+    fx.commit(&[("d/s.db", File("v1")), ("d/s.db-wal", File("w1"))], "c1");
+    // c2 changes the database only; c3 the WAL only.
+    let c2 = fx.commit(&[("d/s.db", File("v2")), ("d/s.db-wal", File("w1"))], "c2");
+    let head = [("d/s.db", File("v2")), ("d/s.db-wal", File("w3"))];
+    fx.commit(&head, "c3");
+    fx.checkout(&head);
+    // Undoing c2 alone would pair v1 with w3: the WAL is part of the
+    // revert, and it changed since, so it needs --force.
+    let err = check_db(&fx, &fx.revert(c2), false).unwrap_err();
+    assert!(
+        matches!(err, RestoreError::ChangedSince { ref paths } if paths == &["d/s.db-wal"]),
+        "{err}"
+    );
+    let plan = check_db(&fx, &fx.revert(c2), true).unwrap();
+    assert_eq!(
+        paths(&plan.steps),
+        [("d/s.db", "write"), ("d/s.db-wal", "write")]
+    );
+    apply(&plan, &fx.repo, &NoLfs, &fx.dir(), &NotLive, true).unwrap();
+    assert_eq!(
+        fx.read_tree(),
+        tree_of(&[("d/s.db", File("v1")), ("d/s.db-wal", File("w1"))])
+    );
 }

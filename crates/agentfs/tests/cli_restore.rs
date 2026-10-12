@@ -585,3 +585,43 @@ fn a_failed_write_can_be_finished_by_a_rerun() {
     assert_eq!(v.read("big"), big);
     assert_eq!(v.history(), vec![("big".to_owned(), big)]);
 }
+
+#[test]
+fn restoring_a_database_member_restores_its_group_in_one_commit() {
+    let v = Volume::new();
+    fs::write(
+        v.state().join("git/info/attributes"),
+        "*.db* agentfs.commit=fsync agentfs.group=sqlite\n",
+    )
+    .unwrap();
+    v.write("d/s.db", "v1");
+    v.write("d/s.db-wal", "w1");
+    v.record(&["d/s.db"]);
+    let c1 = v.head().to_string();
+    v.write("d/s.db", "v2");
+    fs::remove_file(v.t("d/s.db-wal")).unwrap();
+    v.write("d/s.db-journal", "j2");
+    v.record(&["d/s.db"]);
+    let c2 = v.head();
+    assert_eq!(
+        v.history(),
+        h(&[("d/s.db", "v2"), ("d/s.db-journal", "j2")])
+    );
+
+    // Only the database is named: the whole group comes back from c1.
+    let out = v.ok(&["restore", "d/s.db", &c1]);
+    assert!(out.contains("restored 2 path(s), removed 1"), "{out}");
+    assert_eq!(v.history(), h(&[("d/s.db", "v1"), ("d/s.db-wal", "w1")]));
+    assert_eq!(v.read("d/s.db-wal"), "w1");
+    assert!(!v.t("d/s.db-journal").exists());
+    // One commit, so no version in history pairs v1 with j2.
+    let repo = v.repo();
+    let head = repo.find_commit(v.head()).unwrap();
+    assert_eq!(head.parent_id(0).unwrap(), c2);
+    assert!(
+        v.message(v.head())
+            .contains(&format!("Agentfs-Restore: {c1}\n")),
+        "{}",
+        v.message(v.head())
+    );
+}

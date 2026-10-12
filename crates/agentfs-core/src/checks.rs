@@ -160,6 +160,12 @@ pub enum Refusal {
         bytes: u64,
         limit: u64,
     },
+    /// A member of an fsync-class group (design §8) that the path rules
+    /// skip (an operator exclude, an ignore rule): the group would be
+    /// recorded without it, so it is refused whole.
+    GroupMemberSkipped {
+        reason: String,
+    },
 }
 
 impl Refusal {
@@ -182,6 +188,7 @@ impl Refusal {
             Self::GitmodulesUpdate { .. } => "gitmodules_update",
             Self::GitmodulesTooLarge { .. } => "gitmodules_too_large",
             Self::MaxSize { .. } => "max_size",
+            Self::GroupMemberSkipped { .. } => "group_member_skipped",
         }
     }
 
@@ -192,7 +199,8 @@ impl Refusal {
             Self::InvalidPath(_)
             | Self::PathTooLong { .. }
             | Self::BlobTooLarge { .. }
-            | Self::MaxSize { .. } => None,
+            | Self::MaxSize { .. }
+            | Self::GroupMemberSkipped { .. } => None,
             Self::SymlinkedSpecialFile { file } => Some(match file {
                 SpecialFile::Gitmodules => "gitmodulesSymlink",
                 SpecialFile::Gitattributes => "gitattributesSymlink",
@@ -283,6 +291,11 @@ impl fmt::Display for Refusal {
             Self::MaxSize { bytes, limit } => {
                 write!(f, "{bytes} bytes is over agentfs.maxSize ({limit} bytes)")
             }
+            Self::GroupMemberSkipped { reason } => write!(
+                f,
+                "a member of an fsync-class group that the path rules leave out ({reason}): \
+                 the group is recorded whole or not at all"
+            ),
         }
     }
 }
