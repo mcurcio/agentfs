@@ -102,13 +102,20 @@ nested repository detection. Also:
   author; the first that cannot be applied blocks the queue and raises
   `PatchBlocked`, and the volume mounts anyway. See
   [Patches](#patches).
+- **Several mounts of one volume** (phase 4 building blocks, single node):
+  `agentfs serve-history` is the volume's history service, the only
+  writer of its history, and `agentfs mount --history-service` mounts are
+  fronts that hand each change boundary to it over a Unix socket in the
+  state area and return once it is durable. Each pod's changes are
+  committed with that pod's committer and trailers. See
+  [Several mounts of one volume](#several-mounts-of-one-volume).
 - **Deployment:** a container image (`ghcr.io/mcurcio/agentfs`) and
   example Kubernetes manifests for the phase 1 sidecar, tested end to end
   in a kind cluster. See
   [Deploying on Kubernetes](#deploying-on-kubernetes).
 
 The `agentfs` command has `init`, `status`, `mount`, `probe`, `flush`, `record`,
-`push`, `run`, `restore`, `revert` and `patch`. `mount` mounts a backing tree and runs the commit and
+`push`, `run`, `restore`, `revert`, `patch` and `serve-history`. `mount` mounts a backing tree and runs the commit and
 push loops in the same process. `record` records paths of a backing tree
 directly, without a mount, and reports the paths the rules skip or the
 checks refuse, with the reason; a database in the `fsync` class is
@@ -131,7 +138,7 @@ with status 75 if another process holds it, naming the holder;
 lock and changes nothing, so it works beside a running daemon, and shows
 who holds the lock.
 
-Not built yet: the CSI driver (phase 4), asking a running mount to push now, and
+Not built yet: the CSI driver (phase 4) and several mounts across nodes, asking a running mount to push now, and
 restarting a pod automatically after its sidecar crashes. SSH remotes do
 not support ssh-agent, passphrase-protected keys or `@cert-authority`
 host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
@@ -165,6 +172,40 @@ volumes (new files are given to their creator: `CAP_CHOWN` and
 namespace). The
 [operator guide](docs/operator-guide.md) covers requirements, layout,
 flags, settings, permissions, what is recorded when, shutdown and crashes.
+
+## Several mounts of one volume
+
+One volume can be mounted several times on one node, for example by two
+pods sharing a backing tree, with one history (design §14). Start the
+history service first, then a front per mount:
+
+```sh
+agentfs --state /data/state init --volume demo
+agentfs --state /data/state --root /data/backing serve-history &
+AGENTFS_POD=pod-a agentfs --state /data/state mount \
+  --history-service /data/state/meta/history/history.sock /data/backing /mnt/a &
+AGENTFS_POD=pod-b agentfs --state /data/state mount \
+  --history-service /data/state/meta/history/history.sock /data/backing /mnt/b &
+```
+
+The service holds the state-area lock, commits and pushes. A front does
+the rules, checks and freeze for its own mount, sends the record over
+`meta/history/history.sock`, and returns from `close` once the service has
+journaled it. Every commit holds one pod's changes, with that pod's
+committer (the identity templates rendered with its pod flags) and
+`Agentfs-Pod` trailers; history is in the order the service received
+the boundaries, and the tree is last-writer-wins. `agentfs status` shows
+the service and every front.
+
+If the service is down, a change through a front fails with `EIO` and
+the `HistoryServiceUnavailable` alarm; once it is back the fronts
+reconnect and their repairs and sweep record the final state
+([runbook](docs/runbooks/history-service-down.md)). Limits: one node only;
+no `restore` or `revert` while the service runs; locks are not shared
+between mounts, so a database must be written from one of them; patches
+are applied only when the service starts with no fronts. Without
+`--history-service`, `mount` is the single-process mount above. See the
+[operator guide](docs/operator-guide.md#16-several-mounts-of-one-volume-history-service).
 
 ## Deploying on Kubernetes
 
@@ -227,8 +268,9 @@ Runbooks: [recovery and undo](docs/runbooks/recovery-and-undo.md),
 [a diverged remote](docs/runbooks/divergence.md),
 [removing a recorded secret](docs/runbooks/history-rewrite.md) (history
 rewrite with `git filter-repo`, the one documented force-push), and
-[pushes that keep failing](docs/runbooks/stuck-pushes.md), and
-[the patch queue](docs/runbooks/patch-queue.md).
+[pushes that keep failing](docs/runbooks/stuck-pushes.md),
+[the patch queue](docs/runbooks/patch-queue.md), and
+[the history service is down](docs/runbooks/history-service-down.md).
 
 ## Patches
 
@@ -441,6 +483,18 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   per transaction), that every version passes `PRAGMA integrity_check`
   with whole transactions, and the database restore runbook, live and
   direct, restoring one member and getting its whole group.
+- **e2e multi-pod** ([`ci/e2e-multipod.sh`](ci/e2e-multipod.sh)), with
+  passthrough `auto` and `off`: two real FUSE front mounts of one backing
+  tree as pods `pod-a` and `pod-b`, feeding one `agentfs serve-history`.
+  Covers files from each pod, a file created through one and renamed and
+  removed through the other, a directory `mv`, a shared file written in
+  turn, every commit's committer equal to its `Agentfs-Pod` trailer, `EIO`
+  and the alarm while the service is down and the catch-up after it
+  restarts, a `kill -9` of the service right after a close returned, and
+  the push. It then measures the per-close cost through a single-process
+  mount and through a front ([`boundary-latency.py`](ci/boundary-latency.py))
+  and the socket round trip, into the job summary. The `fuse` job also
+  runs `two_fronts_one_service` from `mount.rs`.
 - **e2e runbooks** ([`ci/e2e-runbooks.sh`](ci/e2e-runbooks.sh)): runs the
   shell blocks of the [divergence](docs/runbooks/divergence.md) and
   [history-rewrite](docs/runbooks/history-rewrite.md) runbooks exactly as

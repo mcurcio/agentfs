@@ -136,6 +136,24 @@ it exits 1 and changes nothing
 A missing mount point is created (mode `0755`; its parent must exist), so
 a sidecar can mount into a subdirectory of a fresh `emptyDir`.
 
+`agentfs serve-history` (needs `--root`, the backing tree the fronts
+mount; §16):
+
+| Flag | Environment | Default | Meaning |
+|---|---|---|---|
+| `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | Where fronts reach it: `unix:<path>` or an absolute socket path |
+| `--shutdown-grace DURATION` | | `10s` | At shutdown, how long to wait for fronts' requests in progress |
+| `--push-grace DURATION` | | `5s` | At shutdown, how long to wait for pushes in progress |
+
+`agentfs mount` and `agentfs record` as fronts of a history service
+(§16):
+
+| Flag | Environment | Default | Meaning |
+|---|---|---|---|
+| `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | Record through the history service at ADDR instead of journaling and committing in this process; takes no state-area lock |
+| `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | How long a change boundary waits for the service before it fails with `EIO` |
+| `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | How long to wait at start for the service; then exit 1 with nothing mounted |
+
 `agentfs probe MOUNTPOINT [--allow-stale]` prints what is mounted there
 and takes no lock and reads no state area, for Kubernetes startup and
 readiness probes:
@@ -147,7 +165,7 @@ readiness probes:
 | `not mounted` | 1 |
 | `not an agentfs mount (<fstype>)` | 1 |
 
-Pod flags (`mount`, `run`, `record`, `flush`, `push`), from the downward
+Pod flags (`mount`, `run`, `record`, `flush`, `push`, `serve-history`), from the downward
 API in Kubernetes: `--namespace` (`AGENTFS_NAMESPACE`), `--pod`
 (`AGENTFS_POD`), `--pod-uid` (`AGENTFS_POD_UID`), `--node`
 (`AGENTFS_NODE`), `--replica` (`AGENTFS_REPLICA`). They fill the commit
@@ -403,7 +421,10 @@ Runbooks, with the full procedures:
   secret from the state area and every remote;
 - [stuck-pushes.md](runbooks/stuck-pushes.md): pushes that keep failing;
 - [patch-queue.md](runbooks/patch-queue.md): queued patches, a blocked
-  queue, submitting with plain git.
+  queue, submitting with plain git;
+- [history-service-down.md](runbooks/history-service-down.md): fronts
+  failing with `EIO` because the history service is down, hung or
+  refusing them (§16).
 
 **Patches** (§12) are the other way to change the tree from outside:
 producers queue them on the remote (`agentfs patch submit`), and every
@@ -621,3 +642,111 @@ whole, consistent groups instead.
   `telemetry: <signal> export recovered` line follows when they work again,
   and each failure counts in `agentfs.telemetry.export_failures{signal}`
   (exported once metrics get through).
+
+## 16. Several mounts of one volume (history service)
+
+A volume can be mounted more than once on one node, for example by two
+pods that share a backing tree, with one history (design §14). One
+process, `agentfs serve-history`, is the volume's history service: it
+holds the state-area lock and is the only writer of the journal and the
+branch, and runs the commit and push loops. Every mount is a **front**,
+`agentfs mount --history-service ADDR`: it serves FUSE for its pod, and at
+each change boundary applies the rules and checks, freezes the content
+into `pending/` and sends the record to the service, returning only once
+the service has journaled it. Without `--history-service`, `mount` stays
+the single-process mount of the rest of this guide.
+
+**Requirements.** The service and every front on the same node, with the
+same state area and backing tree (the socket is a Unix socket in the
+state area). The fronts run as root or as the service's user: the
+service refuses any other peer. Cross-node mounts wait for the CSI driver.
+
+**Start order.** Start the service first; a front waits up to
+`--history-wait` (30 s) for it, then exits 1 with nothing mounted.
+
+```sh
+agentfs --state /data/state --root /data/backing serve-history
+AGENTFS_POD=pod-a agentfs --state /data/state mount \
+  --history-service /data/state/meta/history/history.sock /data/backing /mnt/a
+AGENTFS_POD=pod-b agentfs --state /data/state mount \
+  --history-service /data/state/meta/history/history.sock /data/backing /mnt/b
+```
+
+The service opens the volume (recovering its journal), applies the patch
+queue only if no front is running (patches write the backing tree, which
+running fronts serve; it says so otherwise), starts the commit and push
+loops, then listens and prints `serving history for volume ... at ...`.
+A front's startup line names the service and its slot. `agentfs record
+--history-service ADDR PATH...` records paths through the service the
+same way, without a mount.
+
+**What each process holds.**
+
+| Process | Holds |
+|---|---|
+| `serve-history` | `meta/lock` (holder `command=serve-history`), `meta/history/history.sock` (directory 0700, socket 0600), `meta/history/address`, the journal, the branch, the push state |
+| a front | `meta/fronts/slot-N.lock`, an `flock` lease of pending-id slot N (1 to 1023), its frozen copies in `pending/` and its repair queue `meta/fronts/slot-N.repairs` |
+
+**Commits.** A commit holds the changes of one front only. Its committer
+is rendered from the identity templates (§9 of the design,
+[configuration](configuration.md#agentfs-identity)) with that front's pod
+flags (`AGENTFS_POD`, `AGENTFS_REPLICA`, ...), and it carries that pod's
+`Agentfs-Pod`, `Agentfs-Pod-Uid`, `Agentfs-Node` and `Agentfs-Namespace`
+trailers, also after a crash and replay. A front whose pod flags do not
+render the templates is refused when it connects. History follows the
+order the service received the boundaries; in the backing tree, the last
+writer wins, as without agentfs.
+
+**`agentfs status`** shows the service and the fronts:
+
+```text
+lock:      held by pid=4242 command=serve-history since=20261012T100000Z
+history:   serving fronts at unix:/data/state/meta/history/history.sock
+fronts:    slot 1: pid=4300 command=mount pod=pod-a replica=pod-a since=20261012T100005Z
+fronts:    slot 2: pid=4301 command=mount pod=pod-b replica=pod-b since=20261012T100005Z
+```
+
+A `repairs:` line names a slot whose repair queue waits for a front.
+
+**When the service is down.** Every change boundary through a front fails
+with `EIO` (a namespace operation with its own error), raises
+`RecordFailed`, and the first one raises `HistoryServiceUnavailable`; a
+service that does not answer within `--history-timeout` fails it the same
+way. Reads and writes themselves still work. Restart the service: the
+fronts reconnect at their next boundary (printing `history service ... is
+reachable again`), and their repair queue, release and sweep record the
+final state of what failed. States in between are lost. See
+[runbooks/history-service-down.md](runbooks/history-service-down.md).
+Metrics: `agentfs.front.round_trip`, `agentfs.front.service_failures` and,
+on the service, `agentfs.history_service.fronts`.
+
+**Crashes.** A front that dies leaves a stale mount, handled as in §10
+(its lease is released by the kernel; its unsent frozen copies are
+pruned at the next service start). A service that dies is restarted the
+same way it was started: it recovers its journal, commits what fronts had
+journaled with their own committers, and replaces the stale socket.
+
+**Stopping.** Stop the fronts first (each unmounts as `mount` does, but
+leaves the commit to the service), then the service: on SIGINT or SIGTERM
+it stops accepting, waits up to `--shutdown-grace` for fronts' requests,
+makes the final commit and waits up to `--push-grace` for pushes. As with
+`run`, it does not push at shutdown; the push loop pushes every
+`agentfs.pushInterval`, and `agentfs push` pushes once afterwards.
+
+**Limits.**
+
+- No `restore` or `revert` while the service runs: they exit 75. Stop the
+  fronts and the service, then restore directly or through a
+  single-process mount.
+- POSIX and BSD locks are kept by each mount's kernel and are not shared
+  between fronts. A database or any lock-coordinated file must be written
+  through one front only, and the `fsync` class (§14) is per front.
+- Patches are applied only when the service starts with no front
+  running.
+- If two fronts change one path at the same instant, history can keep the
+  earlier one's state until that path's next change.
+- The rules and settings are read when each process starts: after a
+  change, restart the fronts and the service.
+- Frozen copies of a front that crashed before sending them stay in
+  `pending/` until the service restarts; a slot's repair queue is drained
+  only by the next front in that slot.

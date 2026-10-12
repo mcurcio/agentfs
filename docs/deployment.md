@@ -455,7 +455,11 @@ alert on `agentfs.patch.blocked`. See
 - The pod restart after a crash is manual (§7).
 - A sidecar exit that is not a crash is not held (§7).
 - The privileged sidecar (§9); the CSI driver (phase 4) removes it.
-- One pod per volume; several pods on one volume need the CSI driver
-  (§14).
+- One pod per volume. The sidecar stays single-process (`agentfs mount`
+  without `--history-service`). The history service and fronts exist for
+  one node (`agentfs serve-history`, `mount --history-service`; design
+  §14, [operator guide](operator-guide.md#16-several-mounts-of-one-volume-history-service)),
+  but no manifests run them: several pods on one volume wait for the CSI
+  driver, which will run the service per volume and a front per pod.
 - The image is not bit-reproducible (Debian packages are not pinned),
   and is not yet signed or shipped with an SBOM.

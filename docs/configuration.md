@@ -93,6 +93,15 @@ templates also `{uid}` and `{gid}`. They come from the pod flags
 rendered identity that is empty or contains `<`, `>` or a newline is an
 error.
 
+With several mounts of one volume (design §14), the history service
+renders these templates once per front, with that front's pod flags,
+and commits each front's changes with its own identity. A template that
+does not render for a front's pod flags refuses that front when it
+connects. If the templates change across a service restart so that a
+record already journaled no longer renders, that record is committed
+with the service's own committer, keeping the pod's trailers, and the
+`IdentityFallback` alarm says so.
+
 | Key | Default |
 |---|---|
 | `agentfs.identity.committerName` | `{replica}` |
@@ -426,12 +435,17 @@ flags, most with an environment equivalent:
 | `--state DIR` | `AGENTFS_STATE` | `.` | all |
 | `--root DIR` | `AGENTFS_ROOT` | | `record`, `flush`, `run`; `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
 | `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s` | all that take the state-area lock |
-| `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--replica` defaults to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push` |
+| `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--replica` defaults to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `serve-history` |
 | `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount` |
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | `mount` |
 | `--no-allow-other` | | | `mount` |
 | `--unmount-grace DURATION` | | `10s` | `mount` |
-| `--push-grace DURATION` | | `5s` | `mount`, `run` |
+| `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history` |
+| `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
+| `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
+| `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR |
+| `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `mount`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
+| `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | `mount`, `record` with `--history-service`: how long to wait for the service at start |
 | `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount` |
 | `--allow-stale` | | | `probe` |
 | `--remote NAME` (repeatable) | | every remote | `push` |
@@ -441,7 +455,7 @@ flags, most with an environment equivalent:
 
 Telemetry uses the standard `OTEL_*` variables; see the
 [README](../README.md#telemetry). The [operator guide](operator-guide.md)
-§4 describes the mount flags in full.
+§4 describes the mount flags in full, and §16 the history service and fronts.
 
 ### `agentfs init`
 

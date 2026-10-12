@@ -4,7 +4,8 @@ Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer,
 `agentfs mount`, `agentfs restore` and `agentfs revert`, the container
 image and the Kubernetes sidecar deployment exist), and from phase 2 Git
 LFS (§7) and the `fsync` class for databases (§8), and from phase 3 the
-patch queue (§12). Draft 1 was
+patch queue (§12), and the phase 4 building blocks: the history service
+and fronts (§14, single node). Draft 1 was
 reviewed adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
 for the findings and what changed because of them.
 
@@ -110,7 +111,9 @@ through the mount:
 <state>/
   git/       the history repository (bare): objects, refs, config, info/*
   journal/   durable record log (§3.3)
-  pending/   frozen copies of recorded content awaiting commit (§3.2)
+  pending/   frozen copies of recorded content awaiting commit (§3.2);
+             ids carry the writer's slot in their high 16 bits (0 is the
+             single process or the history service, 1..1023 a front, §14)
   lfs/       local LFS object cache (§7)
     objects/aa/bb/<oid>  cached objects, git-lfs's layout; never pruned
     tmp/                 objects being written
@@ -122,6 +125,12 @@ through the mount:
     patch.json           the patch queue's last run, a cache (§12)
     control/agentfs.sock the running mount's control socket for restores (§15);
                          directory 0700, socket 0600
+    history/history.sock the history service's socket for fronts (§14);
+                         directory 0700, socket 0600
+    history/address      the address it serves, for `agentfs status`
+    fronts/slot-N.lock   a front's lease of pending-id slot N (flock), holding
+                         a holder line
+    fronts/slot-N.repairs that slot's repair queue (§3.5)
 ```
 
 ### 2.3 Single writer of history
@@ -170,6 +179,13 @@ so a crash never leaves a stale lock.
   `--wait-lock`, so a probe cannot make it fail.
 - The per-remote push locks (§11.2) stay; they now only matter within one
   process.
+- With several mounts of one volume (§14), `agentfs serve-history` is the
+  lock holder and the only writer of the journal and the branch. Fronts
+  (`mount --history-service`) take no lock: they write only `pending/`
+  (in their own slot) and `meta/fronts/`. While the service runs, every
+  single-process command exits 75 as above, and so do `restore` and
+  `revert`: fronts serve no control socket, and restores through the
+  service are a follow-up.
 
 ## 3. Recording
 
@@ -268,6 +284,18 @@ Hashing, compression, object writes and commits happen afterwards (§3.4):
 LFS content is hashed into the object cache when it is committed, and
 uploaded when it is pushed (§7). Without reflink support, step 1 costs a
 copy of the file, so recorded volumes should use XFS. The phase 1 benchmark (§18) measures this.
+
+**Through a front (§14).** A front mount splits the step with the history
+service. The front decides the path rules (asking the service with a
+cheap, unsynced `Tracked` query only when a write's decision depends on
+whether the path is tracked: an ignored or nested path), runs the
+record-time checks and freezes into its own pending slot, because only it
+holds the inode's descriptor. It then sends the draft in a `Record`
+request. The service takes the path claims, decides again against the
+authoritative tracked set, checks that the frozen copies exist in the
+sender's slot, stamps the front's origin, journals with group commit and
+`fsync`, and replies. The front returns only after that reply, so a
+returned call is as durable as in single-process mode.
 
 ### 3.3 Journal and replay
 
@@ -395,6 +423,17 @@ queued at unmount are listed on exit with where they are saved; if the file
 cannot be written either (the state area is full or unwritable), the exit
 message lists them and says that history differs from the tree there until
 each path is changed again.
+
+**Through a front (§14).** When the history service is down, hung (no
+reply within `--history-timeout`) or refuses a request, the boundary fails
+the same way: `EIO` from FLUSH (or the operation's own error with a
+repair entry), `RecordFailed`, and `HistoryServiceUnavailable` once per
+outage (`HistoryServiceRestored` when a request succeeds again). A
+front's repair queue is `meta/fronts/slot-N.repairs`, for its slot, and
+its sweep retries it, so history catches up once the service is back. A
+draft is never sent twice: a request that timed out may still have been
+journaled, which is harmless because records hold absolute state, while a
+resend could journal one frozen copy twice.
 
 ## 4. Path rules
 
@@ -1580,6 +1619,9 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.patch.blocked` | gauge | 1 while the patch queue is blocked (§12) |
 | `agentfs.state.bytes` | gauge | Size of the state area by part |
 | `agentfs.telemetry.export_failures` | counter, per signal | Telemetry exports (traces, metrics, logs) that failed; counted by the binary, exported once metrics get through |
+| `agentfs.front.round_trip` | histogram, by request | A front's round trip to the history service (`record`, `tracked`, `ping`), in seconds (§14) |
+| `agentfs.front.service_failures` | counter, by stage | A front's failed requests to the history service: `connect`, `timeout`, `request` (connection lost or malformed reply), `refused`, `service` (§3.5, §14) |
+| `agentfs.history_service.fronts` | gauge | Fronts connected to this history service (§14) |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
@@ -1633,6 +1675,9 @@ and logs above; the CLI also prints alarms to stderr.
 | `PatchFetchFailed` | Fetching the inbox from the patch remote failed or timed out; the queue runs with what was already fetched (§12) |
 | `PatchIgnored` | An inbox entry the queue never applies: `stale` (at or below the last applied number, with another commit; deleted on the remote by the queue push) or `malformed` (§12); a warning |
 | `PatchApplied` | A patch was applied as a commit (not an alarm; sinks filter) |
+| `HistoryServiceUnavailable` | A front's request to the history service failed (unreachable, timed out, lost or refused) after it last succeeded: raised once per outage; boundaries fail with `EIO` until it is back (§3.5, §14) |
+| `HistoryServiceRestored` | A front's request succeeded again after `HistoryServiceUnavailable` (not an alarm; sinks filter, the CLI prints it) |
+| `IdentityFallback` | The history service could not render a journaled front origin's committer (the identity templates changed across a restart); that pod's records are committed with the service's own committer, keeping the pod trailers (§9); once per pod |
 
 A sink is called from the synchronous step, on the FUSE threads, so it must
 never block. Backlog gauges (`unpushed_commits`, `oldest_unpushed_age`) come
@@ -1682,8 +1727,143 @@ A volume can be mounted by several pods at once, on one node or several.
 
 **Concurrency semantics.** Pods share one directory with the backing
 filesystem's semantics. Two pods writing the same file is last-writer-wins, as
-it would be without agentfs. History records each pod's change boundary as
-its own commit, in the order the history service received them.
+it would be without agentfs. History records each pod's change boundaries in
+the order the history service received them, and a commit never holds two
+pods' changes: within one pod, `commitWindow` grouping (§3.4) is unchanged.
+
+### 14.1 Built (single node)
+
+The service and the fronts exist for fronts on the same node as the state
+area: `agentfs serve-history --root <backing>` is the service, and
+`agentfs mount --history-service <addr>` (and, for scripts and tests,
+`agentfs record --history-service <addr>`) a front. A plain `agentfs mount`
+stays single-process and is unchanged, journal bytes included. The CSI
+driver that would start these per pod is not built (§17.2).
+
+**Protocol.** A Unix stream socket in the state area,
+`meta/history/history.sock` (directory 0700, socket 0600), reached through
+`/proc/self/fd/<dir>/history.sock` so long paths fit. Addresses are
+`unix:<path>` or an absolute path; `tcp:` is refused as not supported yet.
+Messages are frames of a u32 big-endian length and a JSON body (at most
+64 MiB), protocol version 1, reusing the journal's serde types:
+
+- `Hello {v, volume, front: {origin, slot, instance, pid, version}}`, the
+  first frame on every connection. The service checks, in this order, the
+  peer's credentials (root or the service's own euid, as for the control
+  socket), the protocol version, the volume name, that the slot is in
+  1..=1023 and leased (below), and that the volume's identity templates
+  (§9) render for the front's origin. It replies `Welcome {volume, branch,
+  service_pid}` or `Refused {reason}` and closes.
+- `Tracked {paths}` → `Tracked {tracked}`: which paths are in the tracked
+  set. No `fsync`.
+- `Record {draft}` → `Recorded {seq, skipped}`, or `Error {message}`.
+- `Ping` → `Pong`.
+
+A front keeps a pool of synchronous connections (one request at a time on
+each, up to 64 idle ones kept, each checked with a non-blocking peek before
+reuse), and the service runs a thread per connection (at most 256), so
+concurrent boundaries from all fronts still share the journal's group
+commit. Every request has a timeout (`--history-timeout`, 10 s); a front
+waits up to `--history-wait` (30 s) for the service at start, then exits 1
+with nothing mounted. gRPC was rejected for this step: it brings tonic,
+prost and tokio for nothing a socket in the state area needs. The frame
+protocol does not depend on the transport, so a cross-node transport can
+carry it.
+
+**The synchronous step, split** (§3.2): the front decides the path rules,
+runs every record-time check (size on disk, `maxSize`, the blob limit, the
+content scans) and freezes, because only it holds the inode's descriptor.
+A write whose decision depends on the tracked set (an ignored or nested
+path) first costs one `Tracked` round trip, so an ignored file is still
+never copied. Removals are always sent and decided by the service. The
+service takes the path claims, decides again against its tracked set,
+checks that every frozen copy exists and is in the sender's slot, stamps
+the front's origin (§9), journals with group commit and `fsync`, updates
+the tracked set and replies. The front returns only then.
+
+**Pending slots.** A pending id's high 16 bits are a slot. Slot 0 is the
+single process or the service; a front leases a free slot N in 1..=1023
+with an exclusive `flock` on `meta/fronts/slot-N.lock` for its whole life,
+which the kernel releases when it dies. Ids never collide and the journal
+format is unchanged. The service's prune of unreferenced copies at start
+spares live slots; a dead front's orphaned copies (frozen but never sent)
+are pruned at the next service start.
+
+**Failure** (§3.5): an unreachable, hung or refusing service fails the
+boundary with `EIO`, `RecordFailed` and, once per outage,
+`HistoryServiceUnavailable`. The front reconnects by itself once the
+service is back. A draft is never resent (a request that timed out may
+have been journaled; records hold absolute state, so that is harmless,
+while a resend could journal one frozen copy twice); frozen copies are
+removed on the front only when the request was certainly not sent.
+Repairs go to the slot's `meta/fronts/slot-N.repairs`, which the front's
+sweep retries, and which the next front leasing that slot loads at start.
+
+**Recovery.** A front that crashes leaves a stale mount, handled as for
+the phase 1 sidecar (§17.1); its lease is released by the kernel. A service
+that crashes is restarted: it recovers its journal as `run` does (the
+origin is journaled, so replayed commits keep each pod's committer), the
+stale socket is replaced, and fronts reconnect at their next request.
+Boundaries during the outage failed with `EIO`; their final states are
+recorded by the fronts' repairs, RELEASE and the sweep, but intermediate
+states are lost.
+
+**What fronts do not do.** They serve no control socket: `restore` and
+`revert` exit 75 while the service runs (restores through the service are
+a follow-up). The patch queue (§12) is applied by `serve-history` before it
+listens, and only when no front lease is live, because patches write the
+backing tree that live fronts serve. POSIX and BSD locks stay in each FUSE
+mount's kernel and are not shared between fronts, so a SQLite or other
+lock-coordinated database must be written from one pod. If two pods hit
+one path at the same instant, the race between freeze and journal can
+leave HEAD on the earlier pod's state until that path's next boundary;
+per-path freeze stamps are a follow-up.
+
+**Measured cost per boundary** (open question §19.2 item 2, single node).
+These numbers are indicative: the CI runners are shared, and nothing
+asserts thresholds.
+
+- Local bench (`cargo test --release -p agentfs-core --test history_service
+  -- --ignored --nocapture round_trip_cost`; no FUSE; x86_64, 16 CPUs,
+  kernel 6.18.48-talos, overlayfs), each a `record` of a 4 KiB file,
+  microseconds:
+
+  | Path | p50 | p90 | p99 |
+  |---|---|---|---|
+  | Unix-socket `Ping` round trip | 29 | 33 | 48 |
+  | single-process record, 1 thread | 2976 | 3913 | 6113 |
+  | front record, 1 thread | 3148 | 4457 | 8575 |
+  | single-process record, 8 threads | 6438 | 8284 | 20754 |
+  | front record, 8 threads | 6869 | 9423 | 20858 |
+
+  The round trip itself is tens of microseconds. The record is dominated
+  by the freeze and the journal's `fsync`, which both modes pay, so a
+  front adds about 6 % at the median.
+- CI: the `e2e-multipod` jobs of run 38315269924 for commit 0b35370
+  (GitHub `ubuntu-latest`, x86_64, kernel 6.17.0-1022-azure, backing tree and state area on ext4, which has
+  no reflink, so every freeze is a copy), microseconds:
+
+  | Measurement | Passthrough | p50 | p90 | p99 |
+  |---|---|---|---|---|
+  | close through a single-process mount (`boundary-latency.py`, n=1000) | auto (on) | 870 | 1321 | 1633 |
+  | close through a front | auto (on) | 918 | 1379 | 3089 |
+  | close through a single-process mount | off | 1039 | 1360 | 4206 |
+  | close through a front | off | 1129 | 1566 | 2850 |
+  | Unix-socket `Ping` round trip (bench, no FUSE, n=2000) | | 15–25 | 20–28 | 27–40 |
+  | single-process record, 1 thread (bench) | | 696–793 | 890–962 | 1675–14501 |
+  | front record, 1 thread (bench) | | 771–925 | 1017–1179 | 3834–14331 |
+  | single-process record, 8 threads (bench) | | 1550–2004 | 2194–2735 | 6617–7220 |
+  | front record, 8 threads (bench) | | 1596–2097 | 2214–2789 | 7109–7120 |
+
+  The closes are through real FUSE mounts; bench ranges span the two
+  jobs. A front adds 48–90 µs (5–9 %) to the median close and 58–206 µs
+  at p90; p99 on shared runners is noise in both directions.
+
+**Still open** for this phase: a cross-node transport (TCP or gRPC with
+authentication, mTLS), since the front's origin is self-declared and only
+trusted because the socket is root or same-uid; passthrough and `flock`
+leases over a shared filesystem; the CSI driver; the RBAC and Pod Security
+inventory.
 
 **CSI requirements carried over from review:**
 
@@ -1700,13 +1880,7 @@ its own commit, in the order the history service received them.
   covers:
   - how a crashed front's mount is replaced or its pod restarted;
   - how the service resumes from its journal.
-
-**Open for this phase:**
-
-- whether the cost of a network round trip on every change boundary is
-  acceptable;
-- whether FUSE passthrough works over the chosen shared filesystem;
-- the RBAC and Pod Security inventory.
+  At single-node level both are specified above and tested (§18 test 16).
 
 ## 15. Recovery and undo
 
@@ -2031,6 +2205,30 @@ one-time migration of Hermes' existing data and the initial import in
     signal exits 130.
 
   It works anywhere FUSE does, with no Kubernetes dependency.
+- **`agentfs serve-history --root <backing>`** is the history service of
+  a volume (§14), for fronts on the same node. It takes the state-area
+  lock (holder `command=serve-history`), opens the volume (journal
+  replay), applies the patch queue only when no front lease is live (else
+  it says why not), starts the commit and push loops, then listens on
+  `--listen` (`AGENTFS_HISTORY_LISTEN`, default
+  `unix:<state>/meta/history/history.sock`) and writes the address to
+  `meta/history/address` for `status`. On SIGINT or SIGTERM it stops
+  accepting, waits up to `--shutdown-grace` (10 s) for fronts' requests in
+  progress (those still running fail with `EIO`), then makes the final
+  commit and waits up to `--push-grace` for pushes, as `run` does.
+- **`agentfs mount --history-service <addr>`** is a front (§14): no lock
+  and no control socket. Order: the preflight, a lease of a pending slot,
+  the connection to the service (waiting up to `--history-wait`, 30 s, and
+  exiting 1 with nothing mounted if it never answers), then the FUSE
+  session, whose repair queue is the slot's `meta/fronts/slot-N.repairs`.
+  Every round trip has `--history-timeout` (10 s). The startup line names
+  the service and the slot. Shutdown is as for `mount`, minus the commit
+  and the pushes, which are the service's. `agentfs record
+  --history-service <addr>` records paths of the backing tree through the
+  service the same way (`--root` is the backing tree). `status` adds a
+  `history:` line while a service holds the lock, a `fronts:` line per
+  live lease, and a `repairs:` line for a slot whose repair file waits for
+  a front.
 - **Phase 1 deployment** ([deployment.md](deployment.md), manifests in
   `deploy/sidecar`): a privileged native sidecar (an init container with
   `restartPolicy: Always`) in the workload's pod, from the image
@@ -2155,6 +2353,8 @@ Phase 4 (§14).
     - a crash and replay does not apply the first twice.
 16. **Phase 4.** Two pods on two nodes mount one volume. Each pod's changes carry
     its own committer identity, and history keeps every boundary from both.
+    Built and run at single-node level (two front mounts on one node, §14);
+    two nodes wait for the CSI driver.
 
 **Where they run.** Tests 1, 2, 4, 5, 6, 7 and 11 run through real mounts
 in the `fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with
@@ -2199,8 +2399,23 @@ blocked and resolved queue), through a real mount in the `fuse` job
 (`patches_apply_before_the_mount_serves`), and as `ci/e2e-patches.sh` in
 the `e2e-patches` job: racing producers over smart HTTP with basic auth,
 the conflict, the push of the queue refs, a crash between the commit and
-the ref move, and a replaced patch. Not automated yet: test 3 (a kill at every step), 13
-(performance) and 16.
+the ref move, and a replaced patch. Test 16 runs at single-node level:
+without FUSE in `crates/agentfs-core/tests/history_service.rs` (two
+fronts and one service in one process: committers, outage and restore, a
+hung service, refusals, a crash replay) and
+`crates/agentfs/tests/cli_history.rs` (`serve-history` and `record
+--history-service`, a kill -9 and restart); through real mounts in the
+`fuse` job (`two_fronts_one_service`, with passthrough `auto`, `on` and
+`off`); and as `ci/e2e-multipod.sh` in the `e2e-multipod` job (passthrough
+`auto` and `off`): two front mounts of one backing tree as pods `pod-a`
+and `pod-b`, files from each, a file created in one and renamed and
+removed through the other, a directory `mv`, a shared file written in
+turn, every commit's committer equal to its `Agentfs-Pod` trailer, `EIO`
+and the alarm while the service is down and the catch-up after it
+restarts, a `kill -9` of the service right after a close returned, the
+push, and the per-close cost through a single-process mount and a front.
+Not automated yet: test 3 (a kill at every step), 13 (performance) and
+16 across two nodes.
 
 ## 19. Decisions and open questions
 
@@ -2209,7 +2424,7 @@ the ref move, and a replaced patch. Not automated yet: test 3 (a kill at every s
 | Topic | Decision |
 |---|---|
 | Storage model | Real backing tree with FUSE passthrough; the projection is logical only |
-| Several pods on one volume | Supported by the CSI driver, one committer identity per replica (§14, §9) |
+| Several pods on one volume | Supported by the CSI driver, one committer identity per replica (§14, §9); built at single-node level as `serve-history` and front mounts (§14.1) |
 | Rejected pushes | Alarm, retry, keep operating (§11.3) |
 | Remotes | Any git remote, several at once (§11.1) |
 | Push timing | Interval, independent of pod lifecycle (§11.2) |
@@ -2267,13 +2482,28 @@ the ref move, and a replaced patch. Not automated yet: test 3 (a kill at every s
 | Patch idempotency | Decided by the branch's trailers (`Agentfs-Inbox`, `Agentfs-Patch`), never by refs or a cache; refs move after the commit, so a crash anywhere re-applies nothing (§12) |
 | Queue push | Only to the patch remote, after every branch push attempt (failed ones included) and apart from it: the status ref, `applied/<n>` once the branch holds the commit, and `inbox/<n>` of every applied number deleted, leased on the oid listed; its failures never count against the branch (§11.3) |
 | LFS test server | CI uses git-lfs's `lfs-test-server` (pinned by commit, built with `go install`) behind the git server's nginx, which authenticates with separate users per host; rudolfs (no auth or verify) and giftless (JWT setup) were not used (§18) |
+| Front/service protocol | A Unix stream socket in the state area (`meta/history/history.sock`, directory 0700, socket 0600, peer root or the service's euid), u32 big-endian length-prefixed JSON frames, protocol v1 with a `Hello` handshake checking the version, volume, slot lease and identity; a pool of synchronous connections per front, a thread per connection in the service. gRPC rejected (tonic, prost, tokio for nothing a local socket needs); `tcp:` refused until a cross-node transport is designed (§14) |
+| Split of the synchronous step | The front decides the rules, runs the record-time checks and freezes (it holds the descriptor); the service re-decides against the authoritative tracked set, checks the copies exist in the sender's slot, journals and replies. A `Tracked` query (no `fsync`) only for writes whose decision depends on tracking, so ignored files are never copied (§3.2, §14) |
+| Pending slots | The high 16 bits of a pending id; slot 0 for the single process and the service, 1..=1023 leased by fronts with an `flock` on `meta/fronts/slot-N.lock`; the service's prune spares live slots (§2.2, §14) |
+| Front failures | Service unreachable, hung (`--history-timeout`) or refusing: `EIO` at the boundary, `RecordFailed`, `HistoryServiceUnavailable` once per outage; repairs in the slot's file; a draft is never resent (§3.5, §14) |
+| Committer of a front's records | The front's origin (namespace, pod, pod uid, node, replica) is journaled in the record, so replays keep it; the service renders the identity templates per origin and refuses a front whose identity does not render; a commit never mixes origins (§9, §14) |
+| Patches with fronts | Applied by `serve-history` before it listens, only when no front lease is live; otherwise skipped with a message (§12, §14) |
+| Restores with fronts | Not through fronts: `restore` and `revert` exit 75 while the service runs; through the service is a follow-up (§2.3, §14) |
+| Locks across fronts | POSIX and BSD locks are per FUSE mount, so not shared between pods; a lock-coordinated database (SQLite, the `fsync` class) must be written from one pod (§14) |
 
 ### 19.2 Open questions
 
 1. **Performance budget** for the synchronous step, set after the phase 1
    benchmark (§18 test 13).
-2. **Multi-pod (§14):** the network round trip per boundary, passthrough over a
-   shared filesystem, RBAC and Pod Security.
+2. **Multi-pod (§14):** passthrough over a shared filesystem, RBAC and Pod
+   Security, and a cross-node transport with authentication. The round trip
+   per boundary is measured at single-node level (§14.1): a Unix-socket
+   round trip costs tens of microseconds, against about a millisecond
+   for the freeze and `fsync` both modes pay: on CI (`ubuntu-latest`,
+   ext4) the socket round trip is 15–25 µs and a front close is 48–90 µs
+   slower than a single-process close at the median, of about 1 ms. The
+   cost of a network round trip between nodes stays open with the CSI
+   driver.
 3. **Recovery tooling** beyond `restore`, `revert` and the runbooks (§15):
    whether a read-only history view for operators is worth building,
    whether undo through the patch queue (§12) replaces manual restores for
