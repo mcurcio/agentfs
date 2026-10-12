@@ -232,6 +232,26 @@ recording off or redirect uploads.
 Built-in system- and user-level git attribute and exclude files are never
 consulted. Only the files above count.
 
+**How the sources combine.** These are deliberate departures from git, so
+that operator rules always apply:
+
+- Operator and tree ignore rules are evaluated as separate layers, and either
+  one excludes a path. In git a `.gitignore` takes precedence over
+  `info/exclude`, so a tree `!pattern` could re-include an operator exclude;
+  in agentfs it cannot.
+- Within each layer git's own rules hold: the last matching pattern wins, a
+  deeper `.gitignore` wins over a shallower one, and nothing inside an
+  excluded directory can be re-included.
+- Tree attribute macros are kept apart from operator ones, so a tree
+  `[attr]` line cannot change what an operator line means. `agentfs.*` values
+  from tree files are dropped after macro expansion. Macros are honoured only
+  in `info/attributes` and the root `.gitattributes`, as in git.
+- Matching is always case-sensitive; `core.ignoreCase` is not consulted.
+- Tree rule files are read only if they are regular files, never through a
+  symlink (as git does since 2.32).
+- `info/exclude` and `info/attributes` are read when the volume is opened.
+  Changing them takes a remount, which fits iac setting them.
+
 ### 4.2 agentfs attributes (operator `info/attributes`)
 
 | Attribute | Values | Default | Meaning |
@@ -241,6 +261,13 @@ consulted. Only the files above count.
 | `agentfs.group` | name | unset | Paths with the same group *and the same stem* are recorded together (§8) |
 | `agentfs.store` | `blob`, `lfs` | §7 | Force ordinary git object or LFS |
 | `-agentfs` | | | Never record this path |
+
+- `-agentfs` stops writes to a path being recorded even when the path is
+  already tracked. A removal of a tracked path is still recorded, since it
+  carries no content and keeps history consistent with the tree. History is
+  never rewritten (§10).
+- Attribute patterns follow git: a directory pattern such as `secrets/` does
+  not cover the directory's contents. Write `secrets/** -agentfs`.
 
 ### 4.3 Settings
 
@@ -255,11 +282,29 @@ consulted. Only the files above count.
 
 ### 4.4 Implementation note
 
-libgit2 evaluates ignore and attribute rules against a working directory.
-Because the backing tree is a real directory, agentfs can point libgit2 at it,
-with system and global sources disabled. If that proves unworkable (for
-example, recursion through the mount), the fallback is a rules engine over the
-`gix-ignore` and `gix-attributes` parsers.
+Rules are evaluated by agentfs over the pure-Rust `gix-ignore` and
+`gix-attributes` parsers, fed only with buffers agentfs reads itself:
+`info/exclude`, `info/attributes`, and the tree's `.gitignore` and
+`.gitattributes`. Nothing global can leak in.
+
+Draft 2 proposed pointing libgit2 at the backing tree first. Checking
+libgit2 1.9.7's source ruled that out:
+
+1. `git_ignore__for_path` always loads every working-tree `.gitignore` on the
+   path, with no way to turn that off, so `respectTreeRules = false` could
+   not be honoured.
+2. It merges every source by git's precedence (a `.gitignore` beats
+   `info/exclude`) and cannot report which file an attribute came from, so
+   tree files could neither be kept from re-including operator excludes nor
+   from setting `agentfs.*`.
+3. Its attribute cache takes `core.excludesFile` and `core.attributesFile`
+   from the merged system, global and XDG config, falling back to the XDG
+   defaults. Disabling that needs process-wide search-path overrides.
+4. `git2::Repository` is not `Sync`, so every check from the FUSE threads
+   would be serialised behind a lock.
+
+Nested repositories (§5) are detected by probing the backing tree directly,
+not by opening them with libgit2, which would read global config.
 
 ## 5. Nested repositories
 
@@ -288,6 +333,21 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
 - **Paths git refuses** are not recorded, and each raises an alarm. This includes
   any `.git` component and its NTFS and HFS look-alikes, such as `.GIT`,
   `git~1` and `.git.`.
+
+**Detection details.**
+
+- Only the proper ancestor directories of a path are examined, never the
+  mount root and never the path itself.
+- A `.git` file counts only if its first line is `gitdir: <path>` and that
+  path, resolved relative to the directory holding the file, has `HEAD` plus
+  `objects/` and `refs/`, or `HEAD` plus `commondir` (a linked worktree).
+- A symlinked `.git` is not followed, because its target is a path in the
+  workload's view of the mount, not in the backing tree. It is not a nested
+  repository.
+- Under `nested = working-tree`, a directory with a bare-repository layout is
+  still skipped entirely, because all of it is git directory. This also
+  covers a submodule's git directory kept inside the tree.
+- With several nested repositories on a path, the outermost one is reported.
 
 ## 6. Metadata and permissions
 
@@ -702,7 +762,7 @@ Phase 4 (§14).
 |---|---|---|
 | FUSE | `fuser` | Active. Multi-threaded dispatch, passthrough (`BackingId`) |
 | Git objects, commits, push, credentials | `git2` (libgit2) | Active. Has **no** filter or merge-driver registration, and its fsync option is only reachable through `libgit2-sys` |
-| Ignore and attribute parsing (fallback) | `gix-ignore`, `gix-attributes` | gitoxide has no push, so it is not a full alternative |
+| Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
 | LFS | none exists | Implemented in agentfs (§7) |
 | Telemetry | `opentelemetry` crates | OTLP export |
 | Repack | the `git` CLI | libgit2 has no repack or gc |
