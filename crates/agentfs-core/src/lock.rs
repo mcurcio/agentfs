@@ -36,7 +36,7 @@ const POLL: Duration = Duration::from_millis(50);
 pub enum LockError {
     #[error("state area {} is in use ({holder})", state.display())]
     Busy { state: PathBuf, holder: String },
-    #[error("locking {}: {source}", path.display())]
+    #[error("locking {}", path.display())]
     Io { path: PathBuf, source: io::Error },
 }
 

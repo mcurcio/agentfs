@@ -8,6 +8,7 @@ description = "agentfs command-line tool and daemon"
 
 [dependencies]
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+agentfs-fuse = { version = "0.1.0", path = "../agentfs-fuse" }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 signal-hook = "0.4.5"

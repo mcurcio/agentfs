@@ -1,18 +1,24 @@
 //! The `agentfs` command.
 //!
-//! `mount` (the FUSE layer) is not built yet. Until it is, `record` records
-//! paths from a directory directly, through the same recorder the FUSE layer
-//! will use, including its path rules: paths the rules exclude are reported
-//! as skipped, with the reason.
+//! `mount` mounts a backing tree through the FUSE layer (`agentfs_fuse`)
+//! and runs the commit and push loops in the same process until SIGINT,
+//! SIGTERM or an unmount (design §17.1). `record` records paths from a
+//! directory directly, through the same recorder, including its path rules:
+//! paths the rules exclude are reported as skipped, with the reason.
 //!
 //! `push` pushes once to the configured remotes; `run` runs the commit and
 //! push loops in the foreground until SIGINT or SIGTERM (design §11.2).
 //!
-//! `flush`, `record`, `push` and `run` export telemetry over OTLP when the
-//! standard `OTEL_*` variables configure an endpoint (see [`otel`], design
-//! §13); alarms are also printed to stderr. `init` and `status` export
-//! nothing.
+//! `mount`, `run`, `record`, `flush` and `push` take the state-area lock
+//! (design §2.3) and exit 75 while another process holds it; `status` is
+//! read-only and takes no lock.
+//!
+//! `mount`, `flush`, `record`, `push` and `run` export telemetry over OTLP
+//! when the standard `OTEL_*` variables configure an endpoint (see
+//! [`otel`], design §13); alarms are also printed to stderr. `init` and
+//! `status` export nothing.
 
+mod daemon;
 mod otel;
 
 use std::os::unix::fs::PermissionsExt;
@@ -23,8 +29,6 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 use agentfs_core::config::parse_duration;
 use agentfs_core::events::{Event, Events};
@@ -37,6 +41,9 @@ use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::service::Service;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
+use agentfs_fuse::{Mount, MountConfig, Passthrough, preflight};
+
+use crate::daemon::{Daemon, Wake};
 
 #[derive(Parser)]
 #[command(version, about = "Records every change an agent makes, in git history")]
@@ -99,6 +106,10 @@ enum Command {
         #[arg(long, default_value = "5s", value_parser = parse_grace)]
         push_grace: Duration,
     },
+    /// Mount BACKING at MOUNTPOINT and record every change through it,
+    /// with the commit and push loops, until SIGINT, SIGTERM or an unmount.
+    /// A second signal exits at once.
+    Mount(MountArgs),
 }
 
 fn parse_grace(value: &str) -> Result<Duration, String> {
@@ -278,8 +289,14 @@ fn real_main() -> Result<ExitCode> {
         }
         Command::Run { pod, push_grace } => {
             let root = cli.root.as_deref().unwrap_or(Path::new("."));
+            let daemon = Daemon::start()?;
             let _lock = StateLock::acquire(&state, "run", cli.wait_lock)?;
-            return run(&state, root, &pod, push_grace);
+            return run(daemon, &state, root, &pod, push_grace);
+        }
+        Command::Mount(args) => {
+            let daemon = Daemon::start()?;
+            let _lock = StateLock::acquire(&state, "mount", cli.wait_lock)?;
+            return mount(daemon, &state, cli.root.as_deref(), &args);
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -393,9 +410,13 @@ fn remote_line(remote: &RemoteStatus) -> String {
 }
 
 /// `agentfs run`: the commit and push loops until SIGINT or SIGTERM.
-fn run(state: &StateDir, root: &Path, pod: &Pod, push_grace: Duration) -> Result<ExitCode> {
-    // Registered before anything starts, so an early signal is not lost.
-    let mut signals = Signals::new([SIGINT, SIGTERM]).context("installing signal handlers")?;
+fn run(
+    daemon: Daemon,
+    state: &StateDir,
+    root: &Path,
+    pod: &Pod,
+    push_grace: Duration,
+) -> Result<ExitCode> {
     let session = Session::start(state, pod)?;
     let events = session.events.clone();
     let (_recorder, committer, recovery) = session.open(state, root, pod)?;
@@ -408,30 +429,42 @@ fn run(state: &StateDir, root: &Path, pod: &Pod, push_grace: Duration) -> Result
          stop with SIGINT or SIGTERM",
         settings.volume,
         recovery.uncommitted,
-        if names.is_empty() {
-            "none".to_owned()
-        } else {
-            names.join(", ")
-        }
+        list(&names)
     );
 
-    let signal = signals.forever().next();
+    let wake = daemon.wait();
     eprintln!(
-        "signal {}: stopping (waiting up to {push_grace:?} for pushes; signal again to exit now)",
-        signal.unwrap_or_default()
+        "{}: stopping (waiting up to {push_grace:?} for pushes; signal again to exit now)",
+        describe_wake(wake)
     );
-    std::thread::spawn(move || {
-        if signals.forever().next().is_some() {
-            eprintln!("second signal: exiting now");
-            std::process::exit(130);
-        }
-    });
+    let code = stop_service(service, push_grace);
+    session.finish();
+    Ok(code)
+}
 
+fn list(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn describe_wake(wake: Wake) -> String {
+    match wake {
+        Wake::Signal(signal) => format!("signal {signal}"),
+        Wake::Unmounted => "unmounted from outside".to_owned(),
+    }
+}
+
+/// Stops the service: the final commit, then pushes in progress for up to
+/// `push_grace`. Exit status 1 if the final commit failed.
+fn stop_service(service: Service, push_grace: Duration) -> ExitCode {
     let report = service.shutdown(push_grace);
     for name in &report.abandoned_pushes {
         println!("{name}: push still running at shutdown; abandoned");
     }
-    let code = match report.final_commit {
+    match report.final_commit {
         Ok(commit) => {
             println!(
                 "final commit: {} record(s) into {} commit(s)",
@@ -443,7 +476,141 @@ fn run(state: &StateDir, root: &Path, pod: &Pod, push_grace: Duration) -> Result
             eprintln!("final commit failed: {e}; the records stay journaled");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `agentfs mount`'s own options.
+#[derive(Args)]
+struct MountArgs {
+    /// The backing tree: the real directory whose files the mount shows.
+    backing: PathBuf,
+    /// Where to mount it. Must not be inside the backing tree or the state
+    /// area.
+    mountpoint: PathBuf,
+    #[command(flatten)]
+    pod: Pod,
+    /// Kernel passthrough of reads and writes: `auto` uses it when the
+    /// kernel (6.9+) and privileges (root) allow, `on` requires it, `off`
+    /// never uses it.
+    #[arg(long, env = "AGENTFS_PASSTHROUGH", default_value = "auto", value_parser = parse_passthrough)]
+    passthrough: Passthrough,
+    /// FUSE threads (default: the number of CPUs, between 2 and 16).
+    #[arg(long, env = "AGENTFS_THREADS", default_value_t = 0)]
+    threads: usize,
+    /// Mount without `allow_other`: only the mounting user can use it.
+    #[arg(long)]
+    no_allow_other: bool,
+    /// How long shutdown waits for pushes in progress.
+    #[arg(long, default_value = "5s", value_parser = parse_grace)]
+    push_grace: Duration,
+    /// How long shutdown waits for a busy mount (files still open) to be
+    /// released after it is detached.
+    #[arg(long, default_value = "10s", value_parser = parse_grace)]
+    unmount_grace: Duration,
+}
+
+fn parse_passthrough(value: &str) -> Result<Passthrough, String> {
+    value.parse()
+}
+
+/// `agentfs mount`: the FUSE filesystem, the commit loop and the push loops
+/// in one process, until SIGINT, SIGTERM or an unmount.
+fn mount(
+    daemon: Daemon,
+    state: &StateDir,
+    root: Option<&Path>,
+    args: &MountArgs,
+) -> Result<ExitCode> {
+    if let Some(root) = root {
+        let same = match (root.canonicalize(), args.backing.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if !same {
+            bail!(
+                "--root (or AGENTFS_ROOT) {} is not the backing tree {}; drop it or make them agree",
+                root.display(),
+                args.backing.display()
+            );
+        }
+    }
+    let session = Session::start(state, &args.pod)?;
+    let settings = History::open(&state.git())
+        .with_context(|| format!("opening {}", state.root().display()))?
+        .settings()
+        .clone();
+    let (backing, mountpoint) = preflight(state, &settings, &args.backing, &args.mountpoint)?;
+    let events = session.events.clone();
+    let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
+    let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
+    let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
+    let service = Service::start(committer, pushers, events).context("starting the service")?;
+    let config = MountConfig {
+        volume: settings.volume.clone(),
+        backing: backing.clone(),
+        mountpoint: mountpoint.clone(),
+        passthrough: args.passthrough,
+        allow_other: !args.no_allow_other,
+        threads: args.threads,
+        sweep_interval: settings.sweep_interval,
     };
+    let mounted = match Mount::start(recorder, config) {
+        Ok(mounted) => mounted,
+        Err(e) => {
+            // Commits what recovery found; nothing was mounted.
+            let _ = service.shutdown(args.push_grace);
+            session.finish();
+            return Err(e.into());
+        }
+    };
+    daemon.watch(mounted.ended())?;
+    eprintln!(
+        "mounted {} at {} (volume {}, passthrough: {}, threads {}, {} uncommitted record(s) \
+         recovered, remotes: {}); stop with SIGINT or SIGTERM",
+        backing.display(),
+        mountpoint.display(),
+        settings.volume,
+        mounted.passthrough(),
+        mounted.threads(),
+        recovery.uncommitted,
+        list(&names)
+    );
+
+    let wake = daemon.wait();
+    eprintln!(
+        "{}: unmounting (waiting up to {:?} for open files, then {:?} for pushes; signal \
+         again to exit now)",
+        describe_wake(wake),
+        args.unmount_grace,
+        args.push_grace
+    );
+    let report = mounted.shutdown(args.unmount_grace);
+    if let Some(error) = &report.unmount_error {
+        eprintln!("unmount failed: {error}");
+    }
+    if report.lazy {
+        eprintln!("the mount was busy: detached lazily");
+    }
+    if report.session_abandoned {
+        eprintln!(
+            "files were still open after {:?}: their later changes are not recorded",
+            args.unmount_grace
+        );
+    }
+    if report.swept > 0 || report.repaired > 0 {
+        println!(
+            "final sweep: {} open file(s) recorded, {} failed record(s) repaired",
+            report.swept, report.repaired
+        );
+    }
+    if report.unrepaired > 0 {
+        eprintln!(
+            "{} path(s) could not be recorded (see the alarms); history differs from the \
+             backing tree there until the next mount records them",
+            report.unrepaired
+        );
+    }
+    let code = stop_service(service, args.push_grace);
     session.finish();
     Ok(code)
 }

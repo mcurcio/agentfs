@@ -6,11 +6,10 @@
 //!
 //! - [`ops::Ops`] is every operation, independent of the kernel, so its
 //!   behaviour is unit-tested against a real directory and state area.
-//! - `fuse` maps fuser's `fuser::Filesystem` onto it and negotiates
+//! - [`fuse`] maps fuser's [`fuser::Filesystem`] onto it and negotiates
 //!   kernel passthrough.
-//! - `sweep` runs the RELEASE and periodic backstops and retries failed
-//!   records.
-//! - `mount` checks the layout (nothing of the state area may be
+//! - [`sweep`] runs the periodic backstop and retries failed records.
+//! - [`mount`] checks the layout (nothing of the state area may be
 //!   reachable through the mount), mounts, and unmounts.
 
 // `stat` field types differ between architectures (`c_ulong` on x86_64,
@@ -21,6 +20,12 @@
 pub mod backing;
 pub mod boundary;
 pub mod dirty;
+pub mod fuse;
 pub mod inodes;
+pub mod mount;
 pub mod names;
 pub mod ops;
+pub mod sweep;
+
+pub use fuse::{Passthrough, PassthroughStatus};
+pub use mount::{Mount, MountConfig, MountError, PreflightError, UnmountReport, preflight};
