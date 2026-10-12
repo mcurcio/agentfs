@@ -39,9 +39,15 @@ pub enum HistoryError {
     MissingSeq(Oid),
 }
 
-/// Makes libgit2 fsync objects and refs (it does not by default). The
-/// option is process-wide.
-fn enable_fsync() {
+/// Process-wide libgit2 setup, done once before any repository is opened:
+///
+/// - objects and refs are fsynced (libgit2 does not by default; design
+///   §3.3);
+/// - the system, XDG, global and ProgramData config search paths are
+///   cleared, so no config outside the history repository's own file can
+///   reach a volume: not `url.<base>.insteadOf` redirecting a push, not
+///   `http.*`, not `core.excludesFile` (design §4.4, §11.1).
+pub(crate) fn init_libgit2() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         libgit2_sys::init();
@@ -53,6 +59,21 @@ fn enable_fsync() {
             )
         };
         assert_eq!(rc, 0, "libgit2 rejected GIT_OPT_ENABLE_FSYNC_GITDIR");
+        for level in [
+            git2::ConfigLevel::System,
+            git2::ConfigLevel::XDG,
+            git2::ConfigLevel::Global,
+            git2::ConfigLevel::ProgramData,
+        ] {
+            // SAFETY: called once, inside `call_once`, before this process
+            // opens any repository or config through agentfs; libgit2's
+            // search paths are not otherwise touched by agentfs.
+            let result = unsafe { git2::opts::set_search_path(level, "") };
+            assert!(
+                result.is_ok(),
+                "libgit2 rejected clearing {level:?}: {result:?}"
+            );
+        }
     });
 }
 
@@ -72,7 +93,7 @@ pub struct Committed {
 impl History {
     /// Creates a bare history repository for `volume` at `git_dir`.
     pub fn init(git_dir: &Path, volume: &str, branch: Option<&str>) -> Result<Self, HistoryError> {
-        enable_fsync();
+        init_libgit2();
         let repo = Repository::init_opts(
             git_dir,
             git2::RepositoryInitOptions::new().bare(true).mkpath(true),
@@ -96,7 +117,7 @@ impl History {
     }
 
     pub fn open(git_dir: &Path) -> Result<Self, HistoryError> {
-        enable_fsync();
+        init_libgit2();
         let repo = Repository::open_bare(git_dir)?;
         let settings = Settings::load(git_dir)?;
         Ok(Self { repo, settings })
@@ -555,6 +576,21 @@ mod tests {
             "{msg}"
         );
         assert_eq!(seq_from_message(msg), Some(1));
+    }
+
+    #[test]
+    fn init_libgit2_clears_config_search_paths() {
+        let _f = Fixture::new();
+        for level in [
+            git2::ConfigLevel::System,
+            git2::ConfigLevel::XDG,
+            git2::ConfigLevel::Global,
+            git2::ConfigLevel::ProgramData,
+        ] {
+            // SAFETY: reading the search path set once by init_libgit2.
+            let path = unsafe { git2::opts::get_search_path(level) }.unwrap();
+            assert!(path.as_bytes().is_empty(), "{level:?}: {path:?}");
+        }
     }
 
     #[test]

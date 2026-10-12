@@ -108,7 +108,9 @@ through the mount:
   journal/   durable record log (§3.3)
   pending/   frozen copies of recorded content awaiting commit (§3.2)
   lfs/       local LFS object cache (phase 2)
-  meta/      the daemon's own bookkeeping (sequence numbers, push state)
+  meta/      the daemon's own bookkeeping
+    push/<remote>.json   each remote's push state (§11.2)
+    push/<remote>.lock   flock held while pushing that remote
 ```
 
 ### 2.3 Single writer of history
@@ -320,6 +322,12 @@ that operator rules always apply:
     commitWindow = 200ms       # group journal entries this close in time
     pushInterval = 60s         # §11
     lfsThreshold = 8m          # phase 2, §7
+
+[remote "origin"]               # one section per push remote (§11)
+    url = https://github.com/acme/agent-history.git
+    pushurl = …                 # optional; wins over url, as in git
+    agentfsMaxBlobSize = 50m    # optional; §3.4, §11.3
+    agentfsCredentials = /run/secrets/agentfs/origin   # optional; §11.1
 ```
 
 ### 4.4 Implementation note
@@ -574,37 +582,91 @@ agentfs does not scan content for secrets and does not hold pushes.
 ### 11.1 Remotes
 
 - **Any git remotes,** over HTTPS or SSH, configured by the operator. GitHub,
-  Gitea or a bare repository on a server all work the same way.
+  Gitea or a bare repository on a server all work the same way. Local paths
+  and `file://` URLs work too, which is how pushing is tested.
 - **Several push remotes** can be configured. Each has its own push state and
   alarms.
+- **Configuration** is the standard `[remote "<name>"]` sections (`url`, and
+  `pushurl`, which wins as in git) plus agentfs's own keys (§4.3), read only
+  from the history repository's own config file. libgit2's system, XDG,
+  global and ProgramData config search paths are cleared once per process,
+  and pushes use anonymous remotes with explicit `<oid>:<ref>` refspecs, so
+  `remote.<name>.push` and `fetch`, and any global `url.<base>.insteadOf` or
+  `http.*` setting, are never consulted.
 - **Credentials** come from files the recorder reads, and are re-read when they
   change, so short-lived tokens can be rotated by whatever writes the file.
+  - `remote.<name>.agentfsCredentials` is an absolute path to a file holding
+    either git-credential `key=value` lines (`username=`, `password=`; other
+    keys are ignored) or a bare token, used as the password with the username
+    from the URL, else `x-access-token`.
+  - The file is re-read when its stat stamp (device, inode, size, mtime,
+    ctime) changes. The stamp follows symlinks, so kubelet's atomic `..data`
+    swap for Secret volumes and a rename over the file are both seen. An
+    in-place rewrite of the same size within the filesystem's timestamp
+    granularity would be missed.
+  - A credential is bound to the host (and port) of the remote's push URL
+    and is never given to any other host.
+  - It gets one attempt per connection: a rejected credential is an
+    authentication failure, not a retry loop.
+  - Only username and password (token) credentials are supported. SSH keys
+    need libgit2 built with libssh2, and HTTPS needs it built with TLS; the
+    current build environment has neither, so only local and `file://`
+    remotes are exercised end to end.
 
 ### 11.2 Interval push
 
 - Pushes run every `pushInterval`, independent of the workload's lifecycle.
   Nothing waits for a pod to stop, and stopping a pod never waits for a push.
+  The first push of each remote happens as soon as the service starts.
+- Each remote is pushed from its own thread, so a slow or hung remote cannot
+  delay another. libgit2 has no way to cancel a push in progress, so a push
+  hung on the network keeps its thread until the process exits; shutdown
+  waits for pushes only up to a grace period, then leaves them.
 - Unpushed commits stay safe in the state area and go out on the next
   successful push.
 - Pushes are fast-forward only.
+- **Push state** is kept per remote in `meta/push/<remote>.json` (§2.2): the
+  last pushed commit, the last attempt and success times, consecutive
+  failures, the last error and any divergence. It is bookkeeping: a missing
+  or unreadable file is treated as empty.
+- **A per-remote lock** (`flock` on `meta/push/<remote>.lock`) keeps a manual
+  `agentfs push` and the running service from pushing the same remote at
+  once; whichever loses reports itself busy and does nothing.
+- **Backoff.** After a failure the next attempt waits `pushInterval` doubled
+  for each consecutive failure after the first, up to
+  `max(pushInterval, 15m)`. A success resets it.
 
 ### 11.3 Limits and rejected pushes
 
-- **Limits are configured per remote,** for example maximum blob size, maximum
-  push size and whether fsck rules are enforced. Commits are checked against
-  them before they are made (§3.4).
+- **Limits are configured per remote.** For now the only one is
+  `remote.<name>.agentfsMaxBlobSize`. Commits are checked against it before
+  they are made (§3.4); because one history goes to every remote, the
+  smallest limit applies. git's fsck rules are always enforced, not per
+  remote: history may later go to a stricter remote, and a commit no remote
+  accepts can never be pushed. A maximum push size is deferred.
 - **A rejected push never affects the filesystem.** Rejected means refused,
   non-fast-forward, authentication failure or an unreachable remote. Recording,
   committing and other remotes carry on. The recorder:
-  - raises an alarm (§13) with the reason and the commit;
-  - keeps retrying with backoff;
+  - raises an alarm (`PushFailed`, §13) with the reason and the commit;
+  - keeps retrying with backoff (§11.2);
   - keeps the remote's last successful commit, so the backlog is visible.
-- **Non-fast-forward means someone else wrote the branch.**
+- **Non-fast-forward on the branch means someone else wrote it.**
   - The recorder pushes its head to
-    `refs/agentfs/<volume>/diverged/<UTC timestamp, no colons>` once per
-    divergence, then keeps alarming.
+    `refs/agentfs/<volume>/diverged/<UTC timestamp, no colons>`
+    (`YYYYMMDDTHHMMSSZ`) once per divergence, raising `Diverged`, then keeps
+    raising `PushFailed` (`non_fast_forward`) at every attempt, with the same
+    backoff as other failures.
   - It never force-pushes.
-  - An operator resolves it (§15).
+  - An operator resolves it (§15). The divergence clears when a branch push
+    next succeeds.
+  - A non-fast-forward on one of the volume's other refs is reported the
+    same way but saves no diverged ref. libgit2 rejects the whole push when
+    any ref is not a fast-forward, so the patch-queue refs of phase 3 will
+    need their own push policy.
+- libgit2's local transport updates an existing remote ref without
+  compare-and-swap, so another writer moving a local or `file://` remote
+  between libgit2's ref listing and its update can be overwritten. Smart
+  HTTP and SSH servers compare and swap.
 
 ### 11.4 Shared repositories
 
@@ -619,8 +681,9 @@ set by the operator) and owns a branch and a ref namespace in that repository:
 | `refs/agentfs/<volume>/status` | Recorder status for iac (§12) |
 | `refs/agentfs/<volume>/diverged/<timestamp>` | Divergence (§11.3) |
 
-**Pushing.** A recorder pushes only its own volume's refs, with explicit
-refspecs, so pushes from different volumes never contend.
+**Pushing.** A recorder pushes only its own volume's refs (the branch and
+`refs/agentfs/<volume>/*`), with explicit refspecs, so pushes from different
+volumes never contend.
 
 **Fetching.** At mount it fetches only its own volume's refs.
 
@@ -636,6 +699,11 @@ agentfs **detects** other writers (§11.3) rather than relying on enforcement.
 
 **Volume names** must be unique within a repository. Two recorders configured
 with the same name would see each other as divergence.
+
+**Names.** Volume and remote names must match `[A-Za-z0-9][A-Za-z0-9._-]*`,
+without `..` and not ending in `.` or `.lock`. They become ref components and
+state file names; a `/` in a volume name would let one volume's
+`refs/agentfs/<volume>/` namespace contain another's.
 
 ## 12. Patch queue for iac (phase 3)
 

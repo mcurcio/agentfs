@@ -8,6 +8,7 @@
 pub mod checks;
 pub mod claims;
 pub mod config;
+pub mod credentials;
 pub mod events;
 pub mod history;
 pub mod identity;
@@ -16,6 +17,7 @@ pub mod nested;
 pub mod paths;
 pub mod pending;
 pub mod probe;
+pub mod push;
 pub mod record;
 pub mod rules;
 pub mod tracked;
