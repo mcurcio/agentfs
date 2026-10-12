@@ -30,6 +30,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use agentfs_core::fsync_class::GroupMembers;
 use agentfs_core::nested;
 use agentfs_core::paths::PathError;
 use agentfs_core::record::{Caller, Trigger};
@@ -156,6 +157,47 @@ impl Boundary {
         caller: Caller,
         changes: Vec<Change>,
     ) -> Result<bool, VolumeError> {
+        let inputs = self.inputs(changes);
+        if inputs.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.recorder.record(trigger, caller, inputs)?.seq.is_some())
+    }
+
+    /// Records an fsync-class group's members as one all-or-nothing record
+    /// ([`Recorder::record_group`], design §8). Returns whether anything was
+    /// journaled; a refusal is not an error.
+    pub fn record_group(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        changes: Vec<Change>,
+    ) -> Result<bool, VolumeError> {
+        let inputs = self.inputs(changes);
+        if inputs.is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .recorder
+            .record_group(trigger, caller, inputs)?
+            .seq
+            .is_some())
+    }
+
+    /// The fsync-class group the path `raw` belongs to, if any.
+    pub fn group_of(&self, raw: &[u8]) -> Option<GroupMembers> {
+        if !self.recorder.has_fsync_class() {
+            return None;
+        }
+        match classify(raw) {
+            Class::Record(path) => self.recorder.fsync_group(&path),
+            _ => None,
+        }
+    }
+
+    /// Classifies `changes` into recorder inputs, reporting what cannot be
+    /// recorded.
+    fn inputs(&self, changes: Vec<Change>) -> Vec<Input> {
         let mut inputs = Vec::with_capacity(changes.len());
         for change in changes {
             let path = match classify(&change.path) {
@@ -199,10 +241,7 @@ impl Boundary {
                 State::Removed => Input::Remove { path },
             });
         }
-        if inputs.is_empty() {
-            return Ok(false);
-        }
-        Ok(self.recorder.record(trigger, caller, inputs)?.seq.is_some())
+        inputs
     }
 
     /// New content at `raw`, under `dir/.git`: silent if that `.git` is

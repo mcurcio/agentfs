@@ -8,6 +8,8 @@
 //!   behaviour is unit-tested against a real directory and state area.
 //! - [`fuse`] maps fuser's [`fuser::Filesystem`] onto it and negotiates
 //!   kernel passthrough.
+//! - [`groups`] holds writes to fsync-class databases while they are
+//!   captured and schedules the captures (design §8).
 //! - [`sweep`] runs the periodic backstop and retries failed records.
 //! - [`mount`] checks the layout (nothing of the state area may be
 //!   reachable through the mount), mounts, and unmounts.
@@ -21,6 +23,7 @@ pub mod backing;
 pub mod boundary;
 pub mod dirty;
 pub mod fuse;
+pub mod groups;
 pub mod inodes;
 pub mod mount;
 pub mod names;
