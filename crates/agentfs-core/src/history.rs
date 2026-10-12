@@ -348,6 +348,8 @@ impl History {
             }
             // A symlinked .gitattributes is never recorded (design §3.4).
             Some(_) => return Ok(()),
+            // Nothing to add, nothing to remove: the common case.
+            None if paths.is_empty() => return Ok(()),
             None => {
                 // A directory named .gitattributes: nowhere to put lines.
                 let dir = format!("{}/", attributes::ROOT_GITATTRIBUTES);
