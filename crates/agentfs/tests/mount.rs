@@ -495,7 +495,14 @@ fn recorded_before_close_returns() {
     let m = v.mount(&[]);
     let log = m.log();
     let line = log.lines().rfind(|l| l.starts_with("mounted ")).unwrap();
-    assert!(line.contains("1 uncommitted record(s) recovered"), "{line}");
+    // The shell's redirection closes the file twice (dup2, then close), so
+    // there may be a record of the empty file before the one with data.
+    let recovered: usize = line
+        .split(", ")
+        .find_map(|p| p.strip_suffix(" uncommitted record(s) recovered"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{line}"));
+    assert!(recovered >= 1, "{line}");
     v.expect(&tree(&[("f", f("data"))]));
     assert_eq!(fs::read_to_string(v.backing().join("f")).unwrap(), "data");
     m.stop();
