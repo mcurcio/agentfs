@@ -625,3 +625,27 @@ fn restoring_a_database_member_restores_its_group_in_one_commit() {
         v.message(v.head())
     );
 }
+
+/// A member neither the commit nor history has (a WAL database's
+/// `-journal`) is nothing to record, not a problem.
+#[test]
+fn restoring_a_group_with_a_never_tracked_member_succeeds() {
+    let v = Volume::new();
+    fs::write(
+        v.state().join("git/info/attributes"),
+        "*.db* agentfs.commit=fsync agentfs.group=sqlite\n",
+    )
+    .unwrap();
+    v.write("d/s.db", "v1");
+    v.write("d/s.db-wal", "w1");
+    v.record(&["d/s.db"]);
+    let c1 = v.head().to_string();
+    v.write("d/s.db", "v2");
+    v.write("d/s.db-wal", "w2");
+    v.record(&["d/s.db"]);
+
+    let out = v.ok(&["restore", "d/s.db", &c1]);
+    assert!(out.contains("restored 2 path(s), removed 0"), "{out}");
+    assert_eq!(v.history(), h(&[("d/s.db", "v1"), ("d/s.db-wal", "w1")]));
+    assert!(!v.t("d/s.db-journal").exists());
+}

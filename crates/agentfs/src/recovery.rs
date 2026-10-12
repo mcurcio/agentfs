@@ -445,7 +445,7 @@ fn record_applied(
             }
         }
         let recorded = recorder.record(Trigger::Restore, caller, inputs);
-        note_recorded(recorded, &mut problems);
+        note_recorded(recorded, applied, &mut problems);
         drop(fds);
     }
     for members in groups.into_values() {
@@ -465,7 +465,7 @@ fn record_applied(
         // Whole or not at all.
         if !unreadable {
             let recorded = recorder.record_group(Trigger::Restore, caller, inputs);
-            note_recorded(recorded, &mut problems);
+            note_recorded(recorded, applied, &mut problems);
         }
         drop(fds);
     }
@@ -507,14 +507,22 @@ fn input_at(
     }
 }
 
-/// Adds what a record skipped, or its failure, to `problems`.
+/// Adds what a record skipped of the paths the restore wrote or removed
+/// (`applied`), or its failure, to `problems`. A group member the
+/// restore did not touch, absent and never tracked, is skipped as nothing
+/// to record, and that is no problem.
 fn note_recorded(
     recorded: Result<agentfs_core::volume::Recorded, agentfs_core::volume::VolumeError>,
+    applied: &Applied,
     problems: &mut Vec<String>,
 ) {
     match recorded {
         Ok(recorded) => {
-            for skipped in recorded.skipped {
+            for skipped in recorded
+                .skipped
+                .into_iter()
+                .filter(|s| applied.written.contains(&s.path) || applied.removed.contains(&s.path))
+            {
                 problems.push(format!(
                     "{} was written but not recorded: {}",
                     skipped.path, skipped.reason
