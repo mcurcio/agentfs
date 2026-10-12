@@ -202,6 +202,48 @@ jobs:
         if: always()
         run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
 
+  e2e-multipod:
+    name: e2e (two FUSE mounts, one history service, passthrough ${{ matrix.passthrough }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        passthrough: [auto, off]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: multipod
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 jq python3
+      - name: enable user_allow_other, show the kernel
+        run: |
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          uname -a
+          findmnt -T "$RUNNER_TEMP" || true
+      - run: cargo build --locked --release -p agentfs
+      - run: ci/e2e-multipod.sh
+        env:
+          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
+          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
+      - name: round-trip benchmark
+        run: |
+          set -o pipefail
+          {
+            echo "### History service round trip (passthrough ${{ matrix.passthrough }} job; no FUSE)"
+            echo '```'
+            cargo test --locked --release -p agentfs-core --test history_service -- --ignored --nocapture round_trip_cost
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: daemon logs
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP"/agentfs-multipod-logs/*.log
+      - name: clean up mounts
+        if: always()
+        run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
+
   e2e-lfs:
     name: e2e (Git LFS)
     runs-on: ubuntu-latest
