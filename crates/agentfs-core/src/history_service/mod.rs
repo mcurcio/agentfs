@@ -13,10 +13,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+mod client;
 mod lease;
 pub mod protocol;
+mod server;
 
+pub use client::{ClientConfig, ClientError, HistoryClient};
 pub use lease::{FrontLease, LeaseError, MAX_SLOT};
+pub use server::{HELLO_TIMEOUT, HistoryServer, MAX_CONNECTIONS};
 
 /// Where a history service listens.
 #[derive(Debug, Clone, PartialEq, Eq)]

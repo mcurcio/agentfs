@@ -63,6 +63,9 @@ pub mod names {
     pub const REMOTE_MISCONFIGURED: &str = "agentfs.remote.misconfigured";
     pub const PATCH_QUEUE_DEPTH: &str = "agentfs.patch.queue_depth";
     pub const PATCH_BLOCKED: &str = "agentfs.patch.blocked";
+    pub const FRONT_ROUND_TRIP: &str = "agentfs.front.round_trip";
+    pub const FRONT_SERVICE_FAILURES: &str = "agentfs.front.service_failures";
+    pub const HISTORY_SERVICE_FRONTS: &str = "agentfs.history_service.fronts";
     /// Recorded by the binary, which owns the exporters (design §13).
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -117,6 +120,8 @@ struct Inner {
     repack_failures: Counter<u64>,
     push_failures: Counter<u64>,
     rejected_paths: Counter<u64>,
+    front_round_trip: Histogram<f64>,
+    front_service_failures: Counter<u64>,
 }
 
 impl fmt::Debug for Telemetry {
@@ -184,6 +189,19 @@ impl Telemetry {
                 names::PRECHECK_REJECTED_PATHS,
                 "{path}",
                 "Paths refused by the pre-commit checks, by stage and reason",
+            ),
+            front_round_trip: meter
+                .f64_histogram(names::FRONT_ROUND_TRIP)
+                .with_unit("s")
+                .with_description(
+                    "Time a front waits for the history service to answer, by request (design §14)",
+                )
+                .with_boundaries(RECORD_DURATION_BOUNDARIES.to_vec())
+                .build(),
+            front_service_failures: counter(
+                names::FRONT_SERVICE_FAILURES,
+                "{failure}",
+                "Requests a front could not get answered by the history service, by stage",
             ),
             meter: meter.clone(),
             tracer,
@@ -352,6 +370,45 @@ impl Telemetry {
                 &[KeyValue::new("trigger", trigger.as_str())],
             );
         }
+    }
+
+    /// Records one answered request of a front (design §14): `request` is
+    /// `record`, `tracked` or `ping`.
+    pub(crate) fn front_round_trip(&self, request: &'static str, elapsed: Duration) {
+        if let Some(inner) = &self.inner {
+            inner
+                .front_round_trip
+                .record(elapsed.as_secs_f64(), &[KeyValue::new("request", request)]);
+        }
+    }
+
+    /// Counts one request a front could not get answered: `stage` is
+    /// `connect`, `request`, `timeout`, `refused` or `service`.
+    pub(crate) fn front_service_failure(&self, stage: &'static str) {
+        if let Some(inner) = &self.inner {
+            inner
+                .front_service_failures
+                .add(1, &[KeyValue::new("stage", stage)]);
+        }
+    }
+
+    /// Registers `agentfs.history_service.fronts`, the number of distinct
+    /// fronts connected, read from `fronts` while the server runs.
+    pub(crate) fn observe_fronts(&self, fronts: Weak<dyn Fn() -> usize + Send + Sync>) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner
+            .meter
+            .u64_observable_gauge(names::HISTORY_SERVICE_FRONTS)
+            .with_unit("{front}")
+            .with_description("Fronts connected to this history service (design §14)")
+            .with_callback(move |observer| {
+                if let Some(fronts) = fronts.upgrade() {
+                    observer.observe(fronts() as u64, &[]);
+                }
+            })
+            .build();
     }
 
     /// Counts one commit made.

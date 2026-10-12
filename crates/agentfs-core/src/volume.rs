@@ -33,7 +33,7 @@ use crate::config::{ConfigError, validate_name};
 use crate::events::{CheckStage, Event, Events};
 use crate::fsync_class::{self, FsyncClass, GroupMembers};
 use crate::history::{Committed, History, HistoryError};
-use crate::history_service::FrontLease;
+use crate::history_service::{ClientError, FrontLease, HistoryClient};
 use crate::identity::{Context, IdentityRenderer};
 use crate::journal::{Journal, OpenReport};
 use crate::lfs::{ObjectCache, Store, StorePolicy};
@@ -227,6 +227,12 @@ pub enum VolumeError {
     Rules(#[from] RulesError),
     #[error(transparent)]
     ActorBusy(#[from] ActorBusy),
+    /// A front could not get its record durable (design §3.5, §14).
+    #[error(transparent)]
+    HistoryService(#[from] ClientError),
+    /// The history service will not journal a front's record as sent.
+    #[error("refused a front's record: {0}")]
+    FrontRecord(String),
     #[error(
         "this state area belongs to volume {found:?}, not {wanted:?}; nothing was changed \
          (check which volume or PVC is mounted)"
@@ -460,11 +466,13 @@ pub fn open(
         pruned_pending,
     };
     let recorder = Recorder {
-        journal: journal.clone(),
+        backend: Backend::Local {
+            journal: journal.clone(),
+            tracked: Arc::new(tracked),
+        },
         operations: operations.clone(),
         pending: pending.clone(),
         rules: rules.clone(),
-        tracked: Arc::new(tracked),
         claims: Arc::new(PathClaims::default()),
         checks: checks.clone(),
         store_policy: StorePolicy {
@@ -489,6 +497,43 @@ pub fn open(
         telemetry: telemetry.clone(),
     };
     Ok((recorder, committer, recovery))
+}
+
+/// Opens a front's recorder for the backing tree at `tree` (design §14):
+/// it records through `client`'s history service, freezing into the slot
+/// the client's front leases.
+///
+/// A front reads the volume's settings (rules, checks, LFS threshold,
+/// fsync class) once, here, and runs no recovery: the journal, tracked set
+/// and history belong to the service. It holds no state-area lock; the
+/// caller holds the slot's [`FrontLease`] for as long as the recorder
+/// lives. Half-written copies its slot left are removed.
+pub fn open_front(
+    state: &StateDir,
+    tree: &Path,
+    events: Events,
+    telemetry: &Telemetry,
+    client: Arc<HistoryClient>,
+) -> Result<Recorder, VolumeError> {
+    let history = History::open(&state.git())?;
+    let settings = history.settings();
+    let slot = client.front().slot;
+    let pending = Arc::new(PendingStore::open_slot(state.pending(), slot, |s| {
+        s == slot
+    })?);
+    Ok(Recorder {
+        backend: Backend::Front { client },
+        operations: Arc::new(Operations::default()),
+        pending,
+        rules: Arc::new(Rules::load(&state.git(), tree, settings.into())?),
+        claims: Arc::new(PathClaims::default()),
+        checks: Arc::new(Checks::new(Limits::from_remotes(&settings.remotes))),
+        store_policy: StorePolicy {
+            threshold: settings.lfs.threshold,
+        },
+        events,
+        telemetry: telemetry.clone(),
+    })
 }
 
 /// What [`inspect`] found.
@@ -579,18 +624,34 @@ impl OperationSpec {
 }
 
 /// Records change boundaries. Cheap to clone; safe to share across threads.
+///
+/// A local recorder ([`open`]) journals itself; a front's ([`open_front`])
+/// does the same synchronous step up to the freeze and hands the record to
+/// the history service (design §14).
 #[derive(Clone)]
 pub struct Recorder {
-    journal: Arc<Journal>,
+    backend: Backend,
     operations: Arc<Operations>,
     pending: Arc<PendingStore>,
     rules: Arc<Rules>,
-    tracked: Arc<Tracked>,
     claims: Arc<PathClaims>,
     checks: Arc<Checks>,
     store_policy: StorePolicy,
     events: Events,
     telemetry: Telemetry,
+}
+
+/// Where a [`Recorder`]'s records go.
+#[derive(Clone)]
+enum Backend {
+    /// Single-process mode and the history service: this process journals
+    /// and holds the tracked set.
+    Local {
+        journal: Arc<Journal>,
+        tracked: Arc<Tracked>,
+    },
+    /// A front: the history service journals (design §14).
+    Front { client: Arc<HistoryClient> },
 }
 
 impl Recorder {
@@ -709,10 +770,11 @@ impl Recorder {
         atomic: bool,
     ) -> Result<Recorded, VolumeError> {
         let _claim = self.claims.claim(inputs.iter().map(Input::path));
+        let decisions = self.decide_all(&inputs)?;
         let mut kept = Vec::with_capacity(inputs.len());
         let mut skipped = Vec::new();
-        for input in inputs {
-            match self.decide(&input)? {
+        for (input, decision) in inputs.into_iter().zip(decisions) {
+            match decision {
                 Decision::Record => kept.push(input),
                 // A group member the rules leave out (other than `-shm`)
                 // would be missing from the capture: a database without
@@ -749,58 +811,13 @@ impl Recorder {
                         path,
                         backing,
                         executable,
-                    } => {
-                        if let Some(refusal) = self.checks.check_path(&path) {
+                    } => match self.prepare_write(path, &backing, executable, &mut frozen)? {
+                        Ok(change) => change,
+                        Err((path, refusal)) => {
                             self.refuse(&mut skipped, path, refusal);
                             continue;
                         }
-                        // The store decides whether the blob limit applies
-                        // (design §7): first by the size on disk, so a file
-                        // far over the limit is never copied, then by the
-                        // frozen copy's, which is what is journaled.
-                        let attrs = self.rules.attributes(&path)?;
-                        let on_disk = std::fs::metadata(&backing).map_or(0, |m| m.len());
-                        // `agentfs.maxSize` the same way: on disk, then
-                        // frozen.
-                        let max_size = self.rules.max_size(&path);
-                        if let Some(refusal) = over_max_size(on_disk, max_size) {
-                            self.refuse(&mut skipped, path, refusal);
-                            continue;
-                        }
-                        if self.store_policy.decide(&path, on_disk, &attrs) == Store::Blob
-                            && let Some(refusal) = self.checks.check_backing_size(&backing)
-                        {
-                            self.refuse(&mut skipped, path, refusal);
-                            continue;
-                        }
-                        let (id, _) = self.pending.freeze(&backing)?;
-                        frozen.push(id);
-                        let frozen_size = std::fs::metadata(self.pending.path(id))?.len();
-                        if let Some(refusal) = over_max_size(frozen_size, max_size) {
-                            frozen.pop();
-                            self.pending.remove([id])?;
-                            self.refuse(&mut skipped, path, refusal);
-                            continue;
-                        }
-                        let store = self.store_policy.decide(&path, frozen_size, &attrs);
-                        if let Some(refusal) = self.checks.check_file_stored(
-                            &path,
-                            &self.pending.path(id),
-                            CheckStage::Record,
-                            store,
-                        )? {
-                            frozen.pop();
-                            self.pending.remove([id])?;
-                            self.refuse(&mut skipped, path, refusal);
-                            continue;
-                        }
-                        Change::Write {
-                            path,
-                            pending: id,
-                            executable,
-                            store,
-                        }
-                    }
+                    },
                     Input::Symlink { path, target } => {
                         if let Some(refusal) = self.checks.check_symlink(&path, &target) {
                             self.refuse(&mut skipped, path, refusal);
@@ -831,7 +848,10 @@ impl Recorder {
                 }
             }
             if changes.is_empty() {
-                return Ok(None);
+                return Ok(Recorded {
+                    seq: None,
+                    skipped: Vec::new(),
+                });
             }
             let draft = Draft {
                 trigger,
@@ -842,20 +862,270 @@ impl Recorder {
                 atomic,
                 origin: None,
             };
-            Ok(Some(self.journal.record(draft)?))
+            match &self.backend {
+                Backend::Local { journal, .. } => Ok(Recorded {
+                    seq: Some(journal.record(draft)?),
+                    skipped: Vec::new(),
+                }),
+                // The service decides again and journals (design §14); its
+                // skips come back with the reply.
+                Backend::Front { client } => Ok(client.record(draft)?),
+            }
         })();
         match result {
-            Ok(seq) => {
-                for change in &changes {
-                    self.tracked.apply(change);
+            Ok(Recorded {
+                seq,
+                skipped: by_service,
+            }) => {
+                if let Backend::Local { tracked, .. } = &self.backend {
+                    for change in &changes {
+                        tracked.apply(change);
+                    }
+                }
+                for skip in by_service {
+                    if let SkipReason::Refused(refusal) = &skip.reason {
+                        self.events.emit(Event::PathRefused {
+                            path: skip.path.to_string(),
+                            reason: refusal.clone(),
+                            stage: CheckStage::Record,
+                        });
+                    }
+                    skipped.push(skip);
                 }
                 Ok(Recorded { seq, skipped })
             }
             Err(e) => {
-                // Copies frozen for a record that never became durable.
-                let _ = self.pending.remove(frozen);
+                // Copies frozen for a record that never became durable. A
+                // front's request that may have reached the service keeps
+                // them: the service may have journaled it, and will commit
+                // or prune them (design §3.5).
+                let maybe_journaled =
+                    matches!(&e, VolumeError::HistoryService(c) if c.maybe_journaled());
+                if !maybe_journaled {
+                    let _ = self.pending.remove(frozen);
+                }
                 Err(e)
             }
+        }
+    }
+
+    /// The record-time half of a write (design §3.2, §3.4, §7): the checks
+    /// on the path, `agentfs.maxSize` and the blob limit on the size on
+    /// disk, the freeze, then `agentfs.maxSize` and the content checks on
+    /// the frozen copy, and the store. The copy is pushed to `frozen`
+    /// unless refused, in which case it is already removed.
+    fn prepare_write(
+        &self,
+        path: RepoPath,
+        backing: &Path,
+        executable: bool,
+        frozen: &mut Vec<PendingId>,
+    ) -> Result<Result<Change, (RepoPath, Refusal)>, VolumeError> {
+        if let Some(refusal) = self.checks.check_path(&path) {
+            return Ok(Err((path, refusal)));
+        }
+        // The store decides whether the blob limit applies (design §7):
+        // first by the size on disk, so a file far over the limit is never
+        // copied, then by the frozen copy's, which is what is journaled.
+        let attrs = self.rules.attributes(&path)?;
+        let on_disk = std::fs::metadata(backing).map_or(0, |m| m.len());
+        // `agentfs.maxSize` the same way: on disk, then frozen.
+        let max_size = self.rules.max_size(&path);
+        if let Some(refusal) = over_max_size(on_disk, max_size) {
+            return Ok(Err((path, refusal)));
+        }
+        if self.store_policy.decide(&path, on_disk, &attrs) == Store::Blob
+            && let Some(refusal) = self.checks.check_backing_size(backing)
+        {
+            return Ok(Err((path, refusal)));
+        }
+        let (id, _) = self.pending.freeze(backing)?;
+        frozen.push(id);
+        let frozen_size = std::fs::metadata(self.pending.path(id))?.len();
+        if let Some(refusal) = over_max_size(frozen_size, max_size) {
+            frozen.pop();
+            self.pending.remove([id])?;
+            return Ok(Err((path, refusal)));
+        }
+        let store = self.store_policy.decide(&path, frozen_size, &attrs);
+        if let Some(refusal) = self.checks.check_file_stored(
+            &path,
+            &self.pending.path(id),
+            CheckStage::Record,
+            store,
+        )? {
+            frozen.pop();
+            self.pending.remove([id])?;
+            return Ok(Err((path, refusal)));
+        }
+        Ok(Ok(Change::Write {
+            path,
+            pending: id,
+            executable,
+            store,
+        }))
+    }
+
+    /// Journals a front's record (design §14): the history service's side
+    /// of [`Recorder::record`], on its local recorder.
+    ///
+    /// The front decided with the tracked set as it was; this decides each
+    /// change again with the paths claimed, as [`Recorder::record`] does: a
+    /// removal of nothing tracked and a write the rules now skip are
+    /// skipped, and their copies removed; in an atomic group such a write
+    /// refuses the whole group (design §8). Every write's copy must exist
+    /// and be in the front's `slot`; operations come only from this
+    /// process. The record is journaled with `origin`, so it commits with
+    /// the front's committer (design §9), and this returns once it is
+    /// durable.
+    pub fn sequence(
+        &self,
+        origin: &Origin,
+        slot: u16,
+        mut draft: Draft,
+    ) -> Result<Recorded, VolumeError> {
+        let Backend::Local { journal, tracked } = &self.backend else {
+            return Err(VolumeError::FrontRecord(
+                "a front cannot journal another front's record".into(),
+            ));
+        };
+        if draft.operation.is_some() {
+            return Err(VolumeError::FrontRecord(
+                "operations are not accepted from fronts".into(),
+            ));
+        }
+        let _claim = self.claims.claim(draft.changes.iter().map(Change::path));
+        for change in &draft.changes {
+            if let Change::Write { path, pending, .. } = change {
+                if pending.slot() != slot {
+                    return Err(VolumeError::FrontRecord(format!(
+                        "{path}: frozen copy {:016x} is not in the front's slot {slot}",
+                        pending.0
+                    )));
+                }
+                if !self.pending.path(*pending).is_file() {
+                    return Err(VolumeError::FrontRecord(format!(
+                        "{path}: frozen copy {:016x} does not exist",
+                        pending.0
+                    )));
+                }
+            }
+        }
+        let mut kept = Vec::with_capacity(draft.changes.len());
+        let mut dropped = Vec::new();
+        let mut skipped = Vec::new();
+        let mut refused_member = None;
+        for change in std::mem::take(&mut draft.changes) {
+            let decision = match &change {
+                Change::Remove { path } => {
+                    if tracked.contains_or_under(path) {
+                        Decision::Record
+                    } else {
+                        Decision::Skip(SkipReason::Untracked)
+                    }
+                }
+                Change::Write { path, .. } | Change::Symlink { path, .. } => {
+                    self.rules.decide(path, tracked.contains(path))?
+                }
+            };
+            match decision {
+                Decision::Record => kept.push(change),
+                Decision::Skip(reason) => {
+                    let is_remove = matches!(change, Change::Remove { .. });
+                    let reason = if draft.atomic && !is_remove && reason != SkipReason::SharedMemory
+                    {
+                        refused_member.get_or_insert_with(|| change.path().clone());
+                        SkipReason::Refused(Refusal::GroupMemberSkipped {
+                            reason: reason.to_string(),
+                        })
+                    } else {
+                        reason
+                    };
+                    if let Change::Write { pending, .. } = &change {
+                        dropped.push(*pending);
+                    }
+                    skipped.push(Skipped {
+                        path: change.path().clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+        if let Some(member) = refused_member {
+            for change in kept.drain(..) {
+                if let Change::Write { pending, .. } = &change {
+                    dropped.push(*pending);
+                }
+                skipped.push(Skipped {
+                    path: change.path().clone(),
+                    reason: SkipReason::GroupRefused {
+                        member: member.clone(),
+                    },
+                });
+            }
+        }
+        if kept.is_empty() {
+            self.pending.remove(dropped)?;
+            return Ok(Recorded { seq: None, skipped });
+        }
+        draft.changes = kept;
+        draft.origin = Some(origin.clone());
+        let ids: Vec<PendingId> = draft
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::Write { pending, .. } => Some(*pending),
+                _ => None,
+            })
+            .collect();
+        let paths: Vec<RepoPath> = draft.changes.iter().map(|c| c.path().clone()).collect();
+        let changes = draft.changes.clone();
+        let trigger = draft.trigger;
+        match journal.record(draft) {
+            Ok(seq) => {
+                for change in &changes {
+                    tracked.apply(change);
+                }
+                let _ = self.pending.remove(dropped);
+                Ok(Recorded {
+                    seq: Some(seq),
+                    skipped,
+                })
+            }
+            Err(e) => {
+                // Never durable: the front reports the boundary as failed.
+                let _ = self.pending.remove(ids.into_iter().chain(dropped));
+                let e = VolumeError::from(e);
+                self.events.emit(Event::RecordFailed {
+                    trigger,
+                    paths,
+                    error: format!("{} (from replica {})", e, origin.replica),
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether each of `paths` is tracked now: the history service's answer
+    /// to a front's `Tracked` query (design §14). A front has no tracked
+    /// set and answers `false` for each.
+    pub fn tracked_query(&self, paths: &[RepoPath]) -> Vec<bool> {
+        match &self.backend {
+            Backend::Local { tracked, .. } => paths.iter().map(|p| tracked.contains(p)).collect(),
+            Backend::Front { .. } => vec![false; paths.len()],
+        }
+    }
+
+    /// Whether this recorder is a front of a history service.
+    pub fn is_front(&self) -> bool {
+        matches!(self.backend, Backend::Front { .. })
+    }
+
+    /// A front's connection to its history service.
+    pub fn history_client(&self) -> Option<&Arc<HistoryClient>> {
+        match &self.backend {
+            Backend::Front { client } => Some(client),
+            Backend::Local { .. } => None,
         }
     }
 
@@ -927,7 +1197,7 @@ impl Recorder {
         path: &RepoPath,
         symlink_target: Option<&str>,
     ) -> Result<Option<SkipReason>, VolumeError> {
-        if let Decision::Skip(reason) = self.rules.decide(path, self.tracked.contains(path))? {
+        if let Decision::Skip(reason) = self.decide_write(path)? {
             return Ok(Some(reason));
         }
         let refusal = match symlink_target {
@@ -951,18 +1221,25 @@ impl Recorder {
     }
 
     /// The last sequence number given to a record, journaled or in flight.
+    /// `None` for a front, whose records the history service numbers.
     pub fn last_seq(&self) -> Option<u64> {
-        self.journal.last_seq()
+        match &self.backend {
+            Backend::Local { journal, .. } => journal.last_seq(),
+            Backend::Front { .. } => None,
+        }
     }
 
     /// Waits up to `timeout` until every record up to `seq` is in history
     /// (or failed and was never journaled), including records still being
     /// written to the journal when it is called. Returns whether they all
-    /// are.
+    /// are. A front, which commits nothing itself, returns `false`.
     pub fn wait_committed(&self, seq: u64, timeout: Duration) -> bool {
+        let Backend::Local { journal, .. } = &self.backend else {
+            return false;
+        };
         let deadline = Instant::now() + timeout;
         loop {
-            if self.journal.settled_through(seq) {
+            if journal.settled_through(seq) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -1003,23 +1280,109 @@ impl Recorder {
 
     #[cfg(test)]
     fn journal_for_tests(&self) -> &Journal {
-        &self.journal
+        match &self.backend {
+            Backend::Local { journal, .. } => journal,
+            Backend::Front { .. } => panic!("a front has no journal"),
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked_for_tests(&self) -> &Tracked {
+        match &self.backend {
+            Backend::Local { tracked, .. } => tracked,
+            Backend::Front { .. } => panic!("a front has no tracked set"),
+        }
+    }
+
+    /// The rules' decision for each input (design §4). A front asks the
+    /// history service whether a path is tracked only when the decision
+    /// depends on it (an ignored or nested path), in one query for the
+    /// whole record, and leaves removals to the service, which holds the
+    /// tracked set (design §14).
+    fn decide_all(&self, inputs: &[Input]) -> Result<Vec<Decision>, VolumeError> {
+        let Backend::Front { client } = &self.backend else {
+            return inputs.iter().map(|i| self.decide(i)).collect();
+        };
+        let mut decisions = Vec::with_capacity(inputs.len());
+        let mut ask = Vec::new();
+        for input in inputs {
+            let decision = match input {
+                Input::Remove { .. } => Decision::Record,
+                Input::Write { path, .. } | Input::Symlink { path, .. } => {
+                    match self.front_decide(path)? {
+                        FrontDecision::Final(decision) => decision,
+                        FrontDecision::IfUntracked(skip) => {
+                            ask.push((decisions.len(), path.clone(), skip));
+                            Decision::Record
+                        }
+                    }
+                }
+            };
+            decisions.push(decision);
+        }
+        if !ask.is_empty() {
+            let paths: Vec<RepoPath> = ask.iter().map(|(_, path, _)| path.clone()).collect();
+            let tracked = client.tracked(&paths)?;
+            for ((i, _, skip), tracked) in ask.into_iter().zip(tracked) {
+                if !tracked {
+                    decisions[i] = skip;
+                }
+            }
+        }
+        Ok(decisions)
+    }
+
+    /// A front's decision for a write at `path` without the tracked set:
+    /// final if being tracked does not change it.
+    fn front_decide(&self, path: &RepoPath) -> Result<FrontDecision, VolumeError> {
+        Ok(match self.rules.decide(path, true)? {
+            skip @ Decision::Skip(_) => FrontDecision::Final(skip),
+            Decision::Record => match self.rules.decide(path, false)? {
+                Decision::Record => FrontDecision::Final(Decision::Record),
+                skip @ Decision::Skip(_) => FrontDecision::IfUntracked(skip),
+            },
+        })
+    }
+
+    /// The rules' decision for a write at `path`, given whether it is
+    /// tracked now.
+    fn decide_write(&self, path: &RepoPath) -> Result<Decision, VolumeError> {
+        match &self.backend {
+            Backend::Local { tracked, .. } => {
+                Ok(self.rules.decide(path, tracked.contains(path))?)
+            }
+            Backend::Front { client } => match self.front_decide(path)? {
+                FrontDecision::Final(decision) => Ok(decision),
+                FrontDecision::IfUntracked(skip) => {
+                    let tracked = client.tracked(std::slice::from_ref(path))?;
+                    Ok(if tracked.first() == Some(&true) {
+                        Decision::Record
+                    } else {
+                        skip
+                    })
+                }
+            },
+        }
     }
 
     fn decide(&self, input: &Input) -> Result<Decision, VolumeError> {
         Ok(match input {
-            Input::Remove { path } => {
-                if self.tracked.contains_or_under(path) {
-                    Decision::Record
-                } else {
+            Input::Remove { path } => match &self.backend {
+                Backend::Local { tracked, .. } if !tracked.contains_or_under(path) => {
                     Decision::Skip(SkipReason::Untracked)
                 }
-            }
-            Input::Write { path, .. } | Input::Symlink { path, .. } => {
-                self.rules.decide(path, self.tracked.contains(path))?
-            }
+                _ => Decision::Record,
+            },
+            Input::Write { path, .. } | Input::Symlink { path, .. } => self.decide_write(path)?,
         })
     }
+}
+
+/// A front's decision before it knows whether the path is tracked.
+enum FrontDecision {
+    Final(Decision),
+    /// Recorded if tracked, else skipped like this.
+    IfUntracked(Decision),
 }
 
 /// Turns recorded changes into commits.
@@ -1880,7 +2243,7 @@ mod tests {
     }
 
     fn journaled_stores(rec: &Recorder) -> Vec<(String, Store)> {
-        rec.journal
+        rec.journal_for_tests()
             .uncommitted()
             .iter()
             .flat_map(|r| r.draft.changes.clone())
@@ -2576,7 +2939,7 @@ mod tests {
             executable: false,
             store: Default::default(),
         };
-        rec.journal
+        rec.journal_for_tests()
             .record(Draft {
                 trigger: Trigger::Close,
                 caller: CALLER,
@@ -2587,7 +2950,7 @@ mod tests {
                 origin: None,
             })
             .unwrap();
-        rec.tracked.apply(&change);
+        rec.tracked_for_tests().apply(&change);
     }
 
     #[test]
@@ -4071,5 +4434,187 @@ mod tests {
             let before = state.usage();
             assert_eq!(state.usage(), before);
         }
+    }
+
+    /// Freezes `content` into front slot `slot`, as a front would.
+    fn front_write(state: &StateDir, dir: &Path, slot: u16, name: &str, content: &str) -> Change {
+        let Input::Write { path, backing, .. } = write(dir, name, content) else {
+            unreachable!()
+        };
+        let store = PendingStore::open_slot(state.pending(), slot, |_| false).unwrap();
+        let (id, _) = store.freeze(&backing).unwrap();
+        Change::Write {
+            path,
+            pending: id,
+            executable: false,
+            store: Store::Blob,
+        }
+    }
+
+    fn front_draft(changes: Vec<Change>, atomic: bool) -> Draft {
+        Draft {
+            trigger: Trigger::Close,
+            caller: CALLER,
+            time_ms: now_ms(),
+            changes,
+            operation: None,
+            atomic,
+            origin: None,
+        }
+    }
+
+    fn pending_of(change: &Change) -> PathBuf {
+        let Change::Write { pending, .. } = change else {
+            unreachable!()
+        };
+        PathBuf::from(format!("{:016x}", pending.0))
+    }
+
+    #[test]
+    fn sequence_journals_with_the_fronts_origin() {
+        let (dir, state) = setup();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let change = front_write(&state, dir.path(), 3, "a", "1");
+        let recorded = rec
+            .sequence(&pod("pod-a"), 3, front_draft(vec![change], false))
+            .unwrap();
+        assert_eq!(recorded.seq, Some(0));
+        assert!(recorded.skipped.is_empty());
+        let records = rec.journal_for_tests().uncommitted();
+        assert_eq!(records[0].draft.origin, Some(pod("pod-a")));
+        assert!(rec.tracked_query(&[RepoPath::new("a").unwrap()])[0]);
+        com.commit_pending().unwrap();
+        assert_eq!(commits(&com)[0].0, "pod-a");
+    }
+
+    #[test]
+    fn sequence_decides_again_with_the_tracked_set() {
+        let (dir, state) = setup();
+        {
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "kept.log", "0")],
+            )
+            .unwrap();
+            com.commit_pending().unwrap();
+        }
+        exclude(&state, "*.log\n");
+        let (rec, _com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let ignored = front_write(&state, dir.path(), 2, "new.log", "1");
+        let tracked = front_write(&state, dir.path(), 2, "kept.log", "2");
+        let ignored_copy = state.pending().join(pending_of(&ignored));
+        let recorded = rec
+            .sequence(
+                &pod("pod-a"),
+                2,
+                front_draft(
+                    vec![
+                        ignored,
+                        tracked,
+                        Change::Remove {
+                            path: RepoPath::new("gone").unwrap(),
+                        },
+                    ],
+                    false,
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(recorded.seq, Some(1));
+        assert_eq!(
+            recorded.skipped,
+            vec![
+                skipped(
+                    "new.log",
+                    SkipReason::Ignored {
+                        source: RuleSource::OperatorExclude,
+                        pattern: "*.log".into(),
+                    }
+                ),
+                skipped("gone", SkipReason::Untracked),
+            ]
+        );
+        assert!(!ignored_copy.exists(), "a skipped copy is removed");
+        let records = rec.journal_for_tests().uncommitted();
+        let paths: Vec<_> = records[0]
+            .draft
+            .changes
+            .iter()
+            .map(|c| c.path().to_string())
+            .collect();
+        assert_eq!(paths, ["kept.log"]);
+    }
+
+    #[test]
+    fn sequence_refuses_copies_that_are_missing_or_not_the_fronts() {
+        let (dir, state) = setup();
+        let (rec, _com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let foreign = front_write(&state, dir.path(), 4, "a", "1");
+        let err = rec
+            .sequence(&pod("pod-a"), 3, front_draft(vec![foreign], false))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not in the front's slot 3"),
+            "{err}"
+        );
+
+        let missing = front_write(&state, dir.path(), 3, "b", "1");
+        fs::remove_file(state.pending().join(pending_of(&missing))).unwrap();
+        let err = rec
+            .sequence(&pod("pod-a"), 3, front_draft(vec![missing], false))
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+
+        let mut with_op = front_draft(vec![], false);
+        with_op.operation = Some(Operation {
+            id: 1,
+            kind: OperationKind::Restore,
+            source: "x".into(),
+            summary: "s".into(),
+            caller: CALLER,
+            inbox: None,
+            author: None,
+        });
+        assert!(matches!(
+            rec.sequence(&pod("pod-a"), 3, with_op),
+            Err(VolumeError::FrontRecord(_))
+        ));
+        assert_eq!(rec.journal_for_tests().backlog(), 0);
+    }
+
+    #[test]
+    fn sequence_refuses_an_atomic_group_whole() {
+        let (dir, state) = setup();
+        exclude(&state, "*-wal\n");
+        let (rec, _com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let db = front_write(&state, dir.path(), 1, "db", "1");
+        let wal = front_write(&state, dir.path(), 1, "db-wal", "2");
+        let copies = [pending_of(&db), pending_of(&wal)];
+        let recorded = rec
+            .sequence(&pod("pod-a"), 1, front_draft(vec![db, wal], true))
+            .unwrap();
+        assert_eq!(recorded.seq, None);
+        assert_eq!(recorded.skipped.len(), 2);
+        assert!(
+            matches!(
+                &recorded.skipped[0].reason,
+                SkipReason::Refused(Refusal::GroupMemberSkipped { .. })
+            ) || matches!(
+                &recorded.skipped[1].reason,
+                SkipReason::Refused(Refusal::GroupMemberSkipped { .. })
+            )
+        );
+        assert!(recorded.skipped.iter().any(|s| matches!(&s.reason, SkipReason::GroupRefused { member } if member.as_str() == "db-wal")));
+        for copy in copies {
+            assert!(!state.pending().join(copy).exists());
+        }
+        assert_eq!(rec.journal_for_tests().backlog(), 0);
     }
 }
