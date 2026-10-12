@@ -14,7 +14,8 @@
 //! - **Repack** (on the commit thread): every `repackInterval` (design §8)
 //!   the commit loop runs [`crate::repack::repack`] between commits, then
 //!   refreshes the committer's object database. A failure emits
-//!   [`Event::RepackFailed`] and is tried again an interval later.
+//!   [`Event::RepackFailed`] and is tried again an interval later. A stop
+//!   kills a repack in progress, so shutdown never waits for one.
 //!
 //! [`Service::shutdown`] stops every loop, waits for the final commit, and
 //! waits for pushes in progress only up to a grace period: stopping never
@@ -226,11 +227,15 @@ struct Repacker {
 }
 
 impl Repacker {
-    /// Repacks the committer's repository; failures become events.
-    fn run(&self, committer: &Committer) {
+    /// Repacks the committer's repository; failures become events. A stop
+    /// kills a repack in progress.
+    fn run(&self, committer: &Committer, stop: &Stop) {
         let repo = committer.history().repo();
-        let result = repack::repack(Path::new("git"), repo.path(), &self.push_locks);
-        if matches!(result, Ok(RepackOutcome::PushInProgress)) {
+        let result = repack::repack(Path::new("git"), repo.path(), &self.push_locks, stop);
+        if matches!(
+            result,
+            Ok(RepackOutcome::PushInProgress | RepackOutcome::NothingToDo)
+        ) {
             return;
         }
         // A repack that failed late may still have moved objects into new
@@ -261,7 +266,7 @@ fn commit_loop(
         if let (Some(r), Some(at)) = (repacker, next_repack)
             && Instant::now() >= at
         {
-            r.run(committer);
+            r.run(committer, stop);
             next_repack = Some(Instant::now() + r.schedule.interval.max(MIN_DELAY));
         }
         if committer.backlog() == 0 {
