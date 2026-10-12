@@ -1,0 +1,41 @@
+[package]
+name = "agentfs-csi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The agentfs CSI driver: persistent volumes with a history service per volume and a front per pod"
+
+[dependencies]
+agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+# Only mount_state (live or stale FUSE mounts) and MountState; the FUSE
+# session itself runs in `agentfs` children (design §17.2).
+agentfs-fuse = { version = "0.1.0", path = "../agentfs-fuse" }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+# gRPC over a Unix socket, as CSI requires (design §17.2, §17.3). Default
+# features (router, transport, codegen) and no TLS: pure Rust.
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+prost = "0.14"
+prost-types = "0.14"
+rustix = { version = "1.1.5", features = ["fs", "process", "mount"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# Target keys: a short hash of the kubelet's target path.
+sha2 = "0.11"
+thiserror = "2.0.21"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util", "fs"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+
+[build-dependencies]
+# Compiles the vendored csi.proto without protoc (design §17.3).
+protox = "0.10.0"
+tonic-prost-build = { version = "0.14.6", default-features = false, features = ["transport"] }
+
+[dev-dependencies]
+# A tonic client over a Unix socket in the gRPC tests.
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
+tokio = { version = "1.53", features = ["test-util"] }
+git2 = { version = "0.21.0", default-features = false }

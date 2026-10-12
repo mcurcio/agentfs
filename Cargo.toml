@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs"]
+members = ["crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi"]
 
 [workspace.package]
 edition = "2024"

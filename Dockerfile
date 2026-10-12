@@ -26,8 +26,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/agentfs-core/Cargo.toml crates/agentfs-core/
 COPY crates/agentfs-fuse/Cargo.toml crates/agentfs-fuse/
 COPY crates/agentfs/Cargo.toml crates/agentfs/
-RUN mkdir -p crates/agentfs-core/src crates/agentfs-fuse/src crates/agentfs/src \
- && touch crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs \
+COPY crates/agentfs-csi/Cargo.toml crates/agentfs-csi/
+RUN mkdir -p crates/agentfs-core/src crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src \
+ && touch crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs/src/main.rs \
  && cargo build --release --locked -p agentfs --features https,ssh
 
