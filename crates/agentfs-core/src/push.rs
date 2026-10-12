@@ -10,7 +10,7 @@
 //! on an anonymous remote, never forced. Remote configuration such as
 //! `remote.<name>.push` is therefore never consulted, and the system,
 //! global and XDG git config are not read at all
-//! ([`crate::history::init_libgit2`]).
+//! (see `history::init_libgit2`).
 //!
 //! Outcomes (design §11.3):
 //!
@@ -531,6 +531,9 @@ impl RemotePusher {
     }
 
     fn failed(&mut self, kind: PushFailureKind, message: String, head: Option<Oid>) -> PushOutcome {
+        // libgit2 quotes the URL in its messages; never persist or emit the
+        // userinfo it may carry.
+        let message = scrub_userinfo(&message, self.remote.push_url());
         self.state.consecutive_failures = self.state.consecutive_failures.saturating_add(1);
         self.state.last_error = Some(LastError {
             kind,
@@ -626,16 +629,31 @@ fn unpushed(
     Ok(Some(count))
 }
 
+/// The userinfo (`user:pass`) of a `scheme://user:pass@host/…` URL.
+fn userinfo(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let at = rest[..end].rfind('@')?;
+    Some(&rest[..at]).filter(|u| !u.is_empty())
+}
+
 /// `url` with the userinfo of a `scheme://user:pass@host/…` URL replaced by
 /// `***`.
 pub fn redact_url(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://") {
-        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        if let Some(at) = rest[..end].rfind('@') {
-            return format!("{scheme}://***@{}", &rest[at + 1..]);
+    match (userinfo(url), url.split_once("://")) {
+        (Some(info), Some((scheme, rest))) => {
+            format!("{scheme}://***@{}", &rest[info.len() + 1..])
         }
+        _ => url.to_owned(),
     }
-    url.to_owned()
+}
+
+/// `message` with every copy of `url`'s userinfo replaced by `***`.
+fn scrub_userinfo(message: &str, url: &str) -> String {
+    match userinfo(url) {
+        Some(info) => message.replace(info, "***"),
+        None => message.to_owned(),
+    }
 }
 
 /// Maps a failed push to a failure kind. `negotiated` says whether libgit2
@@ -912,6 +930,31 @@ mod tests {
         );
         assert_eq!(redact_url("git@host:r.git"), "git@host:r.git");
         assert_eq!(redact_url("/srv/r.git"), "/srv/r.git");
+        assert_eq!(
+            scrub_userinfo(
+                "failed to resolve path 'file://u:pw@/x': nope",
+                "file://u:pw@/x"
+            ),
+            "failed to resolve path 'file://***@/x': nope"
+        );
+        assert_eq!(scrub_userinfo("plain", "/x"), "plain");
+    }
+
+    #[test]
+    fn failure_messages_never_carry_url_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("file://bot:hunter2@{}", dir.path().join("nope").display());
+        let mut v = Vol::new("vol", &[("origin", &url)]);
+        v.commit();
+        let (events, sink_events) = sink();
+        let mut pusher = v.pusher("origin", sink_events);
+        let outcome = pusher.push_once();
+        assert!(!format!("{outcome:?}").contains("hunter2"), "{outcome:?}");
+        for event in events.take() {
+            assert!(!event.to_string().contains("hunter2"), "{event}");
+        }
+        let saved = fs::read_to_string(v.state.push_state("origin")).unwrap();
+        assert!(!saved.contains("hunter2"), "{saved}");
     }
 
     #[test]

@@ -3,7 +3,10 @@
 //!
 //! The FUSE layer calls [`volume::Recorder::record`] at each change boundary
 //! and lets the triggering call return once it succeeds. A
-//! [`volume::Committer`] turns records into commits in the background.
+//! [`volume::Committer`] turns records into commits in the background, and a
+//! [`push::RemotePusher`] per remote pushes them. [`service::Service`] runs
+//! both as background loops. Alarm conditions are reported as
+//! [`events::Event`]s.
 
 pub mod checks;
 pub mod claims;
@@ -20,5 +23,6 @@ pub mod probe;
 pub mod push;
 pub mod record;
 pub mod rules;
+pub mod service;
 pub mod tracked;
 pub mod volume;

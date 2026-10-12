@@ -4,19 +4,29 @@
 //! paths from a directory directly, through the same recorder the FUSE layer
 //! will use, including its path rules: paths the rules exclude are reported
 //! as skipped, with the reason.
+//!
+//! `push` pushes once to the configured remotes; `run` runs the commit and
+//! push loops in the foreground until SIGINT or SIGTERM (design §11.2).
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
+use agentfs_core::config::parse_duration;
 use agentfs_core::events::{Event, Events};
 use agentfs_core::history::History;
 use agentfs_core::identity::Context;
 use agentfs_core::paths::{PathError, RepoPath};
+use agentfs_core::push::{self, PushOutcome, RemotePusher, RemoteStatus};
 use agentfs_core::record::{Caller, Trigger};
+use agentfs_core::service::Service;
 use agentfs_core::volume::{self, Input, StateDir};
 
 #[derive(Parser)]
@@ -57,6 +67,26 @@ enum Command {
         #[command(flatten)]
         pod: Pod,
     },
+    /// Push the volume's refs to its remotes once. Exits 1 unless every
+    /// selected remote succeeded.
+    Push {
+        /// Push only this remote; repeatable (default: every remote).
+        #[arg(long = "remote", value_name = "NAME")]
+        remotes: Vec<String>,
+    },
+    /// Run the commit and push loops until SIGINT or SIGTERM. A second
+    /// signal exits at once.
+    Run {
+        #[command(flatten)]
+        pod: Pod,
+        /// How long shutdown waits for pushes in progress.
+        #[arg(long, default_value = "5s", value_parser = parse_grace)]
+        push_grace: Duration,
+    },
+}
+
+fn parse_grace(value: &str) -> Result<Duration, String> {
+    parse_duration(value).ok_or_else(|| format!("{value:?} is not a duration (use e.g. 500ms, 5s)"))
 }
 
 /// Where the volume is mounted. In Kubernetes these come from the downward
@@ -100,7 +130,7 @@ impl Pod {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let state = StateDir::new(&cli.state);
     match cli.command {
@@ -124,6 +154,9 @@ fn main() -> Result<()> {
                 None => println!("committed: nothing"),
             }
             println!("backlog:   {} record(s)", committer.backlog());
+            for remote in push::status(&state, history.settings())? {
+                println!("{}", remote_line(&remote));
+            }
         }
         Command::Flush(pod) => {
             let (_, committer, _) =
@@ -177,8 +210,156 @@ fn main() -> Result<()> {
                 report.records, report.commits
             );
         }
+        Command::Push { remotes } => return push_once(&state, &remotes),
+        Command::Run { pod, push_grace } => {
+            let root = cli.root.as_deref().unwrap_or(Path::new("."));
+            return run(&state, root, &pod, push_grace);
+        }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `agentfs push`: one attempt per selected remote, in name order.
+fn push_once(state: &StateDir, only: &[String]) -> Result<ExitCode> {
+    let history = History::open(&state.git())
+        .with_context(|| format!("opening {}", state.root().display()))?;
+    let settings = history.settings();
+    for name in only {
+        if !settings.remotes.iter().any(|r| r.name == *name) {
+            bail!("no remote named {name:?} is configured");
+        }
+    }
+    let selected: Vec<_> = settings
+        .remotes
+        .iter()
+        .filter(|r| only.is_empty() || only.contains(&r.name))
+        .collect();
+    if selected.is_empty() {
+        println!("no remotes configured");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let events = stderr_sink();
+    let mut ok = true;
+    for remote in selected {
+        let mut pusher = RemotePusher::open(state, settings, remote, events.clone())?;
+        let outcome = pusher.push_once();
+        ok &= outcome.is_success();
+        println!("{}: {}", remote.name, describe(&outcome));
+    }
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+fn describe(outcome: &PushOutcome) -> String {
+    match outcome {
+        PushOutcome::NothingToPush => "nothing to push".into(),
+        PushOutcome::UpToDate { head } => format!("up to date at {head}"),
+        PushOutcome::Pushed { from, to } => match from {
+            Some(from) => format!("pushed {from}..{to}"),
+            None => format!("pushed none..{to}"),
+        },
+        PushOutcome::Diverged {
+            local_head,
+            diverged_ref: Some(saved),
+            ..
+        } => format!("diverged: head {local_head} saved as {saved}"),
+        PushOutcome::Diverged {
+            local_head,
+            diverged_ref: None,
+            ..
+        } => format!("diverged: head {local_head} could not be saved yet"),
+        PushOutcome::Failed {
+            kind,
+            message,
+            retry_in,
+        } => format!("failed ({kind}): {message}; retry in {retry_in:?}"),
+        PushOutcome::Busy => "busy: another push in progress".into(),
+    }
+}
+
+/// One `status` line per remote.
+fn remote_line(remote: &RemoteStatus) -> String {
+    let state = &remote.state;
+    let mut line = format!(
+        "remote:    {} {}: last pushed {}",
+        remote.name,
+        remote.url,
+        state.last_pushed.as_deref().unwrap_or("never")
+    );
+    match remote.unpushed {
+        Some(n) => line.push_str(&format!(", {n} unpushed")),
+        None => line.push_str(", no branch yet"),
+    }
+    line.push_str(&format!(
+        ", {} consecutive failure(s)",
+        state.consecutive_failures
+    ));
+    if let Some(error) = &state.last_error {
+        line.push_str(&format!(", last error ({}): {}", error.kind, error.message));
+    }
+    if let Some(diverged) = &state.diverged {
+        match &diverged.diverged_ref {
+            Some(saved) => line.push_str(&format!(", diverged: head saved as {saved}")),
+            None => line.push_str(", diverged: head not saved yet"),
+        }
+    }
+    line
+}
+
+/// `agentfs run`: the commit and push loops until SIGINT or SIGTERM.
+fn run(state: &StateDir, root: &Path, pod: &Pod, push_grace: Duration) -> Result<ExitCode> {
+    // Registered before anything starts, so an early signal is not lost.
+    let mut signals = Signals::new([SIGINT, SIGTERM]).context("installing signal handlers")?;
+    let events = stderr_sink();
+    let (_recorder, committer, recovery) = open_with(state, root, pod, events.clone())?;
+    let settings = committer.history().settings().clone();
+    let pushers = push::open_all(state, &settings, events.clone())?;
+    let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
+    let service = Service::start(committer, pushers, events).context("starting the service")?;
+    eprintln!(
+        "running volume {} ({} uncommitted record(s) recovered; remotes: {}); \
+         stop with SIGINT or SIGTERM",
+        settings.volume,
+        recovery.uncommitted,
+        if names.is_empty() {
+            "none".to_owned()
+        } else {
+            names.join(", ")
+        }
+    );
+
+    let signal = signals.forever().next();
+    eprintln!(
+        "signal {}: stopping (waiting up to {push_grace:?} for pushes; signal again to exit now)",
+        signal.unwrap_or_default()
+    );
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            eprintln!("second signal: exiting now");
+            std::process::exit(130);
+        }
+    });
+
+    let report = service.shutdown(push_grace);
+    for name in &report.abandoned_pushes {
+        println!("{name}: push still running at shutdown; abandoned");
+    }
+    match report.final_commit {
+        Ok(commit) => {
+            println!(
+                "final commit: {} record(s) into {} commit(s)",
+                commit.records, commit.commits
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("final commit failed: {e}; the records stay journaled");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 fn open(
@@ -186,17 +367,21 @@ fn open(
     root: &Path,
     pod: &Pod,
 ) -> Result<(volume::Recorder, volume::Committer, volume::Recovery)> {
+    open_with(state, root, pod, stderr_sink())
+}
+
+fn open_with(
+    state: &StateDir,
+    root: &Path,
+    pod: &Pod,
+    events: Events,
+) -> Result<(volume::Recorder, volume::Committer, volume::Recovery)> {
     let volume = History::open(&state.git())
         .with_context(|| format!("opening {}", state.root().display()))?
         .settings()
         .volume
         .clone();
-    Ok(volume::open(
-        state,
-        root,
-        pod.context(&volume),
-        stderr_sink(),
-    )?)
+    Ok(volume::open(state, root, pod.context(&volume), events)?)
 }
 
 /// Prints alarms (design §13) to stderr until telemetry exports them.

@@ -29,10 +29,27 @@ Built so far, in `agentfs-core`: path checks, the journal (group commit,
 crash recovery), frozen copies (reflink, else copy), the commit builder,
 identity templates and settings, and path rules: operator and (optionally)
 tree ignore and attribute rules with git's tracked/untracked behaviour, and
-nested repository detection. The `agentfs` command has `init`, `status`,
-`flush` and `record`; `record` stands in for the FUSE layer and reports the
-paths the rules skip, with the reason. It needs `--root` (or `AGENTFS_ROOT`),
-since a path missing from the backing tree is recorded as removed.
+nested repository detection. Also:
+
+- **Pre-commit checks:** git's fsck rules and each remote's
+  `agentfsMaxBlobSize`, checked at record time and again at commit time.
+  A refused path is skipped and raises an alarm; the rest of its record is
+  kept.
+- **Remotes:** several at once, from `[remote "<name>"]` in the history
+  repository's own config. Each has its own push state and backoff.
+- **Interval push:** only the volume's own refs, fast-forward only, never
+  forced. A divergence saves the local head under
+  `refs/agentfs/<volume>/diverged/<timestamp>` and keeps alarming.
+- **The service:** the commit loop and one push loop per remote, with clean
+  shutdown.
+- **Alarm events** (`agentfs_core::events`), ready for telemetry to export.
+
+The `agentfs` command has `init`, `status`, `flush`, `record`, `push` and
+`run`. `record` stands in for the FUSE layer and reports the paths the rules
+skip or the checks refuse, with the reason. It needs `--root` (or
+`AGENTFS_ROOT`), since a path missing from the backing tree is recorded as
+removed. `push` pushes once; `run` runs the commit and push loops until
+SIGINT or SIGTERM. Until telemetry exists, alarms are printed to stderr.
 
 ## Building
 
@@ -41,5 +58,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-libgit2 is built from source, so a C compiler is needed. HTTPS and SSH
-support for pushing are not enabled yet.
+libgit2 is built from source, so a C compiler is needed. It is built without
+HTTPS and SSH support (that needs OpenSSL and libssh2), so pushing works to
+local paths and `file://` remotes only for now. Credential files for HTTPS
+remotes are implemented and unit-tested, but not yet exercised end to end.

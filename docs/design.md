@@ -120,6 +120,11 @@ phase 1 that is the sidecar's daemon. With several pods (§14) it is a separate
 history service per volume, fed by each pod's front. Either way history is a
 straight line, and every commit is made by agentfs.
 
+Not yet enforced: two agentfs processes on one state area (for example
+`agentfs record` or `flush` alongside `agentfs run`) are not excluded; only
+pushes are locked, per remote (§11.2). An exclusive state-area lock taken when
+the volume is opened is a follow-up.
+
 ## 3. Recording
 
 ### 3.1 Change boundaries
@@ -183,7 +188,12 @@ volumes should use XFS. The phase 1 benchmark (§18) measures this.
 ### 3.4 Commits
 
 - A commit builder turns journal entries into commits a few milliseconds after
-  they are recorded.
+  they are recorded. The service's commit loop wakes every `commitWindow` and
+  commits each group that can no longer grow: one whose first entry is more
+  than `commitWindow` old, or is in the future after the clock stepped back.
+  A failed commit raises `CommitFailed` (§13), and the loop backs off (doubling,
+  up to 30 s) while the entries stay journaled. On shutdown everything left is
+  committed, including the open group.
 - **Grouping only affects how history reads,** not whether a change is kept.
   Entries close together in time are grouped. Inside a nested repository with
   `nested = working-tree` (§5), its `index.lock` bounds a group, with a timeout
@@ -883,13 +893,24 @@ target. What it needs:
   - recording (§3);
   - rules (§4);
   - the commit builder;
-  - pre-commit checks;
+  - pre-commit checks (§3.4);
   - push (§11);
+  - the background service: the commit loop and one push loop per remote,
+    with clean shutdown (§11.2);
+  - alarm events, through a non-blocking sink (§13);
   - LFS (§7);
   - the patch queue (§12);
   - telemetry (§13).
 - **`agentfs`, a binary:**
-  - `init`, `mount`, `status`, `flush`, `restore`, `revert`;
+  - `init`, `mount`, `status`, `flush`, `push`, `run`, `restore`, `revert`;
+  - `push` pushes once to every remote (or those named with `--remote`) and
+    exits 1 unless all succeeded; `run` runs the service in the foreground
+    until SIGINT or SIGTERM, makes a final commit, waits up to
+    `--push-grace` (default 5s) for pushes in progress, and exits at once on
+    a second signal. `record` stands in for the FUSE layer until it exists;
+  - `status` shows each remote: its URL (userinfo redacted), last pushed
+    commit, unpushed commits, consecutive failures, last error and any
+    diverged ref;
   - mounted with fuser (multi-threaded, with passthrough).
 
   It works anywhere FUSE does, with no Kubernetes dependency.

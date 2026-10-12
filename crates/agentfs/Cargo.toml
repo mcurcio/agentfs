@@ -10,7 +10,10 @@ description = "agentfs command-line tool and daemon"
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+signal-hook = "0.4.5"
 
 [dev-dependencies]
 git2 = { version = "0.21.0", default-features = false }
+# Sends SIGTERM in the `run` test: std's Child::kill only sends SIGKILL.
+rustix = { version = "1.1.5", features = ["process"] }
 tempfile = "3.27.0"
