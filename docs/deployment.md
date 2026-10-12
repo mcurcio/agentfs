@@ -183,6 +183,15 @@ key and a known_hosts file in the Secret and name them with
 `agentfsSshKey` and `agentfsKnownHosts`
 ([SSH remotes](configuration.md#ssh-remotes)); the commented example in
 `config/config` shows the keys.
+With Git LFS on (`agentfs.lfsThreshold`, design §7), an LFS server on
+another host than the git remote takes its own credentials file from the
+same Secret (`remote.origin.agentfsLfsCredentials =
+/run/secrets/agentfs/origin-lfs`); the LFS endpoint derived from an
+`https` remote reuses `agentfsCredentials`. The commented LFS lines in
+`config/config` show the keys, and the image is built with the `https`
+feature, which https LFS servers need. LFS objects are cached under
+`/data/state/lfs` and never pruned: size the PVC for them
+([operator guide](operator-guide.md#13-large-files-lfs)).
 
 **The downward API** fills `AGENTFS_POD`, `AGENTFS_POD_UID`,
 `AGENTFS_NAMESPACE` and `AGENTFS_NODE`: the commit trailers

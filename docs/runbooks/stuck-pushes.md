@@ -14,7 +14,8 @@ with the next successful push. Design:
 - `agentfs.push.oldest_unpushed_age{remote}` (seconds since the oldest
   unpushed commit) keeps growing: the main alarm to page on.
   `agentfs.push.unpushed_commits` grows with it, and
-  `agentfs.push.failures{remote,reason}` counts attempts.
+  `agentfs.push.failures{remote,reason,stage}` counts attempts (`stage` is
+  `lfs` for [LFS upload failures](#lfs-stage-failures), else `git`).
 - `agentfs --state "$STATE" status` (safe while mounted):
 
   ```
@@ -37,7 +38,9 @@ with the next successful push. Design:
 
 **`RemoteMisconfigured`**: the `[remote "<name>"]` section is invalid, so
 it is left out: a name that is not a valid agentfs name, a relative
-`agentfsCredentials`, `agentfsSshKey` or `agentfsKnownHosts`, an
+`agentfsCredentials`, `agentfsSshKey`, `agentfsKnownHosts` or
+`agentfsLfsCredentials`, an LFS endpoint (`lfsurl`, `lfspushurl`,
+`lfs.url`, `lfs.pushurl`) that is not `http(s)`, `file://` or a path, an
 `agentfsMaxBlobSize` that is not a size; for an SSH push URL, a missing
 `agentfsSshKey` or `agentfsKnownHosts`, an `agentfsCredentials`, a
 password in the URL, or a binary built without the `ssh` feature; for
@@ -46,6 +49,33 @@ names the key; the full list is in the
 [configuration reference](../configuration.md#remote-name). Fix the
 section in `<state>/git/config`; the change takes effect at the next
 start of the mount (or the next `agentfs push`).
+
+## LFS stage failures
+
+A failure with **stage `lfs`** (`failed (auth, stage lfs)` in
+`agentfs push` and the alarm, `stage="lfs"` on
+`agentfs.push.failures`, `agentfs.push.stage` on the log record, `last
+error (…, stage lfs)` in `status`) happened while uploading the Git LFS
+objects the unpushed commits reference (design §7). **No ref was pushed**:
+the git push runs only after every upload succeeded. First find the
+endpoint and where its credentials come from:
+
+```sh
+agentfs --state "$STATE" status
+# remote:    sep https://git.example.com/acme/r.git: …, last error (auth, stage lfs): …
+#            lfs: https://lfs.example.com/acme/r (remote.sep.lfsurl, credentials from agentfsLfsCredentials)
+```
+
+| Kind | Check |
+|---|---|
+| `auth` | The credentials named on the `lfs:` line. `agentfsLfsCredentials` is used wherever it is set; without it, `agentfsCredentials` only for an endpoint with the push URL's scheme, host and port; else a password in the URL; else none ("no credentials are configured for it"). A separate LFS host never gets the git credentials: give it `remote.<name>.agentfsLfsCredentials` (same format). The token needs LFS write access (GitHub: contents write). The file is re-read at the next attempt |
+| `local` | `lfs: none (…)` explains a missing endpoint: an SSH or `git://` remote needs `remote.<name>.lfsurl` (agentfs has no `git-lfs-authenticate`). "built without the `https` cargo feature": use an image built with `--features https`. "missing from the local cache": an object the commits reference is not in `<state>/lfs/objects` (state-area damage, or the directory was deleted): put it back (`git lfs fetch` in a clone that has it, then copy `.git/lfs/objects/aa/bb/<oid>` to `<state>/lfs/objects/aa/bb/<oid>`); there is no `agentfs lfs fetch` yet |
+| `unreachable` | The LFS server: DNS, connection, a 5xx or 429, or a transfer slower than 256 KiB/s past its 5-minute base timeout. `curl -sI <endpoint>/objects/batch` from the same pod |
+| `untrusted_host` | The LFS server's TLS certificate failed verification against the system trust store (recognised from OpenSSL's message; an unrecognised one shows as `unreachable`) |
+| `refused` | Any other answer: the message has the HTTP status or the per-object error (`422` for an object over the server's size limit, `404` for a wrong endpoint, a redirect, which agentfs never follows: use the final URL as `lfsurl`) |
+
+Remotes whose unpushed commits reference no LFS object never contact an
+LFS endpoint, so one remote's LFS problem never blocks another remote.
 
 ## Backoff
 

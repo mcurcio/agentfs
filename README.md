@@ -60,6 +60,19 @@ nested repository detection. Also:
 - **Recovery:** `agentfs restore` and `agentfs revert`, through a running
   mount or directly, each recorded as one commit, and operator runbooks.
   See [Recovery](#recovery).
+- **Git LFS** (phase 2): large files stored as LFS objects, with pointers
+  and a maintained `filter=lfs` block in history's `.gitattributes`, so
+  `git clone` plus `git lfs pull` gives the content back. Off by default:
+
+  ```sh
+  git --git-dir $STATE/git config agentfs.lfsThreshold 8m        # files over 8 MiB
+  git --git-dir $STATE/git config remote.origin.lfsurl https://lfs.example.com/acme/r   # optional
+  ```
+
+  Objects are uploaded before the commits that reference them are pushed,
+  to the endpoint derived from the remote (`<url>.git/info/lfs`) or the
+  one configured, with credentials bound to that host. See
+  [Git LFS](docs/configuration.md#git-lfs).
 - **Deployment:** a container image (`ghcr.io/mcurcio/agentfs`) and
   example Kubernetes manifests for the phase 1 sidecar, tested end to end
   in a kind cluster. See
@@ -88,11 +101,12 @@ with status 75 if another process holds it, naming the holder;
 lock and changes nothing, so it works beside a running daemon, and shows
 who holds the lock.
 
-Not built yet: LFS and the `fsync` class (phase 2), the patch queue
-(phase 3), the CSI driver (phase 4), asking a running mount to push
-now, and restarting a pod automatically after its sidecar crashes. SSH
-remotes do not support ssh-agent, passphrase-protected keys or
-`@cert-authority` host certificates.
+Not built yet: the `fsync` class (phase 2), the patch queue (phase 3),
+the CSI driver (phase 4), asking a running mount to push now, and
+restarting a pod automatically after its sidecar crashes. SSH remotes do
+not support ssh-agent, passphrase-protected keys or `@cert-authority`
+host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
+resumable transfers, proxy settings or pruning.
 
 ## Mounting
 
@@ -236,7 +250,7 @@ Metrics (design §13):
 | `agentfs.commit.failures` | counter | |
 | `agentfs.push.unpushed_commits` | gauge | `remote` |
 | `agentfs.push.oldest_unpushed_age` | gauge, seconds | `remote` |
-| `agentfs.push.failures` | counter | `remote`, `reason` |
+| `agentfs.push.failures` | counter | `remote`, `reason`, `stage` (`git`, or `lfs` for LFS uploads) |
 | `agentfs.push.diverged` | gauge, 0 or 1 | `remote` |
 | `agentfs.remote.misconfigured` | gauge | `remote` |
 | `agentfs.precheck.rejected_paths` | counter | `stage`, `reason` |
@@ -262,7 +276,7 @@ transports; each links OpenSSL (`libssl-dev` and `pkg-config` on Debian
 and Ubuntu):
 
 ```sh
-cargo build -p agentfs --features https      # https:// remotes
+cargo build -p agentfs --features https      # https:// remotes and https LFS servers
 cargo build -p agentfs --features ssh        # ssh:// and scp-like remotes (libssh2)
 cargo build -p agentfs --features https,ssh  # both
 ```
@@ -292,7 +306,10 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   include `restore` and `revert` without a mount
   ([`cli_restore.rs`](crates/agentfs/tests/cli_restore.rs)), and the
   `.gitmodules` checks against the runner's `git` (the parser against
-  `git config --list`, the checks against `git fsck`).
+  `git config --list`, the checks against `git fsck`), Git LFS through the
+  CLI with local and `file://` remotes and `git lfs pull` of a clone
+  ([`cli_lfs.rs`](crates/agentfs/tests/cli_lfs.rs)), and the managed
+  `.gitattributes` block against `git check-attr`.
 - **e2e remotes** ([`ci/e2e-remotes.sh`](ci/e2e-remotes.sh)): pushes to a real
   smart-HTTP server (nginx and `git http-backend`, [`ci/git-http-server.sh`](ci/git-http-server.sh))
   over http and https with basic auth. Covers credential files, auth failures
@@ -308,6 +325,16 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   own remote, unknown and changed host keys refused before the key is
   offered (checked in the sshd log), a key rotated under a running
   `agentfs run`, a clean SIGTERM, and divergence over SSH.
+- **e2e Git LFS** ([`ci/e2e-lfs.sh`](ci/e2e-lfs.sh)): git-lfs's reference
+  `lfs-test-server` (pinned, [`ci/lfs-server.sh`](ci/lfs-server.sh)) behind
+  the same nginx, with a separate LFS host that has its own users, and the
+  real git-lfs client. Covers pointers and the managed `.gitattributes`
+  lines, every upload finishing before the git push (from the nginx log),
+  each host seeing only its own credentials, `git clone` plus
+  `git lfs pull` giving back the exact content, wrong and missing LFS
+  credentials failing at stage `lfs` with no ref pushed, the endpoint
+  derived from the git remote, `file://` remotes, https and an untrusted
+  certificate, and restores from the cache and from a server.
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](ci/e2e-telemetry.sh)): every
   metric, span and alarm log above must reach a real OpenTelemetry Collector,
   and a dead traces endpoint must produce the stderr warning and

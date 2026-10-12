@@ -48,6 +48,8 @@ jobs:
         with:
           key: ${{ matrix.features }}
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      # cli_lfs.rs runs `git lfs pull` when git-lfs is installed; make sure.
+      - run: git lfs version
       - run: cargo test --workspace --locked ${{ matrix.features == 'all' && '--all-features' || '' }}
 
   e2e-remotes:

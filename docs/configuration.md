@@ -279,6 +279,114 @@ The key file's permissions are not checked (kubelet's mode varies); what
 protects it is that it is outside the mount, which `agentfs mount`
 enforces.
 
+## Git LFS
+
+Large files can be stored as Git LFS objects: history holds a small
+pointer, and the content goes to an LFS server before the commits that
+reference it are pushed (design §7). Ordinary clones get the content with
+`git lfs pull`. It is off until you choose what goes to LFS.
+
+### What is stored as LFS
+
+In order, for each regular file when it is recorded:
+
+1. **Never LFS:** empty files, `.gitattributes`, `.gitmodules`,
+   `.gitignore`, `.mailmap` (any spelling git treats as one), `.lfsconfig`,
+   symlinks, and paths holding a tab, CR or LF or too long for a
+   `.gitattributes` line.
+2. **`filter=lfs`** in `<state>/git/info/attributes` (or in a tracked
+   `.gitattributes` when `agentfs.respectTreeRules = true`): LFS.
+   `agentfs.store=blob` does not override it.
+3. **`agentfs.store=lfs` / `agentfs.store=blob`** in `info/attributes`.
+4. **`agentfs.lfsThreshold`:** larger content (strictly `>`) is LFS.
+5. Otherwise a git blob.
+
+```sh
+git --git-dir /data/state/git config agentfs.lfsThreshold 8m
+printf '*.psd filter=lfs\n*.sqlite agentfs.store=blob\n' >> /data/state/git/info/attributes
+```
+
+`agentfsMaxBlobSize` does not apply to content stored as LFS. agentfs
+keeps a block of `filter=lfs diff=lfs merge=lfs -text` lines for the LFS
+paths at the end of the root `.gitattributes` **in history only**; the
+backing tree's own `.gitattributes` is never changed. Settings take effect
+at the next `mount` or `run`.
+
+### Endpoints
+
+Where each remote's objects go, in git-lfs's order (the first that is set
+wins):
+
+| Uploads (push) | Downloads (restore) |
+|---|---|
+| `lfs.pushurl` | |
+| `lfs.url` | `lfs.url` |
+| `remote.<name>.lfspushurl` | |
+| `remote.<name>.lfsurl` | `remote.<name>.lfsurl` |
+| derived from the remote's `pushurl`, else `url` | derived from the remote's `url` |
+
+| Remote URL | Derived endpoint |
+|---|---|
+| `https://github.com/acme/r.git` | `https://github.com/acme/r.git/info/lfs` |
+| `https://git.example/acme/r` | `https://git.example/acme/r.git/info/lfs` |
+| `/srv/r.git`, `file:///srv/r.git` | the files `/srv/r.git/lfs/objects/aa/bb/<oid>` (git-lfs's standalone-file layout) |
+| `ssh://…`, scp-like, `git://…` | none: set `lfsurl` (agentfs has no `git-lfs-authenticate`) |
+
+An explicit URL is used as written (no `/info/lfs` is added). `https`
+endpoints need the `https` build feature. A tracked `.lfsconfig` is never
+read; it only affects people who clone the history. `agentfs status`
+shows each remote's upload endpoint and where its credentials come from,
+or why it has none:
+
+```text
+remote:    origin https://github.com/acme/agent-history.git: last pushed …
+           lfs: https://github.com/acme/agent-history.git/info/lfs (derived from remote.origin.url, credentials from agentfsCredentials)
+```
+
+### LFS credentials
+
+A credential is only ever sent to its endpoint's origin (scheme, host and
+port):
+
+1. `remote.<name>.agentfsLfsCredentials`, if set (same format as
+   `agentfsCredentials`: a token, or `username=`/`password=` lines);
+2. else, if the endpoint has the push URL's origin, `agentfsCredentials`
+   (GitHub, GitLab and Gitea derived endpoints work this way);
+3. else a password in the endpoint URL;
+4. else none (anonymous).
+
+A separate LFS host never sees the git host's credentials, and an `http`
+endpoint never gets those of an `https` remote. Redirects are not
+followed and `HTTP(S)_PROXY` is ignored. The file is re-read when it
+changes; `agentfs mount` refuses one under the backing tree or the mount
+point.
+
+Two examples:
+
+```ini
+# GitHub: the derived endpoint, the same token.
+[remote "origin"]
+    url = https://github.com/acme/agent-history.git
+    agentfsCredentials = /run/secrets/agentfs/origin/token
+
+# A separate LFS server with its own Secret.
+[remote "backup"]
+    url = https://git.example.com/acme/agent-history.git
+    agentfsCredentials = /run/secrets/agentfs/backup/token
+    lfsurl = https://lfs.example.com/acme/agent-history
+    agentfsLfsCredentials = /run/secrets/agentfs/backup-lfs/credentials
+```
+
+### When uploads fail
+
+Uploads run before every push attempt of each remote, for the objects the
+commits the remote lacks reference. A failure fails that attempt with
+**stage `lfs`** (`failed (auth, stage lfs)` in `agentfs push` and the
+alarm, `stage="lfs"` on `agentfs.push.failures`), no ref is pushed, and
+the usual backoff applies. A remote with no LFS content to push never
+contacts an LFS endpoint. See
+[stuck-pushes.md](runbooks/stuck-pushes.md#lfs-stage-failures).
+
 ## Flags and environment
 
 The settings above are per volume, in its config. The commands also take

@@ -2,7 +2,8 @@
 
 Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer,
 `agentfs mount`, `agentfs restore` and `agentfs revert`, the container
-image and the Kubernetes sidecar deployment exist). Draft 1 was
+image and the Kubernetes sidecar deployment exist), and Git LFS from
+phase 2 (§7). Draft 1 was
 reviewed adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
 for the findings and what changed because of them.
 
@@ -109,7 +110,9 @@ through the mount:
   git/       the history repository (bare): objects, refs, config, info/*
   journal/   durable record log (§3.3)
   pending/   frozen copies of recorded content awaiting commit (§3.2)
-  lfs/       local LFS object cache (phase 2)
+  lfs/       local LFS object cache (§7)
+    objects/aa/bb/<oid>  cached objects, git-lfs's layout; never pruned
+    tmp/                 objects being written
   meta/      the daemon's own bookkeeping
     lock                 flock held by the one process using the state area (§2.3)
     push/<remote>.json   each remote's push state (§11.2)
@@ -246,17 +249,19 @@ The work done before the call returns must not depend on file size:
 1. **Freeze** the inode's current content into `pending/`, as a reflink where the
    backing filesystem supports it (XFS, btrfs), otherwise as a copy.
    A file already over the smallest remote blob-size limit (§11.3) by its
-   size on disk is refused before it is copied; the frozen copy is checked
-   again, since the file can change in between.
+   size on disk is refused before it is copied, unless it would be stored
+   as LFS (§7); the frozen copy is checked again, and its store decided
+   and journaled, since the file can change in between.
 2. **Journal**: append a framed, checksummed entry with sequence number, inode,
    current paths, pending id, mode, trigger, caller UID, GID and PID, and time.
 3. **Group commit**: one `fsync` of the journal covers every entry that arrived
    while the previous `fsync` was in progress.
 4. Return.
 
-Hashing, compression, object writes, LFS uploads and commits happen afterwards
-(§3.4). Without reflink support, step 1 costs a copy of the file, so recorded
-volumes should use XFS. The phase 1 benchmark (§18) measures this.
+Hashing, compression, object writes and commits happen afterwards (§3.4):
+LFS content is hashed into the object cache when it is committed, and
+uploaded when it is pushed (§7). Without reflink support, step 1 costs a
+copy of the file, so recorded volumes should use XFS. The phase 1 benchmark (§18) measures this.
 
 ### 3.3 Journal and replay
 
@@ -315,7 +320,7 @@ volumes should use XFS. The phase 1 benchmark (§18) measures this.
   | `.gitmodules` `path` starting with `-` | | `gitmodulesPath` |
   | `.gitmodules` `update` starting with `!` (a command) | | `gitmodulesUpdate` |
   | `.gitmodules` size | over 512 MiB (git's `core.bigFileThreshold`) | `gitmodulesLarge` |
-  | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize` | none: remote policy |
+  | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize`, unless stored as LFS (§7) | none: remote policy |
 
   There is one history for every remote, so the blob limit that applies is the
   smallest across remotes. Changing a remote's limits takes a remount. A path
@@ -401,7 +406,9 @@ Records for unrelated paths do not wait for each other.
 **Safety settings are operator-only.**
 
 - `agentfs.*` attributes are read only from `info/attributes`.
-- LFS endpoints and credentials are read only from operator config.
+- LFS endpoints and credentials are read only from operator config (§7).
+  A tracked `.lfsconfig` is content only: agentfs never reads it, though
+  it may steer the git-lfs of whoever clones the history.
 - Tracked `.gitignore`, `.gitattributes` and `.lfsconfig` files are recorded as
   content. They take part in rules only if `respectTreeRules = true`, and even
   then they cannot set `agentfs.*` attributes or LFS endpoints.
@@ -440,7 +447,7 @@ that operator rules always apply:
 | `agentfs.commit` | `close`, `fsync` | `close` | Boundary class (§3.1, §8) |
 | `agentfs.coalesce` | duration | `30s` | Minimum interval between `fsync` records for one group |
 | `agentfs.group` | name | unset | Paths with the same group *and the same stem* are recorded together (§8) |
-| `agentfs.store` | `blob`, `lfs` | §7 | Force ordinary git object or LFS |
+| `agentfs.store` | `blob`, `lfs` | §7 | Force ordinary git object or LFS; `blob` does not override `filter=lfs` |
 | `-agentfs` | | | Never record this path |
 
 - `-agentfs` stops writes to a path being recorded even when the path is
@@ -459,13 +466,18 @@ that operator rules always apply:
     commitWindow = 200ms       # group journal entries this close in time
     pushInterval = 60s         # §11
     sweepInterval = 30s        # §3.1: backstop for files left open; min 1s
-    lfsThreshold = 8m          # phase 2, §7
+    lfsThreshold = 8m          # §7; unset by default (no size-based LFS)
+
+[lfs]                           # optional, as in git-lfs (§7)
+    url = https://lfs.example.com/acme/agent-history   # every remote's endpoint
 
 [remote "origin"]               # one section per push remote (§11)
     url = https://github.com/acme/agent-history.git
     pushurl = …                 # optional; wins over url, as in git
     agentfsMaxBlobSize = 50m    # optional; §3.4, §11.3
     agentfsCredentials = /run/secrets/agentfs/origin   # optional; §11.1
+    lfsurl = …                  # optional; the LFS endpoint, unless lfs.url (§7)
+    agentfsLfsCredentials = /run/secrets/agentfs/origin-lfs   # optional; §7
 
 [remote "backup"]               # an SSH remote (§11.1)
     url = ssh://git@git.example.com/acme/agent-history.git
@@ -667,40 +679,174 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
 
 ## 7. Large files and LFS (phase 2)
 
-Whether content is stored as an ordinary git object or an LFS pointer:
+Built ahead of the rest of phase 2 (`agentfs_core::lfs`). Large content can be stored as Git LFS
+objects, with pointer blobs in history that an ordinary `git clone` plus
+`git lfs pull` turns back into content.
 
-1. `agentfs.store`, if set;
-2. otherwise a `filter=lfs` attribute;
-3. otherwise `lfsThreshold`: larger content goes to LFS.
+**Which store.** Decided when a file is recorded, on the frozen copy's
+size, and saved in the journal with the change (`Change::Write.store`;
+older journals read as blob), so the blob-size gate stays at record time
+and a replay is deterministic:
 
-**History must be readable by ordinary git.**
+1. **Always a blob:** empty files; git's special files (`.gitattributes`,
+   `.gitmodules`, `.gitignore`, `.mailmap`, in any spelling git treats as
+   one) and `.lfsconfig`; a path no `.gitattributes` line can name exactly
+   (one holding a tab, CR or LF, or whose line would reach git's 2048-byte
+   limit). Symlinks are never LFS.
+2. **`filter=lfs`:** LFS. `agentfs.store=blob` may not override it.
+   Operator `info/attributes` always counts; a tracked `.gitattributes`
+   only with `respectTreeRules = true` (§4.1). Otherwise a tree
+   `filter=lfs` path is stored as a blob, which git-lfs's smudge passes
+   through unchanged, so clones still show the content (but `git status`
+   in such a clone may report it modified).
+3. **`agentfs.store=lfs` or `blob`** (operator attributes only).
+4. **`agentfs.lfsThreshold`:** content strictly larger is LFS. **Unset by
+   default**, so size-based LFS is off until an operator sets it: phase 1
+   remotes have no LFS server, and pushes would stall.
+5. Otherwise a blob.
 
-- Whenever agentfs stores a path as LFS, it also maintains a matching tracked
-  `.gitattributes` entry (`filter=lfs diff=lfs merge=lfs -text`), exactly as
-  `git lfs track` does. Clones and remote web views then show content, not
-  pointer text.
-- `agentfs.store=blob` may not override a `filter=lfs` attribute.
+The blob size limit (`agentfsMaxBlobSize`, §3.4) does not apply to
+content stored as LFS: history holds only the pointer. Before the freeze
+the store is decided on the size on disk, so an LFS file far over the
+limit is still copied while a blob over it is not.
 
-**Endpoint and credentials.**
+**Commit.** Each LFS write is hashed (SHA-256) into the local object
+cache and committed as a canonical pointer blob (git-lfs spec v1:
+`version`, `oid sha256:…`, `size …`, nothing else) with the file's mode,
+so the executable bit is kept. Hashing happens at commit time, outside the
+synchronous step (§3.2). The cache object is durable before the branch
+moves; a crash in between leaves a reusable object.
 
-- LFS endpoints come only from operator config. git-lfs's keys are honoured:
-  `lfs.url`, `lfs.pushurl`, `remote.<name>.lfsurl`.
-- Credentials are bound to their configured host and never sent anywhere else.
-- History and LFS content may live on different servers.
+**History must be readable by ordinary git.** Every commit rebuilds a
+block at the end of the root `.gitattributes`, **in history only** (the
+backing tree is never written):
 
-**Implementation.** Neither libgit2 nor gitoxide implements LFS. agentfs
-implements:
+```text
+<the workload's own .gitattributes, byte for byte>
+# agentfs-lfs-begin: maintained by agentfs (Git LFS paths); edits are replaced
+/big.bin filter=lfs diff=lfs merge=lfs -text
+/dir[[:space:]]with[[:space:]]space/x.psd filter=lfs diff=lfs merge=lfs -text
+# agentfs-lfs-end
+```
 
-- the pointer format;
-- the LFS batch API, including `verify`;
-- a local object cache.
+- One line per path currently stored as LFS, anchored with a leading `/`
+  and escaped so it matches that path alone (`\`, `*`, `?`, `[` get a
+  backslash; a space is `[[:space:]]`, as `git lfs track` writes it), with
+  exactly the attributes `git lfs track` writes. Tested against
+  `git check-attr` and gix-attributes. `[[:space:]]` also matches a tab,
+  so `a b`'s line also covers `a<TAB>b` (harmless: that path cannot be
+  LFS itself).
+- At the end of the file, so its lines win over the workload's (the last
+  match wins). A deeper `.gitattributes` that unsets `filter` for a
+  managed path would still make clones show pointer text; agentfs does
+  not detect that.
+- A path leaves the block when it is removed, rewritten as a blob (for
+  example shrunk below the threshold) or replaced by a symlink or a
+  directory. The block lists the head's managed paths plus this commit's
+  LFS writes; the head's block is trusted because agentfs wrote it.
+- The workload's `.gitattributes` content is kept; any block it wrote,
+  well formed or not, is removed. A root `.gitattributes` holding only the
+  block is created and removed by agentfs.
+- Very many LFS paths make the file large (about 100 bytes a path, up to
+  fsck's 100 MiB); a refused result fails the commit (`CommitFailed`)
+  rather than writing history no remote accepts.
 
-LFS objects are uploaded before the commits that reference them are pushed.
+**Endpoints** come only from operator config (the state area's config and
+its includes; a tracked `.lfsconfig` is content, never read), with
+git-lfs's precedence:
 
-**Retention.** LFS objects cannot be pruned from most LFS servers (GitHub's
-needs the repository deleted), and pruned pointers break clones. agentfs does
-not prune. It limits growth at the source instead, with coalescing intervals
-and size caps per path.
+| Uploads (push) | Downloads (restore) |
+|---|---|
+| `lfs.pushurl` | |
+| `lfs.url` | `lfs.url` |
+| `remote.<name>.lfspushurl` | |
+| `remote.<name>.lfsurl` | `remote.<name>.lfsurl` |
+| derived from `pushurl`, else `url` | derived from `url` |
+
+- An explicit `http(s)` URL is the endpoint as written. A remote URL
+  derives `<url>/info/lfs` when it ends in `.git`, else
+  `<url>.git/info/lfs`, as git-lfs does (GitHub, GitLab and Gitea serve
+  LFS there).
+- A local path or `file://` URL, explicit or derived, uses git-lfs's
+  standalone-file layout: `<git dir>/lfs/objects/aa/bb/<oid>` of that
+  repository, which `git lfs pull` in a clone of it reads.
+- SSH and `git://` remotes derive nothing: agentfs has no
+  `git-lfs-authenticate`, so they need an explicit `lfsurl`.
+- An explicit endpoint that is not `http(s)`, `file://` or a path, or is
+  `https` in a build without the `https` feature, makes the remote
+  misconfigured (§11.1); a bad global `lfs.url` misconfigures every remote.
+
+**Credentials** are bound to the endpoint's origin (scheme, host and
+port) and never sent anywhere else:
+
+1. `remote.<name>.agentfsLfsCredentials` (an absolute path, the same file
+   format as `agentfsCredentials`), if set;
+2. else, when the endpoint has the push URL's origin (as GitHub's derived
+   endpoint does), `remote.<name>.agentfsCredentials`;
+3. else a password in the endpoint URL;
+4. else none.
+
+So a separate LFS host never sees the git host's credentials, and an
+`http` endpoint never gets those of an `https` push URL. The files are
+re-read when they change, like other credentials, and `mount` refuses
+one under the backing tree or mount point. agentfs's `Authorization`
+goes to batch requests, and to an action's `href` only when it has the
+endpoint's origin and the server gave the action no `Authorization` of
+its own; the headers a server gives an action are sent as given.
+Redirects are never followed and proxy environment variables are
+ignored.
+
+**Client.** Neither libgit2 nor gitoxide implements LFS. agentfs's own
+client (`ureq` 3, pure Rust; TLS through native-tls, OpenSSL and the
+system trust store, under the `https` feature, as libgit2 uses) speaks
+the batch API with the `basic` transfer only: batches of 100 objects,
+sequential, a `PUT` of each object the server lacks, then `verify` when
+the server asks for it; a `GET` for downloads, hashed while it is written
+and kept only if it matches. Timeouts: 30 s to connect, 5 minutes for a
+batch or verify request, and for an object 5 minutes plus its size at
+256 KiB/s.
+
+**Upload before push.** Before every push attempt, each remote uploads
+the LFS objects the commits it lacks reference (`head ^ last_pushed`, or
+the whole branch when the remote has nothing or its last pushed commit is
+unknown): blobs a commit adds or modifies, compared with its first parent
+without rename detection, at paths in that commit's managed block, that
+are canonical pointers. Pointer text a workload wrote at an unmanaged path
+is ordinary content. Every object must be in the local cache. Only when
+every upload succeeds does the git push run; any failure fails the attempt
+with stage `lfs` (§13) and pushes no ref, with the usual alarm and backoff
+(§11.2). A remote whose backlog references no LFS object never resolves or
+contacts an endpoint, so an SSH remote without `lfsurl` keeps pushing
+until LFS content appears. Failures reuse the push failure kinds:
+`unreachable` (connections, timeouts, HTTP 429 and 5xx), `auth` (401, 403,
+a missing or rejected credential), `untrusted_host` (a TLS certificate
+that fails verification, recognised from OpenSSL's message), `refused`
+(any other status or per-object error, a redirect) and `local` (a missing
+cache object, no endpoint, no `https` feature).
+
+**Cache.** `<state>/lfs/objects/aa/bb/<oid>`, git-lfs's layout, with
+`<state>/lfs/tmp/` for objects being written: written to `tmp/`, fsynced,
+renamed into place, directories fsynced. `agentfs.state.bytes{part="lfs"}`
+measures it.
+
+**Restore and revert** (§15) are LFS-aware: a pointer at a managed path is
+checked out as its object's content, from the cache or else downloaded
+from the remotes in name order, and every object a plan writes is fetched
+during the check, before anything is written; a missing one refuses the
+restore (`lfs_object`). The tree's file is compared by size and SHA-256.
+The root `.gitattributes` is compared and written without the managed
+block, and one holding only the block is absent from the tree.
+
+**Retention.** LFS objects cannot be pruned from most LFS servers
+(GitHub's needs the repository deleted), and pruned pointers break
+clones. agentfs prunes nothing, neither on servers nor in the local cache.
+It limits growth at the source instead, with operator rules and, later,
+coalescing intervals and size caps per path.
+
+**Not built:** `git-lfs-authenticate` for SSH remotes, concurrent or
+resumable (tus) transfers, a per-remote LFS size limit, pruning cache
+objects every remote has, proxy settings, an `agentfs lfs fetch` command,
+and storing the fsync class (§8) as LFS.
 
 ## 8. Files changed in place: the `fsync` class (phase 2)
 
@@ -842,7 +988,12 @@ agentfs does not scan content for secrets and does not hold pushes.
   - its push URL is not SSH and `agentfsSshKey` or `agentfsKnownHosts` is
     set;
   - its push URL is SSH and the binary was built without the `ssh` cargo
-    feature.
+    feature;
+  - an LFS endpoint (`lfs.url`, `lfs.pushurl`, `remote.<name>.lfsurl` or
+    `lfspushurl`) is not `http(s)`, `file://` or a path, or is `https` in
+    a build without the `https` feature (§7); a bad global key makes every
+    remote misconfigured;
+  - `agentfsLfsCredentials` is not an absolute path.
 
   Each one raises `RemoteMisconfigured` (§13) when the volume opens;
   `agentfs status` lists it and `agentfs push` reports it and exits 1.
@@ -867,6 +1018,12 @@ agentfs does not scan content for secrets and does not hold pushes.
   - It gets one attempt per connection: a rejected credential or key is an
     authentication failure, not a retry loop.
   - HTTPS needs libgit2 built with TLS: the `https` cargo feature (OpenSSL).
+  - `remote.<name>.agentfsLfsCredentials` (same format) authenticates an
+    LFS endpoint on another origin than the push URL; an endpoint on the
+    push URL's own origin reuses `agentfsCredentials` (§7). LFS traffic
+    uses agentfs's own HTTP client (`ureq`), not libgit2, with the same
+    rules: bound to its origin, no redirects followed, no proxies, TLS
+    through OpenSSL and the system trust store with the `https` feature.
 - **SSH remotes** (`ssh://`, `ssh+git://`, `git+ssh://`, and scp-like
   `[user@]host:path`, which needs a `:` before any `/`) need libgit2 built
   with libssh2: the `ssh` cargo feature (libssh2 and OpenSSL).
@@ -905,6 +1062,8 @@ agentfs does not scan content for secrets and does not hold pushes.
   hashed known_hosts, a wrong key, unknown and changed host keys (the key
   is never offered: the sshd log shows no attempt with it), a key rotated
   under a running `agentfs run`, and a divergence over SSH.
+  Git LFS (§7) in `ci/e2e-lfs.sh` against git-lfs's `lfs-test-server`
+  behind the same nginx.
 
 ### 11.2 Interval push
 
@@ -945,7 +1104,9 @@ agentfs does not scan content for secrets and does not hold pushes.
   accepts can never be pushed. A maximum push size is deferred.
 - **A rejected push never affects the filesystem.** Rejected means refused,
   non-fast-forward, authentication failure, an untrusted host (an SSH host
-  key or TLS certificate that fails verification) or an unreachable remote.
+  key or TLS certificate that fails verification), an unreachable remote,
+  or any of these while uploading LFS objects before the git push (stage
+  `lfs`, §7: no ref is pushed then).
   Recording, committing and other remotes carry on. The recorder:
   - raises an alarm (`PushFailed`, §13) with the reason and the commit;
   - keeps retrying with backoff (§11.2);
@@ -1049,7 +1210,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.commit.failures` | counter | Commit passes that failed; the records stay journaled |
 | `agentfs.push.unpushed_commits` | gauge, per remote | Backlog |
 | `agentfs.push.oldest_unpushed_age` | gauge, per remote | Backlog age, the main push alarm |
-| `agentfs.push.failures` | counter, per remote and reason | Rejected, non-fast-forward, authentication, untrusted host, network |
+| `agentfs.push.failures` | counter, per remote, reason and stage | Rejected, non-fast-forward, authentication, untrusted host, network; stage `git`, or `lfs` for the LFS upload before the git push (§7) |
 | `agentfs.push.diverged` | gauge, per remote | 1 while diverged |
 | `agentfs.remote.misconfigured` | gauge, per remote | 1 for each invalid `[remote]` section (§11.1) |
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
@@ -1059,8 +1220,9 @@ API only; the binary picks the SDK and the exporter.
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
-`commit`) and `part` (`git`, `journal`, `pending`, `lfs`, `meta`). Paths never
-become metric attributes. Span and log attributes are namespaced `agentfs.*`.
+`commit` for refused paths, `git` or `lfs` for push failures) and `part`
+(`git`, `journal`, `pending`, `lfs`, `meta`). Paths never become metric
+attributes. Span and log attributes are namespaced `agentfs.*`.
 
 `agentfs.state.bytes` is the apparent size (the sum of file lengths) of each
 part, not allocated blocks: reflinks make both misleading, and apparent size
@@ -1074,7 +1236,9 @@ of the branch, shared by the three push gauges in one collection.
 sequence number when journaled, paths skipped), `agentfs.commit` (first and
 last sequence numbers, records, paths refused, the commit id or
 `agentfs.commit.empty`) and `agentfs.push` (remote, previous and new head,
-outcome, and on failure the reason and any diverged ref). Each span is
+outcome, on failure the reason, the stage and any diverged ref, and when
+the backlog references LFS objects `agentfs.lfs.objects`,
+`agentfs.lfs.uploaded` and `agentfs.lfs.bytes`). Each span is
 current while its operation runs, so alarm logs raised inside it carry its
 trace. Record and commit spans are not linked; they correlate through the
 sequence numbers. Patch-application spans come with phase 3.
@@ -1082,7 +1246,8 @@ sequence numbers. Patch-application spans come with phase 3.
 **Logs.** A structured log record for every alarm condition: the event name
 (`agentfs.path_refused`, `agentfs.push_failed`, ...), WARN for a refused
 path and ERROR otherwise, the event's message as the body and its fields
-(path, reason, remote, kind, heads, ...) as attributes.
+(path, reason, remote, kind, heads, ...) as attributes; a push failure
+carries its stage as `agentfs.push.stage`.
 
 **Events.** The engine reports alarm conditions as events to a sink
 (`agentfs_core::events::EventSink`). The telemetry layer wraps the
@@ -1094,7 +1259,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PathRefused` | A path fails the checks of §3.4 or §5, at record or commit time |
 | `RecordFailed` | The synchronous step fails (§3.5) |
 | `CommitFailed` | Turning records into a commit fails; the records stay journaled and are retried |
-| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`), the head, the last pushed commit, the consecutive failure count and the next retry |
+| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7), the head, the last pushed commit, the consecutive failure count and the next retry |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
 | `PushSucceeded` | A push attempt succeeded, including one with nothing new (not an alarm; sinks filter) |
@@ -1305,7 +1470,9 @@ inode, so only the named path changes, as in git. New files and
 directories take the owner and group of their nearest existing parent
 when the process may chown (`CAP_CHOWN`), with mode `0644`/`0755` and
 `0755`. Content, the executable bit and symlinks are restored, nothing
-else (§6).
+else (§6). Content stored as LFS is written from the object cache, or
+downloaded from a remote during the checks, before anything is written
+(§7); the root `.gitattributes` is written without the managed block.
 
 **Operator history rewrite** removes content that must not stay in
 history, such as a recorded secret (§10). It is a documented procedure,
@@ -1364,7 +1531,9 @@ one-time migration of Hermes' existing data and the initial import in
   - the background service: the commit loop and one push loop per remote,
     with clean shutdown (§11.2);
   - alarm events, through a non-blocking sink (§13);
-  - LFS (§7);
+  - Git LFS (§7, `lfs`): store selection, pointers, the managed
+    `.gitattributes` block, the object cache, endpoints and credentials,
+    the batch client, uploads before each push, and LFS-aware restores;
   - the patch queue (§12);
   - telemetry (§13): implemented against the OpenTelemetry API.
 - **`agentfs-fuse`, a library:** the FUSE layer (§2.1, §3.1, §6).
@@ -1396,9 +1565,12 @@ one-time migration of Hermes' existing data and the initial import in
     command's telemetry resource is the same. `record` records paths of a
     backing tree directly, without a mount;
   - `status` is read-only (§2.3): the head, the last committed sequence,
-    the backlog, the state-area lock's holder, and each remote: its URL
-    (userinfo redacted), last pushed commit, unpushed commits, consecutive
-    failures, last error and any diverged ref;
+    the backlog, the state-area lock's holder, the LFS threshold, and each
+    remote: its URL (userinfo redacted), last pushed commit, unpushed
+    commits, consecutive failures, last error (with its stage) and any
+    diverged ref, and its LFS upload endpoint and where that endpoint's
+    credentials come from, or why it has none (resolved from config, no
+    network);
   - `restore <path> <commit>` and `revert <commit>` (with `--force` and
     `--dry-run`) write content from history back into the tree, recorded
     as one commit (§15): through a running mount over its control socket,
@@ -1412,7 +1584,8 @@ one-time migration of Hermes' existing data and the initial import in
   - **Preflight.** Before anything is mounted it refuses a state area,
     backing tree and mount point that are not three separate directories
     (none inside another, after resolving symlinks), any remote section's
-    `agentfsCredentials`, `agentfsSshKey` or `agentfsKnownHosts` file under
+    `agentfsCredentials`, `agentfsSshKey`, `agentfsKnownHosts` or
+    `agentfsLfsCredentials` file under
     the backing tree or the mount point, invalid sections included (an
     error, not `RemoteMisconfigured`: carrying on would expose the secret,
     or let the workload rewrite known_hosts to trust any host), a
@@ -1520,7 +1693,7 @@ Phase 4 (§14).
 | TLS and SSH transports | `git2` features `https` (OpenSSL) and `ssh` (libssh2 through `libssh2-sys`, over OpenSSL), behind agentfs's `https` and `ssh` cargo features | C libraries, so feature-gated: default builds stay free of OpenSSL. `ssh` keys are handed to libssh2 from memory (`Cred::ssh_key_from_memory`) |
 | SSH host keys | agentfs's own known_hosts parser over `base64` and `sha1_smol` (HMAC-SHA1 for hashed names, written by hand and tested against RFC 2202) | Pure Rust. libgit2's own check reads `~/.ssh/known_hosts` only, so agentfs checks in the certificate callback instead (§11.1) |
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
-| LFS | none exists | Implemented in agentfs (§7) |
+| LFS | none exists: implemented in agentfs (§7) over `ureq` 3 (default features off: pure Rust, no TLS) and `sha2` 0.11; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, as `git2/https`; its webpki root bundle is compiled in but unused: the platform verifier reads the system store) | ureq's `native-tls-no-default` feature does not compile the native-tls connector in 3.4 (its code is behind the `native-tls` feature), hence `native-tls`. `reqwest` stays in the binary only, for OTLP |
 | Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `reqwest-blocking-client`, no TLS) in the binary | OTLP http/protobuf export. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
 | Repack | the `git` CLI | libgit2 has no repack or gc |
 | Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates` and `git`; built on `rust:1.99-trixie`; both pinned by digest | Not distroless: operators follow the runbooks with `git` through `kubectl exec`. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after the kind e2e passes |
@@ -1609,8 +1782,13 @@ pod, namespace and node trailers checked on the remote), test 11 through
 deletion, and test 2 in a pod: `kill -9` of the daemon from the node,
 `ENOTCONN` for the workload, the holding sidecar and NotReady pod,
 `kubectl delete pod` completing, and the new pod recovering and pushing
-the pre-crash write. Not automated yet: test 3 (a kill at every step),
-13 (performance) and 16.
+the pre-crash write. Test 14's LFS part runs in the `e2e-lfs` job
+(`ci/e2e-lfs.sh`: git-lfs's `lfs-test-server` behind nginx, the real
+git-lfs client, `git clone` plus `git lfs pull`, over http and https)
+and without a server in `crates/agentfs/tests/cli_lfs.rs` (local and
+`file://` remotes; `git lfs pull` where git-lfs is installed, as on CI
+runners). Not automated yet: test 3 (a kill at every step), 13
+(performance), 14's SQLite part (§8 is not built) and 16.
 
 ## 19. Decisions and open questions
 
@@ -1659,6 +1837,14 @@ the pre-crash write. Not automated yet: test 3 (a kill at every step),
 | Image user | Root. The sidecar needs privileged for Bidirectional propagation, `CAP_SYS_ADMIN` for mount(2), `/dev/fuse` and passthrough, `CAP_CHOWN`/`CAP_FOWNER` for ownership, and to own the state area for libgit2. The init container drops every capability; workloads run as non-root (§17.1) |
 | Image publishing | `linux/amd64`, published from `main` only after the kind e2e passes, pushing the tested image itself; tags: the full commit sha and `latest` (§17.3) |
 | Kind e2e git server | The runner's nginx + `git http-backend`, reached from pods through a selector-less Service and an EndpointSlice on the kind network's gateway, so the credential Secret is exercised over HTTP basic auth and the bare repository stays on the runner for assertions; the daemon is killed from the node (PID 1 ignores SIGKILL from inside its namespace) |
+| LFS store selection | Decided at record time on the frozen size and journaled with the write (older journals read as blob): always blob for empty files, special files, `.lfsconfig` and unnameable paths; then `filter=lfs` (operator, or tree only with `respectTreeRules`), which `agentfs.store=blob` cannot override; then `agentfs.store`; then `size > agentfs.lfsThreshold`, which is unset by default. The blob limit does not apply to LFS content (§7) |
+| LFS `.gitattributes` | A block at the end of the root `.gitattributes`, in history only, rebuilt every commit: one anchored, escaped line per LFS path with `git lfs track`'s attributes; the workload's lines are kept and forged blocks replaced; a file holding only the block is agentfs's own (§7) |
+| LFS endpoints and credentials | git-lfs's precedence (`lfs.pushurl`, `lfs.url`, `remote.<n>.lfspushurl`, `remote.<n>.lfsurl`, then derived `<url>.git/info/lfs`), from operator config only; local and `file://` remotes use the standalone-file layout; SSH needs an explicit `lfsurl`. Credentials: `agentfsLfsCredentials`, else `agentfsCredentials` on the push URL's own origin, else the URL's password; bound to the origin, sent to action hrefs only on that origin and without a server-given `Authorization`; no redirects, no proxies (§7) |
+| LFS uploads | Before every push attempt, for the objects the commits the remote lacks reference at managed paths; a failure is a `PushFailed` with stage `lfs` and no ref pushed. Batch API, `basic` transfer only, sequential batches of 100, `verify` when offered (§7) |
+| LFS cache and retention | `<state>/lfs/objects/aa/bb/<oid>`, written at commit time; nothing is pruned, locally or on servers (§7) |
+| LFS restores | A pointer is checked out from the cache, else downloaded from the remotes in name order, every object before any write; tree content compared by SHA-256; `.gitattributes` without the managed block (§7, §15) |
+| LFS client and TLS | agentfs's own client over `ureq` 3, pure Rust by default; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, system trust store, as libgit2). An explicit https endpoint without the feature is a misconfigured remote; a derived one fails at push time as `local` (§7, §17.3) |
+| LFS test server | CI uses git-lfs's `lfs-test-server` (pinned by commit, built with `go install`) behind the git server's nginx, which authenticates with separate users per host; rudolfs (no auth or verify) and giftless (JWT setup) were not used (§18) |
 
 ### 19.2 Open questions
 

@@ -14,3 +14,13 @@
 # 	url = ssh://git@git.example.com/acme/agent-history.git
 # 	agentfsSshKey = /run/secrets/agentfs/ssh-privatekey
 # 	agentfsKnownHosts = /run/secrets/agentfs/known_hosts
+
+# Git LFS (design §7; docs/configuration.md#git-lfs), off by default. Files
+# over the threshold go to the remote's LFS endpoint; this one is derived
+# from the url (<url>/info/lfs) and reuses agentfsCredentials. A separate
+# LFS host takes its own credentials file from the same Secret:
+# [agentfs]
+# 	lfsThreshold = 8m
+# [remote "origin"]
+# 	lfsurl = https://lfs.example.com/acme/agent-history
+# 	agentfsLfsCredentials = /run/secrets/agentfs/origin-lfs

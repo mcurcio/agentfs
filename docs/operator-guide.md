@@ -388,7 +388,55 @@ Runbooks, with the full procedures:
   secret from the state area and every remote;
 - [stuck-pushes.md](runbooks/stuck-pushes.md): pushes that keep failing.
 
-## 13. Troubleshooting
+## 13. Large files (LFS)
+
+Git LFS (design §7) keeps large content out of git history: history holds
+a pointer, the content goes to an LFS server. It is off by default.
+
+- **Enabling.** Set `agentfs.lfsThreshold` (for example `8m`), or add
+  `filter=lfs` or `agentfs.store=lfs` lines to `<state>/git/info/attributes`
+  (`*.psd filter=lfs`), then restart the mount. Every remote then needs an
+  LFS endpoint: the one derived from an `https` remote's URL (GitHub,
+  GitLab, Gitea), an explicit `remote.<name>.lfsurl`, or nothing at all for
+  local and `file://` remotes. SSH remotes need `lfsurl`. Endpoints and
+  credentials are in the
+  [configuration reference](configuration.md#git-lfs).
+- **What history looks like.** LFS files are pointer blobs; the root
+  `.gitattributes` in history ends with an agentfs block of
+  `filter=lfs diff=lfs merge=lfs -text` lines, one per LFS path. The
+  workload's own `.gitattributes` lines are kept above it; the backing
+  tree's file is never changed, so the workload never sees the block.
+- **Cloning.** A clone needs git-lfs:
+
+  ```sh
+  GIT_LFS_SKIP_SMUDGE=1 git clone -b agentfs/<volume> https://github.com/acme/agent-history.git
+  cd agent-history
+  git lfs install --local
+  git lfs pull           # downloads the content of the checked-out commit
+  ```
+
+  For a separate LFS server, point the clone at it first
+  (`git config lfs.url https://lfs.example.com/acme/agent-history`).
+  Without git-lfs, LFS files show as pointer text. A `.lfsconfig` the
+  workload wrote is in history and steers the cloner's git-lfs; agentfs
+  itself never reads it.
+- **Pushing.** Each push first uploads the objects of the commits the
+  remote lacks; only then are refs pushed. Failures show as
+  `failed (<kind>, stage lfs)` and in `agentfs status` (`last error (…,
+  stage lfs)`); see [stuck-pushes.md](runbooks/stuck-pushes.md#lfs-stage-failures).
+- **The cache.** Objects are kept in `<state>/lfs/objects` from commit
+  time on, and **never pruned**, locally or on the server: budget the
+  state area for every version of every LFS file, and watch
+  `agentfs.state.bytes{part="lfs"}`. A push needs every object its
+  commits reference in the cache; a lost object blocks that remote's
+  pushes with a `local` failure.
+- **Restores** write LFS content from the cache, or download it from the
+  remotes (in name order) when the cache lacks it, before writing
+  anything.
+- **Status** prints the threshold and each remote's LFS endpoint, or why
+  it has none (`lfs: none (…)`).
+
+## 14. Troubleshooting
 
 - **`passthrough: off (...)` in the startup line.** The reason is given:
   the kernel is older than 6.9, the daemon lacks `CAP_SYS_ADMIN` or runs in
@@ -416,6 +464,13 @@ Runbooks, with the full procedures:
 - **Alarms** are printed to stderr and exported as telemetry logs (see the
   README): `PathRefused`, `RecordFailed`, `CommitFailed`, `PushFailed`,
   `Diverged`, `RemoteMisconfigured`.
+- **`failed (<kind>, stage lfs)`** from `push` or in a `PushFailed`
+  alarm: uploading LFS objects failed, so no ref was pushed. `auth`: the
+  LFS credentials (`agentfsLfsCredentials`, or `agentfsCredentials` for an
+  endpoint on the git host); `local`: no endpoint (an SSH remote without
+  `lfsurl`), no `https` feature, or an object missing from
+  `<state>/lfs/objects`. See
+  [stuck-pushes.md](runbooks/stuck-pushes.md#lfs-stage-failures).
 - **A path is not in history.** Check, in order: is it under a `.git`
   directory or a nested repository (`agentfs.nested`)? Excluded by
   `info/exclude` or `-agentfs`? Refused (an alarm says so)? Still open (it is
