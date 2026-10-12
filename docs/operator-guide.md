@@ -352,7 +352,7 @@ agentfs --state /data/state revert <commit>
 
 | Flag | Meaning |
 |---|---|
-| `--dry-run` | Print the plan (`write`, `remove`, `symlink` or `mode` per path) and write nothing |
+| `--dry-run` | Print the plan (`write`, `remove`, `symlink` or `mode` per path) and write nothing. LFS objects are not downloaded: those missing from the cache are counted |
 | `--force` | `revert`: also revert paths changed again since the commit (the later versions stay in history). Both: write files a workload holds open for writing through the mount. Never overrides a change that is not in history yet |
 | `--root DIR` | The backing tree; only needed when no mount is running |
 | `--wait-lock D` | With no mount running, wait for the state-area lock |
@@ -406,6 +406,12 @@ a pointer, the content goes to an LFS server. It is off by default.
   `filter=lfs diff=lfs merge=lfs -text` lines, one per LFS path. The
   workload's own `.gitattributes` lines are kept above it; the backing
   tree's file is never changed, so the workload never sees the block.
+  A pointer is never committed without its line. If the block cannot be
+  written (a `.gitattributes` that fits `agentfsMaxBlobSize` alone but not
+  with the block, for example), that commit stores its LFS files as
+  ordinary blobs and, if needed, drops the `.gitattributes` change with a
+  `PathRefused` alarm (stage `commit`); commits never stop for it. A
+  directory named `.gitattributes` or `.gitmodules` is never recorded.
 - **Cloning.** A clone needs git-lfs:
 
   ```sh
@@ -432,7 +438,9 @@ a pointer, the content goes to an LFS server. It is off by default.
   pushes with a `local` failure.
 - **Restores** write LFS content from the cache, or download it from the
   remotes (in name order) when the cache lacks it, before writing
-  anything.
+  anything. `--dry-run` downloads nothing: it reports how many objects
+  (and bytes) are missing from the cache and would be downloaded, without
+  checking that a remote has them.
 - **Status** prints the threshold and each remote's LFS endpoint, or why
   it has none (`lfs: none (…)`).
 

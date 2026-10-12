@@ -23,9 +23,10 @@
 //! - A path whose line could not be written exactly (it holds a tab, CR or
 //!   LF, or the line would reach git's 2048-byte limit) is never stored as
 //!   LFS (see [`pattern_for`]).
-//! - Any block in content the workload wrote, well formed or not, is
-//!   removed before the new one is added, so a forged block never decides
-//!   anything.
+//! - A block the workload wrote (a line exactly [`BEGIN`] through the next
+//!   line exactly [`END`]) is removed before the new one is added, so a
+//!   forged block never decides anything. Every other line is kept, even
+//!   one that only starts like a marker, or an unterminated [`BEGIN`].
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -33,12 +34,9 @@ use std::path::Path;
 use crate::checks::ATTR_MAX_LINE_LENGTH;
 use crate::paths::RepoPath;
 
-/// The block's first line. Any line starting with [`BEGIN_PREFIX`] opens a
-/// block.
+/// The block's first line, exactly.
 pub const BEGIN: &str =
     "# agentfs-lfs-begin: maintained by agentfs (Git LFS paths); edits are replaced";
-/// What a line opening a block starts with.
-pub const BEGIN_PREFIX: &str = "# agentfs-lfs-begin";
 /// The block's last line.
 pub const END: &str = "# agentfs-lfs-end";
 /// The attributes of each managed path, as `git lfs track` writes them.
@@ -102,37 +100,51 @@ fn line_for(pattern: &str) -> String {
 /// block removed, byte for byte otherwise) and the paths of the
 /// well-formed managed lines inside blocks. Only blocks agentfs wrote are
 /// trusted with those paths; see the module documentation.
+///
+/// A block is a line exactly [`BEGIN`] through the next line exactly
+/// [`END`], with no other [`BEGIN`] line between them (a trailing CR is
+/// ignored on both). Any other line, including one that merely starts
+/// like a marker or an unterminated [`BEGIN`], is the workload's.
 pub fn split(content: &[u8]) -> (Vec<u8>, BTreeSet<RepoPath>) {
+    fn text(line: &[u8]) -> &[u8] {
+        let text = line.strip_suffix(b"\n").unwrap_or(line);
+        text.strip_suffix(b"\r").unwrap_or(text)
+    }
+    let lines: Vec<&[u8]> = content.split_inclusive(|&b| b == b'\n').collect();
     let mut user = Vec::with_capacity(content.len());
     let mut paths = BTreeSet::new();
-    let mut in_block = false;
-    for line in content.split_inclusive(|&b| b == b'\n') {
-        let text = line.strip_suffix(b"\n").unwrap_or(line);
-        let text = text.strip_suffix(b"\r").unwrap_or(text);
-        if !in_block {
-            if text.starts_with(BEGIN_PREFIX.as_bytes()) {
-                in_block = true;
-            } else {
-                user.extend_from_slice(line);
-            }
-            continue;
-        }
-        if text.starts_with(END.as_bytes()) {
-            in_block = false;
-            continue;
-        }
-        let Ok(text) = std::str::from_utf8(text) else {
-            continue;
-        };
-        if let Some(pattern) = text
-            .strip_suffix(LFS_ATTRS)
-            .and_then(|p| p.strip_suffix(' '))
-            && let Some(path) = path_of(pattern)
+    let mut i = 0;
+    while i < lines.len() {
+        if text(lines[i]) == BEGIN.as_bytes()
+            && let Some(end) = (i + 1..lines.len())
+                .take_while(|&j| text(lines[j]) != BEGIN.as_bytes())
+                .find(|&j| text(lines[j]) == END.as_bytes())
         {
-            paths.insert(path);
+            for line in &lines[i + 1..end] {
+                let Ok(text) = std::str::from_utf8(text(line)) else {
+                    continue;
+                };
+                if let Some(pattern) = text
+                    .strip_suffix(LFS_ATTRS)
+                    .and_then(|p| p.strip_suffix(' '))
+                    && let Some(path) = path_of(pattern)
+                {
+                    paths.insert(path);
+                }
+            }
+            i = end + 1;
+            continue;
         }
+        user.extend_from_slice(lines[i]);
+        i += 1;
     }
     (user, paths)
+}
+
+/// Whether `path` is the root `.gitattributes` or beneath a directory of
+/// that name.
+pub fn at_or_beneath_root(path: &RepoPath) -> bool {
+    path.components().next() == Some(ROOT_GITATTRIBUTES)
 }
 
 /// The workload's own content of a root `.gitattributes` from history.
@@ -269,22 +281,62 @@ mod tests {
     }
 
     #[test]
-    fn every_block_is_removed_and_only_well_formed_lines_count() {
+    fn every_exact_block_is_removed_and_only_well_formed_lines_count() {
         let content = format!(
             "user line\n\
-             # agentfs-lfs-begin forged by the workload\n\
+             {BEGIN}\r\n\
              /evil.bin filter=lfs diff=lfs merge=lfs -text\n\
              *.bin filter=lfs diff=lfs merge=lfs -text\n\
              /x filter=lfs\n\
-             {END}\n\
+             {END}\r\n\
              second user line\n\
              {BEGIN}\n\
              /ok.bin filter=lfs diff=lfs merge=lfs -text\n\
-             /unterminated filter=lfs diff=lfs merge=lfs -text\n"
+             {END}\n"
         );
         let (user, paths) = split(content.as_bytes());
         assert_eq!(user, b"user line\nsecond user line\n");
         let names: Vec<&str> = paths.iter().map(RepoPath::as_str).collect();
-        assert_eq!(names, ["evil.bin", "ok.bin", "unterminated"]);
+        assert_eq!(names, ["evil.bin", "ok.bin"]);
+    }
+
+    #[test]
+    fn lines_that_only_look_like_markers_are_the_workloads() {
+        // A comment starting like a marker, an END alone, and an
+        // unterminated BEGIN (its END comes only after another BEGIN):
+        // all kept, and the lines after them too.
+        let user = format!(
+            "# agentfs-lfs-begin notes\n\
+             *.sh text eol=lf\n\
+             {END}\n\
+             {BEGIN} \n\
+             {BEGIN}\n\
+             *.md text\n"
+        );
+        let (got, paths) = split(user.as_bytes());
+        assert_eq!(got, user.as_bytes());
+        assert!(paths.is_empty());
+        // Composed with a block, the workload's part survives intact.
+        let managed: BTreeSet<RepoPath> = [p("big.bin")].into();
+        let composed = compose(user.as_bytes(), &managed);
+        let (got, paths) = split(&composed);
+        assert_eq!(got, user.as_bytes());
+        assert_eq!(paths, managed);
+        // An unterminated BEGIN at the end is kept too.
+        let open = format!("*.txt text\n{BEGIN}\n/a.bin {LFS_ATTRS}\n");
+        assert_eq!(
+            split(open.as_bytes()),
+            (open.clone().into_bytes(), BTreeSet::new())
+        );
+        let composed = compose(open.as_bytes(), &managed);
+        assert_eq!(split(&composed), (open.into_bytes(), managed));
+    }
+
+    #[test]
+    fn root_gitattributes_and_beneath() {
+        assert!(at_or_beneath_root(&p(".gitattributes")));
+        assert!(at_or_beneath_root(&p(".gitattributes/x")));
+        assert!(!at_or_beneath_root(&p("d/.gitattributes")));
+        assert!(!at_or_beneath_root(&p(".gitattributesx")));
     }
 }

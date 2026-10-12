@@ -12,6 +12,7 @@
 //! |---|---|---|
 //! | Path length | over [`MAX_PATH_BYTES`] | none (agentfs's own: `PATH_MAX` at checkout) |
 //! | Symlinked `.gitmodules`, `.gitattributes`, `.gitignore`, `.mailmap`, any NTFS/HFS+ spelling | | `gitmodulesSymlink` and siblings |
+//! | A path beneath a `.gitmodules` or `.gitattributes` directory, any NTFS/HFS+ spelling | | `gitmodulesBlob`, `gitattributesBlob` |
 //! | Symlink target length | over [`MAX_SYMLINK_TARGET`] | `symlinkTargetLength` |
 //! | Symlink target with a `.git` component | | `symlinkPointsToGitDir` |
 //! | `.gitattributes` size | over [`ATTR_MAX_FILE_SIZE`] | `gitattributesLarge` |
@@ -106,6 +107,13 @@ pub enum Refusal {
     SymlinkedSpecialFile {
         file: SpecialFile,
     },
+    /// The path is beneath a directory named `.gitmodules` or
+    /// `.gitattributes` (in any spelling): git's fsck requires those to be
+    /// blobs (`gitmodulesBlob`, `gitattributesBlob`), and a directory there
+    /// would leave no room for the managed LFS block (design §7).
+    SpecialFileNotBlob {
+        file: SpecialFile,
+    },
     SymlinkTargetTooLong {
         bytes: usize,
     },
@@ -155,6 +163,7 @@ impl Refusal {
             Self::InvalidPath(_) => "invalid_path",
             Self::PathTooLong { .. } => "path_too_long",
             Self::SymlinkedSpecialFile { .. } => "symlinked_special_file",
+            Self::SpecialFileNotBlob { .. } => "special_file_not_blob",
             Self::SymlinkTargetTooLong { .. } => "symlink_target_too_long",
             Self::SymlinkIntoGitDir { .. } => "symlink_into_git_dir",
             Self::GitattributesTooLarge { .. } => "gitattributes_too_large",
@@ -180,6 +189,10 @@ impl Refusal {
                 SpecialFile::Gitignore => "gitignoreSymlink",
                 SpecialFile::Mailmap => "mailmapSymlink",
             }),
+            Self::SpecialFileNotBlob { file } => Some(match file {
+                SpecialFile::Gitmodules => "gitmodulesBlob",
+                _ => "gitattributesBlob",
+            }),
             Self::SymlinkTargetTooLong { .. } => Some("symlinkTargetLength"),
             Self::SymlinkIntoGitDir { .. } => Some("symlinkPointsToGitDir"),
             Self::GitattributesTooLarge { .. } => Some("gitattributesLarge"),
@@ -203,6 +216,9 @@ impl fmt::Display for Refusal {
             }
             Self::SymlinkedSpecialFile { file } => {
                 write!(f, "{file} must be a regular file, not a symlink")
+            }
+            Self::SpecialFileNotBlob { file } => {
+                write!(f, "{file} must be a regular file, not a directory")
             }
             Self::SymlinkTargetTooLong { bytes } => {
                 write!(
@@ -276,7 +292,18 @@ impl Checks {
     /// Rules on the path alone.
     pub fn check_path(&self, path: &RepoPath) -> Option<Refusal> {
         let bytes = path.as_str().len();
-        (bytes > MAX_PATH_BYTES).then_some(Refusal::PathTooLong { bytes })
+        if bytes > MAX_PATH_BYTES {
+            return Some(Refusal::PathTooLong { bytes });
+        }
+        let components: Vec<&str> = path.components().collect();
+        components[..components.len() - 1]
+            .iter()
+            .find_map(|c| match special_file(c) {
+                Some(file @ (SpecialFile::Gitmodules | SpecialFile::Gitattributes)) => {
+                    Some(Refusal::SpecialFileNotBlob { file })
+                }
+                _ => None,
+            })
     }
 
     /// Rules for a symlink at `path` pointing to `target`.
@@ -519,6 +546,33 @@ mod tests {
             c.check_symlink(&p(&long), "t").unwrap().label(),
             "path_too_long"
         );
+    }
+
+    #[test]
+    fn nothing_beneath_a_gitattributes_or_gitmodules_directory() {
+        let c = Checks::default();
+        for (path, id) in [
+            (".gitattributes/x", "gitattributesBlob"),
+            ("d/.GitAttributes/e/f", "gitattributesBlob"),
+            ("gitatt~2/x", "gitattributesBlob"),
+            (".gitmodules/x", "gitmodulesBlob"),
+            ("a/.gitmodules./b", "gitmodulesBlob"),
+        ] {
+            let refusal = c.check_path(&p(path)).unwrap();
+            assert_eq!(refusal.fsck_id(), Some(id), "{path}");
+            assert_eq!(refusal.label(), "special_file_not_blob");
+            assert!(c.check_symlink(&p(path), "t").is_some(), "{path}");
+        }
+        // git checks only these two for blobs.
+        for path in [
+            ".gitattributes",
+            "d/.gitmodules",
+            ".gitignore/x",
+            ".mailmap/x",
+            "gitattributes/x",
+        ] {
+            assert_eq!(c.check_path(&p(path)), None, "{path}");
+        }
     }
 
     #[test]

@@ -310,6 +310,7 @@ copy of the file, so recorded volumes should use XFS. The phase 1 benchmark (§1
   |---|---|---|
   | Path length | over 4096 bytes | none: agentfs's own (`PATH_MAX` at checkout) |
   | Symlinked `.gitmodules`, `.gitattributes`, `.gitignore`, `.mailmap`, in any NTFS or HFS+ spelling, including 8.3 short names (`gitmod~1`, `gi7eba~1`) | | `gitmodulesSymlink`, `gitattributesSymlink`, `gitignoreSymlink`, `mailmapSymlink` |
+  | A path beneath a directory named `.gitmodules` or `.gitattributes`, in the same spellings (git requires both to be blobs) | | `gitmodulesBlob`, `gitattributesBlob` |
   | Symlink target length | over 4096 bytes | `symlinkTargetLength` |
   | Symlink target with a `.git` component, in any spelling | | `symlinkPointsToGitDir` |
   | `.gitattributes` size | over 100 MiB | `gitattributesLarge` |
@@ -744,12 +745,37 @@ backing tree is never written):
   example shrunk below the threshold) or replaced by a symlink or a
   directory. The block lists the head's managed paths plus this commit's
   LFS writes; the head's block is trusted because agentfs wrote it.
-- The workload's `.gitattributes` content is kept; any block it wrote,
-  well formed or not, is removed. A root `.gitattributes` holding only the
-  block is created and removed by agentfs.
-- Very many LFS paths make the file large (about 100 bytes a path, up to
-  fsck's 100 MiB); a refused result fails the commit (`CommitFailed`)
-  rather than writing history no remote accepts.
+- The workload's `.gitattributes` content is kept; a block it wrote (a
+  line exactly the BEGIN line through the next line exactly the END line,
+  with no other BEGIN between, a trailing CR ignored) is removed. Every
+  other line is kept byte for byte, including one that only starts like a
+  marker (`# agentfs-lfs-begin notes`) or an unterminated BEGIN. A root
+  `.gitattributes` holding only the block is created and removed by
+  agentfs.
+- **A pointer is only committed with its line.** The block must have a
+  place and pass the checks of §3.4 with the configured limits (the
+  composed file is a blob like any other: `gitattributesLarge`, the
+  `agentfsMaxBlobSize`, the line length). A directory named
+  `.gitattributes` (or `.gitmodules`) is refused at record time
+  (`gitattributesBlob`, `gitmodulesBlob`, §3.4), so normally it does. When
+  it does not (history from before that check; a `.gitattributes` that
+  fits the limits alone but not with the block; very many LFS paths, at
+  about 100 bytes a path; limits lowered below the head's own file), the
+  commit falls back instead of failing, each step only if the one before
+  is not enough:
+  1. that commit's LFS writes are stored as blobs (the blob limit applies
+     to them, and one over it is dropped with `PathRefused`, stage
+     `commit`);
+  2. its writes at or beneath the root `.gitattributes` are dropped with
+     `PathRefused` (stage `commit`, the composed file's reason), and the
+     block is rebuilt on the head's file;
+  3. the head's root `.gitattributes` is kept as it is (a path that
+     stopped being LFS in that commit keeps its line until it is written
+     again; harmless, since git-lfs passes non-pointer content through).
+
+  Later commits are unaffected: once the block fits again, LFS writes
+  are pointers again. The `agentfs.commit` span carries
+  `agentfs.lfs_as_blobs` when step 1 ran.
 
 **Endpoints** come only from operator config (the state area's config and
 its includes; a tracked `.lfsconfig` is content, never read), with
@@ -835,7 +861,10 @@ from the remotes in name order, and every object a plan writes is fetched
 during the check, before anything is written; a missing one refuses the
 restore (`lfs_object`). The tree's file is compared by size and SHA-256.
 The root `.gitattributes` is compared and written without the managed
-block, and one holding only the block is absent from the tree.
+block, and one holding only the block is absent from the tree. A dry run
+(`--dry-run`) downloads and writes nothing: it looks only in the cache and
+reports how many objects (and bytes) a real run would download, without
+checking that a remote has them.
 
 **Retention.** LFS objects cannot be pruned from most LFS servers
 (GitHub's needs the repository deleted), and pruned pointers break
@@ -1838,11 +1867,11 @@ runners). Not automated yet: test 3 (a kill at every step), 13
 | Image publishing | `linux/amd64`, published from `main` only after the kind e2e passes, pushing the tested image itself; tags: the full commit sha and `latest` (§17.3) |
 | Kind e2e git server | The runner's nginx + `git http-backend`, reached from pods through a selector-less Service and an EndpointSlice on the kind network's gateway, so the credential Secret is exercised over HTTP basic auth and the bare repository stays on the runner for assertions; the daemon is killed from the node (PID 1 ignores SIGKILL from inside its namespace) |
 | LFS store selection | Decided at record time on the frozen size and journaled with the write (older journals read as blob): always blob for empty files, special files, `.lfsconfig` and unnameable paths; then `filter=lfs` (operator, or tree only with `respectTreeRules`), which `agentfs.store=blob` cannot override; then `agentfs.store`; then `size > agentfs.lfsThreshold`, which is unset by default. The blob limit does not apply to LFS content (§7) |
-| LFS `.gitattributes` | A block at the end of the root `.gitattributes`, in history only, rebuilt every commit: one anchored, escaped line per LFS path with `git lfs track`'s attributes; the workload's lines are kept and forged blocks replaced; a file holding only the block is agentfs's own (§7) |
+| LFS `.gitattributes` | A block at the end of the root `.gitattributes`, in history only, rebuilt every commit: one anchored, escaped line per LFS path with `git lfs track`'s attributes; the workload's lines are kept and forged blocks (exact BEGIN through END) replaced; a file holding only the block is agentfs's own. A pointer is never committed without its line: when the block cannot be written, that commit's LFS writes are blobs, then its `.gitattributes` writes are dropped, then the head's file is kept; a commit never fails for it. A directory named `.gitattributes` or `.gitmodules` is refused (`gitattributesBlob`, `gitmodulesBlob`) (§3.4, §7) |
 | LFS endpoints and credentials | git-lfs's precedence (`lfs.pushurl`, `lfs.url`, `remote.<n>.lfspushurl`, `remote.<n>.lfsurl`, then derived `<url>.git/info/lfs`), from operator config only; local and `file://` remotes use the standalone-file layout; SSH needs an explicit `lfsurl`. Credentials: `agentfsLfsCredentials`, else `agentfsCredentials` on the push URL's own origin, else the URL's password; bound to the origin, sent to action hrefs only on that origin and without a server-given `Authorization`; no redirects, no proxies (§7) |
 | LFS uploads | Before every push attempt, for the objects the commits the remote lacks reference at managed paths; a failure is a `PushFailed` with stage `lfs` and no ref pushed. Batch API, `basic` transfer only, sequential batches of 100, `verify` when offered (§7) |
 | LFS cache and retention | `<state>/lfs/objects/aa/bb/<oid>`, written at commit time; nothing is pruned, locally or on servers (§7) |
-| LFS restores | A pointer is checked out from the cache, else downloaded from the remotes in name order, every object before any write; tree content compared by SHA-256; `.gitattributes` without the managed block (§7, §15) |
+| LFS restores | A pointer is checked out from the cache, else downloaded from the remotes in name order, every object before any write; tree content compared by SHA-256; `.gitattributes` without the managed block; a dry run only reports objects missing from the cache, downloading nothing (§7, §15) |
 | LFS client and TLS | agentfs's own client over `ureq` 3, pure Rust by default; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, system trust store, as libgit2). An explicit https endpoint without the feature is a misconfigured remote; a derived one fails at push time as `local` (§7, §17.3) |
 | LFS test server | CI uses git-lfs's `lfs-test-server` (pinned by commit, built with `go install`) behind the git server's nginx, which authenticates with separate users per host; rudolfs (no auth or verify) and giftless (JWT setup) were not used (§18) |
 

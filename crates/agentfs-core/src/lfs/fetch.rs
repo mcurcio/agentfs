@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 
-use super::{Direction, LfsError, ObjectCache, Pointer, Transfer, transfer_for};
+use super::{Direction, LfsError, LfsOid, ObjectCache, Pointer, Transfer, transfer_for};
 use crate::config::Settings;
 use crate::volume::StateDir;
 
@@ -33,6 +33,39 @@ impl LfsObjects for CacheOnly {
                 pointer.oid
             )))
         }
+    }
+}
+
+/// For a dry run: the cache alone, and nothing downloaded or written. An
+/// object missing from the cache does not refuse the plan; it is noted
+/// ([`CacheProbe::uncached`]) for the operator, since a real restore
+/// downloads it then. Whether a remote has it is not checked.
+pub struct CacheProbe {
+    cache: ObjectCache,
+    uncached: RefCell<BTreeMap<LfsOid, u64>>,
+}
+
+impl CacheProbe {
+    pub fn new(cache: ObjectCache) -> Self {
+        Self {
+            cache,
+            uncached: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// The distinct objects not in the cache, and their total size.
+    pub fn uncached(&self) -> (usize, u64) {
+        let uncached = self.uncached.borrow();
+        (uncached.len(), uncached.values().sum())
+    }
+}
+
+impl LfsObjects for CacheProbe {
+    fn ensure(&self, pointer: &Pointer) -> Result<PathBuf, LfsError> {
+        if !self.cache.contains(pointer) {
+            self.uncached.borrow_mut().insert(pointer.oid, pointer.size);
+        }
+        Ok(self.cache.path(&pointer.oid))
     }
 }
 
@@ -138,5 +171,13 @@ mod tests {
         let only = CacheOnly(ObjectCache::at(state.lfs()).unwrap());
         assert!(only.ensure(&pointer).is_ok());
         assert!(only.ensure(&absent).is_err());
+        // A dry run's probe downloads nothing and notes what is missing.
+        let probe = CacheProbe::new(ObjectCache::at(state.lfs()).unwrap());
+        assert!(probe.ensure(&pointer).is_ok());
+        assert_eq!(probe.uncached(), (0, 0));
+        let path = probe.ensure(&absent).unwrap();
+        probe.ensure(&absent).unwrap();
+        assert!(!path.exists());
+        assert_eq!(probe.uncached(), (1, 6));
     }
 }

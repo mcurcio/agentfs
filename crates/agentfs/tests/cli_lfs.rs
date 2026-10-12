@@ -295,6 +295,21 @@ fn restore_brings_lfs_content_back_from_the_cache_or_a_remote() {
     fs::remove_file(v.tree().join("big.bin")).unwrap();
     v.ok(&["record", "big.bin"]);
     fs::remove_dir_all(v.state().join("lfs/objects")).unwrap();
+    // A dry run downloads nothing, and says what a real run would.
+    let out = v.ok(&["restore", "--dry-run", "big.bin", c1]);
+    assert!(
+        out.contains(&format!(
+            "1 LFS object(s), {} bytes, not in the local cache",
+            LARGE.len()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("nothing written"), "{out}");
+    let cached = fs::read_dir(v.state().join("lfs/objects"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(cached, 0, "a dry run downloaded objects");
+    assert!(!v.tree().join("big.bin").exists());
     v.ok(&["restore", "big.bin", c1]);
     assert_eq!(fs::read_to_string(v.tree().join("big.bin")).unwrap(), LARGE);
 

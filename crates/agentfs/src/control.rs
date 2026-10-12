@@ -72,6 +72,12 @@ pub struct Outcome {
     /// The operation's commit, if one was made.
     pub commit: Option<String>,
     pub dry_run: bool,
+    /// A dry run: LFS objects the plan writes that are not in the local
+    /// cache (a restore downloads them), and their total size.
+    #[serde(default)]
+    pub lfs_uncached: usize,
+    #[serde(default)]
+    pub lfs_uncached_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +439,8 @@ mod tests {
                 removed: 0,
                 commit: Some("c".into()),
                 dry_run: false,
+                lfs_uncached: 1,
+                lfs_uncached_bytes: 2,
             }),
             Reply::Refused {
                 kind: "unrecorded".into(),

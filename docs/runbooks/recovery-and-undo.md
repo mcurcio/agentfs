@@ -76,7 +76,7 @@ agentfs --state "$STATE" revert <commit>
 
 | Flag | Meaning |
 |---|---|
-| `--dry-run` | Print the plan, write nothing |
+| `--dry-run` | Print the plan, write nothing (and download no LFS object: those missing from the cache are counted) |
 | `--force` | `revert`: also revert paths changed again since `<commit>` (those later changes stay in history). Both: write files a workload holds open for writing through the mount |
 | `--root DIR` | The backing tree; needed only when no mount is running |
 | `--wait-lock D` | With no mount running: wait for the state-area lock |

@@ -19,9 +19,10 @@ use git2::{Index, IndexEntry, IndexTime, Oid, Repository, Signature, Time};
 
 use crate::checks::{Checks, Refusal};
 use crate::config::{ConfigError, Settings};
+use crate::events::CheckStage;
 use crate::identity::{Context, IdentityError, IdentityRenderer};
 use crate::lfs::{ObjectCache, Store, attributes};
-use crate::paths::RepoPath;
+use crate::paths::{RepoPath, SpecialFile};
 use crate::pending::PendingStore;
 use crate::record::{Change, Record};
 
@@ -50,8 +51,6 @@ pub enum HistoryError {
     MissingSeq(Oid),
     #[error("caching LFS content: {0}")]
     Lfs(#[source] io::Error),
-    #[error("the managed .gitattributes would be refused: {0}")]
-    ManagedAttributes(Refusal),
 }
 
 /// Process-wide libgit2 setup, done once before any repository is opened:
@@ -134,6 +133,12 @@ pub struct Committed {
     /// `None` when the records left the tree unchanged.
     pub commit: Option<Oid>,
     pub last_seq: u64,
+    /// Changes dropped at commit time because the managed `.gitattributes`
+    /// block could not be written otherwise (design §7), with why: raise
+    /// `PathRefused` with stage `commit` for each.
+    pub refused: Vec<(RepoPath, Refusal)>,
+    /// LFS writes stored as blobs for the same reason.
+    pub lfs_as_blobs: usize,
 }
 
 impl History {
@@ -211,36 +216,112 @@ impl History {
     /// history then gets its managed block rebuilt
     /// ([`crate::lfs::attributes`]). The cache object is durable before the
     /// branch moves.
+    ///
+    /// A pointer is only committed when its managed line can be written
+    /// too, so it never lands at a path no clone or upload treats as LFS.
+    /// When the block cannot be placed (the root `.gitattributes` is not a
+    /// regular file) or the composed file fails `checks` (design §3.4), the
+    /// commit falls back, step by step, and never fails for it:
+    ///
+    /// 1. this commit's LFS writes are stored as blobs, each checked
+    ///    against `checks` as a blob and dropped if refused;
+    /// 2. then its writes at or beneath the root `.gitattributes` are
+    ///    dropped too (refused with the composed file's reason), and the
+    ///    block is rebuilt on the head's file;
+    /// 3. then the head's root `.gitattributes` is kept as it is.
+    ///
+    /// Dropped changes are listed in [`Committed::refused`], for
+    /// `PathRefused` alarms with stage `commit`.
     pub fn commit(
         &self,
         records: &[Record],
         pending: &PendingStore,
         lfs: &ObjectCache,
+        checks: &Checks,
         identities: &IdentityRenderer,
         context: &Context,
     ) -> Result<Committed, HistoryError> {
         let last = records.last().expect("commit needs at least one record");
         let head = self.head()?;
-        let mut index = Index::new()?;
-        let mut managed = BTreeSet::new();
-        if let Some(head) = &head {
-            let tree = head.tree()?;
-            index.read_tree(&tree)?;
-            managed = attributes::managed_paths(&self.repo, &tree)?;
-        }
-        let mut written = Written::default();
-        for record in records {
-            for change in &record.draft.changes {
-                self.apply(&mut index, change, pending, lfs)?;
-                written.note(change);
+        let head_tree = head.as_ref().map(|h| h.tree()).transpose()?;
+        let managed = match &head_tree {
+            Some(tree) => attributes::managed_paths(&self.repo, tree)?,
+            None => BTreeSet::new(),
+        };
+        let changes: Vec<&Change> = records.iter().flat_map(|r| &r.draft.changes).collect();
+        let mut fallback = Fallback::None;
+        // Why the attributes could not be written, once they could not.
+        let mut attributes_refusal: Option<Refusal> = None;
+        let (mut index, refused, lfs_as_blobs) = loop {
+            let mut index = Index::new()?;
+            if let Some(tree) = &head_tree {
+                index.read_tree(tree)?;
             }
+            let lfs_as_blob = fallback >= Fallback::LfsAsBlobs;
+            let mut refused = Vec::new();
+            let mut lfs_as_blobs = 0;
+            let mut written = Written::default();
+            for change in &changes {
+                if let Some(reason) = &attributes_refusal
+                    && !matches!(change, Change::Remove { .. })
+                    && attributes::at_or_beneath_root(change.path())
+                {
+                    refused.push((change.path().clone(), reason.clone()));
+                    continue;
+                }
+                if lfs_as_blob
+                    && let Change::Write {
+                        path,
+                        pending: id,
+                        store: Store::Lfs,
+                        ..
+                    } = change
+                {
+                    let content = pending.path(*id);
+                    let refusal = checks.check_file_stored(
+                        path,
+                        &content,
+                        CheckStage::Commit,
+                        Store::Blob,
+                    )?;
+                    if let Some(refusal) = refusal {
+                        refused.push((path.clone(), refusal));
+                        continue;
+                    }
+                    lfs_as_blobs += 1;
+                }
+                self.apply(&mut index, change, pending, lfs, lfs_as_blob)?;
+                written.note(change, lfs_as_blob);
+            }
+            if fallback == Fallback::KeepHeadAttributes {
+                break (index, refused, lfs_as_blobs);
+            }
+            match self.update_managed_attributes(&mut index, &managed, &written, checks)? {
+                None => break (index, refused, lfs_as_blobs),
+                Some(refusal) => {
+                    fallback = match fallback {
+                        Fallback::None if !written.lfs.is_empty() => Fallback::LfsAsBlobs,
+                        Fallback::None | Fallback::LfsAsBlobs => {
+                            attributes_refusal = Some(refusal);
+                            Fallback::DropAttributes
+                        }
+                        Fallback::DropAttributes | Fallback::KeepHeadAttributes => {
+                            Fallback::KeepHeadAttributes
+                        }
+                    };
+                }
+            }
+        };
+        if fallback == Fallback::KeepHeadAttributes {
+            self.keep_head_attributes(&mut index, head_tree.as_ref())?;
         }
-        self.update_managed_attributes(&mut index, managed, &written)?;
         let tree_id = index.write_tree_to(&self.repo)?;
         if head.as_ref().is_some_and(|h| h.tree_id() == tree_id) {
             return Ok(Committed {
                 commit: None,
                 last_seq: last.seq,
+                refused,
+                lfs_as_blobs,
             });
         }
         let tree = self.repo.find_tree(tree_id)?;
@@ -273,15 +354,20 @@ impl History {
         Ok(Committed {
             commit: Some(commit),
             last_seq: last.seq,
+            refused,
+            lfs_as_blobs,
         })
     }
 
+    /// Applies `change` to `index`; with `lfs_as_blob`, an LFS write is
+    /// stored as a blob.
     fn apply(
         &self,
         index: &mut Index,
         change: &Change,
         pending: &PendingStore,
         lfs: &ObjectCache,
+        lfs_as_blob: bool,
     ) -> Result<(), HistoryError> {
         match change {
             Change::Remove { path } => remove_all(index, path)?,
@@ -292,6 +378,7 @@ impl History {
                 store,
             } => {
                 let blob = match store {
+                    Store::Lfs if lfs_as_blob => self.repo.blob_path(&pending.path(*id))?,
                     Store::Blob => self.repo.blob_path(&pending.path(*id))?,
                     Store::Lfs => {
                         let pointer = lfs
@@ -323,22 +410,28 @@ impl History {
     /// path stays managed while it is a regular file not since rewritten
     /// as a blob or symlink; the workload's own content is kept byte for
     /// byte, and any block it wrote is replaced.
+    ///
+    /// Returns why the block cannot be written, leaving `index` as it was:
+    /// the root `.gitattributes` is a symlink or directory while there are
+    /// paths to manage, or the composed file fails `checks`.
     fn update_managed_attributes(
         &self,
         index: &mut Index,
-        managed: BTreeSet<RepoPath>,
+        managed: &BTreeSet<RepoPath>,
         written: &Written,
-    ) -> Result<(), HistoryError> {
+        checks: &Checks,
+    ) -> Result<Option<Refusal>, HistoryError> {
         let is_file = |index: &Index, path: &RepoPath| {
             index
                 .get_path(Path::new(path.as_str()), 0)
                 .is_some_and(|e| matches!(e.mode, MODE_FILE | MODE_EXECUTABLE))
         };
         let paths: BTreeSet<RepoPath> = managed
-            .into_iter()
-            .filter(|p| !written.other.contains(p))
-            .chain(written.lfs.iter().cloned())
+            .iter()
+            .filter(|p| !written.other.contains(*p))
+            .chain(written.lfs.iter())
             .filter(|p| is_file(index, p))
+            .cloned()
             .collect();
         let root = Path::new(attributes::ROOT_GITATTRIBUTES);
         let existing = index.get_path(root, 0);
@@ -346,15 +439,21 @@ impl History {
             Some(e) if matches!(e.mode, MODE_FILE | MODE_EXECUTABLE) => {
                 (self.repo.find_blob(e.id)?.content().to_vec(), e.mode)
             }
-            // A symlinked .gitattributes is never recorded (design §3.4).
-            Some(_) => return Ok(()),
             // Nothing to add, nothing to remove: the common case.
-            None if paths.is_empty() => return Ok(()),
+            Some(_) | None if paths.is_empty() => return Ok(None),
+            // Not recorded since agentfs refuses it (design §3.4), but
+            // history may hold one from before.
+            Some(_) => {
+                return Ok(Some(Refusal::SymlinkedSpecialFile {
+                    file: SpecialFile::Gitattributes,
+                }));
+            }
             None => {
-                // A directory named .gitattributes: nowhere to put lines.
                 let dir = format!("{}/", attributes::ROOT_GITATTRIBUTES);
                 if index.iter().any(|e| e.path.starts_with(dir.as_bytes())) {
-                    return Ok(());
+                    return Ok(Some(Refusal::SpecialFileNotBlob {
+                        file: SpecialFile::Gitattributes,
+                    }));
                 }
                 (Vec::new(), MODE_FILE)
             }
@@ -362,22 +461,51 @@ impl History {
         let (user, _) = attributes::split(&content);
         let had_block = user.len() != content.len();
         if paths.is_empty() && !had_block {
-            return Ok(());
+            return Ok(None);
         }
         if paths.is_empty() && user.is_empty() {
             if existing.is_some() {
                 index.remove_path(root)?;
             }
-            return Ok(());
+            return Ok(None);
         }
         let composed = attributes::compose(&user, &paths);
-        let path =
-            RepoPath::new(attributes::ROOT_GITATTRIBUTES).expect(".gitattributes is a valid path");
-        if let Some(refusal) = Checks::default().check_blob(&path, &composed) {
-            return Err(HistoryError::ManagedAttributes(refusal));
+        let path = root_attributes_path();
+        if let Some(refusal) = checks.check_blob(&path, &composed) {
+            return Ok(Some(refusal));
         }
         let blob = self.repo.blob(&composed)?;
         index.add(&entry(&path, blob, mode))?;
+        Ok(None)
+    }
+
+    /// Puts the head's root `.gitattributes` back into `index` as it is,
+    /// the last resort of [`History::commit`] when no rebuilt block passes
+    /// the checks (for example after the limits were lowered).
+    fn keep_head_attributes(
+        &self,
+        index: &mut Index,
+        head_tree: Option<&git2::Tree<'_>>,
+    ) -> Result<(), HistoryError> {
+        let root = Path::new(attributes::ROOT_GITATTRIBUTES);
+        let head_entry = match head_tree.map(|t| t.get_path(root)) {
+            Some(Ok(e)) if matches!(e.filemode() as u32, MODE_FILE | MODE_EXECUTABLE) => Some(e),
+            Some(Ok(_)) | None => None,
+            Some(Err(e)) if e.code() == git2::ErrorCode::NotFound => None,
+            Some(Err(e)) => return Err(e.into()),
+        };
+        match head_entry {
+            Some(e) => {
+                let path = root_attributes_path();
+                make_room(index, &path)?;
+                index.add(&entry(&path, e.id(), e.filemode() as u32))?;
+            }
+            None => {
+                if index.get_path(root, 0).is_some() {
+                    index.remove_path(root)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -403,13 +531,15 @@ struct Written {
 }
 
 impl Written {
-    fn note(&mut self, change: &Change) {
+    /// Notes `change`; with `lfs_as_blob`, an LFS write was stored as a
+    /// blob.
+    fn note(&mut self, change: &Change, lfs_as_blob: bool) {
         match change {
             Change::Write {
                 path,
                 store: Store::Lfs,
                 ..
-            } => {
+            } if !lfs_as_blob => {
                 self.other.remove(path);
                 self.lfs.insert(path.clone());
             }
@@ -421,6 +551,24 @@ impl Written {
         }
     }
 }
+
+/// How far [`History::commit`] has fallen back because the managed block
+/// could not be written; each step includes the ones before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Fallback {
+    None,
+    /// This commit's LFS writes are stored as blobs.
+    LfsAsBlobs,
+    /// Its writes at or beneath the root `.gitattributes` are dropped.
+    DropAttributes,
+    /// The head's root `.gitattributes` is kept as it is.
+    KeepHeadAttributes,
+}
+
+fn root_attributes_path() -> RepoPath {
+    RepoPath::new(attributes::ROOT_GITATTRIBUTES).expect(".gitattributes is a valid path")
+}
+
 /// Removes `path` and everything beneath it.
 fn remove_all(index: &mut Index, path: &RepoPath) -> Result<(), git2::Error> {
     let p = Path::new(path.as_str());
@@ -619,6 +767,7 @@ mod tests {
         history: History,
         pending: PendingStore,
         lfs: ObjectCache,
+        checks: Checks,
         identities: IdentityRenderer,
         context: Context,
         seq: u64,
@@ -644,6 +793,7 @@ mod tests {
                 history,
                 pending,
                 lfs,
+                checks: Checks::default(),
                 identities,
                 context,
                 seq: 0,
@@ -695,6 +845,7 @@ mod tests {
                     records,
                     &self.pending,
                     &self.lfs,
+                    &self.checks,
                     &self.identities,
                     &self.context,
                 )
@@ -810,7 +961,9 @@ mod tests {
             again,
             Committed {
                 commit: None,
-                last_seq: r.seq
+                last_seq: r.seq,
+                refused: Vec::new(),
+                lfs_as_blobs: 0,
             }
         );
 
@@ -916,15 +1069,16 @@ mod tests {
             f.read(".gitattributes").unwrap().0,
             attributes_with(b"*.txt text\n", &["a.bin"])
         );
-        // The workload rewrites .gitattributes (with another forged block):
-        // its content is replaced, the managed block is not.
+        // The workload rewrites .gitattributes, with an unterminated BEGIN
+        // line: its content is replaced, that line kept as its own, and the
+        // managed block is not replaced.
         let rewritten = format!("*.md text\n{}\n/plain.bin x\n", attributes::BEGIN);
         let user = f.write(".gitattributes", rewritten.as_bytes(), false);
         let r = f.record(Trigger::Close, vec![user]);
         f.commit(&[r]);
         assert_eq!(
             f.read(".gitattributes").unwrap().0,
-            attributes_with(b"*.md text\n", &["a.bin"])
+            attributes_with(rewritten.as_bytes(), &["a.bin"])
         );
         // Removing .gitattributes keeps the block alone.
         let r = f.record(Trigger::Unlink, vec![remove(".gitattributes")]);
@@ -933,6 +1087,124 @@ mod tests {
             f.read(".gitattributes").unwrap().0,
             attributes_with(b"", &["a.bin"])
         );
+    }
+
+    fn limited(bytes: u64) -> Checks {
+        Checks::new(crate::checks::Limits {
+            max_blob_size: Some(crate::checks::BlobLimit {
+                bytes,
+                remote: "r".into(),
+            }),
+        })
+    }
+
+    fn is_pointer(f: &Fixture, path: &str) -> bool {
+        Pointer::parse(&f.read(path).unwrap().0).is_some()
+    }
+
+    #[test]
+    fn lfs_writes_are_blobs_while_the_root_gitattributes_is_a_directory() {
+        let mut f = Fixture::new();
+        // History from before the gitattributesBlob check holds a
+        // directory named .gitattributes.
+        let dir = f.write(".gitattributes/x", b"hi\n", false);
+        let r = f.record(Trigger::Close, vec![dir]);
+        f.commit(&[r]);
+        let big = f.write_lfs("big.bin", b"0123456789abcdef");
+        let r = f.record(Trigger::Close, vec![big]);
+        let done = f.commit(&[r]);
+        assert_eq!((done.lfs_as_blobs, done.refused.len()), (1, 0));
+        // No pointer without its managed line: the content is a blob.
+        assert_eq!(f.read("big.bin").unwrap().0, b"0123456789abcdef");
+        assert_eq!(f.read(".gitattributes/x").unwrap().0, b"hi\n");
+        // Over the blob limit, it is refused instead.
+        f.checks = limited(8);
+        let huge = f.write_lfs("huge.bin", b"0123456789abcdef!");
+        let small = f.write("small.txt", b"ok", false);
+        let r = f.record(Trigger::Close, vec![huge, small]);
+        let done = f.commit(&[r]);
+        assert!(done.commit.is_some());
+        assert_eq!(done.lfs_as_blobs, 0);
+        assert!(
+            matches!(&done.refused[..], [(p, Refusal::BlobTooLarge { bytes: 17, .. })] if p.as_str() == "huge.bin"),
+            "{:?}",
+            done.refused
+        );
+        assert_eq!(f.read("huge.bin"), None);
+        assert_eq!(f.read("small.txt").unwrap().0, b"ok");
+        // Once the directory is gone, LFS writes are pointers again, with
+        // their lines.
+        f.checks = Checks::default();
+        let r = f.record(Trigger::Unlink, vec![remove(".gitattributes")]);
+        f.commit(&[r]);
+        let again = f.write_lfs("big.bin", b"0123456789abcdef");
+        let r = f.record(Trigger::Close, vec![again]);
+        let done = f.commit(&[r]);
+        assert_eq!(done.lfs_as_blobs, 0);
+        assert!(is_pointer(&f, "big.bin"));
+        assert_eq!(
+            f.read(".gitattributes").unwrap().0,
+            attributes_with(b"", &["big.bin"])
+        );
+    }
+
+    #[test]
+    fn a_too_large_composed_gitattributes_never_blocks_commits() {
+        let mut f = Fixture::new();
+        let block = attributes_with(b"", &["big.bin"]).len() as u64;
+        // The workload's .gitattributes fits the limit, but not with a
+        // block: the LFS write becomes a blob and the commit goes ahead.
+        f.checks = limited(block + 10);
+        let user = vec![b'#'; 40]
+            .into_iter()
+            .chain(*b"\n")
+            .collect::<Vec<u8>>();
+        let attrs = f.write(".gitattributes", &user, false);
+        let big = f.write_lfs("big.bin", b"0123456789abcdef");
+        let r = f.record(Trigger::Close, vec![attrs, big]);
+        let done = f.commit(&[r]);
+        assert!(done.commit.is_some());
+        assert_eq!((done.lfs_as_blobs, done.refused.len()), (1, 0));
+        assert_eq!(f.read(".gitattributes").unwrap().0, user);
+        assert_eq!(f.read("big.bin").unwrap().0, b"0123456789abcdef");
+
+        // With a managed path in history, a .gitattributes that leaves no
+        // room for its block is dropped (refused at commit time); the
+        // rest of the commit, LFS writes as blobs, goes ahead.
+        let mut f = Fixture::new();
+        let big = f.write_lfs("big.bin", b"0123456789abcdef");
+        let r = f.record(Trigger::Close, vec![big]);
+        f.commit(&[r]);
+        let head_attrs = f.read(".gitattributes").unwrap().0;
+        f.checks = limited(block + 10);
+        let attrs = f.write(".gitattributes", &user, false);
+        let other = f.write_lfs("other.bin", b"fedcba9876543210");
+        let small = f.write("small.txt", b"ok", false);
+        let r = f.record(Trigger::Close, vec![attrs, other, small]);
+        let done = f.commit(&[r]);
+        assert!(done.commit.is_some());
+        assert_eq!(done.lfs_as_blobs, 1);
+        assert!(
+            matches!(&done.refused[..], [(p, Refusal::BlobTooLarge { .. })] if p.as_str() == ".gitattributes"),
+            "{:?}",
+            done.refused
+        );
+        assert_eq!(f.read(".gitattributes").unwrap().0, head_attrs);
+        assert_eq!(f.read("other.bin").unwrap().0, b"fedcba9876543210");
+        assert_eq!(f.read("small.txt").unwrap().0, b"ok");
+        assert!(is_pointer(&f, "big.bin"));
+
+        // The limit lowered below the head's own .gitattributes: it is
+        // kept as it is, and commits still go ahead.
+        f.checks = limited(16);
+        let more = f.write("more.txt", b"ok", false);
+        let r = f.record(Trigger::Close, vec![more]);
+        let done = f.commit(&[r]);
+        assert!(done.commit.is_some());
+        assert!(done.refused.is_empty());
+        assert_eq!(f.read(".gitattributes").unwrap().0, head_attrs);
+        assert_eq!(f.read("more.txt").unwrap().0, b"ok");
+        assert!(is_pointer(&f, "big.bin"));
     }
 
     #[test]

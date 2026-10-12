@@ -29,9 +29,11 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 
+use agentfs_core::config::Settings;
 use agentfs_core::confined::{self, Dir, Kind};
 use agentfs_core::history::{History, seq_from_message};
-use agentfs_core::lfs::fetch::Fetcher;
+use agentfs_core::lfs::ObjectCache;
+use agentfs_core::lfs::fetch::{CacheProbe, Fetcher, LfsObjects};
 use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::restore::{
@@ -122,6 +124,39 @@ impl Ask {
     }
 }
 
+/// Where a plan's LFS content comes from (design §7, §15): the cache, else
+/// the remotes; a dry run only looks in the cache, so it downloads and
+/// writes nothing.
+enum Objects {
+    Fetch(Box<Fetcher>),
+    Probe(CacheProbe),
+}
+
+impl Objects {
+    fn new(state: &StateDir, settings: &Settings, dry_run: bool) -> std::io::Result<Self> {
+        Ok(if dry_run {
+            Self::Probe(CacheProbe::new(ObjectCache::at(state.lfs())?))
+        } else {
+            Self::Fetch(Box::new(Fetcher::new(state, settings)?))
+        })
+    }
+
+    fn get(&self) -> &dyn LfsObjects {
+        match self {
+            Self::Fetch(f) => f.as_ref(),
+            Self::Probe(p) => p,
+        }
+    }
+
+    /// Objects a dry run found missing from the cache, and their size.
+    fn uncached(&self) -> (usize, u64) {
+        match self {
+            Self::Fetch(_) => (0, 0),
+            Self::Probe(p) => p.uncached(),
+        }
+    }
+}
+
 /// The plan as listed to the operator.
 pub fn plan_lines(plan: &Plan) -> Vec<String> {
     plan.steps
@@ -136,6 +171,13 @@ pub fn report(done: &Outcome) {
         println!("  {line}");
     }
     if done.dry_run {
+        if done.lfs_uncached > 0 {
+            println!(
+                "{} LFS object(s), {} bytes, not in the local cache: a real run downloads \
+                 them from the remotes (not checked by a dry run)",
+                done.lfs_uncached, done.lfs_uncached_bytes
+            );
+        }
         println!(
             "dry run: {} change(s) planned, nothing written",
             done.plan.len()
@@ -267,14 +309,15 @@ fn direct(
     let tree = Dir::open(root).with_context(|| format!("opening {}", root.display()))?;
     let history = committer.history();
     // LFS content comes from the cache, else from the remotes (design §7).
-    let objects = Fetcher::new(state, history.settings()).context("opening the LFS cache")?;
+    let objects =
+        Objects::new(state, history.settings(), ask.dry_run).context("opening the LFS cache")?;
     let checked = restore::plan(history.repo(), &history.settings().branch_ref, &ask.request)
         .and_then(|plan| {
             restore::check(
                 plan,
                 history.repo(),
                 &recorder,
-                &objects,
+                objects.get(),
                 &tree,
                 &NotLive,
                 ask.force,
@@ -291,6 +334,8 @@ fn direct(
     let mut done = Outcome {
         plan: plan_lines(&plan),
         dry_run: ask.dry_run,
+        lfs_uncached: objects.uncached().0,
+        lfs_uncached_bytes: objects.uncached().1,
         ..Outcome::default()
     };
     if ask.dry_run || plan.steps.is_empty() {
@@ -307,11 +352,17 @@ fn direct(
         me,
         &[me.pid],
     )?;
-    let (applied, failure) =
-        match restore::apply(&plan, history.repo(), &objects, &tree, &NotLive, ask.force) {
-            Ok(applied) => (applied, None),
-            Err(e) => (e.applied.clone(), Some(e)),
-        };
+    let (applied, failure) = match restore::apply(
+        &plan,
+        history.repo(),
+        objects.get(),
+        &tree,
+        &NotLive,
+        ask.force,
+    ) {
+        Ok(applied) => (applied, None),
+        Err(e) => (e.applied.clone(), Some(e)),
+    };
     // A path the failure left changed (a write cut short) is recorded as it
     // is, so the tree matches history again and a re-run can finish it.
     let mut to_record = applied.clone();
@@ -465,11 +516,21 @@ impl Daemon {
         let tree = Dir::open(self.view.mountpoint())?;
         let plan = restore::plan(repo, &history.settings().branch_ref, &ask.request)?;
         let live: &dyn Liveness = &self.view;
-        let objects = Fetcher::new(&self.state, history.settings())?;
-        let plan = restore::check(plan, repo, &self.recorder, &objects, &tree, live, ask.force)?;
+        let objects = Objects::new(&self.state, history.settings(), ask.dry_run)?;
+        let plan = restore::check(
+            plan,
+            repo,
+            &self.recorder,
+            objects.get(),
+            &tree,
+            live,
+            ask.force,
+        )?;
         let mut done = Outcome {
             plan: plan_lines(&plan),
             dry_run: ask.dry_run,
+            lfs_uncached: objects.uncached().0,
+            lfs_uncached_bytes: objects.uncached().1,
             ..Outcome::default()
         };
         if ask.dry_run || plan.steps.is_empty() {
@@ -492,7 +553,7 @@ impl Daemon {
                 &[tid, std::process::id()],
             )
             .map_err(other)?;
-        let result = restore::apply(&plan, repo, &objects, &tree, live, ask.force);
+        let result = restore::apply(&plan, repo, objects.get(), &tree, live, ask.force);
         let last = guard.finish();
         let applied = match &result {
             Ok(applied) => applied.clone(),

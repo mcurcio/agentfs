@@ -960,10 +960,36 @@ impl Committer {
                 &checked,
                 &self.pending,
                 &self.lfs,
+                &self.checks,
                 &self.identities,
                 &self.context,
             ) {
-                Ok(Committed { commit, last_seq }) => {
+                Ok(Committed {
+                    commit,
+                    last_seq,
+                    refused,
+                    lfs_as_blobs,
+                }) => {
+                    // The managed .gitattributes block could not be
+                    // written as is (design §7): changes dropped, LFS
+                    // content stored as blobs.
+                    if !refused.is_empty() {
+                        report.refused += refused.len();
+                        span.set(KeyValue::new(
+                            "agentfs.refused.attributes",
+                            refused.len() as i64,
+                        ));
+                    }
+                    for (path, reason) in refused {
+                        self.events.emit(Event::PathRefused {
+                            path: path.to_string(),
+                            reason,
+                            stage: CheckStage::Commit,
+                        });
+                    }
+                    if lfs_as_blobs > 0 {
+                        span.set(KeyValue::new("agentfs.lfs_as_blobs", lfs_as_blobs as i64));
+                    }
                     report.records += group.len();
                     report.commits += usize::from(commit.is_some());
                     report.last_seq = Some(last_seq);
@@ -1298,6 +1324,7 @@ mod tests {
                     &records,
                     &com.pending,
                     &com.lfs,
+                    &com.checks,
                     &com.identities,
                     &com.context,
                 )
@@ -1619,9 +1646,11 @@ mod tests {
 
     #[test]
     fn the_blob_limit_does_not_apply_to_lfs_content() {
+        // The limit still leaves room for the managed .gitattributes, a
+        // blob like any other.
         let (dir, state) = setup();
-        set_remote_limit(&state, "r", 5);
-        set_lfs_threshold(&state, 8);
+        set_remote_limit(&state, "r", 200);
+        set_lfs_threshold(&state, 250);
         fs::write(
             state.git().join("info/attributes"),
             "keep agentfs.store=blob\n",
@@ -1641,9 +1670,9 @@ mod tests {
                 Trigger::Close,
                 CALLER,
                 vec![
-                    write(dir.path(), "large", "0123456789abcdefghij"),
-                    write(dir.path(), "keep", "0123456789abcdefghij"),
-                    write(dir.path(), "mid", "0123456"),
+                    write(dir.path(), "large", &"l".repeat(300)),
+                    write(dir.path(), "keep", &"k".repeat(300)),
+                    write(dir.path(), "mid", &"m".repeat(220)),
                 ],
             )
             .unwrap();
@@ -1666,7 +1695,7 @@ mod tests {
     #[test]
     fn the_commit_time_recheck_honours_the_journaled_store() {
         let (dir, state) = setup();
-        set_lfs_threshold(&state, 8);
+        set_lfs_threshold(&state, 250);
         {
             let (rec, _, _) =
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
@@ -1674,15 +1703,15 @@ mod tests {
                 Trigger::Close,
                 CALLER,
                 vec![
-                    write(dir.path(), "large", "0123456789abcdefghij"),
-                    write(dir.path(), "small", "01234567"),
+                    write(dir.path(), "large", &"l".repeat(300)),
+                    write(dir.path(), "small", &"s".repeat(220)),
                 ],
             )
             .unwrap();
             // Crash before committing; the remount brings a strict remote
             // and no threshold.
         }
-        set_remote_limit(&state, "r", 5);
+        set_remote_limit(&state, "r", 200);
         git2::Config::open(&state.git().join("config"))
             .unwrap()
             .remove("agentfs.lfsThreshold")
@@ -1700,6 +1729,94 @@ mod tests {
         assert_eq!(report.refused, 1, "only the blob over the limit");
         assert_eq!(tree_paths(&com), [".gitattributes", "large"]);
         assert!(Pointer::parse(&blob(&com, "large")).is_some());
+    }
+
+    #[test]
+    fn lfs_content_never_lands_without_its_managed_line() {
+        let (dir, state) = setup();
+        set_lfs_threshold(&state, 8);
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        // A directory named .gitattributes is refused at record time
+        // (gitattributesBlob), so the block always has a place.
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![
+                    write(dir.path(), ".gitattributes/x", "hi\n"),
+                    write(dir.path(), "big.bin", "0123456789abcdef"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            recorded.skipped,
+            [skipped(
+                ".gitattributes/x",
+                SkipReason::Refused(Refusal::SpecialFileNotBlob {
+                    file: crate::paths::SpecialFile::Gitattributes,
+                })
+            )]
+        );
+        sink.take();
+        com.commit_pending().unwrap();
+        assert!(Pointer::parse(&blob(&com, "big.bin")).is_some());
+        assert_eq!(tree_paths(&com), [".gitattributes", "big.bin"]);
+
+        // A .gitattributes that fits the limit alone, but not with the
+        // block: dropped at commit time with an alarm, and later records
+        // still commit.
+        set_remote_limit(&state, "r", 200);
+        drop((rec, com));
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        let before = blob(&com, ".gitattributes");
+        let user = format!("{}\n", "#".repeat(150));
+        rec.record(
+            Trigger::Close,
+            CALLER,
+            vec![
+                write(dir.path(), ".gitattributes", &user),
+                write(dir.path(), "other.bin", "fedcba9876543210"),
+            ],
+        )
+        .unwrap();
+        let report = com.commit_pending().unwrap();
+        assert_eq!((report.commits, report.refused), (1, 1));
+        let events = sink.take();
+        assert!(
+            matches!(
+                &events[..],
+                [Event::PathRefused { path, stage: CheckStage::Commit, reason: Refusal::BlobTooLarge { .. } }]
+                    if path == ".gitattributes"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(blob(&com, ".gitattributes"), before);
+        // Stored as a blob: no pointer without its line.
+        assert_eq!(blob(&com, "other.bin"), b"fedcba9876543210");
+        rec.record(
+            Trigger::Close,
+            CALLER,
+            vec![write(dir.path(), "small.txt", "ok")],
+        )
+        .unwrap();
+        let report = com.commit_pending().unwrap();
+        assert_eq!(report.commits, 1);
+        assert_eq!(com.backlog(), 0);
     }
 
     fn blob(com: &Committer, path: &str) -> Vec<u8> {
