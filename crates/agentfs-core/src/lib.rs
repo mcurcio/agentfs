@@ -20,6 +20,7 @@ pub mod identity;
 pub mod journal;
 pub mod lock;
 pub mod nested;
+pub mod operations;
 pub mod paths;
 pub mod pending;
 pub mod probe;

@@ -86,6 +86,47 @@ impl Change {
     }
 }
 
+/// What an operator operation does (design §15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    /// Paths brought back to their state in a commit.
+    Restore,
+    /// A commit's changes undone.
+    Revert,
+}
+
+impl OperationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Restore => "restore",
+            Self::Revert => "revert",
+        }
+    }
+
+    /// The commit trailer naming the operation's source commit.
+    pub fn trailer(self) -> &'static str {
+        match self {
+            Self::Restore => "Agentfs-Restore",
+            Self::Revert => "Agentfs-Revert",
+        }
+    }
+}
+
+/// An operator restore or revert that records belong to (design §15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Operation {
+    /// Tells one operation's records from the next one's.
+    pub id: u64,
+    pub kind: OperationKind,
+    /// The full id of the commit restored from, or reverted.
+    pub source: String,
+    /// The commit subject, e.g. `restore src from 1a2b3c4`.
+    pub summary: String,
+    /// The operator who asked for it: the author of its commit.
+    pub caller: Caller,
+}
+
 /// A change boundary as given to the journal, before it has a sequence number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
@@ -95,6 +136,10 @@ pub struct Draft {
     pub time_ms: u64,
     /// Applied together: a rename is a removal plus a write.
     pub changes: Vec<Change>,
+    /// The operator operation this record is part of, if any. Absent from
+    /// older journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
 }
 
 /// A durable journal record.

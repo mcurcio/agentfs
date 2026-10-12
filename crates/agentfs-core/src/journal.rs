@@ -184,6 +184,22 @@ impl Journal {
             .len()
     }
 
+    /// The last sequence number handed out, whether its record is durable
+    /// yet or not; `None` before the first.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.lock().next_seq.checked_sub(1)
+    }
+
+    /// The lowest sequence number durable but not yet in history.
+    pub fn oldest_uncommitted(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .uncommitted
+            .first()
+            .map(|r| r.seq)
+    }
+
     /// Durable records not yet committed to history, in sequence order.
     pub fn uncommitted(&self) -> Vec<Record> {
         self.lock().uncommitted.clone()
@@ -341,6 +357,7 @@ mod tests {
             changes: vec![Change::Remove {
                 path: RepoPath::new(path).unwrap(),
             }],
+            operation: None,
         }
     }
 
@@ -524,6 +541,44 @@ mod tests {
             j.uncommitted().iter().map(|r| r.seq).collect::<Vec<_>>(),
             [seq]
         );
+    }
+
+    #[test]
+    fn records_from_before_operations_still_decode() {
+        // A frame as journals written before `operation` existed hold it.
+        let payload = br#"{"seq":7,"trigger":"close","caller":{"uid":1,"gid":2,"pid":3},"time_ms":5,"changes":[{"op":"remove","path":"a"}]}"#;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC);
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+        frame.extend_from_slice(payload);
+        let (records, valid) = decode_all(&frame);
+        assert_eq!(valid, frame.len());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].seq, 7);
+        assert_eq!(records[0].draft.operation, None);
+
+        // And records without an operation are written the old way.
+        let mut out = Vec::new();
+        encode(&records[0], &mut out).unwrap();
+        assert_eq!(out, frame);
+    }
+
+    #[test]
+    fn last_and_oldest_sequence_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (j, _) = Journal::open(dir.path().join("journal"), 0, no_hook()).unwrap();
+        assert_eq!((j.last_seq(), j.oldest_uncommitted()), (None, None));
+        for path in ["a", "b", "c"] {
+            j.record(draft(path)).unwrap();
+        }
+        assert_eq!((j.last_seq(), j.oldest_uncommitted()), (Some(2), Some(0)));
+        j.truncate_through(1).unwrap();
+        assert_eq!((j.last_seq(), j.oldest_uncommitted()), (Some(2), Some(2)));
+        j.truncate_through(2).unwrap();
+        assert_eq!((j.last_seq(), j.oldest_uncommitted()), (Some(2), None));
+        let (j, _) = Journal::open(dir.path().join("other"), 42, no_hook()).unwrap();
+        assert_eq!(j.last_seq(), Some(41));
     }
 
     #[test]

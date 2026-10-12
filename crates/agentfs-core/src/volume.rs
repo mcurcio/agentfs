@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::KeyValue;
 
@@ -35,9 +35,10 @@ use crate::history::{Committed, History, HistoryError};
 use crate::identity::{Context, IdentityRenderer};
 use crate::journal::{Journal, OpenReport};
 use crate::nested;
+use crate::operations::{ActorBusy, OperationGuard, Operations};
 use crate::paths::{PathError, RepoPath};
 use crate::pending::{PendingId, PendingStore};
-use crate::record::{Caller, Change, Draft, Record, Trigger};
+use crate::record::{Caller, Change, Draft, Operation, OperationKind, Record, Trigger};
 use crate::rules::{Decision, Rules, RulesError, SkipReason};
 use crate::telemetry::{Telemetry, spans};
 use crate::tracked::Tracked;
@@ -156,6 +157,8 @@ pub enum VolumeError {
     Path(#[from] PathError),
     #[error(transparent)]
     Rules(#[from] RulesError),
+    #[error(transparent)]
+    ActorBusy(#[from] ActorBusy),
 }
 
 /// One path's new state, as the FUSE layer sees it.
@@ -266,6 +269,7 @@ pub fn open(
         tracked.apply(change);
     }
 
+    let operations = Arc::new(Operations::default());
     let journal = Arc::new(journal);
     telemetry.observe_journal(Arc::downgrade(&journal));
     let recovery = Recovery {
@@ -276,6 +280,7 @@ pub fn open(
     };
     let recorder = Recorder {
         journal: journal.clone(),
+        operations: operations.clone(),
         pending: pending.clone(),
         rules: rules.clone(),
         tracked: Arc::new(tracked),
@@ -287,6 +292,7 @@ pub fn open(
     let committer = Committer {
         history,
         journal,
+        operations,
         pending,
         identities,
         context,
@@ -359,6 +365,7 @@ pub struct Recorded {
 #[derive(Clone)]
 pub struct Recorder {
     journal: Arc<Journal>,
+    operations: Arc<Operations>,
     pending: Arc<PendingStore>,
     rules: Arc<Rules>,
     tracked: Arc<Tracked>,
@@ -402,6 +409,15 @@ impl Recorder {
         inputs: Vec<Input>,
     ) -> Result<Recorded, VolumeError> {
         let start = Instant::now();
+        // A record by an operation's actor is part of that operation (design
+        // §15): trigger `restore`, made by the operator who asked for it.
+        let actor = caller.pid;
+        let operation = self.operations.of_actor(actor);
+        let (trigger, caller) = match &operation {
+            Some(op) => (Trigger::Restore, op.caller),
+            None => (trigger, caller),
+        };
+        let in_operation = operation.is_some();
         let span = self.telemetry.span(spans::RECORD, || {
             vec![
                 KeyValue::new("agentfs.trigger", trigger.as_str()),
@@ -411,11 +427,14 @@ impl Recorder {
             ]
         });
         let paths: Vec<RepoPath> = inputs.iter().map(|i| i.path().clone()).collect();
-        let result = self.record_inner(trigger, caller, inputs);
+        let result = self.record_inner(trigger, caller, inputs, operation);
         match &result {
             Ok(recorded) => {
                 if let Some(seq) = recorded.seq {
                     span.set(KeyValue::new("agentfs.seq", seq as i64));
+                    if in_operation {
+                        self.operations.recorded(actor, seq);
+                    }
                 }
                 span.set(KeyValue::new(
                     "agentfs.skipped",
@@ -442,6 +461,7 @@ impl Recorder {
         trigger: Trigger,
         caller: Caller,
         inputs: Vec<Input>,
+        operation: Option<Operation>,
     ) -> Result<Recorded, VolumeError> {
         let _claim = self.claims.claim(inputs.iter().map(Input::path));
         let mut kept = Vec::with_capacity(inputs.len());
@@ -514,6 +534,7 @@ impl Recorder {
                 caller,
                 time_ms: now_ms(),
                 changes: changes.clone(),
+                operation,
             };
             Ok(Some(self.journal.record(draft)?))
         })();
@@ -555,6 +576,74 @@ impl Recorder {
         });
     }
 
+    /// Starts an operator operation (design §15). Until the guard is
+    /// finished or dropped, every record whose caller pid is one of
+    /// `actors` is part of it: trigger `restore`, `caller` as its author,
+    /// and the operation in the journal record, so the committer gives it
+    /// its own commit. Fails if an actor is already part of one.
+    pub fn begin_operation(
+        &self,
+        kind: OperationKind,
+        source: String,
+        summary: String,
+        caller: Caller,
+        actors: &[u32],
+    ) -> Result<OperationGuard, VolumeError> {
+        let op = Operation {
+            id: self.operations.next_id(now_ms()),
+            kind,
+            source,
+            summary,
+            caller,
+        };
+        Ok(self.operations.begin(op, actors)?)
+    }
+
+    /// Why a write at `path` (a regular file, or a symlink to
+    /// `symlink_target`) would not be recorded now, if it would not: the
+    /// path rules, given whether the path is tracked (design §4, §5), and
+    /// the checks on the path and symlink target (§3.4). A file's content
+    /// is checked with [`Checks::check_blob`].
+    pub fn would_record(
+        &self,
+        path: &RepoPath,
+        symlink_target: Option<&str>,
+    ) -> Result<Option<SkipReason>, VolumeError> {
+        if let Decision::Skip(reason) = self.rules.decide(path, self.tracked.contains(path))? {
+            return Ok(Some(reason));
+        }
+        let refusal = match symlink_target {
+            Some(target) => self.checks.check_symlink(path, target),
+            None => self.checks.check_path(path),
+        };
+        Ok(refusal.map(SkipReason::Refused))
+    }
+
+    /// The pre-commit checks in force.
+    pub fn checks(&self) -> &Checks {
+        &self.checks
+    }
+
+    /// The last sequence number given to a record, journaled or in flight.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.journal.last_seq()
+    }
+
+    /// Waits up to `timeout` until every record up to `seq` is in history
+    /// (or failed and was never journaled). Returns whether they all are.
+    pub fn wait_committed(&self, seq: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.journal.oldest_uncommitted().is_none_or(|o| o > seq) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Where this volume's events go.
     pub fn events(&self) -> &Events {
         &self.events
@@ -580,6 +669,7 @@ impl Recorder {
 pub struct Committer {
     history: History,
     journal: Arc<Journal>,
+    operations: Arc<Operations>,
     pending: Arc<PendingStore>,
     identities: IdentityRenderer,
     context: Context,
@@ -624,7 +714,9 @@ impl Committer {
 
     /// Like [`Committer::commit_pending`], but leaves the last group alone
     /// while more records could still join it: until `now_ms` is past its
-    /// first record's time plus the commit window. A group whose first
+    /// first record's time plus the commit window. An operation's
+    /// group is left alone while the operation runs and settles as soon as
+    /// it ends. A group whose first
     /// record is later than `now_ms` (the clock stepped back) counts as
     /// settled, so a clock step cannot stall commits.
     pub fn commit_settled(&self, now_ms: u64) -> Result<CommitReport, VolumeError> {
@@ -633,7 +725,11 @@ impl Committer {
         let mut groups = group_by_window(&records, window_ms);
         if let Some(last) = groups.last() {
             let first = last[0].draft.time_ms;
-            let settled = now_ms > first.saturating_add(window_ms) || now_ms < first;
+            let settled = match &last[0].draft.operation {
+                // An operation's group grows until it ends (design §15).
+                Some(op) => !self.operations.is_active(op.id),
+                None => now_ms > first.saturating_add(window_ms) || now_ms < first,
+            };
             if !settled {
                 groups.pop();
             }
@@ -854,13 +950,24 @@ fn in_tree(tree: Option<&git2::Tree<'_>>, path: &RepoPath) -> Result<bool, Volum
 }
 
 /// Splits records into runs where each record is within `window_ms` of the
-/// run's first record.
+/// run's first record. Records of an operator operation (design §15) form
+/// runs of their own, however long the operation takes; workload records
+/// interleaved with them (a live restore) split them, since commits
+/// follow the journal's order.
 fn group_by_window(records: &[Record], window_ms: u64) -> Vec<&[Record]> {
+    let op = |r: &Record| r.draft.operation.as_ref().map(|o| o.id);
     let mut groups = Vec::new();
     let mut start = 0;
     for i in 1..records.len() {
-        let first = records[start].draft.time_ms;
-        if records[i].draft.time_ms.saturating_sub(first) > window_ms {
+        let first = &records[start];
+        let split = if op(&records[i]) != op(first) {
+            true
+        } else if op(first).is_some() {
+            false
+        } else {
+            records[i].draft.time_ms.saturating_sub(first.draft.time_ms) > window_ms
+        };
+        if split {
             groups.push(&records[start..i]);
             start = i;
         }
@@ -1499,6 +1606,7 @@ mod tests {
                 caller: CALLER,
                 time_ms,
                 changes: vec![change.clone()],
+                operation: None,
             })
             .unwrap();
         rec.tracked.apply(&change);
@@ -1538,6 +1646,238 @@ mod tests {
         assert_eq!(report.records, 1);
         assert_eq!(com.backlog(), 0);
         assert_eq!(tree_paths(&com), ["a", "b", "c", "d"]);
+    }
+
+    const OPERATOR: Caller = Caller {
+        uid: 0,
+        gid: 0,
+        pid: 4242,
+    };
+
+    fn begin(rec: &Recorder, actors: &[u32]) -> OperationGuard {
+        rec.begin_operation(
+            OperationKind::Restore,
+            "0123456789abcdef0123456789abcdef01234567".into(),
+            "restore a from 0123456".into(),
+            OPERATOR,
+            actors,
+        )
+        .unwrap()
+    }
+
+    fn head_message(com: &Committer) -> String {
+        let head = com.history().head().unwrap().unwrap();
+        head.message().unwrap().to_owned()
+    }
+
+    #[test]
+    fn records_by_an_actor_are_part_of_the_operation() {
+        let (dir, state) = setup();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let actor = Caller { pid: 77, ..CALLER };
+        let guard = begin(&rec, &[77]);
+        assert!(matches!(
+            rec.begin_operation(
+                OperationKind::Revert,
+                "x".into(),
+                "y".into(),
+                OPERATOR,
+                &[77]
+            ),
+            Err(VolumeError::ActorBusy(_))
+        ));
+        let a = rec
+            .record(Trigger::Close, actor, vec![write(dir.path(), "a", "1")])
+            .unwrap()
+            .seq
+            .unwrap();
+        let other = rec
+            .record(Trigger::Close, CALLER, vec![write(dir.path(), "b", "2")])
+            .unwrap()
+            .seq
+            .unwrap();
+        assert_eq!(guard.last_seq(), Some(a));
+        let records = com.journal.uncommitted();
+        assert_eq!(records[0].draft.trigger, Trigger::Restore);
+        assert_eq!(records[0].draft.caller, OPERATOR);
+        assert_eq!(
+            records[0].draft.operation.as_ref().map(|o| o.id),
+            Some(guard.operation().id)
+        );
+        assert_eq!(records[1].seq, other);
+        assert_eq!(records[1].draft.trigger, Trigger::Close);
+        assert_eq!(records[1].draft.caller, CALLER);
+        assert_eq!(records[1].draft.operation, None);
+        assert_eq!(guard.finish(), Some(a));
+        // After the operation, the actor is an ordinary caller again.
+        rec.record(Trigger::Close, actor, vec![write(dir.path(), "c", "3")])
+            .unwrap();
+        assert_eq!(com.journal.uncommitted()[2].draft.operation, None);
+    }
+
+    #[test]
+    fn an_operation_is_its_own_commit() {
+        let (dir, state) = setup();
+        set_window(&state, "10s");
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let t = 1_700_000_000_000;
+        let actor = Caller { pid: 77, ..CALLER };
+        record_at(&rec, dir.path(), "before", t);
+        let guard = begin(&rec, &[77]);
+        rec.record(Trigger::Close, actor, vec![write(dir.path(), "a", "1")])
+            .unwrap();
+        rec.record(Trigger::Unlink, actor, vec![remove("before")])
+            .unwrap();
+        // Held while the operation runs, however long it takes.
+        let report = com.commit_settled(now_ms() + 60_000).unwrap();
+        assert_eq!((report.records, report.commits), (1, 1), "only `before`");
+        assert_eq!(com.backlog(), 2);
+        guard.finish();
+        let report = com.commit_settled(now_ms()).unwrap();
+        assert_eq!((report.records, report.commits), (2, 1), "settled at once");
+        assert_eq!(tree_paths(&com), ["a"]);
+
+        let head = com.history().head().unwrap().unwrap();
+        assert_eq!(head.author().name().unwrap(), "uid-0");
+        let message = head_message(&com);
+        assert!(
+            message.starts_with("restore a from 0123456\n\n"),
+            "{message}"
+        );
+        for line in [
+            "write   a\n",
+            "remove  before\n",
+            "Agentfs-Trigger: restore\nAgentfs-Restore: 0123456789abcdef0123456789abcdef01234567\n",
+            "Agentfs-Uid: 0\n",
+            "Agentfs-Pid: 4242\n",
+        ] {
+            assert!(message.contains(line), "{line:?} in {message}");
+        }
+        assert!(!message.contains("Agentfs-Uid: 10000"), "{message}");
+    }
+
+    #[test]
+    fn grouping_isolates_operations() {
+        let (dir, state) = setup();
+        let (rec, _com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let mut records = Vec::new();
+        let t = 1_700_000_000_000;
+        let op = |id| Operation {
+            id,
+            kind: OperationKind::Revert,
+            source: "s".into(),
+            summary: "revert s".into(),
+            caller: OPERATOR,
+        };
+        for (i, (time, operation)) in [
+            (t, None),
+            (t + 1, Some(op(1))),
+            (t + 2, Some(op(1))),
+            (t + 50_000, Some(op(1))),
+            (t + 50_001, None),
+            (t + 50_002, Some(op(1))),
+            (t + 50_003, Some(op(2))),
+            (t + 50_004, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            records.push(Record {
+                seq: i as u64,
+                draft: Draft {
+                    trigger: Trigger::Close,
+                    caller: CALLER,
+                    time_ms: time,
+                    changes: vec![],
+                    operation,
+                },
+            });
+        }
+        let groups: Vec<Vec<u64>> = group_by_window(&records, 200)
+            .iter()
+            .map(|g| g.iter().map(|r| r.seq).collect())
+            .collect();
+        assert_eq!(
+            groups,
+            [vec![0], vec![1, 2, 3], vec![4], vec![5], vec![6], vec![7]]
+        );
+        drop(rec);
+    }
+
+    #[test]
+    fn would_record_follows_rules_and_checks() {
+        let (dir, state) = setup();
+        fs::write(state.git().join("info/attributes"), "secret -agentfs\n").unwrap();
+        exclude(&state, "*.log\n");
+        set_remote_limit(&state, "origin", 10);
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let p = |s: &str| RepoPath::new(s).unwrap();
+        assert_eq!(rec.would_record(&p("a.txt"), None).unwrap(), None);
+        assert_eq!(
+            rec.would_record(&p("secret"), None).unwrap(),
+            Some(SkipReason::NeverRecord)
+        );
+        assert!(matches!(
+            rec.would_record(&p("x.log"), None).unwrap(),
+            Some(SkipReason::Ignored { .. })
+        ));
+        assert!(matches!(
+            rec.would_record(&p("l"), Some("a-target-over-ten-bytes"))
+                .unwrap(),
+            Some(SkipReason::Refused(Refusal::BlobTooLarge { .. }))
+        ));
+        assert!(matches!(
+            rec.would_record(&p(".gitmodules"), Some("x")).unwrap(),
+            Some(SkipReason::Refused(Refusal::SymlinkedSpecialFile { .. }))
+        ));
+        assert!(matches!(
+            rec.checks().check_blob(&p("big"), b"more than ten bytes"),
+            Some(Refusal::BlobTooLarge { .. })
+        ));
+        // An ignored path that is tracked is recorded (design §4).
+        fs::write(dir.path().join("y.log"), "1").unwrap();
+        exclude(&state, "");
+        drop((rec, com));
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        rec.record(
+            Trigger::Close,
+            CALLER,
+            vec![write(dir.path(), "y.log", "1")],
+        )
+        .unwrap();
+        com.commit_pending().unwrap();
+        drop((rec, com));
+        exclude(&state, "*.log\n");
+        let (rec, _com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        assert_eq!(rec.would_record(&p("y.log"), None).unwrap(), None);
+        assert!(rec.would_record(&p("z.log"), None).unwrap().is_some());
+    }
+
+    #[test]
+    fn wait_committed_waits_for_history() {
+        let (dir, state) = setup();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        assert_eq!(rec.last_seq(), None);
+        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+            .unwrap();
+        let seq = rec.last_seq().unwrap();
+        let start = Instant::now();
+        assert!(!rec.wait_committed(seq, Duration::from_millis(50)));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        let com = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            com.commit_pending().unwrap();
+            com
+        });
+        assert!(rec.wait_committed(seq, Duration::from_secs(10)));
+        drop(com.join().unwrap());
     }
 
     #[test]
@@ -1597,6 +1937,7 @@ mod tests {
                 caller: CALLER,
                 time_ms,
                 changes: vec![],
+                operation: None,
             },
         };
         let records = [

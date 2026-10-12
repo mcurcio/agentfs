@@ -4,6 +4,10 @@
 //! The repository is bare and lives in the state area, never in the mount.
 //! Each commit carries `Agentfs-Seq: <n>`, the last journal record it
 //! includes, which is where recovery resumes after a crash.
+//!
+//! An operator restore or revert (design §15) is its own commit: its
+//! subject is the operation's summary, and `Agentfs-Restore: <commit>` or
+//! `Agentfs-Revert: <commit>` follows `Agentfs-Trigger: restore`.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -330,9 +334,12 @@ fn message(records: &[Record], context: &Context) -> String {
         .iter()
         .flat_map(|r| r.draft.changes.iter().map(move |c| (r, c)))
         .collect();
-    let summary = match changes.as_slice() {
-        [(r, c)] => format!("{}: {}", r.draft.trigger.as_str(), c.path()),
-        _ => format!("{} changes", changes.len()),
+    // The committer never groups an operation's records with others.
+    let operation = records.first().and_then(|r| r.draft.operation.as_ref());
+    let summary = match (operation, changes.as_slice()) {
+        (Some(op), _) => op.summary.clone(),
+        (None, [(r, c)]) => format!("{}: {}", r.draft.trigger.as_str(), c.path()),
+        (None, _) => format!("{} changes", changes.len()),
     };
     let mut out = summary;
     out.push_str("\n\n");
@@ -353,6 +360,9 @@ fn message(records: &[Record], context: &Context) -> String {
     let triggers: BTreeSet<&str> = records.iter().map(|r| r.draft.trigger.as_str()).collect();
     for trigger in triggers {
         out.push_str(&format!("Agentfs-Trigger: {trigger}\n"));
+    }
+    if let Some(op) = operation {
+        out.push_str(&format!("{}: {}\n", op.kind.trailer(), op.source));
     }
     for (key, value) in [
         ("Agentfs-Namespace", &context.namespace),
@@ -465,6 +475,7 @@ mod tests {
                     },
                     time_ms: 1_700_000_000_000,
                     changes,
+                    operation: None,
                 },
             };
             self.seq += 1;

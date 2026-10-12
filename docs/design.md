@@ -756,6 +756,14 @@ Agentfs-Pid: 4711
 - **The CSI driver** gets it from `podInfoOnMount`.
 - **Grouped commits** carry one `Agentfs-Uid` and `Agentfs-Pid` line per
   distinct writer.
+- **Restores and reverts** (§15) are commits of their own, never grouped
+  with workload changes. Their subject is `restore <path> from <short id>`
+  or `revert <short id>: <subject>`, they carry `Agentfs-Trigger: restore`
+  and `Agentfs-Restore: <commit>` or `Agentfs-Revert: <commit>` (the full
+  id), and their author, `Agentfs-Uid` and `Agentfs-Pid` are the
+  operator's: the `agentfs` command's own ids, or, through a running mount,
+  those of the process that asked (§15). Each journal record carries the
+  operation it belongs to; older journals without the field still read.
 
 ## 10. Secrets (not in scope)
 
