@@ -18,13 +18,14 @@
 #![allow(clippy::useless_conversion, clippy::unnecessary_cast)]
 
 use std::ffi::OsStr;
-use std::io::{self, Write as _};
+use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags, Stat};
 
+use crate::lfs::{LfsOid, Pointer};
 use crate::paths::RepoPath;
 
 const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
@@ -61,6 +62,8 @@ pub struct FileState {
     pub nlink: u64,
     pub uid: u32,
     pub gid: u32,
+    /// Its length in bytes.
+    pub size: u64,
 }
 
 /// The kind of an inode, without reading it.
@@ -172,6 +175,7 @@ impl Dir {
                     nlink: st.st_nlink as u64,
                     uid: st.st_uid,
                     gid: st.st_gid,
+                    size: st.st_size as u64,
                 })
             }
         })
@@ -224,6 +228,17 @@ impl Dir {
         Ok((st.st_uid, st.st_gid))
     }
 
+    /// The SHA-256 and length of the regular file `rel` (an LFS object id,
+    /// design §7), read without following a symlink.
+    pub fn sha256_at(&self, rel: &str) -> io::Result<(LfsOid, u64)> {
+        let fd = self.open_at(rel, OFlags::RDONLY, Mode::empty())?;
+        if kind_of(&rustix::fs::fstat(&fd)?) != Kind::File {
+            return Err(io::Error::other(format!("{rel} is not a regular file")));
+        }
+        let pointer = Pointer::of_reader(std::fs::File::from(fd))?;
+        Ok((pointer.oid, pointer.size))
+    }
+
     /// Replaces the content of the regular file `rel` in place (keeping its
     /// inode, owner, mode and extended attributes).
     ///
@@ -232,12 +247,17 @@ impl Dir {
     /// the file as it was. A failure while writing (`EIO`) can still leave
     /// it part written; the caller records what is there (design §15).
     pub fn write_in_place(&self, rel: &str, content: &[u8]) -> io::Result<()> {
+        self.write_in_place_from(rel, &mut &content[..], content.len() as u64)
+    }
+
+    /// [`Dir::write_in_place`] with the `len` bytes of `src`, streamed (an
+    /// LFS object from the cache, design §7).
+    pub fn write_in_place_from(&self, rel: &str, src: &mut dyn Read, len: u64) -> io::Result<()> {
         let fd = self.open_at(rel, OFlags::WRONLY, Mode::empty())?;
         let st = rustix::fs::fstat(&fd)?;
         if kind_of(&st) != Kind::File {
             return Err(io::Error::other(format!("{rel} is not a regular file")));
         }
-        let len = content.len() as u64;
         if len > st.st_size as u64 {
             match rustix::fs::fallocate(&fd, rustix::fs::FallocateFlags::empty(), 0, len) {
                 Ok(()) => {}
@@ -247,7 +267,7 @@ impl Dir {
             }
         }
         let mut file = std::fs::File::from(fd);
-        file.write_all(content)?;
+        copy_exactly(src, &mut file, len)?;
         file.set_len(len)?;
         // Closing is the change boundary a mount records.
         drop(file);
@@ -260,6 +280,18 @@ impl Dir {
         &self,
         rel: &str,
         content: &[u8],
+        mode: u32,
+        owner: Option<Owner>,
+    ) -> io::Result<()> {
+        self.create_file_from(rel, &mut &content[..], content.len() as u64, mode, owner)
+    }
+
+    /// [`Dir::create_file`] with the `len` bytes of `src`, streamed.
+    pub fn create_file_from(
+        &self,
+        rel: &str,
+        src: &mut dyn Read,
+        len: u64,
         mode: u32,
         owner: Option<Owner>,
     ) -> io::Result<()> {
@@ -276,7 +308,7 @@ impl Dir {
             chown_fd(&fd, uid, gid)?;
         }
         let mut file = std::fs::File::from(fd);
-        file.write_all(content)?;
+        copy_exactly(src, &mut file, len)?;
         drop(file);
         Ok(())
     }
@@ -339,6 +371,18 @@ impl Dir {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Copies exactly `len` bytes from `src` to `dst`; fewer is an error.
+fn copy_exactly(src: &mut dyn Read, dst: &mut std::fs::File, len: u64) -> io::Result<()> {
+    let copied = io::copy(&mut src.take(len), dst)?;
+    if copied != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("the content ended after {copied} of {len} bytes"),
+        ));
+    }
+    Ok(())
 }
 
 /// The kind of inode `st` describes.

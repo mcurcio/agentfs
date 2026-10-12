@@ -41,19 +41,30 @@
 //!    New files and directories take the owner of their nearest existing
 //!    parent when the process may chown, with mode 0644 or 0755.
 //!
+//! **Git LFS** (design §7): a pointer at a path its commit's managed
+//! `.gitattributes` block lists is checked out as the object's content,
+//! taken from the local cache or downloaded from a remote
+//! ([`crate::lfs::fetch`]) during the check, before anything is written;
+//! the tree's file is compared with it by size and SHA-256. The root
+//! `.gitattributes` is compared and written without the managed block
+//! (only history has it), and one holding nothing but the block is
+//! agentfs's own, absent from the tree.
+//!
 //! Recording is the caller's: in mount mode the writes go through the
 //! mount and are recorded like any workload's; in direct mode the CLI
 //! records the paths [`apply`] reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 
 use git2::{ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult};
 
 use crate::checks::Refusal;
-use crate::confined::{Current, Dir, Kind, Owner};
+use crate::confined::{Current, Dir, FileState, Kind, Owner};
+use crate::lfs::fetch::LfsObjects;
+use crate::lfs::{Pointer, Store, attributes};
 use crate::paths::{PathError, RepoPath};
 use crate::record::OperationKind;
 use crate::rules::SkipReason;
@@ -112,11 +123,53 @@ pub enum EntryKind {
     Symlink,
 }
 
-/// One path's state in history: a blob and how it is checked out.
+/// How a history entry's blob becomes the tree's content (design §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// The blob is the content.
+    Blob,
+    /// The blob is a pointer to this LFS object, a managed path of its
+    /// commit: the content comes from the object cache or a remote.
+    Lfs(Pointer),
+    /// The root `.gitattributes` with agentfs's managed block, which only
+    /// history has: the content is the workload's own part, whose blob id
+    /// is `user`.
+    ManagedAttributes { user: Oid },
+}
+
+/// One path's state in history: a blob and how it is checked out.
+///
+/// Two entries are equal when they check out the same content and kind,
+/// whatever blob holds it: a `.gitattributes` whose managed block alone
+/// changed is the same file to the tree.
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct Entry {
     pub oid: Oid,
     pub kind: EntryKind,
+    pub stored: Stored,
+}
+
+/// What an entry checks out as.
+#[derive(PartialEq, Eq)]
+enum ContentId {
+    Git(Oid),
+    Lfs(Pointer),
+}
+
+impl Entry {
+    fn content_id(&self) -> ContentId {
+        match self.stored {
+            Stored::Blob => ContentId::Git(self.oid),
+            Stored::Lfs(p) => ContentId::Lfs(p),
+            Stored::ManagedAttributes { user } => ContentId::Git(user),
+        }
+    }
+}
+
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.content_id() == other.content_id()
+    }
 }
 
 /// One path to change. In a restore plan before [`check`], also every path
@@ -143,7 +196,7 @@ impl Step {
                     ..
                 }),
             ) => "symlink",
-            (Some(c), Some(t)) if c.oid == t.oid && c.kind != t.kind => "mode",
+            (Some(c), Some(t)) if c.content_id() == t.content_id() && c.kind != t.kind => "mode",
             _ => "write",
         }
     }
@@ -195,6 +248,12 @@ pub enum RestoreError {
     OpenForWriting { paths: Vec<String> },
     #[error("history is behind the tree: earlier changes are not committed yet")]
     HistoryBehind,
+    #[error("{path}: LFS object {oid} cannot be had: {error}")]
+    LfsObject {
+        path: String,
+        oid: String,
+        error: String,
+    },
     #[error(transparent)]
     Git(#[from] git2::Error),
     #[error(transparent)]
@@ -232,6 +291,7 @@ impl RestoreError {
             Self::ChangedSince { .. } => "changed_since",
             Self::OpenForWriting { .. } => "open_for_writing",
             Self::HistoryBehind => "history_behind",
+            Self::LfsObject { .. } => "lfs_object",
             Self::Git(_) => "git",
             Self::Io(_) => "io",
         }
@@ -279,6 +339,11 @@ impl RestoreError {
                  are still recorded)"
             }
             Self::HistoryBehind => "check `agentfs status` and the CommitFailed alarms, then retry",
+            Self::LfsObject { .. } => {
+                "the content is stored as Git LFS and is neither in <state>/lfs/objects nor on \
+                 a remote agentfs can reach; check the remotes' LFS endpoints and credentials \
+                 (docs/runbooks/stuck-pushes.md)"
+            }
             Self::Git(_) | Self::Io(_) => return None,
         })
     }
@@ -293,7 +358,11 @@ impl RestoreError {
 }
 
 /// Every blob and symlink of `tree` under `prefix` (empty for all), by
-/// path. Submodule entries are skipped (agentfs never records them).
+/// path. Submodule entries are skipped (agentfs never records them). LFS
+/// pointers at the tree's managed paths and a root `.gitattributes` with
+/// a managed block are entries of their content (see [`Stored`]); a root
+/// `.gitattributes` holding only the block is agentfs's own and is left
+/// out.
 fn entries_under(
     repo: &Repository,
     tree: Option<&git2::Tree<'_>>,
@@ -303,13 +372,16 @@ fn entries_under(
     let Some(tree) = tree else {
         return Ok(out);
     };
+    let managed = attributes::managed_paths(repo, tree)?;
     let (subtree, base) = match spec {
         Pathspec::Root => (tree.clone(), String::new()),
         Pathspec::Path(p) => match tree.get_path(Path::new(p.as_str())) {
             Ok(entry) => match entry.kind() {
                 Some(ObjectType::Tree) => (repo.find_tree(entry.id())?, format!("{p}/")),
                 Some(ObjectType::Blob) => {
-                    if let Some(e) = entry_of(entry.filemode(), entry.id()) {
+                    if let Some(e) =
+                        entry_for(repo, p.as_str(), entry.filemode(), entry.id(), &managed)?
+                    {
                         out.insert(p.as_str().to_owned(), e);
                     }
                     return Ok(out);
@@ -320,25 +392,76 @@ fn entries_under(
             Err(e) => return Err(e),
         },
     };
+    let mut blobs = Vec::new();
     subtree.walk(TreeWalkMode::PreOrder, |root, e| {
         if e.kind() == Some(ObjectType::Blob)
-            && let (Ok(name), Some(entry)) = (e.name(), entry_of(e.filemode(), e.id()))
+            && let Ok(name) = e.name()
         {
-            out.insert(format!("{base}{root}{name}"), entry);
+            blobs.push((format!("{base}{root}{name}"), e.filemode(), e.id()));
         }
         TreeWalkResult::Ok
     })?;
+    for (path, mode, id) in blobs {
+        if let Some(entry) = entry_for(repo, &path, mode, id, &managed)? {
+            out.insert(path, entry);
+        }
+    }
     Ok(out)
 }
 
-fn entry_of(mode: i32, oid: Oid) -> Option<Entry> {
+/// The entry at `path` of `tree`, whose managed paths are `managed`.
+fn entry_at(
+    repo: &Repository,
+    tree: &git2::Tree<'_>,
+    managed: &BTreeSet<RepoPath>,
+    path: &str,
+) -> Result<Option<Entry>, git2::Error> {
+    match tree.get_path(Path::new(path)) {
+        Ok(e) if e.kind() == Some(ObjectType::Blob) => {
+            entry_for(repo, path, e.filemode(), e.id(), managed)
+        }
+        Ok(_) => Ok(None),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The entry of the blob `oid` with `mode` at `path`, in a tree whose
+/// managed paths are `managed`; `None` for what a restore never writes.
+fn entry_for(
+    repo: &Repository,
+    path: &str,
+    mode: i32,
+    oid: Oid,
+    managed: &BTreeSet<RepoPath>,
+) -> Result<Option<Entry>, git2::Error> {
     let kind = match mode {
         MODE_SYMLINK => EntryKind::Symlink,
         MODE_EXECUTABLE => EntryKind::File { executable: true },
         0o100644 | 0o100664 => EntryKind::File { executable: false },
-        _ => return None,
+        _ => return Ok(None),
     };
-    Some(Entry { oid, kind })
+    let mut stored = Stored::Blob;
+    if kind != EntryKind::Symlink {
+        if path == attributes::ROOT_GITATTRIBUTES {
+            let blob = repo.find_blob(oid)?;
+            let user = attributes::user_part(blob.content());
+            if user.len() != blob.content().len() {
+                if user.is_empty() {
+                    return Ok(None);
+                }
+                stored = Stored::ManagedAttributes {
+                    user: Oid::hash_object(ObjectType::Blob, &user)?,
+                };
+            }
+        } else if !managed.is_empty() && RepoPath::new(path).is_ok_and(|p| managed.contains(&p)) {
+            let blob = repo.find_blob(oid)?;
+            if let Some(pointer) = Pointer::parse(blob.content()) {
+                stored = Stored::Lfs(pointer);
+            }
+        }
+    }
+    Ok(Some(Entry { oid, kind, stored }))
 }
 
 fn short(commit: &git2::Commit<'_>) -> String {
@@ -443,14 +566,12 @@ pub fn plan(repo: &Repository, branch_ref: &str, request: &Request) -> Result<Pl
                     commit: commit.id().to_string(),
                 });
             }
+            let head_managed = attributes::managed_paths(repo, &head_tree)?;
             let mut steps = Vec::new();
             let mut changed_since = Vec::new();
             for path in changed {
                 let repo_path = RepoPath::new(path.clone()).map_err(git_path)?;
-                let in_head = head_tree
-                    .get_path(Path::new(path))
-                    .ok()
-                    .and_then(|e| entry_of(e.filemode(), e.id()));
+                let in_head = entry_at(repo, &head_tree, &head_managed, path)?;
                 let target = before.get(path).copied();
                 if in_head != after.get(path).copied() && in_head != target {
                     changed_since.push(repo_path.clone());
@@ -490,8 +611,14 @@ pub trait RecordPolicy {
     /// Why a write at `path` (a file, or a symlink to `symlink_target`)
     /// would not be recorded, if it would not.
     fn refuses(&self, path: &RepoPath, symlink_target: Option<&str>) -> io::Result<Option<String>>;
-    /// The content checks for a file holding `content`.
-    fn check_content(&self, path: &RepoPath, content: &[u8]) -> Option<Refusal>;
+    /// Where a file at `path` holding `size` bytes would be stored when
+    /// recorded (design §7).
+    fn store_for(&self, path: &RepoPath, size: u64) -> io::Result<Store>;
+    /// The content checks for a file holding `content`, stored in `store`.
+    fn check_content(&self, path: &RepoPath, content: &[u8], store: Store) -> Option<Refusal>;
+    /// The checks for a file of `size` bytes whose content is not read (an
+    /// LFS object), stored in `store`.
+    fn check_size(&self, path: &RepoPath, size: u64, store: Store) -> Option<Refusal>;
 }
 
 impl RecordPolicy for crate::volume::Recorder {
@@ -501,8 +628,16 @@ impl RecordPolicy for crate::volume::Recorder {
             .map_err(io::Error::other)
     }
 
-    fn check_content(&self, path: &RepoPath, content: &[u8]) -> Option<Refusal> {
-        self.checks().check_blob(path, content)
+    fn store_for(&self, path: &RepoPath, size: u64) -> io::Result<Store> {
+        crate::volume::Recorder::store_for(self, path, size).map_err(io::Error::other)
+    }
+
+    fn check_content(&self, path: &RepoPath, content: &[u8], store: Store) -> Option<Refusal> {
+        self.checks().check_blob_stored(path, content, store)
+    }
+
+    fn check_size(&self, path: &RepoPath, size: u64, store: Store) -> Option<Refusal> {
+        self.checks().check_size(path, size, store)
     }
 }
 
@@ -529,9 +664,22 @@ impl Liveness for NotLive {
     }
 }
 
-/// Whether the tree state `current` is history's `entry` (`None`: nothing).
+/// Whether the regular file `f` at `path` holds `entry`'s content
+/// (whatever its mode). LFS content is compared by size, then SHA-256.
+fn same_content(tree: &Dir, path: &str, f: &FileState, entry: &Entry) -> io::Result<bool> {
+    Ok(match entry.stored {
+        Stored::Blob => f.oid == entry.oid,
+        Stored::ManagedAttributes { user } => f.oid == user,
+        Stored::Lfs(p) => f.size == p.size && tree.sha256_at(path)?.0 == p.oid,
+    })
+}
+
+/// Whether the tree state `current` at `path` is history's `entry`
+/// (`None`: nothing).
 fn matches(
     repo: &Repository,
+    tree: &Dir,
+    path: &str,
     current: &Current,
     entry: Option<&Entry>,
 ) -> Result<bool, RestoreError> {
@@ -539,16 +687,19 @@ fn matches(
         (Current::Absent, None) => true,
         (
             Current::File(f),
-            Some(Entry {
-                oid,
-                kind: EntryKind::File { executable },
-            }),
-        ) => f.oid == *oid && f.executable == *executable,
+            Some(
+                e @ Entry {
+                    kind: EntryKind::File { executable },
+                    ..
+                },
+            ),
+        ) => f.executable == *executable && same_content(tree, path, f, e)?,
         (
             Current::Symlink { target },
             Some(Entry {
                 oid,
                 kind: EntryKind::Symlink,
+                ..
             }),
         ) => repo.find_blob(*oid)?.content() == target.as_slice(),
         _ => false,
@@ -572,10 +723,13 @@ fn ancestors(path: &str) -> Vec<&str> {
 
 /// Runs every check of `plan` against the tree before anything is
 /// written, and returns it without the steps the tree already matches.
+/// Every LFS object a step writes is made available in the cache first
+/// (`objects`), so a missing one refuses the plan before any write.
 pub fn check(
     plan: Plan,
     repo: &Repository,
     policy: &dyn RecordPolicy,
+    objects: &dyn LfsObjects,
     tree: &Dir,
     live: &dyn Liveness,
     force: bool,
@@ -586,30 +740,50 @@ pub fn check(
         .filter(|s| s.target.is_none())
         .map(|s| s.path.to_string())
         .collect();
-    // 1. Everything written must be recordable.
+    // 1. Everything written must be recordable, and its content at hand.
     for step in &plan.steps {
         let Some(target) = &step.target else { continue };
         if step.current.as_ref() == Some(target) {
             continue; // Nothing is written there.
         }
+        let unrecordable = |reason: String| RestoreError::Unrecordable {
+            path: step.path.to_string(),
+            reason,
+        };
         let blob = repo.find_blob(target.oid)?;
         let symlink_target = match target.kind {
             EntryKind::Symlink => Some(String::from_utf8_lossy(blob.content()).into_owned()),
             EntryKind::File { .. } => None,
         };
         if let Some(reason) = policy.refuses(&step.path, symlink_target.as_deref())? {
-            return Err(RestoreError::Unrecordable {
-                path: step.path.to_string(),
-                reason,
-            });
+            return Err(unrecordable(reason));
         }
-        if target.kind != EntryKind::Symlink
-            && let Some(refusal) = policy.check_content(&step.path, blob.content())
-        {
-            return Err(RestoreError::Unrecordable {
-                path: step.path.to_string(),
-                reason: refusal.to_string(),
-            });
+        if target.kind == EntryKind::Symlink {
+            continue;
+        }
+        let refusal = match target.stored {
+            Stored::Blob => {
+                let store = policy.store_for(&step.path, blob.size() as u64)?;
+                policy.check_content(&step.path, blob.content(), store)
+            }
+            Stored::ManagedAttributes { .. } => {
+                let user = attributes::user_part(blob.content());
+                policy.check_content(&step.path, &user, Store::Blob)
+            }
+            Stored::Lfs(pointer) => {
+                objects
+                    .ensure(&pointer)
+                    .map_err(|e| RestoreError::LfsObject {
+                        path: step.path.to_string(),
+                        oid: pointer.oid.to_string(),
+                        error: e.to_string(),
+                    })?;
+                let store = policy.store_for(&step.path, pointer.size)?;
+                policy.check_size(&step.path, pointer.size, store)
+            }
+        };
+        if let Some(refusal) = refusal {
+            return Err(unrecordable(refusal.to_string()));
         }
     }
     // 2. The tree must hold what history says, and nothing untracked may
@@ -640,7 +814,7 @@ pub fn check(
         } else {
             tree.current_entry(&step.path)?
         };
-        if matches(repo, &current, step.target.as_ref())? {
+        if matches(repo, tree, path, &current, step.target.as_ref())? {
             if step.current == step.target {
                 continue; // Already done, in the tree and in history.
             }
@@ -659,7 +833,7 @@ pub fn check(
             kept.push(step);
             continue;
         }
-        if !matches(repo, &current, step.current.as_ref())? {
+        if !matches(repo, tree, path, &current, step.current.as_ref())? {
             match (&current, step.current) {
                 (Current::Dir, _) => {
                     // A directory where a file goes: only if all of it
@@ -750,7 +924,8 @@ impl ApplyError {
         }
         let step = plan.steps.iter().find(|s| s.path.as_str() == self.path)?;
         let current = tree.current_entry(&step.path).ok()?;
-        let unchanged = matches(repo, &current, step.current.as_ref()).unwrap_or(false);
+        let unchanged =
+            matches(repo, tree, &self.path, &current, step.current.as_ref()).unwrap_or(false);
         (!unchanged).then(|| step.path.clone())
     }
 }
@@ -785,8 +960,10 @@ fn recheck(
         // Absent where history has it, for a removal, is done already.
         Current::Absent if step.target.is_none() => true,
         _ => {
-            let is =
-                |entry: Option<&Entry>| matches(repo, &current, entry).map_err(io::Error::other);
+            let path = step.path.as_str();
+            let is = |entry: Option<&Entry>| {
+                matches(repo, tree, path, &current, entry).map_err(io::Error::other)
+            };
             is(step.current.as_ref())? || is(step.target.as_ref())?
         }
     };
@@ -799,10 +976,12 @@ fn recheck(
 /// Writes a checked `plan` into `tree`. Each path is re-checked just
 /// before it changes (see [`recheck`]); a workload can still write a file
 /// in the moment between that and the write, which is why a live restore
-/// should pause the workload.
+/// should pause the workload. LFS content comes from `objects` (the cache,
+/// filled by [`check`]).
 pub fn apply(
     plan: &Plan,
     repo: &Repository,
+    objects: &dyn LfsObjects,
     tree: &Dir,
     live: &dyn Liveness,
     force: bool,
@@ -870,7 +1049,7 @@ pub fn apply(
             Ok(current) => current,
             Err(e) => return Err(fail(&mut applied, path, e, false)),
         };
-        if let Err(e) = write_one(repo, tree, path, current, &target, chown) {
+        if let Err(e) = write_one(repo, objects, tree, path, current, &target, chown) {
             return Err(fail(&mut applied, path, e, true));
         }
         applied.written.push(step.path.clone());
@@ -897,8 +1076,60 @@ fn make_parents(tree: &Dir, path: &str, chown: bool) -> io::Result<Owner> {
     Ok(owner)
 }
 
+/// A file entry's content, ready to be streamed into the tree.
+enum Content<'r> {
+    Blob(git2::Blob<'r>),
+    Bytes(Vec<u8>),
+    /// A cached LFS object.
+    Object(std::fs::File, u64),
+}
+
+impl Content<'_> {
+    fn load<'r>(
+        repo: &'r Repository,
+        objects: &dyn LfsObjects,
+        entry: &Entry,
+    ) -> io::Result<Content<'r>> {
+        Ok(match entry.stored {
+            Stored::Blob => Content::Blob(repo.find_blob(entry.oid).map_err(io::Error::other)?),
+            Stored::ManagedAttributes { .. } => {
+                let blob = repo.find_blob(entry.oid).map_err(io::Error::other)?;
+                Content::Bytes(attributes::user_part(blob.content()))
+            }
+            Stored::Lfs(pointer) => {
+                let path = objects.ensure(&pointer).map_err(io::Error::other)?;
+                let file = std::fs::File::open(path)?;
+                if file.metadata()?.len() != pointer.size {
+                    return Err(io::Error::other(format!(
+                        "the cached LFS object {} is not {} bytes",
+                        pointer.oid, pointer.size
+                    )));
+                }
+                Content::Object(file, pointer.size)
+            }
+        })
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Content::Blob(b) => b.content().len() as u64,
+            Content::Bytes(b) => b.len() as u64,
+            Content::Object(_, len) => *len,
+        }
+    }
+
+    fn reader(&mut self) -> Box<dyn Read + '_> {
+        match self {
+            Content::Blob(b) => Box::new(b.content()),
+            Content::Bytes(b) => Box::new(&b[..]),
+            Content::Object(f, _) => Box::new(f),
+        }
+    }
+}
+
 fn write_one(
     repo: &Repository,
+    objects: &dyn LfsObjects,
     tree: &Dir,
     path: &str,
     current: Current,
@@ -906,14 +1137,15 @@ fn write_one(
     chown: bool,
 ) -> io::Result<()> {
     let parent_owner = make_parents(tree, path, chown)?;
-    let blob = repo.find_blob(target.oid).map_err(io::Error::other)?;
     match target.kind {
         EntryKind::File { executable } => {
             if let Current::File(f) = &current
                 && f.nlink == 1
             {
-                if f.oid != target.oid {
-                    tree.write_in_place(path, blob.content())?;
+                if !same_content(tree, path, f, target)? {
+                    let mut content = Content::load(repo, objects, target)?;
+                    let len = content.len();
+                    tree.write_in_place_from(path, &mut content.reader(), len)?;
                 }
                 if f.executable != executable {
                     let mode = if executable {
@@ -925,11 +1157,20 @@ fn write_one(
                 }
                 return Ok(());
             }
+            let mut content = Content::load(repo, objects, target)?;
             let owner = replace(tree, path, &current, parent_owner)?;
             let mode = if executable { 0o755 } else { 0o644 };
-            tree.create_file(path, blob.content(), mode, chown.then_some(owner))
+            let len = content.len();
+            tree.create_file_from(
+                path,
+                &mut content.reader(),
+                len,
+                mode,
+                chown.then_some(owner),
+            )
         }
         EntryKind::Symlink => {
+            let blob = repo.find_blob(target.oid).map_err(io::Error::other)?;
             if let Current::Symlink { target } = &current
                 && target.as_slice() == blob.content()
             {

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use git2::{Index, IndexEntry, IndexTime, Signature};
 
 use super::*;
+use crate::lfs::fetch::LfsObjects;
 
 const BRANCH: &str = "refs/heads/agentfs/vol";
 
@@ -30,6 +31,21 @@ struct Fixture {
 #[derive(Default)]
 struct Policy {
     refuse: Vec<&'static str>,
+    /// Content over this size would be stored as LFS.
+    lfs_over: Option<u64>,
+    checks: crate::checks::Checks,
+}
+
+/// No LFS object is available.
+struct NoLfs;
+
+impl LfsObjects for NoLfs {
+    fn ensure(&self, pointer: &Pointer) -> Result<PathBuf, crate::lfs::LfsError> {
+        Err(crate::lfs::LfsError::local(format!(
+            "no object {}",
+            pointer.oid
+        )))
+    }
 }
 
 impl RecordPolicy for Policy {
@@ -40,8 +56,19 @@ impl RecordPolicy for Policy {
             .then(|| "never recorded (-agentfs)".to_owned()))
     }
 
-    fn check_content(&self, path: &RepoPath, content: &[u8]) -> Option<Refusal> {
-        crate::checks::Checks::default().check_blob(path, content)
+    fn store_for(&self, _: &RepoPath, size: u64) -> io::Result<Store> {
+        Ok(match self.lfs_over {
+            Some(threshold) if size > threshold => Store::Lfs,
+            _ => Store::Blob,
+        })
+    }
+
+    fn check_content(&self, path: &RepoPath, content: &[u8], store: Store) -> Option<Refusal> {
+        self.checks.check_blob_stored(path, content, store)
+    }
+
+    fn check_size(&self, path: &RepoPath, size: u64, store: Store) -> Option<Refusal> {
+        self.checks.check_size(path, size, store)
     }
 }
 
@@ -187,11 +214,12 @@ impl Fixture {
             plan,
             &self.repo,
             &Policy::default(),
+            &NoLfs,
             &self.dir(),
             &NotLive,
             false,
         )?;
-        apply(&plan, &self.repo, &self.dir(), &NotLive, false)
+        apply(&plan, &self.repo, &NoLfs, &self.dir(), &NotLive, false)
             .map_err(|e| RestoreError::Io(e.error))
     }
 }
@@ -277,6 +305,7 @@ fn restore_a_file_directory_root_and_symlink() {
         plan.clone(),
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &NotLive,
         false,
@@ -289,7 +318,7 @@ fn restore_a_file_directory_root_and_symlink() {
         .cloned()
         .collect();
     assert_eq!(checked.steps, changed);
-    let applied = apply(&checked, &fx.repo, &fx.dir(), &NotLive, false).unwrap();
+    let applied = apply(&checked, &fx.repo, &NoLfs, &fx.dir(), &NotLive, false).unwrap();
     assert_eq!(applied.written.len() + applied.removed.len(), changed.len());
     assert_eq!(fx.read_tree(), tree_of(&v1), "nothing rewritten");
     // Already matching, in history too: an empty plan after the check.
@@ -299,6 +328,7 @@ fn restore_a_file_directory_root_and_symlink() {
         plan,
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &NotLive,
         false,
@@ -490,6 +520,7 @@ fn revert_of_a_path_changed_since_needs_force() {
         plan.clone(),
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &NotLive,
         false,
@@ -501,12 +532,13 @@ fn revert_of_a_path_changed_since_needs_force() {
         plan,
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &NotLive,
         true,
     )
     .unwrap();
-    apply(&plan, &fx.repo, &fx.dir(), &NotLive, false).unwrap();
+    apply(&plan, &fx.repo, &NoLfs, &fx.dir(), &NotLive, false).unwrap();
     assert_eq!(
         fx.read_tree(),
         tree_of(&[("f", File("1")), ("g", File("1"))])
@@ -527,6 +559,7 @@ fn check_refusals() {
             plan,
             &fx.repo,
             &Policy::default(),
+            &NoLfs,
             &fx.dir(),
             &NotLive,
             force,
@@ -554,6 +587,7 @@ fn check_refusals() {
         fx.plan(&fx.restore(".", c1)).unwrap(),
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &NotLive,
         true,
@@ -571,6 +605,7 @@ fn check_refusals() {
         fx.plan(&fx.restore(".", c1)).unwrap(),
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &NotLive,
         false,
@@ -581,6 +616,7 @@ fn check_refusals() {
         fx.plan(&fx.restore(".", c1)).unwrap(),
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &Open(vec![]),
         true,
@@ -614,6 +650,7 @@ fn a_tree_ahead_of_history_is_recorded_not_skipped() {
         fx.plan(&fx.restore(".", c1)).unwrap(),
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &NotLive,
         false,
@@ -628,7 +665,7 @@ fn a_tree_ahead_of_history_is_recorded_not_skipped() {
             ("x", "remove")
         ]
     );
-    let applied = apply(&plan, &fx.repo, &fx.dir(), &NotLive, false).unwrap();
+    let applied = apply(&plan, &fx.repo, &NoLfs, &fx.dir(), &NotLive, false).unwrap();
     let names = |v: &[RepoPath]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
     assert_eq!(names(&applied.written), ["r", "d/a", "d/b"], "all recorded");
     assert_eq!(names(&applied.removed), ["x"]);
@@ -651,6 +688,7 @@ fn apply_rechecks_each_path() {
             fx.plan(&fx.restore(".", c1)).unwrap(),
             &fx.repo,
             &Policy::default(),
+            &NoLfs,
             &fx.dir(),
             &NotLive,
             false,
@@ -661,7 +699,7 @@ fn apply_rechecks_each_path() {
     let plan = checked();
     fs::write(fx.tree.join("b"), "workload").unwrap();
     for force in [false, true] {
-        let err = apply(&plan, &fx.repo, &fx.dir(), &NotLive, force).unwrap_err();
+        let err = apply(&plan, &fx.repo, &NoLfs, &fx.dir(), &NotLive, force).unwrap_err();
         assert_eq!(err.path, "b");
         assert!(!err.started);
         assert!(
@@ -675,11 +713,11 @@ fn apply_rechecks_each_path() {
     // Opened for writing after the check: left alone unless --force.
     fx.checkout(&[("a", File("2")), ("b", File("2"))]);
     let plan = checked();
-    let err = apply(&plan, &fx.repo, &fx.dir(), &Open(vec!["b"]), false).unwrap_err();
+    let err = apply(&plan, &fx.repo, &NoLfs, &fx.dir(), &Open(vec!["b"]), false).unwrap_err();
     assert_eq!((err.path.as_str(), err.started), ("b", false));
     assert!(err.error.to_string().contains("opened for writing"));
     assert_eq!(fs::read(fx.tree.join("b")).unwrap(), b"2");
-    apply(&plan, &fx.repo, &fx.dir(), &Open(vec!["b"]), true).unwrap();
+    apply(&plan, &fx.repo, &NoLfs, &fx.dir(), &Open(vec!["b"]), true).unwrap();
     assert_eq!(fs::read(fx.tree.join("b")).unwrap(), b"1");
 }
 
@@ -693,6 +731,7 @@ fn check_ancestors_and_policies() {
             fx.plan(request).unwrap(),
             &fx.repo,
             policy,
+            &NoLfs,
             &fx.dir(),
             live,
             force,
@@ -721,6 +760,7 @@ fn check_ancestors_and_policies() {
     fx.checkout(&[]);
     let refuse = Policy {
         refuse: vec!["d/x"],
+        ..Policy::default()
     };
     let err = run_check(&fx.restore(".", c1), &refuse, &NotLive, true).unwrap_err();
     assert!(
@@ -736,6 +776,7 @@ fn check_ancestors_and_policies() {
         fx2.plan(&fx2.restore(".", c)).unwrap(),
         &fx2.repo,
         &none,
+        &NoLfs,
         &fx2.dir(),
         &NotLive,
         true,
@@ -754,6 +795,7 @@ fn check_ancestors_and_policies() {
         plan.clone(),
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &open,
         false,
@@ -761,7 +803,18 @@ fn check_ancestors_and_policies() {
     .unwrap_err();
     assert!(matches!(&err, RestoreError::OpenForWriting { paths } if paths == &["f"]));
     assert!(err.overridable());
-    assert!(check(plan, &fx.repo, &Policy::default(), &fx.dir(), &open, true).is_ok());
+    assert!(
+        check(
+            plan,
+            &fx.repo,
+            &Policy::default(),
+            &NoLfs,
+            &fx.dir(),
+            &open,
+            true
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -842,6 +895,7 @@ fn removals_prune_empty_directories_and_keep_untracked_files() {
         plan,
         &fx.repo,
         &Policy::default(),
+        &NoLfs,
         &fx.dir(),
         &NotLive,
         false,
@@ -911,11 +965,15 @@ fn unrecorded_changes_where_history_already_matches_are_refused() {
     }
     // A path the rules now refuse is fine where nothing is written.
     fx.checkout(&[("a", File("1")), ("b", File("b"))]);
-    let refuse = Policy { refuse: vec!["b"] };
+    let refuse = Policy {
+        refuse: vec!["b"],
+        ..Policy::default()
+    };
     let plan = check(
         fx.plan(&fx.restore(".", c1)).unwrap(),
         &fx.repo,
         &refuse,
+        &NoLfs,
         &fx.dir(),
         &NotLive,
         false,
@@ -946,4 +1004,289 @@ fn a_write_cut_short_is_left_changed() {
         Some(RepoPath::new("f").unwrap())
     );
     assert_eq!(failed(false).left_changed(&plan, &fx.repo, &fx.dir()), None);
+}
+
+mod lfs {
+    use std::cell::Cell;
+    use std::collections::{BTreeSet, HashMap};
+
+    use super::*;
+    use crate::checks::{BlobLimit, Checks, Limits};
+    use crate::lfs::ObjectCache;
+    use crate::lfs::fetch::CacheOnly;
+
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    struct Lfs {
+        fx: Fixture,
+        _dir: tempfile::TempDir,
+        cache: CacheOnly,
+    }
+
+    impl Lfs {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = CacheOnly(ObjectCache::open(dir.path().join("lfs")).unwrap());
+            Self {
+                fx: Fixture::new(),
+                _dir: dir,
+                cache,
+            }
+        }
+
+        fn cache_object(&self, content: &str) -> Pointer {
+            let src = self._dir.path().join("src");
+            fs::write(&src, content).unwrap();
+            self.cache.0.insert_file(&src).unwrap()
+        }
+
+        /// Commits `files` plus `lfs` (path, content) stored as LFS, with
+        /// the managed block after `user` in the root .gitattributes; the
+        /// objects are cached.
+        fn commit(&self, files: &[(&str, F)], lfs: &[(&str, &str)], user: &str) -> Oid {
+            let mut all: Vec<(&str, F)> = files.to_vec();
+            let mut managed = BTreeSet::new();
+            for (path, content) in lfs {
+                let pointer = self.cache_object(content);
+                all.push((path, File(leak(pointer.encode()))));
+                managed.insert(RepoPath::new(*path).unwrap());
+            }
+            let attrs = attributes::compose(user.as_bytes(), &managed);
+            if !attrs.is_empty() {
+                all.push((
+                    ".gitattributes",
+                    File(leak(String::from_utf8(attrs).unwrap())),
+                ));
+            }
+            self.fx.commit(&all, "lfs")
+        }
+
+        fn check_with(
+            &self,
+            request: &Request,
+            policy: &Policy,
+            objects: &dyn LfsObjects,
+        ) -> Result<Plan, RestoreError> {
+            check(
+                self.fx.plan(request)?,
+                &self.fx.repo,
+                policy,
+                objects,
+                &self.fx.dir(),
+                &NotLive,
+                false,
+            )
+        }
+
+        fn run_with(
+            &self,
+            request: &Request,
+            objects: &dyn LfsObjects,
+        ) -> Result<Applied, RestoreError> {
+            let plan = self.check_with(request, &Policy::default(), objects)?;
+            apply(
+                &plan,
+                &self.fx.repo,
+                objects,
+                &self.fx.dir(),
+                &NotLive,
+                false,
+            )
+            .map_err(|e| RestoreError::Io(e.error))
+        }
+    }
+
+    #[test]
+    fn lfs_paths_are_restored_and_reverted_from_the_cache() {
+        let l = Lfs::new();
+        let c1 = l.commit(&[("a", File("a"))], &[("big.bin", "big one")], "");
+        let c2 = l.commit(&[("a", File("a"))], &[("big.bin", "big two, longer")], "");
+        l.fx.checkout(&[("a", File("a")), ("big.bin", File("big two, longer"))]);
+
+        // Entries are the content, not the pointers.
+        let plan = l.fx.plan(&l.fx.restore("big.bin", c1)).unwrap();
+        assert!(matches!(
+            plan.steps[0].target.unwrap().stored,
+            Stored::Lfs(p) if p.size == 7
+        ));
+        l.run_with(&l.fx.restore("big.bin", c1), &l.cache).unwrap();
+        assert_eq!(
+            fs::read_to_string(l.fx.tree.join("big.bin")).unwrap(),
+            "big one"
+        );
+
+        // Recorded (as the CLI would), then reverted back.
+        l.commit(&[("a", File("a"))], &[("big.bin", "big one")], "");
+        l.run_with(
+            &l.fx.revert(l.fx.repo.refname_to_id(BRANCH).unwrap()),
+            &l.cache,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(l.fx.tree.join("big.bin")).unwrap(),
+            "big two, longer"
+        );
+        let _ = c2;
+    }
+
+    #[test]
+    fn matching_lfs_content_is_already_done_and_changed_content_is_refused() {
+        let l = Lfs::new();
+        let c1 = l.commit(&[], &[("big.bin", "content")], "");
+        l.fx.checkout(&[("big.bin", File("content"))]);
+        let plan = l
+            .check_with(&l.fx.restore(".", c1), &Policy::default(), &NoLfs)
+            .unwrap();
+        assert!(plan.steps.is_empty(), "{:?}", plan.steps);
+        // Same size, other bytes: not what history holds.
+        l.fx.checkout(&[("big.bin", File("CONTENT"))]);
+        let err = l
+            .check_with(&l.fx.restore(".", c1), &Policy::default(), &l.cache)
+            .unwrap_err();
+        assert!(matches!(err, RestoreError::Unrecorded { .. }), "{err}");
+    }
+
+    #[test]
+    fn an_unavailable_object_refuses_before_any_write() {
+        let l = Lfs::new();
+        let c1 = l.commit(&[("a", File("one"))], &[("big.bin", "big one")], "");
+        l.commit(&[("a", File("two"))], &[("big.bin", "big two")], "");
+        l.fx.checkout(&[("a", File("two")), ("big.bin", File("big two"))]);
+        let err = l.run_with(&l.fx.restore(".", c1), &NoLfs).unwrap_err();
+        assert!(
+            matches!(&err, RestoreError::LfsObject { path, .. } if path == "big.bin"),
+            "{err}"
+        );
+        assert_eq!(err.kind(), "lfs_object");
+        assert!(err.hint().is_some());
+        assert_eq!(
+            l.fx.read_tree(),
+            tree_of(&[("a", File("two")), ("big.bin", File("big two"))]),
+            "nothing written"
+        );
+    }
+
+    /// Fills the cache on demand, as a download would.
+    struct Downloads<'a> {
+        cache: &'a ObjectCache,
+        remote: HashMap<String, &'static str>,
+        calls: Cell<usize>,
+    }
+
+    impl LfsObjects for Downloads<'_> {
+        fn ensure(&self, pointer: &Pointer) -> Result<PathBuf, crate::lfs::LfsError> {
+            if !self.cache.contains(pointer) {
+                self.calls.set(self.calls.get() + 1);
+                let content = self.remote[&pointer.oid.to_string()];
+                self.cache
+                    .insert_verified(pointer, &mut content.as_bytes())?;
+            }
+            Ok(self.cache.path(&pointer.oid))
+        }
+    }
+
+    #[test]
+    fn a_cache_miss_is_downloaded_once() {
+        let l = Lfs::new();
+        let c1 = l.commit(&[], &[("big.bin", "from the remote")], "");
+        l.commit(&[], &[], "");
+        l.fx.checkout(&[]);
+        // The object is not in this cache, only "on the remote".
+        let other = tempfile::tempdir().unwrap();
+        let cache = ObjectCache::open(other.path()).unwrap();
+        let pointer = Pointer::of_reader(&b"from the remote"[..]).unwrap();
+        let objects = Downloads {
+            cache: &cache,
+            remote: [(pointer.oid.to_string(), "from the remote")].into(),
+            calls: Cell::new(0),
+        };
+        l.run_with(&l.fx.restore("big.bin", c1), &objects).unwrap();
+        assert_eq!(
+            fs::read_to_string(l.fx.tree.join("big.bin")).unwrap(),
+            "from the remote"
+        );
+        assert_eq!(
+            objects.calls.get(),
+            1,
+            "fetched in the check, reused to write"
+        );
+    }
+
+    #[test]
+    fn gitattributes_is_restored_without_the_managed_block() {
+        let l = Lfs::new();
+        let c1 = l.commit(&[], &[("big.bin", "x1")], "*.txt text\n");
+        l.commit(&[], &[("big.bin", "x2"), ("more.bin", "y")], "*.md text\n");
+        l.fx.checkout(&[
+            (".gitattributes", File("*.md text\n")),
+            ("big.bin", File("x2")),
+            ("more.bin", File("y")),
+        ]);
+        // The tree's .gitattributes (no block) matches history's.
+        let plan = l
+            .check_with(
+                &l.fx.restore(".gitattributes", c1),
+                &Policy::default(),
+                &l.cache,
+            )
+            .unwrap();
+        assert_eq!(paths(&plan.steps), [(".gitattributes", "write")]);
+        l.run_with(&l.fx.restore(".gitattributes", c1), &l.cache)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(l.fx.tree.join(".gitattributes")).unwrap(),
+            "*.txt text\n"
+        );
+        // A .gitattributes holding only the block is agentfs's own: absent
+        // to the tree.
+        let l = Lfs::new();
+        let c1 = l.commit(&[], &[("big.bin", "x1")], "");
+        l.fx.checkout(&[("big.bin", File("x1"))]);
+        let plan = l.fx.plan(&l.fx.restore(".", c1)).unwrap();
+        assert_eq!(paths(&plan.steps), [("big.bin", "write")]);
+        let checked = l
+            .check_with(&l.fx.restore(".", c1), &Policy::default(), &l.cache)
+            .unwrap();
+        assert!(checked.steps.is_empty());
+        // Only the block changed between two commits: nothing to revert
+        // there.
+        let l = Lfs::new();
+        l.commit(&[("a", File("a"))], &[("big.bin", "x1")], "*.txt text\n");
+        let c2 = l.commit(
+            &[("a", File("a"))],
+            &[("big.bin", "x1"), ("new.bin", "n")],
+            "*.txt text\n",
+        );
+        let plan = l.fx.plan(&l.fx.revert(c2)).unwrap();
+        assert_eq!(paths(&plan.steps), [("new.bin", "remove")]);
+    }
+
+    #[test]
+    fn the_store_the_restore_would_record_decides_the_blob_limit() {
+        let l = Lfs::new();
+        let c1 = l.commit(&[], &[("big.bin", "seven b")], "");
+        l.commit(&[], &[], "");
+        l.fx.checkout(&[]);
+        let limited = |lfs_over| Policy {
+            lfs_over,
+            checks: Checks::new(Limits {
+                max_blob_size: Some(BlobLimit {
+                    bytes: 3,
+                    remote: "r".into(),
+                }),
+            }),
+            ..Policy::default()
+        };
+        let err = l
+            .check_with(&l.fx.restore(".", c1), &limited(None), &l.cache)
+            .unwrap_err();
+        assert!(
+            matches!(&err, RestoreError::Unrecordable { reason, .. } if reason.contains("limit")),
+            "{err}"
+        );
+        l.check_with(&l.fx.restore(".", c1), &limited(Some(3)), &l.cache)
+            .unwrap();
+    }
 }

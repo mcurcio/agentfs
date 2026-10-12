@@ -31,6 +31,7 @@ use anyhow::{Context as _, Result};
 
 use agentfs_core::confined::{self, Dir, Kind};
 use agentfs_core::history::{History, seq_from_message};
+use agentfs_core::lfs::fetch::Fetcher;
 use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::restore::{
@@ -265,9 +266,19 @@ fn direct(
         .context("committing what is already recorded")?;
     let tree = Dir::open(root).with_context(|| format!("opening {}", root.display()))?;
     let history = committer.history();
+    // LFS content comes from the cache, else from the remotes (design §7).
+    let objects = Fetcher::new(state, history.settings()).context("opening the LFS cache")?;
     let checked = restore::plan(history.repo(), &history.settings().branch_ref, &ask.request)
         .and_then(|plan| {
-            restore::check(plan, history.repo(), &recorder, &tree, &NotLive, ask.force)
+            restore::check(
+                plan,
+                history.repo(),
+                &recorder,
+                &objects,
+                &tree,
+                &NotLive,
+                ask.force,
+            )
         });
     let plan = match checked {
         Ok(plan) => plan,
@@ -296,11 +307,11 @@ fn direct(
         me,
         &[me.pid],
     )?;
-    let (applied, failure) = match restore::apply(&plan, history.repo(), &tree, &NotLive, ask.force)
-    {
-        Ok(applied) => (applied, None),
-        Err(e) => (e.applied.clone(), Some(e)),
-    };
+    let (applied, failure) =
+        match restore::apply(&plan, history.repo(), &objects, &tree, &NotLive, ask.force) {
+            Ok(applied) => (applied, None),
+            Err(e) => (e.applied.clone(), Some(e)),
+        };
     // A path the failure left changed (a write cut short) is recorded as it
     // is, so the tree matches history again and a re-run can finish it.
     let mut to_record = applied.clone();
@@ -454,7 +465,8 @@ impl Daemon {
         let tree = Dir::open(self.view.mountpoint())?;
         let plan = restore::plan(repo, &history.settings().branch_ref, &ask.request)?;
         let live: &dyn Liveness = &self.view;
-        let plan = restore::check(plan, repo, &self.recorder, &tree, live, ask.force)?;
+        let objects = Fetcher::new(&self.state, history.settings())?;
+        let plan = restore::check(plan, repo, &self.recorder, &objects, &tree, live, ask.force)?;
         let mut done = Outcome {
             plan: plan_lines(&plan),
             dry_run: ask.dry_run,
@@ -480,7 +492,7 @@ impl Daemon {
                 &[tid, std::process::id()],
             )
             .map_err(other)?;
-        let result = restore::apply(&plan, repo, &tree, live, ask.force);
+        let result = restore::apply(&plan, repo, &objects, &tree, live, ask.force);
         let last = guard.finish();
         let applied = match &result {
             Ok(applied) => applied.clone(),

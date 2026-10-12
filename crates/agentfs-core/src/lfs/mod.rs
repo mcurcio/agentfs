@@ -11,7 +11,9 @@
 //!   end of the root `.gitattributes` in history, as `git lfs track` would;
 //! - [`policy`]: which store a recorded file goes to;
 //! - [`endpoint`]: each remote's LFS endpoint and credentials;
-//! - [`client`]: the batch API client and the standalone-file transfer.
+//! - [`client`]: the batch API client and the standalone-file transfer;
+//! - [`upload`]: the objects a push must upload first;
+//! - [`fetch`]: objects for restores, from the cache or a remote.
 //!
 //! What is stored as LFS is decided when a file is recorded and saved in
 //! the journal; the content is hashed and cached when it is committed, and
@@ -23,6 +25,7 @@ pub mod client;
 pub mod endpoint;
 #[cfg(test)]
 pub(crate) mod fake;
+pub mod fetch;
 pub mod pointer;
 pub mod policy;
 pub mod upload;
