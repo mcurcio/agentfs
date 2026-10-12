@@ -1,0 +1,23 @@
+# OpenTelemetry Collector for ci/e2e-telemetry.sh: receives OTLP over HTTP and
+# writes every signal to /out/otel.jsonl.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  file:
+    path: /out/otel.jsonl
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file]
+    metrics:
+      receivers: [otlp]
+      exporters: [file]
+    logs:
+      receivers: [otlp]
+      exporters: [file]

@@ -1,0 +1,103 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - run: cargo fmt --all --check
+      - name: clippy (default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: clippy (all features)
+        run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, all]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.features }}
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - run: cargo test --workspace --locked ${{ matrix.features == 'all' && '--all-features' || '' }}
+
+  e2e-remotes:
+    name: e2e (http and https remotes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: https
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config nginx fcgiwrap
+      - run: cargo build --locked -p agentfs --features https
+      - name: start git server
+        run: ci/git-http-server.sh start "$RUNNER_TEMP/git-server" --trust-ca >>"$GITHUB_ENV"
+      - run: ci/e2e-remotes.sh
+        env:
+          E2E_HTTPS: 1
+      - name: server logs
+        if: failure()
+        run: tail -n 100 "$RUNNER_TEMP"/git-server/logs/*.log
+      - if: always()
+        run: ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
+
+  e2e-telemetry:
+    name: e2e (OpenTelemetry collector)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --locked -p agentfs
+      - name: start collector
+        run: |
+          mkdir -p "$RUNNER_TEMP/otel" && chmod 777 "$RUNNER_TEMP/otel"
+          docker run -d --name otelcol -p 4318:4318 \
+            -v "$PWD/ci/otelcol.yaml:/etc/otelcol-contrib/config.yaml:ro" \
+            -v "$RUNNER_TEMP/otel:/out" \
+            otel/opentelemetry-collector-contrib:0.162.0
+          for _ in $(seq 60); do
+            curl -s -o /dev/null -X POST http://localhost:4318/v1/metrics && break
+            sleep 1
+          done
+      - run: ci/e2e-telemetry.sh
+        env:
+          OTEL_OUT: ${{ runner.temp }}/otel/otel.jsonl
+      - name: collector logs
+        if: failure()
+        run: docker logs otelcol 2>&1 | tail -n 100
