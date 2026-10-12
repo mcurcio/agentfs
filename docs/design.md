@@ -1434,7 +1434,7 @@ volume stopped. `agentfs run` does not. In order:
 1. commit what is journaled, so the head is the tree's state;
 2. fetch `inbox/*` from the patch remote: forced, this volume's only, local
    inbox refs the remote no longer has are pruned. Best effort, within
-   `agentfs.patchFetchTimeout` (default 30s; 0 skips it); a failure raises
+   `agentfs.patchFetchTimeout` (default 30s; 0 or `off` skips it); a failure raises
    `PatchFetchFailed` and the queue runs with what is already fetched;
 3. scan the branch for applied patches (below);
 4. apply the queue, in order, from the last applied number plus one;

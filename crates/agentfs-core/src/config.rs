@@ -331,8 +331,7 @@ impl Settings {
                     PatchRemote::Named(name.to_owned())
                 }
             },
-            patch_fetch_timeout: duration(config, "agentfs.patchFetchTimeout")?
-                .unwrap_or(DEFAULT_PATCH_FETCH_TIMEOUT),
+            patch_fetch_timeout: patch_fetch_timeout(config)?,
             lfs,
             remotes,
             invalid_remotes,
@@ -655,6 +654,16 @@ pub const DEFAULT_REPACK_INTERVAL: Duration = Duration::from_secs(3600);
 /// The default `agentfs.patchFetchTimeout` (design §12).
 pub const DEFAULT_PATCH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `agentfs.patchFetchTimeout`: default [`DEFAULT_PATCH_FETCH_TIMEOUT`],
+/// `0` or `off` (zero: the fetch is skipped), else a duration.
+fn patch_fetch_timeout(config: &git2::Config) -> Result<Duration, ConfigError> {
+    let key = "agentfs.patchFetchTimeout";
+    match string(config, key)?.as_deref() {
+        Some("0" | "off") => Ok(Duration::ZERO),
+        _ => Ok(duration(config, key)?.unwrap_or(DEFAULT_PATCH_FETCH_TIMEOUT)),
+    }
+}
+
 /// `agentfs.repackInterval`: default [`DEFAULT_REPACK_INTERVAL`], `0` or
 /// `off` for never, else a duration of at least [`MIN_REPACK_INTERVAL`].
 fn repack_interval(config: &git2::Config) -> Result<Option<Duration>, ConfigError> {
@@ -811,6 +820,10 @@ mod tests {
             load("\tpatchFetchTimeout = soon\n"),
             Err(ConfigError::BadDuration { .. })
         ));
+        for off in ["0", "off"] {
+            let s = load(&format!("\tpatchFetchTimeout = {off}\n")).unwrap();
+            assert_eq!(s.patch_fetch_timeout, Duration::ZERO, "{off}");
+        }
         // Two remotes and no choice: none.
         let (_d, c) = config_with(
             "[agentfs]\n\tvolume = v\n[remote \"a\"]\n\turl = /tmp/a.git\n[remote \"b\"]\n\turl = /tmp/b.git\n",

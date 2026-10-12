@@ -205,7 +205,7 @@ by hand.
 | Key | Default | Meaning |
 |---|---|---|
 | `agentfs.patchRemote` | the only remote, if exactly one | The remote whose `inbox/*` is fetched and which gets the queue push; `none` turns both off (patches already fetched still apply) |
-| `agentfs.patchFetchTimeout` | `30s` | How long a mount waits for the fetch; `0` skips it |
+| `agentfs.patchFetchTimeout` | `30s` | How long a mount waits for the fetch; `0` or `off` skips it |
 
 The queue push (status ref, `applied/<n>`, deleting `inbox/<n>`) runs after
 each branch push to the patch remote; `agentfs push` prints it as
