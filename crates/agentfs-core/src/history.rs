@@ -21,6 +21,11 @@ use crate::record::{Change, Record};
 
 pub const SEQ_TRAILER: &str = "Agentfs-Seq";
 
+/// How long libgit2 waits for a remote to accept a connection.
+pub const SERVER_CONNECT_TIMEOUT_MS: std::ffi::c_int = 30_000;
+/// How long libgit2 waits on a stalled read or write to a remote.
+pub const SERVER_IO_TIMEOUT_MS: std::ffi::c_int = 300_000;
+
 const MODE_FILE: u32 = 0o100644;
 const MODE_EXECUTABLE: u32 = 0o100755;
 const MODE_SYMLINK: u32 = 0o120000;
@@ -46,7 +51,10 @@ pub enum HistoryError {
 /// - the system, XDG, global and ProgramData config search paths are
 ///   cleared, so no config outside the history repository's own file can
 ///   reach a volume: not `url.<base>.insteadOf` redirecting a push, not
-///   `http.*`, not `core.excludesFile` (design §4.4, §11.1).
+///   `http.*`, not `core.excludesFile` (design §4.4, §11.1);
+/// - remote connections and reads/writes time out
+///   ([`SERVER_CONNECT_TIMEOUT_MS`], [`SERVER_IO_TIMEOUT_MS`]), so a hung
+///   remote ends as an unreachable push (design §11.2).
 pub(crate) fn init_libgit2() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -74,6 +82,20 @@ pub(crate) fn init_libgit2() {
                 "libgit2 rejected clearing {level:?}: {result:?}"
             );
         }
+        // A remote that accepts the connection and then stalls must end as
+        // a failed push, not hang its thread forever (design §11.2).
+        // SAFETY: plain integer options, set once before any transport is
+        // created.
+        let connect = unsafe {
+            git2::opts::set_server_connect_timeout_in_milliseconds(SERVER_CONNECT_TIMEOUT_MS)
+        };
+        assert!(
+            connect.is_ok(),
+            "libgit2 rejected the connect timeout: {connect:?}"
+        );
+        // SAFETY: as above.
+        let io = unsafe { git2::opts::set_server_timeout_in_milliseconds(SERVER_IO_TIMEOUT_MS) };
+        assert!(io.is_ok(), "libgit2 rejected the I/O timeout: {io:?}");
     });
 }
 
@@ -370,6 +392,22 @@ mod tests {
     use super::*;
     use crate::identity::Templates;
     use crate::record::{Caller, Draft, Trigger};
+
+    #[test]
+    fn libgit2_server_timeouts_are_set() {
+        init_libgit2();
+        // SAFETY: reads of integer options.
+        unsafe {
+            assert_eq!(
+                git2::opts::get_server_connect_timeout_in_milliseconds().unwrap(),
+                SERVER_CONNECT_TIMEOUT_MS
+            );
+            assert_eq!(
+                git2::opts::get_server_timeout_in_milliseconds().unwrap(),
+                SERVER_IO_TIMEOUT_MS
+            );
+        }
+    }
 
     struct Fixture {
         dir: tempfile::TempDir,

@@ -1,4 +1,5 @@
-# agentfs design
+
+| `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |# agentfs design
 
 Status: draft 2, 2026-10-12, updated as phase 1 is built. Draft 1 was reviewed
 adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
@@ -159,6 +160,9 @@ The work done before the call returns must not depend on file size:
 
 1. **Freeze** the inode's current content into `pending/`, as a reflink where the
    backing filesystem supports it (XFS, btrfs), otherwise as a copy.
+   A file already over the smallest remote blob-size limit (§11.3) by its
+   size on disk is refused before it is copied; the frozen copy is checked
+   again, since the file can change in between.
 2. **Journal**: append a framed, checksummed entry with sequence number, inode,
    current paths, pending id, mode, trigger, caller UID, GID and PID, and time.
 3. **Group commit**: one `fsync` of the journal covers every entry that arrived
@@ -603,6 +607,13 @@ agentfs does not scan content for secrets and does not hold pushes.
   and pushes use anonymous remotes with explicit `<oid>:<ref>` refspecs, so
   `remote.<name>.push` and `fetch`, and any global `url.<base>.insteadOf` or
   `http.*` setting, are never consulted.
+- **An invalid remote section never stops the volume.** A remote whose name
+  is not a valid agentfs name (§11.4, e.g. `team/backup`, which git accepts),
+  whose `agentfsCredentials` is not absolute, or whose `agentfsMaxBlobSize`
+  is not a positive size is left out: it is never pushed and its limit does
+  not apply. Each one raises `RemoteMisconfigured` (§13) when the volume
+  opens; `agentfs status` lists it and `agentfs push` reports it and exits 1.
+  Recording, committing and the other remotes carry on.
 - **Credentials** come from files the recorder reads, and are re-read when they
   change, so short-lived tokens can be rotated by whatever writes the file.
   - `remote.<name>.agentfsCredentials` is an absolute path to a file holding
@@ -629,9 +640,14 @@ agentfs does not scan content for secrets and does not hold pushes.
   Nothing waits for a pod to stop, and stopping a pod never waits for a push.
   The first push of each remote happens as soon as the service starts.
 - Each remote is pushed from its own thread, so a slow or hung remote cannot
-  delay another. libgit2 has no way to cancel a push in progress, so a push
-  hung on the network keeps its thread until the process exits; shutdown
-  waits for pushes only up to a grace period, then leaves them.
+  delay another. libgit2 has no way to cancel a push in progress, so
+  shutdown waits for pushes only up to a grace period, then leaves them.
+- **Network timeouts.** libgit2 is set process-wide to give up on a
+  connection after 30 s and on a stalled read or write after 5 min. A remote
+  that accepts the connection and then stops responding ends as an
+  `unreachable` failure with the usual alarm and backoff, rather than
+  hanging its thread and silencing its alarms; `agentfs push`, which pushes
+  remotes in turn, moves on to the next remote.
 - Unpushed commits stay safe in the state area and go out on the next
   successful push.
 - Pushes are fast-forward only.
@@ -666,6 +682,11 @@ agentfs does not scan content for secrets and does not hold pushes.
     (`YYYYMMDDTHHMMSSZ`) once per divergence, raising `Diverged`, then keeps
     raising `PushFailed` (`non_fast_forward`) at every attempt, with the same
     backoff as other failures.
+  - The name is chosen and saved in the remote's push state as pending
+    before that push, and confirmed after it. A crash in between reuses the
+    pending name at the next attempt (the same head, or a fast-forward of
+    it), so a divergence is saved under one name; only `Diverged` may be
+    raised again after such a crash.
   - It never force-pushes.
   - An operator resolves it (§15). The divergence clears when a branch push
     next succeeds.

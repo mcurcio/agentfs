@@ -159,6 +159,13 @@ pub fn open(
     events: Events,
 ) -> Result<(Recorder, Committer, Recovery), VolumeError> {
     let history = History::open(&state.git())?;
+    // A bad remote section only stops that remote's pushes (design §11.1).
+    for bad in &history.settings().invalid_remotes {
+        events.emit(Event::RemoteMisconfigured {
+            remote: bad.name.clone(),
+            error: bad.error.clone(),
+        });
+    }
     let checks = Arc::new(Checks::new(Limits::from_remotes(
         &history.settings().remotes,
     )));
@@ -326,7 +333,11 @@ impl Recorder {
                         backing,
                         executable,
                     } => {
-                        if let Some(refusal) = self.checks.check_path(&path) {
+                        if let Some(refusal) = self
+                            .checks
+                            .check_path(&path)
+                            .or_else(|| self.checks.check_backing_size(&backing))
+                        {
                             self.refuse(&mut skipped, path, refusal);
                             continue;
                         }
@@ -926,6 +937,78 @@ mod tests {
         assert_eq!(com.commit_pending().unwrap(), CommitReport::default());
         assert_eq!(blob(&com, "a.bin"), b"abc");
         assert_eq!(sink.take().len(), 1);
+    }
+
+    /// The limit is checked on the live file before the freeze copies it.
+    /// The backing file is unreadable, so a freeze would fail the record.
+    #[test]
+    fn oversized_file_is_refused_before_the_freeze() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state) = setup();
+        set_remote_limit(&state, "r", 5);
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let input = write(dir.path(), "big", "0123456789");
+        let Input::Write { backing, .. } = &input else {
+            unreachable!()
+        };
+        fs::set_permissions(backing, fs::Permissions::from_mode(0o000)).unwrap();
+        let recorded = rec.record(Trigger::Close, CALLER, vec![input]).unwrap();
+        assert_eq!(recorded.seq, None);
+        assert_eq!(
+            recorded.skipped[0].reason,
+            SkipReason::Refused(Refusal::BlobTooLarge {
+                bytes: 10,
+                limit: 5,
+                remote: "r".into()
+            })
+        );
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+        assert_eq!(com.backlog(), 0);
+        assert_eq!(sink.take().len(), 1);
+    }
+
+    /// A bad remote section is reported and left out; the volume still
+    /// records, and the valid remotes keep their limits.
+    #[test]
+    fn invalid_remote_does_not_stop_the_volume() {
+        let (dir, state) = setup();
+        set_remote_limit(&state, "r", 5);
+        {
+            let mut config = git2::Config::open(&state.git().join("config")).unwrap();
+            config
+                .set_str("remote.team/backup.url", "/nowhere")
+                .unwrap();
+            config.set_str("remote.rel.url", "/nowhere").unwrap();
+            config
+                .set_str("remote.rel.agentfsCredentials", "token")
+                .unwrap();
+        }
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let events = sink.take();
+        let names: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                Event::RemoteMisconfigured { remote, .. } => remote.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["rel", "team/backup"]);
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![
+                    write(dir.path(), "ok", "1"),
+                    write(dir.path(), "big", "0123456789"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, Some(0));
+        assert_eq!(recorded.skipped.len(), 1);
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["ok"]);
     }
 
     #[test]

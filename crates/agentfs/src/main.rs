@@ -157,6 +157,12 @@ fn main() -> Result<ExitCode> {
             for remote in push::status(&state, history.settings())? {
                 println!("{}", remote_line(&remote));
             }
+            for bad in &history.settings().invalid_remotes {
+                println!(
+                    "remote:    {}: misconfigured, not pushed: {}",
+                    bad.name, bad.error
+                );
+            }
         }
         Command::Flush(pod) => {
             let (_, committer, _) =
@@ -224,7 +230,21 @@ fn push_once(state: &StateDir, only: &[String]) -> Result<ExitCode> {
     let history = History::open(&state.git())
         .with_context(|| format!("opening {}", state.root().display()))?;
     let settings = history.settings();
+    let events = stderr_sink();
+    let mut ok = true;
+    for bad in &settings.invalid_remotes {
+        if only.is_empty() || only.contains(&bad.name) {
+            events.emit(Event::RemoteMisconfigured {
+                remote: bad.name.clone(),
+                error: bad.error.clone(),
+            });
+            ok = false;
+        }
+    }
     for name in only {
+        if settings.invalid_remotes.iter().any(|r| r.name == *name) {
+            continue;
+        }
         if !settings.remotes.iter().any(|r| r.name == *name) {
             bail!("no remote named {name:?} is configured");
         }
@@ -235,11 +255,12 @@ fn push_once(state: &StateDir, only: &[String]) -> Result<ExitCode> {
         .filter(|r| only.is_empty() || only.contains(&r.name))
         .collect();
     if selected.is_empty() {
-        println!("no remotes configured");
-        return Ok(ExitCode::SUCCESS);
+        if ok {
+            println!("no remotes configured");
+            return Ok(ExitCode::SUCCESS);
+        }
+        return Ok(ExitCode::FAILURE);
     }
-    let events = stderr_sink();
-    let mut ok = true;
     for remote in selected {
         let mut pusher = RemotePusher::open(state, settings, remote, events.clone())?;
         let outcome = pusher.push_once();

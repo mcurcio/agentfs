@@ -60,6 +60,13 @@ pub struct RemoteSettings {
     pub credentials: Option<PathBuf>,
 }
 
+/// A `[remote "<name>"]` section that is left out because it is invalid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidRemote {
+    pub name: String,
+    pub error: String,
+}
+
 impl RemoteSettings {
     /// The URL pushes go to.
     pub fn push_url(&self) -> &str {
@@ -79,6 +86,10 @@ pub struct Settings {
     pub identity: Templates,
     /// Push remotes, sorted by name.
     pub remotes: Vec<RemoteSettings>,
+    /// Remote sections that could not be used, sorted by name. They are
+    /// left out of `remotes` and reported as alarms; they never fail the
+    /// volume (design §11.1).
+    pub invalid_remotes: Vec<InvalidRemote>,
 }
 
 impl Settings {
@@ -94,6 +105,7 @@ impl Settings {
         let branch =
             string(config, "agentfs.branch")?.unwrap_or_else(|| format!("agentfs/{volume}"));
         let defaults = Templates::default();
+        let (remotes, invalid_remotes) = remotes(config)?;
         Ok(Self {
             branch_ref: format!("refs/heads/{branch}"),
             respect_tree_rules: boolean(config, "agentfs.respectTreeRules")?.unwrap_or(false),
@@ -122,14 +134,19 @@ impl Settings {
                 author_email: string(config, "agentfs.identity.authorEmail")?
                     .unwrap_or(defaults.author_email),
             },
-            remotes: remotes(config)?,
+            remotes,
+            invalid_remotes,
             volume,
         })
     }
 }
 
-/// Every `[remote "<name>"]` with a `url`, sorted by name.
-fn remotes(config: &git2::Config) -> Result<Vec<RemoteSettings>, ConfigError> {
+/// Every `[remote "<name>"]` with a `url`, sorted by name: the valid ones,
+/// and the invalid ones with their errors. A remote only affects pushing,
+/// so a mistake in one never fails the volume (design §11.1).
+fn remotes(
+    config: &git2::Config,
+) -> Result<(Vec<RemoteSettings>, Vec<InvalidRemote>), ConfigError> {
     let mut names = BTreeSet::new();
     {
         let mut entries = config.entries(Some(r"^remote\..*\.url$"))?;
@@ -144,43 +161,54 @@ fn remotes(config: &git2::Config) -> Result<Vec<RemoteSettings>, ConfigError> {
             }
         }
     }
-    names
-        .into_iter()
-        .map(|name| {
-            validate_name(&format!("remote.{name}"), &name)?;
-            let key = |k: &str| format!("remote.{name}.{k}");
-            let Some(url) = string(config, &key("url"))? else {
-                return Err(git2::Error::from_str("remote url vanished while reading").into());
-            };
-            let max_blob_size = match int(config, &key("agentfsMaxBlobSize"))? {
-                None => None,
-                Some(n) if n > 0 => Some(n as u64),
-                Some(n) => {
-                    return Err(ConfigError::BadSize {
-                        key: key("agentfsMaxBlobSize"),
-                        value: n.to_string(),
-                    });
-                }
-            };
-            let credentials = match string(config, &key("agentfsCredentials"))? {
-                None => None,
-                Some(path) if Path::new(&path).is_absolute() => Some(PathBuf::from(path)),
-                Some(path) => {
-                    return Err(ConfigError::RelativePath {
-                        key: key("agentfsCredentials"),
-                        value: path,
-                    });
-                }
-            };
-            Ok(RemoteSettings {
-                push_url: string(config, &key("pushurl"))?,
-                url,
-                max_blob_size,
-                credentials,
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for name in names {
+        match remote(config, &name) {
+            Ok(remote) => valid.push(remote),
+            Err(e) => invalid.push(InvalidRemote {
                 name,
-            })
-        })
-        .collect()
+                error: e.to_string(),
+            }),
+        }
+    }
+    Ok((valid, invalid))
+}
+
+/// One `[remote "<name>"]` section.
+fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigError> {
+    validate_name(&format!("remote.{name}"), name)?;
+    let key = |k: &str| format!("remote.{name}.{k}");
+    let Some(url) = string(config, &key("url"))? else {
+        return Err(git2::Error::from_str("remote url vanished while reading").into());
+    };
+    let max_blob_size = match int(config, &key("agentfsMaxBlobSize"))? {
+        None => None,
+        Some(n) if n > 0 => Some(n as u64),
+        Some(n) => {
+            return Err(ConfigError::BadSize {
+                key: key("agentfsMaxBlobSize"),
+                value: n.to_string(),
+            });
+        }
+    };
+    let credentials = match string(config, &key("agentfsCredentials"))? {
+        None => None,
+        Some(path) if Path::new(&path).is_absolute() => Some(PathBuf::from(path)),
+        Some(path) => {
+            return Err(ConfigError::RelativePath {
+                key: key("agentfsCredentials"),
+                value: path,
+            });
+        }
+    };
+    Ok(RemoteSettings {
+        push_url: string(config, &key("pushurl"))?,
+        url,
+        max_blob_size,
+        credentials,
+        name: name.to_owned(),
+    })
 }
 
 /// Checks a volume or remote name (design §11.4). Names become ref path
@@ -350,34 +378,32 @@ mod tests {
 
     #[test]
     fn remote_and_volume_errors() {
-        for size in ["0", "-1"] {
+        // An invalid remote is left out and reported; the volume still
+        // opens, with its other remotes.
+        let invalid = |section: &str| {
             let (_d, c) = config_with(&format!(
-                "[agentfs]\n\tvolume = v\n[remote \"r\"]\n\turl = /x\n\tagentfsMaxBlobSize = {size}\n"
+                "[agentfs]\n\tvolume = v\n[remote \"good\"]\n\turl = /g\n{section}"
             ));
-            assert!(
-                matches!(Settings::from_config(&c), Err(ConfigError::BadSize { .. })),
-                "{size}"
-            );
+            let s = Settings::from_config(&c).unwrap();
+            let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+            assert_eq!(names, ["good"], "{section}");
+            assert_eq!(s.invalid_remotes.len(), 1, "{section}");
+            s.invalid_remotes[0].clone()
+        };
+        for size in ["0", "-1"] {
+            let bad = invalid(&format!(
+                "[remote \"r\"]\n\turl = /x\n\tagentfsMaxBlobSize = {size}\n"
+            ));
+            assert_eq!(bad.name, "r");
+            assert!(bad.error.contains("agentfsMaxBlobSize"), "{bad:?}");
         }
-        let (_d, c) = config_with(
-            "[agentfs]\n\tvolume = v\n[remote \"r\"]\n\turl = /x\n\tagentfsMaxBlobSize = lots\n",
-        );
-        assert!(matches!(
-            Settings::from_config(&c),
-            Err(ConfigError::Git(_))
-        ));
-        let (_d, c) = config_with(
-            "[agentfs]\n\tvolume = v\n[remote \"r\"]\n\turl = /x\n\tagentfsCredentials = token\n",
-        );
-        assert!(matches!(
-            Settings::from_config(&c),
-            Err(ConfigError::RelativePath { .. })
-        ));
-        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n[remote \"x/y\"]\n\turl = /x\n");
-        assert!(matches!(
-            Settings::from_config(&c),
-            Err(ConfigError::BadName { .. })
-        ));
+        let bad = invalid("[remote \"r\"]\n\turl = /x\n\tagentfsMaxBlobSize = lots\n");
+        assert_eq!(bad.name, "r");
+        let bad = invalid("[remote \"r\"]\n\turl = /x\n\tagentfsCredentials = token\n");
+        assert!(bad.error.contains("absolute"), "{bad:?}");
+        let bad = invalid("[remote \"team/backup\"]\n\turl = /x\n");
+        assert_eq!(bad.name, "team/backup");
+        assert!(bad.error.contains("not a valid name"), "{bad:?}");
         for volume in ["a/b", "-v", "\"\"", ".v", "a..b", "v.lock", "v.", "v*"] {
             let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = {volume}\n"));
             assert!(

@@ -242,6 +242,17 @@ impl Checks {
         Ok(None)
     }
 
+    /// The size limit on the live backing file, before it is frozen, so a
+    /// file far over the limit is never copied (design §3.2). Advisory: the
+    /// file can change before the freeze, so [`Checks::check_file`] on the
+    /// frozen copy stays the authoritative check. A file that cannot be
+    /// stat'ed passes here and fails in the freeze.
+    pub fn check_backing_size(&self, backing: &Path) -> Option<Refusal> {
+        self.limits.max_blob_size.as_ref()?;
+        let bytes = std::fs::metadata(backing).ok()?.len();
+        self.check_blob_size(bytes)
+    }
+
     fn check_blob_size(&self, bytes: u64) -> Option<Refusal> {
         let limit = self.limits.max_blob_size.as_ref()?;
         (bytes > limit.bytes).then(|| Refusal::BlobTooLarge {
@@ -334,6 +345,10 @@ mod tests {
             ".gitmodules:x",
             "gitmod~1",
             "GI7EBA~3",
+            "gi7eb~10",
+            "gi7e~123",
+            "g~123456",
+            "d/~1234567",
             ".g\u{200c}itmodules",
             ".gitattributes",
             "gitatt~2",
@@ -346,7 +361,14 @@ mod tests {
                 "{name:?}: {refusal:?}"
             );
         }
-        for name in ["gitmodules", ".gitmodulesx", "gitmod~5", "x/link"] {
+        for name in [
+            "gitmodules",
+            ".gitmodulesx",
+            "gitmod~5",
+            "x/link",
+            "gi7eba~10",
+            "~123456789",
+        ] {
             assert_eq!(c.check_symlink(&p(name), "target"), None, "{name:?}");
         }
         assert_eq!(

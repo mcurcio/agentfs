@@ -148,34 +148,82 @@ impl fmt::Display for SpecialFile {
 /// as that file on NTFS or HFS+ (git's `is_ntfs_dot_generic` and
 /// `is_hfs_dot_generic`): any case, HFS+ ignorable code points, trailing
 /// spaces and dots, an NTFS stream suffix (`:x`), and the 8.3 short names
-/// (`gitmod~1` to `~4`, or the hashed fallback `gi7eba~1` to `~9`).
+/// (`gitmod~1` to `~4`, or the hashed fallback: a prefix of up to six
+/// characters of `gi7eba`, `~`, a digit 1-9 and more digits, eight
+/// characters in all, so `gi7eba~9`, `gi7eb~10`, `g~123456`, and even
+/// `~1234567`, which names all four files).
 pub fn special_file(component: &str) -> Option<SpecialFile> {
     let stripped: String = component
         .chars()
         .filter(|c| !is_hfs_ignorable(*c))
         .collect();
-    let stream_cut = stripped.split(':').next().unwrap_or_default();
-    let name = stream_cut.trim_end_matches([' ', '.']).to_ascii_lowercase();
-    // (file, full name, 8.3 prefix taking ~1-4, hashed 8.3 prefix taking ~1-9)
-    const NAMES: [(SpecialFile, &str, &str, &str); 4] = [
-        (SpecialFile::Gitmodules, ".gitmodules", "gitmod", "gi7eba"),
-        (
-            SpecialFile::Gitattributes,
-            ".gitattributes",
-            "gitatt",
-            "gi7d29",
-        ),
-        (SpecialFile::Gitignore, ".gitignore", "gitign", "gi250a"),
-        (SpecialFile::Mailmap, ".mailmap", "mailma", "maba30"),
+    // (file, name without its dot, hashed 8.3 fallback prefix)
+    const NAMES: [(SpecialFile, &str, &str); 4] = [
+        (SpecialFile::Gitmodules, "gitmodules", "gi7eba"),
+        (SpecialFile::Gitattributes, "gitattributes", "gi7d29"),
+        (SpecialFile::Gitignore, "gitignore", "gi250a"),
+        (SpecialFile::Mailmap, "mailmap", "maba30"),
     ];
-    let short_name = |prefix: &str, max: u8| {
-        name.strip_prefix(prefix)
-            .and_then(|rest| rest.strip_prefix('~'))
-            .is_some_and(|n| matches!(n.as_bytes(), [d] if (b'1'..=max).contains(d)))
-    };
-    NAMES.into_iter().find_map(|(file, full, short, hashed)| {
-        (name == full || short_name(short, b'4') || short_name(hashed, b'9')).then_some(file)
+    NAMES.into_iter().find_map(|(file, name, hashed)| {
+        is_ntfs_dot_generic(stripped.as_bytes(), name.as_bytes(), hashed.as_bytes()).then_some(file)
     })
+}
+
+/// A port of git's `is_ntfs_dot_generic` (path.c). `dotgit_name` is the
+/// file name without its leading dot (at least six bytes), and
+/// `shortname_prefix` the lower-case six-byte hashed 8.3 fallback prefix.
+fn is_ntfs_dot_generic(name: &[u8], dotgit_name: &[u8], shortname_prefix: &[u8]) -> bool {
+    // After the name proper only spaces and dots may follow, up to the end
+    // or an NTFS stream separator.
+    let only_spaces_and_periods = |rest: &[u8]| {
+        for &c in rest {
+            match c {
+                b':' => return true,
+                b' ' | b'.' => {}
+                _ => return false,
+            }
+        }
+        true
+    };
+    let len = dotgit_name.len();
+    if name.first() == Some(&b'.')
+        && name.len() > len
+        && name[1..=len].eq_ignore_ascii_case(dotgit_name)
+    {
+        return only_spaces_and_periods(&name[len + 1..]);
+    }
+    // The regular short name: the first six characters, then `~1` to `~4`.
+    if name.len() >= 8
+        && name[..6].eq_ignore_ascii_case(&dotgit_name[..6])
+        && name[6] == b'~'
+        && (b'1'..=b'4').contains(&name[7])
+    {
+        return only_spaces_and_periods(&name[8..]);
+    }
+    // The fall-back short name. git reads a NUL at the end of the name.
+    let at = |i: usize| name.get(i).copied().unwrap_or(0);
+    let mut saw_tilde = false;
+    let mut i = 0;
+    while i < 8 {
+        let c = at(i);
+        if c == 0 {
+            return false;
+        } else if saw_tilde {
+            if !c.is_ascii_digit() {
+                return false;
+            }
+        } else if c == b'~' {
+            i += 1;
+            if !(b'1'..=b'9').contains(&at(i)) {
+                return false;
+            }
+            saw_tilde = true;
+        } else if i >= 6 || !c.is_ascii() || c.to_ascii_lowercase() != shortname_prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    only_spaces_and_periods(name.get(i..).unwrap_or_default())
 }
 
 /// True for names git expects to be regular files, never symlinks, in any
@@ -267,6 +315,14 @@ mod tests {
             (".mailmap", SpecialFile::Mailmap),
             ("mailma~2", SpecialFile::Mailmap),
             ("maba30~5", SpecialFile::Mailmap),
+            ("gi7eb~10", SpecialFile::Gitmodules),
+            ("gi7e~123", SpecialFile::Gitmodules),
+            ("GI7~1234", SpecialFile::Gitmodules),
+            ("g~123456", SpecialFile::Gitmodules),
+            ("gi250~99. ", SpecialFile::Gitignore),
+            ("maba3~10:x", SpecialFile::Mailmap),
+            // Names all four files; the first is reported.
+            ("~1234567", SpecialFile::Gitmodules),
         ] {
             assert_eq!(special_file(name), Some(file), "{name:?}");
         }
@@ -278,6 +334,15 @@ mod tests {
             "gitmod~0",
             "gitmod~10",
             "gi7eba~0",
+            "gi7eba~10",
+            "gi7eba~",
+            "gi7eb~0",
+            "gi7eb~1x",
+            "gi7eb~1",
+            "g~12345",
+            "~123456789",
+            "~0123456",
+            "gi7eb\u{e9}~1",
             "gitmod1",
             ".mailmap2",
             "",

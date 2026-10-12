@@ -123,6 +123,9 @@ pub enum Event {
         remote_head: Option<Oid>,
         diverged_ref: String,
     },
+    /// A `[remote "<name>"]` section is invalid, so the remote is never
+    /// pushed; recording and other remotes carry on (design §11.1).
+    RemoteMisconfigured { remote: String, error: String },
     /// A push attempt succeeded, including one with nothing new to send.
     PushSucceeded {
         remote: String,
@@ -145,6 +148,7 @@ impl Event {
             Self::CommitFailed { .. } => "commit_failed",
             Self::PushFailed { .. } => "push_failed",
             Self::Diverged { .. } => "diverged",
+            Self::RemoteMisconfigured { .. } => "remote_misconfigured",
             Self::PushSucceeded { .. } => "push_succeeded",
         }
     }
@@ -204,6 +208,12 @@ impl fmt::Display for Event {
                  saved as {diverged_ref}",
                 oid_or(*remote_head, "unknown"),
             ),
+            Self::RemoteMisconfigured { remote, error } => {
+                write!(
+                    f,
+                    "remote {remote:?} is misconfigured and is not pushed: {error}"
+                )
+            }
             Self::PushSucceeded {
                 remote,
                 head,

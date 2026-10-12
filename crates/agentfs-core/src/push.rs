@@ -82,6 +82,11 @@ pub struct Divergence {
     pub remote_head: Option<String>,
     /// Where the local head was saved, once that push succeeded.
     pub diverged_ref: Option<String>,
+    /// The name chosen for saving the head, recorded before the push and
+    /// cleared once it is confirmed: a restart reuses it rather than
+    /// saving the head again under a new name.
+    #[serde(default)]
+    pub pending_ref: Option<String>,
 }
 
 /// One remote's push bookkeeping, persisted across restarts.
@@ -490,37 +495,73 @@ impl RemotePusher {
 
     /// Someone else wrote the branch: save the local head once per
     /// divergence, then fail like any other attempt.
+    ///
+    /// The ref name is chosen and saved in the state file as
+    /// `pending_ref` before it is pushed, so a crash between the push and
+    /// the state update retries the same name (the same or a descendant
+    /// head: a no-op or a fast-forward) instead of saving the head again
+    /// under a new timestamp.
     fn diverged(&mut self, head: Oid, remote_head: Option<Oid>, message: String) -> PushOutcome {
         let now = now_ms();
         let previous = self.state.diverged.take();
+        let since_ms = previous.as_ref().map_or(now, |d| d.since_ms);
         let mut diverged_ref = previous.as_ref().and_then(|d| d.diverged_ref.clone());
+        let mut pending_ref = previous.as_ref().and_then(|d| d.pending_ref.clone());
         let mut message = message;
         if diverged_ref.is_none() {
-            let name = self::diverged_ref(&self.volume, now / 1000);
-            let attempt = self.attempt(&[format!("{head}:{name}")]);
-            match (&attempt.result, attempt.rejected.first()) {
-                (Ok(()), None) => {
-                    self.events.emit(Event::Diverged {
-                        remote: self.remote.name.clone(),
-                        local_head: head,
-                        remote_head,
-                        diverged_ref: name.clone(),
-                    });
-                    diverged_ref = Some(name);
+            let name = pending_ref
+                .clone()
+                .unwrap_or_else(|| self::diverged_ref(&self.volume, now / 1000));
+            pending_ref = Some(name.clone());
+            self.state.diverged = Some(Divergence {
+                since_ms,
+                local_head: head.to_string(),
+                remote_head: remote_head.map(|o| o.to_string()),
+                diverged_ref: None,
+                pending_ref: pending_ref.clone(),
+            });
+            match self.state.save(&self.state_path) {
+                Err(e) => {
+                    // Without a durable name, pushing could save the head
+                    // twice; try again at the next attempt.
+                    message = format!(
+                        "{message}; not saving the head as {name}: saving {}: {e}",
+                        self.state_path.display()
+                    );
                 }
-                (Ok(()), Some((_, msg))) => {
-                    message = format!("{message}; saving the head as {name}: {msg}");
-                }
-                (Err(e), _) => {
-                    message = format!("{message}; saving the head as {name}: {}", e.message());
+                Ok(()) => {
+                    let attempt = self.attempt(&[format!("{head}:{name}")]);
+                    match (&attempt.result, attempt.rejected.first()) {
+                        (Ok(()), None) => {
+                            self.events.emit(Event::Diverged {
+                                remote: self.remote.name.clone(),
+                                local_head: head,
+                                remote_head,
+                                diverged_ref: name.clone(),
+                            });
+                            diverged_ref = Some(name);
+                            pending_ref = None;
+                        }
+                        (Ok(()), Some((_, msg))) => {
+                            // The remote refused this name; pick a fresh
+                            // one next time.
+                            message = format!("{message}; saving the head as {name}: {msg}");
+                            pending_ref = None;
+                        }
+                        (Err(e), _) => {
+                            message =
+                                format!("{message}; saving the head as {name}: {}", e.message());
+                        }
+                    }
                 }
             }
         }
         self.state.diverged = Some(Divergence {
-            since_ms: previous.map_or(now, |d| d.since_ms),
+            since_ms,
             local_head: head.to_string(),
             remote_head: remote_head.map(|o| o.to_string()),
             diverged_ref: diverged_ref.clone(),
+            pending_ref,
         });
         self.failed(PushFailureKind::NonFastForward, message, Some(head));
         PushOutcome::Diverged {
@@ -663,7 +704,7 @@ pub fn classify(err: &GitError, negotiated: bool) -> PushFailureKind {
     match err.code() {
         ErrorCode::Auth => return PushFailureKind::Auth,
         ErrorCode::NotFastForward => return PushFailureKind::NonFastForward,
-        ErrorCode::Certificate => return PushFailureKind::Unreachable,
+        ErrorCode::Certificate | ErrorCode::Timeout => return PushFailureKind::Unreachable,
         _ => {}
     }
     if !negotiated {
@@ -1231,6 +1272,65 @@ mod tests {
         );
         assert_eq!(pusher.state().diverged, None);
         assert_eq!(pusher.state().consecutive_failures, 0);
+    }
+
+    /// A crash after the diverged ref reached the remote but before the
+    /// state recorded it: the restart reuses the recorded name.
+    #[test]
+    fn divergence_saved_once_across_a_crash() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let url = remote.display().to_string();
+        let mut v = Vol::new("vol", &[("origin", &url)]);
+        v.commit();
+        assert!(
+            v.pusher("origin", Arc::new(NullSink))
+                .push_once()
+                .is_success()
+        );
+        write_remote(remote, "refs/heads/agentfs/vol");
+        let ours = v.commit();
+
+        // What the crashed process left behind: the name recorded as
+        // pending, and the head already pushed under it.
+        let name = diverged_ref("vol", 1);
+        let state_path = v.state.push_state("origin");
+        let mut state = PushState::load(&state_path);
+        state.diverged = Some(Divergence {
+            since_ms: 1000,
+            local_head: ours.to_string(),
+            remote_head: None,
+            diverged_ref: None,
+            pending_ref: Some(name.clone()),
+        });
+        state.save(&state_path).unwrap();
+        v.com
+            .history()
+            .repo()
+            .remote_anonymous(&url)
+            .unwrap()
+            .push(&[format!("{ours}:{name}")], None)
+            .unwrap();
+
+        // The workload carries on, then the service restarts.
+        let newer = v.commit();
+        let (events, sink_events) = sink();
+        let mut pusher = v.pusher("origin", sink_events);
+        let outcome = pusher.push_once();
+        assert!(
+            matches!(&outcome, PushOutcome::Diverged { diverged_ref: Some(r), .. } if *r == name),
+            "{outcome:?}"
+        );
+        assert_eq!(diverged_refs(remote, "vol"), [(name.clone(), newer)]);
+        assert!(matches!(
+            &events.take()[..],
+            [Event::Diverged { diverged_ref, .. }, Event::PushFailed { .. }] if *diverged_ref == name
+        ));
+        let saved = PushState::load(&state_path).diverged.unwrap();
+        assert_eq!(saved.diverged_ref, Some(name));
+        assert_eq!(saved.pending_ref, None);
+        assert_eq!(saved.since_ms, 1000);
     }
 
     #[test]
