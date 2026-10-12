@@ -12,6 +12,7 @@
 pub mod checks;
 pub mod claims;
 pub mod config;
+pub mod confined;
 pub mod credentials;
 pub mod events;
 pub mod gitmodules;
@@ -26,6 +27,7 @@ pub mod pending;
 pub mod probe;
 pub mod push;
 pub mod record;
+pub mod restore;
 pub mod rules;
 pub mod service;
 pub mod telemetry;
