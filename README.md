@@ -61,7 +61,7 @@ nested repository detection. Also:
   mount or directly, each recorded as one commit, and operator runbooks.
   See [Recovery](#recovery).
 
-The `agentfs` command has `init`, `status`, `mount`, `flush`, `record`,
+The `agentfs` command has `init`, `status`, `mount`, `probe`, `flush`, `record`,
 `push`, `run`, `restore` and `revert`. `mount` mounts a backing tree and runs the commit and
 push loops in the same process. `record` records paths of a backing tree
 directly, without a mount, and reports the paths the rules skip or the
@@ -103,8 +103,11 @@ foreground until SIGINT, SIGTERM or an unmount, then unmounts (lazily if
 files are still open), records what is still open, makes a final commit
 and exits. Paths whose record failed and could not be repaired by then are
 saved in `<state>/meta/repairs` and recorded by the next mount before it
-serves anything. Flags: `--passthrough auto|on|off`, `--threads`,
-`--no-allow-other`, `--unmount-grace`, `--push-grace`.
+serves anything. A missing mount point is created. Flags: `--passthrough auto|on|off`, `--threads`,
+`--no-allow-other`, `--unmount-grace`, `--push-grace`,
+`--on-stale-mount refuse|hold` (a restarted Kubernetes sidecar holds
+instead of remounting over a dead mount). `agentfs probe MOUNTPOINT`
+exits 0 only for a live agentfs mount, for Kubernetes probes.
 
 It needs Linux 5.6+ and `/dev/fuse`, and should run as root for multi-user
 volumes (new files are given to their creator: `CAP_CHOWN` and

@@ -275,6 +275,8 @@ flags, most with an environment equivalent:
 | `--no-allow-other` | | | `mount` |
 | `--unmount-grace DURATION` | | `10s` | `mount` |
 | `--push-grace DURATION` | | `5s` | `mount`, `run` |
+| `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount` |
+| `--allow-stale` | | | `probe` |
 | `--remote NAME` (repeatable) | | every remote | `push` |
 | `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init` |
 | `--branch NAME` | | `agentfs/<volume>` | `init` |

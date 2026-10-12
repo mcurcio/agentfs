@@ -127,6 +127,21 @@ it exits 1 and changes nothing
 | `--no-allow-other` | | | Only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | At shutdown, how long to wait for open files on a busy mount after detaching it |
 | `--push-grace DURATION` | | `5s` | At shutdown, how long to wait for pushes in progress |
+| `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | When the mount point is an agentfs mount whose daemon died: `refuse` exits 1 with the command that clears it; `hold` (a restarted Kubernetes sidecar, §10) mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then detaches the stale mount and exits 1 |
+
+A missing mount point is created (mode `0755`; its parent must exist), so
+a sidecar can mount into a subdirectory of a fresh `emptyDir`.
+
+`agentfs probe MOUNTPOINT [--allow-stale]` prints what is mounted there
+and takes no lock and reads no state area, for Kubernetes startup and
+readiness probes:
+
+| Output | Exit status |
+|---|---|
+| `live agentfs mount (agentfs:<volume>)` | 0 |
+| `stale agentfs mount (daemon gone)` | 1, or 0 with `--allow-stale` |
+| `not mounted` | 1 |
+| `not an agentfs mount (<fstype>)` | 1 |
 
 Pod flags (`mount`, `run`, `record`, `flush`, `push`), from the downward
 API in Kubernetes: `--namespace` (`AGENTFS_NAMESPACE`), `--pod`
@@ -285,9 +300,16 @@ nothing that a workload saw succeed.
   `agentfs mount` refuses a stale mount point with exactly this advice.
 - At start, records in the journal that are not in history yet are
   committed (`N uncommitted record(s) recovered` in the startup line).
-- In Kubernetes, phase 1 accepts restarting the pod as the recovery: the
-  sidecar restarts, and workload containers that held the old mount must
-  restart too (§17.1).
+- In Kubernetes, phase 1 recovers by restarting the pod (§17.1). The
+  sidecar container restarts on its own, but runs with
+  `--on-stale-mount hold`: it does not remount while the workload
+  containers still hold the dead mount, its readiness probe fails (the pod
+  shows NotReady) and the workload's writes keep failing with `ENOTCONN`,
+  so nothing goes unrecorded. Delete the pod (`kubectl delete pod <pod>`);
+  the holding sidecar detaches the stale mount when it is stopped, and the
+  new pod recovers the journal and pushes. See the
+  [crashed sidecar runbook](runbooks/crashed-sidecar.md) and
+  [deployment.md](deployment.md#a-crashed-daemon).
 
 ## 11. Kubernetes sidecar sketch
 

@@ -12,6 +12,13 @@
 //! `restore` and `revert` write content from history back into the tree,
 //! recorded as one commit (design §15; [`recovery`]).
 //!
+//! `init` creates a state area or accepts one that already belongs to the
+//! volume, so a pod can run it at every start; `probe` reports whether a
+//! mount point holds a live agentfs mount, for Kubernetes probes; and
+//! `mount --on-stale-mount hold` makes a sidecar restarted after a crash
+//! wait for the pod restart instead of remounting ([`hold`], design
+//! §17.1).
+//!
 //! `mount`, `run`, `record`, `flush`, `push`, and `restore` and `revert`
 //! when no mount runs, take the state-area lock (design §2.3) and exit 75
 //! while another process holds it; `status` is read-only and takes no lock.
@@ -23,6 +30,7 @@
 
 mod control;
 mod daemon;
+mod hold;
 mod otel;
 mod recovery;
 
@@ -46,7 +54,7 @@ use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::service::Service;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
-use agentfs_fuse::{Mount, MountConfig, Passthrough, preflight};
+use agentfs_fuse::{Mount, MountConfig, MountState, Passthrough, mount_state, preflight};
 
 use crate::daemon::{Daemon, Wake};
 
@@ -158,6 +166,17 @@ enum Command {
     /// with the commit and push loops, until SIGINT, SIGTERM or an unmount.
     /// A second signal exits at once.
     Mount(MountArgs),
+    /// Report what is mounted at MOUNTPOINT: a live agentfs mount (exit 0),
+    /// a stale one whose daemon died, nothing, or another filesystem (exit
+    /// 1). Takes no lock and reads no state area: for startup and readiness
+    /// probes (design §17.1).
+    Probe {
+        mountpoint: PathBuf,
+        /// Exit 0 for a stale agentfs mount too (a sidecar holding after a
+        /// crash).
+        #[arg(long)]
+        allow_stale: bool,
+    },
 }
 
 fn parse_grace(value: &str) -> Result<Duration, String> {
@@ -371,8 +390,19 @@ fn real_main() -> Result<ExitCode> {
             let ask = recovery::Ask::revert(commit, force, dry_run);
             return recovery::run(&state, cli.root.as_deref(), cli.wait_lock, &pod, ask);
         }
+        Command::Probe {
+            mountpoint,
+            allow_stale,
+        } => return Ok(probe(&mountpoint, allow_stale)),
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
+            // A restarted sidecar whose daemon died: hold, mount nothing
+            // and take no lock (design §17.1).
+            if args.on_stale_mount == OnStaleMount::Hold
+                && let Ok(MountState::Stale { source }) = mount_state(&args.mountpoint)
+            {
+                return Ok(hold::hold(daemon, &args.mountpoint, &source));
+            }
             let _lock = StateLock::acquire(&state, "mount", cli.wait_lock)?;
             return mount(daemon, &state, cli.root.as_deref(), &args);
         }
@@ -639,10 +669,78 @@ struct MountArgs {
     /// released after it is detached.
     #[arg(long, default_value = "10s", value_parser = parse_grace)]
     unmount_grace: Duration,
+    /// What to do when MOUNTPOINT is an agentfs mount whose daemon died:
+    /// `refuse` (exit 1 with the command that clears it) or `hold` (a
+    /// restarted sidecar: mount nothing, wait for SIGTERM, then detach the
+    /// stale mount; design §17.1).
+    #[arg(
+        long,
+        env = "AGENTFS_ON_STALE_MOUNT",
+        default_value = "refuse",
+        value_enum
+    )]
+    on_stale_mount: OnStaleMount,
+}
+
+/// `mount --on-stale-mount`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OnStaleMount {
+    Refuse,
+    Hold,
 }
 
 fn parse_passthrough(value: &str) -> Result<Passthrough, String> {
     value.parse()
+}
+
+/// `agentfs probe`: one line, exit 0 for a live agentfs mount (or a stale
+/// one with `allow_stale`), else 1.
+fn probe(mountpoint: &Path, allow_stale: bool) -> ExitCode {
+    match mount_state(mountpoint) {
+        Ok(state) => {
+            println!("{}", describe_state(&state));
+            let ok = match state {
+                MountState::Live { .. } => true,
+                MountState::Stale { .. } => allow_stale,
+                MountState::NotMounted | MountState::Foreign { .. } => false,
+            };
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            println!("cannot check {}: {e}", mountpoint.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn describe_state(state: &MountState) -> String {
+    match state {
+        MountState::Live { source } => format!("live agentfs mount ({source})"),
+        MountState::Stale { .. } => "stale agentfs mount (daemon gone)".to_owned(),
+        MountState::NotMounted => "not mounted".to_owned(),
+        MountState::Foreign { fstype } => format!("not an agentfs mount ({fstype})"),
+    }
+}
+
+/// Creates a missing mount point (one level: its parent must exist), so a
+/// sidecar can mount into a subdirectory of a fresh emptyDir.
+fn create_mountpoint(mountpoint: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(mountpoint) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .create(mountpoint)
+                .with_context(|| format!("creating the mount point {}", mountpoint.display()))?;
+            eprintln!("created the mount point {}", mountpoint.display());
+            Ok(())
+        }
+        // Anything else (it exists, or is stale) is preflight's to judge.
+        _ => Ok(()),
+    }
 }
 
 /// `agentfs mount`: the FUSE filesystem, the commit loop and the push loops
@@ -671,6 +769,7 @@ fn mount(
         .with_context(|| format!("opening {}", state.root().display()))?
         .settings()
         .clone();
+    create_mountpoint(&args.mountpoint)?;
     let (backing, mountpoint) = preflight(state, &settings, &args.backing, &args.mountpoint)?;
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;

@@ -12,7 +12,15 @@
 //!   hard error, not a `RemoteMisconfigured` alarm: carrying on would hand
 //!   the secret to the workload;
 //! - a mount point left by a crashed daemon (`ENOTCONN`) is reported with
-//!   the command that clears it.
+//!   the command that clears it;
+//! - no config fragment (`include.path`, design §4.3) may be under the
+//!   backing tree or the mount point, for the same reason as credentials.
+//!
+//! [`mount_state`] tells a live agentfs mount from a stale one (its daemon
+//! gone), from nothing and from another filesystem, using
+//! `/proc/self/mountinfo` ([`parse_mountinfo`]) and a `statfs`; `agentfs
+//! probe` and the hold mode of a restarted sidecar use it, and [`detach`]
+//! clears a stale mount (design §17.1).
 //!
 //! [`Mount::start`] mounts with fuser (multi-threaded, one cloned
 //! `/dev/fuse` descriptor per thread) and these options: `fsname` agentfs
@@ -29,7 +37,9 @@
 //! [`Mount::shutdown`] unmounts (lazily if the mount is busy), waits a grace
 //! period for the session to end, stops the sweep and runs a final one.
 
+use std::ffi::OsStr;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -114,6 +124,21 @@ pub enum PreflightError {
         /// The config key naming the file (`agentfsCredentials`,
         /// `agentfsSshKey` or `agentfsKnownHosts`).
         key: &'static str,
+        path: PathBuf,
+        outer: &'static str,
+        outer_path: PathBuf,
+    },
+    /// An operator config fragment (`include.path`, design §4.3) is under
+    /// the backing tree or the mount point: the workload could rewrite the
+    /// operator's settings and remotes.
+    #[error(
+        "include.path {} is inside {outer} {}, where the workload could change the \
+         operator's settings; keep config fragments outside the backing tree and the mount \
+         point",
+        path.display(),
+        outer_path.display()
+    )]
+    IncludeExposed {
         path: PathBuf,
         outer: &'static str,
         outer_path: PathBuf,
@@ -236,7 +261,169 @@ pub fn preflight(
             }
         }
     }
+    for include in &settings.includes {
+        let path = canonical_any(include);
+        for (outer, outer_path) in [(BACKING, &backing), (MOUNTPOINT, &mountpoint)] {
+            if path.starts_with(outer_path) {
+                return Err(PreflightError::IncludeExposed {
+                    path,
+                    outer,
+                    outer_path: outer_path.clone(),
+                });
+            }
+        }
+    }
     Ok((backing, mountpoint))
+}
+
+/// One line of `/proc/self/mountinfo`: what is mounted where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountEntry {
+    pub mountpoint: PathBuf,
+    /// `fuse.agentfs` for an agentfs mount (`fuse` with some mount
+    /// helpers).
+    pub fstype: String,
+    /// `agentfs:<volume>` for an agentfs mount.
+    pub source: String,
+}
+
+impl MountEntry {
+    /// Whether this is an agentfs FUSE mount.
+    pub fn is_agentfs(&self) -> bool {
+        self.fstype.starts_with("fuse") && self.source.starts_with("agentfs:")
+    }
+}
+
+/// Parses `/proc/self/mountinfo` (proc(5)), in order. Lines that do not
+/// parse are skipped. The mount point and source have their octal escapes
+/// (`\040` for a space, ...) decoded.
+pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
+    text.lines()
+        .filter_map(|line| {
+            // `id parent major:minor root mountpoint options [optional...]
+            // - fstype source superoptions`
+            let (before, after) = line.split_once(" - ")?;
+            let mountpoint = before.split(' ').nth(4)?;
+            let mut after = after.split(' ');
+            let fstype = after.next()?;
+            let source = after.next().unwrap_or("");
+            Some(MountEntry {
+                mountpoint: PathBuf::from(OsStr::from_bytes(&unescape(mountpoint))),
+                fstype: String::from_utf8_lossy(&unescape(fstype)).into_owned(),
+                source: String::from_utf8_lossy(&unescape(source)).into_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Decodes the kernel's `\ooo` escapes (space, tab, newline, backslash).
+fn unescape(field: &str) -> Vec<u8> {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..=i + 3]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            let value = bytes[i + 1..=i + 3]
+                .iter()
+                .fold(0u32, |n, b| n * 8 + u32::from(b - b'0'));
+            if let Ok(byte) = u8::try_from(value) {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// What is mounted at a path, as `agentfs probe` and the hold mode of a
+/// restarted sidecar see it (design §17.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountState {
+    /// An agentfs mount whose daemon answers.
+    Live { source: String },
+    /// An agentfs mount whose daemon is gone (`ENOTCONN`).
+    Stale { source: String },
+    /// Nothing is mounted at the path itself.
+    NotMounted,
+    /// Something other than agentfs is mounted there.
+    Foreign { fstype: String },
+}
+
+/// What is mounted at `path`: the last (topmost) mountinfo entry for it,
+/// and for an agentfs mount, whether its daemon answers a `statfs`. The
+/// path is resolved without touching its last component when that fails,
+/// since a stale mount answers every `stat` with `ENOTCONN`.
+pub fn mount_state(path: &Path) -> io::Result<MountState> {
+    let info = std::fs::read_to_string("/proc/self/mountinfo")?;
+    mount_state_in(&parse_mountinfo(&info), path)
+}
+
+fn mount_state_in(entries: &[MountEntry], path: &Path) -> io::Result<MountState> {
+    let resolved = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => {
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                parent.canonicalize()?.join(name)
+            }
+            _ => std::path::absolute(path)?,
+        },
+    };
+    let Some(entry) = entries.iter().rev().find(|e| e.mountpoint == resolved) else {
+        return Ok(MountState::NotMounted);
+    };
+    if !entry.is_agentfs() {
+        return Ok(MountState::Foreign {
+            fstype: entry.fstype.clone(),
+        });
+    }
+    let source = entry.source.clone();
+    match rustix::fs::statfs(&resolved) {
+        Ok(_) => Ok(MountState::Live { source }),
+        Err(rustix::io::Errno::NOTCONN) => Ok(MountState::Stale { source }),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Detaches whatever is mounted at `path` lazily: `umount2(MNT_DETACH)`
+/// with the privilege to unmount, `fusermount3 -u -z` otherwise. Used to
+/// clear a stale agentfs mount (design §17.1).
+pub fn detach(path: &Path) -> io::Result<()> {
+    if Privileges::current().can_unmount() {
+        return rustix::mount::unmount(path, rustix::mount::UnmountFlags::DETACH)
+            .map_err(io::Error::from);
+    }
+    let out = Command::new(fusermount())
+        .args(["-u", "-q", "-z", "--"])
+        .arg(path)
+        .output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        ))
+    }
+}
+
+/// `fusermount3`, or `fusermount` where only the old one is installed.
+fn fusermount() -> &'static str {
+    ["fusermount3", "fusermount"]
+        .into_iter()
+        .find(|bin| Command::new(bin).arg("-V").output().is_ok())
+        .unwrap_or("fusermount3")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -532,10 +719,7 @@ fn unmount(mountpoint: &Path) -> io::Result<bool> {
             Err(e) => Err(e.into()),
         };
     }
-    let fusermount = ["fusermount3", "fusermount"]
-        .into_iter()
-        .find(|bin| Command::new(bin).arg("-V").output().is_ok())
-        .unwrap_or("fusermount3");
+    let fusermount = fusermount();
     let run = |args: &[&str]| Command::new(fusermount).args(args).arg(mountpoint).output();
     let out = run(&["-u", "-q", "--"])?;
     if out.status.success() {
@@ -763,6 +947,125 @@ mod tests {
             );
             assert!(err.to_string().contains(expected), "{err}");
         }
+    }
+
+    #[test]
+    fn exposed_includes_are_refused() {
+        let l = Layout::new();
+        let mut s = settings(vec![]);
+        s.includes = vec![l.p("operator.conf")];
+        l.check_with("state", "backing", "mnt", &s).unwrap();
+        for (path, outer) in [
+            (l.p("backing/etc/agentfs.conf"), BACKING),
+            (l.p("mnt/agentfs.conf"), MOUNTPOINT),
+        ] {
+            s.includes = vec![l.p("operator.conf"), path.clone()];
+            let err = l.check_with("state", "backing", "mnt", &s).unwrap_err();
+            assert!(
+                matches!(&err, PreflightError::IncludeExposed { path: p, outer: o, .. }
+                    if *p == path && *o == outer),
+                "{err}"
+            );
+            assert!(err.to_string().contains("include.path"), "{err}");
+        }
+    }
+
+    const MOUNTINFO: &str = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+35 22 0:31 / /data rw,relatime shared:2 master:7 - xfs /dev/sdb rw,attr2
+40 35 0:44 / /agentfs/workspace rw,nosuid,nodev,relatime shared:9 - fuse.agentfs agentfs:hermes rw,user_id=0,group_id=0,default_permissions,allow_other
+41 22 0:45 / /with\\040space rw - fuse agentfs:v\\134x rw
+42 22 0:46 / /stacked rw - tmpfs tmpfs rw
+43 42 0:47 / /stacked rw - fuse.agentfs agentfs:top rw
+44 22 0:48 / /tab\\011and\\012newline rw - fuse.sshfs host:/x rw
+garbage line
+";
+
+    #[test]
+    fn mountinfo_is_parsed() {
+        let entries = parse_mountinfo(MOUNTINFO);
+        assert_eq!(entries.len(), 7, "{entries:#?}");
+        assert_eq!(
+            entries[2],
+            MountEntry {
+                mountpoint: "/agentfs/workspace".into(),
+                fstype: "fuse.agentfs".into(),
+                source: "agentfs:hermes".into(),
+            }
+        );
+        assert!(entries[2].is_agentfs());
+        // Escapes, and a `fuse` fstype from a mount helper.
+        assert_eq!(entries[3].mountpoint, Path::new("/with space"));
+        assert_eq!(entries[3].source, "agentfs:v\\x");
+        assert!(entries[3].is_agentfs());
+        assert_eq!(entries[6].mountpoint, Path::new("/tab\tand\nnewline"));
+        assert!(!entries[6].is_agentfs());
+        // Optional fields before the separator do not shift anything.
+        assert_eq!(entries[1].fstype, "xfs");
+        assert!(!entries[0].is_agentfs());
+    }
+
+    #[test]
+    fn unescape_leaves_other_backslashes() {
+        assert_eq!(unescape("a\\0"), b"a\\0");
+        assert_eq!(unescape("\\777"), b"\\777");
+        assert_eq!(unescape("\\101\\"), b"A\\");
+    }
+
+    #[test]
+    fn mount_state_reads_the_topmost_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mnt = root.join("mnt");
+        fs::create_dir(&mnt).unwrap();
+        let entry = |fstype: &str, source: &str| MountEntry {
+            mountpoint: mnt.clone(),
+            fstype: fstype.into(),
+            source: source.into(),
+        };
+        assert_eq!(mount_state_in(&[], &mnt).unwrap(), MountState::NotMounted);
+        // Only the path itself counts, not a mount above it.
+        let above = MountEntry {
+            mountpoint: root.clone(),
+            ..entry("fuse.agentfs", "agentfs:v")
+        };
+        assert_eq!(
+            mount_state_in(std::slice::from_ref(&above), &mnt).unwrap(),
+            MountState::NotMounted
+        );
+        // A foreign mount on top of an agentfs one wins, and the reverse.
+        let stack = [entry("fuse.agentfs", "agentfs:v"), entry("tmpfs", "tmpfs")];
+        assert_eq!(
+            mount_state_in(&stack, &mnt).unwrap(),
+            MountState::Foreign {
+                fstype: "tmpfs".into()
+            }
+        );
+        // The directory answers statfs here, so an agentfs entry is live;
+        // the stale case (ENOTCONN) needs a real dead mount (tests/mount.rs).
+        let stack = [entry("tmpfs", "tmpfs"), entry("fuse.agentfs", "agentfs:v")];
+        assert_eq!(
+            mount_state_in(&stack, &mnt).unwrap(),
+            MountState::Live {
+                source: "agentfs:v".into()
+            }
+        );
+        // A path through a symlink resolves to the mount point.
+        std::os::unix::fs::symlink(&mnt, root.join("alias")).unwrap();
+        assert!(matches!(
+            mount_state_in(&stack, &root.join("alias")).unwrap(),
+            MountState::Live { .. }
+        ));
+        // A missing last component is resolved through its parent.
+        assert_eq!(
+            mount_state_in(&stack, &root.join("missing")).unwrap(),
+            MountState::NotMounted
+        );
+        // This process's real mountinfo parses and has the root.
+        assert!(matches!(
+            mount_state(Path::new("/")).unwrap(),
+            MountState::Foreign { .. } | MountState::NotMounted
+        ));
     }
 
     #[test]

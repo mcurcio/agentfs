@@ -1371,8 +1371,16 @@ target. What it needs:
   - It is a separate crate so the core stays free of FUSE and the binary
     stays a thin CLI.
 - **`agentfs`, a binary:**
-  - `init`, `mount`, `status`, `flush`, `record`, `push`, `run`, `restore`
-    and `revert`;
+  - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
+    `restore` and `revert`;
+  - `init` is safe to re-run (§2.3): exit 0 for the volume it already
+    holds, 1 for another volume or branch; `--include` sets the config's
+    `include.path` entries (§4.3), and `--root` creates the backing tree;
+  - `probe <mountpoint> [--allow-stale]` reports a live agentfs mount
+    (exit 0), a stale one whose daemon died (1, or 0 with
+    `--allow-stale`), nothing, or another filesystem (1), from
+    `/proc/self/mountinfo` and a `statfs`; no lock, no state area. It is
+    the sidecar's startup and readiness probe;
   - `push` pushes once to every remote (or those named with `--remote`) and
     exits 1 unless all succeeded; `run` runs the service in the foreground
     until SIGINT or SIGTERM, makes a final commit, waits up to
@@ -1402,8 +1410,14 @@ target. What it needs:
     the backing tree or the mount point, invalid sections included (an
     error, not `RemoteMisconfigured`: carrying on would expose the secret,
     or let the workload rewrite known_hosts to trust any host), a
-    `--root` that is not the backing tree, and a stale mount point
-    (`ENOTCONN`, with the command that clears it).
+    `--root` that is not the backing tree, an `include.path` fragment
+    under the backing tree or the mount point, and a stale mount point
+    (`ENOTCONN`, with the command that clears it). A missing mount point
+    is created first (one level, mode 0755).
+  - **A stale mount point with `--on-stale-mount hold`** (a sidecar
+    restarted after its daemon died): it mounts nothing and takes no
+    lock, says so, waits for SIGINT or SIGTERM, then lazily detaches the
+    mount point if it is still a stale agentfs mount, and exits 1.
   - **Kernel options.** fuser, multi-threaded (`--threads`, default the CPU
     count between 2 and 16) with a cloned `/dev/fuse` descriptor per thread;
     `default_permissions`, `allow_other` (unless `--no-allow-other`),

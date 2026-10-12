@@ -1,5 +1,6 @@
 //! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7 and 11, plus SQLite,
-//! git on the mount, restores through the mount and the daemon's lifecycle).
+//! git on the mount, restores through the mount, the daemon's lifecycle, and
+//! `probe` and `--on-stale-mount hold` after a crash (design §17.1).
 //!
 //! Every test needs `/dev/fuse` and root, so all are `#[ignore]`d; the
 //! `fuse` CI job runs them through `ci/fuse-tests.sh`:
@@ -1389,4 +1390,116 @@ fn restore_by_another_user_is_refused() {
     assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "v2");
     assert_eq!(v.head_id(), head);
     m.stop();
+}
+
+// ---- design §17.1: probes, and a sidecar restarted after a crash ----
+
+/// The mountinfo line for `mnt`, as the runner's kernel reports it.
+fn mountinfo_line(mnt: &Path) -> Option<String> {
+    let info = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let mnt = mnt.to_str().unwrap();
+    info.lines()
+        .rfind(|l| l.split(' ').nth(4).is_some_and(|m| m == mnt))
+        .map(str::to_owned)
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn probe_hold_and_detach_after_a_crash() {
+    let v = Vol::new("probe_hold");
+    let mnt = v.mnt();
+    let mnt_s = mnt.to_str().unwrap().to_owned();
+    let mut m = v.mount(&[]);
+    // The kernel's view, for the CI log.
+    println!("mountinfo: {:?}", mountinfo_line(&mnt));
+    let out = v.agentfs(&["probe", &mnt_s]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "live agentfs mount (agentfs:demo)\n");
+    v.sh("printf before > before");
+    v.expect(&tree(&[("before", f("before"))]));
+
+    // The daemon dies: the mount point is stale.
+    m.signal(rustix::process::Signal::KILL);
+    m.wait_exit(Duration::from_secs(10));
+    assert_eq!(
+        rustix::fs::stat(&mnt).unwrap_err(),
+        rustix::io::Errno::NOTCONN
+    );
+    let out = v.agentfs(&["probe", &mnt_s]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(text(&out.stdout), "stale agentfs mount (daemon gone)\n");
+    let out = v.agentfs(&["probe", "--allow-stale", &mnt_s]);
+    assert_eq!(out.status.code(), Some(0));
+
+    // The default still refuses, with the advice.
+    let out = v.agentfs(&["mount", v.backing().to_str().unwrap(), &mnt_s]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("stale FUSE mount"),
+        "{}",
+        text(&out.stderr)
+    );
+
+    // Hold: mounts nothing, takes no lock, keeps the mount point stale.
+    let child = v
+        .mount_command(&["--on-stale-mount", "hold"])
+        .spawn()
+        .unwrap();
+    let mut held = Mounted {
+        child: Some(child),
+        mnt: mnt.clone(),
+        log: v.log_path(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !held.log().contains("Holding until SIGTERM") {
+        assert!(
+            Instant::now() < deadline,
+            "never held; log:\n{}",
+            held.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(is_mounted(&mnt), "{}", held.log());
+    assert_eq!(
+        rustix::fs::stat(&mnt).unwrap_err(),
+        rustix::io::Errno::NOTCONN
+    );
+    let status = text(&v.agentfs(&["status"]).stdout);
+    assert!(status.contains("lock:      free"), "{status}");
+    let out = v.agentfs(&["probe", "--allow-stale", &mnt_s]);
+    assert_eq!(out.status.code(), Some(0));
+
+    // SIGTERM: the stale mount is detached and the hold exits 1.
+    held.signal(rustix::process::Signal::TERM);
+    let status = held.wait_exit(Duration::from_secs(20));
+    let log = held.log();
+    assert_eq!(status.code(), Some(1), "{log}");
+    assert!(
+        log.contains(&format!("detached stale mount {mnt_s}")),
+        "{log}"
+    );
+    assert!(!is_mounted(&mnt), "{log}");
+    let out = v.agentfs(&["probe", &mnt_s]);
+    assert_eq!(text(&out.stdout), "not mounted\n");
+
+    // The next mount recovers what was recorded before the kill.
+    let m = v.mount(&["--on-stale-mount", "hold"]);
+    v.expect(&tree(&[("before", f("before"))]));
+    v.sh("printf after > after");
+    v.expect(&tree(&[("after", f("after")), ("before", f("before"))]));
+    m.stop();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn mount_creates_a_missing_mount_point() {
+    let v = Vol::new("create_mnt");
+    fs::remove_dir(v.mnt()).unwrap();
+    let m = v.mount(&[]);
+    assert!(m.log().contains("created the mount point"), "{}", m.log());
+    v.sh("printf x > x");
+    v.expect(&tree(&[("x", f("x"))]));
+    m.stop();
+    assert!(v.mnt().is_dir());
 }

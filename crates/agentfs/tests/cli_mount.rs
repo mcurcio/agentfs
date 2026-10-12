@@ -1,6 +1,7 @@
 //! `agentfs mount` refusals that need no FUSE device (design §1.1, §2.3,
 //! §18 test 5): every one happens before anything is mounted, so these run
-//! anywhere. Real mounts are tested in `mount.rs`, in CI.
+//! anywhere. Real mounts are tested in `mount.rs`, in CI. Also `agentfs
+//! probe` on paths with no agentfs mount (design §17.1).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -182,6 +183,107 @@ fn bad_passthrough_values_are_rejected() {
         &[
             "mount",
             "--passthrough",
+            "maybe",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+#[test]
+fn an_include_inside_the_backing_tree() {
+    let l = Layout::new();
+    let state = l.p("state");
+    std::fs::write(l.p("backing/agentfs.conf"), "").unwrap();
+    let out = run(
+        &state,
+        &[
+            "init",
+            "--volume",
+            "demo",
+            "--include",
+            s(&l.p("backing/agentfs.conf")),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("mnt"))]);
+    refused(&out, "include.path");
+}
+
+#[test]
+fn a_missing_mount_point_is_created_before_the_checks() {
+    let l = Layout::new();
+    let state = l.p("state");
+    l.init(&state);
+    // Created, then refused by the layout check: the point is that
+    // preflight saw a directory, not "does not exist".
+    let out = run(
+        &state,
+        &["mount", s(&l.p("backing")), s(&l.p("backing/new-mnt"))],
+    );
+    refused(&out, "the mount point");
+    assert!(l.p("backing/new-mnt").is_dir());
+    // Only one level: a missing parent is an error.
+    let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("a/b"))]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("creating the mount point"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn probe_without_a_mount() {
+    let l = Layout::new();
+    let state = l.p("state");
+    for args in [
+        &["probe", s(&l.p("mnt"))][..],
+        &["probe", "--allow-stale", s(&l.p("mnt"))],
+    ] {
+        let out = run(&state, args);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "not mounted\n");
+    }
+    // A path that does not exist is not mounted either; no state area is
+    // read or created.
+    let out = run(&state, &["probe", s(&l.p("missing"))]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "not mounted\n");
+    assert!(!state.exists());
+    // The root filesystem is mounted, but not by agentfs.
+    let out = run(&state, &["probe", "/"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("not an agentfs mount ("),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn hold_without_a_stale_mount_behaves_like_refuse() {
+    let l = Layout::new();
+    let state = l.p("state");
+    l.init(&state);
+    std::fs::create_dir_all(l.p("backing/mnt")).unwrap();
+    let out = run(
+        &state,
+        &[
+            "mount",
+            "--on-stale-mount",
+            "hold",
+            s(&l.p("backing")),
+            s(&l.p("backing/mnt")),
+        ],
+    );
+    refused(&out, "the mount point");
+    let out = run(
+        &state,
+        &[
+            "mount",
+            "--on-stale-mount",
             "maybe",
             s(&l.p("backing")),
             s(&l.p("mnt")),
