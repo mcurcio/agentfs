@@ -213,6 +213,10 @@ As with git's index, a path is **tracked** if it is in the branch head or has
 been recorded and is awaiting commit, so this holds during commit lag and
 after crash recovery. A removal is recorded only if something is tracked at
 or below the path; removing a path that was never recorded is not journaled.
+A record holds its paths, and every path above or below them, from the
+decision until the tracked set is updated, so a removal racing an in-flight
+first write of the same path waits for it and is journaled after it.
+Records for unrelated paths do not wait for each other.
 
 ### 4.1 Where rules come from
 
@@ -253,7 +257,8 @@ that operator rules always apply:
   in `info/attributes` and the root `.gitattributes`, as in git.
 - Matching is always case-sensitive; `core.ignoreCase` is not consulted.
 - Tree rule files are read only if they are regular files, never through a
-  symlink (as git does since 2.32).
+  symlink (as git does since 2.32), and a file over 1 MiB is ignored (git
+  ignores oversized attribute files), so the synchronous step stays bounded.
 - `info/exclude` and `info/attributes` are read when the volume is opened.
   Changing them takes a remount, which fits iac setting them.
 
@@ -316,11 +321,12 @@ not by opening them with libgit2, which would read global config.
 **Detection.** A directory is a nested repository if it contains:
 
 - a `.git` directory;
-- a `.git` file that points to a valid git directory; or
-- the layout of a bare repository (`HEAD`, `objects/` and `refs/`).
+- a `.git` file or symlink that points to a git directory inside the tree; or
+- a git directory itself: the layout of a bare repository (`HEAD`, `objects/`
+  and `refs/`), or any mark of one still being created (below).
 
-The last case covers `git clone --bare` and tool-managed stores such as Hermes'
-`checkpoints/store`.
+The last case covers `git clone --bare`, `git init --bare` and tool-managed
+stores such as Hermes' `checkpoints/store`.
 
 **Default (`nested = exclude`).** A nested repository's directory is not
 recorded: neither its working files nor its git directory.
@@ -343,15 +349,37 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
 
 - Only the proper ancestor directories of a path are examined, never the
   mount root and never the path itself.
-- A `.git` file counts only if its first line is `gitdir: <path>` and that
-  path, resolved relative to the directory holding the file, has `HEAD` plus
-  `objects/` and `refs/`, or `HEAD` plus `commondir` (a linked worktree).
-- A symlinked `.git` is not followed, because its target is a path in the
-  workload's view of the mount, not in the backing tree. It is not a nested
-  repository.
-- Under `nested = working-tree`, a directory with a bare-repository layout is
-  still skipped entirely, because all of it is git directory. This also
-  covers a submodule's git directory kept inside the tree.
+- **Repositories under construction.** `git init --bare` writes
+  `description`, `hooks/`, `info/exclude`, `refs/`, `HEAD` and `config`
+  before `objects/` exists, and each file is a change boundary. Because
+  tracked paths stay tracked, anything recorded then would be recorded
+  forever, including later `config` edits that may carry credentials in a
+  remote URL. So any one of these marks a git directory: a `HEAD` or
+  `HEAD.lock` whose first line is a symbolic ref (`ref: refs/…`) or an object
+  id; a `config` or `config.lock` whose `[core]` section sets
+  `repositoryformatversion`; or git's default template `description`. Only a
+  custom template's files written before `HEAD` can still be recorded.
+- **`.git` files and symlinks.** A `.git` file counts only if its first line is
+  `gitdir: <path>`; a `.git` symlink is read, never followed. Either target
+  must be a git directory inside the backing tree: `HEAD` plus `objects/` and
+  `refs/`, or `HEAD` plus `commondir` (a linked worktree). Targets are paths
+  in the workload's view of the mount, so they are never resolved on the
+  host:
+  - a relative target is resolved lexically against the directory holding
+    `.git`, and is ignored if it climbs out of the tree;
+  - an absolute target (what `git worktree add` writes by default) carries
+    the mount point, which agentfs does not know, so each of its suffixes is
+    tried from the tree root: `/workspace/main/.git/worktrees/wt` is found as
+    `main/.git/worktrees/wt` in a tree mounted at `/workspace`. Once the
+    FUSE layer knows its mount point this can become an exact mapping.
+- **Bounded reads.** These files are workload-controlled and read in the
+  synchronous step, so they are opened without following symlinks and
+  without blocking (a FIFO cannot hang the daemon), must be regular files,
+  and are read only up to 4 KiB; a larger one does not count, as git refuses
+  oversized gitfiles.
+- Under `nested = working-tree`, a directory that is a git directory is
+  still skipped entirely. This also covers a submodule's git directory kept
+  inside the tree.
 - With several nested repositories on a path, the outermost one is reported.
 
 ## 6. Metadata and permissions

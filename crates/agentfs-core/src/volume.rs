@@ -9,7 +9,9 @@
 //! The recorder applies path rules (design §4, §5) before freezing anything:
 //! each input is recorded or skipped with a reason, and the set of tracked
 //! paths (branch head plus uncommitted records) is kept current so ignore
-//! rules only ever affect untracked paths.
+//! rules only ever affect untracked paths. Each record claims its paths
+//! ([`crate::claims`]) from the decision until the tracked set is updated, so
+//! records touching the same path are decided and journaled in order.
 
 use std::collections::HashSet;
 use std::io;
@@ -17,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::claims::PathClaims;
 use crate::history::{Committed, History, HistoryError};
 use crate::identity::{Context, IdentityRenderer};
 use crate::journal::{Journal, OpenReport};
@@ -164,6 +167,7 @@ pub fn open(
         pending: pending.clone(),
         rules: Arc::new(rules),
         tracked: Arc::new(tracked),
+        claims: Arc::new(PathClaims::default()),
     };
     let committer = Committer {
         history,
@@ -198,6 +202,7 @@ pub struct Recorder {
     pending: Arc<PendingStore>,
     rules: Arc<Rules>,
     tracked: Arc<Tracked>,
+    claims: Arc<PathClaims>,
 }
 
 impl Recorder {
@@ -210,16 +215,23 @@ impl Recorder {
     /// path, and are never filtered by rules, so history always follows the
     /// tree for tracked paths.
     ///
-    /// The decision, the journal append and the tracked-set update are not
-    /// one atomic step. Two concurrent first writes to the same new path
-    /// while a rule file changes can therefore disagree; the FUSE layer's
-    /// per-inode serialisation narrows this further.
+    /// The record holds its paths, and so excludes every path above or below
+    /// them, from the decision until the tracked set is updated
+    /// ([`crate::claims`]). A removal racing an in-flight first write of the
+    /// same path therefore waits for it, sees the path tracked, and is
+    /// journaled after it. Records for unrelated paths do not wait for each
+    /// other.
+    ///
+    /// Rule files and nested repositories are read without a claim on them,
+    /// so a first write racing an edit of the `.gitignore` that covers it may
+    /// be decided by either version of the rules.
     pub fn record(
         &self,
         trigger: Trigger,
         caller: Caller,
         inputs: Vec<Input>,
     ) -> Result<Recorded, VolumeError> {
+        let _claim = self.claims.claim(inputs.iter().map(Input::path));
         let mut kept = Vec::with_capacity(inputs.len());
         let mut skipped = Vec::new();
         for input in inputs {
@@ -772,5 +784,268 @@ mod tests {
         assert_eq!(recorded.seq, Some(0));
         com.commit_pending().unwrap();
         assert_eq!(tree_paths(&com), ["sub/file"]);
+    }
+
+    #[test]
+    fn removal_waits_for_an_in_flight_first_write() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (dir, state) = setup();
+        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        // Freezing from a FIFO blocks until it is written and closed, which
+        // stands in for a large file whose copy takes a while.
+        let fifo = dir.path().join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let writer = {
+            let rec = rec.clone();
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                rec.record(
+                    Trigger::Close,
+                    CALLER,
+                    vec![Input::Write {
+                        path: RepoPath::new("out.bin").unwrap(),
+                        backing: fifo,
+                        executable: false,
+                    }],
+                )
+            })
+        };
+        // Opening the write end returns once the freeze has opened the read
+        // end, so the first write is in flight from here on.
+        let mut content = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let remover = {
+            let rec = rec.clone();
+            std::thread::spawn(move || {
+                let r = rec.record(Trigger::Unlink, CALLER, vec![remove("out.bin")]);
+                tx.send(()).unwrap();
+                r
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the removal must wait for the write"
+        );
+
+        content.write_all(b"payload").unwrap();
+        drop(content);
+        let written = writer.join().unwrap().unwrap();
+        let removed = remover.join().unwrap().unwrap();
+        assert_eq!(written.seq, Some(0));
+        assert_eq!(
+            removed,
+            Recorded {
+                seq: Some(1),
+                skipped: vec![],
+            }
+        );
+        com.commit_pending().unwrap();
+        assert!(tree_paths(&com).is_empty(), "history follows the tree");
+    }
+
+    /// Writes `rel` in the backing tree and returns the input a close of it
+    /// would produce.
+    fn write_in_tree(tree: &Path, rel: &str, content: &str) -> Input {
+        let backing = tree.join(rel);
+        fs::create_dir_all(backing.parent().unwrap()).unwrap();
+        fs::write(&backing, content).unwrap();
+        Input::Write {
+            path: RepoPath::new(rel).unwrap(),
+            backing,
+            executable: false,
+        }
+    }
+
+    /// Replays the boundaries `git init --bare store` produces, in the order
+    /// git creates its files, and returns every record's outcome.
+    fn replay_git_init_bare(rec: &Recorder, tree: &Path, template: bool) -> Vec<Recorded> {
+        let mut out = Vec::new();
+        let close = |out: &mut Vec<Recorded>, rel: &str, content: &str| {
+            let input = write_in_tree(tree, rel, content);
+            out.push(rec.record(Trigger::Close, CALLER, vec![input]).unwrap());
+        };
+        if template {
+            close(
+                &mut out,
+                "store/description",
+                "Unnamed repository; edit this file 'description' to name the repository.\n",
+            );
+            close(&mut out, "store/hooks/applypatch-msg.sample", "#!/bin/sh\n");
+            close(&mut out, "store/hooks/pre-commit.sample", "#!/bin/sh\n");
+            close(&mut out, "store/info/exclude", "# git ls-files --others\n");
+        }
+        fs::create_dir_all(tree.join("store/refs/heads")).unwrap();
+        fs::create_dir_all(tree.join("store/refs/tags")).unwrap();
+        for (name, content) in [
+            ("HEAD", "ref: refs/heads/main\n"),
+            (
+                "config",
+                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+            ),
+        ] {
+            let lock = format!("store/{name}.lock");
+            close(&mut out, &lock, content);
+            fs::rename(tree.join(&lock), tree.join("store").join(name)).unwrap();
+            let input = write_in_tree(tree, &format!("store/{name}"), content);
+            out.push(
+                rec.record(Trigger::Rename, CALLER, vec![remove(&lock), input])
+                    .unwrap(),
+            );
+        }
+        fs::create_dir_all(tree.join("store/objects/pack")).unwrap();
+        // Later configuration, such as `git remote add`.
+        close(
+            &mut out,
+            "store/config",
+            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n\
+             [remote \"origin\"]\n\turl = https://token@example.com/r.git\n",
+        );
+        out
+    }
+
+    #[test]
+    fn a_bare_repository_being_created_is_never_recorded() {
+        for (nested, template) in [
+            ("exclude", true),
+            ("exclude", false),
+            ("working-tree", true),
+            ("working-tree", false),
+        ] {
+            let (dir, state) = setup();
+            git2::Config::open(&state.git().join("config"))
+                .unwrap()
+                .set_str("agentfs.nested", nested)
+                .unwrap();
+            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+            for recorded in replay_git_init_bare(&rec, dir.path(), template) {
+                assert_eq!(recorded.seq, None, "{nested}, template {template}");
+                for s in &recorded.skipped {
+                    assert!(
+                        matches!(&s.reason, SkipReason::Nested { repo, .. } if repo.as_str() == "store")
+                            || s.reason == SkipReason::Untracked,
+                        "{nested}, template {template}: {s:?}"
+                    );
+                }
+            }
+            assert_eq!(com.backlog(), 0);
+        }
+    }
+
+    #[test]
+    fn never_record_skips_writes_but_not_removals_of_tracked_paths() {
+        let (dir, state) = setup();
+        {
+            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "secret", "1")],
+            )
+            .unwrap();
+            com.commit_pending().unwrap();
+        }
+        fs::write(
+            state.git().join("info").join("attributes"),
+            "secret -agentfs\n",
+        )
+        .unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "secret", "2")],
+            )
+            .unwrap();
+        assert_eq!(
+            recorded,
+            Recorded {
+                seq: None,
+                skipped: vec![skipped("secret", SkipReason::NeverRecord)],
+            }
+        );
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+
+        let recorded = rec
+            .record(Trigger::Unlink, CALLER, vec![remove("secret")])
+            .unwrap();
+        assert_eq!(recorded.seq, Some(1));
+        assert!(recorded.skipped.is_empty());
+        com.commit_pending().unwrap();
+        assert!(tree_paths(&com).is_empty());
+    }
+
+    #[test]
+    fn symlinks_go_through_the_rules() {
+        let (dir, state) = setup();
+        exclude(&state, "*.log\n");
+        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Symlink,
+                CALLER,
+                vec![Input::Symlink {
+                    path: RepoPath::new("latest.log").unwrap(),
+                    target: "run-1.txt".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, None);
+        assert!(matches!(
+            recorded.skipped[0].reason,
+            SkipReason::Ignored {
+                source: RuleSource::OperatorExclude,
+                ..
+            }
+        ));
+        assert_eq!(com.backlog(), 0);
+    }
+
+    #[test]
+    fn respect_tree_rules_comes_from_the_volume_config() {
+        let (dir, state) = setup();
+        fs::write(dir.path().join(".gitignore"), "*.tmp\n").unwrap();
+        {
+            let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
+            let recorded = rec
+                .record(
+                    Trigger::Close,
+                    CALLER,
+                    vec![write(dir.path(), "a.tmp", "1")],
+                )
+                .unwrap();
+            assert_eq!(recorded.seq, Some(0), "tree rules are off by default");
+        }
+        git2::Config::open(&state.git().join("config"))
+            .unwrap()
+            .set_bool("agentfs.respectTreeRules", true)
+            .unwrap();
+        let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "b.tmp", "1")],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, None);
+        assert_eq!(
+            recorded.skipped[0].reason,
+            SkipReason::Ignored {
+                source: RuleSource::TreeIgnore(RepoPath::new(".gitignore").unwrap()),
+                pattern: "*.tmp".into(),
+            }
+        );
     }
 }

@@ -1,30 +1,52 @@
 //! Detects nested git repositories in the backing tree (design §5).
 //!
 //! A directory is a nested repository if it contains a `.git` directory, a
-//! `.git` file pointing at a valid git directory, or has the layout of a bare
-//! repository (`HEAD`, `objects/` and `refs/`). This module only probes one
-//! directory; [`crate::rules`] decides which directories to probe (never the
-//! mount root) and what a hit means under `agentfs.nested`.
+//! `.git` file or symlink pointing at a git directory inside the tree, or is
+//! itself a git directory: a bare repository, or one still being created.
+//! This module only probes one directory; [`crate::rules`] decides which
+//! directories to probe (never the mount root) and what a hit means under
+//! `agentfs.nested`.
 //!
-//! Probing never follows a symlinked `.git`: a symlink's target is a path in
-//! the workload's view of the mount, not in the backing tree, so following it
-//! from here could reach anything. A symlinked `.git` is not a nested
-//! repository.
+//! **Repositories under construction.** `git init --bare` and
+//! `git clone --bare` write `description`, `hooks/`, `info/exclude`, `refs/`,
+//! `HEAD` and `config` before `objects/` exists, and each of those files is a
+//! change boundary. Requiring the complete layout would record them as new
+//! paths, and they would then stay tracked. So any one of these marks a git
+//! directory: a `HEAD` or `HEAD.lock` whose first line is a symbolic ref or
+//! an object id, a `config` or `config.lock` with a `[core]` section setting
+//! `repositoryformatversion`, or git's default template `description`. Only
+//! a custom template's files written before `HEAD` can still be recorded.
+//!
+//! **Where `gitdir:` and `.git` symlinks point.** Their targets are paths in
+//! the workload's view of the mount, never followed on the host. A relative
+//! target is resolved lexically against the directory holding `.git` and
+//! must stay inside the tree. An absolute target (what `git worktree add`
+//! writes by default) has an unknown mount-point prefix, so each of its
+//! suffixes is tried as a path from the tree root: `/workspace/main/.git/x`
+//! is found as `main/.git/x` in a tree mounted at `/workspace`.
+//!
+//! Every file is read with [`probe::read_regular`]: regular files only, never
+//! through a symlink, without blocking, and only up to a few KiB.
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path};
+
+use crate::probe;
 
 /// Why a directory counts as a nested repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NestedKind {
     /// It contains a `.git` directory (`git init`, `git clone`).
     GitDir,
-    /// It contains a `.git` file whose `gitdir:` is a valid git directory
-    /// (submodules, `git worktree add`).
+    /// It contains a `.git` file whose `gitdir:` is a git directory in the
+    /// tree (submodules, `git worktree add`).
     GitFile,
-    /// It is itself laid out as a bare repository (`git clone --bare`,
-    /// tool-managed stores).
+    /// It contains a `.git` symlink to a git directory in the tree (Android's
+    /// `repo` tool).
+    GitSymlink,
+    /// It is itself a git directory, complete or being created
+    /// (`git clone --bare`, `git init --bare`, tool-managed stores).
     Bare,
 }
 
@@ -33,56 +55,121 @@ impl NestedKind {
         match self {
             Self::GitDir => ".git directory",
             Self::GitFile => ".git file",
+            Self::GitSymlink => ".git symlink",
             Self::Bare => "bare repository layout",
         }
     }
 }
 
-/// Probes `dir` (a directory in the backing tree) for a nested repository.
+/// git's default template `description`.
+const DEFAULT_DESCRIPTION: &str =
+    "Unnamed repository; edit this file 'description' to name the repository.";
+
+/// Probes `dir`, a directory relative to the backing tree at `tree` (`""`
+/// is the root), for a nested repository.
 ///
 /// A missing `dir`, or a `dir` that is not a directory, is not nested.
-pub fn detect(dir: &Path) -> io::Result<Option<NestedKind>> {
-    let dot_git = dir.join(".git");
+pub fn detect(tree: &Path, dir: &str) -> io::Result<Option<NestedKind>> {
+    let abs = tree.join(dir);
+    let dot_git = abs.join(".git");
     if let Some(meta) = metadata(&dot_git)? {
         if meta.is_dir() {
             return Ok(Some(NestedKind::GitDir));
         }
-        if meta.is_file() && gitdir_from_file(dir, &dot_git)?.is_some() {
+        if meta.is_file() && gitdir_from_file(tree, dir, &dot_git)? {
             return Ok(Some(NestedKind::GitFile));
         }
+        if meta.is_symlink() && gitdir_from_symlink(tree, dir, &dot_git)? {
+            return Ok(Some(NestedKind::GitSymlink));
+        }
     }
-    if is_file(&dir.join("HEAD"))? && is_dir(&dir.join("objects"))? && is_dir(&dir.join("refs"))? {
+    if looks_like_git_dir(&abs)? {
         return Ok(Some(NestedKind::Bare));
     }
     Ok(None)
 }
 
-/// The valid git directory a `.git` file in `dir` points to, if any.
-///
-/// The file's first line must be `gitdir: <path>`; a relative path is
-/// resolved against `dir`, as git does.
-fn gitdir_from_file(dir: &Path, file: &Path) -> io::Result<Option<PathBuf>> {
-    let content = match fs::read(file) {
-        Ok(c) => c,
-        Err(e) if is_absent(&e) => return Ok(None),
-        Err(e) => return Err(e),
+/// True if the `.git` file `file` in `dir` points at a git directory in the
+/// tree. Its first line must be `gitdir: <path>`.
+fn gitdir_from_file(tree: &Path, dir: &str, file: &Path) -> io::Result<bool> {
+    let Some(content) = probe::read_regular(file, probe::SMALL)? else {
+        return Ok(false);
     };
     let first = content.split(|b| *b == b'\n').next().unwrap_or_default();
     let Some(rest) = first.strip_prefix(b"gitdir:") else {
-        return Ok(None);
+        return Ok(false);
     };
     let Ok(target) = std::str::from_utf8(rest) else {
-        return Ok(None);
+        return Ok(false);
     };
-    let target = target.trim();
-    if target.is_empty() {
-        return Ok(None);
-    }
-    let target = dir.join(target);
-    Ok(is_git_dir(&target)?.then_some(target))
+    any_git_dir(tree, dir, target.trim())
 }
 
-/// True if `p` looks like a git directory: `HEAD` plus `objects/` and
+/// True if the `.git` symlink `link` in `dir` points at a git directory in
+/// the tree. The link is read, never followed.
+fn gitdir_from_symlink(tree: &Path, dir: &str, link: &Path) -> io::Result<bool> {
+    let target = match fs::read_link(link) {
+        Ok(t) => t,
+        Err(e) if probe::is_absent(&e) || e.kind() == io::ErrorKind::InvalidInput => {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(target) = target.to_str() else {
+        return Ok(false);
+    };
+    any_git_dir(tree, dir, target)
+}
+
+/// True if `target`, as written in `dir`, names a git directory in the tree.
+fn any_git_dir(tree: &Path, dir: &str, target: &str) -> io::Result<bool> {
+    for candidate in candidates(dir, target) {
+        if is_git_dir(&tree.join(candidate))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The tree-relative paths `target`, found in `dir`, may refer to (see the
+/// module docs). Never the root, and never outside the tree.
+fn candidates(dir: &str, target: &str) -> Vec<String> {
+    if target.is_empty() {
+        return Vec::new();
+    }
+    let target = Path::new(target);
+    if target.is_absolute() {
+        let Some(parts) = normalize(Vec::new(), target, false) else {
+            return Vec::new();
+        };
+        (0..parts.len()).map(|i| parts[i..].join("/")).collect()
+    } else {
+        let base = dir.split('/').filter(|c| !c.is_empty()).collect();
+        match normalize(base, target, true) {
+            Some(parts) if !parts.is_empty() => vec![parts.join("/")],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Applies `path`'s components to `base` lexically. A `..` above the start
+/// is `None` if `strict`, and ignored otherwise (as `/..` is `/`).
+fn normalize<'a>(mut base: Vec<&'a str>, path: &'a Path, strict: bool) -> Option<Vec<&'a str>> {
+    for component in path.components() {
+        match component {
+            Component::Normal(c) => base.push(c.to_str()?),
+            Component::ParentDir => {
+                if base.pop().is_none() && strict {
+                    return None;
+                }
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    Some(base)
+}
+
+/// True if `p` is a complete git directory: `HEAD` plus `objects/` and
 /// `refs/`, or `HEAD` plus `commondir` (a linked worktree's admin dir).
 fn is_git_dir(p: &Path) -> io::Result<bool> {
     if !is_file(&p.join("HEAD"))? {
@@ -91,12 +178,68 @@ fn is_git_dir(p: &Path) -> io::Result<bool> {
     Ok((is_dir(&p.join("objects"))? && is_dir(&p.join("refs"))?) || is_file(&p.join("commondir"))?)
 }
 
+/// True if `p` is a git directory, complete or being created (see the module
+/// docs).
+fn looks_like_git_dir(p: &Path) -> io::Result<bool> {
+    if is_git_dir(p)? {
+        return Ok(true);
+    }
+    for name in ["HEAD", "HEAD.lock"] {
+        if first_line(&p.join(name))?.is_some_and(is_head) {
+            return Ok(true);
+        }
+    }
+    for name in ["config", "config.lock"] {
+        if probe::read_regular(&p.join(name), probe::SMALL)?.is_some_and(|c| is_git_config(&c)) {
+            return Ok(true);
+        }
+    }
+    Ok(first_line(&p.join("description"))?.is_some_and(|l| l == DEFAULT_DESCRIPTION))
+}
+
+/// The first line of a small regular file, trimmed, if it is UTF-8.
+fn first_line(p: &Path) -> io::Result<Option<String>> {
+    let Some(content) = probe::read_regular(p, probe::SMALL)? else {
+        return Ok(None);
+    };
+    let first = content.split(|b| *b == b'\n').next().unwrap_or_default();
+    Ok(std::str::from_utf8(first).ok().map(|s| s.trim().to_owned()))
+}
+
+/// What git accepts as `HEAD`: a symbolic ref, or a SHA-1 or SHA-256 id.
+fn is_head(line: String) -> bool {
+    line.starts_with("ref: refs/")
+        || (matches!(line.len(), 40 | 64) && line.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// True for a git config with `[core]` setting `repositoryformatversion`,
+/// which git writes into every repository it creates.
+fn is_git_config(content: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return false;
+    };
+    let mut in_core = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_core = line.eq_ignore_ascii_case("[core]");
+        } else if in_core
+            && line
+                .split(['=', ' ', '\t'])
+                .next()
+                .is_some_and(|k| k.eq_ignore_ascii_case("repositoryformatversion"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// `symlink_metadata`, treating a missing path (or a non-directory
 /// ancestor) as absent.
 fn metadata(p: &Path) -> io::Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(p) {
         Ok(m) => Ok(Some(m)),
-        Err(e) if is_absent(&e) => Ok(None),
+        Err(e) if probe::is_absent(&e) => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -107,13 +250,6 @@ fn is_file(p: &Path) -> io::Result<bool> {
 
 fn is_dir(p: &Path) -> io::Result<bool> {
     Ok(metadata(p)?.is_some_and(|m| m.is_dir()))
-}
-
-fn is_absent(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-    )
 }
 
 #[cfg(test)]
@@ -128,20 +264,25 @@ mod tests {
         fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
     }
 
+    fn d(t: &tempfile::TempDir, dir: &str) -> Option<NestedKind> {
+        detect(t.path(), dir).unwrap()
+    }
+
     #[test]
     fn plain_directory_is_not_nested() {
         let t = tempfile::tempdir().unwrap();
-        assert_eq!(detect(t.path()).unwrap(), None);
-        assert_eq!(detect(&t.path().join("missing")).unwrap(), None);
+        fs::create_dir(t.path().join("plain")).unwrap();
+        assert_eq!(d(&t, "plain"), None);
+        assert_eq!(d(&t, "missing"), None);
         fs::write(t.path().join("file"), "").unwrap();
-        assert_eq!(detect(&t.path().join("file")).unwrap(), None);
+        assert_eq!(d(&t, "file"), None);
     }
 
     #[test]
     fn dot_git_directory() {
         let t = tempfile::tempdir().unwrap();
-        fs::create_dir(t.path().join(".git")).unwrap();
-        assert_eq!(detect(t.path()).unwrap(), Some(NestedKind::GitDir));
+        fs::create_dir_all(t.path().join("w/.git")).unwrap();
+        assert_eq!(d(&t, "w"), Some(NestedKind::GitDir));
     }
 
     #[test]
@@ -151,73 +292,177 @@ mod tests {
         fs::create_dir(&work).unwrap();
         bare_layout(&t.path().join("store/x"));
         fs::write(work.join(".git"), "gitdir: ../store/x\n").unwrap();
-        assert_eq!(detect(&work).unwrap(), Some(NestedKind::GitFile));
-
-        // Absolute paths work too.
-        let abs = format!("gitdir: {}\n", t.path().join("store/x").display());
-        fs::write(work.join(".git"), abs).unwrap();
-        assert_eq!(detect(&work).unwrap(), Some(NestedKind::GitFile));
+        assert_eq!(d(&t, "work"), Some(NestedKind::GitFile));
+        fs::write(work.join(".git"), "gitdir: ./../store/./x/\n").unwrap();
+        assert_eq!(d(&t, "work"), Some(NestedKind::GitFile));
     }
 
     #[test]
-    fn dot_git_file_pointing_at_a_worktree_admin_dir() {
+    fn submodule_git_dir_inside_the_root_git_dir() {
+        let t = tempfile::tempdir().unwrap();
+        bare_layout(&t.path().join(".git/modules/lib/sub"));
+        fs::create_dir_all(t.path().join("lib/sub")).unwrap();
+        fs::write(
+            t.path().join("lib/sub/.git"),
+            "gitdir: ../../.git/modules/lib/sub\n",
+        )
+        .unwrap();
+        assert_eq!(d(&t, "lib/sub"), Some(NestedKind::GitFile));
+    }
+
+    #[test]
+    fn absolute_gitdir_is_a_workload_path() {
+        // `git worktree add` inside a mount at /workspace.
         let t = tempfile::tempdir().unwrap();
         let admin = t.path().join("main/.git/worktrees/wt");
         fs::create_dir_all(&admin).unwrap();
         fs::write(admin.join("HEAD"), "ref: refs/heads/wt\n").unwrap();
         fs::write(admin.join("commondir"), "../..\n").unwrap();
-        let wt = t.path().join("wt");
-        fs::create_dir(&wt).unwrap();
-        fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
-        assert_eq!(detect(&wt).unwrap(), Some(NestedKind::GitFile));
+        fs::create_dir(t.path().join("wt")).unwrap();
+        fs::write(
+            t.path().join("wt/.git"),
+            "gitdir: /workspace/main/.git/worktrees/wt\n",
+        )
+        .unwrap();
+        assert_eq!(d(&t, "wt"), Some(NestedKind::GitFile));
+        // Mounted at the namespace root.
+        fs::write(
+            t.path().join("wt/.git"),
+            "gitdir: /main/.git/worktrees/wt\n",
+        )
+        .unwrap();
+        assert_eq!(d(&t, "wt"), Some(NestedKind::GitFile));
+    }
+
+    #[test]
+    fn gitdir_targets_never_leave_the_tree() {
+        let outer = tempfile::tempdir().unwrap();
+        bare_layout(&outer.path().join("outside"));
+        let tree = outer.path().join("tree");
+        fs::create_dir_all(tree.join("w")).unwrap();
+        for target in ["../../outside", "/../outside/..", "/"] {
+            fs::write(tree.join("w/.git"), format!("gitdir: {target}\n")).unwrap();
+            assert_eq!(detect(&tree, "w").unwrap(), None, "{target}");
+        }
+        assert_eq!(candidates("w", "../.."), Vec::<String>::new());
+        assert_eq!(
+            candidates("w", ".."),
+            Vec::<String>::new(),
+            "never the root"
+        );
+        assert_eq!(candidates("a/b", "../c"), ["a/c"]);
+        assert_eq!(candidates("", "/x/../y/z"), ["y/z", "z"]);
     }
 
     #[test]
     fn invalid_dot_git_files_are_not_nested() {
         let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("w")).unwrap();
         for content in ["garbage\n", "gitdir: \n", "gitdir: does/not/exist\n", ""] {
-            fs::write(t.path().join(".git"), content).unwrap();
-            assert_eq!(detect(t.path()).unwrap(), None, "{content:?}");
+            fs::write(t.path().join("w/.git"), content).unwrap();
+            assert_eq!(d(&t, "w"), None, "{content:?}");
         }
         // A gitdir that exists but is not a git directory.
-        fs::create_dir(t.path().join("plain")).unwrap();
-        fs::write(t.path().join(".git"), "gitdir: plain\n").unwrap();
-        assert_eq!(detect(t.path()).unwrap(), None);
+        fs::create_dir(t.path().join("w/plain")).unwrap();
+        fs::write(t.path().join("w/.git"), "gitdir: plain\n").unwrap();
+        assert_eq!(d(&t, "w"), None);
     }
 
     #[test]
-    fn symlinked_dot_git_is_not_followed() {
+    fn oversized_dot_git_file_is_not_read() {
         let t = tempfile::tempdir().unwrap();
-        bare_layout(&t.path().join("real"));
-        let work = t.path().join("work");
-        fs::create_dir(&work).unwrap();
-        symlink(t.path().join("real"), work.join(".git")).unwrap();
-        assert_eq!(detect(&work).unwrap(), None);
+        bare_layout(&t.path().join("store"));
+        fs::create_dir(t.path().join("w")).unwrap();
+        let mut content = b"gitdir: ../store\n".to_vec();
+        content.resize(probe::SMALL as usize + 1, b'x');
+        fs::write(t.path().join("w/.git"), content).unwrap();
+        assert_eq!(d(&t, "w"), None);
     }
 
     #[test]
-    fn bare_layout_needs_all_three_parts() {
-        let t = tempfile::tempdir().unwrap();
-        let store = t.path().join("store");
-        bare_layout(&store);
-        assert_eq!(detect(&store).unwrap(), Some(NestedKind::Bare));
+    fn dot_git_symlinks_resolve_inside_the_tree_only() {
+        let outer = tempfile::tempdir().unwrap();
+        let tree = outer.path().join("tree");
+        bare_layout(&tree.join("projects/p.git"));
+        bare_layout(&outer.path().join("real"));
+        fs::create_dir_all(tree.join("w")).unwrap();
+        symlink("../projects/p.git", tree.join("w/.git")).unwrap();
+        assert_eq!(detect(&tree, "w").unwrap(), Some(NestedKind::GitSymlink));
 
-        for missing in ["HEAD", "objects", "refs"] {
-            let d = t.path().join(format!("no-{missing}"));
-            bare_layout(&d);
-            let p = d.join(missing);
-            if p.is_dir() {
-                fs::remove_dir(&p).unwrap();
-            } else {
-                fs::remove_file(&p).unwrap();
-            }
-            assert_eq!(detect(&d).unwrap(), None, "without {missing}");
+        // Absolute targets are workload paths; the host path is not followed.
+        fs::remove_file(tree.join("w/.git")).unwrap();
+        symlink(outer.path().join("real"), tree.join("w/.git")).unwrap();
+        assert_eq!(detect(&tree, "w").unwrap(), None);
+        fs::remove_file(tree.join("w/.git")).unwrap();
+        symlink("/mnt/projects/p.git", tree.join("w/.git")).unwrap();
+        assert_eq!(detect(&tree, "w").unwrap(), Some(NestedKind::GitSymlink));
+    }
+
+    #[test]
+    fn complete_bare_layout() {
+        let t = tempfile::tempdir().unwrap();
+        bare_layout(&t.path().join("store"));
+        assert_eq!(d(&t, "store"), Some(NestedKind::Bare));
+
+        // HEAD alone is enough when it reads as a HEAD.
+        let only = t.path().join("only-head");
+        fs::create_dir(&only).unwrap();
+        fs::write(only.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(d(&t, "only-head"), Some(NestedKind::Bare));
+
+        // A file named HEAD that is not one, without objects/ and refs/.
+        let other = t.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("HEAD"), "not a ref\n").unwrap();
+        fs::create_dir(other.join("refs")).unwrap();
+        assert_eq!(d(&t, "other"), None);
+
+        let dir_head = t.path().join("head-dir");
+        fs::create_dir_all(dir_head.join("HEAD")).unwrap();
+        fs::create_dir_all(dir_head.join("objects")).unwrap();
+        fs::create_dir_all(dir_head.join("refs")).unwrap();
+        assert_eq!(d(&t, "head-dir"), None);
+    }
+
+    #[test]
+    fn repository_under_construction() {
+        let t = tempfile::tempdir().unwrap();
+        let cases: [(&str, &str); 6] = [
+            ("description", &format!("{DEFAULT_DESCRIPTION}\n")),
+            ("HEAD", "ref: refs/heads/main\n"),
+            ("HEAD.lock", "ref: refs/heads/main\n"),
+            ("HEAD", &format!("{}\n", "a".repeat(40))),
+            (
+                "config",
+                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+            ),
+            ("config.lock", "[Core]\nrepositoryFormatVersion=1\n"),
+        ];
+        for (i, (name, content)) in cases.iter().enumerate() {
+            let dir = format!("s{i}");
+            fs::create_dir(t.path().join(&dir)).unwrap();
+            fs::write(t.path().join(&dir).join(name), content).unwrap();
+            assert_eq!(d(&t, &dir), Some(NestedKind::Bare), "{name}: {content:?}");
         }
+        for (name, content) in [
+            ("description", "My project\n"),
+            ("config", "[user]\n\trepositoryformatversion = 0\n"),
+            ("HEAD", &"g".repeat(40)),
+        ] {
+            let dir = t.path().join("neg");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), content).unwrap();
+            assert_eq!(d(&t, "neg"), None, "{name}: {content:?}");
+            fs::remove_file(dir.join(name)).unwrap();
+        }
+    }
 
-        let d = t.path().join("head-dir");
-        fs::create_dir_all(d.join("HEAD")).unwrap();
-        fs::create_dir_all(d.join("objects")).unwrap();
-        fs::create_dir_all(d.join("refs")).unwrap();
-        assert_eq!(detect(&d).unwrap(), None);
+    #[test]
+    fn markers_are_never_read_through_symlinks() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("real-head"), "ref: refs/heads/main\n").unwrap();
+        fs::create_dir(t.path().join("s")).unwrap();
+        symlink("../real-head", t.path().join("s/HEAD")).unwrap();
+        assert_eq!(d(&t, "s"), None);
     }
 }

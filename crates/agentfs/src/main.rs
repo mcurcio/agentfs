@@ -23,9 +23,11 @@ struct Cli {
     /// The volume's state area.
     #[arg(long, global = true, env = "AGENTFS_STATE", default_value = ".")]
     state: PathBuf,
-    /// The backing tree that paths are relative to. Only `record` reads it.
-    #[arg(long, global = true, env = "AGENTFS_ROOT", default_value = ".")]
-    root: PathBuf,
+    /// The backing tree that paths are relative to. Required by `record`,
+    /// which records a missing path as removed; other commands default to
+    /// the current directory.
+    #[arg(long, global = true, env = "AGENTFS_ROOT")]
+    root: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -106,7 +108,8 @@ fn main() -> Result<()> {
             println!("initialised volume {volume} in {}", state.root().display());
         }
         Command::Status(pod) => {
-            let (_, committer, recovery) = open(&state, &cli.root, &pod)?;
+            let (_, committer, recovery) =
+                open(&state, cli.root.as_deref().unwrap_or(Path::new(".")), &pod)?;
             let history = committer.history();
             println!("volume:    {}", history.settings().volume);
             println!("branch:    {}", history.settings().branch_ref);
@@ -121,7 +124,8 @@ fn main() -> Result<()> {
             println!("backlog:   {} record(s)", committer.backlog());
         }
         Command::Flush(pod) => {
-            let (_, committer, _) = open(&state, &cli.root, &pod)?;
+            let (_, committer, _) =
+                open(&state, cli.root.as_deref().unwrap_or(Path::new(".")), &pod)?;
             let report = committer.commit_pending()?;
             println!(
                 "{} record(s) into {} commit(s)",
@@ -129,14 +133,19 @@ fn main() -> Result<()> {
             );
         }
         Command::Record { paths, pod } => {
-            let (recorder, committer, _) = open(&state, &cli.root, &pod)?;
+            // Guessing the root would turn every path missing from the wrong
+            // directory into a recorded removal.
+            let Some(root) = cli.root.as_deref() else {
+                bail!("record needs --root (or AGENTFS_ROOT): the backing tree the paths are in");
+            };
+            let (recorder, committer, _) = open(&state, root, &pod)?;
             let caller = Caller {
                 uid: current_uid(),
                 gid: current_gid(),
                 pid: std::process::id(),
             };
             for path in paths {
-                let input = match input_for(&cli.root, &path) {
+                let input = match input_for(root, &path) {
                     Ok(input) => input,
                     Err(e) => match e.downcast_ref::<PathError>() {
                         Some(PathError::DotGit(_)) => {

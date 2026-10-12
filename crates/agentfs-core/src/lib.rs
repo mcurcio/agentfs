@@ -5,6 +5,7 @@
 //! and lets the triggering call return once it succeeds. A
 //! [`volume::Committer`] turns records into commits in the background.
 
+pub mod claims;
 pub mod config;
 pub mod history;
 pub mod identity;
@@ -12,6 +13,7 @@ pub mod journal;
 pub mod nested;
 pub mod paths;
 pub mod pending;
+pub mod probe;
 pub mod record;
 pub mod rules;
 pub mod tracked;

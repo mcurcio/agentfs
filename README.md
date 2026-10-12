@@ -31,7 +31,8 @@ identity templates and settings, and path rules: operator and (optionally)
 tree ignore and attribute rules with git's tracked/untracked behaviour, and
 nested repository detection. The `agentfs` command has `init`, `status`,
 `flush` and `record`; `record` stands in for the FUSE layer and reports the
-paths the rules skip, with the reason.
+paths the rules skip, with the reason. It needs `--root` (or `AGENTFS_ROOT`),
+since a path missing from the backing tree is recorded as removed.
 
 ## Building
 

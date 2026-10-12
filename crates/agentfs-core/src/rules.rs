@@ -13,8 +13,8 @@
 //!   them takes a remount.
 //! - **Tree rules**, `.gitignore` and `.gitattributes` files in the backing
 //!   tree, apply only with `agentfs.respectTreeRules = true`. They are read
-//!   on demand, never through a symlink, and can never set `agentfs.*`
-//!   attributes.
+//!   on demand, never through a symlink and never past 1 MiB
+//!   ([`crate::probe`]), and can never set `agentfs.*` attributes.
 //! - System and user-global git config, excludes and attributes are never
 //!   read: rule files are parsed from buffers this module reads itself, with
 //!   the pure-Rust `gix-ignore` and `gix-attributes` parsers (design §4.4).
@@ -38,6 +38,7 @@ use gix_ignore::search::Ignore;
 use crate::config::{Nested, Settings};
 use crate::nested::{self, NestedKind};
 use crate::paths::RepoPath;
+use crate::probe;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RulesError {
@@ -335,7 +336,7 @@ impl Rules {
             }
             prefix.push_str(component);
             let dir = self.tree.join(&prefix);
-            let Some(kind) = nested::detect(&dir).map_err(io_error(&dir))? else {
+            let Some(kind) = nested::detect(&self.tree, &prefix).map_err(io_error(&dir))? else {
                 continue;
             };
             if self.options.nested == Nested::WorkingTree && kind != NestedKind::Bare {
@@ -426,26 +427,12 @@ impl Rules {
 
     /// Reads a rule file from the backing tree. Only regular files count:
     /// symlinks are skipped, as git (2.32 and later) does and as
-    /// [`crate::paths::must_not_be_symlink`] requires.
+    /// [`crate::paths::must_not_be_symlink`] requires. A file over
+    /// [`probe::RULE_FILE`] bytes is ignored, as git ignores oversized
+    /// attribute files, so the synchronous step stays bounded.
     fn read_tree_rule_file(&self, rel: &str) -> Result<Option<Vec<u8>>, RulesError> {
         let path = self.tree.join(rel);
-        let absent = |e: &io::Error| {
-            matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            )
-        };
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.is_file() => {}
-            Ok(_) => return Ok(None),
-            Err(e) if absent(&e) => return Ok(None),
-            Err(e) => return Err(io_error(path)(e)),
-        }
-        match fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if absent(&e) => Ok(None),
-            Err(e) => Err(io_error(path)(e)),
-        }
+        probe::read_regular(&path, probe::RULE_FILE).map_err(io_error(path))
     }
 }
 

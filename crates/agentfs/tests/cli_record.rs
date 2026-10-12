@@ -43,12 +43,17 @@ impl Volume {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        let mut root: Vec<std::ffi::OsString> = vec!["--root".into(), self.tree().into()];
+        root.extend(args.iter().map(Into::into));
+        self.run_raw(&root)
+    }
+
+    /// Runs with `--state` only.
+    fn run_raw(&self, args: &[std::ffi::OsString]) -> Output {
         let home = self.home();
         Command::new(env!("CARGO_BIN_EXE_agentfs"))
             .arg("--state")
             .arg(self.state())
-            .arg("--root")
-            .arg(self.tree())
             .args(args)
             .env_remove("AGENTFS_STATE")
             .env_remove("AGENTFS_ROOT")
@@ -187,5 +192,20 @@ fn tracked_paths_stay_recorded() {
 fn status_accepts_the_global_root() {
     let v = Volume::new();
     let out = v.run(&["status"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn record_needs_an_explicit_root() {
+    let v = Volume::new();
+    v.file("a.txt", "1");
+    v.record(&["a.txt"]);
+    // Run from elsewhere without --root, a.txt would look removed.
+    let out = v.run_raw(&["record".into(), "a.txt".into()]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--root"), "{}", stderr(&out));
+    assert_eq!(v.head_paths(), ["a.txt"]);
+    // Commands that do not record still default to the current directory.
+    let out = v.run_raw(&["status".into()]);
     assert!(out.status.success(), "{}", stderr(&out));
 }
