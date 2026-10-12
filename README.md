@@ -44,25 +44,54 @@ nested repository detection. Also:
   shutdown.
 - **Alarm events** (`agentfs_core::events`).
 - **Telemetry:** OpenTelemetry metrics, traces and logs (see below).
+- **The FUSE layer** (`agentfs-fuse`): a passthrough filesystem over a real
+  backing directory that records every change boundary before the call
+  returns, with kernel passthrough (Linux 6.9+) when available. See
+  [Mounting](#mounting).
 
-The `agentfs` command has `init`, `status`, `flush`, `record`, `push` and
-`run`. `record` stands in for the FUSE layer and reports the paths the rules
-skip or the checks refuse, with the reason. It needs `--root` (or
-`AGENTFS_ROOT`), since a path missing from the backing tree is recorded as
-removed. `push` pushes once; `run` runs the commit and push loops until
-SIGINT or SIGTERM. Alarms are printed to stderr, and exported as telemetry
-when it is enabled.
+The `agentfs` command has `init`, `status`, `mount`, `flush`, `record`,
+`push` and `run`. `mount` mounts a backing tree and runs the commit and
+push loops in the same process. `record` records paths of a backing tree
+directly, without a mount, and reports the paths the rules skip or the
+checks refuse, with the reason. It needs `--root` (or `AGENTFS_ROOT`),
+since a path missing from the backing tree is recorded as removed. `push`
+pushes once; `run` runs the commit and push loops until SIGINT or SIGTERM.
+Alarms are printed to stderr, and exported as telemetry when it is enabled.
 
-Only one process uses a state area at a time. `run`, `record`, `flush` and
-`push` take an exclusive lock on `<state>/meta/lock` and exit with status
-75 if another process holds it, naming the holder; `--wait-lock 30s` (or
-`AGENTFS_WAIT_LOCK`) waits instead. `status` takes no lock and changes
-nothing, so it works beside a running daemon, and shows who holds the
-lock.
+Only one process uses a state area at a time. `mount`, `run`, `record`,
+`flush` and `push` take an exclusive lock on `<state>/meta/lock` and exit
+with status 75 if another process holds it, naming the holder;
+`--wait-lock 30s` (or `AGENTFS_WAIT_LOCK`) waits instead. `status` takes no
+lock and changes nothing, so it works beside a running daemon, and shows
+who holds the lock.
+
+Not built yet: restore and revert (§15), LFS and the `fsync` class (phase
+2), the patch queue (phase 3), the CSI driver (phase 4), SSH remotes.
+
+## Mounting
+
+```sh
+agentfs --state /data/state init --volume demo
+agentfs --state /data/state mount /data/backing /workspace
+```
+
+The backing tree, the state area and the mount point must be separate
+directories, none inside another, and no remote's credentials file may be
+under the backing tree; `mount` refuses to start otherwise. It runs in the
+foreground until SIGINT, SIGTERM or an unmount, then unmounts (lazily if
+files are still open), records what is still open, makes a final commit
+and exits. Flags: `--passthrough auto|on|off`, `--threads`,
+`--no-allow-other`, `--unmount-grace`, `--push-grace`.
+
+It needs Linux 5.6+ and `/dev/fuse`, and should run as root for multi-user
+volumes (new files are given to their creator) and for passthrough. The
+[operator guide](docs/operator-guide.md) covers requirements, layout,
+flags, settings, permissions, what is recorded when, shutdown, crashes and
+a Kubernetes sidecar sketch.
 
 ## Telemetry
 
-`flush`, `record`, `push` and `run` export OpenTelemetry metrics, traces and
+`mount`, `flush`, `record`, `push` and `run` export OpenTelemetry metrics, traces and
 logs over OTLP, configured with the standard `OTEL_*` environment variables.
 With no endpoint set, telemetry is off and costs nothing.
 
@@ -134,6 +163,10 @@ remotes needs the `https` feature, which links OpenSSL:
 cargo build -p agentfs --features https
 ```
 
+The FUSE layer uses fuser's pure-Rust mount code, so building needs no
+libfuse or pkg-config; running a mount needs `/dev/fuse` (and `fusermount3`
+from the `fuse3` package for a non-root daemon).
+
 SSH remotes are not supported yet (credentials are username/password or
 token only).
 
@@ -150,7 +183,19 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   running `agentfs run`, divergence, and TLS certificate verification.
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](ci/e2e-telemetry.sh)): every
   metric, span and alarm log above must reach a real OpenTelemetry Collector.
+- **e2e FUSE mount** ([`ci/fuse-tests.sh`](ci/fuse-tests.sh)), with
+  passthrough `auto` and `off`: real mounts as root running the `#[ignore]`d
+  tests in [`crates/agentfs/tests/mount.rs`](crates/agentfs/tests/mount.rs):
+  every operation of design §18 test 1 (editor saves, appends, truncate,
+  directory renames, `rm -r`, hard links, `chmod +x`, symlinks, unlink and
+  rename of open files, log rotation), `kill -9` right after a close, root
+  and uid 10000 writers, invisibility of the state area, rules and nested
+  repositories through the mount, SQLite (WAL and DELETE) and git on the
+  mount, shutdown with files open, external unmounts, the lock, and an
+  unprivileged daemon. The job log shows the passthrough mode the runner's
+  kernel negotiated.
 
 The e2e scripts run locally too: start the server with
-`ci/git-http-server.sh start <dir>` and source its output, or run the
-collector with [`ci/otelcol.yaml`](ci/otelcol.yaml).
+`ci/git-http-server.sh start <dir>` and source its output, run the
+collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run
+`ci/fuse-tests.sh` on any Linux host with FUSE and passwordless sudo.

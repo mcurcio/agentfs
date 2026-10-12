@@ -1,6 +1,7 @@
 # agentfs design
 
-Status: draft 2, 2026-10-12, updated as phase 1 is built. Draft 1 was reviewed
+Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer and
+`agentfs mount` exist; restore and revert do not yet). Draft 1 was reviewed
 adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
 for the findings and what changed because of them.
 
@@ -175,6 +176,51 @@ Rules that make this precise:
 - **Empty directories** are not recorded, because git cannot represent them.
   `mkdir` alone is not a boundary.
 
+**How the FUSE layer implements this** (`agentfs-fuse`):
+
+- **Dirty detection.** With passthrough the daemon never sees writes, so
+  "changed" is read from the inode. An inode is *armed* by a write-open, a
+  write the daemon serves, or a size change; FLUSH `fstat`s only armed
+  inodes and records when the stamp (device, inode, size, mtime, ctime,
+  mode) differs from the one taken just before the last freeze. Timestamps
+  come from a coarse clock, so git's racy-timestamp rule applies: if the
+  last record's stamp is within twice the coarse clock's resolution of the
+  record time, the next FLUSH records regardless. A created file is
+  recorded at its first FLUSH even when empty (`touch`); a write-open of an
+  existing file takes its stamp at open, so opening and closing without a
+  change records nothing.
+- **`O_TRUNC`.** `FUSE_ATOMIC_O_TRUNC` is negotiated, so a shell `>` is one
+  open with `O_TRUNC` and one record at close, even when nothing is written
+  after the truncation. `truncate`/`ftruncate` remain setattr boundaries.
+- **What is frozen.** FLUSH, RELEASE and the sweep hand the recorder
+  `/proc/self/fd/<n>` of the handle's own descriptor, so the frozen content
+  is exactly that inode's, whatever renames happened. Other boundaries open
+  the path with `openat2` first and do the same.
+- **Current paths.** An inode's paths are the names the mount has seen for
+  it (looked up, created or linked), resolved through the parent chain at
+  record time. A hard link made before the mount and never looked up is not
+  known, so a change through another name is not recorded at it.
+- **Renames.** A file rename records the source's removal and the
+  destination's content in one record. A directory rename records the
+  removal of both names and then every regular file and symlink under the
+  destination, never inside a `.git` directory; past 4096 files it is
+  several consecutive records, the first carrying the removals, holding one
+  descriptor per file while each is made (the daemon raises its open-file
+  limit at start). `RENAME_EXCHANGE` removes both names and records both
+  trees. Renaming one hard link over another of the same inode changes
+  nothing and records nothing. The cost is O(files) in the synchronous
+  step; a tree-move change type is a follow-up.
+- **`mknod` of a regular file** has no FLUSH to follow, so it is recorded at
+  once (trigger `close`). FIFOs, sockets and devices are never recorded.
+- **RELEASE** of the last handle that could write records the inode if it
+  changed after its last record (trigger `release`).
+- **The sweep** runs every `agentfs.sweepInterval` (default 30 s, at least
+  1 s): it records inodes open for writing whose stamp changed (trigger
+  `sweep`) and retries the repair queue (§3.5). At unmount a final sweep
+  records every armed inode with any handle still open.
+- **The `fsync` class** (§8) is phase 2: paths with `agentfs.commit=fsync`
+  are recorded at close like any other, and `fsync` is passed through.
+
 ### 3.2 The synchronous step
 
 The work done before the call returns must not depend on file size:
@@ -270,6 +316,18 @@ If the synchronous step fails (for example, the state area is full):
 
 Many programs ignore errors from `close`, so the alarm, not the error code, is
 what people will see.
+
+**Namespace operations.** A rename, unlink, rmdir, link, symlink or setattr
+has already changed the backing tree when its record fails, so "the inode
+stays marked" is not enough. It returns `EIO` and puts the affected paths
+on a **repair queue**. The sweep (every `sweepInterval`, and at unmount)
+re-derives each queued path's absolute state from the backing tree (a
+file's content, a symlink, a directory's files, or a removal) and records
+it with trigger `sweep`. Because records hold absolute state, a repair is
+idempotent and cannot undo a later change. Until it succeeds, history
+differs from the tree at those paths; the `RecordFailed` alarm says so. A
+RELEASE whose record fails queues its paths too, since no handle is left to
+record from. Paths still queued at unmount are reported on exit.
 
 ## 4. Path rules
 
@@ -417,10 +475,15 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
 - **Tracked paths stay tracked** (§4). If `git init` runs in a directory whose
   files are already recorded, those files keep being recorded. Only new paths
   under it are excluded. Nothing is deleted from history because of nesting.
-- **Paths git refuses** are not recorded, and each raises an alarm
-  (`PathRefused`, §13). This includes any `.git` component and its NTFS and HFS
-  look-alikes, such as `.GIT`, `git~1` and `.git.`, and the checks of §3.4. A
-  refused path is reported per path; it never fails the rest of its record.
+- **Paths git refuses** are not recorded. A path with a component that is
+  exactly `.git` is git's own data (`git init` at the root, a clone's git
+  directory, a gitfile): it is skipped silently, since a `git clone` on the
+  mount would otherwise raise an alarm per object. Every other path git
+  refuses raises an alarm (`PathRefused`, §13): `.git` look-alikes in their
+  NTFS and HFS spellings, such as `.GIT`, `git~1` and `.git.`, names that
+  are not UTF-8, and the checks of §3.4. A refused path is reported per
+  path; it never fails the rest of its record, and the operation itself
+  still succeeds in the backing tree.
 
 **Detection details.**
 
@@ -452,8 +515,9 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
   - an absolute target (what `git worktree add` writes by default) carries
     the mount point, which agentfs does not know, so each of its suffixes is
     tried from the tree root: `/workspace/main/.git/worktrees/wt` is found as
-    `main/.git/worktrees/wt` in a tree mounted at `/workspace`. Once the
-    FUSE layer knows its mount point this can become an exact mapping.
+    `main/.git/worktrees/wt` in a tree mounted at `/workspace`. The FUSE
+    layer now knows its mount point, so this can become an exact mapping;
+    that is a follow-up.
 - **Bounded reads.** These files are workload-controlled and read in the
   synchronous step, so they are opened without following symlinks and
   without blocking (a FIFO cannot hang the daemon), must be regular files,
@@ -476,7 +540,32 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
   - The mount uses `allow_other` and the kernel's `default_permissions`. The
     kernel checks the real stored ownership and modes, so root and non-root
     callers behave as they would on the backing filesystem.
-  - `chown`, `chmod` and `utimens` are passed through to the backing tree.
+  - `chown`, `chmod` and `utimens` are passed through to the backing tree,
+    and so are extended attributes (on regular files and directories).
+    `chmod` of a symlink is not supported (Linux has no `lchmod`).
+  - **Ownership of new objects.** The daemon performs each operation with
+    its own privileges once the kernel has checked the caller's. Running as
+    root, it then gives every file, directory, symlink and device it creates
+    to the caller (`fchown`): the caller's group, except under a setgid
+    directory, where the backing filesystem already chose the directory's
+    group. It then sets exactly the mode the caller asked for, so the
+    daemon's own umask never applies. A non-root daemon cannot do this:
+    everything it creates belongs to its own user.
+  - **POSIX ACLs are not enforced** through the mount (`FUSE_POSIX_ACL` is
+    not negotiated); only mode bits are.
+  - **Inode numbers.** fuser sends the attribute's inode number as the FUSE
+    node id, so `st_ino` (and `d_ino` in directory listings) is agentfs's
+    node id: one per backing inode, shared by hard links, kept for the life
+    of the mount even after the kernel forgets the node (at one small map
+    entry per backing inode seen), but not stable across remounts. Tools
+    that cache inode numbers, such as git's index for a repository on the
+    mount, re-read files once after a remount.
+  - **Confinement.** The daemon reaches the backing tree only through a
+    descriptor opened at mount and `openat2` with `RESOLVE_BENEATH`,
+    `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS` (Linux 5.6+), and
+    checks that every path still leads to the node's backing inode
+    (`ESTALE` otherwise). A symlink anywhere in a path, whatever the
+    workload did to the tree, is never followed.
 - **Hermes.** Its tool containers run as root while files are owned by UID
   10000. git's "dubious ownership" check then needs `safe.directory` in those
   containers. That is a consumer setting (§16), not an agentfs one.
@@ -991,22 +1080,67 @@ target. What it needs:
   - LFS (§7);
   - the patch queue (§12);
   - telemetry (§13): implemented against the OpenTelemetry API.
+- **`agentfs-fuse`, a library:** the FUSE layer (§2.1, §3.1, §6).
+  - `Ops`: every filesystem operation over the backing tree, independent of
+    the kernel, so all of its behaviour is unit-tested against real
+    directories and state areas; the inode table; dirty detection; the
+    change boundaries; the repair queue (§3.5).
+  - The fuser adapter, the sweep thread, the layout preflight, mount and
+    unmount.
+  - It is a separate crate so the core stays free of FUSE and the binary
+    stays a thin CLI.
 - **`agentfs`, a binary:**
-  - `init`, `mount`, `status`, `flush`, `push`, `run`, `restore`, `revert`;
+  - `init`, `mount`, `status`, `flush`, `record`, `push`, `run`; `restore`
+    and `revert` are not built yet (§15);
   - `push` pushes once to every remote (or those named with `--remote`) and
     exits 1 unless all succeeded; `run` runs the service in the foreground
     until SIGINT or SIGTERM, makes a final commit, waits up to
     `--push-grace` (default 5s) for pushes in progress, and exits at once on
-    a second signal. `flush`, `record`, `push` and `run` export telemetry
-    (§13) and take the pod flags (`AGENTFS_POD`, ...), so every command's
-    telemetry resource is the same. `record` stands in for the FUSE layer until it exists;
+    a second signal. `mount`, `flush`, `record`, `push` and `run` export
+    telemetry (§13) and take the pod flags (`AGENTFS_POD`, ...), so every
+    command's telemetry resource is the same. `record` records paths of a
+    backing tree directly, without a mount;
   - `status` is read-only (§2.3): the head, the last committed sequence,
     the backlog, the state-area lock's holder, and each remote: its URL
     (userinfo redacted), last pushed commit, unpushed commits, consecutive
     failures, last error and any diverged ref;
   - `mount`, `run`, `record`, `flush` and `push` take the state-area lock
-    (§2.3) and exit 75 while another process holds it;
-  - mounted with fuser (multi-threaded, with passthrough).
+    (§2.3) and exit 75 while another process holds it.
+- **`agentfs mount <backing> <mountpoint>`** runs the FUSE session, the
+  commit loop and the push loops in one process.
+  - **Preflight.** Before anything is mounted it refuses a state area,
+    backing tree and mount point that are not three separate directories
+    (none inside another, after resolving symlinks), a remote credentials
+    file under the backing tree or the mount point (an error, not
+    `RemoteMisconfigured`: carrying on would expose the secret), a
+    `--root` that is not the backing tree, and a stale mount point
+    (`ENOTCONN`, with the command that clears it).
+  - **Kernel options.** fuser, multi-threaded (`--threads`, default the CPU
+    count between 2 and 16) with a cloned `/dev/fuse` descriptor per thread;
+    `default_permissions`, `allow_other` (unless `--no-allow-other`),
+    `nodev`, `nosuid`, `rw`, fsname `agentfs:<volume>`, subtype `agentfs`.
+    INIT asks for `FUSE_ATOMIC_O_TRUNC` and `FUSE_PARALLEL_DIROPS`; never for
+    the writeback cache (FLUSH must see every write the daemon serves),
+    POSIX or BSD locks (they stay in the kernel, which is right for one
+    mount) or POSIX ACLs. No `auto_unmount`: a crashed daemon leaves
+    `ENOTCONN` rather than exposing the empty mount point to writes nothing
+    would record. Entries are cached 1 s, attributes not at all.
+  - **Passthrough.** `--passthrough auto` (default) asks for
+    `FUSE_PASSTHROUGH` (maximum stack depth 1) when the kernel offers it and
+    the daemon is root (registering backing files needs `CAP_SYS_ADMIN`),
+    and keeps one backing id per inode while any handle on it is open. If
+    registering fails (a stacked backing filesystem such as overlayfs) it
+    switches passthrough off for the rest of the mount and serves data
+    through the daemon. `on` fails the mount at INIT instead; `off` never
+    asks. The startup line reports the result and the reason. CI's
+    `ubuntu-latest` kernel negotiates it (the `fuse` job runs `auto` and
+    `off`).
+  - **Shutdown** on SIGINT, SIGTERM or an external unmount: unmount (a
+    plain unmount, then a lazy detach if busy; `fusermount3 -u`, then
+    `-u -z`, when not root), wait up to `--unmount-grace` (10 s) for the
+    session to end, run a final sweep, make the final commit, wait up to
+    `--push-grace` for pushes, flush telemetry, release the lock. A second
+    signal exits 130.
 
   It works anywhere FUSE does, with no Kubernetes dependency.
 - **Phase 1 deployment:** a privileged native sidecar (an init container with
@@ -1027,7 +1161,7 @@ Phase 4 (§14).
 
 | Need | Choice | Notes |
 |---|---|---|
-| FUSE | `fuser` | Active. Multi-threaded dispatch, passthrough (`BackingId`) |
+| FUSE | `fuser` 0.18 | Active. Multi-threaded dispatch with cloned fds, passthrough (`BackingId`). Default features are pure Rust: `mount(2)` as root, `fusermount3` otherwise, no libfuse. It sends the attribute inode number as the node id, so `st_ino` is the node id (§6) |
 | Git objects, commits, push, credentials | `git2` (libgit2) | Active. Has **no** filter or merge-driver registration, and its fsync option is only reachable through `libgit2-sys` |
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
 | LFS | none exists | Implemented in agentfs (§7) |
@@ -1095,6 +1229,15 @@ Phase 4 (§14).
 16. **Phase 4.** Two pods on two nodes mount one volume. Each pod's changes carry
     its own committer identity, and history keeps every boundary from both.
 
+**Where they run.** Tests 1, 2, 4, 5, 6 and 7 run through real mounts in the
+`fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with passthrough
+`auto` and `off`), along with SQLite in WAL and DELETE mode and git
+(`gc`, `fsck`) on the mount, though not test 14's restore of every
+recorded version. Tests 8 and 12 (all but the record and commit failure
+counters) run in the `e2e` jobs against a real git
+server and OpenTelemetry Collector. Not automated yet: test 3 (a kill at
+every step), 11 (restore is not built), 13 (performance) and 16.
+
 ## 19. Decisions and open questions
 
 ### 19.1 Decisions (2026-10-12)
@@ -1112,6 +1255,14 @@ Phase 4 (§14).
 | Repository layout | Several volumes may share a repository, each with its own branch and ref namespace (§11.4) |
 | Identity | Configurable templates with defaults (§9) |
 | Backing filesystem | Both supported. XFS (reflink) makes the synchronous step size-independent; ext4 falls back to a copy. The phase 1 benchmark sets the documented recommendation (§3.2) |
+| One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `record`, `flush` and `push`; exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
+| FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
+| Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close (§3.1) |
+| `.git` paths | An exact `.git` component is git's own data, skipped without an alarm; look-alikes and invalid names raise `PathRefused` (§5) |
+| Layout | The state area, backing tree and mount point are separate; credentials are never under the backing tree. `mount` refuses otherwise (§17.1) |
+| Passthrough | `auto` by default: used when the kernel and privileges allow, off with the reason reported otherwise, and switched off for the mount if registering a backing file fails (§17.1) |
+| Failed namespace records | `EIO` plus a repair queue the sweep drains from the backing tree's current state (§3.5) |
+| `st_ino` | The FUSE node id, stable while mounted and shared by hard links, not across remounts (§6) |
 
 ### 19.2 Open questions
 
