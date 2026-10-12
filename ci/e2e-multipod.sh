@@ -281,13 +281,15 @@ assert_eq "$(head_of)" "$(sudo git --git-dir "$REMOTE" rev-parse refs/heads/agen
 
 step "per-close cost: single-process mount, then a front"
 N=${BOUNDARY_N:-1000}
+# uid 10000 cannot read the checkout (the runner's home is private).
+install -m 755 "$HERE/boundary-latency.py" "$W/boundary-latency.py"
 sudo "$AGENTFS_BIN" --state "$STATE" mount --passthrough "$P" --unmount-grace 5s \
   "$BACKING" "$MNT_A" >>"$SP_LOG" 2>&1 &
 SP_PID=$!
 wait_for 30 mountpoint -q "$MNT_A" || fail "the single-process mount never mounted"
 as_agent "$MNT_A" 'mkdir -p bench-single'
 SINGLE=$(sudo setpriv --reuid=10000 --regid=10000 --clear-groups -- \
-  python3 "$HERE/boundary-latency.py" "$MNT_A/bench-single" "$N" single-process)
+  python3 "$W/boundary-latency.py" "$MNT_A/bench-single" "$N" single-process)
 sudo kill -TERM "$SP_PID"
 wait "$SP_PID" || fail "the single-process mount did not exit cleanly"
 SP_PID=
@@ -296,7 +298,7 @@ start_front pod-a "$MNT_A" "$A_LOG"
 A_PID=$FRONT_PID
 as_agent "$MNT_A" 'mkdir -p bench-front'
 FRONT=$(sudo setpriv --reuid=10000 --regid=10000 --clear-groups -- \
-  python3 "$HERE/boundary-latency.py" "$MNT_A/bench-front" "$N" front)
+  python3 "$W/boundary-latency.py" "$MNT_A/bench-front" "$N" front)
 stop_front "$A_PID" pod-a
 A_PID=
 stop_service

@@ -336,11 +336,13 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
         branch: shared.branch.clone(),
         service_pid: std::process::id(),
     };
-    if write_frame(&mut stream, &welcome).is_err() {
-        return;
-    }
+    // Counted before the welcome, so a front that has its welcome is
+    // counted.
     if let Some(conn) = shared.conns().get_mut(&id) {
         conn.instance = Some(hello.front.instance);
+    }
+    if write_frame(&mut stream, &welcome).is_err() {
+        return;
     }
     // Idle connections wait for their next request as long as the front
     // keeps them.
