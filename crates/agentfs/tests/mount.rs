@@ -1263,7 +1263,8 @@ fn restore_with_the_workload_stopped() {
 }
 
 /// A file a workload has written through the mount and still holds open
-/// is a change not recorded yet: refused even with --force, and kept.
+/// is a change not recorded yet: refused even with --force, and kept. The
+/// check's own read records it, so a retry finds it in history.
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn restore_refuses_an_unrecorded_write_through_the_mount() {
@@ -1276,29 +1277,59 @@ fn restore_refuses_an_unrecorded_write_through_the_mount() {
     v.expect(&tree(&[("f", f("v2"))]));
     let head = v.head_id();
 
-    // A writer that has written f and holds it open: nothing recorded. (A
-    // shell redirection would close a duplicate of the descriptor, and
-    // that close is a change boundary the mount records.)
-    let mut holder = fs::File::create(v.mnt().join("f")).unwrap();
+    // A writer that has written f and holds it open: nothing recorded.
+    // Every close of a descriptor for f is a change boundary the mount
+    // records, including a copy closed by fork and exec (or by a shell
+    // redirection), so the writer is a process that never forks.
+    let mut holder = Command::new("perl")
+        .arg("-e")
+        .arg(
+            r#"open(my $f, ">", "f") or die "$!"; syswrite($f, "dirty") == 5 or die "$!";
+               $| = 1; print "ready\n"; sleep 60;"#,
+        )
+        .current_dir(v.mnt())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
     {
-        use std::io::Write as _;
-        holder.write_all(b"dirty").unwrap();
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
     }
-    for force in [&[][..], &["--force"][..]] {
-        let mut args = vec!["restore"];
-        args.extend_from_slice(force);
-        args.extend(["f", c1.as_str()]);
-        let out = v.agentfs(&args);
-        let err = text(&out.stderr);
-        assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
-        assert!(err.contains("f differs from history"), "{args:?}: {err}");
-        assert!(err.contains("--force does not override"), "{err}");
-        assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "dirty");
-    }
-    assert_eq!(v.head_id(), head, "nothing committed");
-    // Closed, the workload's write is recorded as usual.
-    drop(holder);
+    let out = v.agentfs(&["restore", "--force", "f", &c1]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("f differs from history"), "{err}");
+    assert!(err.contains("--force does not override"), "{err}");
+    assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "dirty");
+    // The check's own read of f through the mount was a change boundary
+    // (its close is a FLUSH of a changed inode), so the write is in
+    // history now: nothing unrecorded is left to lose, and only the
+    // open handle remains, which --force overrides.
     v.expect(&tree(&[("f", f("dirty"))]));
+    assert_ne!(v.head_id(), head);
+    let out = v.agentfs(&["restore", "f", &c1]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("open for writing through the mount: f"),
+        "{err}"
+    );
+    v.ok(&["restore", "--force", "f", &c1]);
+    assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "v1");
+    v.expect(&tree(&[("f", f("v1"))]));
+    // The commit before the restore holds the workload's write.
+    let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    let parent = repo
+        .find_commit(git2::Oid::from_str(&v.parent_id()).unwrap())
+        .unwrap();
+    let blob = parent.tree().unwrap().get_name("f").unwrap().id();
+    assert_eq!(repo.find_blob(blob).unwrap().content(), b"dirty");
+    let _ = holder.kill();
+    let _ = holder.wait();
     m.stop();
 }
 

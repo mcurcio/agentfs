@@ -1211,11 +1211,15 @@ is left alone and the operation stops there. A window remains between
 that re-check and the write: a workload that opens and writes the file
 in that moment, without closing it, has those writes replaced before
 they are recorded, so nothing unrecorded is lost only while the workload
-is paused. A failure part way records what was written and reports the
-error. A file is rewritten in place only after the space its new content
-needs is allocated, so a full disk or a file size limit leaves it whole;
-a write that fails after that (an I/O error) can leave it part written,
-and direct mode then records it as it is, so tree and history agree. A
+is paused. Through a mount, the check's own read of a file a workload
+has written but not closed ends with a FLUSH of a changed inode, a change
+boundary (§3.1): that content is recorded before the refusal, so a retry
+finds it in history and only the open handle (overridable) remains. A
+failure part way records what was written and reports the error. A file
+is rewritten in place only after the space its new content needs is
+allocated, so a full disk or a file size limit leaves it whole; a write
+that fails after that (an I/O error) can leave it part written, and
+direct mode then records it as it is, so tree and history agree. A
 re-run records what the tree already holds and writes the rest.
 
 **Writing.** Removals run deepest first and prune directories they leave
