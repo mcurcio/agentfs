@@ -159,6 +159,7 @@ jobs:
       - name: enable user_allow_other, show the kernel
         run: |
           echo user_allow_other | sudo tee -a /etc/fuse.conf
+          python3 --version && sqlite3 --version
           uname -a
           ls -l /dev/fuse
           findmnt -T "$RUNNER_TEMP" || true
@@ -167,6 +168,9 @@ jobs:
           AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
           AGENTFS_TEST_UNPRIV_USER: runner
       - run: ci/e2e-recovery.sh
+        env:
+          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
+      - run: ci/e2e-sqlite.sh
         env:
           AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
       - name: daemon logs
