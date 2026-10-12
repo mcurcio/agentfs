@@ -19,9 +19,8 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
 # The restore thread's id (`thread`), and signals in tests (`process`).
 rustix = { version = "1.1.5", features = ["fs", "process", "thread"] }
-# The control socket's peer credentials (SO_PEERCRED) as plain integers: a
-# peer outside the daemon's pid namespace has pid 0, which rustix's `UCred`
-# (a non-zero `Pid`) cannot hold.
+# close(2) and its errno in the FUSE tests (a front failing a boundary with
+# EIO, design §14).
 libc = "0.2.190"
 # The control socket's JSON-lines protocol.
 serde = { version = "1.0.229", features = ["derive"] }

@@ -1,7 +1,8 @@
 //! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7, 11 and 15, plus SQLite
 //! in and out of the fsync class (design §8),
 //! git on the mount, restores through the mount, the daemon's lifecycle, and
-//! `probe` and `--on-stale-mount hold` after a crash (design §17.1).
+//! `probe` and `--on-stale-mount hold` after a crash (design §17.1), and two
+//! front mounts of one backing tree feeding one history service (design §14).
 //!
 //! Every test needs `/dev/fuse` and root, so all are `#[ignore]`d; the
 //! `fuse` CI job runs them through `ci/fuse-tests.sh`:
@@ -1737,4 +1738,195 @@ fn patches_apply_before_the_mount_serves() {
         ("d.txt", f("more")),
     ]));
     m.stop();
+}
+
+// ---- design §14: two fronts, one history service ----
+
+/// Starts `agentfs serve-history` for `v`, logging to its log, and waits
+/// for it to serve.
+fn start_history_service(v: &Vol) -> Mounted {
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(v.log_path())
+        .unwrap();
+    writeln!(log, "---- serve-history").unwrap();
+    let before = fs::read_to_string(v.log_path())
+        .unwrap_or_default()
+        .matches("serving history for volume")
+        .count();
+    let child = v
+        .command()
+        .arg("--root")
+        .arg(v.backing())
+        .arg("serve-history")
+        .env("AGENTFS_REPLICA", "history-0")
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Not a mount: `mnt` is never mounted, so Drop unmounts nothing.
+    let service = Mounted {
+        child: Some(child),
+        mnt: v.p("no-mount"),
+        log: v.log_path(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while service.log().matches("serving history for volume").count() <= before {
+        assert!(
+            Instant::now() < deadline,
+            "never served; log:\n{}",
+            service.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    service
+}
+
+/// Starts a front mount of `v`'s backing tree at `mnt` as pod `pod`.
+fn start_front(v: &Vol, mnt: &Path, pod: &str) -> Mounted {
+    let socket = v.state().join("meta/history/history.sock");
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(v.log_path())
+        .unwrap();
+    writeln!(log, "---- front {pod}").unwrap();
+    let before = startup_lines(&fs::read_to_string(v.log_path()).unwrap_or_default());
+    let child = v
+        .command()
+        .args([
+            "mount",
+            "--passthrough",
+            &passthrough(),
+            "--unmount-grace",
+            "3s",
+        ])
+        .arg("--history-service")
+        .arg(&socket)
+        .args(["--history-timeout", "3s", "--history-wait", "10s"])
+        .arg(v.backing())
+        .arg(mnt)
+        .env("AGENTFS_REPLICA", pod)
+        .env("AGENTFS_POD", pod)
+        .env("AGENTFS_POD_UID", format!("{pod}-uid"))
+        .env("AGENTFS_NAMESPACE", "agents")
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let front = Mounted {
+        child: Some(child),
+        mnt: mnt.to_owned(),
+        log: v.log_path(),
+    };
+    front.wait_mounted(before);
+    front
+}
+
+/// Writes `content` to `path` and returns what close(2) said.
+fn write_and_close(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::os::fd::IntoRawFd as _;
+    let mut file = fs::File::create(path)?;
+    file.write_all(content.as_bytes())?;
+    let fd = file.into_raw_fd();
+    // SAFETY: `fd` came from `into_raw_fd`, so this is its only owner.
+    if unsafe { libc::close(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Every commit with a pod trailer, oldest first: committer and pod.
+fn pod_commits(v: &Vol) -> Vec<(String, String)> {
+    let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    let mut walk = repo.revwalk().unwrap();
+    walk.push_ref("refs/heads/agentfs/demo").unwrap();
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+        .unwrap();
+    walk.filter_map(|id| {
+        let commit = repo.find_commit(id.unwrap()).unwrap();
+        let pod = commit
+            .message()
+            .unwrap_or("")
+            .lines()
+            .find_map(|l| l.strip_prefix("Agentfs-Pod: "))?
+            .to_owned();
+        Some((commit.committer().name().unwrap_or("").to_owned(), pod))
+    })
+    .collect()
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn two_fronts_one_service() {
+    let v = Vol::new("two-fronts");
+    let mnt2 = v.p("mnt2");
+    fs::create_dir_all(&mnt2).unwrap();
+    fs::set_permissions(&mnt2, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // No service: a front exits without mounting.
+    let out = v
+        .command()
+        .args(["mount", "--history-service"])
+        .arg(v.state().join("meta/history/history.sock"))
+        .args(["--history-wait", "1s"])
+        .arg(v.backing())
+        .arg(v.mnt())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(!is_mounted(&v.mnt()));
+
+    let service = start_history_service(&v);
+    let a = start_front(&v, &v.mnt(), "pod-a");
+    let b = start_front(&v, &mnt2, "pod-b");
+    write_and_close(&v.mnt().join("from-a.txt"), "a").unwrap();
+    write_and_close(&mnt2.join("from-b.txt"), "b").unwrap();
+    // One backing tree: each front sees the other's file.
+    assert_eq!(fs::read_to_string(mnt2.join("from-a.txt")).unwrap(), "a");
+    assert_eq!(fs::read_to_string(v.mnt().join("from-b.txt")).unwrap(), "b");
+    v.expect(&tree(&[("from-a.txt", f("a")), ("from-b.txt", f("b"))]));
+    let status = v.ok(&["status"]);
+    assert!(status.contains("history:   serving fronts at"), "{status}");
+    assert!(status.contains("command=mount pod=pod-a"), "{status}");
+    assert!(status.contains("command=mount pod=pod-b"), "{status}");
+
+    // The service down: the boundary fails with EIO and an alarm.
+    let mut service = service;
+    service.signal(rustix::process::Signal::KILL);
+    service.wait_exit(Duration::from_secs(10));
+    let err = write_and_close(&v.mnt().join("lost.txt"), "x").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EIO), "{err}");
+    let log = a.log();
+    assert!(log.contains("alarm: "), "{log}");
+
+    // Back up: the fronts carry on without a restart.
+    let service = start_history_service(&v);
+    write_and_close(&mnt2.join("after.txt"), "after").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !v.history().contains_key("after.txt") {
+        assert!(Instant::now() < deadline, "after.txt never committed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    a.stop();
+    b.stop();
+    service.stop();
+    let commits = pod_commits(&v);
+    assert!(
+        commits.contains(&("pod-a".to_owned(), "pod-a".to_owned())),
+        "{commits:?}"
+    );
+    assert!(
+        commits.contains(&("pod-b".to_owned(), "pod-b".to_owned())),
+        "{commits:?}"
+    );
+    assert!(
+        commits.iter().all(|(c, p)| c == p),
+        "a commit mixes pods: {commits:?}"
+    );
 }

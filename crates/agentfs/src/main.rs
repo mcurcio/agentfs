@@ -19,9 +19,16 @@
 //! wait for the pod restart instead of remounting ([`hold`], design
 //! §17.1).
 //!
-//! `mount`, `run`, `record`, `flush`, `push`, and `restore` and `revert`
-//! when no mount runs, take the state-area lock (design §2.3) and exit 75
-//! while another process holds it; `status` is read-only and takes no lock.
+//! `serve-history` is a volume's history service and `mount
+//! --history-service` and `record --history-service` are its fronts, one
+//! per pod (design §14; [`serve_history`], [`front`]): the service is the
+//! only writer of the journal and branch, and each front records its pod's
+//! changes through it, carrying its pod's committer.
+//!
+//! `mount`, `run`, `record`, `flush`, `push`, `serve-history`, and
+//! `restore` and `revert` when no mount runs, take the state-area lock
+//! (design §2.3) and exit 75 while another process holds it; fronts take
+//! no lock; `status` is read-only and takes no lock.
 //!
 //! `mount`, `flush`, `record`, `push` and `run` export telemetry over OTLP
 //! when the standard `OTEL_*` variables configure an endpoint (see
@@ -30,10 +37,12 @@
 
 mod control;
 mod daemon;
+mod front;
 mod hold;
 mod otel;
 mod patch_cmd;
 mod recovery;
+mod serve_history;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -56,7 +65,9 @@ use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::service::Service;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
-use agentfs_fuse::{Mount, MountConfig, MountState, Passthrough, mount_state, preflight};
+use agentfs_fuse::{
+    Mount, MountConfig, MountState, Passthrough, UnmountReport, mount_state, preflight,
+};
 
 use crate::daemon::{Daemon, Wake};
 
@@ -103,7 +114,9 @@ enum Command {
     Status(Pod),
     /// Commit every recorded change now.
     Flush(Pod),
-    /// Record the current state of PATHs under ROOT, then commit.
+    /// Record the current state of PATHs under ROOT, then commit. With
+    /// --history-service, record through the history service instead,
+    /// which commits them (design §14).
     Record {
         /// Paths relative to ROOT. A missing path is recorded as removed. A
         /// path in the fsync class records its whole group (database,
@@ -112,6 +125,26 @@ enum Command {
         paths: Vec<String>,
         #[command(flatten)]
         pod: Pod,
+        #[command(flatten)]
+        history: HistoryArgs,
+    },
+    /// Serve the volume's history to fronts (`mount --history-service`)
+    /// until SIGINT or SIGTERM: the only writer of the journal and the
+    /// branch, with the commit and push loops (design §14). Needs --root,
+    /// the backing tree the fronts mount. A second signal exits at once.
+    ServeHistory {
+        /// Where to listen: `unix:<path>` or an absolute socket path
+        /// (default: <state>/meta/history/history.sock).
+        #[arg(long, env = "AGENTFS_HISTORY_LISTEN", value_name = "ADDR")]
+        listen: Option<String>,
+        #[command(flatten)]
+        pod: Pod,
+        /// How long shutdown waits for pushes in progress.
+        #[arg(long, default_value = "5s", value_parser = parse_grace)]
+        push_grace: Duration,
+        /// How long shutdown waits for fronts' requests in progress.
+        #[arg(long, default_value = "10s", value_parser = parse_grace)]
+        shutdown_grace: Duration,
     },
     /// Push the volume's refs to its remotes once. Exits 1 unless every
     /// selected remote succeeded.
@@ -187,6 +220,23 @@ enum Command {
         #[command(subcommand)]
         command: patch_cmd::PatchCommand,
     },
+}
+
+/// Being a front of a history service (design §14).
+#[derive(Args)]
+struct HistoryArgs {
+    /// Record through the history service at ADDR (`unix:<path>` or an
+    /// absolute socket path) as a front: take no state-area lock, freeze
+    /// into a leased pending slot, and let the service journal and commit.
+    #[arg(long, env = "AGENTFS_HISTORY_SERVICE", value_name = "ADDR")]
+    history_service: Option<String>,
+    /// How long a boundary waits for the history service before it fails
+    /// with EIO.
+    #[arg(long, env = "AGENTFS_HISTORY_TIMEOUT", default_value = "10s", value_parser = parse_grace, value_name = "DURATION")]
+    history_timeout: Duration,
+    /// How long to wait at start for the history service to be up.
+    #[arg(long, env = "AGENTFS_HISTORY_WAIT", default_value = "30s", value_parser = parse_grace, value_name = "DURATION")]
+    history_wait: Duration,
 }
 
 fn parse_grace(value: &str) -> Result<Duration, String> {
@@ -292,10 +342,18 @@ fn real_main() -> Result<ExitCode> {
                     inspection.torn_bytes
                 );
             }
-            match StateLock::holder(&state)? {
+            let holder = StateLock::holder(&state)?;
+            match &holder {
                 Some(holder) => println!("lock:      held by {holder}"),
                 None => println!("lock:      free"),
             }
+            if holder.is_some_and(|h| h.contains("command=serve-history")) {
+                match serve_history::read_address(&state) {
+                    Some(address) => println!("history:   serving fronts at {address}"),
+                    None => println!("history:   serving fronts"),
+                }
+            }
+            front::print_status(&state);
             let settings = history.settings();
             match settings.lfs.threshold {
                 Some(bytes) => println!("lfs:       files over {bytes} byte(s) are stored as LFS"),
@@ -337,79 +395,53 @@ fn real_main() -> Result<ExitCode> {
             );
             session.finish();
         }
-        Command::Record { paths, pod } => {
+        Command::Record {
+            paths,
+            pod,
+            history,
+        } => {
             // Guessing the root would turn every path missing from the wrong
             // directory into a recorded removal.
             let Some(root) = cli.root.as_deref() else {
                 bail!("record needs --root (or AGENTFS_ROOT): the backing tree the paths are in");
             };
+            if let Some(address) = &history.history_service {
+                return front::record_front(&state, root, &pod, address, &history, &paths);
+            }
             let _lock = StateLock::acquire(&state, "record", cli.wait_lock)?;
             let session = Session::start(&state, &pod)?;
             let (recorder, committer, _) = session.open(&state, root, &pod)?;
-            let caller = Caller {
-                uid: current_uid(),
-                gid: current_gid(),
-                pid: std::process::id(),
-            };
-            let mut groups_done = std::collections::HashSet::new();
-            for path in paths {
-                // A path in the fsync class records its whole group as one
-                // record (design §8).
-                if let Ok(repo_path) = RepoPath::new(path.as_str())
-                    && let Some(group) = recorder.fsync_group(&repo_path)
-                {
-                    if !groups_done.insert(group.key.clone()) {
-                        continue;
-                    }
-                    let mut inputs = Vec::with_capacity(group.members.len());
-                    for member in &group.members {
-                        match input_for(root, member.as_str()) {
-                            Ok(input) => inputs.push(input),
-                            // A directory at a member's name is no member.
-                            Err(_) if *member != repo_path => {}
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    let names: Vec<&str> = group.members.iter().map(RepoPath::as_str).collect();
-                    let recorded = recorder.record_group(Trigger::Close, caller, inputs)?;
-                    if let Some(seq) = recorded.seq {
-                        println!("recorded group {} as seq {seq}", names.join(", "));
-                    }
-                    for skipped in recorded.skipped {
-                        println!("skipped {}: {}", skipped.path, skipped.reason);
-                    }
-                    continue;
-                }
-                let input = match input_for(root, &path) {
-                    Ok(input) => input,
-                    Err(e) => match e.downcast_ref::<PathError>() {
-                        Some(err @ PathError::DotGit(_)) => {
-                            recorder.refuse_invalid(&path, err.clone());
-                            println!("skipped {path}: {e}");
-                            continue;
-                        }
-                        _ => return Err(e),
-                    },
-                };
-                let trigger = match input {
-                    Input::Remove { .. } => Trigger::Unlink,
-                    Input::Symlink { .. } => Trigger::Symlink,
-                    Input::Write { .. } => Trigger::Close,
-                };
-                let recorded = recorder.record(trigger, caller, vec![input])?;
-                if let Some(seq) = recorded.seq {
-                    println!("recorded {path} as seq {seq}");
-                }
-                for skipped in recorded.skipped {
-                    println!("skipped {}: {}", skipped.path, skipped.reason);
-                }
-            }
+            record_paths(&recorder, root, &paths)?;
             let report = committer.commit_pending()?;
             println!(
                 "{} record(s) into {} commit(s)",
                 report.records, report.commits
             );
             session.finish();
+        }
+        Command::ServeHistory {
+            listen,
+            pod,
+            push_grace,
+            shutdown_grace,
+        } => {
+            let daemon = Daemon::start()?;
+            let Some(root) = cli.root.as_deref() else {
+                bail!(
+                    "serve-history needs --root (or AGENTFS_ROOT): the backing tree its fronts \
+                     mount"
+                );
+            };
+            let _lock = StateLock::acquire(&state, "serve-history", cli.wait_lock)?;
+            return serve_history::serve(
+                daemon,
+                &state,
+                root,
+                listen.as_deref(),
+                &pod,
+                push_grace,
+                shutdown_grace,
+            );
         }
         Command::Push { remotes, pod } => {
             let _lock = StateLock::acquire(&state, "push", cli.wait_lock)?;
@@ -460,6 +492,10 @@ fn real_main() -> Result<ExitCode> {
                 && let Ok(MountState::Stale { source }) = mount_state(&args.mountpoint)
             {
                 return Ok(hold::hold(daemon, &args.mountpoint, &source));
+            }
+            if let Some(address) = &args.history.history_service {
+                // A front takes no lock: the history service holds it.
+                return front::mount_front(daemon, &state, cli.root.as_deref(), &args, address);
             }
             let _lock = StateLock::acquire(&state, "mount", cli.wait_lock)?;
             return mount(daemon, &state, cli.root.as_deref(), &args);
@@ -763,6 +799,8 @@ struct MountArgs {
         value_enum
     )]
     on_stale_mount: OnStaleMount,
+    #[command(flatten)]
+    history: HistoryArgs,
 }
 
 /// `mount --on-stale-mount`.
@@ -958,6 +996,14 @@ fn mount(
         eprintln!("a restore was still running at shutdown; it stops with the unmount");
     }
     let report = mounted.shutdown(args.unmount_grace);
+    print_unmount(&report, args.unmount_grace);
+    let code = stop_service(service, args.push_grace);
+    session.finish();
+    Ok(if failed { ExitCode::FAILURE } else { code })
+}
+
+/// Reports what an unmount did and what it could not record.
+fn print_unmount(report: &UnmountReport, unmount_grace: Duration) {
     if let Some(error) = &report.unmount_error {
         eprintln!("unmount failed: {error}");
     }
@@ -967,7 +1013,7 @@ fn mount(
     if report.session_abandoned {
         eprintln!(
             "files were still open after {:?}: their later changes are not recorded",
-            args.unmount_grace
+            unmount_grace
         );
     }
     if report.swept > 0 || report.repaired > 0 {
@@ -997,11 +1043,7 @@ fn mount(
             ),
         }
     }
-    let code = stop_service(service, args.push_grace);
-    session.finish();
-    Ok(if failed { ExitCode::FAILURE } else { code })
 }
-
 type Opened = (volume::Recorder, volume::Committer, volume::Recovery);
 
 fn volume_name(state: &StateDir) -> Result<String> {
@@ -1061,11 +1103,76 @@ impl Session {
     }
 }
 
+/// Records the current state of each of `paths` under `root`, printing
+/// what was recorded and skipped.
+fn record_paths(recorder: &volume::Recorder, root: &Path, paths: &[String]) -> Result<()> {
+    let caller = Caller {
+        uid: current_uid(),
+        gid: current_gid(),
+        pid: std::process::id(),
+    };
+    let mut groups_done = std::collections::HashSet::new();
+    for path in paths {
+        // A path in the fsync class records its whole group as one
+        // record (design §8).
+        if let Ok(repo_path) = RepoPath::new(path.as_str())
+            && let Some(group) = recorder.fsync_group(&repo_path)
+        {
+            if !groups_done.insert(group.key.clone()) {
+                continue;
+            }
+            let mut inputs = Vec::with_capacity(group.members.len());
+            for member in &group.members {
+                match input_for(root, member.as_str()) {
+                    Ok(input) => inputs.push(input),
+                    // A directory at a member's name is no member.
+                    Err(_) if *member != repo_path => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let names: Vec<&str> = group.members.iter().map(RepoPath::as_str).collect();
+            let recorded = recorder.record_group(Trigger::Close, caller, inputs)?;
+            if let Some(seq) = recorded.seq {
+                println!("recorded group {} as seq {seq}", names.join(", "));
+            }
+            for skipped in recorded.skipped {
+                println!("skipped {}: {}", skipped.path, skipped.reason);
+            }
+            continue;
+        }
+        let input = match input_for(root, path) {
+            Ok(input) => input,
+            Err(e) => match e.downcast_ref::<PathError>() {
+                Some(err @ PathError::DotGit(_)) => {
+                    recorder.refuse_invalid(path, err.clone());
+                    println!("skipped {path}: {e}");
+                    continue;
+                }
+                _ => return Err(e),
+            },
+        };
+        let trigger = match input {
+            Input::Remove { .. } => Trigger::Unlink,
+            Input::Symlink { .. } => Trigger::Symlink,
+            Input::Write { .. } => Trigger::Close,
+        };
+        let recorded = recorder.record(trigger, caller, vec![input])?;
+        if let Some(seq) = recorded.seq {
+            println!("recorded {path} as seq {seq}");
+        }
+        for skipped in recorded.skipped {
+            println!("skipped {}: {}", skipped.path, skipped.reason);
+        }
+    }
+    Ok(())
+}
 /// Prints alarms (design §13) to stderr, alongside any telemetry export.
 fn stderr_sink() -> Events {
     Arc::new(|event: Event| {
         if event.is_alarm() {
             eprintln!("alarm: {event}");
+        } else if let Event::HistoryServiceRestored { .. } = event {
+            eprintln!("{event}");
         }
     })
 }
