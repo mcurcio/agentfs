@@ -293,6 +293,9 @@ fn dry_run_writes_nothing() {
 #[test]
 fn revert_adds_modifies_and_deletes() {
     let v = Volume::new();
+    // Each `record` below is one commit however slow the runner: a 10ms
+    // window split one invocation's records over several commits in CI.
+    v.config("agentfs.commitWindow", "1h");
     v.write("keep", "k");
     v.write("mod", "m1");
     v.write("gone", "g");

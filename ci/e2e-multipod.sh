@@ -250,6 +250,8 @@ VERSIONS=$(sgit log --format=%cn refs/heads/agentfs/demo -- shared.txt | tr '\n'
 assert_eq "pod-b pod-a pod-b pod-a " "$VERSIONS" "every boundary of shared.txt is in history"
 
 step "a shared file, written by both at once"
+# A create racing the other front's create of the same name can fail with
+# EACCES for an instant (design §14): a lost write, not a lost record.
 burst() { # mountpoint pod
   as_agent "$1" "for i in \$(seq 1 40); do printf '$2-%s' \$i > burst.txt; done"
 }

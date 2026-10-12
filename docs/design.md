@@ -1860,6 +1860,11 @@ it either sees A's write journaled first or A's write sees the path gone.
 A path that another front replaced with a new file between A's check and
 the service's is not caught: A's late state can then be in HEAD until
 that path's next boundary, as for two writers at one instant above.
+A daemon running as root creates a new file as root and then gives it to
+its caller (§6), so for that instant another front's open of the same
+name as the caller can fail with `EACCES` (seen in the e2e's concurrent
+burst); creating with the caller's filesystem uid would close the window
+and is a follow-up.
 
 **Measured cost per boundary** (open question §19.2 item 2, single node).
 These numbers are indicative: the CI runners are shared, and nothing
