@@ -35,6 +35,9 @@ jobs:
           tags: |
             type=sha,format=long,prefix=
             type=raw,value=latest,enable={{is_default_branch}}
+          # The repository has no description: keep the Dockerfile's.
+          labels: |
+            org.opencontainers.image.description=Records every change an agent makes to a directory, in git history the agent cannot see
       - name: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -59,3 +62,81 @@ jobs:
           name: agentfs-image
           path: ${{ runner.temp }}/agentfs-image.tar
           retention-days: 1
+
+  e2e-kind:
+    name: e2e (kind cluster)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentfs-image
+          path: ${{ runner.temp }}
+      - name: FUSE, nginx and fcgiwrap
+        run: |
+          sudo modprobe fuse
+          ls -l /dev/fuse
+          uname -a
+          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+      - name: install kind and kubectl
+        run: |
+          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
+          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+      - name: create the cluster
+        run: |
+          kind version
+          kind create cluster --name agentfs-e2e --config ci/kind/cluster.yaml \
+            --image "$KIND_NODE_IMAGE" --wait 120s
+          kind load image-archive "$RUNNER_TEMP/agentfs-image.tar" --name agentfs-e2e
+          kubectl get nodes -o wide
+      - name: start git server
+        run: |
+          GIT_SERVER_EXTRA_LISTEN=$(ci/e2e-kind.sh gateway) \
+            ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
+      - run: ci/e2e-kind.sh
+      - name: diagnose
+        if: failure()
+        run: ci/e2e-kind.sh diagnose
+      - name: clean up
+        if: always()
+        run: |
+          kind delete cluster --name agentfs-e2e || true
+          ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
+
+  # Pushes the image e2e-kind tested (the same tar, not a rebuild), from
+  # main only.
+  publish:
+    needs: [build, e2e-kind]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentfs-image
+          path: ${{ runner.temp }}
+      - run: docker load -i "$RUNNER_TEMP/agentfs-image.tar"
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: push
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          for tag in "$SHA" latest; do
+            docker push "ghcr.io/mcurcio/agentfs:$tag"
+          done
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "ghcr.io/mcurcio/agentfs:$SHA")
+          {
+            echo "### Published"
+            echo
+            echo "- \`ghcr.io/mcurcio/agentfs:$SHA\`"
+            echo "- \`ghcr.io/mcurcio/agentfs:latest\`"
+            echo "- digest: \`$digest\`"
+          } >>"$GITHUB_STEP_SUMMARY"
