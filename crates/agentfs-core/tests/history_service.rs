@@ -252,12 +252,17 @@ fn concurrent_fronts_commit_with_their_own_committers() {
 
     const THREADS: usize = 4;
     const PER_THREAD: usize = 25;
+    // Writes of the shared path are serialized (write, then record), as
+    // two boundaries a moment apart: two at the same instant race between
+    // freeze and journal (design §14), which this test does not cover.
+    let shared_lock = std::sync::Mutex::new(());
     // Each record of the shared path, by the sequence number it got.
     let shared: BTreeMap<u64, String> = std::thread::scope(|s| {
         let mut handles = Vec::new();
         for (f, front) in fronts.iter().enumerate() {
             for t in 0..THREADS {
                 let env = &env;
+                let shared_lock = &shared_lock;
                 handles.push(s.spawn(move || {
                     let mut shared = Vec::new();
                     for i in 0..PER_THREAD {
@@ -266,6 +271,7 @@ fn concurrent_fronts_commit_with_their_own_committers() {
                         if t == 0 && i % 5 == 0 {
                             // Both fronts write the shared path; the
                             // backing tree keeps whichever wrote last.
+                            let _turn = shared_lock.lock().unwrap();
                             let content = format!("{f}-{i}");
                             let input = write(env, "shared", &content);
                             let seq = front
@@ -306,9 +312,13 @@ fn concurrent_fronts_commit_with_their_own_committers() {
         }
     }
     // History keeps the boundary received last: the highest sequence
-    // number. (Its frozen content is what that front's close saw.)
+    // number, which is also what the backing tree holds.
     let (_, last) = shared.last_key_value().unwrap();
     assert_eq!(service.head_blob("shared").unwrap(), last.as_bytes());
+    assert_eq!(
+        std::fs::read_to_string(env.tree.join("shared")).unwrap(),
+        *last
+    );
     for front in &fronts {
         let events = front.sink.take();
         assert!(events.iter().all(|e| !e.is_alarm()), "{events:?}");
