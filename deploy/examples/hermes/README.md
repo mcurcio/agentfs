@@ -11,7 +11,7 @@ The operator files for running Hermes (design §16) on an agentfs volume:
 To use them, replace the files in [`../../sidecar/config/`](../../sidecar/config)
 (or point an overlay's `configMapGenerator` at these). The pod changes for
 Hermes, the one-time migration of its existing data and the initial import
-are in [docs/deployment.md](../../../docs/deployment.md#hermes).
+are in [docs/deployment.md](../../../docs/deployment.md#10-hermes).
 
 `crates/agentfs/tests/deploy_examples.rs` checks these rules against a
 representative Hermes layout. Check the profile layout against the Hermes

@@ -14,7 +14,7 @@ what to do when something goes wrong. The design behind it is
   and `mmap` go straight to the backing files without passing through the
   daemon. Without it everything still works, through the daemon.
 - **`/dev/fuse`.** In a container, give it the device (and, for a mount
-  other containers see, a privileged sidecar: see §11 below).
+  other containers see, a privileged sidecar: see section 11 below).
 - **Run as root** for multi-user volumes. What the daemon does is decided
   from its effective capabilities, not its uid:
   - with `CAP_CHOWN` and `CAP_FOWNER` it gives every new file to the user
@@ -309,64 +309,34 @@ nothing that a workload saw succeed.
   the holding sidecar detaches the stale mount when it is stopped, and the
   new pod recovers the journal and pushes. See the
   [crashed sidecar runbook](runbooks/crashed-sidecar.md) and
-  [deployment.md](deployment.md#a-crashed-daemon).
+  [deployment.md](deployment.md#7-a-crashed-daemon).
 
-## 11. Kubernetes sidecar sketch
+## 11. Kubernetes
 
-Phase 1 runs agentfs as a native sidecar in the workload's pod (§17.1):
+Phase 1 runs agentfs as a privileged native sidecar in the workload's pod
+(§17.1). The example manifests are in [`deploy/sidecar`](../deploy/sidecar)
+and [deployment.md](deployment.md) explains them. In short:
 
-```yaml
-spec:
-  terminationGracePeriodSeconds: 30
-  initContainers:
-    - name: agentfs
-      image: ghcr.io/acme/agentfs:<tag>
-      restartPolicy: Always            # a native sidecar
-      args: [mount, /data/backing, /workspace]
-      env:
-        - { name: AGENTFS_STATE, value: /data/state }
-        - { name: AGENTFS_POD, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
-        - { name: AGENTFS_POD_UID, valueFrom: { fieldRef: { fieldPath: metadata.uid } } }
-        - { name: AGENTFS_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
-        - { name: AGENTFS_NODE, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }
-      securityContext:
-        privileged: true               # /dev/fuse, mount(2), passthrough
-      volumeMounts:
-        - { name: data, mountPath: /data }
-        - { name: workspace, mountPath: /workspace, mountPropagation: Bidirectional }
-        - { name: credentials, mountPath: /run/secrets/agentfs, readOnly: true }
-  containers:
-    - name: workload
-      volumeMounts:
-        - { name: workspace, mountPath: /workspace, mountPropagation: HostToContainer }
-  volumes:
-    - name: data
-      persistentVolumeClaim: { claimName: hermes-data }   # ReadWriteOncePod: backing/ and state/
-    - name: workspace
-      emptyDir: {}
-    - name: credentials
-      secret: { secretName: agentfs-origin }
-```
-
-- The backing tree and the state area live on one `ReadWriteOncePod` PVC,
-  as siblings, so the state area is never under the backing tree.
-- The mount point is an `emptyDir` shared with Bidirectional propagation
-  from the sidecar and HostToContainer in the workload.
-- Credentials come from a Secret volume outside the backing tree; rotated
-  Secrets are picked up without a restart (§11.1). For an SSH remote the
-  `credentials` volume holds the private key and known_hosts instead:
-
-  ```yaml
-      - name: credentials
-        secret: { secretName: agentfs-origin-ssh, defaultMode: 0400 }   # keys ssh-privatekey, known_hosts
-  ```
-
-  with `agentfsSshKey = /run/secrets/agentfs/ssh-privatekey` and
-  `agentfsKnownHosts = /run/secrets/agentfs/known_hosts`
-  ([configuration reference](configuration.md#ssh-remotes)).
-- Workload containers should wait for the mount (a startup probe on the
-  sidecar that checks `/proc/mounts`, or a check in the workload's
-  entrypoint).
+- one `ReadWriteOncePod` PVC mounted once at `/data`, holding
+  `backing/` and `state/` as siblings (reflinks fail across mounts), and a
+  Deployment with the `Recreate` strategy, so one pod writes the volume;
+- an init container, `agentfs init --include /etc/agentfs/config`, safe to
+  run at every start;
+- the sidecar (`restartPolicy: Always`, privileged) runs
+  `agentfs mount /data/backing /agentfs/workspace`: the mount point is a
+  subdirectory of an `emptyDir` mounted at `/agentfs` with
+  `Bidirectional` propagation; workload containers mount the `emptyDir`
+  with `HostToContainer` and use `/agentfs/workspace`;
+- `agentfs probe --allow-stale /agentfs/workspace` is its startup probe
+  (workloads start once the mount is live), `agentfs probe` its readiness
+  probe, and there is no liveness probe; `AGENTFS_ON_STALE_MOUNT=hold`
+  makes a sidecar restarted after a crash wait for the pod restart (§10);
+- settings and remotes come from a ConfigMap fragment (`include.path`),
+  the rules from the same ConfigMap mounted over `info/exclude` and
+  `info/attributes`, credentials from a Secret outside the backing tree
+  (rotation needs no restart), and the pod flags from the downward API;
+- `terminationGracePeriodSeconds: 60`, above `--unmount-grace` plus
+  `--push-grace`.
 
 ## 12. Recovery and undo
 

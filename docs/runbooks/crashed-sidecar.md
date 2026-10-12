@@ -5,7 +5,7 @@ The agentfs daemon in a pod's sidecar died (a crash, an OOM kill, `kill
 returned, so nothing is lost, but the mount is dead until the pod is
 restarted. Phase 1 recovers by restarting the pod, by hand. Design:
 [§17.1](../design.md#171-layer-1-core-and-daemon-rust); deployment:
-[deployment.md](../deployment.md#a-crashed-daemon).
+[deployment.md](../deployment.md#7-a-crashed-daemon).
 
 ## Symptoms
 

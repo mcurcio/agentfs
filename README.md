@@ -60,6 +60,10 @@ nested repository detection. Also:
 - **Recovery:** `agentfs restore` and `agentfs revert`, through a running
   mount or directly, each recorded as one commit, and operator runbooks.
   See [Recovery](#recovery).
+- **Deployment:** a container image (`ghcr.io/mcurcio/agentfs`) and
+  example Kubernetes manifests for the phase 1 sidecar, tested end to end
+  in a kind cluster. See
+  [Deploying on Kubernetes](#deploying-on-kubernetes).
 
 The `agentfs` command has `init`, `status`, `mount`, `probe`, `flush`, `record`,
 `push`, `run`, `restore` and `revert`. `mount` mounts a backing tree and runs the commit and
@@ -85,8 +89,9 @@ lock and changes nothing, so it works beside a running daemon, and shows
 who holds the lock.
 
 Not built yet: LFS and the `fsync` class (phase 2), the patch queue
-(phase 3), the CSI driver (phase 4), and asking a running mount to push
-now. SSH remotes do not support ssh-agent, passphrase-protected keys or
+(phase 3), the CSI driver (phase 4), asking a running mount to push
+now, and restarting a pod automatically after its sidecar crashes. SSH
+remotes do not support ssh-agent, passphrase-protected keys or
 `@cert-authority` host certificates.
 
 ## Mounting
@@ -114,8 +119,31 @@ volumes (new files are given to their creator: `CAP_CHOWN` and
 `CAP_FOWNER`) and for passthrough (`CAP_SYS_ADMIN` outside any user
 namespace). The
 [operator guide](docs/operator-guide.md) covers requirements, layout,
-flags, settings, permissions, what is recorded when, shutdown, crashes and
-a Kubernetes sidecar sketch.
+flags, settings, permissions, what is recorded when, shutdown and crashes.
+
+## Deploying on Kubernetes
+
+The image `ghcr.io/mcurcio/agentfs` (tags: the commit sha, and `latest`
+for `main`) has `agentfs` built with the `https` and `ssh` features, plus
+`fuse3`, `git` and the CA certificates. [`deploy/sidecar`](deploy/sidecar)
+is a kustomize base that runs it as a privileged native sidecar next to a
+workload (phase 1, design §17.1):
+
+```sh
+kubectl apply -k deploy/sidecar   # after editing deploy/sidecar/config/ and the Secret
+```
+
+The workload sees the volume at `/agentfs/workspace`; the backing tree
+and the state area live on a `ReadWriteOncePod` PVC it never sees.
+Settings and remotes come from a ConfigMap (`agentfs init --include`),
+rules from the same ConfigMap, credentials from a Secret. If the daemon
+crashes, the workload's calls fail with `ENOTCONN` (nothing goes
+unrecorded), the pod turns NotReady, and deleting the pod recovers.
+[docs/deployment.md](docs/deployment.md) explains the layout, the
+configuration, operations, the security trade-offs of the privileged
+sidecar and the Hermes example ([`deploy/examples/hermes`](deploy/examples/hermes));
+[runbooks/crashed-sidecar.md](docs/runbooks/crashed-sidecar.md) covers a
+crash.
 
 ## Recovery
 
@@ -249,6 +277,12 @@ The FUSE layer uses fuser's pure-Rust mount code, so building needs no
 libfuse or pkg-config; running a mount needs `/dev/fuse` (and `fusermount3`
 from the `fuse3` package for a non-root daemon).
 
+The container image:
+
+```sh
+docker build -t agentfs:dev .                 # https and ssh features, Debian trixie
+```
+
 ## CI
 
 Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
@@ -302,6 +336,29 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   the secret is gone locally and remotely and pushes are fast-forwards
   again.
 
+[`.github/workflows/image.yml`](.github/workflows/image.yml) builds and
+tests the container image on every push:
+
+- **build:** the [`Dockerfile`](Dockerfile) (with the GitHub Actions layer
+  cache), a smoke test of the image (`agentfs --version`, `fusermount3`,
+  `git`), and a render of the kustomizations in `deploy/sidecar` and
+  `ci/k8s`. The image is kept as an artifact for the next jobs.
+- **e2e kind cluster** ([`ci/e2e-kind.sh`](ci/e2e-kind.sh)): loads that
+  image into a kind cluster (kind, kubectl and the node image pinned by
+  checksum and digest, [`ci/install-kind.sh`](ci/install-kind.sh)),
+  validates `deploy/sidecar` with `kubectl apply --dry-run=server`, and
+  deploys its CI overlay [`ci/k8s`](ci/k8s) against the runner's git
+  server. It checks root and uid 10000 writers (one through a `subPath` of
+  the FUSE mount), operator rules, the invisible state area, authors and
+  pod, namespace and node trailers in commits pushed over HTTP with the
+  credential Secret, a restore through `kubectl exec`, the final commit
+  when the pod is deleted, and recovery after `kill -9` of the daemon:
+  `ENOTCONN` for the workload, a holding sidecar and a NotReady pod,
+  `kubectl delete pod` completing, and the new pod pushing what was
+  written before the kill.
+- **publish** (main only, after the kind test): pushes the tested image to
+  `ghcr.io/mcurcio/agentfs` as `<commit sha>` and `latest`.
+
 The e2e scripts run locally too: start the server with
 `ci/git-http-server.sh start <dir>` and source its output, run the
 collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run
@@ -310,3 +367,5 @@ collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run
 `ci/e2e-ssh.sh` with its output in the environment, or run
 `ci/fuse-tests.sh` and `ci/e2e-recovery.sh` on any Linux host with FUSE
 and passwordless sudo. `ci/e2e-runbooks.sh` needs only `git-filter-repo`.
+`ci/e2e-kind.sh` runs on any Linux host with docker, kind, kubectl, nginx
+and fcgiwrap; its header lists the commands.

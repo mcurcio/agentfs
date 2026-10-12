@@ -1,7 +1,8 @@
 # agentfs design
 
 Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer,
-`agentfs mount`, `agentfs restore` and `agentfs revert` exist). Draft 1 was
+`agentfs mount`, `agentfs restore` and `agentfs revert`, the container
+image and the Kubernetes sidecar deployment exist). Draft 1 was
 reviewed adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
 for the findings and what changed because of them.
 
@@ -1184,6 +1185,7 @@ operator runbooks ([runbooks/](runbooks/)):
 | [divergence.md](runbooks/divergence.md) | Resolving `refs/agentfs/<volume>/diverged/*` (§11.3) |
 | [history-rewrite.md](runbooks/history-rewrite.md) | Removing a recorded secret from the state area and each remote (§10) |
 | [stuck-pushes.md](runbooks/stuck-pushes.md) | Pushes that keep failing |
+| [crashed-sidecar.md](runbooks/crashed-sidecar.md) | A sidecar whose daemon died: `ENOTCONN`, a holding sidecar, the pod restart (§17.1) |
 
 **The supported path:**
 
@@ -1345,6 +1347,10 @@ target. What it needs:
 - **Restarts.** iac patches (§12) apply only at mount, which for Hermes means a
   pod restart.
 
+The rule files are in `deploy/examples/hermes`, and the pod changes, the
+one-time migration of Hermes' existing data and the initial import in
+[deployment.md](deployment.md#10-hermes).
+
 ## 17. Layers and libraries
 
 ### 17.1 Layer 1: core and daemon (Rust)
@@ -1456,15 +1462,50 @@ target. What it needs:
     signal exits 130.
 
   It works anywhere FUSE does, with no Kubernetes dependency.
-- **Phase 1 deployment:** a privileged native sidecar (an init container with
-  `restartPolicy: Always`).
-  - It mounts the FUSE filesystem into an `emptyDir` with Bidirectional
-    propagation.
-  - Workload containers mount it with HostToContainer propagation.
-  - The backing tree and state area live on a `ReadWriteOncePod` PVC owned by
-    the workload.
-  - If the sidecar crashes, the mount fails (`ENOTCONN`) until the pod restarts.
-    Phase 1 accepts restarting the pod as the recovery.
+- **Phase 1 deployment** ([deployment.md](deployment.md), manifests in
+  `deploy/sidecar`): a privileged native sidecar (an init container with
+  `restartPolicy: Always`) in the workload's pod, from the image
+  `ghcr.io/mcurcio/agentfs` (§17.3).
+  - **Volume.** The backing tree and the state area live on one
+    `ReadWriteOncePod` PVC, mounted once at `/data` as `backing/` and
+    `state/` (two subPath mounts would break reflinks with `EXDEV`,
+    §3.2). The Deployment uses the `Recreate` strategy, so one pod writes
+    the volume (§2.3).
+  - **Init container** `agentfs init --include /etc/agentfs/config`, as
+    root with every capability dropped: creates the state area and the
+    backing tree on the first start, accepts its own volume and refuses
+    another on every later one.
+  - **Mount.** The sidecar mounts the FUSE filesystem at
+    `/agentfs/workspace`, a subdirectory of an `emptyDir` it mounts at
+    `/agentfs` with Bidirectional propagation; workload containers mount
+    the `emptyDir` with HostToContainer propagation (or the mount itself
+    with `subPath: workspace` at a fixed path, as Hermes needs, §16). A
+    subdirectory, not the `emptyDir`'s root, so that a dead daemon leaves
+    only the subdirectory answering `ENOTCONN`: a restarted sidecar can
+    still be created, and the kubelet can still tear the pod down.
+  - **Probes.** Startup: `agentfs probe --allow-stale /agentfs/workspace`
+    (workload containers start once the mount is live; 5 minutes for
+    journal recovery). Readiness: `agentfs probe /agentfs/workspace` (a
+    dead daemon shows as a NotReady pod). No liveness probe.
+  - **Configuration.** Settings and remotes from a ConfigMap fragment
+    (`include.path`, §4.3); the operator rules from the same ConfigMap,
+    mounted read-only over `info/exclude` and `info/attributes` in the
+    sidecar (a change rolls the pod through the generated name's hash);
+    credentials from a Secret; the pod flags from the downward API.
+  - **A crashed daemon.** The workload's calls fail with `ENOTCONN`
+    (nothing is written where it would not be recorded). The kubelet
+    restarts the sidecar, which runs with `--on-stale-mount hold`: it does
+    not remount while the workload holds the dead mount, so the pod goes
+    NotReady. The recovery is a pod restart, by hand in phase 1
+    (`kubectl delete pod`, [runbook](runbooks/crashed-sidecar.md)): the
+    holding sidecar, stopped after the workload containers, detaches the
+    stale mount so the pod's volumes can be removed, and the new pod
+    recovers the journal and pushes. A sidecar that exits cleanly while
+    the pod runs is not held (a known gap, [deployment.md](deployment.md#7-a-crashed-daemon)).
+  - **Privilege.** `privileged: true` is what Bidirectional propagation
+    requires; its cost and mitigations are in
+    [deployment.md](deployment.md#9-security-trade-offs-of-the-privileged-sidecar).
+    The CSI driver (phase 4) removes it from workload pods.
 
 ### 17.2 Layer 2: CSI driver (Rust)
 
@@ -1482,6 +1523,7 @@ Phase 4 (§14).
 | LFS | none exists | Implemented in agentfs (§7) |
 | Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `reqwest-blocking-client`, no TLS) in the binary | OTLP http/protobuf export. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
 | Repack | the `git` CLI | libgit2 has no repack or gc |
+| Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates` and `git`; built on `rust:1.99-trixie`; both pinned by digest | Not distroless: operators follow the runbooks with `git` through `kubectl exec`. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after the kind e2e passes |
 
 ## 18. Acceptance tests
 
@@ -1555,8 +1597,20 @@ the divergence and history-rewrite runbooks run in the `e2e-runbooks` job.
 Tests 8 and 12 (all but the record and commit failure counters, plus the
 export-failure counter) run in the `e2e` jobs against a real git server
 and OpenTelemetry Collector; test 8 runs over smart HTTP and HTTPS
-(`e2e-remotes`) and over SSH (`e2e-ssh`, against OpenSSH's sshd). Not
-automated yet: test 3 (a kill at every step), 13 (performance) and 16.
+(`e2e-remotes`) and over SSH (`e2e-ssh`, against OpenSSH's sshd). The
+`e2e-kind` job (`ci/e2e-kind.sh`, in the `image` workflow) runs the
+phase 1 deployment in a kind cluster with the image just built: test 4
+in a pod (root and uid 10000 writers in separate containers, one through
+a `subPath` of the FUSE mount), test 5 for the writers (no `/data`,
+nothing but the tree under the mount), the operator-rules part of test
+6, test 8 over HTTP from a pod with the credential Secret (authors and
+pod, namespace and node trailers checked on the remote), test 11 through
+`kubectl exec` and the control socket, the final commit on pod
+deletion, and test 2 in a pod: `kill -9` of the daemon from the node,
+`ENOTCONN` for the workload, the holding sidecar and NotReady pod,
+`kubectl delete pod` completing, and the new pod recovering and pushing
+the pre-crash write. Not automated yet: test 3 (a kill at every step),
+13 (performance) and 16.
 
 ## 19. Decisions and open questions
 
@@ -1597,6 +1651,14 @@ automated yet: test 3 (a kill at every step), 13 (performance) and 16.
 | SSH remotes | Built with the `ssh` cargo feature (libssh2). Each SSH remote names an unencrypted private key (`agentfsSshKey`) and a known_hosts file (`agentfsKnownHosts`), both required and both re-read when they change; the key is bound to the push URL's host and port and offered once per connection, as the URL's user, else `git`. No ssh-agent, no passphrases, no global or `~/.ssh` files (§11.1) |
 | Host key verification | Done by agentfs against `agentfsKnownHosts`, in libgit2's certificate callback, before any authentication; plain and hashed names, `[host]:port`, wildcards, negation and `@revoked` honoured, `@cert-authority` not supported; unknown, changed, unlisted-type and revoked keys refused, never learned (§11.1) |
 | Untrusted host reason | SSH host key refusals and TLS certificates libgit2 refuses (`GIT_ECERTIFICATE`: a self-signed or unknown CA, a host name the certificate does not cover) fail the push as `untrusted_host`, apart from `unreachable`, so a possible interception alarms differently from a network problem. A TLS handshake that fails before any certificate check (a server that drops it, as for a certificate host mismatch reached over an IP address in CI) stays `unreachable` (§11.3, §13) |
+| Phase 1 pod layout | One `ReadWriteOncePod` PVC mounted once at `/data` (`backing/`, `state/`: reflinks fail across mounts), `Recreate` strategy; the FUSE mount at `/agentfs/workspace`, a subdirectory of a shared `emptyDir` (Bidirectional in the sidecar, HostToContainer in workloads), so a dead daemon does not block the restarted sidecar or the pod's teardown (§17.1) |
+| Crashed daemon in a pod | Recovery is a pod restart, manual in phase 1. The restarted sidecar runs `mount --on-stale-mount hold`: no remount, no lock, NotReady pod, writes keep failing with `ENOTCONN`; on SIGTERM (after the workload containers stop) it detaches the stale mount. Automatic restart and fencing a clean exit are follow-ups (§17.1) |
+| Sidecar probes | Startup `agentfs probe --allow-stale` (gates workloads; passes while holding), readiness `agentfs probe` (live only); no liveness probe, since a restart cannot remount safely; a shell-free subcommand reading mountinfo and `statfs` (§17.1) |
+| Operator config in Kubernetes | Rules: the ConfigMap's `exclude` and `attributes` subPath-mounted read-only over `info/*` in the sidecar; settings and remotes: a git-config fragment in the same ConfigMap named by `include.path`, so `kubectl exec` commands and `git` see them. Includes must be absolute, exist, not set `agentfs.volume`/`agentfs.branch`, and stay outside the backing tree and mount point; `includeIf` is refused (§4.3) |
+| `agentfs init` re-runs | Safe at every pod start: exit 0 for its own volume (taking the lock), 1 for another volume or branch with nothing changed; `--include` sets the includes declaratively; `--root` creates the backing tree (§2.3) |
+| Image user | Root. The sidecar needs privileged for Bidirectional propagation, `CAP_SYS_ADMIN` for mount(2), `/dev/fuse` and passthrough, `CAP_CHOWN`/`CAP_FOWNER` for ownership, and to own the state area for libgit2. The init container drops every capability; workloads run as non-root (§17.1) |
+| Image publishing | `linux/amd64`, published from `main` only after the kind e2e passes, pushing the tested image itself; tags: the full commit sha and `latest` (§17.3) |
+| Kind e2e git server | The runner's nginx + `git http-backend`, reached from pods through a selector-less Service and an EndpointSlice on the kind network's gateway, so the credential Secret is exercised over HTTP basic auth and the bare repository stays on the runner for assertions; the daemon is killed from the node (PID 1 ignores SIGKILL from inside its namespace) |
 
 ### 19.2 Open questions
 
