@@ -111,7 +111,8 @@ done
 pass "all PUTs ended before git-receive-pack"
 for path in "${LFS_PATHS[@]}"; do
   oid=$(show "$path" | sed -n 2p | sed 's/^oid sha256://')
-  find "$LFS_SERVER_DIR/separate/content" -name "*$oid*" | grep -q . || fail "$path not on the LFS host"
+  # lfs-test-server stores <content>/aa/bb/<the rest of the oid>.
+  [ -f "$LFS_SERVER_DIR/separate/content/${oid:0:2}/${oid:2:2}/${oid:4}" ] || fail "$path not on the LFS host"
 done
 pass "objects are on the separate LFS host"
 
