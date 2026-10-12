@@ -99,14 +99,21 @@ pub enum PreflightError {
         outer_path: PathBuf,
         why: &'static str,
     },
+    /// A remote's credentials, SSH key or known_hosts file is under the
+    /// backing tree or the mount point: the workload could read the secret,
+    /// or rewrite known_hosts to trust any host.
     #[error(
-        "remote {remote:?}: its credentials file {} is inside {outer} {}, where the workload \
-         could read it; keep credentials outside the backing tree and the mount point",
+        "remote {remote:?}: its {key} file {} is inside {outer} {}, where the workload \
+         could read or change it; keep credentials, keys and known_hosts outside the backing \
+         tree and the mount point",
         path.display(),
         outer_path.display()
     )]
     CredentialsExposed {
         remote: String,
+        /// The config key naming the file (`agentfsCredentials`,
+        /// `agentfsSshKey` or `agentfsKnownHosts`).
+        key: &'static str,
         path: PathBuf,
         outer: &'static str,
         outer_path: PathBuf,
@@ -160,7 +167,10 @@ fn why(inner: &'static str, outer: &'static str) -> &'static str {
 
 /// Checks that mounting `backing` at `mountpoint` with state area `state`
 /// keeps everything of the state area out of the mount (design §1.1,
-/// §18 test 5). Returns the canonical backing tree and mount point.
+/// §18 test 5), and every remote section's credentials, SSH key and
+/// known_hosts file out of the backing tree and the mount point, invalid
+/// sections included (design §17.1). Returns the canonical backing tree and
+/// mount point.
 pub fn preflight(
     state: &StateDir,
     settings: &Settings,
@@ -202,16 +212,24 @@ pub fn preflight(
             }
         }
     }
-    for remote in &settings.remotes {
-        let Some(creds) = &remote.credentials else {
-            continue;
-        };
-        let creds = canonical_any(creds);
+    for (remote, key, path) in settings
+        .remotes
+        .iter()
+        .flat_map(|r| r.files().into_iter().map(move |(k, p)| (&r.name, k, p)))
+        .chain(
+            settings
+                .invalid_remotes
+                .iter()
+                .flat_map(|r| r.files.iter().map(move |(k, p)| (&r.name, *k, p.as_path()))),
+        )
+    {
+        let path = canonical_any(path);
         for (outer, outer_path) in [(BACKING, &backing), (MOUNTPOINT, &mountpoint)] {
-            if creds.starts_with(outer_path) {
+            if path.starts_with(outer_path) {
                 return Err(PreflightError::CredentialsExposed {
-                    remote: remote.name.clone(),
-                    path: creds,
+                    remote: remote.clone(),
+                    key,
+                    path,
                     outer,
                     outer_path: outer_path.clone(),
                 });
@@ -537,7 +555,7 @@ fn unmount(mountpoint: &Path) -> io::Result<bool> {
 mod tests {
     use std::fs;
 
-    use agentfs_core::config::RemoteSettings;
+    use agentfs_core::config::{InvalidRemote, RemoteSettings};
 
     use super::*;
 
@@ -598,6 +616,20 @@ mod tests {
             push_url: None,
             max_blob_size: None,
             credentials: Some(creds),
+            ssh_key: None,
+            known_hosts: None,
+        }
+    }
+
+    fn ssh_remote(key: PathBuf, known_hosts: PathBuf) -> RemoteSettings {
+        RemoteSettings {
+            name: "ssh".into(),
+            url: "ssh://git@git.example/r.git".into(),
+            push_url: None,
+            max_blob_size: None,
+            credentials: None,
+            ssh_key: Some(key),
+            known_hosts: Some(known_hosts),
         }
     }
 
@@ -690,6 +722,68 @@ mod tests {
         // Outside is fine.
         fs::write(l.p("token"), "secret").unwrap();
         let s = settings(vec![remote(l.p("token"))]);
+        l.check_with("state", "backing", "mnt", &s).unwrap();
+    }
+
+    #[test]
+    fn exposed_ssh_keys_and_known_hosts_are_refused() {
+        let l = Layout::new();
+        let (key, kh) = (l.p("id"), l.p("known_hosts"));
+        fs::write(&key, "key").unwrap();
+        fs::write(&kh, "hosts").unwrap();
+        l.check_with(
+            "state",
+            "backing",
+            "mnt",
+            &settings(vec![ssh_remote(key.clone(), kh.clone())]),
+        )
+        .unwrap();
+        for (k, h, expected, outer) in [
+            (l.p("backing/id"), kh.clone(), "agentfsSshKey", BACKING),
+            (
+                key.clone(),
+                l.p("backing/.ssh/known_hosts"),
+                "agentfsKnownHosts",
+                BACKING,
+            ),
+            (l.p("mnt/id"), kh.clone(), "agentfsSshKey", MOUNTPOINT),
+            (
+                key.clone(),
+                l.p("mnt/known_hosts"),
+                "agentfsKnownHosts",
+                MOUNTPOINT,
+            ),
+        ] {
+            let s = settings(vec![ssh_remote(k, h)]);
+            let err = l.check_with("state", "backing", "mnt", &s).unwrap_err();
+            assert!(
+                matches!(&err, PreflightError::CredentialsExposed { key, outer: o, remote, .. }
+                    if *key == expected && *o == outer && remote == "ssh"),
+                "{err}"
+            );
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn invalid_remote_sections_are_checked_too() {
+        let l = Layout::new();
+        let mut s = settings(vec![]);
+        s.invalid_remotes = vec![InvalidRemote {
+            name: "broken".into(),
+            error: "whatever".into(),
+            files: vec![
+                ("agentfsCredentials", l.p("token")),
+                ("agentfsSshKey", l.p("backing/keys/id")),
+            ],
+        }];
+        let err = l.check_with("state", "backing", "mnt", &s).unwrap_err();
+        assert!(
+            matches!(&err, PreflightError::CredentialsExposed { key: "agentfsSshKey", remote, .. }
+                if remote == "broken"),
+            "{err}"
+        );
+        s.invalid_remotes[0].files.pop();
         l.check_with("state", "backing", "mnt", &s).unwrap();
     }
 

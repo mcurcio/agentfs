@@ -56,6 +56,8 @@ pub enum HistoryError {
 ///   cleared, so no config outside the history repository's own file can
 ///   reach a volume: not `url.<base>.insteadOf` redirecting a push, not
 ///   `http.*`, not `core.excludesFile` (design §4.4, §11.1);
+/// - the home directory is cleared, so `~/.ssh/known_hosts` never decides
+///   or steers an SSH host key check (design §11.1);
 /// - remote connections and reads/writes time out
 ///   ([`SERVER_CONNECT_TIMEOUT_MS`], [`SERVER_IO_TIMEOUT_MS`]), so a hung
 ///   remote ends as an unreachable push (design §11.2).
@@ -86,6 +88,18 @@ pub(crate) fn init_libgit2() {
                 "libgit2 rejected clearing {level:?}: {result:?}"
             );
         }
+        // No home directory either: libgit2's SSH transport reads
+        // `~/.ssh/known_hosts` from it, and agentfs checks host keys only
+        // against each remote's own agentfsKnownHosts (design §11.1).
+        // SAFETY: GIT_OPT_SET_HOMEDIR takes one C string, which libgit2
+        // copies; called once, before any transport is created.
+        let rc = unsafe {
+            libgit2_sys::git_libgit2_opts(
+                libgit2_sys::GIT_OPT_SET_HOMEDIR as std::ffi::c_int,
+                c"".as_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "libgit2 rejected GIT_OPT_SET_HOMEDIR");
         // A remote that accepts the connection and then stalls must end as
         // a failed push, not hang its thread forever (design §11.2).
         // SAFETY: plain integer options, set once before any transport is
@@ -407,6 +421,28 @@ mod tests {
     use super::*;
     use crate::identity::Templates;
     use crate::record::{Caller, Draft, Trigger};
+
+    #[test]
+    fn libgit2_home_directory_is_cleared() {
+        init_libgit2();
+        let mut buf = libgit2_sys::git_buf {
+            ptr: std::ptr::null_mut(),
+            reserved: 0,
+            size: 0,
+        };
+        // SAFETY: GIT_OPT_GET_HOMEDIR fills a git_buf, disposed below.
+        let rc = unsafe {
+            libgit2_sys::git_libgit2_opts(
+                libgit2_sys::GIT_OPT_GET_HOMEDIR as std::ffi::c_int,
+                &mut buf as *mut libgit2_sys::git_buf,
+            )
+        };
+        let size = buf.size;
+        // SAFETY: the buffer came from libgit2.
+        unsafe { libgit2_sys::git_buf_dispose(&mut buf) };
+        assert_eq!(rc, 0);
+        assert_eq!(size, 0, "libgit2 still has a home directory");
+    }
 
     #[test]
     fn libgit2_server_timeouts_are_set() {

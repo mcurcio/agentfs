@@ -35,6 +35,10 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 tempfile = "3.27.0"
 
 [features]
-# Push to https:// remotes (links OpenSSL). Local, file:// and plain http://
-# remotes need no feature.
+# Push to https:// remotes: libgit2 with TLS (links OpenSSL). Local,
+# file:// and plain http:// remotes need no feature.
 https = ["git2/https"]
+# Push to ssh:// and scp-like remotes: libgit2 with libssh2 (links
+# OpenSSL). Without it an ssh remote is reported as misconfigured (design
+# §11.1).
+ssh = ["git2/ssh"]

@@ -106,7 +106,37 @@ fn credentials_inside_the_backing_tree() {
     config("remote.origin.url", "file:///nowhere.git");
     config("remote.origin.agentfsCredentials", s(&l.p("backing/token")));
     let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("mnt"))]);
-    refused(&out, "credentials file");
+    refused(&out, "agentfsCredentials file");
+}
+
+/// An SSH key or known_hosts file under the backing tree is refused before
+/// anything is mounted, whether or not this build supports SSH (without the
+/// `ssh` feature the remote is misconfigured, and its files are still
+/// checked).
+#[test]
+fn ssh_files_inside_the_backing_tree() {
+    for (key, known_hosts, expected) in [
+        ("backing/id", "known_hosts", "agentfsSshKey file"),
+        ("id", "backing/known_hosts", "agentfsKnownHosts file"),
+    ] {
+        let l = Layout::new();
+        let state = l.p("state");
+        l.init(&state);
+        let git = state.join("git");
+        let config = |k: &str, v: &str| {
+            let ok = Command::new("git")
+                .args(["--git-dir", s(&git), "config", k, v])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        config("remote.origin.url", "ssh://git@git.example/r.git");
+        config("remote.origin.agentfsSshKey", s(&l.p(key)));
+        config("remote.origin.agentfsKnownHosts", s(&l.p(known_hosts)));
+        let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("mnt"))]);
+        refused(&out, expected);
+    }
 }
 
 #[test]

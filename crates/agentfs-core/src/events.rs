@@ -50,10 +50,16 @@ impl fmt::Display for CheckStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PushFailureKind {
-    /// The remote could not be reached: network, TLS, or a missing path.
+    /// The remote could not be reached: network, timeouts, or a missing
+    /// path.
     Unreachable,
     /// The remote rejected the credentials, or none were available.
     Auth,
+    /// The remote host is not trusted: its SSH host key is unknown, changed
+    /// or revoked in `agentfsKnownHosts`, or its TLS certificate failed
+    /// verification. Possibly an attack, so it is told apart from
+    /// `unreachable`.
+    UntrustedHost,
     /// Someone else wrote one of the volume's refs on the remote.
     NonFastForward,
     /// The remote refused a ref update for another reason (a hook, a lock,
@@ -68,6 +74,7 @@ impl PushFailureKind {
         match self {
             Self::Unreachable => "unreachable",
             Self::Auth => "auth",
+            Self::UntrustedHost => "untrusted_host",
             Self::NonFastForward => "non_fast_forward",
             Self::Refused => "refused",
             Self::Local => "local",
@@ -355,12 +362,18 @@ mod tests {
         for kind in [
             PushFailureKind::Unreachable,
             PushFailureKind::Auth,
+            PushFailureKind::UntrustedHost,
             PushFailureKind::NonFastForward,
             PushFailureKind::Refused,
             PushFailureKind::Local,
         ] {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{}\"", kind.as_str()));
+            assert_eq!(kind.to_string(), kind.as_str());
         }
+        assert_eq!(
+            serde_json::to_string(&PushFailureKind::UntrustedHost).unwrap(),
+            "\"untrusted_host\""
+        );
     }
 }

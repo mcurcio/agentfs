@@ -453,6 +453,8 @@ mod tests {
             push_url: None,
             max_blob_size: max,
             credentials: None,
+            ssh_key: None,
+            known_hosts: None,
         }
     }
 

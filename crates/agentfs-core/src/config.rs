@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::identity::Templates;
+use crate::remote_url::{self, Transport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -41,6 +42,20 @@ pub enum ConfigError {
     },
     #[error("{key}: {value:?} must be an absolute path")]
     RelativePath { key: String, value: String },
+    #[error("{key} applies only to ssh remotes, and this remote pushes to a non-ssh URL")]
+    SshOnly { key: String },
+    #[error("{key} must be set for an ssh remote: an absolute path (design §11.1)")]
+    SshNeeds { key: String },
+    #[error("{key}: ssh remotes authenticate with agentfsSshKey, not agentfsCredentials")]
+    SshCredentials { key: String },
+    #[error(
+        "{key}: an ssh URL must not carry a password; ssh remotes authenticate with agentfsSshKey"
+    )]
+    SshPassword { key: String },
+    #[error("{key}: {value:?} is not a valid ssh URL (it needs a host, and a numeric port if any)")]
+    SshUrl { key: String, value: String },
+    #[error("{key}: ssh remotes need agentfs built with the `ssh` cargo feature")]
+    SshUnsupported { key: String },
 }
 
 /// How nested repositories are handled (design §5).
@@ -62,21 +77,53 @@ pub struct RemoteSettings {
     /// accepts, in bytes.
     pub max_blob_size: Option<u64>,
     /// `remote.<name>.agentfsCredentials`: an absolute path to the
-    /// credential file ([`crate::credentials`]).
+    /// credential file ([`crate::credentials`]). Not for ssh remotes.
     pub credentials: Option<PathBuf>,
+    /// `remote.<name>.agentfsSshKey`: an absolute path to the private key
+    /// of an ssh remote ([`crate::credentials::SshKeyFile`]). Required for
+    /// ssh remotes, refused for any other.
+    pub ssh_key: Option<PathBuf>,
+    /// `remote.<name>.agentfsKnownHosts`: an absolute path to the
+    /// known_hosts file an ssh remote's host key is checked against
+    /// ([`crate::known_hosts`]). Required for ssh remotes, refused for any
+    /// other.
+    pub known_hosts: Option<PathBuf>,
 }
+
+/// The agentfs keys of a remote section that name files, which the mount
+/// preflight keeps out of the backing tree (design §17.1).
+pub const REMOTE_FILE_KEYS: [&str; 3] =
+    ["agentfsCredentials", "agentfsSshKey", "agentfsKnownHosts"];
 
 /// A `[remote "<name>"]` section that is left out because it is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidRemote {
     pub name: String,
     pub error: String,
+    /// The section's absolute file paths (`(key, path)`, keys from
+    /// [`REMOTE_FILE_KEYS`]), read separately so the mount preflight checks
+    /// them even though the section is not used.
+    pub files: Vec<(&'static str, PathBuf)>,
 }
 
 impl RemoteSettings {
     /// The URL pushes go to.
     pub fn push_url(&self) -> &str {
         self.push_url.as_deref().unwrap_or(&self.url)
+    }
+
+    /// The transport of the push URL.
+    pub fn transport(&self) -> Transport {
+        remote_url::transport(self.push_url())
+    }
+
+    /// The files this remote names, as `(key, path)`.
+    pub fn files(&self) -> Vec<(&'static str, &Path)> {
+        REMOTE_FILE_KEYS
+            .into_iter()
+            .zip([&self.credentials, &self.ssh_key, &self.known_hosts])
+            .filter_map(|(key, path)| Some((key, path.as_deref()?)))
+            .collect()
     }
 }
 
@@ -178,12 +225,27 @@ fn remotes(
         match remote(config, &name) {
             Ok(remote) => valid.push(remote),
             Err(e) => invalid.push(InvalidRemote {
+                files: remote_files(config, &name),
                 name,
                 error: e.to_string(),
             }),
         }
     }
     Ok((valid, invalid))
+}
+
+/// The absolute paths an invalid section names, whatever else is wrong
+/// with it.
+fn remote_files(config: &git2::Config, name: &str) -> Vec<(&'static str, PathBuf)> {
+    REMOTE_FILE_KEYS
+        .into_iter()
+        .filter_map(|key| {
+            let value = string(config, &format!("remote.{name}.{key}")).ok()??;
+            Path::new(&value)
+                .is_absolute()
+                .then(|| (key, PathBuf::from(value)))
+        })
+        .collect()
 }
 
 /// One `[remote "<name>"]` section.
@@ -203,23 +265,75 @@ fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigErr
             });
         }
     };
-    let credentials = match string(config, &key("agentfsCredentials"))? {
-        None => None,
-        Some(path) if Path::new(&path).is_absolute() => Some(PathBuf::from(path)),
-        Some(path) => {
-            return Err(ConfigError::RelativePath {
-                key: key("agentfsCredentials"),
-                value: path,
-            });
-        }
+    let path = |k: &str| match string(config, &key(k))? {
+        None => Ok(None),
+        Some(path) if Path::new(&path).is_absolute() => Ok(Some(PathBuf::from(path))),
+        Some(path) => Err(ConfigError::RelativePath {
+            key: key(k),
+            value: path,
+        }),
     };
-    Ok(RemoteSettings {
+    let remote = RemoteSettings {
         push_url: string(config, &key("pushurl"))?,
         url,
         max_blob_size,
-        credentials,
+        credentials: path("agentfsCredentials")?,
+        ssh_key: path("agentfsSshKey")?,
+        known_hosts: path("agentfsKnownHosts")?,
         name: name.to_owned(),
-    })
+    };
+    validate_transport(&remote)?;
+    Ok(remote)
+}
+
+/// Checks the agentfs keys against the push URL's transport (design
+/// §11.1): ssh remotes need a key and a known_hosts file and take no
+/// password or token; other remotes take no ssh keys.
+fn validate_transport(remote: &RemoteSettings) -> Result<(), ConfigError> {
+    let key = |k: &str| format!("remote.{}.{k}", remote.name);
+    let url_key = key(if remote.push_url.is_some() {
+        "pushurl"
+    } else {
+        "url"
+    });
+    if remote.transport() != Transport::Ssh {
+        for (k, set) in [
+            ("agentfsSshKey", remote.ssh_key.is_some()),
+            ("agentfsKnownHosts", remote.known_hosts.is_some()),
+        ] {
+            if set {
+                return Err(ConfigError::SshOnly { key: key(k) });
+            }
+        }
+        return Ok(());
+    }
+    if remote_url::has_password(remote.push_url()) {
+        return Err(ConfigError::SshPassword { key: url_key });
+    }
+    if remote_url::ssh_endpoint(remote.push_url()).is_none() {
+        return Err(ConfigError::SshUrl {
+            key: url_key,
+            // No password: has_password was checked first.
+            value: remote.push_url().to_owned(),
+        });
+    }
+    if remote.credentials.is_some() {
+        return Err(ConfigError::SshCredentials {
+            key: key("agentfsCredentials"),
+        });
+    }
+    for (k, set) in [
+        ("agentfsSshKey", remote.ssh_key.is_some()),
+        ("agentfsKnownHosts", remote.known_hosts.is_some()),
+    ] {
+        if !set {
+            return Err(ConfigError::SshNeeds { key: key(k) });
+        }
+    }
+    if !cfg!(feature = "ssh") {
+        return Err(ConfigError::SshUnsupported { key: url_key });
+    }
+    Ok(())
 }
 
 /// Checks a volume or remote name (design §11.4). Names become ref path
@@ -460,6 +574,143 @@ mod tests {
         for ok in ["v", "hermes-0", "a.b_c", "9"] {
             validate_name("k", ok).unwrap();
         }
+    }
+
+    /// The settings of `[remote "r"]` with `section` as its body, next to a
+    /// valid `[remote "good"]`.
+    fn one_remote(section: &str) -> Settings {
+        let (_d, c) = config_with(&format!(
+            "[agentfs]\n\tvolume = v\n[remote \"good\"]\n\turl = /g\n[remote \"r\"]\n{section}"
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert!(s.remotes.iter().any(|r| r.name == "good"), "{section}");
+        s
+    }
+
+    fn invalid_error(section: &str) -> InvalidRemote {
+        let s = one_remote(section);
+        assert_eq!(s.remotes.len(), 1, "{section}: {:?}", s.remotes);
+        assert_eq!(s.invalid_remotes.len(), 1, "{section}");
+        s.invalid_remotes[0].clone()
+    }
+
+    #[test]
+    fn ssh_remotes() {
+        let full = "\turl = ssh://git@git.example:2222/o/r.git\n\
+                    \tagentfsSshKey = /run/secrets/ssh/ssh-privatekey\n\
+                    \tagentfsKnownHosts = /run/secrets/ssh/known_hosts\n";
+        let s = one_remote(full);
+        if cfg!(feature = "ssh") {
+            let r = s.remotes.iter().find(|r| r.name == "r").unwrap();
+            assert_eq!(r.transport(), Transport::Ssh);
+            assert_eq!(
+                r.ssh_key.as_deref(),
+                Some(Path::new("/run/secrets/ssh/ssh-privatekey"))
+            );
+            assert_eq!(
+                r.files(),
+                [
+                    (
+                        "agentfsSshKey",
+                        Path::new("/run/secrets/ssh/ssh-privatekey")
+                    ),
+                    (
+                        "agentfsKnownHosts",
+                        Path::new("/run/secrets/ssh/known_hosts")
+                    )
+                ]
+            );
+            // scp-like and a pushurl.
+            for url in [
+                "\turl = git@github.com:o/r.git\n",
+                "\turl = https://example.com/r\n\tpushurl = git+ssh://h/r\n",
+            ] {
+                let s = one_remote(&format!(
+                    "{url}\tagentfsSshKey = /k\n\tagentfsKnownHosts = /kh\n"
+                ));
+                assert_eq!(s.remotes.len(), 2, "{url}: {:?}", s.invalid_remotes);
+            }
+        } else {
+            let bad = invalid_error(full);
+            assert!(bad.error.contains("`ssh` cargo feature"), "{bad:?}");
+            assert_eq!(bad.files.len(), 2, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ssh_misconfigurations() {
+        for (section, expected) in [
+            // A key or known_hosts on a non-ssh remote.
+            (
+                "\turl = https://h/r\n\tagentfsSshKey = /k\n",
+                "remote.r.agentfsSshKey applies only to ssh remotes",
+            ),
+            (
+                "\turl = /srv/r.git\n\tagentfsKnownHosts = /kh\n",
+                "remote.r.agentfsKnownHosts applies only to ssh remotes",
+            ),
+            // pushurl wins: a non-ssh push URL takes no ssh keys.
+            (
+                "\turl = ssh://h/r\n\tpushurl = https://h/r\n\tagentfsSshKey = /k\n\
+                 \tagentfsKnownHosts = /kh\n",
+                "applies only to ssh remotes",
+            ),
+            // An ssh remote missing either file.
+            (
+                "\turl = ssh://h/r\n\tagentfsKnownHosts = /kh\n",
+                "remote.r.agentfsSshKey must be set",
+            ),
+            (
+                "\turl = git@h:r\n\tagentfsSshKey = /k\n",
+                "remote.r.agentfsKnownHosts must be set",
+            ),
+            // Tokens and passwords are not for ssh.
+            (
+                "\turl = ssh://h/r\n\tagentfsSshKey = /k\n\tagentfsKnownHosts = /kh\n\
+                 \tagentfsCredentials = /c\n",
+                "authenticate with agentfsSshKey, not agentfsCredentials",
+            ),
+            (
+                "\turl = ssh://u:secret@h/r\n\tagentfsSshKey = /k\n\tagentfsKnownHosts = /kh\n",
+                "remote.r.url: an ssh URL must not carry a password",
+            ),
+            (
+                "\turl = /x\n\tpushurl = ssh://h:port/r\n\tagentfsSshKey = /k\n\
+                 \tagentfsKnownHosts = /kh\n",
+                "remote.r.pushurl: \"ssh://h:port/r\" is not a valid ssh URL",
+            ),
+            // Relative paths.
+            (
+                "\turl = ssh://h/r\n\tagentfsSshKey = id_ed25519\n\tagentfsKnownHosts = /kh\n",
+                "must be an absolute path",
+            ),
+            (
+                "\turl = ssh://h/r\n\tagentfsSshKey = /k\n\tagentfsKnownHosts = known_hosts\n",
+                "must be an absolute path",
+            ),
+        ] {
+            let bad = invalid_error(section);
+            assert!(bad.error.contains(expected), "{section}: {}", bad.error);
+            assert!(!bad.error.contains("secret"), "{}", bad.error);
+        }
+    }
+
+    #[test]
+    fn invalid_sections_keep_their_absolute_files() {
+        let bad = invalid_error(
+            "\turl = ssh://h/r\n\tagentfsCredentials = /c\n\tagentfsSshKey = /k\n\
+             \tagentfsKnownHosts = relative\n",
+        );
+        assert_eq!(
+            bad.files,
+            [
+                ("agentfsCredentials", PathBuf::from("/c")),
+                ("agentfsSshKey", PathBuf::from("/k"))
+            ]
+        );
+        let bad =
+            invalid_error("\turl = /x\n\tagentfsMaxBlobSize = 0\n\tagentfsCredentials = /c\n");
+        assert_eq!(bad.files, [("agentfsCredentials", PathBuf::from("/c"))]);
     }
 
     #[test]
