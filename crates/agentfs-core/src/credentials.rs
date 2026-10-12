@@ -6,21 +6,19 @@
 //!   keys are ignored), or
 //! - a bare token, used as the password (one trailing newline is dropped).
 //!
-//! The file is re-read whenever its stat stamp (device, inode, size, mtime,
-//! ctime) changes, so whatever rotates short-lived tokens only has to
-//! rewrite or replace it. [`std::fs::metadata`] follows symlinks, so
-//! kubelet's atomic `..data` symlink swap for Secret volumes is seen.
+//! The file is re-read whenever its stat stamp changes
+//! ([`crate::watched`]), so whatever rotates short-lived tokens only has to
+//! rewrite or replace it.
 //!
 //! A credential is bound to the host of the remote URL it was configured
 //! for and is never handed to any other host, whatever the transport is
 //! redirected to.
 
-use std::fs::File;
-use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub use crate::remote_url::authority;
+use crate::watched::{WatchedError, WatchedFile};
 
 /// The largest credential file read.
 pub const MAX_CREDENTIAL_FILE: u64 = 64 << 10;
@@ -64,28 +62,6 @@ impl std::fmt::Debug for Credential {
     }
 }
 
-/// What identifies one version of the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    mtime_ns: i128,
-    ctime_ns: i128,
-}
-
-impl Stamp {
-    fn of(meta: &std::fs::Metadata) -> Self {
-        Self {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            len: meta.len(),
-            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-            ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
-        }
-    }
-}
-
 /// The file's content, parsed.
 #[derive(Clone)]
 struct Parsed {
@@ -95,25 +71,21 @@ struct Parsed {
 
 /// One remote's credential file.
 pub struct CredentialFile {
-    path: PathBuf,
+    file: WatchedFile<Parsed>,
     bound: Option<String>,
-    cache: Mutex<Option<(Stamp, Parsed)>>,
-    reloads: AtomicUsize,
 }
 
 impl CredentialFile {
     /// The file at `path`, bound to the host of `bound_url`.
     pub fn new(path: impl Into<PathBuf>, bound_url: &str) -> Self {
         Self {
-            path: path.into(),
+            file: WatchedFile::new(path, MAX_CREDENTIAL_FILE),
             bound: authority(bound_url),
-            cache: Mutex::new(None),
-            reloads: AtomicUsize::new(0),
         }
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.file.path()
     }
 
     /// The credential for a connection to `url`. `username_from_url` is the
@@ -124,13 +96,7 @@ impl CredentialFile {
         url: &str,
         username_from_url: Option<&str>,
     ) -> Result<Credential, CredentialError> {
-        let got = authority(url);
-        if got != self.bound {
-            return Err(CredentialError::HostMismatch {
-                expected: self.bound.clone(),
-                got,
-            });
-        }
+        check_bound(self.bound.as_deref(), url)?;
         let parsed = self.load()?;
         let username = parsed
             .username
@@ -148,42 +114,46 @@ impl CredentialFile {
 
     /// How many times the file has been read and parsed.
     pub fn reloads(&self) -> usize {
-        self.reloads.load(Ordering::Relaxed)
+        self.file.reloads()
     }
 
     fn load(&self) -> Result<Parsed, CredentialError> {
-        let io_err = |source| CredentialError::Io {
-            path: self.path.clone(),
+        let path = self.path();
+        self.file
+            .load(|bytes| parse(&utf8(path, bytes)?))
+            .map_err(|e| flatten(path, e))
+    }
+}
+
+/// Refuses a URL whose authority is not the one a file is bound to.
+fn check_bound(bound: Option<&str>, url: &str) -> Result<(), CredentialError> {
+    let got = authority(url);
+    if got.as_deref() != bound {
+        return Err(CredentialError::HostMismatch {
+            expected: bound.map(str::to_owned),
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// The content as UTF-8; anything else is an IO error, as for a file that
+/// cannot be read.
+fn utf8(path: &Path, bytes: &[u8]) -> Result<String, CredentialError> {
+    String::from_utf8(bytes.to_vec()).map_err(|e| CredentialError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidData, e),
+    })
+}
+
+/// A [`WatchedError`] as a [`CredentialError`].
+fn flatten(path: &Path, e: WatchedError<CredentialError>) -> CredentialError {
+    match e {
+        WatchedError::Io(source) => CredentialError::Io {
+            path: path.to_path_buf(),
             source,
-        };
-        let stamp = Stamp::of(&std::fs::metadata(&self.path).map_err(io_err)?);
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((cached, parsed)) = cache.as_ref()
-            && *cached == stamp
-        {
-            return Ok(parsed.clone());
-        }
-        // Read after the stat: a change in between is caught by the next
-        // stat, which no longer matches the cached stamp.
-        let mut content = Vec::new();
-        File::open(&self.path)
-            .and_then(|f| f.take(MAX_CREDENTIAL_FILE + 1).read_to_end(&mut content))
-            .map_err(io_err)?;
-        if content.len() as u64 > MAX_CREDENTIAL_FILE {
-            return Err(io_err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("larger than {MAX_CREDENTIAL_FILE} bytes"),
-            )));
-        }
-        let content = String::from_utf8(content)
-            .map_err(|e| io_err(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-        self.reloads.fetch_add(1, Ordering::Relaxed);
-        let parsed = parse(&content)?;
-        *cache = Some((stamp, parsed.clone()));
-        Ok(parsed)
+        },
+        WatchedError::Parse(e) => e,
     }
 }
 
@@ -214,28 +184,6 @@ fn parse(content: &str) -> Result<Parsed, CredentialError> {
         username: username.filter(|u| !u.is_empty()),
         password: password.ok_or(CredentialError::MissingPassword)?,
     })
-}
-
-/// The lowercased `host[:port]` of a network URL, either
-/// `scheme://[userinfo@]host[:port]/…` or scp-like `[user@]host:path`.
-/// `None` for local paths and `file://` URLs.
-pub fn authority(url: &str) -> Option<String> {
-    let hostport = if let Some((scheme, rest)) = url.split_once("://") {
-        if scheme.eq_ignore_ascii_case("file") {
-            return None;
-        }
-        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let auth = &rest[..end];
-        auth.rsplit_once('@').map_or(auth, |(_, h)| h)
-    } else {
-        // scp-like syntax needs a `:` before any `/`, as in git.
-        let (before, _) = url.split_once(':')?;
-        if before.is_empty() || before.contains('/') {
-            return None;
-        }
-        before.rsplit_once('@').map_or(before, |(_, h)| h)
-    };
-    (!hostport.is_empty()).then(|| hostport.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -372,25 +320,5 @@ mod tests {
             cf.credential_for("https://github.com:8443/o/r", None)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn authorities() {
-        for (url, expected) in [
-            ("https://github.com/o/r", Some("github.com")),
-            ("https://u:p@Example.COM:8443/r", Some("example.com:8443")),
-            ("ssh://git@host.example/r.git", Some("host.example")),
-            ("git@github.com:o/r.git", Some("github.com")),
-            ("host.example:r.git", Some("host.example")),
-            ("https://host?x=1", Some("host")),
-            ("file:///x", None),
-            ("FILE:///x", None),
-            ("/x", None),
-            ("./a:b", None),
-            ("rel/dir:x", None),
-            ("https:///nohost", None),
-        ] {
-            assert_eq!(authority(url).as_deref(), expected, "{url}");
-        }
     }
 }
