@@ -1,5 +1,4 @@
-
-| `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |# agentfs design
+# agentfs design
 
 Status: draft 2, 2026-10-12, updated as phase 1 is built. Draft 1 was reviewed
 adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
@@ -110,6 +109,7 @@ through the mount:
   pending/   frozen copies of recorded content awaiting commit (§3.2)
   lfs/       local LFS object cache (phase 2)
   meta/      the daemon's own bookkeeping
+    lock                 flock held by the one process using the state area (§2.3)
     push/<remote>.json   each remote's push state (§11.2)
     push/<remote>.lock   flock held while pushing that remote
 ```
@@ -121,10 +121,31 @@ phase 1 that is the sidecar's daemon. With several pods (§14) it is a separate
 history service per volume, fed by each pod's front. Either way history is a
 straight line, and every commit is made by agentfs.
 
-Not yet enforced: two agentfs processes on one state area (for example
-`agentfs record` or `flush` alongside `agentfs run`) are not excluded; only
-pushes are locked, per remote (§11.2). An exclusive state-area lock taken when
-the volume is opened is a follow-up.
+**Enforced by a state-area lock.** Every command that writes the state area
+(`mount`, `run`, `record`, `flush` and `push`) first takes an exclusive
+`flock` on `meta/lock`, before it opens the volume, and holds it until it
+exits. The kernel releases it when the process dies, even after `kill -9`,
+so a crash never leaves a stale lock.
+
+- The file holds a line describing the holder (`pid=… command=…
+  since=<UTC>`), used only in messages; a line left by a dead holder is
+  never taken for a held lock.
+- A command that finds the lock held exits with status 75 (`EX_TEMPFAIL`)
+  and names the holder, unless `--wait-lock <duration>`
+  (`AGENTFS_WAIT_LOCK`) lets it wait.
+- So `agentfs push` while a volume is mounted is refused: the mount's own
+  push loops push. A way to ask a running daemon to push now is a
+  follow-up.
+- `agentfs status` takes no lock and changes nothing: it reads history and
+  the journal without recovery (it used to run recovery, which could
+  truncate the journal or prune frozen copies under a running daemon). It
+  reports the lock's holder. A torn journal tail is reported, and trimmed by
+  the next command that takes the lock.
+- `status` probes the lock by taking a shared lock and dropping it at once;
+  taking the lock therefore retries for at least 250 ms even with no
+  `--wait-lock`, so a probe cannot make it fail.
+- The per-remote push locks (§11.2) stay; they now only matter within one
+  process.
 
 ## 3. Recording
 
@@ -630,9 +651,11 @@ agentfs does not scan content for secrets and does not hold pushes.
   - It gets one attempt per connection: a rejected credential is an
     authentication failure, not a retry loop.
   - Only username and password (token) credentials are supported. SSH keys
-    need libgit2 built with libssh2, and HTTPS needs it built with TLS; the
-    current build environment has neither, so only local and `file://`
-    remotes are exercised end to end.
+    need libgit2 built with libssh2 and credential support that does not
+    exist yet, so SSH remotes are not supported. HTTPS needs libgit2 built
+    with TLS: the `https` cargo feature (OpenSSL). Local, `file://`,
+    `http://` and `https://` remotes are exercised end to end in CI
+    (`ci/e2e-remotes.sh`, against nginx and `git http-backend`).
 
 ### 11.2 Interval push
 
@@ -655,9 +678,10 @@ agentfs does not scan content for secrets and does not hold pushes.
   last pushed commit, the last attempt and success times, consecutive
   failures, the last error and any divergence. It is bookkeeping: a missing
   or unreadable file is treated as empty.
-- **A per-remote lock** (`flock` on `meta/push/<remote>.lock`) keeps a manual
-  `agentfs push` and the running service from pushing the same remote at
-  once; whichever loses reports itself busy and does nothing.
+- **A per-remote lock** (`flock` on `meta/push/<remote>.lock`) keeps two
+  push attempts on one remote from overlapping. Since the state-area lock
+  (§2.3) a manual `agentfs push` can no longer run beside the service, so
+  this guards only pushes within one process.
 - **Backoff.** After a failure the next attempt waits `pushInterval` doubled
   for each consecutive failure after the first, up to
   `max(pushInterval, 15m)`. A success resets it.
@@ -820,6 +844,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `CommitFailed` | Turning records into a commit fails; the records stay journaled and are retried |
 | `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `non_fast_forward`, `refused`, `local`), the head, the last pushed commit, the consecutive failure count and the next retry |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
+| `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
 | `PushSucceeded` | A push attempt succeeded, including one with nothing new (not an alarm; sinks filter) |
 
 A sink is called from the synchronous step, on the FUSE threads, so it must
@@ -969,9 +994,12 @@ target. What it needs:
     a second signal. `flush`, `record`, `push` and `run` export telemetry
     (§13) and take the pod flags (`AGENTFS_POD`, ...), so every command's
     telemetry resource is the same. `record` stands in for the FUSE layer until it exists;
-  - `status` shows each remote: its URL (userinfo redacted), last pushed
-    commit, unpushed commits, consecutive failures, last error and any
-    diverged ref;
+  - `status` is read-only (§2.3): the head, the last committed sequence,
+    the backlog, the state-area lock's holder, and each remote: its URL
+    (userinfo redacted), last pushed commit, unpushed commits, consecutive
+    failures, last error and any diverged ref;
+  - `mount`, `run`, `record`, `flush` and `push` take the state-area lock
+    (§2.3) and exit 75 while another process holds it;
   - mounted with fuser (multi-threaded, with passthrough).
 
   It works anywhere FUSE does, with no Kubernetes dependency.

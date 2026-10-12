@@ -250,6 +250,20 @@ fn encode(record: &Record, out: &mut Vec<u8>) -> io::Result<()> {
 
 /// Decodes frames until the first invalid one. Returns the records and the
 /// length of the valid prefix.
+/// Reads the journal at `path` without changing it: the valid records, and
+/// how many bytes follow the last valid frame. Unlike [`Journal::open`] a
+/// torn tail is left in place, so this is safe while another process is
+/// appending (design §2.3). A missing file reads as empty.
+pub fn read_records(path: &Path) -> io::Result<(Vec<Record>, u64)> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(e) => return Err(e),
+    };
+    let (records, valid) = decode_all(&bytes);
+    Ok((records, (bytes.len() - valid) as u64))
+}
+
 fn decode_all(bytes: &[u8]) -> (Vec<Record>, usize) {
     let mut records = Vec::new();
     let mut offset = 0;
@@ -379,6 +393,35 @@ mod tests {
         assert_eq!(j.uncommitted()[0].seq, 0);
         // The torn record's number is reused: its call never returned.
         assert_eq!(j.record(draft("c")).unwrap(), 1);
+    }
+
+    #[test]
+    fn read_records_leaves_a_torn_tail_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        assert_eq!(read_records(&path).unwrap(), (Vec::new(), 0), "missing");
+        {
+            let (j, _) = Journal::open(&path, 0, no_hook()).unwrap();
+            j.record(draft("a")).unwrap();
+            j.record(draft("b")).unwrap();
+        }
+        let (records, torn) = read_records(&path).unwrap();
+        let (j, _) = Journal::open(&path, 0, no_hook()).unwrap();
+        assert_eq!(records, j.uncommitted());
+        assert_eq!(torn, 0);
+        drop(j);
+
+        let full = fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(full - 3)
+            .unwrap();
+        let (records, torn) = read_records(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(torn > 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), full - 3, "untouched");
     }
 
     #[test]

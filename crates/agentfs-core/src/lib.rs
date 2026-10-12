@@ -17,6 +17,7 @@ pub mod events;
 pub mod history;
 pub mod identity;
 pub mod journal;
+pub mod lock;
 pub mod nested;
 pub mod paths;
 pub mod pending;

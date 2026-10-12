@@ -53,6 +53,13 @@ removed. `push` pushes once; `run` runs the commit and push loops until
 SIGINT or SIGTERM. Alarms are printed to stderr, and exported as telemetry
 when it is enabled.
 
+Only one process uses a state area at a time. `run`, `record`, `flush` and
+`push` take an exclusive lock on `<state>/meta/lock` and exit with status
+75 if another process holds it, naming the holder; `--wait-lock 30s` (or
+`AGENTFS_WAIT_LOCK`) waits instead. `status` takes no lock and changes
+nothing, so it works beside a running daemon, and shows who holds the
+lock.
+
 ## Telemetry
 
 `flush`, `record`, `push` and `run` export OpenTelemetry metrics, traces and

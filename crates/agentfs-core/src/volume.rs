@@ -88,6 +88,11 @@ impl StateDir {
         self.push_dir().join(format!("{remote}.lock"))
     }
 
+    /// The state-area lock (design §2.3, [`crate::lock`]).
+    pub fn lock_file(&self) -> PathBuf {
+        self.meta().join("lock")
+    }
+
     /// Large-file objects (design §7).
     pub fn lfs(&self) -> PathBuf {
         self.root.join("lfs")
@@ -283,6 +288,46 @@ pub fn open(
         telemetry: telemetry.clone(),
     };
     Ok((recorder, committer, recovery))
+}
+
+/// What [`inspect`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inspection {
+    /// The branch head, if the branch exists.
+    pub head: Option<git2::Oid>,
+    /// Last sequence number already in history.
+    pub committed_through: Option<u64>,
+    /// Journaled records not yet in history.
+    pub backlog: usize,
+    /// Bytes past the last valid journal frame: a torn tail the next
+    /// [`open`] will discard, or a record being appended right now.
+    pub torn_bytes: u64,
+}
+
+/// Reads a state area without changing it, for `agentfs status`.
+///
+/// Unlike [`open`], this runs no recovery: it never truncates the journal or
+/// prunes frozen copies, so it is safe while another process holds the
+/// state-area lock and is writing (design §2.3). A record being appended at
+/// that moment may be missed, or counted in [`Inspection::torn_bytes`].
+pub fn inspect(state: &StateDir) -> Result<(History, Inspection), VolumeError> {
+    let history = History::open(&state.git())?;
+    let head = history.head()?.map(|c| c.id());
+    let committed_through = history.head_seq()?;
+    let (records, torn_bytes) = crate::journal::read_records(&state.journal())?;
+    let backlog = records
+        .iter()
+        .filter(|r| committed_through.is_none_or(|c| r.seq > c))
+        .count();
+    Ok((
+        history,
+        Inspection {
+            head,
+            committed_through,
+            backlog,
+            torn_bytes,
+        },
+    ))
 }
 
 /// An input the path rules kept out of history.
@@ -871,6 +916,39 @@ mod tests {
         assert_eq!(com.commit_pending().unwrap(), CommitReport::default());
         let head = com.history().head().unwrap().unwrap();
         assert_eq!(head.parent_count(), 0, "no duplicate commit");
+    }
+
+    #[test]
+    fn inspect_reads_without_recovery() {
+        let (dir, state) = setup();
+        let (_, i) = inspect(&state).unwrap();
+        assert_eq!(
+            i,
+            Inspection {
+                head: None,
+                committed_through: None,
+                backlog: 0,
+                torn_bytes: 0
+            }
+        );
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+            .unwrap();
+        com.commit_pending().unwrap();
+        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "b", "2")])
+            .unwrap();
+        // A copy frozen for a record that is not journaled yet: open would
+        // prune it, inspect must not.
+        let stray = state.pending().join(format!("{:016x}", 999));
+        fs::write(&stray, "in flight").unwrap();
+
+        let (history, i) = inspect(&state).unwrap();
+        assert_eq!(i.head, Some(history.head().unwrap().unwrap().id()));
+        assert_eq!(i.committed_through, Some(0));
+        assert_eq!(i.backlog, 1);
+        assert!(stray.exists(), "inspect pruned a pending copy");
+        drop((rec, com));
     }
 
     #[test]

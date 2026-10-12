@@ -30,6 +30,7 @@ use agentfs_core::config::parse_duration;
 use agentfs_core::events::{Event, Events};
 use agentfs_core::history::History;
 use agentfs_core::identity::Context;
+use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::push::{self, PushOutcome, RemotePusher, RemoteStatus};
 use agentfs_core::record::{Caller, Trigger};
@@ -48,6 +49,11 @@ struct Cli {
     /// the current directory.
     #[arg(long, global = true, env = "AGENTFS_ROOT")]
     root: Option<PathBuf>,
+    /// How long to wait for another agentfs process to release the state
+    /// area (`mount`, `run`, `record`, `flush` and `push` take it; design
+    /// §2.3). By default a busy state area exits 75 at once.
+    #[arg(long, global = true, env = "AGENTFS_WAIT_LOCK", default_value = "0s", value_parser = parse_grace, value_name = "DURATION")]
+    wait_lock: Duration,
     #[command(subcommand)]
     command: Command,
 }
@@ -140,7 +146,26 @@ impl Pod {
     }
 }
 
-fn main() -> Result<ExitCode> {
+/// Exit status when another process holds the state area (`EX_TEMPFAIL`).
+const EXIT_LOCKED: u8 = 75;
+
+fn main() -> ExitCode {
+    match real_main() {
+        Ok(code) => code,
+        Err(e) => match e.downcast_ref::<LockError>() {
+            Some(busy @ LockError::Busy { .. }) => {
+                eprintln!("error: {busy}");
+                ExitCode::from(EXIT_LOCKED)
+            }
+            _ => {
+                eprintln!("Error: {e:?}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let state = StateDir::new(&cli.state);
     match cli.command {
@@ -149,21 +174,33 @@ fn main() -> Result<ExitCode> {
                 .with_context(|| format!("initialising {}", state.root().display()))?;
             println!("initialised volume {volume} in {}", state.root().display());
         }
-        Command::Status(pod) => {
-            let (_, committer, recovery) =
-                open(&state, cli.root.as_deref().unwrap_or(Path::new(".")), &pod)?;
-            let history = committer.history();
+        Command::Status(_pod) => {
+            // Read-only: no recovery, no lock, so it is safe beside a
+            // running `mount` or `run` (design §2.3).
+            let (history, inspection) = volume::inspect(&state)
+                .with_context(|| format!("opening {}", state.root().display()))?;
             println!("volume:    {}", history.settings().volume);
             println!("branch:    {}", history.settings().branch_ref);
-            match history.head()? {
-                Some(head) => println!("head:      {}", head.id()),
+            match inspection.head {
+                Some(head) => println!("head:      {head}"),
                 None => println!("head:      (none)"),
             }
-            match recovery.committed_through {
+            match inspection.committed_through {
                 Some(seq) => println!("committed: through seq {seq}"),
                 None => println!("committed: nothing"),
             }
-            println!("backlog:   {} record(s)", committer.backlog());
+            println!("backlog:   {} record(s)", inspection.backlog);
+            if inspection.torn_bytes > 0 {
+                println!(
+                    "journal:   {} byte(s) past the last valid record (a torn tail, \
+                     or a record being written)",
+                    inspection.torn_bytes
+                );
+            }
+            match StateLock::holder(&state)? {
+                Some(holder) => println!("lock:      held by {holder}"),
+                None => println!("lock:      free"),
+            }
             for remote in push::status(&state, history.settings())? {
                 println!("{}", remote_line(&remote));
             }
@@ -175,6 +212,7 @@ fn main() -> Result<ExitCode> {
             }
         }
         Command::Flush(pod) => {
+            let _lock = StateLock::acquire(&state, "flush", cli.wait_lock)?;
             let session = Session::start(&state, &pod)?;
             let (_, committer, _) =
                 session.open(&state, cli.root.as_deref().unwrap_or(Path::new(".")), &pod)?;
@@ -191,6 +229,7 @@ fn main() -> Result<ExitCode> {
             let Some(root) = cli.root.as_deref() else {
                 bail!("record needs --root (or AGENTFS_ROOT): the backing tree the paths are in");
             };
+            let _lock = StateLock::acquire(&state, "record", cli.wait_lock)?;
             let session = Session::start(&state, &pod)?;
             let (recorder, committer, _) = session.open(&state, root, &pod)?;
             let caller = Caller {
@@ -231,6 +270,7 @@ fn main() -> Result<ExitCode> {
             session.finish();
         }
         Command::Push { remotes, pod } => {
+            let _lock = StateLock::acquire(&state, "push", cli.wait_lock)?;
             let session = Session::start(&state, &pod)?;
             let code = push_once(&state, &remotes, &session)?;
             session.finish();
@@ -238,6 +278,7 @@ fn main() -> Result<ExitCode> {
         }
         Command::Run { pod, push_grace } => {
             let root = cli.root.as_deref().unwrap_or(Path::new("."));
+            let _lock = StateLock::acquire(&state, "run", cli.wait_lock)?;
             return run(&state, root, &pod, push_grace);
         }
     }
@@ -408,18 +449,6 @@ fn run(state: &StateDir, root: &Path, pod: &Pod, push_grace: Duration) -> Result
 }
 
 type Opened = (volume::Recorder, volume::Committer, volume::Recovery);
-
-/// Opens the volume without telemetry (for `status`).
-fn open(state: &StateDir, root: &Path, pod: &Pod) -> Result<Opened> {
-    let volume = volume_name(state)?;
-    Ok(volume::open(
-        state,
-        root,
-        pod.context(&volume),
-        stderr_sink(),
-        &Telemetry::noop(),
-    )?)
-}
 
 fn volume_name(state: &StateDir) -> Result<String> {
     Ok(History::open(&state.git())
