@@ -121,7 +121,7 @@ if [ "${E2E_HTTPS:-0}" = 1 ]; then
   assert_contains "$out" "tls: pushed" "pushed over https"
   assert_eq "$(local_head tls)" "$(remote_ref "$TLS_REPO" refs/heads/agentfs/tls)" "https remote has the branch"
   assert_eq 1 "$code" "a certificate for another host fails the push"
-  assert_contains "$out" "wronghost: failed (unreachable)" "certificate mismatch is refused"
+  assert_contains "$out" "wronghost: failed (untrusted_host)" "certificate mismatch is refused as an untrusted host"
 fi
 
 step "all remote scenarios passed"

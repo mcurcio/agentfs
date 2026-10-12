@@ -74,6 +74,28 @@ jobs:
       - if: always()
         run: ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
 
+  e2e-ssh:
+    name: e2e (ssh remotes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ssh
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config openssh-server openssh-client
+      - run: cargo build --locked -p agentfs --features ssh
+      - name: start ssh server
+        run: ci/git-ssh-server.sh start "$RUNNER_TEMP/ssh-server" >>"$GITHUB_ENV"
+      - run: ci/e2e-ssh.sh
+      - name: sshd log
+        if: failure()
+        run: sudo tail -n 200 "$RUNNER_TEMP/ssh-server/sshd.log"
+      - if: always()
+        run: ci/git-ssh-server.sh stop "$RUNNER_TEMP/ssh-server"
+
   e2e-telemetry:
     name: e2e (OpenTelemetry collector)
     runs-on: ubuntu-latest
