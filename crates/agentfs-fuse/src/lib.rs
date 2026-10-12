@@ -1,0 +1,26 @@
+//! The agentfs FUSE layer (design §2.1, §3.1, §6, §17.1).
+//!
+//! A passthrough filesystem over a real backing directory that records
+//! every change boundary through [`agentfs_core::volume::Recorder`] before
+//! the triggering call returns.
+//!
+//! - [`ops::Ops`] is every operation, independent of the kernel, so its
+//!   behaviour is unit-tested against a real directory and state area.
+//! - `fuse` maps fuser's `fuser::Filesystem` onto it and negotiates
+//!   kernel passthrough.
+//! - `sweep` runs the RELEASE and periodic backstops and retries failed
+//!   records.
+//! - `mount` checks the layout (nothing of the state area may be
+//!   reachable through the mount), mounts, and unmounts.
+
+// `stat` field types differ between architectures (`c_ulong` on x86_64,
+// `u32` or `i64` elsewhere), so conversions written to be portable are
+// identities on some targets.
+#![allow(clippy::useless_conversion)]
+
+pub mod backing;
+pub mod boundary;
+pub mod dirty;
+pub mod inodes;
+pub mod names;
+pub mod ops;

@@ -385,10 +385,7 @@ mod tests {
                 "[agentfs]\n\tvolume = v\n\tsweepInterval = {bad}\n"
             ));
             assert!(
-                matches!(
-                    Settings::from_config(&c),
-                    Err(ConfigError::TooShort { .. })
-                ),
+                matches!(Settings::from_config(&c), Err(ConfigError::TooShort { .. })),
                 "{bad}"
             );
         }

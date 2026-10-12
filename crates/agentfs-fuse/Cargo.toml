@@ -1,0 +1,19 @@
+[package]
+name = "agentfs-fuse"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The agentfs FUSE layer: a recording passthrough filesystem over a backing tree"
+
+[dependencies]
+agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+# Default features only: pure Rust (mount(2) as root, fusermount3
+# otherwise), no libfuse or pkg-config needed to build (design §17.1).
+fuser = "0.18.0"
+rustix = { version = "1.1.5", features = ["fs", "process", "mount", "time"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+git2 = { version = "0.21.0", default-features = false }
+tempfile = "3.27.0"
