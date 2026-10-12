@@ -652,7 +652,9 @@ fn stale_backing_inodes_are_detected() {
     let fx = Fx::new();
     fx.put("f", "1");
     let id = fx.id("f");
-    // Replaced behind the mount's back.
+    // Replaced behind the mount's back. Holding the old inode open keeps
+    // the filesystem from reusing its number (ext4 would).
+    let _old = fs::File::open(fx.backing().join("f")).unwrap();
     fs::remove_file(fx.backing().join("f")).unwrap();
     fs::write(fx.backing().join("f"), "other").unwrap();
     assert_eq!(fx.ops.getattr(id, None), Err(estale()));

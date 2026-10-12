@@ -1,0 +1,941 @@
+//! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6 and 7, plus SQLite, git
+//! on the mount and the daemon's lifecycle).
+//!
+//! Every test needs `/dev/fuse` and root, so all are `#[ignore]`d; the
+//! `fuse` CI job runs them through `ci/fuse-tests.sh`:
+//!
+//! ```sh
+//! sudo AGENTFS_TEST_PASSTHROUGH=auto target/debug/deps/mount-<hash> --ignored --test-threads=1
+//! ```
+//!
+//! - `AGENTFS_TEST_PASSTHROUGH` (`auto`, `on`, `off`) is passed to every
+//!   mount.
+//! - `AGENTFS_TEST_UNPRIV_USER` names a user to run an unprivileged daemon
+//!   as (needs `user_allow_other` in `/etc/fuse.conf`); without it that test
+//!   is skipped.
+//! - Daemon logs go to `$RUNNER_TEMP/agentfs-mount-logs` when set.
+//!
+//! Each test mounts its own volume; history is read with git2 straight from
+//! the state area while the daemon holds it (reading needs no lock).
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write as _;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
+
+const UID: u32 = 10000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Item {
+    File(String),
+    Exec(String),
+    Link(String),
+}
+
+use Item::{Exec, File, Link};
+
+fn f(s: &str) -> Item {
+    File(s.into())
+}
+
+type Tree = BTreeMap<String, Item>;
+
+fn tree(items: &[(&str, Item)]) -> Tree {
+    items
+        .iter()
+        .map(|(p, i)| ((*p).to_owned(), i.clone()))
+        .collect()
+}
+
+fn require_root() {
+    assert!(
+        rustix::process::geteuid().is_root(),
+        "the mount tests run as root (ci/fuse-tests.sh)"
+    );
+}
+
+fn passthrough() -> String {
+    std::env::var("AGENTFS_TEST_PASSTHROUGH").unwrap_or_else(|_| "auto".into())
+}
+
+fn log_dir() -> PathBuf {
+    let dir = match std::env::var_os("RUNNER_TEMP") {
+        Some(t) => PathBuf::from(t).join("agentfs-mount-logs"),
+        None => std::env::temp_dir().join("agentfs-mount-logs"),
+    };
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A volume: `backing/`, `state/` and `mnt/` side by side.
+struct Vol {
+    dir: tempfile::TempDir,
+    name: &'static str,
+}
+
+impl Vol {
+    fn new(name: &'static str) -> Self {
+        require_root();
+        let dir = tempfile::tempdir().unwrap();
+        // Other users (uid 10000) must reach the mount point.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let v = Self { dir, name };
+        for d in ["backing", "mnt"] {
+            fs::create_dir_all(v.p(d)).unwrap();
+            fs::set_permissions(v.p(d), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = v.agentfs(&["init", "--volume", "demo"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        v.config("agentfs.commitWindow", "50ms");
+        v
+    }
+
+    fn p(&self, rel: &str) -> PathBuf {
+        self.dir.path().join(rel)
+    }
+
+    fn backing(&self) -> PathBuf {
+        self.p("backing")
+    }
+
+    fn mnt(&self) -> PathBuf {
+        self.p("mnt")
+    }
+
+    fn state(&self) -> PathBuf {
+        self.p("state")
+    }
+
+    fn config(&self, key: &str, value: &str) {
+        let mut c = git2::Config::open(&self.state().join("git/config")).unwrap();
+        c.set_str(key, value).unwrap();
+    }
+
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
+        for (name, _) in std::env::vars_os() {
+            let n = name.to_string_lossy();
+            if n.starts_with("OTEL_") || n.starts_with("AGENTFS_") {
+                cmd.env_remove(name);
+            }
+        }
+        cmd.arg("--state")
+            .arg(self.state())
+            .env("AGENTFS_REPLICA", "test-0");
+        cmd
+    }
+
+    fn agentfs(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().unwrap()
+    }
+
+    fn log_path(&self) -> PathBuf {
+        log_dir().join(format!("{}.log", self.name))
+    }
+
+    /// Starts `agentfs mount` and waits until the kernel lists the mount.
+    fn mount(&self, extra: &[&str]) -> Mounted {
+        self.mount_with(extra, |c| c)
+    }
+
+    fn mount_with(&self, extra: &[&str], wrap: impl FnOnce(Command) -> Command) -> Mounted {
+        let log_path = self.log_path();
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(log, "---- mount {extra:?}").unwrap();
+        let mut cmd = self.command();
+        cmd.args([
+            "mount",
+            "--passthrough",
+            &passthrough(),
+            "--unmount-grace",
+            "3s",
+        ])
+        .args(extra)
+        .arg(self.backing())
+        .arg(self.mnt())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .stdin(Stdio::null());
+        let mut cmd = wrap(cmd);
+        let child = cmd.spawn().unwrap();
+        let mounted = Mounted {
+            child: Some(child),
+            mnt: self.mnt(),
+            log: log_path,
+        };
+        mounted.wait_mounted();
+        mounted
+    }
+
+    /// The branch's tree: path to content, mode.
+    fn history(&self) -> Tree {
+        let mut out = Tree::new();
+        let Ok(repo) = git2::Repository::open_bare(self.state().join("git")) else {
+            return out;
+        };
+        let Ok(reference) = repo.find_reference("refs/heads/agentfs/demo") else {
+            return out;
+        };
+        let commit = reference.peel_to_commit().unwrap();
+        commit
+            .tree()
+            .unwrap()
+            .walk(git2::TreeWalkMode::PreOrder, |root, e| {
+                if e.kind() == Some(git2::ObjectType::Blob) {
+                    let blob = repo.find_blob(e.id()).unwrap();
+                    let content = String::from_utf8_lossy(blob.content()).into_owned();
+                    let item = match e.filemode() {
+                        0o100755 => Exec(content),
+                        0o120000 => Link(content),
+                        _ => File(content),
+                    };
+                    out.insert(format!("{root}{}", e.name().unwrap()), item);
+                }
+                git2::TreeWalkResult::Ok
+            })
+            .unwrap();
+        out
+    }
+
+    /// The head commit's author name and message.
+    fn head(&self) -> (String, String) {
+        let repo = git2::Repository::open_bare(self.state().join("git")).unwrap();
+        let commit = repo
+            .find_reference("refs/heads/agentfs/demo")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        (
+            commit.author().name().unwrap_or("").to_owned(),
+            commit.message().unwrap_or("").to_owned(),
+        )
+    }
+
+    /// Waits until history is exactly `want`.
+    fn expect(&self, want: &Tree) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let got = self.history();
+            if &got == want {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "history never became {want:#?}\ngot {got:#?}\ndaemon log:\n{}",
+                    fs::read_to_string(self.log_path()).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Runs a shell command in the mount as root; it must succeed.
+    fn sh(&self, script: &str) -> String {
+        self.sh_as(None, script, true)
+    }
+
+    /// Runs a shell command in the mount as `uid` (and gid) if given.
+    fn sh_as(&self, uid: Option<u32>, script: &str, must_succeed: bool) -> String {
+        let mut cmd = match uid {
+            None => Command::new("sh"),
+            Some(uid) => {
+                let mut c = Command::new("setpriv");
+                c.args([
+                    format!("--reuid={uid}"),
+                    format!("--regid={uid}"),
+                    "--clear-groups".into(),
+                    "--".into(),
+                    "sh".into(),
+                ]);
+                c
+            }
+        };
+        let out = cmd
+            .arg("-c")
+            .arg(script)
+            .current_dir(self.mnt())
+            .output()
+            .unwrap();
+        if must_succeed {
+            assert!(
+                out.status.success(),
+                "`{script}` failed: {}{}",
+                text(&out.stdout),
+                text(&out.stderr)
+            );
+        }
+        text(&out.stdout)
+    }
+}
+
+fn text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+fn is_mounted(mnt: &Path) -> bool {
+    let info = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let mnt = mnt.to_str().unwrap();
+    info.lines()
+        .any(|l| l.split(' ').nth(4).is_some_and(|m| m == mnt))
+}
+
+/// A running `agentfs mount`.
+struct Mounted {
+    child: Option<Child>,
+    mnt: PathBuf,
+    log: PathBuf,
+}
+
+impl Mounted {
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn wait_mounted(&self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !(is_mounted(&self.mnt) && self.log().contains("mounted ")) {
+            if Instant::now() > deadline {
+                panic!("never mounted; log:\n{}", self.log());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn pid(&self) -> rustix::process::Pid {
+        rustix::process::Pid::from_child(self.child.as_ref().unwrap())
+    }
+
+    fn signal(&self, sig: rustix::process::Signal) {
+        rustix::process::kill_process(self.pid(), sig).unwrap();
+    }
+
+    fn wait_exit(&mut self, timeout: Duration) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        let child = self.child.as_mut().unwrap();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                self.child = None;
+                return status;
+            }
+            if Instant::now() > deadline {
+                panic!("the daemon did not exit; log:\n{}", self.log());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// SIGTERM; the daemon must exit 0 and leave nothing mounted.
+    fn stop(mut self) -> String {
+        self.signal(rustix::process::Signal::TERM);
+        let status = self.wait_exit(Duration::from_secs(30));
+        let log = self.log();
+        assert!(status.success(), "exit {status:?}; log:\n{log}");
+        assert!(!is_mounted(&self.mnt), "still mounted; log:\n{log}");
+        log
+    }
+}
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if is_mounted(&self.mnt) {
+            let _ = Command::new("umount").arg("-l").arg(&self.mnt).status();
+        }
+    }
+}
+
+// ---- design §18 test 1: no gaps ----
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn no_gaps() {
+    let v = Vol::new("no_gaps");
+    let m = v.mount(&[]);
+    let mut want = Tree::new();
+
+    // An editor's save.
+    v.sh("printf old > f && printf new > .f.swp && mv .f.swp f");
+    want.insert("f".into(), f("new"));
+    v.expect(&want);
+
+    v.sh("printf more >> f");
+    want.insert("f".into(), f("newmore"));
+    v.expect(&want);
+
+    v.sh("truncate -s 3 f");
+    want.insert("f".into(), f("new"));
+    v.expect(&want);
+
+    v.sh("mkdir -p dir/sub && printf x > dir/sub/x && printf y > dir/y && mv dir dir2");
+    want.insert("dir2/sub/x".into(), f("x"));
+    want.insert("dir2/y".into(), f("y"));
+    v.expect(&want);
+
+    v.sh("rm -r dir2");
+    want.retain(|k, _| !k.starts_with("dir2/"));
+    v.expect(&want);
+
+    v.sh("ln f hard");
+    want.insert("hard".into(), f("new"));
+    v.expect(&want);
+
+    v.sh("chmod +x f");
+    want.insert("f".into(), Exec("new".into()));
+    want.insert("hard".into(), Exec("new".into()));
+    v.expect(&want);
+
+    v.sh("ln -s f sym");
+    want.insert("sym".into(), Link("f".into()));
+    v.expect(&want);
+
+    // Unlink of an open file.
+    v.sh("printf g > g");
+    want.insert("g".into(), f("g"));
+    v.expect(&want);
+    v.sh("exec 3>>g; rm g; echo x >&3; exec 3>&-");
+    want.remove("g");
+    v.expect(&want);
+
+    // Rename over an open file.
+    v.sh("printf old > h && printf fresh > h2");
+    v.sh("exec 3>>h; mv h2 h; echo late >&3; exec 3>&-");
+    want.insert("h".into(), f("fresh"));
+    v.expect(&want);
+
+    // Log rotation while the writer is open.
+    v.sh(
+        "i=0; while [ $i -lt 300 ]; do echo line$i; i=$((i+1)); sleep 0.002; done >> app.log & \
+         sleep 0.3; mv app.log app.log.1; printf 'fresh\\n' > app.log; wait",
+    );
+    let rotated = fs::read_to_string(v.backing().join("app.log.1")).unwrap();
+    assert_eq!(rotated.lines().count(), 300, "{rotated}");
+    want.insert("app.log".into(), f("fresh\n"));
+    want.insert("app.log.1".into(), File(rotated));
+    v.expect(&want);
+
+    // A writer other than root.
+    v.sh("mkdir u && chown 10000:10000 u");
+    v.sh_as(Some(UID), "printf mine > u/by-10000", true);
+    want.insert("u/by-10000".into(), f("mine"));
+    v.expect(&want);
+    let (author, message) = v.head();
+    assert_eq!(author, "uid-10000", "{message}");
+
+    // The backing tree has the same content.
+    assert_eq!(fs::read_to_string(v.backing().join("f")).unwrap(), "new");
+    m.stop();
+}
+
+// ---- design §18 test 2: before return ----
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn recorded_before_close_returns() {
+    let v = Vol::new("before_return");
+    let mut m = v.mount(&[]);
+    v.sh("printf data > f");
+    // close has returned: kill the daemon at once.
+    m.signal(rustix::process::Signal::KILL);
+    m.wait_exit(Duration::from_secs(10));
+
+    // A stale mount point is refused with the way out.
+    let err = rustix::fs::stat(v.mnt()).unwrap_err();
+    assert_eq!(err, rustix::io::Errno::NOTCONN);
+    let out = v.agentfs(&[
+        "mount",
+        v.backing().to_str().unwrap(),
+        v.mnt().to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("stale FUSE mount"),
+        "{}",
+        text(&out.stderr)
+    );
+    // The kernel released the lock with the process.
+    let status = text(&v.agentfs(&["status"]).stdout);
+    assert!(status.contains("lock:      free"), "{status}");
+    assert!(
+        Command::new("umount")
+            .arg("-l")
+            .arg(v.mnt())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Remount: recovery commits the record made before close returned.
+    let m = v.mount(&[]);
+    v.expect(&tree(&[("f", f("data"))]));
+    assert_eq!(fs::read_to_string(v.backing().join("f")).unwrap(), "data");
+    m.stop();
+}
+
+// ---- design §18 test 4: any user ----
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn any_user() {
+    let v = Vol::new("any_user");
+    let m = v.mount(&[]);
+    v.sh("mkdir u && chown 10000:10000 u");
+    v.sh_as(Some(UID), "printf a > u/f", true);
+    let meta = fs::metadata(v.backing().join("u/f")).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (UID, UID), "owned by its creator");
+    v.expect(&tree(&[("u/f", f("a"))]));
+    assert_eq!(v.head().0, "uid-10000");
+
+    // Ordinary permission semantics.
+    v.sh("printf r > rootfile && chmod 644 rootfile");
+    v.sh_as(Some(UID), "printf x >> rootfile", false);
+    assert_eq!(
+        fs::read_to_string(v.backing().join("rootfile")).unwrap(),
+        "r"
+    );
+    let denied = Command::new("setpriv")
+        .args(["--reuid=10000", "--regid=10000", "--clear-groups", "--"])
+        .args(["sh", "-c", "printf x >> rootfile"])
+        .current_dir(v.mnt())
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(
+        text(&denied.stderr).contains("Permission denied"),
+        "{}",
+        text(&denied.stderr)
+    );
+
+    // Root reads a 0600 file of uid 10000; chmod 600 persists.
+    v.sh_as(Some(UID), "printf s > u/secret && chmod 600 u/secret", true);
+    assert_eq!(v.sh("cat u/secret"), "s");
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&v.backing().join("u/secret")), 0o600);
+    assert_eq!(mode(&v.mnt().join("u/secret")), 0o600);
+    v.sh_as(Some(UID), "cat secret 2>/dev/null || true", false);
+
+    // chown and utimens pass through.
+    v.sh("chown 10000 rootfile && TZ=UTC touch -d '2001-02-03 04:05:06' rootfile");
+    let meta = fs::metadata(v.backing().join("rootfile")).unwrap();
+    assert_eq!(meta.uid(), UID);
+    assert_eq!(meta.mtime(), 981_173_106);
+
+    // A setgid directory's group is inherited.
+    v.sh("mkdir sg && chown 10000:4242 sg && chmod 2775 sg");
+    v.sh_as(Some(UID), "printf z > sg/f && mkdir sg/d", true);
+    assert_eq!(fs::metadata(v.backing().join("sg/f")).unwrap().gid(), 4242);
+    let d = fs::metadata(v.backing().join("sg/d")).unwrap();
+    assert_eq!(d.gid(), 4242);
+    assert_eq!(d.permissions().mode() & 0o2000, 0o2000, "setgid kept");
+    m.stop();
+
+    // chmod 600 survives a remount.
+    let m = v.mount(&[]);
+    assert_eq!(mode(&v.mnt().join("u/secret")), 0o600);
+    m.stop();
+}
+
+// ---- design §18 test 5: invisible ----
+
+fn walk(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir).unwrap() {
+            let e = e.unwrap();
+            let rel = e
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            }
+            out.push(rel);
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn nothing_of_the_state_area_is_visible() {
+    let v = Vol::new("invisible");
+    let creds = v.p("creds");
+    fs::write(&creds, "username=bot\npassword=CRED-SECRET-4711\n").unwrap();
+    v.config(
+        "remote.origin.url",
+        &format!("file://{}", v.p("remote.git").display()),
+    );
+    v.config("remote.origin.agentfsCredentials", creds.to_str().unwrap());
+    git2::Repository::init_bare(v.p("remote.git")).unwrap();
+    let m = v.mount(&[]);
+    v.sh("mkdir -p a/b && printf one > a/b/one && printf two > two && ln -s two l");
+    v.expect(&tree(&[
+        ("a/b/one", f("one")),
+        ("l", Link("two".into())),
+        ("two", f("two")),
+    ]));
+    assert_eq!(walk(&v.mnt()), walk(&v.backing()));
+    let grep = Command::new("grep")
+        .args(["-r", "-l", "CRED-SECRET"])
+        .arg(v.mnt())
+        .output()
+        .unwrap();
+    assert!(grep.stdout.is_empty(), "{}", text(&grep.stdout));
+    for name in ["git", "journal", "pending", "meta", "HEAD", "objects"] {
+        assert!(!v.mnt().join(name).exists(), "{name} visible");
+    }
+    // `..` from the mount root is the mount point's parent.
+    let up = fs::metadata(v.mnt().join("..")).unwrap();
+    let parent = fs::metadata(v.dir.path()).unwrap();
+    assert_eq!((up.dev(), up.ino()), (parent.dev(), parent.ino()));
+    // Nothing reachable through the mount is the state area.
+    let state = fs::metadata(v.state()).unwrap();
+    for rel in walk(&v.mnt()) {
+        let meta = fs::symlink_metadata(v.mnt().join(&rel)).unwrap();
+        assert_ne!(
+            (meta.dev(), meta.ino()),
+            (state.dev(), state.ino()),
+            "{rel}"
+        );
+    }
+    m.stop();
+}
+
+// ---- design §18 test 6: rules ----
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn rules_through_the_mount() {
+    let v = Vol::new("rules");
+    let exclude = v.state().join("git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, "*.log\n").unwrap();
+    let m = v.mount(&[]);
+    v.sh("printf a > a.log && printf t > t.txt");
+    v.expect(&tree(&[("t.txt", f("t"))]));
+    m.stop();
+
+    // Ignored after it was recorded: still recorded.
+    fs::write(&exclude, "*.log\n*.txt\n").unwrap();
+    let m = v.mount(&[]);
+    v.sh("printf t2 > t.txt && printf n > new.txt && printf x > x.dat");
+    v.expect(&tree(&[("t.txt", f("t2")), ("x.dat", f("x"))]));
+
+    // Tracked rule files cannot turn recording off by default, and are
+    // content themselves.
+    v.sh("printf '*\\n' > .gitignore && printf '* -agentfs\\n' > .gitattributes");
+    v.sh("printf z > z.dat");
+    v.expect(&tree(&[
+        (".gitattributes", f("* -agentfs\n")),
+        (".gitignore", f("*\n")),
+        ("t.txt", f("t2")),
+        ("x.dat", f("x")),
+        ("z.dat", f("z")),
+    ]));
+    m.stop();
+}
+
+// ---- design §18 test 7: nested repositories ----
+
+fn source_repo(v: &Vol) -> PathBuf {
+    let src = v.p("src");
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(["-c", "init.defaultBranch=main"])
+            .args(args)
+            .current_dir(v.dir.path())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q", "src"]);
+    fs::write(src.join("README"), "hello").unwrap();
+    fs::create_dir_all(src.join("lib")).unwrap();
+    fs::write(src.join("lib/code.rs"), "fn main() {}").unwrap();
+    git(&["-C", "src", "add", "."]);
+    git(&["-C", "src", "commit", "-q", "-m", "init"]);
+    src
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn nested_repositories() {
+    let v = Vol::new("nested");
+    let src = source_repo(&v);
+    let m = v.mount(&[]);
+    v.sh("printf k > keep");
+    v.expect(&tree(&[("keep", f("k"))]));
+    let src = src.to_str().unwrap();
+    v.sh(&format!("git clone -q {src} work"));
+    v.sh(&format!("git clone -q --bare {src} b.git"));
+    v.sh("git init -q .");
+    v.sh("printf n > new");
+    v.expect(&tree(&[("keep", f("k")), ("new", f("n"))]));
+    let log = m.stop();
+    assert!(!log.contains("alarm:"), "{log}");
+
+    v.config("agentfs.nested", "working-tree");
+    let m = v.mount(&[]);
+    v.sh(&format!("git clone -q {src} wt"));
+    v.expect(&tree(&[
+        ("keep", f("k")),
+        ("new", f("n")),
+        ("wt/README", f("hello")),
+        ("wt/lib/code.rs", f("fn main() {}")),
+    ]));
+    let log = m.stop();
+    assert!(!log.contains("alarm:"), "{log}");
+}
+
+// ---- workloads ----
+
+fn sqlite(v: &Vol, db: &str, mode: &str) {
+    let mut sql =
+        format!("PRAGMA journal_mode={mode};\nCREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);\n");
+    for tx in 0..10 {
+        sql.push_str("BEGIN;\n");
+        for i in 0..100 {
+            sql.push_str(&format!("INSERT INTO t(v) VALUES ('row {tx}-{i}');\n"));
+        }
+        sql.push_str("COMMIT;\n");
+    }
+    let script = v.p(&format!("{db}.sql"));
+    fs::write(&script, sql).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+    v.sh_as(
+        Some(UID),
+        &format!("sqlite3 u/{db} < {} > /dev/null", script.display()),
+        true,
+    );
+    check_sqlite(v, db);
+}
+
+fn check_sqlite(v: &Vol, db: &str) {
+    let out = v.sh_as(
+        Some(UID),
+        &format!("sqlite3 u/{db} 'PRAGMA integrity_check; SELECT count(*) FROM t;'"),
+        true,
+    );
+    assert_eq!(out, "ok\n1000\n", "{db}");
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn sqlite_on_the_mount() {
+    let v = Vol::new("sqlite");
+    let m = v.mount(&[]);
+    v.sh("mkdir u && chown 10000:10000 u");
+    sqlite(&v, "wal.db", "WAL");
+    sqlite(&v, "delete.db", "DELETE");
+    m.stop();
+    let m = v.mount(&[]);
+    check_sqlite(&v, "wal.db");
+    check_sqlite(&v, "delete.db");
+    m.stop();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn git_works_on_the_mount() {
+    let v = Vol::new("git");
+    let m = v.mount(&[]);
+    let script = "set -e
+        git init -q proj
+        cd proj
+        git config user.name t
+        git config user.email t@example.com
+        mkdir -p src
+        for i in $(seq 1 50); do echo \"line $i\" > src/f$i.txt; done
+        git add .
+        git commit -q -m one
+        for i in $(seq 1 50); do echo more >> src/f$i.txt; done
+        git commit -q -am two
+        git mv src/f1.txt src/g1.txt
+        git commit -q -m three
+        git gc -q
+        git fsck --no-progress
+        git status --porcelain
+        git log --oneline | wc -l";
+    let out = v.sh(script);
+    assert!(out.trim_end().ends_with('3'), "{out}");
+    // proj is a nested repository: nothing of it is recorded.
+    v.sh("printf r > recorded");
+    v.expect(&tree(&[("recorded", f("r"))]));
+    m.stop();
+}
+
+// ---- the daemon ----
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn sigterm_with_a_file_open_for_writing() {
+    let v = Vol::new("sigterm_open");
+    let mut m = v.mount(&[]);
+    // A writer that never closes its file.
+    let mut writer = Command::new("sh")
+        .args(["-c", "exec 3>held; printf data >&3; exec sleep 60"])
+        .current_dir(v.mnt())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    m.signal(rustix::process::Signal::TERM);
+    let status = m.wait_exit(Duration::from_secs(30));
+    let log = m.log();
+    assert!(status.success(), "{log}");
+    assert!(log.contains("detached lazily"), "{log}");
+    assert!(
+        log.contains("final sweep: 1 open file(s) recorded"),
+        "{log}"
+    );
+    assert!(!is_mounted(&v.mnt()));
+    let _ = writer.kill();
+    let _ = writer.wait();
+    v.expect(&tree(&[("held", f("data"))]));
+    let status = text(&v.agentfs(&["status"]).stdout);
+    assert!(status.contains("backlog:   0 record(s)"), "{status}");
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn an_external_unmount_stops_the_daemon() {
+    let v = Vol::new("external_umount");
+    let mut m = v.mount(&[]);
+    v.sh("printf a > a");
+    v.expect(&tree(&[("a", f("a"))]));
+    assert!(
+        Command::new("umount")
+            .arg(v.mnt())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = m.wait_exit(Duration::from_secs(30));
+    assert!(status.success(), "{}", m.log());
+    assert!(m.log().contains("unmounted from outside"), "{}", m.log());
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn the_lock_holds_while_mounted() {
+    let v = Vol::new("lock");
+    let m = v.mount(&[]);
+    for args in [&["run"][..], &["push"], &["flush"]] {
+        let out = v.agentfs(args);
+        assert_eq!(
+            out.status.code(),
+            Some(75),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
+    let out = v.agentfs(&["status"]);
+    assert!(out.status.success());
+    assert!(
+        text(&out.stdout).contains("command=mount"),
+        "{}",
+        text(&out.stdout)
+    );
+    m.stop();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn the_startup_line_reports_passthrough() {
+    let v = Vol::new("passthrough");
+    let m = v.mount(&[]);
+    v.sh("printf data > f && cat f > /dev/null");
+    v.expect(&tree(&[("f", f("data"))]));
+    let log = m.stop();
+    let line = log
+        .lines()
+        .find(|l| l.starts_with("mounted "))
+        .unwrap()
+        .to_owned();
+    // The CI job's log shows what the runner's kernel negotiated.
+    println!("startup ({}): {line}", passthrough());
+    match passthrough().as_str() {
+        "off" => assert!(
+            line.contains("passthrough: off (disabled by --passthrough off)"),
+            "{line}"
+        ),
+        "on" => assert!(line.contains("passthrough: on,"), "{line}"),
+        _ => assert!(line.contains("passthrough: "), "{line}"),
+    }
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn an_unprivileged_daemon() {
+    let Ok(user) = std::env::var("AGENTFS_TEST_UNPRIV_USER") else {
+        println!("AGENTFS_TEST_UNPRIV_USER not set: skipped");
+        return;
+    };
+    let id = |flag: &str| -> u32 {
+        let out = Command::new("id").arg(flag).arg(&user).output().unwrap();
+        text(&out.stdout).trim().parse().unwrap()
+    };
+    let (uid, gid) = (id("-u"), id("-g"));
+    let v = Vol::new("unprivileged");
+    let ok = Command::new("chown")
+        .arg("-R")
+        .arg(format!("{uid}:{gid}"))
+        .arg(v.dir.path())
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let m = v.mount_with(&[], |cmd| {
+        let mut wrapped = Command::new("setpriv");
+        wrapped
+            .arg(format!("--reuid={uid}"))
+            .arg(format!("--regid={gid}"))
+            .arg("--init-groups")
+            .arg("--")
+            .arg(cmd.get_program())
+            .args(cmd.get_args());
+        for (k, val) in cmd.get_envs() {
+            match val {
+                Some(val) => wrapped.env(k, val),
+                None => wrapped.env_remove(k),
+            };
+        }
+        let log = fs::OpenOptions::new()
+            .append(true)
+            .open(v.log_path())
+            .unwrap();
+        wrapped
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .stdin(Stdio::null());
+        wrapped
+    });
+    // Root writes through another user's allow_other mount.
+    v.sh("printf r > by-root");
+    v.expect(&tree(&[("by-root", f("r"))]));
+    let meta = fs::metadata(v.backing().join("by-root")).unwrap();
+    assert_eq!(meta.uid(), uid, "a non-root daemon creates files as itself");
+    let log = m.stop();
+    let line = log.lines().find(|l| l.starts_with("mounted ")).unwrap();
+    println!("unprivileged startup: {line}");
+    if passthrough() != "off" {
+        assert!(
+            line.contains("passthrough: off (the daemon is not root"),
+            "{line}"
+        );
+    }
+}

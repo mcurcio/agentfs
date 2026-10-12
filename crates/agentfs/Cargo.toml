@@ -24,7 +24,7 @@ opentelemetry-proto = { version = "0.33.1", default-features = false, features =
 prost = "0.14"
 git2 = { version = "0.21.0", default-features = false }
 # Sends SIGTERM in the `run` test: std's Child::kill only sends SIGKILL.
-rustix = { version = "1.1.5", features = ["process"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 tempfile = "3.27.0"
 
 [features]
