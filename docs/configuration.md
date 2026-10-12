@@ -72,6 +72,7 @@ suffix (`512k`, `100m`).
 | `agentfs.commitWindow` | duration | `200ms` | Records this close in time become one commit (§3.4) |
 | `agentfs.pushInterval` | duration | `60s` | How often each remote is pushed; also the base of the failure backoff, which doubles up to `max(pushInterval, 15m)` (§11.2) |
 | `agentfs.sweepInterval` | duration, at least `1s` | `30s` | How often the mount records files held open and retries failed records (§3.1, §3.5) |
+| `agentfs.lfsThreshold` | positive size | unset: no size rule | Content larger than this (strictly `>`) is stored as Git LFS instead of a git blob (§7). Unset, only `agentfs.store=lfs` and `filter=lfs` in `info/attributes` select LFS. Setting it needs an LFS server for every remote (see [Git LFS](#git-lfs)) |
 
 Operator path rules are not config keys: they are `<state>/git/info/exclude`
 (git ignore syntax: paths never recorded when new) and
@@ -96,6 +97,20 @@ error.
 | `agentfs.identity.authorName` | `uid-{uid}` |
 | `agentfs.identity.authorEmail` | `uid-{uid}@{volume}.agentfs.invalid` |
 
+## `[lfs]`
+
+git-lfs's own global keys, read from the same config file (never from a
+tracked `.lfsconfig`, which is content only). They apply to every remote
+and win over the per-remote keys, as in git-lfs; see [Git LFS](#git-lfs).
+
+| Key | Type | Default | Meaning and validation |
+|---|---|---|---|
+| `lfs.url` | `http(s)://` URL, `file://` URL or path | unset | The LFS endpoint for every remote |
+| `lfs.pushurl` | as `lfs.url` | unset | Where LFS uploads go for every remote |
+
+A bad value does not stop the volume: every remote is reported as
+misconfigured instead.
+
 ## `[remote "<name>"]`
 
 One section per push remote; every section with a `url` is a remote. The
@@ -111,6 +126,9 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `agentfsCredentials` | absolute path | none | HTTP and HTTPS only: a file holding a token or `username=`/`password=` lines (see [HTTPS](#https-and-http-remotes)) |
 | `agentfsSshKey` | absolute path | none | SSH only, and required there: the private key (see [SSH](#ssh-remotes)) |
 | `agentfsKnownHosts` | absolute path | none | SSH only, and required there: the known_hosts file the server's host key is checked against |
+| `lfsurl` | `http(s)://` URL, `file://` URL or path | derived from the remote's URL | The Git LFS endpoint for this remote, as in git-lfs, unless `lfs.url` is set (see [Git LFS](#git-lfs)) |
+| `lfspushurl` | as `lfsurl` | `lfsurl` | Where LFS uploads go, unless `lfs.pushurl` or `lfs.url` is set |
+| `agentfsLfsCredentials` | absolute path | none | The credential file (same format as `agentfsCredentials`) for an LFS endpoint on another host or port than the push URL; never sent to any other host |
 
 The remote's name must be a valid agentfs name (as for `agentfs.volume`;
 git accepts `team/backup`, agentfs does not), because it names the push
@@ -122,13 +140,15 @@ state file and appears in metrics.
 |---|---|
 | the name is not a valid agentfs name | `remote.<name>` |
 | `agentfsMaxBlobSize` is not a positive size | `remote.<name>.agentfsMaxBlobSize` |
-| `agentfsCredentials`, `agentfsSshKey` or `agentfsKnownHosts` is not an absolute path | the key |
+| `agentfsCredentials`, `agentfsSshKey`, `agentfsKnownHosts` or `agentfsLfsCredentials` is not an absolute path | the key |
 | the push URL is SSH and `agentfsSshKey` or `agentfsKnownHosts` is not set | the missing key |
 | the push URL is SSH and `agentfsCredentials` is set | `agentfsCredentials` |
 | the push URL is SSH and carries a password (`ssh://user:pw@host/…`) | `url` or `pushurl` |
 | the push URL is SSH and has no host or a non-numeric port | `url` or `pushurl` |
 | the push URL is not SSH and `agentfsSshKey` or `agentfsKnownHosts` is set | the key |
 | the push URL is SSH and the binary was built without the `ssh` feature | `url` or `pushurl` |
+| `lfsurl`, `lfspushurl`, or the global `lfs.url` or `lfs.pushurl`, is not an `http(s)://` URL, a `file://` URL or a path (SSH and `git://` are refused) | the key; a bad global key misconfigures every remote |
+| one of those is `https://` and the binary was built without the `https` feature | the key |
 
 Problems with the files themselves (missing, unreadable, malformed) are
 not misconfigurations: they fail each push attempt, with the usual alarm

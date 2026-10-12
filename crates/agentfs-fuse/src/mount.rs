@@ -802,6 +802,9 @@ mod tests {
             credentials: Some(creds),
             ssh_key: None,
             known_hosts: None,
+            lfs_url: None,
+            lfs_push_url: None,
+            lfs_credentials: None,
         }
     }
 
@@ -811,6 +814,9 @@ mod tests {
             url: "ssh://git@git.example/r.git".into(),
             push_url: None,
             max_blob_size: None,
+            lfs_url: None,
+            lfs_push_url: None,
+            lfs_credentials: None,
             credentials: None,
             ssh_key: Some(key),
             known_hosts: Some(known_hosts),
@@ -907,6 +913,17 @@ mod tests {
         fs::write(l.p("token"), "secret").unwrap();
         let s = settings(vec![remote(l.p("token"))]);
         l.check_with("state", "backing", "mnt", &s).unwrap();
+        // The LFS credential file is held to the same rule (design §7).
+        let mut lfs = remote(l.p("token"));
+        lfs.lfs_credentials = Some(l.p("mnt/lfs-token"));
+        let err = l
+            .check_with("state", "backing", "mnt", &settings(vec![lfs]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, PreflightError::CredentialsExposed { key, outer, .. }
+                if *key == "agentfsLfsCredentials" && *outer == MOUNTPOINT),
+            "{err}"
+        );
     }
 
     #[test]

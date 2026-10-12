@@ -455,6 +455,9 @@ mod tests {
             credentials: None,
             ssh_key: None,
             known_hosts: None,
+            lfs_url: None,
+            lfs_push_url: None,
+            lfs_credentials: None,
         }
     }
 

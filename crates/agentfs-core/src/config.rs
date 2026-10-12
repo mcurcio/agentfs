@@ -15,6 +15,11 @@
 //! would be evaluated differently with and without a repository. Keeping
 //! includes out of the backing tree and the mount point is the mount
 //! preflight's job.
+//!
+//! Git LFS settings (design §7) come from the same file only: the size
+//! threshold `agentfs.lfsThreshold`, git-lfs's `lfs.url` and `lfs.pushurl`,
+//! and per remote `lfsurl`, `lfspushurl` and `agentfsLfsCredentials`. A
+//! tracked `.lfsconfig` is content and is never read.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -85,6 +90,13 @@ pub enum ConfigError {
         path.display()
     )]
     IncludeSetsIdentity { path: PathBuf, key: &'static str },
+    #[error(
+        "{key}: {value:?} is not an LFS endpoint agentfs can use (an http:// or https:// \
+         URL, a file:// URL or a path; design §7)"
+    )]
+    LfsUrl { key: String, value: String },
+    #[error("{key}: https LFS endpoints need agentfs built with the `https` cargo feature")]
+    LfsHttpsUnsupported { key: String },
 }
 
 /// How nested repositories are handled (design §5).
@@ -117,12 +129,26 @@ pub struct RemoteSettings {
     /// ([`crate::known_hosts`]). Required for ssh remotes, refused for any
     /// other.
     pub known_hosts: Option<PathBuf>,
+    /// `remote.<name>.lfsurl`: the LFS endpoint for this remote, unless
+    /// `lfs.url` is set (design §7).
+    pub lfs_url: Option<String>,
+    /// `remote.<name>.lfspushurl`: the LFS endpoint uploads go to, unless
+    /// `lfs.pushurl` or `lfs.url` is set.
+    pub lfs_push_url: Option<String>,
+    /// `remote.<name>.agentfsLfsCredentials`: an absolute path to the
+    /// credential file for an LFS endpoint on another host than the push
+    /// URL's ([`crate::credentials`] format).
+    pub lfs_credentials: Option<PathBuf>,
 }
 
 /// The agentfs keys of a remote section that name files, which the mount
 /// preflight keeps out of the backing tree (design §17.1).
-pub const REMOTE_FILE_KEYS: [&str; 3] =
-    ["agentfsCredentials", "agentfsSshKey", "agentfsKnownHosts"];
+pub const REMOTE_FILE_KEYS: [&str; 4] = [
+    "agentfsCredentials",
+    "agentfsSshKey",
+    "agentfsKnownHosts",
+    "agentfsLfsCredentials",
+];
 
 /// A `[remote "<name>"]` section that is left out because it is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,10 +176,28 @@ impl RemoteSettings {
     pub fn files(&self) -> Vec<(&'static str, &Path)> {
         REMOTE_FILE_KEYS
             .into_iter()
-            .zip([&self.credentials, &self.ssh_key, &self.known_hosts])
+            .zip([
+                &self.credentials,
+                &self.ssh_key,
+                &self.known_hosts,
+                &self.lfs_credentials,
+            ])
             .filter_map(|(key, path)| Some((key, path.as_deref()?)))
             .collect()
     }
+}
+
+/// Git LFS settings (design §7), all optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LfsSettings {
+    /// `agentfs.lfsThreshold`: content larger than this many bytes is
+    /// stored as LFS. Unset (the default) means no size rule: only
+    /// `agentfs.store=lfs` and operator `filter=lfs` select LFS.
+    pub threshold: Option<u64>,
+    /// `lfs.url`: the LFS endpoint for every remote, as in git-lfs.
+    pub url: Option<String>,
+    /// `lfs.pushurl`: the LFS endpoint uploads go to, for every remote.
+    pub push_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +214,8 @@ pub struct Settings {
     /// §3.1, §3.5). At least [`MIN_SWEEP_INTERVAL`].
     pub sweep_interval: Duration,
     pub identity: Templates,
+    /// Git LFS (design §7).
+    pub lfs: LfsSettings,
     /// Push remotes, sorted by name.
     pub remotes: Vec<RemoteSettings>,
     /// Remote sections that could not be used, sorted by name. They are
@@ -195,7 +241,21 @@ impl Settings {
         let branch =
             string(config, "agentfs.branch")?.unwrap_or_else(|| format!("agentfs/{volume}"));
         let defaults = Templates::default();
-        let (remotes, invalid_remotes) = remotes(config)?;
+        let lfs = LfsSettings {
+            threshold: match int(config, "agentfs.lfsThreshold")? {
+                None => None,
+                Some(n) if n > 0 => Some(n as u64),
+                Some(n) => {
+                    return Err(ConfigError::BadSize {
+                        key: "agentfs.lfsThreshold".into(),
+                        value: n.to_string(),
+                    });
+                }
+            },
+            url: string(config, "lfs.url")?,
+            push_url: string(config, "lfs.pushurl")?,
+        };
+        let (remotes, invalid_remotes) = remotes(config, &lfs)?;
         Ok(Self {
             branch_ref: format!("refs/heads/{branch}"),
             respect_tree_rules: boolean(config, "agentfs.respectTreeRules")?.unwrap_or(false),
@@ -225,6 +285,7 @@ impl Settings {
                 author_email: string(config, "agentfs.identity.authorEmail")?
                     .unwrap_or(defaults.author_email),
             },
+            lfs,
             remotes,
             invalid_remotes,
             includes,
@@ -290,6 +351,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
 /// so a mistake in one never fails the volume (design §11.1).
 fn remotes(
     config: &git2::Config,
+    lfs: &LfsSettings,
 ) -> Result<(Vec<RemoteSettings>, Vec<InvalidRemote>), ConfigError> {
     let mut names = BTreeSet::new();
     {
@@ -308,7 +370,7 @@ fn remotes(
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
     for name in names {
-        match remote(config, &name) {
+        match remote(config, &name).and_then(|r| validate_lfs(&r, lfs).map(|()| r)) {
             Ok(remote) => valid.push(remote),
             Err(e) => invalid.push(InvalidRemote {
                 files: remote_files(config, &name),
@@ -366,6 +428,9 @@ fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigErr
         credentials: path("agentfsCredentials")?,
         ssh_key: path("agentfsSshKey")?,
         known_hosts: path("agentfsKnownHosts")?,
+        lfs_url: string(config, &key("lfsurl"))?,
+        lfs_push_url: string(config, &key("lfspushurl"))?,
+        lfs_credentials: path("agentfsLfsCredentials")?,
         name: name.to_owned(),
     };
     validate_transport(&remote)?;
@@ -418,6 +483,38 @@ fn validate_transport(remote: &RemoteSettings) -> Result<(), ConfigError> {
     }
     if !cfg!(feature = "ssh") {
         return Err(ConfigError::SshUnsupported { key: url_key });
+    }
+    Ok(())
+}
+
+/// Checks every LFS endpoint that could apply to `remote` (design §7): the
+/// global `lfs.url` and `lfs.pushurl` and the remote's own `lfsurl` and
+/// `lfspushurl`. Each must be an `http(s)://` URL, a `file://` URL or a
+/// path; `https` needs the `https` cargo feature. A bad global key makes
+/// every remote misconfigured, reported per remote, so it never fails the
+/// volume.
+fn validate_lfs(remote: &RemoteSettings, lfs: &LfsSettings) -> Result<(), ConfigError> {
+    let remote_key = |k: &str| format!("remote.{}.{k}", remote.name);
+    let keys = [
+        ("lfs.url".to_owned(), &lfs.url),
+        ("lfs.pushurl".to_owned(), &lfs.push_url),
+        (remote_key("lfsurl"), &remote.lfs_url),
+        (remote_key("lfspushurl"), &remote.lfs_push_url),
+    ];
+    for (key, value) in keys {
+        let Some(value) = value else { continue };
+        match remote_url::transport(value) {
+            Transport::Http | Transport::Local if !value.trim().is_empty() => {}
+            Transport::Https if cfg!(feature = "https") => {}
+            Transport::Https => return Err(ConfigError::LfsHttpsUnsupported { key }),
+            _ => {
+                return Err(ConfigError::LfsUrl {
+                    key,
+                    // Never echo a password a URL may carry.
+                    value: crate::push::redact_url(value),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -797,6 +894,129 @@ mod tests {
         let bad =
             invalid_error("\turl = /x\n\tagentfsMaxBlobSize = 0\n\tagentfsCredentials = /c\n");
         assert_eq!(bad.files, [("agentfsCredentials", PathBuf::from("/c"))]);
+    }
+
+    #[test]
+    fn lfs_settings() {
+        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n");
+        assert_eq!(
+            Settings::from_config(&c).unwrap().lfs,
+            LfsSettings::default()
+        );
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n\tlfsThreshold = 8m\n\
+             [lfs]\n\turl = http://lfs.example/r\n\tpushurl = /srv/lfs.git\n\
+             [remote \"r\"]\n\turl = http://git.example/r.git\n\
+             \tlfsurl = http://lfs.example/r/info/lfs\n\
+             \tlfspushurl = file:///srv/up.git\n\
+             \tagentfsLfsCredentials = /run/secrets/lfs\n",
+        );
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(
+            s.lfs,
+            LfsSettings {
+                threshold: Some(8 << 20),
+                url: Some("http://lfs.example/r".into()),
+                push_url: Some("/srv/lfs.git".into()),
+            }
+        );
+        let r = &s.remotes[0];
+        assert_eq!(r.lfs_url.as_deref(), Some("http://lfs.example/r/info/lfs"));
+        assert_eq!(r.lfs_push_url.as_deref(), Some("file:///srv/up.git"));
+        assert_eq!(
+            r.lfs_credentials.as_deref(),
+            Some(Path::new("/run/secrets/lfs"))
+        );
+        assert_eq!(
+            r.files(),
+            [("agentfsLfsCredentials", Path::new("/run/secrets/lfs"))]
+        );
+        for (value, ok) in [
+            ("1", Some(1)),
+            ("512k", Some(512 << 10)),
+            ("2g", Some(2 << 30)),
+        ] {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n\tlfsThreshold = {value}\n"
+            ));
+            assert_eq!(Settings::from_config(&c).unwrap().lfs.threshold, ok);
+        }
+        for bad in ["0", "-5"] {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n\tlfsThreshold = {bad}\n"
+            ));
+            assert!(
+                matches!(Settings::from_config(&c), Err(ConfigError::BadSize { ref key, .. })
+                    if key == "agentfs.lfsThreshold"),
+                "{bad}"
+            );
+        }
+        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n\tlfsThreshold = lots\n");
+        assert!(Settings::from_config(&c).is_err());
+    }
+
+    #[test]
+    fn lfs_misconfigurations() {
+        for (section, expected) in [
+            (
+                "\turl = /x\n\tlfsurl = ssh://git@h/r\n",
+                "remote.r.lfsurl: \"ssh://***@h/r\" is not an LFS endpoint",
+            ),
+            (
+                "\turl = /x\n\tlfspushurl = git@h:r\n",
+                "remote.r.lfspushurl: \"git@h:r\" is not an LFS endpoint",
+            ),
+            (
+                "\turl = /x\n\tlfsurl = git://h/r\n",
+                "remote.r.lfsurl: \"git://h/r\" is not an LFS endpoint",
+            ),
+            (
+                "\turl = /x\n\tagentfsLfsCredentials = lfs-token\n",
+                "must be an absolute path",
+            ),
+        ] {
+            let bad = invalid_error(section);
+            assert!(bad.error.contains(expected), "{section}: {}", bad.error);
+        }
+        // A password in the URL is never echoed.
+        let bad = invalid_error("\turl = /x\n\tlfsurl = ftp://u:hunter2@h/r\n");
+        assert!(!bad.error.contains("hunter2"), "{}", bad.error);
+        // The invalid section still names its LFS credential file for the
+        // mount preflight.
+        let bad = invalid_error(
+            "\turl = /x\n\tlfsurl = ssh://h/r\n\tagentfsLfsCredentials = /run/secrets/lfs\n",
+        );
+        assert_eq!(
+            bad.files,
+            [("agentfsLfsCredentials", PathBuf::from("/run/secrets/lfs"))]
+        );
+        // https needs the feature.
+        let s = one_remote("\turl = /x\n\tlfsurl = https://lfs.example/r\n");
+        if cfg!(feature = "https") {
+            assert_eq!(s.remotes.len(), 2, "{:?}", s.invalid_remotes);
+        } else {
+            assert_eq!(s.invalid_remotes.len(), 1);
+            assert!(
+                s.invalid_remotes[0].error.contains("`https` cargo feature"),
+                "{:?}",
+                s.invalid_remotes
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_global_lfs_url_misconfigures_every_remote_but_not_the_volume() {
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n[lfs]\n\turl = ssh://lfs.example/r\n\
+             [remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n",
+        );
+        let s = Settings::from_config(&c).unwrap();
+        assert!(s.remotes.is_empty());
+        let names: Vec<&str> = s.invalid_remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        for bad in &s.invalid_remotes {
+            assert!(bad.error.starts_with("lfs.url:"), "{}", bad.error);
+        }
     }
 
     #[test]
