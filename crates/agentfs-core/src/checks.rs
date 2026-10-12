@@ -22,6 +22,13 @@
 //! the smallest across remotes. Checks are pure: they read only the frozen
 //! copy they are given, so one [`Checks`] is shared by the recorder's
 //! threads and the committer.
+//!
+//! **Bounded synchronous step.** Size checks are a `stat` and always run.
+//! Content scans (the `.gitattributes` line length) run in the synchronous
+//! step ([`CheckStage::Record`]) only for files up to [`SYNC_SCAN_LIMIT`],
+//! the bound tree rule files already have (design §4.1); a larger file is
+//! scanned in full at commit time ([`CheckStage::Commit`]), where a refusal
+//! drops the change and raises `PathRefused` with stage `commit`.
 
 use std::fmt;
 use std::fs::File;
@@ -29,6 +36,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
 use crate::config::RemoteSettings;
+use crate::events::CheckStage;
 use crate::paths::{PathError, RepoPath, SpecialFile, is_dotgit, special_file};
 
 /// Longest path recorded, in bytes.
@@ -39,6 +47,10 @@ pub const MAX_SYMLINK_TARGET: usize = 4096;
 pub const ATTR_MAX_FILE_SIZE: u64 = 100 << 20;
 /// A `.gitattributes` line this long or longer is refused by git's fsck.
 pub const ATTR_MAX_LINE_LENGTH: usize = 2048;
+/// The largest file whose content is scanned in the synchronous step
+/// ([`CheckStage::Record`]); larger ones are scanned at commit time. The
+/// same bound as tree rule files (design §4.1).
+pub const SYNC_SCAN_LIMIT: u64 = 1 << 20;
 
 /// The blob size limit in force, and the remote it comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,23 +235,43 @@ impl Checks {
     }
 
     /// Rules for a regular file at `path` whose content is the frozen copy
-    /// at `content`. Reads only a `.gitattributes`, and only up to
-    /// [`ATTR_MAX_FILE_SIZE`].
-    pub fn check_file(&self, path: &RepoPath, content: &Path) -> io::Result<Option<Refusal>> {
+    /// at `content`, at `stage`. Reads only special files, and in the
+    /// synchronous step ([`CheckStage::Record`]) only those up to
+    /// [`SYNC_SCAN_LIMIT`]; at [`CheckStage::Commit`] they are read in full
+    /// (bounded by their size limits, checked first by length alone).
+    pub fn check_file(
+        &self,
+        path: &RepoPath,
+        content: &Path,
+        stage: CheckStage,
+    ) -> io::Result<Option<Refusal>> {
         if let Some(refusal) = self.check_path(path) {
             return Ok(Some(refusal));
         }
         let bytes = std::fs::metadata(content)?.len();
-        if let Some(refusal) = self.check_blob_size(bytes) {
+        if let Some(refusal) = self
+            .check_blob_size(bytes)
+            .or_else(|| special_size(path, bytes))
+        {
             return Ok(Some(refusal));
         }
-        if special_file(path.file_name()) == Some(SpecialFile::Gitattributes) {
-            if bytes > ATTR_MAX_FILE_SIZE {
-                return Ok(Some(Refusal::GitattributesTooLarge { bytes }));
-            }
-            return long_attribute_line(content);
+        if special_file(path.file_name()).is_none()
+            || (stage == CheckStage::Record && bytes > SYNC_SCAN_LIMIT)
+        {
+            return Ok(None);
         }
-        Ok(None)
+        scan_content(path, BufReader::new(File::open(content)?))
+    }
+
+    /// Every rule for a regular file at `path` holding `bytes`, as at
+    /// commit time (content scans run in full). A restore checks content
+    /// with this before writing it back (design §15).
+    pub fn check_blob(&self, path: &RepoPath, bytes: &[u8]) -> Option<Refusal> {
+        let len = bytes.len() as u64;
+        self.check_path(path)
+            .or_else(|| self.check_blob_size(len))
+            .or_else(|| special_size(path, len))
+            .or_else(|| scan_content(path, bytes).unwrap_or(None))
     }
 
     /// The size limit on the live backing file, before it is frozen, so a
@@ -263,10 +295,27 @@ impl Checks {
     }
 }
 
+/// The size rules of special files, which need only their length.
+fn special_size(path: &RepoPath, bytes: u64) -> Option<Refusal> {
+    match special_file(path.file_name()) {
+        Some(SpecialFile::Gitattributes) if bytes > ATTR_MAX_FILE_SIZE => {
+            Some(Refusal::GitattributesTooLarge { bytes })
+        }
+        _ => None,
+    }
+}
+
+/// The content rules of special files, over `reader`.
+fn scan_content(path: &RepoPath, reader: impl BufRead) -> io::Result<Option<Refusal>> {
+    match special_file(path.file_name()) {
+        Some(SpecialFile::Gitattributes) => long_attribute_line(reader),
+        _ => Ok(None),
+    }
+}
+
 /// The first line of [`ATTR_MAX_LINE_LENGTH`] bytes or more (excluding its
 /// `\n`), as git's fsck measures it.
-fn long_attribute_line(content: &Path) -> io::Result<Option<Refusal>> {
-    let mut reader = BufReader::new(File::open(content)?);
+fn long_attribute_line(mut reader: impl BufRead) -> io::Result<Option<Refusal>> {
     let mut line = 0;
     loop {
         line += 1;
@@ -303,6 +352,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use CheckStage::{Commit, Record};
 
     fn p(path: &str) -> RepoPath {
         RepoPath::new(path).unwrap()
@@ -419,7 +469,10 @@ mod tests {
         };
 
         let ok = file(format!("{}\nshort\n", "a".repeat(2047)).as_bytes());
-        assert_eq!(c.check_file(&p(".gitattributes"), &ok).unwrap(), None);
+        assert_eq!(
+            c.check_file(&p(".gitattributes"), &ok, Commit).unwrap(),
+            None
+        );
 
         let long = file(format!("* text\n{}\nmore\n", "b".repeat(2048)).as_bytes());
         let refusal = Refusal::GitattributesLineTooLong {
@@ -434,16 +487,24 @@ mod tests {
             "gitatt~1",
             ".GitAttributes.",
         ] {
-            assert_eq!(c.check_file(&p(name), &long).unwrap(), expected, "{name}");
+            assert_eq!(
+                c.check_file(&p(name), &long, Commit).unwrap(),
+                expected,
+                "{name}"
+            );
         }
         for name in [".gitignore", "a.txt"] {
-            assert_eq!(c.check_file(&p(name), &long).unwrap(), None, "{name}");
+            assert_eq!(
+                c.check_file(&p(name), &long, Commit).unwrap(),
+                None,
+                "{name}"
+            );
         }
 
         // A last line without a newline is still checked.
         let last = file(format!("x\n{}", "c".repeat(3000)).as_bytes());
         assert_eq!(
-            c.check_file(&p(".gitattributes"), &last).unwrap(),
+            c.check_file(&p(".gitattributes"), &last, Commit).unwrap(),
             Some(Refusal::GitattributesLineTooLong {
                 line: 2,
                 bytes: 3000
@@ -452,7 +513,7 @@ mod tests {
         // CR is a byte of the line, as in git.
         let crlf = file(format!("{}\r\n", "d".repeat(2047)).as_bytes());
         assert_eq!(
-            c.check_file(&p(".gitattributes"), &crlf).unwrap(),
+            c.check_file(&p(".gitattributes"), &crlf, Commit).unwrap(),
             Some(Refusal::GitattributesLineTooLong {
                 line: 1,
                 bytes: 2048
@@ -461,14 +522,17 @@ mod tests {
         // Lines longer than the reader's buffer.
         let huge = file(format!("x\n\n{}\n", "e".repeat(20_000)).as_bytes());
         assert_eq!(
-            c.check_file(&p(".gitattributes"), &huge).unwrap(),
+            c.check_file(&p(".gitattributes"), &huge, Commit).unwrap(),
             Some(Refusal::GitattributesLineTooLong {
                 line: 3,
                 bytes: 20_000
             })
         );
         let empty = file(b"");
-        assert_eq!(c.check_file(&p(".gitattributes"), &empty).unwrap(), None);
+        assert_eq!(
+            c.check_file(&p(".gitattributes"), &empty, Commit).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -482,7 +546,7 @@ mod tests {
             .unwrap();
         let start = Instant::now();
         let refusal = Checks::default()
-            .check_file(&p(".gitattributes"), &path)
+            .check_file(&p(".gitattributes"), &path, Commit)
             .unwrap();
         assert_eq!(
             refusal,
@@ -515,8 +579,8 @@ mod tests {
         fs::write(&five, b"12345").unwrap();
         let six = dir.path().join("six");
         fs::write(&six, b"123456").unwrap();
-        assert_eq!(c.check_file(&p("f"), &five).unwrap(), None);
-        let refused = c.check_file(&p("f"), &six).unwrap().unwrap();
+        assert_eq!(c.check_file(&p("f"), &five, Commit).unwrap(), None);
+        let refused = c.check_file(&p("f"), &six, Commit).unwrap().unwrap();
         assert_eq!(
             refused,
             Refusal::BlobTooLarge {
@@ -549,8 +613,82 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(
             Checks::default()
-                .check_file(&p("a"), &dir.path().join("missing"))
+                .check_file(&p("a"), &dir.path().join("missing"), Record)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn record_stage_scans_only_up_to_the_sync_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Checks::default();
+        let attrs = p(".gitattributes");
+
+        // 2 MiB of short lines, then one over the line limit at the end.
+        let big = dir.path().join("big");
+        let mut content = "* text\n".repeat((2 << 20) / 7).into_bytes();
+        content.extend_from_slice(&[b'x'; 3000]);
+        fs::write(&big, &content).unwrap();
+        assert!(content.len() as u64 > SYNC_SCAN_LIMIT);
+        assert_eq!(c.check_file(&attrs, &big, Record).unwrap(), None);
+        let line = (2 << 20) / 7 + 1;
+        let refusal = Some(Refusal::GitattributesLineTooLong { line, bytes: 3000 });
+        assert_eq!(c.check_file(&attrs, &big, Commit).unwrap(), refusal);
+        assert_eq!(c.check_blob(&attrs, &content), refusal);
+
+        // A sparse file far over the bound but under the size limit is not
+        // read at record time at all.
+        let sparse = dir.path().join("sparse");
+        File::create(&sparse)
+            .unwrap()
+            .set_len(ATTR_MAX_FILE_SIZE - 1)
+            .unwrap();
+        let start = Instant::now();
+        assert_eq!(c.check_file(&attrs, &sparse, Record).unwrap(), None);
+        assert!(
+            start.elapsed().as_millis() < 500,
+            "the file must not be read"
+        );
+
+        // Up to the bound, the record stage scans as the commit stage does.
+        let small = dir.path().join("small");
+        fs::write(&small, format!("x\n{}\n", "y".repeat(2048))).unwrap();
+        for stage in [Record, Commit] {
+            assert!(
+                matches!(
+                    c.check_file(&attrs, &small, stage).unwrap(),
+                    Some(Refusal::GitattributesLineTooLong { line: 2, .. })
+                ),
+                "{stage}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_blob_agrees_with_check_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Checks::new(Limits {
+            max_blob_size: Some(BlobLimit {
+                bytes: 4000,
+                remote: "r".into(),
+            }),
+        });
+        let cases: [(&str, Vec<u8>); 6] = [
+            ("a.txt", b"hello".to_vec()),
+            ("a.txt", vec![b'z'; 4001]),
+            (".gitattributes", b"* text\n".to_vec()),
+            ("d/.gitattributes", [&b"x\n"[..], &[b'l'; 2500]].concat()),
+            (".gitattributes", vec![b'l'; 3000]),
+            ("gitatt~1", [&b"\n\n"[..], &[b'l'; 2048]].concat()),
+        ];
+        for (name, content) in cases {
+            let file = dir.path().join("content");
+            fs::write(&file, &content).unwrap();
+            assert_eq!(
+                c.check_blob(&p(name), &content),
+                c.check_file(&p(name), &file, Commit).unwrap(),
+                "{name}"
+            );
+        }
     }
 }

@@ -476,9 +476,11 @@ impl Recorder {
                         }
                         let (id, _) = self.pending.freeze(&backing)?;
                         frozen.push(id);
-                        if let Some(refusal) =
-                            self.checks.check_file(&path, &self.pending.path(id))?
-                        {
+                        if let Some(refusal) = self.checks.check_file(
+                            &path,
+                            &self.pending.path(id),
+                            CheckStage::Record,
+                        )? {
                             frozen.pop();
                             self.pending.remove([id])?;
                             self.refuse(&mut skipped, path, refusal);
@@ -726,9 +728,11 @@ impl Committer {
             let mut kept = Vec::with_capacity(record.draft.changes.len());
             for change in record.draft.changes {
                 let refusal = match &change {
-                    Change::Write { path, pending, .. } => {
-                        self.checks.check_file(path, &self.pending.path(*pending))?
-                    }
+                    Change::Write { path, pending, .. } => self.checks.check_file(
+                        path,
+                        &self.pending.path(*pending),
+                        CheckStage::Commit,
+                    )?,
                     Change::Symlink { path, target } => self.checks.check_symlink(path, target),
                     Change::Remove { .. } => None,
                 };
@@ -1091,6 +1095,54 @@ mod tests {
             .record(Trigger::Unlink, CALLER, vec![remove(".gitattributes")])
             .unwrap();
         assert_eq!(recorded.seq, None);
+    }
+
+    #[test]
+    fn a_large_rule_file_is_scanned_at_commit_time() {
+        let (dir, state) = setup();
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        let attrs = format!(
+            "{}{}",
+            "* text\n".repeat((crate::checks::SYNC_SCAN_LIMIT as usize) / 7 + 1),
+            "x".repeat(3000)
+        );
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![
+                    write(dir.path(), ".gitattributes", &attrs),
+                    write(dir.path(), "ok", "1"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, Some(0));
+        assert!(recorded.skipped.is_empty(), "{:?}", recorded.skipped);
+        assert!(sink.take().is_empty());
+
+        let report = com.commit_pending().unwrap();
+        assert_eq!(report.refused, 1);
+        assert_eq!(tree_paths(&com), ["ok"]);
+        let events = sink.take();
+        assert!(
+            matches!(
+                &events[..],
+                [Event::PathRefused {
+                    path,
+                    stage: CheckStage::Commit,
+                    reason: Refusal::GitattributesLineTooLong { .. },
+                }] if path == ".gitattributes"
+            ),
+            "{events:?}"
+        );
     }
 
     fn set_remote_limit(state: &StateDir, remote: &str, limit: u64) {

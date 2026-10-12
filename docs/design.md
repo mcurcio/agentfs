@@ -297,6 +297,11 @@ volumes should use XFS. The phase 1 benchmark (§18) measures this.
   smallest across remotes. Changing a remote's limits takes a remount. A path
   refused at commit time stays in the in-memory tracked set (§4) until the
   next open.
+- **The synchronous step stays bounded.** Size checks are a `stat` and
+  always run at record time. The content scan (the `.gitattributes`
+  line length) runs at record time only for files up to 1 MiB, the bound
+  tree rule files already have (§4.1). A larger file is scanned in full at commit time, where a refusal drops the change and
+  raises `PathRefused` with stage `commit`, like any commit-time refusal.
 - **Not yet checked:** the content rules for `.gitmodules` (`gitmodulesParse`,
   `gitmodulesUrl`, `gitmodulesPath`, `gitmodulesName`, `gitmodulesLarge`). A
   remote with `receive.fsckObjects` may refuse a commit carrying a hostile
