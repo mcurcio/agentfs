@@ -857,7 +857,9 @@ fn mount(
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
     // The patch queue, before anything can see the tree (design §12). A
-    // blocked queue is an alarm; the volume mounts anyway.
+    // blocked queue is an alarm; the volume mounts anyway, and so it does
+    // when the queue cannot run at all (apply_queue raised the alarm and
+    // recorded the failure).
     if let Err(e) = patch_cmd::apply_queue(
         state,
         &settings,
@@ -868,13 +870,7 @@ fn mount(
         &events,
         true,
     ) {
-        events.emit(Event::PatchBlocked {
-            inbox: 0,
-            patch: None,
-            reason: "failed",
-            message: format!("the patch queue could not run: {e:#}"),
-            queued: 0,
-        });
+        eprintln!("patches: the queue could not run: {e:#}");
     }
     let restorer = recorder.clone();
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;

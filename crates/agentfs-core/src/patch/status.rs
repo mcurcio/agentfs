@@ -47,6 +47,22 @@ pub struct PatchState {
     pub status_oid: Option<String>,
     /// When the queue last ran (milliseconds since the Unix epoch).
     pub updated_ms: u64,
+    /// The patch being written into the tree: set just before the write,
+    /// cleared when the run saves its state. Present at the start of a run
+    /// only after a crash between the write and the record (design §12).
+    pub in_flight: Option<InFlight>,
+}
+
+/// A patch whose write into the tree may have been interrupted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InFlight {
+    pub inbox: u64,
+    pub patch: String,
+    /// The branch head it was merged onto.
+    pub head: String,
+    /// The paths the write changes.
+    pub paths: Vec<String>,
 }
 
 impl PatchState {
@@ -240,6 +256,7 @@ mod tests {
             blocked: doc().blocked,
             status_oid: None,
             updated_ms: 5,
+            in_flight: None,
         };
         state.save(&path).unwrap();
         assert_eq!(PatchState::load(&path), state);

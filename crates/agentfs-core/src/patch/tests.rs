@@ -723,3 +723,153 @@ fn the_scan_cache_is_not_authoritative() {
         p1
     );
 }
+
+/// What `apply_inner` notes before writing patch `n` (`p`) on the head.
+fn note_in_flight(f: &Fixture, n: u64, p: Oid, paths: &[&str]) {
+    let path = f.state.patch_state();
+    let mut state = PatchState::load(&path);
+    state.in_flight = Some(status::InFlight {
+        inbox: n,
+        patch: p.to_string(),
+        head: f.head().to_string(),
+        paths: paths.iter().map(|s| s.to_string()).collect(),
+    });
+    state.save(&path).unwrap();
+}
+
+/// Crash (b), then the producer skips the patch: what the interrupted
+/// write left goes back to the head's state; nothing of it reaches the
+/// tree or history.
+#[test]
+fn crash_after_the_tree_write_then_the_patch_is_skipped() {
+    let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(
+        base,
+        &[
+            ("a.txt", Some("a1\n")),
+            ("b.txt", None),
+            ("d/e.txt", Some("e\n")),
+        ],
+        "patch",
+    );
+    f.queue(1, p1);
+    note_in_flight(&f, 1, p1, &["a.txt", "b.txt", "d/e.txt"]);
+    fs::write(f.root.join("a.txt"), "a1\n").unwrap();
+    fs::remove_file(f.root.join("b.txt")).unwrap();
+    // The producer skips 1: an empty commit on the head.
+    let skip = f.patch(base, &[], "agentfs: skip patch 1");
+    f.queue(1, skip);
+
+    let report = f.process();
+    assert_eq!(report.applied.len(), 1, "{report:?}");
+    assert_eq!(report.blocked, None);
+    assert_eq!(f.read("a.txt").as_deref(), Some("a0\n"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("b0\n"));
+    assert_eq!(f.read("d/e.txt"), None);
+    assert_eq!(f.at_head("a.txt").as_deref(), Some("a0\n"));
+    assert_eq!(f.at_head("b.txt").as_deref(), Some("b0\n"));
+    // The marker commit for the skip, right on the seed.
+    let head = f.repo().find_commit(f.head()).unwrap();
+    assert_eq!(head.parent_id(0).unwrap(), base);
+    assert_eq!(
+        head.tree_id(),
+        f.repo().find_commit(base).unwrap().tree_id()
+    );
+    assert_eq!(PatchState::load(&f.state.patch_state()).in_flight, None);
+}
+
+/// When the paths cannot be put back (here the head moved), they are
+/// recorded as they stand, so the tree still matches history.
+#[test]
+fn an_interrupted_write_that_cannot_be_put_back_is_recorded() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "patch");
+    note_in_flight(&f, 1, p1, &["a.txt"]);
+    let mut state = PatchState::load(&f.state.patch_state());
+    state.in_flight.as_mut().unwrap().head = "1".repeat(40);
+    state.save(&f.state.patch_state()).unwrap();
+    fs::write(f.root.join("a.txt"), "a1\n").unwrap();
+    // Patch 1 was withdrawn.
+    let report = f.process();
+    assert_eq!(report.applied.len(), 0, "{report:?}");
+    assert_eq!(f.at_head("a.txt").as_deref(), Some("a1\n"));
+    let head = f.repo().find_commit(f.head()).unwrap();
+    assert!(inbox_from_message(head.message().unwrap()).is_none());
+    assert_eq!(PatchState::load(&f.state.patch_state()).in_flight, None);
+}
+
+/// The same patch still queued: the run applies it as usual.
+#[test]
+fn an_interrupted_write_of_a_patch_still_queued_is_applied() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "patch");
+    f.queue(1, p1);
+    note_in_flight(&f, 1, p1, &["a.txt"]);
+    fs::write(f.root.join("a.txt"), "a1\n").unwrap();
+    let report = f.process();
+    assert_eq!(report.applied.len(), 1, "{report:?}");
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.at_head("a.txt").as_deref(), Some("a1\n"));
+}
+
+/// A queue that cannot run is recorded as blocked, for the gauges.
+#[test]
+fn a_failed_run_is_recorded_as_blocked() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    f.process();
+    let before = PatchState::load(&f.state.patch_state());
+    assert_eq!(before.blocked, None);
+    // The status ref cannot be written: it is locked.
+    fs::create_dir_all(f.state.git().join("refs/agentfs/vol")).unwrap();
+    fs::write(f.state.git().join("refs/agentfs/vol/status.lock"), "").unwrap();
+    let tree = f.dir();
+    let telemetry = Telemetry::noop();
+    let mut queue = Queue::new(QueueContext {
+        state: &f.state,
+        recorder: &f.recorder,
+        committer: &f.committer,
+        tree: &tree,
+        objects: &NoLfs,
+        telemetry: &telemetry,
+        caller: CALLER,
+    });
+    assert!(queue.process(None).is_err());
+    let after = PatchState::load(&f.state.patch_state());
+    let blocked = after.blocked.unwrap();
+    assert_eq!((blocked.inbox, blocked.reason), (0, BlockReason::Failed));
+    assert!(
+        blocked.message.contains("could not run"),
+        "{}",
+        blocked.message
+    );
+    assert!(after.updated_ms >= before.updated_ms);
+}
+
+/// A stale entry is a warning event.
+#[test]
+fn ignored_entries_raise_a_warning() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
+    f.queue(1, p1);
+    f.process();
+    f.events();
+    let other = f.patch(f.head(), &[("a.txt", Some("other\n"))], "1 again");
+    f.queue(1, other);
+    f.process();
+    let warned: Vec<Event> = f
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, Event::PatchIgnored { .. }))
+        .collect();
+    assert_eq!(
+        warned,
+        [Event::PatchIgnored {
+            ref_name: inbox_ref("vol", 1),
+            inbox: Some(1),
+            patch: Some(other),
+            why: "stale".into(),
+        }]
+    );
+    assert!(warned[0].is_alarm());
+}

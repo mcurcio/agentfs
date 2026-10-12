@@ -20,8 +20,9 @@ use agentfs_core::events::{Event, Events};
 use agentfs_core::history::History;
 use agentfs_core::lfs::fetch::Fetcher;
 use agentfs_core::lock::StateLock;
+use agentfs_core::patch::BlockReason;
 use agentfs_core::patch::fetch::{FetchOutcome, fetch_inbox};
-use agentfs_core::patch::queue::{Queue, QueueContext, QueueReport};
+use agentfs_core::patch::queue::{Queue, QueueContext, QueueReport, record_failure};
 use agentfs_core::patch::status::{PatchState, StatusDoc, read_status};
 use agentfs_core::patch::status_ref;
 use agentfs_core::patch::submit::{self, GitCli, Source, SubmitRequest};
@@ -124,8 +125,10 @@ pub fn run(
                 session.telemetry(),
                 &session.events,
                 !no_fetch,
-            )?;
+            );
+            // Telemetry is flushed on failure too: the alarm and gauges.
             session.finish();
+            let report = report?;
             Ok(if report.blocked.is_some() {
                 ExitCode::FAILURE
             } else {
@@ -228,7 +231,7 @@ fn status_cmd(state: &StateDir, json: bool) -> Result<ExitCode> {
         }
         if let Some(b) = &status.blocked {
             println!("blocked:   {} ({}): {}", b.inbox, b.reason, b.message);
-            println!("           {}", b.reason.hint());
+            println!("           {}", b.hint());
         }
         for i in &status.ignored {
             println!("ignored:   {} ({})", i.ref_name, i.why);
@@ -241,10 +244,40 @@ fn status_cmd(state: &StateDir, json: bool) -> Result<ExitCode> {
 /// serving the tree, fetch the inbox from the patch remote (best effort,
 /// unless `fetch` is false or `agentfs.patchFetchTimeout` is 0) and apply
 /// the queue. A blocked queue is an alarm, not an error: the volume
-/// serves anyway. An `Err` is a failure to read the history or the state
-/// area.
+/// serves anyway. An `Err` is a failure to run the queue at all (reading
+/// the history or the state area, opening the tree or the LFS cache): it
+/// raises a `PatchBlocked` alarm (reason `failed`, inbox 0) and is recorded
+/// as blocked in `meta/patch.json` and the status ref, so the gauges and
+/// `agentfs status` show it.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_queue(
+    state: &StateDir,
+    settings: &Settings,
+    recorder: &Recorder,
+    committer: &Committer,
+    root: &Path,
+    telemetry: &Telemetry,
+    events: &Events,
+    fetch: bool,
+) -> Result<QueueReport> {
+    apply_queue_inner(
+        state, settings, recorder, committer, root, telemetry, events, fetch,
+    )
+    .inspect_err(|e| {
+        let message = format!("the patch queue could not run: {e:#}");
+        record_failure(state, Some(committer), &message);
+        events.emit(Event::PatchBlocked {
+            inbox: 0,
+            patch: None,
+            reason: BlockReason::Failed.as_str(),
+            message,
+            queued: 0,
+        });
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_queue_inner(
     state: &StateDir,
     settings: &Settings,
     recorder: &Recorder,
@@ -320,7 +353,7 @@ pub fn apply_queue(
             b.reason,
             b.message,
             report.queue_depth,
-            b.reason.hint()
+            b.hint()
         ),
         None if !report.applied.is_empty() || fetched.is_some() => eprintln!(
             "patches: through {} applied, none queued",

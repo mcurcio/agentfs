@@ -577,11 +577,16 @@ whole, consistent groups instead.
   watch the alarms.
 - **Alarms** are printed to stderr and exported as telemetry logs (see the
   README): `PathRefused`, `RecordFailed`, `CommitFailed`, `PushFailed`,
-  `Diverged`, `RemoteMisconfigured`, `PatchBlocked`, `PatchFetchFailed`.
+  `Diverged`, `RemoteMisconfigured`, `PatchBlocked`, `PatchFetchFailed`,
+  `PatchIgnored` (a warning: a stale inbox entry that is never applied).
 - **`patches: blocked at N (<reason>)`** at mount: patch N could not be
   applied; the mount serves without it and the patches after it. The
   reason and its fix are in
   [patch-queue.md](runbooks/patch-queue.md#4-a-blocked-queue).
+- **`patches: the queue could not run`** at mount (and `blocked at 0
+  (failed)` in `agentfs status`): the patch phase failed as a whole, so no
+  patch was applied; the message says why (the LFS cache, the backing
+  tree, a locked ref). The mount serves anyway; fix the cause and restart.
 - **`failed (<kind>, stage queue)`** from `push`: the patch remote's
   queue refs (status, applied, inbox) were not pushed; the branch push is
   unaffected and the queue push is retried with the next push.

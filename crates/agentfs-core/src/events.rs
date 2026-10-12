@@ -196,6 +196,16 @@ pub enum Event {
         /// Patches still queued, the blocked one included.
         queued: usize,
     },
+    /// An inbox entry the queue does not apply and that does not block it
+    /// (design §12): `stale` (numbered at or below the last applied patch,
+    /// with another commit; the queue push deletes it on the remote) or
+    /// `malformed`. A warning: a producer's change was not applied.
+    PatchIgnored {
+        ref_name: String,
+        inbox: Option<u64>,
+        patch: Option<Oid>,
+        why: String,
+    },
     /// Fetching the patch queue from its remote failed; the queue ran with
     /// what was already fetched (design §12).
     PatchFetchFailed {
@@ -225,6 +235,7 @@ impl Event {
             Self::PushSucceeded { .. } => "push_succeeded",
             Self::PatchApplied { .. } => "patch_applied",
             Self::PatchBlocked { .. } => "patch_blocked",
+            Self::PatchIgnored { .. } => "patch_ignored",
             Self::PatchFetchFailed { .. } => "patch_fetch_failed",
         }
     }
@@ -322,6 +333,16 @@ impl fmt::Display for Event {
                 "patch queue blocked at {inbox} ({}, {reason}): {message}; {queued} patch(es) \
                  queued",
                 oid_or(*patch, "no patch"),
+            ),
+            Self::PatchIgnored {
+                ref_name,
+                inbox: _,
+                patch,
+                why,
+            } => write!(
+                f,
+                "patch queue: ignoring {ref_name} ({}, {why}); it is never applied",
+                oid_or(*patch, "no commit"),
             ),
             Self::PatchFetchFailed {
                 remote,

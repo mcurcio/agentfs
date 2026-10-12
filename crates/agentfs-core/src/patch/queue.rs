@@ -29,7 +29,13 @@
 //! run's check keeps as steps with nothing to write and records; a crash
 //! after the record is committed by journal replay and found by the
 //! trailer scan; a crash after the commit leaves only the ref moves, which
-//! step 3 does.
+//! step 3 does. The patch being written is noted in `meta/patch.json`
+//! ([`InFlight`]) first, so if a crash after the tree write is followed by
+//! the producer replacing, skipping or withdrawing that patch, the next run
+//! puts the paths it wrote back to the branch head's state (or, when that
+//! cannot be done, records them as they stand, as a patch operation
+//! without an inbox number) before it applies anything: the tree never
+//! keeps content that history does not have.
 //!
 //! A write that fails part way is recorded as it stands, as a patch
 //! operation without an inbox number, so the tree matches history and the
@@ -43,7 +49,8 @@ use opentelemetry::KeyValue;
 
 use super::fetch::FetchOutcome;
 use super::status::{
-    AppliedEntry, FetchStatus, PatchState, QueueEntry, STATUS_VERSION, StatusDoc, write_status_ref,
+    AppliedEntry, FetchStatus, InFlight, PatchState, QueueEntry, STATUS_VERSION, StatusDoc,
+    write_status_ref,
 };
 use super::{
     BlockReason, Blocked, Ignored, MAX_PATCH_PATHS, PatchError, applied_ref, inbox_from_message,
@@ -55,7 +62,7 @@ use crate::history::InboxCommit;
 use crate::lfs::fetch::LfsObjects;
 use crate::paths::RepoPath;
 use crate::record::{Caller, Operation, OperationKind, PatchAuthor};
-use crate::restore::{self, NotLive, Plan, RecordMode, RestoreError, Step};
+use crate::restore::{self, Applied, NotLive, Plan, RecordMode, RestoreError, Step};
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::{Committer, OperationSpec, Recorder, StateDir};
 
@@ -114,7 +121,18 @@ impl<'a> Queue<'a> {
     /// fetch before it went, for the status document. Fails only when the
     /// history or the state area cannot be read; a patch that cannot be
     /// applied blocks the queue instead.
+    ///
+    /// A failure is recorded as blocked (`failed`, inbox 0) in
+    /// `meta/patch.json` and, if it can be, the status ref
+    /// ([`record_failure`]), so the gauges and `agentfs status` show it.
     pub fn process(&mut self, fetch: Option<&FetchOutcome>) -> Result<QueueReport, PatchError> {
+        self.process_inner(fetch).inspect_err(|e| {
+            let message = format!("the patch queue could not run: {e}");
+            record_failure(self.cx.state, Some(self.cx.committer), &message);
+        })
+    }
+
+    fn process_inner(&mut self, fetch: Option<&FetchOutcome>) -> Result<QueueReport, PatchError> {
         let committer = self.cx.committer;
         committer.commit_pending()?;
         let history = committer.history();
@@ -191,6 +209,20 @@ impl<'a> Queue<'a> {
                     why: "stale".into(),
                 }),
             }
+        }
+
+        for i in &ignored {
+            self.cx.recorder.events().emit(Event::PatchIgnored {
+                ref_name: i.ref_name.clone(),
+                inbox: i.inbox,
+                patch: i.patch.as_deref().and_then(|p| Oid::from_str(p).ok()),
+                why: i.why.clone(),
+            });
+        }
+
+        // A write a crash interrupted, of a patch that has changed since.
+        if let Some(f) = state.in_flight.take() {
+            self.recover_in_flight(&f, last_applied, &inbox)?;
         }
 
         // The rest, in order.
@@ -463,6 +495,17 @@ impl<'a> Queue<'a> {
                 return block(reason, e.to_string(), error_paths(&e));
             }
         };
+        // Noted before the write, for a crash before the record (see the
+        // module docs); the run's own save clears it.
+        let state_path = self.cx.state.patch_state();
+        let mut noted = PatchState::load(&state_path);
+        noted.in_flight = Some(InFlight {
+            inbox: n,
+            patch: patch_oid.to_string(),
+            head: head.id().to_string(),
+            paths: plan.steps.iter().map(|s| s.path.to_string()).collect(),
+        });
+        noted.save(&state_path)?;
         let guard = recorder.begin_operation_spec(spec.clone(), &[caller.pid])?;
         let result = restore::apply(&plan, repo, *objects, tree, &NotLive, false);
         match result {
@@ -533,6 +576,92 @@ impl<'a> Queue<'a> {
                 block(BlockReason::Failed, message, vec![e.path.clone()])
             }
         }
+    }
+
+    /// After a crash between writing patch `f.inbox` into the tree and
+    /// recording it: if the branch has not applied that number and the
+    /// inbox no longer holds that patch (replaced, skipped, withdrawn), the
+    /// paths it wrote go back to the branch head's state, or, when that
+    /// cannot be done, are recorded as they stand without an inbox number.
+    /// When the same patch is still queued, the run applies it as usual.
+    fn recover_in_flight(
+        &self,
+        f: &InFlight,
+        last_applied: u64,
+        inbox: &BTreeMap<u64, Oid>,
+    ) -> Result<(), PatchError> {
+        let patch = Oid::from_str(&f.patch).ok();
+        if f.inbox <= last_applied || (patch.is_some() && inbox.get(&f.inbox) == patch.as_ref()) {
+            return Ok(());
+        }
+        if self.put_back(f, patch).is_ok() {
+            return Ok(());
+        }
+        let QueueContext {
+            recorder,
+            committer,
+            tree,
+            caller,
+            ..
+        } = &self.cx;
+        let spec = OperationSpec::new(
+            OperationKind::Patch,
+            f.patch.clone(),
+            format!(
+                "part of patch {} (interrupted, then replaced or withdrawn)",
+                f.inbox
+            ),
+            *caller,
+        );
+        let written: Vec<RepoPath> = f
+            .paths
+            .iter()
+            .filter_map(|p| RepoPath::new(p.clone()).ok())
+            .collect();
+        let guard = recorder.begin_operation_spec(spec, &[caller.pid])?;
+        // What cannot be recorded is left for the check, which blocks on
+        // it as `unrecorded`.
+        let _ = restore::record_applied(
+            recorder,
+            tree,
+            &Applied {
+                written,
+                removed: Vec::new(),
+            },
+            *caller,
+            RecordMode::Chunked(PARTIAL_RECORD_CHUNK),
+        );
+        guard.finish();
+        committer.commit_pending()?;
+        Ok(())
+    }
+
+    /// Writes the paths `f`'s patch changes back to the branch head's
+    /// state, if the head is still the one it was merged onto.
+    fn put_back(&self, f: &InFlight, patch: Option<Oid>) -> Result<(), String> {
+        let history = self.cx.committer.history();
+        let repo = history.repo();
+        let head = history
+            .head()
+            .map_err(|e| e.to_string())?
+            .ok_or("no branch head")?;
+        if head.id().to_string() != f.head {
+            return Err("the branch head moved".into());
+        }
+        let patch = repo
+            .find_commit(patch.ok_or("not a commit id")?)
+            .map_err(|e| e.to_string())?;
+        let mut index = repo
+            .cherrypick_commit(&patch, &head, 0, None)
+            .map_err(|e| e.to_string())?;
+        if index.has_conflicts() {
+            return Err("the merge conflicts".into());
+        }
+        let merged = index.write_tree_to(repo).map_err(|e| e.to_string())?;
+        let plan = restore::plan_tree(repo, head.id(), patch.id(), merged, String::new())
+            .map_err(|e| e.to_string())?;
+        let paths: Vec<RepoPath> = plan.steps.iter().map(|s| s.path.clone()).collect();
+        self.write_back(&plan, &paths, &paths)
     }
 
     /// Puts the paths of `plan` that were written or removed back to the
@@ -720,4 +849,54 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Records that the patch queue could not run at all (design §12): blocked
+/// with reason `failed` at inbox 0 in `meta/patch.json`, so the
+/// `agentfs.patch.blocked` gauge and `agentfs status` show it, and, when
+/// `committer` is given and the repository can be written, in a new status
+/// commit that the queue push takes to the remote. Best effort: it runs
+/// on a failure path, and the alarm is the caller's.
+pub fn record_failure(state: &StateDir, committer: Option<&Committer>, message: &str) {
+    let blocked = Blocked {
+        inbox: 0,
+        patch: None,
+        reason: BlockReason::Failed,
+        message: message.to_owned(),
+        paths: Vec::new(),
+    };
+    let path = state.patch_state();
+    let mut cache = PatchState::load(&path);
+    cache.version = STATUS_VERSION;
+    cache.blocked = Some(blocked.clone());
+    cache.updated_ms = now_ms();
+    if let Some(committer) = committer {
+        let history = committer.history();
+        let repo = history.repo();
+        let volume = history.settings().volume.clone();
+        let previous = repo
+            .refname_to_id(&super::status_ref(&volume))
+            .ok()
+            .and_then(|oid| super::status::read_status(repo, oid).ok());
+        let head = history.head().ok().flatten().map(|c| c.id().to_string());
+        let doc = StatusDoc {
+            version: STATUS_VERSION,
+            volume: volume.clone(),
+            branch: history.settings().branch_ref.clone(),
+            head,
+            updated: crate::push::utc_basic(now_ms() / 1000),
+            last_applied: previous.as_ref().and_then(|p| p.last_applied.clone()),
+            applied_now: Vec::new(),
+            queue: previous.map(|p| p.queue).unwrap_or_default(),
+            blocked: Some(blocked),
+            ignored: Vec::new(),
+            fetch: None,
+        };
+        if let Ok(signature) = committer.committer_signature()
+            && let Ok(oid) = write_status_ref(repo, &volume, &doc, &signature)
+        {
+            cache.status_oid = Some(oid.to_string());
+        }
+    }
+    let _ = cache.save(&path);
 }

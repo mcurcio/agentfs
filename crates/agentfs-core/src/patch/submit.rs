@@ -12,7 +12,12 @@
 //!    from `--put`/`--delete` (with a temporary index), or, for `--skip`,
 //!    an empty commit on `H`.
 //! 4. Its number is one past the highest inbox or applied number on the
-//!    remote (or the number being replaced).
+//!    remote, or, for `--replace N`/`--skip N`, `N`: a queued patch, or a
+//!    gap (a number below the highest one that the remote has neither as
+//!    inbox nor applied), which is filled create-only. A number the volume
+//!    has applied (the remote's `applied/N`, or `last_applied` in its
+//!    status ref, which reaches the remote even while applied refs are
+//!    held back) is refused: a replacement would only be ignored as stale.
 //! 5. `git push --force-with-lease=<ref>: <oid>:<ref>` creates the inbox
 //!    ref only if it does not exist yet (`<ref>:<oid>` for a replacement,
 //!    which must still hold what was listed). A submitter that loses a race
@@ -27,7 +32,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use super::{applied_prefix, inbox_prefix, inbox_ref, seq_of_ref};
+use super::{applied_prefix, applied_ref, inbox_prefix, inbox_ref, seq_of_ref, status_ref};
 
 /// The default number of numbers tried before giving up on a race.
 pub const DEFAULT_ATTEMPTS: u32 = 10;
@@ -57,8 +62,16 @@ pub enum SubmitError {
         head: String,
         shallow: &'static str,
     },
-    #[error("patch {0} is not queued on the remote, so it cannot be replaced")]
+    #[error(
+        "patch {0} is not queued on the remote and is not a gap below the highest number, so \
+         it cannot be replaced or skipped"
+    )]
     NotQueued(u64),
+    #[error(
+        "patch {0} is already applied on the volume (the remote's applied ref or status says \
+         so); a replacement would never be applied: submit a new patch instead"
+    )]
+    AlreadyApplied(u64),
     #[error("lost the race for an inbox number {attempts} times; try again")]
     Raced { attempts: u32 },
     #[error("the remote refused {ref_name}: {message}")]
@@ -279,11 +292,25 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
         (_, r) => r,
     };
     if let Some(n) = replace {
+        if n == 0 {
+            return Err(SubmitError::BadRequest("inbox numbers start at 1".into()));
+        }
         let ref_name = inbox_ref(&req.volume, n);
-        let Some(current) = listing.get(&ref_name) else {
-            return Err(SubmitError::NotQueued(n));
+        // Applied already, even if the remote still lists it: a
+        // replacement would only ever be ignored as stale.
+        if listing.contains_key(&applied_ref(&req.volume, n))
+            || remote_last_applied(git, req, &listing).is_some_and(|last| last >= n)
+        {
+            return Err(SubmitError::AlreadyApplied(n));
+        }
+        let expected = match listing.get(&ref_name) {
+            Some(current) => current.clone(),
+            // A gap (a missing number below the highest one): filled
+            // create-only.
+            None if n < next_seq(&req.volume, listing.keys()) => String::new(),
+            None => return Err(SubmitError::NotQueued(n)),
         };
-        return match push(git, req, &oid, &ref_name, current)? {
+        return match push(git, req, &oid, &ref_name, &expected)? {
             PushLine::Ok => Ok(Submitted {
                 inbox: n,
                 ref_name,
@@ -353,6 +380,36 @@ fn ls_remote(
         .into_iter()
         .filter(|(name, _)| *name == branch_ref || name.starts_with(&prefix))
         .collect())
+}
+
+/// The highest number the volume has applied, as the remote's status ref
+/// says (`last_applied.inbox` in its `status.json`). The status reaches
+/// the remote even while the branch and the applied refs cannot, so it
+/// catches a patch applied whose applied ref is held back. `None` when
+/// there is no status or it cannot be read: best effort.
+fn remote_last_applied(
+    git: &impl GitRunner,
+    req: &SubmitRequest,
+    listing: &BTreeMap<String, String>,
+) -> Option<u64> {
+    let name = status_ref(&req.volume);
+    let oid = listing.get(&name)?;
+    let base = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"];
+    let by_oid = [&base[..], &[req.remote.as_str(), oid.as_str()]].concat();
+    let fetched = git.run(&by_oid, &[]).is_ok_and(|o| o.success)
+        || git
+            .run(&["fetch", "--quiet", "--no-tags", &req.remote, &name], &[])
+            .is_ok_and(|o| o.success);
+    if !fetched {
+        return None;
+    }
+    let spec = format!("{oid}:{}", super::status::STATUS_FILE);
+    let out = git.run(&["cat-file", "blob", &spec], &[]).ok()?;
+    if !out.success {
+        return None;
+    }
+    let doc: serde_json::Value = serde_json::from_str(&out.stdout).ok()?;
+    doc.get("last_applied")?.get("inbox")?.as_u64()
 }
 
 /// `git push` of `oid` to `ref_name`, leased on the remote holding
@@ -627,6 +684,8 @@ mod tests {
         remote: RefCell<BTreeMap<String, String>>,
         /// Numbers someone else takes just before this submitter's push.
         steal: RefCell<Vec<u64>>,
+        /// `status.json` of the remote's status ref, for `git cat-file`.
+        status: RefCell<Option<String>>,
     }
 
     const HEAD: &str = "1111111111111111111111111111111111111111";
@@ -643,6 +702,7 @@ mod tests {
                         .collect(),
                 ),
                 steal: RefCell::new(Vec::new()),
+                status: RefCell::new(None),
             }
         }
 
@@ -671,7 +731,17 @@ mod tests {
                         .collect();
                     Self::ok(&out)
                 }
-                "fetch" | "merge-base" => Self::ok(""),
+                "fetch" | "merge-base" | "read-tree" | "update-index" => Self::ok(""),
+                "write-tree" => Self::ok(&format!("{OTHER}\n")),
+                "commit-tree" => Self::ok(&format!("{PATCH}\n")),
+                "cat-file" => match self.status.borrow().as_deref() {
+                    Some(json) => Self::ok(json),
+                    None => Ok(GitOutput {
+                        success: false,
+                        code: Some(128),
+                        ..GitOutput::default()
+                    }),
+                },
                 "rev-parse" => Self::ok(&format!("{PATCH}\n")),
                 "rev-list" => Self::ok(&format!("{PATCH} {HEAD}\n")),
                 "push" => {
@@ -780,6 +850,82 @@ mod tests {
             submit(&git, &req).unwrap_err(),
             SubmitError::NotQueued(3)
         ));
+    }
+
+    /// A missing number below the highest one is a gap: `--skip N` and
+    /// `--replace N` fill it create-only.
+    #[test]
+    fn skip_and_replace_fill_a_gap() {
+        let git = FakeGit::new(&[
+            ("refs/heads/agentfs/v", HEAD),
+            ("refs/agentfs/v/applied/0000000001", OTHER),
+            ("refs/agentfs/v/inbox/0000000003", OTHER),
+        ]);
+        let done = submit(&git, &request(Source::Skip(2))).unwrap();
+        assert_eq!(done.inbox, 2);
+        let push = git
+            .calls
+            .borrow()
+            .iter()
+            .find(|c| c[0] == "push")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            push[3],
+            "--force-with-lease=refs/agentfs/v/inbox/0000000002:"
+        );
+        assert_eq!(
+            git.remote.borrow()["refs/agentfs/v/inbox/0000000002"],
+            PATCH
+        );
+        // Not a gap: above the highest number.
+        let mut req = request(Source::Commit("HEAD".into()));
+        req.replace = Some(4);
+        assert!(matches!(
+            submit(&git, &req).unwrap_err(),
+            SubmitError::NotQueued(4)
+        ));
+        // A gap filled by --replace.
+        git.remote
+            .borrow_mut()
+            .insert("refs/agentfs/v/inbox/0000000006".into(), OTHER.into());
+        req.replace = Some(5);
+        assert_eq!(submit(&git, &req).unwrap().inbox, 5);
+    }
+
+    /// A number the volume applied is refused, even while the remote still
+    /// lists its inbox ref (applied ref held back, or not deleted yet).
+    #[test]
+    fn replacing_an_applied_patch_is_refused() {
+        let git = FakeGit::new(&[
+            ("refs/heads/agentfs/v", HEAD),
+            ("refs/agentfs/v/inbox/0000000004", OTHER),
+            ("refs/agentfs/v/inbox/0000000005", OTHER),
+            ("refs/agentfs/v/status", OTHER),
+        ]);
+        *git.status.borrow_mut() = Some(r#"{"last_applied": {"inbox": 4}}"#.into());
+        let mut req = request(Source::Commit("HEAD".into()));
+        req.replace = Some(4);
+        assert!(matches!(
+            submit(&git, &req).unwrap_err(),
+            SubmitError::AlreadyApplied(4)
+        ));
+        assert!(matches!(
+            submit(&git, &request(Source::Skip(4))).unwrap_err(),
+            SubmitError::AlreadyApplied(4)
+        ));
+        req.replace = Some(5);
+        assert_eq!(submit(&git, &req).unwrap().inbox, 5);
+        // The applied ref says so too.
+        git.remote
+            .borrow_mut()
+            .insert("refs/agentfs/v/applied/0000000005".into(), OTHER.into());
+        assert!(matches!(
+            submit(&git, &req).unwrap_err(),
+            SubmitError::AlreadyApplied(5)
+        ));
+        assert!(git.calls.borrow().iter().all(|c| c[0] != "push"
+            || c[3] != format!("--force-with-lease=refs/agentfs/v/inbox/0000000004:{OTHER}")));
     }
 
     #[test]

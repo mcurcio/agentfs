@@ -528,6 +528,7 @@ impl EventSink for TelemetrySink {
             | Event::PushSucceeded { .. }
             | Event::PatchApplied { .. }
             | Event::PatchBlocked { .. }
+            | Event::PatchIgnored { .. }
             | Event::PatchFetchFailed { .. } => {}
         }
         if event.is_alarm()
@@ -569,6 +570,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::PushSucceeded { .. } => "agentfs.push_succeeded",
         Event::PatchApplied { .. } => "agentfs.patch_applied",
         Event::PatchBlocked { .. } => "agentfs.patch_blocked",
+        Event::PatchIgnored { .. } => "agentfs.patch_ignored",
         Event::PatchFetchFailed { .. } => "agentfs.patch_fetch_failed",
     }
 }
@@ -687,6 +689,21 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             out.push(("agentfs.message", s(message)));
             out.push(("agentfs.patch.queued", AnyValue::Int(*queued as i64)));
         }
+        Event::PatchIgnored {
+            ref_name,
+            inbox,
+            patch,
+            why,
+        } => {
+            out.push(("agentfs.patch.ref", s(ref_name)));
+            if let Some(n) = inbox {
+                out.push(("agentfs.patch.inbox", AnyValue::Int(*n as i64)));
+            }
+            if let Some(p) = patch {
+                out.push(("agentfs.patch.oid", oid(p)));
+            }
+            out.push(("agentfs.patch.why", s(why)));
+        }
         Event::PatchFetchFailed {
             remote,
             kind,
@@ -705,7 +722,7 @@ impl<L: Logger + Send + Sync> AlarmLog for OtelAlarmLog<L> {
         let (severity, text) = match event {
             Event::PathRefused { .. } => (Severity::Warn, "WARN"),
             Event::PushSucceeded { .. } | Event::PatchApplied { .. } => (Severity::Info, "INFO"),
-            Event::PatchFetchFailed { .. } => (Severity::Warn, "WARN"),
+            Event::PatchFetchFailed { .. } | Event::PatchIgnored { .. } => (Severity::Warn, "WARN"),
             _ => (Severity::Error, "ERROR"),
         };
         let name = event_name(event);

@@ -19,7 +19,7 @@ BRANCH=agentfs/$VOL                                # the volume's branch
 ## What a patch is
 
 - **One commit with exactly one parent**, the branch commit it was written
-  against: the head, or a first-parent ancestor of it (agentfs merges it
+  against: the head, or any ancestor of it (agentfs merges it
   onto the head as `git cherry-pick` would).
 - At most 4096 changed paths, regular files and symlinks only (no
   submodules), and only paths agentfs records (no `.git` components).
@@ -70,8 +70,15 @@ parent <commit>)`. Options:
 | `--repo DIR` | The producer's repository (default `.`) |
 | `--put PATH=FILE`, `--delete PATH` | Build the patch on the remote head; repeatable |
 | `-m MSG`, `--author 'Name <email>'` | Message and author of a built patch |
-| `--replace N` | Replace queued patch N (it must still be the commit listed) |
-| `--skip N` | Replace queued patch N with an empty patch, so the queue moves on |
+| `--replace N` | Replace queued patch N (it must still be the commit listed), or fill a gap at N |
+| `--skip N` | Replace queued patch N with an empty patch, or fill a gap at N with one, so the queue moves on |
+
+A gap is a number below the highest one listed that the remote has
+neither as `inbox/N` nor as `applied/N`; `--replace N` and `--skip N` fill
+it create-only. Both refuse a number the volume has already applied (the
+remote's `applied/N`, or `last_applied` in its status ref, which is pushed
+even while the applied refs wait for the branch): a replacement would
+never be applied. Submit a new patch instead.
 | `--depth D` | Fetch only D commits (shallow producers) |
 | `--attempts K` | Numbers to try when other submitters race (default 10) |
 
@@ -96,7 +103,8 @@ If the push is rejected (`stale info`), another producer took that number:
 list again and try the next one. Never push to a number that exists
 unless you mean to replace that patch (lease on its current oid:
 `--force-with-lease=$REF:<oid listed>`), and never reuse a number below
-the highest applied one: it is ignored as `stale`.
+the highest applied one: it is ignored as `stale` (the warning
+`PatchIgnored`), never applied, and deleted by the next queue push.
 
 ## 2. When patches apply
 
@@ -150,8 +158,8 @@ git show FETCH_HEAD:status.json
 | `fetch` | `{remote, ok, error}` of this run's fetch, or `null` when none ran |
 
 Telemetry: `agentfs.patch.queue_depth`, `agentfs.patch.blocked` (alert on
-it being 1), the span `agentfs.patch`, and the `PatchBlocked` and
-`PatchFetchFailed` alarms.
+it being 1), the span `agentfs.patch`, the `PatchBlocked` and
+`PatchFetchFailed` alarms, and the `PatchIgnored` warning.
 
 ## 4. A blocked queue
 
@@ -163,13 +171,20 @@ patches before it applied. Nothing of the blocked patch is written.
 | Reason | Cause | Fix |
 |---|---|---|
 | `conflict` | The patch conflicts with changes on the branch since its parent; `paths` lists them | Rebase it onto the current head and `--replace N` |
-| `gap` | Number N is missing while later ones are queued | Submit N, or `--skip N` |
+| `gap` | Number N is missing while later ones are queued | `agentfs patch submit --volume "$VOL" --skip N`, or `--replace N` with the missing patch (both fill N create-only) |
 | `parent_not_in_history` | Its parent is not on the volume's branch | Rebase onto the branch and `--replace N` |
 | `merge_commit` | More than one parent | Squash it and `--replace N` |
 | `unsupported` | A root commit, a submodule, or a path agentfs does not record | Remove the path and `--replace N`, or `--skip N` |
 | `too_large` | More than 4096 paths | Split it: `--replace N` with the first part, then submit the rest |
-| `unrecorded` | The tree holds changes history does not have yet where the patch writes | Mount without the patch (it blocks, the mount records the change), then restart again |
+| `unrecorded` | The tree differs from history where the patch writes (`paths` lists them): a change not recorded, a pending repair, something untracked in the way | Record the paths with the volume stopped, `agentfs --state "$STATE" --root "$BACKING" record <paths>` (or finish the repair or restore that left them), then restart. The mount only commits what is journaled; it never records other differences by itself |
 | `failed` | Writing or recording failed, or an LFS object could not be found | Read the message; fix the state area or the LFS server, restart |
+
+`blocked at 0 (failed)` means the queue could not run at all (the LFS
+cache or the backing tree could not be opened, a ref was locked, history
+could not be read): no patch was applied this time. The mount says
+`patches: the queue could not run: ...` and raises `PatchBlocked`;
+`meta/patch.json`, the gauge and the status ref say blocked. Fix the
+cause and restart, or run `agentfs patch apply` with the volume stopped.
 
 To rebase a conflicting patch:
 
@@ -197,8 +212,13 @@ above, never by refs or `meta/patch.json`. The refs move only after the
 commit, so a crash at any point applies each patch exactly once: a
 recorded but uncommitted patch is committed by journal replay, and a
 committed patch whose refs did not move is recognised and its refs moved
-(`patch(es) N were already applied; their refs are moved`). Nothing to do
-by hand.
+(`patch(es) N were already applied; their refs are moved`). A crash after
+the patch was written into the tree but before it was recorded is noted in
+`meta/patch.json` (`in_flight`): if the producer then replaced, skipped
+or withdrew the patch, the next run puts the paths it wrote back as the
+branch has them (or, failing that, records them as they stand) before
+applying anything, so the tree never keeps content history lacks.
+Nothing to do by hand.
 
 ## 6. Configuration
 
@@ -207,7 +227,10 @@ by hand.
 | `agentfs.patchRemote` | the only remote, if exactly one | The remote whose `inbox/*` is fetched and which gets the queue push; `none` turns both off (patches already fetched still apply) |
 | `agentfs.patchFetchTimeout` | `30s` | How long a mount waits for the fetch; `0` or `off` skips it |
 
-The queue push (status ref, `applied/<n>`, deleting `inbox/<n>`) runs after
-each branch push to the patch remote; `agentfs push` prints it as
+The queue push (status ref, `applied/<n>`, deleting `inbox/<n>` of applied
+numbers, stale ones included) runs after each branch push attempt to the
+patch remote, failed ones included, so the status is current on the
+remote even while the branch cannot push (applied refs and deletions wait
+for a branch push that worked); `agentfs push` prints it as
 `<remote>: queue: ...`. Its failures are `PushFailed` with stage `queue`
 and never count against the branch.

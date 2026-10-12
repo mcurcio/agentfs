@@ -257,7 +257,7 @@ agentfs --state /data/state --root /data/backing patch apply   # with the volume
   twice: the branch's trailers decide what is applied.
 - The first patch that conflicts (or is otherwise refused) blocks the
   queue; the mount carries on. Fix it with `patch submit --replace N` or
-  `--skip N`, then restart.
+  `--skip N` (both also fill a missing number), then restart.
 - The push to the patch remote (`agentfs.patchRemote`) moves
   `applied/<n>`, deletes `inbox/<n>` and updates the status ref
   (`refs/agentfs/<volume>/status`, holding `status.json`).

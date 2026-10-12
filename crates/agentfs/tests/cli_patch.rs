@@ -494,3 +494,90 @@ fn apply_needs_the_lock_and_a_root() {
         "{status}"
     );
 }
+
+/// A gap (a number missing below the highest one) is cleared with
+/// `--skip N`, and the queue moves on.
+#[test]
+fn a_gap_is_cleared_with_skip() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("a.txt", "a0\n");
+    s.ok(&["push"]);
+    let p = s.producer("p");
+    let a1 = s.file("a1", "a1\n");
+    let b1 = s.file("b1", "b1\n");
+    s.submit_ok(&p, &["--put", &format!("a.txt={a1}"), "-m", "one"]);
+    s.submit_ok(&p, &["--put", &format!("b.txt={b1}"), "-m", "two"]);
+    // Patch 1 vanishes from the remote.
+    Repository::open_bare(s.remote())
+        .unwrap()
+        .find_reference(&inbox(1))
+        .unwrap()
+        .delete()
+        .unwrap();
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("patches: blocked at 1 (gap)"), "{err}");
+    assert!(err.contains("`agentfs patch submit --skip 1`"), "{err}");
+
+    // As the hint says.
+    let out = s.submit_ok(&p, &["--skip", "1"]);
+    assert!(out.contains("queued patch 1"), "{out}");
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(s.tree().join("a.txt")).unwrap(), "a0\n");
+    assert_eq!(fs::read_to_string(s.tree().join("b.txt")).unwrap(), "b1\n");
+    assert_eq!(s.inbox_commits(1), 1);
+    assert_eq!(s.inbox_commits(2), 1);
+
+    // Applied: skipping it now is refused, by the applied ref or, without
+    // it (held back while the branch cannot push), by the remote status.
+    s.ok(&["push"]);
+    let out = s.submit(&p, &["--skip", "2"]);
+    assert!(
+        text(&out.stderr).contains("already applied"),
+        "{}",
+        text(&out.stderr)
+    );
+    Repository::open_bare(s.remote())
+        .unwrap()
+        .find_reference(&applied(2))
+        .unwrap()
+        .delete()
+        .unwrap();
+    let out = s.submit(&p, &["--skip", "2"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("already applied"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// A queue that cannot run at all is an alarm and reads as blocked
+/// (`failed`) in `agentfs status`, not as the previous run's state.
+#[test]
+fn a_queue_that_cannot_run_reads_as_blocked() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("a.txt", "a0\n");
+    s.ok(&["patch", "apply", "--no-fetch"]);
+    // The status ref is locked.
+    let refs = s.state().join("git/refs/agentfs/demo");
+    fs::create_dir_all(&refs).unwrap();
+    fs::write(refs.join("status.lock"), "").unwrap();
+    let out = s.agentfs(&["patch", "apply", "--no-fetch"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("alarm: "), "{err}");
+    let status = s.ok(&["status"]);
+    assert!(status.contains("blocked at 0 (failed)"), "{status}");
+    let json = s.ok(&["patch", "status", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(doc["cache"]["blocked"]["reason"], "failed");
+}

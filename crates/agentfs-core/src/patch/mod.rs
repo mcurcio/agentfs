@@ -141,7 +141,9 @@ impl BlockReason {
                  `agentfs patch submit --replace <n>`"
             }
             Self::Gap => {
-                "submit the missing number, or clear it with `agentfs patch submit --skip <n>`"
+                "a patch number is missing: submit the missing patch with `agentfs patch submit \
+                 --replace <n>`, or clear it with `agentfs patch submit --skip <n>` (both fill \
+                 the gap create-only)"
             }
             Self::ParentNotInHistory => {
                 "the patch must be written against a commit of the volume's branch; rebase it \
@@ -152,8 +154,9 @@ impl BlockReason {
                  symlinks (--replace <n>), or skip it (--skip <n>)"
             }
             Self::Unrecorded => {
-                "the tree holds changes history does not have yet; let the mount record them \
-                 (or finish the repair), then remount"
+                "the tree differs from history at the paths named (changes not recorded yet, or \
+                 something untracked in the way); record them with `agentfs record <paths>` (or \
+                 finish the repair or restore in progress), then remount"
             }
             Self::Failed => {
                 "see the message; fix the cause (an LFS object the producer did not upload, a \
@@ -180,6 +183,19 @@ pub struct Blocked {
     /// The paths involved (conflicts, refusals), if any.
     #[serde(default)]
     pub paths: Vec<String>,
+}
+
+impl Blocked {
+    /// [`BlockReason::hint`] with this patch's number in place of `<n>`;
+    /// for a queue that could not run at all (inbox 0), what to do then.
+    pub fn hint(&self) -> String {
+        if self.inbox == 0 {
+            return "the queue could not run (see the message); fix the cause and remount, or \
+                    run `agentfs patch apply` with the volume stopped"
+                .to_owned();
+        }
+        self.reason.hint().replace("<n>", &self.inbox.to_string())
+    }
 }
 
 /// An inbox entry the queue does not apply and that does not block it.

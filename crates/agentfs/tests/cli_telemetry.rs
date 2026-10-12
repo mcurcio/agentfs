@@ -627,3 +627,26 @@ fn a_blocked_patch_queue_exports_gauges_span_and_alarm() {
         "applied is not an alarm"
     );
 }
+
+/// A patch phase that cannot run at all reads as blocked on the gauge,
+/// not as the previous run's state.
+#[test]
+fn a_queue_that_cannot_run_sets_the_blocked_gauge() {
+    let collector = Collector::start();
+    let v = Volume::new();
+    fs::write(v.tree().join("a.txt"), "a0\n").unwrap();
+    let out = v.run(&["record", "a.txt"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = v.run(&["patch", "apply", "--no-fetch"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // The status ref is locked: the run fails as a whole.
+    let refs = v.dir.path().join("state/git/refs/agentfs/demo");
+    fs::create_dir_all(&refs).unwrap();
+    fs::write(refs.join("status.lock"), "").unwrap();
+    let out = v.run(
+        &["patch", "apply", "--no-fetch"],
+        &[("OTEL_EXPORTER_OTLP_ENDPOINT", &collector.endpoint())],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(gauge_last(&collector, "agentfs.patch.blocked"), Some(1));
+}
