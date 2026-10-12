@@ -19,6 +19,7 @@ mod fsutil;
 pub mod fsync_class;
 pub mod gitmodules;
 pub mod history;
+pub mod history_service;
 pub mod identity;
 pub mod journal;
 pub mod known_hosts;

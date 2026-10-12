@@ -33,6 +33,7 @@ use crate::config::{ConfigError, validate_name};
 use crate::events::{CheckStage, Event, Events};
 use crate::fsync_class::{self, FsyncClass, GroupMembers};
 use crate::history::{Committed, History, HistoryError};
+use crate::history_service::FrontLease;
 use crate::identity::{Context, IdentityRenderer};
 use crate::journal::{Journal, OpenReport};
 use crate::lfs::{ObjectCache, Store, StorePolicy};
@@ -49,6 +50,9 @@ use crate::tracked::Tracked;
 
 /// The control socket's name in `meta/control`.
 pub const CONTROL_SOCKET: &str = "agentfs.sock";
+
+/// The history service's default socket name in `meta/history`.
+pub const HISTORY_SOCKET: &str = "history.sock";
 
 /// Layout of a state area (design §2.2).
 #[derive(Debug, Clone)]
@@ -117,6 +121,36 @@ impl StateDir {
     /// The control socket in [`StateDir::control_dir`].
     pub fn control_socket(&self) -> PathBuf {
         self.control_dir().join(CONTROL_SOCKET)
+    }
+
+    /// Leases and repair lists of the fronts feeding a history service
+    /// (design §2.2, §14).
+    pub fn fronts_dir(&self) -> PathBuf {
+        self.meta().join("fronts")
+    }
+
+    /// The lease a front holds on pending slot `slot`
+    /// ([`crate::history_service::FrontLease`]).
+    pub fn front_lease(&self, slot: u16) -> PathBuf {
+        self.fronts_dir().join(format!("slot-{slot}.lock"))
+    }
+
+    /// The paths a front in `slot` could not record, kept for the next
+    /// front in that slot to repair (design §3.5); the counterpart of
+    /// [`StateDir::repairs`].
+    pub fn front_repairs(&self, slot: u16) -> PathBuf {
+        self.fronts_dir().join(format!("slot-{slot}.repairs"))
+    }
+
+    /// Where the history service listens by default, readable only by the
+    /// daemon's user (design §14).
+    pub fn history_dir(&self) -> PathBuf {
+        self.meta().join("history")
+    }
+
+    /// The history service's default socket in [`StateDir::history_dir`].
+    pub fn history_socket(&self) -> PathBuf {
+        self.history_dir().join(HISTORY_SOCKET)
     }
 
     /// The state-area lock (design §2.3, [`crate::lock`]).
@@ -317,7 +351,10 @@ pub fn init_with(
         }
     };
     std::fs::create_dir_all(state.journal().parent().expect("journal has a parent"))?;
-    PendingStore::open(state.pending())?;
+    // Not `PendingStore::open`: a running front's half-written copies
+    // must survive an `init` beside it.
+    std::fs::create_dir_all(state.pending())?;
+    std::fs::create_dir_all(state.fronts_dir())?;
     std::fs::create_dir_all(state.push_dir())?;
     if let Some(includes) = includes {
         crate::history::write_includes(&git, includes)?;
@@ -381,7 +418,12 @@ pub fn open(
         .map_err(HistoryError::from)?;
     let committed_through = history.head_seq()?;
 
-    let pending = Arc::new(PendingStore::open(state.pending())?);
+    // Fronts feeding a history service write into the same `pending/`;
+    // their copies are theirs to clean up while they live (design §14).
+    let live_fronts = FrontLease::live(state)?;
+    let pending = Arc::new(PendingStore::open_slot(state.pending(), 0, |slot| {
+        !live_fronts.contains(&slot)
+    })?);
     let hook_store = pending.clone();
     let (journal, report) = Journal::open(
         state.journal(),
@@ -393,7 +435,7 @@ pub fn open(
     }
     let uncommitted = journal.uncommitted();
     let keep: HashSet<PendingId> = uncommitted.iter().flat_map(Record::pending_ids).collect();
-    let pruned_pending = pending.prune_except(&keep)?;
+    let pruned_pending = pending.prune_except(&keep, &live_fronts)?;
     pending.sync_dir()?;
 
     let rules = Arc::new(Rules::load(&state.git(), tree, history.settings().into())?);
@@ -1471,6 +1513,39 @@ mod tests {
             })
             .unwrap();
         out
+    }
+
+    #[test]
+    fn open_spares_a_live_fronts_pending_copies() {
+        let (dir, state) = setup();
+        let lease = FrontLease::acquire(&state, "test").unwrap();
+        let dead = PendingId::in_slot(lease.slot() + 1, 0);
+        let src = dir.path().join("src");
+        fs::write(&src, "x").unwrap();
+        let front = PendingStore::open_slot(state.pending(), lease.slot(), |_| false).unwrap();
+        let (live, _) = front.freeze(&src).unwrap();
+        let tmp = state.pending().join(format!("tmp-{:016x}", live.0 + 1));
+        fs::write(&tmp, "half").unwrap();
+        fs::write(front.path(dead), "orphan").unwrap();
+
+        let (_, _, recovery) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+
+        assert_eq!(recovery.pruned_pending, 1, "only the dead slot's copy");
+        assert!(front.path(live).exists());
+        assert!(tmp.exists(), "a live front's half-written copy survives");
+        assert!(!front.path(dead).exists());
+        drop(lease);
+    }
+
+    #[test]
+    fn init_creates_the_fronts_dir_and_keeps_pending_tmp_files() {
+        let (_dir, state) = setup();
+        assert!(state.fronts_dir().is_dir());
+        let tmp = state.pending().join("tmp-0001000000000000");
+        fs::write(&tmp, "half").unwrap();
+        init(&state, "vol", None).unwrap();
+        assert!(tmp.exists());
     }
 
     #[test]
