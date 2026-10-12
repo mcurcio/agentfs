@@ -124,4 +124,34 @@ if [ "${E2E_HTTPS:-0}" = 1 ]; then
   assert_contains "$out" "wronghost: failed (untrusted_host)" "certificate mismatch is refused as an untrusted host"
 fi
 
+if [ "${E2E_HTTPS:-0}" = 1 ]; then
+  : "${GIT_HTTPS_BASE:?}" "${GIT_HTTPS_UNTRUSTED_BASE:?}"
+  step "https with certificate verification"
+  new_volume tls
+  TLS_REPO=$(server_repo tls)
+  server_repo wronghost >/dev/null
+  volume_config remote.tls.url "$GIT_HTTPS_BASE/tls.git"
+  volume_config remote.tls.agentfsCredentials "$CREDS/alice"
+  # The certificate is for "localhost" only. Over an IP address the TLS
+  # handshake itself fails (libgit2 reports "received early EOF", not a
+  # certificate error), so only the failure is asserted, not its kind.
+  volume_config remote.wronghost.url "https://127.0.0.1:8443/git/wronghost.git"
+  volume_config remote.wronghost.agentfsCredentials "$CREDS/alice"
+  # A self-signed certificate no store trusts: libgit2's verification
+  # refuses it, which agentfs reports as an untrusted host.
+  volume_config remote.untrusted.url "$GIT_HTTPS_UNTRUSTED_BASE/untrusted.git"
+  volume_config remote.untrusted.agentfsCredentials "$CREDS/alice"
+  echo secure >"$TREE/s.txt"
+  agentfs record s.txt
+  set +e
+  out=$(agentfs push 2>&1); code=$?
+  set -e
+  echo "$out"
+  assert_contains "$out" "tls: pushed" "pushed over https"
+  assert_eq "$(local_head tls)" "$(remote_ref "$TLS_REPO" refs/heads/agentfs/tls)" "https remote has the branch"
+  assert_eq 1 "$code" "certificates that fail verification fail the push"
+  assert_contains "$out" "wronghost: failed (" "a certificate for another host is refused"
+  assert_contains "$out" "untrusted: failed (untrusted_host)" "an untrusted certificate is an untrusted host"
+fi
+
 step "all remote scenarios passed"

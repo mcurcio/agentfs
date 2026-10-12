@@ -3,12 +3,14 @@
 # `git http-backend` (through fcgiwrap), with HTTP basic auth, on
 #   http://localhost:8080/git/<repo>.git
 #   https://localhost:8443/git/<repo>.git  (certificate for "localhost" only)
+#   https://localhost:8444/              (self-signed, untrusted: refuses all)
 #
 # Usage: ci/git-http-server.sh start <dir> [--trust-ca]
 #        ci/git-http-server.sh stop <dir>
 #
 # `start` prints environment assignments for the test scripts:
-#   GIT_SERVER_REPOS, GIT_SERVER_HTPASSWD, GIT_HTTP_BASE, GIT_HTTPS_BASE.
+#   GIT_SERVER_REPOS, GIT_SERVER_HTPASSWD, GIT_HTTP_BASE, GIT_HTTPS_BASE,
+#   GIT_HTTPS_UNTRUSTED_BASE (a self-signed certificate nothing trusts).
 # --trust-ca installs the throwaway CA into the system trust store (sudo),
 # which is where libgit2's OpenSSL backend looks.
 #
@@ -43,6 +45,12 @@ printf 'subjectAltName=DNS:localhost\n' >"$dir/tls/san.ext"
 openssl x509 -req -in "$dir/tls/server.csr" -CA "$dir/tls/ca.crt" \
   -CAkey "$dir/tls/ca.key" -CAcreateserial -days 2 -extfile "$dir/tls/san.ext" \
   -out "$dir/tls/server.crt" 2>/dev/null
+# A self-signed certificate for "localhost" that no store trusts, served on
+# 8444: a certificate that fails verification for a reason other than the
+# host name.
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost" \
+  -keyout "$dir/tls/untrusted.key" -out "$dir/tls/untrusted.crt" 2>/dev/null
 
 if [ "${3:-}" = "--trust-ca" ]; then
   sudo cp "$dir/tls/ca.crt" /usr/local/share/ca-certificates/agentfs-ci.crt
@@ -88,6 +96,14 @@ http {
       fastcgi_param REMOTE_USER \$remote_user;
     }
   }
+
+  server {
+    listen 127.0.0.1:8444 ssl;
+    server_name localhost;
+    ssl_certificate $dir/tls/untrusted.crt;
+    ssl_certificate_key $dir/tls/untrusted.key;
+    location / { return 403; }
+  }
 }
 EOF
 nginx -p "$dir" -c "$dir/nginx.conf"
@@ -102,4 +118,5 @@ GIT_SERVER_REPOS=$dir/repos
 GIT_SERVER_HTPASSWD=$dir/htpasswd
 GIT_HTTP_BASE=http://localhost:8080/git
 GIT_HTTPS_BASE=https://localhost:8443/git
+GIT_HTTPS_UNTRUSTED_BASE=https://localhost:8444/git
 EOF

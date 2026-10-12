@@ -59,6 +59,7 @@ sudo mkdir -p /run/sshd
 
 sudo tee "$conf/sshd_config" >/dev/null <<EOF
 ListenAddress 127.0.0.1
+ListenAddress ::1
 Port $port
 HostKey $conf/ssh_host_ed25519_key
 HostKey $conf/ssh_host_ecdsa_key
@@ -76,15 +77,19 @@ EOF
 sudo /usr/sbin/sshd -t -f "$conf/sshd_config"
 sudo /usr/sbin/sshd -f "$conf/sshd_config" -E "$dir/sshd.log"
 
+# ssh-keyscan tries only the first address of a name, so pin IPv4, which
+# sshd always listens on (::1 too where the host has IPv6).
+keyscan() { ssh-keyscan -4 -p "$port" "$@" localhost 2>>"$dir/keyscan.err" || true; }
 for _ in $(seq 100); do
-  ssh-keyscan -p "$port" localhost >/dev/null 2>&1 && break
+  [ -n "$(keyscan)" ] && break
   sleep 0.2
 done
-ssh-keyscan -p "$port" localhost 2>/dev/null | sort >"$dir/known_hosts"
-ssh-keyscan -H -p "$port" localhost 2>/dev/null >"$dir/known_hosts.hashed"
+keyscan | sort >"$dir/known_hosts"
+keyscan -H >"$dir/known_hosts.hashed"
 [ "$(grep -c . "$dir/known_hosts")" -ge 3 ] || {
   echo "ssh-keyscan found fewer than 3 host keys:" >&2
-  cat "$dir/known_hosts" >&2
+  cat "$dir/known_hosts" "$dir/keyscan.err" >&2
+  sudo cat "$dir/sshd.log" >&2
   exit 1
 }
 
