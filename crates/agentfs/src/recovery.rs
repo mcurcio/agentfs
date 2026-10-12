@@ -30,17 +30,16 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 
 use agentfs_core::config::Settings;
-use agentfs_core::confined::{self, Dir, Kind};
+use agentfs_core::confined::Dir;
 use agentfs_core::history::{History, seq_from_message};
 use agentfs_core::lfs::ObjectCache;
 use agentfs_core::lfs::fetch::{CacheProbe, Fetcher, LfsObjects};
 use agentfs_core::lock::{LockError, StateLock};
-use agentfs_core::paths::RepoPath;
-use agentfs_core::record::{Caller, Trigger};
+use agentfs_core::record::Caller;
 use agentfs_core::restore::{
-    self, Applied, Liveness, NotLive, Pathspec, Plan, Request, RestoreError,
+    self, Liveness, NotLive, Pathspec, Plan, RecordMode, Request, RestoreError,
 };
-use agentfs_core::volume::{Input, Recorder, StateDir};
+use agentfs_core::volume::{Recorder, StateDir};
 use agentfs_fuse::MountView;
 
 use crate::control::{self, ClientError, Op, Outcome, Reply};
@@ -373,7 +372,13 @@ fn direct(
     {
         to_record.written.push(path);
     }
-    let recorded = record_applied(&recorder, &tree, &to_record, me);
+    let recorded = restore::record_applied(
+        &recorder,
+        &tree,
+        &to_record,
+        me,
+        RecordMode::Chunked(RECORD_CHUNK),
+    );
     guard.finish();
     let report_commit = committer
         .commit_pending()
@@ -401,136 +406,6 @@ fn direct(
     };
     session.finish();
     Ok(code)
-}
-
-/// Records what [`restore::apply`] changed, from confined descriptors (so
-/// no symlink is ever followed), as records of the running operation. A
-/// path in the fsync class records its whole group (design §8) as one
-/// atomic record, so history never pairs one version's database with
-/// another's `-wal` or `-journal`.
-fn record_applied(
-    recorder: &Recorder,
-    tree: &Dir,
-    applied: &Applied,
-    caller: Caller,
-) -> Result<(), String> {
-    let mut groups = std::collections::BTreeMap::new();
-    let paths: Vec<(&RepoPath, bool)> = applied
-        .written
-        .iter()
-        .map(|p| (p, true))
-        .chain(applied.removed.iter().map(|p| (p, false)))
-        .filter(|(p, _)| match recorder.fsync_group(p) {
-            Some(group) => {
-                groups.insert(group.key, group.members);
-                false
-            }
-            None => true,
-        })
-        .collect();
-    let mut problems = Vec::new();
-    for chunk in paths.chunks(RECORD_CHUNK) {
-        let mut fds = Vec::new();
-        let mut inputs = Vec::with_capacity(chunk.len());
-        for (path, written) in chunk {
-            let path = (*path).clone();
-            if !written {
-                inputs.push(Input::Remove { path });
-                continue;
-            }
-            match input_at(tree, path, &mut fds) {
-                Ok(Some(input)) => inputs.push(input),
-                Ok(None) => {}
-                Err(problem) => problems.push(problem),
-            }
-        }
-        let recorded = recorder.record(Trigger::Restore, caller, inputs);
-        note_recorded(recorded, applied, &mut problems);
-        drop(fds);
-    }
-    for members in groups.into_values() {
-        let mut fds = Vec::new();
-        let mut inputs = Vec::with_capacity(members.len());
-        let mut unreadable = false;
-        for member in members {
-            match input_at(tree, member, &mut fds) {
-                Ok(Some(input)) => inputs.push(input),
-                Ok(None) => {}
-                Err(problem) => {
-                    problems.push(problem);
-                    unreadable = true;
-                }
-            }
-        }
-        // Whole or not at all.
-        if !unreadable {
-            let recorded = recorder.record_group(Trigger::Restore, caller, inputs);
-            note_recorded(recorded, applied, &mut problems);
-        }
-        drop(fds);
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(problems.join("; "))
-    }
-}
-
-/// The tree's state at `path` as a record input (`None`: a directory,
-/// which [`restore::apply`] never writes), keeping a file's descriptor in
-/// `fds`.
-fn input_at(
-    tree: &Dir,
-    path: RepoPath,
-    fds: &mut Vec<std::os::fd::OwnedFd>,
-) -> Result<Option<Input>, String> {
-    match tree.stat_at(path.as_str()) {
-        Ok(Some((fd, st))) => match confined::kind_of(&st) {
-            Kind::File => {
-                let input = Input::Write {
-                    path,
-                    backing: confined::proc_path(&fd),
-                    executable: st.st_mode & 0o111 != 0,
-                };
-                fds.push(fd);
-                Ok(Some(input))
-            }
-            Kind::Symlink => match confined::read_link_fd(&fd).map(String::from_utf8) {
-                Ok(Ok(target)) => Ok(Some(Input::Symlink { path, target })),
-                _ => Err(format!("{path}: unreadable symlink")),
-            },
-            Kind::Dir => Ok(None),
-            _ => Err(format!("{path}: changed while restoring")),
-        },
-        Ok(None) => Ok(Some(Input::Remove { path })),
-        Err(e) => Err(format!("{path}: {e}")),
-    }
-}
-
-/// Adds what a record skipped of the paths the restore wrote or removed
-/// (`applied`), or its failure, to `problems`. A group member the
-/// restore did not touch, absent and never tracked, is skipped as nothing
-/// to record, and that is no problem.
-fn note_recorded(
-    recorded: Result<agentfs_core::volume::Recorded, agentfs_core::volume::VolumeError>,
-    applied: &Applied,
-    problems: &mut Vec<String>,
-) {
-    match recorded {
-        Ok(recorded) => {
-            for skipped in recorded
-                .skipped
-                .into_iter()
-                .filter(|s| applied.written.contains(&s.path) || applied.removed.contains(&s.path))
-            {
-                problems.push(format!(
-                    "{} was written but not recorded: {}",
-                    skipped.path, skipped.reason
-                ));
-            }
-        }
-        Err(e) => problems.push(format!("recording failed: {e}")),
-    }
 }
 
 /// A refusal as the control socket carries it.

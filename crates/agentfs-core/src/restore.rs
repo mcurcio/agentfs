@@ -1138,6 +1138,191 @@ pub fn apply(
     Ok(applied)
 }
 
+/// How [`record_applied`] turns what [`apply`] changed into records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordMode {
+    /// Restore and revert: records of at most this many inputs, as a
+    /// directory rename does in the FUSE layer, plus one atomic record per
+    /// fsync-class group (design §8).
+    Chunked(usize),
+    /// A patch (design §12): every change in one atomic record, so a
+    /// refusal at record or commit time records none of it.
+    Atomic,
+}
+
+/// Records what [`apply`] changed in `tree` (written directly, not through
+/// a mount), from confined descriptors so no symlink is ever followed, as
+/// records of the running operation: `caller` must be one of its actors. A
+/// path in the fsync class records its whole group (design §8) atomically,
+/// so history never pairs one version's database with another's `-wal` or
+/// `-journal`. Returns the problems, joined, if anything was not recorded.
+pub fn record_applied(
+    recorder: &crate::volume::Recorder,
+    tree: &Dir,
+    applied: &Applied,
+    caller: crate::record::Caller,
+    mode: RecordMode,
+) -> Result<(), String> {
+    let mut groups = BTreeMap::new();
+    let paths: Vec<(&RepoPath, bool)> = applied
+        .written
+        .iter()
+        .map(|p| (p, true))
+        .chain(applied.removed.iter().map(|p| (p, false)))
+        .filter(|(p, _)| match recorder.fsync_group(p) {
+            Some(group) => {
+                groups.insert(group.key, group.members);
+                false
+            }
+            None => true,
+        })
+        .collect();
+    let mut problems = Vec::new();
+    let trigger = crate::record::Trigger::Restore;
+    let chunk = match mode {
+        RecordMode::Chunked(n) => n.max(1),
+        RecordMode::Atomic => usize::MAX,
+    };
+    if mode == RecordMode::Atomic {
+        let mut fds = Vec::new();
+        let mut inputs = Vec::new();
+        let mut seen = BTreeSet::new();
+        let members = groups.into_values().flatten().map(|m| (m, true));
+        let owned: Vec<(RepoPath, bool)> = paths
+            .iter()
+            .map(|(p, w)| ((*p).clone(), *w))
+            .chain(members)
+            .collect();
+        for (path, written) in owned {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            if !written {
+                inputs.push(crate::volume::Input::Remove { path });
+                continue;
+            }
+            match input_at(tree, path, &mut fds) {
+                Ok(Some(input)) => inputs.push(input),
+                Ok(None) => {}
+                Err(problem) => problems.push(problem),
+            }
+        }
+        // Whole or not at all.
+        if problems.is_empty() {
+            let recorded = recorder.record_group(trigger, caller, inputs);
+            note_recorded(recorded, applied, &mut problems);
+        }
+        drop(fds);
+        return if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        };
+    }
+    for chunk in paths.chunks(chunk) {
+        let mut fds = Vec::new();
+        let mut inputs = Vec::with_capacity(chunk.len());
+        for (path, written) in chunk {
+            let path = (*path).clone();
+            if !written {
+                inputs.push(crate::volume::Input::Remove { path });
+                continue;
+            }
+            match input_at(tree, path, &mut fds) {
+                Ok(Some(input)) => inputs.push(input),
+                Ok(None) => {}
+                Err(problem) => problems.push(problem),
+            }
+        }
+        let recorded = recorder.record(trigger, caller, inputs);
+        note_recorded(recorded, applied, &mut problems);
+        drop(fds);
+    }
+    for members in groups.into_values() {
+        let mut fds = Vec::new();
+        let mut inputs = Vec::with_capacity(members.len());
+        let mut unreadable = false;
+        for member in members {
+            match input_at(tree, member, &mut fds) {
+                Ok(Some(input)) => inputs.push(input),
+                Ok(None) => {}
+                Err(problem) => {
+                    problems.push(problem);
+                    unreadable = true;
+                }
+            }
+        }
+        // Whole or not at all.
+        if !unreadable {
+            let recorded = recorder.record_group(trigger, caller, inputs);
+            note_recorded(recorded, applied, &mut problems);
+        }
+        drop(fds);
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
+/// The tree's state at `path` as a record input (`None`: a directory,
+/// which [`apply`] never writes), keeping a file's descriptor in `fds`.
+fn input_at(
+    tree: &Dir,
+    path: RepoPath,
+    fds: &mut Vec<std::os::fd::OwnedFd>,
+) -> Result<Option<crate::volume::Input>, String> {
+    use crate::volume::Input;
+    match tree.stat_at(path.as_str()) {
+        Ok(Some((fd, st))) => match crate::confined::kind_of(&st) {
+            Kind::File => {
+                let input = Input::Write {
+                    path,
+                    backing: crate::confined::proc_path(&fd),
+                    executable: st.st_mode & 0o111 != 0,
+                };
+                fds.push(fd);
+                Ok(Some(input))
+            }
+            Kind::Symlink => match crate::confined::read_link_fd(&fd).map(String::from_utf8) {
+                Ok(Ok(target)) => Ok(Some(Input::Symlink { path, target })),
+                _ => Err(format!("{path}: unreadable symlink")),
+            },
+            Kind::Dir => Ok(None),
+            _ => Err(format!("{path}: changed while restoring")),
+        },
+        Ok(None) => Ok(Some(Input::Remove { path })),
+        Err(e) => Err(format!("{path}: {e}")),
+    }
+}
+
+/// Adds what a record skipped of the paths [`apply`] wrote or removed
+/// (`applied`), or its failure, to `problems`. A group member the
+/// operation did not touch, absent and never tracked, is skipped as
+/// nothing to record, and that is no problem.
+fn note_recorded(
+    recorded: Result<crate::volume::Recorded, crate::volume::VolumeError>,
+    applied: &Applied,
+    problems: &mut Vec<String>,
+) {
+    match recorded {
+        Ok(recorded) => {
+            for skipped in recorded
+                .skipped
+                .into_iter()
+                .filter(|s| applied.written.contains(&s.path) || applied.removed.contains(&s.path))
+            {
+                problems.push(format!(
+                    "{} was written but not recorded: {}",
+                    skipped.path, skipped.reason
+                ));
+            }
+        }
+        Err(e) => problems.push(format!("recording failed: {e}")),
+    }
+}
+
 /// Creates the missing ancestors of `path`, each owned like its nearest
 /// existing parent when `chown`. Returns the owner of `path`'s parent.
 fn make_parents(tree: &Dir, path: &str, chown: bool) -> io::Result<Owner> {
