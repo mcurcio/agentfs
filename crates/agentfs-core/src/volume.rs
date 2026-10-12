@@ -120,6 +120,17 @@ impl StateDir {
         self.root.join("lfs")
     }
 
+    /// Cached LFS objects, `aa/bb/<oid>` as in git-lfs
+    /// ([`crate::lfs::ObjectCache`]).
+    pub fn lfs_objects(&self) -> PathBuf {
+        self.lfs().join("objects")
+    }
+
+    /// LFS objects being written.
+    pub fn lfs_tmp(&self) -> PathBuf {
+        self.lfs().join("tmp")
+    }
+
     /// The apparent size in bytes (the sum of regular files' lengths) of
     /// each part of the state area: `git`, `journal`, `pending`, `lfs` and
     /// `meta` (design §13). Symlinks are not followed; a missing part, and

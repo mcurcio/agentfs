@@ -1,0 +1,60 @@
+//! Git LFS (design §7): large content stored as LFS objects, with pointer
+//! blobs in history that ordinary `git clone` plus `git lfs pull` turns
+//! back into content.
+//!
+//! Neither libgit2 nor gitoxide implements LFS, so agentfs does:
+//!
+//! - [`pointer`]: the pointer format (git-lfs spec v1, canonical form);
+//! - [`cache`]: the local object cache in `<state>/lfs/objects`, in
+//!   git-lfs's layout;
+//! - [`attributes`]: the block of `filter=lfs` lines agentfs keeps at the
+//!   end of the root `.gitattributes` in history, as `git lfs track` would;
+//! - [`policy`]: which store a recorded file goes to.
+//!
+//! What is stored as LFS is decided when a file is recorded and saved in
+//! the journal; the content is hashed and cached when it is committed, and
+//! uploaded before the commits that reference it are pushed.
+
+pub mod attributes;
+pub mod cache;
+pub mod pointer;
+pub mod policy;
+
+use std::fmt;
+
+use crate::events::PushFailureKind;
+
+pub use cache::ObjectCache;
+pub use pointer::{LfsOid, Pointer};
+pub use policy::{Store, StorePolicy};
+
+/// An LFS problem, classified like a push failure (design §11.3, §13): it
+/// fails the push attempt with stage `lfs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LfsError {
+    pub kind: PushFailureKind,
+    pub message: String,
+}
+
+impl LfsError {
+    pub fn new(kind: PushFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// A problem on this side: the cache, the history repository, or a
+    /// setting that cannot work.
+    pub fn local(message: impl Into<String>) -> Self {
+        Self::new(PushFailureKind::Local, message)
+    }
+}
+
+impl fmt::Display for LfsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LfsError {}

@@ -124,7 +124,9 @@ impl PendingStore {
     }
 }
 
-fn copy_into(src: &Path, dst: &Path) -> io::Result<FreezeMethod> {
+/// Creates `dst` (which must not exist, mode 0600) as a reflink of `src` or,
+/// where the filesystem cannot, a copy; its data is durable on return.
+pub(crate) fn copy_into(src: &Path, dst: &Path) -> io::Result<FreezeMethod> {
     let from = File::open(src)?;
     let to = OpenOptions::new()
         .write(true)
