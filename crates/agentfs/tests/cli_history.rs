@@ -329,3 +329,54 @@ fn fronts_carry_on_after_the_service_is_killed_and_restarted() {
     assert_eq!(commits.len(), 2, "{commits:?}");
     assert!(commits.iter().all(|(c, _)| c == "pod-a"), "{commits:?}");
 }
+
+#[test]
+fn a_front_prefers_the_slot_it_is_given() {
+    let v = Volume::new();
+    let service = v.serve();
+    let front = |slot: &str, path: &str| {
+        fs::write(v.tree().join(path), path).unwrap();
+        command(v.state().root(), &v.tree())
+            .args(["record", "--history-service"])
+            .arg(v.state().history_socket())
+            .args(["--history-wait", "10s", "--history-slot", slot, path])
+            .env("AGENTFS_POD", "pod-a")
+            .output()
+            .unwrap()
+    };
+    let out = front("7", "a");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("(slot 7)"), "{}", stdout(&out));
+    let holder = fs::read_to_string(v.state().front_lease(7)).unwrap();
+    assert!(holder.contains("command=record pod=pod-a"), "{holder}");
+
+    // A held preferred slot falls back to the lowest free one.
+    let held =
+        agentfs_core::history_service::FrontLease::acquire_preferring(&v.state(), "test", Some(7))
+            .unwrap();
+    assert_eq!(held.slot(), 7);
+    let out = front("7", "b");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("(slot 1)"), "{}", stdout(&out));
+
+    // The environment variable works too, and 0 is refused.
+    let out = command(v.state().root(), &v.tree())
+        .args(["record", "--history-service"])
+        .arg(v.state().history_socket())
+        .args(["--history-slot", "0", "a"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    fs::write(v.tree().join("c"), "c").unwrap();
+    let out = command(v.state().root(), &v.tree())
+        .args(["record", "--history-service"])
+        .arg(v.state().history_socket())
+        .args(["--history-wait", "10s", "c"])
+        .env("AGENTFS_HISTORY_SLOT", "9")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("(slot 9)"), "{}", stdout(&out));
+    drop(held);
+    service.stop();
+}

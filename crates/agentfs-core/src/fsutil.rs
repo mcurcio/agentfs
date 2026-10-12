@@ -9,7 +9,7 @@ use serde::Serialize;
 
 /// Writes `value` as pretty JSON to `path` atomically: a temporary file
 /// (mode 0600), fsync, rename, fsync of the directory.
-pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;

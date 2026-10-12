@@ -50,12 +50,13 @@ fn connect(
         .settings()
         .clone();
     let context = pod.context(&settings.volume);
-    let lease = FrontLease::acquire(
+    let lease = FrontLease::acquire_preferring(
         state,
         &format!(
             "command={command} pod={} replica={}",
             context.pod, context.replica
         ),
+        history.history_slot,
     )?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

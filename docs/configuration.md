@@ -446,6 +446,7 @@ flags, most with an environment equivalent:
 | `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR |
 | `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `mount`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
 | `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | `mount`, `record` with `--history-service`: how long to wait for the service at start |
+| `--history-slot N` | `AGENTFS_HISTORY_SLOT` | the lowest free slot | `mount`, `record` with `--history-service`: lease pending slot N (1 to 1023) when it is free, else the lowest free slot; a front restarted after a crash passes its predecessor's slot to drain that slot's repairs |
 | `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount` |
 | `--allow-stale` | | | `probe` |
 | `--remote NAME` (repeatable) | | every remote | `push` |

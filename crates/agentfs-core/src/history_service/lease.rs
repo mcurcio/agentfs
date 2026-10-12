@@ -48,47 +48,78 @@ impl FrontLease {
     /// Leases the lowest free slot of `state`, writing `description` (who
     /// holds it) into the lease file for operators.
     pub fn acquire(state: &StateDir, description: &str) -> Result<Self, LeaseError> {
+        Self::acquire_preferring(state, description, None)
+    }
+
+    /// Leases `preferred` when it is a front slot (1..=[`MAX_SLOT`]) that
+    /// no one holds, else the lowest free slot as [`FrontLease::acquire`]
+    /// does.
+    ///
+    /// A front restarted after a crash prefers its predecessor's slot, so
+    /// it drains that slot's repair queue (§3.5) under the same pod
+    /// identity (design §14.2).
+    pub fn acquire_preferring(
+        state: &StateDir,
+        description: &str,
+        preferred: Option<u16>,
+    ) -> Result<Self, LeaseError> {
         let dir = state.fronts_dir();
         fs::create_dir_all(&dir).map_err(|source| LeaseError::Io {
             path: dir.clone(),
             source,
         })?;
+        if let Some(slot) = preferred.filter(|s| (1..=MAX_SLOT).contains(s))
+            && let Some(lease) = Self::try_slot(state, slot, description)?
+        {
+            return Ok(lease);
+        }
         for slot in 1..=MAX_SLOT {
-            let path = state.front_lease(slot);
-            let io_err = |source| LeaseError::Io {
-                path: path.clone(),
-                source,
-            };
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(&path)
-                .map_err(io_err)?;
-            if !try_lock(&file, FlockOperation::NonBlockingLockExclusive).map_err(io_err)? {
-                continue;
+            if let Some(lease) = Self::try_slot(state, slot, description)? {
+                return Ok(lease);
             }
-            let since = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            let line = format!(
-                "pid={} {description} since={}\n",
-                std::process::id(),
-                utc_basic(since)
-            );
-            (|| {
-                file.set_len(0)?;
-                file.seek(SeekFrom::Start(0))?;
-                file.write_all(line.as_bytes())
-            })()
-            .map_err(io_err)?;
-            return Ok(Self { _file: file, slot });
         }
         Err(LeaseError::Full {
             state: state.root().to_path_buf(),
         })
+    }
+
+    /// Leases `slot` if no one holds it, writing the holder line.
+    fn try_slot(
+        state: &StateDir,
+        slot: u16,
+        description: &str,
+    ) -> Result<Option<Self>, LeaseError> {
+        let path = state.front_lease(slot);
+        let io_err = |source| LeaseError::Io {
+            path: path.clone(),
+            source,
+        };
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(io_err)?;
+        if !try_lock(&file, FlockOperation::NonBlockingLockExclusive).map_err(io_err)? {
+            return Ok(None);
+        }
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let line = format!(
+            "pid={} {description} since={}\n",
+            std::process::id(),
+            utc_basic(since)
+        );
+        (|| {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(line.as_bytes())
+        })()
+        .map_err(io_err)?;
+        Ok(Some(Self { _file: file, slot }))
     }
 
     /// The leased slot.
@@ -221,6 +252,37 @@ mod tests {
         assert_eq!(holders[0].0, 1);
         assert!(holders[0].1.contains("pod=a"), "{holders:?}");
         assert!(holders[1].1.contains("pod=b"), "{holders:?}");
+    }
+
+    #[test]
+    fn a_free_preferred_slot_is_taken() {
+        let (_dir, state) = state();
+        let a = FrontLease::acquire_preferring(&state, "a", Some(7)).unwrap();
+        assert_eq!(a.slot(), 7);
+        // A plain lease still starts from the lowest free slot.
+        let b = FrontLease::acquire(&state, "b").unwrap();
+        assert_eq!(b.slot(), 1);
+        assert_eq!(FrontLease::live(&state).unwrap(), HashSet::from([1, 7]));
+    }
+
+    #[test]
+    fn a_held_preferred_slot_falls_back_to_the_lowest_free() {
+        let (_dir, state) = state();
+        let _a = FrontLease::acquire(&state, "a").unwrap();
+        let _b = FrontLease::acquire(&state, "b").unwrap();
+        let c = FrontLease::acquire_preferring(&state, "c", Some(1)).unwrap();
+        assert_eq!(c.slot(), 3);
+    }
+
+    #[test]
+    fn out_of_range_preferences_are_ignored() {
+        let (_dir, state) = state();
+        let a = FrontLease::acquire_preferring(&state, "a", Some(0)).unwrap();
+        assert_eq!(a.slot(), 1);
+        let b = FrontLease::acquire_preferring(&state, "b", Some(MAX_SLOT + 1)).unwrap();
+        assert_eq!(b.slot(), 2);
+        assert!(!state.front_lease(0).exists());
+        assert!(!state.front_lease(MAX_SLOT + 1).exists());
     }
 
     #[test]

@@ -237,6 +237,12 @@ struct HistoryArgs {
     /// How long to wait at start for the history service to be up.
     #[arg(long, env = "AGENTFS_HISTORY_WAIT", default_value = "30s", value_parser = parse_grace, value_name = "DURATION")]
     history_wait: Duration,
+    /// Prefer pending slot N (1..=1023) when leasing as a front, else the
+    /// lowest free slot. A front restarted after a crash passes its
+    /// predecessor's slot so it drains that slot's repairs (the CSI
+    /// driver does this, design §14.2).
+    #[arg(long, env = "AGENTFS_HISTORY_SLOT", value_name = "N", value_parser = clap::value_parser!(u16).range(1..=1023))]
+    history_slot: Option<u16>,
 }
 
 fn parse_grace(value: &str) -> Result<Duration, String> {

@@ -725,6 +725,11 @@ on the service, `agentfs.history_service.fronts`.
 removed when a front next leases its slot). A service that dies is restarted the
 same way it was started: it recovers its journal, commits what fronts had
 journaled with their own committers, and replaces the stale socket.
+A front started in place of a dead one should pass `--history-slot N`
+(`AGENTFS_HISTORY_SLOT`) with the dead front's slot (from `agentfs
+status` before it died, or its logs): it then leases that slot when it
+is free, and drains the slot's repair queue as the same pod. Without
+it, or when the slot is taken, a front leases the lowest free slot.
 
 **Stopping.** Stop the fronts first (each unmounts as `mount` does, but
 leaves the commit to the service), then the service: on SIGINT or SIGTERM
