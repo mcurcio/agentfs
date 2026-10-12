@@ -25,6 +25,7 @@ pub mod endpoint;
 pub(crate) mod fake;
 pub mod pointer;
 pub mod policy;
+pub mod upload;
 
 use std::fmt;
 

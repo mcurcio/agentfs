@@ -24,7 +24,6 @@ use crate::events::PushFailureKind;
 pub struct ObjectCache {
     objects: PathBuf,
     tmp: PathBuf,
-    next: AtomicU64,
 }
 
 impl ObjectCache {
@@ -44,11 +43,19 @@ impl ObjectCache {
                 fs::remove_file(entry.path())?;
             }
         }
-        Ok(Self {
-            objects,
-            tmp,
-            next: AtomicU64::new(0),
-        })
+        Ok(Self { objects, tmp })
+    }
+
+    /// The cache at `dir` as another user of the same state area sees it
+    /// (a pusher, a restore): created if missing, but `tmp/` is left alone,
+    /// since the committer may be writing there.
+    pub fn at(dir: impl Into<PathBuf>) -> io::Result<Self> {
+        let dir = dir.into();
+        let objects = dir.join("objects");
+        let tmp = dir.join("tmp");
+        fs::create_dir_all(&objects)?;
+        fs::create_dir_all(&tmp)?;
+        Ok(Self { objects, tmp })
     }
 
     /// Where the object `oid` is (or would be).
@@ -154,7 +161,8 @@ impl ObjectCache {
     }
 
     fn tmp_path(&self, oid: &LfsOid) -> PathBuf {
-        let n = self.next.fetch_add(1, Ordering::Relaxed);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
         self.tmp.join(format!("{oid}-{}-{n}", std::process::id()))
     }
 

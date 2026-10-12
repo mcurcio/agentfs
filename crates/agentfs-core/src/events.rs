@@ -88,6 +88,33 @@ impl fmt::Display for PushFailureKind {
     }
 }
 
+/// Which part of a push attempt failed (design §7, §13).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushStage {
+    /// The git push itself.
+    #[default]
+    Git,
+    /// Uploading the LFS objects the unpushed commits reference, before
+    /// the git push; no ref was pushed.
+    Lfs,
+}
+
+impl PushStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Lfs => "lfs",
+        }
+    }
+}
+
+impl fmt::Display for PushStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One signal. Every variant except [`Event::PushSucceeded`] is an alarm
 /// condition (design §13).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +149,8 @@ pub enum Event {
         last_pushed: Option<Oid>,
         consecutive_failures: u32,
         retry_in: Duration,
+        /// Where it failed: the git push, or the LFS upload before it.
+        stage: PushStage,
     },
     /// The remote branch was written by someone else; the local head was
     /// saved under `diverged_ref` (design §11.3).
@@ -198,10 +227,15 @@ impl fmt::Display for Event {
                 last_pushed,
                 consecutive_failures,
                 retry_in,
+                stage,
             } => write!(
                 f,
-                "push to {remote} failed ({kind}): {message}; head {}, last pushed {}, \
+                "push to {remote} failed ({kind}{}): {message}; head {}, last pushed {}, \
                  {consecutive_failures} consecutive failure(s), retry in {retry_in:?}",
+                match stage {
+                    PushStage::Git => "",
+                    PushStage::Lfs => ", stage lfs",
+                },
                 oid_or(*head, "none"),
                 oid_or(*last_pushed, "never"),
             ),
@@ -306,7 +340,28 @@ mod tests {
             last_pushed: None,
             consecutive_failures: n,
             retry_in: Duration::from_secs(120),
+            stage: PushStage::Git,
         }
+    }
+
+    #[test]
+    fn the_stage_shows_only_for_lfs_and_defaults_to_git() {
+        assert!(
+            failed(1)
+                .to_string()
+                .starts_with("push to origin failed (unreachable): ")
+        );
+        let mut lfs = failed(1);
+        if let Event::PushFailed { stage, .. } = &mut lfs {
+            *stage = PushStage::Lfs;
+        }
+        assert!(
+            lfs.to_string()
+                .starts_with("push to origin failed (unreachable, stage lfs): "),
+            "{lfs}"
+        );
+        assert_eq!(PushStage::default(), PushStage::Git);
+        assert_eq!(serde_json::to_string(&PushStage::Lfs).unwrap(), "\"lfs\"");
     }
 
     #[test]

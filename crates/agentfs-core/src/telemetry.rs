@@ -165,7 +165,7 @@ impl Telemetry {
             push_failures: counter(
                 names::PUSH_FAILURES,
                 "{failure}",
-                "Failed push attempts, by remote and reason",
+                "Failed push attempts, by remote, reason and stage (git or lfs)",
             ),
             rejected_paths: counter(
                 names::PRECHECK_REJECTED_PATHS,
@@ -473,9 +473,18 @@ impl EventSink for TelemetrySink {
                 .record_failures
                 .add(1, &[KeyValue::new("trigger", trigger.as_str())]),
             Event::CommitFailed { .. } => inner.commit_failures.add(1, &[]),
-            Event::PushFailed { remote, kind, .. } => inner.push_failures.add(
+            Event::PushFailed {
+                remote,
+                kind,
+                stage,
+                ..
+            } => inner.push_failures.add(
                 1,
-                &[remote_attr(remote), KeyValue::new("reason", kind.as_str())],
+                &[
+                    remote_attr(remote),
+                    KeyValue::new("reason", kind.as_str()),
+                    KeyValue::new("stage", stage.as_str()),
+                ],
             ),
             // Their gauges are read from state.
             Event::Diverged { .. }
@@ -561,9 +570,11 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             last_pushed,
             consecutive_failures,
             retry_in,
+            stage,
         } => {
             out.push(("agentfs.remote", s(remote)));
             out.push(("agentfs.kind", AnyValue::from(kind.as_str())));
+            out.push(("agentfs.push.stage", AnyValue::from(stage.as_str())));
             out.push(("agentfs.message", s(message)));
             if let Some(head) = head {
                 out.push(("agentfs.head", oid(head)));
@@ -850,11 +861,11 @@ mod tests {
     use super::testing::{Harness, any_str, log_attr};
     use super::*;
     use crate::checks::Refusal;
-    use crate::events::{CheckStage, MemorySink, PushFailureKind};
+    use crate::events::{CheckStage, MemorySink, PushFailureKind, PushStage};
     use crate::paths::RepoPath;
 
     fn alarms() -> Vec<Event> {
-        let failed = |remote: &str, kind| Event::PushFailed {
+        let failed = |remote: &str, kind, stage| Event::PushFailed {
             remote: remote.into(),
             kind,
             message: "nope".into(),
@@ -862,6 +873,7 @@ mod tests {
             last_pushed: None,
             consecutive_failures: 1,
             retry_in: Duration::from_secs(60),
+            stage,
         };
         vec![
             Event::PathRefused {
@@ -889,9 +901,10 @@ mod tests {
                 error: "locked".into(),
                 backlog: 3,
             },
-            failed("origin", PushFailureKind::Auth),
-            failed("origin", PushFailureKind::Auth),
-            failed("backup", PushFailureKind::Unreachable),
+            failed("origin", PushFailureKind::Auth, PushStage::Git),
+            failed("origin", PushFailureKind::Auth, PushStage::Git),
+            failed("backup", PushFailureKind::Unreachable, PushStage::Git),
+            failed("origin", PushFailureKind::Auth, PushStage::Lfs),
             Event::PushSucceeded {
                 remote: "backup".into(),
                 head: git2::Oid::ZERO_SHA1,
@@ -931,14 +944,25 @@ mod tests {
         assert_eq!(
             h.sum(
                 names::PUSH_FAILURES,
-                &[("remote", "origin"), ("reason", "auth")]
+                &[("remote", "origin"), ("reason", "auth"), ("stage", "git")]
             ),
             Some(2)
         );
         assert_eq!(
             h.sum(
                 names::PUSH_FAILURES,
-                &[("remote", "backup"), ("reason", "unreachable")]
+                &[("remote", "origin"), ("reason", "auth"), ("stage", "lfs")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            h.sum(
+                names::PUSH_FAILURES,
+                &[
+                    ("remote", "backup"),
+                    ("reason", "unreachable"),
+                    ("stage", "git")
+                ]
             ),
             Some(1)
         );
@@ -954,7 +978,7 @@ mod tests {
         }
         let logs = h.logs();
         let expected: Vec<Event> = alarms().into_iter().filter(Event::is_alarm).collect();
-        assert_eq!(logs.len(), 7, "no record for the successful push");
+        assert_eq!(logs.len(), 8, "no record for the successful push");
         for (record, event) in logs.iter().zip(&expected) {
             assert_eq!(
                 record.body().map(any_str),
@@ -984,6 +1008,26 @@ mod tests {
             Some(git2::Oid::ZERO_SHA1.to_string())
         );
         assert!(log_attr(push, "agentfs.last_pushed").is_none());
+        assert_eq!(
+            log_attr(push, "agentfs.push.stage").map(|v| any_str(&v)),
+            Some("git".into())
+        );
+        let lfs = logs
+            .iter()
+            .rfind(|r| r.event_name() == Some("agentfs.push_failed"))
+            .unwrap();
+        assert_eq!(
+            log_attr(lfs, "agentfs.push.stage").map(|v| any_str(&v)),
+            Some("lfs".into())
+        );
+        assert!(
+            lfs.body()
+                .map(any_str)
+                .unwrap()
+                .contains("failed (auth, stage lfs)"),
+            "{:?}",
+            lfs.body()
+        );
 
         let refused = &logs[0];
         assert_eq!(refused.event_name(), Some("agentfs.path_refused"));

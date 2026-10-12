@@ -44,7 +44,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use agentfs_core::config::parse_duration;
-use agentfs_core::events::{Event, Events};
+use agentfs_core::events::{Event, Events, PushStage};
 use agentfs_core::history::History;
 use agentfs_core::identity::Context;
 use agentfs_core::lock::{LockError, StateLock};
@@ -533,7 +533,14 @@ fn describe(outcome: &PushOutcome) -> String {
             kind,
             message,
             retry_in,
+            stage: PushStage::Git,
         } => format!("failed ({kind}): {message}; retry in {retry_in:?}"),
+        PushOutcome::Failed {
+            kind,
+            message,
+            retry_in,
+            stage: PushStage::Lfs,
+        } => format!("failed ({kind}, stage lfs): {message}; retry in {retry_in:?}"),
         PushOutcome::Busy => "busy: another push in progress".into(),
     }
 }

@@ -62,9 +62,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{RemoteSettings, Settings};
 use crate::credentials::{Credential, CredentialFile, DEFAULT_SSH_USERNAME, SshKey, SshKeyFile};
-use crate::events::{Event, Events, PushFailureKind};
+use crate::events::{Event, Events, PushFailureKind, PushStage};
 use crate::history::init_libgit2;
 use crate::known_hosts::{self, KnownHostsFile};
+use crate::lfs::upload::objects_to_upload;
+use crate::lfs::{Direction, LfsError, ObjectCache, Transfer, UploadReport, transfer_for};
 use crate::remote_url::{Endpoint, ssh_endpoint};
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::StateDir;
@@ -88,6 +90,9 @@ pub enum PushError {
 pub struct LastError {
     pub kind: PushFailureKind,
     pub message: String,
+    /// Where it failed. Absent from state written before LFS existed.
+    #[serde(default)]
+    pub stage: PushStage,
 }
 
 /// An unresolved divergence (design §11.3).
@@ -183,6 +188,8 @@ pub enum PushOutcome {
         kind: PushFailureKind,
         message: String,
         retry_in: Duration,
+        /// The git push, or the LFS upload before it (design §7).
+        stage: PushStage,
     },
     /// Another process holds this remote's push lock.
     Busy,
@@ -267,6 +274,12 @@ pub struct RemotePusher {
     ssh: Option<Endpoint>,
     ssh_key: Option<SshKeyFile>,
     known_hosts: Option<KnownHostsFile>,
+    /// For resolving the LFS endpoint (design §7).
+    settings: Settings,
+    lfs: ObjectCache,
+    /// The LFS upload transfer, resolved the first time a push has
+    /// objects to upload.
+    transfer: Option<Box<dyn Transfer>>,
     events: Events,
     telemetry: Telemetry,
     state: PushState,
@@ -306,6 +319,9 @@ impl RemotePusher {
                 .map(|path| SshKeyFile::new(path, remote.push_url())),
             known_hosts: remote.known_hosts.as_ref().map(KnownHostsFile::new),
             remote: remote.clone(),
+            settings: settings.clone(),
+            lfs: ObjectCache::at(state.lfs())?,
+            transfer: None,
             events,
             telemetry: telemetry.clone(),
         })
@@ -351,14 +367,29 @@ impl RemotePusher {
             attrs
         });
         let mut head = None;
-        let outcome = self.push_once_inner(&mut head);
+        let mut lfs = None;
+        let outcome = self.push_once_inner(&mut head, &mut lfs);
         span.set(KeyValue::new("agentfs.push.outcome", outcome.label()));
+        if let Some(report) = lfs {
+            span.set(KeyValue::new("agentfs.lfs.objects", report.objects as i64));
+            span.set(KeyValue::new(
+                "agentfs.lfs.uploaded",
+                report.uploaded as i64,
+            ));
+            span.set(KeyValue::new("agentfs.lfs.bytes", report.bytes as i64));
+        }
         if let Some(head) = head {
             span.set_with(|| KeyValue::new("agentfs.push.head", head.to_string()));
         }
         match &outcome {
-            PushOutcome::Failed { kind, message, .. } => {
+            PushOutcome::Failed {
+                kind,
+                message,
+                stage,
+                ..
+            } => {
                 span.set(KeyValue::new("agentfs.push.reason", kind.as_str()));
+                span.set(KeyValue::new("agentfs.push.stage", stage.as_str()));
                 span.error(message);
             }
             PushOutcome::Diverged { diverged_ref, .. } => {
@@ -378,8 +409,13 @@ impl RemotePusher {
     }
 
     /// [`RemotePusher::push_once`], setting `head_out` to the branch head
-    /// once it is known.
-    fn push_once_inner(&mut self, head_out: &mut Option<Oid>) -> PushOutcome {
+    /// once it is known and `lfs_out` to what the LFS upload did, if the
+    /// unpushed commits reference LFS objects.
+    fn push_once_inner(
+        &mut self,
+        head_out: &mut Option<Oid>,
+        lfs_out: &mut Option<UploadReport>,
+    ) -> PushOutcome {
         let _lock = match self.lock() {
             Ok(Some(lock)) => lock,
             Ok(None) => return PushOutcome::Busy,
@@ -402,6 +438,12 @@ impl RemotePusher {
             Ok(refspecs) => refspecs,
             Err(e) => return self.failed(PushFailureKind::Local, e.to_string(), Some(head)),
         };
+        // LFS objects first: a ref is never pushed before the objects its
+        // commits reference (design §7).
+        match self.upload_lfs(head) {
+            Ok(report) => *lfs_out = report,
+            Err(e) => return self.failed_at(e.kind, e.message, Some(head), PushStage::Lfs),
+        }
         let attempt = self.attempt(&refspecs);
         let remote_branch = attempt
             .updates
@@ -460,6 +502,47 @@ impl RemotePusher {
                 self.failed(kind, e.message().to_owned(), Some(head))
             }
         }
+    }
+
+    /// Uploads the LFS objects that the commits the remote lacks reference
+    /// (design §7), before any ref is pushed. `None` when they reference
+    /// none: then no LFS endpoint is resolved or contacted. Every object
+    /// must be in the local cache.
+    fn upload_lfs(&mut self, head: Oid) -> Result<Option<UploadReport>, LfsError> {
+        let objects = objects_to_upload(&self.repo, head, self.state.last_pushed_oid())?;
+        if objects.is_empty() {
+            return Ok(None);
+        }
+        let missing: Vec<String> = objects
+            .iter()
+            .filter(|(p, _)| !self.lfs.contains(p))
+            .map(|(p, path)| format!("{path} ({})", p.oid))
+            .collect();
+        if !missing.is_empty() {
+            return Err(LfsError::local(format!(
+                "{} LFS object(s) the unpushed commits reference are missing from the local \
+                 cache (<state>/lfs/objects), so they cannot be uploaded: {}",
+                missing.len(),
+                missing
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if self.transfer.is_none() {
+            self.transfer = Some(transfer_for(
+                &self.settings,
+                &self.remote,
+                Direction::Upload,
+            )?);
+        }
+        let transfer = self.transfer.as_ref().expect("resolved just above");
+        let pointers: Vec<_> = objects.iter().map(|(p, _)| *p).collect();
+        transfer
+            .upload(&pointers, &self.lfs, &self.branch_ref)
+            .map(Some)
     }
 
     /// Takes this remote's push lock without waiting.
@@ -809,6 +892,17 @@ impl RemotePusher {
     }
 
     fn failed(&mut self, kind: PushFailureKind, message: String, head: Option<Oid>) -> PushOutcome {
+        self.failed_at(kind, message, head, PushStage::Git)
+    }
+
+    /// A failed attempt at `stage`: persisted, alarmed, backed off.
+    fn failed_at(
+        &mut self,
+        kind: PushFailureKind,
+        message: String,
+        head: Option<Oid>,
+        stage: PushStage,
+    ) -> PushOutcome {
         // libgit2 quotes the URL in its messages; never persist or emit the
         // userinfo it may carry.
         let message = scrub_userinfo(&message, self.remote.push_url());
@@ -816,6 +910,7 @@ impl RemotePusher {
         self.state.last_error = Some(LastError {
             kind,
             message: message.clone(),
+            stage,
         });
         let retry_in = self.next_delay();
         let mut message = message;
@@ -830,11 +925,13 @@ impl RemotePusher {
             last_pushed: self.state.last_pushed_oid(),
             consecutive_failures: self.state.consecutive_failures,
             retry_in,
+            stage,
         });
         PushOutcome::Failed {
             kind,
             message,
             retry_in,
+            stage,
         }
     }
 }
@@ -1099,12 +1196,20 @@ mod tests {
 
     impl Vol {
         fn new(volume: &str, remotes: &[(&str, &str)]) -> Self {
+            Self::with_config(volume, remotes, &[])
+        }
+
+        /// [`Vol::new`] with more `(key, value)` config entries.
+        fn with_config(volume: &str, remotes: &[(&str, &str)], extra: &[(&str, &str)]) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let state = StateDir::new(dir.path().join("state"));
             volume::init(&state, volume, None).unwrap();
             let mut config = git2::Config::open(&state.git().join("config")).unwrap();
             for (name, url) in remotes {
                 config.set_str(&format!("remote.{name}.url"), url).unwrap();
+            }
+            for (key, value) in extra {
+                config.set_str(key, value).unwrap();
             }
             let context = Context {
                 volume: volume.into(),
@@ -1143,6 +1248,25 @@ mod tests {
                     CALLER,
                     vec![Input::Write {
                         path: RepoPath::new(format!("f{}", self.n)).unwrap(),
+                        backing,
+                        executable: false,
+                    }],
+                )
+                .unwrap();
+            self.com.commit_pending().unwrap();
+            self.head()
+        }
+
+        /// Records and commits `name` holding `content`; returns the new head.
+        fn commit_file(&mut self, name: &str, content: &[u8]) -> Oid {
+            let backing = self.dir.path().join("tree").join(name);
+            fs::write(&backing, content).unwrap();
+            self.rec
+                .record(
+                    Trigger::Close,
+                    CALLER,
+                    vec![Input::Write {
+                        path: RepoPath::new(name).unwrap(),
                         backing,
                         executable: false,
                     }],
@@ -2127,6 +2251,192 @@ mod tests {
         );
     }
 
+    mod lfs {
+        use super::*;
+        use crate::lfs::Pointer;
+        use crate::lfs::fake::FakeLfs;
+
+        const THRESHOLD: (&str, &str) = ("agentfs.lfsThreshold", "8");
+
+        fn object_in(remote: &Path, p: &Pointer) -> PathBuf {
+            let hex = p.oid.to_string();
+            remote.join(format!("lfs/objects/{}/{}/{hex}", &hex[..2], &hex[2..4]))
+        }
+
+        fn pointer_at(v: &Vol, path: &str) -> Pointer {
+            let head = v.com.history().head().unwrap().unwrap();
+            let id = head.tree().unwrap().get_path(Path::new(path)).unwrap().id();
+            Pointer::parse(v.com.history().repo().find_blob(id).unwrap().content()).unwrap()
+        }
+
+        #[test]
+        fn objects_are_uploaded_with_the_push_and_only_once() {
+            let remote_dir = tempfile::tempdir().unwrap();
+            bare(remote_dir.path());
+            let url = remote_dir.path().display().to_string();
+            let mut v = Vol::with_config("vol", &[("origin", &url)], &[THRESHOLD]);
+            v.commit_file("big.bin", b"large content one");
+            let head = v.commit_file("small.txt", b"small");
+            let first = pointer_at(&v, "big.bin");
+            let (events, sink) = sink();
+            let mut pusher = v.pusher("origin", sink);
+            assert!(pusher.push_once().is_success());
+            assert_eq!(
+                remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
+                Some(head)
+            );
+            assert_eq!(
+                fs::read(object_in(remote_dir.path(), &first)).unwrap(),
+                b"large content one"
+            );
+            assert!(matches!(&events.take()[..], [Event::PushSucceeded { .. }]));
+
+            // A later push uploads only the new object.
+            let mtime = fs::metadata(object_in(remote_dir.path(), &first))
+                .unwrap()
+                .modified()
+                .unwrap();
+            v.commit_file("second.bin", b"large content two");
+            let second = pointer_at(&v, "second.bin");
+            assert!(pusher.push_once().is_success());
+            assert!(object_in(remote_dir.path(), &second).is_file());
+            assert_eq!(
+                fs::metadata(object_in(remote_dir.path(), &first))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                mtime
+            );
+        }
+
+        #[test]
+        fn a_missing_cache_object_fails_the_lfs_stage_and_pushes_no_ref() {
+            let remote_dir = tempfile::tempdir().unwrap();
+            bare(remote_dir.path());
+            let url = remote_dir.path().display().to_string();
+            let mut v = Vol::with_config("vol", &[("origin", &url)], &[THRESHOLD]);
+            v.commit_file("big.bin", b"large content");
+            let p = pointer_at(&v, "big.bin");
+            fs::remove_file(v.com.lfs_cache().path(&p.oid)).unwrap();
+            let (events, sink) = sink();
+            let mut pusher = v.pusher("origin", sink);
+            let outcome = pusher.push_once();
+            let PushOutcome::Failed {
+                kind,
+                stage,
+                message,
+                ..
+            } = &outcome
+            else {
+                panic!("{outcome:?}")
+            };
+            assert_eq!((*kind, *stage), (PushFailureKind::Local, PushStage::Lfs));
+            assert!(message.contains("big.bin"), "{message}");
+            assert!(
+                message.contains("missing from the local cache"),
+                "{message}"
+            );
+            assert_eq!(
+                remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
+                None
+            );
+            let saved = PushState::load(&v.state.push_state("origin"));
+            assert_eq!(saved.last_error.unwrap().stage, PushStage::Lfs);
+            assert!(matches!(
+                &events.take()[..],
+                [Event::PushFailed {
+                    stage: PushStage::Lfs,
+                    kind: PushFailureKind::Local,
+                    ..
+                }]
+            ));
+        }
+
+        #[test]
+        fn remotes_without_lfs_content_never_resolve_an_endpoint() {
+            // git:// derives no LFS endpoint; without LFS content the push
+            // fails at the git stage only.
+            let mut v =
+                Vol::with_config("vol", &[("other", "git://127.0.0.1:1/r.git")], &[THRESHOLD]);
+            v.commit_file("small.txt", b"small");
+            let mut pusher = v.pusher("other", Arc::new(NullSink));
+            assert!(matches!(
+                pusher.push_once(),
+                PushOutcome::Failed {
+                    stage: PushStage::Git,
+                    ..
+                }
+            ));
+            // With LFS content it cannot upload, and says what to set.
+            v.commit_file("big.bin", b"large content");
+            let outcome = pusher.push_once();
+            assert!(
+                matches!(&outcome, PushOutcome::Failed { stage: PushStage::Lfs, kind: PushFailureKind::Local, message, .. }
+                    if message.contains("set remote.other.lfsurl")),
+                "{outcome:?}"
+            );
+        }
+
+        #[test]
+        fn an_http_lfs_failure_pushes_no_ref_and_a_fix_pushes_everything() {
+            let remote_dir = tempfile::tempdir().unwrap();
+            bare(remote_dir.path());
+            let server = FakeLfs::start();
+            server.with(|st| st.batch_status = Some(401));
+            let url = remote_dir.path().display().to_string();
+            let lfs_url = server.url();
+            let mut v = Vol::with_config(
+                "vol",
+                &[("origin", &url)],
+                &[THRESHOLD, ("remote.origin.lfsurl", &lfs_url)],
+            );
+            let head = v.commit_file("big.bin", b"large content");
+            let p = pointer_at(&v, "big.bin");
+            let mut pusher = v.pusher("origin", Arc::new(NullSink));
+            let outcome = pusher.push_once();
+            assert!(
+                matches!(
+                    &outcome,
+                    PushOutcome::Failed {
+                        stage: PushStage::Lfs,
+                        kind: PushFailureKind::Auth,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
+                None
+            );
+            server.with(|st| st.batch_status = None);
+            assert!(pusher.push_once().is_success());
+            assert_eq!(
+                remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
+                Some(head)
+            );
+            assert_eq!(server.object(&p.oid.to_string()).unwrap(), b"large content");
+            // No object went to the git remote's own LFS directory.
+            assert!(!object_in(remote_dir.path(), &p).exists());
+            let batch = server
+                .seen()
+                .into_iter()
+                .filter(|s| s.path.ends_with("/objects/batch"))
+                .count();
+            assert_eq!(batch, 2);
+            // The branch is up to date now: no batch request at all.
+            assert!(pusher.push_once().is_success());
+            assert_eq!(
+                server
+                    .seen()
+                    .into_iter()
+                    .filter(|s| s.path.ends_with("/objects/batch"))
+                    .count(),
+                2
+            );
+        }
+    }
+
     mod telemetry {
         use opentelemetry::trace::Status;
 
@@ -2169,7 +2479,7 @@ mod tests {
             assert_eq!(
                 h.sum(
                     names::PUSH_FAILURES,
-                    &[("remote", "origin"), ("reason", "auth")]
+                    &[("remote", "origin"), ("reason", "auth"), ("stage", "git")]
                 ),
                 None
             );
@@ -2200,6 +2510,60 @@ mod tests {
         }
 
         #[test]
+        fn the_push_span_counts_lfs_objects() {
+            let remote_dir = tempfile::tempdir().unwrap();
+            bare(remote_dir.path());
+            let mut v = Vol::with_config(
+                "vol",
+                &[("origin", &remote_dir.path().display().to_string())],
+                &[("agentfs.lfsThreshold", "4")],
+            );
+            v.commit_file("a.bin", b"aaaaaaaa");
+            v.commit_file("b.bin", b"bbbbbbbbbb");
+            let h = Harness::new();
+            let mut pusher =
+                v.pusher_with("origin", h.telemetry.sink(Arc::new(NullSink)), &h.telemetry);
+            assert!(pusher.push_once().is_success());
+            let span = &h.spans(spans::PUSH)[0];
+            assert_eq!(span_attr(span, "agentfs.lfs.objects").as_deref(), Some("2"));
+            assert_eq!(
+                span_attr(span, "agentfs.lfs.uploaded").as_deref(),
+                Some("2")
+            );
+            assert_eq!(span_attr(span, "agentfs.lfs.bytes").as_deref(), Some("18"));
+            // A failed upload: the stage is on the span and the counter.
+            let cache = v.com.lfs_cache().clone();
+            v.commit_file("c.bin", b"cccccccccccc");
+            let objects = fs::read_dir(v.state.lfs_objects()).unwrap().count();
+            assert!(objects > 0);
+            let head = v.com.history().head().unwrap().unwrap();
+            let c = head
+                .tree()
+                .unwrap()
+                .get_path(Path::new("c.bin"))
+                .unwrap()
+                .id();
+            let c =
+                crate::lfs::Pointer::parse(v.com.history().repo().find_blob(c).unwrap().content())
+                    .unwrap();
+            fs::remove_file(cache.path(&c.oid)).unwrap();
+            assert!(!pusher.push_once().is_success());
+            let span = &h.spans(spans::PUSH)[1];
+            assert_eq!(
+                span_attr(span, "agentfs.push.stage").as_deref(),
+                Some("lfs")
+            );
+            assert_eq!(span_attr(span, "agentfs.lfs.objects"), None);
+            assert_eq!(
+                h.sum(
+                    names::PUSH_FAILURES,
+                    &[("remote", "origin"), ("reason", "local"), ("stage", "lfs")]
+                ),
+                Some(1)
+            );
+        }
+
+        #[test]
         fn push_failures_by_reason() {
             let missing = tempfile::tempdir().unwrap().path().join("nope");
             let mut v = Vol::new("vol", &[("gone", &missing.display().to_string())]);
@@ -2213,7 +2577,11 @@ mod tests {
             assert_eq!(
                 h.sum(
                     names::PUSH_FAILURES,
-                    &[("remote", "gone"), ("reason", "unreachable")]
+                    &[
+                        ("remote", "gone"),
+                        ("reason", "unreachable"),
+                        ("stage", "git")
+                    ]
                 ),
                 Some(2)
             );
@@ -2275,7 +2643,11 @@ mod tests {
             assert_eq!(
                 h.sum(
                     names::PUSH_FAILURES,
-                    &[("remote", "origin"), ("reason", "non_fast_forward")]
+                    &[
+                        ("remote", "origin"),
+                        ("reason", "non_fast_forward"),
+                        ("stage", "git")
+                    ]
                 ),
                 Some(1)
             );
