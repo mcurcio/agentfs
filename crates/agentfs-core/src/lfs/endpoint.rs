@@ -171,11 +171,13 @@ fn endpoint(remote: &RemoteSettings, source: String, url: String) -> Result<LfsE
             })
         }
         Transport::Local => {
-            let path = local_path(&url);
+            let path = local_path(&remote_url::without_userinfo(&url));
             let git_dir = git_dir_of(&path).map_err(|e| {
+                // libgit2 names the path; never echo a userinfo it held.
+                let reason = e.message().replace(&*path.to_string_lossy(), "the path");
                 LfsError::local(format!(
                     "the LFS endpoint {display_url} ({source}) is not a git repository agentfs \
-                     can open: {e}"
+                     can open: {reason}"
                 ))
             })?;
             Ok(LfsEndpoint {
@@ -383,6 +385,16 @@ mod tests {
         let err = resolve(&s, &remote("/nonexistent/r.git"), Direction::Upload).unwrap_err();
         assert_eq!(err.kind, crate::events::PushFailureKind::Local);
         assert!(err.message.contains("not a git repository"), "{err}");
+        // Userinfo in a file URL is ignored, and never echoed.
+        let url = format!("file://u:secret@{}", bare.display());
+        assert!(resolve(&s, &remote(&url), Direction::Upload).is_ok());
+        let err = resolve(
+            &s,
+            &remote("file://u:secret@/nonexistent/r.git"),
+            Direction::Upload,
+        )
+        .unwrap_err();
+        assert!(!err.message.contains("secret"), "{err}");
     }
 
     #[test]

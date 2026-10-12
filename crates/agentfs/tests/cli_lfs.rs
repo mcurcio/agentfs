@@ -1,0 +1,439 @@
+//! Git LFS through the binary (design §7): `record` stores large files as
+//! pointers with a managed `.gitattributes` block, `push` uploads the
+//! objects to local and `file://` remotes before their refs, a failed
+//! upload pushes no ref, `restore` brings LFS content back from the cache
+//! or a remote, and `status` shows each remote's LFS endpoint.
+//!
+//! Ordinary clones are checked with the `git` binary. When `git-lfs` is on
+//! PATH (it is in CI) a clone also runs `git lfs pull` and compares the
+//! bytes; otherwise that part is skipped with a message.
+
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const LARGE: &str = "large content, over the sixteen-byte threshold\n";
+
+struct Volume {
+    dir: tempfile::TempDir,
+}
+
+impl Volume {
+    fn new() -> Self {
+        let v = Self {
+            dir: tempfile::tempdir().unwrap(),
+        };
+        fs::create_dir_all(v.tree()).unwrap();
+        fs::create_dir_all(v.home()).unwrap();
+        v.ok(&["init", "--volume", "demo"]);
+        v.config(&[("agentfs.lfsThreshold", "16")]);
+        fs::write(
+            v.state().join("git/info/attributes"),
+            "*.psd filter=lfs\nkeep.bin agentfs.store=blob\n",
+        )
+        .unwrap();
+        v
+    }
+
+    fn state(&self) -> PathBuf {
+        self.dir.path().join("state")
+    }
+
+    fn tree(&self) -> PathBuf {
+        self.dir.path().join("tree")
+    }
+
+    fn home(&self) -> PathBuf {
+        self.dir.path().join("home")
+    }
+
+    fn config(&self, pairs: &[(&str, &str)]) {
+        let mut config = git2::Config::open(&self.state().join("git/config")).unwrap();
+        for (k, v) in pairs {
+            config.set_str(k, v).unwrap();
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        let home = self.home();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
+        cmd.arg("--state")
+            .arg(self.state())
+            .arg("--root")
+            .arg(self.tree())
+            .args(args)
+            .env_remove("AGENTFS_STATE")
+            .env_remove("AGENTFS_ROOT")
+            .env("AGENTFS_REPLICA", "test-0")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"));
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("OTEL_") {
+                cmd.env_remove(name);
+            }
+        }
+        cmd.output().unwrap()
+    }
+
+    fn ok(&self, args: &[&str]) -> String {
+        let out = self.run(args);
+        assert!(
+            out.status.success(),
+            "agentfs {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn write(&self, path: &str, content: &str, executable: bool) {
+        let p = self.tree().join(path);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, content).unwrap();
+        let mode = if executable { 0o755 } else { 0o644 };
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// The cache path of an object.
+    fn cached(&self, oid: &str) -> PathBuf {
+        self.state()
+            .join(format!("lfs/objects/{}/{}/{oid}", &oid[..2], &oid[2..4]))
+    }
+}
+
+/// Runs git hermetically in `dir`.
+fn git(dir: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", dir)
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .output()
+        .expect("running git")
+}
+
+fn git_ok(dir: &Path, args: &[&str]) -> String {
+    let out = git(dir, args);
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn have(program: &str, arg: &str) -> bool {
+    Command::new(program)
+        .arg(arg)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// `version …\noid sha256:<oid>\nsize <n>\n` → `(oid, n)`.
+fn pointer(text: &str) -> (String, u64) {
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next(),
+        Some("version https://git-lfs.github.com/spec/v1"),
+        "{text:?}"
+    );
+    let oid = lines.next().unwrap().strip_prefix("oid sha256:").unwrap();
+    let size = lines.next().unwrap().strip_prefix("size ").unwrap();
+    (oid.to_owned(), size.parse().unwrap())
+}
+
+fn bare(path: &Path) {
+    git2::Repository::init_bare(path).unwrap();
+}
+
+/// Records the standard set of files: LFS by threshold, by attribute, with
+/// a space and an executable bit, and blobs.
+fn record_files(v: &Volume) {
+    v.write("small.txt", "small\n", false);
+    v.write("big.bin", LARGE, false);
+    v.write("art.psd", "tiny psd", false);
+    v.write("keep.bin", LARGE, false);
+    v.write("dir with space/large file.bin", LARGE, true);
+    v.ok(&[
+        "record",
+        "small.txt",
+        "big.bin",
+        "art.psd",
+        "keep.bin",
+        "dir with space/large file.bin",
+    ]);
+}
+
+const LFS: [&str; 3] = ["art.psd", "big.bin", "dir with space/large file.bin"];
+
+#[test]
+fn large_files_reach_local_and_file_remotes_as_lfs() {
+    if !have("git", "--version") {
+        eprintln!("skipped: git is not installed");
+        return;
+    }
+    let v = Volume::new();
+    let remotes = v.dir.path().join("remotes");
+    let local = remotes.join("local.git");
+    let file = remotes.join("file.git");
+    bare(&local);
+    bare(&file);
+    v.config(&[
+        ("remote.local.url", local.to_str().unwrap()),
+        ("remote.file.url", &format!("file://{}", file.display())),
+    ]);
+    record_files(&v);
+    let out = v.ok(&["push"]);
+    assert!(out.contains("local: pushed"), "{out}");
+    assert!(out.contains("file: pushed"), "{out}");
+
+    let state_git = v.state().join("git");
+    let attributes = git_ok(&state_git, &["show", "agentfs/demo:.gitattributes"]);
+    assert_eq!(
+        attributes,
+        "# agentfs-lfs-begin: maintained by agentfs (Git LFS paths); edits are replaced\n\
+         /art.psd filter=lfs diff=lfs merge=lfs -text\n\
+         /big.bin filter=lfs diff=lfs merge=lfs -text\n\
+         /dir[[:space:]]with[[:space:]]space/large[[:space:]]file.bin filter=lfs diff=lfs merge=lfs -text\n\
+         # agentfs-lfs-end\n"
+    );
+    // The backing tree never gets it.
+    assert!(!v.tree().join(".gitattributes").exists());
+    for remote in [&local, &file] {
+        for path in LFS {
+            let text = git_ok(remote, &["show", &format!("agentfs/demo:{path}")]);
+            let (oid, size) = pointer(&text);
+            let content = fs::read(v.tree().join(path)).unwrap();
+            assert_eq!(size, content.len() as u64, "{path}");
+            let object = remote.join(format!("lfs/objects/{}/{}/{oid}", &oid[..2], &oid[2..4]));
+            assert_eq!(fs::read(&object).unwrap(), content, "{path}");
+            assert!(v.cached(&oid).is_file());
+        }
+        for (path, content) in [("small.txt", "small\n"), ("keep.bin", LARGE)] {
+            assert_eq!(
+                git_ok(remote, &["show", &format!("agentfs/demo:{path}")]),
+                content
+            );
+        }
+        let mode = git_ok(
+            remote,
+            &["ls-tree", "agentfs/demo", "dir with space/large file.bin"],
+        );
+        assert!(mode.starts_with("100755 "), "{mode}");
+    }
+
+    // An ordinary clone sees the attributes; with git-lfs, the content.
+    let clone = v.dir.path().join("clone");
+    let out = git(
+        v.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "agentfs/demo",
+            &format!("file://{}", file.display()),
+            clone.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let check = git_ok(
+        &clone,
+        &["check-attr", "filter", "--", "big.bin", "small.txt"],
+    );
+    assert_eq!(
+        check,
+        "big.bin: filter: lfs\nsmall.txt: filter: unspecified\n"
+    );
+    if !have("git-lfs", "version") {
+        eprintln!("skipped `git lfs pull`: git-lfs is not installed");
+        return;
+    }
+    git_ok(&clone, &["lfs", "install", "--local"]);
+    git_ok(&clone, &["lfs", "pull"]);
+    for path in LFS.iter().chain(&["small.txt", "keep.bin"]) {
+        assert_eq!(
+            fs::read(clone.join(path)).unwrap(),
+            fs::read(v.tree().join(path)).unwrap(),
+            "{path}"
+        );
+    }
+    let files = git_ok(&clone, &["lfs", "ls-files", "-n"]);
+    let mut listed: Vec<&str> = files.lines().collect();
+    listed.sort();
+    assert_eq!(listed, LFS);
+    assert_eq!(git_ok(&clone, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn restore_brings_lfs_content_back_from_the_cache_or_a_remote() {
+    let v = Volume::new();
+    let remote = v.dir.path().join("remote.git");
+    bare(&remote);
+    v.config(&[("remote.origin.url", remote.to_str().unwrap())]);
+    v.write("big.bin", LARGE, false);
+    v.ok(&["record", "big.bin"]);
+    v.ok(&["push"]);
+    let c1 = git_ok(&v.state().join("git"), &["rev-parse", "agentfs/demo"]);
+    let c1 = c1.trim();
+    fs::remove_file(v.tree().join("big.bin")).unwrap();
+    v.ok(&["record", "big.bin"]);
+
+    let out = v.ok(&["restore", "big.bin", c1]);
+    assert!(out.contains("write"), "{out}");
+    assert_eq!(fs::read_to_string(v.tree().join("big.bin")).unwrap(), LARGE);
+
+    // Again, with the cache lost: the object comes from the remote.
+    fs::remove_file(v.tree().join("big.bin")).unwrap();
+    v.ok(&["record", "big.bin"]);
+    fs::remove_dir_all(v.state().join("lfs/objects")).unwrap();
+    v.ok(&["restore", "big.bin", c1]);
+    assert_eq!(fs::read_to_string(v.tree().join("big.bin")).unwrap(), LARGE);
+
+    // Nowhere to get it from: refused before anything is written.
+    fs::remove_file(v.tree().join("big.bin")).unwrap();
+    v.ok(&["record", "big.bin"]);
+    fs::remove_dir_all(v.state().join("lfs/objects")).unwrap();
+    fs::remove_dir_all(remote.join("lfs")).unwrap();
+    let out = v.run(&["restore", "big.bin", c1]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("LFS object"), "{err}");
+    assert!(!v.tree().join("big.bin").exists());
+}
+
+/// An HTTP server that answers every request with 401, counting them.
+fn refusing_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = count.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; length];
+            let _ = reader.read_exact(&mut body);
+            let reply = "{\"message\":\"Credentials needed\"}";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/vnd.git-lfs+json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    (port, count)
+}
+
+#[test]
+fn a_refused_lfs_upload_pushes_no_ref() {
+    let v = Volume::new();
+    let remote = v.dir.path().join("remote.git");
+    bare(&remote);
+    let (port, requests) = refusing_server();
+    let lfs_url = format!("http://bob:hunter2@127.0.0.1:{port}/acme/lfs");
+    v.config(&[
+        ("remote.origin.url", remote.to_str().unwrap()),
+        ("remote.origin.lfsurl", &lfs_url),
+    ]);
+    let status = v.ok(&["status"]);
+    assert!(
+        status.contains(&format!(
+            "lfs: http://***@127.0.0.1:{port}/acme/lfs (remote.origin.lfsurl, credentials from \
+             the URL)"
+        )),
+        "{status}"
+    );
+    assert!(
+        status.contains("files over 16 byte(s) are stored as LFS"),
+        "{status}"
+    );
+    assert!(!status.contains("hunter2"), "{status}");
+
+    // Nothing stored as LFS yet: the endpoint is never contacted.
+    v.write("small.txt", "small\n", false);
+    v.ok(&["record", "small.txt"]);
+    v.ok(&["push"]);
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let pushed = git_ok_or_none(&remote);
+
+    v.write("big.bin", LARGE, false);
+    v.ok(&["record", "big.bin"]);
+    let out = v.run(&["push"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("origin: failed (auth, stage lfs)"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("failed (auth, stage lfs)"), "{stderr}");
+    assert!(!stdout.contains("hunter2") && !stderr.contains("hunter2"));
+    assert!(requests.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    // The remote branch did not move.
+    assert_eq!(git_ok_or_none(&remote), pushed);
+    let status = v.ok(&["status"]);
+    assert!(status.contains("last error (auth, stage lfs)"), "{status}");
+}
+
+/// The remote's branch head, if any.
+fn git_ok_or_none(remote: &Path) -> Option<git2::Oid> {
+    git2::Repository::open_bare(remote)
+        .unwrap()
+        .refname_to_id("refs/heads/agentfs/demo")
+        .ok()
+}
+
+#[test]
+fn status_shows_derived_endpoints_and_why_there_is_none() {
+    let v = Volume::new();
+    let remote = v.dir.path().join("remote.git");
+    bare(&remote);
+    v.config(&[
+        ("remote.local.url", remote.to_str().unwrap()),
+        ("remote.web.url", "https://git.example/acme/r"),
+        ("remote.web.agentfsCredentials", "/run/secrets/git"),
+        ("remote.git.url", "git://git.example/acme/r.git"),
+    ]);
+    let status = v.ok(&["status"]);
+    assert!(
+        status.contains(&format!(
+            "lfs: {} (derived from remote.local.url)",
+            remote.display()
+        )),
+        "{status}"
+    );
+    if cfg!(feature = "https") {
+        assert!(
+            status.contains(
+                "lfs: https://git.example/acme/r.git/info/lfs (derived from remote.web.url, \
+                 credentials from agentfsCredentials)"
+            ),
+            "{status}"
+        );
+    }
+    assert!(
+        status.contains("lfs: none (remote git pushes over git://"),
+        "{status}"
+    );
+}

@@ -47,6 +47,7 @@ use agentfs_core::config::parse_duration;
 use agentfs_core::events::{Event, Events, PushStage};
 use agentfs_core::history::History;
 use agentfs_core::identity::Context;
+use agentfs_core::lfs;
 use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::push::{self, PushOutcome, RemotePusher, RemoteStatus};
@@ -286,8 +287,20 @@ fn real_main() -> Result<ExitCode> {
                 Some(holder) => println!("lock:      held by {holder}"),
                 None => println!("lock:      free"),
             }
-            for remote in push::status(&state, history.settings())? {
+            let settings = history.settings();
+            match settings.lfs.threshold {
+                Some(bytes) => println!("lfs:       files over {bytes} byte(s) are stored as LFS"),
+                None => println!("lfs:       no size threshold (only lfs attributes select LFS)"),
+            }
+            for remote in push::status(&state, settings)? {
                 println!("{}", remote_line(&remote));
+                // Where its LFS objects go: resolved from config, no network.
+                if let Some(r) = settings.remotes.iter().find(|r| r.name == remote.name) {
+                    match lfs::endpoint::resolve(settings, r, lfs::Direction::Upload) {
+                        Ok(endpoint) => println!("           lfs: {}", endpoint.describe()),
+                        Err(e) => println!("           lfs: none ({e})"),
+                    }
+                }
             }
             for bad in &history.settings().invalid_remotes {
                 println!(
@@ -563,7 +576,14 @@ fn remote_line(remote: &RemoteStatus) -> String {
         state.consecutive_failures
     ));
     if let Some(error) = &state.last_error {
-        line.push_str(&format!(", last error ({}): {}", error.kind, error.message));
+        let stage = match error.stage {
+            PushStage::Git => "",
+            PushStage::Lfs => ", stage lfs",
+        };
+        line.push_str(&format!(
+            ", last error ({}{stage}): {}",
+            error.kind, error.message
+        ));
     }
     if let Some(diverged) = &state.diverged {
         match &diverged.diverged_ref {
