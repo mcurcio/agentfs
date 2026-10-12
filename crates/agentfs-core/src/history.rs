@@ -17,8 +17,10 @@ use std::sync::Once;
 
 use git2::{Index, IndexEntry, IndexTime, Oid, Repository, Signature, Time};
 
+use crate::checks::{Checks, Refusal};
 use crate::config::{ConfigError, Settings};
 use crate::identity::{Context, IdentityError, IdentityRenderer};
+use crate::lfs::{ObjectCache, Store, attributes};
 use crate::paths::RepoPath;
 use crate::pending::PendingStore;
 use crate::record::{Change, Record};
@@ -46,6 +48,10 @@ pub enum HistoryError {
     Identity(#[from] IdentityError),
     #[error("branch head {0} has no valid {SEQ_TRAILER} trailer")]
     MissingSeq(Oid),
+    #[error("caching LFS content: {0}")]
+    Lfs(#[source] io::Error),
+    #[error("the managed .gitattributes would be refused: {0}")]
+    ManagedAttributes(Refusal),
 }
 
 /// Process-wide libgit2 setup, done once before any repository is opened:
@@ -199,24 +205,37 @@ impl History {
     }
 
     /// Commits `records` (already grouped) as one commit on the branch.
+    ///
+    /// Writes stored as LFS (design §7) are hashed into `lfs`, the object
+    /// cache, and committed as pointer blobs; the root `.gitattributes` in
+    /// history then gets its managed block rebuilt
+    /// ([`crate::lfs::attributes`]). The cache object is durable before the
+    /// branch moves.
     pub fn commit(
         &self,
         records: &[Record],
         pending: &PendingStore,
+        lfs: &ObjectCache,
         identities: &IdentityRenderer,
         context: &Context,
     ) -> Result<Committed, HistoryError> {
         let last = records.last().expect("commit needs at least one record");
         let head = self.head()?;
         let mut index = Index::new()?;
+        let mut managed = BTreeSet::new();
         if let Some(head) = &head {
-            index.read_tree(&head.tree()?)?;
+            let tree = head.tree()?;
+            index.read_tree(&tree)?;
+            managed = attributes::managed_paths(&self.repo, &tree)?;
         }
+        let mut written = Written::default();
         for record in records {
             for change in &record.draft.changes {
-                self.apply(&mut index, change, pending)?;
+                self.apply(&mut index, change, pending, lfs)?;
+                written.note(change);
             }
         }
+        self.update_managed_attributes(&mut index, managed, &written)?;
         let tree_id = index.write_tree_to(&self.repo)?;
         if head.as_ref().is_some_and(|h| h.tree_id() == tree_id) {
             return Ok(Committed {
@@ -262,6 +281,7 @@ impl History {
         index: &mut Index,
         change: &Change,
         pending: &PendingStore,
+        lfs: &ObjectCache,
     ) -> Result<(), HistoryError> {
         match change {
             Change::Remove { path } => remove_all(index, path)?,
@@ -269,8 +289,17 @@ impl History {
                 path,
                 pending: id,
                 executable,
+                store,
             } => {
-                let blob = self.repo.blob_path(&pending.path(*id))?;
+                let blob = match store {
+                    Store::Blob => self.repo.blob_path(&pending.path(*id))?,
+                    Store::Lfs => {
+                        let pointer = lfs
+                            .insert_file(&pending.path(*id))
+                            .map_err(HistoryError::Lfs)?;
+                        self.repo.blob(pointer.encode().as_bytes())?
+                    }
+                };
                 let mode = if *executable {
                     MODE_EXECUTABLE
                 } else {
@@ -288,6 +317,68 @@ impl History {
         Ok(())
     }
 
+    /// Rebuilds the managed block of the root `.gitattributes` in `index`
+    /// (design §7): one line for every path stored as LFS. `managed` is the
+    /// head's block (agentfs wrote it), `written` what this commit wrote. A
+    /// path stays managed while it is a regular file not since rewritten
+    /// as a blob or symlink; the workload's own content is kept byte for
+    /// byte, and any block it wrote is replaced.
+    fn update_managed_attributes(
+        &self,
+        index: &mut Index,
+        managed: BTreeSet<RepoPath>,
+        written: &Written,
+    ) -> Result<(), HistoryError> {
+        let is_file = |index: &Index, path: &RepoPath| {
+            index
+                .get_path(Path::new(path.as_str()), 0)
+                .is_some_and(|e| matches!(e.mode, MODE_FILE | MODE_EXECUTABLE))
+        };
+        let paths: BTreeSet<RepoPath> = managed
+            .into_iter()
+            .filter(|p| !written.other.contains(p))
+            .chain(written.lfs.iter().cloned())
+            .filter(|p| is_file(index, p))
+            .collect();
+        let root = Path::new(attributes::ROOT_GITATTRIBUTES);
+        let existing = index.get_path(root, 0);
+        let (content, mode) = match &existing {
+            Some(e) if matches!(e.mode, MODE_FILE | MODE_EXECUTABLE) => {
+                (self.repo.find_blob(e.id)?.content().to_vec(), e.mode)
+            }
+            // A symlinked .gitattributes is never recorded (design §3.4).
+            Some(_) => return Ok(()),
+            None => {
+                // A directory named .gitattributes: nowhere to put lines.
+                let dir = format!("{}/", attributes::ROOT_GITATTRIBUTES);
+                if index.iter().any(|e| e.path.starts_with(dir.as_bytes())) {
+                    return Ok(());
+                }
+                (Vec::new(), MODE_FILE)
+            }
+        };
+        let (user, _) = attributes::split(&content);
+        let had_block = user.len() != content.len();
+        if paths.is_empty() && !had_block {
+            return Ok(());
+        }
+        if paths.is_empty() && user.is_empty() {
+            if existing.is_some() {
+                index.remove_path(root)?;
+            }
+            return Ok(());
+        }
+        let composed = attributes::compose(&user, &paths);
+        let path =
+            RepoPath::new(attributes::ROOT_GITATTRIBUTES).expect(".gitattributes is a valid path");
+        if let Some(refusal) = Checks::default().check_blob(&path, &composed) {
+            return Err(HistoryError::ManagedAttributes(refusal));
+        }
+        let blob = self.repo.blob(&composed)?;
+        index.add(&entry(&path, blob, mode))?;
+        Ok(())
+    }
+
     /// libgit2 fsyncs object files and refs once enabled, but not newly
     /// created directories; fsync the ones a commit can create.
     fn sync_dirs(&self) -> io::Result<()> {
@@ -301,6 +392,33 @@ impl History {
     }
 }
 
+/// What one commit wrote, for the managed `.gitattributes` block: the
+/// paths last written as LFS, and those last written as a blob or symlink.
+#[derive(Default)]
+struct Written {
+    lfs: BTreeSet<RepoPath>,
+    other: BTreeSet<RepoPath>,
+}
+
+impl Written {
+    fn note(&mut self, change: &Change) {
+        match change {
+            Change::Write {
+                path,
+                store: Store::Lfs,
+                ..
+            } => {
+                self.other.remove(path);
+                self.lfs.insert(path.clone());
+            }
+            Change::Write { path, .. } | Change::Symlink { path, .. } => {
+                self.lfs.remove(path);
+                self.other.insert(path.clone());
+            }
+            Change::Remove { .. } => {}
+        }
+    }
+}
 /// Removes `path` and everything beneath it.
 fn remove_all(index: &mut Index, path: &RepoPath) -> Result<(), git2::Error> {
     let p = Path::new(path.as_str());
@@ -453,6 +571,7 @@ mod tests {
 
     use super::*;
     use crate::identity::Templates;
+    use crate::lfs::Pointer;
     use crate::record::{Caller, Draft, Trigger};
 
     #[test]
@@ -497,6 +616,7 @@ mod tests {
         dir: tempfile::TempDir,
         history: History,
         pending: PendingStore,
+        lfs: ObjectCache,
         identities: IdentityRenderer,
         context: Context,
         seq: u64,
@@ -507,6 +627,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let history = History::init(&dir.path().join("git"), "vol", None).unwrap();
             let pending = PendingStore::open(dir.path().join("pending")).unwrap();
+            let lfs = ObjectCache::open(dir.path().join("lfs")).unwrap();
             let context = Context {
                 volume: "vol".into(),
                 namespace: "agent".into(),
@@ -520,6 +641,7 @@ mod tests {
                 dir,
                 history,
                 pending,
+                lfs,
                 identities,
                 context,
                 seq: 0,
@@ -527,6 +649,14 @@ mod tests {
         }
 
         fn write(&self, path: &str, content: &[u8], executable: bool) -> Change {
+            self.write_to(path, content, executable, Store::Blob)
+        }
+
+        fn write_lfs(&self, path: &str, content: &[u8]) -> Change {
+            self.write_to(path, content, false, Store::Lfs)
+        }
+
+        fn write_to(&self, path: &str, content: &[u8], executable: bool, store: Store) -> Change {
             let src = self.dir.path().join("src");
             fs::write(&src, content).unwrap();
             let (id, _) = self.pending.freeze(&src).unwrap();
@@ -534,6 +664,7 @@ mod tests {
                 path: RepoPath::new(path).unwrap(),
                 pending: id,
                 executable,
+                store,
             }
         }
 
@@ -558,7 +689,13 @@ mod tests {
 
         fn commit(&self, records: &[Record]) -> Committed {
             self.history
-                .commit(records, &self.pending, &self.identities, &self.context)
+                .commit(
+                    records,
+                    &self.pending,
+                    &self.lfs,
+                    &self.identities,
+                    &self.context,
+                )
                 .unwrap()
         }
 
@@ -716,6 +853,153 @@ mod tests {
         }
     }
 
+    fn managed(paths: &[&str]) -> BTreeSet<RepoPath> {
+        paths.iter().map(|p| RepoPath::new(*p).unwrap()).collect()
+    }
+
+    fn attributes_with(user: &[u8], paths: &[&str]) -> Vec<u8> {
+        attributes::compose(user, &managed(paths))
+    }
+
+    #[test]
+    fn lfs_writes_become_pointers_with_a_managed_attributes_line() {
+        let mut f = Fixture::new();
+        let content = b"large content".repeat(100);
+        let big = f.write_lfs("big.bin", &content);
+        let small = f.write("small.txt", b"small", false);
+        let r = f.record(Trigger::Close, vec![big, small]);
+        f.commit(&[r]);
+
+        let (pointer, mode) = f.read("big.bin").unwrap();
+        assert_eq!(mode, 0o100644);
+        let pointer = Pointer::parse(&pointer).expect("a canonical pointer");
+        assert_eq!(pointer.oid, crate::lfs::LfsOid::of(&content));
+        assert_eq!(pointer.size, content.len() as u64);
+        assert_eq!(fs::read(f.lfs.path(&pointer.oid)).unwrap(), content);
+        assert_eq!(f.read("small.txt").unwrap().0, b"small");
+        assert_eq!(
+            f.read(".gitattributes").unwrap(),
+            (attributes_with(b"", &["big.bin"]), 0o100644)
+        );
+        // The executable bit stays on the pointer.
+        let exec = f.write_to("tool", &content, true, Store::Lfs);
+        let r = f.record(Trigger::Close, vec![exec]);
+        f.commit(&[r]);
+        assert_eq!(f.read("tool").unwrap().1, 0o100755);
+        assert_eq!(
+            f.read(".gitattributes").unwrap().0,
+            attributes_with(b"", &["big.bin", "tool"])
+        );
+    }
+
+    #[test]
+    fn the_workloads_gitattributes_is_kept_and_forged_blocks_replaced() {
+        let mut f = Fixture::new();
+        let forged = format!(
+            "*.txt text\n{}\n/plain.bin filter=lfs diff=lfs merge=lfs -text\n{}\n",
+            attributes::BEGIN,
+            attributes::END
+        );
+        let user = f.write(".gitattributes", forged.as_bytes(), false);
+        let plain = f.write("plain.bin", b"not a pointer", false);
+        let r = f.record(Trigger::Close, vec![user, plain]);
+        f.commit(&[r]);
+        // No LFS path: the forged block goes, the user's line stays.
+        assert_eq!(f.read(".gitattributes").unwrap().0, b"*.txt text\n");
+
+        let lfs = f.write_lfs("a.bin", b"aaaa");
+        let r = f.record(Trigger::Close, vec![lfs]);
+        f.commit(&[r]);
+        assert_eq!(
+            f.read(".gitattributes").unwrap().0,
+            attributes_with(b"*.txt text\n", &["a.bin"])
+        );
+        // The workload rewrites .gitattributes (with another forged block):
+        // its content is replaced, the managed block is not.
+        let rewritten = format!("*.md text\n{}\n/plain.bin x\n", attributes::BEGIN);
+        let user = f.write(".gitattributes", rewritten.as_bytes(), false);
+        let r = f.record(Trigger::Close, vec![user]);
+        f.commit(&[r]);
+        assert_eq!(
+            f.read(".gitattributes").unwrap().0,
+            attributes_with(b"*.md text\n", &["a.bin"])
+        );
+        // Removing .gitattributes keeps the block alone.
+        let r = f.record(Trigger::Unlink, vec![remove(".gitattributes")]);
+        f.commit(&[r]);
+        assert_eq!(
+            f.read(".gitattributes").unwrap().0,
+            attributes_with(b"", &["a.bin"])
+        );
+    }
+
+    #[test]
+    fn managed_lines_go_when_their_paths_stop_being_lfs() {
+        let mut f = Fixture::new();
+        let changes = vec![
+            f.write_lfs("rm.bin", b"1111"),
+            f.write_lfs("shrunk.bin", b"2222"),
+            f.write_lfs("dir/a.bin", b"3333"),
+            f.write_lfs("dir/b.bin", b"4444"),
+            f.write_lfs("linked.bin", b"5555"),
+            f.write_lfs("stays.bin", b"6666"),
+        ];
+        let r = f.record(Trigger::Close, changes);
+        f.commit(&[r]);
+        assert_eq!(
+            f.read(".gitattributes").unwrap().0,
+            attributes_with(
+                b"",
+                &[
+                    "dir/a.bin",
+                    "dir/b.bin",
+                    "linked.bin",
+                    "rm.bin",
+                    "shrunk.bin",
+                    "stays.bin"
+                ]
+            )
+        );
+        let shrunk = f.write("shrunk.bin", b"2", false);
+        let r = f.record(
+            Trigger::Close,
+            vec![
+                remove("rm.bin"),
+                shrunk,
+                remove("dir"),
+                Change::Symlink {
+                    path: RepoPath::new("linked.bin").unwrap(),
+                    target: "stays.bin".into(),
+                },
+            ],
+        );
+        f.commit(&[r]);
+        assert_eq!(
+            f.read(".gitattributes").unwrap().0,
+            attributes_with(b"", &["stays.bin"])
+        );
+        assert_eq!(f.read("shrunk.bin").unwrap().0, b"2");
+        // The last one goes: so does the file agentfs created.
+        let r = f.record(Trigger::Unlink, vec![remove("stays.bin")]);
+        f.commit(&[r]);
+        assert_eq!(f.read(".gitattributes"), None);
+    }
+
+    #[test]
+    fn lfs_commits_replay_idempotently() {
+        let mut f = Fixture::new();
+        let w = f.write_lfs("big", b"0123456789");
+        let r = f.record(Trigger::Close, vec![w]);
+        let first = f.commit(std::slice::from_ref(&r));
+        assert!(first.commit.is_some());
+        // As after a crash between the commit and the journal truncation.
+        assert_eq!(f.commit(std::slice::from_ref(&r)).commit, None);
+        // And between the cache insert and the commit: the object is reused.
+        let w = f.write_lfs("again", b"0123456789");
+        let r = f.record(Trigger::Close, vec![w]);
+        f.commit(&[r]);
+        assert_eq!(f.read("again").unwrap().0, f.read("big").unwrap().0);
+    }
     #[test]
     fn settings_come_from_init() {
         let dir = tempfile::tempdir().unwrap();

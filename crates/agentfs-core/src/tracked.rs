@@ -127,6 +127,7 @@ mod tests {
             path: p(s),
             pending: PendingId(0),
             executable: false,
+            store: Default::default(),
         }
     }
 

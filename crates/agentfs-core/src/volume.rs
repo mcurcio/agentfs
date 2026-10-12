@@ -34,6 +34,7 @@ use crate::events::{CheckStage, Event, Events};
 use crate::history::{Committed, History, HistoryError};
 use crate::identity::{Context, IdentityRenderer};
 use crate::journal::{Journal, OpenReport};
+use crate::lfs::{ObjectCache, Store, StorePolicy};
 use crate::nested;
 use crate::operations::{ActorBusy, OperationGuard, Operations};
 use crate::paths::{PathError, RepoPath};
@@ -416,6 +417,9 @@ pub fn open(
         tracked: Arc::new(tracked),
         claims: Arc::new(PathClaims::default()),
         checks: checks.clone(),
+        store_policy: StorePolicy {
+            threshold: history.settings().lfs.threshold,
+        },
         events: events.clone(),
         telemetry: telemetry.clone(),
     };
@@ -424,6 +428,7 @@ pub fn open(
         journal,
         operations,
         pending,
+        lfs: Arc::new(ObjectCache::open(state.lfs())?),
         identities,
         context,
         checks,
@@ -501,6 +506,7 @@ pub struct Recorder {
     tracked: Arc<Tracked>,
     claims: Arc<PathClaims>,
     checks: Arc<Checks>,
+    store_policy: StorePolicy,
     events: Events,
     telemetry: Telemetry,
 }
@@ -619,20 +625,31 @@ impl Recorder {
                         backing,
                         executable,
                     } => {
-                        if let Some(refusal) = self
-                            .checks
-                            .check_path(&path)
-                            .or_else(|| self.checks.check_backing_size(&backing))
+                        if let Some(refusal) = self.checks.check_path(&path) {
+                            self.refuse(&mut skipped, path, refusal);
+                            continue;
+                        }
+                        // The store decides whether the blob limit applies
+                        // (design §7): first by the size on disk, so a file
+                        // far over the limit is never copied, then by the
+                        // frozen copy's, which is what is journaled.
+                        let attrs = self.rules.attributes(&path)?;
+                        let on_disk = std::fs::metadata(&backing).map_or(0, |m| m.len());
+                        if self.store_policy.decide(&path, on_disk, &attrs) == Store::Blob
+                            && let Some(refusal) = self.checks.check_backing_size(&backing)
                         {
                             self.refuse(&mut skipped, path, refusal);
                             continue;
                         }
                         let (id, _) = self.pending.freeze(&backing)?;
                         frozen.push(id);
-                        if let Some(refusal) = self.checks.check_file(
+                        let frozen_size = std::fs::metadata(self.pending.path(id))?.len();
+                        let store = self.store_policy.decide(&path, frozen_size, &attrs);
+                        if let Some(refusal) = self.checks.check_file_stored(
                             &path,
                             &self.pending.path(id),
                             CheckStage::Record,
+                            store,
                         )? {
                             frozen.pop();
                             self.pending.remove([id])?;
@@ -643,6 +660,7 @@ impl Recorder {
                             path,
                             pending: id,
                             executable,
+                            store,
                         }
                     }
                     Input::Symlink { path, target } => {
@@ -754,6 +772,14 @@ impl Recorder {
         &self.checks
     }
 
+    /// Where a regular file at `path` holding `size` bytes would be stored
+    /// if it were recorded now (design §7): the attributes in force and
+    /// `agentfs.lfsThreshold`.
+    pub fn store_for(&self, path: &RepoPath, size: u64) -> Result<Store, VolumeError> {
+        let attrs = self.rules.attributes(path)?;
+        Ok(self.store_policy.decide(path, size, &attrs))
+    }
+
     /// The last sequence number given to a record, journaled or in flight.
     pub fn last_seq(&self) -> Option<u64> {
         self.journal.last_seq()
@@ -803,6 +829,7 @@ pub struct Committer {
     journal: Arc<Journal>,
     operations: Arc<Operations>,
     pending: Arc<PendingStore>,
+    lfs: Arc<ObjectCache>,
     identities: IdentityRenderer,
     context: Context,
     checks: Arc<Checks>,
@@ -829,6 +856,11 @@ pub struct CommitReport {
 impl Committer {
     pub fn history(&self) -> &History {
         &self.history
+    }
+
+    /// The local LFS object cache (design §7).
+    pub fn lfs_cache(&self) -> &Arc<ObjectCache> {
+        &self.lfs
     }
 
     /// Records durable but not yet in history.
@@ -924,10 +956,13 @@ impl Committer {
                     break;
                 }
             };
-            match self
-                .history
-                .commit(&checked, &self.pending, &self.identities, &self.context)
-            {
+            match self.history.commit(
+                &checked,
+                &self.pending,
+                &self.lfs,
+                &self.identities,
+                &self.context,
+            ) {
                 Ok(Committed { commit, last_seq }) => {
                     report.records += group.len();
                     report.commits += usize::from(commit.is_some());
@@ -989,10 +1024,16 @@ impl Committer {
             let mut kept = Vec::with_capacity(record.draft.changes.len());
             for change in record.draft.changes {
                 let refusal = match &change {
-                    Change::Write { path, pending, .. } => self.checks.check_file(
+                    Change::Write {
+                        path,
+                        pending,
+                        store,
+                        ..
+                    } => self.checks.check_file_stored(
                         path,
                         &self.pending.path(*pending),
                         CheckStage::Commit,
+                        *store,
                     )?,
                     Change::Symlink { path, target } => self.checks.check_symlink(path, target),
                     Change::Remove { .. } => None,
@@ -1122,6 +1163,7 @@ mod tests {
 
     use super::*;
     use crate::events::{MemorySink, NullSink};
+    use crate::lfs::Pointer;
     use crate::rules::RuleSource;
 
     const CALLER: Caller = Caller {
@@ -1252,7 +1294,13 @@ mod tests {
             // between the ref update and journal truncation.
             let records = com.journal.uncommitted();
             com.history
-                .commit(&records, &com.pending, &com.identities, &com.context)
+                .commit(
+                    &records,
+                    &com.pending,
+                    &com.lfs,
+                    &com.identities,
+                    &com.context,
+                )
                 .unwrap();
         }
         let (_, com, recovery) =
@@ -1490,6 +1538,168 @@ mod tests {
         config
             .set_i64(&format!("remote.{remote}.agentfsMaxBlobSize"), limit as i64)
             .unwrap();
+    }
+
+    fn set_lfs_threshold(state: &StateDir, threshold: u64) {
+        let mut config = git2::Config::open(&state.git().join("config")).unwrap();
+        config
+            .set_i64("agentfs.lfsThreshold", threshold as i64)
+            .unwrap();
+    }
+
+    fn journaled_stores(rec: &Recorder) -> Vec<(String, Store)> {
+        rec.journal
+            .uncommitted()
+            .iter()
+            .flat_map(|r| r.draft.changes.clone())
+            .filter_map(|c| match c {
+                Change::Write { path, store, .. } => Some((path.to_string(), store)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_store_is_decided_at_record_time_and_journaled() {
+        let (dir, state) = setup();
+        set_lfs_threshold(&state, 10);
+        fs::write(
+            state.git().join("info/attributes"),
+            "*.psd filter=lfs\nkeep.bin agentfs.store=blob\n",
+        )
+        .unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let (rec, com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
+        rec.record(
+            Trigger::Close,
+            CALLER,
+            vec![
+                write(dir.path(), "ten.bin", "0123456789"),
+                write(dir.path(), "eleven.bin", "0123456789a"),
+                write(dir.path(), "tiny.psd", "x"),
+                write(dir.path(), "keep.bin", "0123456789abcdef"),
+                write(dir.path(), "empty.psd", ""),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            journaled_stores(&rec),
+            [
+                ("ten.bin".to_owned(), Store::Blob),
+                ("eleven.bin".to_owned(), Store::Lfs),
+                ("tiny.psd".to_owned(), Store::Lfs),
+                ("keep.bin".to_owned(), Store::Blob),
+                ("empty.psd".to_owned(), Store::Blob),
+            ]
+        );
+        assert_eq!(
+            rec.store_for(&RepoPath::new("x").unwrap(), 11).unwrap(),
+            Store::Lfs
+        );
+        assert_eq!(
+            rec.store_for(&RepoPath::new("x").unwrap(), 10).unwrap(),
+            Store::Blob
+        );
+        com.commit_pending().unwrap();
+        assert!(Pointer::parse(&blob(&com, "eleven.bin")).is_some());
+        assert!(Pointer::parse(&blob(&com, "tiny.psd")).is_some());
+        assert_eq!(blob(&com, "ten.bin"), b"0123456789");
+        assert_eq!(blob(&com, "keep.bin"), b"0123456789abcdef");
+        let attrs = String::from_utf8(blob(&com, ".gitattributes")).unwrap();
+        assert!(attrs.contains("\n/eleven.bin filter=lfs"), "{attrs}");
+        assert!(attrs.contains("\n/tiny.psd filter=lfs"), "{attrs}");
+        assert!(!attrs.contains("keep.bin"), "{attrs}");
+        // History only: the backing tree is never written.
+        assert_eq!(fs::read_dir(&tree).unwrap().count(), 0);
+        let cached = fs::read_dir(state.lfs_objects()).unwrap().count();
+        assert_eq!(cached, 2, "two objects, under their aa/ directories");
+        assert_eq!(fs::read_dir(state.lfs_tmp()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_blob_limit_does_not_apply_to_lfs_content() {
+        let (dir, state) = setup();
+        set_remote_limit(&state, "r", 5);
+        set_lfs_threshold(&state, 8);
+        fs::write(
+            state.git().join("info/attributes"),
+            "keep agentfs.store=blob\n",
+        )
+        .unwrap();
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![
+                    write(dir.path(), "large", "0123456789abcdefghij"),
+                    write(dir.path(), "keep", "0123456789abcdefghij"),
+                    write(dir.path(), "mid", "0123456"),
+                ],
+            )
+            .unwrap();
+        // Blobs over the limit are refused, whatever forced them to be blobs.
+        let skipped: Vec<&str> = recorded.skipped.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(skipped, ["keep", "mid"]);
+        let refused: Vec<String> = sink
+            .take()
+            .into_iter()
+            .map(|e| match e {
+                Event::PathRefused { path, .. } => path,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(refused, ["keep", "mid"]);
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), [".gitattributes", "large"]);
+    }
+
+    #[test]
+    fn the_commit_time_recheck_honours_the_journaled_store() {
+        let (dir, state) = setup();
+        set_lfs_threshold(&state, 8);
+        {
+            let (rec, _, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![
+                    write(dir.path(), "large", "0123456789abcdefghij"),
+                    write(dir.path(), "small", "01234567"),
+                ],
+            )
+            .unwrap();
+            // Crash before committing; the remount brings a strict remote
+            // and no threshold.
+        }
+        set_remote_limit(&state, "r", 5);
+        git2::Config::open(&state.git().join("config"))
+            .unwrap()
+            .remove("agentfs.lfsThreshold")
+            .unwrap();
+        let sink = Arc::new(MemorySink::new());
+        let (_, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        let report = com.commit_pending().unwrap();
+        assert_eq!(report.refused, 1, "only the blob over the limit");
+        assert_eq!(tree_paths(&com), [".gitattributes", "large"]);
+        assert!(Pointer::parse(&blob(&com, "large")).is_some());
     }
 
     fn blob(com: &Committer, path: &str) -> Vec<u8> {
@@ -1731,6 +1941,7 @@ mod tests {
             path: RepoPath::new(name).unwrap(),
             pending: id,
             executable: false,
+            store: Default::default(),
         };
         rec.journal
             .record(Draft {

@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::lfs::Store;
 use crate::paths::RepoPath;
 use crate::pending::PendingId;
 
@@ -64,6 +65,10 @@ pub enum Change {
         path: RepoPath,
         pending: PendingId,
         executable: bool,
+        /// Where the content is stored, decided when it was recorded
+        /// (design §7). Absent from older journals, and from blob writes.
+        #[serde(default, skip_serializing_if = "Store::is_blob")]
+        store: Store,
     },
     /// `path` is a symlink to `target`.
     Symlink { path: RepoPath, target: String },
@@ -153,5 +158,34 @@ pub struct Record {
 impl Record {
     pub fn pending_ids(&self) -> impl Iterator<Item = PendingId> + '_ {
         self.draft.changes.iter().filter_map(Change::pending)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_store_is_journaled_only_for_lfs_and_defaults_to_blob() {
+        let write = |store| Change::Write {
+            path: RepoPath::new("a").unwrap(),
+            pending: PendingId(7),
+            executable: false,
+            store,
+        };
+        let blob = serde_json::to_string(&write(Store::Blob)).unwrap();
+        assert_eq!(
+            blob,
+            r#"{"op":"write","path":"a","pending":7,"executable":false}"#
+        );
+        let lfs = serde_json::to_string(&write(Store::Lfs)).unwrap();
+        assert!(lfs.ends_with(r#","store":"lfs"}"#), "{lfs}");
+        // A journal written before LFS existed.
+        let old: Change = serde_json::from_str(&blob).unwrap();
+        assert_eq!(old, write(Store::Blob));
+        assert_eq!(
+            serde_json::from_str::<Change>(&lfs).unwrap(),
+            write(Store::Lfs)
+        );
     }
 }

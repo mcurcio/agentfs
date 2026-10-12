@@ -22,7 +22,7 @@
 //! | `.gitmodules` path starting with `-` | | `gitmodulesPath` |
 //! | `.gitmodules` update starting with `!` (a command) | | `gitmodulesUpdate` |
 //! | `.gitmodules` size | over [`GITMODULES_MAX_SIZE`] | `gitmodulesLarge` |
-//! | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize` | none (remote policy) |
+//! | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize`, unless stored as LFS | none (remote policy) |
 //!
 //! There is one history for every remote, so the blob limit that applies is
 //! the smallest across remotes. Checks are pure: they read only the frozen
@@ -45,6 +45,7 @@ use std::path::Path;
 use crate::config::RemoteSettings;
 use crate::events::CheckStage;
 use crate::gitmodules;
+use crate::lfs::Store;
 use crate::paths::{PathError, RepoPath, SpecialFile, is_dotgit, special_file};
 
 /// Longest path recorded, in bytes.
@@ -301,22 +302,37 @@ impl Checks {
     }
 
     /// Rules for a regular file at `path` whose content is the frozen copy
-    /// at `content`, at `stage`. Reads only special files, and in the
-    /// synchronous step ([`CheckStage::Record`]) only those up to
-    /// [`SYNC_SCAN_LIMIT`]; at [`CheckStage::Commit`] they are read in full
-    /// (bounded by their size limits, checked first by length alone).
+    /// at `content`, at `stage`, stored as a git blob
+    /// ([`Checks::check_file_stored`] with [`Store::Blob`]).
     pub fn check_file(
         &self,
         path: &RepoPath,
         content: &Path,
         stage: CheckStage,
     ) -> io::Result<Option<Refusal>> {
+        self.check_file_stored(path, content, stage, Store::Blob)
+    }
+
+    /// Rules for a regular file at `path` whose content is the frozen copy
+    /// at `content`, at `stage`, stored in `store`. Reads only special
+    /// files, and in the synchronous step ([`CheckStage::Record`]) only
+    /// those up to [`SYNC_SCAN_LIMIT`]; at [`CheckStage::Commit`] they are
+    /// read in full (bounded by their size limits, checked first by length
+    /// alone). The blob size limit does not apply to content stored as LFS
+    /// (design §7): history then holds only a pointer.
+    pub fn check_file_stored(
+        &self,
+        path: &RepoPath,
+        content: &Path,
+        stage: CheckStage,
+        store: Store,
+    ) -> io::Result<Option<Refusal>> {
         if let Some(refusal) = self.check_path(path) {
             return Ok(Some(refusal));
         }
         let bytes = std::fs::metadata(content)?.len();
         if let Some(refusal) = self
-            .check_blob_size(bytes)
+            .check_stored_size(bytes, store)
             .or_else(|| special_size(path, bytes))
         {
             return Ok(Some(refusal));
@@ -330,14 +346,35 @@ impl Checks {
     }
 
     /// Every rule for a regular file at `path` holding `bytes`, as at
-    /// commit time (content scans run in full). A restore checks content
-    /// with this before writing it back (design §15).
+    /// commit time (content scans run in full), stored as a git blob.
     pub fn check_blob(&self, path: &RepoPath, bytes: &[u8]) -> Option<Refusal> {
+        self.check_blob_stored(path, bytes, Store::Blob)
+    }
+
+    /// Every rule for a regular file at `path` holding `bytes`, stored in
+    /// `store`, as at commit time (content scans run in full). A restore
+    /// checks content with this before writing it back (design §15).
+    pub fn check_blob_stored(
+        &self,
+        path: &RepoPath,
+        bytes: &[u8],
+        store: Store,
+    ) -> Option<Refusal> {
         let len = bytes.len() as u64;
         self.check_path(path)
-            .or_else(|| self.check_blob_size(len))
+            .or_else(|| self.check_stored_size(len, store))
             .or_else(|| special_size(path, len))
             .or_else(|| scan_content(path, bytes).unwrap_or(None))
+    }
+
+    /// The rules for a regular file at `path` known only by its `size`,
+    /// stored in `store`: everything but content scans. For LFS content a
+    /// restore cannot hold in memory; special files are never stored as
+    /// LFS, so nothing is left to scan.
+    pub fn check_size(&self, path: &RepoPath, size: u64, store: Store) -> Option<Refusal> {
+        self.check_path(path)
+            .or_else(|| self.check_stored_size(size, store))
+            .or_else(|| special_size(path, size))
     }
 
     /// The size limit on the live backing file, before it is frozen, so a
@@ -349,6 +386,13 @@ impl Checks {
         self.limits.max_blob_size.as_ref()?;
         let bytes = std::fs::metadata(backing).ok()?.len();
         self.check_blob_size(bytes)
+    }
+
+    fn check_stored_size(&self, bytes: u64, store: Store) -> Option<Refusal> {
+        match store {
+            Store::Blob => self.check_blob_size(bytes),
+            Store::Lfs => None,
+        }
     }
 
     fn check_blob_size(&self, bytes: u64) -> Option<Refusal> {
@@ -684,6 +728,24 @@ mod tests {
         );
         assert_eq!(refused.fsck_id(), None);
         assert!(refused.to_string().contains("remote b"), "{refused}");
+        // Content stored as LFS is a pointer in history: no blob limit
+        // (design §7). Every other rule still applies.
+        for stage in [Record, Commit] {
+            assert_eq!(
+                c.check_file_stored(&p("f"), &six, stage, Store::Lfs)
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(c.check_blob_stored(&p("f"), b"123456", Store::Lfs), None);
+        assert_eq!(c.check_size(&p("f"), 6, Store::Lfs), None);
+        assert_eq!(c.check_size(&p("f"), 6, Store::Blob), Some(refused.clone()));
+        assert_eq!(
+            c.check_blob_stored(&p("f"), b"123456", Store::Blob),
+            Some(refused)
+        );
+        let long = format!("d/{}", "a".repeat(MAX_PATH_BYTES));
+        assert!(c.check_size(&p(&long), 1, Store::Lfs).is_some());
         assert_eq!(
             c.check_symlink(&p("l"), "123456"),
             Some(Refusal::BlobTooLarge {
