@@ -434,8 +434,13 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
   remote URL. So any one of these marks a git directory: a `HEAD` or
   `HEAD.lock` whose first line is a symbolic ref (`ref: refs/…`) or an object
   id; a `config` or `config.lock` whose `[core]` section sets
-  `repositoryformatversion`; or git's default template `description`. Only a
-  custom template's files written before `HEAD` can still be recorded.
+  `repositoryformatversion`; or any file of git's default template: its
+  `description`, its `info/exclude`, or one of its sample hooks
+  (`hooks/<name>.sample` starting with `#!`). git copies the template in
+  directory order, which differs between filesystems, so any of these may be
+  written first: the FUSE tests caught `git clone --bare` recording its
+  sample hooks before `description` existed. Only a custom template's files
+  written before `HEAD` can still be recorded.
 - **`.git` files and symlinks.** A `.git` file counts only if its first line is
   `gitdir: <path>`; a `.git` symlink is read, never followed. Either target
   must be a git directory inside the backing tree: `HEAD` plus `objects/` and

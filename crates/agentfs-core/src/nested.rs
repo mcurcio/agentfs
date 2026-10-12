@@ -14,8 +14,11 @@
 //! paths, and they would then stay tracked. So any one of these marks a git
 //! directory: a `HEAD` or `HEAD.lock` whose first line is a symbolic ref or
 //! an object id, a `config` or `config.lock` with a `[core]` section setting
-//! `repositoryformatversion`, or git's default template `description`. Only
-//! a custom template's files written before `HEAD` can still be recorded.
+//! `repositoryformatversion`, or any file of git's default template:
+//! `description`, `info/exclude`, or a sample hook (`hooks/<name>.sample`
+//! starting with `#!`). git copies the template in directory order, which
+//! differs between filesystems, so any of them can come first. Only a
+//! custom template's files written before `HEAD` can still be recorded.
 //!
 //! **Where `gitdir:` and `.git` symlinks point.** Their targets are paths in
 //! the workload's view of the mount, never followed on the host. A relative
@@ -64,6 +67,27 @@ impl NestedKind {
 /// git's default template `description`.
 const DEFAULT_DESCRIPTION: &str =
     "Unnamed repository; edit this file 'description' to name the repository.";
+
+/// The first line of git's default template `info/exclude`.
+const DEFAULT_EXCLUDE: &str = "# git ls-files --others --exclude-from=.git/info/exclude";
+
+/// The sample hooks of git's default template (`hooks/<name>.sample`).
+const SAMPLE_HOOKS: [&str; 14] = [
+    "applypatch-msg",
+    "commit-msg",
+    "fsmonitor-watchman",
+    "post-update",
+    "pre-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    "pre-push",
+    "pre-rebase",
+    "pre-receive",
+    "prepare-commit-msg",
+    "push-to-checkout",
+    "sendemail-validate",
+    "update",
+];
 
 /// Probes `dir`, a directory relative to the backing tree at `tree` (`""`
 /// is the root), for a nested repository.
@@ -194,7 +218,23 @@ fn looks_like_git_dir(p: &Path) -> io::Result<bool> {
             return Ok(true);
         }
     }
-    Ok(first_line(&p.join("description"))?.is_some_and(|l| l == DEFAULT_DESCRIPTION))
+    if first_line(&p.join("description"))?.is_some_and(|l| l == DEFAULT_DESCRIPTION) {
+        return Ok(true);
+    }
+    if first_line(&p.join("info/exclude"))?.is_some_and(|l| l == DEFAULT_EXCLUDE) {
+        return Ok(true);
+    }
+    // The template's sample hooks: probed only when `hooks/` exists, so an
+    // ordinary directory costs one extra stat.
+    if is_dir(&p.join("hooks"))? {
+        for hook in SAMPLE_HOOKS {
+            let sample = p.join("hooks").join(format!("{hook}.sample"));
+            if first_line(&sample)?.is_some_and(|l| l.starts_with("#!")) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// The first line of a small regular file, trimmed, if it is UTF-8.
@@ -427,8 +467,13 @@ mod tests {
     #[test]
     fn repository_under_construction() {
         let t = tempfile::tempdir().unwrap();
-        let cases: [(&str, &str); 6] = [
+        let cases: [(&str, &str); 8] = [
             ("description", &format!("{DEFAULT_DESCRIPTION}\n")),
+            ("info/exclude", &format!("{DEFAULT_EXCLUDE}\n# more\n")),
+            (
+                "hooks/pre-commit.sample",
+                "#!/bin/sh\n#\n# An example hook\n",
+            ),
             ("HEAD", "ref: refs/heads/main\n"),
             ("HEAD.lock", "ref: refs/heads/main\n"),
             ("HEAD", &format!("{}\n", "a".repeat(40))),
@@ -441,16 +486,22 @@ mod tests {
         for (i, (name, content)) in cases.iter().enumerate() {
             let dir = format!("s{i}");
             fs::create_dir(t.path().join(&dir)).unwrap();
-            fs::write(t.path().join(&dir).join(name), content).unwrap();
+            let file = t.path().join(&dir).join(name);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, content).unwrap();
             assert_eq!(d(&t, &dir), Some(NestedKind::Bare), "{name}: {content:?}");
         }
         for (name, content) in [
             ("description", "My project\n"),
             ("config", "[user]\n\trepositoryformatversion = 0\n"),
             ("HEAD", &"g".repeat(40)),
+            ("hooks/pre-commit", "#!/bin/sh\n"),
+            ("hooks/my-hook.sample", "#!/bin/sh\n"),
+            ("hooks/pre-commit.sample", "not a script\n"),
+            ("info/exclude", "*.o\n"),
         ] {
             let dir = t.path().join("neg");
-            fs::create_dir_all(&dir).unwrap();
+            fs::create_dir_all(dir.join(name).parent().unwrap()).unwrap();
             fs::write(dir.join(name), content).unwrap();
             assert_eq!(d(&t, "neg"), None, "{name}: {content:?}");
             fs::remove_file(dir.join(name)).unwrap();
