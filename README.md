@@ -119,7 +119,31 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-libgit2 is built from source, so a C compiler is needed. It is built without
-HTTPS and SSH support (that needs OpenSSL and libssh2), so pushing works to
-local paths and `file://` remotes only for now. Credential files for HTTPS
-remotes are implemented and unit-tested, but not yet exercised end to end.
+libgit2 is built from source, so a C compiler is needed. Local, `file://`
+and plain `http://` remotes work in the default build. Pushing to `https://`
+remotes needs the `https` feature, which links OpenSSL:
+
+```sh
+cargo build -p agentfs --features https
+```
+
+SSH remotes are not supported yet (credentials are username/password or
+token only).
+
+## CI
+
+Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+- **lint:** rustfmt, and clippy with default and all features.
+- **test:** the workspace tests, with default and all features.
+- **e2e remotes** ([`ci/e2e-remotes.sh`](ci/e2e-remotes.sh)): pushes to a real
+  smart-HTTP server (nginx and `git http-backend`, [`ci/git-http-server.sh`](ci/git-http-server.sh))
+  over http and https with basic auth. Covers credential files, auth failures
+  that do not block other remotes, credential rotation picked up by a
+  running `agentfs run`, divergence, and TLS certificate verification.
+- **e2e telemetry** ([`ci/e2e-telemetry.sh`](ci/e2e-telemetry.sh)): every
+  metric, span and alarm log above must reach a real OpenTelemetry Collector.
+
+The e2e scripts run locally too: start the server with
+`ci/git-http-server.sh start <dir>` and source its output, or run the
+collector with [`ci/otelcol.yaml`](ci/otelcol.yaml).
