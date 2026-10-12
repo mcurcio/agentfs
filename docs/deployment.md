@@ -250,7 +250,9 @@ and write through the mount, so the workload sees the result at once
   retries.
 - **Alerts:** page on `agentfs.push.oldest_unpushed_age` (history not
   leaving the pod), the sidecar's readiness (a dead daemon), its restart
-  count, and the `RecordFailed` and `CommitFailed` alarms.
+  count, the `RecordFailed` and `CommitFailed` alarms, and
+  `agentfs.patch.blocked` (a patch queue that needs its producer,
+  [patch-queue.md](runbooks/patch-queue.md)).
 
 ## 7. A crashed daemon
 
@@ -438,8 +440,14 @@ spec; from then on every change is recorded through the mount.
 
 ### Restarts and patches
 
-iac's patches to Hermes' files (the patch queue, phase 3, §12) apply
-only at mount, which for Hermes means a pod restart.
+iac's patches to Hermes' files (the patch queue, §12) apply only at
+mount, which for Hermes means a pod restart: iac queues them with
+`agentfs patch submit` (or plain git) on the remote the sidecar pushes
+to, then restarts the pod (`kubectl delete pod`, or a rollout). The
+sidecar's startup probe allows for the fetch, which waits at most
+`agentfs.patchFetchTimeout` (30s). A blocked queue does not stop the pod;
+alert on `agentfs.patch.blocked`. See
+[patch-queue.md](runbooks/patch-queue.md).
 
 ## 11. Limitations
 

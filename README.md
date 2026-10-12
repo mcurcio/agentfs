@@ -94,13 +94,21 @@ nested repository detection. Also:
   (`agentfs.repackInterval`, about 256 MiB of memory while it runs), and
   `agentfs.maxSize` caps a path's size.
   See [Databases](docs/operator-guide.md#14-databases-the-fsync-class).
+- **The patch queue** (phase 3): producers outside the volume (iac, an
+  operator, CI) queue single-commit patches at
+  `refs/agentfs/<volume>/inbox/<n>` on the volume's remote, with
+  `agentfs patch submit` or plain git. Each mount applies them in order
+  before anything sees the tree, each as one commit with the producer as
+  author; the first that cannot be applied blocks the queue and raises
+  `PatchBlocked`, and the volume mounts anyway. See
+  [Patches](#patches).
 - **Deployment:** a container image (`ghcr.io/mcurcio/agentfs`) and
   example Kubernetes manifests for the phase 1 sidecar, tested end to end
   in a kind cluster. See
   [Deploying on Kubernetes](#deploying-on-kubernetes).
 
 The `agentfs` command has `init`, `status`, `mount`, `probe`, `flush`, `record`,
-`push`, `run`, `restore` and `revert`. `mount` mounts a backing tree and runs the commit and
+`push`, `run`, `restore`, `revert` and `patch`. `mount` mounts a backing tree and runs the commit and
 push loops in the same process. `record` records paths of a backing tree
 directly, without a mount, and reports the paths the rules skip or the
 checks refuse, with the reason; a database in the `fsync` class is
@@ -123,8 +131,7 @@ with status 75 if another process holds it, naming the holder;
 lock and changes nothing, so it works beside a running daemon, and shows
 who holds the lock.
 
-Not built yet: the patch queue (phase 3),
-the CSI driver (phase 4), asking a running mount to push now, and
+Not built yet: the CSI driver (phase 4), asking a running mount to push now, and
 restarting a pod automatically after its sidecar crashes. SSH remotes do
 not support ssh-agent, passphrase-protected keys or `@cert-authority`
 host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
@@ -220,7 +227,42 @@ Runbooks: [recovery and undo](docs/runbooks/recovery-and-undo.md),
 [a diverged remote](docs/runbooks/divergence.md),
 [removing a recorded secret](docs/runbooks/history-rewrite.md) (history
 rewrite with `git filter-repo`, the one documented force-push), and
-[pushes that keep failing](docs/runbooks/stuck-pushes.md).
+[pushes that keep failing](docs/runbooks/stuck-pushes.md), and
+[the patch queue](docs/runbooks/patch-queue.md).
+
+## Patches
+
+Change a volume's files from outside it: queue a patch, and the next mount
+applies it before the workload sees the tree.
+
+```sh
+# In the producer's git repository (its remote and credentials are used):
+agentfs patch submit --volume demo --put config/app.yaml=./app.yaml -m "Raise the limit"
+agentfs patch submit --volume demo HEAD          # a commit whose parent is on agentfs/demo
+
+# On the volume:
+agentfs --state /data/state status               # patches:   last applied 3, 0 queued, ok (from origin)
+agentfs --state /data/state patch status         # the queue, a block and why
+agentfs --state /data/state --root /data/backing patch apply   # with the volume stopped
+```
+
+- A patch is one commit with one parent on the volume's branch, at
+  `refs/agentfs/<volume>/inbox/<n>` (ten digits). Submitters that race
+  for a number take the next one: the ref is created with
+  `git push --force-with-lease=<ref>:`.
+- The mount fetches the inbox (`agentfs.patchFetchTimeout`, default 30s),
+  cherry-picks each patch onto the head through the same checks as
+  `restore`, and records it as one commit (`Agentfs-Trigger: patch`,
+  `Agentfs-Patch`, `Agentfs-Inbox`). A crash at any point applies nothing
+  twice: the branch's trailers decide what is applied.
+- The first patch that conflicts (or is otherwise refused) blocks the
+  queue; the mount carries on. Fix it with `patch submit --replace N` or
+  `--skip N`, then restart.
+- The push to the patch remote (`agentfs.patchRemote`) moves
+  `applied/<n>`, deletes `inbox/<n>` and updates the status ref
+  (`refs/agentfs/<volume>/status`, holding `status.json`).
+
+Runbook: [the patch queue](docs/runbooks/patch-queue.md).
 
 ## Telemetry
 
@@ -342,6 +384,13 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   running `agentfs run`, divergence, and TLS certificate verification (a
   certificate for another host fails, and a self-signed one fails as
   `untrusted_host`).
+- **e2e patches** ([`ci/e2e-patches.sh`](ci/e2e-patches.sh)): the patch
+  queue against the same smart-HTTP server and a real FUSE mount, following
+  the [runbook](docs/runbooks/patch-queue.md): two producers racing
+  `agentfs patch submit` for a number, a conflicting patch that blocks
+  the queue while the volume mounts, the queue push (applied refs, inbox
+  refs deleted, the status ref), a crash between the commit and the ref
+  move, and a replaced patch unblocking it, with the producer as author.
 - **e2e ssh remotes** ([`ci/e2e-ssh.sh`](ci/e2e-ssh.sh)): pushes to a real
   OpenSSH server ([`ci/git-ssh-server.sh`](ci/git-ssh-server.sh): its own
   sshd on 127.0.0.1:2222, key-only authentication, a `git-shell` user),
@@ -428,7 +477,8 @@ collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run
 `ci/git-ssh-server.sh start <dir>` (it needs passwordless sudo and
 `openssh-server`: it creates a system user and runs a root sshd) and
 `ci/e2e-ssh.sh` with its output in the environment, or run
-`ci/fuse-tests.sh` and `ci/e2e-recovery.sh` on any Linux host with FUSE
+`ci/fuse-tests.sh`, `ci/e2e-recovery.sh` and (with the HTTP server)
+`ci/e2e-patches.sh` on any Linux host with FUSE
 and passwordless sudo. `ci/e2e-runbooks.sh` needs only `git-filter-repo`.
 `ci/e2e-kind.sh` runs on any Linux host with docker, kind, kubectl, nginx
 and fcgiwrap; its header lists the commands.

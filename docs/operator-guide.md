@@ -235,7 +235,9 @@ and up to one interval late: see [Databases](#14-databases-the-fsync-class).
 ## 8. Lifecycle
 
 - **Start.** The daemon takes the state-area lock, checks the layout,
-  recovers the journal (records made before a crash are committed), starts
+  recovers the journal (records made before a crash are committed),
+  fetches and applies the patch queue (§12; at most
+  `agentfs.patchFetchTimeout` waiting for the remote), starts
   the commit and push loops, mounts, and prints the line shown in §3.
 - **Stop.** On SIGINT or SIGTERM it:
   1. stops serving restores (waiting up to `--unmount-grace` for one in
@@ -399,7 +401,17 @@ Runbooks, with the full procedures:
   else moved (`Diverged`);
 - [history-rewrite.md](runbooks/history-rewrite.md): removing a recorded
   secret from the state area and every remote;
-- [stuck-pushes.md](runbooks/stuck-pushes.md): pushes that keep failing.
+- [stuck-pushes.md](runbooks/stuck-pushes.md): pushes that keep failing;
+- [patch-queue.md](runbooks/patch-queue.md): queued patches, a blocked
+  queue, submitting with plain git.
+
+**Patches** (§12) are the other way to change the tree from outside:
+producers queue them on the remote (`agentfs patch submit`), and every
+mount applies them, in order, after journal recovery and before it
+serves. `agentfs status` shows a `patches:` line, `agentfs patch status`
+the whole queue, and `agentfs patch apply` applies it with the volume
+stopped. A patch that cannot be applied blocks the queue (`PatchBlocked`)
+without stopping the mount.
 
 ## 13. Large files (LFS)
 
@@ -565,7 +577,14 @@ whole, consistent groups instead.
   watch the alarms.
 - **Alarms** are printed to stderr and exported as telemetry logs (see the
   README): `PathRefused`, `RecordFailed`, `CommitFailed`, `PushFailed`,
-  `Diverged`, `RemoteMisconfigured`.
+  `Diverged`, `RemoteMisconfigured`, `PatchBlocked`, `PatchFetchFailed`.
+- **`patches: blocked at N (<reason>)`** at mount: patch N could not be
+  applied; the mount serves without it and the patches after it. The
+  reason and its fix are in
+  [patch-queue.md](runbooks/patch-queue.md#4-a-blocked-queue).
+- **`failed (<kind>, stage queue)`** from `push`: the patch remote's
+  queue refs (status, applied, inbox) were not pushed; the branch push is
+  unaffected and the queue push is retried with the next push.
 - **`failed (<kind>, stage lfs)`** from `push` or in a `PushFailed`
   alarm: uploading LFS objects failed, so no ref was pushed. `auth`: the
   LFS credentials (`agentfsLfsCredentials`, or `agentfsCredentials` for an

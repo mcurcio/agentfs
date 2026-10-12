@@ -3,7 +3,8 @@
 Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer,
 `agentfs mount`, `agentfs restore` and `agentfs revert`, the container
 image and the Kubernetes sidecar deployment exist), and from phase 2 Git
-LFS (§7) and the `fsync` class for databases (§8). Draft 1 was
+LFS (§7) and the `fsync` class for databases (§8), and from phase 3 the
+patch queue (§12). Draft 1 was
 reviewed adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
 for the findings and what changed because of them.
 
@@ -54,7 +55,7 @@ be recorded after the fact; §3.1 lists them.
 |---|---|
 | 1 | The recorder as a native sidecar for one pod: recording, commits, interval push to any remote, path rules, operator-only safety settings, push checks, OpenTelemetry, a supported manual recovery path |
 | 2 | Git LFS (§7), and the `fsync` class for databases (§8); both built |
-| 3 | The ordered patch queue for iac (§12) |
+| 3 | The ordered patch queue for iac (§12); built |
 | 4 | The CSI driver, including volumes mounted by several pods at once (§14) |
 
 ### 1.4 Not goals
@@ -118,6 +119,7 @@ through the mount:
     push/<remote>.json   each remote's push state (§11.2)
     push/<remote>.lock   flock held while pushing that remote
     repairs              paths a mount could not record, for the next one (§3.5)
+    patch.json           the patch queue's last run, a cache (§12)
     control/agentfs.sock the running mount's control socket for restores (§15);
                          directory 0700, socket 0600
 ```
@@ -297,7 +299,9 @@ copy of the file, so recorded volumes should use XFS. The phase 1 benchmark (§1
   database (§8). A failure raises `RepackFailed` (§13).
 - **A commit whose tree would not change is not made**: its records are
   consumed without one, so a capture of an unchanged database costs a
-  copy, not a commit.
+  copy, not a commit. The exception is a patch that changes nothing:
+  it gets a marker commit with the head's tree, so the branch records that
+  it was applied (§12).
 - **Atomic records** (an `fsync`-class group, §8) are committed whole: if
   the commit-time checks refuse any change in one, the whole record is
   dropped, with a `PathRefused` alarm for the refused path.
@@ -1140,6 +1144,13 @@ Agentfs-Pid: 4711
   operator's: the `agentfs` command's own ids, or, through a running mount,
   those of the process that asked (§15). Each journal record carries the
   operation it belongs to; older journals without the field still read.
+- **Patches** (§12) are commits of their own too, authored by the patch's
+  author (name, email and time) and committed by the replica. Their
+  message is the patch's, and their last paragraph carries
+  `Agentfs-Trigger: patch`, `Agentfs-Patch: <patch commit>` and
+  `Agentfs-Inbox: <n>`, which is how the queue knows a patch is applied:
+  only that paragraph counts, so a path or a patch message cannot forge
+  it.
 
 ## 10. Secrets (not in scope)
 
@@ -1321,10 +1332,24 @@ agentfs does not scan content for secrets and does not hold pushes.
   - An operator resolves it (§15,
     [divergence.md](runbooks/divergence.md)). The divergence clears when a
     branch push next succeeds.
-  - A non-fast-forward on one of the volume's other refs is reported the
-    same way but saves no diverged ref. libgit2 rejects the whole push when
-    any ref is not a fast-forward, so the patch-queue refs of phase 3 will
-    need their own push policy.
+  - The branch push carries only the branch and the `diverged/*` refs. A
+    non-fast-forward on a diverged ref is reported like any other and saves
+    nothing.
+- **The patch queue has its own push** (§12), to the patch remote only,
+  after the branch push, under the same lock:
+  1. the status ref, forced (the only ref agentfs ever force-pushes: it is
+     a snapshot), and, only when the branch push succeeded, every
+     `applied/<n>` the remote lacks, never forced;
+  2. then, once that succeeded, the deletion of each remote `inbox/<n>`
+     that still names the applied patch, checked again against libgit2's
+     push negotiation, so a patch the producer replaced meanwhile stays.
+
+  libgit2 rejects a whole push when one ref is refused, which is why the
+  two are apart: a queue push failure raises `PushFailed` with stage
+  `queue`, is kept as the remote's `queue_error` and makes `agentfs push`
+  exit 1, but never counts toward the branch's failures, backoff or
+  divergence. It is skipped while the status pushed last is still the
+  local one.
 - libgit2's local transport updates an existing remote ref without
   compare-and-swap, so another writer moving a local or `file://` remote
   between libgit2's ref listing and its update can be overwritten. Smart
@@ -1338,16 +1363,18 @@ set by the operator) and owns a branch and a ref namespace in that repository:
 | Ref | Purpose |
 |---|---|
 | `refs/heads/agentfs/<volume>` | The volume's history (configurable: `[agentfs] branch`) |
-| `refs/agentfs/<volume>/inbox/<n>` | Patch queue (§12) |
-| `refs/agentfs/<volume>/applied/<n>` | Applied patches |
-| `refs/agentfs/<volume>/status` | Recorder status for iac (§12) |
+| `refs/agentfs/<volume>/inbox/<n>` | Patch queue (§12): `<n>` is ten zero-padded digits from `0000000001`; written by producers |
+| `refs/agentfs/<volume>/applied/<n>` | The patch commit applied as `<n>`; pushed before `inbox/<n>` is deleted on the remote |
+| `refs/agentfs/<volume>/status` | The queue's status for iac (§12): a parentless commit with `status.json`, force-pushed |
 | `refs/agentfs/<volume>/diverged/<timestamp>` | Divergence (§11.3) |
 
-**Pushing.** A recorder pushes only its own volume's refs (the branch and
-`refs/agentfs/<volume>/*`), with explicit refspecs, so pushes from different
-volumes never contend.
+**Pushing.** A recorder pushes only its own volume's refs, with explicit
+refspecs, so pushes from different volumes never contend: the branch and
+`diverged/*`, and to the patch remote the status and `applied/*`, then
+deletions of `inbox/*` (§11.3). It never pushes an inbox ref.
 
-**Fetching.** At mount it fetches only its own volume's refs.
+**Fetching.** At mount it fetches only its own volume's `inbox/*` from the
+patch remote (§12), and deletes local inbox refs the remote no longer has.
 
 **Single writer.** Each recorder is the only intended writer of its volume's
 refs. Remotes cannot always enforce that:
@@ -1367,26 +1394,131 @@ without `..` and not ending in `.` or `.lock`. They become ref components and
 state file names; a `/` in a volume name would let one volume's
 `refs/agentfs/<volume>/` namespace contain another's.
 
-## 12. Patch queue for iac (phase 3)
+## 12. Patch queue for iac (phase 3, built)
 
-- **What a patch is:** a single commit pushed to the remote at
-  `refs/agentfs/<volume>/inbox/<n>`, where `<n>` is a zero-padded sequence
-  number. Its parent is the branch commit it was written against.
-- **When it runs:** at mount, after journal replay and before the workload starts.
-- **What it does:** each patch is applied in sequence order as a three-way merge
-  against its parent, onto the current branch head.
-  - **Success:** a commit authored by the patch's author, committed by agentfs,
-    with `Agentfs-Inbox: <n>`.
-  - **The first failure stops processing.** That patch and all later ones stay
-    queued, in order.
-  - The volume mounts regardless, and an alarm is raised.
-- **Idempotency:** before applying patch `<n>`, the recorder checks the branch
-  for a commit carrying `Agentfs-Inbox: <n>`. Moving `inbox/<n>` to
-  `applied/<n>` is then only bookkeeping, and redoing it after a crash is
-  harmless.
-- **Visibility to iac:** the recorder writes the volume's status ref (§11.4) and
-  emits telemetry (§13) with the queue head and the last failure.
-- **Open:** how iac writes patches (§19).
+Producers outside the volume (iac, an operator, CI) change a volume's tree
+through history: they queue patches, and the recorder applies them, in
+order, before anything can see the tree. Runbook:
+[patch-queue.md](runbooks/patch-queue.md).
+
+**What a patch is.** A single commit with exactly one parent, the branch
+commit it was written against (the head or one of its first-parent
+ancestors), pushed to `refs/agentfs/<volume>/inbox/<n>` on the volume's
+patch remote. `<n>` is ten zero-padded digits from `0000000001`; any other
+name under `inbox/` is ignored and reported. A patch may change at most
+4096 paths, only regular files and symlinks.
+
+**Submitting** (`agentfs patch submit`, or plain git; §19.1). The producer
+runs it in its own git repository, and it drives the producer's `git`, so
+the repository's remote, credential helpers and SSH setup apply:
+
+1. `git ls-remote` lists the branch, `inbox/*` and `applied/*`;
+2. `git fetch` brings the head (`--depth` for shallow producers);
+3. the patch is a given commit (its parent must be on the branch), or one
+   built on the remote head from `--put PATH=FILE` and `--delete PATH` in a
+   temporary index, with `-m` and `--author`;
+4. its number is one past the highest inbox or applied number listed;
+5. `git push --force-with-lease=<ref>: <oid>:<ref>` creates the ref only if
+   it does not exist. A submitter that loses the race lists again and tries
+   the next number (`--attempts`, default 10).
+
+`--replace N` swaps a queued patch, leased on the oid listed;
+`--skip N` replaces it with an empty commit on the head, so the queue moves
+on. Applied refs reach the remote before inbox refs are deleted there, so
+the highest number listed never goes down and a number is never reused.
+
+**When it runs.** At mount, after journal replay and before the service
+and the FUSE layer start; `agentfs patch apply` does the same with the
+volume stopped. `agentfs run` does not. In order:
+
+1. commit what is journaled, so the head is the tree's state;
+2. fetch `inbox/*` from the patch remote: forced, this volume's only, local
+   inbox refs the remote no longer has are pruned. Best effort, within
+   `agentfs.patchFetchTimeout` (default 30s; 0 skips it); a failure raises
+   `PatchFetchFailed` and the queue runs with what is already fetched;
+3. scan the branch for applied patches (below);
+4. apply the queue, in order, from the last applied number plus one;
+5. move the refs and write the status.
+
+**Applying a patch.**
+
+- **Merge:** libgit2's cherry-pick of the patch onto the head, a three-way
+  merge against the patch's parent.
+- **Write:** the merged tree is written into the backing tree by the
+  restore engine (§15): plan the paths whose head and merged entries
+  differ, check them (an unrecorded change or something in the way
+  refuses), write them, LFS content from the cache or the remotes (§7).
+- **Record:** one atomic record of an operation of kind `patch` (§3.4, §8),
+  so it becomes one commit, never grouped with workload changes. Its author
+  is the patch's author (name, email, time); its committer is the replica's
+  identity (§9). It carries `Agentfs-Trigger: patch`, `Agentfs-Patch: <patch
+  oid>` and `Agentfs-Inbox: <n>`; its message is the patch's, without a
+  final trailer paragraph.
+- **A patch that changes nothing** (its content is already there) gets a
+  marker commit with the head's tree and the same trailers: the one
+  exception to §3.4's no empty commits.
+- **Refused at record or commit time** (a commit-time check drops the
+  atomic record), the patch's writes are put back and the queue blocks.
+  **A write that fails part way** is recorded as it stands, as an
+  operation without an inbox number, so the tree matches history again.
+
+**The first patch that cannot be applied blocks the queue.** It and every
+later patch stay queued, `PatchBlocked` is raised, and the volume mounts
+anyway. Reasons:
+
+| Reason | When |
+|---|---|
+| `conflict` | The merge conflicts; the paths are listed |
+| `gap` | The next number is missing while later ones are queued |
+| `parent_not_in_history` | The parent is not the head or one of its ancestors |
+| `merge_commit` | More than one parent |
+| `unsupported` | A root commit, a gitlink, a path agentfs does not record (§5) |
+| `too_large` | More than 4096 paths |
+| `unrecorded` | The tree differs from history where the patch writes (an unrecorded change, a pending repair, something in the way) |
+| `failed` | Writing or recording failed, or an LFS object is missing |
+
+The producer fixes it by replacing the patch (`--replace N`, rebased onto
+the head) or skipping it (`--skip N`); the next mount, or `agentfs patch
+apply`, carries on.
+
+**Idempotency.** Whether patch `<n>` is applied is decided by the branch:
+the newest first-parent commit whose last message paragraph carries
+`Agentfs-Trigger: patch`, `Agentfs-Patch` and `Agentfs-Inbox: <n>`.
+`meta/patch.json` caches the scan (the head it reached), never
+authoritatively. Refs move only after the commit, so every crash converges
+on exactly one commit per patch:
+
+| Crash after | Next run |
+|---|---|
+| the tree write, before the record | the check finds the patch's content already there and records it without writing |
+| the record, before the commit | journal replay commits it; the scan finds it |
+| the commit, before the ref moves | the scan finds it; the refs are moved |
+
+An inbox entry at or below the last applied number is bookkeeping when it
+names the applied patch, and is reported as `stale` and ignored otherwise.
+
+**Refs.** `applied/<n>` is the patch commit itself; `inbox/<n>` is deleted
+locally once `applied/<n>` is written, and on the remote by the queue push
+(§11.3) once `applied/<n>` is there, only if it still names the applied
+patch.
+
+**Status.** `refs/agentfs/<volume>/status` is a parentless commit holding
+`status.json`, rewritten at every run and force-pushed: a snapshot, not
+history. Schema version 1 (fields in the runbook): the volume, branch and
+head, `updated`, `last_applied` (inbox, patch, commit), `applied_now`,
+`queue` (inbox, patch; the blocked one first), `blocked` (inbox, patch,
+reason, message, paths), `ignored` and `fetch` (remote, ok, error).
+`agentfs status` prints a `patches:` line from `meta/patch.json`, and
+`agentfs patch status [--json]` the whole status.
+
+**Telemetry** (§13): the gauges `agentfs.patch.queue_depth` and
+`agentfs.patch.blocked`, an `agentfs.patch` span per patch, and the events
+`PatchApplied`, `PatchBlocked` and `PatchFetchFailed`.
+
+**The patch remote** is `agentfs.patchRemote`: a remote's name, or `none`.
+By default it is the only remote when exactly one is configured, else
+none: no fetch and no queue push, while patches already in the local
+inbox still apply. A name that matches no valid remote also means none.
 
 ## 13. Observability (OpenTelemetry)
 
@@ -1406,17 +1538,18 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.repack.failures` | counter | Periodic repacks that failed (§8) |
 | `agentfs.push.unpushed_commits` | gauge, per remote | Backlog |
 | `agentfs.push.oldest_unpushed_age` | gauge, per remote | Backlog age, the main push alarm |
-| `agentfs.push.failures` | counter, per remote, reason and stage | Rejected, non-fast-forward, authentication, untrusted host, network; stage `git`, or `lfs` for the LFS upload before the git push (§7) |
+| `agentfs.push.failures` | counter, per remote, reason and stage | Rejected, non-fast-forward, authentication, untrusted host, network; stage `git`, `lfs` for the LFS upload before the git push (§7), or `queue` for the patch remote's queue refs (§11.3, §12) |
 | `agentfs.push.diverged` | gauge, per remote | 1 while diverged |
 | `agentfs.remote.misconfigured` | gauge, per remote | 1 for each invalid `[remote]` section (§11.1) |
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
-| `agentfs.patch.queue_depth`, `agentfs.patch.blocked` | gauge | Phase 3 |
+| `agentfs.patch.queue_depth` | gauge | Patches queued after the last applied one, the blocked one included (§12) |
+| `agentfs.patch.blocked` | gauge | 1 while the patch queue is blocked (§12) |
 | `agentfs.state.bytes` | gauge | Size of the state area by part |
 | `agentfs.telemetry.export_failures` | counter, per signal | Telemetry exports (traces, metrics, logs) that failed; counted by the binary, exported once metrics get through |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
-`commit` for refused paths, `git` or `lfs` for push failures) and `part`
+`commit` for refused paths, `git`, `lfs` or `queue` for push failures) and `part`
 (`git`, `journal`, `pending`, `lfs`, `meta`). Paths never become metric
 attributes. Span and log attributes are namespaced `agentfs.*`.
 
@@ -1437,7 +1570,9 @@ the backlog references LFS objects `agentfs.lfs.objects`,
 `agentfs.lfs.uploaded` and `agentfs.lfs.bytes`). Each span is
 current while its operation runs, so alarm logs raised inside it carry its
 trace. Record and commit spans are not linked; they correlate through the
-sequence numbers. Patch-application spans come with phase 3.
+sequence numbers. `agentfs.patch` covers one patch at mount (inbox number,
+patch oid, outcome, the commit or the block reason, §12); a push to the
+patch remote carries the queue push's result as `agentfs.push.queue`.
 
 **Logs.** A structured log record for every alarm condition: the event name
 (`agentfs.path_refused`, `agentfs.push_failed`, ...), WARN for a refused
@@ -1455,11 +1590,14 @@ and logs above; the CLI also prints alarms to stderr.
 | `PathRefused` | A path fails the checks of §3.4 or §5, at record or commit time |
 | `RecordFailed` | The synchronous step fails (§3.5) |
 | `CommitFailed` | Turning records into a commit fails; the records stay journaled and are retried |
-| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7), the head, the last pushed commit, the consecutive failure count and the next retry |
+| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7), the head, the last pushed commit, the consecutive failure count and the next retry; stage `queue` for the patch remote's status, applied and inbox refs (§11.3), which never counts against the branch |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
 | `RepackFailed` | The periodic `git repack` (§8) failed, or refreshing the object database after it; tried again an interval later |
 | `PushSucceeded` | A push attempt succeeded, including one with nothing new (not an alarm; sinks filter) |
+| `PatchBlocked` | A patch could not be applied at mount: the inbox number, the patch, the reason (§12) and the queue depth; the volume mounts anyway |
+| `PatchFetchFailed` | Fetching the inbox from the patch remote failed or timed out; the queue runs with what was already fetched (§12) |
+| `PatchApplied` | A patch was applied as a commit (not an alarm; sinks filter) |
 
 A sink is called from the synchronous step, on the FUSE threads, so it must
 never block. Backlog gauges (`unpushed_commits`, `oldest_unpushed_age`) come
@@ -1548,6 +1686,7 @@ operator runbooks ([runbooks/](runbooks/)):
 | [history-rewrite.md](runbooks/history-rewrite.md) | Removing a recorded secret from the state area and each remote (§10) |
 | [stuck-pushes.md](runbooks/stuck-pushes.md) | Pushes that keep failing |
 | [crashed-sidecar.md](runbooks/crashed-sidecar.md) | A sidecar whose daemon died: `ENOTCONN`, a holding sidecar, the pod restart (§17.1) |
+| [patch-queue.md](runbooks/patch-queue.md) | Submitting patches (with agentfs or plain git), a blocked queue, replacing or skipping a patch (§12) |
 
 **The supported path:**
 
@@ -1717,7 +1856,7 @@ target. What it needs:
 - **Root init.** The Hermes image's start-up runs as root. With a real backing
   tree and `default_permissions`, root reads the mount like any other directory.
 - **Restarts.** iac patches (§12) apply only at mount, which for Hermes means a
-  pod restart.
+  pod restart (or `agentfs patch apply` with the sidecar stopped).
 
 The rule files are in `deploy/examples/hermes`, and the pod changes, the
 one-time migration of Hermes' existing data and the initial import in
@@ -1757,7 +1896,7 @@ one-time migration of Hermes' existing data and the initial import in
     stays a thin CLI.
 - **`agentfs`, a binary:**
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
-    `restore` and `revert`;
+    `restore`, `revert` and `patch` (`submit`, `apply`, `status`);
   - `init` is safe to re-run (§2.3): exit 0 for the volume it already
     holds, 1 for another volume or branch; `--include` sets the config's
     `include.path` entries (§4.3), and `--root` creates the backing tree;
@@ -1789,7 +1928,13 @@ one-time migration of Hermes' existing data and the initial import in
     refused (a reason and a hint) or failed, 75 busy;
   - `mount`, `run`, `record`, `flush` and `push` take the state-area lock
     (§2.3) and exit 75 while another process holds it; `restore` and
-    `revert` take it only in direct mode.
+    `revert` take it only in direct mode;
+  - `patch submit` runs on the producer's side, in its git repository,
+    through its `git` (§12); `patch apply` fetches and applies the queue
+    with the volume stopped (it takes the lock; exit 1 when blocked);
+    `patch status` reads `meta/patch.json` and the status ref, like
+    `status`, which prints a `patches:` line. `push` prints a `queue:`
+    line for the patch remote (§11.3).
 - **`agentfs mount <backing> <mountpoint>`** runs the FUSE session, the
   commit loop and the push loops in one process.
   - **Preflight.** Before anything is mounted it refuses a state area,
@@ -1804,6 +1949,10 @@ one-time migration of Hermes' existing data and the initial import in
     under the backing tree or the mount point, and a stale mount point
     (`ENOTCONN`, with the command that clears it). A missing mount point
     is created first (one level, mode 0755).
+  - **Order.** Lock, open the volume (journal replay, repairs), the patch
+    phase (§12: fetch the inbox with `agentfs.patchFetchTimeout`, apply the
+    queue, block on the first failure), then the service and the push
+    loops, then the FUSE session. A blocked queue never stops the mount.
   - **A stale mount point with `--on-stale-mount hold`** (a sidecar
     restarted after its daemon died): it mounts nothing and takes no
     lock, says so, waits for SIGINT or SIGTERM, then lazily detaches the
@@ -1907,6 +2056,7 @@ Phase 4 (§14).
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
 | LFS | none exists: implemented in agentfs (§7) over `ureq` 3 (default features off: pure Rust, no TLS) and `sha2` 0.11; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, as `git2/https`; its webpki root bundle is compiled in but unused: the platform verifier reads the system store) | ureq's `native-tls-no-default` feature does not compile the native-tls connector in 3.4 (its code is behind the `native-tls` feature), hence `native-tls`. `reqwest` stays in the binary only, for OTLP |
 | Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `reqwest-blocking-client`, no TLS) in the binary | OTLP http/protobuf export. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
+| Patch submission | the `git` CLI on the producer's side (`ls-remote`, `fetch`, `commit-tree`, `push --force-with-lease`) | Runs in the producer's repository with its own credentials and config, so agentfs needs none of them; the lease makes a number create-only (§12) |
 | Repack | the `git` CLI (`git repack --geometric=2`, git 2.32 or later) | libgit2 has no repack or gc. Run by the commit loop with system and global config off (§8); the image ships `git` |
 | Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates` and `git`; built on `rust:1.99-trixie`; both pinned by digest | Not distroless: the daemon runs `git repack` (§8), and operators follow the runbooks with `git` through `kubectl exec`. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after the kind e2e passes |
 
@@ -2007,7 +2157,14 @@ the pre-crash write. Test 14's LFS part runs in the `e2e-lfs` job
 git-lfs client, `git clone` plus `git lfs pull`, over http and https)
 and without a server in `crates/agentfs/tests/cli_lfs.rs` (local and
 `file://` remotes; `git lfs pull` where git-lfs is installed, as on CI
-runners). Not automated yet: test 3 (a kill at every step), 13
+runners). Test 15 runs without a mount in
+`agentfs_core::patch` (unit tests, including a crash at each step) and
+`crates/agentfs/tests/cli_patch.rs` (racing submitters over `file://`, a
+blocked and resolved queue), through a real mount in the `fuse` job
+(`patches_apply_before_the_mount_serves`), and as `ci/e2e-patches.sh` in
+the `e2e-patches` job: racing producers over smart HTTP with basic auth,
+the conflict, the push of the queue refs, a crash between the commit and
+the ref move, and a replaced patch. Not automated yet: test 3 (a kill at every step), 13
 (performance) and 16.
 
 ## 19. Decisions and open questions
@@ -2070,16 +2227,19 @@ runners). Not automated yet: test 3 (a kill at every step), 13
 | Atomic records | A journal record flag: at record time a refused member, or one a path rule skips (`group_member_skipped`), skips the rest of the group (`GroupRefused`), at commit time a refused change drops the whole record; a refused capture counts as done (§3.4, §8) |
 | `agentfs.maxSize` | An operator attribute for any path, refusing larger content (`max_size`) whatever the store, checked on the size on disk and on the frozen copy at record time, not again at commit (§4.2, §8) |
 | Repack | `git repack -d -q --geometric=2` with bitmaps off, one thread, bounded window, delta cache and big-file threshold (about 256 MiB), a cleared environment and system and global config ignored, skipped when nothing is loose, killed on stop, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); skipped while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
+| Patch submission | A patch is a single commit pushed to `inbox/<n>` with a create-only lease (`--force-with-lease=<ref>:`); a race loses and takes `n+1`. `agentfs patch submit` wraps the producer's `git`; plain git works the same (§12, [runbook](runbooks/patch-queue.md)) |
+| Patch application | At mount only, after journal replay and before the service and FUSE start; a cherry-pick through the restore engine's checks, recorded as one atomic operation of kind `patch` with the patch's author and agentfs as committer; the first failure blocks the queue, raises `PatchBlocked`, and the volume mounts anyway (§12) |
+| Patch idempotency | Decided by the branch's trailers (`Agentfs-Inbox`, `Agentfs-Patch`), never by refs or a cache; refs move after the commit, so a crash anywhere re-applies nothing (§12) |
+| Queue push | Only to the patch remote, after the branch push and apart from it: the status ref, `applied/<n>` once the branch holds the commit, and `inbox/<n>` deleted only while it still names the applied patch; its failures never count against the branch (§11.3) |
 | LFS test server | CI uses git-lfs's `lfs-test-server` (pinned by commit, built with `go install`) behind the git server's nginx, which authenticates with separate users per host; rudolfs (no auth or verify) and giftless (JWT setup) were not used (§18) |
 
 ### 19.2 Open questions
 
-1. **How iac produces patches** for the queue (§12).
-2. **Performance budget** for the synchronous step, set after the phase 1
+1. **Performance budget** for the synchronous step, set after the phase 1
    benchmark (§18 test 13).
-3. **Multi-pod (§14):** the network round trip per boundary, passthrough over a
+2. **Multi-pod (§14):** the network round trip per boundary, passthrough over a
    shared filesystem, RBAC and Pod Security.
-4. **Recovery tooling** beyond `restore`, `revert` and the runbooks (§15):
+3. **Recovery tooling** beyond `restore`, `revert` and the runbooks (§15):
    whether a read-only history view for operators is worth building,
    whether undo through the patch queue (§12) replaces manual restores for
    iac, and asking a running daemon to push now.
