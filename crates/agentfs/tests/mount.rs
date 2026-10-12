@@ -1742,16 +1742,18 @@ fn patches_apply_before_the_mount_serves() {
 
 // ---- design §14: two fronts, one history service ----
 
-/// Starts `agentfs serve-history` for `v`, logging to its log, and waits
+/// Starts `agentfs serve-history` for `v`, logging to its own log, and waits
 /// for it to serve.
 fn start_history_service(v: &Vol) -> Mounted {
+    // A log of its own, apart from the fronts'.
+    let path = log_dir().join(format!("{}-service.log", v.name));
     let mut log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(v.log_path())
+        .open(&path)
         .unwrap();
     writeln!(log, "---- serve-history").unwrap();
-    let before = fs::read_to_string(v.log_path())
+    let before = fs::read_to_string(&path)
         .unwrap_or_default()
         .matches("serving history for volume")
         .count();
@@ -1770,7 +1772,7 @@ fn start_history_service(v: &Vol) -> Mounted {
     let service = Mounted {
         child: Some(child),
         mnt: v.p("no-mount"),
-        log: v.log_path(),
+        log: path,
     };
     let deadline = Instant::now() + Duration::from_secs(20);
     while service.log().matches("serving history for volume").count() <= before {
@@ -1786,14 +1788,16 @@ fn start_history_service(v: &Vol) -> Mounted {
 
 /// Starts a front mount of `v`'s backing tree at `mnt` as pod `pod`.
 fn start_front(v: &Vol, mnt: &Path, pod: &str) -> Mounted {
+    // A log of its own: its alarms are its own.
+    let path = log_dir().join(format!("{}-{pod}.log", v.name));
     let socket = v.state().join("meta/history/history.sock");
     let mut log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(v.log_path())
+        .open(&path)
         .unwrap();
     writeln!(log, "---- front {pod}").unwrap();
-    let before = startup_lines(&fs::read_to_string(v.log_path()).unwrap_or_default());
+    let before = startup_lines(&fs::read_to_string(&path).unwrap_or_default());
     let child = v
         .command()
         .args([
@@ -1820,7 +1824,7 @@ fn start_front(v: &Vol, mnt: &Path, pod: &str) -> Mounted {
     let front = Mounted {
         child: Some(child),
         mnt: mnt.to_owned(),
-        log: v.log_path(),
+        log: path,
     };
     front.wait_mounted(before);
     front
@@ -1864,6 +1868,8 @@ fn pod_commits(v: &Vol) -> Vec<(String, String)> {
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn two_fronts_one_service() {
     let v = Vol::new("two-fronts");
+    // The fronts' repairs are retried at each sweep.
+    v.config("agentfs.sweepInterval", "1s");
     let mnt2 = v.p("mnt2");
     fs::create_dir_all(&mnt2).unwrap();
     fs::set_permissions(&mnt2, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1895,21 +1901,67 @@ fn two_fronts_one_service() {
     assert!(status.contains("command=mount pod=pod-a"), "{status}");
     assert!(status.contains("command=mount pod=pod-b"), "{status}");
 
+    // A file open in A that B renames, or removes: A's close records it
+    // under its current name, or nowhere (design §14).
+    {
+        write_and_close(&v.mnt().join("app.log"), "1").unwrap();
+        write_and_close(&v.mnt().join("gone.log"), "1").unwrap();
+        let mut moved = fs::OpenOptions::new()
+            .append(true)
+            .open(v.mnt().join("app.log"))
+            .unwrap();
+        let mut removed = fs::OpenOptions::new()
+            .append(true)
+            .open(v.mnt().join("gone.log"))
+            .unwrap();
+        fs::rename(mnt2.join("app.log"), mnt2.join("app.log.1")).unwrap();
+        fs::remove_file(mnt2.join("gone.log")).unwrap();
+        moved.write_all(b"2").unwrap();
+        removed.write_all(b"2").unwrap();
+        drop(moved);
+        drop(removed);
+        v.expect(&tree(&[
+            ("from-a.txt", f("a")),
+            ("from-b.txt", f("b")),
+            ("app.log.1", f("12")),
+        ]));
+        fs::remove_file(mnt2.join("app.log.1")).unwrap();
+    }
+
     // The service down: the boundary fails with EIO and an alarm.
     let mut service = service;
     service.signal(rustix::process::Signal::KILL);
     service.wait_exit(Duration::from_secs(10));
     let err = write_and_close(&v.mnt().join("lost.txt"), "x").unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EIO), "{err}");
+    // A rename is a boundary too: EIO, though the tree has the new name.
+    let err = fs::rename(v.mnt().join("from-a.txt"), v.mnt().join("moved.txt")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EIO), "{err}");
+    assert!(v.backing().join("moved.txt").exists());
+    // Front A's own log: the alarm is A's, not the service's or B's.
     let log = a.log();
     assert!(log.contains("alarm: "), "{log}");
+    assert!(log.contains("is unavailable"), "{log}");
 
     // Back up: the fronts carry on without a restart.
     let service = start_history_service(&v);
     write_and_close(&mnt2.join("after.txt"), "after").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !v.history().contains_key("after.txt") {
-        assert!(Instant::now() < deadline, "after.txt never committed");
+    // A's repairs (the failed close and rename) reach history at its next
+    // sweep: HEAD follows the tree again.
+    let want = tree(&[
+        ("from-b.txt", f("b")),
+        ("lost.txt", f("x")),
+        ("moved.txt", f("a")),
+        ("after.txt", f("after")),
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while v.history() != want {
+        assert!(
+            Instant::now() < deadline,
+            "history never caught up: {:?}\nfront a:\n{}",
+            v.history(),
+            a.log()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 

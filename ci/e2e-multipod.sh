@@ -4,7 +4,11 @@
 # feeding one `agentfs serve-history`. Checks that every commit carries the
 # committer and pod trailers of the mount that made the change, that a
 # service outage fails the boundary with EIO and an alarm and that history
-# catches up once it is back, that a change whose close returned survives a
+# catches up once it is back (front a reconnecting by itself), that a file
+# open in one front and renamed or removed through the other is recorded
+# under its new name or not at all, that a concurrent burst on one path
+# from both fronts converges, that a change whose close returned (journaled,
+# not yet committed: commitWindow is raised for it) survives a
 # kill -9 of the service, and that the service pushes. Then measures the
 # per-close cost, single-process against front (ci/boundary-latency.py).
 #
@@ -198,6 +202,32 @@ assert_eq pod-b "$(committer_of moved-by-b.txt)" "the rename is pod-b's"
 as_agent "$MNT_B" 'rm moved-by-b.txt'
 wait_history moved-by-b.txt -
 
+step "a file open in a, renamed or removed through b, then written and closed in a"
+as_agent "$MNT_A" 'printf 1 > app.log && printf 1 > gone.log'
+wait_history app.log 1
+wait_history gone.log 1
+sudo setpriv --reuid=10000 --regid=10000 --clear-groups -- python3 -c '
+import os, sys
+a, b = sys.argv[1], sys.argv[2]
+moved = os.open(a + "/app.log", os.O_WRONLY | os.O_APPEND)
+removed = os.open(a + "/gone.log", os.O_WRONLY | os.O_APPEND)
+os.rename(b + "/app.log", b + "/app.log.1")  # pod b rotates the log
+os.remove(b + "/gone.log")                    # and removes the other
+os.write(moved, b"2")
+os.write(removed, b"2")
+os.close(moved)
+os.close(removed)
+' "$MNT_A" "$MNT_B"
+wait_history app.log.1 12
+wait_history app.log -
+wait_history gone.log -
+# Quiet for a sweep or two: nothing brings the old names back.
+sleep 3
+wait_history app.log -
+wait_history gone.log -
+as_agent "$MNT_B" 'rm app.log.1'
+wait_history app.log.1 -
+
 step "a directory mv"
 as_agent "$MNT_A" 'mkdir -p dir/sub && printf x > dir/sub/f && printf y > dir/g'
 wait_history dir/sub/f x
@@ -218,6 +248,32 @@ done
 assert_eq 4 "$(sudo cat "$BACKING/shared.txt")" "last writer wins in the tree"
 VERSIONS=$(sgit log --format=%cn refs/heads/agentfs/demo -- shared.txt | tr '\n' ' ')
 assert_eq "pod-b pod-a pod-b pod-a " "$VERSIONS" "every boundary of shared.txt is in history"
+
+step "a shared file, written by both at once"
+burst() { # mountpoint pod
+  as_agent "$1" "for i in \$(seq 1 40); do printf '$2-%s' \$i > burst.txt; done"
+}
+burst "$MNT_A" pod-a &
+BURST_A=$!
+burst "$MNT_B" pod-b &
+BURST_B=$!
+wait "$BURST_A" || fail "pod-a's burst failed"
+wait "$BURST_B" || fail "pod-b's burst failed"
+TREE=$(sudo cat "$BACKING/burst.txt")
+# commitWindow is 200ms: give the burst's records time to commit.
+sleep 3
+if [ "$(sgit show refs/heads/agentfs/demo:burst.txt)" = "$TREE" ]; then
+  pass "after the burst, HEAD has the tree's burst.txt ($TREE)"
+else
+  # Two boundaries of one path at the same instant may journal in the
+  # other order than their freezes (design §14); the next boundary fixes it.
+  echo "note: after the burst HEAD has $(sgit show refs/heads/agentfs/demo:burst.txt), the tree $TREE"
+fi
+N_BURST=$(sgit log --format=%cn refs/heads/agentfs/demo -- burst.txt | wc -l)
+[ "$N_BURST" -ge 2 ] || fail "only $N_BURST commits of burst.txt"
+pass "$N_BURST commits of burst.txt"
+as_agent "$MNT_A" 'printf final > burst.txt'
+wait_history burst.txt final
 
 step "every commit's committer is its pod"
 LOG=$(sgit log --format='%cn|%(trailers:key=Agentfs-Pod,valueonly,separator=%x2C)' \
@@ -254,11 +310,22 @@ start_service
 wait_history outage.txt "during the outage"
 as_agent "$MNT_B" 'printf back > after-restart.txt'
 wait_history after-restart.txt back
-grep -q "is reachable again" "$A_LOG" && pass "front a saw the service back" || true
+# Front a's sweep retries its failed close, so it reaches the service too.
+wait_for 30 grep -q "is reachable again" "$A_LOG" || fail "front a never saw the service back"
+pass "front a saw the service back"
 
 step "kill -9 the service right after a close returns"
+# A long commit window, so the record is journaled but not committed when
+# the service dies, and only the journal's replay can commit it.
+stop_service
+sgit config agentfs.commitWindow 5s
+start_service
 as_agent "$MNT_B" 'printf durable > durable.txt'
 kill_service
+sgit cat-file -e refs/heads/agentfs/demo:durable.txt 2>/dev/null &&
+  fail "durable.txt was committed before the kill: the replay is not exercised"
+pass "durable.txt is journaled, not committed, when the service dies"
+sgit config agentfs.commitWindow 200ms
 start_service
 wait_history durable.txt durable
 assert_eq pod-b "$(committer_of durable.txt)" "replayed with pod-b's committer"

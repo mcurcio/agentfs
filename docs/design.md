@@ -1753,17 +1753,26 @@ Messages are frames of a u32 big-endian length and a JSON body (at most
   socket), the protocol version, the volume name, that the slot is in
   1..=1023 and leased (below), and that the volume's identity templates
   (§9) render for the front's origin. It replies `Welcome {volume, branch,
-  service_pid}` or `Refused {reason}` and closes.
+  service_pid}` or `Refused {reason}` and closes; at its connection limit
+  it replies `Busy {reason}` and closes, before reading the hello. The
+  front checks the other way too: the socket's peer must be root or the
+  front's own euid (`SO_PEERCRED`), so a squatter on a shared listen
+  directory cannot acknowledge records it never journaled.
 - `Tracked {paths}` → `Tracked {tracked}`: which paths are in the tracked
   set. No `fsync`.
 - `Record {draft}` → `Recorded {seq, skipped}`, or `Error {message}`.
 - `Ping` → `Pong`.
 
 A front keeps a pool of synchronous connections (one request at a time on
-each, up to 64 idle ones kept, each checked with a non-blocking peek before
-reuse), and the service runs a thread per connection (at most 256), so
-concurrent boundaries from all fronts still share the journal's group
-commit. Every request has a timeout (`--history-timeout`, 10 s); a front
+each, up to 64 idle ones kept for at most 20 s, each checked with a
+non-blocking peek before reuse), and the service runs a thread per
+connection (at most 1024, each closed after 60 s idle), so concurrent
+boundaries from all fronts still share the journal's group commit. A
+front holds about as many connections as it has boundaries in flight
+(its FUSE threads, at most 16 by default, plus its sweep), so about 60
+fronts can be busy at once; past that a boundary fails with `EIO` and
+`RecordFailed` but, being no outage, without `HistoryServiceUnavailable`.
+Every request has a timeout (`--history-timeout`, 10 s); a front
 waits up to `--history-wait` (30 s) for the service at start, then exits 1
 with nothing mounted. gRPC was rejected for this step: it brings tonic,
 prost and tokio for nothing a socket in the state area needs. The frame
@@ -1777,17 +1786,23 @@ A write whose decision depends on the tracked set (an ignored or nested
 path) first costs one `Tracked` round trip, so an ignored file is still
 never copied. Removals are always sent and decided by the service. The
 service takes the path claims, decides again against its tracked set,
-checks that every frozen copy exists and is in the sender's slot, stamps
-the front's origin (§9), journals with group commit and `fsync`, updates
-the tracked set and replies. The front returns only then.
+skips a write or symlink whose path is no longer in the backing tree as
+sent (below), checks that every frozen copy exists and is in the sender's
+slot, stamps the front's origin (§9), journals with group commit and
+`fsync`, updates the tracked set and replies. The front returns only then.
 
 **Pending slots.** A pending id's high 16 bits are a slot. Slot 0 is the
 single process or the service; a front leases a free slot N in 1..=1023
 with an exclusive `flock` on `meta/fronts/slot-N.lock` for its whole life,
 which the kernel releases when it dies. Ids never collide and the journal
 format is unchanged. The service's prune of unreferenced copies at start
-spares live slots; a dead front's orphaned copies (frozen but never sent)
-are pruned at the next service start.
+spares live slots. A copy frozen but never journaled (its front died
+between freeze and send, or the service died after reading the request
+and before journaling it) is removed when a front instance first
+connects to the service: the service removes that slot's copies older
+than the slot's lease file (rewritten at every lease) that no journaled
+record references, holding off every front record meanwhile. A front
+that keeps running keeps such copies until a front next leases its slot.
 
 **Failure** (§3.5): an unreachable, hung or refusing service fails the
 boundary with `EIO`, `RecordFailed` and, once per outage,
@@ -1798,6 +1813,10 @@ while a resend could journal one frozen copy twice); frozen copies are
 removed on the front only when the request was certainly not sent.
 Repairs go to the slot's `meta/fronts/slot-N.repairs`, which the front's
 sweep retries, and which the next front leasing that slot loads at start.
+Repairs hold paths only, not the pod that failed to record them, so
+repairs a front inherits from a dead predecessor in its slot are
+committed as its own pod; per-repair origins would need the service to
+accept a per-record origin from a front, a follow-up.
 
 **Recovery.** A front that crashes leaves a stale mount, handled as for
 the phase 1 sidecar (§17.1); its lease is released by the kernel. A service
@@ -1821,8 +1840,26 @@ per-path freeze stamps are a follow-up.
 Each front learns of another front's renames and removals only at its
 next lookup (entries are cached 1 s); a name a front knew that no longer
 leads to the file it looks up (moved away, or its inode number reused by
-the filesystem) is dropped then, so opens and records use the current
-name.
+the filesystem) is dropped then, so opens use the current name. A record
+from an open descriptor (close, RELEASE, the sweep) never trusts a cached
+name: each of the node's names is opened and compared (device and inode)
+with the descriptor, and the names that no longer lead to it are dropped.
+With none left, a file still linked is recorded at the path the kernel
+gives for the descriptor (`/proc/self/fd`, which follows renames by any
+process), if that leads to it; a removed file is recorded nowhere, since
+the front that removed it records the removal. This costs one `O_PATH`
+open and `fstat` per name per record, also in single-process mode.
+A removal can still race a record in flight: front A checks the name,
+front B removes the file and sends the removal, and A's write reaches
+the service. The service therefore checks every front write or symlink
+(outside an atomic fsync-class group) against the backing tree under the
+path claim, and skips it (`no longer in the backing tree`) if the path is
+gone or no longer a file (or symlink) under real directories. B's removal
+is sent only after the tree changed and journals under the same claim, so
+it either sees A's write journaled first or A's write sees the path gone.
+A path that another front replaced with a new file between A's check and
+the service's is not caught: A's late state can then be in HEAD until
+that path's next boundary, as for two writers at one instant above.
 
 **Measured cost per boundary** (open question §19.2 item 2, single node).
 These numbers are indicative: the CI runners are shared, and nothing
@@ -2358,7 +2395,11 @@ Phase 4 (§14).
     - a crash and replay does not apply the first twice.
 16. **Phase 4.** Two pods on two nodes mount one volume. Each pod's changes carry
     its own committer identity, and history keeps every boundary from both.
-    Built and run at single-node level (two front mounts on one node, §14);
+    Built and run at single-node level (two front mounts on one node, §14,
+    `ci/e2e-multipod.sh`: renames and removals across fronts, also of a
+    file still open in the other front, a concurrent burst on one path, an
+    outage, and a `kill -9` of the service with a journaled, uncommitted
+    record);
     two nodes wait for the CSI driver.
 
 **Where they run.** Tests 1, 2, 4, 5, 6, 7 and 11 run through real mounts

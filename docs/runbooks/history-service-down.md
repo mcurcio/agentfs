@@ -56,6 +56,12 @@ guide: [§16](../operator-guide.md#16-several-mounts-of-one-volume-history-servi
    | `the volume's identity templates do not render for pod "p"` | The front's pod flags do not fill `[agentfs "identity"]` (an empty `{pod}` in a template, for example): set the flags (`AGENTFS_POD`, ...) or fix the templates ([configuration](../configuration.md#agentfs-identity)) |
    | `slot N is not leased` | The front lost its lease file (`meta/fronts/` was removed): restart the front |
    | `protocol version N is not supported` | The front and the service are different agentfs versions: run one version |
+   | `the socket is served by uid N, not root or this front's uid M` | Another user is listening at the address (a shared, writable listen directory): move `--listen` to a directory only the service's user can write, and find who bound the socket |
+
+   A front that says `history service ... is busy: ... already serves 1024
+   connections` is not refused and raises no `HistoryServiceUnavailable`:
+   too many fronts are busy at once (design §14). Spread the fronts over
+   more volumes, or lower their `--threads`.
 
 ## Restart the service
 

@@ -722,7 +722,7 @@ on the service, `agentfs.history_service.fronts`.
 
 **Crashes.** A front that dies leaves a stale mount, handled as in §10
 (its lease is released by the kernel; its unsent frozen copies are
-pruned at the next service start). A service that dies is restarted the
+removed when a front next leases its slot). A service that dies is restarted the
 same way it was started: it recovers its journal, commits what fronts had
 journaled with their own committers, and replaces the stale socket.
 
@@ -745,8 +745,30 @@ makes the final commit and waits up to `--push-grace` for pushes. As with
   running.
 - If two fronts change one path at the same instant, history can keep the
   earlier one's state until that path's next change.
+- A file open in one front that another front renames or removes: the
+  first front's later close records it under its current name, or not
+  at all once it is removed, so history never gets back a path the tree
+  no longer has. A record that reaches the service after its path left
+  the tree is skipped ("no longer in the backing tree").
 - The rules and settings are read when each process starts: after a
   change, restart the fronts and the service.
-- Frozen copies of a front that crashed before sending them stay in
-  `pending/` until the service restarts; a slot's repair queue is drained
-  only by the next front in that slot.
+- Frozen copies a front made but never got journaled (it died between
+  freeze and send, or the service died while reading the request) stay
+  in `pending/` until a front next leases that slot: the service then
+  removes the slot's copies older than the new lease that no journaled
+  record references. A front that keeps running keeps such copies (each
+  as large as the file it froze) until it restarts. A slot's repair
+  queue is drained only by the next front in that slot, and those
+  repairs are committed as that front's pod, not the pod that made the
+  change.
+- The service serves at most 1024 connections at once (one thread each).
+  A front holds about as many as it has boundaries in flight at once
+  (at most its FUSE threads plus its sweep, 17 by default on a 16-CPU
+  node) and drops them after 20 s idle; the service closes any idle for
+  60 s. So about 60 fronts can all be busy at once; past that, a
+  boundary fails with `EIO` and `RecordFailed` ("history service ... is
+  busy"), without the `HistoryServiceUnavailable` alarm.
+- A front checks that the socket is served by root or by its own user and
+  refuses anything else, so a socket in a directory other users can
+  write cannot be answered by them. Keep `--listen` in a directory only
+  the service's user can write (the default `meta/history/` is 0700).

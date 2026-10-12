@@ -780,41 +780,87 @@ impl Ops {
     /// records would name the wrong path. Only nodes with several names
     /// pay the extra lookups.
     fn prune_stale_names(&self, id: u64, parent: u64, name: &[u8], inode: (u64, u64)) {
-        let others: Vec<(u64, Vec<u8>, Vec<u8>)> = {
+        let several = self
+            .table()
+            .get(id)
+            .is_some_and(|node| node.links().len() >= 2);
+        if several {
+            self.current_names(id, inode, Some((parent, name)));
+        }
+    }
+
+    /// The paths of node `id` that still lead to its backing inode `inode`
+    /// (design §14). Names another front renamed or removed under this
+    /// mount, or whose inode number the filesystem has reused, are dropped
+    /// from the node and left out. A name that cannot be checked (any
+    /// failure but a missing path) is kept. `known`, a name just looked
+    /// up, is current without a check.
+    fn current_names(
+        &self,
+        id: u64,
+        inode: (u64, u64),
+        known: Option<(u64, &[u8])>,
+    ) -> Vec<Vec<u8>> {
+        let names: Vec<(u64, Vec<u8>, Vec<u8>)> = {
             let table = self.table();
             let Some(node) = table.get(id) else {
-                return;
+                return Vec::new();
             };
-            if node.links().len() < 2 {
-                return;
-            }
             node.links()
                 .iter()
-                .filter(|(p, n)| !(*p == parent && n == name))
                 .filter_map(|(p, n)| Some((*p, n.clone(), join(&table.path(*p)?, n))))
                 .collect()
         };
-        let stale: Vec<(u64, Vec<u8>)> = others
-            .into_iter()
-            .filter(|(_, _, path)| match self.backing.open_path(path) {
-                Ok(fd) => rustix::fs::fstat(&fd).is_ok_and(|st| dev_ino(&st) != inode),
-                Err(e) => matches!(
-                    e.raw_os_error(),
-                    Some(libc_errno) if libc_errno == Errno::ENOENT.code()
-                        || libc_errno == Errno::ENOTDIR.code()
-                        || libc_errno == Errno::ELOOP.code()
-                ),
-            })
-            .map(|(p, n, _)| (p, n))
-            .collect();
-        if stale.is_empty() {
-            return;
-        }
-        let mut table = self.table();
-        for (p, n) in stale {
-            if table.child(p, &n) == Some(id) {
-                table.remove_link(p, &n);
+        let mut current = Vec::with_capacity(names.len());
+        let mut stale = Vec::new();
+        for (p, n, path) in names {
+            let is_known = known.is_some_and(|(kp, kn)| kp == p && kn == n.as_slice());
+            if is_known || self.leads_to(&path, inode) != Some(false) {
+                current.push(path);
+            } else {
+                stale.push((p, n));
             }
+        }
+        if !stale.is_empty() {
+            let mut table = self.table();
+            for (p, n) in stale {
+                if table.child(p, &n) == Some(id) {
+                    table.remove_link(p, &n);
+                }
+            }
+        }
+        current
+    }
+
+    /// Whether `path` in the backing tree is the inode `inode`: `None` if
+    /// that cannot be told (a failure other than a missing path).
+    fn leads_to(&self, path: &[u8], inode: (u64, u64)) -> Option<bool> {
+        match self.backing.open_path(path) {
+            Ok(fd) => rustix::fs::fstat(&fd).ok().map(|st| dev_ino(&st) == inode),
+            Err(e) => {
+                let missing = [Errno::ENOENT, Errno::ENOTDIR, Errno::ELOOP]
+                    .iter()
+                    .any(|n| e.raw_os_error() == Some(n.code()));
+                if missing { Some(false) } else { None }
+            }
+        }
+    }
+
+    /// The paths to record an open file `fd` (node `id`, now `st`) under
+    /// (design §14): its names that still lead to it. A file with none
+    /// left that is still in the tree was moved by another front, or its
+    /// directory was: it is recorded at the path the kernel knows for the
+    /// descriptor, if that leads to it. A file removed from the tree is
+    /// recorded nowhere: the front that removed it records the removal.
+    fn record_paths(&self, id: u64, fd: &impl AsFd, st: &Stat) -> Vec<Vec<u8>> {
+        let inode = dev_ino(st);
+        let paths = self.current_names(id, inode, None);
+        if !paths.is_empty() || st.st_nlink == 0 {
+            return paths;
+        }
+        match self.backing.rel_of(fd) {
+            Some(rel) if self.leads_to(&rel, inode) == Some(true) => vec![rel],
+            _ => Vec::new(),
         }
     }
 
@@ -1691,7 +1737,7 @@ impl Ops {
         }
         let st = rustix::fs::fstat(fd).eno()?;
         let current = stamp(&st);
-        let paths = {
+        {
             let table = self.table();
             let Some(node) = table.get(id) else {
                 return Ok(false);
@@ -1699,8 +1745,10 @@ impl Ops {
             if node.kind != Kind::File || !node.dirty.needs_record(&current) {
                 return Ok(false);
             }
-            table.paths(id)
-        };
+        }
+        // Never a cached name another front has since moved or removed
+        // (design §14).
+        let paths = self.record_paths(id, fd, &st);
         let now = now_ns();
         let changes: Vec<Change> = paths
             .iter()
@@ -1713,7 +1761,8 @@ impl Ops {
             })
             .collect();
         let recorded = if changes.is_empty() {
-            // No name left (unlinked): nowhere to record it.
+            // No name left (unlinked here, or removed by another front):
+            // nowhere to record it.
             false
         } else {
             self.boundary

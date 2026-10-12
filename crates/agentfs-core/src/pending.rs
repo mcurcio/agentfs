@@ -19,6 +19,7 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -186,6 +187,41 @@ impl PendingStore {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
                 }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Removes the copies in `slot` made before `before` and not in
+    /// `keep`: a dead front's orphans, once another front leased the slot
+    /// at `before` (design §14). The new holder's own copies are newer.
+    pub fn reclaim_slot(
+        &self,
+        slot: u16,
+        before: SystemTime,
+        keep: &HashSet<PendingId>,
+    ) -> io::Result<usize> {
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let Some(id) = PendingId::parse(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+            if id.slot() != slot || keep.contains(&id) {
+                continue;
+            }
+            let made = match entry.metadata().and_then(|m| m.modified()) {
+                Ok(made) => made,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if made >= before {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(removed)

@@ -203,7 +203,10 @@ reconnect and their repairs and sweep record the final state
 ([runbook](docs/runbooks/history-service-down.md)). Limits: one node only;
 no `restore` or `revert` while the service runs; locks are not shared
 between mounts, so a database must be written from one of them; patches
-are applied only when the service starts with no fronts. Without
+are applied only when the service starts with no fronts; the service
+serves 1024 connections, about 60 fronts busy at once. A file open in
+one mount that another mount renames or removes is recorded under its
+new name, or not at all. Without
 `--history-service`, `mount` is the single-process mount above. See the
 [operator guide](docs/operator-guide.md#16-several-mounts-of-one-volume-history-service).
 

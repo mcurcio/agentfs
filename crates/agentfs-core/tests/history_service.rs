@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use agentfs_core::events::{Event, Events, MemorySink, NullSink};
@@ -146,11 +147,15 @@ struct Front {
     sink: Arc<MemorySink>,
 }
 
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
 fn front_info(lease: &FrontLease, origin: Origin) -> FrontInfo {
     FrontInfo {
         origin,
         slot: lease.slot(),
-        instance: u64::from(std::process::id()) << 16 | u64::from(lease.slot()),
+        // Distinct for every front, as a real front's is.
+        instance: u64::from(std::process::id()) << 32
+            | NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
         pid: std::process::id(),
         version: "test".into(),
     }
@@ -323,6 +328,61 @@ fn concurrent_fronts_commit_with_their_own_committers() {
         let events = front.sink.take();
         assert!(events.iter().all(|e| !e.is_alarm()), "{events:?}");
     }
+}
+
+#[test]
+fn a_write_whose_path_another_front_removed_meanwhile_is_skipped() {
+    // Front A froze `log` from its open descriptor; before its record
+    // reaches the service, front B removed `log` from the tree (and
+    // records the removal itself). A's late write must not bring the path
+    // back into HEAD (design §14).
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    close(&env, &a.recorder, "log", "1").unwrap().unwrap();
+    std::fs::remove_file(env.tree.join("log")).unwrap();
+    let elsewhere = env.tree.parent().unwrap().join("open-descriptor");
+    std::fs::write(&elsewhere, "2").unwrap();
+    let recorded = a
+        .recorder
+        .record(
+            Trigger::Close,
+            CALLER,
+            vec![Input::Write {
+                path: RepoPath::new("log").unwrap(),
+                backing: elsewhere.clone(),
+                executable: false,
+            }],
+        )
+        .unwrap();
+    assert_eq!(recorded.seq, None);
+    assert_eq!(recorded.skipped.len(), 1);
+    assert_eq!(
+        recorded.skipped[0].reason,
+        agentfs_core::rules::SkipReason::Gone
+    );
+    // The same when the path's directory became a symlink.
+    std::fs::create_dir(env.tree.join("real")).unwrap();
+    std::os::unix::fs::symlink("real", env.tree.join("d")).unwrap();
+    std::fs::write(env.tree.join("real/f"), "x").unwrap();
+    let recorded = a
+        .recorder
+        .record(
+            Trigger::Close,
+            CALLER,
+            vec![Input::Write {
+                path: RepoPath::new("d/f").unwrap(),
+                backing: elsewhere,
+                executable: false,
+            }],
+        )
+        .unwrap();
+    assert_eq!(recorded.seq, None);
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("log").unwrap(), b"1");
+    assert_eq!(service.head_blob("d/f"), None);
+    // No frozen copy is left behind.
+    assert_eq!(slot_copies(&env, a._lease.slot()), 0);
 }
 
 #[test]
@@ -512,6 +572,84 @@ fn a_hung_service_times_out() {
 }
 
 #[test]
+fn a_busy_service_fails_the_boundary_without_an_outage_alarm() {
+    let env = env();
+    let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
+    std::fs::create_dir_all(env.state.history_dir()).unwrap();
+    let listener = UnixListener::bind(env.state.history_socket()).unwrap();
+    let branch = agentfs_core::history::History::open(&env.state.git())
+        .unwrap()
+        .settings()
+        .branch_ref
+        .clone();
+    let fake = std::thread::spawn(move || {
+        // Welcomes the first connection and closes it, as an idle timeout
+        // would; then is at its connection limit.
+        let (mut stream, _) = listener.accept().unwrap();
+        read_frame_bytes(&mut stream).unwrap();
+        write_frame(
+            &mut stream,
+            &Reply::Welcome {
+                volume: "vol".into(),
+                branch,
+                service_pid: 1,
+            },
+        )
+        .unwrap();
+        drop(stream);
+        let (mut stream, _) = listener.accept().unwrap();
+        write_frame(
+            &mut stream,
+            &Reply::Busy {
+                reason: "already serves 1024 connections".into(),
+            },
+        )
+        .unwrap();
+    });
+    let sink = Arc::new(MemorySink::new());
+    let client = connect(
+        &env,
+        &lease,
+        pod("pod-a"),
+        "vol",
+        Duration::from_secs(5),
+        sink.clone(),
+    )
+    .unwrap();
+    let recorder = volume::open_front(
+        &env.state,
+        &env.tree,
+        sink.clone(),
+        &Telemetry::noop(),
+        Arc::new(client),
+    )
+    .unwrap();
+    // Let the close reach the client's pool.
+    std::thread::sleep(Duration::from_millis(100));
+    let err = close(&env, &recorder, "a", "1").unwrap_err();
+    let VolumeError::HistoryService(e) = &err else {
+        panic!("{err:?}")
+    };
+    assert!(matches!(e, ClientError::Busy { .. }), "{e:?}");
+    assert!(!e.maybe_journaled());
+    assert_eq!(slot_copies(&env, 1), 0, "nothing was sent");
+    let events = sink.take();
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, Event::HistoryServiceUnavailable { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::RecordFailed { .. })),
+        "{events:?}"
+    );
+    fake.join().unwrap();
+}
+
+#[test]
 fn the_service_refuses_fronts_it_cannot_serve() {
     let env = env();
     let _service = Service::start(&env);
@@ -589,6 +727,38 @@ fn records_journaled_through_a_service_survive_its_crash() {
     let committers: Vec<String> = service.commits().into_iter().map(|(c, _)| c).collect();
     assert_eq!(committers, ["pod-a", "pod-b"]);
     assert_eq!(service.head_blob("a").unwrap(), b"1");
+}
+
+#[test]
+fn a_dead_fronts_orphaned_copies_are_reclaimed_when_its_slot_is_leased_again() {
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let slot = a._lease.slot();
+    // Journaled, not committed yet: its copy must survive.
+    close(&env, &a.recorder, "kept", "1").unwrap().unwrap();
+    // Frozen but never journaled: the front died between freeze and send,
+    // or the service died before journaling the request.
+    let orphan = env
+        .state
+        .pending()
+        .join(format!("{:016x}", (u64::from(slot) << 48) | 0xffff));
+    std::fs::write(&orphan, "lost").unwrap();
+    assert_eq!(slot_copies(&env, slot), 2);
+    drop(a);
+    // Timestamps are coarse: the next lease is clearly later.
+    std::thread::sleep(Duration::from_millis(50));
+    let c = front(&env, "pod-c");
+    assert_eq!(c._lease.slot(), slot);
+    assert!(!orphan.exists(), "the orphan is reclaimed");
+    // The journaled copy is still there and commits; the new front's own
+    // copies are untouched.
+    close(&env, &c.recorder, "new", "2").unwrap().unwrap();
+    let report = service.committer.commit_pending().unwrap();
+    assert_eq!(report.records, 2);
+    assert_eq!(service.head_blob("kept").unwrap(), b"1");
+    assert_eq!(service.head_blob("new").unwrap(), b"2");
+    assert_eq!(slot_copies(&env, slot), 0);
 }
 
 #[test]

@@ -96,6 +96,13 @@ impl FrontLease {
         self.slot
     }
 
+    /// When `slot`'s current holder leased it: the lease file's mtime,
+    /// which [`FrontLease::acquire`] sets by rewriting the file. Frozen
+    /// copies in the slot older than this are a previous holder's.
+    pub fn leased_at(state: &StateDir, slot: u16) -> io::Result<SystemTime> {
+        fs::metadata(state.front_lease(slot))?.modified()
+    }
+
     /// The slots some process holds a lease on now. A slot being leased or
     /// given up concurrently may land on either side.
     pub fn live(state: &StateDir) -> io::Result<HashSet<u16>> {

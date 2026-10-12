@@ -7,7 +7,8 @@
 //! **Protocol v1**, synchronous, one request in flight per connection:
 //!
 //! 1. The front sends [`Hello`]; the service answers [`Reply::Welcome`] or
-//!    [`Reply::Refused`] and closes.
+//!    [`Reply::Refused`] and closes, or [`Reply::Busy`] and closes when it
+//!    serves as many connections as it can.
 //! 2. Then any number of [`Request`]s, each answered by one [`Reply`]:
 //!    - `Tracked{paths}`: whether each path is tracked now, for the rules
 //!      of an ignored or nested write. Answered from memory, no fsync.
@@ -90,6 +91,11 @@ pub enum Reply {
     Refused {
         reason: String,
     },
+    /// The service serves as many connections as it can; the connection
+    /// is closed. Not an outage: the front may try again.
+    Busy {
+        reason: String,
+    },
     /// The request failed; nothing was journaled.
     Error {
         message: String,
@@ -121,6 +127,8 @@ pub enum WireSkipReason {
     },
     Untracked,
     SharedMemory,
+    /// The path left the backing tree before the record was journaled.
+    Gone,
     GroupRefused {
         member: RepoPath,
     },
@@ -180,6 +188,7 @@ impl WireSkipReason {
             },
             SkipReason::Untracked => Self::Untracked,
             SkipReason::SharedMemory => Self::SharedMemory,
+            SkipReason::Gone => Self::Gone,
             SkipReason::GroupRefused { member } => Self::GroupRefused {
                 member: member.clone(),
             },
@@ -205,6 +214,7 @@ impl WireSkipReason {
             },
             Self::Untracked => SkipReason::Untracked,
             Self::SharedMemory => SkipReason::SharedMemory,
+            Self::Gone => SkipReason::Gone,
             Self::GroupRefused { member } => SkipReason::GroupRefused { member },
             Self::GroupMemberSkipped { reason } => {
                 SkipReason::Refused(Refusal::GroupMemberSkipped { reason })
@@ -397,6 +407,7 @@ mod tests {
             },
             Reply::Pong,
             Reply::Refused { reason: "r".into() },
+            Reply::Busy { reason: "b".into() },
             Reply::Error {
                 message: "m".into(),
             },
@@ -461,6 +472,7 @@ mod tests {
             },
             SkipReason::Untracked,
             SkipReason::SharedMemory,
+            SkipReason::Gone,
             SkipReason::GroupRefused { member: path("m") },
             SkipReason::Refused(Refusal::GroupMemberSkipped { reason: "r".into() }),
         ];

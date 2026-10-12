@@ -17,7 +17,7 @@
 //! [`Hello`]: super::protocol::Hello
 //! [`PROTOCOL_VERSION`]: super::protocol::PROTOCOL_VERSION
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Shutdown;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -39,7 +39,15 @@ use crate::telemetry::Telemetry;
 use crate::volume::{Recorder, Skipped, StateDir};
 
 /// The most connections served at once.
-pub const MAX_CONNECTIONS: usize = 256;
+/// One thread each; a front holds at most as many as it has boundaries in
+/// flight at once (its FUSE threads and its sweep), and none once idle for
+/// [`IDLE_TIMEOUT`].
+pub const MAX_CONNECTIONS: usize = 1024;
+
+/// How long a connection may wait for its next request before the service
+/// closes it. A front drops pooled connections well before this
+/// (`client::MAX_IDLE_AGE`), so an idle front holds no service thread.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a new connection has to send its hello.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -58,6 +66,8 @@ struct Shared {
     stop: AtomicBool,
     next_id: AtomicU64,
     conns: Mutex<HashMap<u64, Conn>>,
+    /// Front instances whose slot was reclaimed when they first connected.
+    reclaimed: Mutex<HashSet<u64>>,
     gone: Condvar,
 }
 
@@ -134,6 +144,7 @@ impl HistoryServer {
             stop: AtomicBool::new(false),
             next_id: AtomicU64::new(0),
             conns: Mutex::new(HashMap::new()),
+            reclaimed: Mutex::new(HashSet::new()),
             gone: Condvar::new(),
         });
         let gauge: Arc<dyn Fn() -> usize + Send + Sync> = {
@@ -234,7 +245,7 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
             let mut conns = shared.conns();
             if conns.len() >= MAX_CONNECTIONS {
                 drop(conns);
-                refuse(
+                busy(
                     &mut stream,
                     format!("the history service already serves {MAX_CONNECTIONS} connections"),
                 );
@@ -264,6 +275,12 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
             shared.gone.notify_all();
         }
     }
+}
+
+/// At the connection limit: not a refusal of the front, which may retry.
+fn busy(stream: &mut UnixStream, reason: String) {
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let _ = write_frame(stream, &Reply::Busy { reason });
 }
 
 fn refuse(stream: &mut UnixStream, reason: String) {
@@ -305,6 +322,23 @@ fn admit(shared: &Shared, front: &FrontInfo, volume: &str) -> Result<(), String>
     Ok(())
 }
 
+/// At a front instance's first connection, removes the frozen copies a
+/// previous holder of its slot left and never got journaled (design §14).
+/// A failure only leaves them for the slot's next holder.
+fn reclaim(shared: &Shared, front: &FrontInfo) {
+    let first = shared
+        .reclaimed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(front.instance);
+    if !first {
+        return;
+    }
+    if let Ok(leased_at) = FrontLease::leased_at(&shared.state, front.slot) {
+        let _ = shared.recorder.reclaim_slot(front.slot, leased_at);
+    }
+}
+
 fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
     match local_socket::peer(&stream) {
         Ok(peer) if local_socket::allowed(peer.uid, shared.euid) => {}
@@ -331,6 +365,7 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
     if let Err(reason) = admit(shared, &hello.front, &hello.volume) {
         return refuse(&mut stream, reason);
     }
+    reclaim(shared, &hello.front);
     let welcome = Reply::Welcome {
         volume: shared.volume.clone(),
         branch: shared.branch.clone(),
@@ -344,9 +379,9 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
     if write_frame(&mut stream, &welcome).is_err() {
         return;
     }
-    // Idle connections wait for their next request as long as the front
-    // keeps them.
-    let _ = stream.set_read_timeout(None);
+    // An idle connection waits for its next request up to IDLE_TIMEOUT;
+    // a front stops using it well before.
+    let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
     let front = hello.front;
     loop {
         let request = match read_frame::<Request>(&mut stream) {

@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::KeyValue;
@@ -480,6 +480,7 @@ pub fn open(
         },
         events: events.clone(),
         telemetry: telemetry.clone(),
+        reclaim: Arc::default(),
     };
     let committer = Committer {
         history,
@@ -533,6 +534,7 @@ pub fn open_front(
         },
         events,
         telemetry: telemetry.clone(),
+        reclaim: Arc::default(),
     })
 }
 
@@ -639,6 +641,10 @@ pub struct Recorder {
     store_policy: StorePolicy,
     events: Events,
     telemetry: Telemetry,
+    /// Held for reading by [`Recorder::sequence`] and for writing by
+    /// [`Recorder::reclaim_slot`], so no copy a front's record is about to
+    /// journal is reclaimed meanwhile.
+    reclaim: Arc<RwLock<()>>,
 }
 
 /// Where a [`Recorder`]'s records go.
@@ -973,7 +979,11 @@ impl Recorder {
     /// change again with the paths claimed, as [`Recorder::record`] does: a
     /// removal of nothing tracked and a write the rules now skip are
     /// skipped, and their copies removed; in an atomic group such a write
-    /// refuses the whole group (design §8). Every write's copy must exist
+    /// refuses the whole group (design §8). A write or symlink whose path
+    /// is no longer in the backing tree as sent is skipped
+    /// ([`SkipReason::Gone`]): another front removed or renamed it after
+    /// this front froze it, and that front's boundary, journaled after
+    /// this check under the same claim, records it. Every write's copy must exist
     /// and be in the front's `slot`; operations come only from this
     /// process. The record is journaled with `origin`, so it commits with
     /// the front's committer (design §9), and this returns once it is
@@ -994,6 +1004,7 @@ impl Recorder {
                 "operations are not accepted from fronts".into(),
             ));
         }
+        let _reclaim = self.reclaim.read().unwrap_or_else(PoisonError::into_inner);
         let _claim = self.claims.claim(draft.changes.iter().map(Change::path));
         for change in &draft.changes {
             if let Change::Write { path, pending, .. } = change {
@@ -1023,6 +1034,16 @@ impl Recorder {
                     } else {
                         Decision::Skip(SkipReason::Untracked)
                     }
+                }
+                Change::Write { path, .. } | Change::Symlink { path, .. }
+                    if !draft.atomic
+                        && !still_in_backing(
+                            self.rules.tree(),
+                            path,
+                            matches!(change, Change::Symlink { .. }),
+                        ) =>
+                {
+                    Decision::Skip(SkipReason::Gone)
                 }
                 Change::Write { path, .. } | Change::Symlink { path, .. } => {
                     self.rules.decide(path, tracked.contains(path))?
@@ -1114,6 +1135,28 @@ impl Recorder {
             Backend::Local { tracked, .. } => paths.iter().map(|p| tracked.contains(p)).collect(),
             Backend::Front { .. } => vec![false; paths.len()],
         }
+    }
+
+    /// Removes the frozen copies a dead front left in `slot` (design §14):
+    /// copies frozen before `leased_at`, when the slot's current holder
+    /// leased it, that no journaled record references. They were frozen
+    /// for records that never reached the journal (the front died between
+    /// freeze and send, or the service died before journaling what it
+    /// read). No front record is being journaled meanwhile, so a copy a
+    /// record is about to reference is never taken. Only the history
+    /// service calls this, when a front instance first connects. Returns
+    /// how many copies were removed.
+    pub fn reclaim_slot(&self, slot: u16, leased_at: SystemTime) -> Result<usize, VolumeError> {
+        let Backend::Local { journal, .. } = &self.backend else {
+            return Ok(0);
+        };
+        let _reclaim = self.reclaim.write().unwrap_or_else(PoisonError::into_inner);
+        let keep: HashSet<PendingId> = journal
+            .uncommitted()
+            .iter()
+            .flat_map(Record::pending_ids)
+            .collect();
+        Ok(self.pending.reclaim_slot(slot, leased_at, &keep)?)
     }
 
     /// Whether this recorder is a front of a history service.
@@ -1771,6 +1814,41 @@ fn in_tree(tree: Option<&git2::Tree<'_>>, path: &RepoPath) -> Result<bool, Volum
         Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(false),
         Err(e) => Err(HistoryError::from(e).into()),
     }
+}
+
+/// Whether `path` is still in the backing tree at `tree` as a front
+/// recorded it (design §14): a regular file (or, with `symlink`, a
+/// symlink) whose every directory is a real directory. Another front
+/// that removed or renamed the path since records that itself, so a late
+/// write must not bring it back. A failure other than a missing path
+/// counts as present.
+fn still_in_backing(tree: &Path, path: &RepoPath, symlink: bool) -> bool {
+    let mut at = tree.to_path_buf();
+    let parts: Vec<&str> = path.as_str().split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(meta) => meta,
+            Err(e) => {
+                return !matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                );
+            }
+        };
+        let ty = meta.file_type();
+        let ok = if i + 1 < parts.len() {
+            ty.is_dir()
+        } else if symlink {
+            ty.is_symlink()
+        } else {
+            ty.is_file()
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 /// Splits records into runs where each record is within `window_ms` of the

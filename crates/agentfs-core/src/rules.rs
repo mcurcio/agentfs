@@ -126,6 +126,10 @@ pub enum SkipReason {
     /// A SQLite shared-memory file (`<stem>-shm`) of an fsync-class
     /// database: SQLite rebuilds it, so it is never recorded (design §8).
     SharedMemory,
+    /// A front's write or symlink whose path left the backing tree before
+    /// the history service journaled it: another front removed or renamed
+    /// it, and that front's boundary records the change (design §14).
+    Gone,
     /// Another member of the path's fsync-class group was refused, and a
     /// group is recorded whole or not at all (design §8).
     GroupRefused { member: RepoPath },
@@ -142,6 +146,9 @@ impl fmt::Display for SkipReason {
             Self::Untracked => f.write_str("nothing tracked at this path"),
             Self::Refused(refusal) => write!(f, "refused: {refusal}"),
             Self::SharedMemory => f.write_str("SQLite shared memory of an fsync-class database"),
+            Self::Gone => {
+                f.write_str("no longer in the backing tree (another front moved or removed it)")
+            }
             Self::GroupRefused { member } => {
                 write!(
                     f,

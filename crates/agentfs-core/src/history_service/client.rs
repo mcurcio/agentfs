@@ -43,6 +43,11 @@ pub struct ClientConfig {
 /// The most idle connections kept for reuse.
 const MAX_IDLE: usize = 64;
 
+/// How long an idle connection is kept for reuse: well under the service's
+/// [`super::IDLE_TIMEOUT`], so a pooled connection is never one the service
+/// is closing, and an idle front holds none of the service's threads.
+const MAX_IDLE_AGE: Duration = Duration::from_secs(20);
+
 /// How often [`HistoryClient::connect`] retries.
 const CONNECT_RETRY: Duration = Duration::from_millis(100);
 
@@ -73,6 +78,10 @@ pub enum ClientError {
     /// version, an identity it cannot render).
     #[error("history service {address} refused this front: {reason}")]
     Refused { address: String, reason: String },
+    /// The service serves as many connections as it can. Nothing was sent;
+    /// not an outage.
+    #[error("history service {address} is busy: {reason}")]
+    Busy { address: String, reason: String },
     /// The service answered that the request failed; nothing was journaled.
     #[error("history service {address} could not record: {message}")]
     Service { address: String, message: String },
@@ -89,7 +98,10 @@ impl ClientError {
         match self {
             Self::Timeout { sent, .. } | Self::Lost { sent, .. } => *sent,
             Self::Protocol { .. } => true,
-            Self::Unreachable { .. } | Self::Refused { .. } | Self::Service { .. } => false,
+            Self::Unreachable { .. }
+            | Self::Refused { .. }
+            | Self::Busy { .. }
+            | Self::Service { .. } => false,
         }
     }
 
@@ -100,6 +112,7 @@ impl ClientError {
             Self::Timeout { .. } => "timeout",
             Self::Lost { .. } | Self::Protocol { .. } => "request",
             Self::Refused { .. } => "refused",
+            Self::Busy { .. } => "busy",
             Self::Service { .. } => "service",
         }
     }
@@ -107,7 +120,7 @@ impl ClientError {
     /// Whether this says the service is not doing its job, as opposed to
     /// answering that one request failed.
     fn is_outage(&self) -> bool {
-        !matches!(self, Self::Service { .. })
+        !matches!(self, Self::Service { .. } | Self::Busy { .. })
     }
 }
 
@@ -117,7 +130,8 @@ pub struct HistoryClient {
     address: String,
     hello: Hello,
     branch: String,
-    idle: Mutex<Vec<UnixStream>>,
+    /// Idle connections and when each went idle.
+    idle: Mutex<Vec<(UnixStream, Instant)>>,
     down: AtomicBool,
     events: Events,
     telemetry: Telemetry,
@@ -157,9 +171,11 @@ impl HistoryClient {
                     client.check_in(stream);
                     return Ok(client);
                 }
-                Err(e @ (ClientError::Unreachable { .. } | ClientError::Timeout { .. }))
-                    if Instant::now() < deadline =>
-                {
+                Err(
+                    e @ (ClientError::Unreachable { .. }
+                    | ClientError::Timeout { .. }
+                    | ClientError::Busy { .. }),
+                ) if Instant::now() < deadline => {
                     drop(e);
                     std::thread::sleep(CONNECT_RETRY);
                 }
@@ -230,6 +246,10 @@ impl HistoryClient {
                 address: self.address.clone(),
                 reason: reason.clone(),
             },
+            Reply::Busy { reason } => ClientError::Busy {
+                address: self.address.clone(),
+                reason: reason.clone(),
+            },
             other => ClientError::Protocol {
                 address: self.address.clone(),
                 message: format!("unexpected reply {other:?}"),
@@ -242,7 +262,7 @@ impl HistoryClient {
         let start = Instant::now();
         let result = self.exchange(request);
         match &result {
-            Ok(Reply::Error { .. }) | Ok(Reply::Refused { .. }) => {}
+            Ok(Reply::Error { .. } | Reply::Refused { .. } | Reply::Busy { .. }) => {}
             Ok(_) => {
                 self.telemetry.front_round_trip(name, start.elapsed());
                 if self.down.swap(false, Ordering::SeqCst) {
@@ -315,8 +335,9 @@ impl HistoryClient {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pop();
             match pooled {
-                Some(stream) if local_socket::is_closed(&stream) => continue,
-                Some(stream) => return Ok(stream),
+                Some((_, since)) if since.elapsed() >= MAX_IDLE_AGE => continue,
+                Some((stream, _)) if local_socket::is_closed(&stream) => continue,
+                Some((stream, _)) => return Ok(stream),
                 None => return self.open(),
             }
         }
@@ -327,8 +348,10 @@ impl HistoryClient {
             .idle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The oldest are first: drop those idle too long.
+        idle.retain(|(_, since)| since.elapsed() < MAX_IDLE_AGE);
         if idle.len() < MAX_IDLE {
-            idle.push(stream);
+            idle.push((stream, Instant::now()));
         }
     }
 
@@ -346,12 +369,39 @@ impl HistoryClient {
             .ok_or_else(|| unreachable(format!("{} is not a socket path", path.display())))?;
         let mut stream =
             local_socket::connect(dir, name).map_err(|e| unreachable(e.to_string()))?;
+        // Only a service running as root or as this front's own user may
+        // acknowledge records: anyone else listening there (a squatter on
+        // a shared directory) could answer for records never journaled.
+        let euid = rustix::process::geteuid().as_raw();
+        match local_socket::peer(&stream) {
+            Ok(peer) if local_socket::allowed(peer.uid, euid) => {}
+            Ok(peer) => {
+                return Err(ClientError::Refused {
+                    address: self.address.clone(),
+                    reason: format!(
+                        "the socket is served by uid {}, not root or this front's uid {euid}; \
+                         refusing to trust it",
+                        peer.uid
+                    ),
+                });
+            }
+            Err(e) => return Err(unreachable(format!("peer credentials: {e}"))),
+        }
         let timeout = Some(self.config.timeout.max(Duration::from_millis(1)));
         stream
             .set_read_timeout(timeout)
             .and_then(|()| stream.set_write_timeout(timeout))
             .map_err(|e| unreachable(e.to_string()))?;
-        write_frame(&mut stream, &self.hello).map_err(|e| unreachable(e.to_string()))?;
+        if let Err(e) = write_frame(&mut stream, &self.hello) {
+            // A service at its connection limit answers `Busy` and closes
+            // without reading the hello: its reply may be waiting.
+            return match read_frame::<Reply>(&mut stream) {
+                Ok(reply @ (Reply::Busy { .. } | Reply::Refused { .. })) => {
+                    Err(self.unexpected(&reply))
+                }
+                _ => Err(unreachable(e.to_string())),
+            };
+        }
         let reply =
             read_frame::<Reply>(&mut stream).map_err(|e| match self.read_error(e, false) {
                 // The service went away during the handshake: still nothing

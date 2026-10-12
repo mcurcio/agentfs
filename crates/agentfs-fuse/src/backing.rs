@@ -89,6 +89,18 @@ impl Backing {
         self.open_at(rel, OFlags::PATH, Mode::empty())
     }
 
+    /// The path of the open file `fd` relative to the root, as the kernel
+    /// knows it now (`/proc/self/fd`): it follows renames by any process,
+    /// such as another front of the tree (design §14). `None` if the file
+    /// is not under the root. The caller checks that the path leads to the
+    /// file: an unlinked file's name ends in ` (deleted)`.
+    pub fn rel_of(&self, fd: &impl AsFd) -> Option<Vec<u8>> {
+        let root = std::fs::read_link(proc_path(&self.root)).ok()?;
+        let file = std::fs::read_link(proc_path(fd)).ok()?;
+        let rel = file.strip_prefix(&root).ok()?.as_os_str().as_bytes();
+        (!rel.is_empty()).then(|| rel.to_vec())
+    }
+
     /// Opens the directory `rel` as an `O_PATH` descriptor.
     pub fn open_dir(&self, rel: &[u8]) -> io::Result<OwnedFd> {
         self.open_at(rel, OFlags::PATH | OFlags::DIRECTORY, Mode::empty())

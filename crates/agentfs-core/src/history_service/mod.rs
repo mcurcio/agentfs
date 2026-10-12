@@ -20,7 +20,7 @@ mod server;
 
 pub use client::{ClientConfig, ClientError, HistoryClient};
 pub use lease::{FrontLease, LeaseError, MAX_SLOT};
-pub use server::{HELLO_TIMEOUT, HistoryServer, MAX_CONNECTIONS};
+pub use server::{HELLO_TIMEOUT, HistoryServer, IDLE_TIMEOUT, MAX_CONNECTIONS};
 
 /// Where a history service listens.
 #[derive(Debug, Clone, PartialEq, Eq)]

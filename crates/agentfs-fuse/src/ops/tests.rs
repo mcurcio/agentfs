@@ -689,6 +689,62 @@ fn names_another_process_moved_away_are_dropped_at_lookup() {
 }
 
 #[test]
+fn an_open_file_another_process_renamed_is_recorded_at_its_new_name() {
+    // Another front renames a file open here (design §14); its own boundary
+    // records the rename. This mount's close must not record the old name.
+    let fx = Fx::new();
+    fx.put("old", "1");
+    let fh = fx.open("old", O_WRONLY | O_TRUNC);
+    fs::rename(fx.backing().join("old"), fx.backing().join("new")).unwrap();
+    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.close(fh);
+    let history = fx.history();
+    assert_eq!(history.get("old"), Some(&file("1")), "{history:?}");
+    assert_eq!(history.get("new"), Some(&file("2")), "{history:?}");
+    // Its directory moved instead: recorded under the new directory.
+    fx.mkdir("d");
+    fx.put("d/f", "1");
+    let fh = fx.open("d/f", O_WRONLY | O_TRUNC);
+    fs::rename(fx.backing().join("d"), fx.backing().join("e")).unwrap();
+    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.close(fh);
+    let history = fx.history();
+    assert_eq!(history.get("d/f"), Some(&file("1")), "{history:?}");
+    assert_eq!(history.get("e/f"), Some(&file("2")), "{history:?}");
+    // The sweep of an open, changed file too.
+    fx.put("s", "1");
+    let fh = fx.open("s", O_WRONLY | O_TRUNC);
+    fs::rename(fx.backing().join("s"), fx.backing().join("t")).unwrap();
+    fx.ops.write(fh, 0, b"2", C).unwrap();
+    assert_eq!(fx.ops.sweep(false).recorded, 1);
+    let history = fx.history();
+    assert_eq!(history.get("s"), Some(&file("1")), "{history:?}");
+    assert_eq!(history.get("t"), Some(&file("2")), "{history:?}");
+    fx.close(fh);
+}
+
+#[test]
+fn an_open_file_another_process_removed_is_recorded_nowhere() {
+    // Another front removes a file open here and records the removal
+    // (design §14); this mount's close must not bring the path back.
+    let fx = Fx::new();
+    fx.put("x", "1");
+    let fh = fx.open("x", O_WRONLY | O_TRUNC);
+    fs::remove_file(fx.backing().join("x")).unwrap();
+    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.close(fh);
+    assert_eq!(fx.history(), map(&[("x", file("1"))]));
+    // Removed, and the name reused for another file.
+    fx.put("y", "1");
+    let fh = fx.open("y", O_WRONLY | O_TRUNC);
+    fs::remove_file(fx.backing().join("y")).unwrap();
+    fs::write(fx.backing().join("y"), "other").unwrap();
+    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.close(fh);
+    assert_eq!(fx.history().get("y"), Some(&file("1")));
+}
+
+#[test]
 fn symlinked_components_never_escape() {
     let fx = Fx::new();
     fs::write(fx.dir.path().join("outside"), "secret").unwrap();
