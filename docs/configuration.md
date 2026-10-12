@@ -13,6 +13,30 @@ global and ProgramData config, and its home directory, are cleared once per
 process, so `~/.gitconfig`, `url.<base>.insteadOf`, `http.*` and
 `~/.ssh/known_hosts` never affect a volume (design §11.1).
 
+**The one exception: `include.path`.** The repository's config may
+include operator-owned fragments, for example a Kubernetes ConfigMap
+mounted read-only at `/etc/agentfs/config` (see
+[deployment.md](deployment.md)). Their keys count as if they were in
+`<state>/git/config`, at the point of the include, so a key after the
+include in the own file wins, as in git. `agentfs init --include FILE`
+sets the entries (repeatable; a re-run replaces them). agentfs is stricter
+than git about includes, and every command that opens the volume fails
+when one is wrong:
+
+- the path must be absolute (git would resolve a relative one against the
+  config file's directory);
+- the file must exist and be a readable regular file (git and libgit2
+  silently skip a missing include, which would make the operator's
+  remotes and settings vanish without a sign);
+- a fragment must not set `agentfs.volume` or `agentfs.branch`: the
+  volume's identity belongs to its state area, set by `agentfs init`;
+- conditional includes (`includeIf.<condition>.path`) are refused;
+- `agentfs mount` refuses an include under the backing tree or the mount
+  point, where the workload could rewrite it, like a credentials file.
+
+The `git` CLI reads the same includes, so `git --git-dir <state>/git
+config --list --show-origin` shows where each key comes from.
+
 Set them with `git config`:
 
 ```sh

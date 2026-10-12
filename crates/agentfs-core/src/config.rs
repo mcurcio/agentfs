@@ -5,6 +5,16 @@
 //! config never influence a volume. Remotes are the standard
 //! `[remote "<name>"]` sections with `url` (and optionally `pushurl`), plus
 //! agentfs's own per-remote keys.
+//!
+//! The one exception is `include.path` (design §4.3): an operator-owned
+//! fragment, such as a Kubernetes ConfigMap, that libgit2 expands in place.
+//! agentfs is stricter than git about it: every include must be an
+//! absolute path to a readable regular file (git skips a missing one
+//! silently, which would make the operator's remotes and settings vanish
+//! without a sign), and conditional `includeIf.*.path` is refused, since it
+//! would be evaluated differently with and without a repository. Keeping
+//! includes out of the backing tree and the mount point is the mount
+//! preflight's job.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -56,6 +66,25 @@ pub enum ConfigError {
     SshUrl { key: String, value: String },
     #[error("{key}: ssh remotes need agentfs built with the `ssh` cargo feature")]
     SshUnsupported { key: String },
+    #[error("include.path: {value:?} must be an absolute path")]
+    IncludeNotAbsolute { value: String },
+    #[error(
+        "include.path: {} cannot be read ({source}); git would skip it silently, agentfs \
+         refuses: create it, or remove the include",
+        path.display()
+    )]
+    IncludeUnreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{key}: conditional includes are not supported; use include.path")]
+    ConditionalInclude { key: String },
+    #[error(
+        "include.path: {} sets {key}, which only `agentfs init` sets, in the state area's \
+         own config",
+        path.display()
+    )]
+    IncludeSetsIdentity { path: PathBuf, key: &'static str },
 }
 
 /// How nested repositories are handled (design §5).
@@ -147,6 +176,9 @@ pub struct Settings {
     /// left out of `remotes` and reported as alarms; they never fail the
     /// volume (design §11.1).
     pub invalid_remotes: Vec<InvalidRemote>,
+    /// Every `include.path`, in order: absolute, readable config fragments
+    /// whose keys count as the repository's own (design §4.3).
+    pub includes: Vec<PathBuf>,
 }
 
 impl Settings {
@@ -157,6 +189,7 @@ impl Settings {
     }
 
     pub fn from_config(config: &git2::Config) -> Result<Self, ConfigError> {
+        let includes = includes(config)?;
         let volume = string(config, "agentfs.volume")?.ok_or(ConfigError::MissingVolume)?;
         validate_name("agentfs.volume", &volume)?;
         let branch =
@@ -194,9 +227,62 @@ impl Settings {
             },
             remotes,
             invalid_remotes,
+            includes,
             volume,
         })
     }
+}
+
+/// Every `include.path`, in order, each absolute and a readable regular
+/// file. Any `includeIf.<condition>.path` is refused.
+fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
+    {
+        let mut entries = config.entries(Some(r"^includeif\..*\.path$"))?;
+        if let Some(entry) = entries.next() {
+            let entry = entry?;
+            return Err(ConfigError::ConditionalInclude {
+                key: entry
+                    .name()
+                    .unwrap_or("includeIf.<condition>.path")
+                    .to_owned(),
+            });
+        }
+    }
+    let mut paths = Vec::new();
+    let mut entries = match config.multivar("include.path", None) {
+        Ok(entries) => entries,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(paths),
+        Err(e) => return Err(e.into()),
+    };
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        let value = String::from_utf8_lossy(entry.value_bytes()).into_owned();
+        let path = PathBuf::from(&value);
+        if !path.is_absolute() {
+            return Err(ConfigError::IncludeNotAbsolute { value });
+        }
+        let readable = std::fs::File::open(&path).and_then(|file| {
+            if file.metadata()?.is_file() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("not a regular file"))
+            }
+        });
+        if let Err(source) = readable {
+            return Err(ConfigError::IncludeUnreadable { path, source });
+        }
+        // The volume's identity belongs to its state area (`agentfs
+        // init`): a shared fragment naming one would silently turn every
+        // volume using it into the same volume.
+        let fragment = git2::Config::open(&path)?;
+        for key in ["agentfs.volume", "agentfs.branch"] {
+            if string(&fragment, key)?.is_some() {
+                return Err(ConfigError::IncludeSetsIdentity { path, key });
+            }
+        }
+        paths.push(path);
+    }
+    Ok(paths)
 }
 
 /// Every `[remote "<name>"]` with a `url`, sorted by name: the valid ones,
@@ -720,5 +806,111 @@ mod tests {
         assert_eq!(parse_duration("10"), None);
         assert_eq!(parse_duration("s"), None);
         assert_eq!(parse_duration("1d"), None);
+    }
+
+    /// A config file at `<dir>/config` including `fragment` (written to
+    /// `<dir>/fragment`) with `include_line`, loaded the way
+    /// [`Settings::load`] loads it.
+    fn with_include(
+        own: &str,
+        fragment: &str,
+    ) -> (tempfile::TempDir, Result<Settings, ConfigError>) {
+        let dir = tempfile::tempdir().unwrap();
+        let fragment_path = dir.path().join("fragment");
+        std::fs::write(&fragment_path, fragment).unwrap();
+        let own = own.replace("FRAGMENT", fragment_path.to_str().unwrap());
+        std::fs::write(dir.path().join("config"), own).unwrap();
+        let settings = Settings::load(dir.path());
+        (dir, settings)
+    }
+
+    #[test]
+    fn included_fragments_supply_settings_and_remotes() {
+        let (dir, s) = with_include(
+            "[agentfs]\n\tvolume = v\n[include]\n\tpath = FRAGMENT\n",
+            "[agentfs]\n\tpushInterval = 7s\n\tnested = working-tree\n\
+             [remote \"origin\"]\n\turl = https://git.example/r.git\n\
+             \tagentfsCredentials = /run/secrets/agentfs/origin\n",
+        );
+        let s = s.unwrap();
+        assert_eq!(s.push_interval, Duration::from_secs(7));
+        assert_eq!(s.nested, Nested::WorkingTree);
+        assert_eq!(s.remotes.len(), 1);
+        assert_eq!(s.remotes[0].url, "https://git.example/r.git");
+        assert_eq!(s.includes, [dir.path().join("fragment")]);
+        // No includes: an empty list.
+        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n");
+        assert!(Settings::from_config(&c).unwrap().includes.is_empty());
+    }
+
+    #[test]
+    fn the_own_file_wins_over_an_earlier_include() {
+        // As in git: the last value read wins, so keys after the include
+        // override it.
+        let (_d, s) = with_include(
+            "[include]\n\tpath = FRAGMENT\n[agentfs]\n\tvolume = v\n\tpushInterval = 9s\n",
+            "[agentfs]\n\tpushInterval = 7s\n",
+        );
+        let s = s.unwrap();
+        assert_eq!(s.push_interval, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn bad_includes_are_refused() {
+        // Missing: git and libgit2 skip it; agentfs refuses.
+        let (_d, s) = with_include(
+            "[agentfs]\n\tvolume = v\n[include]\n\tpath = /nonexistent/agentfs/fragment\n",
+            "",
+        );
+        let err = s.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::IncludeUnreadable { path, .. }
+                if path == Path::new("/nonexistent/agentfs/fragment")),
+            "{err}"
+        );
+        assert!(err.to_string().contains("skip it silently"), "{err}");
+        // A directory is not a config file.
+        let (_d, s) = with_include("[agentfs]\n\tvolume = v\n[include]\n\tpath = /\n", "");
+        assert!(
+            matches!(s, Err(ConfigError::IncludeUnreadable { .. })),
+            "{s:?}"
+        );
+        // Relative: git would resolve it against the config file's
+        // directory; agentfs refuses it.
+        let (_d, s) = with_include(
+            "[agentfs]\n\tvolume = v\n[include]\n\tpath = fragment\n",
+            "[agentfs]\n\tpushInterval = 7s\n",
+        );
+        assert!(
+            matches!(&s, Err(ConfigError::IncludeNotAbsolute { value }) if value == "fragment"),
+            "{s:?}"
+        );
+        // Conditional includes.
+        let (_d, s) = with_include(
+            "[agentfs]\n\tvolume = v\n[includeIf \"gitdir:/x/\"]\n\tpath = FRAGMENT\n",
+            "",
+        );
+        assert!(
+            matches!(&s, Err(ConfigError::ConditionalInclude { key }) if key.contains("gitdir")),
+            "{s:?}"
+        );
+        // An invalid key in a fragment fails like one in the own file.
+        let (_d, s) = with_include(
+            "[agentfs]\n\tvolume = v\n[include]\n\tpath = FRAGMENT\n",
+            "[agentfs]\n\tpushInterval = soon\n",
+        );
+        assert!(matches!(s, Err(ConfigError::BadDuration { .. })), "{s:?}");
+        // The volume's identity cannot come from a fragment.
+        for key in ["volume", "branch"] {
+            let (_d, s) = with_include(
+                "[agentfs]\n\tvolume = v\n[include]\n\tpath = FRAGMENT\n",
+                &format!("[agentfs]\n\t{key} = other\n"),
+            );
+            assert!(
+                matches!(&s, Err(ConfigError::IncludeSetsIdentity { key: k, .. })
+                    if *k == format!("agentfs.{key}")),
+                "{s:?}"
+            );
+        }
     }
 }

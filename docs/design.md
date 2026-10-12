@@ -467,6 +467,15 @@ that operator rules always apply:
 
 Every key is described in [configuration.md](configuration.md).
 
+Settings and remotes may also come from operator-owned fragments named by
+`include.path` in `$GIT_DIR/config` (a Kubernetes ConfigMap, §17.1). They
+are read as part of the repository's own config, and checked more strictly
+than git does: each include must be an absolute path to a readable file (a
+missing include fails the volume instead of being skipped), must not set
+`agentfs.volume` or `agentfs.branch`, and must not be under the backing
+tree or the mount point (a mount preflight error, like credentials);
+`includeIf` is refused.
+
 ### 4.4 Implementation note
 
 Rules are evaluated by agentfs over the pure-Rust `gix-ignore` and

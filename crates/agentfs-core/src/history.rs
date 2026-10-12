@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use git2::{Index, IndexEntry, IndexTime, Oid, Repository, Signature, Time};
@@ -165,6 +165,30 @@ impl History {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Makes `includes` exactly the `include.path` entries of the
+    /// repository's own config, in order (design §4.3). The settings of
+    /// this `History` are not reloaded; open it again to see them.
+    pub fn set_includes(&self, includes: &[PathBuf]) -> Result<(), HistoryError> {
+        let mut config = self.repo.config()?.open_level(git2::ConfigLevel::Local)?;
+        match config.remove_multivar("include.path", ".*") {
+            Ok(()) => {}
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        for path in includes {
+            let Some(value) = path.to_str() else {
+                return Err(git2::Error::from_str(&format!(
+                    "include path {} is not UTF-8",
+                    path.display()
+                ))
+                .into());
+            };
+            // A pattern no existing value matches appends a new entry.
+            config.set_multivar("include.path", "^$", value)?;
+        }
+        Ok(())
     }
 
     pub fn repo(&self) -> &Repository {
@@ -417,6 +441,7 @@ pub fn seq_from_message(message: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Duration;
 
     use super::*;
     use crate::identity::Templates;
@@ -689,5 +714,36 @@ mod tests {
         let h = History::init(&dir.path().join("git"), "v1", Some("custom/branch")).unwrap();
         assert_eq!(h.settings().branch_ref, "refs/heads/custom/branch");
         assert!(dir.path().join("git/info/attributes").exists());
+    }
+
+    #[test]
+    fn set_includes_replaces_the_entries_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join("git");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, "[agentfs]\n\tpushInterval = 7s\n").unwrap();
+        std::fs::write(&b, "[remote \"origin\"]\n\turl = /srv/r.git\n").unwrap();
+        let h = History::init(&git, "v", None).unwrap();
+        let own = || std::fs::read_to_string(git.join("config")).unwrap();
+        h.set_includes(&[a.clone(), b.clone()]).unwrap();
+        let h = History::open(&git).unwrap();
+        assert_eq!(h.settings().includes, [a.clone(), b.clone()]);
+        assert_eq!(h.settings().push_interval, Duration::from_secs(7));
+        assert_eq!(h.settings().remotes[0].url, "/srv/r.git");
+        let once = own();
+        h.set_includes(&[a.clone(), b.clone()]).unwrap();
+        assert_eq!(own(), once);
+        // Replaced, not added to.
+        h.set_includes(std::slice::from_ref(&b)).unwrap();
+        let h = History::open(&git).unwrap();
+        assert_eq!(h.settings().includes, std::slice::from_ref(&b));
+        assert_eq!(h.settings().push_interval, Duration::from_secs(60));
+        assert_eq!(own().matches("path = ").count(), 1, "{}", own());
+        // And removed.
+        h.set_includes(&[]).unwrap();
+        let h = History::open(&git).unwrap();
+        assert!(h.settings().includes.is_empty());
+        assert!(h.settings().remotes.is_empty());
+        assert_eq!(h.settings().volume, "v");
     }
 }
