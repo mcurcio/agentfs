@@ -18,6 +18,16 @@
 # clients that cannot reach the runner's loopback (pods in a kind cluster
 # reach the kind network's gateway). 127.0.0.1 is always served.
 #
+# GIT_SERVER_LFS=1 adds Git LFS routes for ci/lfs-server.sh (design §7):
+#   http://localhost:8080/git/<repo>.git/info/lfs/...   the derived endpoint,
+#     and /git/<repo>/objects/... its object hrefs, proxied to 127.0.0.1:9002
+#     under the git server's own users (htpasswd);
+#   http://127.0.0.1:8081/...  a separate LFS host with its own users
+#     (htpasswd-lfs), proxied to 127.0.0.1:9001;
+# and logs every request as `$msec $server_port $remote_user "$request" $status`
+# to logs/access.log, for ordering and per-host credential checks. It also
+# prints GIT_SERVER_LFS_HTPASSWD, LFS_SEPARATE_BASE and GIT_SERVER_ACCESS_LOG.
+#
 # Needs nginx, fcgiwrap, git and openssl. Everything runs as the calling
 # user except --trust-ca.
 
@@ -66,6 +76,37 @@ if [ -n "${GIT_SERVER_EXTRA_LISTEN:-}" ]; then
   extra_listen="listen ${GIT_SERVER_EXTRA_LISTEN}:8080;"
 fi
 
+log_format=""
+access_log="access_log $dir/logs/access.log;"
+lfs_locations=""
+lfs_server=""
+if [ "${GIT_SERVER_LFS:-}" = 1 ]; then
+  : >"$dir/htpasswd-lfs"
+  log_format="log_format agentfs '\$msec \$server_port \$remote_user \"\$request\" \$status';"
+  access_log="access_log $dir/logs/access.log agentfs;"
+  lfs_locations="
+    location ~ ^/git/([^/]+)\\.git/info/lfs/(.*)\$ {
+      auth_basic \"git\";
+      auth_basic_user_file $dir/htpasswd;
+      proxy_pass http://127.0.0.1:9002/git/\$1/\$2;
+    }
+    location ~ ^/git/[^/.]+/objects/ {
+      auth_basic \"git\";
+      auth_basic_user_file $dir/htpasswd;
+      proxy_pass http://127.0.0.1:9002;
+    }"
+  lfs_server="
+  server {
+    listen 127.0.0.1:8081;
+    server_name 127.0.0.1;
+    location / {
+      auth_basic \"lfs\";
+      auth_basic_user_file $dir/htpasswd-lfs;
+      proxy_pass http://127.0.0.1:9001;
+    }
+  }"
+fi
+
 fcgiwrap -s "unix:$dir/fcgiwrap.sock" &
 echo $! >"$dir/fcgiwrap.pid"
 for _ in $(seq 50); do [ -S "$dir/fcgiwrap.sock" ] && break; sleep 0.1; done
@@ -78,7 +119,8 @@ pid $dir/nginx.pid;
 error_log $dir/logs/error.log;
 events { worker_connections 64; }
 http {
-  access_log $dir/logs/access.log;
+  $log_format
+  $access_log
   client_body_temp_path $dir/tmp/body;
   proxy_temp_path $dir/tmp/proxy;
   fastcgi_temp_path $dir/tmp/fastcgi;
@@ -93,6 +135,7 @@ http {
     server_name localhost;
     ssl_certificate $dir/tls/server.crt;
     ssl_certificate_key $dir/tls/server.key;
+$lfs_locations
 
     location ~ ^/git(/.*)\$ {
       auth_basic "git";
@@ -114,6 +157,7 @@ http {
     ssl_certificate_key $dir/tls/untrusted.key;
     location / { return 403; }
   }
+$lfs_server
 }
 EOF
 nginx -p "$dir" -c "$dir/nginx.conf"
@@ -130,3 +174,10 @@ GIT_HTTP_BASE=http://localhost:8080/git
 GIT_HTTPS_BASE=https://localhost:8443/git
 GIT_HTTPS_UNTRUSTED_BASE=https://localhost:8444/git
 EOF
+if [ "${GIT_SERVER_LFS:-}" = 1 ]; then
+  cat <<EOF
+GIT_SERVER_LFS_HTPASSWD=$dir/htpasswd-lfs
+LFS_SEPARATE_BASE=http://127.0.0.1:8081
+GIT_SERVER_ACCESS_LOG=$dir/logs/access.log
+EOF
+fi
