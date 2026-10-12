@@ -1,10 +1,10 @@
 //! Signals and shutdown for the long-running commands, `run` and `mount`
 //! (design §11.2, §17.1).
 //!
-//! SIGINT and SIGTERM, and the end of a FUSE session (something else
-//! unmounted the volume), all arrive on one channel, so the command waits
-//! for whichever comes first. Once shutdown has begun, another signal exits
-//! at once with status 130.
+//! SIGINT and SIGTERM, the end of a FUSE session (something else
+//! unmounted the volume) and a failure of `--passthrough on` all arrive on
+//! one channel, so the command waits for whichever comes first. Once
+//! shutdown has begun, another signal exits at once with status 130.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -24,6 +24,8 @@ pub enum Wake {
     Signal(i32),
     /// The FUSE session ended without being asked to.
     Unmounted,
+    /// `--passthrough on` could not be honoured after INIT.
+    PassthroughFailed,
 }
 
 pub struct Daemon {
@@ -51,14 +53,14 @@ impl Daemon {
         Ok(Self { tx, rx })
     }
 
-    /// Wakes the daemon with [`Wake::Unmounted`] when `ended` is set.
-    pub fn watch(&self, ended: Arc<Stop>) -> Result<()> {
+    /// Wakes the daemon with `wake` when `ended` is set.
+    pub fn watch(&self, ended: Arc<Stop>, wake: Wake) -> Result<()> {
         let tx = self.tx.clone();
         std::thread::Builder::new()
             .name("agentfs-watch".into())
             .spawn(move || {
                 while !ended.wait(Duration::from_secs(3600)) {}
-                let _ = tx.send(Wake::Unmounted);
+                let _ = tx.send(wake);
             })
             .context("starting the session watcher")?;
         Ok(())

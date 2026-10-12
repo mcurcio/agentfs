@@ -327,7 +327,17 @@ it with trigger `sweep`. Because records hold absolute state, a repair is
 idempotent and cannot undo a later change. Until it succeeds, history
 differs from the tree at those paths; the `RecordFailed` alarm says so. A
 RELEASE whose record fails queues its paths too, since no handle is left to
-record from. Paths still queued at unmount are reported on exit.
+record from.
+
+The queue outlives the daemon. It is kept in `meta/repairs` in the state
+area (one line per path: the caller's uid, gid and pid and the path in hex),
+rewritten whenever it changes, and the next `agentfs mount` repairs what it
+lists from the backing tree before it serves any request. A repair made
+from an older entry never drops one queued again meanwhile. Paths still
+queued at unmount are listed on exit with where they are saved; if the file
+cannot be written either (the state area is full or unwritable), the exit
+message lists them and says that history differs from the tree there until
+each path is changed again.
 
 ## 4. Path rules
 
@@ -476,10 +486,16 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
   files are already recorded, those files keep being recorded. Only new paths
   under it are excluded. Nothing is deleted from history because of nesting.
 - **Paths git refuses** are not recorded. A path with a component that is
-  exactly `.git` is git's own data (`git init` at the root, a clone's git
-  directory, a gitfile): it is skipped silently, since a `git clone` on the
-  mount would otherwise raise an alarm per object. Every other path git
-  refuses raises an alarm (`PathRefused`, §13): `.git` look-alikes in their
+  exactly `.git` is skipped silently when that `.git` is git's own data: a
+  directory that is (or is becoming, by the markers below) a git directory,
+  as after `git init` at the root or in a clone, or a gitfile or `.git`
+  symlink pointing at a git directory in the tree. A `git clone` on the
+  mount would otherwise raise an alarm per object. Any other `.git` (an
+  ordinary directory or file someone named `.git`) raises `PathRefused`
+  once per such `.git` per mount, so its contents never leave history
+  without a trace. A git directory written by a custom template whose first
+  files are none of the markers can raise that alarm once. Every other path
+  git refuses raises an alarm (`PathRefused`, §13): `.git` look-alikes in their
   NTFS and HFS spellings, such as `.GIT`, `git~1` and `.git.`, names that
   are not UTF-8, and the checks of §3.4. A refused path is reported per
   path; it never fails the rest of its record, and the operation itself
@@ -544,13 +560,23 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
     and so are extended attributes (on regular files and directories).
     `chmod` of a symlink is not supported (Linux has no `lchmod`).
   - **Ownership of new objects.** The daemon performs each operation with
-    its own privileges once the kernel has checked the caller's. Running as
-    root, it then gives every file, directory, symlink and device it creates
-    to the caller (`fchown`): the caller's group, except under a setgid
+    its own privileges once the kernel has checked the caller's. With
+    `CAP_CHOWN` and `CAP_FOWNER` (root, or a non-root daemon given both;
+    decided from the effective capability set, not the uid), it then gives
+    every file, directory, symlink and device it creates to the caller: the caller's group, except under a setgid
     directory, where the backing filesystem already chose the directory's
     group. It then sets exactly the mode the caller asked for, so the
-    daemon's own umask never applies. A non-root daemon cannot do this:
-    everything it creates belongs to its own user.
+    daemon's own umask never applies. Without those capabilities everything
+    it creates belongs to its own user. Owner and mode are always set on a
+    descriptor of the new object (opened with `O_PATH | O_NOFOLLOW` and
+    checked to be what was just created: the right type, owned by the
+    daemon, one link unless a directory), never by name, so a name swapped
+    for a symlink or hard link in the backing tree meanwhile is refused
+    with `ESTALE` and nothing outside is touched. `create` makes the backing
+    file with `O_EXCL`: if another writer made the name first, an exclusive
+    create fails with `EEXIST`, and any other opens the existing file as
+    `open` would (checking the caller against its mode bits, with the
+    caller's primary group only), without changing its owner or mode.
   - **POSIX ACLs are not enforced** through the mount (`FUSE_POSIX_ACL` is
     not negotiated); only mode bits are.
   - **Inode numbers.** fuser sends the attribute's inode number as the FUSE
@@ -565,7 +591,11 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
     `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS` (Linux 5.6+), and
     checks that every path still leads to the node's backing inode
     (`ESTALE` otherwise). A symlink anywhere in a path, whatever the
-    workload did to the tree, is never followed.
+    workload did to the tree, is never followed. Path resolution is ordered
+    against renames (a rename holds a lock for writing; every other
+    operation, including `getattr`, `readlink` and the extended-attribute
+    calls, holds it for reading), so an ancestor rename never makes a
+    `stat` of an existing file fail.
 - **Hermes.** Its tool containers run as root while files are owned by UID
   10000. git's "dubious ownership" check then needs `safe.directory` in those
   containers. That is a consumer setting (§16), not an agentfs one.
@@ -1127,14 +1157,20 @@ target. What it needs:
     would record. Entries are cached 1 s, attributes not at all.
   - **Passthrough.** `--passthrough auto` (default) asks for
     `FUSE_PASSTHROUGH` (maximum stack depth 1) when the kernel offers it and
-    the daemon is root (registering backing files needs `CAP_SYS_ADMIN`),
-    and keeps one backing id per inode while any handle on it is open. If
-    registering fails (a stacked backing filesystem such as overlayfs) it
-    switches passthrough off for the rest of the mount and serves data
-    through the daemon. `on` fails the mount at INIT instead; `off` never
-    asks. The startup line reports the result and the reason. CI's
-    `ubuntu-latest` kernel negotiates it (the `fuse` job runs `auto` and
-    `off`).
+    the daemon may register backing files (`CAP_SYS_ADMIN` in the initial
+    user namespace: root, not root inside a rootless container), and keeps
+    one backing id per inode while any handle on it is open. If registering
+    fails for one inode (a stacked backing filesystem such as overlayfs,
+    `EMFILE`), only that inode is served through the daemon while it has a
+    handle open; every other inode keeps passthrough, and an inode that
+    already has a backing id keeps using it (the kernel refuses to mix the
+    two on one inode with `ETXTBSY`). Each fallback is logged ("passthrough
+    refused for inode ..."; the first ten). `on` refuses to mount without
+    the privilege, fails at INIT without kernel support, and if a
+    registration fails later it fails that open with `EIO` and stops the
+    mount (exit status 1); `off` never asks. The startup line reports the
+    result and the reason. CI's `ubuntu-latest` kernel negotiates it (the
+    `fuse` job runs `auto`, `on` and `off`, and asserts no open fell back).
   - **Shutdown** on SIGINT, SIGTERM or an external unmount: unmount (a
     plain unmount, then a lazy detach if busy; `fusermount3 -u`, then
     `-u -z`, when not root), wait up to `--unmount-grace` (10 s) for the
@@ -1231,7 +1267,7 @@ Phase 4 (§14).
 
 **Where they run.** Tests 1, 2, 4, 5, 6 and 7 run through real mounts in the
 `fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with passthrough
-`auto` and `off`), along with SQLite in WAL and DELETE mode and git
+`auto`, `on` and `off`), along with SQLite in WAL and DELETE mode and git
 (`gc`, `fsck`) on the mount, though not test 14's restore of every
 recorded version. Tests 8 and 12 (all but the record and commit failure
 counters) run in the `e2e` jobs against a real git
@@ -1258,10 +1294,11 @@ every step), 11 (restore is not built), 13 (performance) and 16.
 | One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `record`, `flush` and `push`; exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
 | FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
 | Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close (§3.1) |
-| `.git` paths | An exact `.git` component is git's own data, skipped without an alarm; look-alikes and invalid names raise `PathRefused` (§5) |
+| `.git` paths | An exact `.git` component that is a git directory or gitfile is skipped without an alarm; any other `.git`, look-alikes and invalid names raise `PathRefused` (§5) |
 | Layout | The state area, backing tree and mount point are separate; credentials are never under the backing tree. `mount` refuses otherwise (§17.1) |
-| Passthrough | `auto` by default: used when the kernel and privileges allow, off with the reason reported otherwise, and switched off for the mount if registering a backing file fails (§17.1) |
-| Failed namespace records | `EIO` plus a repair queue the sweep drains from the backing tree's current state (§3.5) |
+| Passthrough | `auto` by default: used when the kernel and privileges allow, off with the reason reported otherwise, and switched off per inode (not per mount) if registering its backing file fails; `on` fails the mount instead (§17.1) |
+| Failed namespace records | `EIO` plus a repair queue the sweep drains from the backing tree's current state, kept in `meta/repairs` across mounts and drained before the next mount serves (§3.5) |
+| Privileges | Decided from the effective capabilities, not the uid: `CAP_CHOWN` + `CAP_FOWNER` to give new objects to their caller, `CAP_SYS_ADMIN` in the initial user namespace for passthrough (§6, §17.1) |
 | `st_ino` | The FUSE node id, stable while mounted and shared by hard links, not across remounts (§6) |
 
 ### 19.2 Open questions

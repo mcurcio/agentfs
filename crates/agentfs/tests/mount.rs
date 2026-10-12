@@ -141,12 +141,12 @@ impl Vol {
         self.mount_with(extra, |c| c)
     }
 
-    fn mount_with(&self, extra: &[&str], wrap: impl FnOnce(Command) -> Command) -> Mounted {
-        let log_path = self.log_path();
+    /// `agentfs mount` with `extra` options, logging to the test's log.
+    fn mount_command(&self, extra: &[&str]) -> Command {
         let mut log = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&log_path)
+            .open(self.log_path())
             .unwrap();
         writeln!(log, "---- mount {extra:?}").unwrap();
         let mut cmd = self.command();
@@ -163,12 +163,16 @@ impl Vol {
         .stdout(log.try_clone().unwrap())
         .stderr(log)
         .stdin(Stdio::null());
-        let mut cmd = wrap(cmd);
+        cmd
+    }
+
+    fn mount_with(&self, extra: &[&str], wrap: impl FnOnce(Command) -> Command) -> Mounted {
+        let mut cmd = wrap(self.mount_command(extra));
         let child = cmd.spawn().unwrap();
         let mounted = Mounted {
             child: Some(child),
             mnt: self.mnt(),
-            log: log_path,
+            log: self.log_path(),
         };
         mounted.wait_mounted();
         mounted
@@ -338,6 +342,12 @@ impl Mounted {
         let log = self.log();
         assert!(status.success(), "exit {status:?}; log:\n{log}");
         assert!(!is_mounted(&self.mnt), "still mounted; log:\n{log}");
+        // No open fell back to the daemon: with passthrough on, every
+        // regular file's I/O really went to its backing file.
+        assert!(
+            !log.contains("passthrough refused"),
+            "passthrough fell back; log:\n{log}"
+        );
         log
     }
 }
@@ -442,6 +452,9 @@ fn no_gaps() {
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn recorded_before_close_returns() {
     let v = Vol::new("before_return");
+    // Nothing is committed before the kill, so only the journal can carry
+    // the record over.
+    v.config("agentfs.commitWindow", "10m");
     let mut m = v.mount(&[]);
     v.sh("printf data > f");
     // close has returned: kill the daemon at once.
@@ -474,8 +487,15 @@ fn recorded_before_close_returns() {
             .success()
     );
 
-    // Remount: recovery commits the record made before close returned.
+    assert!(v.history().is_empty(), "committed before the kill");
+
+    // Remount: recovery finds the record made before close returned in
+    // the journal, and commits it.
+    v.config("agentfs.commitWindow", "50ms");
     let m = v.mount(&[]);
+    let log = m.log();
+    let line = log.lines().rfind(|l| l.starts_with("mounted ")).unwrap();
+    assert!(line.contains("1 uncommitted record(s) recovered"), "{line}");
     v.expect(&tree(&[("f", f("data"))]));
     assert_eq!(fs::read_to_string(v.backing().join("f")).unwrap(), "data");
     m.stop();
@@ -521,7 +541,6 @@ fn any_user() {
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode(&v.backing().join("u/secret")), 0o600);
     assert_eq!(mode(&v.mnt().join("u/secret")), 0o600);
-    v.sh_as(Some(UID), "cat secret 2>/dev/null || true", false);
 
     // chown and utimens pass through.
     v.sh("chown 10000 rootfile && TZ=UTC touch -d '2001-02-03 04:05:06' rootfile");
@@ -834,7 +853,13 @@ fn an_external_unmount_stops_the_daemon() {
 fn the_lock_holds_while_mounted() {
     let v = Vol::new("lock");
     let m = v.mount(&[]);
-    for args in [&["run"][..], &["push"], &["flush"]] {
+    let root = v.backing().to_str().unwrap().to_owned();
+    for args in [
+        &["run"][..],
+        &["push"],
+        &["flush"],
+        &["--root", &root, "record", "f"],
+    ] {
         let out = v.agentfs(args);
         assert_eq!(
             out.status.code(),
@@ -899,7 +924,8 @@ fn an_unprivileged_daemon() {
         .unwrap()
         .success();
     assert!(ok);
-    let m = v.mount_with(&[], |cmd| {
+    let log_path = v.log_path();
+    let as_user = move |cmd: Command| {
         let mut wrapped = Command::new("setpriv");
         wrapped
             .arg(format!("--reuid={uid}"))
@@ -914,16 +940,27 @@ fn an_unprivileged_daemon() {
                 None => wrapped.env_remove(k),
             };
         }
-        let log = fs::OpenOptions::new()
-            .append(true)
-            .open(v.log_path())
-            .unwrap();
+        let log = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
         wrapped
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .stdin(Stdio::null());
         wrapped
-    });
+    };
+    if passthrough() == "on" {
+        // Without CAP_SYS_ADMIN, `on` is refused before anything is
+        // mounted.
+        let status = as_user(v.mount_command(&[])).status().unwrap();
+        let log = fs::read_to_string(v.log_path()).unwrap();
+        assert_eq!(status.code(), Some(1), "{log}");
+        assert!(
+            log.contains("--passthrough on: the daemon lacks CAP_SYS_ADMIN"),
+            "{log}"
+        );
+        assert!(!is_mounted(&v.mnt()));
+        return;
+    }
+    let m = v.mount_with(&[], as_user);
     // Root writes through another user's allow_other mount.
     v.sh("printf r > by-root");
     v.expect(&tree(&[("by-root", f("r"))]));
@@ -934,8 +971,50 @@ fn an_unprivileged_daemon() {
     println!("unprivileged startup: {line}");
     if passthrough() != "off" {
         assert!(
-            line.contains("passthrough: off (the daemon is not root"),
+            line.contains("passthrough: off (the daemon lacks CAP_SYS_ADMIN"),
             "{line}"
         );
     }
+}
+
+// ---- extended attributes and stray .git directories ----
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn xattrs_through_the_mount() {
+    let v = Vol::new("xattrs");
+    let m = v.mount(&[]);
+    v.sh("printf x > f && mkdir d");
+    for target in ["f", "d"] {
+        v.sh(&format!("setfattr -n user.agentfs -v hello {target}"));
+        let got = v.sh(&format!("getfattr --only-values -n user.agentfs {target}"));
+        assert_eq!(got, "hello", "{target}");
+        // It is the backing inode's attribute.
+        let mut buf = [0u8; 64];
+        let n =
+            rustix::fs::getxattr(v.backing().join(target), "user.agentfs", &mut buf[..]).unwrap();
+        assert_eq!(&buf[..n], b"hello", "{target}");
+        let listed = v.sh(&format!("getfattr -d -m - {target}"));
+        assert!(listed.contains("user.agentfs=\"hello\""), "{listed}");
+        v.sh(&format!("setfattr -x user.agentfs {target}"));
+        assert!(
+            rustix::fs::getxattr(v.backing().join(target), "user.agentfs", &mut buf[..]).is_err()
+        );
+    }
+    // Extended attributes are not content: nothing new is recorded.
+    v.expect(&tree(&[("f", f("x"))]));
+    m.stop();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn a_dot_git_that_is_no_repository_alarms() {
+    let v = Vol::new("stray_dot_git");
+    let m = v.mount(&[]);
+    v.sh("mkdir -p notes/.git && printf r > notes/.git/report.txt && printf k > keep");
+    v.expect(&tree(&[("keep", f("k"))]));
+    let log = m.stop();
+    let alarms: Vec<&str> = log.lines().filter(|l| l.starts_with("alarm:")).collect();
+    assert_eq!(alarms.len(), 1, "{log}");
+    assert!(alarms[0].contains("notes/.git/report.txt"), "{log}");
 }

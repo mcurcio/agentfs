@@ -535,7 +535,7 @@ fn git_internals_are_never_recorded() {
     // A nested repository in a subdirectory.
     fx.mkdir("sub");
     fx.mkdir("sub/.git");
-    fx.put("sub/.git/config", "[core]\n");
+    fx.put("sub/.git/config", "[core]\n\trepositoryformatversion = 0\n");
     fx.rename(".git/HEAD", ".git/HEAD2", 0).unwrap();
     let git = fx.id(".git");
     fx.ops.unlink(git, b"HEAD2", C).unwrap();
@@ -843,4 +843,230 @@ fn final_sweep_covers_read_only_handles_of_armed_inodes() {
     assert_eq!(fx.ops.sweep(true).recorded, 1);
     assert_eq!(fx.history()["f"], file("12"));
     fx.close(r);
+}
+
+// ---- review fixes: confinement, races, the repair queue ----
+
+fn mode_of_path(p: &std::path::Path) -> u32 {
+    fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+#[test]
+fn a_new_objects_name_swapped_for_a_symlink_or_link_is_never_followed() {
+    let fx = Fx::new();
+    let outside = fx.dir.path().join("outside");
+    fs::write(&outside, "host file").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+    let dir = fx.ops.open_dir_node(ROOT).unwrap();
+    let pst = rustix::fs::fstat(&dir).unwrap();
+    // mkdir made `x`, then something replaced it with a symlink out of the
+    // tree before the mode was set.
+    std::os::unix::fs::symlink(&outside, fx.backing().join("x")).unwrap();
+    for kind in [Kind::Dir, Kind::File, Kind::Other] {
+        assert_eq!(
+            fx.ops.own_new(&dir, b"x", None, &pst, C, 0o4777, kind),
+            Err(estale())
+        );
+    }
+    assert_eq!(mode_of_path(&outside), 0o600);
+    // mknod made `y`, then it was replaced by a hard link to another file.
+    fs::hard_link(&outside, fx.backing().join("y")).unwrap();
+    assert_eq!(
+        fx.ops
+            .own_new(&dir, b"y", None, &pst, C, 0o4777, Kind::File),
+        Err(estale())
+    );
+    assert_eq!(mode_of_path(&outside), 0o600);
+    // The real thing still works.
+    fx.ops.mkdir(ROOT, b"d", 0o1777, C).unwrap();
+    assert_eq!(mode_of_path(&fx.backing().join("d")), 0o1777);
+    fx.ops.mknod(ROOT, b"n", 0o100640, 0, C).unwrap();
+    assert_eq!(mode_of_path(&fx.backing().join("n")), 0o640);
+}
+
+#[test]
+fn mkdir_and_mknod_race_a_symlink_swap_without_following_it() {
+    let fx = Fx::new();
+    let outside = fx.dir.path().join("outside");
+    fs::write(&outside, "host file").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+    let backing = fx.backing();
+    let ops = Arc::new(fx.ops);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // A writer changing the backing tree directly.
+    let swapper = {
+        let stop = stop.clone();
+        let target = outside.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                for name in ["x", "y"] {
+                    let p = backing.join(name);
+                    let _ = fs::remove_dir(&p);
+                    let _ = fs::remove_file(&p);
+                    let _ = std::os::unix::fs::symlink(&target, &p);
+                    let _ = fs::remove_file(&p);
+                }
+            }
+        })
+    };
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        let _ = ops.mkdir(ROOT, b"x", 0o1777, C);
+        let _ = ops.mknod(ROOT, b"y", 0o104777, 0, C);
+        assert_eq!(
+            mode_of_path(&outside),
+            0o600,
+            "a swapped-in symlink was followed"
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().unwrap();
+}
+
+#[test]
+fn getattr_never_fails_while_an_ancestor_is_renamed() {
+    let fx = Fx::new();
+    fx.mkdir("d");
+    fx.put("d/f", "x");
+    let f = fx.id("d/f");
+    let ops = Arc::new(fx.ops);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let renamer = {
+        let ops = ops.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                ops.rename(ROOT, b"d", ROOT, b"d2", 0, C).unwrap();
+                ops.rename(ROOT, b"d2", ROOT, b"d", 0, C).unwrap();
+            }
+        })
+    };
+    let start = std::time::Instant::now();
+    let mut errors = 0;
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        if ops.getattr(f, None).is_err() {
+            errors += 1;
+        }
+        if ops
+            .listxattr(f, 0)
+            .is_err_and(|e| e != errno(rustix::io::Errno::OPNOTSUPP))
+        {
+            errors += 1;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    renamer.join().unwrap();
+    assert_eq!(errors, 0);
+}
+
+#[test]
+fn create_over_an_existing_file_does_not_take_it_over() {
+    let fx = Fx::new();
+    let victim = fx.backing().join("victim");
+    fs::write(&victim, "secret").unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+    fx.history();
+    let before = fx.backlog();
+    // FUSE_CREATE after another writer made the name in the backing tree.
+    let owner = Caller {
+        uid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getegid().as_raw(),
+        pid: 1,
+    };
+    let (_, fh, _) = fx
+        .ops
+        .create(ROOT, b"victim", 0o666, O_WRONLY, owner)
+        .unwrap();
+    assert_eq!(mode_of_path(&victim), 0o600, "mode rewritten");
+    // Not marked new: closing it unchanged records nothing.
+    fx.close(fh);
+    assert_eq!(fx.backlog(), before);
+    // An exclusive create fails as it would natively.
+    let excl = 0o200;
+    assert_eq!(
+        fx.ops
+            .create(ROOT, b"victim", 0o666, O_WRONLY | excl, owner)
+            .err(),
+        Some(Errno::EEXIST)
+    );
+    // Another user may not open it through create.
+    let other = Caller {
+        uid: owner.uid + 1,
+        gid: owner.gid + 1,
+        pid: 2,
+    };
+    assert_eq!(
+        fx.ops.create(ROOT, b"victim", 0o666, O_RDWR, other).err(),
+        Some(Errno::EACCES)
+    );
+    // A FIFO in the way is not opened (that would block).
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        fx.backing().join("fifo"),
+        rustix::fs::FileType::Fifo,
+        Mode::from_raw_mode(0o666),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        fx.ops.create(ROOT, b"fifo", 0o666, O_RDONLY, C).err(),
+        Some(Errno::EEXIST)
+    );
+}
+
+#[test]
+fn a_dot_git_that_is_no_repository_raises_path_refused_once() {
+    let fx = Fx::new();
+    fx.mkdir("notes");
+    fx.mkdir("notes/.git");
+    fx.put("notes/.git/report.txt", "r");
+    fx.put("notes/.git/more.txt", "m");
+    assert_eq!(fx.refused(), ["notes/.git/report.txt"]);
+    assert_eq!(fx.history(), map(&[]));
+    // A file named .git that is no gitfile.
+    fx.mkdir("plain");
+    fx.put("plain/.git", "hello\n");
+    assert_eq!(fx.refused(), ["notes/.git/report.txt", "plain/.git"]);
+    // Removing such paths raises nothing.
+    fx.ops.unlink(fx.id("plain"), b".git", C).unwrap();
+    assert_eq!(fx.refused().len(), 2);
+}
+
+#[test]
+fn the_repair_queue_survives_the_process() {
+    let fx = Fx::new();
+    fx.put("big.log", "data");
+    fx.put("keep", "k");
+    assert_eq!(fx.history().len(), 2);
+    let store = fx.state().repairs();
+    fx.ops.boundary().persist_repairs(store.clone()).unwrap();
+    // An unlink whose record failed: the file is gone from the tree, the
+    // path is queued, and the process then ends without repairing it.
+    fs::remove_file(fx.backing().join("big.log")).unwrap();
+    fx.ops.boundary().queue_repair([b"big.log".to_vec()], C);
+    assert!(store.exists());
+    let Fx { dir, ops, .. } = fx;
+    drop(ops);
+
+    // The next mount loads the queue and repairs it from the backing tree.
+    let fx = Fx::open_on(dir, OpsConfig::default());
+    assert_eq!(fx.ops.boundary().persist_repairs(store.clone()).unwrap(), 1);
+    let report = fx.ops.sweep(false);
+    assert_eq!((report.repaired, report.still_queued), (1, 0));
+    assert_eq!(fx.history(), map(&[("keep", file("k"))]));
+    assert!(!store.exists(), "an empty queue leaves no file");
+}
+
+#[test]
+fn a_repair_never_drops_a_path_queued_again_meanwhile() {
+    let fx = Fx::new();
+    fx.ops.boundary().queue_repair([b"a".to_vec()], C);
+    let listed = fx.ops.boundary().repairs();
+    // Queued again (a newer failure) before the older repair finishes.
+    fx.ops.boundary().queue_repair([b"a".to_vec()], C);
+    fx.ops.boundary().repaired(&listed);
+    assert_eq!(fx.ops.boundary().pending_repairs(), 1);
+    let listed = fx.ops.boundary().repairs();
+    fx.ops.boundary().repaired(&listed);
+    assert_eq!(fx.ops.boundary().pending_repairs(), 0);
 }

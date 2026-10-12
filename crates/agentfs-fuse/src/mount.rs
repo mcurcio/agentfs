@@ -21,7 +21,10 @@
 //! `nosuid`, `rw`. There is no `auto_unmount`: a crashed daemon leaves the
 //! mount point failing with `ENOTCONN` rather than exposing the empty
 //! directory beneath it to writes nothing would record. Mounting is done
-//! with `mount(2)` as root and `fusermount3` otherwise.
+//! with `mount(2)` as root and `fusermount3` otherwise. Before it mounts,
+//! it repairs the paths a previous mount could not record
+//! ([`MountConfig::repair_store`], design §3.5), and refuses
+//! `--passthrough on` without the privilege for it ([`crate::privileges`]).
 //!
 //! [`Mount::shutdown`] unmounts (lazily if the mount is busy), waits a grace
 //! period for the session to end, stops the sweep and runs a final one.
@@ -40,6 +43,7 @@ use fuser::{MountOption, SessionACL};
 use crate::backing::Backing;
 use crate::fuse::{FuseFs, Passthrough, PassthroughStatus};
 use crate::ops::{Ops, OpsConfig};
+use crate::privileges::Privileges;
 use crate::sweep::Sweeper;
 
 /// How to mount.
@@ -56,6 +60,9 @@ pub struct MountConfig {
     /// FUSE threads; 0 picks the number of CPUs, between 2 and 16.
     pub threads: usize,
     pub sweep_interval: Duration,
+    /// Where the repair queue is kept across mounts (design §3.5); `None`
+    /// keeps it in memory only.
+    pub repair_store: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -225,6 +232,9 @@ pub enum MountError {
          the device"
     )]
     NoFuse,
+    /// `--passthrough on` cannot be honoured with these privileges.
+    #[error("--passthrough on: {0}")]
+    Passthrough(&'static str),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -244,6 +254,19 @@ pub struct UnmountReport {
     /// Failed records the final sweep repaired, and those still failing.
     pub repaired: usize,
     pub unrepaired: usize,
+    /// The paths still failing.
+    pub unrepaired_paths: Vec<String>,
+    /// Where they are saved for the next mount; `None` if they could not
+    /// be saved (or no store is configured).
+    pub repairs_saved: Option<PathBuf>,
+}
+
+/// What [`Mount::start`] repaired from the queue a previous mount left.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StartupRepairs {
+    pub loaded: usize,
+    pub repaired: usize,
+    pub still_queued: usize,
 }
 
 /// FUSE threads for `requested` (0 = by CPU count).
@@ -299,8 +322,10 @@ pub struct Mount {
     mountpoint: PathBuf,
     status: Arc<Mutex<PassthroughStatus>>,
     ended: Arc<Stop>,
+    failed: Arc<Stop>,
     sweeper: Option<Sweeper>,
     threads: usize,
+    startup: StartupRepairs,
 }
 
 impl Mount {
@@ -311,14 +336,36 @@ impl Mount {
         if !Path::new("/dev/fuse").exists() {
             return Err(MountError::NoFuse);
         }
+        if config.passthrough == Passthrough::On
+            && let Some(refusal) = Privileges::current().passthrough_refusal()
+        {
+            return Err(MountError::Passthrough(refusal));
+        }
         raise_nofile();
         let backing = Backing::open(&config.backing).map_err(|source| MountError::Backing {
             path: config.backing.clone(),
             source,
         })?;
         let ops = Arc::new(Ops::new(backing, recorder, OpsConfig::default())?);
+        // Paths a previous mount could not record are repaired from the
+        // backing tree before any request is served.
+        let mut startup = StartupRepairs::default();
+        if let Some(store) = &config.repair_store {
+            startup.loaded = ops.boundary().persist_repairs(store.clone())?;
+            if startup.loaded > 0 {
+                let report = ops.sweep(false);
+                startup.repaired = report.repaired;
+                startup.still_queued = report.still_queued;
+            }
+        }
         let status = Arc::new(Mutex::new(PassthroughStatus::Off("not negotiated".into())));
-        let fs = FuseFs::new(ops.clone(), config.passthrough, status.clone());
+        let failed = Arc::new(Stop::default());
+        let fs = FuseFs::new(
+            ops.clone(),
+            config.passthrough,
+            status.clone(),
+            failed.clone(),
+        );
         let fuser_config = fuser_config(&config);
         let threads = fuser_config.n_threads.unwrap_or(1);
         // Session::new mounts and completes INIT before it returns.
@@ -347,8 +394,10 @@ impl Mount {
             mountpoint: config.mountpoint,
             status,
             ended,
+            failed,
             sweeper: Some(sweeper),
             threads,
+            startup,
         })
     }
 
@@ -364,6 +413,17 @@ impl Mount {
     /// or when something else unmounted it.
     pub fn ended(&self) -> Arc<Stop> {
         self.ended.clone()
+    }
+
+    /// Set when `--passthrough on` could not be honoured after INIT: the
+    /// mount must stop ([`Mount::passthrough`] says why).
+    pub fn failed(&self) -> Arc<Stop> {
+        self.failed.clone()
+    }
+
+    /// What was repaired at start from a previous mount's queue.
+    pub fn startup_repairs(&self) -> StartupRepairs {
+        self.startup
     }
 
     pub fn threads(&self) -> usize {
@@ -393,6 +453,14 @@ impl Mount {
         report.swept = last.recorded;
         report.repaired = last.repaired;
         report.unrepaired = last.still_queued;
+        if report.unrepaired > 0 {
+            report.unrepaired_paths = self.ops.boundary().pending_paths();
+            report.repairs_saved = self
+                .ops
+                .boundary()
+                .repair_store()
+                .and_then(|(store, error)| error.is_none().then_some(store));
+        }
         report
     }
 }
@@ -401,7 +469,7 @@ impl Mount {
 /// because it was busy.
 fn unmount(mountpoint: &Path) -> io::Result<bool> {
     use rustix::mount::UnmountFlags;
-    if rustix::process::geteuid().is_root() {
+    if Privileges::current().can_unmount() {
         return match rustix::mount::unmount(mountpoint, UnmountFlags::empty()) {
             Ok(()) => Ok(false),
             Err(rustix::io::Errno::BUSY) => {
@@ -624,6 +692,7 @@ mod tests {
             allow_other: true,
             threads: 0,
             sweep_interval: Duration::from_secs(30),
+            repair_store: None,
         };
         let c = fuser_config(&config);
         assert!(

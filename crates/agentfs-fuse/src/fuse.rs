@@ -11,14 +11,18 @@
 //!   which is right for one mount) or POSIX ACLs (only mode bits are
 //!   enforced).
 //! - **Passthrough.** With `--passthrough auto` (the default) or `on`, when
-//!   the kernel offers `FUSE_PASSTHROUGH` (Linux 6.9+) and the daemon is
-//!   root (registering a backing file needs `CAP_SYS_ADMIN`), regular files
-//!   are opened with a backing file, so reads, writes and mmap go straight
-//!   to the backing inode without the daemon. One backing id is kept per
-//!   inode while any handle on it is open. If registering fails (a stacked
-//!   backing filesystem such as overlayfs), passthrough is switched off for
-//!   the rest of the mount and data goes through the daemon; `on` instead
-//!   fails the mount at INIT when the kernel or privileges do not allow it.
+//!   the kernel offers `FUSE_PASSTHROUGH` (Linux 6.9+) and the daemon may
+//!   register backing files (`CAP_SYS_ADMIN` in the initial user namespace;
+//!   [`crate::privileges`]), regular files are opened with a backing file,
+//!   so reads, writes and mmap go straight to the backing inode without the
+//!   daemon. One backing id is kept per inode while any handle on it is
+//!   open. If registering fails for an inode (a stacked backing filesystem
+//!   such as overlayfs, `EMFILE`), only that inode goes through the daemon,
+//!   while it has a handle open: the kernel refuses to mix the two modes on
+//!   one inode (`ETXTBSY`), so an inode with a backing id open keeps it and
+//!   one with daemon handles open gets no new one. `on` instead fails the
+//!   mount when the kernel or privileges do not allow it, and a later
+//!   registration failure fails that open with `EIO` and stops the mount.
 //! - **Caching.** Entries are cached for 1 s, attributes not at all: with
 //!   passthrough the daemon does not see writes, so only the backing inode
 //!   knows the size.
@@ -33,13 +37,16 @@ use std::time::{Duration, SystemTime};
 
 use agentfs_core::record::Caller;
 use fuser::{
-    AccessFlags, BackingId, BsdFileFlags, CopyFileRangeFlags, FileHandle, Filesystem, FopenFlags,
-    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen,
-    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    AccessFlags, BackingId, BsdFileFlags, CopyFileRangeFlags, Errno, FileHandle, Filesystem,
+    FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
+use agentfs_core::service::Stop;
+
 use crate::ops::{Handle, Ops, SetAttr, Xattr};
+use crate::privileges::Privileges;
 
 const ENTRY_TTL: Duration = Duration::from_secs(1);
 const ATTR_TTL: Duration = Duration::ZERO;
@@ -74,6 +81,9 @@ impl std::str::FromStr for Passthrough {
 pub enum PassthroughStatus {
     Active,
     Off(String),
+    /// `--passthrough on` and registering a backing file failed: the mount
+    /// is stopping.
+    Failed(String),
 }
 
 impl std::fmt::Display for PassthroughStatus {
@@ -81,45 +91,66 @@ impl std::fmt::Display for PassthroughStatus {
         match self {
             Self::Active => f.write_str("on"),
             Self::Off(reason) => write!(f, "off ({reason})"),
+            Self::Failed(reason) => write!(f, "failed ({reason})"),
         }
     }
 }
 
 /// What INIT should do about passthrough: whether to request it, and the
 /// resulting status, or why the mount must fail (`--passthrough on`).
+/// `refusal` is why the daemon's privileges do not allow it, if they do
+/// not ([`Privileges::passthrough_refusal`]).
 pub fn decide_passthrough(
     mode: Passthrough,
     kernel_offers: bool,
-    root: bool,
+    refusal: Option<&str>,
 ) -> Result<(bool, PassthroughStatus), String> {
     let off = |reason: &str| Ok((false, PassthroughStatus::Off(reason.to_owned())));
-    match mode {
-        Passthrough::Off => off("disabled by --passthrough off"),
-        _ if !kernel_offers => {
-            let reason = "the kernel does not offer FUSE passthrough (needs Linux 6.9 or later)";
-            if mode == Passthrough::On {
-                Err(format!("--passthrough on: {reason}"))
-            } else {
-                off(reason)
-            }
-        }
-        _ if !root => {
-            let reason = "the daemon is not root (registering backing files needs CAP_SYS_ADMIN)";
-            if mode == Passthrough::On {
-                Err(format!("--passthrough on: {reason}"))
-            } else {
-                off(reason)
-            }
-        }
-        _ => Ok((true, PassthroughStatus::Active)),
+    let reason = match (mode, kernel_offers, refusal) {
+        (Passthrough::Off, _, _) => return off("disabled by --passthrough off"),
+        (_, false, _) => "the kernel does not offer FUSE passthrough (needs Linux 6.9 or later)",
+        (_, true, Some(refusal)) => refusal,
+        (_, true, None) => return Ok((true, PassthroughStatus::Active)),
+    };
+    if mode == Passthrough::On {
+        Err(format!("--passthrough on: {reason}"))
+    } else {
+        off(reason)
     }
 }
+
+/// Registration failures logged before the rest are only counted.
+const REFUSALS_LOGGED: u64 = 10;
 
 #[derive(Default)]
 struct BackingIds {
     /// Open handle to (node, backing id): the strong references.
     by_handle: HashMap<u64, (u64, Arc<BackingId>)>,
     by_node: HashMap<u64, Weak<BackingId>>,
+    /// Handles opened through the daemon while passthrough is active, to
+    /// their node, and how many each node has. Such a node gets no backing
+    /// id while any of them is open (the kernel refuses to mix the two on
+    /// one inode, with `ETXTBSY`), and a node with a backing id open keeps
+    /// it for new handles.
+    daemon_handles: HashMap<u64, u64>,
+    daemon_nodes: HashMap<u64, usize>,
+    /// Registrations that failed.
+    refused: u64,
+}
+
+impl BackingIds {
+    fn track_daemon(&mut self, fh: u64, node: u64) {
+        self.daemon_handles.insert(fh, node);
+        *self.daemon_nodes.entry(node).or_default() += 1;
+    }
+}
+
+/// How to open one handle.
+enum Route {
+    Passthrough(Arc<BackingId>),
+    Daemon,
+    /// `--passthrough on` cannot be honoured: fail the open.
+    Fatal,
 }
 
 /// The filesystem fuser runs.
@@ -127,15 +158,23 @@ pub struct FuseFs {
     ops: Arc<Ops>,
     mode: Passthrough,
     status: Arc<Mutex<PassthroughStatus>>,
+    /// Set when `--passthrough on` fails after INIT: the mount stops.
+    failed: Arc<Stop>,
     ids: Mutex<BackingIds>,
 }
 
 impl FuseFs {
-    pub fn new(ops: Arc<Ops>, mode: Passthrough, status: Arc<Mutex<PassthroughStatus>>) -> Self {
+    pub fn new(
+        ops: Arc<Ops>,
+        mode: Passthrough,
+        status: Arc<Mutex<PassthroughStatus>>,
+        failed: Arc<Stop>,
+    ) -> Self {
         Self {
             ops,
             mode,
             status,
+            failed,
             ids: Mutex::new(BackingIds::default()),
         }
     }
@@ -152,43 +191,70 @@ impl FuseFs {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The backing id to open handle `fh` with, if passthrough is active
-    /// and `handle` is a regular file. `register` makes a new one.
-    fn backing_id(
+    /// How to open handle `fh`: with the node's backing id when passthrough
+    /// is active and `handle` is a regular file (`register` makes a new
+    /// one), else through the daemon. A failed registration sends only this
+    /// node through the daemon while it has a handle open; under
+    /// `--passthrough on` it fails the open and stops the mount.
+    fn route(
         &self,
         fh: u64,
         handle: &Handle,
         register: impl FnOnce(&Handle) -> io::Result<BackingId>,
-    ) -> Option<Arc<BackingId>> {
+    ) -> Route {
         if *self.status() != PassthroughStatus::Active {
-            return None;
+            return Route::Daemon;
         }
-        let st = rustix::fs::fstat(&handle.fd).ok()?;
-        if u32::from(st.st_mode) & 0o170000 != 0o100000 {
-            return None;
+        let regular = rustix::fs::fstat(&handle.fd)
+            .is_ok_and(|st| u32::from(st.st_mode) & 0o170000 == 0o100000);
+        if !regular {
+            return Route::Daemon;
         }
         let mut ids = self.ids();
-        let id = match ids.by_node.get(&handle.node).and_then(Weak::upgrade) {
-            Some(id) => id,
-            None => match register(handle) {
-                Ok(id) => {
-                    let id = Arc::new(id);
-                    ids.by_node.insert(handle.node, Arc::downgrade(&id));
-                    id
-                }
-                Err(e) => {
+        if let Some(id) = ids.by_node.get(&handle.node).and_then(Weak::upgrade) {
+            ids.by_handle.insert(fh, (handle.node, id.clone()));
+            return Route::Passthrough(id);
+        }
+        if ids.daemon_nodes.get(&handle.node).is_some_and(|n| *n > 0) {
+            ids.track_daemon(fh, handle.node);
+            return Route::Daemon;
+        }
+        match register(handle) {
+            Ok(id) => {
+                let id = Arc::new(id);
+                ids.by_node.insert(handle.node, Arc::downgrade(&id));
+                ids.by_handle.insert(fh, (handle.node, id.clone()));
+                Route::Passthrough(id)
+            }
+            Err(e) => {
+                ids.refused += 1;
+                if self.mode == Passthrough::On {
                     let reason = format!("registering a backing file failed: {e}");
                     eprintln!(
-                        "agentfs: passthrough switched off for this mount: {reason}; \
-                         reads and writes now go through the daemon"
+                        "agentfs: --passthrough on: {reason}; failing the open and stopping \
+                         the mount"
                     );
-                    *self.status() = PassthroughStatus::Off(reason);
-                    return None;
+                    *self.status() = PassthroughStatus::Failed(reason);
+                    self.failed.stop();
+                    return Route::Fatal;
                 }
-            },
-        };
-        ids.by_handle.insert(fh, (handle.node, id.clone()));
-        Some(id)
+                if ids.refused <= REFUSALS_LOGGED {
+                    eprintln!(
+                        "agentfs: passthrough refused for inode {}: registering a backing file \
+                         failed: {e}; its reads and writes go through the daemon while it is \
+                         open{}",
+                        handle.node,
+                        if ids.refused == REFUSALS_LOGGED {
+                            " (further refusals are not logged)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                ids.track_daemon(fh, handle.node);
+                Route::Daemon
+            }
+        }
     }
 
     fn forget_backing(&self, fh: u64) {
@@ -202,6 +268,14 @@ impl FuseFs {
                 .is_some_and(|w| w.strong_count() == 0)
             {
                 ids.by_node.remove(&node);
+            }
+        }
+        if let Some(node) = ids.daemon_handles.remove(&fh)
+            && let Some(n) = ids.daemon_nodes.get_mut(&node)
+        {
+            *n -= 1;
+            if *n == 0 {
+                ids.daemon_nodes.remove(&node);
             }
         }
     }
@@ -230,8 +304,12 @@ impl Filesystem for FuseFs {
                 let _ = config.add_capabilities(flag);
             }
         }
-        let root = rustix::process::geteuid().is_root();
-        match decide_passthrough(self.mode, caps.contains(InitFlags::FUSE_PASSTHROUGH), root) {
+        let privileges = Privileges::current();
+        match decide_passthrough(
+            self.mode,
+            caps.contains(InitFlags::FUSE_PASSTHROUGH),
+            privileges.passthrough_refusal(),
+        ) {
             Ok((true, status)) => {
                 let requested = config.set_max_stack_depth(1).map_err(|_| ()).and_then(|_| {
                     config
@@ -425,9 +503,15 @@ impl Filesystem for FuseFs {
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         match self.ops.open(ino.0, flags.0, caller(req)) {
-            Ok((fh, handle)) => match self.backing_id(fh, &handle, |h| reply.open_backing(&h.fd)) {
-                Some(id) => reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id),
-                None => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Ok((fh, handle)) => match self.route(fh, &handle, |h| reply.open_backing(&h.fd)) {
+                Route::Passthrough(id) => {
+                    reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id);
+                }
+                Route::Daemon => reply.opened(FileHandle(fh), FopenFlags::empty()),
+                Route::Fatal => {
+                    let _ = self.ops.release(fh);
+                    reply.error(Errno::EIO);
+                }
             },
             Err(e) => reply.error(e),
         }
@@ -448,8 +532,8 @@ impl Filesystem for FuseFs {
             .create(parent.0, bytes(name), mode, flags, caller(req))
         {
             Ok((entry, fh, handle)) => {
-                match self.backing_id(fh, &handle, |h| reply.open_backing(&h.fd)) {
-                    Some(id) => reply.created_passthrough(
+                match self.route(fh, &handle, |h| reply.open_backing(&h.fd)) {
+                    Route::Passthrough(id) => reply.created_passthrough(
                         &ATTR_TTL,
                         &entry.attr,
                         Generation(0),
@@ -457,13 +541,18 @@ impl Filesystem for FuseFs {
                         FopenFlags::empty(),
                         &id,
                     ),
-                    None => reply.created(
+                    Route::Daemon => reply.created(
                         &ATTR_TTL,
                         &entry.attr,
                         Generation(0),
                         FileHandle(fh),
                         FopenFlags::empty(),
                     ),
+                    Route::Fatal => {
+                        let _ = self.ops.release(fh);
+                        self.ops.forget(entry.id, 1);
+                        reply.error(Errno::EIO);
+                    }
                 }
             }
             Err(e) => reply.error(e),
@@ -723,36 +812,48 @@ impl Filesystem for FuseFs {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::os::fd::OwnedFd;
+
+    use agentfs_core::events::MemorySink;
+    use agentfs_core::identity::Context;
+    use agentfs_core::telemetry::Telemetry;
+    use agentfs_core::volume::{self, StateDir};
+
     use super::*;
+    use crate::backing::Backing;
+    use crate::ops::OpsConfig;
+
+    const NO_PRIVILEGE: &str = "the daemon lacks CAP_SYS_ADMIN";
 
     #[test]
     fn passthrough_decisions() {
         use Passthrough::*;
         assert_eq!(
-            decide_passthrough(Auto, true, true),
+            decide_passthrough(Auto, true, None),
             Ok((true, PassthroughStatus::Active))
         );
         assert_eq!(
-            decide_passthrough(On, true, true),
+            decide_passthrough(On, true, None),
             Ok((true, PassthroughStatus::Active))
         );
-        let (req, status) = decide_passthrough(Auto, false, true).unwrap();
+        let (req, status) = decide_passthrough(Auto, false, None).unwrap();
         assert!(!req);
         assert!(status.to_string().contains("6.9"), "{status}");
-        let (req, status) = decide_passthrough(Auto, true, false).unwrap();
+        let (req, status) = decide_passthrough(Auto, true, Some(NO_PRIVILEGE)).unwrap();
         assert!(!req);
-        assert!(status.to_string().contains("not root"), "{status}");
+        assert!(status.to_string().contains("CAP_SYS_ADMIN"), "{status}");
         assert!(
-            decide_passthrough(On, false, true)
+            decide_passthrough(On, false, None)
                 .unwrap_err()
                 .contains("6.9")
         );
         assert!(
-            decide_passthrough(On, true, false)
+            decide_passthrough(On, true, Some(NO_PRIVILEGE))
                 .unwrap_err()
-                .contains("root")
+                .contains("CAP_SYS_ADMIN")
         );
-        let (req, status) = decide_passthrough(Off, true, true).unwrap();
+        let (req, status) = decide_passthrough(Off, true, Some(NO_PRIVILEGE)).unwrap();
         assert!(!req);
         assert_eq!(status.to_string(), "off (disabled by --passthrough off)");
         assert_eq!(PassthroughStatus::Active.to_string(), "on");
@@ -764,5 +865,110 @@ mod tests {
         assert_eq!("on".parse(), Ok(Passthrough::On));
         assert_eq!("off".parse(), Ok(Passthrough::Off));
         assert!("yes".parse::<Passthrough>().is_err());
+    }
+
+    struct Fx {
+        _dir: tempfile::TempDir,
+        fs: FuseFs,
+        failed: Arc<Stop>,
+        file: std::path::PathBuf,
+    }
+
+    fn fx(mode: Passthrough) -> Fx {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("backing");
+        std::fs::create_dir_all(&backing).unwrap();
+        let file = backing.join("f");
+        std::fs::write(&file, "x").unwrap();
+        let state = StateDir::new(dir.path().join("state"));
+        volume::init(&state, "vol", None).unwrap();
+        let (recorder, _committer, _) = volume::open(
+            &state,
+            &backing,
+            Context {
+                volume: "vol".into(),
+                replica: "pod-0".into(),
+                pod_uid: "u".into(),
+                ..Context::default()
+            },
+            Arc::new(MemorySink::new()),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        let ops = Ops::new(
+            Backing::open(&backing).unwrap(),
+            recorder,
+            OpsConfig::default(),
+        )
+        .unwrap();
+        let status = Arc::new(Mutex::new(PassthroughStatus::Active));
+        let failed = Arc::new(Stop::default());
+        Fx {
+            _dir: dir,
+            fs: FuseFs::new(Arc::new(ops), mode, status, failed.clone()),
+            failed,
+            file,
+        }
+    }
+
+    fn handle(fx: &Fx, node: u64) -> Handle {
+        let fd: OwnedFd = std::fs::File::open(&fx.file).unwrap().into();
+        Handle {
+            node,
+            fd,
+            write: false,
+        }
+    }
+
+    fn refuse(_: &Handle) -> io::Result<BackingId> {
+        Err(io::Error::from_raw_os_error(1))
+    }
+
+    #[test]
+    fn a_refused_registration_falls_back_for_that_inode_only() {
+        let fx = fx(Passthrough::Auto);
+        let h = handle(&fx, 7);
+        assert!(matches!(fx.fs.route(1, &h, refuse), Route::Daemon));
+        // Passthrough stays on for the mount.
+        assert_eq!(*fx.fs.status(), PassthroughStatus::Active);
+        // While a daemon handle is open on node 7, no registration is even
+        // tried there (the kernel would refuse mixing the two).
+        let tried = Cell::new(false);
+        let route = fx.fs.route(2, &h, |_| {
+            tried.set(true);
+            refuse(&h)
+        });
+        assert!(matches!(route, Route::Daemon));
+        assert!(!tried.get());
+        // Another node still tries.
+        let other = handle(&fx, 8);
+        fx.fs.route(3, &other, |_| {
+            tried.set(true);
+            refuse(&other)
+        });
+        assert!(tried.get());
+        // Once node 7's daemon handles are closed, it tries again.
+        fx.fs.forget_backing(1);
+        fx.fs.forget_backing(2);
+        tried.set(false);
+        fx.fs.route(4, &h, |_| {
+            tried.set(true);
+            refuse(&h)
+        });
+        assert!(tried.get());
+        assert!(!fx.failed.is_stopped());
+    }
+
+    #[test]
+    fn a_refused_registration_under_on_stops_the_mount() {
+        let fx = fx(Passthrough::On);
+        let h = handle(&fx, 7);
+        assert!(matches!(fx.fs.route(1, &h, refuse), Route::Fatal));
+        assert!(fx.failed.is_stopped());
+        assert!(
+            matches!(&*fx.fs.status(), PassthroughStatus::Failed(r) if r.contains("registering")),
+            "{}",
+            fx.fs.status()
+        );
     }
 }

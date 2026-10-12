@@ -454,6 +454,7 @@ fn describe_wake(wake: Wake) -> String {
     match wake {
         Wake::Signal(signal) => format!("signal {signal}"),
         Wake::Unmounted => "unmounted from outside".to_owned(),
+        Wake::PassthroughFailed => "--passthrough on failed".to_owned(),
     }
 }
 
@@ -553,6 +554,7 @@ fn mount(
         allow_other: !args.no_allow_other,
         threads: args.threads,
         sweep_interval: settings.sweep_interval,
+        repair_store: Some(state.repairs()),
     };
     let mounted = match Mount::start(recorder, config) {
         Ok(mounted) => mounted,
@@ -563,7 +565,16 @@ fn mount(
             return Err(e.into());
         }
     };
-    daemon.watch(mounted.ended())?;
+    daemon.watch(mounted.ended(), Wake::Unmounted)?;
+    daemon.watch(mounted.failed(), Wake::PassthroughFailed)?;
+    let startup = mounted.startup_repairs();
+    if startup.loaded > 0 {
+        eprintln!(
+            "{} path(s) a previous mount could not record: {} repaired from the backing tree, \
+             {} still failing",
+            startup.loaded, startup.repaired, startup.still_queued
+        );
+    }
     eprintln!(
         "mounted {} at {} (volume {}, passthrough: {}, threads {}, {} uncommitted record(s) \
          recovered, remotes: {}); stop with SIGINT or SIGTERM",
@@ -577,6 +588,10 @@ fn mount(
     );
 
     let wake = daemon.wait();
+    let failed = wake == Wake::PassthroughFailed;
+    if failed {
+        eprintln!("passthrough: {}", mounted.passthrough());
+    }
     eprintln!(
         "{}: unmounting (waiting up to {:?} for open files, then {:?} for pushes; signal \
          again to exit now)",
@@ -604,15 +619,26 @@ fn mount(
         );
     }
     if report.unrepaired > 0 {
-        eprintln!(
-            "{} path(s) could not be recorded (see the alarms); history differs from the \
-             backing tree there until the next mount records them",
-            report.unrepaired
-        );
+        match &report.repairs_saved {
+            Some(store) => eprintln!(
+                "{} path(s) could not be recorded (see the alarms); they are saved in {} and \
+                 the next mount records them from the backing tree before it serves anything: {}",
+                report.unrepaired,
+                store.display(),
+                report.unrepaired_paths.join(", ")
+            ),
+            None => eprintln!(
+                "{} path(s) could not be recorded, nor saved for the next mount (see the \
+                 alarms); history differs from the backing tree at these paths until each is \
+                 changed again: {}",
+                report.unrepaired,
+                report.unrepaired_paths.join(", ")
+            ),
+        }
     }
     let code = stop_service(service, args.push_grace);
     session.finish();
-    Ok(code)
+    Ok(if failed { ExitCode::FAILURE } else { code })
 }
 
 type Opened = (volume::Recorder, volume::Committer, volume::Recovery);

@@ -15,11 +15,19 @@ what to do when something goes wrong. The design behind it is
   daemon. Without it everything still works, through the daemon.
 - **`/dev/fuse`.** In a container, give it the device (and, for a mount
   other containers see, a privileged sidecar: see §11 below).
-- **Run as root** (or with `CAP_SYS_ADMIN`, `CAP_CHOWN`, `CAP_DAC_OVERRIDE`
-  and `CAP_FOWNER`) for multi-user volumes. As root the daemon gives every
-  new file to the user who created it, and can use passthrough. A non-root
-  daemon works, but every file it creates is owned by the daemon's user,
-  and passthrough is off.
+- **Run as root** for multi-user volumes. What the daemon does is decided
+  from its effective capabilities, not its uid:
+  - with `CAP_CHOWN` and `CAP_FOWNER` it gives every new file to the user
+    who created it, with the mode that user asked for;
+  - with `CAP_SYS_ADMIN` in the initial user namespace it can use
+    passthrough. Root inside a rootless container (a user namespace) does
+    not have that, so passthrough is off there;
+  - `CAP_DAC_OVERRIDE` lets it serve files whose modes would deny its own
+    user (the kernel has already checked the caller's permissions).
+
+  Root has all of these. A non-root daemon given them behaves the same; one
+  without them works, but every file it creates is owned by the daemon's
+  user, and passthrough is off.
 - **A non-root daemon** also needs the `fuse3` package (`fusermount3`) and
   `user_allow_other` in `/etc/fuse.conf`, unless it mounts with
   `--no-allow-other`.
@@ -85,7 +93,7 @@ Global flags (every command):
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
-| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | Kernel passthrough: `auto` uses it when the kernel (6.9+) and privileges (root) allow, `on` refuses to mount without it, `off` never uses it |
+| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | Kernel passthrough: `auto` uses it when the kernel (6.9+) and privileges (`CAP_SYS_ADMIN`, see §1) allow, `on` refuses to mount without it and stops the mount (exit 1) if a file cannot be given a backing file later, `off` never uses it |
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | FUSE request threads |
 | `--no-allow-other` | | | Only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | At shutdown, how long to wait for open files on a busy mount after detaching it |
@@ -161,7 +169,10 @@ Two late backstops cover writes no close follows:
 
 Never recorded: anything inside a `.git` directory (git's own data:
 `git init`, clones, submodules), paths the rules exclude, empty
-directories, FIFOs, sockets and devices. A path git cannot store (a `.git`
+directories, FIFOs, sockets and devices. A `.git` that is not a repository
+(an ordinary directory or file someone named `.git`) is not recorded
+either, but raises one `PathRefused` alarm per such `.git`, so its contents
+never vanish without a trace. A path git cannot store (a `.git`
 look-alike such as `.GIT`, or a name that is not UTF-8) is not recorded and
 raises a `PathRefused` alarm; the file itself works normally.
 
@@ -178,7 +189,9 @@ changes, is not recorded again.
      (it disappears from the namespace, open files keep working);
   2. waits up to `--unmount-grace` for those files to close;
   3. runs a final sweep, recording files still open and retrying failed
-     records;
+     records. Paths still failing are listed and saved in
+     `<state>/meta/repairs`; the next mount records them from the backing
+     tree before it serves anything;
   4. makes the final commit and waits up to `--push-grace` for pushes in
      progress;
   5. flushes telemetry and releases the lock.
@@ -290,16 +303,27 @@ spec:
 ## 12. Troubleshooting
 
 - **`passthrough: off (...)` in the startup line.** The reason is given:
-  the kernel is older than 6.9, the daemon is not root, `--passthrough off`
-  was set, or registering a backing file failed (a backing tree on
-  overlayfs or another stacked filesystem). Everything still works, through
-  the daemon. `--passthrough on` turns any of these into a mount failure.
+  the kernel is older than 6.9, the daemon lacks `CAP_SYS_ADMIN` or runs in
+  a user namespace, or `--passthrough off` was set. Everything still works,
+  through the daemon. `--passthrough on` turns any of these into a mount
+  failure.
+- **`passthrough refused for inode N` in the log.** Registering one file's
+  backing file failed (a backing tree on overlayfs or another stacked
+  filesystem, or too many open files). That file is served through the
+  daemon while it is open; every other file keeps passthrough. The first
+  ten are logged. With `--passthrough on` the open fails with `EIO` and the
+  mount stops with exit status 1 instead.
 - **`close` fails with `EIO`.** Recording failed, usually because the state
   area is full or unwritable. A `RecordFailed` alarm says why. The file is
   still changed in the backing tree and stays marked as changed, so its next
   close records it. A rename, delete or link whose record failed also
   returns `EIO` after it happened; the sweep records the affected paths once
-  recording works again (§3.5). Many programs ignore errors from `close`, so
+  recording works again (§3.5). Paths still queued at shutdown are saved in
+  `<state>/meta/repairs` and recorded by the next mount before it serves
+  anything ("N path(s) a previous mount could not record: ..." at start).
+  If that file could not be written either, the shutdown message lists the
+  paths: history differs from the backing tree there until each is changed
+  again, or recorded by hand with `agentfs --root <backing> record <path>`. Many programs ignore errors from `close`, so
   watch the alarms.
 - **Alarms** are printed to stderr and exported as telemetry logs (see the
   README): `PathRefused`, `RecordFailed`, `CommitFailed`, `PushFailed`,

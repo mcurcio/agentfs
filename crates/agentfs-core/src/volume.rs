@@ -73,6 +73,12 @@ impl StateDir {
         self.root.join("meta")
     }
 
+    /// Paths the FUSE layer could not record, kept for the next mount to
+    /// repair (design §3.5).
+    pub fn repairs(&self) -> PathBuf {
+        self.meta().join("repairs")
+    }
+
     /// Per-remote push state (design §11.2).
     pub fn push_dir(&self) -> PathBuf {
         self.meta().join("push")

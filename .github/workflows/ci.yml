@@ -108,7 +108,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        passthrough: [auto, off]
+        passthrough: [auto, on, off]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
@@ -117,7 +117,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: fuse
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 sqlite3 jq
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 sqlite3 jq attr
       - name: enable user_allow_other, show the kernel
         run: |
           echo user_allow_other | sudo tee -a /etc/fuse.conf

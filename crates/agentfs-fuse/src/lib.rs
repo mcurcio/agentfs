@@ -25,7 +25,10 @@ pub mod inodes;
 pub mod mount;
 pub mod names;
 pub mod ops;
+pub mod privileges;
 pub mod sweep;
 
 pub use fuse::{Passthrough, PassthroughStatus};
-pub use mount::{Mount, MountConfig, MountError, PreflightError, UnmountReport, preflight};
+pub use mount::{
+    Mount, MountConfig, MountError, PreflightError, StartupRepairs, UnmountReport, preflight,
+};

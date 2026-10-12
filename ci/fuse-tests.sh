@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the real FUSE mount tests (crates/agentfs/tests/mount.rs) as root.
 #
-# Needs Linux with /dev/fuse, fuse3 (fusermount3), sqlite3, git, jq,
+# Needs Linux with /dev/fuse, fuse3 (fusermount3), sqlite3, git, jq, attr,
 # setpriv and passwordless sudo; the unprivileged-daemon test also needs
 # `user_allow_other` in /etc/fuse.conf. Reproducible on any such host:
 #

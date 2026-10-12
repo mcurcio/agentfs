@@ -113,6 +113,21 @@ pub fn detect(tree: &Path, dir: &str) -> io::Result<Option<NestedKind>> {
     Ok(None)
 }
 
+/// True if `dir/.git` (`dir` relative to the tree at `tree`, `""` the root)
+/// is git's own data: a directory that is, or is becoming, a git directory
+/// (see the module docs), or a `.git` file or symlink pointing at a git
+/// directory in the tree. A `.git` that is none of these (an ordinary
+/// directory or file someone named `.git`) is not.
+pub fn is_git_metadata(tree: &Path, dir: &str) -> io::Result<bool> {
+    let dot_git = tree.join(dir).join(".git");
+    match metadata(&dot_git)? {
+        Some(m) if m.is_dir() => looks_like_git_dir(&dot_git),
+        Some(m) if m.is_file() => gitdir_from_file(tree, dir, &dot_git),
+        Some(m) if m.is_symlink() => gitdir_from_symlink(tree, dir, &dot_git),
+        _ => Ok(false),
+    }
+}
+
 /// True if the `.git` file `file` in `dir` points at a git directory in the
 /// tree. Its first line must be `gitdir: <path>`.
 fn gitdir_from_file(tree: &Path, dir: &str, file: &Path) -> io::Result<bool> {
@@ -515,5 +530,30 @@ mod tests {
         fs::create_dir(t.path().join("s")).unwrap();
         symlink("../real-head", t.path().join("s/HEAD")).unwrap();
         assert_eq!(d(&t, "s"), None);
+    }
+
+    #[test]
+    fn git_metadata_is_only_a_real_git_dir_or_gitfile() {
+        let t = tempfile::tempdir().unwrap();
+        let m = |dir: &str| is_git_metadata(t.path(), dir).unwrap();
+        // An ordinary directory named .git, and a file that is no gitfile.
+        fs::create_dir_all(t.path().join("notes/.git")).unwrap();
+        fs::write(t.path().join("notes/.git/report.txt"), "r").unwrap();
+        assert!(!m("notes"));
+        fs::create_dir_all(t.path().join("plain")).unwrap();
+        fs::write(t.path().join("plain/.git"), "hello\n").unwrap();
+        assert!(!m("plain"));
+        assert!(!m("missing"));
+        // A repository, also while git is creating it.
+        fs::create_dir_all(t.path().join(".git")).unwrap();
+        assert!(!m(""));
+        fs::write(t.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(m(""));
+        bare_layout(&t.path().join("w/.git"));
+        assert!(m("w"));
+        // A gitfile pointing at it.
+        fs::create_dir_all(t.path().join("sub")).unwrap();
+        fs::write(t.path().join("sub/.git"), "gitdir: ../w/.git\n").unwrap();
+        assert!(m("sub"));
     }
 }

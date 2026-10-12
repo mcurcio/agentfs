@@ -26,9 +26,13 @@
 //!
 //! **Permissions** (design §6) are checked by the kernel
 //! (`default_permissions`) before a request arrives; the daemon then acts
-//! with its own privileges. When it runs as root it gives new objects to
-//! the caller (`fchown`), keeping the group the backing filesystem chose
-//! under a setgid directory, then sets the exact mode the caller asked for.
+//! with its own privileges. When it has `CAP_CHOWN` and `CAP_FOWNER` (root;
+//! [`crate::privileges`]) it gives new objects to the caller, keeping the
+//! group the backing filesystem chose under a setgid directory, then sets
+//! the exact mode the caller asked for. Both are done on a descriptor of
+//! the new object, opened without following and checked to be the object
+//! just made, never by name: the backing tree may change under the daemon
+//! (design §6 "Confinement"). `create` never takes over an existing file.
 //!
 //! **Locking.** The inode table and the handle map are each behind a mutex
 //! that is never held across a system call on the tree or a record.
@@ -57,6 +61,7 @@ use crate::boundary::{Boundary, Change, REPAIR_TRIGGER, State};
 use crate::dirty::{Stamp, now_ns, timestamp_granularity_ns};
 use crate::inodes::{InodeTable, Kind, ROOT};
 use crate::names::is_git_dir_name;
+use crate::privileges::Privileges;
 
 pub type OpResult<T> = Result<T, Errno>;
 
@@ -172,8 +177,11 @@ pub struct Ops {
     names: RwLock<()>,
     boundary: Boundary,
     config: OpsConfig,
-    /// The daemon runs as root, so new objects are given to their caller.
+    /// The daemon may give new objects to their caller
+    /// ([`crate::privileges`]).
     chown_new: bool,
+    /// The daemon's effective uid: the owner of every object it creates.
+    euid: u32,
 }
 
 /// Converts a rustix result.
@@ -219,6 +227,26 @@ fn check_name(name: &[u8]) -> OpResult<()> {
     Ok(())
 }
 
+/// Whether `caller` may open the file `st` with access mode `acc`
+/// (`O_RDONLY`, `O_WRONLY`, `O_RDWR`), and `truncate`, by its mode bits.
+/// Root (uid 0) always may.
+fn may_open(st: &Stat, caller: Caller, acc: i32, truncate: bool) -> bool {
+    if caller.uid == 0 {
+        return true;
+    }
+    let mode = mode_of(st);
+    let bits = if st.st_uid == caller.uid {
+        (mode >> 6) & 0o7
+    } else if st.st_gid == caller.gid {
+        (mode >> 3) & 0o7
+    } else {
+        mode & 0o7
+    };
+    let read = acc != 1;
+    let write = acc != 0 || truncate;
+    (!read || bits & 0o4 != 0) && (!write || bits & 0o2 != 0)
+}
+
 fn timespec(t: Option<TimeOrNow>) -> Timespec {
     match t {
         None => Timespec {
@@ -257,6 +285,7 @@ impl Ops {
     pub fn new(backing: Backing, recorder: Recorder, config: OpsConfig) -> io::Result<Self> {
         let st = rustix::fs::fstat(backing.root())?;
         let (dev, ino) = dev_ino(&st);
+        let tree = backing.path().to_path_buf();
         Ok(Self {
             backing,
             table: Mutex::new(InodeTable::new(dev, ino)),
@@ -264,9 +293,10 @@ impl Ops {
             dirs: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             names: RwLock::new(()),
-            boundary: Boundary::new(recorder),
+            boundary: Boundary::new(recorder, tree),
             config,
-            chown_new: rustix::process::geteuid().is_root(),
+            chown_new: Privileges::current().can_chown_new(),
+            euid: rustix::process::geteuid().as_raw(),
         })
     }
 
@@ -383,7 +413,11 @@ impl Ops {
     pub fn getattr(&self, id: u64, fh: Option<u64>) -> OpResult<FileAttr> {
         let st = match fh.and_then(|fh| self.handle(fh).ok()) {
             Some(h) => rustix::fs::fstat(&h.fd).eno()?,
-            None => rustix::fs::fstat(self.node_fd(id)?).eno()?,
+            None => {
+                // Resolving the path must not race a rename of an ancestor.
+                let _names = self.read_names();
+                rustix::fs::fstat(self.node_fd(id)?).eno()?
+            }
         };
         Ok(attr(id, &st))
     }
@@ -504,6 +538,7 @@ impl Ops {
     }
 
     pub fn readlink(&self, id: u64) -> OpResult<Vec<u8>> {
+        let _names = self.read_names();
         let fd = self.node_fd(id)?;
         let target = rustix::fs::readlinkat(&fd, "", Vec::new()).eno()?;
         Ok(target.into_bytes())
@@ -512,8 +547,10 @@ impl Ops {
     // ---- creating ----
 
     /// Gives a new object to its caller and sets the mode it asked for
-    /// (design §6). `fd` is the object itself when it is open, else it is
-    /// `name` in `dir`.
+    /// (design §6). `fd` is the object itself when it is open; otherwise
+    /// `name` in `dir` is opened first ([`Ops::open_new`]), so neither the
+    /// owner nor the mode is ever changed by name: a name swapped for a
+    /// symlink in the backing tree meanwhile is never followed.
     #[allow(clippy::too_many_arguments)]
     fn own_new(
         &self,
@@ -525,38 +562,70 @@ impl Ops {
         mode: u32,
         kind: Kind,
     ) -> OpResult<()> {
-        let name = OsStr::from_bytes(name);
+        if !self.chown_new && kind == Kind::Symlink {
+            return Ok(());
+        }
+        let opened;
+        let fd = match fd {
+            Some(fd) => fd,
+            None => {
+                opened = self.open_new(dir, name, kind)?;
+                &opened
+            }
+        };
         if self.chown_new {
             let uid = Some(rustix::fs::Uid::from_raw(caller.uid));
             // Under a setgid directory the filesystem already chose the group.
             let gid =
                 (mode_of(parent) & S_ISGID == 0).then(|| rustix::fs::Gid::from_raw(caller.gid));
-            match fd {
-                Some(fd) => rustix::fs::fchown(fd, uid, gid).eno()?,
-                None => {
-                    rustix::fs::chownat(dir, name, uid, gid, AtFlags::SYMLINK_NOFOLLOW).eno()?
-                }
-            }
+            // On the descriptor itself: an `O_PATH` symlink is changed, not
+            // followed.
+            rustix::fs::chownat(fd, "", uid, gid, AtFlags::EMPTY_PATH).eno()?;
         }
         if kind == Kind::Symlink {
             return Ok(());
         }
-        let current = match fd {
-            Some(fd) => rustix::fs::fstat(fd).eno()?,
-            None => rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).eno()?,
-        };
+        let current = rustix::fs::fstat(fd).eno()?;
         let mut want = mode & 0o7777;
         if kind == Kind::Dir {
             want |= mode_of(&current) & S_ISGID;
         }
         if mode_of(&current) & 0o7777 != want {
-            let want = Mode::from_raw_mode(want);
-            match fd {
-                Some(fd) => rustix::fs::fchmod(fd, want).eno()?,
-                None => rustix::fs::chmodat(dir, name, want, AtFlags::empty()).eno()?,
-            }
+            // Never a symlink here ([`Ops::open_new`] checked the type), so
+            // the magic link reaches exactly this inode.
+            rustix::fs::chmodat(
+                rustix::fs::CWD,
+                proc_path(fd),
+                Mode::from_raw_mode(want),
+                AtFlags::empty(),
+            )
+            .eno()?;
         }
         Ok(())
+    }
+
+    /// Opens `name` in `dir`, just created as a `kind`, without following
+    /// it (`O_PATH | O_NOFOLLOW`), and checks it is still the object this
+    /// daemon made: of that type, owned by the daemon and, unless a
+    /// directory, with a single link. Anything else means the name was
+    /// replaced in the backing tree between the creation and now (a symlink
+    /// or hard link to a file elsewhere): `ESTALE`, and nothing is changed.
+    fn open_new(&self, dir: &OwnedFd, name: &[u8], kind: Kind) -> OpResult<OwnedFd> {
+        let fd = rustix::fs::openat(
+            dir,
+            OsStr::from_bytes(name),
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .eno()?;
+        let st = rustix::fs::fstat(&fd).eno()?;
+        let same_kind = Kind::from_mode(mode_of(&st)) == kind;
+        let ours = st.st_uid == self.euid;
+        let single = kind == Kind::Dir || st.st_nlink == 1;
+        if !(same_kind && ours && single) {
+            return Err(estale());
+        }
+        Ok(fd)
     }
 
     /// Undoes the lookup count of an entry the kernel never received.
@@ -1020,7 +1089,12 @@ impl Ops {
         (fh, handle)
     }
 
-    /// Creates and opens `name` in `parent`.
+    /// Creates and opens `name` in `parent`. The backing file is always
+    /// created with `O_EXCL`: if the name exists by then (made in the
+    /// backing tree directly, after the kernel saw no entry), an exclusive
+    /// create fails with `EEXIST`, and any other opens the existing file as
+    /// `open` would, without taking it over (its owner and mode are left
+    /// alone, and it is not marked new).
     pub fn create(
         &self,
         parent: u64,
@@ -1033,22 +1107,56 @@ impl Ops {
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
-        let oflags = (OFlags::from_bits_retain(flags as u32) & !(OFlags::NOCTTY | OFlags::NOATIME))
-            | OFlags::CREATE
+        let requested = OFlags::from_bits_retain(flags as u32);
+        let base = (requested
+            & !(OFlags::NOCTTY | OFlags::NOATIME | OFlags::CREATE | OFlags::EXCL))
             | OFlags::NOFOLLOW
             | OFlags::CLOEXEC;
-        let fd = rustix::fs::openat(
+        let created = rustix::fs::openat(
             &dir,
             OsStr::from_bytes(name),
-            oflags,
+            base | OFlags::CREATE | OFlags::EXCL,
             Mode::from_raw_mode(mode & 0o7777),
-        )
-        .eno()?;
-        self.own_new(&dir, name, Some(&fd), &pst, caller, mode, Kind::File)?;
+        );
+        let write = flags & 0o3 != 0;
+        let (fd, new) = match created {
+            Ok(fd) => (fd, true),
+            Err(rustix::io::Errno::EXIST) if !requested.contains(OFlags::EXCL) => {
+                // Only a regular file is reopened: never a FIFO (which
+                // would block) or a device.
+                let path = rustix::fs::openat(
+                    &dir,
+                    OsStr::from_bytes(name),
+                    OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .eno()?;
+                let st = rustix::fs::fstat(&path).eno()?;
+                if Kind::from_mode(mode_of(&st)) != Kind::File {
+                    return Err(Errno::EEXIST);
+                }
+                // The kernel checked permission to create, not to open
+                // this file: check that as the kernel would, from the
+                // mode bits (the caller's supplementary groups are not
+                // known, so only its primary group counts).
+                if !may_open(&st, caller, flags & 0o3, requested.contains(OFlags::TRUNC)) {
+                    return Err(Errno::EACCES);
+                }
+                let fd =
+                    rustix::fs::open(proc_path(&path), base & !OFlags::NOFOLLOW, Mode::empty())
+                        .eno()?;
+                (fd, false)
+            }
+            Err(e) => return Err(errno(e)),
+        };
+        if new {
+            self.own_new(&dir, name, Some(&fd), &pst, caller, mode, Kind::File)?;
+        }
         let st = rustix::fs::fstat(&fd).eno()?;
         let entry = self.entry(parent, name, &st);
-        let write = flags & 0o3 != 0;
-        let (fh, handle) = self.add_handle(entry.id, fd, write, false, true, Some(&st), caller);
+        let truncate = !new && requested.contains(OFlags::TRUNC);
+        let write = write || truncate;
+        let (fh, handle) = self.add_handle(entry.id, fd, write, truncate, new, Some(&st), caller);
         Ok((entry, fh, handle))
     }
 
@@ -1351,7 +1459,10 @@ impl Ops {
             Kind::File | Kind::Dir => {}
             _ => return Err(errno(rustix::io::Errno::OPNOTSUPP)),
         }
-        let fd = self.node_fd(id)?;
+        let fd = {
+            let _names = self.read_names();
+            self.node_fd(id)?
+        };
         let path = proc_path(&fd);
         Ok((fd, path))
     }
@@ -1406,12 +1517,21 @@ impl Ops {
     pub fn sweep(&self, all: bool) -> SweepReport {
         let _names = self.read_names();
         let mut report = SweepReport::default();
-        for (path, caller) in self.boundary.take_repairs() {
+        let mut done = Vec::new();
+        for repair in self.boundary.repairs() {
+            let path = repair.path.clone();
             let removed = vec![path.clone()];
-            match self.record_tree(REPAIR_TRIGGER, caller, removed, std::slice::from_ref(&path)) {
-                Ok(()) => report.repaired += 1,
-                Err(()) => self.boundary.queue_repair([path], caller),
+            let roots = std::slice::from_ref(&path);
+            if self
+                .record_tree(REPAIR_TRIGGER, repair.caller, removed, roots)
+                .is_ok()
+            {
+                done.push(repair);
             }
+        }
+        if !done.is_empty() {
+            report.repaired = done.len();
+            self.boundary.repaired(&done);
         }
         report.still_queued = self.boundary.pending_repairs();
         let candidates: Vec<(u64, u64, Caller)> = {

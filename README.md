@@ -80,11 +80,15 @@ directories, none inside another, and no remote's credentials file may be
 under the backing tree; `mount` refuses to start otherwise. It runs in the
 foreground until SIGINT, SIGTERM or an unmount, then unmounts (lazily if
 files are still open), records what is still open, makes a final commit
-and exits. Flags: `--passthrough auto|on|off`, `--threads`,
+and exits. Paths whose record failed and could not be repaired by then are
+saved in `<state>/meta/repairs` and recorded by the next mount before it
+serves anything. Flags: `--passthrough auto|on|off`, `--threads`,
 `--no-allow-other`, `--unmount-grace`, `--push-grace`.
 
 It needs Linux 5.6+ and `/dev/fuse`, and should run as root for multi-user
-volumes (new files are given to their creator) and for passthrough. The
+volumes (new files are given to their creator: `CAP_CHOWN` and
+`CAP_FOWNER`) and for passthrough (`CAP_SYS_ADMIN` outside any user
+namespace). The
 [operator guide](docs/operator-guide.md) covers requirements, layout,
 flags, settings, permissions, what is recorded when, shutdown, crashes and
 a Kubernetes sidecar sketch.
@@ -184,16 +188,18 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](ci/e2e-telemetry.sh)): every
   metric, span and alarm log above must reach a real OpenTelemetry Collector.
 - **e2e FUSE mount** ([`ci/fuse-tests.sh`](ci/fuse-tests.sh)), with
-  passthrough `auto` and `off`: real mounts as root running the `#[ignore]`d
+  passthrough `auto`, `on` and `off`: real mounts as root running the `#[ignore]`d
   tests in [`crates/agentfs/tests/mount.rs`](crates/agentfs/tests/mount.rs):
   every operation of design §18 test 1 (editor saves, appends, truncate,
   directory renames, `rm -r`, hard links, `chmod +x`, symlinks, unlink and
   rename of open files, log rotation), `kill -9` right after a close, root
   and uid 10000 writers, invisibility of the state area, rules and nested
   repositories through the mount, SQLite (WAL and DELETE) and git on the
-  mount, shutdown with files open, external unmounts, the lock, and an
-  unprivileged daemon. The job log shows the passthrough mode the runner's
-  kernel negotiated.
+  mount, extended attributes, a `.git` that is no repository, shutdown with
+  files open, external unmounts, the lock, and an unprivileged daemon
+  (refused under `on`). The job log shows the passthrough mode the runner's
+  kernel negotiated, and every mount asserts that no open fell back from
+  passthrough to the daemon.
 
 The e2e scripts run locally too: start the server with
 `ci/git-http-server.sh start <dir>` and source its output, run the

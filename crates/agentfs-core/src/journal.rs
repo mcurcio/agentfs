@@ -248,8 +248,6 @@ fn encode(record: &Record, out: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-/// Decodes frames until the first invalid one. Returns the records and the
-/// length of the valid prefix.
 /// Reads the journal at `path` without changing it: the valid records, and
 /// how many bytes follow the last valid frame. Unlike [`Journal::open`] a
 /// torn tail is left in place, so this is safe while another process is
@@ -264,6 +262,8 @@ pub fn read_records(path: &Path) -> io::Result<(Vec<Record>, u64)> {
     Ok((records, (bytes.len() - valid) as u64))
 }
 
+/// Decodes frames until the first invalid one. Returns the records and the
+/// length of the valid prefix.
 fn decode_all(bytes: &[u8]) -> (Vec<Record>, usize) {
     let mut records = Vec::new();
     let mut offset = 0;
