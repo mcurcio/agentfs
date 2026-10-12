@@ -59,6 +59,12 @@ A volume is three directories, side by side:
 Paths are compared after resolving symlinks, so a symlinked path to inside
 the backing tree is caught too.
 
+While mounted, the daemon listens on `<state>/meta/control/agentfs.sock`
+(directory `0700`, socket `0600`; only root and the daemon's own user may
+connect) for `agentfs restore` and `agentfs revert` (section 12 below). It is
+removed at shutdown; a stale one left by a crash is replaced at the next
+mount.
+
 ## 3. Quick start
 
 ```sh
@@ -86,7 +92,7 @@ Global flags (every command):
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | The state area |
-| `--root DIR` | `AGENTFS_ROOT` | | The backing tree, for `record`, `flush` and `run`. With `mount` it must match the positional backing tree |
+| `--root DIR` | `AGENTFS_ROOT` | | The backing tree, for `record`, `flush` and `run`, and for `restore` and `revert` when no mount is running. With `mount` it must match the positional backing tree |
 | `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s` | Wait this long for another process to release the state area instead of exiting 75 (§9) |
 
 `agentfs mount BACKING MOUNTPOINT`:
@@ -185,8 +191,10 @@ changes, is not recorded again.
   recovers the journal (records made before a crash are committed), starts
   the commit and push loops, mounts, and prints the line shown in §3.
 - **Stop.** On SIGINT or SIGTERM it:
-  1. unmounts; if files are still open, the mount is detached lazily
-     (it disappears from the namespace, open files keep working);
+  1. stops serving restores (waiting up to `--unmount-grace` for one in
+     progress), then unmounts; if files are still open, the mount is
+     detached lazily (it disappears from the namespace, open files keep
+     working);
   2. waits up to `--unmount-grace` for those files to close;
   3. runs a final sweep, recording files still open and retrying failed
      records. Paths still failing are listed and saved in
@@ -210,7 +218,8 @@ commit always happens. Pushing never delays shutdown beyond
 ## 9. The state-area lock
 
 One process uses a state area at a time (§2.3). `mount`, `run`, `record`,
-`flush` and `push` take an exclusive lock on `<state>/meta/lock` before
+`flush`, `push`, and `restore` and `revert` when no mount runs, take an
+exclusive lock on `<state>/meta/lock` before
 opening the volume; a second one exits with status 75 and names the
 holder:
 
@@ -227,8 +236,11 @@ lock:      held by pid=4711 command=mount since=20261012T110302Z
 ```
 
 While mounted, `agentfs push` is therefore refused: the mount's own push
-loop pushes every `pushInterval`. The kernel releases the lock when the
-holder dies, even after `kill -9`.
+loop pushes every `pushInterval`. `agentfs restore` and `agentfs revert`
+are not refused: they go to the mount over its control socket (section 12).
+While `agentfs run` holds the lock they exit 75: `run` serves no
+restores. The kernel releases the lock when the holder dies, even after
+`kill -9`.
 
 ## 10. Crashes and stale mounts
 
@@ -300,7 +312,55 @@ spec:
   sidecar that checks `/proc/mounts`, or a check in the workload's
   entrypoint).
 
-## 12. Troubleshooting
+## 12. Recovery and undo
+
+Bring files back as they were in a commit, or undo a commit (§15). Both
+commands write the tree and record the result as **one commit**
+(`Agentfs-Trigger: restore`, plus `Agentfs-Restore: <commit>` or
+`Agentfs-Revert: <commit>`), authored by whoever ran them.
+
+```sh
+agentfs --state /data/state restore <path> <commit>   # a file, symlink, directory, or `.`
+agentfs --state /data/state revert <commit>
+```
+
+| Flag | Meaning |
+|---|---|
+| `--dry-run` | Print the plan (`write`, `remove`, `symlink` or `mode` per path) and write nothing |
+| `--force` | `revert`: also revert paths changed again since the commit (the later versions stay in history). Both: write files a workload holds open for writing through the mount. Never overrides a change that is not in history yet |
+| `--root DIR` | The backing tree; only needed when no mount is running |
+| `--wait-lock D` | With no mount running, wait for the state-area lock |
+| pod flags | As for the other commands (section 4) |
+
+**Which mode runs:**
+
+- **A mount is running**: the command connects to
+  `<state>/meta/control/agentfs.sock` (run it as root or as the daemon's
+  user) and the daemon does the work: it waits until history has caught
+  up with the tree, checks against its mount point, and writes through
+  its own mount, so the workload sees the result at once. In Kubernetes,
+  `kubectl exec -c agentfs <pod> -- agentfs restore ...` in the sidecar.
+- **Nothing is running**: the command takes the state-area lock and
+  writes the backing tree (`--root`) itself.
+- **`agentfs run`, `record`, `flush` or `push` holds the state area**:
+  exit 75. One restore runs at a time per mount; a second one also exits
+  75.
+
+Exit status: `0` done (or `already matches: nothing to do`), `1` refused
+(a one-line reason and a hint) or failed, `75` busy.
+
+Runbooks, with the full procedures:
+
+- [recovery-and-undo.md](runbooks/recovery-and-undo.md): finding a change,
+  pausing the workload, restore and revert, every refusal and its fix,
+  undoing a restore, plain-git alternatives;
+- [divergence.md](runbooks/divergence.md): a remote whose branch someone
+  else moved (`Diverged`);
+- [history-rewrite.md](runbooks/history-rewrite.md): removing a recorded
+  secret from the state area and every remote;
+- [stuck-pushes.md](runbooks/stuck-pushes.md): pushes that keep failing.
+
+## 13. Troubleshooting
 
 - **`passthrough: off (...)` in the startup line.** The reason is given:
   the kernel is older than 6.9, the daemon lacks `CAP_SYS_ADMIN` or runs in
@@ -337,4 +397,18 @@ spec:
   recorded at the names the mount has seen.
 - **Exit status 75** from `push`, `flush`, `record` or `run`: the volume is
   mounted (or another command is running). Use `--wait-lock`, or stop the
-  mount first.
+  mount first. From `restore` or `revert`: `agentfs run` (or another
+  command) holds the state area, or the mount is already running a
+  restore; retry when it is done.
+- **`restore refused: ...`** (exit 1): nothing was written. The message
+  says why and the `hint:` line what to do; the refusals and their fixes
+  are listed in [recovery-and-undo.md](runbooks/recovery-and-undo.md).
+  `<path> differs from history` means the tree holds a change that is
+  not recorded yet; it is never overwritten, even with `--force`.
+- **`warning: telemetry: <signal> export failed: ...`** on stderr: the
+  collector is down, refused the export (an HTTP error) or timed out.
+  Telemetry never stops a command. The warning repeats at most once a
+  minute while exports keep failing (with the count), a
+  `telemetry: <signal> export recovered` line follows when they work again,
+  and each failure counts in `agentfs.telemetry.export_failures{signal}`
+  (exported once metrics get through).

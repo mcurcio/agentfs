@@ -51,25 +51,32 @@ nested repository detection. Also:
   backing directory that records every change boundary before the call
   returns, with kernel passthrough (Linux 6.9+) when available. See
   [Mounting](#mounting).
+- **Recovery:** `agentfs restore` and `agentfs revert`, through a running
+  mount or directly, each recorded as one commit, and operator runbooks.
+  See [Recovery](#recovery).
 
 The `agentfs` command has `init`, `status`, `mount`, `flush`, `record`,
-`push` and `run`. `mount` mounts a backing tree and runs the commit and
+`push`, `run`, `restore` and `revert`. `mount` mounts a backing tree and runs the commit and
 push loops in the same process. `record` records paths of a backing tree
 directly, without a mount, and reports the paths the rules skip or the
 checks refuse, with the reason. It needs `--root` (or `AGENTFS_ROOT`),
 since a path missing from the backing tree is recorded as removed. `push`
 pushes once; `run` runs the commit and push loops until SIGINT or SIGTERM.
+`restore` and `revert` write content from history back into the tree
+([Recovery](#recovery)).
 Alarms are printed to stderr, and exported as telemetry when it is enabled.
 
 Only one process uses a state area at a time. `mount`, `run`, `record`,
-`flush` and `push` take an exclusive lock on `<state>/meta/lock` and exit
+`flush`, `push`, and `restore` and `revert` when no mount runs, take an
+exclusive lock on `<state>/meta/lock` and exit
 with status 75 if another process holds it, naming the holder;
 `--wait-lock 30s` (or `AGENTFS_WAIT_LOCK`) waits instead. `status` takes no
 lock and changes nothing, so it works beside a running daemon, and shows
 who holds the lock.
 
-Not built yet: restore and revert (§15), LFS and the `fsync` class (phase
-2), the patch queue (phase 3), the CSI driver (phase 4), SSH remotes.
+Not built yet: LFS and the `fsync` class (phase 2), the patch queue
+(phase 3), the CSI driver (phase 4), SSH remotes, and asking a running
+mount to push now.
 
 ## Mounting
 
@@ -95,6 +102,41 @@ namespace). The
 [operator guide](docs/operator-guide.md) covers requirements, layout,
 flags, settings, permissions, what is recorded when, shutdown, crashes and
 a Kubernetes sidecar sketch.
+
+## Recovery
+
+Bring files back as they were in a commit, or undo a commit; either way
+the change is recorded as one commit (`Agentfs-Trigger: restore`, with
+`Agentfs-Restore: <commit>` or `Agentfs-Revert: <commit>`), authored by
+whoever ran it:
+
+```sh
+git --git-dir /data/state/git log --follow --oneline agentfs/demo -- notes/plan.md
+agentfs --state /data/state restore notes/plan.md <commit>   # a file, a directory, or `.`
+agentfs --state /data/state revert <commit>
+```
+
+- **With the volume mounted** the command asks the running mount, over
+  an owner-only socket in the state area, to write through the mount: the
+  workload sees the files at once. **With nothing running** it takes the
+  state-area lock and writes the backing tree (`--root`) itself.
+- `restore` follows `git restore --source`: files the commit has under
+  the path are written back, files history has there but the commit did
+  not are removed, untracked files are never touched. `revert` undoes a
+  commit's diff against its parent.
+- Every check runs before anything is written. Content history does not
+  have yet is never overwritten (not even with `--force`), and paths the
+  rules would not record are refused. `--force` only overrides what loses
+  nothing: a revert of paths changed again later, and files the workload
+  holds open. `--dry-run` prints the plan.
+- Exit status: 0 done or already matching, 1 refused (with the reason and
+  a hint) or failed, 75 busy.
+
+Runbooks: [recovery and undo](docs/runbooks/recovery-and-undo.md),
+[a diverged remote](docs/runbooks/divergence.md),
+[removing a recorded secret](docs/runbooks/history-rewrite.md) (history
+rewrite with `git filter-repo`, the one documented force-push), and
+[pushes that keep failing](docs/runbooks/stuck-pushes.md).
 
 ## Telemetry
 
@@ -188,14 +230,20 @@ token only).
 Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 
 - **lint:** rustfmt, and clippy with default and all features.
-- **test:** the workspace tests, with default and all features.
+- **test:** the workspace tests, with default and all features. They
+  include `restore` and `revert` without a mount
+  ([`cli_restore.rs`](crates/agentfs/tests/cli_restore.rs)), and the
+  `.gitmodules` checks against the runner's `git` (the parser against
+  `git config --list`, the checks against `git fsck`).
 - **e2e remotes** ([`ci/e2e-remotes.sh`](ci/e2e-remotes.sh)): pushes to a real
   smart-HTTP server (nginx and `git http-backend`, [`ci/git-http-server.sh`](ci/git-http-server.sh))
   over http and https with basic auth. Covers credential files, auth failures
   that do not block other remotes, credential rotation picked up by a
   running `agentfs run`, divergence, and TLS certificate verification.
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](ci/e2e-telemetry.sh)): every
-  metric, span and alarm log above must reach a real OpenTelemetry Collector.
+  metric, span and alarm log above must reach a real OpenTelemetry Collector,
+  and a dead traces endpoint must produce the stderr warning and
+  `agentfs.telemetry.export_failures` over metrics.
 - **e2e FUSE mount** ([`ci/fuse-tests.sh`](ci/fuse-tests.sh)), with
   passthrough `auto`, `on` and `off`: real mounts as root running the `#[ignore]`d
   tests in [`crates/agentfs/tests/mount.rs`](crates/agentfs/tests/mount.rs):
@@ -208,9 +256,20 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   files open, external unmounts, the lock, and an unprivileged daemon
   (refused under `on`). The job log shows the passthrough mode the runner's
   kernel negotiated, and every mount asserts that no open fell back from
-  passthrough to the daemon.
+  passthrough to the daemon. The same job runs restores and reverts through a real mount (the
+  `mount.rs` recovery tests: in-place rewrites, removals, owners, files
+  open for writing, direct mode with the workload stopped) and
+  [`ci/e2e-recovery.sh`](ci/e2e-recovery.sh), the recovery runbook end to
+  end, from finding a change to pushing the restore commits.
+- **e2e runbooks** ([`ci/e2e-runbooks.sh`](ci/e2e-runbooks.sh)): runs the
+  shell blocks of the [divergence](docs/runbooks/divergence.md) and
+  [history-rewrite](docs/runbooks/history-rewrite.md) runbooks exactly as
+  written (with `git filter-repo`), against a `file://` remote, and checks
+  the secret is gone locally and remotely and pushes are fast-forwards
+  again.
 
 The e2e scripts run locally too: start the server with
 `ci/git-http-server.sh start <dir>` and source its output, run the
 collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run
-`ci/fuse-tests.sh` on any Linux host with FUSE and passwordless sudo.
+`ci/fuse-tests.sh` and `ci/e2e-recovery.sh` on any Linux host with FUSE
+and passwordless sudo. `ci/e2e-runbooks.sh` needs only `git-filter-repo`.

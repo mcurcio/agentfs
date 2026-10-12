@@ -1,8 +1,8 @@
 # agentfs design
 
-Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer and
-`agentfs mount` exist; restore and revert do not yet). Draft 1 was reviewed
-adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
+Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer,
+`agentfs mount`, `agentfs restore` and `agentfs revert` exist). Draft 1 was
+reviewed adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
 for the findings and what changed because of them.
 
 ## 1. Objective
@@ -126,7 +126,8 @@ history service per volume, fed by each pod's front. Either way history is a
 straight line, and every commit is made by agentfs.
 
 **Enforced by a state-area lock.** Every command that writes the state area
-(`mount`, `run`, `record`, `flush` and `push`) first takes an exclusive
+(`mount`, `run`, `record`, `flush`, `push`, and `restore` and `revert` when
+no mount is running) first takes an exclusive
 `flock` on `meta/lock`, before it opens the volume, and holds it until it
 exits. The kernel releases it when the process dies, even after `kill -9`,
 so a crash never leaves a stale lock.
@@ -140,6 +141,12 @@ so a crash never leaves a stale lock.
 - So `agentfs push` while a volume is mounted is refused: the mount's own
   push loops push. A way to ask a running daemon to push now is a
   follow-up.
+- `restore` and `revert` (§15) first try the running mount's control socket
+  (`meta/control/agentfs.sock`, §2.2): a mount holds the lock and serves
+  them itself, writing through its own mount. With nothing listening they
+  take the lock and write the backing tree directly. While `run`,
+  `record`, `flush` or `push` holds the lock they exit 75: `run` serves
+  no restores.
 - `agentfs status` takes no lock and changes nothing: it reads history and
   the journal without recovery (it used to run recovery, which could
   truncate the journal or prune frozen copies under a running daemon). It
@@ -776,7 +783,9 @@ agentfs does not scan content for secrets and does not hold pushes.
   consumer excludes its own secret files (§16).
 - **A secret that gets recorded anyway** is permanent in history, locally and on
   every remote it reaches. Removing it means rewriting history: a documented
-  operator procedure (§15) for the state area and each remote, run with the
+  operator procedure (§15,
+  [history-rewrite.md](runbooks/history-rewrite.md)) for the state area
+  and each remote, run with the
   workload stopped. It is never automatic.
 
 ## 11. Remotes and pushing
@@ -879,8 +888,9 @@ agentfs does not scan content for secrets and does not hold pushes.
     it), so a divergence is saved under one name; only `Diverged` may be
     raised again after such a crash.
   - It never force-pushes.
-  - An operator resolves it (§15). The divergence clears when a branch push
-    next succeeds.
+  - An operator resolves it (§15,
+    [divergence.md](runbooks/divergence.md)). The divergence clears when a
+    branch push next succeeds.
   - A non-fast-forward on one of the volume's other refs is reported the
     same way but saves no diverged ref. libgit2 rejects the whole push when
     any ref is not a fast-forward, so the patch-queue refs of phase 3 will
@@ -1089,41 +1099,130 @@ its own commit, in the order the history service received them.
 - whether FUSE passthrough works over the chosen shared filesystem;
 - the RBAC and Pod Security inventory.
 
-## 15. Recovery and undo (to be discovered)
+## 15. Recovery and undo
 
 Recovery may be manual, but it must be supported and documented. Phase 1
-delivers a supported path; better tooling is discovered from real use.
+delivers two commands, `agentfs restore` and `agentfs revert`, and
+operator runbooks ([runbooks/](runbooks/)):
 
-**Phase 1 supported path:**
+| Runbook | For |
+|---|---|
+| [recovery-and-undo.md](runbooks/recovery-and-undo.md) | Finding a change, pausing the workload, restore and revert, refusals, plain-git alternatives |
+| [divergence.md](runbooks/divergence.md) | Resolving `refs/agentfs/<volume>/diverged/*` (§11.3) |
+| [history-rewrite.md](runbooks/history-rewrite.md) | Removing a recorded secret from the state area and each remote (§10) |
+| [stuck-pushes.md](runbooks/stuck-pushes.md) | Pushes that keep failing |
 
-1. **Find the change.** History is ordinary git on the remote, or in the state
-   area. Use any git tool: `git log --follow <path>`, `git show`, the remote's web
-   view. Trailers (§9) say which pod, process and trigger made each change.
-2. **Pause the workload.** Stop it, or scale it to zero.
-3. **Restore.** Copy file content from the wanted commit into the backing tree.
-   - A small command does this: `agentfs restore <path> <commit>`, or `agentfs
-     revert <commit>` for a whole commit.
-   - With the workload stopped, plain `git show <commit>:<path> > <file>`
-     against the state area's repository also works.
-   - The restore is itself recorded, with `Agentfs-Trigger: restore`.
+**The supported path:**
+
+1. **Find the change.** History is ordinary git on the remote, or in the
+   state area: `git log --follow <path>`, `git show`, the remote's web
+   view. Trailers (§9) say which pod, process and trigger made each
+   change.
+2. **Pause the workload** when possible (a live restore is supported, but
+   a workload writing the same files can overwrite it again; its writes
+   are recorded too).
+3. **Restore or revert:**
+   - `agentfs restore <path> <commit>` writes `<path>` (a file, symlink,
+     directory, or `.` for the whole tree) as it was in `<commit>`,
+     following `git restore --source=<commit> -- <path>`: every entry the
+     commit has there is written, every entry history has there now but
+     the commit did not is removed, and untracked files are never
+     touched.
+   - `agentfs revert <commit>` applies the inverse of the commit's diff
+     against its first parent (the empty tree for a root commit), without
+     rename detection. Merge commits are refused.
+   - `<commit>` is any git revision; `HEAD` means the volume's branch. It
+     must be on the branch (the head or an ancestor); other commits,
+     including diverged refs, are restored with plain git.
+   - With the workload stopped, plain git also works: `git show
+     <commit>:<path> > <file>` into the backing tree, then `agentfs record
+     <path>`.
 4. **Resume the workload.**
 
-**To discover:**
+**Two modes, one engine** (`agentfs_core::restore`: plan, check, apply):
 
-- whether restoring with the workload live is safe enough to support;
-- whether a read-only history view for operators (not the workload) is worth
-  building;
-- whether undo through the patch queue (§12) replaces manual restores for iac.
+- **Through a running mount.** `agentfs mount` listens on
+  `meta/control/agentfs.sock` (§2.2): directory `0700`, socket `0600`,
+  and each connection's `SO_PEERCRED` must be root or the daemon's user.
+  Both ends address it as `/proc/self/fd/<dir fd>/agentfs.sock`, so a long
+  state path never hits the 108-byte `sun_path` limit. The protocol is
+  JSON lines, version 1, one request per connection, at most 64 KiB, read
+  within 10 s; one restore runs at a time and a second gets `busy` (exit
+  75). The daemon waits until every record made before the request is
+  committed (at least 10 s, or 20 commit windows; otherwise refused as
+  history being behind), checks against its mount point, and writes
+  through its own mount from the connection's thread. The writes go
+  through the kernel like any workload's, so kernel caches, the inode
+  table and dirty detection stay coherent, and the FUSE layer records
+  them. The control socket is shut down before the unmount.
+- **Directly.** With nothing listening, no mount (and so no workload
+  through one) can be running. The command takes the state-area lock
+  (§2.3), commits what is journaled, writes the backing tree (`--root`)
+  through `openat2` descriptors confined like the FUSE layer's (§6), and
+  records what it wrote. `run` serves no restores, so while it (or
+  `record`, `flush`, `push`) holds the lock, restore exits 75.
 
-**Operator history rewrite** removes content that must not stay in history,
-such as a recorded secret (§10). It is a documented procedure:
+**Recording.** The process applying a restore (the CLI's pid, or the
+daemon thread's id, which FUSE reports as the caller's pid; the daemon's
+pid is registered too) is registered as the operation's **actor** while
+it runs. Every record by an actor, including late RELEASE and sweep
+records naming it as the last writer, gets trigger `restore`, the operator
+(the CLI's ids, or the socket peer's) as its caller, and the operation in
+its journal record (an optional field older journals lack). The committer
+gives each operation its own commit, never grouped with workload records
+and held open while the operation runs, with `Agentfs-Trigger: restore`
+and `Agentfs-Restore: <commit>` or `Agentfs-Revert: <commit>` (§9).
+Workload records interleaved with a live restore split it into more than
+one commit, since commits follow the journal's order.
 
-- run against the state area's repository and every remote the content reached;
-- run with the workload stopped;
-- never automatic.
+**Safety.** Every check runs before anything is written:
 
-On remotes it requires a force-push of the volume's branch, the one case where
-agentfs's no-force-push rule is set aside, by an operator.
+- everything written must be recordable: the path rules (§4, including
+  `-agentfs` and ignores for untracked paths) and every pre-commit check
+  (§3.4) on the content;
+- the tree must hold what history says at every path the restore covers,
+  including paths history already has right; anything else is a change
+  not in history, and is never overwritten, even with `--force`;
+- nothing untracked may be in the way: a file where a restored one goes,
+  a directory with files where a file goes, or a symlink or file as a
+  parent directory (symlinks are never followed);
+- `--force` overrides only refusals where nothing is lost: a revert of
+  paths changed again since the commit (the later versions stay in
+  history), and files a workload holds open for writing through the
+  mount.
+
+A failure part way records what was written and reports the error; a
+re-run skips what is already done.
+
+**Writing.** Removals run deepest first and prune directories they leave
+empty (never above the restored path's parent); writes run shallowest
+first. A regular file with one link is rewritten in place, keeping its
+inode, owner, other mode bits and extended attributes, with only its exec
+bits changed; a hard-linked file, a type change or a new file is a new
+inode, so only the named path changes, as in git. New files and
+directories take the owner and group of their nearest existing parent
+when the process may chown (`CAP_CHOWN`), with mode `0644`/`0755` and
+`0755`. Content, the executable bit and symlinks are restored, nothing
+else (§6).
+
+**Operator history rewrite** removes content that must not stay in
+history, such as a recorded secret (§10). It is a documented procedure,
+[history-rewrite.md](runbooks/history-rewrite.md), not a command:
+
+- run against the state area's repository and every remote the content
+  reached, with the workload stopped, never automatically;
+- `git filter-repo --prune-empty never` in a mirror clone of the state
+  repository, so every commit and its `Agentfs-Seq` survive and
+  filter-repo never edits the state area's config or remotes; the
+  rewritten branch is fetched back, the reflog expired and old objects
+  collected, and the push state (`meta/push/*.json`) deleted;
+- on each remote, a force-push of the volume's branch with a lease, the
+  one case where agentfs's no-force-push rule is set aside, by an
+  operator, plus deleting the volume's other refs there and the host's
+  own purge.
+
+**Not built yet** (§19.2): a read-only history view for operators, undo
+through the patch queue (§12), and asking a running daemon to push now.
 
 ## 16. First consumer: Hermes
 
@@ -1172,8 +1271,8 @@ target. What it needs:
   - It is a separate crate so the core stays free of FUSE and the binary
     stays a thin CLI.
 - **`agentfs`, a binary:**
-  - `init`, `mount`, `status`, `flush`, `record`, `push`, `run`; `restore`
-    and `revert` are not built yet (§15);
+  - `init`, `mount`, `status`, `flush`, `record`, `push`, `run`, `restore`
+    and `revert`;
   - `push` pushes once to every remote (or those named with `--remote`) and
     exits 1 unless all succeeded; `run` runs the service in the foreground
     until SIGINT or SIGTERM, makes a final commit, waits up to
@@ -1186,8 +1285,14 @@ target. What it needs:
     the backlog, the state-area lock's holder, and each remote: its URL
     (userinfo redacted), last pushed commit, unpushed commits, consecutive
     failures, last error and any diverged ref;
+  - `restore <path> <commit>` and `revert <commit>` (with `--force` and
+    `--dry-run`) write content from history back into the tree, recorded
+    as one commit (§15): through a running mount over its control socket,
+    or directly into `--root` when nothing runs. Exit status 0 done, 1
+    refused (a reason and a hint) or failed, 75 busy;
   - `mount`, `run`, `record`, `flush` and `push` take the state-area lock
-    (§2.3) and exit 75 while another process holds it.
+    (§2.3) and exit 75 while another process holds it; `restore` and
+    `revert` take it only in direct mode.
 - **`agentfs mount <backing> <mountpoint>`** runs the FUSE session, the
   commit loop and the push loops in one process.
   - **Preflight.** Before anything is mounted it refuses a state area,
@@ -1223,7 +1328,11 @@ target. What it needs:
     mount (exit status 1); `off` never asks. The startup line reports the
     result and the reason. CI's `ubuntu-latest` kernel negotiates it (the
     `fuse` job runs `auto`, `on` and `off`, and asserts no open fell back).
-  - **Shutdown** on SIGINT, SIGTERM or an external unmount: unmount (a
+  - **Restores.** After mounting it serves `restore` and `revert` on its
+    control socket (§15).
+  - **Shutdown** on SIGINT, SIGTERM or an external unmount: stop the
+    control socket (waiting up to `--unmount-grace` for a restore in
+    progress, which writes through the mount), unmount (a
     plain unmount, then a lazy detach if busy; `fusermount3 -u`, then
     `-u -z`, when not root), wait up to `--unmount-grace` (10 s) for the
     session to end, run a final sweep, make the final commit, wait up to
@@ -1317,14 +1426,18 @@ Phase 4 (§14).
 16. **Phase 4.** Two pods on two nodes mount one volume. Each pod's changes carry
     its own committer identity, and history keeps every boundary from both.
 
-**Where they run.** Tests 1, 2, 4, 5, 6 and 7 run through real mounts in the
-`fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with passthrough
-`auto`, `on` and `off`), along with SQLite in WAL and DELETE mode and git
-(`gc`, `fsck`) on the mount, though not test 14's restore of every
-recorded version. Tests 8 and 12 (all but the record and commit failure
-counters) run in the `e2e` jobs against a real git
-server and OpenTelemetry Collector. Not automated yet: test 3 (a kill at
-every step), 11 (restore is not built), 13 (performance) and 16.
+**Where they run.** Tests 1, 2, 4, 5, 6, 7 and 11 run through real mounts
+in the `fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with
+passthrough `auto`, `on` and `off`), along with SQLite in WAL and DELETE
+mode and git (`gc`, `fsck`) on the mount, though not test 14's restore of
+every recorded version. Test 11 also runs as `ci/e2e-recovery.sh` in the
+same job (the recovery runbook end to end, ending with a push of the
+restore commits), and without a mount in `crates/agentfs/tests/cli_restore.rs`;
+the divergence and history-rewrite runbooks run in the `e2e-runbooks` job.
+Tests 8 and 12 (all but the record and commit failure counters, plus the
+export-failure counter) run in the `e2e` jobs against a real git server
+and OpenTelemetry Collector. Not automated yet: test 3 (a kill at every
+step), 13 (performance) and 16.
 
 ## 19. Decisions and open questions
 
@@ -1337,13 +1450,13 @@ every step), 11 (restore is not built), 13 (performance) and 16.
 | Rejected pushes | Alarm, retry, keep operating (§11.3) |
 | Remotes | Any git remote, several at once (§11.1) |
 | Push timing | Interval, independent of pod lifecycle (§11.2) |
-| Recovery | Manual but supported; tooling discovered from use (§15) |
+| Recovery | `agentfs restore` and `agentfs revert`, plus operator runbooks; further tooling discovered from use (§15) |
 | Telemetry | OpenTelemetry (§13) |
 | Secret scanning | Not in scope (§10) |
 | Repository layout | Several volumes may share a repository, each with its own branch and ref namespace (§11.4) |
 | Identity | Configurable templates with defaults (§9) |
 | Backing filesystem | Both supported. XFS (reflink) makes the synchronous step size-independent; ext4 falls back to a copy. The phase 1 benchmark sets the documented recommendation (§3.2) |
-| One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `record`, `flush` and `push`; exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
+| One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `record`, `flush`, `push`, and `restore` and `revert` in direct mode; exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
 | FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
 | Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close (§3.1) |
 | `.git` paths | An exact `.git` component that is a git directory or gitfile is skipped without an alarm; any other `.git`, look-alikes and invalid names raise `PathRefused` (§5) |
@@ -1356,6 +1469,12 @@ every step), 11 (restore is not built), 13 (performance) and 16.
 | Synchronous-step bound | Content scans of special files run at record time only up to 1 MiB, the tree rule file bound; larger files are scanned in full at commit time. Size checks always run at record time (§3.4) |
 | Nested custom-template gap | At commit time, a write at a path new to history under a directory that has since become a bare git directory is dropped silently; only with the real backing tree known (§5) |
 | Telemetry export failures | Each OTLP exporter is wrapped: a stderr warning at once, then at most once a minute with a count, a recovery line, and the counter `agentfs.telemetry.export_failures{signal}`; telemetry still never stops a command (§13) |
+| Restore modes | Live restore is supported: with a mount running, `restore` and `revert` ask it over the control socket and it writes through its own mount, so caches and dirty detection stay coherent; with nothing running they take the lock and write the backing tree directly; `run` serves none (exit 75) (§15) |
+| Restore semantics | `git restore --source=<commit> -- <path>` for restore, the inverse of the first-parent diff for revert; only commits on the volume's branch; untracked files never touched (§15) |
+| Restore safety | Every check before any write; content not in history is never overwritten, even with `--force`; `--force` overrides only what loses nothing (later recorded changes to a reverted path, files open for writing through the mount); a partial apply is recorded and a re-run is idempotent (§15) |
+| Operation commits | The applying process or thread is registered as an actor; its records get trigger `restore`, the operator as author, and the operation in the journal record; each operation is its own commit with `Agentfs-Restore` or `Agentfs-Revert` (§9, §15) |
+| Control socket | `meta/control/agentfs.sock`, directory 0700, socket 0600, peer root or the daemon's user, addressed through `/proc/self/fd`; JSON lines, protocol v1, one operation at a time (§2.2, §15) |
+| History rewrite | A documented procedure with `git filter-repo --prune-empty never` in a mirror clone, then a force-push with lease per remote by an operator; not a command (§10, §15) |
 
 ### 19.2 Open questions
 
@@ -1364,7 +1483,10 @@ every step), 11 (restore is not built), 13 (performance) and 16.
    benchmark (§18 test 13).
 3. **Multi-pod (§14):** the network round trip per boundary, passthrough over a
    shared filesystem, RBAC and Pod Security.
-4. **Recovery tooling** beyond the phase 1 path (§15).
+4. **Recovery tooling** beyond `restore`, `revert` and the runbooks (§15):
+   whether a read-only history view for operators is worth building,
+   whether undo through the patch queue (§12) replaces manual restores for
+   iac, and asking a running daemon to push now.
 
 ## 20. Prior art
 
