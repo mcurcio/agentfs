@@ -69,4 +69,16 @@ for name in agentfs.path_refused agentfs.push_failed agentfs.diverged \
 done
 assert_contains "$(cat "$OTEL_OUT")" '"agentfs-ci"' "service.name is set"
 
+step "a failing exporter is reported, and counted over metrics"
+# Traces go to a port nothing listens on; metrics still reach the collector.
+echo again >"$TREE/again.txt"
+ERR=$VOL/failing.err
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:9/v1/traces \
+  agentfs record again.txt 2>"$ERR" || { cat "$ERR"; fail "record failed"; }
+assert_contains "$(cat "$ERR")" "warning: telemetry: traces export failed" \
+  "stderr warns about the failed trace export"
+wait_for 20 grep -q '"agentfs.telemetry.export_failures"' "$OTEL_OUT" ||
+  fail "metric agentfs.telemetry.export_failures never arrived"
+pass "metric agentfs.telemetry.export_failures"
+
 step "telemetry passed"

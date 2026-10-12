@@ -25,12 +25,18 @@ type Requests = Mutex<Vec<(String, Vec<u8>)>>;
 /// `(path, body)` of each.
 struct Collector {
     port: u16,
+    /// Requests to this path are answered 500 (and still kept).
+    failing: Option<&'static str>,
     requests: Arc<Requests>,
     connections: Arc<AtomicUsize>,
 }
 
 impl Collector {
     fn start() -> Self {
+        Self::start_failing(None)
+    }
+
+    fn start_failing(failing: Option<&'static str>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -43,12 +49,13 @@ impl Collector {
                     let Ok(stream) = stream else { continue };
                     connections.fetch_add(1, Ordering::SeqCst);
                     let requests = requests.clone();
-                    thread::spawn(move || serve(stream, &requests));
+                    thread::spawn(move || serve(stream, &requests, failing));
                 }
             });
         }
         Self {
             port,
+            failing,
             requests,
             connections,
         }
@@ -79,7 +86,7 @@ impl Collector {
 }
 
 /// Serves one HTTP/1.1 request, then closes the connection.
-fn serve(stream: TcpStream, requests: &Requests) {
+fn serve(stream: TcpStream, requests: &Requests, failing: Option<&str>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut stream = stream;
     let mut request_line = String::new();
@@ -111,10 +118,18 @@ fn serve(stream: TcpStream, requests: &Requests) {
     if reader.read_exact(&mut body).is_err() {
         return;
     }
+    let status = if failing == Some(path.as_str()) {
+        "500 Internal Server Error"
+    } else {
+        "200 OK"
+    };
     requests.lock().unwrap().push((path, body));
     let _ = stream.write_all(
-        b"HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\n\
-          content-length: 0\r\nconnection: close\r\n\r\n",
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/x-protobuf\r\n\
+          content-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .as_bytes(),
     );
 }
 
@@ -408,5 +423,69 @@ fn a_collector_that_is_down_never_fails_the_command() {
         String::from_utf8_lossy(&out.stdout).contains("1 record(s) into 1 commit(s)"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// The value of `name`'s data points with `attr` = `value`, summed over
+/// every metrics request (cumulative sums report their running total, so
+/// the largest is the total).
+fn counter_max(collector: &Collector, name: &str, attr: (&str, &str)) -> Option<u64> {
+    use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point};
+    let mut best = None;
+    for body in collector.bodies("/v1/metrics") {
+        let request = ExportMetricsServiceRequest::decode(&body[..]).unwrap();
+        for rm in request.resource_metrics {
+            for sm in rm.scope_metrics {
+                for m in sm.metrics.into_iter().filter(|m| m.name == name) {
+                    let Some(metric::Data::Sum(sum)) = m.data else {
+                        continue;
+                    };
+                    for point in sum.data_points {
+                        if string_attr(&point.attributes, attr.0).as_deref() != Some(attr.1) {
+                            continue;
+                        }
+                        if let Some(number_data_point::Value::AsInt(v)) = point.value {
+                            best = best.max(Some(v as u64));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+#[test]
+fn failed_exports_are_visible() {
+    // Traces are refused with HTTP 500; metrics and logs are accepted.
+    let collector = Collector::start_failing(Some("/v1/traces"));
+    assert_eq!(collector.failing, Some("/v1/traces"));
+    let v = Volume::new();
+    let endpoint = collector.endpoint();
+    let out = v.record(&[("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint)]);
+    let err = stderr(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 record(s) into 1 commit(s)"),
+        "the command carries on"
+    );
+    assert_eq!(
+        err.matches("warning: telemetry: traces export failed")
+            .count(),
+        1,
+        "{err}"
+    );
+    assert!(!err.contains("metrics export failed"), "{err}");
+    assert!(
+        collector.paths().contains("/v1/traces"),
+        "traces were tried"
+    );
+    assert_eq!(
+        counter_max(
+            &collector,
+            "agentfs.telemetry.export_failures",
+            ("signal", "traces")
+        ),
+        Some(1),
+        "the failure is counted and exported over metrics"
     );
 }

@@ -960,6 +960,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
 | `agentfs.patch.queue_depth`, `agentfs.patch.blocked` | gauge | Phase 3 |
 | `agentfs.state.bytes` | gauge | Size of the state area by part |
+| `agentfs.telemetry.export_failures` | counter, per signal | Telemetry exports (traces, metrics, logs) that failed; counted by the binary, exported once metrics get through |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
@@ -1018,6 +1019,15 @@ deferred. They are reported with a warning and that signal stays off: a
 telemetry misconfiguration never stops a command, in keeping with telemetry
 never affecting the filesystem. Telemetry is flushed at exit, waiting at
 most 5 seconds.
+
+**Failed exports are visible.** Each exporter is wrapped: an export that
+fails (the collector is down, refuses with an HTTP error, or times out)
+prints `warning: telemetry: <signal> export failed: <error>` on stderr at
+once, then at most once a minute with the number of failures in a row,
+and `telemetry: <signal> export recovered after N failure(s)` when one
+succeeds again. Each failure also counts in
+`agentfs.telemetry.export_failures{signal}`, so a collector that drops
+only traces or logs shows up in metrics. A failure never stops a command.
 
 **Alarms** are alert rules on these metrics in the consumer's monitoring stack.
 agentfs emits the signals; it does not page anyone itself. The CSI driver may
@@ -1334,6 +1344,7 @@ every step), 11 (restore is not built), 13 (performance) and 16.
 | `.gitmodules` checks | git fsck's `gitmodulesParse`, `Name`, `Url`, `Path`, `Update` and `Large` are refused at record and commit time (`gitmodulesParse` too, though git only reports it); a port of git's config parser and URL checks, tested against the `git` binary; `http(s)` URLs must pass both git 2.39's and 2.40+'s checks (§3.4) |
 | Synchronous-step bound | Content scans of special files run at record time only up to 1 MiB, the tree rule file bound; larger files are scanned in full at commit time. Size checks always run at record time (§3.4) |
 | Nested custom-template gap | At commit time, a write at a path new to history under a directory that has since become a bare git directory is dropped silently; only with the real backing tree known (§5) |
+| Telemetry export failures | Each OTLP exporter is wrapped: a stderr warning at once, then at most once a minute with a count, a recovery line, and the counter `agentfs.telemetry.export_failures{signal}`; telemetry still never stops a command (§13) |
 
 ### 19.2 Open questions
 

@@ -117,6 +117,11 @@ agentfs run
   endpoints are not built: they are reported with a `warning: telemetry:`
   line on stderr and that signal stays off. Telemetry problems never stop a
   command.
+- **Failed exports** (collector down, an HTTP error) print
+  `warning: telemetry: <signal> export failed: ...` on stderr, at once and
+  then at most once a minute while they keep failing, and a
+  `telemetry: <signal> export recovered` line when they work again. Each
+  failure is also counted in `agentfs.telemetry.export_failures`.
 - **Other settings**, read by the OpenTelemetry SDK:
   `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT` (and their
   per-signal forms), `OTEL_SERVICE_NAME` (default `agentfs`),
@@ -148,6 +153,7 @@ Metrics (design §13):
 | `agentfs.remote.misconfigured` | gauge | `remote` |
 | `agentfs.precheck.rejected_paths` | counter | `stage`, `reason` |
 | `agentfs.state.bytes` | gauge, bytes | `part` |
+| `agentfs.telemetry.export_failures` | counter | `signal` (`traces`, `metrics`, `logs`) |
 
 Spans are `agentfs.record`, `agentfs.commit` and `agentfs.push`, carrying
 journal sequence numbers and commit ids. Every alarm is also a log record

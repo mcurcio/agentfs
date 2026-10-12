@@ -11,26 +11,34 @@
 //! and TLS are not built. A setting this build cannot serve turns its signal
 //! off with a warning on stderr; telemetry never stops a command.
 //!
+//! Every exporter is wrapped in [`Watched`], so a failed export is visible
+//! ([`ExportHealth`]): a rate-limited warning on stderr and the counter
+//! `agentfs.telemetry.export_failures{signal}`.
+//!
 //! The rest of the configuration (headers, timeouts, compression, batch
 //! sizes, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_TRACES_SAMPLER`,
 //! `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`) is read by the
 //! OpenTelemetry SDK and exporter themselves.
 
 use std::fmt;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
 
 use opentelemetry::global::{BoxedTracer, ObjectSafeTracerProvider as _};
-use opentelemetry::logs::LoggerProvider as _;
-use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry::logs::{LoggerProvider as _, Severity};
+use opentelemetry::metrics::{Counter, Meter, MeterProvider as _};
 use opentelemetry::{Key, KeyValue};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::logs::SdkLoggerProvider;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::logs::{LogBatch, LogExporter, SdkLoggerProvider};
+use opentelemetry_sdk::metrics::data::ResourceMetrics;
+use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+use opentelemetry_sdk::metrics::{SdkMeterProvider, Temporality};
+use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 
 use agentfs_core::identity::Context;
-use agentfs_core::telemetry::{self, OtelAlarmLog, Telemetry};
+use agentfs_core::telemetry::{self, OtelAlarmLog, Telemetry, names};
 
 /// How long exit waits for telemetry to flush.
 pub const TELEMETRY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -195,6 +203,201 @@ pub fn plan(env: &dyn Fn(&str) -> Option<String>) -> Plan {
     }
 }
 
+/// How often a signal that keeps failing is reported again on stderr.
+pub const EXPORT_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Failed exports, made visible (design §13): each failure counts in
+/// `agentfs.telemetry.export_failures{signal}` (once metrics are set up)
+/// and is reported on stderr, at once for the first failure, then at most
+/// once per [`EXPORT_WARNING_INTERVAL`] with the count, and once more
+/// when exports succeed again. Telemetry still never stops a command.
+pub struct ExportHealth {
+    signals: [SignalHealth; 3],
+    counter: OnceLock<Counter<u64>>,
+    warn: Box<dyn Fn(&str) + Send + Sync>,
+    interval: Duration,
+}
+
+#[derive(Default)]
+struct SignalHealth {
+    /// Failures since the last success.
+    failing: AtomicU64,
+    /// When the last warning for the current run of failures was printed.
+    warned: Mutex<Option<Instant>>,
+}
+
+impl fmt::Debug for ExportHealth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExportHealth").finish_non_exhaustive()
+    }
+}
+
+impl ExportHealth {
+    /// Reports to stderr.
+    pub fn new() -> Arc<Self> {
+        Self::with_warn(
+            Box::new(|line| eprintln!("{line}")),
+            EXPORT_WARNING_INTERVAL,
+        )
+    }
+
+    /// Reports through `warn`, repeating at most every `interval`.
+    pub fn with_warn(warn: Box<dyn Fn(&str) + Send + Sync>, interval: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            signals: Default::default(),
+            counter: OnceLock::new(),
+            warn,
+            interval,
+        })
+    }
+
+    /// Counts failures in `agentfs.telemetry.export_failures` from now on.
+    pub fn count_with(&self, meter: &Meter) {
+        let _ = self.counter.set(
+            meter
+                .u64_counter(names::TELEMETRY_EXPORT_FAILURES)
+                .with_description("Telemetry exports that failed, by signal")
+                .build(),
+        );
+    }
+
+    fn slot(&self, signal: Signal) -> &SignalHealth {
+        &self.signals[match signal {
+            Signal::Traces => 0,
+            Signal::Metrics => 1,
+            Signal::Logs => 2,
+        }]
+    }
+
+    /// Notes the outcome of one export of `signal`.
+    pub fn observe(&self, signal: Signal, result: &OTelSdkResult) {
+        let slot = self.slot(signal);
+        let mut warned = slot
+            .warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match result {
+            Ok(()) => {
+                let failed = slot.failing.swap(0, Ordering::SeqCst);
+                *warned = None;
+                if failed > 0 {
+                    (self.warn)(&format!(
+                        "telemetry: {signal} export recovered after {failed} failure(s)"
+                    ));
+                }
+            }
+            Err(e) => {
+                let failed = slot.failing.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Some(counter) = self.counter.get() {
+                    counter.add(1, &[KeyValue::new("signal", signal.to_string())]);
+                }
+                if warned.is_none_or(|at| at.elapsed() >= self.interval) {
+                    *warned = Some(Instant::now());
+                    let count = if failed == 1 {
+                        String::new()
+                    } else {
+                        format!(" ({failed} failures in a row)")
+                    };
+                    (self.warn)(&format!(
+                        "warning: telemetry: {signal} export failed: {e}{count}"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// An exporter whose outcomes go to an [`ExportHealth`]; every other call
+/// is passed through.
+#[derive(Debug)]
+pub struct Watched<E> {
+    inner: E,
+    signal: Signal,
+    health: Arc<ExportHealth>,
+}
+
+impl<E> Watched<E> {
+    pub fn new(inner: E, signal: Signal, health: Arc<ExportHealth>) -> Self {
+        Self {
+            inner,
+            signal,
+            health,
+        }
+    }
+}
+
+impl<E: SpanExporter> SpanExporter for Watched<E> {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        let result = self.inner.export(batch).await;
+        self.health.observe(self.signal, &result);
+        result
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        self.inner.shutdown()
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
+impl<E: PushMetricExporter> PushMetricExporter for Watched<E> {
+    async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
+        let result = self.inner.export(metrics).await;
+        self.health.observe(self.signal, &result);
+        result
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        self.inner.shutdown()
+    }
+
+    fn temporality(&self) -> Temporality {
+        self.inner.temporality()
+    }
+}
+
+impl<E: LogExporter> LogExporter for Watched<E> {
+    async fn export(&self, batch: LogBatch<'_>) -> OTelSdkResult {
+        let result = self.inner.export(batch).await;
+        self.health.observe(self.signal, &result);
+        result
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        self.inner.shutdown()
+    }
+
+    fn event_enabled(&self, level: Severity, target: &str, name: Option<&str>) -> bool {
+        self.inner.event_enabled(level, target, name)
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
 /// The process's telemetry: the handle given to the engine, and the SDK
 /// providers behind it. Flushes and shuts down when dropped, waiting at
 /// most [`TELEMETRY_SHUTDOWN_GRACE`].
@@ -290,6 +493,7 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
         return Otel::noop();
     }
     let resource = resource(volume, ctx);
+    let health = ExportHealth::new();
     let enabled = |s: Signal| *plan.get(s) == Decision::Enabled;
     let warn = |signal: Signal, e: &dyn fmt::Display| {
         eprintln!("warning: telemetry: {signal} exporter: {e}; {signal} not exported");
@@ -302,7 +506,7 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
         {
             Ok(exporter) => Some(
                 SdkTracerProvider::builder()
-                    .with_batch_exporter(exporter)
+                    .with_batch_exporter(Watched::new(exporter, Signal::Traces, health.clone()))
                     .with_resource(resource.clone())
                     .build(),
             ),
@@ -321,7 +525,7 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
         {
             Ok(exporter) => Some(
                 SdkMeterProvider::builder()
-                    .with_periodic_exporter(exporter)
+                    .with_periodic_exporter(Watched::new(exporter, Signal::Metrics, health.clone()))
                     .with_resource(resource.clone())
                     .build(),
             ),
@@ -340,7 +544,7 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
         {
             Ok(exporter) => Some(
                 SdkLoggerProvider::builder()
-                    .with_batch_exporter(exporter)
+                    .with_batch_exporter(Watched::new(exporter, Signal::Logs, health.clone()))
                     .with_resource(resource)
                     .build(),
             ),
@@ -364,6 +568,9 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
             opentelemetry::metrics::NoopMeterProvider::new().meter_with_scope(telemetry::scope())
         }
     };
+    if meter.is_some() {
+        health.count_with(&meter_handle);
+    }
     let tracer_handle = tracer
         .as_ref()
         .map(|p| BoxedTracer::new(p.boxed_tracer(telemetry::scope())));
@@ -571,5 +778,54 @@ mod tests {
         assert_eq!(get("service.instance.id").as_deref(), Some("pod-0"));
         assert_eq!(get("k8s.namespace.name").as_deref(), Some("ns"));
         assert_eq!(get("k8s.node.name"), None, "empty values are left out");
+    }
+
+    #[test]
+    fn export_failures_warn_once_then_rate_limited_then_recover() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        let health = ExportHealth::with_warn(
+            Box::new(move |line| sink.lock().unwrap().push(line.to_owned())),
+            Duration::from_millis(200),
+        );
+        let failed = || -> OTelSdkResult {
+            Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                "HTTP 500".into(),
+            ))
+        };
+        let take = || std::mem::take(&mut *lines.lock().unwrap());
+
+        health.observe(Signal::Traces, &Ok(()));
+        assert!(take().is_empty(), "success says nothing");
+        health.observe(Signal::Traces, &failed());
+        let first = take();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(
+            first[0].starts_with("warning: telemetry: traces export failed: ")
+                && first[0].contains("HTTP 500"),
+            "{first:?}"
+        );
+        for _ in 0..5 {
+            health.observe(Signal::Traces, &failed());
+        }
+        assert!(take().is_empty(), "rate limited");
+        // Another signal is reported on its own.
+        health.observe(Signal::Logs, &failed());
+        assert_eq!(take().len(), 1);
+        std::thread::sleep(Duration::from_millis(250));
+        health.observe(Signal::Traces, &failed());
+        let again = take();
+        assert!(
+            again.len() == 1 && again[0].contains("(7 failures in a row)"),
+            "{again:?}"
+        );
+        health.observe(Signal::Traces, &Ok(()));
+        assert_eq!(
+            take(),
+            ["telemetry: traces export recovered after 7 failure(s)"]
+        );
+        // A new run of failures warns at once.
+        health.observe(Signal::Traces, &failed());
+        assert_eq!(take().len(), 1);
     }
 }

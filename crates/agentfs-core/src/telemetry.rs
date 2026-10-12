@@ -57,6 +57,8 @@ pub mod names {
     pub const PRECHECK_REJECTED_PATHS: &str = "agentfs.precheck.rejected_paths";
     pub const STATE_BYTES: &str = "agentfs.state.bytes";
     pub const REMOTE_MISCONFIGURED: &str = "agentfs.remote.misconfigured";
+    /// Recorded by the binary, which owns the exporters (design §13).
+    pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
 
 /// Span names (design §13).
