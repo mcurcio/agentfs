@@ -458,7 +458,14 @@ that operator rules always apply:
     pushurl = …                 # optional; wins over url, as in git
     agentfsMaxBlobSize = 50m    # optional; §3.4, §11.3
     agentfsCredentials = /run/secrets/agentfs/origin   # optional; §11.1
+
+[remote "backup"]               # an SSH remote (§11.1)
+    url = ssh://git@git.example.com/acme/agent-history.git
+    agentfsSshKey = /run/secrets/agentfs/backup/ssh-privatekey   # required for SSH
+    agentfsKnownHosts = /run/secrets/agentfs/backup/known_hosts  # required for SSH
 ```
+
+Every key is described in [configuration.md](configuration.md).
 
 ### 4.4 Implementation note
 
@@ -801,38 +808,86 @@ agentfs does not scan content for secrets and does not hold pushes.
 - **Configuration** is the standard `[remote "<name>"]` sections (`url`, and
   `pushurl`, which wins as in git) plus agentfs's own keys (§4.3), read only
   from the history repository's own config file. libgit2's system, XDG,
-  global and ProgramData config search paths are cleared once per process,
-  and pushes use anonymous remotes with explicit `<oid>:<ref>` refspecs, so
-  `remote.<name>.push` and `fetch`, and any global `url.<base>.insteadOf` or
-  `http.*` setting, are never consulted.
-- **An invalid remote section never stops the volume.** A remote whose name
-  is not a valid agentfs name (§11.4, e.g. `team/backup`, which git accepts),
-  whose `agentfsCredentials` is not absolute, or whose `agentfsMaxBlobSize`
-  is not a positive size is left out: it is never pushed and its limit does
-  not apply. Each one raises `RemoteMisconfigured` (§13) when the volume
-  opens; `agentfs status` lists it and `agentfs push` reports it and exits 1.
-  Recording, committing and the other remotes carry on.
+  global and ProgramData config search paths and its home directory are
+  cleared once per process, and pushes use anonymous remotes with explicit
+  `<oid>:<ref>` refspecs, so `remote.<name>.push` and `fetch`, any global
+  `url.<base>.insteadOf` or `http.*` setting, and `~/.ssh/known_hosts` are
+  never consulted.
+- **An invalid remote section never stops the volume.** A remote section is
+  left out (never pushed, and its limit does not apply) when:
+  - its name is not a valid agentfs name (§11.4, e.g. `team/backup`, which
+    git accepts);
+  - `agentfsCredentials`, `agentfsSshKey` or `agentfsKnownHosts` is not an
+    absolute path, or `agentfsMaxBlobSize` is not a positive size;
+  - its push URL is SSH and `agentfsSshKey` or `agentfsKnownHosts` is
+    missing, `agentfsCredentials` is set, the URL carries a password, or
+    the URL has no host or a bad port;
+  - its push URL is not SSH and `agentfsSshKey` or `agentfsKnownHosts` is
+    set;
+  - its push URL is SSH and the binary was built without the `ssh` cargo
+    feature.
+
+  Each one raises `RemoteMisconfigured` (§13) when the volume opens;
+  `agentfs status` lists it and `agentfs push` reports it and exits 1.
+  Recording, committing and the other remotes carry on. Files that are
+  missing or unreadable at push time are push failures instead (`auth` for
+  a credential or key, `untrusted_host` for known_hosts), so a Secret
+  mounted late or being rotated keeps working once it appears.
 - **Credentials** come from files the recorder reads, and are re-read when they
-  change, so short-lived tokens can be rotated by whatever writes the file.
-  - `remote.<name>.agentfsCredentials` is an absolute path to a file holding
-    either git-credential `key=value` lines (`username=`, `password=`; other
-    keys are ignored) or a bare token, used as the password with the username
-    from the URL, else `x-access-token`.
-  - The file is re-read when its stat stamp (device, inode, size, mtime,
+  change, so short-lived tokens and keys can be rotated by whatever writes
+  the file.
+  - `remote.<name>.agentfsCredentials` (HTTP and HTTPS remotes) is an
+    absolute path to a file holding either git-credential `key=value` lines
+    (`username=`, `password=`; other keys are ignored) or a bare token, used
+    as the password with the username from the URL, else `x-access-token`.
+  - Every file is re-read when its stat stamp (device, inode, size, mtime,
     ctime) changes. The stamp follows symlinks, so kubelet's atomic `..data`
     swap for Secret volumes and a rename over the file are both seen. An
     in-place rewrite of the same size within the filesystem's timestamp
     granularity would be missed.
-  - A credential is bound to the host (and port) of the remote's push URL
-    and is never given to any other host.
-  - It gets one attempt per connection: a rejected credential is an
+  - A credential or key is bound to the host (and port) of the remote's push
+    URL and is never given to any other host.
+  - It gets one attempt per connection: a rejected credential or key is an
     authentication failure, not a retry loop.
-  - Only username and password (token) credentials are supported. SSH keys
-    need libgit2 built with libssh2 and credential support that does not
-    exist yet, so SSH remotes are not supported. HTTPS needs libgit2 built
-    with TLS: the `https` cargo feature (OpenSSL). Local, `file://`,
-    `http://` and `https://` remotes are exercised end to end in CI
-    (`ci/e2e-remotes.sh`, against nginx and `git http-backend`).
+  - HTTPS needs libgit2 built with TLS: the `https` cargo feature (OpenSSL).
+- **SSH remotes** (`ssh://`, `ssh+git://`, `git+ssh://`, and scp-like
+  `[user@]host:path`, which needs a `:` before any `/`) need libgit2 built
+  with libssh2: the `ssh` cargo feature (libssh2 and OpenSSL).
+  - `remote.<name>.agentfsSshKey` is an absolute path to an unencrypted
+    private key, OpenSSH (`BEGIN OPENSSH PRIVATE KEY`) or PEM (`RSA`, `EC`,
+    PKCS#8), handed to libssh2 from memory, so no public key file is
+    needed. Encrypted keys and `.pub` files are refused with an `auth`
+    failure that says why. There is no ssh-agent and no passphrase support.
+  - The user is the URL's, else `git`. libgit2's request for a user name
+    before authenticating is answered without counting as the attempt.
+  - The host key is verified by agentfs, in libgit2's certificate callback,
+    which runs before any authentication, against
+    `remote.<name>.agentfsKnownHosts`: an absolute path to an OpenSSH
+    known_hosts file, required for every SSH remote. The host is looked up
+    as the push URL's host, or `[host]:port` on a port other than 22, and
+    the host libgit2 connected to must be that host. Plain and hashed
+    (`|1|…`) names, comma lists, `*` and `?` wildcards, `!` negation and
+    `@revoked` are honoured; `@cert-authority` (host certificates) is not
+    supported. An unknown host, a changed key, a key type the file does
+    not list for the host and a revoked key are all refused, so the key is
+    never offered to that host, and the push fails as `untrusted_host` with
+    the file, the name looked up, the key type, its SHA256 fingerprint and
+    the `ssh-keyscan` command that lists the server's keys. Nothing is ever
+    accepted on first use or written back.
+  - libssh2 picks the host key type (ECDSA, then Ed25519, then RSA) before
+    agentfs sees it, and git2 offers no way to steer that, so known_hosts
+    must list every type the server has, as `ssh-keyscan` prints them.
+  - libgit2 built with SSH also sends a local path containing a `:` after a
+    `/` (`/srv/a:b.git`) to its SSH transport. agentfs treats such a path as
+    local, as git does, so with the `ssh` feature its push fails, closed:
+    neither a credential nor a key is offered and no host key is trusted.
+- **Tested end to end in CI:** local, `file://`, `http://` and `https://`
+  remotes in `ci/e2e-remotes.sh` (nginx and `git http-backend`), and SSH
+  remotes in `ci/e2e-ssh.sh` (OpenSSH's sshd with a `git-shell` user and
+  key-only authentication): Ed25519 OpenSSH and RSA PEM keys, plain and
+  hashed known_hosts, a wrong key, unknown and changed host keys (the key
+  is never offered: the sshd log shows no attempt with it), a key rotated
+  under a running `agentfs run`, and a divergence over SSH.
 
 ### 11.2 Interval push
 
@@ -872,8 +927,9 @@ agentfs does not scan content for secrets and does not hold pushes.
   remote: history may later go to a stricter remote, and a commit no remote
   accepts can never be pushed. A maximum push size is deferred.
 - **A rejected push never affects the filesystem.** Rejected means refused,
-  non-fast-forward, authentication failure or an unreachable remote. Recording,
-  committing and other remotes carry on. The recorder:
+  non-fast-forward, authentication failure, an untrusted host (an SSH host
+  key or TLS certificate that fails verification) or an unreachable remote.
+  Recording, committing and other remotes carry on. The recorder:
   - raises an alarm (`PushFailed`, §13) with the reason and the commit;
   - keeps retrying with backoff (§11.2);
   - keeps the remote's last successful commit, so the backlog is visible.
@@ -976,7 +1032,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.commit.failures` | counter | Commit passes that failed; the records stay journaled |
 | `agentfs.push.unpushed_commits` | gauge, per remote | Backlog |
 | `agentfs.push.oldest_unpushed_age` | gauge, per remote | Backlog age, the main push alarm |
-| `agentfs.push.failures` | counter, per remote and reason | Rejected, non-fast-forward, authentication, network |
+| `agentfs.push.failures` | counter, per remote and reason | Rejected, non-fast-forward, authentication, untrusted host, network |
 | `agentfs.push.diverged` | gauge, per remote | 1 while diverged |
 | `agentfs.remote.misconfigured` | gauge, per remote | 1 for each invalid `[remote]` section (§11.1) |
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
@@ -1021,7 +1077,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PathRefused` | A path fails the checks of §3.4 or §5, at record or commit time |
 | `RecordFailed` | The synchronous step fails (§3.5) |
 | `CommitFailed` | Turning records into a commit fails; the records stay journaled and are retried |
-| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `non_fast_forward`, `refused`, `local`), the head, the last pushed commit, the consecutive failure count and the next retry |
+| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`), the head, the last pushed commit, the consecutive failure count and the next retry |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
 | `PushSucceeded` | A push attempt succeeded, including one with nothing new (not an alarm; sinks filter) |
@@ -1325,9 +1381,11 @@ target. What it needs:
   commit loop and the push loops in one process.
   - **Preflight.** Before anything is mounted it refuses a state area,
     backing tree and mount point that are not three separate directories
-    (none inside another, after resolving symlinks), a remote credentials
-    file under the backing tree or the mount point (an error, not
-    `RemoteMisconfigured`: carrying on would expose the secret), a
+    (none inside another, after resolving symlinks), any remote section's
+    `agentfsCredentials`, `agentfsSshKey` or `agentfsKnownHosts` file under
+    the backing tree or the mount point, invalid sections included (an
+    error, not `RemoteMisconfigured`: carrying on would expose the secret,
+    or let the workload rewrite known_hosts to trust any host), a
     `--root` that is not the backing tree, and a stale mount point
     (`ENOTCONN`, with the command that clears it).
   - **Kernel options.** fuser, multi-threaded (`--threads`, default the CPU
@@ -1388,6 +1446,8 @@ Phase 4 (§14).
 |---|---|---|
 | FUSE | `fuser` 0.18 | Active. Multi-threaded dispatch with cloned fds, passthrough (`BackingId`). Default features are pure Rust: `mount(2)` as root, `fusermount3` otherwise, no libfuse. It sends the attribute inode number as the node id, so `st_ino` is the node id (§6) |
 | Git objects, commits, push, credentials | `git2` (libgit2) | Active. Has **no** filter or merge-driver registration, and its fsync option is only reachable through `libgit2-sys` |
+| TLS and SSH transports | `git2` features `https` (OpenSSL) and `ssh` (libssh2 through `libssh2-sys`, over OpenSSL), behind agentfs's `https` and `ssh` cargo features | C libraries, so feature-gated: default builds stay free of OpenSSL. `ssh` keys are handed to libssh2 from memory (`Cred::ssh_key_from_memory`) |
+| SSH host keys | agentfs's own known_hosts parser over `base64` and `sha1_smol` (HMAC-SHA1 for hashed names, written by hand and tested against RFC 2202) | Pure Rust. libgit2's own check reads `~/.ssh/known_hosts` only, so agentfs checks in the certificate callback instead (§11.1) |
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
 | LFS | none exists | Implemented in agentfs (§7) |
 | Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `reqwest-blocking-client`, no TLS) in the binary | OTLP http/protobuf export. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
@@ -1464,8 +1524,9 @@ restore commits), and without a mount in `crates/agentfs/tests/cli_restore.rs`;
 the divergence and history-rewrite runbooks run in the `e2e-runbooks` job.
 Tests 8 and 12 (all but the record and commit failure counters, plus the
 export-failure counter) run in the `e2e` jobs against a real git server
-and OpenTelemetry Collector. Not automated yet: test 3 (a kill at every
-step), 13 (performance) and 16.
+and OpenTelemetry Collector; test 8 runs over smart HTTP and HTTPS
+(`e2e-remotes`) and over SSH (`e2e-ssh`, against OpenSSH's sshd). Not
+automated yet: test 3 (a kill at every step), 13 (performance) and 16.
 
 ## 19. Decisions and open questions
 
@@ -1503,6 +1564,9 @@ step), 13 (performance) and 16.
 | Operation commits | The applying process or thread is registered as an actor; its records get trigger `restore`, the operator as author, and the operation in the journal record; each operation is its own commit with `Agentfs-Restore` or `Agentfs-Revert` (§9, §15) |
 | Control socket | `meta/control/agentfs.sock`, directory 0700, socket 0600, peer root or the daemon's user, addressed through `/proc/self/fd`; JSON lines, protocol v1, one operation at a time (§2.2, §15) |
 | History rewrite | A documented procedure with `git filter-repo --prune-empty never` in a mirror clone, then a force-push with lease per remote by an operator; not a command (§10, §15) |
+| SSH remotes | Built with the `ssh` cargo feature (libssh2). Each SSH remote names an unencrypted private key (`agentfsSshKey`) and a known_hosts file (`agentfsKnownHosts`), both required and both re-read when they change; the key is bound to the push URL's host and port and offered once per connection, as the URL's user, else `git`. No ssh-agent, no passphrases, no global or `~/.ssh` files (§11.1) |
+| Host key verification | Done by agentfs against `agentfsKnownHosts`, in libgit2's certificate callback, before any authentication; plain and hashed names, `[host]:port`, wildcards, negation and `@revoked` honoured, `@cert-authority` not supported; unknown, changed, unlisted-type and revoked keys refused, never learned (§11.1) |
+| Untrusted host reason | SSH host key refusals and TLS certificate failures fail the push as `untrusted_host`, apart from `unreachable`, so a possible interception alarms differently from a network problem (§11.3, §13) |
 
 ### 19.2 Open questions
 

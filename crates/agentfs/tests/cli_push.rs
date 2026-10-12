@@ -219,6 +219,75 @@ fn status_shows_remote_state() {
     assert!(line.contains("last error (unreachable): "), "{line}");
 }
 
+/// SSH remotes that are misconfigured, or that this build cannot push to,
+/// are reported and never stop the other remotes (design §11.1).
+#[test]
+fn ssh_remotes_are_validated() {
+    let v = Volume::new();
+    let good = v.dir.path().join("good.git");
+    bare(&good);
+    let key = v.dir.path().join("id");
+    let known_hosts = v.dir.path().join("known_hosts");
+    let (key, known_hosts) = (key.display().to_string(), known_hosts.display().to_string());
+    v.config(&[
+        ("remote.good.url", &good.display().to_string()),
+        ("remote.nokh.url", "ssh://git@localhost:1/x.git"),
+        ("remote.nokh.agentfsSshKey", &key),
+        ("remote.token.url", "git@localhost:x.git"),
+        ("remote.token.agentfsSshKey", &key),
+        ("remote.token.agentfsKnownHosts", &known_hosts),
+        ("remote.token.agentfsCredentials", &key),
+        ("remote.full.url", "ssh://git@localhost:1/x.git"),
+        ("remote.full.agentfsSshKey", &key),
+        ("remote.full.agentfsKnownHosts", &known_hosts),
+    ]);
+    v.record("a.txt", "a");
+
+    let out = v.run(&["push"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let (text, err) = (stdout(&out), stderr(&out));
+    assert!(
+        text.contains(&format!("good: pushed none..{}", v.head())),
+        "{text}"
+    );
+    assert_eq!(branch(&good), Some(v.head()));
+    assert!(
+        err.contains("remote.nokh.agentfsKnownHosts must be set for an ssh remote"),
+        "{err}"
+    );
+    assert!(
+        err.contains("ssh remotes authenticate with agentfsSshKey, not agentfsCredentials"),
+        "{err}"
+    );
+    if cfg!(feature = "ssh") {
+        // Valid, and nothing listens on port 1.
+        assert!(text.contains("full: failed (unreachable)"), "{text}");
+    } else {
+        assert!(
+            err.contains(
+                "remote.full.url: ssh remotes need agentfs built with the `ssh` cargo feature"
+            ),
+            "{err}"
+        );
+        assert!(!text.contains("full:"), "{text}");
+    }
+
+    let out = v.run(&["status"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for name in ["nokh", "token"] {
+        assert!(
+            text.contains(&format!("remote:    {name}: misconfigured, not pushed")),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        text.contains("remote:    full: misconfigured"),
+        !cfg!(feature = "ssh"),
+        "{text}"
+    );
+}
+
 fn spawn_run(v: &Volume) -> Child {
     v.command(&["run", "--push-grace", "1s"])
         .stdout(Stdio::piped())
