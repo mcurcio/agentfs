@@ -26,6 +26,7 @@ pub mod lfs;
 pub mod lock;
 pub mod nested;
 pub mod operations;
+pub mod patch;
 pub mod paths;
 pub mod pending;
 pub mod probe;

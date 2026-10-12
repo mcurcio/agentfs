@@ -44,6 +44,7 @@
 //! HTTP and SSH servers compare and swap.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -124,6 +125,14 @@ pub struct PushState {
     pub consecutive_failures: u32,
     pub last_error: Option<LastError>,
     pub diverged: Option<Divergence>,
+    /// The patch queue push's last failure (design §11.3, §12): kept apart
+    /// from `last_error` so it never backs off or blocks the branch.
+    pub queue_error: Option<LastError>,
+    /// When the queue's refs were last fully pushed.
+    pub queue_synced_ms: Option<u64>,
+    /// The status commit then pushed, with its applied refs and inbox
+    /// deletions: the queue push is skipped while it is still current.
+    pub queue_synced_status: Option<String>,
 }
 
 impl PushState {
@@ -176,6 +185,42 @@ pub enum PushOutcome {
     },
     /// Another process holds this remote's push lock.
     Busy,
+}
+
+/// What the patch queue push of one attempt did (design §11.3, §12).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueuePush {
+    /// The status ref was pushed.
+    pub status: bool,
+    /// `applied/<n>` refs the remote did not have.
+    pub applied: usize,
+    /// `inbox/<n>` refs deleted on the remote.
+    pub deleted: usize,
+    /// `applied/<n>` refs held back because the branch push failed.
+    pub held_back: bool,
+    /// Why it failed, if it did.
+    pub error: Option<(PushFailureKind, String)>,
+}
+
+impl QueuePush {
+    /// One line for `agentfs push`.
+    pub fn summary(&self) -> String {
+        match &self.error {
+            Some((kind, message)) => format!("failed ({kind}): {message}"),
+            None => {
+                let mut s = format!(
+                    "status {}, {} applied ref(s) created, {} inbox ref(s) deleted",
+                    if self.status { "pushed" } else { "unchanged" },
+                    self.applied,
+                    self.deleted
+                );
+                if self.held_back {
+                    s.push_str(" (applied refs wait for the branch push)");
+                }
+                s
+            }
+        }
+    }
 }
 
 impl PushOutcome {
@@ -236,6 +281,10 @@ pub struct RemotePusher {
     events: Events,
     telemetry: Telemetry,
     state: PushState,
+    /// This remote is the patch remote: it gets the queue push.
+    patch_remote: bool,
+    /// What the last attempt's queue push did.
+    queue: Option<QueuePush>,
 }
 
 impl RemotePusher {
@@ -268,7 +317,17 @@ impl RemotePusher {
             transfer: None,
             events,
             telemetry: telemetry.clone(),
+            patch_remote: settings
+                .patch_remote()
+                .is_some_and(|p| p.name == remote.name),
+            queue: None,
         })
+    }
+
+    /// What the last [`RemotePusher::push_once`]'s queue push did; `None`
+    /// when there was none (not the patch remote, nothing new to push).
+    pub fn queue(&self) -> Option<&QueuePush> {
+        self.queue.as_ref()
     }
 
     pub fn name(&self) -> &str {
@@ -312,7 +371,16 @@ impl RemotePusher {
         });
         let mut head = None;
         let mut lfs = None;
+        self.queue = None;
         let outcome = self.push_once_inner(&mut head, &mut lfs);
+        if let Some(queue) = &self.queue {
+            let label = if queue.error.is_some() {
+                "failed"
+            } else {
+                "pushed"
+            };
+            span.set(KeyValue::new("agentfs.push.queue", label));
+        }
         span.set(KeyValue::new("agentfs.push.outcome", outcome.label()));
         if let Some(report) = lfs {
             span.set(KeyValue::new("agentfs.lfs.objects", report.objects as i64));
@@ -388,7 +456,7 @@ impl RemotePusher {
             Ok(report) => *lfs_out = report,
             Err(e) => return self.failed_at(e.kind, e.message, Some(head), PushStage::Lfs),
         }
-        let attempt = self.attempt(&refspecs);
+        let attempt = self.attempt(&refspecs, &[]);
         let remote_branch = attempt
             .updates
             .iter()
@@ -396,7 +464,7 @@ impl RemotePusher {
             .map(|(_, oid)| *oid)
             .filter(|oid| !oid.is_zero());
 
-        match &attempt.result {
+        let outcome = match &attempt.result {
             Ok(()) if attempt.rejected.is_empty() => {
                 let up_to_date = attempt.updates.iter().all(|(name, remote)| {
                     refspecs
@@ -445,7 +513,11 @@ impl RemotePusher {
                 };
                 self.failed(kind, e.message().to_owned(), Some(head))
             }
+        };
+        if self.patch_remote {
+            self.queue = self.queue_push(outcome.is_success());
         }
+        outcome
     }
 
     /// Uploads the LFS objects that the commits the remote lacks reference
@@ -510,11 +582,12 @@ impl RemotePusher {
         }
     }
 
-    /// `<oid>:<ref>` for the branch and every `refs/agentfs/<volume>/*` ref,
-    /// never forced.
+    /// `<oid>:<ref>` for the branch and every
+    /// `refs/agentfs/<volume>/diverged/*` ref, never forced. The patch
+    /// queue's refs have their own push ([`RemotePusher::queue_push`]).
     fn refspecs(&self, head: Oid) -> Result<Vec<String>, GitError> {
         let mut refspecs = vec![format!("{head}:{}", self.branch_ref)];
-        let glob = format!("refs/agentfs/{}/*", self.volume);
+        let glob = format!("refs/agentfs/{}/diverged/*", self.volume);
         for reference in self.repo.references_glob(&glob)? {
             let reference = reference?;
             let (Ok(name), Ok(target)) = (reference.name(), reference.resolve()) else {
@@ -527,8 +600,212 @@ impl RemotePusher {
         Ok(refspecs)
     }
 
-    /// One libgit2 push of `refspecs`.
-    fn attempt(&self, refspecs: &[String]) -> Attempt {
+    /// The patch queue push (design §11.3, §12), after the branch push,
+    /// for the patch remote only. Two pushes:
+    ///
+    /// 1. the status ref, forced (it is a snapshot), and, only when the
+    ///    branch push succeeded, every local `applied/<n>` ref the remote
+    ///    lacks, so an applied ref never reaches the remote before the
+    ///    commit that applied it;
+    /// 2. then, once push 1 succeeded, the deletion of each remote
+    ///    `inbox/<n>` that still names the patch applied as `n`. A
+    ///    producer that replaced it in the meantime keeps it: libgit2's
+    ///    negotiation is checked against the expected oids, and a mismatch
+    ///    stops push 2.
+    ///
+    /// Inbox refs are deleted only after their applied refs are on the
+    /// remote, so the highest number there never goes down and
+    /// `agentfs patch submit` never reuses one. A failure raises
+    /// [`Event::PushFailed`] at stage `queue` and is kept as `queue_error`;
+    /// it never counts toward the branch's failures, backoff or divergence.
+    /// Skipped while the status pushed last is still the local one.
+    fn queue_push(&mut self, branch_ok: bool) -> Option<QueuePush> {
+        let status_ref = crate::patch::status_ref(&self.volume);
+        let status = self.repo.refname_to_id(&status_ref).ok()?;
+        if self.state.queue_error.is_none()
+            && self.state.queue_synced_status.as_deref() == Some(status.to_string().as_str())
+        {
+            return None;
+        }
+        let mut report = QueuePush::default();
+        match self.queue_push_inner(status, &status_ref, branch_ok, &mut report) {
+            Ok(()) => {
+                self.state.queue_error = None;
+                if branch_ok {
+                    self.state.queue_synced_ms = Some(now_ms());
+                    self.state.queue_synced_status = Some(status.to_string());
+                }
+            }
+            Err((kind, message)) => {
+                let message = scrub_userinfo(&message, self.remote.push_url());
+                self.state.queue_error = Some(LastError {
+                    kind,
+                    message: message.clone(),
+                    stage: PushStage::Queue,
+                });
+                self.events.emit(Event::PushFailed {
+                    remote: self.remote.name.clone(),
+                    kind,
+                    message: message.clone(),
+                    head: None,
+                    last_pushed: self.state.last_pushed_oid(),
+                    consecutive_failures: self.state.consecutive_failures,
+                    retry_in: self.next_delay(),
+                    stage: PushStage::Queue,
+                });
+                report.error = Some((kind, message));
+            }
+        }
+        if let Err(e) = self.state.save(&self.state_path)
+            && report.error.is_none()
+        {
+            report.error = Some((
+                PushFailureKind::Local,
+                format!("saving {}: {e}", self.state_path.display()),
+            ));
+        }
+        Some(report)
+    }
+
+    fn queue_push_inner(
+        &self,
+        status: Oid,
+        status_ref: &str,
+        branch_ok: bool,
+        report: &mut QueuePush,
+    ) -> Result<(), (PushFailureKind, String)> {
+        let local = |e: GitError| (PushFailureKind::Local, e.message().to_owned());
+        let applied_prefix = crate::patch::applied_prefix(&self.volume);
+        let mut applied = BTreeMap::new();
+        for reference in self
+            .repo
+            .references_glob(&format!("{applied_prefix}*"))
+            .map_err(local)?
+        {
+            let reference = reference.map_err(local)?;
+            let (Ok(name), Some(oid)) = (reference.name(), reference.target()) else {
+                continue;
+            };
+            if let Some(n) = crate::patch::seq_of_ref(&applied_prefix, name) {
+                applied.insert(n, oid);
+            }
+        }
+        let remote = self.list_remote()?;
+
+        // Push 1.
+        let mut specs = Vec::new();
+        if remote.get(status_ref) != Some(&status) {
+            specs.push(format!("+{status}:{status_ref}"));
+            report.status = true;
+        }
+        for (n, oid) in &applied {
+            let name = crate::patch::applied_ref(&self.volume, *n);
+            if remote.get(&name) == Some(oid) {
+                continue;
+            }
+            if branch_ok {
+                specs.push(format!("{oid}:{name}"));
+                report.applied += 1;
+            } else {
+                report.held_back = true;
+            }
+        }
+        if !specs.is_empty()
+            && let Some(error) = self.attempt_error(&self.attempt(&specs, &[]))
+        {
+            report.status = false;
+            report.applied = 0;
+            return Err(error);
+        }
+        if !branch_ok {
+            return Ok(());
+        }
+
+        // Push 2.
+        let deletes: Vec<(String, Oid)> = applied
+            .iter()
+            .map(|(n, oid)| (crate::patch::inbox_ref(&self.volume, *n), *oid))
+            .filter(|(name, oid)| remote.get(name) == Some(oid))
+            .collect();
+        if deletes.is_empty() {
+            return Ok(());
+        }
+        let specs: Vec<String> = deletes.iter().map(|(name, _)| format!(":{name}")).collect();
+        if let Some(error) = self.attempt_error(&self.attempt(&specs, &deletes)) {
+            return Err(error);
+        }
+        report.deleted = deletes.len();
+        Ok(())
+    }
+
+    /// The remote's `refs/agentfs/<volume>/*` refs, as its receive side
+    /// advertises them.
+    fn list_remote(&self) -> Result<BTreeMap<String, Oid>, (PushFailureKind, String)> {
+        let auth = AuthState::default();
+        let listed = (|| {
+            let mut remote = self.repo.remote_anonymous(self.remote.push_url())?;
+            let callbacks = self.auth.callbacks(&auth);
+            let connection = remote.connect_auth(git2::Direction::Push, Some(callbacks), None)?;
+            let prefix = format!("refs/agentfs/{}/", self.volume);
+            Ok(connection
+                .list()?
+                .iter()
+                .filter(|head| head.name().starts_with(&prefix))
+                .map(|head| (head.name().to_owned(), head.oid()))
+                .collect())
+        })();
+        listed.map_err(|e: GitError| {
+            let attempt = Attempt {
+                result: Err(e),
+                negotiated: false,
+                auth_failed: auth.auth_failed.get(),
+                host_key_failure: auth.host_key_failure.borrow().clone(),
+                updates: Vec::new(),
+                rejected: Vec::new(),
+            };
+            self.attempt_error(&attempt)
+                .unwrap_or((PushFailureKind::Unreachable, "listing the remote".into()))
+        })
+    }
+
+    /// How a queue push attempt failed, if it did.
+    fn attempt_error(&self, attempt: &Attempt) -> Option<(PushFailureKind, String)> {
+        match &attempt.result {
+            Ok(()) if attempt.rejected.is_empty() => None,
+            Ok(()) => {
+                let message = attempt
+                    .rejected
+                    .iter()
+                    .map(|(name, msg)| format!("{name}: {msg}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let kind =
+                    if message.contains("non-fast-forward") || message.contains("fetch first") {
+                        PushFailureKind::NonFastForward
+                    } else {
+                        PushFailureKind::Refused
+                    };
+                Some((kind, message))
+            }
+            Err(e) => {
+                if let Some(message) = &attempt.host_key_failure {
+                    return Some((PushFailureKind::UntrustedHost, message.clone()));
+                }
+                let kind = if attempt.auth_failed {
+                    PushFailureKind::Auth
+                } else if e.code() == ErrorCode::User {
+                    PushFailureKind::Refused
+                } else {
+                    classify(e, attempt.negotiated)
+                };
+                Some((kind, e.message().to_owned()))
+            }
+        }
+    }
+
+    /// One libgit2 push of `refspecs`. A ref in `expect` must hold the
+    /// given oid on the remote, or the push is stopped before it is sent.
+    fn attempt(&self, refspecs: &[String], expect: &[(String, Oid)]) -> Attempt {
         let negotiated = Cell::new(false);
         let auth = AuthState::default();
         let updates = RefCell::new(Vec::new());
@@ -538,6 +815,17 @@ impl RemotePusher {
             let mut callbacks = self.auth.callbacks(&auth);
             callbacks.push_negotiation(|ups| {
                 negotiated.set(true);
+                for update in ups {
+                    let name = String::from_utf8_lossy(update.dst_refname_bytes());
+                    if let Some((_, want)) = expect.iter().find(|(n, _)| *n == name)
+                        && update.src() != *want
+                    {
+                        return Err(GitError::from_str(&format!(
+                            "{name} changed on the remote (it holds {}, not {want}); kept",
+                            update.src()
+                        )));
+                    }
+                }
                 updates.borrow_mut().extend(ups.iter().map(|u| {
                     (
                         String::from_utf8_lossy(u.dst_refname_bytes()).into_owned(),
@@ -664,7 +952,7 @@ impl RemotePusher {
                     );
                 }
                 Ok(()) => {
-                    let attempt = self.attempt(&[format!("{head}:{name}")]);
+                    let attempt = self.attempt(&[format!("{head}:{name}")], &[]);
                     match (&attempt.result, attempt.rejected.first()) {
                         (Ok(()), None) => {
                             self.events.emit(Event::Diverged {
@@ -890,7 +1178,7 @@ pub fn redact_url(url: &str) -> String {
 }
 
 /// `message` with every copy of `url`'s userinfo replaced by `***`.
-fn scrub_userinfo(message: &str, url: &str) -> String {
+pub(crate) fn scrub_userinfo(message: &str, url: &str) -> String {
     match userinfo(url) {
         Some(info) => message.replace(info, "***"),
         None => message.to_owned(),
@@ -1339,7 +1627,8 @@ mod tests {
         let head = v.commit();
         let repo = v.com.history().repo();
         for name in [
-            "refs/agentfs/vol/status",
+            "refs/agentfs/vol/diverged/20260101T000000Z",
+            "refs/agentfs/vol/inbox/0000000001",
             "refs/heads/other",
             "refs/agentfs/other/x",
             "refs/agentfs/volx/y",
@@ -1348,10 +1637,238 @@ mod tests {
         }
         let mut pusher = v.pusher("origin", Arc::new(NullSink));
         assert!(pusher.push_once().is_success());
+        // No status ref yet: no queue push.
+        assert_eq!(pusher.queue(), None);
         assert_eq!(
             remote_refs(remote_dir.path()),
-            ["refs/agentfs/vol/status", "refs/heads/agentfs/vol"]
+            [
+                "refs/agentfs/vol/diverged/20260101T000000Z",
+                "refs/heads/agentfs/vol"
+            ]
         );
+        // The queue's refs go with the queue push, inbox refs never.
+        repo.reference("refs/agentfs/vol/status", head, false, "test")
+            .unwrap();
+        repo.reference("refs/agentfs/vol/applied/0000000001", head, false, "test")
+            .unwrap();
+        assert!(pusher.push_once().is_success());
+        assert_eq!(
+            remote_refs(remote_dir.path()),
+            [
+                "refs/agentfs/vol/applied/0000000001",
+                "refs/agentfs/vol/diverged/20260101T000000Z",
+                "refs/agentfs/vol/status",
+                "refs/heads/agentfs/vol"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_patch_remote_gets_the_queue_push() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        bare(a.path());
+        bare(b.path());
+        let mut v = Vol::with_config(
+            "vol",
+            &[
+                ("a", &a.path().display().to_string()),
+                ("b", &b.path().display().to_string()),
+            ],
+            &[("agentfs.patchRemote", "b")],
+        );
+        let head = v.commit();
+        v.com
+            .history()
+            .repo()
+            .reference("refs/agentfs/vol/status", head, false, "t")
+            .unwrap();
+        for (name, dir, status) in [("a", a.path(), None), ("b", b.path(), Some(head))] {
+            let mut pusher = v.pusher(name, Arc::new(NullSink));
+            assert!(pusher.push_once().is_success());
+            assert_eq!(pusher.queue().is_some(), status.is_some());
+            assert_eq!(remote_ref(dir, "refs/agentfs/vol/status"), status);
+        }
+    }
+
+    /// Push 1 creates the applied refs and forces the status; push 2
+    /// deletes the inbox refs that still name the applied patches.
+    #[test]
+    fn queue_push_moves_applied_refs_and_deletes_matching_inbox_refs() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        let c1 = v.commit();
+        let c2 = v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        let theirs = Repository::open_bare(remote).unwrap();
+        theirs
+            .reference("refs/agentfs/vol/inbox/0000000001", c1, false, "t")
+            .unwrap();
+        // Replaced by the producer after this volume applied c1 as 2.
+        theirs
+            .reference("refs/agentfs/vol/inbox/0000000002", c2, false, "t")
+            .unwrap();
+        let repo = v.com.history().repo();
+        repo.reference("refs/agentfs/vol/applied/0000000001", c1, false, "t")
+            .unwrap();
+        repo.reference("refs/agentfs/vol/applied/0000000002", c1, false, "t")
+            .unwrap();
+        repo.reference("refs/agentfs/vol/status", c2, false, "t")
+            .unwrap();
+
+        assert!(pusher.push_once().is_success());
+        assert_eq!(
+            pusher.queue(),
+            Some(&QueuePush {
+                status: true,
+                applied: 2,
+                deleted: 1,
+                held_back: false,
+                error: None,
+            })
+        );
+        assert_eq!(
+            remote_ref(remote, "refs/agentfs/vol/applied/0000000001"),
+            Some(c1)
+        );
+        assert_eq!(
+            remote_ref(remote, "refs/agentfs/vol/inbox/0000000001"),
+            None
+        );
+        assert_eq!(
+            remote_ref(remote, "refs/agentfs/vol/inbox/0000000002"),
+            Some(c2)
+        );
+        assert_eq!(remote_ref(remote, "refs/agentfs/vol/status"), Some(c2));
+        let state = PushState::load(&v.state.push_state("origin"));
+        assert_eq!(state.queue_synced_status, Some(c2.to_string()));
+        assert!(state.queue_synced_ms.is_some());
+        assert_eq!(state.queue_error, None);
+        // Nothing new: no queue push.
+        assert!(pusher.push_once().is_success());
+        assert_eq!(pusher.queue(), None);
+        // A new status is forced over whatever the remote has.
+        repo.reference("refs/agentfs/vol/status", c1, true, "t")
+            .unwrap();
+        assert!(pusher.push_once().is_success());
+        assert_eq!(remote_ref(remote, "refs/agentfs/vol/status"), Some(c1));
+    }
+
+    /// A queue push failure is the queue's: the branch succeeds, does not
+    /// back off, and push 2 is skipped.
+    #[test]
+    fn queue_failure_never_touches_the_branch() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        let c1 = v.commit();
+        let (sink, events) = sink();
+        let mut pusher = v.pusher("origin", events);
+        assert!(pusher.push_once().is_success());
+        let theirs = Repository::open_bare(remote).unwrap();
+        theirs
+            .reference("refs/agentfs/vol/applied/0000000001", c1, false, "t")
+            .unwrap();
+        theirs
+            .reference("refs/agentfs/vol/inbox/0000000001", c1, false, "t")
+            .unwrap();
+        drop(theirs);
+        // The remote's applied/1 moves to a commit this volume lacks.
+        let other = write_remote(remote, "refs/agentfs/vol/applied/0000000001");
+        let repo = v.com.history().repo();
+        repo.reference("refs/agentfs/vol/applied/0000000001", c1, false, "t")
+            .unwrap();
+        repo.reference("refs/agentfs/vol/status", c1, false, "t")
+            .unwrap();
+        let c2 = v.commit();
+        sink.take();
+
+        let outcome = pusher.push_once();
+        assert_eq!(
+            outcome,
+            PushOutcome::Pushed {
+                from: Some(c1),
+                to: c2
+            }
+        );
+        let queue = pusher.queue().unwrap();
+        assert!(
+            matches!(queue.error, Some((PushFailureKind::NonFastForward, _))),
+            "{queue:?}"
+        );
+        assert_eq!(pusher.state().consecutive_failures, 0);
+        assert_eq!(pusher.state().last_error, None);
+        assert_eq!(pusher.next_delay(), v.settings.push_interval);
+        let error = pusher.state().queue_error.clone().unwrap();
+        assert_eq!(error.stage, PushStage::Queue);
+        assert_eq!(
+            remote_ref(remote, "refs/agentfs/vol/applied/0000000001"),
+            Some(other)
+        );
+        // Push 2 did not run.
+        assert_eq!(
+            remote_ref(remote, "refs/agentfs/vol/inbox/0000000001"),
+            Some(c1)
+        );
+        let failed: Vec<Event> = sink
+            .take()
+            .into_iter()
+            .filter(|e| matches!(e, Event::PushFailed { .. }))
+            .collect();
+        assert!(
+            matches!(
+                failed.as_slice(),
+                [Event::PushFailed {
+                    stage: PushStage::Queue,
+                    head: None,
+                    ..
+                }]
+            ),
+            "{failed:?}"
+        );
+        // It is retried at the next push even though the status is the same.
+        assert!(pusher.push_once().is_success());
+        assert!(pusher.queue().unwrap().error.is_some());
+    }
+
+    /// Applied refs wait for the branch; the status goes anyway.
+    #[test]
+    fn applied_refs_wait_for_the_branch_push() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        let c1 = v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        write_remote(remote, "refs/heads/agentfs/vol");
+        let c2 = v.commit();
+        let repo = v.com.history().repo();
+        repo.reference("refs/agentfs/vol/applied/0000000001", c1, false, "t")
+            .unwrap();
+        repo.reference("refs/agentfs/vol/status", c2, false, "t")
+            .unwrap();
+        let outcome = pusher.push_once();
+        assert!(
+            matches!(outcome, PushOutcome::Diverged { .. }),
+            "{outcome:?}"
+        );
+        let queue = pusher.queue().unwrap();
+        assert!(
+            queue.status && queue.held_back && queue.error.is_none(),
+            "{queue:?}"
+        );
+        assert_eq!(queue.applied, 0);
+        assert_eq!(remote_ref(remote, "refs/agentfs/vol/status"), Some(c2));
+        assert_eq!(
+            remote_ref(remote, "refs/agentfs/vol/applied/0000000001"),
+            None
+        );
+        assert_eq!(pusher.state().queue_synced_status, None);
     }
 
     #[test]
@@ -1641,20 +2158,27 @@ mod tests {
         assert!(pusher.push_once().is_success());
         // Someone moves the status ref on the remote to a commit we lack.
         let theirs = write_remote(remote, "refs/agentfs/vol/status");
-        v.commit();
+        let second = v.commit();
+        // The branch push no longer carries it: it succeeds.
         let outcome = pusher.push_once();
-        assert!(
-            matches!(
-                outcome,
-                PushOutcome::Failed {
-                    kind: PushFailureKind::NonFastForward,
-                    ..
-                }
-            ),
-            "{outcome:?}"
+        assert_eq!(
+            outcome,
+            PushOutcome::Pushed {
+                from: Some(first),
+                to: second
+            }
         );
         assert!(diverged_refs(remote, "vol").is_empty());
         assert_eq!(remote_ref(remote, "refs/agentfs/vol/status"), Some(theirs));
+        // A new local status is forced over it by the queue push.
+        v.com
+            .history()
+            .repo()
+            .reference("refs/agentfs/vol/status", second, true, "t")
+            .unwrap();
+        assert!(pusher.push_once().is_success());
+        assert_eq!(pusher.queue().and_then(|q| q.error.clone()), None);
+        assert_eq!(remote_ref(remote, "refs/agentfs/vol/status"), Some(second));
     }
 
     #[test]

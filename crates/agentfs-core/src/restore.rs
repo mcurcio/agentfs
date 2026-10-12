@@ -219,6 +219,8 @@ pub struct Plan {
     /// Restore only: the deepest directory removals may prune up to
     /// (exclusive): the parent of the restored path, or the root.
     pub prune_floor: String,
+    /// Patch only: the merged tree the steps lead to (design §12).
+    pub target_tree: Option<Oid>,
 }
 
 /// Why a restore or revert cannot run, or failed.
@@ -545,6 +547,7 @@ pub fn plan(repo: &Repository, branch_ref: &str, request: &Request) -> Result<Pl
                 steps,
                 changed_since: Vec::new(),
                 prune_floor,
+                target_tree: None,
             })
         }
         Request::Revert { .. } => {
@@ -596,9 +599,49 @@ pub fn plan(repo: &Repository, branch_ref: &str, request: &Request) -> Result<Pl
                 steps,
                 changed_since,
                 prune_floor: String::new(),
+                target_tree: None,
             })
         }
     }
+}
+
+/// The plan that brings the tree from the branch head `head` to `merged`,
+/// the result of merging patch `source` onto it (design §12): one step per
+/// path whose entry differs.
+pub fn plan_tree(
+    repo: &Repository,
+    head: Oid,
+    source: Oid,
+    merged: Oid,
+    summary: String,
+) -> Result<Plan, RestoreError> {
+    let head_commit = repo.find_commit(head)?;
+    let head_tree = head_commit.tree()?;
+    let merged_tree = repo.find_tree(merged)?;
+    let current = entries_under(repo, Some(&head_tree), &Pathspec::Root)?;
+    let target = entries_under(repo, Some(&merged_tree), &Pathspec::Root)?;
+    let paths: BTreeSet<&String> = current.keys().chain(target.keys()).collect();
+    let mut steps = Vec::new();
+    for path in paths {
+        let (c, t) = (current.get(path).copied(), target.get(path).copied());
+        if c != t {
+            steps.push(Step {
+                path: RepoPath::new(path.clone()).map_err(git_path)?,
+                current: c,
+                target: t,
+            });
+        }
+    }
+    Ok(Plan {
+        kind: OperationKind::Patch,
+        source,
+        head,
+        summary,
+        steps,
+        changed_since: Vec::new(),
+        prune_floor: String::new(),
+        target_tree: Some(merged),
+    })
 }
 
 /// A history path that is not a valid [`RepoPath`] (never written by
@@ -764,6 +807,10 @@ fn expand_groups(
     let source = repo.find_commit(plan.source)?;
     let (target_tree, after_tree) = match plan.kind {
         OperationKind::Restore => (Some(source.tree()?), None),
+        OperationKind::Patch => match plan.target_tree {
+            Some(tree) => (Some(repo.find_tree(tree)?), None),
+            None => (Some(source.tree()?), None),
+        },
         OperationKind::Revert => {
             let parent = match source.parent_count() {
                 0 => None,

@@ -40,7 +40,9 @@ use crate::nested;
 use crate::operations::{ActorBusy, OperationGuard, Operations};
 use crate::paths::{PathError, RepoPath};
 use crate::pending::{PendingId, PendingStore};
-use crate::record::{Caller, Change, Draft, Operation, OperationKind, Record, Trigger};
+use crate::record::{
+    Caller, Change, Draft, Operation, OperationKind, PatchAuthor, Record, Trigger,
+};
 use crate::rules::{Decision, Rules, RulesError, SkipReason};
 use crate::telemetry::{Telemetry, spans};
 use crate::tracked::Tracked;
@@ -94,6 +96,11 @@ impl StateDir {
     /// `remote`'s persisted push state.
     pub fn push_state(&self, remote: &str) -> PathBuf {
         self.push_dir().join(format!("{remote}.json"))
+    }
+
+    /// The patch queue's cached state (design §12): `meta/patch.json`.
+    pub fn patch_state(&self) -> PathBuf {
+        self.meta().join("patch.json")
     }
 
     /// The lock that keeps two processes from pushing `remote` at once.
@@ -497,6 +504,37 @@ pub struct Recorded {
     pub skipped: Vec<Skipped>,
 }
 
+/// What an operator operation is, before it has an id (see
+/// [`Recorder::begin_operation_spec`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationSpec {
+    pub kind: OperationKind,
+    /// The full id of the source commit: restored from, reverted, or the
+    /// patch.
+    pub source: String,
+    /// The commit subject (for a patch, its whole message).
+    pub summary: String,
+    /// Who asked for it.
+    pub caller: Caller,
+    /// A patch's inbox number.
+    pub inbox: Option<u64>,
+    /// A patch's author.
+    pub author: Option<PatchAuthor>,
+}
+
+impl OperationSpec {
+    pub fn new(kind: OperationKind, source: String, summary: String, caller: Caller) -> Self {
+        Self {
+            kind,
+            source,
+            summary,
+            caller,
+            inbox: None,
+            author: None,
+        }
+    }
+}
+
 /// Records change boundaries. Cheap to clone; safe to share across threads.
 #[derive(Clone)]
 pub struct Recorder {
@@ -577,7 +615,7 @@ impl Recorder {
         let actor = caller.pid;
         let operation = self.operations.of_actor(actor);
         let (trigger, caller) = match &operation {
-            Some(op) => (Trigger::Restore, op.caller),
+            Some(op) => (op.kind.trigger(), op.caller),
             None => (trigger, caller),
         };
         let in_operation = operation.is_some();
@@ -813,12 +851,24 @@ impl Recorder {
         caller: Caller,
         actors: &[u32],
     ) -> Result<OperationGuard, VolumeError> {
+        self.begin_operation_spec(OperationSpec::new(kind, source, summary, caller), actors)
+    }
+
+    /// [`Recorder::begin_operation`] with every field of the operation,
+    /// including a patch's inbox number and author (design §12).
+    pub fn begin_operation_spec(
+        &self,
+        spec: OperationSpec,
+        actors: &[u32],
+    ) -> Result<OperationGuard, VolumeError> {
         let op = Operation {
             id: self.operations.next_id(now_ms()),
-            kind,
-            source,
-            summary,
-            caller,
+            kind: spec.kind,
+            source: spec.source,
+            summary: spec.summary,
+            caller: spec.caller,
+            inbox: spec.inbox,
+            author: spec.author,
         };
         Ok(self.operations.begin(op, actors)?)
     }
@@ -956,6 +1006,22 @@ pub struct CommitReport {
 impl Committer {
     pub fn history(&self) -> &History {
         &self.history
+    }
+
+    /// The replica's committer signature, now (design §9).
+    pub fn committer_signature(&self) -> Result<git2::Signature<'static>, git2::Error> {
+        let c = self.identities.committer();
+        git2::Signature::now(&c.name, &c.email)
+    }
+
+    /// Commits that the patch of `op` is applied when it changes nothing
+    /// ([`History::commit_patch_marker`], design §12).
+    pub fn commit_patch_marker(&self, op: &Operation) -> Result<git2::Oid, VolumeError> {
+        let commit = self
+            .history
+            .commit_patch_marker(op, &self.identities, &self.context)?;
+        self.telemetry.commit_made();
+        Ok(commit)
     }
 
     /// The local LFS object cache (design §7).
@@ -2556,6 +2622,8 @@ mod tests {
             source: "s".into(),
             summary: "revert s".into(),
             caller: OPERATOR,
+            inbox: None,
+            author: None,
         };
         for (i, (time, operation)) in [
             (t, None),

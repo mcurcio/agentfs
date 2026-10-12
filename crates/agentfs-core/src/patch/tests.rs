@@ -1,0 +1,725 @@
+//! The patch queue against real volumes (design §12, §18 test 15): a state
+//! area, a backing tree, the recorder and committer, no FUSE.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use git2::{Oid, Repository, Signature, Time};
+
+use super::queue::{Queue, QueueContext, QueueReport};
+use super::status::{PatchState, read_status};
+use super::*;
+use crate::confined::Dir;
+use crate::events::{Event, Events, MemorySink};
+use crate::identity::Context;
+use crate::lfs::Pointer;
+use crate::lfs::fetch::LfsObjects;
+use crate::paths::RepoPath;
+use crate::record::{Caller, OperationKind};
+use crate::restore::{self, Applied, NotLive, RecordMode};
+use crate::telemetry::Telemetry;
+use crate::volume::{self, Committer, OperationSpec, Recorder, StateDir};
+
+const CALLER: Caller = Caller {
+    uid: 10000,
+    gid: 10000,
+    pid: 1,
+};
+
+struct NoLfs;
+
+impl LfsObjects for NoLfs {
+    fn ensure(&self, pointer: &Pointer) -> Result<PathBuf, crate::lfs::LfsError> {
+        Err(crate::lfs::LfsError::local(format!(
+            "no object {}",
+            pointer.oid
+        )))
+    }
+}
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    state: StateDir,
+    root: PathBuf,
+    sink: Arc<MemorySink>,
+    recorder: Recorder,
+    committer: Committer,
+}
+
+fn context() -> Context {
+    Context {
+        volume: "vol".into(),
+        replica: "pod-0".into(),
+        pod_uid: "u".into(),
+        ..Context::default()
+    }
+}
+
+impl Fixture {
+    /// A volume whose branch holds `files`.
+    fn new(files: &[(&str, &str)]) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path().join("state"));
+        volume::init(&state, "vol", None).unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(&root).unwrap();
+        let sink = Arc::new(MemorySink::new());
+        let (recorder, committer) = open(&state, &root, &sink);
+        let f = Self {
+            _dir: dir,
+            state,
+            root,
+            sink,
+            recorder,
+            committer,
+        };
+        f.change(files, &[]);
+        f
+    }
+
+    /// Writes and removes files in the tree and records them, committed.
+    fn change(&self, files: &[(&str, &str)], removes: &[&str]) {
+        for (path, content) in files {
+            let full = self.root.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, content).unwrap();
+        }
+        for path in removes {
+            fs::remove_file(self.root.join(path)).unwrap();
+        }
+        let applied = Applied {
+            written: files
+                .iter()
+                .map(|(p, _)| RepoPath::new(*p).unwrap())
+                .collect(),
+            removed: removes.iter().map(|p| RepoPath::new(*p).unwrap()).collect(),
+        };
+        restore::record_applied(
+            &self.recorder,
+            &self.dir(),
+            &applied,
+            CALLER,
+            RecordMode::Chunked(100),
+        )
+        .unwrap();
+        self.committer.commit_pending().unwrap();
+    }
+
+    /// Closes and reopens the volume (journal replay).
+    fn reopen(&mut self) {
+        let (recorder, committer) = open(&self.state, &self.root, &self.sink);
+        self.recorder = recorder;
+        self.committer = committer;
+    }
+
+    fn dir(&self) -> Dir {
+        Dir::open(&self.root).unwrap()
+    }
+
+    fn repo(&self) -> &Repository {
+        self.committer.history().repo()
+    }
+
+    fn head(&self) -> Oid {
+        self.committer.history().head().unwrap().unwrap().id()
+    }
+
+    fn read(&self, path: &str) -> Option<String> {
+        fs::read_to_string(self.root.join(path)).ok()
+    }
+
+    /// The content of `path` in the branch head.
+    fn at_head(&self, path: &str) -> Option<String> {
+        let tree = self
+            .committer
+            .history()
+            .head()
+            .unwrap()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = tree.get_path(Path::new(path)).ok()?;
+        let blob = self.repo().find_blob(entry.id()).unwrap();
+        Some(String::from_utf8_lossy(blob.content()).into_owned())
+    }
+
+    /// A patch on `parent`: `files` written (`None` removes), authored by
+    /// Ada.
+    fn patch(&self, parent: Oid, files: &[(&str, Option<&str>)], message: &str) -> Oid {
+        let repo = self.repo();
+        let parent = repo.find_commit(parent).unwrap();
+        let tree = edit_tree(repo, &parent.tree().unwrap(), files);
+        let ada = Signature::new(
+            "Ada Lovelace",
+            "ada@example.com",
+            &Time::new(1_700_000_000, 60),
+        )
+        .unwrap();
+        repo.commit(None, &ada, &ada, message, &tree, &[&parent])
+            .unwrap()
+    }
+
+    fn queue(&self, n: u64, oid: Oid) {
+        self.repo()
+            .reference(&inbox_ref("vol", n), oid, true, "test")
+            .unwrap();
+    }
+
+    fn reference(&self, name: &str) -> Option<Oid> {
+        self.repo().refname_to_id(name).ok()
+    }
+
+    fn process(&self) -> QueueReport {
+        let tree = self.dir();
+        let telemetry = Telemetry::noop();
+        let mut queue = Queue::new(QueueContext {
+            state: &self.state,
+            recorder: &self.recorder,
+            committer: &self.committer,
+            tree: &tree,
+            objects: &NoLfs,
+            telemetry: &telemetry,
+            caller: CALLER,
+        });
+        queue.process(None).unwrap()
+    }
+
+    /// The commits applying patch `n` on first-parent history.
+    fn inbox_commits(&self, n: u64) -> usize {
+        let repo = self.repo();
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(self.head()).unwrap();
+        walk.simplify_first_parent().unwrap();
+        walk.filter(|oid| {
+            let c = repo.find_commit(*oid.as_ref().unwrap()).unwrap();
+            inbox_from_message(c.message().unwrap()).map(|(i, _)| i) == Some(n)
+        })
+        .count()
+    }
+
+    fn events(&self) -> Vec<Event> {
+        self.sink.take()
+    }
+}
+
+fn open(state: &StateDir, root: &Path, sink: &Arc<MemorySink>) -> (Recorder, Committer) {
+    let events: Events = sink.clone();
+    let (recorder, committer, _) =
+        volume::open(state, root, context(), events, &Telemetry::noop()).unwrap();
+    (recorder, committer)
+}
+
+/// `base` with `files` written or removed (top-level and one level of
+/// directories).
+fn edit_tree<'r>(
+    repo: &'r Repository,
+    base: &git2::Tree<'_>,
+    files: &[(&str, Option<&str>)],
+) -> git2::Tree<'r> {
+    let mut index = git2::Index::new().unwrap();
+    index.read_tree(base).unwrap();
+    for (path, content) in files {
+        match content {
+            Some(content) => {
+                let id = repo.blob(content.as_bytes()).unwrap();
+                index.add(&entry(path, id, 0o100644)).unwrap();
+            }
+            None => index.remove_path(Path::new(path)).unwrap(),
+        }
+    }
+    repo.find_tree(index.write_tree_to(repo).unwrap()).unwrap()
+}
+
+fn entry(path: &str, id: Oid, mode: u32) -> git2::IndexEntry {
+    git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id,
+        flags: 0,
+        flags_extended: 0,
+        path: path.as_bytes().to_vec(),
+    }
+}
+
+#[test]
+fn naming_and_parsing() {
+    assert_eq!(inbox_ref("v", 1), "refs/agentfs/v/inbox/0000000001");
+    assert_eq!(applied_ref("v", 42), "refs/agentfs/v/applied/0000000042");
+    assert_eq!(status_ref("v"), "refs/agentfs/v/status");
+    assert_eq!(format_seq(9_999_999_999), "9999999999");
+    assert_eq!(parse_seq("0000000001"), Some(1));
+    for bad in [
+        "0000000000",
+        "1",
+        "000000001",
+        "00000000001",
+        "000000000a",
+        "",
+    ] {
+        assert_eq!(parse_seq(bad), None, "{bad}");
+    }
+    assert_eq!(
+        seq_of_ref("refs/agentfs/v/inbox/", "refs/agentfs/v/inbox/0000000003"),
+        Some(3)
+    );
+    assert_eq!(
+        seq_of_ref("refs/agentfs/v/inbox/", "refs/agentfs/w/inbox/0000000003"),
+        None
+    );
+    let reasons = serde_json::to_string(&BlockReason::ParentNotInHistory).unwrap();
+    assert_eq!(reasons, "\"parent_not_in_history\"");
+    assert_eq!(BlockReason::TooLarge.to_string(), "too_large");
+}
+
+#[test]
+fn inbox_trailers_only_count_from_patch_commits() {
+    let oid = "1".repeat(40);
+    let good = format!(
+        "fix\n\nAgentfs-Seq: 3\nAgentfs-Trigger: patch\nAgentfs-Patch: {oid}\nAgentfs-Inbox: 4\n"
+    );
+    assert_eq!(
+        inbox_from_message(&good),
+        Some((4, Oid::from_str(&oid).unwrap()))
+    );
+    // Another trigger, a trailer in an earlier paragraph, no patch oid.
+    let other = format!(
+        "x\n\nAgentfs-Seq: 3\nAgentfs-Trigger: write\nAgentfs-Patch: {oid}\nAgentfs-Inbox: 4\n"
+    );
+    assert_eq!(inbox_from_message(&other), None);
+    let earlier = format!(
+        "x\n\nAgentfs-Trigger: patch\nAgentfs-Patch: {oid}\nAgentfs-Inbox: 4\n\nAgentfs-Seq: 3\n"
+    );
+    assert_eq!(inbox_from_message(&earlier), None);
+    assert_eq!(
+        inbox_from_message("x\n\nAgentfs-Trigger: patch\nAgentfs-Inbox: 4\n"),
+        None
+    );
+    assert_eq!(
+        inbox_from_message(&format!(
+            "x\n\nAgentfs-Trigger: patch\nAgentfs-Patch: {oid}\nAgentfs-Inbox: 0\n"
+        )),
+        None
+    );
+}
+
+/// Design §18 test 15: three patches, the second conflicts.
+#[test]
+fn three_patches_the_second_conflicts() {
+    let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(
+        base,
+        &[("a.txt", Some("a1\n"))],
+        "edit a\n\nSigned-off-by: Ada\n",
+    );
+    let p2 = f.patch(base, &[("b.txt", Some("b-from-iac\n"))], "edit b");
+    let p3 = f.patch(base, &[("c.txt", Some("c\n"))], "add c");
+    // The workload changes b.txt, so 2 conflicts.
+    f.change(&[("b.txt", "b-from-workload\n")], &[]);
+    f.events();
+    for (n, p) in [(1, p1), (2, p2), (3, p3)] {
+        f.queue(n, p);
+    }
+
+    let report = f.process();
+    assert_eq!(report.applied.len(), 1);
+    let (n, commit) = report.applied[0];
+    assert_eq!(n, 1);
+    assert_eq!(commit, f.head());
+    let c = f.repo().find_commit(commit).unwrap();
+    assert_eq!(c.author().name(), Ok("Ada Lovelace"));
+    assert_eq!(c.author().email(), Ok("ada@example.com"));
+    assert_eq!(c.author().when().seconds(), 1_700_000_000);
+    assert_ne!(c.committer().name(), Ok("Ada Lovelace"));
+    let message = c.message().unwrap();
+    assert!(message.starts_with("edit a\n\n"), "{message}");
+    assert!(!message.contains("Signed-off-by"), "{message}");
+    assert_eq!(inbox_from_message(message), Some((1, p1)));
+    assert!(message.contains("Agentfs-Trigger: patch\n"), "{message}");
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.reference(&applied_ref("vol", 1)), Some(p1));
+    assert_eq!(f.reference(&inbox_ref("vol", 1)), None);
+
+    let blocked = report.blocked.clone().unwrap();
+    assert_eq!(blocked.inbox, 2);
+    assert_eq!(blocked.reason, BlockReason::Conflict);
+    assert_eq!(blocked.paths, ["b.txt"]);
+    assert_eq!(blocked.patch, Some(p2.to_string()));
+    assert_eq!(report.queue_depth, 2);
+    assert_eq!(report.last_applied, 1);
+    assert_eq!(f.reference(&inbox_ref("vol", 2)), Some(p2));
+    assert_eq!(f.reference(&inbox_ref("vol", 3)), Some(p3));
+
+    // The tree has 1's change and not 3's; b.txt is the workload's.
+    assert_eq!(f.read("a.txt").as_deref(), Some("a1\n"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("b-from-workload\n"));
+    assert_eq!(f.read("c.txt"), None);
+    assert_eq!(f.at_head("a.txt").as_deref(), Some("a1\n"));
+
+    let state = PatchState::load(&f.state.patch_state());
+    assert_eq!(state.queue_depth, 2);
+    assert_eq!(state.last_applied, 1);
+    assert_eq!(
+        state.blocked.as_ref().map(|b| b.reason),
+        Some(BlockReason::Conflict)
+    );
+    assert_eq!(
+        state.summary(),
+        "last applied 1, 2 queued, blocked at 2 (conflict)"
+    );
+
+    let status = read_status(f.repo(), report.status).unwrap();
+    assert_eq!(f.reference(&status_ref("vol")), Some(report.status));
+    assert_eq!(status.applied_now, [1]);
+    assert_eq!(status.last_applied.as_ref().unwrap().patch, p1.to_string());
+    assert_eq!(
+        status.last_applied.as_ref().unwrap().commit,
+        commit.to_string()
+    );
+    assert_eq!(
+        status.queue.iter().map(|q| q.inbox).collect::<Vec<_>>(),
+        [2, 3]
+    );
+    assert_eq!(status.blocked, report.blocked);
+    assert_eq!(status.head, Some(commit.to_string()));
+
+    let events = f.events();
+    let applied = events
+        .iter()
+        .find(|e| matches!(e, Event::PatchApplied { .. }))
+        .unwrap();
+    assert!(!applied.is_alarm());
+    let blocked_event = events
+        .iter()
+        .find(|e| matches!(e, Event::PatchBlocked { .. }))
+        .unwrap();
+    assert!(blocked_event.is_alarm());
+    assert!(matches!(
+        blocked_event,
+        Event::PatchBlocked {
+            inbox: 2,
+            reason: "conflict",
+            queued: 2,
+            ..
+        }
+    ));
+
+    // A rerun changes nothing and blocks the same way.
+    let again = f.process();
+    assert!(again.applied.is_empty());
+    assert_eq!(again.blocked.map(|b| b.inbox), Some(2));
+    assert_eq!(f.head(), commit);
+
+    // Rebased onto the head, 2 applies, and 3 after it.
+    let p2b = f.patch(
+        f.head(),
+        &[("b.txt", Some("b-merged\n"))],
+        "edit b, rebased",
+    );
+    f.queue(2, p2b);
+    let report = f.process();
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [2, 3]
+    );
+    assert_eq!(report.blocked, None);
+    assert_eq!(report.queue_depth, 0);
+    assert_eq!(f.read("b.txt").as_deref(), Some("b-merged\n"));
+    assert_eq!(f.read("c.txt").as_deref(), Some("c\n"));
+    assert_eq!(f.at_head("c.txt").as_deref(), Some("c\n"));
+    for n in 1..=3 {
+        assert_eq!(f.inbox_commits(n), 1, "patch {n}");
+        assert_eq!(f.reference(&inbox_ref("vol", n)), None);
+    }
+    assert_eq!(f.reference(&applied_ref("vol", 2)), Some(p2b));
+    let state = PatchState::load(&f.state.patch_state());
+    assert_eq!(state.queue_depth, 0);
+    assert_eq!(state.blocked, None);
+    assert_eq!(state.last_applied, 3);
+    let status = read_status(f.repo(), report.status).unwrap();
+    assert_eq!(status.blocked, None);
+    assert!(status.queue.is_empty());
+}
+
+/// Crash (a): the commit is made, the refs are not moved.
+#[test]
+fn crash_between_commit_and_ref_move() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
+    f.queue(1, p1);
+    f.process();
+    let head = f.head();
+    // Undo the ref moves and forget the cache.
+    f.repo()
+        .find_reference(&applied_ref("vol", 1))
+        .unwrap()
+        .delete()
+        .unwrap();
+    f.queue(1, p1);
+    fs::remove_file(f.state.patch_state()).unwrap();
+
+    let report = f.process();
+    assert!(report.applied.is_empty());
+    assert_eq!(report.already, [1]);
+    assert_eq!(report.blocked, None);
+    assert_eq!(report.last_applied, 1);
+    assert_eq!(f.head(), head);
+    assert_eq!(f.reference(&applied_ref("vol", 1)), Some(p1));
+    assert_eq!(f.reference(&inbox_ref("vol", 1)), None);
+    assert_eq!(f.inbox_commits(1), 1);
+}
+
+/// Crash (b): the tree is written, nothing is recorded.
+#[test]
+fn crash_after_the_tree_write() {
+    let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
+    let p1 = f.patch(
+        f.head(),
+        &[
+            ("a.txt", Some("a1\n")),
+            ("b.txt", None),
+            ("d/e.txt", Some("e\n")),
+        ],
+        "patch",
+    );
+    f.queue(1, p1);
+    // What apply wrote before the crash.
+    fs::write(f.root.join("a.txt"), "a1\n").unwrap();
+    fs::remove_file(f.root.join("b.txt")).unwrap();
+
+    let report = f.process();
+    assert_eq!(report.applied.len(), 1, "{report:?}");
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.at_head("a.txt").as_deref(), Some("a1\n"));
+    assert_eq!(f.at_head("b.txt"), None);
+    assert_eq!(f.at_head("d/e.txt").as_deref(), Some("e\n"));
+    assert_eq!(f.read("d/e.txt").as_deref(), Some("e\n"));
+    // One commit for the patch, right after the seed.
+    let head = f.repo().find_commit(f.head()).unwrap();
+    assert!(inbox_from_message(head.parent(0).unwrap().message().unwrap()).is_none());
+    assert_eq!(f.process().applied.len(), 0);
+    assert_eq!(f.inbox_commits(1), 1);
+}
+
+/// Crash (c): the record is journaled, not committed.
+#[test]
+fn crash_before_the_commit() {
+    let mut f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
+    f.queue(1, p1);
+    // What Queue::apply_inner does, up to the commit.
+    {
+        let repo = f.repo();
+        let head = repo.find_commit(f.head()).unwrap();
+        let patch = repo.find_commit(p1).unwrap();
+        let mut index = repo.cherrypick_commit(&patch, &head, 0, None).unwrap();
+        let merged = index.write_tree_to(repo).unwrap();
+        let plan = restore::plan_tree(repo, head.id(), p1, merged, "edit a".into()).unwrap();
+        let tree = f.dir();
+        let plan = restore::check(plan, repo, &f.recorder, &NoLfs, &tree, &NotLive, false).unwrap();
+        let spec = OperationSpec {
+            inbox: Some(1),
+            author: Some(queue::author_of(&patch)),
+            ..OperationSpec::new(
+                OperationKind::Patch,
+                p1.to_string(),
+                "edit a".into(),
+                CALLER,
+            )
+        };
+        let guard = f
+            .recorder
+            .begin_operation_spec(spec, &[CALLER.pid])
+            .unwrap();
+        let applied = restore::apply(&plan, repo, &NoLfs, &tree, &NotLive, false).unwrap();
+        restore::record_applied(&f.recorder, &tree, &applied, CALLER, RecordMode::Atomic).unwrap();
+        guard.finish();
+    }
+    f.reopen();
+    let report = f.process();
+    assert!(report.applied.is_empty(), "{report:?}");
+    assert_eq!(report.already, [1]);
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.at_head("a.txt").as_deref(), Some("a1\n"));
+    let head = f.repo().find_commit(f.head()).unwrap();
+    assert_eq!(head.author().name(), Ok("Ada Lovelace"));
+    assert_eq!(f.reference(&applied_ref("vol", 1)), Some(p1));
+}
+
+#[test]
+fn a_patch_that_changes_nothing_gets_a_marker_commit() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let base = f.head();
+    f.change(&[("a.txt", "a1\n")], &[]);
+    let before = f.repo().find_commit(f.head()).unwrap();
+    let seq = f.committer.history().head_seq().unwrap();
+    let p1 = f.patch(base, &[("a.txt", Some("a1\n"))], "edit a");
+    f.queue(1, p1);
+    let report = f.process();
+    assert_eq!(report.applied.len(), 1);
+    let marker = f.repo().find_commit(f.head()).unwrap();
+    assert_eq!(marker.parent_id(0).unwrap(), before.id());
+    assert_eq!(marker.tree_id(), before.tree_id());
+    assert_eq!(marker.author().name(), Ok("Ada Lovelace"));
+    assert_eq!(inbox_from_message(marker.message().unwrap()), Some((1, p1)));
+    assert_eq!(f.committer.history().head_seq().unwrap(), seq);
+    // The next record still commits.
+    f.change(&[("z.txt", "z\n")], &[]);
+    assert_eq!(f.at_head("z.txt").as_deref(), Some("z\n"));
+}
+
+#[test]
+fn a_gap_blocks() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
+    f.queue(1, p1);
+    f.process();
+    let p3 = f.patch(f.head(), &[("a.txt", Some("a3\n"))], "3");
+    f.queue(3, p3);
+    let report = f.process();
+    let blocked = report.blocked.unwrap();
+    assert_eq!(blocked.reason, BlockReason::Gap);
+    assert_eq!(blocked.inbox, 2);
+    assert_eq!(blocked.patch, None);
+    assert_eq!(report.queue_depth, 1);
+    assert_eq!(f.read("a.txt").as_deref(), Some("a1\n"));
+}
+
+#[test]
+fn merge_commits_root_commits_and_foreign_parents_block() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let head = f.head();
+    let repo = f.repo();
+    let sig = Signature::now("Ada", "ada@example.com").unwrap();
+    let tree = repo.find_commit(head).unwrap().tree().unwrap();
+    let other = repo.commit(None, &sig, &sig, "other", &tree, &[]).unwrap();
+    let merge = {
+        let parents = [
+            &repo.find_commit(head).unwrap(),
+            &repo.find_commit(other).unwrap(),
+        ];
+        repo.commit(None, &sig, &sig, "merge", &tree, &parents)
+            .unwrap()
+    };
+    let cases = [
+        (merge, BlockReason::MergeCommit),
+        (other, BlockReason::Unsupported),
+        (
+            f.patch(other, &[("a.txt", Some("x\n"))], "foreign"),
+            BlockReason::ParentNotInHistory,
+        ),
+    ];
+    for (oid, reason) in cases {
+        f.queue(1, oid);
+        let report = f.process();
+        assert_eq!(report.blocked.map(|b| b.reason), Some(reason));
+        assert_eq!(f.head(), head);
+    }
+}
+
+#[test]
+fn gitlinks_are_unsupported() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let repo = f.repo();
+    let parent = repo.find_commit(f.head()).unwrap();
+    let mut index = git2::Index::new().unwrap();
+    index.read_tree(&parent.tree().unwrap()).unwrap();
+    index.add(&entry("sub", parent.id(), 0o160000)).unwrap();
+    let tree = repo.find_tree(index.write_tree_to(repo).unwrap()).unwrap();
+    let sig = Signature::now("Ada", "ada@example.com").unwrap();
+    let p = repo
+        .commit(None, &sig, &sig, "submodule", &tree, &[&parent])
+        .unwrap();
+    f.queue(1, p);
+    let blocked = f.process().blocked.unwrap();
+    assert_eq!(blocked.reason, BlockReason::Unsupported);
+    assert_eq!(blocked.paths, ["sub"]);
+}
+
+#[test]
+fn unrecorded_changes_block_and_leave_the_tree_alone() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
+    f.queue(1, p1);
+    // A change history does not have yet.
+    fs::write(f.root.join("a.txt"), "live\n").unwrap();
+    let head = f.head();
+    let blocked = f.process().blocked.unwrap();
+    assert_eq!(blocked.reason, BlockReason::Unrecorded, "{blocked:?}");
+    assert_eq!(blocked.paths, ["a.txt"]);
+    assert_eq!(f.read("a.txt").as_deref(), Some("live\n"));
+    assert_eq!(f.head(), head);
+}
+
+#[test]
+fn stale_entries_are_ignored_and_do_not_block() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
+    f.queue(1, p1);
+    f.process();
+    // Someone re-queues 1 with another commit, and queues 2.
+    let other = f.patch(f.head(), &[("a.txt", Some("other\n"))], "1 again");
+    f.queue(1, other);
+    let p2 = f.patch(f.head(), &[("b.txt", Some("b\n"))], "2");
+    f.queue(2, p2);
+    // A malformed name.
+    f.repo()
+        .reference("refs/agentfs/vol/inbox/3", p2, true, "test")
+        .unwrap();
+    let report = f.process();
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(report.blocked, None);
+    let why: Vec<(&str, &str)> = report
+        .ignored
+        .iter()
+        .map(|i| (i.ref_name.as_str(), i.why.as_str()))
+        .collect();
+    assert!(
+        why.contains(&("refs/agentfs/vol/inbox/0000000001", "stale")),
+        "{why:?}"
+    );
+    assert!(
+        why.contains(&("refs/agentfs/vol/inbox/3", "malformed")),
+        "{why:?}"
+    );
+    assert_eq!(f.read("a.txt").as_deref(), Some("a1\n"));
+    assert_eq!(f.inbox_commits(1), 1);
+}
+
+#[test]
+fn the_scan_cache_is_not_authoritative() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
+    f.queue(1, p1);
+    f.process();
+    // A cache that lies about the scanned head (not on the branch).
+    let mut state = PatchState::load(&f.state.patch_state());
+    state.scanned_head = Some("1".repeat(40));
+    state.last_applied = 0;
+    state.save(&f.state.patch_state()).unwrap();
+    f.queue(1, p1);
+    let report = f.process();
+    assert_eq!(report.already, [1]);
+    assert_eq!(f.inbox_commits(1), 1);
+    // An incremental scan from a good cache finds new ones too.
+    let found = f
+        .committer
+        .history()
+        .find_inbox_commits(Some(f.head()))
+        .unwrap();
+    assert!(found.is_empty());
+    assert_eq!(
+        f.committer.history().find_inbox_commits(None).unwrap()[&1].patch,
+        p1
+    );
+}

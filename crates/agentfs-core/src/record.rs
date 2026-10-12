@@ -30,6 +30,8 @@ pub enum Trigger {
     Interval,
     /// An operator restore (design §15).
     Restore,
+    /// A patch from the queue, applied at mount (design §12).
+    Patch,
 }
 
 impl Trigger {
@@ -47,6 +49,7 @@ impl Trigger {
             Self::Sweep => "sweep",
             Self::Interval => "interval",
             Self::Restore => "restore",
+            Self::Patch => "patch",
         }
     }
 }
@@ -103,6 +106,8 @@ pub enum OperationKind {
     Restore,
     /// A commit's changes undone.
     Revert,
+    /// A patch from the queue applied onto the branch (design §12).
+    Patch,
 }
 
 impl OperationKind {
@@ -110,6 +115,7 @@ impl OperationKind {
         match self {
             Self::Restore => "restore",
             Self::Revert => "revert",
+            Self::Patch => "patch",
         }
     }
 
@@ -118,8 +124,30 @@ impl OperationKind {
         match self {
             Self::Restore => "Agentfs-Restore",
             Self::Revert => "Agentfs-Revert",
+            Self::Patch => "Agentfs-Patch",
         }
     }
+
+    /// The trigger of the operation's records: `restore` for restores and
+    /// reverts, `patch` for patches.
+    pub fn trigger(self) -> Trigger {
+        match self {
+            Self::Restore | Self::Revert => Trigger::Restore,
+            Self::Patch => Trigger::Patch,
+        }
+    }
+}
+
+/// A patch commit's author, kept as the git author of the commit that
+/// applies it (design §9, §12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchAuthor {
+    pub name: String,
+    pub email: String,
+    /// Seconds since the Unix epoch.
+    pub time_s: i64,
+    /// The author's UTC offset, in minutes.
+    pub offset_min: i32,
 }
 
 /// An operator restore or revert that records belong to (design §15).
@@ -132,8 +160,17 @@ pub struct Operation {
     pub source: String,
     /// The commit subject, e.g. `restore src from 1a2b3c4`.
     pub summary: String,
-    /// The operator who asked for it: the author of its commit.
+    /// The operator who asked for it: the author of its commit, unless
+    /// `author` is set.
     pub caller: Caller,
+    /// A patch's inbox number (design §12): its commit carries
+    /// `Agentfs-Inbox`. Absent from older journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<u64>,
+    /// A patch's author, the git author of its commit. Absent from older
+    /// journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<PatchAuthor>,
 }
 
 /// A change boundary as given to the journal, before it has a sequence number.
@@ -177,6 +214,33 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operations_without_patch_fields_read_and_write_as_before() {
+        let old = r#"{"id":3,"kind":"restore","source":"abc","summary":"restore a","caller":{"uid":1,"gid":2,"pid":3}}"#;
+        let op: Operation = serde_json::from_str(old).unwrap();
+        assert_eq!(op.inbox, None);
+        assert_eq!(op.author, None);
+        assert_eq!(op.kind.trigger(), Trigger::Restore);
+        assert_eq!(serde_json::to_string(&op).unwrap(), old);
+        let patch = Operation {
+            kind: OperationKind::Patch,
+            inbox: Some(4),
+            author: Some(PatchAuthor {
+                name: "Ada".into(),
+                email: "ada@example.com".into(),
+                time_s: 5,
+                offset_min: -60,
+            }),
+            ..op
+        };
+        let json = serde_json::to_string(&patch).unwrap();
+        assert!(json.contains(r#""kind":"patch""#), "{json}");
+        assert!(json.contains(r#""inbox":4"#), "{json}");
+        assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), patch);
+        assert_eq!(patch.kind.trigger(), Trigger::Patch);
+        assert_eq!(patch.kind.trailer(), "Agentfs-Patch");
+    }
 
     #[test]
     fn the_store_is_journaled_only_for_lfs_and_defaults_to_blob() {

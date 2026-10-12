@@ -226,9 +226,42 @@ pub struct Settings {
     /// left out of `remotes` and reported as alarms; they never fail the
     /// volume (design §11.1).
     pub invalid_remotes: Vec<InvalidRemote>,
+    /// `agentfs.patchRemote`: where the patch queue is fetched from and
+    /// its refs pushed to (design §12).
+    pub patch_remote: PatchRemote,
+    /// `agentfs.patchFetchTimeout`: how long the mount waits for the
+    /// patch fetch (design §12). Default 30s.
+    pub patch_fetch_timeout: Duration,
     /// Every `include.path`, in order: absolute, readable config fragments
     /// whose keys count as the repository's own (design §4.3).
     pub includes: Vec<PathBuf>,
+}
+
+/// `agentfs.patchRemote` (design §12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchRemote {
+    /// Unset: the only remote, if exactly one is configured and valid.
+    Auto,
+    /// `none`: no patches are fetched and no queue refs pushed.
+    Disabled,
+    /// A remote by name. One that is not configured (or not valid)
+    /// disables fetching and raises an alarm at mount; it never fails the
+    /// volume.
+    Named(String),
+}
+
+impl Settings {
+    /// The remote the patch queue uses, if any (design §12).
+    pub fn patch_remote(&self) -> Option<&RemoteSettings> {
+        match &self.patch_remote {
+            PatchRemote::Disabled => None,
+            PatchRemote::Auto => match self.remotes.as_slice() {
+                [only] if self.invalid_remotes.is_empty() => Some(only),
+                _ => None,
+            },
+            PatchRemote::Named(name) => self.remotes.iter().find(|r| r.name == *name),
+        }
+    }
 }
 
 impl Settings {
@@ -290,6 +323,16 @@ impl Settings {
                 author_email: string(config, "agentfs.identity.authorEmail")?
                     .unwrap_or(defaults.author_email),
             },
+            patch_remote: match string(config, "agentfs.patchRemote")?.as_deref() {
+                None | Some("") => PatchRemote::Auto,
+                Some("none") => PatchRemote::Disabled,
+                Some(name) => {
+                    validate_name("agentfs.patchRemote", name)?;
+                    PatchRemote::Named(name.to_owned())
+                }
+            },
+            patch_fetch_timeout: duration(config, "agentfs.patchFetchTimeout")?
+                .unwrap_or(DEFAULT_PATCH_FETCH_TIMEOUT),
             lfs,
             remotes,
             invalid_remotes,
@@ -609,6 +652,9 @@ pub const MIN_REPACK_INTERVAL: Duration = Duration::from_secs(60);
 /// The default `agentfs.repackInterval`.
 pub const DEFAULT_REPACK_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// The default `agentfs.patchFetchTimeout` (design §12).
+pub const DEFAULT_PATCH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// `agentfs.repackInterval`: default [`DEFAULT_REPACK_INTERVAL`], `0` or
 /// `off` for never, else a duration of at least [`MIN_REPACK_INTERVAL`].
 fn repack_interval(config: &git2::Config) -> Result<Option<Duration>, ConfigError> {
@@ -736,6 +782,40 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn patch_remote_and_fetch_timeout() {
+        let load = |extra: &str| {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n{extra}[remote \"origin\"]\n\turl = /tmp/r.git\n"
+            ));
+            Settings::from_config(&c)
+        };
+        let s = load("").unwrap();
+        assert_eq!(s.patch_remote, PatchRemote::Auto);
+        assert_eq!(s.patch_remote().unwrap().name, "origin");
+        assert_eq!(s.patch_fetch_timeout, DEFAULT_PATCH_FETCH_TIMEOUT);
+        let s = load("\tpatchRemote = none\n\tpatchFetchTimeout = 5s\n").unwrap();
+        assert_eq!(s.patch_remote, PatchRemote::Disabled);
+        assert!(s.patch_remote().is_none());
+        assert_eq!(s.patch_fetch_timeout, Duration::from_secs(5));
+        let s = load("\tpatchRemote = origin\n").unwrap();
+        assert_eq!(s.patch_remote().unwrap().name, "origin");
+        // A remote that is not configured disables the queue's fetch.
+        let s = load("\tpatchRemote = other\n").unwrap();
+        assert_eq!(s.patch_remote, PatchRemote::Named("other".into()));
+        assert!(s.patch_remote().is_none());
+        assert!(load("\tpatchRemote = a/b\n").is_err());
+        assert!(matches!(
+            load("\tpatchFetchTimeout = soon\n"),
+            Err(ConfigError::BadDuration { .. })
+        ));
+        // Two remotes and no choice: none.
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n[remote \"a\"]\n\turl = /tmp/a.git\n[remote \"b\"]\n\turl = /tmp/b.git\n",
+        );
+        assert!(Settings::from_config(&c).unwrap().patch_remote().is_none());
     }
 
     #[test]

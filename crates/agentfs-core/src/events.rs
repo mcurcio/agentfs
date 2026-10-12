@@ -98,6 +98,10 @@ pub enum PushStage {
     /// Uploading the LFS objects the unpushed commits reference, before
     /// the git push; no ref was pushed.
     Lfs,
+    /// Pushing the patch queue's refs (status, applied, inbox deletions)
+    /// to the patch remote, after the branch push (design §12). Never
+    /// affects the branch's backoff or divergence.
+    Queue,
 }
 
 impl PushStage {
@@ -105,6 +109,7 @@ impl PushStage {
         match self {
             Self::Git => "git",
             Self::Lfs => "lfs",
+            Self::Queue => "queue",
         }
     }
 }
@@ -115,8 +120,8 @@ impl fmt::Display for PushStage {
     }
 }
 
-/// One signal. Every variant except [`Event::PushSucceeded`] is an alarm
-/// condition (design §13).
+/// One signal. Every variant except [`Event::PushSucceeded`] and
+/// [`Event::PatchApplied`] is an alarm condition (design §13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A path was not recorded, or dropped from a commit, because git's
@@ -173,12 +178,38 @@ pub enum Event {
         head: Oid,
         previous: Option<Oid>,
     },
+    /// A queued patch was applied at mount (design §12). Not an alarm.
+    PatchApplied {
+        inbox: u64,
+        patch: Oid,
+        /// The branch commit that applies it.
+        commit: Oid,
+    },
+    /// The patch queue stopped at a patch it could not apply; it and the
+    /// later ones stay queued (design §12).
+    PatchBlocked {
+        inbox: u64,
+        patch: Option<Oid>,
+        /// [`crate::patch::BlockReason::as_str`].
+        reason: &'static str,
+        message: String,
+        /// Patches still queued, the blocked one included.
+        queued: usize,
+    },
+    /// Fetching the patch queue from its remote failed; the queue ran with
+    /// what was already fetched (design §12).
+    PatchFetchFailed {
+        remote: String,
+        kind: PushFailureKind,
+        message: String,
+    },
 }
 
 impl Event {
-    /// True for alarm conditions: everything except a successful push.
+    /// True for alarm conditions: everything except a successful push and
+    /// an applied patch.
     pub fn is_alarm(&self) -> bool {
-        !matches!(self, Self::PushSucceeded { .. })
+        !matches!(self, Self::PushSucceeded { .. } | Self::PatchApplied { .. })
     }
 
     /// A stable name for logs and metrics.
@@ -192,6 +223,9 @@ impl Event {
             Self::Diverged { .. } => "diverged",
             Self::RemoteMisconfigured { .. } => "remote_misconfigured",
             Self::PushSucceeded { .. } => "push_succeeded",
+            Self::PatchApplied { .. } => "patch_applied",
+            Self::PatchBlocked { .. } => "patch_blocked",
+            Self::PatchFetchFailed { .. } => "patch_fetch_failed",
         }
     }
 }
@@ -241,6 +275,7 @@ impl fmt::Display for Event {
                 match stage {
                     PushStage::Git => "",
                     PushStage::Lfs => ", stage lfs",
+                    PushStage::Queue => ", stage queue",
                 },
                 oid_or(*head, "none"),
                 oid_or(*last_pushed, "never"),
@@ -270,6 +305,31 @@ impl fmt::Display for Event {
                 f,
                 "pushed {}..{head} to {remote}",
                 oid_or(*previous, "none")
+            ),
+            Self::PatchApplied {
+                inbox,
+                patch,
+                commit,
+            } => write!(f, "patch {inbox} ({patch}) applied as {commit}"),
+            Self::PatchBlocked {
+                inbox,
+                patch,
+                reason,
+                message,
+                queued,
+            } => write!(
+                f,
+                "patch queue blocked at {inbox} ({}, {reason}): {message}; {queued} patch(es) \
+                 queued",
+                oid_or(*patch, "no patch"),
+            ),
+            Self::PatchFetchFailed {
+                remote,
+                kind,
+                message,
+            } => write!(
+                f,
+                "fetching the patch queue from {remote} failed ({kind}): {message}"
             ),
         }
     }

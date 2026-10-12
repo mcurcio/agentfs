@@ -15,12 +15,15 @@
 //!   twice.
 //! - **Direct instrumentation.** The recorder, committer and pushers call
 //!   the handle for `agentfs.record.duration`, `agentfs.commit.count` and
-//!   the `agentfs.record`, `agentfs.commit` and `agentfs.push` spans. Each
+//!   the `agentfs.record`, `agentfs.commit`, `agentfs.push` and `agentfs.patch`
+//!   spans. Each
 //!   span is current while its operation runs, so alarm logs raised inside
 //!   it carry its trace context.
 //! - **Observable gauges**, read from state when metrics are collected:
 //!   the journal backlog, each remote's push backlog, age and divergence,
-//!   misconfigured remotes and the size of the state area.
+//!   misconfigured remotes, the size of the state area and the patch queue
+//!   (`agentfs.patch.queue_depth`, `agentfs.patch.blocked`, from
+//!   `meta/patch.json`).
 //!
 //! Metric attributes are short and low-cardinality (`trigger`, `remote`,
 //! `reason`, `stage`, `part`); paths never become metric attributes. Span
@@ -58,6 +61,8 @@ pub mod names {
     pub const PRECHECK_REJECTED_PATHS: &str = "agentfs.precheck.rejected_paths";
     pub const STATE_BYTES: &str = "agentfs.state.bytes";
     pub const REMOTE_MISCONFIGURED: &str = "agentfs.remote.misconfigured";
+    pub const PATCH_QUEUE_DEPTH: &str = "agentfs.patch.queue_depth";
+    pub const PATCH_BLOCKED: &str = "agentfs.patch.blocked";
     /// Recorded by the binary, which owns the exporters (design §13).
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -67,6 +72,7 @@ pub mod spans {
     pub const RECORD: &str = "agentfs.record";
     pub const COMMIT: &str = "agentfs.commit";
     pub const PUSH: &str = "agentfs.push";
+    pub const PATCH: &str = "agentfs.patch";
 }
 
 /// Bucket boundaries of `agentfs.record.duration`, in seconds: the
@@ -283,6 +289,28 @@ impl Telemetry {
                 }
             })
             .build();
+        let patch_state = state.patch_state();
+        inner
+            .meter
+            .u64_observable_gauge(names::PATCH_QUEUE_DEPTH)
+            .with_unit("{patch}")
+            .with_description("Patches queued and not applied, as of the last mount (design §12)")
+            .with_callback(move |observer| {
+                let state = crate::patch::status::PatchState::load(&patch_state);
+                observer.observe(state.queue_depth, &[]);
+            })
+            .build();
+        let patch_state = state.patch_state();
+        inner
+            .meter
+            .u64_observable_gauge(names::PATCH_BLOCKED)
+            .with_unit("{queue}")
+            .with_description("1 while the patch queue is blocked (design §12)")
+            .with_callback(move |observer| {
+                let state = crate::patch::status::PatchState::load(&patch_state);
+                observer.observe(u64::from(state.blocked.is_some()), &[]);
+            })
+            .build();
         let state = state.clone();
         inner
             .meter
@@ -497,7 +525,10 @@ impl EventSink for TelemetrySink {
             // Their gauges are read from state.
             Event::Diverged { .. }
             | Event::RemoteMisconfigured { .. }
-            | Event::PushSucceeded { .. } => {}
+            | Event::PushSucceeded { .. }
+            | Event::PatchApplied { .. }
+            | Event::PatchBlocked { .. }
+            | Event::PatchFetchFailed { .. } => {}
         }
         if event.is_alarm()
             && let Some(alarms) = &inner.alarms
@@ -536,6 +567,9 @@ fn event_name(event: &Event) -> &'static str {
         Event::Diverged { .. } => "agentfs.diverged",
         Event::RemoteMisconfigured { .. } => "agentfs.remote_misconfigured",
         Event::PushSucceeded { .. } => "agentfs.push_succeeded",
+        Event::PatchApplied { .. } => "agentfs.patch_applied",
+        Event::PatchBlocked { .. } => "agentfs.patch_blocked",
+        Event::PatchFetchFailed { .. } => "agentfs.patch_fetch_failed",
     }
 }
 
@@ -629,6 +663,39 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
                 out.push(("agentfs.last_pushed", oid(p)));
             }
         }
+        Event::PatchApplied {
+            inbox,
+            patch,
+            commit,
+        } => {
+            out.push(("agentfs.patch.inbox", AnyValue::Int(*inbox as i64)));
+            out.push(("agentfs.patch.oid", oid(patch)));
+            out.push(("agentfs.patch.commit", oid(commit)));
+        }
+        Event::PatchBlocked {
+            inbox,
+            patch,
+            reason,
+            message,
+            queued,
+        } => {
+            out.push(("agentfs.patch.inbox", AnyValue::Int(*inbox as i64)));
+            if let Some(p) = patch {
+                out.push(("agentfs.patch.oid", oid(p)));
+            }
+            out.push(("agentfs.patch.reason", AnyValue::from(*reason)));
+            out.push(("agentfs.message", s(message)));
+            out.push(("agentfs.patch.queued", AnyValue::Int(*queued as i64)));
+        }
+        Event::PatchFetchFailed {
+            remote,
+            kind,
+            message,
+        } => {
+            out.push(("agentfs.remote", s(remote)));
+            out.push(("agentfs.kind", AnyValue::from(kind.as_str())));
+            out.push(("agentfs.message", s(message)));
+        }
     }
     out
 }
@@ -637,7 +704,8 @@ impl<L: Logger + Send + Sync> AlarmLog for OtelAlarmLog<L> {
     fn log(&self, event: &Event) {
         let (severity, text) = match event {
             Event::PathRefused { .. } => (Severity::Warn, "WARN"),
-            Event::PushSucceeded { .. } => (Severity::Info, "INFO"),
+            Event::PushSucceeded { .. } | Event::PatchApplied { .. } => (Severity::Info, "INFO"),
+            Event::PatchFetchFailed { .. } => (Severity::Warn, "WARN"),
             _ => (Severity::Error, "ERROR"),
         };
         let name = event_name(event);

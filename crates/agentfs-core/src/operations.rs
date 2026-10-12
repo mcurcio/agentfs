@@ -212,6 +212,8 @@ mod tests {
                 gid: 1,
                 pid: 99,
             },
+            inbox: None,
+            author: None,
         }
     }
 

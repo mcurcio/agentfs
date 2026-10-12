@@ -32,6 +32,7 @@ mod control;
 mod daemon;
 mod hold;
 mod otel;
+mod patch_cmd;
 mod recovery;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -180,6 +181,12 @@ enum Command {
         #[arg(long)]
         allow_stale: bool,
     },
+    /// The patch queue (design §12): submit a patch for a volume, apply
+    /// the queue now, or show it.
+    Patch {
+        #[command(subcommand)]
+        command: patch_cmd::PatchCommand,
+    },
 }
 
 fn parse_grace(value: &str) -> Result<Duration, String> {
@@ -303,6 +310,11 @@ fn real_main() -> Result<ExitCode> {
                         Err(e) => println!("           lfs: none ({e})"),
                     }
                 }
+            }
+            let patches = agentfs_core::patch::status::PatchState::load(&state.patch_state());
+            match settings.patch_remote() {
+                Some(remote) => println!("patches:   {} (from {})", patches.summary(), remote.name),
+                None => println!("patches:   {} (no patch remote)", patches.summary()),
             }
             for bad in &history.settings().invalid_remotes {
                 println!(
@@ -437,6 +449,9 @@ fn real_main() -> Result<ExitCode> {
             mountpoint,
             allow_stale,
         } => return Ok(probe(&mountpoint, allow_stale)),
+        Command::Patch { command } => {
+            return patch_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
+        }
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
             // A restarted sidecar whose daemon died: hold, mount nothing
@@ -546,6 +561,10 @@ fn push_once(state: &StateDir, only: &[String], session: &Session) -> Result<Exi
         let outcome = pusher.push_once();
         ok &= outcome.is_success();
         println!("{}: {}", remote.name, describe(&outcome));
+        if let Some(queue) = pusher.queue() {
+            ok &= queue.error.is_none();
+            println!("{}: queue: {}", remote.name, queue.summary());
+        }
     }
     Ok(if ok {
         ExitCode::SUCCESS
@@ -582,8 +601,8 @@ fn describe(outcome: &PushOutcome) -> String {
             kind,
             message,
             retry_in,
-            stage: PushStage::Lfs,
-        } => format!("failed ({kind}, stage lfs): {message}; retry in {retry_in:?}"),
+            stage,
+        } => format!("failed ({kind}, stage {stage}): {message}; retry in {retry_in:?}"),
         PushOutcome::Busy => "busy: another push in progress".into(),
     }
 }
@@ -609,6 +628,7 @@ fn remote_line(remote: &RemoteStatus) -> String {
         let stage = match error.stage {
             PushStage::Git => "",
             PushStage::Lfs => ", stage lfs",
+            PushStage::Queue => ", stage queue",
         };
         line.push_str(&format!(
             ", last error ({}{stage}): {}",
@@ -620,6 +640,12 @@ fn remote_line(remote: &RemoteStatus) -> String {
             Some(saved) => line.push_str(&format!(", diverged: head saved as {saved}")),
             None => line.push_str(", diverged: head not saved yet"),
         }
+    }
+    if let Some(error) = &state.queue_error {
+        line.push_str(&format!(
+            ", queue push failed ({}): {}",
+            error.kind, error.message
+        ));
     }
     line
 }
@@ -830,6 +856,26 @@ fn mount(
     let (backing, mountpoint) = preflight(state, &settings, &args.backing, &args.mountpoint)?;
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
+    // The patch queue, before anything can see the tree (design §12). A
+    // blocked queue is an alarm; the volume mounts anyway.
+    if let Err(e) = patch_cmd::apply_queue(
+        state,
+        &settings,
+        &recorder,
+        &committer,
+        &backing,
+        session.telemetry(),
+        &events,
+        true,
+    ) {
+        events.emit(Event::PatchBlocked {
+            inbox: 0,
+            patch: None,
+            reason: "failed",
+            message: format!("the patch queue could not run: {e:#}"),
+            queued: 0,
+        });
+    }
     let restorer = recorder.clone();
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();

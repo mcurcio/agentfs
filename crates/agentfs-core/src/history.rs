@@ -24,9 +24,11 @@ use crate::identity::{Context, IdentityError, IdentityRenderer};
 use crate::lfs::{ObjectCache, Store, attributes};
 use crate::paths::{RepoPath, SpecialFile};
 use crate::pending::PendingStore;
-use crate::record::{Change, Record};
+use crate::record::{Change, Operation, OperationKind, PatchAuthor, Record};
 
 pub const SEQ_TRAILER: &str = "Agentfs-Seq";
+/// The inbox number of the patch a commit applies (design §12).
+pub const INBOX_TRAILER: &str = "Agentfs-Inbox";
 
 /// How long libgit2 waits for a remote to accept a connection.
 pub const SERVER_CONNECT_TIMEOUT_MS: std::ffi::c_int = 30_000;
@@ -327,8 +329,18 @@ impl History {
         let tree = self.repo.find_tree(tree_id)?;
 
         let first = &records[0];
-        let author = identities.author(first.draft.caller)?;
-        let author = Signature::new(&author.name, &author.email, &time(last.draft.time_ms))?;
+        let author = match first
+            .draft
+            .operation
+            .as_ref()
+            .and_then(|op| patch_author(op.author.as_ref()))
+        {
+            Some(author) => author,
+            None => {
+                let author = identities.author(first.draft.caller)?;
+                Signature::new(&author.name, &author.email, &time(last.draft.time_ms))?
+            }
+        };
         let committer = identities.committer();
         let committer = Signature::now(&committer.name, &committer.email)?;
         let message = message(records, context);
@@ -565,6 +577,149 @@ enum Fallback {
     KeepHeadAttributes,
 }
 
+/// A commit on the branch that applies a patch (design §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboxCommit {
+    /// The branch commit.
+    pub commit: Oid,
+    /// The patch it applied (`Agentfs-Patch`).
+    pub patch: Oid,
+}
+
+impl History {
+    /// Records that the patch of `op` (kind patch, with an inbox number)
+    /// is applied when it changes nothing (design §12, the exception to
+    /// §3.4's no empty commits): a commit with the head's tree and
+    /// `Agentfs-Seq`, `Agentfs-Trigger: patch`, `Agentfs-Patch` and
+    /// `Agentfs-Inbox`, authored like any patch commit.
+    pub fn commit_patch_marker(
+        &self,
+        op: &Operation,
+        identities: &IdentityRenderer,
+        context: &Context,
+    ) -> Result<Oid, HistoryError> {
+        let head = self.head()?.ok_or_else(|| {
+            git2::Error::from_str("the branch does not exist: nothing to apply a patch to")
+        })?;
+        let seq = self.head_seq()?.unwrap_or_default();
+        let author = match patch_author(op.author.as_ref()) {
+            Some(author) => author,
+            None => {
+                let author = identities.author(op.caller)?;
+                Signature::now(&author.name, &author.email)?
+            }
+        };
+        let committer = identities.committer();
+        let committer = Signature::now(&committer.name, &committer.email)?;
+        let mut message = format!("{}\n\n", op.summary);
+        message.push_str(&format!("{SEQ_TRAILER}: {seq}\n"));
+        message.push_str(&format!(
+            "Agentfs-Trigger: {}\n",
+            op.kind.trigger().as_str()
+        ));
+        message.push_str(&format!("{}: {}\n", op.kind.trailer(), op.source));
+        if let Some(n) = op.inbox {
+            message.push_str(&format!("{INBOX_TRAILER}: {n}\n"));
+        }
+        push_context_trailers(&mut message, context);
+        message.push_str(&format!("Agentfs-Uid: {}\n", op.caller.uid));
+        let tree = head.tree()?;
+        let commit = self
+            .repo
+            .commit(None, &author, &committer, &message, &tree, &[&head])?;
+        let log = format!("agentfs: patch marker through seq {seq}");
+        self.repo
+            .reference_matching(&self.settings.branch_ref, commit, true, head.id(), &log)?;
+        self.sync_dirs()?;
+        Ok(commit)
+    }
+
+    /// Every patch commit on the branch's first-parent history from the
+    /// head back to `since` (exclusive; the whole history when `None` or
+    /// when `since` is not on it), by inbox number (design §12). Only a
+    /// commit whose last message paragraph carries `Agentfs-Trigger:
+    /// patch`, `Agentfs-Patch` and `Agentfs-Inbox` counts.
+    pub fn find_inbox_commits(
+        &self,
+        since: Option<Oid>,
+    ) -> Result<std::collections::BTreeMap<u64, InboxCommit>, HistoryError> {
+        let mut found = std::collections::BTreeMap::new();
+        let Some(head) = self.head()? else {
+            return Ok(found);
+        };
+        let mut walk = self.repo.revwalk()?;
+        walk.push(head.id())?;
+        walk.simplify_first_parent()?;
+        if let Some(since) = since
+            && self.repo.odb()?.exists(since)
+            && (since == head.id() || self.repo.graph_descendant_of(head.id(), since)?)
+        {
+            walk.hide(since)?;
+        }
+        for oid in walk {
+            let oid = oid?;
+            let commit = self.repo.find_commit(oid)?;
+            if let Some((n, patch)) = inbox_from_message(commit.message_raw().unwrap_or_default()) {
+                // The newest commit for an inbox number wins.
+                found.entry(n).or_insert(InboxCommit { commit: oid, patch });
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// The inbox number and patch of a commit that applies a patch: read only
+/// from the message's last paragraph, which agentfs writes itself, and only
+/// with `Agentfs-Trigger: patch` there (design §12). A path in the change
+/// list or a line of the patch's own message cannot forge it.
+pub fn inbox_from_message(message: &str) -> Option<(u64, Oid)> {
+    let trimmed = message.trim_end_matches('\n');
+    let last = trimmed.rsplit("\n\n").next()?;
+    let mut trigger = false;
+    let mut inbox = None;
+    let mut patch = None;
+    let patch_prefix = format!("{}: ", OperationKind::Patch.trailer());
+    let inbox_prefix = format!("{INBOX_TRAILER}: ");
+    for line in last.lines() {
+        if line == "Agentfs-Trigger: patch" {
+            trigger = true;
+        } else if let Some(n) = line.strip_prefix(&inbox_prefix) {
+            inbox = n.trim().parse::<u64>().ok();
+        } else if let Some(oid) = line.strip_prefix(&patch_prefix) {
+            patch = Oid::from_str(oid.trim()).ok();
+        }
+    }
+    match (trigger, inbox, patch) {
+        (true, Some(n), Some(patch)) if n > 0 => Some((n, patch)),
+        _ => None,
+    }
+}
+
+/// The git signature of a patch author, if it makes one (a name or email
+/// libgit2 refuses falls back to the default author).
+fn patch_author(author: Option<&PatchAuthor>) -> Option<Signature<'static>> {
+    let author = author?;
+    Signature::new(
+        &author.name,
+        &author.email,
+        &Time::new(author.time_s, author.offset_min),
+    )
+    .ok()
+}
+
+fn push_context_trailers(out: &mut String, context: &Context) {
+    for (key, value) in [
+        ("Agentfs-Namespace", &context.namespace),
+        ("Agentfs-Pod", &context.pod),
+        ("Agentfs-Pod-Uid", &context.pod_uid),
+        ("Agentfs-Node", &context.node),
+    ] {
+        if !value.is_empty() {
+            out.push_str(&format!("{key}: {value}\n"));
+        }
+    }
+}
+
 fn root_attributes_path() -> RepoPath {
     RepoPath::new(attributes::ROOT_GITATTRIBUTES).expect(".gitattributes is a valid path")
 }
@@ -652,17 +807,11 @@ fn message(records: &[Record], context: &Context) -> String {
     }
     if let Some(op) = operation {
         out.push_str(&format!("{}: {}\n", op.kind.trailer(), op.source));
-    }
-    for (key, value) in [
-        ("Agentfs-Namespace", &context.namespace),
-        ("Agentfs-Pod", &context.pod),
-        ("Agentfs-Pod-Uid", &context.pod_uid),
-        ("Agentfs-Node", &context.node),
-    ] {
-        if !value.is_empty() {
-            out.push_str(&format!("{key}: {value}\n"));
+        if let Some(n) = op.inbox {
+            out.push_str(&format!("{INBOX_TRAILER}: {n}\n"));
         }
     }
+    push_context_trailers(&mut out, context);
     let uids: BTreeSet<u32> = records.iter().map(|r| r.draft.caller.uid).collect();
     for uid in uids {
         out.push_str(&format!("Agentfs-Uid: {uid}\n"));
