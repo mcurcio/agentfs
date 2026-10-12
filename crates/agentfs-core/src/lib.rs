@@ -31,6 +31,7 @@ pub mod probe;
 pub mod push;
 pub mod record;
 pub mod remote_url;
+pub mod repack;
 pub mod restore;
 pub mod rules;
 pub mod service;

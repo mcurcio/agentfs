@@ -11,6 +11,11 @@
 //!   success, the backoff after a failure. A thread per remote means a slow
 //!   or hung remote never delays another.
 //!
+//! - **Repack** (on the commit thread): every `repackInterval` (design §8)
+//!   the commit loop runs [`crate::repack::repack`] between commits, then
+//!   refreshes the committer's object database. A failure emits
+//!   [`Event::RepackFailed`] and is tried again an interval later.
+//!
 //! [`Service::shutdown`] stops every loop, waits for the final commit, and
 //! waits for pushes in progress only up to a grace period: stopping never
 //! waits for a push (design §11.2). libgit2 cannot cancel a push, so a push
@@ -21,6 +26,7 @@
 //! [`Service::shutdown`].
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -28,6 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::events::{Event, Events};
 use crate::push::{RemotePusher, backoff};
+use crate::repack::{self, RepackOutcome, RepackSchedule};
 use crate::volume::{CommitReport, Committer, VolumeError};
 
 /// The longest wait between commit attempts after failures.
@@ -89,19 +96,41 @@ pub struct Service {
 }
 
 impl Service {
-    /// Starts the loops. The committer and pushers report their own events;
-    /// `events` receives the service's own (a commit thread that panicked).
+    /// Starts the loops, repacking every `repackInterval` from the
+    /// committer's settings. The committer and pushers report their own
+    /// events; `events` receives the service's own (a commit thread that
+    /// panicked, a failed repack).
     pub fn start(
         committer: Committer,
         pushers: Vec<RemotePusher>,
         events: Events,
     ) -> io::Result<Self> {
+        let schedule = committer
+            .history()
+            .settings()
+            .repack_interval
+            .map(RepackSchedule::every);
+        Self::start_with_repack(committer, pushers, events, schedule)
+    }
+
+    /// [`Service::start`] with an explicit repack schedule (`None`: never).
+    pub fn start_with_repack(
+        committer: Committer,
+        pushers: Vec<RemotePusher>,
+        events: Events,
+        repack: Option<RepackSchedule>,
+    ) -> io::Result<Self> {
         let stop = Arc::new(Stop::default());
         let commit = {
             let stop = stop.clone();
+            let repacker = repack.map(|schedule| Repacker {
+                schedule,
+                push_locks: pushers.iter().map(|p| p.lock_path().to_owned()).collect(),
+                events: events.clone(),
+            });
             thread::Builder::new()
                 .name("agentfs-commit".into())
-                .spawn(move || commit_loop(&committer, &stop))?
+                .spawn(move || commit_loop(&committer, &stop, repacker.as_ref()))?
         };
         let (done_tx, push_done) = mpsc::channel();
         let mut pushes = Vec::with_capacity(pushers.len());
@@ -189,13 +218,51 @@ impl Service {
     }
 }
 
-fn commit_loop(committer: &Committer, stop: &Stop) -> Result<CommitReport, VolumeError> {
+/// The repack half of the commit loop.
+struct Repacker {
+    schedule: RepackSchedule,
+    push_locks: Vec<PathBuf>,
+    events: Events,
+}
+
+impl Repacker {
+    /// Repacks the committer's repository; failures become events.
+    fn run(&self, committer: &Committer) {
+        let repo = committer.history().repo();
+        let result = repack::repack(Path::new("git"), repo.path(), &self.push_locks);
+        if matches!(result, Ok(RepackOutcome::PushInProgress)) {
+            return;
+        }
+        // A repack that failed late may still have moved objects into new
+        // packs: see them either way.
+        let refreshed = repo.odb().and_then(|odb| odb.refresh());
+        let error = match (result, refreshed) {
+            (Err(e), _) => e.to_string(),
+            (Ok(_), Err(e)) => format!("refreshing the object database: {e}"),
+            (Ok(_), Ok(())) => return,
+        };
+        self.events.emit(Event::RepackFailed { error });
+    }
+}
+
+fn commit_loop(
+    committer: &Committer,
+    stop: &Stop,
+    repacker: Option<&Repacker>,
+) -> Result<CommitReport, VolumeError> {
     let window = committer.history().settings().commit_window.max(MIN_DELAY);
     let mut failures = 0u32;
+    let mut next_repack = repacker.map(|r| Instant::now() + r.schedule.first);
     loop {
         let delay = backoff(window, failures, COMMIT_BACKOFF_CAP);
         if stop.wait(delay) {
             break;
+        }
+        if let (Some(r), Some(at)) = (repacker, next_repack)
+            && Instant::now() >= at
+        {
+            r.run(committer);
+            next_repack = Some(Instant::now() + r.schedule.interval.max(MIN_DELAY));
         }
         if committer.backlog() == 0 {
             continue;
@@ -298,6 +365,61 @@ mod tests {
             .ok()
     }
 
+    fn packs(state: &StateDir) -> usize {
+        fs::read_dir(state.git().join("objects/pack"))
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// The commit loop repacks on schedule, and keeps committing after.
+    #[test]
+    fn the_commit_loop_repacks() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("git is not installed: skipped");
+            return;
+        }
+        let (dir, state) = setup(&[("agentfs.commitWindow", "10ms")]);
+        let sink = Arc::new(MemorySink::default());
+        let (rec, com, pushers) = open(dir.path(), &state, sink.clone());
+        record(&rec, dir.path(), "a");
+        let schedule = RepackSchedule {
+            first: Duration::ZERO,
+            interval: Duration::from_millis(20),
+        };
+        let service =
+            Service::start_with_repack(com, pushers, sink.clone(), Some(schedule)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while local_head(&state).is_none() || packs(&state) == 0 {
+            assert!(Instant::now() < deadline, "never committed and repacked");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The committer still reads and writes the history after a repack.
+        record(&rec, dir.path(), "b");
+        let report = service.shutdown(Duration::ZERO);
+        report.final_commit.unwrap();
+        let repo = git2::Repository::open_bare(state.git()).unwrap();
+        let tree = repo
+            .find_commit(local_head(&state).unwrap())
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(tree.get_name("a").is_some() && tree.get_name("b").is_some());
+        let events = sink.take();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::RepackFailed { .. })),
+            "{events:?}"
+        );
+    }
     #[test]
     fn stop_wakes_waiters() {
         let stop = Arc::new(Stop::default());

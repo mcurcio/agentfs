@@ -138,6 +138,10 @@ pub enum Event {
     /// Turning records into a commit failed; the records stay in the
     /// journal and are retried.
     CommitFailed { error: String, backlog: usize },
+    /// The periodic repack of the state area's git directory failed
+    /// (design §8); it is retried one `agentfs.repackInterval` later.
+    /// History is intact, only less compact.
+    RepackFailed { error: String },
     /// A push attempt failed (design §11.3).
     PushFailed {
         remote: String,
@@ -183,6 +187,7 @@ impl Event {
             Self::PathRefused { .. } => "path_refused",
             Self::RecordFailed { .. } => "record_failed",
             Self::CommitFailed { .. } => "commit_failed",
+            Self::RepackFailed { .. } => "repack_failed",
             Self::PushFailed { .. } => "push_failed",
             Self::Diverged { .. } => "diverged",
             Self::RemoteMisconfigured { .. } => "remote_misconfigured",
@@ -219,6 +224,7 @@ impl fmt::Display for Event {
             Self::CommitFailed { error, backlog } => {
                 write!(f, "commit failed, {backlog} record(s) waiting: {error}")
             }
+            Self::RepackFailed { error } => write!(f, "repack failed: {error}"),
             Self::PushFailed {
                 remote,
                 kind,

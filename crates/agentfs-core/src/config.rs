@@ -213,6 +213,10 @@ pub struct Settings {
     /// files that stay open and changed, and retries failed records (design
     /// §3.1, §3.5). At least [`MIN_SWEEP_INTERVAL`].
     pub sweep_interval: Duration,
+    /// `agentfs.repackInterval`: how often the daemon repacks the history
+    /// with the git CLI (design §8). `None` (`0` or `off`) never repacks.
+    /// At least [`MIN_REPACK_INTERVAL`].
+    pub repack_interval: Option<Duration>,
     pub identity: Templates,
     /// Git LFS (design §7).
     pub lfs: LfsSettings,
@@ -273,6 +277,7 @@ impl Settings {
             commit_window: duration(config, "agentfs.commitWindow")?
                 .unwrap_or(Duration::from_millis(200)),
             sweep_interval: sweep_interval(config)?,
+            repack_interval: repack_interval(config)?,
             push_interval: duration(config, "agentfs.pushInterval")?
                 .unwrap_or(Duration::from_secs(60)),
             identity: Templates {
@@ -598,6 +603,31 @@ fn sweep_interval(config: &git2::Config) -> Result<Duration, ConfigError> {
     }
 }
 
+/// The shortest `agentfs.repackInterval` accepted.
+pub const MIN_REPACK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The default `agentfs.repackInterval`.
+pub const DEFAULT_REPACK_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// `agentfs.repackInterval`: default [`DEFAULT_REPACK_INTERVAL`], `0` or
+/// `off` for never, else a duration of at least [`MIN_REPACK_INTERVAL`].
+fn repack_interval(config: &git2::Config) -> Result<Option<Duration>, ConfigError> {
+    let key = "agentfs.repackInterval";
+    match string(config, key)?.as_deref() {
+        None => return Ok(Some(DEFAULT_REPACK_INTERVAL)),
+        Some("0" | "off") => return Ok(None),
+        Some(_) => {}
+    }
+    match duration(config, key)? {
+        Some(d) if d >= MIN_REPACK_INTERVAL => Ok(Some(d)),
+        _ => Err(ConfigError::TooShort {
+            key: key.into(),
+            value: string(config, key)?.unwrap_or_default(),
+            min: MIN_REPACK_INTERVAL,
+        }),
+    }
+}
+
 /// Parses `<integer><unit>` with unit `ms`, `s`, `m` or `h`.
 pub fn parse_duration(value: &str) -> Option<Duration> {
     let value = value.trim();
@@ -654,6 +684,7 @@ mod tests {
         assert_eq!(s.commit_window, Duration::from_millis(200));
         assert_eq!(s.push_interval, Duration::from_secs(60));
         assert_eq!(s.sweep_interval, Duration::from_secs(30));
+        assert_eq!(s.repack_interval, Some(Duration::from_secs(3600)));
         assert_eq!(s.identity, Templates::default());
     }
 
@@ -705,6 +736,22 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn repack_interval() {
+        let get = |value: &str| {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n\trepackInterval = {value}\n"
+            ));
+            Settings::from_config(&c).map(|s| s.repack_interval)
+        };
+        assert_eq!(get("6h").unwrap(), Some(Duration::from_secs(6 * 3600)));
+        assert_eq!(get("1m").unwrap(), Some(Duration::from_secs(60)));
+        assert_eq!(get("0").unwrap(), None);
+        assert_eq!(get("off").unwrap(), None);
+        assert!(matches!(get("30s"), Err(ConfigError::TooShort { .. })));
+        assert!(matches!(get("never"), Err(ConfigError::BadDuration { .. })));
     }
 
     #[test]

@@ -41,8 +41,8 @@ RUN find crates -name '*.rs' -exec touch {} + \
 FROM ${RUNTIME_IMAGE}
 # fuse3: fusermount3 and /etc/fuse.conf (a non-root daemon); libssl3t64:
 # the `https` and `ssh` transports link OpenSSL; ca-certificates: the TLS
-# trust store; git: so operators can follow the runbooks (git log, show)
-# with kubectl exec.
+# trust store; git: the daemon repacks the history with it (design §8),
+# and operators follow the runbooks (git log, show) with kubectl exec.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends fuse3 libssl3t64 ca-certificates git \
  && rm -rf /var/lib/apt/lists/*

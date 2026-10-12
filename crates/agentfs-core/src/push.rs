@@ -545,6 +545,12 @@ impl RemotePusher {
             .map(Some)
     }
 
+    /// This remote's push lock file: held while a push runs, and by a
+    /// repack ([`crate::repack`]) so it never deletes a pack a push reads.
+    pub fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+
     /// Takes this remote's push lock without waiting.
     fn lock(&self) -> io::Result<Option<File>> {
         let file = OpenOptions::new()

@@ -50,6 +50,7 @@ pub mod names {
     pub const JOURNAL_BACKLOG: &str = "agentfs.journal.backlog";
     pub const COMMIT_COUNT: &str = "agentfs.commit.count";
     pub const COMMIT_FAILURES: &str = "agentfs.commit.failures";
+    pub const REPACK_FAILURES: &str = "agentfs.repack.failures";
     pub const PUSH_UNPUSHED_COMMITS: &str = "agentfs.push.unpushed_commits";
     pub const PUSH_OLDEST_UNPUSHED_AGE: &str = "agentfs.push.oldest_unpushed_age";
     pub const PUSH_FAILURES: &str = "agentfs.push.failures";
@@ -107,6 +108,7 @@ struct Inner {
     record_failures: Counter<u64>,
     commit_count: Counter<u64>,
     commit_failures: Counter<u64>,
+    repack_failures: Counter<u64>,
     push_failures: Counter<u64>,
     rejected_paths: Counter<u64>,
 }
@@ -161,6 +163,11 @@ impl Telemetry {
                 names::COMMIT_FAILURES,
                 "{failure}",
                 "Commit passes that failed; the records stay journaled",
+            ),
+            repack_failures: counter(
+                names::REPACK_FAILURES,
+                "{failure}",
+                "Periodic repacks of the history that failed",
             ),
             push_failures: counter(
                 names::PUSH_FAILURES,
@@ -473,6 +480,7 @@ impl EventSink for TelemetrySink {
                 .record_failures
                 .add(1, &[KeyValue::new("trigger", trigger.as_str())]),
             Event::CommitFailed { .. } => inner.commit_failures.add(1, &[]),
+            Event::RepackFailed { .. } => inner.repack_failures.add(1, &[]),
             Event::PushFailed {
                 remote,
                 kind,
@@ -523,6 +531,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::PathRefused { .. } => "agentfs.path_refused",
         Event::RecordFailed { .. } => "agentfs.record_failed",
         Event::CommitFailed { .. } => "agentfs.commit_failed",
+        Event::RepackFailed { .. } => "agentfs.repack_failed",
         Event::PushFailed { .. } => "agentfs.push_failed",
         Event::Diverged { .. } => "agentfs.diverged",
         Event::RemoteMisconfigured { .. } => "agentfs.remote_misconfigured",
@@ -562,6 +571,7 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             out.push(("agentfs.error", s(error)));
             out.push(("agentfs.backlog", AnyValue::Int(*backlog as i64)));
         }
+        Event::RepackFailed { error } => out.push(("agentfs.error", s(error))),
         Event::PushFailed {
             remote,
             kind,
@@ -901,6 +911,9 @@ mod tests {
                 error: "locked".into(),
                 backlog: 3,
             },
+            Event::RepackFailed {
+                error: "git: not found".into(),
+            },
             failed("origin", PushFailureKind::Auth, PushStage::Git),
             failed("origin", PushFailureKind::Auth, PushStage::Git),
             failed("backup", PushFailureKind::Unreachable, PushStage::Git),
@@ -941,6 +954,7 @@ mod tests {
             Some(1)
         );
         assert_eq!(h.sum(names::COMMIT_FAILURES, &[]), Some(1));
+        assert_eq!(h.sum(names::REPACK_FAILURES, &[]), Some(1));
         assert_eq!(
             h.sum(
                 names::PUSH_FAILURES,
@@ -978,7 +992,7 @@ mod tests {
         }
         let logs = h.logs();
         let expected: Vec<Event> = alarms().into_iter().filter(Event::is_alarm).collect();
-        assert_eq!(logs.len(), 8, "no record for the successful push");
+        assert_eq!(logs.len(), 9, "no record for the successful push");
         for (record, event) in logs.iter().zip(&expected) {
             assert_eq!(
                 record.body().map(any_str),
