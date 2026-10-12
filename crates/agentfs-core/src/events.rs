@@ -2,8 +2,9 @@
 //!
 //! The engine reports what operators need to see (refused paths, failed
 //! records and commits, push failures and divergence) as [`Event`]s handed
-//! to an [`EventSink`]. The telemetry milestone implements a sink that turns
-//! them into OpenTelemetry metrics and logs; the CLI prints alarms to stderr.
+//! to an [`EventSink`]. [`crate::telemetry::Telemetry::sink`] wraps a sink so
+//! events also become OpenTelemetry metrics and logs; the CLI also prints
+//! alarms to stderr.
 //! This module holds no telemetry or IO policy of its own.
 //!
 //! [`EventSink::emit`] is called from the synchronous step of a record

@@ -6,7 +6,8 @@
 //! [`volume::Committer`] turns records into commits in the background, and a
 //! [`push::RemotePusher`] per remote pushes them. [`service::Service`] runs
 //! both as background loops. Alarm conditions are reported as
-//! [`events::Event`]s.
+//! [`events::Event`]s, and [`telemetry::Telemetry`] turns them, with the
+//! engine's own measurements and spans, into OpenTelemetry signals.
 
 pub mod checks;
 pub mod claims;
@@ -24,5 +25,6 @@ pub mod push;
 pub mod record;
 pub mod rules;
 pub mod service;
+pub mod telemetry;
 pub mod tracked;
 pub mod volume;

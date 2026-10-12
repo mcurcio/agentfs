@@ -27,6 +27,7 @@ use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::push::{self, PushOutcome, RemotePusher, RemoteStatus};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::service::Service;
+use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
 
 #[derive(Parser)]
@@ -262,7 +263,8 @@ fn push_once(state: &StateDir, only: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     for remote in selected {
-        let mut pusher = RemotePusher::open(state, settings, remote, events.clone())?;
+        let mut pusher =
+            RemotePusher::open(state, settings, remote, events.clone(), &Telemetry::noop())?;
         let outcome = pusher.push_once();
         ok &= outcome.is_success();
         println!("{}: {}", remote.name, describe(&outcome));
@@ -337,7 +339,7 @@ fn run(state: &StateDir, root: &Path, pod: &Pod, push_grace: Duration) -> Result
     let events = stderr_sink();
     let (_recorder, committer, recovery) = open_with(state, root, pod, events.clone())?;
     let settings = committer.history().settings().clone();
-    let pushers = push::open_all(state, &settings, events.clone())?;
+    let pushers = push::open_all(state, &settings, events.clone(), &Telemetry::noop())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
     let service = Service::start(committer, pushers, events).context("starting the service")?;
     eprintln!(
@@ -402,7 +404,13 @@ fn open_with(
         .settings()
         .volume
         .clone();
-    Ok(volume::open(state, root, pod.context(&volume), events)?)
+    Ok(volume::open(
+        state,
+        root,
+        pod.context(&volume),
+        events,
+        &Telemetry::noop(),
+    )?)
 }
 
 /// Prints alarms (design §13) to stderr until telemetry exports them.

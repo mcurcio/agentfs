@@ -23,7 +23,9 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use opentelemetry::KeyValue;
 
 use crate::checks::{Checks, Limits, Refusal};
 use crate::claims::PathClaims;
@@ -36,6 +38,7 @@ use crate::paths::{PathError, RepoPath};
 use crate::pending::{PendingId, PendingStore};
 use crate::record::{Caller, Change, Draft, Record, Trigger};
 use crate::rules::{Decision, Rules, RulesError, SkipReason};
+use crate::telemetry::{Telemetry, spans};
 use crate::tracked::Tracked;
 
 /// Layout of a state area (design §2.2).
@@ -84,6 +87,51 @@ impl StateDir {
     pub fn push_lock(&self, remote: &str) -> PathBuf {
         self.push_dir().join(format!("{remote}.lock"))
     }
+
+    /// Large-file objects (design §7).
+    pub fn lfs(&self) -> PathBuf {
+        self.root.join("lfs")
+    }
+
+    /// The apparent size in bytes (the sum of regular files' lengths) of
+    /// each part of the state area: `git`, `journal`, `pending`, `lfs` and
+    /// `meta` (design §13). Symlinks are not followed; a missing part, and
+    /// files that vanish while it is walked, count 0.
+    pub fn usage(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("git", self.git()),
+            ("journal", self.root.join("journal")),
+            ("pending", self.pending()),
+            ("lfs", self.lfs()),
+            ("meta", self.meta()),
+        ]
+        .into_iter()
+        .map(|(part, dir)| (part, apparent_size(&dir)))
+        .collect()
+    }
+}
+
+/// The sum of the lengths of the regular files under `dir`, without
+/// following symlinks. Anything unreadable counts 0.
+fn apparent_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,13 +198,19 @@ fn config_error(e: ConfigError) -> VolumeError {
     VolumeError::History(HistoryError::Config(e))
 }
 
-/// Opens an existing state area for the backing tree at `tree`. Alarms go to
-/// `events` (design §13).
+/// Opens an existing state area for the backing tree at `tree`.
+///
+/// Alarms go to `events`, which the caller has already wrapped with
+/// [`Telemetry::sink`] if telemetry is on; spans, `agentfs.record.duration`,
+/// `agentfs.commit.count` and the `agentfs.journal.backlog` gauge go to
+/// `telemetry` (design §13). Open a volume once per process: each open
+/// registers another backlog gauge.
 pub fn open(
     state: &StateDir,
     tree: &Path,
     context: Context,
     events: Events,
+    telemetry: &Telemetry,
 ) -> Result<(Recorder, Committer, Recovery), VolumeError> {
     let history = History::open(&state.git())?;
     // A bad remote section only stops that remote's pushes (design §11.1).
@@ -201,6 +255,7 @@ pub fn open(
     }
 
     let journal = Arc::new(journal);
+    telemetry.observe_journal(Arc::downgrade(&journal));
     let recovery = Recovery {
         journal: report,
         committed_through,
@@ -215,6 +270,7 @@ pub fn open(
         claims: Arc::new(PathClaims::default()),
         checks: checks.clone(),
         events: events.clone(),
+        telemetry: telemetry.clone(),
     };
     let committer = Committer {
         history,
@@ -224,6 +280,7 @@ pub fn open(
         context,
         checks,
         events,
+        telemetry: telemetry.clone(),
     };
     Ok((recorder, committer, recovery))
 }
@@ -254,6 +311,7 @@ pub struct Recorder {
     claims: Arc<PathClaims>,
     checks: Arc<Checks>,
     events: Events,
+    telemetry: Telemetry,
 }
 
 impl Recorder {
@@ -289,15 +347,39 @@ impl Recorder {
         caller: Caller,
         inputs: Vec<Input>,
     ) -> Result<Recorded, VolumeError> {
+        let start = Instant::now();
+        let span = self.telemetry.span(spans::RECORD, || {
+            vec![
+                KeyValue::new("agentfs.trigger", trigger.as_str()),
+                KeyValue::new("agentfs.inputs", inputs.len() as i64),
+                KeyValue::new("agentfs.caller.uid", i64::from(caller.uid)),
+                KeyValue::new("process.pid", i64::from(caller.pid)),
+            ]
+        });
         let paths: Vec<RepoPath> = inputs.iter().map(|i| i.path().clone()).collect();
         let result = self.record_inner(trigger, caller, inputs);
-        if let Err(e) = &result {
-            self.events.emit(Event::RecordFailed {
-                trigger,
-                paths,
-                error: e.to_string(),
-            });
+        match &result {
+            Ok(recorded) => {
+                if let Some(seq) = recorded.seq {
+                    span.set(KeyValue::new("agentfs.seq", seq as i64));
+                }
+                span.set(KeyValue::new(
+                    "agentfs.skipped",
+                    recorded.skipped.len() as i64,
+                ));
+            }
+            Err(e) => {
+                span.error(e);
+                // Inside the span, so the alarm log carries its trace.
+                self.events.emit(Event::RecordFailed {
+                    trigger,
+                    paths,
+                    error: e.to_string(),
+                });
+            }
         }
+        self.telemetry.record_duration(trigger, start.elapsed());
+        span.end();
         result
     }
 
@@ -447,6 +529,7 @@ pub struct Committer {
     context: Context,
     checks: Arc<Checks>,
     events: Events,
+    telemetry: Telemetry,
 }
 
 /// What one commit pass did.
@@ -466,7 +549,7 @@ impl Committer {
 
     /// Records durable but not yet in history.
     pub fn backlog(&self) -> usize {
-        self.journal.uncommitted().len()
+        self.journal.backlog()
     }
 
     /// Commits every durable record, grouping records whose times fall
@@ -524,12 +607,22 @@ impl Committer {
         let mut report = CommitReport::default();
         let mut result = Ok(());
         for group in groups {
+            let span = self.telemetry.span(spans::COMMIT, || {
+                let seq = |r: Option<&Record>| r.map_or(0, |r| r.seq as i64);
+                vec![
+                    KeyValue::new("agentfs.seq.first", seq(group.first())),
+                    KeyValue::new("agentfs.seq.last", seq(group.last())),
+                    KeyValue::new("agentfs.records", group.len() as i64),
+                ]
+            });
             let checked = match self.recheck(group) {
                 Ok((checked, refused)) => {
                     report.refused += refused;
+                    span.set(KeyValue::new("agentfs.refused", refused as i64));
                     checked
                 }
                 Err(e) => {
+                    span.error(&e);
                     result = Err(e);
                     break;
                 }
@@ -542,12 +635,21 @@ impl Committer {
                     report.records += group.len();
                     report.commits += usize::from(commit.is_some());
                     report.last_seq = Some(last_seq);
+                    match commit {
+                        Some(id) => {
+                            self.telemetry.commit_made();
+                            span.set_with(|| KeyValue::new("agentfs.commit.id", id.to_string()));
+                        }
+                        None => span.set(KeyValue::new("agentfs.commit.empty", true)),
+                    }
                 }
                 Err(e) => {
+                    span.error(&e);
                     result = Err(e.into());
                     break;
                 }
             }
+            span.end();
         }
         if let Some(seq) = report.last_seq {
             self.journal.truncate_through(seq)?;
@@ -684,7 +786,8 @@ mod tests {
     #[test]
     fn record_then_commit() {
         let (dir, state) = setup();
-        let (rec, com, recovery) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, recovery) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         assert_eq!(recovery.committed_through, None);
 
         rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
@@ -704,7 +807,8 @@ mod tests {
     #[test]
     fn content_is_what_it_was_at_the_boundary() {
         let (dir, state) = setup();
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let input = write(dir.path(), "a", "at close");
         rec.record(Trigger::Close, CALLER, vec![input]).unwrap();
         fs::write(dir.path().join("a"), "changed later").unwrap();
@@ -720,7 +824,8 @@ mod tests {
     fn recorded_but_uncommitted_survives_a_crash() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             com.commit_pending().unwrap();
@@ -728,7 +833,8 @@ mod tests {
                 .unwrap();
             // Crash: the second record is durable but never committed.
         }
-        let (rec, com, recovery) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, recovery) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         assert_eq!(recovery.committed_through, Some(0));
         assert_eq!(recovery.uncommitted, 1);
 
@@ -746,7 +852,8 @@ mod tests {
     fn crash_after_commit_before_truncate_does_not_duplicate() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             // Commit without letting the committer truncate: simulates a crash
@@ -756,7 +863,8 @@ mod tests {
                 .commit(&records, &com.pending, &com.identities, &com.context)
                 .unwrap();
         }
-        let (_, com, recovery) = open(&state, dir.path(), context(), null()).unwrap();
+        let (_, com, recovery) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         assert_eq!(recovery.committed_through, Some(0));
         assert_eq!(recovery.uncommitted, 0);
         assert_eq!(recovery.pruned_pending, 1);
@@ -769,7 +877,14 @@ mod tests {
     fn failed_record_leaves_no_frozen_copy() {
         let (dir, state) = setup();
         let sink = Arc::new(MemorySink::new());
-        let (rec, _, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let (rec, _, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
         let err = rec.record(
             Trigger::Close,
             CALLER,
@@ -799,7 +914,14 @@ mod tests {
     fn symlinked_gitmodules_is_refused_not_an_error() {
         let (dir, state) = setup();
         let sink = Arc::new(MemorySink::new());
-        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -840,7 +962,14 @@ mod tests {
     fn refused_path_does_not_stop_the_record() {
         let (dir, state) = setup();
         let sink = Arc::new(MemorySink::new());
-        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
         let attrs = format!("* text\n{}\n", "x".repeat(3000));
         let recorded = rec
             .record(
@@ -905,7 +1034,8 @@ mod tests {
     fn refusing_a_tracked_path_keeps_its_last_content() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
                 CALLER,
@@ -916,7 +1046,14 @@ mod tests {
         }
         set_remote_limit(&state, "r", 2);
         let sink = Arc::new(MemorySink::new());
-        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -947,7 +1084,14 @@ mod tests {
         let (dir, state) = setup();
         set_remote_limit(&state, "r", 5);
         let sink = Arc::new(MemorySink::new());
-        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
         let input = write(dir.path(), "big", "0123456789");
         let Input::Write { backing, .. } = &input else {
             unreachable!()
@@ -985,7 +1129,14 @@ mod tests {
                 .unwrap();
         }
         let sink = Arc::new(MemorySink::new());
-        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let (rec, com, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
         let events = sink.take();
         let names: Vec<&str> = events
             .iter()
@@ -1015,7 +1166,8 @@ mod tests {
     fn commit_time_recheck() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "keep", "1")])
                 .unwrap();
             com.commit_pending().unwrap();
@@ -1032,7 +1184,14 @@ mod tests {
         }
         set_remote_limit(&state, "r", 5);
         let sink = Arc::new(MemorySink::new());
-        let (_, com, recovery) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let (_, com, recovery) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
         assert_eq!(recovery.uncommitted, 1);
         let report = com.commit_pending().unwrap();
         assert_eq!(report.refused, 1);
@@ -1056,7 +1215,8 @@ mod tests {
     fn a_record_with_every_change_refused_at_commit_is_consumed() {
         let (dir, state) = setup();
         {
-            let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, _, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
                 CALLER,
@@ -1065,7 +1225,8 @@ mod tests {
             .unwrap();
         }
         set_remote_limit(&state, "r", 5);
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let report = com.commit_pending().unwrap();
         // With no branch yet, an empty root commit carries the sequence.
         assert_eq!((report.records, report.commits, report.refused), (1, 1, 1));
@@ -1113,7 +1274,8 @@ mod tests {
     fn commit_settled_leaves_the_open_group() {
         let (dir, state) = setup();
         set_window(&state, "200ms");
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let t = 1_700_000_000_000;
         record_at(&rec, dir.path(), "a", t);
         record_at(&rec, dir.path(), "b", t + 50);
@@ -1148,7 +1310,14 @@ mod tests {
     fn refuse_invalid_emits_an_alarm() {
         let (dir, state) = setup();
         let sink = Arc::new(MemorySink::new());
-        let (rec, _, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let (rec, _, _) = open(
+            &state,
+            dir.path(),
+            context(),
+            sink.clone(),
+            &Telemetry::noop(),
+        )
+        .unwrap();
         let err = RepoPath::new("sub/.git/config").unwrap_err();
         rec.refuse_invalid("sub/.git/config", err.clone());
         let events = sink.take();
@@ -1232,7 +1401,8 @@ mod tests {
     fn excluded_untracked_path_is_skipped_without_cost() {
         let (dir, state) = setup();
         exclude(&state, "*.log\n");
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -1261,7 +1431,8 @@ mod tests {
     fn rename_into_an_excluded_path_records_only_the_removal() {
         let (dir, state) = setup();
         exclude(&state, "ignored/\n");
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "src", "1")])
             .unwrap();
         com.commit_pending().unwrap();
@@ -1284,7 +1455,8 @@ mod tests {
     #[test]
     fn removals_need_something_tracked() {
         let (dir, state) = setup();
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let recorded = rec
             .record(Trigger::Unlink, CALLER, vec![remove("never")])
             .unwrap();
@@ -1311,7 +1483,8 @@ mod tests {
     fn uncommitted_records_stay_tracked_across_recovery() {
         let (dir, state) = setup();
         {
-            let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, _, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
                 CALLER,
@@ -1321,7 +1494,8 @@ mod tests {
             // Crash before committing.
         }
         exclude(&state, "*.log\n");
-        let (rec, com, recovery) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, recovery) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         assert_eq!(recovery.uncommitted, 1);
         let recorded = rec
             .record(
@@ -1349,7 +1523,8 @@ mod tests {
     fn committed_paths_stay_tracked_after_an_exclude() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
                 CALLER,
@@ -1359,7 +1534,8 @@ mod tests {
             com.commit_pending().unwrap();
         }
         exclude(&state, "*.log\n");
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -1380,7 +1556,8 @@ mod tests {
         let (dir, state) = setup();
         fs::create_dir_all(dir.path().join("sub/.git")).unwrap();
         {
-            let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, _, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             let recorded = rec
                 .record(
                     Trigger::Close,
@@ -1398,7 +1575,8 @@ mod tests {
             .unwrap()
             .set_str("agentfs.nested", "working-tree")
             .unwrap();
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -1418,7 +1596,8 @@ mod tests {
         use std::time::Duration;
 
         let (dir, state) = setup();
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         // Freezing from a FIFO blocks until it is written and closed, which
         // stands in for a large file whose copy takes a while.
         let fifo = dir.path().join("fifo");
@@ -1552,7 +1731,8 @@ mod tests {
                 .unwrap()
                 .set_str("agentfs.nested", nested)
                 .unwrap();
-            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             for recorded in replay_git_init_bare(&rec, dir.path(), template) {
                 assert_eq!(recorded.seq, None, "{nested}, template {template}");
                 for s in &recorded.skipped {
@@ -1571,7 +1751,8 @@ mod tests {
     fn never_record_skips_writes_but_not_removals_of_tracked_paths() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
                 CALLER,
@@ -1585,7 +1766,8 @@ mod tests {
             "secret -agentfs\n",
         )
         .unwrap();
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -1615,7 +1797,8 @@ mod tests {
     fn symlinks_go_through_the_rules() {
         let (dir, state) = setup();
         exclude(&state, "*.log\n");
-        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Symlink,
@@ -1642,7 +1825,8 @@ mod tests {
         let (dir, state) = setup();
         fs::write(dir.path().join(".gitignore"), "*.tmp\n").unwrap();
         {
-            let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
+            let (rec, _, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             let recorded = rec
                 .record(
                     Trigger::Close,
@@ -1656,7 +1840,7 @@ mod tests {
             .unwrap()
             .set_bool("agentfs.respectTreeRules", true)
             .unwrap();
-        let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let (rec, _, _) = open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -1672,5 +1856,310 @@ mod tests {
                 pattern: "*.tmp".into(),
             }
         );
+    }
+
+    mod telemetry {
+        use opentelemetry::trace::Status;
+
+        use super::*;
+        use crate::telemetry::testing::{Harness, any_str, span_attr};
+        use crate::telemetry::{names, spans};
+
+        /// Opens the volume with `h`'s telemetry, events wrapped as the CLI
+        /// wraps them.
+        fn open_traced(state: &StateDir, dir: &Path, h: &Harness) -> (Recorder, Committer) {
+            let events = h.telemetry.sink(null());
+            let (rec, com, _) = open(state, dir, context(), events, &h.telemetry).unwrap();
+            (rec, com)
+        }
+
+        #[test]
+        fn record_duration_and_span() {
+            let (dir, state) = setup();
+            let h = Harness::new();
+            let (rec, _com) = open_traced(&state, dir.path(), &h);
+            let seq = rec
+                .record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+                .unwrap()
+                .seq
+                .unwrap();
+            let skipped = rec
+                .record(Trigger::Unlink, CALLER, vec![remove("never-tracked")])
+                .unwrap();
+            assert_eq!(skipped.seq, None);
+
+            for trigger in ["close", "unlink"] {
+                assert_eq!(
+                    h.histogram_count(names::RECORD_DURATION, &[("trigger", trigger)]),
+                    Some(1),
+                    "{trigger}"
+                );
+            }
+            let records = h.spans(spans::RECORD);
+            assert_eq!(records.len(), 2);
+            assert_eq!(
+                span_attr(&records[0], "agentfs.trigger").as_deref(),
+                Some("close")
+            );
+            assert_eq!(span_attr(&records[0], "agentfs.seq"), Some(seq.to_string()));
+            assert_eq!(
+                span_attr(&records[0], "agentfs.inputs").as_deref(),
+                Some("1")
+            );
+            assert_eq!(
+                span_attr(&records[0], "agentfs.caller.uid").as_deref(),
+                Some("10000")
+            );
+            assert_eq!(
+                span_attr(&records[0], "agentfs.skipped").as_deref(),
+                Some("0")
+            );
+            assert_eq!(records[0].status, Status::Unset);
+            assert_eq!(span_attr(&records[1], "agentfs.seq"), None);
+            assert_eq!(
+                span_attr(&records[1], "agentfs.skipped").as_deref(),
+                Some("1")
+            );
+        }
+
+        #[test]
+        fn journal_backlog_gauge() {
+            let (dir, state) = setup();
+            {
+                let h = Harness::new();
+                let (rec, com) = open_traced(&state, dir.path(), &h);
+                for name in ["a", "b"] {
+                    rec.record(Trigger::Close, CALLER, vec![write(dir.path(), name, "1")])
+                        .unwrap();
+                }
+                assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(2));
+                com.commit_pending().unwrap();
+                assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(0));
+                rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "c", "1")])
+                    .unwrap();
+                // Crash before committing.
+            }
+            let h = Harness::new();
+            let (rec, com) = open_traced(&state, dir.path(), &h);
+            assert_eq!(
+                h.gauge_u64(names::JOURNAL_BACKLOG, &[]),
+                Some(1),
+                "the recovered record"
+            );
+            drop((rec, com));
+            assert_eq!(
+                h.gauge_u64(names::JOURNAL_BACKLOG, &[]),
+                None,
+                "a closed volume reports nothing"
+            );
+        }
+
+        #[test]
+        fn commit_count_and_span() {
+            let (dir, state) = setup();
+            set_window(&state, "1h");
+            let h = Harness::new();
+            let (rec, com) = open_traced(&state, dir.path(), &h);
+            let seqs: Vec<u64> = ["a", "b"]
+                .into_iter()
+                .map(|name| {
+                    rec.record(Trigger::Close, CALLER, vec![write(dir.path(), name, "1")])
+                        .unwrap()
+                        .seq
+                        .unwrap()
+                })
+                .collect();
+            let report = com.commit_pending().unwrap();
+            assert_eq!(report.commits, 1);
+            assert_eq!(h.sum(names::COMMIT_COUNT, &[]), Some(1));
+            let commits = h.spans(spans::COMMIT);
+            assert_eq!(commits.len(), 1);
+            let head = com.history().head().unwrap().unwrap().id();
+            assert_eq!(
+                span_attr(&commits[0], "agentfs.seq.first"),
+                Some(seqs[0].to_string())
+            );
+            assert_eq!(
+                span_attr(&commits[0], "agentfs.seq.last"),
+                Some(seqs[1].to_string())
+            );
+            assert_eq!(
+                span_attr(&commits[0], "agentfs.records").as_deref(),
+                Some("2")
+            );
+            assert_eq!(
+                span_attr(&commits[0], "agentfs.refused").as_deref(),
+                Some("0")
+            );
+            assert_eq!(
+                span_attr(&commits[0], "agentfs.commit.id"),
+                Some(head.to_string())
+            );
+            assert_eq!(span_attr(&commits[0], "agentfs.commit.empty"), None);
+
+            // The same content again leaves the tree unchanged: no commit.
+            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+                .unwrap();
+            let report = com.commit_pending().unwrap();
+            assert_eq!((report.records, report.commits), (1, 0));
+            assert_eq!(h.sum(names::COMMIT_COUNT, &[]), Some(1));
+            let commits = h.spans(spans::COMMIT);
+            assert_eq!(commits.len(), 2);
+            assert_eq!(
+                span_attr(&commits[1], "agentfs.commit.empty").as_deref(),
+                Some("true")
+            );
+            assert_eq!(span_attr(&commits[1], "agentfs.commit.id"), None);
+        }
+
+        #[test]
+        fn failed_record_counts_and_errors_span() {
+            let (dir, state) = setup();
+            let h = Harness::new();
+            let memory = Arc::new(MemorySink::new());
+            let (rec, _, _) = open(
+                &state,
+                dir.path(),
+                context(),
+                h.telemetry.sink(memory.clone()),
+                &h.telemetry,
+            )
+            .unwrap();
+            let missing = Input::Write {
+                path: RepoPath::new("b").unwrap(),
+                backing: dir.path().join("missing"),
+                executable: false,
+            };
+            rec.record(Trigger::Close, CALLER, vec![missing])
+                .unwrap_err();
+            assert!(matches!(&memory.take()[..], [Event::RecordFailed { .. }]));
+            assert_eq!(
+                h.sum(names::RECORD_FAILURES, &[("trigger", "close")]),
+                Some(1)
+            );
+            assert_eq!(
+                h.histogram_count(names::RECORD_DURATION, &[("trigger", "close")]),
+                Some(1),
+                "failed records are timed too"
+            );
+            let records = h.spans(spans::RECORD);
+            assert_eq!(records.len(), 1);
+            assert!(
+                matches!(&records[0].status, Status::Error { description } if !description.is_empty()),
+                "{:?}",
+                records[0].status
+            );
+            let logs = h.logs();
+            let failed = logs
+                .iter()
+                .find(|r| r.event_name() == Some("agentfs.record_failed"))
+                .expect("a record_failed log");
+            let trace = failed.trace_context().expect("trace context");
+            assert_eq!(trace.trace_id, records[0].span_context.trace_id());
+            assert_eq!(trace.span_id, records[0].span_context.span_id());
+            assert!(
+                failed
+                    .body()
+                    .map(any_str)
+                    .is_some_and(|b| b.starts_with("record failed (close) for b")),
+                "{:?}",
+                failed.body()
+            );
+        }
+
+        #[test]
+        fn precheck_rejections_by_stage() {
+            let (dir, state) = setup();
+            {
+                let h = Harness::new();
+                let (rec, com) = open_traced(&state, dir.path(), &h);
+                rec.record(
+                    Trigger::Symlink,
+                    CALLER,
+                    vec![Input::Symlink {
+                        path: RepoPath::new(".gitmodules").unwrap(),
+                        target: "elsewhere".into(),
+                    }],
+                )
+                .unwrap();
+                assert_eq!(
+                    h.sum(
+                        names::PRECHECK_REJECTED_PATHS,
+                        &[("stage", "record"), ("reason", "symlinked_special_file")]
+                    ),
+                    Some(1)
+                );
+                rec.record(
+                    Trigger::Close,
+                    CALLER,
+                    vec![write(dir.path(), "big", "0123456789")],
+                )
+                .unwrap();
+                drop(com);
+                // Not committed; the remount brings a stricter remote.
+            }
+            set_remote_limit(&state, "r", 5);
+            let h = Harness::new();
+            let (_, com) = open_traced(&state, dir.path(), &h);
+            assert_eq!(com.commit_pending().unwrap().refused, 1);
+            assert_eq!(
+                h.sum(
+                    names::PRECHECK_REJECTED_PATHS,
+                    &[("stage", "commit"), ("reason", "blob_too_large")]
+                ),
+                Some(1)
+            );
+            let commits = h.spans(spans::COMMIT);
+            assert_eq!(
+                span_attr(&commits[0], "agentfs.refused").as_deref(),
+                Some("1")
+            );
+            let logs = h.logs();
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].event_name(), Some("agentfs.path_refused"));
+            assert_eq!(
+                logs[0].trace_context().map(|t| t.span_id),
+                Some(commits[0].span_context.span_id()),
+                "raised inside the commit span"
+            );
+        }
+
+        #[test]
+        fn state_usage_by_part() {
+            let (dir, state) = setup();
+            let h = Harness::new();
+            let (rec, com) = open_traced(&state, dir.path(), &h);
+            let settings = com.history().settings().clone();
+            h.telemetry.observe_volume(&state, &settings);
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "a", "12345")],
+            )
+            .unwrap();
+            let usage: std::collections::HashMap<_, _> = state.usage().into_iter().collect();
+            assert_eq!(usage.len(), 5);
+            assert_eq!(usage["pending"], 5);
+            assert!(usage["journal"] > 0, "{usage:?}");
+            assert!(usage["git"] > 0, "{usage:?}");
+            assert_eq!(usage["lfs"], 0, "no lfs directory yet");
+            assert_eq!(
+                h.gauge_u64(names::STATE_BYTES, &[("part", "pending")]),
+                Some(5)
+            );
+            assert_eq!(h.gauge_u64(names::STATE_BYTES, &[("part", "lfs")]), Some(0));
+
+            com.commit_pending().unwrap();
+            let usage: std::collections::HashMap<_, _> = state.usage().into_iter().collect();
+            assert_eq!(usage["pending"], 0);
+            assert_eq!(
+                h.gauge_u64(names::STATE_BYTES, &[("part", "pending")]),
+                Some(0)
+            );
+            // Symlinks are not followed.
+            std::os::unix::fs::symlink(dir.path(), state.meta().join("loop")).unwrap();
+            let before = state.usage();
+            assert_eq!(state.usage(), before);
+        }
     }
 }

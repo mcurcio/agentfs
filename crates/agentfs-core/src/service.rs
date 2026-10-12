@@ -226,6 +226,7 @@ mod tests {
     use crate::paths::RepoPath;
     use crate::push;
     use crate::record::{Caller, Trigger};
+    use crate::telemetry::Telemetry;
     use crate::volume::{self, Input, Recorder, StateDir};
 
     const CALLER: Caller = Caller {
@@ -251,6 +252,15 @@ mod tests {
         state: &StateDir,
         events: Events,
     ) -> (Recorder, Committer, Vec<RemotePusher>) {
+        open_with(dir, state, events, &Telemetry::noop())
+    }
+
+    fn open_with(
+        dir: &Path,
+        state: &StateDir,
+        events: Events,
+        telemetry: &Telemetry,
+    ) -> (Recorder, Committer, Vec<RemotePusher>) {
         let context = Context {
             volume: "vol".into(),
             replica: "r".into(),
@@ -258,9 +268,9 @@ mod tests {
             ..Context::default()
         };
         let (rec, com, _) =
-            volume::open(state, &dir.join("tree"), context, events.clone()).unwrap();
+            volume::open(state, &dir.join("tree"), context, events.clone(), telemetry).unwrap();
         let settings = com.history().settings().clone();
-        let pushers = push::open_all(state, &settings, events).unwrap();
+        let pushers = push::open_all(state, &settings, events, telemetry).unwrap();
         (rec, com, pushers)
     }
 
@@ -365,6 +375,48 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, Event::PushSucceeded { remote, .. } if remote == "good"))
+        );
+    }
+
+    /// The service's loops emit telemetry from their own threads.
+    #[test]
+    fn background_loops_report_telemetry() {
+        use crate::telemetry::testing::{Harness, span_attr};
+        use crate::telemetry::{names, spans};
+
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let (dir, state) = setup(&[
+            ("agentfs.commitWindow", "1h"),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.origin.url", &remote.path().display().to_string()),
+        ]);
+        let h = Harness::new();
+        let events = h.telemetry.sink(Arc::new(NullSink));
+        let (rec, com, pushers) = open_with(dir.path(), &state, events.clone(), &h.telemetry);
+        let settings = com.history().settings().clone();
+        h.telemetry.observe_volume(&state, &settings);
+        let service = Service::start(com, pushers, events).unwrap();
+        record(&rec, dir.path(), "a");
+        assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(1));
+        let report = service.shutdown(Duration::from_secs(5));
+        report.final_commit.unwrap();
+
+        assert_eq!(h.sum(names::COMMIT_COUNT, &[]), Some(1));
+        assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(0));
+        let head = local_head(&state).unwrap();
+        let commits = h.spans(spans::COMMIT);
+        assert_eq!(
+            span_attr(commits.last().unwrap(), "agentfs.commit.id"),
+            Some(head.to_string())
+        );
+        // The push loop's first attempt ran before anything was committed.
+        let pushes = h.spans(spans::PUSH);
+        assert!(!pushes.is_empty());
+        assert!(
+            pushes
+                .iter()
+                .all(|s| span_attr(s, "agentfs.remote").as_deref() == Some("origin"))
         );
     }
 

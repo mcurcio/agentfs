@@ -42,12 +42,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use git2::{Cred, CredentialType, ErrorClass, ErrorCode, Oid, PushOptions, RemoteCallbacks};
 use git2::{Error as GitError, Repository};
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{RemoteSettings, Settings};
 use crate::credentials::CredentialFile;
 use crate::events::{Event, Events, PushFailureKind};
 use crate::history::init_libgit2;
+use crate::telemetry::{Telemetry, spans};
 use crate::volume::StateDir;
 
 /// The longest delay between retries of a failing remote, unless
@@ -176,6 +178,18 @@ impl PushOutcome {
             Self::NothingToPush | Self::UpToDate { .. } | Self::Pushed { .. }
         )
     }
+
+    /// A stable label for spans (`agentfs.push.outcome`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NothingToPush => "nothing_to_push",
+            Self::UpToDate { .. } => "up_to_date",
+            Self::Pushed { .. } => "pushed",
+            Self::Diverged { .. } => "diverged",
+            Self::Failed { .. } => "failed",
+            Self::Busy => "busy",
+        }
+    }
 }
 
 /// What libgit2 reported for one push call.
@@ -203,15 +217,20 @@ pub struct RemotePusher {
     remote: RemoteSettings,
     credentials: Option<CredentialFile>,
     events: Events,
+    telemetry: Telemetry,
     state: PushState,
 }
 
 impl RemotePusher {
+    /// A pusher for `remote`. Alarms go to `events`, which the caller has
+    /// already wrapped with [`Telemetry::sink`] if telemetry is on; spans go
+    /// to `telemetry` (design §13).
     pub fn open(
         state: &StateDir,
         settings: &Settings,
         remote: &RemoteSettings,
         events: Events,
+        telemetry: &Telemetry,
     ) -> Result<Self, PushError> {
         init_libgit2();
         let repo = Repository::open_bare(state.git())?;
@@ -231,6 +250,7 @@ impl RemotePusher {
                 .map(|path| CredentialFile::new(path, remote.push_url())),
             remote: remote.clone(),
             events,
+            telemetry: telemetry.clone(),
         })
     }
 
@@ -256,11 +276,53 @@ impl RemotePusher {
     /// the branch does not exist yet.
     pub fn unpushed(&self) -> Result<Option<usize>, GitError> {
         unpushed(&self.repo, &self.branch_ref, self.state.last_pushed_oid())
+            .map(|w| w.map(|w| w.count))
     }
 
     /// One push attempt. Never fails: every problem becomes an outcome and,
     /// except for [`PushOutcome::Busy`], an event.
+    ///
+    /// Runs in an `agentfs.push` span carrying the remote, the last pushed
+    /// commit, the head, the outcome and, on failure, the reason (design
+    /// §13).
     pub fn push_once(&mut self) -> PushOutcome {
+        let span = self.telemetry.span(spans::PUSH, || {
+            let mut attrs = vec![KeyValue::new("agentfs.remote", self.remote.name.clone())];
+            if let Some(last) = PushState::load(&self.state_path).last_pushed {
+                attrs.push(KeyValue::new("agentfs.push.previous", last));
+            }
+            attrs
+        });
+        let mut head = None;
+        let outcome = self.push_once_inner(&mut head);
+        span.set(KeyValue::new("agentfs.push.outcome", outcome.label()));
+        if let Some(head) = head {
+            span.set_with(|| KeyValue::new("agentfs.push.head", head.to_string()));
+        }
+        match &outcome {
+            PushOutcome::Failed { kind, message, .. } => {
+                span.set(KeyValue::new("agentfs.push.reason", kind.as_str()));
+                span.error(message);
+            }
+            PushOutcome::Diverged { diverged_ref, .. } => {
+                span.set(KeyValue::new(
+                    "agentfs.push.reason",
+                    PushFailureKind::NonFastForward.as_str(),
+                ));
+                if let Some(saved) = diverged_ref {
+                    span.set(KeyValue::new("agentfs.push.diverged_ref", saved.clone()));
+                }
+                span.error("the remote branch has diverged");
+            }
+            _ => {}
+        }
+        span.end();
+        outcome
+    }
+
+    /// [`RemotePusher::push_once`], setting `head_out` to the branch head
+    /// once it is known.
+    fn push_once_inner(&mut self, head_out: &mut Option<Oid>) -> PushOutcome {
         let _lock = match self.lock() {
             Ok(Some(lock)) => lock,
             Ok(None) => return PushOutcome::Busy,
@@ -278,6 +340,7 @@ impl RemotePusher {
             Err(e) if e.code() == ErrorCode::NotFound => return PushOutcome::NothingToPush,
             Err(e) => return self.failed(PushFailureKind::Local, e.to_string(), None),
         };
+        *head_out = Some(head);
         let refspecs = match self.refspecs(head) {
             Ok(refspecs) => refspecs,
             Err(e) => return self.failed(PushFailureKind::Local, e.to_string(), Some(head)),
@@ -602,16 +665,17 @@ impl RemotePusher {
     }
 }
 
-/// A pusher for every configured remote.
+/// A pusher for every configured remote (see [`RemotePusher::open`]).
 pub fn open_all(
     state: &StateDir,
     settings: &Settings,
     events: Events,
+    telemetry: &Telemetry,
 ) -> Result<Vec<RemotePusher>, PushError> {
     settings
         .remotes
         .iter()
-        .map(|remote| RemotePusher::open(state, settings, remote, events.clone()))
+        .map(|remote| RemotePusher::open(state, settings, remote, events.clone(), telemetry))
         .collect()
 }
 
@@ -634,7 +698,8 @@ pub fn status(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteStatus>
         .iter()
         .map(|remote| {
             let push_state = PushState::load(&state.push_state(&remote.name));
-            let unpushed = unpushed(&repo, &settings.branch_ref, push_state.last_pushed_oid())?;
+            let unpushed = unpushed(&repo, &settings.branch_ref, push_state.last_pushed_oid())?
+                .map(|w| w.count);
             Ok(RemoteStatus {
                 name: remote.name.clone(),
                 url: redact_url(remote.push_url()),
@@ -645,11 +710,60 @@ pub fn status(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteStatus>
         .collect()
 }
 
+/// One remote's push backlog, as the telemetry gauges report it (design
+/// §13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBacklog {
+    pub remote: String,
+    /// Commits on the branch the remote is not known to have; 0 if the
+    /// branch does not exist yet.
+    pub unpushed: usize,
+    /// The committer time (Unix seconds) of the oldest unpushed commit.
+    pub oldest_unpushed_s: Option<i64>,
+    /// The remote branch has diverged and is not resolved (design §11.3).
+    pub diverged: bool,
+}
+
+/// Every remote's backlog, read from its push state and the branch without
+/// taking the push locks. Opens its own repository handle, so it can run on
+/// any thread.
+pub fn backlog(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteBacklog>, PushError> {
+    init_libgit2();
+    let repo = Repository::open_bare(state.git())?;
+    settings
+        .remotes
+        .iter()
+        .map(|remote| {
+            let push_state = PushState::load(&state.push_state(&remote.name));
+            let walk = unpushed(&repo, &settings.branch_ref, push_state.last_pushed_oid())?;
+            let oldest = match walk.and_then(|w| w.oldest) {
+                Some(oid) => Some(repo.find_commit(oid)?.committer().when().seconds()),
+                None => None,
+            };
+            Ok(RemoteBacklog {
+                remote: remote.name.clone(),
+                unpushed: walk.map_or(0, |w| w.count),
+                oldest_unpushed_s: oldest,
+                diverged: push_state.diverged.is_some(),
+            })
+        })
+        .collect()
+}
+
+/// What [`unpushed`] walked.
+#[derive(Debug, Clone, Copy)]
+struct Unpushed {
+    count: usize,
+    /// The last commit walked: the oldest unpushed one, since the history
+    /// branch is linear.
+    oldest: Option<Oid>,
+}
+
 fn unpushed(
     repo: &Repository,
     branch_ref: &str,
     last_pushed: Option<Oid>,
-) -> Result<Option<usize>, GitError> {
+) -> Result<Option<Unpushed>, GitError> {
     let head = match repo.refname_to_id(branch_ref) {
         Ok(head) => head,
         Err(e) if e.code() == ErrorCode::NotFound => return Ok(None),
@@ -663,11 +777,12 @@ fn unpushed(
         walk.hide(last)?;
     }
     let mut count = 0;
+    let mut oldest = None;
     for oid in walk {
-        oid?;
+        oldest = Some(oid?);
         count += 1;
     }
-    Ok(Some(count))
+    Ok(Some(Unpushed { count, oldest }))
 }
 
 /// The userinfo (`user:pass`) of a `scheme://user:pass@host/…` URL.
@@ -815,6 +930,7 @@ mod tests {
                 &dir.path().join("tree"),
                 context,
                 Arc::new(NullSink),
+                &Telemetry::noop(),
             )
             .unwrap();
             let settings = com.history().settings().clone();
@@ -853,13 +969,17 @@ mod tests {
         }
 
         fn pusher(&self, remote: &str, events: Events) -> RemotePusher {
+            self.pusher_with(remote, events, &Telemetry::noop())
+        }
+
+        fn pusher_with(&self, remote: &str, events: Events, telemetry: &Telemetry) -> RemotePusher {
             let r = self
                 .settings
                 .remotes
                 .iter()
                 .find(|r| r.name == remote)
                 .unwrap();
-            RemotePusher::open(&self.state, &self.settings, r, events).unwrap()
+            RemotePusher::open(&self.state, &self.settings, r, events, telemetry).unwrap()
         }
     }
 
@@ -1503,7 +1623,14 @@ mod tests {
         );
         v.commit();
         v.commit();
-        for mut pusher in open_all(&v.state, &v.settings, Arc::new(NullSink)).unwrap() {
+        for mut pusher in open_all(
+            &v.state,
+            &v.settings,
+            Arc::new(NullSink),
+            &Telemetry::noop(),
+        )
+        .unwrap()
+        {
             pusher.push_once();
         }
         v.commit();
@@ -1579,5 +1706,246 @@ mod tests {
                 .credential(url, None, CredentialType::SSH_KEY, &calls)
                 .is_err()
         );
+    }
+
+    mod telemetry {
+        use opentelemetry::trace::Status;
+
+        use super::*;
+        use crate::telemetry::testing::{Harness, span_attr};
+        use crate::telemetry::{names, spans};
+
+        fn origin() -> &'static [(&'static str, &'static str)] {
+            &[("remote", "origin")]
+        }
+
+        #[test]
+        fn push_span_and_backlog_gauges() {
+            let remote_dir = tempfile::tempdir().unwrap();
+            bare(remote_dir.path());
+            let mut v = Vol::new(
+                "vol",
+                &[("origin", &remote_dir.path().display().to_string())],
+            );
+            let h = Harness::new();
+            h.telemetry.observe_volume(&v.state, &v.settings);
+            v.commit();
+            let head = v.commit();
+            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(2));
+            let age = h
+                .gauge_f64(names::PUSH_OLDEST_UNPUSHED_AGE, origin())
+                .unwrap();
+            assert!((0.0..60.0).contains(&age), "{age}");
+            assert_eq!(h.gauge_u64(names::PUSH_DIVERGED, origin()), Some(0));
+
+            let mut pusher =
+                v.pusher_with("origin", h.telemetry.sink(Arc::new(NullSink)), &h.telemetry);
+            assert!(pusher.push_once().is_success());
+            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(0));
+            assert_eq!(
+                h.gauge_f64(names::PUSH_OLDEST_UNPUSHED_AGE, origin()),
+                Some(0.0)
+            );
+            assert_eq!(h.gauge_u64(names::PUSH_DIVERGED, origin()), Some(0));
+            assert_eq!(
+                h.sum(
+                    names::PUSH_FAILURES,
+                    &[("remote", "origin"), ("reason", "auth")]
+                ),
+                None
+            );
+
+            let pushes = h.spans(spans::PUSH);
+            assert_eq!(pushes.len(), 1);
+            let span = &pushes[0];
+            assert_eq!(span_attr(span, "agentfs.remote").as_deref(), Some("origin"));
+            assert_eq!(
+                span_attr(span, "agentfs.push.outcome").as_deref(),
+                Some("pushed")
+            );
+            assert_eq!(span_attr(span, "agentfs.push.head"), Some(head.to_string()));
+            assert_eq!(span_attr(span, "agentfs.push.previous"), None);
+            assert_eq!(span_attr(span, "agentfs.push.reason"), None);
+            assert_eq!(span.status, Status::Unset);
+
+            assert!(pusher.push_once().is_success());
+            let pushes = h.spans(spans::PUSH);
+            assert_eq!(
+                span_attr(&pushes[1], "agentfs.push.outcome").as_deref(),
+                Some("up_to_date")
+            );
+            assert_eq!(
+                span_attr(&pushes[1], "agentfs.push.previous"),
+                Some(head.to_string())
+            );
+        }
+
+        #[test]
+        fn push_failures_by_reason() {
+            let missing = tempfile::tempdir().unwrap().path().join("nope");
+            let mut v = Vol::new("vol", &[("gone", &missing.display().to_string())]);
+            v.commit();
+            let h = Harness::new();
+            let mut pusher =
+                v.pusher_with("gone", h.telemetry.sink(Arc::new(NullSink)), &h.telemetry);
+            for _ in 0..2 {
+                assert!(!pusher.push_once().is_success());
+            }
+            assert_eq!(
+                h.sum(
+                    names::PUSH_FAILURES,
+                    &[("remote", "gone"), ("reason", "unreachable")]
+                ),
+                Some(2)
+            );
+            let pushes = h.spans(spans::PUSH);
+            assert_eq!(pushes.len(), 2);
+            for span in &pushes {
+                assert!(
+                    matches!(span.status, Status::Error { .. }),
+                    "{:?}",
+                    span.status
+                );
+                assert_eq!(
+                    span_attr(span, "agentfs.push.reason").as_deref(),
+                    Some("unreachable")
+                );
+                assert_eq!(
+                    span_attr(span, "agentfs.push.outcome").as_deref(),
+                    Some("failed")
+                );
+            }
+            let logs: Vec<_> = h
+                .logs()
+                .into_iter()
+                .filter(|r| r.event_name() == Some("agentfs.push_failed"))
+                .collect();
+            assert_eq!(logs.len(), 2);
+            for (log, span) in logs.iter().zip(&pushes) {
+                let trace = log.trace_context().expect("trace context");
+                assert_eq!(trace.trace_id, span.span_context.trace_id());
+                assert_eq!(trace.span_id, span.span_context.span_id());
+            }
+        }
+
+        #[test]
+        fn diverged_gauge() {
+            let remote_dir = tempfile::tempdir().unwrap();
+            let remote = remote_dir.path();
+            bare(remote);
+            let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+            let h = Harness::new();
+            h.telemetry.observe_volume(&v.state, &v.settings);
+            let pushed = v.commit();
+            let mut pusher =
+                v.pusher_with("origin", h.telemetry.sink(Arc::new(NullSink)), &h.telemetry);
+            assert!(pusher.push_once().is_success());
+
+            write_remote(remote, "refs/heads/agentfs/vol");
+            let ours = v.commit();
+            let outcome = pusher.push_once();
+            let PushOutcome::Diverged {
+                diverged_ref: Some(saved_as),
+                ..
+            } = &outcome
+            else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(h.gauge_u64(names::PUSH_DIVERGED, origin()), Some(1));
+            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(1));
+            assert_eq!(
+                h.sum(
+                    names::PUSH_FAILURES,
+                    &[("remote", "origin"), ("reason", "non_fast_forward")]
+                ),
+                Some(1)
+            );
+            let pushes = h.spans(spans::PUSH);
+            let span = pushes.last().unwrap();
+            assert_eq!(
+                span_attr(span, "agentfs.push.outcome").as_deref(),
+                Some("diverged")
+            );
+            assert_eq!(
+                span_attr(span, "agentfs.push.diverged_ref").as_ref(),
+                Some(saved_as)
+            );
+            assert_eq!(span_attr(span, "agentfs.push.head"), Some(ours.to_string()));
+            assert!(matches!(span.status, Status::Error { .. }));
+            assert!(
+                h.logs()
+                    .iter()
+                    .any(|r| r.event_name() == Some("agentfs.diverged")),
+                "the divergence is logged"
+            );
+
+            // The operator resets the remote branch to an ancestor.
+            Repository::open_bare(remote)
+                .unwrap()
+                .reference("refs/heads/agentfs/vol", pushed, true, "operator reset")
+                .unwrap();
+            assert!(pusher.push_once().is_success());
+            assert_eq!(h.gauge_u64(names::PUSH_DIVERGED, origin()), Some(0));
+            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(0));
+        }
+
+        #[test]
+        fn backlog_and_misconfigured() {
+            let v = Vol::new("vol", &[("origin", "/nowhere")]);
+            assert_eq!(
+                backlog(&v.state, &v.settings).unwrap(),
+                [RemoteBacklog {
+                    remote: "origin".into(),
+                    unpushed: 0,
+                    oldest_unpushed_s: None,
+                    diverged: false,
+                }]
+            );
+
+            let mut config = git2::Config::open(&v.state.git().join("config")).unwrap();
+            config
+                .set_str("remote.team/backup.url", "/nowhere")
+                .unwrap();
+            let settings = crate::history::History::open(&v.state.git())
+                .unwrap()
+                .settings()
+                .clone();
+            assert_eq!(settings.invalid_remotes.len(), 1);
+            let h = Harness::new();
+            h.telemetry.observe_volume(&v.state, &settings);
+            assert_eq!(
+                h.gauge_u64(names::REMOTE_MISCONFIGURED, &[("remote", "team/backup")]),
+                Some(1)
+            );
+            assert_eq!(
+                h.gauge_u64(names::REMOTE_MISCONFIGURED, origin()),
+                None,
+                "valid remotes are not reported"
+            );
+            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(0));
+        }
+
+        #[test]
+        fn backlog_reports_the_oldest_unpushed_commit() {
+            let remote_dir = tempfile::tempdir().unwrap();
+            bare(remote_dir.path());
+            let mut v = Vol::new(
+                "vol",
+                &[("origin", &remote_dir.path().display().to_string())],
+            );
+            let first = v.commit();
+            let mut pusher = v.pusher("origin", Arc::new(NullSink));
+            assert!(pusher.push_once().is_success());
+            let second = v.commit();
+            v.commit();
+            let backlog = backlog(&v.state, &v.settings).unwrap();
+            assert_eq!(backlog[0].unpushed, 2);
+            let repo = v.com.history().repo();
+            let time = |oid| repo.find_commit(oid).unwrap().committer().when().seconds();
+            assert_eq!(backlog[0].oldest_unpushed_s, Some(time(second)));
+            assert!(time(first) <= time(second));
+            // `status` still reports the count.
+            assert_eq!(status(&v.state, &v.settings).unwrap()[0].unpushed, Some(2));
+        }
     }
 }

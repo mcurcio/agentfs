@@ -309,6 +309,7 @@ fn run_commits_journaled_records_and_stops_on_sigint() {
                 ..Default::default()
             },
             std::sync::Arc::new(agentfs_core::events::NullSink),
+            &agentfs_core::telemetry::Telemetry::noop(),
         )
         .unwrap();
         rec.record(

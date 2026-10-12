@@ -173,6 +173,17 @@ impl Journal {
         written
     }
 
+    /// How many durable records are not yet committed to history, without
+    /// copying them. Cheap enough for a metric callback (design §13); a
+    /// poisoned lock still reports, since the count is only read.
+    pub fn backlog(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .uncommitted
+            .len()
+    }
+
     /// Durable records not yet committed to history, in sequence order.
     pub fn uncommitted(&self) -> Vec<Record> {
         self.lock().uncommitted.clone()
@@ -470,5 +481,19 @@ mod tests {
             j.uncommitted().iter().map(|r| r.seq).collect::<Vec<_>>(),
             [seq]
         );
+    }
+
+    #[test]
+    fn backlog_counts_uncommitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (j, _) = Journal::open(dir.path().join("journal"), 0, no_hook()).unwrap();
+        assert_eq!(j.backlog(), 0);
+        for path in ["a", "b", "c"] {
+            j.record(draft(path)).unwrap();
+        }
+        assert_eq!(j.backlog(), 3);
+        j.truncate_through(1).unwrap();
+        assert_eq!(j.backlog(), 1);
+        assert_eq!(j.backlog(), j.uncommitted().len());
     }
 }
