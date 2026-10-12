@@ -25,3 +25,7 @@ pub mod params;
 pub mod records;
 
 pub use error::Error;
+pub mod controller;
+pub mod identity;
+pub mod server;
+pub mod volume;
