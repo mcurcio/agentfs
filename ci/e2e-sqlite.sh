@@ -158,10 +158,11 @@ pass "the DELETE database: captures spaced, at most $MAX for $TXS transactions"
 
 step "restore the DELETE database live, through the mount"
 sudo python3 "$CHECK" "$STATE/git" "$BRANCH" delete/app.db --rows "$ROWS" --min 0 >"$W/live-versions"
-# An older version, with its -journal if one was captured.
+# An older version with rows (the first may predate the table), with
+# its -journal if one was captured.
 read -r OLD_D OLD_D_ROWS OLD_D_MEMBERS < <(
   { grep -- '-journal)' "$W/live-versions" || true; cat "$W/live-versions"; } |
-    awk -v want="$WANT_DELETE" '$2 < want' | head -n 1
+    awk -v want="$WANT_DELETE" '$2 > 0 && $2 < want' | head -n 1
 ) || true
 [ -n "$OLD_D" ] || fail "no older version of delete/app.db: $(cat "$W/live-versions")"
 # No --root: the running mount serves it over its control socket.
