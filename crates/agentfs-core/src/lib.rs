@@ -24,6 +24,7 @@ pub mod identity;
 pub mod journal;
 pub mod known_hosts;
 pub mod lfs;
+pub mod local_socket;
 pub mod lock;
 pub mod nested;
 pub mod operations;

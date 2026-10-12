@@ -36,6 +36,7 @@ dependencies = [
  "gix-attributes",
  "gix-ignore",
  "gix-parallel",
+ "libc",
  "libgit2-sys",
  "opentelemetry",
  "opentelemetry_sdk",

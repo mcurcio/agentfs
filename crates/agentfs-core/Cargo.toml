@@ -21,7 +21,10 @@ gix-parallel = { version = "0.50.0", features = ["parallel"] }
 libgit2-sys = { version = "0.18.8", default-features = false }
 # The API only: the binary picks the SDK and exporters (design §13).
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
-rustix = { version = "1.1.5", features = ["fs"] }
+# SO_PEERCRED and recv(MSG_PEEK) on local sockets (design §14, §15):
+# bindings only, no C build.
+libc = "0.2.190"
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # SHA-1 for the HMAC-SHA1 of hashed known_hosts entries; pure Rust, no

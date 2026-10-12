@@ -21,18 +21,17 @@
 //! One restore or revert runs at a time; a second gets `busy`.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rustix::fs::{AtFlags, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
+use agentfs_core::local_socket;
 use agentfs_core::volume::CONTROL_SOCKET;
 
 /// The protocol version this build speaks.
@@ -94,34 +93,14 @@ pub enum Reply {
     Error(String),
 }
 
-/// Who is on the other end of a connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Peer {
-    pub uid: u32,
-    pub gid: u32,
-    /// 0 when unknown (the peer is outside the daemon's pid namespace).
-    pub pid: u32,
-}
-
-/// Whether a peer with `uid` may use a daemon running as `daemon_euid`.
-pub fn allowed(uid: u32, daemon_euid: u32) -> bool {
-    uid == 0 || uid == daemon_euid
-}
+pub use agentfs_core::local_socket::{Peer, allowed};
 
 /// Serves one request.
 pub type Handler = Arc<dyn Fn(Request, Peer) -> Reply + Send + Sync>;
 
 /// `/proc/self/fd/<dir>/agentfs.sock`.
 fn socket_address(dir: &OwnedFd) -> String {
-    format!("/proc/self/fd/{}/{CONTROL_SOCKET}", dir.as_raw_fd())
-}
-
-fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
-    Ok(rustix::fs::open(
-        dir,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?)
+    local_socket::socket_address(dir, CONTROL_SOCKET)
 }
 
 /// Requests in progress, so shutdown can wait for them.
@@ -143,20 +122,7 @@ impl Server {
     /// Listens in `dir` (created `0700`), replacing a stale socket (the
     /// caller holds the state-area lock, so no other daemon owns it).
     pub fn start(dir: &Path, handler: Handler) -> io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        let dir_fd = open_dir(dir)?;
-        match rustix::fs::unlinkat(&dir_fd, CONTROL_SOCKET, AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => return Err(e.into()),
-        }
-        let listener = UnixListener::bind(socket_address(&dir_fd))?;
-        rustix::fs::chmodat(
-            &dir_fd,
-            CONTROL_SOCKET,
-            Mode::from_raw_mode(0o600),
-            AtFlags::empty(),
-        )?;
+        let (dir_fd, listener) = local_socket::bind_private(dir, CONTROL_SOCKET)?;
         let stop = Arc::new(AtomicBool::new(false));
         let in_flight = Arc::new(InFlight::default());
         let busy = Arc::new(Mutex::new(()));
@@ -235,7 +201,7 @@ impl Server {
         }
         let idle = *count == 0;
         drop(count);
-        let _ = rustix::fs::unlinkat(&self.dir, CONTROL_SOCKET, AtFlags::empty());
+        let _ = local_socket::unlink(&self.dir, CONTROL_SOCKET);
         idle
     }
 }
@@ -272,43 +238,9 @@ pub fn read_request(reader: impl Read) -> Result<Request, String> {
     serde_json::from_slice(&line).map_err(|e| format!("malformed request: {e}"))
 }
 
-/// The connection's `SO_PEERCRED`. The pid is 0 when the peer is in a pid
-/// namespace the daemon cannot see (it is then unknown, and no
-/// `Agentfs-Pid` names it).
-fn peer_credentials(stream: &UnixStream) -> io::Result<Peer> {
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `cred` is a valid, writable `ucred` of `len` bytes, the
-    // buffer SO_PEERCRED fills; the descriptor is open for the call.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut cred).cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if len as usize != std::mem::size_of::<libc::ucred>() {
-        return Err(io::Error::other("short SO_PEERCRED reply"));
-    }
-    Ok(Peer {
-        uid: cred.uid,
-        gid: cred.gid,
-        pid: u32::try_from(cred.pid).unwrap_or(0),
-    })
-}
-
 fn serve_one(mut stream: UnixStream, handler: &Handler, busy: &Mutex<()>, euid: u32) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-    let peer = match peer_credentials(&stream) {
+    let peer = match local_socket::peer(&stream) {
         Ok(peer) => peer,
         Err(e) => {
             write_reply(&mut stream, &Reply::Error(format!("peer credentials: {e}")));
@@ -362,7 +294,7 @@ pub enum ClientError {
 /// Sends `request` to the mount listening in `dir` and waits for its
 /// reply, however long the restore takes.
 pub fn call(dir: &Path, request: &Request) -> Result<Reply, ClientError> {
-    let dir_fd = match open_dir(dir) {
+    let dir_fd = match local_socket::open_dir(dir) {
         Ok(fd) => fd,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ClientError::NotRunning),
         Err(e) => return Err(e.into()),
@@ -395,6 +327,8 @@ pub fn call(dir: &Path, request: &Request) -> Result<Reply, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
 
     fn request() -> Request {
         Request {
@@ -405,15 +339,6 @@ mod tests {
             force: false,
             dry_run: true,
         }
-    }
-
-    #[test]
-    fn peer_credentials_are_the_peers_own() {
-        let (a, _b) = UnixStream::pair().unwrap();
-        let peer = peer_credentials(&a).unwrap();
-        assert_eq!(peer.pid, std::process::id());
-        assert_eq!(peer.uid, rustix::process::geteuid().as_raw());
-        assert_eq!(peer.gid, rustix::process::getegid().as_raw());
     }
 
     #[test]
@@ -484,15 +409,6 @@ mod tests {
             "x".repeat(MAX_REQUEST)
         );
         assert!(read_request(huge.as_bytes()).unwrap_err().contains("over"));
-    }
-
-    #[test]
-    fn only_root_and_the_daemons_user() {
-        assert!(allowed(0, 1000));
-        assert!(allowed(1000, 1000));
-        assert!(!allowed(1001, 1000));
-        assert!(allowed(0, 0));
-        assert!(!allowed(1000, 0));
     }
 
     #[test]
@@ -567,7 +483,7 @@ mod tests {
         assert!(matches!(slow.join().unwrap(), Ok(Reply::Ok(_))));
 
         // A bad request gets an error reply, not a hang.
-        let fd = open_dir(&dir).unwrap();
+        let fd = local_socket::open_dir(&dir).unwrap();
         let mut raw = UnixStream::connect(socket_address(&fd)).unwrap();
         raw.write_all(b"{\"v\":9,\"op\":\"revert\",\"commit\":\"x\"}\n")
             .unwrap();
@@ -583,7 +499,8 @@ mod tests {
         ));
         // A stale socket file (a crashed daemon) is not running either,
         // and the next server replaces it.
-        let stale = UnixListener::bind(socket_address(&open_dir(&dir).unwrap())).unwrap();
+        let stale =
+            UnixListener::bind(socket_address(&local_socket::open_dir(&dir).unwrap())).unwrap();
         drop(stale);
         assert!(matches!(
             call(&dir, &request()),
