@@ -56,8 +56,8 @@ be recorded after the fact; §3.1 lists them.
 
 ### 1.4 Not goals
 
-- **Enforcing content rules.** agentfs records; it does not reject writes. The
-  secret guard (§10) holds pushes, not writes.
+- **Enforcing content rules.** agentfs records; it does not reject writes.
+- **Detecting secrets.** agentfs does not scan content (§10).
 - **Pushing remote changes into a running workload.** Remote changes enter only
   at mount time.
 - **Showing history to the workload.**
@@ -385,19 +385,34 @@ late". This is deliberate.
 ## 9. Commit metadata
 
 **Committer: the replica that made the change.** Every pod mounting a volume has
-a unique committer identity:
+its own committer identity. Operators set it with templates; the defaults are
+below.
 
-- **Name:** the pod's replica identity:
-  - the StatefulSet pod name, which is stable across restarts;
-  - otherwise the pod name.
-- **Email:** `<pod-uid>@<volume>.agentfs.invalid`.
-- The `.invalid` domain can never belong to a real account, so commits are never
-  linked to a person on a hosted remote.
+```ini
+[agentfs "identity"]
+    committerName  = {replica}
+    committerEmail = {podUid}@{volume}.agentfs.invalid
+    authorName     = uid-{uid}
+    authorEmail    = uid-{uid}@{volume}.agentfs.invalid
+```
 
-**Author: the writer process** as FUSE reports it, `uid-<uid>
-<uid-<uid>@<volume>.agentfs.invalid>`. PIDs and UIDs are as seen from the
-mount's own PID namespace. Identity beyond UID needs the workload's cooperation
-(§1.3, later phases).
+**Template variables:**
+
+- `{volume}`, `{namespace}`, `{pod}`, `{podUid}`, `{node}`;
+- `{replica}`: the StatefulSet pod name, which is stable across restarts;
+  otherwise the pod name;
+- `{uid}`, `{gid}` (author templates only).
+
+**Rules.**
+
+- Rendered identities must pass git's fsck rules (§3.4). A template that does
+  not is a configuration error at mount.
+- The default `.invalid` domain can never belong to a real account, so commits
+  are never linked to a person on a hosted remote.
+
+**Author: the writer process** as FUSE reports it. PIDs and UIDs are as seen
+from the mount's own PID namespace. Identity beyond UID needs the workload's
+cooperation (§1.3, later phases).
 
 **Trailers: pod metadata.**
 
@@ -417,29 +432,16 @@ Agentfs-Pid: 4711
 - **Grouped commits** carry one `Agentfs-Uid` and `Agentfs-Pid` line per
   distinct writer.
 
-## 10. Secret guard (proposed baseline)
+## 10. Secrets (not in scope)
 
-History is append-only and pushed to remotes, so a secret an agent writes into
-a recorded file would otherwise be permanent.
+agentfs does not scan content for secrets and does not hold pushes.
 
-**Default deny.**
-
-- The default operator `info/exclude` excludes common secret files, such as
-  `.env*`, `*.pem`, `*.key`, `id_*`, `auth.json` and `credentials*`.
-- Consumers extend the list.
-
-**Push hold.**
-
-- Before pushing, a scanner checks new content for likely credentials.
-- A match still lets the commit be recorded locally, so the record is kept. But
-  pushing stops at that commit, and an alarm is raised.
-- An operator then decides:
-  - release the commit; or
-  - rewrite local history before it is ever pushed. This is a documented,
-    deliberate operator action (§15), never automatic.
-
-**Already pushed.** A secret that has already been pushed needs a remote-side
-rewrite. agentfs documents the procedure but never does it on its own.
+- **Keeping secrets out** is done with ordinary operator rules (§4). Each
+  consumer excludes its own secret files (§16).
+- **A secret that gets recorded anyway** is permanent in history, locally and on
+  every remote it reaches. Removing it means rewriting history: a documented
+  operator procedure (§15) for the state area and each remote, run with the
+  workload stopped. It is never automatic.
 
 ## 11. Remotes and pushing
 
@@ -472,25 +474,48 @@ rewrite. agentfs documents the procedure but never does it on its own.
   - keeps retrying with backoff;
   - keeps the remote's last successful commit, so the backlog is visible.
 - **Non-fast-forward means someone else wrote the branch.**
-  - The recorder pushes its head to `refs/agentfs/diverged/<UTC timestamp,
-    no colons>` once per divergence, then keeps alarming.
+  - The recorder pushes its head to
+    `refs/agentfs/<volume>/diverged/<UTC timestamp, no colons>` once per
+    divergence, then keeps alarming.
   - It never force-pushes.
   - An operator resolves it (§15).
 
-### 11.4 Single writer on the remote
+### 11.4 Shared repositories
 
-The recorder is the only intended writer of its branch. Remotes cannot always
-enforce that: GitHub can restrict pushers only on organisation-owned
-repositories, and tokens are scoped to repositories, not branches. agentfs
-therefore **detects** other writers (§11.3) rather than relying on
-enforcement. Using one repository per volume, or a credential scoped to that
-repository, narrows the exposure.
+Several volumes may share one repository. Each volume has a name (`{volume}`,
+set by the operator) and owns a branch and a ref namespace in that repository:
+
+| Ref | Purpose |
+|---|---|
+| `refs/heads/agentfs/<volume>` | The volume's history (configurable: `[agentfs] branch`) |
+| `refs/agentfs/<volume>/inbox/<n>` | Patch queue (§12) |
+| `refs/agentfs/<volume>/applied/<n>` | Applied patches |
+| `refs/agentfs/<volume>/status` | Recorder status for iac (§12) |
+| `refs/agentfs/<volume>/diverged/<timestamp>` | Divergence (§11.3) |
+
+**Pushing.** A recorder pushes only its own volume's refs, with explicit
+refspecs, so pushes from different volumes never contend.
+
+**Fetching.** At mount it fetches only its own volume's refs.
+
+**Single writer.** Each recorder is the only intended writer of its volume's
+refs. Remotes cannot always enforce that:
+
+- GitHub can restrict pushers only on organisation-owned repositories.
+- Tokens are scoped to repositories, not branches.
+- Every volume sharing a repository can therefore write every other volume's
+  refs.
+
+agentfs **detects** other writers (§11.3) rather than relying on enforcement.
+
+**Volume names** must be unique within a repository. Two recorders configured
+with the same name would see each other as divergence.
 
 ## 12. Patch queue for iac (phase 3)
 
 - **What a patch is:** a single commit pushed to the remote at
-  `refs/agentfs/inbox/<n>`, where `<n>` is a zero-padded sequence number. Its
-  parent is the branch commit it was written against.
+  `refs/agentfs/<volume>/inbox/<n>`, where `<n>` is a zero-padded sequence
+  number. Its parent is the branch commit it was written against.
 - **When it runs:** at mount, after journal replay and before the workload starts.
 - **What it does:** each patch is applied in sequence order as a three-way merge
   against its parent, onto the current branch head.
@@ -503,9 +528,8 @@ repository, narrows the exposure.
   for a commit carrying `Agentfs-Inbox: <n>`. Moving `inbox/<n>` to
   `applied/<n>` is then only bookkeeping, and redoing it after a crash is
   harmless.
-- **Visibility to iac:** the recorder writes a status ref
-  (`refs/agentfs/status`) and emits telemetry (§13) with the queue head and the
-  last failure.
+- **Visibility to iac:** the recorder writes the volume's status ref (§11.4) and
+  emits telemetry (§13) with the queue head and the last failure.
 - **Open:** how iac writes patches (§19).
 
 ## 13. Observability (OpenTelemetry)
@@ -524,7 +548,6 @@ The recorder exports metrics, traces and logs over OTLP.
 | `agentfs.push.oldest_unpushed_age` | gauge, per remote | Backlog age, the main push alarm |
 | `agentfs.push.failures` | counter, per remote and reason | Rejected, non-fast-forward, authentication, network |
 | `agentfs.push.diverged` | gauge, per remote | 1 while diverged |
-| `agentfs.secret.held` | gauge | Commits held by the secret guard |
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks |
 | `agentfs.patch.queue_depth`, `agentfs.patch.blocked` | gauge | Phase 3 |
 | `agentfs.state.bytes` | gauge | Size of the state area by part |
@@ -610,9 +633,15 @@ delivers a supported path; better tooling is discovered from real use.
   building;
 - whether undo through the patch queue (§12) replaces manual restores for iac.
 
-**Operator history rewrite** (for held secrets, §10) is a documented procedure
-on the state area's repository, run with the workload stopped. It is never
-automatic.
+**Operator history rewrite** removes content that must not stay in history,
+such as a recorded secret (§10). It is a documented procedure:
+
+- run against the state area's repository and every remote the content reached;
+- run with the workload stopped;
+- never automatic.
+
+On remotes it requires a force-push of the volume's branch, the one case where
+agentfs's no-force-push rule is set aside, by an operator.
 
 ## 16. First consumer: Hermes
 
@@ -645,7 +674,6 @@ target. What it needs:
   - the commit builder;
   - pre-commit checks;
   - push (§11);
-  - the secret guard (§10);
   - LFS (§7);
   - the patch queue (§12);
   - telemetry (§13).
@@ -714,8 +742,12 @@ Phase 4 (§14).
      alarm while the filesystem keeps working.
 9. **Pre-commit checks.** A path git's fsck or a remote limit would refuse is not
    recorded, and raises an alarm.
-10. **Secret guard.** A planted token is recorded locally, its push is held, and
-    the alarm fires.
+10. **Shared repository.**
+    - Two volumes push to one repository on their own branches and ref
+      namespaces without contending.
+    - A volume's recorder writing into another volume's refs is detected as
+      divergence.
+    - Committer identities follow the configured templates.
 11. **Recovery.** Following §15, a file and a whole commit are restored, and the
     restore is recorded.
 12. **Telemetry.** Every metric in §13 is exported and moves as expected in the
@@ -736,22 +768,32 @@ Phase 4 (§14).
 16. **Phase 4.** Two pods on two nodes mount one volume. Each pod's changes carry
     its own committer identity, and history keeps every boundary from both.
 
-## 19. Open questions
+## 19. Decisions and open questions
 
-1. **Secret guard as baseline (§10):** confirm, and confirm that a suspected
-   secret holds the push until an operator releases it.
-2. **Repository layout:** one repository per volume, or one repository with a
-   branch per volume (§11.4)?
-3. **Replica identity:** is "StatefulSet pod name, else pod name" right for the
-   committer name, or should operators be able to set it (§9)?
-4. **How iac produces patches** for the queue (§12).
-5. **Backing filesystem:** require XFS for reflink, or accept the copy cost on
-   ext4 (§3.2)?
-6. **Performance budget** for the synchronous step, set after the phase 1
+### 19.1 Decisions (2026-10-12)
+
+| Topic | Decision |
+|---|---|
+| Storage model | Real backing tree with FUSE passthrough; the projection is logical only |
+| Several pods on one volume | Supported by the CSI driver, one committer identity per replica (§14, §9) |
+| Rejected pushes | Alarm, retry, keep operating (§11.3) |
+| Remotes | Any git remote, several at once (§11.1) |
+| Push timing | Interval, independent of pod lifecycle (§11.2) |
+| Recovery | Manual but supported; tooling discovered from use (§15) |
+| Telemetry | OpenTelemetry (§13) |
+| Secret scanning | Not in scope (§10) |
+| Repository layout | Several volumes may share a repository, each with its own branch and ref namespace (§11.4) |
+| Identity | Configurable templates with defaults (§9) |
+| Backing filesystem | Both supported. XFS (reflink) makes the synchronous step size-independent; ext4 falls back to a copy. The phase 1 benchmark sets the documented recommendation (§3.2) |
+
+### 19.2 Open questions
+
+1. **How iac produces patches** for the queue (§12).
+2. **Performance budget** for the synchronous step, set after the phase 1
    benchmark (§18 test 13).
-7. **Multi-pod (§14):** the network round trip per boundary, passthrough over a
+3. **Multi-pod (§14):** the network round trip per boundary, passthrough over a
    shared filesystem, RBAC and Pod Security.
-8. **Recovery tooling** beyond the phase 1 path (§15).
+4. **Recovery tooling** beyond the phase 1 path (§15).
 
 ## 20. Prior art
 

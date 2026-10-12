@@ -80,7 +80,7 @@ passthrough, and records by interception.
 | # | Finding | Severity | Draft 2 |
 |---|---|---|---|
 | 1 | The design does not reach Hermes' sandboxed tool writes | blocker | §16 |
-| 2 | Secrets would be pushed permanently | blocker | Proposed secret guard (§10). Owner confirmation pending (§19) |
+| 2 | Secrets would be pushed permanently | blocker | Owner declined secret scanning. Consumers exclude secret files with operator rules; recorded secrets need the operator rewrite procedure (§10, §15) |
 | 3 | No undo story | major | Supported manual path, plus discovery (§15) |
 | 4 | Tracked rule files can turn recording off | major | Fixed (§4.1) |
 | 5 | The projection is the main hidden complexity | major | Dropped |
