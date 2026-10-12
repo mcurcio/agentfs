@@ -1,0 +1,9 @@
+# The sidecar is privileged, so its namespace must allow it (Pod Security
+# Admission). Keep agentfs workloads in namespaces of their own.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agentfs-e2e
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: baseline

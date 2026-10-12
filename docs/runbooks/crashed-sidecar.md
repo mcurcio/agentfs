@@ -91,7 +91,7 @@ not set to `hold`), detach it on the node:
 
 ```sh
 # on the node (or: kubectl debug node/<node> -it --image=busybox -- chroot /host sh)
-findmnt -t fuse.agentfs
+findmnt -t fuse,fuse.agentfs      # source agentfs:<volume>
 umount -l /var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~empty-dir/agentfs-mount/workspace
 ```
 

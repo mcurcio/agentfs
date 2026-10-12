@@ -1,0 +1,6 @@
+# One node for the e2e-kind job. The node image is pinned by digest on the
+# command line (ci/install-kind.sh prints it as KIND_NODE_IMAGE).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane

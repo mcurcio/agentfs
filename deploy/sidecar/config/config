@@ -1,0 +1,16 @@
+# Operator settings and remotes, included from the state area's config
+# (`agentfs init --include /etc/agentfs/config`, design §4.3). Every key is
+# in docs/configuration.md. A fragment must not set agentfs.volume or
+# agentfs.branch: the init container sets them from AGENTFS_VOLUME.
+[agentfs]
+	pushInterval = 60s
+
+[remote "origin"]
+	url = https://git.example.com/acme/agent-history.git
+	agentfsCredentials = /run/secrets/agentfs/origin
+
+# Over SSH instead (the Secret holds ssh-privatekey and known_hosts):
+# [remote "origin"]
+# 	url = ssh://git@git.example.com/acme/agent-history.git
+# 	agentfsSshKey = /run/secrets/agentfs/ssh-privatekey
+# 	agentfsKnownHosts = /run/secrets/agentfs/known_hosts

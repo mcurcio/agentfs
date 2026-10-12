@@ -1,0 +1,21 @@
+# The volume: the backing tree (backing/) and the state area (state/) as
+# siblings on one filesystem, mounted once at /data. Never mount them as
+# two subPaths: recording freezes files with FICLONE reflinks, which fail
+# with EXDEV across mounts (design §3.2).
+#
+# ReadWriteOncePod makes this pod the volume's single writer (design §2.3);
+# most clusters need a CSI driver for it. XFS (or btrfs) is recommended:
+# reflinks make recording cost the same whatever a file's size; on ext4 it
+# is a copy.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agentfs-data
+  labels:
+    app.kubernetes.io/name: agentfs-example
+spec:
+  accessModes: [ReadWriteOncePod]
+  resources:
+    requests:
+      storage: 10Gi
+  # storageClassName: xfs-csi    # the cluster default otherwise

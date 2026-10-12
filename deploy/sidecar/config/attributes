@@ -1,0 +1,4 @@
+# Mounted over <state>/git/info/attributes: agentfs attributes (design §4.2).
+# `-agentfs` is never recorded, even when tracked. A directory pattern does
+# not cover its contents: write `dir/**`.
+secrets/** -agentfs

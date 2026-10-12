@@ -1,0 +1,10 @@
+# Hermes (design §16): the operator fragment, mounted from a ConfigMap and
+# included with `agentfs init --include /etc/agentfs/config`.
+[agentfs]
+	# Nested repositories (a skill cloned with git) are not recorded.
+	nested = exclude
+	pushInterval = 60s
+
+[remote "origin"]
+	url = https://git.example.com/acme/hermes-history.git
+	agentfsCredentials = /run/secrets/agentfs/origin

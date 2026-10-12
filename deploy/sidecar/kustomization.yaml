@@ -1,0 +1,29 @@
+# agentfs as a phase 1 native sidecar (design §17.1, docs/deployment.md).
+#
+#   kubectl apply -k deploy/sidecar        # after editing config/ and secret.yaml
+#
+# Copy this directory as a starting point, or use it as a kustomize base and
+# patch the `workload` container in an overlay.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - pvc.yaml
+  - secret.yaml
+  - deployment.yaml
+
+# The operator's settings and rules. The generated name carries a hash of
+# the content, so changing a rule or a remote rolls the pod: rules are read
+# at mount time (design §4.1).
+configMapGenerator:
+  - name: agentfs-config
+    files:
+      - config/config
+      - config/exclude
+      - config/attributes
+
+images:
+  # Pin a commit tag (ghcr.io/mcurcio/agentfs:<40-char sha>) or a digest in
+  # production; `latest` follows main.
+  - name: ghcr.io/mcurcio/agentfs
+    newTag: latest

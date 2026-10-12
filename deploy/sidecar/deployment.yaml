@@ -1,0 +1,155 @@
+# A workload with agentfs as a phase 1 native sidecar (design §17.1). The
+# layout and every choice here are explained in docs/deployment.md.
+#
+#   /data                 the PVC: backing/ (the files) and state/ (history)
+#   /agentfs              an emptyDir shared by every container
+#   /agentfs/workspace    the FUSE mount: what the workload uses
+#
+# The mount point is a subdirectory of the emptyDir, never its root: when a
+# daemon dies, only that subdirectory answers ENOTCONN, so the restarted
+# sidecar can still be created and the pod's volumes torn down.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentfs-example
+  labels:
+    app.kubernetes.io/name: agentfs-example
+spec:
+  replicas: 1
+  # One pod at a time: the old pod releases the ReadWriteOncePod volume
+  # (and the state area) before the new one starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentfs-example
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentfs-example
+    spec:
+      # Longer than --unmount-grace (10s) + --push-grace (5s) + the final
+      # commit, so a deleted pod always makes its final commit.
+      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      initContainers:
+        # Creates the state area on first start, checks it on every later
+        # one (another volume on this PVC fails the pod), creates
+        # /data/backing, and sets the operator config include.
+        - name: agentfs-init
+          image: ghcr.io/mcurcio/agentfs
+          args: [init, --include, /etc/agentfs/config]
+          env:
+            - { name: AGENTFS_VOLUME, value: example }
+            - { name: AGENTFS_STATE, value: /data/state }
+            - { name: AGENTFS_ROOT, value: /data/backing }
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: config, mountPath: /etc/agentfs, readOnly: true }
+        # The recorder: a native sidecar (an init container that keeps
+        # running). Workload containers start once its startup probe sees
+        # the mount, and it is stopped after them.
+        - name: agentfs
+          image: ghcr.io/mcurcio/agentfs
+          restartPolicy: Always
+          args: [mount, /data/backing, /agentfs/workspace]
+          env:
+            - { name: AGENTFS_STATE, value: /data/state }
+            - { name: AGENTFS_ROOT, value: /data/backing }
+            # Restarted after a crash: hold instead of remounting; the
+            # recovery is a pod restart (docs/runbooks/crashed-sidecar.md).
+            - { name: AGENTFS_ON_STALE_MOUNT, value: hold }
+            # Commit trailers, committer identity and telemetry resource.
+            - name: AGENTFS_POD
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: AGENTFS_POD_UID
+              valueFrom: { fieldRef: { fieldPath: metadata.uid } }
+            - name: AGENTFS_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: AGENTFS_NODE
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            # OpenTelemetry (README "Telemetry"): point this at your
+            # collector, or set OTEL_SDK_DISABLED=true.
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability.svc:4318" }
+            - { name: OTEL_SERVICE_NAME, value: agentfs }
+            - { name: OTEL_RESOURCE_ATTRIBUTES, value: k8s.container.name=agentfs }
+            - { name: OTEL_TRACES_SAMPLER, value: parentbased_traceidratio }
+            - { name: OTEL_TRACES_SAMPLER_ARG, value: "0.01" }
+          securityContext:
+            # Bidirectional propagation is only allowed in privileged
+            # containers; mount(2), /dev/fuse and passthrough need
+            # CAP_SYS_ADMIN anyway. See "Security trade-offs" in
+            # docs/deployment.md.
+            privileged: true
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: Bidirectional }
+            # Operator rules over the state area's own files, in the
+            # sidecar only (the workload never sees /data).
+            - { name: config, mountPath: /data/state/git/info/exclude, subPath: exclude, readOnly: true }
+            - { name: config, mountPath: /data/state/git/info/attributes, subPath: attributes, readOnly: true }
+            - { name: config, mountPath: /etc/agentfs, readOnly: true }
+            - { name: credentials, mountPath: /run/secrets/agentfs, readOnly: true }
+          # Gates the workload containers until the mount is live. It also
+          # passes for a sidecar holding after a crash, so the kubelet does
+          # not kill it. 5 minutes for journal recovery at start.
+          startupProbe:
+            exec:
+              command: [agentfs, probe, --allow-stale, /agentfs/workspace]
+            periodSeconds: 2
+            failureThreshold: 150
+          # A dead daemon shows as a NotReady pod.
+          readinessProbe:
+            exec:
+              command: [agentfs, probe, /agentfs/workspace]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          # No livenessProbe: a restart cannot remount safely while the
+          # workload holds the old mount; the recovery is a pod restart.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # An OOM kill is a crash: size this for the volume.
+              memory: 512Mi
+      containers:
+        # Your workload. Any user works; files it creates are its own.
+        - name: workload
+          image: debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+          command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+          securityContext:
+            runAsUser: 10000
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            # Use /agentfs/workspace.
+            - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: HostToContainer }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: agentfs-data
+        - name: agentfs-mount
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: agentfs-config
+        - name: credentials
+          secret:
+            secretName: agentfs-credentials
+            defaultMode: 0400

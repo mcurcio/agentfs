@@ -1,0 +1,18 @@
+# Hermes (design §16): never record secrets, databases, sessions, logs or
+# checkpoints, even if a path was tracked or the exclude allowlist changes.
+# Defence in depth behind ./exclude.
+.env -agentfs
+**/.env -agentfs
+auth.json -agentfs
+**/auth.json -agentfs
+*.db -agentfs
+*.db-wal -agentfs
+*.db-shm -agentfs
+*.db-journal -agentfs
+*.sqlite* -agentfs
+checkpoints/** -agentfs
+**/checkpoints/** -agentfs
+sessions/** -agentfs
+**/sessions/** -agentfs
+logs/** -agentfs
+**/logs/** -agentfs

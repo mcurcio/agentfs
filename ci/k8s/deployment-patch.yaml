@@ -1,0 +1,43 @@
+# CI: its own volume name, no telemetry, and two writers instead of the
+# workload: root (default capabilities) through the emptyDir at /agentfs,
+# and uid 10000 with the mount itself at a fixed path (subPath workspace),
+# the pattern Hermes needs for /opt/data (docs/deployment.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentfs-example
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: agentfs-init
+          env:
+            - { name: AGENTFS_VOLUME, value: ci-kind }
+        - name: agentfs
+          env:
+            - { name: OTEL_SDK_DISABLED, value: "true" }
+      containers:
+        - name: workload
+          $patch: delete
+        - name: writer-root
+          image: ghcr.io/mcurcio/agentfs
+          command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: HostToContainer }
+        - name: writer-10000
+          image: ghcr.io/mcurcio/agentfs
+          command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+          securityContext:
+            runAsUser: 10000
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - { name: agentfs-mount, mountPath: /workspace, subPath: workspace, mountPropagation: HostToContainer }

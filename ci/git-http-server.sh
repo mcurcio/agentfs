@@ -14,6 +14,10 @@
 # --trust-ca installs the throwaway CA into the system trust store (sudo),
 # which is where libgit2's OpenSSL backend looks.
 #
+# GIT_SERVER_EXTRA_LISTEN=<ip> also serves plain http on <ip>:8080, for
+# clients that cannot reach the runner's loopback (pods in a kind cluster
+# reach the kind network's gateway). 127.0.0.1 is always served.
+#
 # Needs nginx, fcgiwrap, git and openssl. Everything runs as the calling
 # user except --trust-ca.
 
@@ -57,6 +61,11 @@ if [ "${3:-}" = "--trust-ca" ]; then
   sudo update-ca-certificates >/dev/null
 fi
 
+extra_listen=""
+if [ -n "${GIT_SERVER_EXTRA_LISTEN:-}" ]; then
+  extra_listen="listen ${GIT_SERVER_EXTRA_LISTEN}:8080;"
+fi
+
 fcgiwrap -s "unix:$dir/fcgiwrap.sock" &
 echo $! >"$dir/fcgiwrap.pid"
 for _ in $(seq 50); do [ -S "$dir/fcgiwrap.sock" ] && break; sleep 0.1; done
@@ -79,6 +88,7 @@ http {
 
   server {
     listen 127.0.0.1:8080;
+    $extra_listen
     listen 127.0.0.1:8443 ssl;
     server_name localhost;
     ssl_certificate $dir/tls/server.crt;

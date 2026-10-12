@@ -1,0 +1,4 @@
+# Mounted over <state>/git/info/exclude: paths never recorded when new
+# (git ignore syntax, design §4.1). Tracked paths stay recorded.
+*.log
+tmp/

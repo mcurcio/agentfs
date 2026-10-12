@@ -1,0 +1,16 @@
+# Hermes (design §16): record only what the agent authors. An allowlist:
+# everything at the top of HERMES_HOME is excluded when new, then the
+# definitions are re-included. Tracked paths stay recorded whatever these
+# rules say; attributes (-agentfs) are the hard stop for secrets.
+/*
+!/skills/
+!/SOUL.md
+!/config.yaml
+!/profiles/
+
+# In each profile, only its definition files and skills.
+/profiles/*/*
+!/profiles/*/SOUL.md
+!/profiles/*/config.yaml
+!/profiles/*/profile.yaml
+!/profiles/*/skills/
