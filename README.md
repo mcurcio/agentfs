@@ -34,8 +34,10 @@ nested repository detection. Also:
 - **Pre-commit checks:** git's fsck rules and each remote's
   `agentfsMaxBlobSize`, checked at record time and again at commit time.
   A refused path is skipped and raises an alarm; the rest of its record is
-  kept. Content scans of special files over 1 MiB are left to commit time,
-  so recording stays fast whatever their size.
+  kept. `.gitmodules` content is checked as `git fsck` checks it (submodule
+  names, URLs, paths, `update` commands, parse errors). Content scans of
+  special files over 1 MiB are left to commit time, so recording stays
+  fast whatever their size.
 - **Remotes:** several at once, from `[remote "<name>"]` in the history
   repository's own config. Each has its own push state and backoff.
 - **Interval push:** only the volume's own refs, fast-forward only, never

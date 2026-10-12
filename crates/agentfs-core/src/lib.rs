@@ -14,6 +14,7 @@ pub mod claims;
 pub mod config;
 pub mod credentials;
 pub mod events;
+pub mod gitmodules;
 pub mod history;
 pub mod identity;
 pub mod journal;

@@ -16,6 +16,12 @@
 //! | Symlink target with a `.git` component | | `symlinkPointsToGitDir` |
 //! | `.gitattributes` size | over [`ATTR_MAX_FILE_SIZE`] | `gitattributesLarge` |
 //! | `.gitattributes` line length | [`ATTR_MAX_LINE_LENGTH`] or more | `gitattributesLineLength` |
+//! | `.gitmodules` that git's config parser cannot read | | `gitmodulesParse` |
+//! | `.gitmodules` submodule name empty or with a `..` component | | `gitmodulesName` |
+//! | `.gitmodules` url an option, with a decoded newline, escaping its root, or invalid for git-remote-curl | | `gitmodulesUrl` |
+//! | `.gitmodules` path starting with `-` | | `gitmodulesPath` |
+//! | `.gitmodules` update starting with `!` (a command) | | `gitmodulesUpdate` |
+//! | `.gitmodules` size | over [`GITMODULES_MAX_SIZE`] | `gitmodulesLarge` |
 //! | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize` | none (remote policy) |
 //!
 //! There is one history for every remote, so the blob limit that applies is
@@ -24,7 +30,8 @@
 //! threads and the committer.
 //!
 //! **Bounded synchronous step.** Size checks are a `stat` and always run.
-//! Content scans (the `.gitattributes` line length) run in the synchronous
+//! Content scans (the `.gitattributes` line length, the `.gitmodules` rules
+//! of [`crate::gitmodules`]) run in the synchronous
 //! step ([`CheckStage::Record`]) only for files up to [`SYNC_SCAN_LIMIT`],
 //! the bound tree rule files already have (design §4.1); a larger file is
 //! scanned in full at commit time ([`CheckStage::Commit`]), where a refusal
@@ -37,6 +44,7 @@ use std::path::Path;
 
 use crate::config::RemoteSettings;
 use crate::events::CheckStage;
+use crate::gitmodules;
 use crate::paths::{PathError, RepoPath, SpecialFile, is_dotgit, special_file};
 
 /// Longest path recorded, in bytes.
@@ -51,6 +59,9 @@ pub const ATTR_MAX_LINE_LENGTH: usize = 2048;
 /// ([`CheckStage::Record`]); larger ones are scanned at commit time. The
 /// same bound as tree rule files (design §4.1).
 pub const SYNC_SCAN_LIMIT: u64 = 1 << 20;
+/// Largest `.gitmodules` git's fsck parses: above `core.bigFileThreshold`
+/// (512 MiB by default) it reports `gitmodulesLarge`.
+pub const GITMODULES_MAX_SIZE: u64 = 512 << 20;
 
 /// The blob size limit in force, and the remote it comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +124,27 @@ pub enum Refusal {
         limit: u64,
         remote: String,
     },
+    /// git's config parser cannot read the `.gitmodules`
+    /// (`gitmodulesParse`, which git only reports; agentfs refuses it, as
+    /// it does the other `.gitmodules` rules, design §3.4).
+    GitmodulesParse {
+        line: usize,
+    },
+    GitmodulesName {
+        name: String,
+    },
+    GitmodulesUrl {
+        url: String,
+    },
+    GitmodulesPath {
+        path: String,
+    },
+    GitmodulesUpdate {
+        value: String,
+    },
+    GitmodulesTooLarge {
+        bytes: u64,
+    },
 }
 
 impl Refusal {
@@ -127,6 +159,12 @@ impl Refusal {
             Self::GitattributesTooLarge { .. } => "gitattributes_too_large",
             Self::GitattributesLineTooLong { .. } => "gitattributes_line_too_long",
             Self::BlobTooLarge { .. } => "blob_too_large",
+            Self::GitmodulesParse { .. } => "gitmodules_parse",
+            Self::GitmodulesName { .. } => "gitmodules_name",
+            Self::GitmodulesUrl { .. } => "gitmodules_url",
+            Self::GitmodulesPath { .. } => "gitmodules_path",
+            Self::GitmodulesUpdate { .. } => "gitmodules_update",
+            Self::GitmodulesTooLarge { .. } => "gitmodules_too_large",
         }
     }
 
@@ -145,6 +183,12 @@ impl Refusal {
             Self::SymlinkIntoGitDir { .. } => Some("symlinkPointsToGitDir"),
             Self::GitattributesTooLarge { .. } => Some("gitattributesLarge"),
             Self::GitattributesLineTooLong { .. } => Some("gitattributesLineLength"),
+            Self::GitmodulesParse { .. } => Some("gitmodulesParse"),
+            Self::GitmodulesName { .. } => Some("gitmodulesName"),
+            Self::GitmodulesUrl { .. } => Some("gitmodulesUrl"),
+            Self::GitmodulesPath { .. } => Some("gitmodulesPath"),
+            Self::GitmodulesUpdate { .. } => Some("gitmodulesUpdate"),
+            Self::GitmodulesTooLarge { .. } => Some("gitmodulesLarge"),
         }
     }
 }
@@ -187,6 +231,28 @@ impl fmt::Display for Refusal {
                 f,
                 "{bytes} bytes is over the {limit}-byte limit of remote {remote}"
             ),
+            Self::GitmodulesParse { line } => {
+                write!(f, ".gitmodules cannot be parsed by git (line {line})")
+            }
+            Self::GitmodulesName { name } => {
+                write!(f, ".gitmodules has a disallowed submodule name {name:?}")
+            }
+            Self::GitmodulesUrl { url } => {
+                write!(f, ".gitmodules has a disallowed submodule url {url:?}")
+            }
+            Self::GitmodulesPath { path } => {
+                write!(f, ".gitmodules has a disallowed submodule path {path:?}")
+            }
+            Self::GitmodulesUpdate { value } => write!(
+                f,
+                ".gitmodules has a disallowed submodule update setting {value:?}"
+            ),
+            Self::GitmodulesTooLarge { bytes } => {
+                write!(
+                    f,
+                    ".gitmodules is {bytes} bytes, over {GITMODULES_MAX_SIZE}"
+                )
+            }
         }
     }
 }
@@ -301,6 +367,9 @@ fn special_size(path: &RepoPath, bytes: u64) -> Option<Refusal> {
         Some(SpecialFile::Gitattributes) if bytes > ATTR_MAX_FILE_SIZE => {
             Some(Refusal::GitattributesTooLarge { bytes })
         }
+        Some(SpecialFile::Gitmodules) if bytes > GITMODULES_MAX_SIZE => {
+            Some(Refusal::GitmodulesTooLarge { bytes })
+        }
         _ => None,
     }
 }
@@ -309,8 +378,27 @@ fn special_size(path: &RepoPath, bytes: u64) -> Option<Refusal> {
 fn scan_content(path: &RepoPath, reader: impl BufRead) -> io::Result<Option<Refusal>> {
     match special_file(path.file_name()) {
         Some(SpecialFile::Gitattributes) => long_attribute_line(reader),
+        Some(SpecialFile::Gitmodules) => {
+            let mut content = Vec::new();
+            let mut reader = reader;
+            reader.read_to_end(&mut content)?;
+            Ok(gitmodules_refusal(&content))
+        }
         _ => Ok(None),
     }
+}
+
+/// git fsck's `.gitmodules` content rules ([`crate::gitmodules`]).
+fn gitmodules_refusal(content: &[u8]) -> Option<Refusal> {
+    use crate::gitmodules::Problem;
+    let problem = gitmodules::check(content).err()?;
+    Some(match problem {
+        Problem::Parse { line } => Refusal::GitmodulesParse { line },
+        Problem::Name(name) => Refusal::GitmodulesName { name },
+        Problem::Url(url) => Refusal::GitmodulesUrl { url },
+        Problem::Path(path) => Refusal::GitmodulesPath { path },
+        Problem::Update(value) => Refusal::GitmodulesUpdate { value },
+    })
 }
 
 /// The first line of [`ATTR_MAX_LINE_LENGTH`] bytes or more (excluding its
@@ -690,5 +778,136 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn gitmodules_content_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Checks::default();
+        let check = |name: &str, content: &str, stage| {
+            let file = dir.path().join("content");
+            fs::write(&file, content).unwrap();
+            c.check_file(&p(name), &file, stage).unwrap()
+        };
+        let cases = [
+            (
+                "[submodule \"x\"]\n\tpath = x\n\turl = https://example.com/x.git\n",
+                None,
+            ),
+            (
+                "[submodule \"x\"\n",
+                Some((
+                    Refusal::GitmodulesParse { line: 1 },
+                    "gitmodulesParse",
+                    "gitmodules_parse",
+                )),
+            ),
+            (
+                "[submodule \"../../x\"]\nurl = ./x\n",
+                Some((
+                    Refusal::GitmodulesName {
+                        name: "../../x".into(),
+                    },
+                    "gitmodulesName",
+                    "gitmodules_name",
+                )),
+            ),
+            (
+                "[submodule \"x\"]\nurl = --upload-pack=evil\n",
+                Some((
+                    Refusal::GitmodulesUrl {
+                        url: "--upload-pack=evil".into(),
+                    },
+                    "gitmodulesUrl",
+                    "gitmodules_url",
+                )),
+            ),
+            (
+                "[submodule \"x\"]\npath = -x\n",
+                Some((
+                    Refusal::GitmodulesPath { path: "-x".into() },
+                    "gitmodulesPath",
+                    "gitmodules_path",
+                )),
+            ),
+            (
+                "[submodule \"x\"]\nupdate = !sh\n",
+                Some((
+                    Refusal::GitmodulesUpdate {
+                        value: "!sh".into(),
+                    },
+                    "gitmodulesUpdate",
+                    "gitmodules_update",
+                )),
+            ),
+        ];
+        for (content, expected) in cases {
+            let got = check(".gitmodules", content, Record);
+            match expected {
+                None => assert_eq!(got, None, "{content:?}"),
+                Some((refusal, id, label)) => {
+                    assert_eq!(got.as_ref(), Some(&refusal), "{content:?}");
+                    assert_eq!(refusal.fsck_id(), Some(id));
+                    assert_eq!(refusal.label(), label);
+                    assert!(refusal.to_string().contains(".gitmodules"), "{refusal}");
+                }
+            }
+        }
+        // Every spelling, in any directory; other names are not parsed.
+        let bad = "[submodule \"x\"]\npath = -x\n";
+        for name in [
+            "sub/.gitmodules",
+            ".GITMODULES",
+            "gitmod~1",
+            ".gitmodules.",
+            ".gitmodules ",
+        ] {
+            assert!(
+                matches!(
+                    check(name, bad, Commit),
+                    Some(Refusal::GitmodulesPath { .. })
+                ),
+                "{name}"
+            );
+        }
+        for name in ["gitmodules", ".gitmodulesx", "a.txt", ".gitattributes"] {
+            assert_eq!(check(name, bad, Commit), None, "{name}");
+        }
+
+        // Over the sync bound: parsed at commit time only.
+        let large = format!("{}{bad}", "# padding\n".repeat((1 << 20) / 10 + 1));
+        assert_eq!(check(".gitmodules", &large, Record), None);
+        assert!(matches!(
+            check(".gitmodules", &large, Commit),
+            Some(Refusal::GitmodulesPath { .. })
+        ));
+        assert!(matches!(
+            c.check_blob(&p(".gitmodules"), large.as_bytes()),
+            Some(Refusal::GitmodulesPath { .. })
+        ));
+    }
+
+    #[test]
+    fn gitmodules_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        File::create(&path)
+            .unwrap()
+            .set_len(GITMODULES_MAX_SIZE + 1)
+            .unwrap();
+        let start = Instant::now();
+        for stage in [Record, Commit] {
+            let refusal = Checks::default()
+                .check_file(&p(".gitmodules"), &path, stage)
+                .unwrap();
+            assert_eq!(
+                refusal,
+                Some(Refusal::GitmodulesTooLarge {
+                    bytes: GITMODULES_MAX_SIZE + 1
+                })
+            );
+            assert_eq!(refusal.unwrap().fsck_id(), Some("gitmodulesLarge"));
+        }
+        assert!(start.elapsed().as_secs() < 2, "the file must not be read");
     }
 }

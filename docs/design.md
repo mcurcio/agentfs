@@ -291,6 +291,12 @@ volumes should use XFS. The phase 1 benchmark (§18) measures this.
   | Symlink target with a `.git` component, in any spelling | | `symlinkPointsToGitDir` |
   | `.gitattributes` size | over 100 MiB | `gitattributesLarge` |
   | `.gitattributes` line length | 2048 bytes or more (git's test is `>=`) | `gitattributesLineLength` |
+  | `.gitmodules` (any spelling, any directory) that git's config parser cannot read | | `gitmodulesParse` |
+  | `.gitmodules` submodule name empty or with a `..` component (split on `/` and `\`) | | `gitmodulesName` |
+  | `.gitmodules` `url` that is an option (`-…`), holds a decoded newline, climbs out of its root with `../` followed by `:` or `/`, or is an `http(s)`/`ftp(s)` URL git refuses | | `gitmodulesUrl` |
+  | `.gitmodules` `path` starting with `-` | | `gitmodulesPath` |
+  | `.gitmodules` `update` starting with `!` (a command) | | `gitmodulesUpdate` |
+  | `.gitmodules` size | over 512 MiB (git's `core.bigFileThreshold`) | `gitmodulesLarge` |
   | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize` | none: remote policy |
 
   There is one history for every remote, so the blob limit that applies is the
@@ -298,18 +304,23 @@ volumes should use XFS. The phase 1 benchmark (§18) measures this.
   refused at commit time stays in the in-memory tracked set (§4) until the
   next open.
 - **The synchronous step stays bounded.** Size checks are a `stat` and
-  always run at record time. The content scan (the `.gitattributes`
-  line length) runs at record time only for files up to 1 MiB, the bound
-  tree rule files already have (§4.1). A larger file is scanned in full at commit time, where a refusal drops the change and
+  always run at record time. Content scans (the `.gitattributes` line
+  length, the `.gitmodules` rules) run at record time only for files up to
+  1 MiB, the bound tree rule files already have (§4.1). A larger file is
+  scanned in full at commit time, where a refusal drops the change and
   raises `PathRefused` with stage `commit`, like any commit-time refusal.
-- **Not yet checked:** the content rules for `.gitmodules` (`gitmodulesParse`,
-  `gitmodulesUrl`, `gitmodulesPath`, `gitmodulesName`, `gitmodulesLarge`). A
-  remote with `receive.fsckObjects` may refuse a commit carrying a hostile
-  `.gitmodules`, leaving that remote alarming until an operator rewrites
-  history.
-- `symlinkPointsToGitDir` is only a warning in default git. agentfs always
-  refuses it, so a workload symlink into a nested repository's `.git` is not
-  recorded.
+- **`.gitmodules` checks** are a port of git's config parser and of the
+  submodule checks in git's fsck (`agentfs_core::gitmodules`), tested
+  against the `git` binary: the parser against `git config --list`, the
+  checks against `git fsck`. git changed its check of `http(s)` and
+  `ftp(s)` submodule URLs in 2.40 (from `credential_from_url` to
+  `url_normalize`); remotes run either, so agentfs refuses what either
+  version refuses. Entries before a parse error are still checked, as in
+  git.
+- `symlinkPointsToGitDir` and `gitmodulesParse` are only a warning or
+  info in default git. agentfs always refuses them: a workload symlink
+  into a nested repository's `.git` is not recorded, and history stays
+  acceptable to remotes with stricter fsck settings.
 
 ### 3.5 When recording fails
 
@@ -1305,6 +1316,8 @@ every step), 11 (restore is not built), 13 (performance) and 16.
 | Failed namespace records | `EIO` plus a repair queue the sweep drains from the backing tree's current state, kept in `meta/repairs` across mounts and drained before the next mount serves (§3.5) |
 | Privileges | Decided from the effective capabilities, not the uid: `CAP_CHOWN` + `CAP_FOWNER` to give new objects to their caller, `CAP_SYS_ADMIN` in the initial user namespace for passthrough (§6, §17.1) |
 | `st_ino` | The FUSE node id, stable while mounted and shared by hard links, not across remounts (§6) |
+| `.gitmodules` checks | git fsck's `gitmodulesParse`, `Name`, `Url`, `Path`, `Update` and `Large` are refused at record and commit time (`gitmodulesParse` too, though git only reports it); a port of git's config parser and URL checks, tested against the `git` binary; `http(s)` URLs must pass both git 2.39's and 2.40+'s checks (§3.4) |
+| Synchronous-step bound | Content scans of special files run at record time only up to 1 MiB, the tree rule file bound; larger files are scanned in full at commit time. Size checks always run at record time (§3.4) |
 
 ### 19.2 Open questions
 
