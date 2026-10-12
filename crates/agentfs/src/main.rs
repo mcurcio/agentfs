@@ -9,9 +9,12 @@
 //! `push` pushes once to the configured remotes; `run` runs the commit and
 //! push loops in the foreground until SIGINT or SIGTERM (design §11.2).
 //!
-//! `mount`, `run`, `record`, `flush` and `push` take the state-area lock
-//! (design §2.3) and exit 75 while another process holds it; `status` is
-//! read-only and takes no lock.
+//! `restore` and `revert` write content from history back into the tree,
+//! recorded as one commit (design §15; [`recovery`]).
+//!
+//! `mount`, `run`, `record`, `flush`, `push`, and `restore` and `revert`
+//! when no mount runs, take the state-area lock (design §2.3) and exit 75
+//! while another process holds it; `status` is read-only and takes no lock.
 //!
 //! `mount`, `flush`, `record`, `push` and `run` export telemetry over OTLP
 //! when the standard `OTEL_*` variables configure an endpoint (see
@@ -20,6 +23,7 @@
 
 mod daemon;
 mod otel;
+mod recovery;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -105,6 +109,41 @@ enum Command {
         /// How long shutdown waits for pushes in progress.
         #[arg(long, default_value = "5s", value_parser = parse_grace)]
         push_grace: Duration,
+    },
+    /// Write PATH (a file, symlink or directory, or `.` for the whole
+    /// tree) back as it was in COMMIT, removing what COMMIT did not have
+    /// there; recorded as one commit (design §15). Goes through a running
+    /// mount when there is one; otherwise writes --root directly.
+    Restore {
+        /// Relative to the tree root.
+        path: String,
+        /// A commit on the volume's branch (any git revision syntax).
+        commit: String,
+        /// Write even files open for writing through the mount.
+        #[arg(long)]
+        force: bool,
+        /// Print the plan and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        pod: Pod,
+    },
+    /// Undo COMMIT's changes (against its first parent); recorded as one
+    /// commit (design §15). Through a running mount when there is one;
+    /// otherwise writes --root directly.
+    Revert {
+        /// A commit on the volume's branch (any git revision syntax).
+        commit: String,
+        /// Revert paths changed again since COMMIT too (the later changes
+        /// stay in history), and write files open for writing through the
+        /// mount.
+        #[arg(long)]
+        force: bool,
+        /// Print the plan and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        pod: Pod,
     },
     /// Mount BACKING at MOUNTPOINT and record every change through it,
     /// with the commit and push loops, until SIGINT, SIGTERM or an unmount.
@@ -293,6 +332,28 @@ fn real_main() -> Result<ExitCode> {
             let daemon = Daemon::start()?;
             let _lock = StateLock::acquire(&state, "run", cli.wait_lock)?;
             return run(daemon, &state, cli.root.as_deref(), &pod, push_grace);
+        }
+        Command::Restore {
+            path,
+            commit,
+            force,
+            dry_run,
+            pod,
+        } => {
+            let ask = match recovery::Ask::restore(&path, commit, force, dry_run) {
+                Ok(ask) => ask,
+                Err(e) => return Ok(recovery::refused("restore", &e)),
+            };
+            return recovery::run(&state, cli.root.as_deref(), cli.wait_lock, &pod, ask);
+        }
+        Command::Revert {
+            commit,
+            force,
+            dry_run,
+            pod,
+        } => {
+            let ask = recovery::Ask::revert(commit, force, dry_run);
+            return recovery::run(&state, cli.root.as_deref(), cli.wait_lock, &pod, ask);
         }
         Command::Mount(args) => {
             let daemon = Daemon::start()?;

@@ -322,6 +322,14 @@ fn plan_refusals() {
     assert!(matches!(err, RestoreError::NotInHistory { .. }), "{err}");
     assert!(err.is_refusal() && !err.overridable());
     assert!(err.hint().unwrap().contains("plain git"));
+    // HEAD is the volume's branch.
+    let plan = fx
+        .plan(&Request::Restore {
+            spec: Pathspec::Root,
+            commit: "HEAD~0".into(),
+        })
+        .unwrap();
+    assert_eq!(plan.source, c1);
     // An abbreviated id and a ref work.
     let short = &c1.to_string()[..10];
     assert!(
@@ -747,4 +755,36 @@ fn new_files_and_directories_take_the_parents_owner() {
         fs::metadata(fx.tree.join("d/new")).unwrap().mode() & 0o7777,
         0o755
     );
+}
+
+#[test]
+fn unrecorded_changes_where_history_already_matches_are_refused() {
+    let fx = Fixture::new();
+    let c1 = fx.commit(&[("a", File("1")), ("b", File("b"))], "v1");
+    fx.commit(&[("a", File("2")), ("b", File("b"))], "v2");
+    let c3 = fx.commit(&[("a", File("1")), ("b", File("b"))], "v3");
+    let _ = c3;
+    // History already has `a` as in v1, but the tree changed it without a
+    // record: not "already matches", and not overwritten.
+    fx.checkout(&[("a", File("unrecorded")), ("b", File("b"))]);
+    for spec in ["a", "."] {
+        let err = fx.run(&fx.restore(spec, c1)).unwrap_err();
+        assert!(
+            matches!(&err, RestoreError::Unrecorded { path } if path == "a"),
+            "{err}"
+        );
+    }
+    // A path the rules now refuse is fine where nothing is written.
+    fx.checkout(&[("a", File("1")), ("b", File("b"))]);
+    let refuse = Policy { refuse: vec!["b"] };
+    let plan = check(
+        fx.plan(&fx.restore(".", c1)).unwrap(),
+        &fx.repo,
+        &refuse,
+        &fx.dir(),
+        &NotLive,
+        false,
+    )
+    .unwrap();
+    assert!(plan.steps.is_empty());
 }

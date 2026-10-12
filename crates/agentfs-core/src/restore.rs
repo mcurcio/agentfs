@@ -16,7 +16,9 @@
 //!
 //!    The commit must be on the volume's branch: the head or one of its
 //!    ancestors.
-//! 2. [`check`] runs every refusal before anything is written: content
+//! 2. [`check`] runs every refusal before anything is written (a restore
+//!    plan also lists the paths history already has right, so an unrecorded
+//!    change there is refused rather than reported as matching): content
 //!    the rules or checks would not record, anything in the tree that is
 //!    not in history (never overridable: it would be lost), untracked
 //!    files or directories in the way, and, overridable with `force`
@@ -109,7 +111,9 @@ pub struct Entry {
     pub kind: EntryKind,
 }
 
-/// One path to change.
+/// One path to change. In a restore plan before [`check`], also every path
+/// history already has right (`current == target`), so the tree is
+/// verified there too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub path: RepoPath,
@@ -339,8 +343,16 @@ pub fn plan(repo: &Repository, branch_ref: &str, request: &Request) -> Result<Pl
     let wanted = match request {
         Request::Restore { commit, .. } | Request::Revert { commit } => commit,
     };
+    // `HEAD` is the volume's branch: the state area's own HEAD names no
+    // branch agentfs writes.
+    let spec = match wanted.strip_prefix("HEAD") {
+        Some(rest) if rest.is_empty() || rest.starts_with(['~', '^', '@', ':']) => {
+            format!("{branch_ref}{rest}")
+        }
+        _ => wanted.clone(),
+    };
     let commit = repo
-        .revparse_single(wanted)
+        .revparse_single(&spec)
         .and_then(|o| o.peel_to_commit())
         .map_err(|_| RestoreError::UnknownCommit {
             commit: wanted.clone(),
@@ -371,14 +383,14 @@ pub fn plan(repo: &Repository, branch_ref: &str, request: &Request) -> Result<Pl
             let paths: BTreeSet<&String> = target.keys().chain(current.keys()).collect();
             let mut steps = Vec::new();
             for path in paths {
-                let (c, t) = (current.get(path).copied(), target.get(path).copied());
-                if c != t {
-                    steps.push(Step {
-                        path: RepoPath::new(path.clone()).map_err(git_path)?,
-                        current: c,
-                        target: t,
-                    });
-                }
+                // Paths history already has right are kept as steps too, so
+                // the check finds unrecorded changes in the tree there
+                // instead of reporting that everything matches.
+                steps.push(Step {
+                    path: RepoPath::new(path.clone()).map_err(git_path)?,
+                    current: current.get(path).copied(),
+                    target: target.get(path).copied(),
+                });
             }
             let prune_floor = match spec {
                 Pathspec::Root => String::new(),
@@ -555,6 +567,9 @@ pub fn check(
     // 1. Everything written must be recordable.
     for step in &plan.steps {
         let Some(target) = &step.target else { continue };
+        if step.current.as_ref() == Some(target) {
+            continue; // Nothing is written there.
+        }
         let blob = repo.find_blob(target.oid)?;
         let symlink_target = match target.kind {
             EntryKind::Symlink => Some(String::from_utf8_lossy(blob.content()).into_owned()),
