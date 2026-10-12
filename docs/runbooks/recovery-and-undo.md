@@ -204,3 +204,65 @@ History holds file content, the executable bit and symlinks
 - Empty directories are not recorded: directories a restore empties are
   removed (up to the restored path's parent), and directories it needs
   are created.
+
+## 7. Restoring a database
+
+A database in the `fsync` class
+([§8](../design.md#8-files-changed-in-place-the-fsync-class-phase-2),
+[operator guide](../operator-guide.md#14-databases-the-fsync-class)) is
+recorded as a group: `app.db` with its `-wal` or `-journal`, captured at
+one point in time. Every commit holds a consistent group, which SQLite
+opens as it would after a crash. `-shm` is never recorded. A restore must
+bring back the whole group from one commit, and `restore` does not do
+that by itself: it restores the path it is given. `ci/e2e-sqlite.sh` runs
+this procedure in CI.
+
+1. **Find the version.** List the commits that changed the database, then
+   check one before restoring it (optional; `ci/sqlite-check.py` checks
+   every version at once):
+
+   ```sh
+   DB=data/app.db
+   git --git-dir "$STATE/git" log --format='%H %ad %s' --date=iso "$BRANCH" -- "$DB" "$DB-wal" "$DB-journal"
+   mkdir -p /tmp/v && rm -f /tmp/v/*
+   for s in "" -wal -journal; do
+     git --git-dir "$STATE/git" show "<commit>:$DB$s" > "/tmp/v/app.db$s" 2>/dev/null || rm -f "/tmp/v/app.db$s"
+   done
+   sqlite3 /tmp/v/app.db 'PRAGMA integrity_check'
+   ```
+
+2. **Stop everything** (§2, "Stop everything"): the database's writer
+   must be gone, and no mount should run. Through a running mount a
+   restore writes the members one at a time, each write may be captured,
+   and history then holds versions that mix two groups (the final state
+   is whole, and the restore refuses a member open for writing anyway).
+
+3. **Restore the group in direct mode.** If the database has a directory
+   to itself, restore the directory; it writes the members the commit has
+   and removes those it does not:
+
+   ```sh
+   agentfs --state "$STATE" --root "$BACKING" restore data <commit>
+   ```
+
+   Otherwise restore each of `app.db`, `app.db-wal` and `app.db-journal`
+   that the commit or the branch head has (a name the commit lacks is
+   removed):
+
+   ```sh
+   for s in "" -wal -journal; do
+     agentfs --state "$STATE" --root "$BACKING" restore "$DB$s" <commit>
+   done
+   ```
+
+   A name neither has is refused as nothing to restore; skip it.
+
+4. **Remove the stale `-shm`**, which belongs to the old state, then start
+   the workload again:
+
+   ```sh
+   rm -f "$BACKING/$DB-shm"
+   ```
+
+The next open replays the restored `-wal` (or rolls back the `-journal`)
+as after a crash.

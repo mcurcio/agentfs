@@ -73,6 +73,21 @@ nested repository detection. Also:
   to the endpoint derived from the remote (`<url>.git/info/lfs`) or the
   one configured, with credentials bound to that host. See
   [Git LFS](docs/configuration.md#git-lfs).
+- **Databases: the `fsync` class** (phase 2): files changed in place, such
+  as SQLite databases, are captured whole (the database with its `-wal` or
+  `-journal`, never `-shm`) at `fsync`, at most once per interval, by a
+  trailing timer, at close and at unmount, while writes to them are held
+  for the length of the copy. Every recorded version opens and passes
+  `PRAGMA integrity_check`; a change is in history at most one interval
+  late. Opt in from the operator's `info/attributes`:
+
+  ```text
+  *.db* agentfs.commit=fsync agentfs.group=sqlite
+  ```
+
+  The history is repacked with `git repack --geometric=2` every hour
+  (`agentfs.repackInterval`), and `agentfs.maxSize` caps a path's size.
+  See [Databases](docs/operator-guide.md#14-databases-the-fsync-class).
 - **Deployment:** a container image (`ghcr.io/mcurcio/agentfs`) and
   example Kubernetes manifests for the phase 1 sidecar, tested end to end
   in a kind cluster. See
@@ -82,7 +97,8 @@ The `agentfs` command has `init`, `status`, `mount`, `probe`, `flush`, `record`,
 `push`, `run`, `restore` and `revert`. `mount` mounts a backing tree and runs the commit and
 push loops in the same process. `record` records paths of a backing tree
 directly, without a mount, and reports the paths the rules skip or the
-checks refuse, with the reason. It needs `--root` (or `AGENTFS_ROOT`),
+checks refuse, with the reason; a database in the `fsync` class is
+recorded with its whole group. It needs `--root` (or `AGENTFS_ROOT`),
 since a path missing from the backing tree is recorded as removed. `push`
 pushes once; `run` runs the commit and push loops until SIGINT or SIGTERM.
 `restore` and `revert` write content from history back into the tree
@@ -101,12 +117,14 @@ with status 75 if another process holds it, naming the holder;
 lock and changes nothing, so it works beside a running daemon, and shows
 who holds the lock.
 
-Not built yet: the `fsync` class (phase 2), the patch queue (phase 3),
+Not built yet: the patch queue (phase 3),
 the CSI driver (phase 4), asking a running mount to push now, and
 restarting a pod automatically after its sidecar crashes. SSH remotes do
 not support ssh-agent, passphrase-protected keys or `@cert-authority`
 host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
-resumable transfers, proxy settings or pruning.
+resumable transfers, proxy settings or pruning. `restore` and `revert` do
+not expand a database's group: restore its directory with the workload
+stopped ([runbook](docs/runbooks/recovery-and-undo.md#7-restoring-a-database)).
 
 ## Mounting
 
@@ -248,6 +266,7 @@ Metrics (design §13):
 | `agentfs.journal.backlog` | gauge | |
 | `agentfs.commit.count` | counter | |
 | `agentfs.commit.failures` | counter | |
+| `agentfs.repack.failures` | counter | |
 | `agentfs.push.unpushed_commits` | gauge | `remote` |
 | `agentfs.push.oldest_unpushed_age` | gauge, seconds | `remote` |
 | `agentfs.push.failures` | counter | `remote`, `reason`, `stage` (`git`, or `lfs` for LFS uploads) |
@@ -355,7 +374,16 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   `mount.rs` recovery tests: in-place rewrites, removals, owners, files
   open for writing, direct mode with the workload stopped) and
   [`ci/e2e-recovery.sh`](ci/e2e-recovery.sh), the recovery runbook end to
-  end, from finding a change to pushing the restore commits.
+  end, from finding a change to pushing the restore commits. It also
+  runs SQLite databases in the `fsync` class: the `mount.rs` tests
+  restore every recorded version of WAL and DELETE databases with its
+  `-wal` or `-journal` and check it, and
+  [`ci/e2e-sqlite.sh`](ci/e2e-sqlite.sh) (with
+  [`sqlite-writer.py`](ci/sqlite-writer.py) and
+  [`sqlite-check.py`](ci/sqlite-check.py)) checks that history catches up
+  within one interval while a WAL writer stays open, that every version
+  passes `PRAGMA integrity_check` with whole transactions, and the
+  database restore runbook.
 - **e2e runbooks** ([`ci/e2e-runbooks.sh`](ci/e2e-runbooks.sh)): runs the
   shell blocks of the [divergence](docs/runbooks/divergence.md) and
   [history-rewrite](docs/runbooks/history-rewrite.md) runbooks exactly as

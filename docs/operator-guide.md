@@ -34,6 +34,10 @@ what to do when something goes wrong. The design behind it is
 - **Filesystem.** XFS (or btrfs) is recommended for the backing tree and
   state area: recording freezes a file's content with a reflink, which costs
   the same whatever the file's size. On ext4 it is a copy (§3.2).
+- **`git` 2.32 or later on `PATH`** for the hourly repack (§8); the
+  container image has it. Without it each repack fails with a
+  `RepackFailed` alarm and nothing else changes; set
+  `agentfs.repackInterval = off` to stop trying.
 - Building needs no FUSE library: the FUSE layer is pure Rust (fuser).
 
 ## 2. Layout
@@ -164,6 +168,7 @@ them takes a remount. Every key, including the per-remote ones, is in the
 | `agentfs.commitWindow` | `200ms` | Records this close in time become one commit |
 | `agentfs.pushInterval` | `60s` | How often each remote is pushed |
 | `agentfs.sweepInterval` | `30s` | How often files held open are checked and recorded, and failed records retried (minimum `1s`) |
+| `agentfs.repackInterval` | `1h` | How often the history is repacked with `git repack` (`0` or `off`: never; minimum `1m`); see [Databases](#14-databases-the-fsync-class) |
 | `agentfs.nested` | `exclude` | Nested git repositories: `exclude` records nothing in them, `working-tree` records their working files (§5) |
 | `agentfs.respectTreeRules` | `false` | Whether `.gitignore` and `.gitattributes` in the tree take part in rules |
 | `$GIT_DIR/info/exclude` | | Paths never recorded when new (git ignore syntax) |
@@ -223,6 +228,9 @@ raises a `PathRefused` alarm; the file itself works normally.
 
 A file opened for writing but not changed, or closed again without
 changes, is not recorded again.
+
+Databases in the `fsync` class are recorded differently, as whole groups
+and up to one interval late: see [Databases](#14-databases-the-fsync-class).
 
 ## 8. Lifecycle
 
@@ -444,7 +452,68 @@ a pointer, the content goes to an LFS server. It is off by default.
 - **Status** prints the threshold and each remote's LFS endpoint, or why
   it has none (`lfs: none (…)`).
 
-## 14. Troubleshooting
+## 14. Databases: the fsync class
+
+A database is held open and changed in place, so "recorded at close" could
+mean never, and a copy of the main file alone, taken while the writer is
+busy, may not open. The `fsync` class (design §8) records such files as
+whole, consistent groups instead.
+
+- **Opting in.** Add a line to the operator's
+  `<state>/git/info/attributes` (in Kubernetes, the ConfigMap's
+  `attributes`), then restart the mount:
+
+  ```text
+  *.db* agentfs.commit=fsync agentfs.group=sqlite
+  ```
+
+  `*.db*` matters: it puts the `-wal` and `-journal` files in the class
+  too. Only the operator's file counts; a tracked `.gitattributes` cannot
+  opt in. A bad value (`agentfs.commit=yes`, `agentfs.coalesce=100ms`)
+  stops the volume from opening, naming the line, rather than being
+  ignored.
+- **Groups.** `app.db`, `app.db-wal` and `app.db-journal` in one directory
+  with the same `agentfs.group` are one group, captured together; two
+  databases are two groups. A class path without `agentfs.group` is a
+  group of its own. `-shm` files are never recorded (SQLite rebuilds them).
+- **When.** A group is captured when a member is `fsync`ed, at most once
+  per `agentfs.coalesce` (default `30s`, at least `1s`, set per pattern:
+  `agentfs.coalesce=5m`); by a timer one interval after its first change
+  since the last capture, so a database whose commits never `fsync`
+  (SQLite WAL with `synchronous=NORMAL`) is still recorded; when a member
+  is closed or its last handle goes away; and at unmount
+  (`unmount: N database group(s) captured`). Renames and deletes of a
+  member are folded into the next capture.
+- **The guarantee is weaker on purpose.** A change to a database is in
+  history at most one interval late (plus the commit window), not before
+  the call returns. An `fsync` returning does not mean it is recorded.
+- **What a capture costs the workload.** Database files never use kernel
+  passthrough: every write goes through the daemon. During a capture,
+  writes to the group wait while its files are copied (a reflink on XFS,
+  a full copy on ext4). Choose `agentfs.coalesce` with the copy time and
+  the history size in mind.
+- **Every version opens.** Each capture is one point in time, as a crash
+  would leave the files, and is recorded whole or not at all: if one
+  member is refused (`agentfs.maxSize`, a remote's blob limit) the group
+  is skipped with a `PathRefused` alarm, and captured again after its
+  next change. Restore a version with the
+  [runbook](runbooks/recovery-and-undo.md#7-restoring-a-database).
+- **Size.** Every capture stores each changed member in full.
+  `agentfs.maxSize=512m` (any path, operator attributes) refuses larger
+  content; `agentfs.store=lfs` or `filter=lfs` sends the versions to LFS
+  (section 13) instead of git. The history is repacked every
+  `agentfs.repackInterval` (default `1h`) with `git repack --geometric=2`,
+  which stores versions of a database as deltas. A repack is skipped while
+  a push runs; a failing one raises `RepackFailed` and counts in
+  `agentfs.repack.failures`. Watch `agentfs.state.bytes{part="git"}`.
+- **`agentfs record`** of a member records its whole group; run it with
+  the workload stopped, since it does not hold writes.
+- **Limits.** `agentfs restore` and `revert` do not expand groups (see the
+  runbook). A database opened before its directory was renamed keeps its
+  old group until closed. A hard link to a member under a name the
+  pattern does not match is an ordinary file.
+
+## 15. Troubleshooting
 
 - **`passthrough: off (...)` in the startup line.** The reason is given:
   the kernel is older than 6.9, the daemon lacks `CAP_SYS_ADMIN` or runs in

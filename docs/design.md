@@ -2,8 +2,8 @@
 
 Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer,
 `agentfs mount`, `agentfs restore` and `agentfs revert`, the container
-image and the Kubernetes sidecar deployment exist), and Git LFS from
-phase 2 (§7). Draft 1 was
+image and the Kubernetes sidecar deployment exist), and from phase 2 Git
+LFS (§7) and the `fsync` class for databases (§8). Draft 1 was
 reviewed adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
 for the findings and what changed because of them.
 
@@ -53,7 +53,7 @@ be recorded after the fact; §3.1 lists them.
 | Phase | Contents |
 |---|---|
 | 1 | The recorder as a native sidecar for one pod: recording, commits, interval push to any remote, path rules, operator-only safety settings, push checks, OpenTelemetry, a supported manual recovery path |
-| 2 | Git LFS, and the `fsync` class for databases (§8) |
+| 2 | Git LFS (§7), and the `fsync` class for databases (§8); both built |
 | 3 | The ordered patch queue for iac (§12) |
 | 4 | The CSI driver, including volumes mounted by several pods at once (§14) |
 
@@ -180,7 +180,8 @@ so a crash never leaves a stale lock.
 | `unlink`, `rmdir` | removal | yes |
 | `link`, `symlink` | new path | yes |
 | `setattr` changing size (`truncate`) or the executable bit | new content or mode | yes |
-| `fsync` on a path marked `agentfs.commit=fsync` | content, coalesced (§8) | yes, at most once per interval |
+| `fsync` on a path marked `agentfs.commit=fsync` | its whole group (§8), coalesced | yes, at most once per interval |
+| the trailing timer of an `fsync`-class group | its whole group (§8) | **no**: at most one `agentfs.coalesce` late |
 | RELEASE (all handles and mappings gone) | content, if changed after the last FLUSH | **no**: backstop for mmap and late writes |
 | periodic sweep | content of files still open and changed | **no**: backstop for files never closed |
 
@@ -239,8 +240,11 @@ Rules that make this precise:
   1 s): it records inodes open for writing whose stamp changed (trigger
   `sweep`) and retries the repair queue (§3.5). At unmount a final sweep
   records every armed inode with any handle still open.
-- **The `fsync` class** (§8) is phase 2: paths with `agentfs.commit=fsync`
-  are recorded at close like any other, and `fsync` is passed through.
+- **The `fsync` class** (§8): paths with `agentfs.commit=fsync` are opened
+  without passthrough and recorded as whole groups, at `fsync` (rate
+  limited), by the trailing timer, at close and at unmount. Their own
+  renames, unlinks, links and size changes are folded into the group's
+  next capture rather than recorded alone; the sweep skips them.
 
 ### 3.2 The synchronous step
 
@@ -288,6 +292,15 @@ copy of the file, so recorded volumes should use XFS. The phase 1 benchmark (§1
   A failed commit raises `CommitFailed` (§13), and the loop backs off (doubling,
   up to 30 s) while the entries stay journaled. On shutdown everything left is
   committed, including the open group.
+- **Repack.** Every `agentfs.repackInterval` (default 1h) the commit loop
+  runs `git repack --geometric=2` between commits, then refreshes its object
+  database (§8). A failure raises `RepackFailed` (§13).
+- **A commit whose tree would not change is not made**: its records are
+  consumed without one, so a capture of an unchanged database costs a
+  copy, not a commit.
+- **Atomic records** (an `fsync`-class group, §8) are committed whole: if
+  the commit-time checks refuse any change in one, the whole record is
+  dropped, with a `PathRefused` alarm for the refused path.
 - **Grouping only affects how history reads,** not whether a change is kept.
   Entries close together in time are grouped. Inside a nested repository with
   `nested = working-tree` (§5), its `index.lock` bounds a group, with a timeout
@@ -446,8 +459,9 @@ that operator rules always apply:
 | Attribute | Values | Default | Meaning |
 |---|---|---|---|
 | `agentfs.commit` | `close`, `fsync` | `close` | Boundary class (§3.1, §8) |
-| `agentfs.coalesce` | duration | `30s` | Minimum interval between `fsync` records for one group |
-| `agentfs.group` | name | unset | Paths with the same group *and the same stem* are recorded together (§8) |
+| `agentfs.coalesce` | duration, at least `1s` | `30s` | Minimum interval between `fsync` records for one group, and the trailing timer's delay (§8) |
+| `agentfs.group` | name | unset (a group of one) | Paths with the same group *and the same stem* are recorded together (§8) |
+| `agentfs.maxSize` | size (`512k`, `100m`, `2g`) | unset | Content larger is refused (`max_size`), whatever the store (§8) |
 | `agentfs.store` | `blob`, `lfs` | §7 | Force ordinary git object or LFS; `blob` does not override `filter=lfs` |
 | `-agentfs` | | | Never record this path |
 
@@ -457,6 +471,12 @@ that operator rules always apply:
   never rewritten (§10).
 - Attribute patterns follow git: a directory pattern such as `secrets/` does
   not cover the directory's contents. Write `secrets/** -agentfs`.
+- `agentfs.commit`, `agentfs.coalesce`, `agentfs.group` and `agentfs.maxSize`
+  count only in the operator's `info/attributes`, never in a tracked
+  `.gitattributes`. The values of the first, second and fourth are
+  checked when the volume opens: a bad one (`agentfs.commit=sometimes`,
+  `agentfs.coalesce=100ms`) fails the open with the line number, so a typo
+  cannot silently turn the class off.
 
 ### 4.3 Settings
 
@@ -467,6 +487,7 @@ that operator rules always apply:
     commitWindow = 200ms       # group journal entries this close in time
     pushInterval = 60s         # §11
     sweepInterval = 30s        # §3.1: backstop for files left open; min 1s
+    repackInterval = 1h        # §8: git repack; 0 or off disables; min 1m
     lfsThreshold = 8m          # §7; unset by default (no size-based LFS)
 
 [lfs]                           # optional, as in git-lfs (§7)
@@ -869,52 +890,141 @@ checking that a remote has them.
 **Retention.** LFS objects cannot be pruned from most LFS servers
 (GitHub's needs the repository deleted), and pruned pointers break
 clones. agentfs prunes nothing, neither on servers nor in the local cache.
-It limits growth at the source instead, with operator rules and, later,
-coalescing intervals and size caps per path.
+It limits growth at the source instead, with operator rules, the `fsync`
+class's coalescing interval and `agentfs.maxSize` per path (§8).
 
 **Not built:** `git-lfs-authenticate` for SSH remotes, concurrent or
 resumable (tus) transfers, a per-remote LFS size limit, pruning cache
-objects every remote has, proxy settings, an `agentfs lfs fetch` command,
-and storing the fsync class (§8) as LFS.
+objects every remote has, proxy settings, and an `agentfs lfs fetch`
+command. Members of an `fsync`-class group (§8) follow the same store
+rules as any path.
 
 ## 8. Files changed in place: the `fsync` class (phase 2)
 
 Databases and similar files are held open and changed in place. Recording them
-only on `close` could mean never.
+only on `close` could mean never. Built in `agentfs_core::fsync_class` (the
+policy), `agentfs_core::volume` (atomic group records), `agentfs_fuse::groups`
+and `agentfs_fuse::ops` (the mount) and `agentfs_core::repack`.
+
+**Opting in.** Only the operator's `info/attributes` (§4.2) puts paths in
+the class; a tracked `.gitattributes` cannot, whatever
+`respectTreeRules` says. The usual line for SQLite is
+
+```text
+*.db* agentfs.commit=fsync agentfs.group=sqlite
+```
+
+with `*.db*` so the pattern covers the `-wal` and `-journal` files too. A
+bad `agentfs.commit`, `agentfs.coalesce` or `agentfs.maxSize` value in
+`info/attributes` fails the volume at open (`RulesError::BadAttribute`,
+naming the line), rather than being ignored as git ignores unknown values.
 
 **Groups.**
 
-- A group is the set of paths with the same `agentfs.group` value *and the same
-  stem* in one directory, for example `state.db`, `state.db-wal` and
-  `state.db-journal`.
-- `-shm` files are never recorded.
+- A group is the set of paths in one directory with the same
+  `agentfs.group` value *and the same stem*: `state.db`, `state.db-wal`
+  and `state.db-journal` (stem `state.db`). Every member must be in the
+  class; a member the attributes leave out is not part of the group.
+- A class path with no `agentfs.group` is a group of one: only itself.
+- The group's interval is the smallest `agentfs.coalesce` of its members.
+- `-shm` files are never recorded (`SkipReason::SharedMemory`): SQLite
+  rebuilds the WAL index from the WAL when a database is opened.
 - Two databases in one directory are two groups.
 
 **Triggers.**
 
-- An `fsync` on any member, at most once per `agentfs.coalesce` interval.
-- **A trailing timer.** SQLite with `synchronous=NORMAL` does not `fsync` on
-  commit, so a group with unrecorded changes is recorded when its interval
-  elapses even without an `fsync`.
-- At `close` and at unmount.
+- An `fsync` (or `fdatasync`) on any member, if the group changed and no
+  capture was attempted in the last interval (trigger `fsync`). An `fsync`
+  inside the interval is passed through and records nothing; a capture that
+  fails does not fail the `fsync`.
+- **A trailing timer** (thread `agentfs-capture`, trigger `interval`).
+  SQLite with `synchronous=NORMAL` does not `fsync` on commit, so a group
+  with unrecorded changes is captured one interval after its first change
+  since the last capture, and never sooner than one interval after the
+  last attempt.
+- The close (FLUSH) of a member's handle, if the group changed (trigger
+  `close`; a failure fails the `close` with `EIO`, as for any file), and
+  the release of the group's last handle (trigger `release`).
+- Unmount: every group with changes is captured after the sweep thread
+  stops (`unmount: N database group(s) captured`).
+- A rename, unlink, link or size change of a member is not recorded on
+  its own, which could split the group: it marks the group changed, and
+  the next capture of the whole group records it, at most one interval
+  later. The exception is an operator operation through the mount
+  (`agentfs restore`, `revert`, §15), whose changes capture their groups
+  at once.
+- `agentfs record <path>` (§17.1) records a member's whole group in one
+  record. It is meant for a stopped workload: it does not hold writes.
 
 **Consistent capture.**
 
-- While a group is frozen into `pending/`, writes to every member are held back.
-  The daemon can do this because it receives every write for these paths: they
-  are opened without passthrough and with writeback caching off.
-- The whole group is frozen as one unit. A restored database plus its `-wal` or
-  `-journal` then recovers normally.
+- Handles on class paths are never passthrough (§2.1), so the daemon serves
+  every write to them. Each write, truncation, `fallocate`,
+  `copy_file_range`, `O_TRUNC` open, unlink, link or `mknod` of a member
+  holds the group's gate around its system call. A capture *freezes* the
+  gate: it waits for the holds in progress, blocks new ones, and copies
+  every member into `pending/` while nothing can change any of them, so
+  the copies are one point in time, as a crash would leave them, which
+  SQLite recovers from. Renames are kept out by the mount's name lock,
+  which a capture holds for reading. The gate prefers the capture, so a
+  busy writer cannot starve it; writes wait for the length of one copy.
+- The writeback cache is never enabled (§2.1), so the daemon sees writes
+  as they happen. Writes through a shared mapping reach it when the kernel
+  writes the pages back, and are captured from then on.
+- **The group is recorded whole or not at all.** A capture is one record
+  marked atomic in the journal. If any member is refused (a check of §3.4,
+  `agentfs.maxSize`, a path rule), at record time the others are skipped
+  (`SkipReason::GroupRefused`), and at commit time the whole record is
+  dropped. A restored database plus its `-wal` or `-journal` therefore
+  always comes from one capture.
+- A capture that fails leaves the group changed, so the timer tries again
+  one interval later. A refused capture counts as done, as a refused close
+  does for an ordinary file. Captures of an unchanged group commit nothing
+  (the committer skips commits whose tree does not change).
 
 **Storage.**
 
-- Store databases as LFS (§7) or as ordinary objects, as the operator chooses.
-- libgit2 writes each version as a full compressed loose object and its push
-  makes no thin packs. So the recorder repacks periodically, for example by
-  running `git repack`, and size caps limit the worst case.
+- Members are stored by the rules of §7 like any path: LFS when the
+  operator says so (`agentfs.store=lfs`, `filter=lfs` or the threshold),
+  ordinary objects otherwise.
+- **`agentfs.maxSize`** (operator attribute, any path, `k`/`m`/`g` in
+  powers of 1024) refuses content larger than it, whatever the store,
+  checked on the size on disk and again on the frozen copy
+  (`PathRefused` with reason `max_size`). For a group it refuses the
+  whole capture.
+- **Repack.** libgit2 writes each version as a full compressed loose
+  object and has no repack. Every `agentfs.repackInterval` (default 1h,
+  `0` or `off` disables, at least 1m) the commit loop runs
+  `git repack -d -q --geometric=2` (with bitmaps off, system and global
+  git config ignored) between commits, so versions of a database are
+  delta-compressed into packs. It never prunes. It takes every remote's
+  push lock without waiting and skips the round if a push is running; a
+  failure raises `RepackFailed` (§13) and is tried again an interval later.
+  The container image ships the `git` CLI for this; without it, every
+  round fails with `RepackFailed`.
 
 **Guarantee.** For this class "before return" weakens to "at most one interval
-late". This is deliberate.
+late": a change to a member is in a journaled record no later than one
+`agentfs.coalesce` after it was made (plus the time of the capture), or
+at the member's close or unmount, whichever comes first, and it reaches a
+commit `commitWindow` later. This is deliberate. An `fsync` returning does
+not mean its data is recorded.
+
+**Not built, and known limits.**
+
+- `agentfs restore` and `agentfs revert` do not expand groups: restore
+  the database's directory, or each member, with the workload stopped
+  ([runbook](runbooks/recovery-and-undo.md#7-restoring-a-database)). Through
+  a running mount, a restore writes members one at a time and each write
+  may be captured, so history can hold intermediate versions that mix two
+  versions of the group; the final one is whole.
+- A member's group is found when it is opened. A handle opened before its
+  directory was renamed keeps the old group until it is closed; a hard
+  link to a member under a name outside the class is an ordinary file.
+- The class is per mount: a passthrough handle on the inode opened under a
+  non-class name (a hard link) is not held by the gate.
+- No per-group storage budget beyond `agentfs.maxSize`, and no pruning of
+  old versions.
 
 ## 9. Commit metadata
 
@@ -1237,6 +1347,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.journal.backlog` | gauge | Entries recorded but not committed |
 | `agentfs.commit.count` | counter | Commits made |
 | `agentfs.commit.failures` | counter | Commit passes that failed; the records stay journaled |
+| `agentfs.repack.failures` | counter | Periodic repacks that failed (§8) |
 | `agentfs.push.unpushed_commits` | gauge, per remote | Backlog |
 | `agentfs.push.oldest_unpushed_age` | gauge, per remote | Backlog age, the main push alarm |
 | `agentfs.push.failures` | counter, per remote, reason and stage | Rejected, non-fast-forward, authentication, untrusted host, network; stage `git`, or `lfs` for the LFS upload before the git push (§7) |
@@ -1291,6 +1402,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7), the head, the last pushed commit, the consecutive failure count and the next retry |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
+| `RepackFailed` | The periodic `git repack` (§8) failed, or refreshing the object database after it; tried again an interval later |
 | `PushSucceeded` | A push attempt succeeded, including one with nothing new (not an alarm; sinks filter) |
 
 A sink is called from the synchronous step, on the FUSE threads, so it must
@@ -1558,7 +1670,10 @@ one-time migration of Hermes' existing data and the initial import in
   - pre-commit checks (§3.4);
   - push (§11);
   - the background service: the commit loop and one push loop per remote,
-    with clean shutdown (§11.2);
+    with clean shutdown (§11.2), and the periodic repack on the commit
+    thread (§8, `repack`);
+  - the `fsync` class policy (§8, `fsync_class`): groups, stems, the
+    attributes and their validation; atomic group records in the recorder;
   - alarm events, through a non-blocking sink (§13);
   - Git LFS (§7, `lfs`): store selection, pointers, the managed
     `.gitattributes` block, the object cache, endpoints and credentials,
@@ -1570,8 +1685,10 @@ one-time migration of Hermes' existing data and the initial import in
     the kernel, so all of its behaviour is unit-tested against real
     directories and state areas; the inode table; dirty detection; the
     change boundaries; the repair queue (§3.5).
-  - The fuser adapter, the sweep thread, the layout preflight, mount and
-    unmount.
+  - `groups`: the `fsync`-class groups of the mount (§8): the gate that
+    holds writes while a group is captured, and each group's schedule.
+  - The fuser adapter, the sweep thread, the capture thread (the `fsync`
+    class's trailing timer), the layout preflight, mount and unmount.
   - It is a separate crate so the core stays free of FUSE and the binary
     stays a thin CLI.
 - **`agentfs`, a binary:**
@@ -1592,7 +1709,8 @@ one-time migration of Hermes' existing data and the initial import in
     a second signal. `mount`, `flush`, `record`, `push` and `run` export
     telemetry (§13) and take the pod flags (`AGENTFS_POD`, ...), so every
     command's telemetry resource is the same. `record` records paths of a
-    backing tree directly, without a mount;
+    backing tree directly, without a mount; a path in the `fsync` class
+    records its whole group as one atomic record (§8);
   - `status` is read-only (§2.3): the head, the last committed sequence,
     the backlog, the state-area lock's holder, the LFS threshold, and each
     remote: its URL (userinfo redacted), last pushed commit, unpushed
@@ -1659,7 +1777,8 @@ one-time migration of Hermes' existing data and the initial import in
     progress, which writes through the mount), unmount (a
     plain unmount, then a lazy detach if busy; `fusermount3 -u`, then
     `-u -z`, when not root), wait up to `--unmount-grace` (10 s) for the
-    session to end, run a final sweep, make the final commit, wait up to
+    session to end, run a final sweep, capture every `fsync`-class group
+    with changes (§8), make the final commit, wait up to
     `--push-grace` for pushes, flush telemetry, release the lock. A second
     signal exits 130.
 
@@ -1724,8 +1843,8 @@ Phase 4 (§14).
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
 | LFS | none exists: implemented in agentfs (§7) over `ureq` 3 (default features off: pure Rust, no TLS) and `sha2` 0.11; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, as `git2/https`; its webpki root bundle is compiled in but unused: the platform verifier reads the system store) | ureq's `native-tls-no-default` feature does not compile the native-tls connector in 3.4 (its code is behind the `native-tls` feature), hence `native-tls`. `reqwest` stays in the binary only, for OTLP |
 | Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `reqwest-blocking-client`, no TLS) in the binary | OTLP http/protobuf export. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
-| Repack | the `git` CLI | libgit2 has no repack or gc |
-| Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates` and `git`; built on `rust:1.99-trixie`; both pinned by digest | Not distroless: operators follow the runbooks with `git` through `kubectl exec`. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after the kind e2e passes |
+| Repack | the `git` CLI (`git repack --geometric=2`, git 2.32 or later) | libgit2 has no repack or gc. Run by the commit loop with system and global config off (§8); the image ships `git` |
+| Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates` and `git`; built on `rust:1.99-trixie`; both pinned by digest | Not distroless: the daemon runs `git repack` (§8), and operators follow the runbooks with `git` through `kubectl exec`. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after the kind e2e passes |
 
 ## 18. Acceptance tests
 
@@ -1791,12 +1910,18 @@ Phase 4 (§14).
 **Where they run.** Tests 1, 2, 4, 5, 6, 7 and 11 run through real mounts
 in the `fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with
 passthrough `auto`, `on` and `off`), along with SQLite in WAL and DELETE
-mode and git (`gc`, `fsck`) on the mount, though not test 14's restore of
-every recorded version. Test 11 also runs as `ci/e2e-recovery.sh` in the
+mode and git (`gc`, `fsck`) on the mount. Test 14's SQLite part runs there
+too, with the databases in the `fsync` class (every recorded version
+restored with its `-wal` or `-journal` and checked), and as
+`ci/e2e-sqlite.sh` in the same job: long-lived Python writers, the
+history catching up within one `agentfs.coalesce` of a WAL writer's last
+commit while it is still open, every version checked with
+`PRAGMA integrity_check` and whole transactions, and a restore of an
+older version by the runbook. Test 11 also runs as `ci/e2e-recovery.sh` in the
 same job (the recovery runbook end to end, ending with a push of the
 restore commits), and without a mount in `crates/agentfs/tests/cli_restore.rs`;
 the divergence and history-rewrite runbooks run in the `e2e-runbooks` job.
-Tests 8 and 12 (all but the record and commit failure counters, plus the
+Tests 8 and 12 (all but the record, commit and repack failure counters, plus the
 export-failure counter) run in the `e2e` jobs against a real git server
 and OpenTelemetry Collector; test 8 runs over smart HTTP and HTTPS
 (`e2e-remotes`) and over SSH (`e2e-ssh`, against OpenSSH's sshd). The
@@ -1817,7 +1942,7 @@ git-lfs client, `git clone` plus `git lfs pull`, over http and https)
 and without a server in `crates/agentfs/tests/cli_lfs.rs` (local and
 `file://` remotes; `git lfs pull` where git-lfs is installed, as on CI
 runners). Not automated yet: test 3 (a kill at every step), 13
-(performance), 14's SQLite part (§8 is not built) and 16.
+(performance) and 16.
 
 ## 19. Decisions and open questions
 
@@ -1873,6 +1998,12 @@ runners). Not automated yet: test 3 (a kill at every step), 13
 | LFS cache and retention | `<state>/lfs/objects/aa/bb/<oid>`, written at commit time; nothing is pruned, locally or on servers (§7) |
 | LFS restores | A pointer is checked out from the cache, else downloaded from the remotes in name order, every object before any write; tree content compared by SHA-256; `.gitattributes` without the managed block; a dry run only reports objects missing from the cache, downloading nothing (§7, §15) |
 | LFS client and TLS | agentfs's own client over `ureq` 3, pure Rust by default; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, system trust store, as libgit2). An explicit https endpoint without the feature is a misconfigured remote; a derived one fails at push time as `local` (§7, §17.3) |
+| `fsync` class: opting in | Operator `info/attributes` only; `agentfs.commit`, `agentfs.coalesce` (at least 1s) and `agentfs.maxSize` values are validated at open, and a bad one fails the volume naming the line (§4.2, §8) |
+| `fsync` class: groups | Same directory, same `agentfs.group`, same stem (`db`, `db-wal`, `db-journal`), every member in the class; no group is a group of one; the smallest member interval wins; `-shm` never recorded (§8) |
+| `fsync` class: capture | Class handles are never passthrough; every content or name change of a member holds a writer-preferring gate around its syscall, and a capture freezes the gate and copies every member as one atomic record. Triggers: `fsync` (rate-limited, and a capture failure does not fail the `fsync`), a trailing timer at max(first change, last attempt) + interval, close (`EIO` on failure), last release, unmount. A member's own namespace changes are folded into the next capture, except during an operator operation (§8) |
+| Atomic records | A journal record flag: at record time a refused member skips the rest of the group (`GroupRefused`), at commit time a refused change drops the whole record; a refused capture counts as done (§3.4, §8) |
+| `agentfs.maxSize` | An operator attribute for any path, refusing larger content (`max_size`) whatever the store, checked on the size on disk and on the frozen copy (§4.2, §8) |
+| Repack | `git repack -d -q --geometric=2` with bitmaps off and system and global config ignored, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); skipped while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
 | LFS test server | CI uses git-lfs's `lfs-test-server` (pinned by commit, built with `go install`) behind the git server's nginx, which authenticates with separate users per host; rudolfs (no auth or verify) and giftless (JWT setup) were not used (§18) |
 
 ### 19.2 Open questions
