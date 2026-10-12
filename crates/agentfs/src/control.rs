@@ -93,6 +93,7 @@ pub enum Reply {
 pub struct Peer {
     pub uid: u32,
     pub gid: u32,
+    /// 0 when unknown (the peer is outside the daemon's pid namespace).
     pub pid: u32,
 }
 
@@ -265,14 +266,44 @@ pub fn read_request(reader: impl Read) -> Result<Request, String> {
     serde_json::from_slice(&line).map_err(|e| format!("malformed request: {e}"))
 }
 
+/// The connection's `SO_PEERCRED`. The pid is 0 when the peer is in a pid
+/// namespace the daemon cannot see (it is then unknown, and no
+/// `Agentfs-Pid` names it).
+fn peer_credentials(stream: &UnixStream) -> io::Result<Peer> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` is a valid, writable `ucred` of `len` bytes, the
+    // buffer SO_PEERCRED fills; the descriptor is open for the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(io::Error::other("short SO_PEERCRED reply"));
+    }
+    Ok(Peer {
+        uid: cred.uid,
+        gid: cred.gid,
+        pid: u32::try_from(cred.pid).unwrap_or(0),
+    })
+}
+
 fn serve_one(mut stream: UnixStream, handler: &Handler, busy: &Mutex<()>, euid: u32) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-    let peer = match rustix::net::sockopt::socket_peercred(&stream) {
-        Ok(cred) => Peer {
-            uid: cred.uid.as_raw(),
-            gid: cred.gid.as_raw(),
-            pid: cred.pid.as_raw_nonzero().get() as u32,
-        },
+    let peer = match peer_credentials(&stream) {
+        Ok(peer) => peer,
         Err(e) => {
             write_reply(&mut stream, &Reply::Error(format!("peer credentials: {e}")));
             return;
@@ -368,6 +399,15 @@ mod tests {
             force: false,
             dry_run: true,
         }
+    }
+
+    #[test]
+    fn peer_credentials_are_the_peers_own() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let peer = peer_credentials(&a).unwrap();
+        assert_eq!(peer.pid, std::process::id());
+        assert_eq!(peer.uid, rustix::process::geteuid().as_raw());
+        assert_eq!(peer.gid, rustix::process::getegid().as_raw());
     }
 
     #[test]

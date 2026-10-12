@@ -200,6 +200,19 @@ impl Journal {
             .map(|r| r.seq)
     }
 
+    /// Whether every record up to `seq` is settled: written (or failed and
+    /// never journaled) and no longer waiting to be committed. Unlike
+    /// [`Journal::oldest_uncommitted`], records handed a sequence number
+    /// but still queued or being written count as unsettled.
+    pub fn settled_through(&self, seq: u64) -> bool {
+        let st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.processed_through.is_some_and(|p| p >= seq)
+            && st.uncommitted.first().is_none_or(|r| r.seq > seq)
+    }
+
     /// Durable records not yet committed to history, in sequence order.
     pub fn uncommitted(&self) -> Vec<Record> {
         self.lock().uncommitted.clone()
@@ -579,6 +592,37 @@ mod tests {
         assert_eq!((j.last_seq(), j.oldest_uncommitted()), (Some(2), None));
         let (j, _) = Journal::open(dir.path().join("other"), 42, no_hook()).unwrap();
         assert_eq!(j.last_seq(), Some(41));
+    }
+
+    #[test]
+    fn a_record_being_written_is_not_settled() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let hook: SyncHook = Box::new(move || {
+            entered_tx.lock().unwrap().send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(())
+        });
+        let (j, _) = Journal::open(dir.path().join("journal"), 0, hook).unwrap();
+        let j = Arc::new(j);
+        let writer = {
+            let j = Arc::clone(&j);
+            std::thread::spawn(move || j.record(draft("a")).unwrap())
+        };
+        entered.recv().unwrap();
+        // Handed out, not durable: nothing uncommitted yet, but not settled.
+        assert_eq!((j.last_seq(), j.oldest_uncommitted()), (Some(0), None));
+        assert!(!j.settled_through(0));
+        release.send(()).unwrap();
+        assert_eq!(writer.join().unwrap(), 0);
+        assert!(!j.settled_through(0), "durable, not committed");
+        j.truncate_through(0).unwrap();
+        assert!(j.settled_through(0));
     }
 
     #[test]

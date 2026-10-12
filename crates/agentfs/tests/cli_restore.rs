@@ -462,3 +462,126 @@ fn a_busy_state_area_exits_75() {
     assert!(err.contains("is in use"), "{err}");
     assert!(err.contains("`agentfs run` holds it"), "{err}");
 }
+
+impl Volume {
+    /// Runs `agentfs --root <tree> args` under `sh -c "<prefix>; exec ..."`
+    /// (a `ulimit`, a `trap`), with the same environment as [`Self::run`].
+    fn run_limited(&self, prefix: &str, args: &[&str]) -> Output {
+        let base = self.command();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("{prefix}; exec \"$@\""))
+            .arg("sh")
+            .arg(base.get_program())
+            .args(base.get_args())
+            .arg("--root")
+            .arg(self.tree())
+            .args(args);
+        for (name, value) in base.get_envs() {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            };
+        }
+        cmd.output().unwrap()
+    }
+}
+
+/// The tree already holds what the restore writes, but history does not
+/// (content put back by hand without `agentfs record`): the restore records
+/// it instead of reporting that everything matches.
+#[test]
+fn a_tree_ahead_of_history_is_recorded() {
+    let v = Volume::new();
+    v.write("p", "v1");
+    v.write("keep", "k");
+    v.record(&["p", "keep"]);
+    let c1 = v.head().to_string();
+    v.write("p", "v2");
+    v.write("q", "new");
+    v.record(&["p", "q"]);
+    // `git show C1:p > tree/p`, and q deleted, neither recorded.
+    v.write("p", "v1");
+    fs::remove_file(v.t("q")).unwrap();
+    let out = v.ok(&["restore", ".", &c1]);
+    assert!(
+        out.contains("  write p\n") && out.contains("  remove q\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("restored 1 path(s), removed 1: commit "),
+        "{out}"
+    );
+    assert_eq!(v.history(), h(&[("keep", "k"), ("p", "v1")]));
+    let message = v.message(v.head());
+    assert!(message.contains("Agentfs-Trigger: restore\n"), "{message}");
+    // Now both agree: a re-run has nothing to do.
+    let out = v.ok(&["restore", ".", &c1]);
+    assert!(out.contains("already matches"), "{out}");
+}
+
+/// A restore killed after writing some paths and before recording them
+/// (here by SIGXFSZ) is finished by running it again: what the tree
+/// already holds is recorded, the rest written.
+#[test]
+fn a_restore_killed_part_way_is_finished_by_a_rerun() {
+    let v = Volume::new();
+    let big = "b".repeat(20 << 10);
+    v.write("d/a", "a1");
+    v.write("d/b", &big);
+    v.record(&["d/a", "d/b"]);
+    let c1 = v.head().to_string();
+    v.write("d/a", "a2");
+    v.write("d/b", "b2");
+    v.record(&["d/a", "d/b"]);
+    let head = v.head();
+    // Writing d/a fits in 4 KiB; d/b does not, and SIGXFSZ kills it.
+    let out = v.run_limited("ulimit -f 8", &["restore", "d", &c1]);
+    assert_eq!(
+        out.status.code(),
+        None,
+        "killed: {}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert_eq!(v.read("d/a"), "a1", "written before the kill");
+    assert_eq!(v.read("d/b"), "b2", "the failed write left it whole");
+    assert_eq!(v.head(), head, "nothing recorded");
+    let out = v.ok(&["restore", "d", &c1]);
+    assert!(
+        out.contains("  write d/a\n") && out.contains("  write d/b\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("restored 2 path(s), removed 0: commit "),
+        "{out}"
+    );
+    assert_eq!(v.history(), h(&[("d/a", "a1"), ("d/b", &big)]));
+    assert_eq!(v.read("d/b"), big);
+}
+
+/// A write that fails (EFBIG here, as ENOSPC would) leaves the tree and
+/// history agreeing, so running the command again finishes the job.
+#[test]
+fn a_failed_write_can_be_finished_by_a_rerun() {
+    let v = Volume::new();
+    let big = "x".repeat(600 << 10);
+    v.write("big", &big);
+    v.record(&["big"]);
+    let c1 = v.head().to_string();
+    v.write("big", "small");
+    v.record(&["big"]);
+    let out = v.run_limited("trap '' XFSZ; ulimit -f 200", &["restore", "big", &c1]);
+    let (so, se) = (stdout(&out), stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "{so}{se}");
+    assert!(se.contains("failed part way"), "{se}");
+    assert!(!so.contains("already matched"), "{so}");
+    // Whatever the tree holds now, history holds too (the space is
+    // allocated first, so normally the file is untouched).
+    let now = v.read("big");
+    assert_eq!(v.history(), vec![("big".to_owned(), now)]);
+    let out = v.ok(&["restore", "big", &c1]);
+    assert!(out.contains(": commit "), "{out}");
+    assert_eq!(v.read("big"), big);
+    assert_eq!(v.history(), vec![("big".to_owned(), big)]);
+}

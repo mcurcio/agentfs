@@ -765,7 +765,8 @@ Agentfs-Pid: 4711
 - **Phase 1** gets pod metadata from the downward API.
 - **The CSI driver** gets it from `podInfoOnMount`.
 - **Grouped commits** carry one `Agentfs-Uid` and `Agentfs-Pid` line per
-  distinct writer.
+  distinct writer. A pid of 0 (an operator outside the daemon's pid
+  namespace, §15) is unknown and gets no `Agentfs-Pid` line.
 - **Restores and reverts** (§15) are commits of their own, never grouped
   with workload changes. Their subject is `restore <path> from <short id>`
   or `revert <short id>: <subject>`, they carry `Agentfs-Trigger: restore`
@@ -1118,9 +1119,11 @@ operator runbooks ([runbooks/](runbooks/)):
    state area: `git log --follow <path>`, `git show`, the remote's web
    view. Trailers (§9) say which pod, process and trigger made each
    change.
-2. **Pause the workload** when possible (a live restore is supported, but
-   a workload writing the same files can overwrite it again; its writes
-   are recorded too).
+2. **Pause the workload** when possible. A live restore is supported,
+   but a workload writing the same files can overwrite it again (its
+   writes are recorded too), and a file the workload opens and writes in
+   the moment between a path's last re-check and its write (see Safety)
+   has those writes replaced before they are recorded.
 3. **Restore or revert:**
    - `agentfs restore <path> <commit>` writes `<path>` (a file, symlink,
      directory, or `.` for the whole tree) as it was in `<commit>`,
@@ -1145,11 +1148,15 @@ operator runbooks ([runbooks/](runbooks/)):
   `meta/control/agentfs.sock` (§2.2): directory `0700`, socket `0600`,
   and each connection's `SO_PEERCRED` must be root or the daemon's user.
   Both ends address it as `/proc/self/fd/<dir fd>/agentfs.sock`, so a long
-  state path never hits the 108-byte `sun_path` limit. The protocol is
-  JSON lines, version 1, one request per connection, at most 64 KiB, read
-  within 10 s; one restore runs at a time and a second gets `busy` (exit
-  75). The daemon waits until every record made before the request is
-  committed (at least 10 s, or 20 commit windows; otherwise refused as
+  state path never hits the 108-byte `sun_path` limit. The peer's pid is
+  0 when it is in a pid namespace the daemon cannot see; it is then
+  unknown and named in no `Agentfs-Pid` (§9). The protocol is JSON
+  lines, version 1, one request per connection, at most 64 KiB, read
+  within 10 s; a restore request must name its path (`.` for the whole
+  tree; a missing path is refused, never taken as the root); one restore
+  runs at a time and a second gets `busy` (exit 75). The daemon waits
+  until every record made before the request, including one still being
+  written to the journal, is committed (at least 10 s, or 20 commit windows; otherwise refused as
   history being behind), checks against its mount point, and writes
   through its own mount from the connection's thread. The writes go
   through the kernel like any workload's, so kernel caches, the inode
@@ -1182,7 +1189,13 @@ one commit, since commits follow the journal's order.
   (§3.4) on the content;
 - the tree must hold what history says at every path the restore covers,
   including paths history already has right; anything else is a change
-  not in history, and is never overwritten, even with `--force`;
+  not in history, and is never overwritten, even with `--force`. The one
+  exception is a tree that already holds the restore's target where
+  history does not (a restore stopped between writing and recording, or
+  content put back by hand): nothing there would be lost, so direct mode
+  records it as part of the operation instead of calling it done, and a
+  mount, which records only what it sees written, refuses it as not
+  recorded;
 - nothing untracked may be in the way: a file where a restored one goes,
   a directory with files where a file goes, or a symlink or file as a
   parent directory (symlinks are never followed);
@@ -1191,8 +1204,19 @@ one commit, since commits follow the journal's order.
   history), and files a workload holds open for writing through the
   mount.
 
-A failure part way records what was written and reports the error; a
-re-run skips what is already done.
+**Re-checks and failures.** Each path is re-checked just before it
+changes: one that no longer holds what the check saw, or (unless
+`--force`) that a workload opened for writing through the mount since,
+is left alone and the operation stops there. A window remains between
+that re-check and the write: a workload that opens and writes the file
+in that moment, without closing it, has those writes replaced before
+they are recorded, so nothing unrecorded is lost only while the workload
+is paused. A failure part way records what was written and reports the
+error. A file is rewritten in place only after the space its new content
+needs is allocated, so a full disk or a file size limit leaves it whole;
+a write that fails after that (an I/O error) can leave it part written,
+and direct mode then records it as it is, so tree and history agree. A
+re-run records what the tree already holds and writes the rest.
 
 **Writing.** Removals run deepest first and prune directories they leave
 empty (never above the restored path's parent); writes run shallowest
@@ -1471,7 +1495,7 @@ step), 13 (performance) and 16.
 | Telemetry export failures | Each OTLP exporter is wrapped: a stderr warning at once, then at most once a minute with a count, a recovery line, and the counter `agentfs.telemetry.export_failures{signal}`; telemetry still never stops a command (§13) |
 | Restore modes | Live restore is supported: with a mount running, `restore` and `revert` ask it over the control socket and it writes through its own mount, so caches and dirty detection stay coherent; with nothing running they take the lock and write the backing tree directly; `run` serves none (exit 75) (§15) |
 | Restore semantics | `git restore --source=<commit> -- <path>` for restore, the inverse of the first-parent diff for revert; only commits on the volume's branch; untracked files never touched (§15) |
-| Restore safety | Every check before any write; content not in history is never overwritten, even with `--force`; `--force` overrides only what loses nothing (later recorded changes to a reverted path, files open for writing through the mount); a partial apply is recorded and a re-run is idempotent (§15) |
+| Restore safety | Every check before any write; content not in history is never overwritten, even with `--force`; `--force` overrides only what loses nothing (later recorded changes to a reverted path, files open for writing through the mount); each path is re-checked just before it changes; a partial apply is recorded, a tree already holding the target is recorded (direct) or refused (mount), and a re-run finishes the job (§15) |
 | Operation commits | The applying process or thread is registered as an actor; its records get trigger `restore`, the operator as author, and the operation in the journal record; each operation is its own commit with `Agentfs-Restore` or `Agentfs-Revert` (§9, §15) |
 | Control socket | `meta/control/agentfs.sock`, directory 0700, socket 0600, peer root or the daemon's user, addressed through `/proc/self/fd`; JSON lines, protocol v1, one operation at a time (§2.2, §15) |
 | History rewrite | A documented procedure with `git filter-repo --prune-empty never` in a mirror clone, then a force-push with lease per remote by an operator; not a command (§10, §15) |

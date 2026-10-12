@@ -226,14 +226,29 @@ impl Dir {
 
     /// Replaces the content of the regular file `rel` in place (keeping its
     /// inode, owner, mode and extended attributes).
+    ///
+    /// The space the new content needs is allocated before the first byte
+    /// changes, so the usual failures (`ENOSPC`, `EFBIG`, a quota) leave
+    /// the file as it was. A failure while writing (`EIO`) can still leave
+    /// it part written; the caller records what is there (design §15).
     pub fn write_in_place(&self, rel: &str, content: &[u8]) -> io::Result<()> {
-        let fd = self.open_at(rel, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())?;
+        let fd = self.open_at(rel, OFlags::WRONLY, Mode::empty())?;
         let st = rustix::fs::fstat(&fd)?;
         if kind_of(&st) != Kind::File {
             return Err(io::Error::other(format!("{rel} is not a regular file")));
         }
+        let len = content.len() as u64;
+        if len > st.st_size as u64 {
+            match rustix::fs::fallocate(&fd, rustix::fs::FallocateFlags::empty(), 0, len) {
+                Ok(()) => {}
+                // Not every filesystem (or FUSE layer) allocates ahead.
+                Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let mut file = std::fs::File::from(fd);
         file.write_all(content)?;
+        file.set_len(len)?;
         // Closing is the change boundary a mount records.
         drop(file);
         Ok(())

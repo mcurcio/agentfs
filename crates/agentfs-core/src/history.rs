@@ -378,7 +378,12 @@ fn message(records: &[Record], context: &Context) -> String {
     for uid in uids {
         out.push_str(&format!("Agentfs-Uid: {uid}\n"));
     }
-    let pids: BTreeSet<u32> = records.iter().map(|r| r.draft.caller.pid).collect();
+    // Pid 0 is unknown (a caller outside the pid namespace): not named.
+    let pids: BTreeSet<u32> = records
+        .iter()
+        .map(|r| r.draft.caller.pid)
+        .filter(|&pid| pid != 0)
+        .collect();
     for pid in pids {
         out.push_str(&format!("Agentfs-Pid: {pid}\n"));
     }

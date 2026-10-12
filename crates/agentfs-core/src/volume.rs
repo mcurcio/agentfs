@@ -644,11 +644,13 @@ impl Recorder {
     }
 
     /// Waits up to `timeout` until every record up to `seq` is in history
-    /// (or failed and was never journaled). Returns whether they all are.
+    /// (or failed and was never journaled), including records still being
+    /// written to the journal when it is called. Returns whether they all
+    /// are.
     pub fn wait_committed(&self, seq: u64, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.journal.oldest_uncommitted().is_none_or(|o| o > seq) {
+            if self.journal.settled_through(seq) {
                 return true;
             }
             if Instant::now() >= deadline {

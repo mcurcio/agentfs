@@ -17,9 +17,12 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 # OTLP over http/protobuf with a blocking client and no TLS: pure Rust, no
 # protoc, no C (design §13, §17.3).
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
-# Peer credentials of the control socket (`net`), the restore thread's id
-# (`thread`), and signals in tests (`process`).
-rustix = { version = "1.1.5", features = ["fs", "process", "net", "thread"] }
+# The restore thread's id (`thread`), and signals in tests (`process`).
+rustix = { version = "1.1.5", features = ["fs", "process", "thread"] }
+# The control socket's peer credentials (SO_PEERCRED) as plain integers: a
+# peer outside the daemon's pid namespace has pid 0, which rustix's `UCred`
+# (a non-zero `Pid`) cannot hold.
+libc = "0.2.190"
 # The control socket's JSON-lines protocol.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

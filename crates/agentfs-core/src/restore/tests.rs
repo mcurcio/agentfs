@@ -52,6 +52,10 @@ impl Liveness for Open {
     fn open_for_writing(&self, path: &RepoPath) -> bool {
         self.0.contains(&path.as_str())
     }
+
+    fn records_its_writes(&self) -> bool {
+        true
+    }
 }
 
 impl Fixture {
@@ -187,7 +191,8 @@ impl Fixture {
             &NotLive,
             false,
         )?;
-        apply(&plan, &self.repo, &self.dir()).map_err(|e| RestoreError::Io(e.error))
+        apply(&plan, &self.repo, &self.dir(), &NotLive, false)
+            .map_err(|e| RestoreError::Io(e.error))
     }
 }
 
@@ -265,7 +270,30 @@ fn restore_a_file_directory_root_and_symlink() {
     fx.checkout(&v2);
     fx.run(&fx.restore(".", c1)).unwrap();
     assert_eq!(fx.read_tree(), tree_of(&v1));
-    // Already matching: an empty plan after the check.
+    // The tree matches but history does not (stopped before recording):
+    // every changed path is kept, with nothing to write, to be recorded.
+    let plan = fx.plan(&fx.restore(".", c1)).unwrap();
+    let checked = check(
+        plan.clone(),
+        &fx.repo,
+        &Policy::default(),
+        &fx.dir(),
+        &NotLive,
+        false,
+    )
+    .unwrap();
+    let changed: Vec<_> = plan
+        .steps
+        .iter()
+        .filter(|s| s.current != s.target)
+        .cloned()
+        .collect();
+    assert_eq!(checked.steps, changed);
+    let applied = apply(&checked, &fx.repo, &fx.dir(), &NotLive, false).unwrap();
+    assert_eq!(applied.written.len() + applied.removed.len(), changed.len());
+    assert_eq!(fx.read_tree(), tree_of(&v1), "nothing rewritten");
+    // Already matching, in history too: an empty plan after the check.
+    fx.commit(&v1, "recorded");
     let plan = fx.plan(&fx.restore(".", c1)).unwrap();
     let checked = check(
         plan,
@@ -478,7 +506,7 @@ fn revert_of_a_path_changed_since_needs_force() {
         true,
     )
     .unwrap();
-    apply(&plan, &fx.repo, &fx.dir()).unwrap();
+    apply(&plan, &fx.repo, &fx.dir(), &NotLive, false).unwrap();
     assert_eq!(
         fx.read_tree(),
         tree_of(&[("f", File("1")), ("g", File("1"))])
@@ -535,7 +563,9 @@ fn check_refusals() {
         matches!(&err, RestoreError::InTheWay { path, what: "a file" } if path == "n"),
         "{err}"
     );
-    // ... unless it already holds the restored content.
+    // ... unless it already holds the restored content: then it is only
+    // recorded (directly), or refused as not in history (through a mount,
+    // which records only what it sees written).
     fs::write(fx.tree.join("n"), "new").unwrap();
     let plan = check(
         fx.plan(&fx.restore(".", c1)).unwrap(),
@@ -546,7 +576,111 @@ fn check_refusals() {
         false,
     )
     .unwrap();
-    assert!(plan.steps.is_empty());
+    assert_eq!(paths(&plan.steps), [("n", "write")]);
+    let err = check(
+        fx.plan(&fx.restore(".", c1)).unwrap(),
+        &fx.repo,
+        &Policy::default(),
+        &fx.dir(),
+        &Open(vec![]),
+        true,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::Unrecorded { path } if path == "n"),
+        "{err}"
+    );
+}
+
+/// The tree already holds the target but the branch head does not (a
+/// restore stopped between writing and recording, or `git show > file`
+/// without `agentfs record`): the path is kept so it gets recorded, never
+/// reported as matching.
+#[test]
+fn a_tree_ahead_of_history_is_recorded_not_skipped() {
+    let fx = Fixture::new();
+    let c1 = fx.commit(
+        &[("d/a", File("a1")), ("d/b", File("b1")), ("r", File("r"))],
+        "v1",
+    );
+    fx.commit(
+        &[("d/a", File("a2")), ("d/b", File("b2")), ("x", File("x"))],
+        "v2",
+    );
+    // d/a written, d/b not yet; x removed and r written by an earlier run
+    // of `restore .`, none of it recorded.
+    fx.checkout(&[("d/a", File("a1")), ("d/b", File("b2")), ("r", File("r"))]);
+    let plan = check(
+        fx.plan(&fx.restore(".", c1)).unwrap(),
+        &fx.repo,
+        &Policy::default(),
+        &fx.dir(),
+        &NotLive,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        paths(&plan.steps),
+        [
+            ("d/a", "write"),
+            ("d/b", "write"),
+            ("r", "write"),
+            ("x", "remove")
+        ]
+    );
+    let applied = apply(&plan, &fx.repo, &fx.dir(), &NotLive, false).unwrap();
+    let names = |v: &[RepoPath]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(names(&applied.written), ["r", "d/a", "d/b"], "all recorded");
+    assert_eq!(names(&applied.removed), ["x"]);
+    assert_eq!(
+        fx.read_tree(),
+        tree_of(&[("d/a", File("a1")), ("d/b", File("b1")), ("r", File("r"))])
+    );
+}
+
+/// Each path is re-checked just before it changes: a file a workload
+/// changed or opened for writing after the check is left alone.
+#[test]
+fn apply_rechecks_each_path() {
+    let fx = Fixture::new();
+    let c1 = fx.commit(&[("a", File("1")), ("b", File("1"))], "v1");
+    fx.commit(&[("a", File("2")), ("b", File("2"))], "v2");
+    fx.checkout(&[("a", File("2")), ("b", File("2"))]);
+    let checked = || {
+        check(
+            fx.plan(&fx.restore(".", c1)).unwrap(),
+            &fx.repo,
+            &Policy::default(),
+            &fx.dir(),
+            &NotLive,
+            false,
+        )
+        .unwrap()
+    };
+    // Changed after the check: not overwritten, whatever --force says.
+    let plan = checked();
+    fs::write(fx.tree.join("b"), "workload").unwrap();
+    for force in [false, true] {
+        let err = apply(&plan, &fx.repo, &fx.dir(), &NotLive, force).unwrap_err();
+        assert_eq!(err.path, "b");
+        assert!(!err.started);
+        assert!(
+            err.error.to_string().contains("changed since the check"),
+            "{}",
+            err.error
+        );
+        assert_eq!(fs::read(fx.tree.join("b")).unwrap(), b"workload");
+        assert!(err.left_changed(&plan, &fx.repo, &fx.dir()).is_none());
+    }
+    // Opened for writing after the check: left alone unless --force.
+    fx.checkout(&[("a", File("2")), ("b", File("2"))]);
+    let plan = checked();
+    let err = apply(&plan, &fx.repo, &fx.dir(), &Open(vec!["b"]), false).unwrap_err();
+    assert_eq!((err.path.as_str(), err.started), ("b", false));
+    assert!(err.error.to_string().contains("opened for writing"));
+    assert_eq!(fs::read(fx.tree.join("b")).unwrap(), b"2");
+    apply(&plan, &fx.repo, &fx.dir(), &Open(vec!["b"]), true).unwrap();
+    assert_eq!(fs::read(fx.tree.join("b")).unwrap(), b"1");
 }
 
 #[test]
@@ -701,7 +835,8 @@ fn removals_prune_empty_directories_and_keep_untracked_files() {
         fx.read_tree(),
         tree_of(&[("keep", File("k")), ("u/untracked", File("mine"))])
     );
-    // A re-run changes nothing.
+    // A re-run changes nothing (once history holds what was written).
+    fx.commit(&[("keep", File("k"))], "recorded");
     let plan = fx.plan(&fx.restore(".", c1)).unwrap();
     let plan = check(
         plan,
@@ -787,4 +922,28 @@ fn unrecorded_changes_where_history_already_matches_are_refused() {
     )
     .unwrap();
     assert!(plan.steps.is_empty());
+}
+
+/// A write cut short part way (EIO) is reported for recording as it is;
+/// a path left as history has it is not.
+#[test]
+fn a_write_cut_short_is_left_changed() {
+    let fx = Fixture::new();
+    let c1 = fx.commit(&[("f", File("old"))], "v1");
+    fx.commit(&[("f", File("new"))], "v2");
+    fx.checkout(&[("f", File("new"))]);
+    let plan = fx.plan(&fx.restore("f", c1)).unwrap();
+    let failed = |started| ApplyError {
+        applied: Applied::default(),
+        path: "f".into(),
+        error: io::Error::other("EIO"),
+        started,
+    };
+    assert_eq!(failed(true).left_changed(&plan, &fx.repo, &fx.dir()), None);
+    fs::write(fx.tree.join("f"), "ol").unwrap();
+    assert_eq!(
+        failed(true).left_changed(&plan, &fx.repo, &fx.dir()),
+        Some(RepoPath::new("f").unwrap())
+    );
+    assert_eq!(failed(false).left_changed(&plan, &fx.repo, &fx.dir()), None);
 }

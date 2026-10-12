@@ -104,12 +104,11 @@ impl Ask {
     /// The request a daemon received.
     fn from_wire(r: control::Request) -> Result<Self, RestoreError> {
         match r.op {
-            Op::Restore => Self::restore(
-                r.path.as_deref().unwrap_or("."),
-                r.commit,
-                r.force,
-                r.dry_run,
-            ),
+            // No default: a missing path must not mean the whole tree.
+            Op::Restore => match r.path.as_deref() {
+                Some(path) => Self::restore(path, r.commit, r.force, r.dry_run),
+                None => Err(RestoreError::MissingPath),
+            },
             Op::Revert => Ok(Self::revert(r.commit, r.force, r.dry_run)),
         }
     }
@@ -145,7 +144,7 @@ pub fn report(done: &Outcome) {
     match &done.commit {
         None if done.plan.is_empty() => println!("already matches: nothing to do"),
         None => println!(
-            "restored {} path(s), removed {}: no commit (history already matched)",
+            "restored {} path(s), removed {}: no commit",
             done.written, done.removed
         ),
         Some(commit) => println!(
@@ -297,11 +296,21 @@ fn direct(
         me,
         &[me.pid],
     )?;
-    let (applied, failure) = match restore::apply(&plan, history.repo(), &tree) {
+    let (applied, failure) = match restore::apply(&plan, history.repo(), &tree, &NotLive, ask.force)
+    {
         Ok(applied) => (applied, None),
-        Err(e) => (e.applied.clone(), Some(e.to_string())),
+        Err(e) => (e.applied.clone(), Some(e)),
     };
-    let recorded = record_applied(&recorder, &tree, &applied, me);
+    // A path the failure left changed (a write cut short) is recorded as it
+    // is, so the tree matches history again and a re-run can finish it.
+    let mut to_record = applied.clone();
+    if let Some(path) = failure
+        .as_ref()
+        .and_then(|e| e.left_changed(&plan, history.repo(), &tree))
+    {
+        to_record.written.push(path);
+    }
+    let recorded = record_applied(&recorder, &tree, &to_record, me);
     guard.finish();
     let report_commit = committer
         .commit_pending()
@@ -471,7 +480,7 @@ impl Daemon {
                 &[tid, std::process::id()],
             )
             .map_err(other)?;
-        let result = restore::apply(&plan, repo, &tree);
+        let result = restore::apply(&plan, repo, &tree, live, ask.force);
         let last = guard.finish();
         let applied = match &result {
             Ok(applied) => applied.clone(),
@@ -512,4 +521,37 @@ fn commit_with_seq(history: &History, seq: u64) -> Option<String> {
         commit = commit.parent(0).ok()?;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire(op: Op, path: Option<&str>) -> control::Request {
+        control::Request {
+            v: control::PROTOCOL_VERSION,
+            op,
+            path: path.map(str::to_owned),
+            commit: "HEAD~5".into(),
+            force: false,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn a_restore_request_must_name_its_path() {
+        let err = Ask::from_wire(wire(Op::Restore, None)).err().unwrap();
+        assert!(matches!(err, RestoreError::MissingPath), "{err}");
+        assert!(err.is_refusal());
+        let whole = Ask::from_wire(wire(Op::Restore, Some("."))).unwrap();
+        assert!(matches!(
+            whole.request,
+            Request::Restore {
+                spec: Pathspec::Root,
+                ..
+            }
+        ));
+        let revert = Ask::from_wire(wire(Op::Revert, None)).unwrap();
+        assert!(matches!(revert.request, Request::Revert { .. }));
+    }
 }

@@ -111,7 +111,13 @@ plain git (§5).
 restored 1 path(s), removed 1: commit 4f0c2e1d...
 ```
 
-`already matches: nothing to do` when the tree already is as asked.
+`already matches: nothing to do` when the tree and history both already
+are as asked. When the tree already holds what you asked for but history
+does not (an earlier restore stopped before recording, or you put the
+file back by hand without `agentfs record`), the path is still listed:
+with no mount running it is recorded, with nothing rewritten; through a
+mount it is refused as not recorded yet (pause the workload so the mount
+records it, then retry).
 Exit status: `0` done, `1` refused or failed (a reason and a hint on
 stderr), `75` the state area is busy or the mount is running another
 restore.
@@ -134,9 +140,22 @@ nothing.
 | `open for writing through the mount: ...` | The workload holds the file open | Pause it, or `--force` |
 | `history is behind the tree` | Records are not being committed (see `CommitFailed` alarms) | Fix that first (`agentfs status`) |
 
-A failure part way (a full disk, say) records what was written, reports
-the error and exits 1; running the same command again finishes the job:
-steps already done are skipped.
+Each path is re-checked just before it is written. If the workload
+changed it, or opened it for writing through the mount, since the
+checks, it is left alone and the command stops with `... since the
+check, so it was left alone`: run it again to check anew. A workload
+that opens and writes a file in the moment between that re-check and
+the write, without closing it, loses those unrecorded writes: pause the
+workload for anything it may be writing.
+
+A failure part way records what was written, reports the error and exits
+1, with `no commit` if nothing was recorded. A file is rewritten only
+after the space its new content needs is allocated, so a full disk
+(`ENOSPC`) or a file size limit leaves it as it was; an I/O error while
+writing can leave it part written, and with no mount running the command
+then records it as it is, so the tree and history agree. Either way,
+once the cause is fixed, running the same command again finishes the
+job: what the tree already holds is recorded, the rest written.
 
 ## 4. Undo a restore
 

@@ -491,6 +491,11 @@ impl agentfs_core::restore::Liveness for MountView {
     fn open_for_writing(&self, path: &agentfs_core::paths::RepoPath) -> bool {
         self.ops.open_for_writing(path.as_str().as_bytes())
     }
+
+    /// The FUSE layer records every write through the mount.
+    fn records_its_writes(&self) -> bool {
+        true
+    }
 }
 
 /// Unmounts `mountpoint`. Returns whether it had to be detached lazily

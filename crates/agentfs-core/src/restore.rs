@@ -24,12 +24,20 @@
 //!    files or directories in the way, and, overridable with `force`
 //!    because nothing is lost, later changes to a reverted path that are
 //!    already in history and files open for writing through a mount.
-//!    Steps the tree already matches are dropped, so a re-run is a no-op.
-//! 3. [`apply`] writes: removals deepest first (pruning directories they
-//!    leave empty), then writes shallowest first. A regular file with one
-//!    link is rewritten in place, keeping its inode, owner, other mode
-//!    bits and extended attributes; a hard-linked file, a type change or a
-//!    new file is a new inode (only the named path changes, as in git).
+//!    Steps the tree and the branch head both already match are dropped,
+//!    so a re-run is a no-op. Where the tree holds the target but the head
+//!    does not (a restore stopped between writing and recording), the step
+//!    is kept with nothing to write, so the caller records it (direct
+//!    mode); through a mount, which records only what it sees written, it
+//!    is refused as a change not in history.
+//! 3. [`apply`] re-checks each path just before changing it (it must still
+//!    hold what the check saw and, unless `force`, not be open for writing
+//!    through a mount), then writes: removals deepest first (pruning
+//!    directories they leave empty), then writes shallowest first. A
+//!    regular file with one link is rewritten in place, keeping its inode,
+//!    owner, other mode bits and extended attributes; a hard-linked file,
+//!    a type change or a new file is a new inode (only the named path
+//!    changes, as in git).
 //!    New files and directories take the owner of their nearest existing
 //!    parent when the process may chown, with mode 0644 or 0755.
 //!
@@ -171,6 +179,8 @@ pub enum RestoreError {
     NothingAtPath { path: String, commit: String },
     #[error("commit {commit} changes nothing")]
     NothingToRevert { commit: String },
+    #[error("a restore request must name a path (`.` for the whole tree)")]
+    MissingPath,
     #[error("{path:?} is not a path agentfs records: {error}")]
     InvalidPath { path: String, error: PathError },
     #[error("{path} would not be recorded: {reason}")]
@@ -214,6 +224,7 @@ impl RestoreError {
             Self::MergeCommit { .. } => "merge_commit",
             Self::NothingAtPath { .. } => "nothing_at_path",
             Self::NothingToRevert { .. } => "nothing_to_revert",
+            Self::MissingPath => "missing_path",
             Self::InvalidPath { .. } => "invalid_path",
             Self::Unrecordable { .. } => "unrecordable",
             Self::Unrecorded { .. } => "unrecorded",
@@ -245,7 +256,9 @@ impl RestoreError {
             Self::MergeCommit { .. } => "restore the paths you need from the commit instead",
             Self::NothingAtPath { .. } => "check the path with `git show <commit> --stat`",
             Self::NothingToRevert { .. } => return None,
-            Self::InvalidPath { .. } => "give a path relative to the tree root, or `.`",
+            Self::MissingPath | Self::InvalidPath { .. } => {
+                "give a path relative to the tree root, or `.`"
+            }
             Self::Unrecordable { .. } => {
                 "the path rules or checks (info/exclude, -agentfs, size limits) keep it out of \
                  history; change them first, or restore it with plain git"
@@ -493,16 +506,25 @@ impl RecordPolicy for crate::volume::Recorder {
     }
 }
 
-/// Which files a running workload holds open for writing.
+/// Which files a running workload holds open for writing, and who records
+/// the tree's changes.
 pub trait Liveness {
     fn open_for_writing(&self, path: &RepoPath) -> bool;
+    /// Whether the tree records its own writes (a mount: the FUSE layer
+    /// records them), rather than the caller recording what [`apply`]
+    /// reports (the backing tree, written directly).
+    fn records_its_writes(&self) -> bool;
 }
 
-/// No mount: nothing can be open through one.
+/// No mount: nothing can be open through one, and the caller records.
 pub struct NotLive;
 
 impl Liveness for NotLive {
     fn open_for_writing(&self, _: &RepoPath) -> bool {
+        false
+    }
+
+    fn records_its_writes(&self) -> bool {
         false
     }
 }
@@ -619,7 +641,23 @@ pub fn check(
             tree.current_entry(&step.path)?
         };
         if matches(repo, &current, step.target.as_ref())? {
-            continue; // Already done: a re-run is a no-op.
+            if step.current == step.target {
+                continue; // Already done, in the tree and in history.
+            }
+            // The tree already holds the target but history does not: an
+            // earlier restore stopped between writing and recording, or the
+            // content was put there by hand. Recording it loses nothing
+            // (the target is in history already). Directly, the step is
+            // kept, with nothing to write, so the caller records it; through
+            // a mount, which records only what it sees written, it is a
+            // change not in history yet.
+            if live.records_its_writes() {
+                return Err(RestoreError::Unrecorded {
+                    path: path.to_owned(),
+                });
+            }
+            kept.push(step);
+            continue;
         }
         if !matches(repo, &current, step.current.as_ref())? {
             match (&current, step.current) {
@@ -695,16 +733,87 @@ pub struct ApplyError {
     pub applied: Applied,
     pub path: String,
     pub error: io::Error,
+    /// Whether the re-check passed and [`apply`] had begun changing `path`
+    /// (so it may be left part written).
+    pub started: bool,
 }
 
-/// Writes a checked `plan` into `tree`.
-pub fn apply(plan: &Plan, repo: &Repository, tree: &Dir) -> Result<Applied, ApplyError> {
+impl ApplyError {
+    /// The failed step's path if [`apply`] had begun changing it and the
+    /// tree no longer holds history's entry there (a write cut short): the
+    /// caller records it as it is, so the tree matches history again and a
+    /// re-run finishes the job. `None` when nothing there changed, or it
+    /// failed its re-check (someone else changed it).
+    pub fn left_changed(&self, plan: &Plan, repo: &Repository, tree: &Dir) -> Option<RepoPath> {
+        if !self.started {
+            return None;
+        }
+        let step = plan.steps.iter().find(|s| s.path.as_str() == self.path)?;
+        let current = tree.current_entry(&step.path).ok()?;
+        let unchanged = matches(repo, &current, step.current.as_ref()).unwrap_or(false);
+        (!unchanged).then(|| step.path.clone())
+    }
+}
+
+/// Why [`apply`] stopped before changing a path: it no longer holds what
+/// [`check`] saw, or a workload opened it for writing since.
+fn changed_since_check(what: &str) -> io::Error {
+    io::Error::other(format!(
+        "{what} since the check, so it was left alone; run the command again to check anew"
+    ))
+}
+
+/// Re-checks `step` just before it is applied: the tree must hold what
+/// [`check`] accepted (history's current entry, or already the target; a
+/// directory or nothing only where the check allowed it), and, unless
+/// `force`, no workload may have opened it for writing since.
+fn recheck(
+    repo: &Repository,
+    tree: &Dir,
+    step: &Step,
+    live: &dyn Liveness,
+    force: bool,
+) -> io::Result<Current> {
+    if !force && live.open_for_writing(&step.path) {
+        return Err(changed_since_check("opened for writing through the mount"));
+    }
+    let current = tree.current_entry(&step.path)?;
+    let accepted = match &current {
+        // A directory in the way was checked to hold only removed paths;
+        // removing it fails if anything else appeared.
+        Current::Dir => step.target.is_some(),
+        // Absent where history has it, for a removal, is done already.
+        Current::Absent if step.target.is_none() => true,
+        _ => {
+            let is =
+                |entry: Option<&Entry>| matches(repo, &current, entry).map_err(io::Error::other);
+            is(step.current.as_ref())? || is(step.target.as_ref())?
+        }
+    };
+    if !accepted {
+        return Err(changed_since_check("changed"));
+    }
+    Ok(current)
+}
+
+/// Writes a checked `plan` into `tree`. Each path is re-checked just
+/// before it changes (see [`recheck`]); a workload can still write a file
+/// in the moment between that and the write, which is why a live restore
+/// should pause the workload.
+pub fn apply(
+    plan: &Plan,
+    repo: &Repository,
+    tree: &Dir,
+    live: &dyn Liveness,
+    force: bool,
+) -> Result<Applied, ApplyError> {
     let chown = crate::confined::can_chown();
     let mut applied = Applied::default();
-    let fail = |applied: &mut Applied, path: &str, error: io::Error| ApplyError {
+    let fail = |applied: &mut Applied, path: &str, error: io::Error, started: bool| ApplyError {
         applied: std::mem::take(applied),
         path: path.to_owned(),
         error,
+        started,
     };
     // Directories a write needs are never pruned.
     let needed: BTreeSet<&str> = plan
@@ -720,14 +829,14 @@ pub fn apply(plan: &Plan, repo: &Repository, tree: &Dir) -> Result<Applied, Appl
     let mut emptied: BTreeSet<String> = BTreeSet::new();
     for step in removals {
         let path = step.path.as_str();
-        match tree.kind_at(path) {
-            Ok(Kind::Absent) => {}
+        match recheck(repo, tree, step, live, force) {
+            Ok(Current::Absent) => {}
             Ok(_) => {
                 if let Err(e) = tree.unlink(path) {
-                    return Err(fail(&mut applied, path, e));
+                    return Err(fail(&mut applied, path, e, true));
                 }
             }
-            Err(e) => return Err(fail(&mut applied, path, e)),
+            Err(e) => return Err(fail(&mut applied, path, e, false)),
         }
         applied.removed.push(step.path.clone());
         for ancestor in ancestors(path) {
@@ -747,7 +856,7 @@ pub fn apply(plan: &Plan, repo: &Repository, tree: &Dir) -> Result<Applied, Appl
         if tree.kind_at(&dir).is_ok_and(|k| k == Kind::Dir)
             && let Err(e) = tree.rmdir(&dir)
         {
-            return Err(fail(&mut applied, &dir, e));
+            return Err(fail(&mut applied, &dir, e, false));
         }
     }
 
@@ -757,8 +866,12 @@ pub fn apply(plan: &Plan, repo: &Repository, tree: &Dir) -> Result<Applied, Appl
     for step in writes {
         let path = step.path.as_str();
         let Some(target) = step.target else { continue };
-        if let Err(e) = write_one(repo, tree, path, step, &target, chown) {
-            return Err(fail(&mut applied, path, e));
+        let current = match recheck(repo, tree, step, live, force) {
+            Ok(current) => current,
+            Err(e) => return Err(fail(&mut applied, path, e, false)),
+        };
+        if let Err(e) = write_one(repo, tree, path, current, &target, chown) {
+            return Err(fail(&mut applied, path, e, true));
         }
         applied.written.push(step.path.clone());
     }
@@ -788,13 +901,12 @@ fn write_one(
     repo: &Repository,
     tree: &Dir,
     path: &str,
-    step: &Step,
+    current: Current,
     target: &Entry,
     chown: bool,
 ) -> io::Result<()> {
     let parent_owner = make_parents(tree, path, chown)?;
     let blob = repo.find_blob(target.oid).map_err(io::Error::other)?;
-    let current = tree.current_entry(&step.path)?;
     match target.kind {
         EntryKind::File { executable } => {
             if let Current::File(f) = &current

@@ -128,7 +128,11 @@ agentfs --state /data/state revert <commit>
   have yet is never overwritten (not even with `--force`), and paths the
   rules would not record are refused. `--force` only overrides what loses
   nothing: a revert of paths changed again later, and files the workload
-  holds open. `--dry-run` prints the plan.
+  holds open. `--dry-run` prints the plan. Pause the workload for files
+  it may be writing: a write it makes in the moment between a path's last
+  check and the restore's write is replaced before it is recorded.
+- A restore that fails or is killed part way is finished by running it
+  again: what the tree already holds is recorded, the rest written.
 - Exit status: 0 done or already matching, 1 refused (with the reason and
   a hint) or failed, 75 busy.
 

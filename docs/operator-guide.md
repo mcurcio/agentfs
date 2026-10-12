@@ -347,7 +347,9 @@ agentfs --state /data/state revert <commit>
   75.
 
 Exit status: `0` done (or `already matches: nothing to do`), `1` refused
-(a one-line reason and a hint) or failed, `75` busy.
+(a one-line reason and a hint) or failed, `75` busy. A request sent to
+the control socket by hand must name its `path` (`"."` for the whole
+tree); one without is refused.
 
 Runbooks, with the full procedures:
 

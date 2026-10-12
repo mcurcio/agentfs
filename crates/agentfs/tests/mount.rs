@@ -1125,8 +1125,8 @@ fn restore_through_the_mount() {
     v.expect(&tree(&[("d/x", f("x1")), ("f", f("v1"))]));
     let out = v.ok(&["restore", ".", &c1]);
     assert!(out.contains("already matches"), "{out}");
-    // A change the workload made but nothing recorded yet cannot exist
-    // through a mount; a refusal still says why and exits 1.
+    // A refusal says why and exits 1 (an unrecorded write through the
+    // mount: restore_refuses_an_unrecorded_write_through_the_mount).
     let out = v.agentfs(&["restore", "nothing-here", &c1]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("nothing at nothing-here"));
@@ -1259,5 +1259,112 @@ fn restore_with_the_workload_stopped() {
     assert_eq!(fs::read_to_string(v.mnt().join("other")).unwrap(), "o");
     v.sh("printf v3 > f");
     v.expect(&tree(&[("f", f("v3")), ("other", f("o"))]));
+    m.stop();
+}
+
+/// A file a workload has written through the mount and still holds open
+/// is a change not recorded yet: refused even with --force, and kept.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn restore_refuses_an_unrecorded_write_through_the_mount() {
+    let v = Vol::new("restore_unrecorded_write");
+    let m = v.mount(&[]);
+    v.sh("printf v1 > f");
+    v.expect(&tree(&[("f", f("v1"))]));
+    let c1 = v.head_id();
+    v.sh("printf v2 > f");
+    v.expect(&tree(&[("f", f("v2"))]));
+    let head = v.head_id();
+
+    // A writer that has written f and holds it open: nothing recorded.
+    let mut holder = Command::new("sh")
+        .arg("-c")
+        .arg("exec 3>f; printf dirty >&3; echo ready; exec sleep 60")
+        .current_dir(v.mnt())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+    }
+    for force in [&[][..], &["--force"][..]] {
+        let mut args = vec!["restore"];
+        args.extend_from_slice(force);
+        args.extend(["f", c1.as_str()]);
+        let out = v.agentfs(&args);
+        let err = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.contains("f differs from history"), "{args:?}: {err}");
+        assert!(err.contains("--force does not override"), "{err}");
+        assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "dirty");
+    }
+    assert_eq!(v.head_id(), head, "nothing committed");
+    // Closed, the workload's write is recorded as usual.
+    let _ = holder.kill();
+    let _ = holder.wait();
+    v.expect(&tree(&[("f", f("dirty"))]));
+    m.stop();
+}
+
+/// Only root and the daemon's user may use the control socket: another
+/// uid is refused by its peer credentials when it can reach the socket
+/// (CAP_DAC_OVERRIDE), and cannot reach it otherwise.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn restore_by_another_user_is_refused() {
+    let v = Vol::new("restore_other_user");
+    let m = v.mount(&[]);
+    v.sh("printf v1 > f");
+    v.expect(&tree(&[("f", f("v1"))]));
+    let c1 = v.head_id();
+    v.sh("printf v2 > f");
+    v.expect(&tree(&[("f", f("v2"))]));
+    let head = v.head_id();
+    // A copy of the binary uid 10000 can execute wherever the build is.
+    let bin = v.p("agentfs-bin");
+    fs::copy(env!("CARGO_BIN_EXE_agentfs"), &bin).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let as_other = |caps: &[&str]| {
+        let mut cmd = Command::new("setpriv");
+        cmd.args([
+            format!("--reuid={UID}"),
+            format!("--regid={UID}"),
+            "--clear-groups".into(),
+        ])
+        .args(caps)
+        .arg("--")
+        .arg(&bin)
+        .arg("--state")
+        .arg(v.state())
+        .args(["restore", "f", c1.as_str()])
+        .env("AGENTFS_REPLICA", "test-0")
+        .env_remove("AGENTFS_ROOT");
+        cmd.output().unwrap()
+    };
+    // Through the socket: the peer's uid is refused.
+    let out = as_other(&["--inh-caps=+dac_override", "--ambient-caps=+dac_override"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains(&format!(
+            "uid {UID} may not use this mount's control socket"
+        )),
+        "{err}"
+    );
+    // Without it: the socket's directory is closed to it.
+    let out = as_other(&[]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("cannot be used") || err.contains("ermission denied"),
+        "{err}"
+    );
+    assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "v2");
+    assert_eq!(v.head_id(), head);
     m.stop();
 }
