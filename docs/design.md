@@ -113,6 +113,9 @@ through the mount:
     lock                 flock held by the one process using the state area (§2.3)
     push/<remote>.json   each remote's push state (§11.2)
     push/<remote>.lock   flock held while pushing that remote
+    repairs              paths a mount could not record, for the next one (§3.5)
+    control/agentfs.sock the running mount's control socket for restores (§15);
+                         directory 0700, socket 0600
 ```
 
 ### 2.3 Single writer of history

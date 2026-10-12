@@ -1,5 +1,5 @@
-//! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6 and 7, plus SQLite, git
-//! on the mount and the daemon's lifecycle).
+//! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7 and 11, plus SQLite,
+//! git on the mount, restores through the mount and the daemon's lifecycle).
 //!
 //! Every test needs `/dev/fuse` and root, so all are `#[ignore]`d; the
 //! `fuse` CI job runs them through `ci/fuse-tests.sh`:
@@ -220,6 +220,38 @@ impl Vol {
             commit.author().name().unwrap_or("").to_owned(),
             commit.message().unwrap_or("").to_owned(),
         )
+    }
+
+    /// The branch head commit id.
+    fn head_id(&self) -> String {
+        let repo = git2::Repository::open_bare(self.state().join("git")).unwrap();
+        repo.refname_to_id("refs/heads/agentfs/demo")
+            .unwrap()
+            .to_string()
+    }
+
+    /// The id of the head commit's first parent.
+    fn parent_id(&self) -> String {
+        let repo = git2::Repository::open_bare(self.state().join("git")).unwrap();
+        let head = repo
+            .find_reference("refs/heads/agentfs/demo")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        head.parent_id(0).unwrap().to_string()
+    }
+
+    /// Runs `agentfs` and expects success; its stdout.
+    fn ok(&self, args: &[&str]) -> String {
+        let out = self.agentfs(args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}{}\nlog:\n{}",
+            text(&out.stdout),
+            text(&out.stderr),
+            fs::read_to_string(self.log_path()).unwrap_or_default()
+        );
+        text(&out.stdout)
     }
 
     /// Waits until history is exactly `want`.
@@ -1024,4 +1056,208 @@ fn a_dot_git_that_is_no_repository_alarms() {
     let alarms: Vec<&str> = log.lines().filter(|l| l.starts_with("alarm:")).collect();
     assert_eq!(alarms.len(), 1, "{log}");
     assert!(alarms[0].contains("notes/.git/report.txt"), "{log}");
+}
+
+// ---- design §15, §18 test 11: recovery ----
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn restore_through_the_mount() {
+    let v = Vol::new("restore_through_the_mount");
+    let m = v.mount(&[]);
+    v.sh("chown 10000:10000 .");
+    v.sh_as(
+        Some(UID),
+        "printf v1 > f && mkdir d && printf x1 > d/x",
+        true,
+    );
+    v.expect(&tree(&[("d/x", f("x1")), ("f", f("v1"))]));
+    let c1 = v.head_id();
+    v.sh_as(Some(UID), "printf v2 > f && printf n > d/new", true);
+    v.expect(&tree(&[
+        ("d/new", f("n")),
+        ("d/x", f("x1")),
+        ("f", f("v2")),
+    ]));
+    let c2 = v.head_id();
+
+    // A file, while mounted: the mount shows it at once, history has one
+    // new commit, authored by the operator (root here).
+    let out = v.ok(&["restore", "f", &c1]);
+    assert!(out.contains("  write f\n"), "{out}");
+    assert!(
+        out.contains("restored 1 path(s), removed 0: commit "),
+        "{out}"
+    );
+    assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "v1");
+    v.expect(&tree(&[
+        ("d/new", f("n")),
+        ("d/x", f("x1")),
+        ("f", f("v1")),
+    ]));
+    assert_eq!(v.parent_id(), c2, "one commit");
+    let (author, message) = v.head();
+    assert_eq!(author, "uid-0");
+    assert!(message.starts_with("restore f from "), "{message}");
+    assert!(message.contains("Agentfs-Trigger: restore\n"), "{message}");
+    assert!(
+        message.contains(&format!("Agentfs-Restore: {c1}\n")),
+        "{message}"
+    );
+    assert!(message.contains("Agentfs-Uid: 0\n"), "{message}");
+    assert!(!message.contains("Agentfs-Uid: 10000"), "{message}");
+    assert!(
+        out.contains(&v.head_id()),
+        "the reply names the commit: {out}"
+    );
+    // Rewritten in place: still the workload's file.
+    assert_eq!(fs::metadata(v.mnt().join("f")).unwrap().uid(), UID);
+
+    // A directory: a removal too. Then a dry run and a no-op.
+    let out = v.ok(&["restore", "--dry-run", "d", &c1]);
+    assert!(
+        out.contains("remove d/new") && out.contains("dry run"),
+        "{out}"
+    );
+    assert!(v.mnt().join("d/new").exists());
+    v.ok(&["restore", "d", &c1]);
+    assert!(!v.mnt().join("d/new").exists());
+    v.expect(&tree(&[("d/x", f("x1")), ("f", f("v1"))]));
+    let out = v.ok(&["restore", ".", &c1]);
+    assert!(out.contains("already matches"), "{out}");
+    // A change the workload made but nothing recorded yet cannot exist
+    // through a mount; a refusal still says why and exits 1.
+    let out = v.agentfs(&["restore", "nothing-here", &c1]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("nothing at nothing-here"));
+    m.stop();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn revert_through_the_mount() {
+    let v = Vol::new("revert_through_the_mount");
+    let m = v.mount(&[]);
+    v.sh("chown 10000:10000 .");
+    v.sh_as(
+        Some(UID),
+        "mkdir d && printf y > d/y && chmod 750 d/y && printf k > keep",
+        true,
+    );
+    v.expect(&tree(&[("d/y", Exec("y".into())), ("keep", f("k"))]));
+    v.sh_as(Some(UID), "printf x > x", true);
+    v.expect(&tree(&[
+        ("d/y", Exec("y".into())),
+        ("keep", f("k")),
+        ("x", f("x")),
+    ]));
+    let add = v.head_id();
+    v.sh_as(Some(UID), "rm d/y", true);
+    v.expect(&tree(&[("keep", f("k")), ("x", f("x"))]));
+    let delete = v.head_id();
+
+    // Revert the add: x is removed.
+    let out = v.ok(&["revert", &add]);
+    assert!(out.contains("  remove x\n"), "{out}");
+    assert!(!v.mnt().join("x").exists());
+    v.expect(&tree(&[("keep", f("k"))]));
+    let (_, message) = v.head();
+    assert!(
+        message.contains(&format!("Agentfs-Revert: {add}\n")),
+        "{message}"
+    );
+    assert!(message.contains("Agentfs-Trigger: restore\n"), "{message}");
+
+    // Revert the delete: d/y comes back, owned like its directory, with
+    // its exec bit.
+    v.ok(&["revert", &delete]);
+    v.expect(&tree(&[("d/y", Exec("y".into())), ("keep", f("k"))]));
+    let meta = fs::metadata(v.mnt().join("d/y")).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (UID, UID), "the parent's owner");
+    assert_eq!(meta.mode() & 0o777, 0o755);
+    assert_eq!(fs::read_to_string(v.mnt().join("d/y")).unwrap(), "y");
+    m.stop();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn restore_refuses_a_file_open_for_writing() {
+    let v = Vol::new("restore_open_for_writing");
+    let m = v.mount(&[]);
+    v.sh("printf v1 > f");
+    v.expect(&tree(&[("f", f("v1"))]));
+    let c1 = v.head_id();
+    v.sh("printf v2 > f");
+    v.expect(&tree(&[("f", f("v2"))]));
+
+    // A writer holding f open (without writing).
+    let mut holder = Command::new("sh")
+        .arg("-c")
+        .arg("exec 3>>f; echo ready; exec sleep 60")
+        .current_dir(v.mnt())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+    }
+    let out = v.agentfs(&["restore", "f", &c1]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("open for writing through the mount: f"),
+        "{err}"
+    );
+    assert!(err.contains("--force"), "{err}");
+    assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "v2");
+
+    v.ok(&["restore", "--force", "f", &c1]);
+    assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "v1");
+    v.expect(&tree(&[("f", f("v1"))]));
+    let _ = holder.kill();
+    let _ = holder.wait();
+    m.stop();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn restore_with_the_workload_stopped() {
+    let v = Vol::new("restore_stopped");
+    let m = v.mount(&[]);
+    v.sh("chown 10000:10000 .");
+    v.sh_as(Some(UID), "printf v1 > f && printf o > other", true);
+    v.expect(&tree(&[("f", f("v1")), ("other", f("o"))]));
+    let c1 = v.head_id();
+    v.sh_as(Some(UID), "printf v2 > f && rm other", true);
+    v.expect(&tree(&[("f", f("v2"))]));
+    m.stop();
+
+    // No mount: direct mode writes the backing tree and records it.
+    let backing = v.backing().to_str().unwrap().to_owned();
+    let out = v.ok(&["--root", &backing, "restore", ".", &c1]);
+    assert!(
+        out.contains("restored 2 path(s), removed 0: commit "),
+        "{out}"
+    );
+    v.expect(&tree(&[("f", f("v1")), ("other", f("o"))]));
+    let (author, message) = v.head();
+    assert_eq!(author, "uid-0");
+    assert!(message.contains("Agentfs-Restore: "), "{message}");
+    // The rewritten file keeps its owner; the recreated one gets its
+    // directory's.
+    assert_eq!(fs::metadata(v.backing().join("f")).unwrap().uid(), UID);
+    assert_eq!(fs::metadata(v.backing().join("other")).unwrap().uid(), UID);
+
+    // Remounted, the tree and history agree.
+    let m = v.mount(&[]);
+    assert_eq!(fs::read_to_string(v.mnt().join("f")).unwrap(), "v1");
+    assert_eq!(fs::read_to_string(v.mnt().join("other")).unwrap(), "o");
+    v.sh("printf v3 > f");
+    v.expect(&tree(&[("f", f("v3")), ("other", f("o"))]));
+    m.stop();
 }

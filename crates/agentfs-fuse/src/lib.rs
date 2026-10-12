@@ -30,5 +30,6 @@ pub mod sweep;
 
 pub use fuse::{Passthrough, PassthroughStatus};
 pub use mount::{
-    Mount, MountConfig, MountError, PreflightError, StartupRepairs, UnmountReport, preflight,
+    Mount, MountConfig, MountError, MountView, PreflightError, StartupRepairs, UnmountReport,
+    preflight,
 };

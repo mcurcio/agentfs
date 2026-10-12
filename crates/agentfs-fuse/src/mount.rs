@@ -434,6 +434,14 @@ impl Mount {
         &self.mountpoint
     }
 
+    /// What a restore through the mount needs of it (design §15).
+    pub fn view(&self) -> MountView {
+        MountView {
+            mountpoint: self.mountpoint.clone(),
+            ops: self.ops.clone(),
+        }
+    }
+
     /// Unmounts (lazily if busy), waits up to `grace` for the session to
     /// end, stops the sweep and runs a final one over every file still
     /// open, plus the repair queue.
@@ -462,6 +470,26 @@ impl Mount {
                 .and_then(|(store, error)| error.is_none().then_some(store));
         }
         report
+    }
+}
+
+/// A running mount as a restore sees it: where to write, and which files
+/// the workload holds open for writing (design §15). Cheap to clone.
+#[derive(Clone)]
+pub struct MountView {
+    mountpoint: PathBuf,
+    ops: Arc<Ops>,
+}
+
+impl MountView {
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+}
+
+impl agentfs_core::restore::Liveness for MountView {
+    fn open_for_writing(&self, path: &agentfs_core::paths::RepoPath) -> bool {
+        self.ops.open_for_writing(path.as_str().as_bytes())
     }
 }
 

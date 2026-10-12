@@ -17,14 +17,19 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 # OTLP over http/protobuf with a blocking client and no TLS: pure Rust, no
 # protoc, no C (design §13, §17.3).
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
+# Peer credentials of the control socket (`net`), the restore thread's id
+# (`thread`), and signals in tests (`process`).
+rustix = { version = "1.1.5", features = ["fs", "process", "net", "thread"] }
+# The control socket's JSON-lines protocol.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
 
 [dev-dependencies]
 # Decodes OTLP payloads in the fake collector of the telemetry test.
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs"] }
 prost = "0.14"
 git2 = { version = "0.21.0", default-features = false }
-# Sends SIGTERM in the `run` test: std's Child::kill only sends SIGKILL.
-rustix = { version = "1.1.5", features = ["fs", "process"] }
 tempfile = "3.27.0"
 
 [features]

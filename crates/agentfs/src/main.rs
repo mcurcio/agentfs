@@ -21,6 +21,7 @@
 //! [`otel`], design §13); alarms are also printed to stderr. `init` and
 //! `status` export nothing.
 
+mod control;
 mod daemon;
 mod otel;
 mod recovery;
@@ -608,6 +609,7 @@ fn mount(
     let (backing, mountpoint) = preflight(state, &settings, &args.backing, &args.mountpoint)?;
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
+    let restorer = recorder.clone();
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
     let service = Service::start(committer, pushers, events).context("starting the service")?;
@@ -628,6 +630,28 @@ fn mount(
             let _ = service.shutdown(args.push_grace);
             session.finish();
             return Err(e.into());
+        }
+    };
+    // Restores and reverts through the mount (design §15). Without the
+    // socket the mount still works; restores then need it stopped.
+    let control = {
+        let handler = recovery::Daemon {
+            state: state.clone(),
+            recorder: restorer,
+            view: mounted.view(),
+            commit_window: settings.commit_window,
+        };
+        let handler: control::Handler = Arc::new(move |request, peer| handler.serve(request, peer));
+        match control::Server::start(&state.control_dir(), handler) {
+            Ok(server) => Some(server),
+            Err(e) => {
+                eprintln!(
+                    "warning: control socket in {}: {e}; restore and revert need the mount \
+                     stopped",
+                    state.control_dir().display()
+                );
+                None
+            }
         }
     };
     daemon.watch(mounted.ended(), Wake::Unmounted)?;
@@ -664,6 +688,12 @@ fn mount(
         args.unmount_grace,
         args.push_grace
     );
+    // Before the unmount: a restore writes through the mount.
+    if let Some(control) = control
+        && !control.shutdown(args.unmount_grace)
+    {
+        eprintln!("a restore was still running at shutdown; it stops with the unmount");
+    }
     let report = mounted.shutdown(args.unmount_grace);
     if let Some(error) = &report.unmount_error {
         eprintln!("unmount failed: {error}");

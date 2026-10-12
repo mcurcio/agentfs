@@ -1565,6 +1565,22 @@ impl Ops {
         report
     }
 
+    /// Whether the file at `rel` (a path from the mount root) has a handle
+    /// open for writing through the mount. A path the mount has never
+    /// looked up has no open handle (design §15: a restore through the
+    /// mount refuses such files without `--force`).
+    pub fn open_for_writing(&self, rel: &[u8]) -> bool {
+        let table = self.table();
+        let mut id = ROOT;
+        for name in rel.split(|&b| b == b'/').filter(|n| !n.is_empty()) {
+            match table.child(id, name) {
+                Some(child) => id = child,
+                None => return false,
+            }
+        }
+        table.get(id).is_some_and(|n| n.write_handles > 0)
+    }
+
     /// How many handles are open (for tests and the shutdown report).
     pub fn open_handles(&self) -> usize {
         self.handles().len()

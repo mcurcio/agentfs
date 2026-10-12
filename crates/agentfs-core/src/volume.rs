@@ -43,6 +43,9 @@ use crate::rules::{Decision, Rules, RulesError, SkipReason};
 use crate::telemetry::{Telemetry, spans};
 use crate::tracked::Tracked;
 
+/// The control socket's name in `meta/control`.
+pub const CONTROL_SOCKET: &str = "agentfs.sock";
+
 /// Layout of a state area (design §2.2).
 #[derive(Debug, Clone)]
 pub struct StateDir {
@@ -94,6 +97,17 @@ impl StateDir {
     /// The lock that keeps two processes from pushing `remote` at once.
     pub fn push_lock(&self, remote: &str) -> PathBuf {
         self.push_dir().join(format!("{remote}.lock"))
+    }
+
+    /// Where a running mount listens for restores (design §2.2, §15),
+    /// readable only by the daemon's user.
+    pub fn control_dir(&self) -> PathBuf {
+        self.meta().join("control")
+    }
+
+    /// The control socket in [`StateDir::control_dir`].
+    pub fn control_socket(&self) -> PathBuf {
+        self.control_dir().join(CONTROL_SOCKET)
     }
 
     /// The state-area lock (design §2.3, [`crate::lock`]).

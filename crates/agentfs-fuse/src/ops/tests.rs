@@ -1070,3 +1070,105 @@ fn a_repair_never_drops_a_path_queued_again_meanwhile() {
     fx.ops.boundary().repaired(&listed);
     assert_eq!(fx.ops.boundary().pending_repairs(), 0);
 }
+
+// ---- restores through the mount (design §15) ----
+
+#[test]
+fn open_for_writing_tracks_write_handles() {
+    let fx = Fx::new();
+    fx.put("f", "x");
+    fx.mkdir("d");
+    fx.put("d/g", "y");
+    assert!(!fx.ops.open_for_writing(b"f"));
+    let read = fx.open("f", O_RDONLY);
+    assert!(!fx.ops.open_for_writing(b"f"), "a read handle");
+    let write = fx.open("f", O_WRONLY);
+    assert!(fx.ops.open_for_writing(b"f"));
+    let nested = fx.open("d/g", O_RDWR);
+    assert!(fx.ops.open_for_writing(b"d/g"));
+    assert!(!fx.ops.open_for_writing(b"d"));
+    assert!(!fx.ops.open_for_writing(b"unknown"));
+    assert!(!fx.ops.open_for_writing(b"d/unknown/x"));
+    fx.close(write);
+    fx.close(nested);
+    assert!(!fx.ops.open_for_writing(b"f"));
+    assert!(!fx.ops.open_for_writing(b"d/g"));
+    fx.close(read);
+}
+
+#[test]
+fn records_by_a_restore_actor_belong_to_the_operation() {
+    use agentfs_core::record::OperationKind;
+    let fx = Fx::new();
+    fx.put("a", "1");
+    fx.put("b", "2");
+    fx.history();
+    let operator = Caller {
+        uid: 0,
+        gid: 0,
+        pid: 999,
+    };
+    let actor = Caller { pid: 4321, ..C };
+    let guard = fx
+        .ops
+        .boundary()
+        .recorder()
+        .begin_operation(
+            OperationKind::Revert,
+            "0123456789012345678901234567890123456789".into(),
+            "revert 0123456: x".into(),
+            operator,
+            &[actor.pid],
+        )
+        .unwrap();
+    // A write (close), a chmod +x (setattr) and an unlink by the actor.
+    let fh = fx.open("a", O_WRONLY | O_TRUNC);
+    fx.ops.write(fh, 0, b"restored", actor).unwrap();
+    fx.ops.flush(fh, actor).unwrap();
+    fx.ops.release(fh).unwrap();
+    let id = fx.id("a");
+    fx.ops
+        .setattr(
+            id,
+            &SetAttr {
+                mode: Some(0o100755),
+                ..SetAttr::default()
+            },
+            actor,
+        )
+        .unwrap();
+    fx.ops.unlink(ROOT, b"b", actor).unwrap();
+    // Someone else, meanwhile.
+    fx.put("c", "3");
+    let last = guard.finish();
+    let journal: Vec<_> = agentfs_core::journal::read_records(&fx.state().journal())
+        .unwrap()
+        .0;
+    let ours: Vec<_> = journal
+        .iter()
+        .filter(|r| r.draft.operation.is_some())
+        .collect();
+    assert_eq!(ours.len(), 3, "{journal:#?}");
+    for r in &ours {
+        assert_eq!(r.draft.trigger, Trigger::Restore);
+        assert_eq!(r.draft.caller, operator);
+    }
+    assert_eq!(last, Some(ours[2].seq));
+    let theirs = journal
+        .iter()
+        .find(|r| r.draft.operation.is_none())
+        .unwrap();
+    assert_eq!(theirs.draft.caller, C);
+    assert_eq!(
+        fx.history(),
+        map(&[("a", Item::Exec("restored".into())), ("c", file("3"))])
+    );
+    let head = fx.committer.history().head().unwrap().unwrap();
+    let parent = head.parent(0).unwrap();
+    let message = parent.message().unwrap().to_owned();
+    assert!(message.starts_with("revert 0123456: x"), "{message}");
+    assert!(
+        message.contains("Agentfs-Revert: 0123456789012345678901234567890123456789"),
+        "{message}"
+    );
+}
