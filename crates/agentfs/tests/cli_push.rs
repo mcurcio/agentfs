@@ -55,6 +55,12 @@ impl Volume {
             .env("AGENTFS_REPLICA", "test-0")
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"));
+        // Hermetic: no telemetry from the environment running the tests.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("OTEL_") {
+                cmd.env_remove(name);
+            }
+        }
         cmd
     }
 

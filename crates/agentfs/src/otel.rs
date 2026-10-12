@@ -1,0 +1,575 @@
+//! Telemetry export for the `agentfs` process (design §13).
+//!
+//! Export is configured with the standard `OTEL_*` environment variables.
+//! A signal (traces, metrics, logs) is exported only when an OTLP endpoint
+//! is set for it (`OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT`, else
+//! `OTEL_EXPORTER_OTLP_ENDPOINT`); with none, or with
+//! `OTEL_SDK_DISABLED=true` or `OTEL_<SIGNAL>_EXPORTER=none`, the engine gets
+//! [`Telemetry::noop`] and nothing is built.
+//!
+//! This build exports OTLP http/protobuf over plain http only: gRPC, JSON
+//! and TLS are not built. A setting this build cannot serve turns its signal
+//! off with a warning on stderr; telemetry never stops a command.
+//!
+//! The rest of the configuration (headers, timeouts, compression, batch
+//! sizes, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_TRACES_SAMPLER`,
+//! `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`) is read by the
+//! OpenTelemetry SDK and exporter themselves.
+
+use std::fmt;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use opentelemetry::global::{BoxedTracer, ObjectSafeTracerProvider as _};
+use opentelemetry::logs::LoggerProvider as _;
+use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry::{Key, KeyValue};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+
+use agentfs_core::identity::Context;
+use agentfs_core::telemetry::{self, OtelAlarmLog, Telemetry};
+
+/// How long exit waits for telemetry to flush.
+pub const TELEMETRY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// One OpenTelemetry signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Traces,
+    Metrics,
+    Logs,
+}
+
+impl Signal {
+    const ALL: [Signal; 3] = [Signal::Traces, Signal::Metrics, Signal::Logs];
+
+    fn upper(self) -> &'static str {
+        match self {
+            Self::Traces => "TRACES",
+            Self::Metrics => "METRICS",
+            Self::Logs => "LOGS",
+        }
+    }
+}
+
+impl fmt::Display for Signal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Traces => "traces",
+            Self::Metrics => "metrics",
+            Self::Logs => "logs",
+        })
+    }
+}
+
+/// Whether one signal is exported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Enabled,
+    /// Off; `warning` says why when the configuration asked for something
+    /// this build cannot do.
+    Disabled {
+        warning: Option<String>,
+    },
+}
+
+impl Decision {
+    fn off() -> Self {
+        Self::Disabled { warning: None }
+    }
+
+    fn warn(message: String) -> Self {
+        Self::Disabled {
+            warning: Some(message),
+        }
+    }
+}
+
+/// What to export, per signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub traces: Decision,
+    pub metrics: Decision,
+    pub logs: Decision,
+}
+
+impl Plan {
+    pub fn get(&self, signal: Signal) -> &Decision {
+        match signal {
+            Signal::Traces => &self.traces,
+            Signal::Metrics => &self.metrics,
+            Signal::Logs => &self.logs,
+        }
+    }
+
+    /// The warnings, one line each, merging signals that share one.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out: Vec<(String, Vec<Signal>)> = Vec::new();
+        for signal in Signal::ALL {
+            if let Decision::Disabled {
+                warning: Some(message),
+            } = self.get(signal)
+            {
+                match out.iter_mut().find(|(m, _)| m == message) {
+                    Some((_, signals)) => signals.push(signal),
+                    None => out.push((message.clone(), vec![signal])),
+                }
+            }
+        }
+        out.into_iter()
+            .map(|(message, signals)| {
+                let signals: Vec<String> = signals.iter().map(Signal::to_string).collect();
+                format!("{message}; {} not exported", signals.join(", "))
+            })
+            .collect()
+    }
+}
+
+/// Decides, from the environment as read by `env`, which signals to
+/// export. Empty values count as unset, as the OpenTelemetry spec says.
+pub fn plan(env: &dyn Fn(&str) -> Option<String>) -> Plan {
+    let get = |name: &str| {
+        env(name)
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let disabled = get("OTEL_SDK_DISABLED").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let decide = |signal: Signal| -> Decision {
+        if disabled {
+            return Decision::off();
+        }
+        let upper = signal.upper();
+        let exporter_var = format!("OTEL_{upper}_EXPORTER");
+        if let Some(exporters) = get(&exporter_var) {
+            let exporters: Vec<String> = exporters
+                .split(',')
+                .map(|e| e.trim().to_ascii_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect();
+            if !exporters.iter().any(|e| e == "otlp") {
+                if exporters.iter().all(|e| e == "none") {
+                    return Decision::off();
+                }
+                return Decision::warn(format!(
+                    "{exporter_var}={} is not supported (only otlp is built)",
+                    exporters.join(",")
+                ));
+            }
+        }
+        let signal_endpoint = format!("OTEL_EXPORTER_OTLP_{upper}_ENDPOINT");
+        let Some(endpoint) = get(&signal_endpoint).or_else(|| get("OTEL_EXPORTER_OTLP_ENDPOINT"))
+        else {
+            return Decision::off();
+        };
+        let signal_protocol = format!("OTEL_EXPORTER_OTLP_{upper}_PROTOCOL");
+        let protocol = get(&signal_protocol)
+            .map(|p| (signal_protocol.clone(), p))
+            .or_else(|| {
+                get("OTEL_EXPORTER_OTLP_PROTOCOL")
+                    .map(|p| ("OTEL_EXPORTER_OTLP_PROTOCOL".into(), p))
+            });
+        if let Some((var, protocol)) = protocol
+            && protocol != "http/protobuf"
+        {
+            return Decision::warn(format!(
+                "{var}={protocol} is not built (only http/protobuf is)"
+            ));
+        }
+        if endpoint
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+        {
+            return Decision::warn(format!(
+                "endpoint {endpoint} needs TLS, which is not built (use http://)"
+            ));
+        }
+        Decision::Enabled
+    };
+    Plan {
+        traces: decide(Signal::Traces),
+        metrics: decide(Signal::Metrics),
+        logs: decide(Signal::Logs),
+    }
+}
+
+/// The process's telemetry: the handle given to the engine, and the SDK
+/// providers behind it. Flushes and shuts down when dropped, waiting at
+/// most [`TELEMETRY_SHUTDOWN_GRACE`].
+pub struct Otel {
+    telemetry: Telemetry,
+    providers: Option<Providers>,
+}
+
+struct Providers {
+    tracer: Option<SdkTracerProvider>,
+    meter: Option<SdkMeterProvider>,
+    logger: Option<SdkLoggerProvider>,
+}
+
+impl Otel {
+    /// No telemetry at all.
+    pub fn noop() -> Self {
+        Self {
+            telemetry: Telemetry::noop(),
+            providers: None,
+        }
+    }
+
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.telemetry
+    }
+
+    /// Flushes and shuts down every provider, waiting at most `grace`.
+    /// Failures are printed as warnings; a stuck exporter is left behind on
+    /// its thread.
+    pub fn shutdown(&mut self, grace: Duration) {
+        let Some(providers) = self.providers.take() else {
+            return;
+        };
+        // Callbacks and spans hold provider references; drop ours first.
+        self.telemetry = Telemetry::noop();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("agentfs-otel-shutdown".into())
+            .spawn(move || {
+                let mut errors = Vec::new();
+                // Metrics last, so they see everything recorded.
+                if let Some(tracer) = providers.tracer
+                    && let Err(e) = tracer.shutdown()
+                {
+                    errors.push(format!("traces: {e}"));
+                }
+                if let Some(logger) = providers.logger
+                    && let Err(e) = logger.shutdown()
+                {
+                    errors.push(format!("logs: {e}"));
+                }
+                if let Some(meter) = providers.meter
+                    && let Err(e) = meter.shutdown()
+                {
+                    errors.push(format!("metrics: {e}"));
+                }
+                let _ = tx.send(errors);
+            });
+        if let Err(e) = spawned {
+            eprintln!("warning: telemetry: not flushed: {e}");
+            return;
+        }
+        match rx.recv_timeout(grace) {
+            Ok(errors) => {
+                for error in errors {
+                    eprintln!("warning: telemetry: flushing {error}");
+                }
+            }
+            Err(_) => {
+                eprintln!("warning: telemetry: still flushing after {grace:?}; exiting without it")
+            }
+        }
+    }
+}
+
+impl Drop for Otel {
+    fn drop(&mut self) {
+        self.shutdown(TELEMETRY_SHUTDOWN_GRACE);
+    }
+}
+
+/// Sets up export for `volume` from the process environment.
+pub fn init(volume: &str, ctx: &Context) -> Otel {
+    let plan = plan(&|name| std::env::var(name).ok());
+    for warning in plan.warnings() {
+        eprintln!("warning: telemetry: {warning}");
+    }
+    if Signal::ALL
+        .iter()
+        .all(|s| *plan.get(*s) != Decision::Enabled)
+    {
+        return Otel::noop();
+    }
+    let resource = resource(volume, ctx);
+    let enabled = |s: Signal| *plan.get(s) == Decision::Enabled;
+    let warn = |signal: Signal, e: &dyn fmt::Display| {
+        eprintln!("warning: telemetry: {signal} exporter: {e}; {signal} not exported");
+    };
+
+    let tracer = if enabled(Signal::Traces) {
+        match opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .build()
+        {
+            Ok(exporter) => Some(
+                SdkTracerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .with_resource(resource.clone())
+                    .build(),
+            ),
+            Err(e) => {
+                warn(Signal::Traces, &e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let meter = if enabled(Signal::Metrics) {
+        match opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .build()
+        {
+            Ok(exporter) => Some(
+                SdkMeterProvider::builder()
+                    .with_periodic_exporter(exporter)
+                    .with_resource(resource.clone())
+                    .build(),
+            ),
+            Err(e) => {
+                warn(Signal::Metrics, &e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let logger = if enabled(Signal::Logs) {
+        match opentelemetry_otlp::LogExporter::builder()
+            .with_http()
+            .build()
+        {
+            Ok(exporter) => Some(
+                SdkLoggerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .with_resource(resource)
+                    .build(),
+            ),
+            Err(e) => {
+                warn(Signal::Logs, &e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if tracer.is_none() && meter.is_none() && logger.is_none() {
+        return Otel::noop();
+    }
+
+    // With metrics off the engine still gets a meter, from the API's no-op
+    // provider, so the handle is uniform.
+    let meter_handle = match &meter {
+        Some(provider) => provider.meter_with_scope(telemetry::scope()),
+        None => {
+            opentelemetry::metrics::NoopMeterProvider::new().meter_with_scope(telemetry::scope())
+        }
+    };
+    let tracer_handle = tracer
+        .as_ref()
+        .map(|p| BoxedTracer::new(p.boxed_tracer(telemetry::scope())));
+    let alarms = logger.as_ref().map(|p| {
+        Box::new(OtelAlarmLog::new(p.logger_with_scope(telemetry::scope())))
+            as Box<dyn telemetry::AlarmLog>
+    });
+    Otel {
+        telemetry: Telemetry::new(&meter_handle, tracer_handle, alarms),
+        providers: Some(Providers {
+            tracer,
+            meter,
+            logger,
+        }),
+    }
+}
+
+/// The resource every signal carries. `OTEL_SERVICE_NAME` and
+/// `OTEL_RESOURCE_ATTRIBUTES` win over what agentfs sets.
+fn resource(volume: &str, ctx: &Context) -> Resource {
+    let detected = Resource::builder().build();
+    let service_name = Key::from_static_str("service.name");
+    let named = detected
+        .get(&service_name)
+        .is_some_and(|name| !name.as_str().starts_with("unknown_service"));
+    let mut ours = vec![
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        KeyValue::new("service.instance.id", ctx.replica.clone()),
+        KeyValue::new("process.pid", i64::from(std::process::id())),
+        KeyValue::new("agentfs.volume", volume.to_owned()),
+    ];
+    for (key, value) in [
+        ("k8s.namespace.name", &ctx.namespace),
+        ("k8s.pod.name", &ctx.pod),
+        ("k8s.pod.uid", &ctx.pod_uid),
+        ("k8s.node.name", &ctx.node),
+    ] {
+        if !value.is_empty() {
+            ours.push(KeyValue::new(key, value.clone()));
+        }
+    }
+    let mut builder = Resource::builder();
+    if !named {
+        builder = builder.with_service_name("agentfs");
+    }
+    builder
+        .with_attributes(
+            ours.into_iter()
+                .filter(|kv| detected.get(&kv.key).is_none()),
+        )
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn plan_of(vars: &[(&str, &str)]) -> Plan {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        plan(&|name| map.get(name).cloned())
+    }
+
+    fn all(decision: Decision) -> Plan {
+        Plan {
+            traces: decision.clone(),
+            metrics: decision.clone(),
+            logs: decision,
+        }
+    }
+
+    const ENDPOINT: (&str, &str) = ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318");
+
+    #[test]
+    fn plan_reads_otel_env() {
+        // Nothing set: nothing exported, nothing said.
+        assert_eq!(plan_of(&[]), all(Decision::off()));
+        assert!(plan_of(&[]).warnings().is_empty());
+        assert_eq!(
+            plan_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", " ")]),
+            all(Decision::off()),
+            "empty counts as unset"
+        );
+
+        // A generic endpoint enables every signal.
+        assert_eq!(plan_of(&[ENDPOINT]), all(Decision::Enabled));
+        assert_eq!(
+            plan_of(&[ENDPOINT, ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")]),
+            all(Decision::Enabled)
+        );
+
+        // A signal-specific endpoint enables only that signal.
+        let only = plan_of(&[("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://c/v1/metrics")]);
+        assert_eq!(only.metrics, Decision::Enabled);
+        assert_eq!(only.traces, Decision::off());
+        assert_eq!(only.logs, Decision::off());
+
+        // `none` turns a signal off silently.
+        let p = plan_of(&[ENDPOINT, ("OTEL_TRACES_EXPORTER", "none")]);
+        assert_eq!(p.traces, Decision::off());
+        assert_eq!(p.metrics, Decision::Enabled);
+        assert!(p.warnings().is_empty());
+
+        // Other exporters are not built.
+        let p = plan_of(&[ENDPOINT, ("OTEL_METRICS_EXPORTER", "prometheus")]);
+        assert!(
+            matches!(&p.metrics, Decision::Disabled { warning: Some(w) } if w.contains("prometheus")),
+            "{p:?}"
+        );
+        assert_eq!(p.logs, Decision::Enabled);
+        assert_eq!(
+            plan_of(&[ENDPOINT, ("OTEL_LOGS_EXPORTER", "otlp,console")]).logs,
+            Decision::Enabled
+        );
+
+        // gRPC and JSON are not built.
+        for protocol in ["grpc", "http/json"] {
+            let p = plan_of(&[ENDPOINT, ("OTEL_EXPORTER_OTLP_PROTOCOL", protocol)]);
+            for signal in Signal::ALL {
+                assert!(
+                    matches!(p.get(signal), Decision::Disabled { warning: Some(w) } if w.contains(protocol)),
+                    "{protocol}: {p:?}"
+                );
+            }
+            let warnings = p.warnings();
+            assert_eq!(warnings.len(), 1, "merged: {warnings:?}");
+            assert!(
+                warnings[0].ends_with("traces, metrics, logs not exported"),
+                "{warnings:?}"
+            );
+        }
+
+        // TLS is not built.
+        let p = plan_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "HTTPS://collector:4318")]);
+        assert!(
+            matches!(&p.traces, Decision::Disabled { warning: Some(w) } if w.contains("TLS")),
+            "{p:?}"
+        );
+
+        // OTEL_SDK_DISABLED wins, silently.
+        let p = plan_of(&[
+            ENDPOINT,
+            ("OTEL_SDK_DISABLED", "TRUE"),
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+        ]);
+        assert_eq!(p, all(Decision::off()));
+        assert_eq!(
+            plan_of(&[ENDPOINT, ("OTEL_SDK_DISABLED", "false")]),
+            all(Decision::Enabled)
+        );
+
+        // A signal-specific protocol overrides the generic one.
+        let p = plan_of(&[
+            ENDPOINT,
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+            ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+        ]);
+        assert_eq!(p.traces, Decision::Enabled);
+        assert!(matches!(p.metrics, Decision::Disabled { warning: Some(_) }));
+        let p = plan_of(&[ENDPOINT, ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "grpc")]);
+        assert!(matches!(p.logs, Decision::Disabled { warning: Some(_) }));
+        assert_eq!(p.traces, Decision::Enabled);
+
+        // A signal-specific endpoint is checked, not the generic one.
+        let p = plan_of(&[
+            ENDPOINT,
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "https://secure/v1/traces",
+            ),
+        ]);
+        assert!(matches!(p.traces, Decision::Disabled { warning: Some(_) }));
+        assert_eq!(p.metrics, Decision::Enabled);
+    }
+
+    #[test]
+    fn noop_shutdown_is_instant() {
+        let mut otel = Otel::noop();
+        assert!(!otel.telemetry().is_enabled());
+        let start = std::time::Instant::now();
+        otel.shutdown(Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn resource_names_the_service_and_volume() {
+        let ctx = Context {
+            volume: "demo".into(),
+            replica: "pod-0".into(),
+            pod: "pod-0".into(),
+            namespace: "ns".into(),
+            ..Context::default()
+        };
+        let r = resource("demo", &ctx);
+        let get = |k: &'static str| r.get(&Key::from_static_str(k)).map(|v| v.to_string());
+        // The test runner does not set OTEL_SERVICE_NAME.
+        if std::env::var_os("OTEL_SERVICE_NAME").is_none() {
+            assert_eq!(get("service.name").as_deref(), Some("agentfs"));
+        }
+        assert_eq!(get("agentfs.volume").as_deref(), Some("demo"));
+        assert_eq!(get("service.instance.id").as_deref(), Some("pod-0"));
+        assert_eq!(get("k8s.namespace.name").as_deref(), Some("ns"));
+        assert_eq!(get("k8s.node.name"), None, "empty values are left out");
+    }
+}

@@ -51,8 +51,14 @@ impl Volume {
     /// Runs with `--state` only.
     fn run_raw(&self, args: &[std::ffi::OsString]) -> Output {
         let home = self.home();
-        Command::new(env!("CARGO_BIN_EXE_agentfs"))
-            .arg("--state")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
+        // Hermetic: no telemetry from the environment running the tests.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("OTEL_") {
+                cmd.env_remove(name);
+            }
+        }
+        cmd.arg("--state")
             .arg(self.state())
             .args(args)
             .env_remove("AGENTFS_STATE")

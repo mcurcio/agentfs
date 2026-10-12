@@ -7,6 +7,13 @@
 //!
 //! `push` pushes once to the configured remotes; `run` runs the commit and
 //! push loops in the foreground until SIGINT or SIGTERM (design §11.2).
+//!
+//! `flush`, `record`, `push` and `run` export telemetry over OTLP when the
+//! standard `OTEL_*` variables configure an endpoint (see [`otel`], design
+//! §13); alarms are also printed to stderr. `init` and `status` export
+//! nothing.
+
+mod otel;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -74,6 +81,8 @@ enum Command {
         /// Push only this remote; repeatable (default: every remote).
         #[arg(long = "remote", value_name = "NAME")]
         remotes: Vec<String>,
+        #[command(flatten)]
+        pod: Pod,
     },
     /// Run the commit and push loops until SIGINT or SIGTERM. A second
     /// signal exits at once.
@@ -166,13 +175,15 @@ fn main() -> Result<ExitCode> {
             }
         }
         Command::Flush(pod) => {
+            let session = Session::start(&state, &pod)?;
             let (_, committer, _) =
-                open(&state, cli.root.as_deref().unwrap_or(Path::new(".")), &pod)?;
+                session.open(&state, cli.root.as_deref().unwrap_or(Path::new(".")), &pod)?;
             let report = committer.commit_pending()?;
             println!(
                 "{} record(s) into {} commit(s)",
                 report.records, report.commits
             );
+            session.finish();
         }
         Command::Record { paths, pod } => {
             // Guessing the root would turn every path missing from the wrong
@@ -180,7 +191,8 @@ fn main() -> Result<ExitCode> {
             let Some(root) = cli.root.as_deref() else {
                 bail!("record needs --root (or AGENTFS_ROOT): the backing tree the paths are in");
             };
-            let (recorder, committer, _) = open(&state, root, &pod)?;
+            let session = Session::start(&state, &pod)?;
+            let (recorder, committer, _) = session.open(&state, root, &pod)?;
             let caller = Caller {
                 uid: current_uid(),
                 gid: current_gid(),
@@ -216,8 +228,14 @@ fn main() -> Result<ExitCode> {
                 "{} record(s) into {} commit(s)",
                 report.records, report.commits
             );
+            session.finish();
         }
-        Command::Push { remotes } => return push_once(&state, &remotes),
+        Command::Push { remotes, pod } => {
+            let session = Session::start(&state, &pod)?;
+            let code = push_once(&state, &remotes, &session)?;
+            session.finish();
+            return Ok(code);
+        }
         Command::Run { pod, push_grace } => {
             let root = cli.root.as_deref().unwrap_or(Path::new("."));
             return run(&state, root, &pod, push_grace);
@@ -227,11 +245,12 @@ fn main() -> Result<ExitCode> {
 }
 
 /// `agentfs push`: one attempt per selected remote, in name order.
-fn push_once(state: &StateDir, only: &[String]) -> Result<ExitCode> {
+fn push_once(state: &StateDir, only: &[String], session: &Session) -> Result<ExitCode> {
     let history = History::open(&state.git())
         .with_context(|| format!("opening {}", state.root().display()))?;
     let settings = history.settings();
-    let events = stderr_sink();
+    session.telemetry().observe_volume(state, settings);
+    let events = session.events.clone();
     let mut ok = true;
     for bad in &settings.invalid_remotes {
         if only.is_empty() || only.contains(&bad.name) {
@@ -264,7 +283,7 @@ fn push_once(state: &StateDir, only: &[String]) -> Result<ExitCode> {
     }
     for remote in selected {
         let mut pusher =
-            RemotePusher::open(state, settings, remote, events.clone(), &Telemetry::noop())?;
+            RemotePusher::open(state, settings, remote, events.clone(), session.telemetry())?;
         let outcome = pusher.push_once();
         ok &= outcome.is_success();
         println!("{}: {}", remote.name, describe(&outcome));
@@ -336,10 +355,11 @@ fn remote_line(remote: &RemoteStatus) -> String {
 fn run(state: &StateDir, root: &Path, pod: &Pod, push_grace: Duration) -> Result<ExitCode> {
     // Registered before anything starts, so an early signal is not lost.
     let mut signals = Signals::new([SIGINT, SIGTERM]).context("installing signal handlers")?;
-    let events = stderr_sink();
-    let (_recorder, committer, recovery) = open_with(state, root, pod, events.clone())?;
+    let session = Session::start(state, pod)?;
+    let events = session.events.clone();
+    let (_recorder, committer, recovery) = session.open(state, root, pod)?;
     let settings = committer.history().settings().clone();
-    let pushers = push::open_all(state, &settings, events.clone(), &Telemetry::noop())?;
+    let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
     let service = Service::start(committer, pushers, events).context("starting the service")?;
     eprintln!(
@@ -370,50 +390,95 @@ fn run(state: &StateDir, root: &Path, pod: &Pod, push_grace: Duration) -> Result
     for name in &report.abandoned_pushes {
         println!("{name}: push still running at shutdown; abandoned");
     }
-    match report.final_commit {
+    let code = match report.final_commit {
         Ok(commit) => {
             println!(
                 "final commit: {} record(s) into {} commit(s)",
                 commit.records, commit.commits
             );
-            Ok(ExitCode::SUCCESS)
+            ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("final commit failed: {e}; the records stay journaled");
-            Ok(ExitCode::FAILURE)
+            ExitCode::FAILURE
         }
-    }
+    };
+    session.finish();
+    Ok(code)
 }
 
-fn open(
-    state: &StateDir,
-    root: &Path,
-    pod: &Pod,
-) -> Result<(volume::Recorder, volume::Committer, volume::Recovery)> {
-    open_with(state, root, pod, stderr_sink())
-}
+type Opened = (volume::Recorder, volume::Committer, volume::Recovery);
 
-fn open_with(
-    state: &StateDir,
-    root: &Path,
-    pod: &Pod,
-    events: Events,
-) -> Result<(volume::Recorder, volume::Committer, volume::Recovery)> {
-    let volume = History::open(&state.git())
-        .with_context(|| format!("opening {}", state.root().display()))?
-        .settings()
-        .volume
-        .clone();
+/// Opens the volume without telemetry (for `status`).
+fn open(state: &StateDir, root: &Path, pod: &Pod) -> Result<Opened> {
+    let volume = volume_name(state)?;
     Ok(volume::open(
         state,
         root,
         pod.context(&volume),
-        events,
+        stderr_sink(),
         &Telemetry::noop(),
     )?)
 }
 
-/// Prints alarms (design §13) to stderr until telemetry exports them.
+fn volume_name(state: &StateDir) -> Result<String> {
+    Ok(History::open(&state.git())
+        .with_context(|| format!("opening {}", state.root().display()))?
+        .settings()
+        .volume
+        .clone())
+}
+
+/// Telemetry and alarms for one command on an existing volume (design
+/// §13). Telemetry is flushed when this is dropped, waiting at most
+/// [`otel::TELEMETRY_SHUTDOWN_GRACE`]; declare it before anything that
+/// records, so it is dropped after them.
+struct Session {
+    volume: String,
+    otel: otel::Otel,
+    /// Alarms to telemetry, then to stderr: the process's one wrapped sink.
+    events: Events,
+}
+
+impl Session {
+    fn start(state: &StateDir, pod: &Pod) -> Result<Self> {
+        let volume = volume_name(state)?;
+        let otel = otel::init(&volume, &pod.context(&volume));
+        let events = otel.telemetry().sink(stderr_sink());
+        Ok(Self {
+            volume,
+            otel,
+            events,
+        })
+    }
+
+    fn telemetry(&self) -> &Telemetry {
+        self.otel.telemetry()
+    }
+
+    /// Flushes telemetry now, while the volume is still open, so the last
+    /// export still reads its gauges. Dropping the session without this
+    /// (an error return) flushes too, after the volume is closed.
+    fn finish(mut self) {
+        self.otel.shutdown(otel::TELEMETRY_SHUTDOWN_GRACE);
+    }
+
+    /// Opens the volume and registers its state gauges. Once per process.
+    fn open(&self, state: &StateDir, root: &Path, pod: &Pod) -> Result<Opened> {
+        let opened = volume::open(
+            state,
+            root,
+            pod.context(&self.volume),
+            self.events.clone(),
+            self.telemetry(),
+        )?;
+        self.telemetry()
+            .observe_volume(state, opened.1.history().settings());
+        Ok(opened)
+    }
+}
+
+/// Prints alarms (design §13) to stderr, alongside any telemetry export.
 fn stderr_sink() -> Events {
     Arc::new(|event: Event| {
         if event.is_alarm() {

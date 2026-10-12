@@ -42,14 +42,75 @@ nested repository detection. Also:
   `refs/agentfs/<volume>/diverged/<timestamp>` and keeps alarming.
 - **The service:** the commit loop and one push loop per remote, with clean
   shutdown.
-- **Alarm events** (`agentfs_core::events`), ready for telemetry to export.
+- **Alarm events** (`agentfs_core::events`).
+- **Telemetry:** OpenTelemetry metrics, traces and logs (see below).
 
 The `agentfs` command has `init`, `status`, `flush`, `record`, `push` and
 `run`. `record` stands in for the FUSE layer and reports the paths the rules
 skip or the checks refuse, with the reason. It needs `--root` (or
 `AGENTFS_ROOT`), since a path missing from the backing tree is recorded as
 removed. `push` pushes once; `run` runs the commit and push loops until
-SIGINT or SIGTERM. Until telemetry exists, alarms are printed to stderr.
+SIGINT or SIGTERM. Alarms are printed to stderr, and exported as telemetry
+when it is enabled.
+
+## Telemetry
+
+`flush`, `record`, `push` and `run` export OpenTelemetry metrics, traces and
+logs over OTLP, configured with the standard `OTEL_*` environment variables.
+With no endpoint set, telemetry is off and costs nothing.
+
+```sh
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+agentfs run
+```
+
+- **Endpoints:** `OTEL_EXPORTER_OTLP_ENDPOINT` enables every signal, at
+  `/v1/traces`, `/v1/metrics` and `/v1/logs` under it. A signal-specific
+  `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` (a full URL) enables
+  only that signal. `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none` turns one off;
+  `OTEL_SDK_DISABLED=true` turns everything off.
+- **Transport:** this build speaks OTLP **http/protobuf over plain http**
+  only, which suits an in-cluster collector. gRPC, `http/json` and `https`
+  endpoints are not built: they are reported with a `warning: telemetry:`
+  line on stderr and that signal stays off. Telemetry problems never stop a
+  command.
+- **Other settings**, read by the OpenTelemetry SDK:
+  `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT` (and their
+  per-signal forms), `OTEL_SERVICE_NAME` (default `agentfs`),
+  `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRIC_EXPORT_INTERVAL` (default 60s),
+  and the batch settings `OTEL_BSP_*` and `OTEL_BLRP_*`.
+- **Sampling:** every record makes an `agentfs.record` span. On a busy
+  volume, sample: `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with
+  `OTEL_TRACES_SAMPLER_ARG=0.01`. Metrics and alarm logs are not sampled.
+- **Resource:** `service.name`, `service.version`, `service.instance.id`
+  (the replica), `process.pid`, `agentfs.volume`, and `k8s.*` from the pod
+  flags (`AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`,
+  `AGENTFS_NODE`).
+- **Shutdown** flushes telemetry, waiting up to 5s, so a collector that is
+  down can add up to 5s to a short command.
+
+Metrics (design §13):
+
+| Metric | Type | Attributes |
+|---|---|---|
+| `agentfs.record.duration` | histogram, seconds | `trigger` |
+| `agentfs.record.failures` | counter | `trigger` |
+| `agentfs.journal.backlog` | gauge | |
+| `agentfs.commit.count` | counter | |
+| `agentfs.commit.failures` | counter | |
+| `agentfs.push.unpushed_commits` | gauge | `remote` |
+| `agentfs.push.oldest_unpushed_age` | gauge, seconds | `remote` |
+| `agentfs.push.failures` | counter | `remote`, `reason` |
+| `agentfs.push.diverged` | gauge, 0 or 1 | `remote` |
+| `agentfs.remote.misconfigured` | gauge | `remote` |
+| `agentfs.precheck.rejected_paths` | counter | `stage`, `reason` |
+| `agentfs.state.bytes` | gauge, bytes | `part` |
+
+Spans are `agentfs.record`, `agentfs.commit` and `agentfs.push`, carrying
+journal sequence numbers and commit ids. Every alarm is also a log record
+(`agentfs.path_refused`, `agentfs.push_failed`, ...) with its details as
+`agentfs.*` attributes and the trace of the operation that raised it.
+Alarms are still printed to stderr as well.
 
 ## Building
 

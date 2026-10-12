@@ -11,8 +11,16 @@ agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 signal-hook = "0.4.5"
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
+# OTLP over http/protobuf with a blocking client and no TLS: pure Rust, no
+# protoc, no C (design §13, §17.3).
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
 
 [dev-dependencies]
+# Decodes OTLP payloads in the fake collector of the telemetry test.
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs"] }
+prost = "0.14"
 git2 = { version = "0.21.0", default-features = false }
 # Sends SIGTERM in the `run` test: std's Child::kill only sends SIGKILL.
 rustix = { version = "1.1.5", features = ["process"] }

@@ -760,32 +760,58 @@ state file names; a `/` in a volume name would let one volume's
 ## 13. Observability (OpenTelemetry)
 
 The recorder exports metrics, traces and logs over OTLP.
+`agentfs_core::telemetry` instruments the engine against the OpenTelemetry
+API only; the binary picks the SDK and the exporter.
 
-**Metrics (examples):**
+**Metrics:**
 
 | Metric | Type | Use |
 |---|---|---|
 | `agentfs.record.duration` | histogram | Cost of the synchronous step, by trigger |
-| `agentfs.record.failures` | counter | Recording errors (§3.5) |
+| `agentfs.record.failures` | counter | Recording errors (§3.5), by trigger |
 | `agentfs.journal.backlog` | gauge | Entries recorded but not committed |
 | `agentfs.commit.count` | counter | Commits made |
+| `agentfs.commit.failures` | counter | Commit passes that failed; the records stay journaled |
 | `agentfs.push.unpushed_commits` | gauge, per remote | Backlog |
 | `agentfs.push.oldest_unpushed_age` | gauge, per remote | Backlog age, the main push alarm |
 | `agentfs.push.failures` | counter, per remote and reason | Rejected, non-fast-forward, authentication, network |
 | `agentfs.push.diverged` | gauge, per remote | 1 while diverged |
-| `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks |
+| `agentfs.remote.misconfigured` | gauge, per remote | 1 for each invalid `[remote]` section (§11.1) |
+| `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
 | `agentfs.patch.queue_depth`, `agentfs.patch.blocked` | gauge | Phase 3 |
 | `agentfs.state.bytes` | gauge | Size of the state area by part |
 
-**Traces.** Spans for record, commit, push and patch application, carrying
-journal sequence numbers and commit ids.
+Metric attributes are short and low-cardinality: `trigger`, `remote`,
+`reason` (a refusal label or a push failure kind), `stage` (`record` or
+`commit`) and `part` (`git`, `journal`, `pending`, `lfs`, `meta`). Paths never
+become metric attributes. Span and log attributes are namespaced `agentfs.*`.
 
-**Logs.** Structured events for every alarm condition, with commit, path and
-reason.
+`agentfs.state.bytes` is the apparent size (the sum of file lengths) of each
+part, not allocated blocks: reflinks make both misleading, and apparent size
+is deterministic. The journal backlog and the push gauges are read when
+metrics are collected: the backlog from the open journal; unpushed commits,
+oldest unpushed age (seconds since the oldest unpushed commit's committer
+time, 0 when none) and divergence from each remote's push state plus a walk
+of the branch, shared by the three push gauges in one collection.
+
+**Traces.** Spans `agentfs.record` (trigger, inputs, caller uid and pid, the
+sequence number when journaled, paths skipped), `agentfs.commit` (first and
+last sequence numbers, records, paths refused, the commit id or
+`agentfs.commit.empty`) and `agentfs.push` (remote, previous and new head,
+outcome, and on failure the reason and any diverged ref). Each span is
+current while its operation runs, so alarm logs raised inside it carry its
+trace. Record and commit spans are not linked; they correlate through the
+sequence numbers. Patch-application spans come with phase 3.
+
+**Logs.** A structured log record for every alarm condition: the event name
+(`agentfs.path_refused`, `agentfs.push_failed`, ...), WARN for a refused
+path and ERROR otherwise, the event's message as the body and its fields
+(path, reason, remote, kind, heads, ...) as attributes.
 
 **Events.** The engine reports alarm conditions as events to a sink
-(`agentfs_core::events::EventSink`), which the telemetry layer turns into the
-metrics and logs above; until then the CLI prints alarms to stderr.
+(`agentfs_core::events::EventSink`). The telemetry layer wraps the
+process's sink once (`Telemetry::sink`), turning events into the counters
+and logs above; the CLI also prints alarms to stderr.
 
 | Event | Raised when |
 |---|---|
@@ -799,6 +825,18 @@ metrics and logs above; until then the CLI prints alarms to stderr.
 A sink is called from the synchronous step, on the FUSE threads, so it must
 never block. Backlog gauges (`unpushed_commits`, `oldest_unpushed_age`) come
 from each remote's push state, not from events.
+
+**Export.** The binary reads the standard `OTEL_*` variables. A signal is
+exported only when an OTLP endpoint is set for it
+(`OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT`);
+with none, with `OTEL_SDK_DISABLED=true`, or with
+`OTEL_<SIGNAL>_EXPORTER=none`, telemetry is a no-op and nothing is built.
+This build exports OTLP http/protobuf over plain http only, which is what an
+in-cluster collector needs; gRPC, JSON and TLS (`https`) endpoints are
+deferred. They are reported with a warning and that signal stays off: a
+telemetry misconfiguration never stops a command, in keeping with telemetry
+never affecting the filesystem. Telemetry is flushed at exit, waiting at
+most 5 seconds.
 
 **Alarms** are alert rules on these metrics in the consumer's monitoring stack.
 agentfs emits the signals; it does not page anyone itself. The CSI driver may
@@ -921,14 +959,16 @@ target. What it needs:
   - alarm events, through a non-blocking sink (§13);
   - LFS (§7);
   - the patch queue (§12);
-  - telemetry (§13).
+  - telemetry (§13): implemented against the OpenTelemetry API.
 - **`agentfs`, a binary:**
   - `init`, `mount`, `status`, `flush`, `push`, `run`, `restore`, `revert`;
   - `push` pushes once to every remote (or those named with `--remote`) and
     exits 1 unless all succeeded; `run` runs the service in the foreground
     until SIGINT or SIGTERM, makes a final commit, waits up to
     `--push-grace` (default 5s) for pushes in progress, and exits at once on
-    a second signal. `record` stands in for the FUSE layer until it exists;
+    a second signal. `flush`, `record`, `push` and `run` export telemetry
+    (§13) and take the pod flags (`AGENTFS_POD`, ...), so every command's
+    telemetry resource is the same. `record` stands in for the FUSE layer until it exists;
   - `status` shows each remote: its URL (userinfo redacted), last pushed
     commit, unpushed commits, consecutive failures, last error and any
     diverged ref;
@@ -957,7 +997,7 @@ Phase 4 (§14).
 | Git objects, commits, push, credentials | `git2` (libgit2) | Active. Has **no** filter or merge-driver registration, and its fsync option is only reachable through `libgit2-sys` |
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
 | LFS | none exists | Implemented in agentfs (§7) |
-| Telemetry | `opentelemetry` crates | OTLP export |
+| Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `reqwest-blocking-client`, no TLS) in the binary | OTLP http/protobuf export. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
 | Repack | the `git` CLI | libgit2 has no repack or gc |
 
 ## 18. Acceptance tests
