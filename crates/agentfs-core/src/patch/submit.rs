@@ -296,6 +296,7 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
     }
     let mut listing = listing;
     let attempts = req.attempts.max(1);
+    let mut refused = None;
     for raced in 0..attempts {
         let n = next_seq(&req.volume, listing.keys());
         let ref_name = inbox_ref(&req.volume, n);
@@ -323,12 +324,17 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
                             raced,
                         });
                     }
-                    None => return Err(SubmitError::Refused { ref_name, message }),
+                    // Refused for another reason, or lost a lock race
+                    // whose winner gave up too: try again.
+                    None => refused = Some((ref_name, message)),
                 }
             }
         }
     }
-    Err(SubmitError::Raced { attempts })
+    match refused {
+        Some((ref_name, message)) => Err(SubmitError::Refused { ref_name, message }),
+        None => Err(SubmitError::Raced { attempts }),
+    }
 }
 
 fn ls_remote(

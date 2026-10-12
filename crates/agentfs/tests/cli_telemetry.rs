@@ -242,6 +242,8 @@ fn exports_over_otlp_http() {
         "agentfs.precheck.rejected_paths",
         "agentfs.journal.backlog",
         "agentfs.state.bytes",
+        "agentfs.patch.queue_depth",
+        "agentfs.patch.blocked",
     ] {
         assert!(
             metric_names.contains(name),
@@ -487,5 +489,141 @@ fn failed_exports_are_visible() {
         ),
         Some(1),
         "the failure is counted and exported over metrics"
+    );
+}
+
+/// The last value of gauge `name`.
+fn gauge_last(collector: &Collector, name: &str) -> Option<i64> {
+    use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point};
+    let mut last = None;
+    for body in collector.bodies("/v1/metrics") {
+        let request = ExportMetricsServiceRequest::decode(&body[..]).unwrap();
+        for rm in request.resource_metrics {
+            for sm in rm.scope_metrics {
+                for m in sm.metrics.into_iter().filter(|m| m.name == name) {
+                    let Some(metric::Data::Gauge(gauge)) = m.data else {
+                        continue;
+                    };
+                    for point in gauge.data_points {
+                        if let Some(number_data_point::Value::AsInt(v)) = point.value {
+                            last = Some(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    last
+}
+
+/// A patch on `parent` in the volume's own repository, queued as `n`.
+fn queue_patch(git: &std::path::Path, n: u64, parent: git2::Oid, path: &str, content: &str) {
+    let repo = git2::Repository::open_bare(git).unwrap();
+    let parent = repo.find_commit(parent).unwrap();
+    let mut index = git2::Index::new().unwrap();
+    index.read_tree(&parent.tree().unwrap()).unwrap();
+    let blob = repo.blob(content.as_bytes()).unwrap();
+    index
+        .add(&git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: blob,
+            flags: 0,
+            flags_extended: 0,
+            path: path.as_bytes().to_vec(),
+        })
+        .unwrap();
+    let tree = repo.find_tree(index.write_tree_to(&repo).unwrap()).unwrap();
+    let sig = git2::Signature::now("Ada", "ada@example.com").unwrap();
+    let oid = repo
+        .commit(None, &sig, &sig, &format!("patch {n}"), &tree, &[&parent])
+        .unwrap();
+    repo.reference(
+        &format!("refs/agentfs/demo/inbox/{n:010}"),
+        oid,
+        true,
+        "test",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_blocked_patch_queue_exports_gauges_span_and_alarm() {
+    let collector = Collector::start();
+    let v = Volume::new();
+    let git = v.dir.path().join("state/git");
+    fs::write(v.tree().join("a.txt"), "a0\n").unwrap();
+    fs::write(v.tree().join("b.txt"), "b0\n").unwrap();
+    let out = v.run(&["record", "a.txt", "b.txt"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let base = git2::Repository::open_bare(&git)
+        .unwrap()
+        .refname_to_id("refs/heads/agentfs/demo")
+        .unwrap();
+    queue_patch(&git, 1, base, "a.txt", "a1\n");
+    queue_patch(&git, 2, base, "b.txt", "b-from-iac\n");
+    queue_patch(&git, 3, base, "c.txt", "c\n");
+    fs::write(v.tree().join("b.txt"), "b-from-workload\n").unwrap();
+    let out = v.run(&["record", "b.txt"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = v.run(
+        &["patch", "apply", "--no-fetch"],
+        &[("OTEL_EXPORTER_OTLP_ENDPOINT", &collector.endpoint())],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("alarm: "), "{}", stderr(&out));
+
+    assert_eq!(gauge_last(&collector, "agentfs.patch.queue_depth"), Some(2));
+    assert_eq!(gauge_last(&collector, "agentfs.patch.blocked"), Some(1));
+
+    let mut patches = Vec::new();
+    for body in collector.bodies("/v1/traces") {
+        let request = ExportTraceServiceRequest::decode(&body[..]).unwrap();
+        for rs in request.resource_spans {
+            for ss in rs.scope_spans {
+                patches.extend(ss.spans.into_iter().filter(|s| s.name == "agentfs.patch"));
+            }
+        }
+    }
+    let outcomes: Vec<Option<String>> = patches
+        .iter()
+        .map(|s| string_attr(&s.attributes, "agentfs.patch.outcome"))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [Some("applied".to_owned()), Some("blocked".to_owned())]
+    );
+    assert_eq!(
+        string_attr(&patches[1].attributes, "agentfs.patch.reason").as_deref(),
+        Some("conflict")
+    );
+
+    let mut logs = Vec::new();
+    for body in collector.bodies("/v1/logs") {
+        let request = ExportLogsServiceRequest::decode(&body[..]).unwrap();
+        for rl in request.resource_logs {
+            for sl in rl.scope_logs {
+                logs.extend(sl.log_records);
+            }
+        }
+    }
+    let blocked = logs
+        .iter()
+        .find(|r| r.event_name == "agentfs.patch_blocked")
+        .unwrap_or_else(|| panic!("no patch_blocked log: {logs:?}"));
+    assert_eq!(
+        string_attr(&blocked.attributes, "agentfs.patch.reason").as_deref(),
+        Some("conflict")
+    );
+    assert!(
+        !logs.iter().any(|r| r.event_name == "agentfs.patch_applied"),
+        "applied is not an alarm"
     );
 }

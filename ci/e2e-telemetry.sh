@@ -53,7 +53,8 @@ for name in \
   agentfs.record.duration agentfs.commit.count agentfs.journal.backlog \
   agentfs.push.unpushed_commits agentfs.push.oldest_unpushed_age \
   agentfs.push.failures agentfs.push.diverged agentfs.remote.misconfigured \
-  agentfs.precheck.rejected_paths agentfs.state.bytes; do
+  agentfs.precheck.rejected_paths agentfs.state.bytes \
+  agentfs.patch.queue_depth agentfs.patch.blocked; do
   wait_for 20 grep -q "\"$name\"" "$OTEL_OUT" || fail "metric $name never arrived"
   pass "metric $name"
 done

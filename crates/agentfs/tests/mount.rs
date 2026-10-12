@@ -1,4 +1,4 @@
-//! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7 and 11, plus SQLite
+//! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7, 11 and 15, plus SQLite
 //! in and out of the fsync class (design §8),
 //! git on the mount, restores through the mount, the daemon's lifecycle, and
 //! `probe` and `--on-stale-mount hold` after a crash (design §17.1).
@@ -1651,4 +1651,90 @@ fn mount_creates_a_missing_mount_point() {
     v.expect(&tree(&[("x", f("x"))]));
     m.stop();
     assert!(v.mnt().is_dir());
+}
+
+// ---- design §18 test 15: the patch queue at mount (design §12) ----
+
+/// Queues patch `n` in the volume's own repository: `parent` with `path`
+/// set to `content`.
+fn queue_patch(v: &Vol, n: u64, parent: &str, path: &str, content: &str) {
+    let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    let parent = repo
+        .find_commit(git2::Oid::from_str(parent).unwrap())
+        .unwrap();
+    let mut index = git2::Index::new().unwrap();
+    index.read_tree(&parent.tree().unwrap()).unwrap();
+    let blob = repo.blob(content.as_bytes()).unwrap();
+    index
+        .add(&git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: blob,
+            flags: 0,
+            flags_extended: 0,
+            path: path.as_bytes().to_vec(),
+        })
+        .unwrap();
+    let tree = repo.find_tree(index.write_tree_to(&repo).unwrap()).unwrap();
+    let sig = git2::Signature::now("Ada", "ada@example.com").unwrap();
+    let oid = repo
+        .commit(None, &sig, &sig, &format!("patch {n}"), &tree, &[&parent])
+        .unwrap();
+    repo.reference(
+        &format!("refs/agentfs/demo/inbox/{n:010}"),
+        oid,
+        true,
+        "test",
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn patches_apply_before_the_mount_serves() {
+    let v = Vol::new("patches_apply_before_the_mount_serves");
+    let m = v.mount(&[]);
+    v.sh("printf a0 > a.txt && printf b0 > b.txt");
+    v.expect(&tree(&[("a.txt", f("a0")), ("b.txt", f("b0"))]));
+    let base = v.head_id();
+    v.sh("printf workload > b.txt");
+    v.expect(&tree(&[("a.txt", f("a0")), ("b.txt", f("workload"))]));
+    m.stop();
+    queue_patch(&v, 1, &base, "a.txt", "a1");
+    queue_patch(&v, 2, &base, "b.txt", "iac");
+    queue_patch(&v, 3, &base, "c.txt", "c");
+
+    // Patch 1 is there from the first read; 2 conflicts and blocks 3; the
+    // volume mounts anyway.
+    let m = v.mount(&[]);
+    assert_eq!(fs::read_to_string(v.mnt().join("a.txt")).unwrap(), "a1");
+    assert_eq!(
+        fs::read_to_string(v.mnt().join("b.txt")).unwrap(),
+        "workload"
+    );
+    assert!(!v.mnt().join("c.txt").exists());
+    let (author, message) = v.head();
+    assert_eq!(author, "Ada");
+    assert!(message.contains("Agentfs-Inbox: 1\n"), "{message}");
+    let log = m.log();
+    assert!(log.contains("patches: blocked at 2 (conflict)"), "{log}");
+    assert!(log.contains("alarm: "), "{log}");
+    let status = v.ok(&["patch", "status", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(doc["status"]["blocked"]["reason"], "conflict");
+    assert_eq!(doc["status"]["queue"].as_array().unwrap().len(), 2);
+    // The workload goes on.
+    v.sh("printf more > d.txt");
+    v.expect(&tree(&[
+        ("a.txt", f("a1")),
+        ("b.txt", f("workload")),
+        ("d.txt", f("more")),
+    ]));
+    m.stop();
 }

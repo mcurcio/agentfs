@@ -76,6 +76,28 @@ jobs:
       - if: always()
         run: ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
 
+  e2e-patches:
+    name: e2e (patch queue over http, FUSE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: patches
+      - run: sudo apt-get update && sudo apt-get install -y nginx fcgiwrap fuse3
+      - run: cargo build --locked -p agentfs
+      - name: start git server
+        run: ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
+      - run: ci/e2e-patches.sh
+      - name: server logs
+        if: failure()
+        run: tail -n 100 "$RUNNER_TEMP"/git-server/logs/*.log
+      - if: always()
+        run: ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
+
   e2e-ssh:
     name: e2e (ssh remotes)
     runs-on: ubuntu-latest
