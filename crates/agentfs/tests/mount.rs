@@ -169,13 +169,15 @@ impl Vol {
 
     fn mount_with(&self, extra: &[&str], wrap: impl FnOnce(Command) -> Command) -> Mounted {
         let mut cmd = wrap(self.mount_command(extra));
+        // The log is appended to across mounts: wait for this one's line.
+        let before = startup_lines(&fs::read_to_string(self.log_path()).unwrap_or_default());
         let child = cmd.spawn().unwrap();
         let mounted = Mounted {
             child: Some(child),
             mnt: self.mnt(),
             log: self.log_path(),
         };
-        mounted.wait_mounted();
+        mounted.wait_mounted(before);
         mounted
     }
 
@@ -316,6 +318,11 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+/// How many startup lines (`mounted ...`) a daemon log holds.
+fn startup_lines(log: &str) -> usize {
+    log.lines().filter(|l| l.starts_with("mounted ")).count()
+}
+
 fn is_mounted(mnt: &Path) -> bool {
     let info = fs::read_to_string("/proc/self/mountinfo").unwrap();
     let mnt = mnt.to_str().unwrap();
@@ -335,9 +342,11 @@ impl Mounted {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    fn wait_mounted(&self) {
+    /// Waits until the kernel lists the mount and the daemon has printed
+    /// a startup line beyond the `before` already in the log.
+    fn wait_mounted(&self, before: usize) {
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !(is_mounted(&self.mnt) && self.log().contains("mounted ")) {
+        while !(is_mounted(&self.mnt) && startup_lines(&self.log()) > before) {
             if Instant::now() > deadline {
                 panic!("never mounted; log:\n{}", self.log());
             }
