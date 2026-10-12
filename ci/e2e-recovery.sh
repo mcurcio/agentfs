@@ -72,7 +72,9 @@ wait_history() { # path content
 
 step "a volume with a remote, mounted"
 af init --volume demo >/dev/null
-sgit config agentfs.commitWindow 50ms
+# Long enough that each step's writes (a few closes, milliseconds apart)
+# land in one commit, which GOOD and BAD below rely on.
+sgit config agentfs.commitWindow 500ms
 sudo git init -q --bare "$REMOTE"
 sgit config remote.origin.url "$REMOTE"
 start_mount
