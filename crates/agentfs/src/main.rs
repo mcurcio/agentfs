@@ -904,6 +904,9 @@ fn mount(
             report.swept, report.repaired
         );
     }
+    if report.captured > 0 {
+        println!("unmount: {} database group(s) captured", report.captured);
+    }
     if report.unrepaired > 0 {
         match &report.repairs_saved {
             Some(store) => eprintln!(

@@ -196,6 +196,7 @@ impl FuseFs {
     /// one), else through the daemon. A failed registration sends only this
     /// node through the daemon while it has a handle open; under
     /// `--passthrough on` it fails the open and stops the mount.
+    /// An fsync-class file always goes through the daemon (design §8).
     fn route(
         &self,
         fh: u64,
@@ -203,6 +204,13 @@ impl FuseFs {
         register: impl FnOnce(&Handle) -> io::Result<BackingId>,
     ) -> Route {
         if *self.status() != PassthroughStatus::Active {
+            return Route::Daemon;
+        }
+        if handle.daemon_only() {
+            // An fsync-class file (design §8): the daemon must see its
+            // writes. Other handles on the inode follow it, as after a
+            // refused registration.
+            self.ids().track_daemon(fh, handle.node);
             return Route::Daemon;
         }
         let regular = rustix::fs::fstat(&handle.fd)
@@ -917,6 +925,7 @@ mod tests {
             node,
             fd,
             write: false,
+            group: None,
         }
     }
 

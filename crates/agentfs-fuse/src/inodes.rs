@@ -21,8 +21,10 @@
 //!   known, so a change through one name is not attributed to it.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::dirty::DirtyState;
+use crate::groups::Group;
 
 /// The root's node id (`FUSE_ROOT_ID`).
 pub const ROOT: u64 = 1;
@@ -67,6 +69,9 @@ pub struct Node {
     /// How many of [`Node::handles`] were opened for writing.
     pub write_handles: u32,
     pub dirty: DirtyState,
+    /// The fsync-class group of the open handles, if they are in one
+    /// (design §8): such a node is recorded by group captures, never alone.
+    pub group: Option<Arc<Group>>,
     /// Links of other nodes that name this node as parent.
     children: usize,
 }
@@ -82,6 +87,7 @@ impl Node {
             handles: Vec::new(),
             write_handles: 0,
             dirty: DirtyState::default(),
+            group: None,
             children: 0,
         }
     }
@@ -145,6 +151,7 @@ impl InodeTable {
             node.kind = kind;
             if node.links.is_empty() && node.handles.is_empty() {
                 node.dirty = DirtyState::default();
+                node.group = None;
             }
         }
         node.nlookup += 1;

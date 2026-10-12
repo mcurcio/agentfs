@@ -54,7 +54,7 @@ use crate::backing::Backing;
 use crate::fuse::{FuseFs, Passthrough, PassthroughStatus};
 use crate::ops::{Ops, OpsConfig};
 use crate::privileges::Privileges;
-use crate::sweep::Sweeper;
+use crate::sweep::{Capturer, Sweeper};
 
 /// How to mount.
 #[derive(Debug, Clone)]
@@ -456,6 +456,8 @@ pub struct UnmountReport {
     pub session_abandoned: bool,
     /// Open, changed files the final sweep recorded.
     pub swept: usize,
+    /// fsync-class groups captured at unmount (design §8).
+    pub captured: usize,
     /// Failed records the final sweep repaired, and those still failing.
     pub repaired: usize,
     pub unrepaired: usize,
@@ -529,6 +531,7 @@ pub struct Mount {
     ended: Arc<Stop>,
     failed: Arc<Stop>,
     sweeper: Option<Sweeper>,
+    capturer: Option<Capturer>,
     threads: usize,
     startup: StartupRepairs,
 }
@@ -594,6 +597,11 @@ impl Mount {
                 })?;
         }
         let sweeper = Sweeper::start(ops.clone(), config.sweep_interval)?;
+        let capturer = if ops.boundary().recorder().has_fsync_class() {
+            Some(Capturer::start(ops.clone())?)
+        } else {
+            None
+        };
         Ok(Self {
             ops,
             mountpoint: config.mountpoint,
@@ -601,6 +609,7 @@ impl Mount {
             ended,
             failed,
             sweeper: Some(sweeper),
+            capturer,
             threads,
             startup,
         })
@@ -649,7 +658,8 @@ impl Mount {
 
     /// Unmounts (lazily if busy), waits up to `grace` for the session to
     /// end, stops the sweep and runs a final one over every file still
-    /// open, plus the repair queue.
+    /// open, plus the repair queue, then captures every changed
+    /// fsync-class group.
     pub fn shutdown(mut self, grace: Duration) -> UnmountReport {
         let mut report = UnmountReport::default();
         if !self.ended.is_stopped() {
@@ -662,7 +672,11 @@ impl Mount {
         if let Some(sweeper) = self.sweeper.take() {
             sweeper.stop();
         }
+        if let Some(capturer) = self.capturer.take() {
+            capturer.stop();
+        }
         let last = self.ops.sweep(true);
+        report.captured = self.ops.capture_all();
         report.swept = last.recorded;
         report.repaired = last.repaired;
         report.unrepaired = last.still_queued;

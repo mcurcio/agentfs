@@ -6,7 +6,7 @@
 use std::io;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agentfs_core::service::Stop;
 
@@ -38,6 +38,38 @@ impl Sweeper {
     /// Stops the thread, waiting for a sweep in progress.
     pub fn stop(self) {
         self.stop.stop();
+        let _ = self.thread.join();
+    }
+}
+
+/// The fsync-class trailing timer (design §8): captures each changed group
+/// `agentfs.coalesce` after its first change since its last capture
+/// ([`crate::groups`]), sleeping until the next one is due.
+pub struct Capturer {
+    ops: Arc<Ops>,
+    thread: JoinHandle<()>,
+}
+
+impl Capturer {
+    /// Starts the timer for `ops`'s groups.
+    pub fn start(ops: Arc<Ops>) -> io::Result<Self> {
+        let thread = {
+            let ops = ops.clone();
+            thread::Builder::new()
+                .name("agentfs-capture".into())
+                .spawn(move || {
+                    while ops.groups().wait(ops.groups().next_due()) {
+                        ops.capture_due(Instant::now());
+                    }
+                })?
+        };
+        Ok(Self { ops, thread })
+    }
+
+    /// Stops the timer, waiting for a capture in progress. Changed groups
+    /// stay changed, for [`Ops::capture_all`] at unmount.
+    pub fn stop(self) {
+        self.ops.groups().stop();
         let _ = self.thread.join();
     }
 }

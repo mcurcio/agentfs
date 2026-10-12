@@ -10,7 +10,8 @@
 //!   kernel passthrough.
 //! - [`groups`] holds writes to fsync-class databases while they are
 //!   captured and schedules the captures (design §8).
-//! - [`sweep`] runs the periodic backstop and retries failed records.
+//! - [`sweep`] runs the periodic backstop and retries failed records, and
+//!   the fsync-class trailing timer.
 //! - [`mount`] checks the layout (nothing of the state area may be
 //!   reachable through the mount), mounts, and unmounts.
 

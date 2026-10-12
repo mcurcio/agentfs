@@ -24,6 +24,14 @@
 //! empty; an `open` with `O_TRUNC` likewise. `mkdir`, `chown`, `utimens`,
 //! `chmod` of other bits and extended attributes pass through unrecorded.
 //!
+//! **fsync-class files** (design §8, [`crate::groups`]) are the exception:
+//! no boundary records one alone. Each change to a member of a group (a
+//! database and its `-wal` and `-journal`) is held against captures and
+//! marks the group changed; the whole group is then captured as one record
+//! at `fsync` (at most once per `agentfs.coalesce`), by the trailing timer,
+//! at close, at the release of its last handle and at unmount. `-shm` files
+//! are never recorded. Class files never use kernel passthrough.
+//!
 //! **Permissions** (design §6) are checked by the kernel
 //! (`default_permissions`) before a request arrives; the daemon then acts
 //! with its own privileges. When it has `CAP_CHOWN` and `CAP_FOWNER` (root;
@@ -50,15 +58,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::time::Instant;
 
 use agentfs_core::record::{Caller, Trigger};
-use agentfs_core::volume::Recorder;
+use agentfs_core::volume::{Recorder, VolumeError};
 use fuser::{Errno, FileAttr, FileType, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
 
 use crate::backing::{self, Backing, attr, join, proc_path};
 use crate::boundary::{Boundary, Change, REPAIR_TRIGGER, State};
 use crate::dirty::{Stamp, now_ns, timestamp_granularity_ns};
+use crate::groups::{Group, Groups};
 use crate::inodes::{InodeTable, Kind, ROOT};
 use crate::names::is_git_dir_name;
 use crate::privileges::Privileges;
@@ -103,6 +113,18 @@ pub struct Handle {
     pub node: u64,
     pub fd: OwnedFd,
     pub write: bool,
+    /// The fsync-class group of the file, when it was opened at a path in
+    /// the class (design §8): its writes are held during captures.
+    pub group: Option<Arc<Group>>,
+}
+
+impl Handle {
+    /// Whether reads and writes must go through the daemon, never kernel
+    /// passthrough: an fsync-class file, whose writes the daemon must see
+    /// to hold them during a capture.
+    pub fn daemon_only(&self) -> bool {
+        self.group.is_some()
+    }
 }
 
 /// A node as a lookup-style reply describes it.
@@ -151,6 +173,17 @@ pub struct SweepReport {
     pub still_queued: usize,
 }
 
+/// When [`Ops::capture`] captures a group.
+#[derive(Debug, Clone, Copy)]
+enum When {
+    /// If it changed since its last capture.
+    Changed,
+    /// If an `fsync` at this instant is due ([`crate::groups::GroupState::fsync_due`]).
+    Fsync(Instant),
+    /// If the trailing timer is due by this instant.
+    Timer(Instant),
+}
+
 /// A descriptor for a node: freshly opened by path, or an open handle's
 /// (for a file with no name left).
 enum NodeFd {
@@ -176,6 +209,8 @@ pub struct Ops {
     next_fh: AtomicU64,
     names: RwLock<()>,
     boundary: Boundary,
+    /// fsync-class groups (design §8).
+    groups: Groups,
     config: OpsConfig,
     /// The daemon may give new objects to their caller
     /// ([`crate::privileges`]).
@@ -294,6 +329,7 @@ impl Ops {
             next_fh: AtomicU64::new(1),
             names: RwLock::new(()),
             boundary: Boundary::new(recorder, tree),
+            groups: Groups::default(),
             config,
             chown_new: Privileges::current().can_chown_new(),
             euid: rustix::process::geteuid().as_raw(),
@@ -306,6 +342,144 @@ impl Ops {
 
     pub fn boundary(&self) -> &Boundary {
         &self.boundary
+    }
+
+    pub fn groups(&self) -> &Groups {
+        &self.groups
+    }
+
+    /// The fsync-class group of the path `raw`, if it is in the class.
+    fn group_at(&self, raw: &[u8]) -> Option<Arc<Group>> {
+        self.boundary.group_of(raw).map(|m| self.groups.get(m))
+    }
+
+    /// The fsync-class group of node `id`: of its open handles, or else of
+    /// the first of its current paths in the class.
+    fn node_group(&self, id: u64) -> Option<Arc<Group>> {
+        if !self.boundary.recorder().has_fsync_class() {
+            return None;
+        }
+        let (cached, paths) = {
+            let table = self.table();
+            let node = table.get(id)?;
+            (node.group.clone(), table.paths(id))
+        };
+        cached.or_else(|| paths.iter().find_map(|p| self.group_at(p)))
+    }
+
+    /// Records `changes` as one record, except changes at fsync-class paths
+    /// (design §8): those mark their group changed instead, to be captured
+    /// whole later; when `caller` is an operator operation's actor (a
+    /// restore, design §15), at once, so the operation's changes stay its
+    /// own. The caller holds `names` for reading and no group hold.
+    fn record(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        changes: Vec<Change>,
+    ) -> Result<bool, VolumeError> {
+        if !self.boundary.recorder().has_fsync_class() {
+            return self.boundary.record(trigger, caller, changes);
+        }
+        let mut groups: Vec<Arc<Group>> = Vec::new();
+        let changes: Vec<Change> = changes
+            .into_iter()
+            .filter(|c| match self.group_at(&c.path) {
+                Some(g) => {
+                    g.changed(caller);
+                    if !groups.iter().any(|x| Arc::ptr_eq(x, &g)) {
+                        groups.push(g);
+                    }
+                    false
+                }
+                None => true,
+            })
+            .collect();
+        let mut recorded = if changes.is_empty() {
+            false
+        } else {
+            self.boundary.record(trigger, caller, changes)?
+        };
+        if !groups.is_empty() && self.boundary.recorder().in_operation(caller.pid) {
+            for g in groups {
+                recorded |= self.capture(&g, trigger, Some(caller), When::Changed)?;
+            }
+        }
+        Ok(recorded)
+    }
+
+    /// Captures `group` (design §8) if `when` says it is due: freezes its
+    /// gate, so no member changes meanwhile, and records every member's
+    /// current state (content, or removal) as one all-or-nothing record.
+    /// `caller` defaults to whoever changed the group last. Returns whether
+    /// anything was journaled. The caller holds `names` for reading, so no
+    /// member is renamed meanwhile, and no hold on any group.
+    fn capture(
+        &self,
+        group: &Group,
+        trigger: Trigger,
+        caller: Option<Caller>,
+        when: When,
+    ) -> Result<bool, VolumeError> {
+        let _one = group.capturing();
+        {
+            let s = group.state();
+            let due = match when {
+                When::Changed => s.is_dirty(),
+                When::Fsync(now) => s.fsync_due(now, group.coalesce()),
+                When::Timer(now) => s.due_at(group.coalesce()).is_some_and(|at| at <= now),
+            };
+            if !due {
+                return Ok(false);
+            }
+        }
+        let frozen = group.gate().freeze();
+        let (generation, last) = {
+            let s = group.state();
+            (s.generation, s.caller)
+        };
+        let caller = caller.or(last).unwrap_or(NOBODY);
+        let mut fds = Vec::new();
+        let changes: Vec<Change> = group
+            .members()
+            .iter()
+            .filter_map(|m| self.leaf_change(m, &mut fds))
+            .collect();
+        let result = self.boundary.record_group(trigger, caller, changes);
+        drop(fds);
+        drop(frozen);
+        group
+            .state()
+            .captured(generation, Instant::now(), result.is_ok());
+        result
+    }
+
+    /// Captures every group the trailing timer has due at `now` (design
+    /// §8), then forgets groups nothing uses. Returns how many captures
+    /// were journaled.
+    pub fn capture_due(&self, now: Instant) -> usize {
+        let mut n = 0;
+        for group in self.groups.due(now) {
+            let _names = self.read_names();
+            if let Ok(true) = self.capture(&group, Trigger::Interval, None, When::Timer(now)) {
+                n += 1;
+            }
+        }
+        self.groups.prune();
+        n
+    }
+
+    /// Captures every changed group now, whatever its schedule: at unmount.
+    /// Returns how many captures were journaled.
+    pub fn capture_all(&self) -> usize {
+        let mut n = 0;
+        for group in self.groups.dirty() {
+            let _names = self.read_names();
+            if let Ok(true) = self.capture(&group, Trigger::Sweep, None, When::Changed) {
+                n += 1;
+            }
+        }
+        n
     }
 
     fn table(&self) -> MutexGuard<'_, InodeTable> {
@@ -429,6 +603,17 @@ impl Ops {
             Some(h) => NodeFd::Handle(h),
             None => self.node_fd(id)?,
         };
+        // A size or mode change to an fsync-class file changes its group:
+        // held until the change is made; [`Ops::record`] marks the group.
+        let group = if kind == Kind::File && (set.size.is_some() || set.mode.is_some()) {
+            match &fd {
+                NodeFd::Handle(h) if h.group.is_some() => h.group.clone(),
+                _ => self.node_group(id),
+            }
+        } else {
+            None
+        };
+        let hold = group.as_ref().map(|g| g.hold());
         let before = rustix::fs::fstat(&fd).eno()?;
         if set.uid.is_some() || set.gid.is_some() {
             rustix::fs::chownat(
@@ -476,6 +661,7 @@ impl Ops {
             self.utimens(id, &fd, kind, set)?;
         }
         let after = rustix::fs::fstat(&fd).eno()?;
+        drop(hold);
         let record = kind == Kind::File
             && (set.size.is_some() || executable(mode_of(&before)) != executable(mode_of(&after)));
         if record {
@@ -491,7 +677,7 @@ impl Ops {
                 })
                 .collect();
             let now = now_ns();
-            match self.boundary.record(Trigger::Setattr, caller, changes) {
+            match self.record(Trigger::Setattr, caller, changes) {
                 Ok(_) => {
                     if let Some(node) = self.table().get_mut(id) {
                         node.dirty
@@ -663,6 +849,8 @@ impl Ops {
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
         let kind = Kind::from_mode(mode);
+        let group = self.group_at(&join(&self.path_of(parent)?, name));
+        let hold = group.as_ref().map(|g| g.hold());
         rustix::fs::mknodat(
             &dir,
             OsStr::from_bytes(name),
@@ -671,6 +859,7 @@ impl Ops {
             u64::from(rdev),
         )
         .eno()?;
+        drop(hold);
         self.own_new(&dir, name, None, &pst, caller, mode, kind)?;
         let st =
             rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
@@ -687,11 +876,7 @@ impl Ops {
                     executable: executable(mode_of(&st)),
                 },
             };
-            if self
-                .boundary
-                .record(Trigger::Close, caller, vec![change])
-                .is_err()
-            {
+            if self.record(Trigger::Close, caller, vec![change]).is_err() {
                 self.boundary.queue_repair([path], caller);
                 self.unlookup(entry.id);
                 return Err(Errno::EIO);
@@ -711,7 +896,10 @@ impl Ops {
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
+        let group = self.group_at(&join(&self.path_of(parent)?, name));
+        let hold = group.as_ref().map(|g| g.hold());
         rustix::fs::symlinkat(OsStr::from_bytes(target), &dir, OsStr::from_bytes(name)).eno()?;
+        drop(hold);
         self.own_new(&dir, name, None, &pst, caller, 0o777, Kind::Symlink)?;
         let st =
             rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
@@ -723,11 +911,7 @@ impl Ops {
                 target: target.to_vec(),
             },
         };
-        if self
-            .boundary
-            .record(Trigger::Symlink, caller, vec![change])
-            .is_err()
-        {
+        if self.record(Trigger::Symlink, caller, vec![change]).is_err() {
             self.boundary.queue_repair([path], caller);
             self.unlookup(entry.id);
             return Err(Errno::EIO);
@@ -751,6 +935,8 @@ impl Ops {
             return Err(estale());
         }
         let dir = self.open_dir_node(parent)?;
+        let group = self.group_at(&join(&self.path_of(parent)?, name));
+        let hold = group.as_ref().map(|g| g.hold());
         rustix::fs::linkat(
             &sdir,
             OsStr::from_bytes(&sname),
@@ -759,6 +945,7 @@ impl Ops {
             AtFlags::empty(),
         )
         .eno()?;
+        drop(hold);
         let st =
             rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
         let entry = self.entry(parent, name, &st);
@@ -780,11 +967,7 @@ impl Ops {
             path: path.clone(),
             state,
         };
-        if self
-            .boundary
-            .record(Trigger::Link, caller, vec![change])
-            .is_err()
-        {
+        if self.record(Trigger::Link, caller, vec![change]).is_err() {
             self.boundary.queue_repair([path], caller);
             self.unlookup(entry.id);
             return Err(Errno::EIO);
@@ -812,11 +995,14 @@ impl Ops {
         } else {
             AtFlags::empty()
         };
+        // Removing a member changes its group: held while it happens.
+        let group = self.group_at(&path);
+        let hold = group.as_ref().map(|g| g.hold());
         rustix::fs::unlinkat(&pdir, OsStr::from_bytes(name), flags).eno()?;
+        drop(hold);
         self.table().remove_link(parent, name);
         let trigger = if dir { Trigger::Rmdir } else { Trigger::Unlink };
         if self
-            .boundary
             .record(trigger, caller, vec![Change::removed(path.clone())])
             .is_err()
         {
@@ -927,7 +1113,6 @@ impl Ops {
         let mut chunks = leaves.chunks(chunk).peekable();
         if chunks.peek().is_none() {
             return self
-                .boundary
                 .record(trigger, caller, first)
                 .map(|_| ())
                 .map_err(|_| ());
@@ -940,9 +1125,7 @@ impl Ops {
                     changes.push(change);
                 }
             }
-            self.boundary
-                .record(trigger, caller, changes)
-                .map_err(|_| ())?;
+            self.record(trigger, caller, changes).map_err(|_| ())?;
             drop(fds);
         }
         Ok(())
@@ -1042,13 +1225,20 @@ impl Ops {
         let truncate = oflags.contains(OFlags::TRUNC);
         let write = acc != 0 || truncate;
         let _names = self.read_names();
+        let group = self.node_group(id);
+        // Truncating a member changes its group: held, like a write.
+        let hold = group.as_ref().filter(|_| truncate).map(|g| g.hold());
         let fd = self.open_node(id, oflags)?;
+        if let Some(hold) = &hold {
+            hold.changed(caller);
+        }
+        drop(hold);
         let st = if write {
             Some(rustix::fs::fstat(&fd).eno()?)
         } else {
             None
         };
-        Ok(self.add_handle(id, fd, write, truncate, false, st.as_ref(), caller))
+        Ok(self.add_handle(id, fd, write, truncate, false, st.as_ref(), caller, group))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1061,17 +1251,23 @@ impl Ops {
         created: bool,
         st: Option<&Stat>,
         caller: Caller,
+        group: Option<Arc<Group>>,
     ) -> (u64, Arc<Handle>) {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let handle = Arc::new(Handle {
             node: id,
             fd,
             write,
+            group: group.clone(),
         });
+        if let Some(group) = &group {
+            group.opened();
+        }
         {
             let mut table = self.table();
             if let Some(node) = table.get_mut(id) {
                 node.handles.push(fh);
+                node.group = group.clone();
                 if write || created {
                     node.dirty.arm(caller);
                     if truncate || created {
@@ -1112,6 +1308,9 @@ impl Ops {
             & !(OFlags::NOCTTY | OFlags::NOATIME | OFlags::CREATE | OFlags::EXCL))
             | OFlags::NOFOLLOW
             | OFlags::CLOEXEC;
+        // Creating or truncating a member changes its group: held.
+        let group = self.group_at(&join(&self.path_of(parent)?, name));
+        let hold = group.as_ref().map(|g| g.hold());
         let created = rustix::fs::openat(
             &dir,
             OsStr::from_bytes(name),
@@ -1156,7 +1355,14 @@ impl Ops {
         let entry = self.entry(parent, name, &st);
         let truncate = !new && requested.contains(OFlags::TRUNC);
         let write = write || truncate;
-        let (fh, handle) = self.add_handle(entry.id, fd, write, truncate, new, Some(&st), caller);
+        if let Some(hold) = &hold
+            && (new || truncate)
+        {
+            hold.changed(caller);
+        }
+        drop(hold);
+        let (fh, handle) =
+            self.add_handle(entry.id, fd, write, truncate, new, Some(&st), caller, group);
         Ok((entry, fh, handle))
     }
 
@@ -1180,15 +1386,22 @@ impl Ops {
         if let Some(node) = self.table().get_mut(h.node) {
             node.dirty.arm(caller);
         }
+        let hold = h.group.as_ref().map(|g| g.hold());
         let mut done = 0;
-        while done < data.len() {
-            let n = rustix::io::pwrite(&h.fd, &data[done..], offset + done as u64).eno()?;
-            if n == 0 {
-                return Err(Errno::EIO);
+        let result = loop {
+            if done >= data.len() {
+                break Ok(u32::try_from(done).unwrap_or(u32::MAX));
             }
-            done += n;
+            match rustix::io::pwrite(&h.fd, &data[done..], offset + done as u64).eno() {
+                Ok(0) => break Err(Errno::EIO),
+                Ok(n) => done += n,
+                Err(e) => break Err(e),
+            }
+        };
+        if let Some(hold) = &hold {
+            hold.changed(caller);
         }
-        Ok(u32::try_from(done).unwrap_or(u32::MAX))
+        result
     }
 
     /// `close` of a descriptor: records the inode if it changed since its
@@ -1197,6 +1410,14 @@ impl Ops {
     pub fn flush(&self, fh: u64, caller: Caller) -> OpResult<()> {
         let h = self.handle(fh)?;
         let _names = self.read_names();
+        if let Some(group) = &h.group {
+            // An fsync-class file: its whole group, if it changed (design
+            // §8).
+            return self
+                .capture(group, Trigger::Close, Some(caller), When::Changed)
+                .map(|_| ())
+                .map_err(|_| Errno::EIO);
+        }
         self.record_node(h.node, &h.fd, Trigger::Close, caller)
             .map(|_| ())
     }
@@ -1210,7 +1431,12 @@ impl Ops {
         trigger: Trigger,
         caller: Caller,
     ) -> OpResult<bool> {
-        if !self.table().get(id).is_some_and(|n| n.dirty.armed) {
+        // fsync-class nodes are recorded by group captures only.
+        if !self
+            .table()
+            .get(id)
+            .is_some_and(|n| n.dirty.armed && n.group.is_none())
+        {
             return Ok(false);
         }
         let st = rustix::fs::fstat(fd).eno()?;
@@ -1259,20 +1485,33 @@ impl Ops {
         let Some(h) = self.handles().remove(&fh) else {
             return Err(Errno::EBADF);
         };
+        let last_in_group = h.group.as_ref().is_some_and(|g| g.released() == 0);
         let (last_writer, check) = {
             let mut table = self.table();
             let Some(node) = table.get_mut(h.node) else {
                 return Ok(());
             };
             node.handles.retain(|f| *f != fh);
+            if node.handles.is_empty() {
+                node.group = None;
+            }
             if h.write {
                 node.write_handles = node.write_handles.saturating_sub(1);
             }
             (
                 node.dirty.last_writer.unwrap_or(NOBODY),
-                node.write_handles == 0 && node.dirty.armed,
+                // An fsync-class handle never records its node alone.
+                h.group.is_none() && node.write_handles == 0 && node.dirty.armed,
             )
         };
+        if let Some(group) = &h.group
+            && last_in_group
+        {
+            // The group's last handle: capture it if it changed. A failure
+            // leaves it changed, for the timer to retry.
+            let _names = self.read_names();
+            let _ = self.capture(group, Trigger::Release, None, When::Changed);
+        }
         let mut result = Ok(());
         if check {
             let _names = self.read_names();
@@ -1300,10 +1539,18 @@ impl Ops {
     pub fn fsync(&self, fh: u64, datasync: bool) -> OpResult<()> {
         let h = self.handle(fh)?;
         if datasync {
-            rustix::fs::fdatasync(&h.fd).eno()
+            rustix::fs::fdatasync(&h.fd).eno()?;
         } else {
-            rustix::fs::fsync(&h.fd).eno()
+            rustix::fs::fsync(&h.fd).eno()?;
         }
+        if let Some(group) = &h.group {
+            // At most once per `agentfs.coalesce` (design §8). A failed
+            // capture does not fail the fsync, which did reach the disk:
+            // the group stays changed and the timer retries it.
+            let _names = self.read_names();
+            let _ = self.capture(group, Trigger::Fsync, None, When::Fsync(Instant::now()));
+        }
+        Ok(())
     }
 
     pub fn fallocate(
@@ -1318,13 +1565,18 @@ impl Ops {
         if let Some(node) = self.table().get_mut(h.node) {
             node.dirty.arm(caller);
         }
-        rustix::fs::fallocate(
+        let hold = h.group.as_ref().map(|g| g.hold());
+        let result = rustix::fs::fallocate(
             &h.fd,
             rustix::fs::FallocateFlags::from_bits_retain(mode as u32),
             offset,
             length,
         )
-        .eno()
+        .eno();
+        if let Some(hold) = &hold {
+            hold.changed(caller);
+        }
+        result
     }
 
     pub fn lseek(&self, fh: u64, offset: i64, whence: i32) -> OpResult<i64> {
@@ -1359,6 +1611,7 @@ impl Ops {
         let mut off_in = offset_in;
         let mut off_out = offset_out;
         let len = usize::try_from(len.min(u64::from(u32::MAX))).unwrap_or(usize::MAX);
+        let hold = output.group.as_ref().map(|g| g.hold());
         let n = rustix::fs::copy_file_range(
             &input.fd,
             Some(&mut off_in),
@@ -1366,8 +1619,11 @@ impl Ops {
             Some(&mut off_out),
             len,
         )
-        .eno()?;
-        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+        .eno();
+        if let Some(hold) = &hold {
+            hold.changed(caller);
+        }
+        Ok(u32::try_from(n?).unwrap_or(u32::MAX))
     }
 
     // ---- directories ----
@@ -1546,7 +1802,7 @@ impl Ops {
                     } else {
                         node.write_handles > 0
                     };
-                    (node.dirty.armed && open).then(|| {
+                    (node.dirty.armed && open && node.group.is_none()).then(|| {
                         (
                             id,
                             node.handles[0],

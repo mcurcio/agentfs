@@ -1172,3 +1172,237 @@ fn records_by_a_restore_actor_belong_to_the_operation() {
         "{message}"
     );
 }
+
+// ---- the fsync class (design §8) ----
+
+const SQLITE: &str = "*.db* agentfs.commit=fsync agentfs.group=sqlite agentfs.coalesce=5s\n";
+
+impl Fx {
+    /// A fixture whose operator `info/attributes` is `attributes`.
+    fn with_attributes(attributes: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("backing")).unwrap();
+        let state = StateDir::new(dir.path().join("state"));
+        volume::init(&state, "vol", None).unwrap();
+        fs::write(state.git().join("info/attributes"), attributes).unwrap();
+        Self::open_on(
+            dir,
+            OpsConfig {
+                granularity_ns: 0,
+                chunk: RENAME_CHUNK,
+            },
+        )
+    }
+
+    fn journal(&self) -> Vec<agentfs_core::record::Record> {
+        agentfs_core::journal::read_records(&self.state().journal())
+            .unwrap()
+            .0
+    }
+
+    /// Runs the trailing timer as if `secs` had passed.
+    fn later(&self, secs: u64) -> usize {
+        self.ops
+            .capture_due(Instant::now() + std::time::Duration::from_secs(secs))
+    }
+}
+
+#[test]
+fn fsync_class_files_are_captured_whole_at_fsync_at_most_once_per_interval() {
+    let fx = Fx::with_attributes(SQLITE);
+    let (_, db) = fx.create("s.db");
+    let (_, wal) = fx.create("s.db-wal");
+    fx.ops.write(db, 0, b"db1", C).unwrap();
+    fx.ops.write(wal, 0, b"wal1", C).unwrap();
+    // Nothing is recorded per file.
+    assert_eq!(fx.backlog(), 0);
+    fx.ops.fsync(wal, false).unwrap();
+    let journal = fx.journal();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].draft.trigger, Trigger::Fsync);
+    assert!(journal[0].draft.atomic);
+    assert_eq!(
+        fx.history(),
+        map(&[("s.db", file("db1")), ("s.db-wal", file("wal1"))])
+    );
+    // A second fsync within the interval records nothing...
+    fx.ops.write(db, 0, b"db2", C).unwrap();
+    fx.ops.fsync(db, true).unwrap();
+    assert_eq!(fx.backlog(), 0);
+    // ...nor does the timer before the interval has passed...
+    assert_eq!(fx.later(1), 0);
+    // ...but it does after.
+    assert_eq!(fx.later(6), 1);
+    assert_eq!(
+        fx.journal().last().unwrap().draft.trigger,
+        Trigger::Interval
+    );
+    assert_eq!(fx.history()["s.db"], file("db2"));
+    // Clean: nothing more to capture, not even at close.
+    assert_eq!(fx.later(60), 0);
+    fx.close(db);
+    fx.close(wal);
+    assert_eq!(fx.backlog(), 0);
+    assert!(fx.ops.groups().is_empty() || fx.ops.groups().dirty().is_empty());
+}
+
+#[test]
+fn close_captures_and_shm_is_never_recorded() {
+    let fx = Fx::with_attributes(SQLITE);
+    fx.put("s.db-shm", "shared");
+    assert_eq!(fx.backlog(), 0);
+    fx.put("s.db", "v1");
+    let journal = fx.journal();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].draft.trigger, Trigger::Close);
+    fx.put("s.db-journal", "hot");
+    assert_eq!(
+        fx.history(),
+        map(&[("s.db", file("v1")), ("s.db-journal", file("hot"))])
+    );
+    // An unlink of a member is captured with the group, not alone.
+    fx.ops.unlink(ROOT, b"s.db-journal", C).unwrap();
+    assert_eq!(fx.backlog(), 0);
+    assert_eq!(fx.later(6), 1);
+    assert_eq!(fx.history(), map(&[("s.db", file("v1"))]));
+    // Ordinary files are untouched by all this.
+    fx.put("a.txt", "x");
+    assert_eq!(fx.history()["a.txt"], file("x"));
+}
+
+#[test]
+fn class_handles_never_use_passthrough() {
+    let fx = Fx::with_attributes(SQLITE);
+    fx.put("s.db", "v1");
+    fx.put("a.txt", "x");
+    let id = fx.id("s.db");
+    let (_, h) = fx.ops.open(id, O_RDONLY, C).unwrap();
+    assert!(h.daemon_only());
+    let id = fx.id("a.txt");
+    let (_, h) = fx.ops.open(id, O_RDONLY, C).unwrap();
+    assert!(!h.daemon_only());
+    // Without the class, nothing is daemon-only.
+    let fx = Fx::new();
+    fx.put("s.db", "v1");
+    let id = fx.id("s.db");
+    assert!(!fx.ops.open(id, O_RDONLY, C).unwrap().1.daemon_only());
+}
+
+#[test]
+fn a_capture_holds_writes_to_every_member() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fx = Fx::with_attributes(SQLITE);
+    let (_, db) = fx.create("s.db");
+    fx.ops.write(db, 0, b"1", C).unwrap();
+    let (_, wal) = fx.create("s.db-wal");
+    let group = fx.ops.groups().dirty().pop().unwrap();
+    let frozen = group.gate().freeze();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            fx.ops.write(wal, 0, b"w", C).unwrap();
+            done.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the write waits for the capture"
+        );
+        drop(frozen);
+    });
+    assert!(done.load(Ordering::SeqCst));
+    fx.close(db);
+    fx.close(wal);
+    assert_eq!(
+        fx.history(),
+        map(&[("s.db", file("1")), ("s.db-wal", file("w"))])
+    );
+}
+
+#[test]
+fn a_rename_into_the_class_is_captured_with_the_group() {
+    let fx = Fx::with_attributes(SQLITE);
+    fx.put("tmp", "new db");
+    fx.history();
+    fx.rename("tmp", "s.db", 0).unwrap();
+    // The removal of `tmp` is recorded at once; `s.db` by the timer.
+    assert_eq!(fx.history(), map(&[]));
+    assert_eq!(fx.later(6), 1);
+    assert_eq!(fx.history(), map(&[("s.db", file("new db"))]));
+}
+
+#[test]
+fn the_last_release_and_unmount_capture_what_changed() {
+    let fx = Fx::with_attributes(SQLITE);
+    // A write no close follows (a mapping, say): captured at release.
+    let (_, db) = fx.create("s.db");
+    fx.ops.write(db, 0, b"mapped", C).unwrap();
+    fx.ops.release(db).unwrap();
+    assert_eq!(fx.journal().last().unwrap().draft.trigger, Trigger::Release);
+    assert_eq!(fx.history()["s.db"], file("mapped"));
+    // A truncate by path, never closed: captured at unmount.
+    let id = fx.id("s.db");
+    fx.ops
+        .setattr(
+            id,
+            &SetAttr {
+                size: Some(3),
+                ..SetAttr::default()
+            },
+            C,
+        )
+        .unwrap();
+    assert_eq!(fx.backlog(), 0);
+    assert_eq!(fx.ops.capture_all(), 1);
+    assert_eq!(fx.history()["s.db"], file("map"));
+    assert_eq!(fx.ops.capture_all(), 0);
+}
+
+#[test]
+fn a_member_over_max_size_refuses_the_whole_group() {
+    let fx = Fx::with_attributes(&format!("{SQLITE}*.db-wal agentfs.maxSize=4\n"));
+    let (_, db) = fx.create("s.db");
+    let (_, wal) = fx.create("s.db-wal");
+    fx.ops.write(db, 0, b"db", C).unwrap();
+    fx.ops.write(wal, 0, b"0123456789", C).unwrap();
+    // A refusal is not a failure: close succeeds, nothing is recorded,
+    // and the group is clean.
+    fx.close(db);
+    assert_eq!(fx.backlog(), 0);
+    assert_eq!(fx.refused(), ["s.db-wal"]);
+    assert_eq!(fx.later(60), 0);
+    fx.close(wal);
+}
+
+#[test]
+fn a_restore_actor_captures_namespace_changes_at_once() {
+    use agentfs_core::record::OperationKind;
+    let fx = Fx::with_attributes(SQLITE);
+    fx.put("s.db", "v1");
+    fx.put("s.db-journal", "j");
+    fx.history();
+    let operator = Caller {
+        uid: 0,
+        gid: 0,
+        pid: 999,
+    };
+    let actor = Caller { pid: 4321, ..C };
+    let guard = fx
+        .ops
+        .boundary()
+        .recorder()
+        .begin_operation(
+            OperationKind::Restore,
+            "0123456789012345678901234567890123456789".into(),
+            "restore s.db from 0123456".into(),
+            operator,
+            &[actor.pid],
+        )
+        .unwrap();
+    fx.ops.unlink(ROOT, b"s.db-journal", actor).unwrap();
+    guard.finish();
+    let last = fx.journal().pop().unwrap();
+    assert_eq!(last.draft.trigger, Trigger::Restore);
+    assert!(last.draft.atomic);
+    assert_eq!(fx.history(), map(&[("s.db", file("v1"))]));
+}
