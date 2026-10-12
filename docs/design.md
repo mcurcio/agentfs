@@ -1,449 +1,766 @@
 # agentfs design
 
-Status: draft, 2026-10-12. Nothing here is implemented.
+Status: draft 2, 2026-10-12. Nothing here is implemented. Draft 1 was reviewed
+adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
+for the findings and what changed because of them.
 
 ## 1. Objective
 
-agentfs presents the latest commit of a git branch as an ordinary directory.
-Any process can use it, root or non-root, with no knowledge of git.
+agentfs records every change an agent makes to a directory, in git history
+the agent cannot see.
 
-- **Recorded before return.** Every completed change made through the mount
-  (create, write-and-close, rename, delete, mode change) is durably recorded
-  before the call that completes it returns.
-- **Committed and pushed.** Recorded changes become commits on the branch, and
-  a recorder outside the workload's view pushes them to a remote in the
-  background.
-- **Large files.** Large files go to Git LFS, whose store may differ from the
-  repository's remote.
-- **Rules use git's idioms**: `.gitignore`, `.gitattributes`, `.lfsconfig`,
-  `$GIT_DIR/info/*` and git-config syntax.
-- **History is never visible in the mount.**
-
-The core idea is a **projection**. The directory is not a copy that gets backed
-up; it is a view of the history's latest state plus changes in progress.
+- **Ordinary files.** Any process, root or not, uses the directory with ordinary
+  file calls and never sees git. The files live in a real directory on a backing
+  volume.
+- **Recording.** agentfs sits in front of that directory as a FUSE filesystem.
+  When a file is closed after being changed, or renamed, deleted, linked or
+  marked executable, agentfs durably records the new state before the call
+  returns. It later turns recorded states into commits.
+- **Pushing.** Commits are pushed at regular intervals to one or more git
+  remotes. GitHub is one possible remote, not an assumption.
+- **Logical projection.** Logically, the branch's history is the sequence of
+  states of the directory. Physically, the directory is a normal tree, and the
+  history lives outside the mount.
+- **Rules.** Path rules use git's own idioms: `.gitignore`, `.gitattributes`,
+  `.lfsconfig`, `$GIT_DIR/info/*` and git-config syntax.
 
 ### 1.1 Threat model
 
-agentfs protects against an agent's **mistakes**, not against a malicious
-agent. It exists to:
+agentfs protects against an agent's **mistakes**, not a malicious agent. It
+exists to:
 
-- show every change an agent made, so mistakes can be found and undone;
-- sync that history to GitHub;
+- show every change an agent made, so mistakes can be found and recovered from;
+- sync that history to remotes;
 - let infrastructure-as-code (iac) change files with versioned patches instead
   of overwriting whole files.
 
-So "invisible" is enough: no `.git` in the mount and no credentials in the
-workload. agentfs does not try to resist a workload that is actively trying to
-defeat it, or a compromised node.
+"Invisible" means no history, journal, state or credential is reachable through
+the mount. agentfs does not try to resist a workload that is actively trying to
+defeat it.
 
-### 1.2 Baseline and extras
+### 1.2 What "every change" means
 
-| Baseline (must have) | Extras (later) |
+A change is recorded at each **change boundary** (§3.1), before the call that
+ends it returns. Intermediate states between boundaries, such as the bytes of a
+file between two writes, are not recorded separately. A few boundaries can only
+be recorded after the fact; §3.1 lists them.
+
+### 1.3 Baseline, extras, phases
+
+| Phase | Contents |
 |---|---|
-| Every completed change recorded | Attribution beyond container and UID, such as agent, session or tool call |
-| History pushed to a remote | Reconciling iac patches (§9) |
-| Path rules in git idioms | Deeper handling of nested repositories (§7) |
-
-### 1.3 Not goals
-
-- **Enforcing content rules.** agentfs records; it does not reject writes.
-- **Several pods writing one volume at once.** A volume has one mount at a time.
-- **Pushing remote changes into a running workload.** Remote changes are only
-  taken in at mount time.
-- **Showing history to the workload.** The agent cannot read its own history
-  through the mount.
-
-## 2. Concepts
-
-### 2.1 Two storage areas
-
-Every path belongs to exactly one area, decided by the ignore rules (§4):
-
-| Area | Holds | Versioned | Pushed |
-|---|---|---|---|
-| **Versioned** | tracked paths | yes, as git objects | yes |
-| **Pass-through** | ignored paths, nested repositories (§7), and files git cannot store (special files, empty directories) | no; plain files on the state volume | no |
-
-Both areas survive restarts because both live on the state volume (§10).
-
-### 2.2 Record, then commit
-
-"Recorded before return" and "committed" are separate steps:
-
-1. **Record (synchronous).** When a change completes, agentfs writes the new
-   content into the git object store and appends an entry (path, object id,
-   mode, trigger, uid, pid, time) to a local **journal**. It `fsync`s both, then
-   lets the call return. This is the guarantee.
-2. **Commit (asynchronous, milliseconds later).** A commit builder groups journal
-   entries into commits, updates the tree, and moves the branch ref. Grouping is
-   cosmetic: it decides how history reads, not whether a change is kept.
-
-After a crash, journal entries not yet in a commit are replayed into commits at
-the next start.
-
-### 2.3 What the mount shows
-
-The mount shows:
-
-- the branch's latest committed tree,
-- plus journal entries not yet committed,
-- plus files currently open for writing.
-
-A file being written lives in a staging file on the state volume until it is
-closed. Other processes reading it see the staging file, which matches normal
-POSIX visibility.
-
-### 2.4 What git cannot represent
-
-agentfs inherits git's data model:
-
-- Only the executable bit of the mode is recorded. Ownership, timestamps and
-  extended attributes are not.
-- Empty directories are not recorded; they live in the pass-through area.
-- Symlinks are recorded as symlinks.
-- Hard links are recorded as independent files.
-- Special files (FIFOs, sockets, devices) live in the pass-through area.
-- Paths git refuses, such as any `.git` component, are handled by rules (§7),
-  never silently dropped.
-
-## 3. Change triggers
-
-| Event | Recorded when | Notes |
-|---|---|---|
-| File opened for writing, then closed | at `close` | Includes `O_TRUNC` and appends |
-| `rename` | at `rename` | Records source and destination together, so a temp-file save is one change |
-| `unlink`, `rmdir` | at the call | |
-| `chmod` changing the executable bit | at the call | Other mode bits are not recorded |
-| `symlink` | at the call | |
-| `fsync` on a path marked `agentfs.commit=fsync` | at `fsync`, coalesced | See §5 |
-
-A file held open and modified without `fsync` is recorded when it is closed.
-
-## 4. Path rules
-
-agentfs reads git's own rule files. Two places hold them:
-
-- **Tracked** files are part of the content. They are visible in the mount, the
-  agent may edit them, and edits to them are themselves recorded.
-- **Operator** files live in the git directory, outside the mount. iac supplies
-  them and the agent cannot see them.
-
-| Concern | Tracked | Operator |
-|---|---|---|
-| Ignore (pass-through area) | `.gitignore` in any directory | `$GIT_DIR/info/exclude` |
-| Per-path attributes | `.gitattributes` in any directory | `$GIT_DIR/info/attributes` (takes precedence over tracked attributes) |
-| LFS location | `.lfsconfig` | `lfs.url` in `$GIT_DIR/config` (overrides `.lfsconfig`) |
-| Daemon settings | none | `[agentfs]` sections in `$GIT_DIR/config` |
-
-### 4.1 agentfs attributes
-
-Custom attributes use the `agentfs.` prefix:
-
-| Attribute | Values | Default | Meaning |
-|---|---|---|---|
-| `agentfs.commit` | `close`, `fsync` | `close` | Change trigger (§3, §5) |
-| `agentfs.coalesce` | duration | `30s` | Minimum interval between `fsync` records for one path or group |
-| `agentfs.group` | name | unset | Paths in the same group, in the same directory, are recorded together |
-| `agentfs.store` | `blob`, `lfs` | see §6 | Force ordinary git object or LFS |
-| `-agentfs` | | | Never record this path; it goes to the pass-through area. Equivalent to ignoring it |
-
-Example operator `info/attributes` for a directory holding SQLite databases:
-
-```gitattributes
-*.db      agentfs.commit=fsync agentfs.coalesce=30s agentfs.group=sqlite agentfs.store=lfs
-*.db-wal  agentfs.group=sqlite
-*.db-shm  -agentfs
-```
-
-### 4.2 Daemon settings
-
-```ini
-[agentfs]
-    # Content larger than this goes to LFS unless agentfs.store says otherwise.
-    lfsThreshold = 8m
-    # When false, only operator ignore rules count; tracked .gitignore files are
-    # recorded as content but do not decide what is recorded.
-    respectTreeIgnores = true
-    # How nested repositories are handled (§7).
-    nested = exclude
-```
-
-### 4.3 Tracked ignores and safety
-
-In git, a tracked `.gitignore` can override `info/exclude` (a `!pattern`
-re-includes a path). So an agent that writes `*` into `.gitignore` stops
-recording everything after that edit. The edit itself is recorded, so it is
-visible, but later changes are not.
-
-`respectTreeIgnores = false` makes only operator rules count. The default is
-`true` because it is git's behaviour; agent volumes should set it to `false`.
-
-## 5. Files changed in place (`fsync` class)
-
-Some files are held open and changed in place: SQLite databases, other embedded
-databases, long-running logs. Recording them only at `close` could mean never.
-Paths marked `agentfs.commit=fsync` are recorded on `fsync` instead:
-
-- **Coalescing.** At most one record per path or group per `agentfs.coalesce`
-  interval. The latest content is always recorded at `close`, and when the mount
-  is unmounted.
-- **Groups.** Paths sharing `agentfs.group` in one directory are captured
-  together, from the same instant. For SQLite in WAL mode, the database and its
-  `-wal` file must be captured together. Restoring both lets SQLite recover
-  normally. The `-shm` file is regenerated by SQLite and must not be recorded.
-- **Guarantee.** For these paths, "recorded before return" weakens to "recorded
-  at most one coalescing interval late". This is deliberate.
-- **Memory-mapped shared writes** (the SQLite `-shm` pattern) are not supported on
-  recorded paths; such files belong in the pass-through area.
-
-### 5.1 Storage growth
-
-Snapshots of a large, frequently changed file grow storage quickly. A 50 MB
-database recorded every 30 seconds is up to about 144 GB a day in LFS, which
-stores whole files. Two mitigations, both open (§13):
-
-- **Store as ordinary git objects** (`agentfs.store=blob`). Git's pack
-  compression stores the differences between versions, which suits database
-  pages well. GitHub rejects individual files over 100 MB.
-- **Retention.** Prune LFS content for old versions of `fsync`-class paths while
-  keeping their pointers. History still shows that a version existed, and its
-  hash, but the content may be gone.
-
-## 6. Large files and LFS
-
-Whether content becomes an ordinary git object or an LFS pointer:
-
-1. `agentfs.store` (§4.1), if set;
-2. otherwise `filter=lfs` from `.gitattributes`, as in standard git LFS;
-3. otherwise `lfsThreshold`: larger content goes to LFS.
-
-**LFS location** follows git-lfs's own rules: `lfs.url` in `$GIT_DIR/config`,
-then `.lfsconfig`, then the repository remote. A typical setup keeps history on
-GitHub and LFS content on a self-hosted LFS server backed by in-cluster object
-storage.
-
-**Implementation.** Neither libgit2 nor gitoxide implements LFS, so agentfs
-implements:
-
-- the pointer-file format;
-- the LFS HTTP batch API (upload and download);
-- a local LFS object cache on the state volume.
-
-LFS objects are uploaded before the commits that reference them are pushed.
-
-## 7. Nested git repositories
-
-Agents clone repositories into their workspace. A clone has its own `.git`
-directory (or a `.git` file, for submodules and worktrees), its own objects and
-its own nested `.gitignore` files.
-
-**Constraint.** A git tree cannot contain a path with a `.git` component. Git
-and libgit2 both refuse it as a security protection. Recording a nested `.git`
-would also flood history: the index is rewritten on every `git status`.
-
-**Default: nested repositories are excluded.** Any directory containing a
-`.git` entry, at any depth, is treated as ignored. The whole directory, working
-files and `.git` alike, lives in the pass-through area. It works normally and
-survives restarts, but is not versioned or pushed.
-
-**Option: `nested = working-tree`.** Configurable globally or per path. The
-nested repository's working files are recorded like any other file, while its
-`.git` stays in the pass-through area. Its own `.gitignore` files apply to what
-is below them, as in git. Inner `.git/index.lock` gives natural grouping: while
-it exists, changes in that repository become one commit, so a `git checkout`
-of hundreds of files reads as one change.
-
-**Later options:**
-
-- Commit trailers recording the inner repository's state
-  (`Agentfs-Nested: path=src/foo head=<sha> dirty=true`).
-- Fetching the inner repository's objects into agentfs's object store under
-  `refs/agentfs/nested/<path>/*`, so even unpushed inner commits are kept.
-
-**Edge case.** When `git init` runs in a directory whose files are already
-recorded, the directory becomes nested. agentfs records one commit that removes
-those files from the versioned area, with a trailer saying why
-(`Agentfs-Reason: nested-repository`), so it does not read as the agent
-deleting them.
-
-## 8. History and the remote
-
-- **Single writer.** agentfs is the only writer of its branch. On GitHub, branch
-  protection allows only agentfs's credential to push it.
-- **Straight-line history.** Every commit on the branch is made by agentfs.
-- **Fast-forward pushes only.** If the remote branch has moved anyway, agentfs
-  pushes its commits to `refs/agentfs/diverged/<timestamp>` and raises an alert.
-  It never rewrites or force-pushes history.
-- **Push queue.** Pushes happen in the background, retrying on failure.
-  Unpushed commits stay on the state volume (§10).
-- **Commit metadata.** Author is the container and UID that made the change.
-  Committer is agentfs. Trailers carry the trigger and caller:
-
-  ```
-  Agentfs-Trigger: close
-  Agentfs-Pid: 4711
-  ```
-
-## 9. Reconciling iac patches (extra)
-
-The core only records. Taking in changes from outside is an extra that runs
-only at mount time, before the workload starts.
-
-**The patch queue.**
-
-- iac adds patches to the queue as commits on numbered refs:
-  `refs/agentfs/inbox/<sequence>`.
-- At mount, agentfs applies them **in sequence order**. Each is cherry-picked
-  onto the current branch head with a three-way merge.
-- **Success.** The result becomes a commit on the branch, authored by the
-  patch's author and committed by agentfs, with a trailer
-  `Agentfs-Inbox: <sequence>`. The inbox ref moves to
-  `refs/agentfs/applied/<sequence>`.
-- **First failure.** Processing **stops**. The failing patch and every later one
-  stay in the queue, in order. agentfs records the failure, emits an event, and
-  mounts the volume anyway. Recording is never blocked by a reconciliation
-  problem.
-- **Next mount.** Processing resumes at the head of the queue. A person or iac
-  fixes or withdraws the failing patch.
-
-Because patches become ordinary commits made by agentfs, the branch keeps a
-single writer and a straight line.
-
-**Per-path merge drivers** are a possible refinement. `.gitattributes`
-`merge=<driver>` selects a driver for a path, and libgit2 lets agentfs register
-custom drivers. For example, a YAML-aware driver could let iac own certain keys.
-
-**Open:** how iac produces patches and pushes them to the inbox. The baseline
-above does not depend on it.
-
-## 10. Layers
-
-### 10.1 Layer 1: the FUSE layer (Rust)
-
-- **`agentfs-core`, a library crate:**
-  - the rules engine (ignores and attributes, via libgit2);
-  - the journal and commit builder;
-  - the projection;
-  - LFS;
-  - the push queue;
-  - the patch queue.
-- **`agentfs`, a binary.** It mounts with `fuser` and works anywhere FUSE does:
-  a laptop, Docker, CI. Mount options include `allow_other` or `allow_root`,
-  and the owner (`uid`, `gid`, `umask`) reported for files.
-
-Candidate commands:
+| 1 | The recorder as a native sidecar for one pod: recording, commits, interval push to any remote, path rules, operator-only safety settings, push checks, OpenTelemetry, a supported manual recovery path |
+| 2 | Git LFS, and the `fsync` class for databases (§8) |
+| 3 | The ordered patch queue for iac (§12) |
+| 4 | The CSI driver, including volumes mounted by several pods at once (§14) |
+
+### 1.4 Not goals
+
+- **Enforcing content rules.** agentfs records; it does not reject writes. The
+  secret guard (§10) holds pushes, not writes.
+- **Pushing remote changes into a running workload.** Remote changes enter only
+  at mount time.
+- **Showing history to the workload.**
+
+## 2. Architecture
 
 ```
-agentfs init   --state <dir> --remote <url> --branch <name>
-agentfs mount  --state <dir> <mountpoint> [--allow-other] [--uid N --gid N]
-agentfs status --state <dir>
-agentfs flush  --state <dir>      # commit and push everything pending
+ workload processes
+        │  ordinary file calls
+        ▼
+ ┌──────────────┐   reads/writes go straight to backing files (FUSE passthrough)
+ │ agentfs FUSE │──────────────────────────────────────────────┐
+ │   (front)    │  intercepts namespace ops + change boundaries │
+ └──────┬───────┘                                              ▼
+        │ record (synchronous)                         backing tree (real files)
+        ▼
+ ┌──────────────┐   async: hash, objects, commits, push    state area
+ │   recorder   │─────────────────────────────────────▶  (journal, pending,
+ │ (history svc)│                                          git dir, LFS cache)
+ └──────────────┘
 ```
 
-State directory layout:
+### 2.1 Backing tree
+
+The visible directory is a real directory tree on the backing volume.
+
+- **Reads and writes** go straight to the backing files. On Linux 6.9 and later,
+  the kernel's FUSE passthrough means data I/O does not go through the daemon at
+  all. fuser exposes this through `BackingId`.
+- **Normal behaviour.** Because the files are real:
+  - hard links, mmap, `O_APPEND`, sparse files and SQLite behave normally;
+  - unlinking or renaming an open file behaves normally;
+  - permissions, ownership, timestamps and extended attributes are kept by the
+    backing filesystem.
+- **What the daemon handles.** It handles lookups, directory operations, renames,
+  links and attribute changes, and it sees the change boundaries it must record.
+- **Recording is per inode.** A change is attributed to the inode's current
+  paths at the moment of recording, not to the path it was opened with.
+
+### 2.2 State area
+
+The state area is a separate directory on the same volume, never visible
+through the mount:
 
 ```
 <state>/
-  git/          bare repository: objects, refs, config, info/{exclude,attributes}
-  journal/      the durable change log (§2.2)
-  staging/      files currently open for writing (§2.3)
-  passthrough/  the pass-through area (§2.1)
-  lfs/          local LFS object cache
+  git/       the history repository (bare): objects, refs, config, info/*
+  journal/   durable record log (§3.3)
+  pending/   frozen copies of recorded content awaiting commit (§3.2)
+  lfs/       local LFS object cache (phase 2)
+  meta/      the daemon's own bookkeeping (sequence numbers, push state)
 ```
 
-### 10.2 Layer 2: the CSI driver
+### 2.3 Single writer of history
 
-A Kubernetes CSI node plugin. Volumes are declared inline in the pod spec
-(ephemeral inline CSI volumes), so no controller is needed at first. Volume
-settings name the remote, branch, owner and operator rules (or a ConfigMap
-holding them). The push credential comes from a Secret referenced by the volume
-(`nodePublishSecretRef`) and never enters the workload.
+Exactly one recorder process owns the history repository and its branch. In
+phase 1 that is the sidecar's daemon. With several pods (§14) it is a separate
+history service per volume, fed by each pod's front. Either way history is a
+straight line, and every commit is made by agentfs.
 
-**Mount pods.** For each volume, the driver starts a small mount pod that runs
-Layer 1. This follows JuiceFS's CSI driver and solves two problems:
+## 3. Recording
 
-1. **Lifetime.** FUSE daemons running inside the driver's own container would
-   die when it restarts, leaving workloads with broken mounts.
-2. **Durability.** The mount pod holds a small PVC for its state directory, so
-   journal entries and unpushed commits follow the volume if the workload moves
-   to another node.
+### 3.1 Change boundaries
 
-Lifecycle:
+| Event (FUSE op) | Recorded | Before return? |
+|---|---|---|
+| `close` (FLUSH) of a file changed since its last record | its content and executable bit | yes |
+| `rename` | source removed, destination added | yes |
+| `unlink`, `rmdir` | removal | yes |
+| `link`, `symlink` | new path | yes |
+| `setattr` changing size (`truncate`) or the executable bit | new content or mode | yes |
+| `fsync` on a path marked `agentfs.commit=fsync` | content, coalesced (§8) | yes, at most once per interval |
+| RELEASE (all handles and mappings gone) | content, if changed after the last FLUSH | **no**: backstop for mmap and late writes |
+| periodic sweep | content of files still open and changed | **no**: backstop for files never closed |
 
-- **On mount (`NodePublishVolume`):**
-  - ensure the mount pod and its state PVC exist;
-  - clone, or fetch and process the patch queue (§9);
-  - write the operator rule files;
-  - start `agentfs mount`;
-  - bind-mount the result into the pod.
-- **On unmount (`NodeUnpublishVolume`):**
-  - flush;
-  - push one final time;
-  - unmount.
+Rules that make this precise:
 
-## 11. Attribution
+- **FLUSH records only if the inode changed.** FLUSH is sent on every `close()`
+  of every duplicated descriptor, for example each forked child that inherited
+  stdout. Unchanged inodes are skipped, so a build writing to a log does not
+  record the log thousands of times. A changed one is still recorded at every
+  close.
+- **RELEASE is asynchronous.** Its result never reaches the caller, which is why
+  writes through shared memory mappings, or after the last close, are recorded
+  late.
+- **Empty directories** are not recorded, because git cannot represent them.
+  `mkdir` alone is not a boundary.
 
-FUSE reports the caller's UID, GID and PID with every request. agentfs maps
-these to commit author and trailers (§8). Attributing a change to an agent,
-session or tool call needs the workload's cooperation, for example a variable or
-side channel the workload sets. That is an extra.
+### 3.2 The synchronous step
 
-## 12. Acceptance tests
+The work done before the call returns must not depend on file size:
+
+1. **Freeze** the inode's current content into `pending/`, as a reflink where the
+   backing filesystem supports it (XFS, btrfs), otherwise as a copy.
+2. **Journal**: append a framed, checksummed entry with sequence number, inode,
+   current paths, pending id, mode, trigger, caller UID, GID and PID, and time.
+3. **Group commit**: one `fsync` of the journal covers every entry that arrived
+   while the previous `fsync` was in progress.
+4. Return.
+
+Hashing, compression, object writes, LFS uploads and commits happen afterwards
+(§3.4). Without reflink support, step 1 costs a copy of the file, so recorded
+volumes should use XFS. The phase 1 benchmark (§18) measures this.
+
+### 3.3 Journal and replay
+
+- Entries hold **absolute state** (path → pending content and mode, or a
+  removal), never deltas, so replaying an entry twice gives the same result.
+- **Torn entries.** A torn final entry, which fails its checksum, is discarded.
+  Its call never returned, so nothing was promised.
+- **Commits record the last journal sequence number they include,** as a trailer
+  (`Agentfs-Seq: <n>`).
+- **Truncation.** The journal and `pending/` are truncated only after the commit
+  and branch ref are durable.
+- **libgit2 fsync** is enabled for objects and refs (`GIT_OPT_ENABLE_FSYNC_GITDIR`,
+  set through libgit2-sys). agentfs also fsyncs new object directories itself,
+  because libgit2 does not.
+- **After a crash,** the recorder resumes from the branch head's `Agentfs-Seq`
+  and replays later entries.
+
+### 3.4 Commits
+
+- A commit builder turns journal entries into commits a few milliseconds after
+  they are recorded.
+- **Grouping only affects how history reads,** not whether a change is kept.
+  Entries close together in time are grouped. Inside a nested repository with
+  `nested = working-tree` (§5), its `index.lock` bounds a group, with a timeout
+  for stale locks.
+- **Commit metadata** is in §9.
+- **Every commit is checked before it is made** against git's fsck rules and the
+  configured limits of each remote (§11.3). Paths that would fail are not
+  recorded. They stay in the backing tree, and an alarm is raised (§13).
+
+### 3.5 When recording fails
+
+If the synchronous step fails (for example, the state area is full):
+
+- the call returns an error (`EIO` from FLUSH, or the operation's own error);
+- the inode stays marked as changed, so the next boundary records it;
+- agentfs raises an alarm.
+
+Many programs ignore errors from `close`, so the alarm, not the error code, is
+what people will see.
+
+## 4. Path rules
+
+agentfs follows git's model: **ignore rules decide only whether new
+(untracked) paths are recorded. A tracked path stays recorded until it is
+deleted, even if a rule later matches it.** Rules never decide where data
+lives; all data lives in the backing tree.
+
+### 4.1 Where rules come from
+
+| Concern | Tracked (in the tree; edits are recorded) | Operator (in the git dir; iac sets them; invisible) |
+|---|---|---|
+| Ignore | `.gitignore` in any directory | `$GIT_DIR/info/exclude` |
+| Attributes | `.gitattributes` in any directory | `$GIT_DIR/info/attributes` |
+| LFS endpoint | `.lfsconfig` | `$GIT_DIR/config` |
+| agentfs settings | none | `[agentfs]` in `$GIT_DIR/config` |
+
+**Safety settings are operator-only.**
+
+- `agentfs.*` attributes are read only from `info/attributes`.
+- LFS endpoints and credentials are read only from operator config.
+- Tracked `.gitignore`, `.gitattributes` and `.lfsconfig` files are recorded as
+  content. They take part in rules only if `respectTreeRules = true`, and even
+  then they cannot set `agentfs.*` attributes or LFS endpoints.
+
+The default is `false`, so an agent's edit to a tracked rule file cannot turn
+recording off or redirect uploads.
+
+Built-in system- and user-level git attribute and exclude files are never
+consulted. Only the files above count.
+
+### 4.2 agentfs attributes (operator `info/attributes`)
+
+| Attribute | Values | Default | Meaning |
+|---|---|---|---|
+| `agentfs.commit` | `close`, `fsync` | `close` | Boundary class (§3.1, §8) |
+| `agentfs.coalesce` | duration | `30s` | Minimum interval between `fsync` records for one group |
+| `agentfs.group` | name | unset | Paths with the same group *and the same stem* are recorded together (§8) |
+| `agentfs.store` | `blob`, `lfs` | §7 | Force ordinary git object or LFS |
+| `-agentfs` | | | Never record this path |
+
+### 4.3 Settings
+
+```ini
+[agentfs]
+    respectTreeRules = false   # tracked .gitignore/.gitattributes are content only
+    nested = exclude           # §5
+    commitWindow = 200ms       # group journal entries this close in time
+    pushInterval = 60s         # §11
+    lfsThreshold = 8m          # phase 2, §7
+```
+
+### 4.4 Implementation note
+
+libgit2 evaluates ignore and attribute rules against a working directory.
+Because the backing tree is a real directory, agentfs can point libgit2 at it,
+with system and global sources disabled. If that proves unworkable (for
+example, recursion through the mount), the fallback is a rules engine over the
+`gix-ignore` and `gix-attributes` parsers.
+
+## 5. Nested repositories
+
+**Detection.** A directory is a nested repository if it contains:
+
+- a `.git` directory;
+- a `.git` file that points to a valid git directory; or
+- the layout of a bare repository (`HEAD`, `objects/` and `refs/`).
+
+The last case covers `git clone --bare` and tool-managed stores such as Hermes'
+`checkpoints/store`.
+
+**Default (`nested = exclude`).** A nested repository's directory is not
+recorded: neither its working files nor its git directory.
+
+**Option (`nested = working-tree`).** Working files are recorded, the git
+directory is not, and the inner `index.lock` bounds commit groups (§3.4).
+
+**Rules that prevent surprises:**
+
+- **The mount root is never treated as nested.** `git init` at the root creates
+  an ordinary directory named `.git`, which agentfs does not record.
+- **Tracked paths stay tracked** (§4). If `git init` runs in a directory whose
+  files are already recorded, those files keep being recorded. Only new paths
+  under it are excluded. Nothing is deleted from history because of nesting.
+- **Paths git refuses** are not recorded, and each raises an alarm. This includes
+  any `.git` component and its NTFS and HFS look-alikes, such as `.GIT`,
+  `git~1` and `.git.`.
+
+## 6. Metadata and permissions
+
+- **Kept by the backing filesystem:** all metadata, including permissions,
+  ownership, timestamps and extended attributes.
+- **Recorded in history:** what git can represent: file content, the executable
+  bit, and symlinks.
+- **Not recorded:** ownership, other permission bits, timestamps and extended
+  attributes. Recovery (§15) restores content and the executable bit only.
+- **Access.**
+  - The mount uses `allow_other` and the kernel's `default_permissions`. The
+    kernel checks the real stored ownership and modes, so root and non-root
+    callers behave as they would on the backing filesystem.
+  - `chown`, `chmod` and `utimens` are passed through to the backing tree.
+- **Hermes.** Its tool containers run as root while files are owned by UID
+  10000. git's "dubious ownership" check then needs `safe.directory` in those
+  containers. That is a consumer setting (§16), not an agentfs one.
+
+## 7. Large files and LFS (phase 2)
+
+Whether content is stored as an ordinary git object or an LFS pointer:
+
+1. `agentfs.store`, if set;
+2. otherwise a `filter=lfs` attribute;
+3. otherwise `lfsThreshold`: larger content goes to LFS.
+
+**History must be readable by ordinary git.**
+
+- Whenever agentfs stores a path as LFS, it also maintains a matching tracked
+  `.gitattributes` entry (`filter=lfs diff=lfs merge=lfs -text`), exactly as
+  `git lfs track` does. Clones and remote web views then show content, not
+  pointer text.
+- `agentfs.store=blob` may not override a `filter=lfs` attribute.
+
+**Endpoint and credentials.**
+
+- LFS endpoints come only from operator config. git-lfs's keys are honoured:
+  `lfs.url`, `lfs.pushurl`, `remote.<name>.lfsurl`.
+- Credentials are bound to their configured host and never sent anywhere else.
+- History and LFS content may live on different servers.
+
+**Implementation.** Neither libgit2 nor gitoxide implements LFS. agentfs
+implements:
+
+- the pointer format;
+- the LFS batch API, including `verify`;
+- a local object cache.
+
+LFS objects are uploaded before the commits that reference them are pushed.
+
+**Retention.** LFS objects cannot be pruned from most LFS servers (GitHub's
+needs the repository deleted), and pruned pointers break clones. agentfs does
+not prune. It limits growth at the source instead, with coalescing intervals
+and size caps per path.
+
+## 8. Files changed in place: the `fsync` class (phase 2)
+
+Databases and similar files are held open and changed in place. Recording them
+only on `close` could mean never.
+
+**Groups.**
+
+- A group is the set of paths with the same `agentfs.group` value *and the same
+  stem* in one directory, for example `state.db`, `state.db-wal` and
+  `state.db-journal`.
+- `-shm` files are never recorded.
+- Two databases in one directory are two groups.
+
+**Triggers.**
+
+- An `fsync` on any member, at most once per `agentfs.coalesce` interval.
+- **A trailing timer.** SQLite with `synchronous=NORMAL` does not `fsync` on
+  commit, so a group with unrecorded changes is recorded when its interval
+  elapses even without an `fsync`.
+- At `close` and at unmount.
+
+**Consistent capture.**
+
+- While a group is frozen into `pending/`, writes to every member are held back.
+  The daemon can do this because it receives every write for these paths: they
+  are opened without passthrough and with writeback caching off.
+- The whole group is frozen as one unit. A restored database plus its `-wal` or
+  `-journal` then recovers normally.
+
+**Storage.**
+
+- Store databases as LFS (§7) or as ordinary objects, as the operator chooses.
+- libgit2 writes each version as a full compressed loose object and its push
+  makes no thin packs. So the recorder repacks periodically, for example by
+  running `git repack`, and size caps limit the worst case.
+
+**Guarantee.** For this class "before return" weakens to "at most one interval
+late". This is deliberate.
+
+## 9. Commit metadata
+
+**Committer: the replica that made the change.** Every pod mounting a volume has
+a unique committer identity:
+
+- **Name:** the pod's replica identity:
+  - the StatefulSet pod name, which is stable across restarts;
+  - otherwise the pod name.
+- **Email:** `<pod-uid>@<volume>.agentfs.invalid`.
+- The `.invalid` domain can never belong to a real account, so commits are never
+  linked to a person on a hosted remote.
+
+**Author: the writer process** as FUSE reports it, `uid-<uid>
+<uid-<uid>@<volume>.agentfs.invalid>`. PIDs and UIDs are as seen from the
+mount's own PID namespace. Identity beyond UID needs the workload's cooperation
+(§1.3, later phases).
+
+**Trailers: pod metadata.**
+
+```
+Agentfs-Seq: 18342
+Agentfs-Trigger: close
+Agentfs-Namespace: agent
+Agentfs-Pod: hermes-7c9d8-x2k4q
+Agentfs-Pod-Uid: 0b6f…
+Agentfs-Node: hawking
+Agentfs-Uid: 10000
+Agentfs-Pid: 4711
+```
+
+- **Phase 1** gets pod metadata from the downward API.
+- **The CSI driver** gets it from `podInfoOnMount`.
+- **Grouped commits** carry one `Agentfs-Uid` and `Agentfs-Pid` line per
+  distinct writer.
+
+## 10. Secret guard (proposed baseline)
+
+History is append-only and pushed to remotes, so a secret an agent writes into
+a recorded file would otherwise be permanent.
+
+**Default deny.**
+
+- The default operator `info/exclude` excludes common secret files, such as
+  `.env*`, `*.pem`, `*.key`, `id_*`, `auth.json` and `credentials*`.
+- Consumers extend the list.
+
+**Push hold.**
+
+- Before pushing, a scanner checks new content for likely credentials.
+- A match still lets the commit be recorded locally, so the record is kept. But
+  pushing stops at that commit, and an alarm is raised.
+- An operator then decides:
+  - release the commit; or
+  - rewrite local history before it is ever pushed. This is a documented,
+    deliberate operator action (§15), never automatic.
+
+**Already pushed.** A secret that has already been pushed needs a remote-side
+rewrite. agentfs documents the procedure but never does it on its own.
+
+## 11. Remotes and pushing
+
+### 11.1 Remotes
+
+- **Any git remotes,** over HTTPS or SSH, configured by the operator. GitHub,
+  Gitea or a bare repository on a server all work the same way.
+- **Several push remotes** can be configured. Each has its own push state and
+  alarms.
+- **Credentials** come from files the recorder reads, and are re-read when they
+  change, so short-lived tokens can be rotated by whatever writes the file.
+
+### 11.2 Interval push
+
+- Pushes run every `pushInterval`, independent of the workload's lifecycle.
+  Nothing waits for a pod to stop, and stopping a pod never waits for a push.
+- Unpushed commits stay safe in the state area and go out on the next
+  successful push.
+- Pushes are fast-forward only.
+
+### 11.3 Limits and rejected pushes
+
+- **Limits are configured per remote,** for example maximum blob size, maximum
+  push size and whether fsck rules are enforced. Commits are checked against
+  them before they are made (§3.4).
+- **A rejected push never affects the filesystem.** Rejected means refused,
+  non-fast-forward, authentication failure or an unreachable remote. Recording,
+  committing and other remotes carry on. The recorder:
+  - raises an alarm (§13) with the reason and the commit;
+  - keeps retrying with backoff;
+  - keeps the remote's last successful commit, so the backlog is visible.
+- **Non-fast-forward means someone else wrote the branch.**
+  - The recorder pushes its head to `refs/agentfs/diverged/<UTC timestamp,
+    no colons>` once per divergence, then keeps alarming.
+  - It never force-pushes.
+  - An operator resolves it (§15).
+
+### 11.4 Single writer on the remote
+
+The recorder is the only intended writer of its branch. Remotes cannot always
+enforce that: GitHub can restrict pushers only on organisation-owned
+repositories, and tokens are scoped to repositories, not branches. agentfs
+therefore **detects** other writers (§11.3) rather than relying on
+enforcement. Using one repository per volume, or a credential scoped to that
+repository, narrows the exposure.
+
+## 12. Patch queue for iac (phase 3)
+
+- **What a patch is:** a single commit pushed to the remote at
+  `refs/agentfs/inbox/<n>`, where `<n>` is a zero-padded sequence number. Its
+  parent is the branch commit it was written against.
+- **When it runs:** at mount, after journal replay and before the workload starts.
+- **What it does:** each patch is applied in sequence order as a three-way merge
+  against its parent, onto the current branch head.
+  - **Success:** a commit authored by the patch's author, committed by agentfs,
+    with `Agentfs-Inbox: <n>`.
+  - **The first failure stops processing.** That patch and all later ones stay
+    queued, in order.
+  - The volume mounts regardless, and an alarm is raised.
+- **Idempotency:** before applying patch `<n>`, the recorder checks the branch
+  for a commit carrying `Agentfs-Inbox: <n>`. Moving `inbox/<n>` to
+  `applied/<n>` is then only bookkeeping, and redoing it after a crash is
+  harmless.
+- **Visibility to iac:** the recorder writes a status ref
+  (`refs/agentfs/status`) and emits telemetry (§13) with the queue head and the
+  last failure.
+- **Open:** how iac writes patches (§19).
+
+## 13. Observability (OpenTelemetry)
+
+The recorder exports metrics, traces and logs over OTLP.
+
+**Metrics (examples):**
+
+| Metric | Type | Use |
+|---|---|---|
+| `agentfs.record.duration` | histogram | Cost of the synchronous step, by trigger |
+| `agentfs.record.failures` | counter | Recording errors (§3.5) |
+| `agentfs.journal.backlog` | gauge | Entries recorded but not committed |
+| `agentfs.commit.count` | counter | Commits made |
+| `agentfs.push.unpushed_commits` | gauge, per remote | Backlog |
+| `agentfs.push.oldest_unpushed_age` | gauge, per remote | Backlog age, the main push alarm |
+| `agentfs.push.failures` | counter, per remote and reason | Rejected, non-fast-forward, authentication, network |
+| `agentfs.push.diverged` | gauge, per remote | 1 while diverged |
+| `agentfs.secret.held` | gauge | Commits held by the secret guard |
+| `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks |
+| `agentfs.patch.queue_depth`, `agentfs.patch.blocked` | gauge | Phase 3 |
+| `agentfs.state.bytes` | gauge | Size of the state area by part |
+
+**Traces.** Spans for record, commit, push and patch application, carrying
+journal sequence numbers and commit ids.
+
+**Logs.** Structured events for every alarm condition, with commit, path and
+reason.
+
+**Alarms** are alert rules on these metrics in the consumer's monitoring stack.
+agentfs emits the signals; it does not page anyone itself. The CSI driver may
+also emit Kubernetes Events on the pod.
+
+## 14. Volumes mounted by several pods (CSI, phase 4)
+
+A volume can be mounted by several pods at once, on one node or several.
+
+**Shape.**
+
+- **Backing tree:** on storage every mounting pod can reach. On one node that can
+  be local; across nodes it needs a shared filesystem such as NFS or SeaweedFS.
+- **A front per pod:** a FUSE mount that does the synchronous step of §3.2 for
+  that pod's changes.
+  - It freezes content into the volume's shared `pending/`.
+  - It hands a journal entry to the volume's history service, and returns only
+    once the service has made the entry durable.
+- **One history service per volume:** the single writer of §2.3. It orders
+  entries from all fronts, commits and pushes. Each front's entries carry that
+  pod's committer identity and pod metadata (§9).
+
+**Concurrency semantics.** Pods share one directory with the backing
+filesystem's semantics. Two pods writing the same file is last-writer-wins, as
+it would be without agentfs. History records each pod's change boundary as
+its own commit, in the order the history service received them.
+
+**CSI requirements carried over from review:**
+
+- **Persistent identity.** A volume is a PersistentVolume or PVC, not an inline
+  ephemeral volume. Its state and history service outlive any pod, and garbage
+  collection follows the volume's lifecycle.
+- **No network work on mount or unmount.** Mounting a volume never clones, fetches
+  or pushes. The history service does that work in the background (§11.2),
+  except for a first-ever clone. Patch processing (§12) happens in the history
+  service before it accepts the first front, with a time limit.
+- **Operator-owned parameters.** Remote, rules and credentials are set by the
+  StorageClass or PV, not by pod authors.
+- **Recovery** from a front or service crash is specified and tested. This
+  covers:
+  - how a crashed front's mount is replaced or its pod restarted;
+  - how the service resumes from its journal.
+
+**Open for this phase:**
+
+- whether the cost of a network round trip on every change boundary is
+  acceptable;
+- whether FUSE passthrough works over the chosen shared filesystem;
+- the RBAC and Pod Security inventory.
+
+## 15. Recovery and undo (to be discovered)
+
+Recovery may be manual, but it must be supported and documented. Phase 1
+delivers a supported path; better tooling is discovered from real use.
+
+**Phase 1 supported path:**
+
+1. **Find the change.** History is ordinary git on the remote, or in the state
+   area. Use any git tool: `git log --follow <path>`, `git show`, the remote's web
+   view. Trailers (§9) say which pod, process and trigger made each change.
+2. **Pause the workload.** Stop it, or scale it to zero.
+3. **Restore.** Copy file content from the wanted commit into the backing tree.
+   - A small command does this: `agentfs restore <path> <commit>`, or `agentfs
+     revert <commit>` for a whole commit.
+   - With the workload stopped, plain `git show <commit>:<path> > <file>`
+     against the state area's repository also works.
+   - The restore is itself recorded, with `Agentfs-Trigger: restore`.
+4. **Resume the workload.**
+
+**To discover:**
+
+- whether restoring with the workload live is safe enough to support;
+- whether a read-only history view for operators (not the workload) is worth
+  building;
+- whether undo through the patch queue (§12) replaces manual restores for iac.
+
+**Operator history rewrite** (for held secrets, §10) is a documented procedure
+on the state area's repository, run with the workload stopped. It is never
+automatic.
+
+## 16. First consumer: Hermes
+
+Hermes is the first consumer, used to validate the design, not a design
+target. What it needs:
+
+- **What is mounted.** Only agent-authored definitions are recorded, for example
+  `skills/` and each profile's `SOUL.md`, `config.yaml`, `profile.yaml` and
+  `skills/`. The operator rules exclude Hermes' secrets (`.env`, `auth.json`),
+  databases, sessions, logs, caches and `checkpoints/`.
+- **Two kinds of writer.**
+  - The Hermes process writes to the mount directly.
+  - Hermes' file and terminal tools run in containers on a docker-in-docker
+    sidecar, so the mount must also reach that sidecar, and tool containers need
+    it as a volume.
+  - In the iac workload that is a deliberate policy change to the `docker_volumes`
+    pin, which the owner must approve.
+- **Root init.** The Hermes image's start-up runs as root. With a real backing
+  tree and `default_permissions`, root reads the mount like any other directory.
+- **Restarts.** iac patches (§12) apply only at mount, which for Hermes means a
+  pod restart.
+
+## 17. Layers and libraries
+
+### 17.1 Layer 1: core and daemon (Rust)
+
+- **`agentfs-core`, a library:**
+  - recording (§3);
+  - rules (§4);
+  - the commit builder;
+  - pre-commit checks;
+  - push (§11);
+  - the secret guard (§10);
+  - LFS (§7);
+  - the patch queue (§12);
+  - telemetry (§13).
+- **`agentfs`, a binary:**
+  - `init`, `mount`, `status`, `flush`, `restore`, `revert`;
+  - mounted with fuser (multi-threaded, with passthrough).
+
+  It works anywhere FUSE does, with no Kubernetes dependency.
+- **Phase 1 deployment:** a privileged native sidecar (an init container with
+  `restartPolicy: Always`).
+  - It mounts the FUSE filesystem into an `emptyDir` with Bidirectional
+    propagation.
+  - Workload containers mount it with HostToContainer propagation.
+  - The backing tree and state area live on a `ReadWriteOncePod` PVC owned by
+    the workload.
+  - If the sidecar crashes, the mount fails (`ENOTCONN`) until the pod restarts.
+    Phase 1 accepts restarting the pod as the recovery.
+
+### 17.2 Layer 2: CSI driver (Rust)
+
+Phase 4 (§14).
+
+### 17.3 Libraries (verified 2026-10-12)
+
+| Need | Choice | Notes |
+|---|---|---|
+| FUSE | `fuser` | Active. Multi-threaded dispatch, passthrough (`BackingId`) |
+| Git objects, commits, push, credentials | `git2` (libgit2) | Active. Has **no** filter or merge-driver registration, and its fsync option is only reachable through `libgit2-sys` |
+| Ignore and attribute parsing (fallback) | `gix-ignore`, `gix-attributes` | gitoxide has no push, so it is not a full alternative |
+| LFS | none exists | Implemented in agentfs (§7) |
+| Telemetry | `opentelemetry` crates | OTLP export |
+| Repack | the `git` CLI | libgit2 has no repack or gc |
+
+## 18. Acceptance tests
 
 1. **No gaps.** Each of these produces the expected recorded state:
    - an editor's temp-file-and-rename save;
    - an append;
-   - a truncate;
+   - `truncate`;
    - `mv` of a directory;
    - `rm -r`;
+   - a hard link;
    - an executable-bit change;
-   - a symlink.
-2. **Recorded before return.** Killing the daemon immediately after `close`
-   returns, then remounting, shows the change in history.
-3. **Any user.** Root and UID 10000 containers in one pod both read and write the
-   mount.
-4. **Invisible.** No `.git`, journal, state or credential is reachable from the
-   mount.
-5. **Rules.** `.gitignore`, `info/exclude` and `.gitattributes` decide the area
-   and store exactly as git would. `respectTreeIgnores = false` ignores tracked
-   `.gitignore` files.
-6. **SQLite.** A WAL-mode database under steady writes is recorded at most once
-   per coalescing interval. Each recorded version, restored with its `-wal`,
-   opens cleanly and passes `PRAGMA integrity_check`.
-7. **LFS.** Content over the threshold is stored as an LFS pointer, uploaded to
-   the configured LFS location before the referencing commit is pushed, and
-   restored on a fresh mount.
-8. **Nested repository.** `git clone` into the mount works. By default nothing
-   under the clone is recorded, and the clone survives a remount.
-9. **Remote.** History reaches the remote. A remote branch moved by someone else
-   leads to a push to `refs/agentfs/diverged/*`, not a force-push.
-10. **Patch queue.** Three queued patches where the second conflicts: the first
-    applies, the second and third stay queued in order, and the volume mounts.
+   - a symlink;
+   - unlink of an open file;
+   - rename over an open file;
+   - log rotation while the writer is open.
+2. **Before return.** Killing the daemon right after `close` returns, then
+   remounting, shows the change in history.
+3. **Crash safety.** Killing the daemon or node at every step of record → commit
+   → ref update loses nothing and duplicates nothing.
+4. **Any user.** Root and UID 10000 in one pod read and write with normal
+   permission semantics. `chmod 600` persists.
+5. **Invisible.** No history, journal, state or credential is reachable through
+   the mount.
+6. **Rules.**
+   - Ignores apply only to new paths.
+   - A tracked file stays recorded after it is ignored.
+   - With the default settings, tracked rule files cannot turn recording off.
+7. **Nested repositories.**
+   - A clone, a bare clone and `git init` at the root behave as §5 says.
+   - Nothing is deleted from history by nesting.
+8. **Remotes.**
+   - Interval pushes reach two remotes.
+   - An unreachable remote, a refused push and a non-fast-forward each raise the
+     alarm while the filesystem keeps working.
+9. **Pre-commit checks.** A path git's fsck or a remote limit would refuse is not
+   recorded, and raises an alarm.
+10. **Secret guard.** A planted token is recorded locally, its push is held, and
+    the alarm fires.
+11. **Recovery.** Following §15, a file and a whole commit are restored, and the
+    restore is recorded.
+12. **Telemetry.** Every metric in §13 is exported and moves as expected in the
+    tests above.
+13. **Performance.** Recorded latency and throughput for:
+    - a mid-size `git clone` with `nested = working-tree`;
+    - `npm install` into an excluded path;
+    - `rm -rf` of 100k files;
+    - closing a 1 GB file, on XFS (reflink) and ext4 (copy).
+14. **Phase 2.** SQLite in WAL mode with `synchronous=NORMAL`, and in DELETE mode:
+    every recorded version restores and passes `PRAGMA integrity_check`. LFS
+    content is readable through an ordinary `git clone` plus `git lfs pull`.
+15. **Phase 3.** Three queued patches where the second conflicts:
+    - the first applies;
+    - the second and third stay queued;
+    - the volume mounts;
+    - a crash and replay does not apply the first twice.
+16. **Phase 4.** Two pods on two nodes mount one volume. Each pod's changes carry
+    its own committer identity, and history keeps every boundary from both.
 
-## 13. Open questions
+## 19. Open questions
 
-1. **Libraries.** libgit2 through `git2-rs` (mature push, credentials, filters
-   and merge drivers) or gitoxide (`gix`, pure Rust; push support needs
-   checking). The working assumption is `git2-rs`.
-2. **CSI layer language.** Rust (one toolchain, gRPC via `tonic`) or Go (the
-   Kubernetes CSI ecosystem's usual language).
-3. **Retention** for `fsync`-class content (§5.1): pruning LFS content keeps
-   history honest but loses data. Does storing these as ordinary git objects
-   avoid the need?
-4. **Commit grouping** policy beyond the nested-repository case. One commit per
-   change, or group changes that complete within a short window?
-5. **How iac produces patches** for the queue (§9).
-6. **Locking.** Is one mount per volume enforced by a lease on the state PVC, by
-   the CSI driver, or both?
-7. **Performance budget.** An acceptable added delay per `close` from the
-   synchronous record step (object write and two `fsync`s).
+1. **Secret guard as baseline (§10):** confirm, and confirm that a suspected
+   secret holds the push until an operator releases it.
+2. **Repository layout:** one repository per volume, or one repository with a
+   branch per volume (§11.4)?
+3. **Replica identity:** is "StatefulSet pod name, else pod name" right for the
+   committer name, or should operators be able to set it (§9)?
+4. **How iac produces patches** for the queue (§12).
+5. **Backing filesystem:** require XFS for reflink, or accept the copy cost on
+   ext4 (§3.2)?
+6. **Performance budget** for the synchronous step, set after the phase 1
+   benchmark (§18 test 13).
+7. **Multi-pod (§14):** the network round trip per boundary, passthrough over a
+   shared filesystem, RBAC and Pod Security.
+8. **Recovery tooling** beyond the phase 1 path (§15).
 
-## 14. Prior art
+## 20. Prior art
 
 | Project | What it is | Why not use it |
 |---|---|---|
-| gitfs (Presslabs; community fork `vtemian/gitfs`) | Python FUSE filesystem over git that commits after an idle period | Commits after 5 s idle, not before return; fetches and merges while running; exposes history in the mount; no LFS; 10 MB file cap by default. Last commit 2021 (original) and 2025-08-11 (fork). A design reference |
-| Cloudflare ArtifactFS | FUSE client for Cloudflare Artifacts: a lazily loaded git working copy with a writable layer | Commits only when `git commit` runs; single-user mount (`allow_root` impossible through jacobsa/fuse); built for large repositories |
-| Mesa | Hosted versioned filesystem for agents, FUSE-mounted | Private beta, hosted; no self-hosting, git sync or LFS described |
-| Coregit, Freestyle | Hosted git APIs for agents | REST APIs, not mounts |
-| lakeFS | Open-source branches and commits over object storage | Explicit commits, not git |
+| gitfs (Presslabs; fork `vtemian/gitfs`) | Python FUSE filesystem over git that commits after idle | Commits after a 5 s idle period; merges while running; history visible in the mount; no LFS. Last commits 2021 and 2025-08-11. Design reference |
+| Cloudflare ArtifactFS | FUSE client for Cloudflare Artifacts | Commits only on `git commit`; single-user mount (`allow_root` impossible through jacobsa/fuse); built for large lazily loaded repositories. PR 197 in iac stalled on it |
+| JuiceFS CSI driver | FUSE filesystem with a CSI driver and mount pods | Reference for §14's recovery problems |
+| Hermes `checkpoint_manager` | Shadow git store outside the project, snapshot before each turn | Evidence that a git directory outside the tree works for undo; snapshots per turn, not per change |
+| Mesa | Hosted versioned filesystem for agents | Hosted private beta |
+| Coregit, Freestyle | Hosted git APIs for agents | APIs, not mounts |
+| lakeFS | Branches and commits over object storage | Explicit commits, not git |

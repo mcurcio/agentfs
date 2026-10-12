@@ -2,22 +2,25 @@
 
 A filesystem that records every change an agent makes.
 
-agentfs presents a git branch as an ordinary directory. Any process, root or
-not, reads and writes it with normal file calls and never sees git. Every
-completed change made through the mount is durably recorded before the call
-returns, then committed to the branch and pushed to a remote such as GitHub.
+agentfs sits in front of an ordinary directory as a FUSE filesystem. Any
+process, root or not, uses the directory with normal file calls and never sees
+git. Each time a file is closed after a change, or renamed, deleted or linked,
+agentfs durably records the new state before the call returns. It then commits
+it to a git branch and pushes at regular intervals to one or more git remotes.
 The history lives outside the mount, where the agent cannot see or reach it.
+
+Path rules use git's own files (`.gitignore`, `.gitattributes`, `.lfsconfig`,
+`$GIT_DIR/info/*`). Nested git repositories are excluded by default.
+Telemetry is exported over OpenTelemetry.
 
 It is built in two layers:
 
-1. **The FUSE layer**: a Rust library and daemon (`agentfs mount`) that runs
-   anywhere FUSE does, with no Kubernetes dependency.
-2. **The CSI layer**: a Kubernetes CSI driver that gives any pod an agentfs
-   volume declared like any other volume.
-
-Configuration uses git's own files: `.gitignore`, `.gitattributes`,
-`.lfsconfig`, `$GIT_DIR/info/*` and git-config syntax.
+1. **Core and daemon**: a Rust library and `agentfs` binary that run anywhere
+   FUSE does, with no Kubernetes dependency. The first deployment is a sidecar.
+2. **CSI driver**: gives pods agentfs volumes, including volumes several pods
+   mount at once.
 
 ## Status
 
-Design. See [docs/design.md](docs/design.md). No code yet.
+Design, draft 2. See [docs/design.md](docs/design.md) and the
+[review record](docs/reviews/2026-10-12-adversarial.md). No code yet.
