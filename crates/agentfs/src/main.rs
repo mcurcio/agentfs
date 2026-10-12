@@ -104,7 +104,9 @@ enum Command {
     Flush(Pod),
     /// Record the current state of PATHs under ROOT, then commit.
     Record {
-        /// Paths relative to ROOT. A missing path is recorded as removed.
+        /// Paths relative to ROOT. A missing path is recorded as removed. A
+        /// path in the fsync class records its whole group (database,
+        /// -wal, -journal) as one record; stop the database writer first.
         #[arg(required = true)]
         paths: Vec<String>,
         #[command(flatten)]
@@ -337,7 +339,35 @@ fn real_main() -> Result<ExitCode> {
                 gid: current_gid(),
                 pid: std::process::id(),
             };
+            let mut groups_done = std::collections::HashSet::new();
             for path in paths {
+                // A path in the fsync class records its whole group as one
+                // record (design §8).
+                if let Ok(repo_path) = RepoPath::new(path.as_str())
+                    && let Some(group) = recorder.fsync_group(&repo_path)
+                {
+                    if !groups_done.insert(group.key.clone()) {
+                        continue;
+                    }
+                    let mut inputs = Vec::with_capacity(group.members.len());
+                    for member in &group.members {
+                        match input_for(root, member.as_str()) {
+                            Ok(input) => inputs.push(input),
+                            // A directory at a member's name is no member.
+                            Err(_) if *member != repo_path => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    let names: Vec<&str> = group.members.iter().map(RepoPath::as_str).collect();
+                    let recorded = recorder.record_group(Trigger::Close, caller, inputs)?;
+                    if let Some(seq) = recorded.seq {
+                        println!("recorded group {} as seq {seq}", names.join(", "));
+                    }
+                    for skipped in recorded.skipped {
+                        println!("skipped {}: {}", skipped.path, skipped.reason);
+                    }
+                    continue;
+                }
                 let input = match input_for(root, &path) {
                     Ok(input) => input,
                     Err(e) => match e.downcast_ref::<PathError>() {

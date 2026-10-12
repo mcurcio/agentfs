@@ -243,3 +243,55 @@ fn refused_paths_are_reported() {
     );
     assert_eq!(v.head_paths(), ["a.txt"]);
 }
+
+#[test]
+fn a_database_path_records_its_whole_group() {
+    let v = Volume::new();
+    fs::write(
+        v.state().join("git/info/attributes"),
+        "*.db* agentfs.commit=fsync agentfs.group=sqlite\n",
+    )
+    .unwrap();
+    v.file("d/s.db", "db");
+    v.file("d/s.db-wal", "wal");
+    v.file("d/s.db-shm", "shm");
+    let stdout = v.record(&["d/s.db", "d/s.db-wal", "d/s.db-shm"]);
+    assert!(
+        stdout.contains("recorded group d/s.db, d/s.db-journal, d/s.db-wal as seq 0"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("skipped d/s.db-journal: nothing tracked at this path"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("skipped d/s.db-shm: SQLite shared memory of an fsync-class database"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1 record(s) into 1 commit(s)"), "{stdout}");
+    assert_eq!(v.head_paths(), ["d/s.db", "d/s.db-wal"]);
+
+    // The WAL checkpointed away: recording the database records its removal.
+    fs::remove_file(v.tree().join("d/s.db-wal")).unwrap();
+    let stdout = v.record(&["d/s.db"]);
+    assert!(stdout.contains("recorded group"), "{stdout}");
+    assert_eq!(v.head_paths(), ["d/s.db"]);
+}
+
+#[test]
+fn a_bad_class_value_fails_the_command() {
+    let v = Volume::new();
+    fs::write(
+        v.state().join("git/info/attributes"),
+        "*.db agentfs.commit=fsync agentfs.coalesce=100ms\n",
+    )
+    .unwrap();
+    v.file("a.txt", "a");
+    let out = v.run(&["record", "a.txt"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("info/attributes line 1: agentfs.coalesce=100ms"),
+        "{err}"
+    );
+}
