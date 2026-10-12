@@ -29,6 +29,7 @@ dependencies = [
 name = "agentfs-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bstr",
  "crc32fast",
  "git2",
@@ -41,6 +42,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha1_smol",
  "tempfile",
  "thiserror",
 ]
@@ -1358,6 +1360,12 @@ dependencies = [
  "serde_core",
  "zmij",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "shlex"

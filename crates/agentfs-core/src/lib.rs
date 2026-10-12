@@ -19,6 +19,7 @@ pub mod gitmodules;
 pub mod history;
 pub mod identity;
 pub mod journal;
+pub mod known_hosts;
 pub mod lock;
 pub mod nested;
 pub mod operations;
