@@ -103,28 +103,6 @@ saved=$(git --git-dir "$HTTP_REPO" for-each-ref --format='%(objectname)' 'refs/a
 assert_eq "$(local_head demo)" "$saved" "local head saved under refs/agentfs/demo/diverged/"
 
 if [ "${E2E_HTTPS:-0}" = 1 ]; then
-  : "${GIT_HTTPS_BASE:?}"
-  step "https with certificate verification"
-  new_volume tls
-  TLS_REPO=$(server_repo tls)
-  server_repo wronghost >/dev/null
-  volume_config remote.tls.url "$GIT_HTTPS_BASE/tls.git"
-  volume_config remote.tls.agentfsCredentials "$CREDS/alice"
-  # The certificate is for "localhost" only.
-  volume_config remote.wronghost.url "https://127.0.0.1:8443/git/wronghost.git"
-  volume_config remote.wronghost.agentfsCredentials "$CREDS/alice"
-  echo secure >"$TREE/s.txt"
-  agentfs record s.txt
-  set +e
-  out=$(agentfs push 2>&1); code=$?
-  set -e
-  assert_contains "$out" "tls: pushed" "pushed over https"
-  assert_eq "$(local_head tls)" "$(remote_ref "$TLS_REPO" refs/heads/agentfs/tls)" "https remote has the branch"
-  assert_eq 1 "$code" "a certificate for another host fails the push"
-  assert_contains "$out" "wronghost: failed (untrusted_host)" "certificate mismatch is refused as an untrusted host"
-fi
-
-if [ "${E2E_HTTPS:-0}" = 1 ]; then
   : "${GIT_HTTPS_BASE:?}" "${GIT_HTTPS_UNTRUSTED_BASE:?}"
   step "https with certificate verification"
   new_volume tls
