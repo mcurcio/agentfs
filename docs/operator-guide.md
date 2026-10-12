@@ -292,7 +292,12 @@ restores. The kernel releases the lock when the holder dies, even after
 ## 10. Crashes and stale mounts
 
 Every change was journaled before its call returned, so a crash loses
-nothing that a workload saw succeed.
+nothing that a workload saw succeed. The exception is the `fsync` class
+(databases, [section 14](#14-databases-the-fsync-class)): changes made
+since a group's last capture are in the files but not in history, and
+are recorded when the database next changes. To record a database that
+will not change again, run `agentfs record <path>` with the workload
+stopped.
 
 - After the daemon dies, the mount point fails with "Transport endpoint is
   not connected" (`ENOTCONN`). agentfs does not use `auto_unmount`, so the
@@ -480,38 +485,58 @@ whole, consistent groups instead.
   per `agentfs.coalesce` (default `30s`, at least `1s`, set per pattern:
   `agentfs.coalesce=5m`); by a timer one interval after its first change
   since the last capture, so a database whose commits never `fsync`
-  (SQLite WAL with `synchronous=NORMAL`) is still recorded; when a member
-  is closed or its last handle goes away; and at unmount
-  (`unmount: N database group(s) captured`). Renames and deletes of a
+  (SQLite WAL with `synchronous=NORMAL`) is still recorded; when the
+  group's last open handle is closed or goes away; and at unmount
+  (`unmount: N database group(s) captured`). Closing one member while
+  another stays open (SQLite's `-journal` in DELETE mode, every
+  transaction) records nothing by itself. Renames and deletes of a
   member are folded into the next capture.
 - **The guarantee is weaker on purpose.** A change to a database is in
   history at most one interval late (plus the commit window), not before
   the call returns. An `fsync` returning does not mean it is recorded.
+  If the daemon or node crashes, the changes since each group's last
+  capture are not in history until the database next changes (section
+  10).
 - **What a capture costs the workload.** Database files never use kernel
   passthrough: every write goes through the daemon. During a capture,
   writes to the group wait while its files are copied (a reflink on XFS,
-  a full copy on ext4). Choose `agentfs.coalesce` with the copy time and
-  the history size in mind.
-- **Every version opens.** Each capture is one point in time, as a crash
-  would leave the files, and is recorded whole or not at all: if one
-  member is refused (`agentfs.maxSize`, a remote's blob limit) the group
-  is skipped with a `PathRefused` alarm, and captured again after its
-  next change. Restore a version with the
+  a full copy on ext4), and so do renames, deletes and creates *anywhere
+  on the mount*, since the capture holds the mount's name lock. Reads and
+  writes of other files do not wait. A large database on ext4 can stall a
+  rename-heavy workload for the copy time once per interval. Choose
+  `agentfs.coalesce` with the copy time and the history size in mind.
+- **Every capture is one point in time,** as a crash would leave the
+  files, which SQLite recovers from, and is recorded whole or not at all:
+  if one member is refused (`agentfs.maxSize`, a remote's blob limit) or
+  a path rule leaves a member out (`info/exclude` matching `*-wal`:
+  `group_member_skipped`), the group is skipped with a `PathRefused` alarm
+  and captured again after its next change. A member the daemon cannot
+  read (other than gone) fails the capture with `RecordFailed`, and the
+  timer retries. Restore a version with the
   [runbook](runbooks/recovery-and-undo.md#7-restoring-a-database).
 - **Size.** Every capture stores each changed member in full.
   `agentfs.maxSize=512m` (any path, operator attributes) refuses larger
-  content; `agentfs.store=lfs` or `filter=lfs` sends the versions to LFS
-  (section 13) instead of git. The history is repacked every
-  `agentfs.repackInterval` (default `1h`) with `git repack --geometric=2`,
-  which stores versions of a database as deltas. A repack is skipped while
-  a push runs; a failing one raises `RepackFailed` and counts in
+  content when it is captured; `agentfs.store=lfs` or `filter=lfs` sends
+  the versions to LFS (section 13) instead of git. The history is
+  repacked every `agentfs.repackInterval` (default `1h`) with
+  `git repack --geometric=2`, which stores versions of a database as
+  deltas. A round with nothing loose is skipped. A repack is skipped
+  while a push runs; a failing one raises `RepackFailed` and counts in
   `agentfs.repack.failures`. Watch `agentfs.state.bytes{part="git"}`.
+- **Repack memory.** git runs with one thread and bounded windows
+  (`pack.windowMemory=64m`, `pack.deltaCacheSize=16m`,
+  `core.bigFileThreshold=64m`, `core.packedGitLimit=128m`): plan for about
+  256 MiB more than the daemon's usual use, plus the largest object, in
+  the sidecar's memory limit (the example manifests set `512Mi`), or set
+  `agentfs.repackInterval = off`. Commits wait while a repack runs;
+  stopping the daemon kills it.
 - **`agentfs record`** of a member records its whole group; run it with
   the workload stopped, since it does not hold writes.
-- **Limits.** `agentfs restore` and `revert` do not expand groups (see the
-  runbook). A database opened before its directory was renamed keeps its
-  old group until closed. A hard link to a member under a name the
-  pattern does not match is an ordinary file.
+- **Restore and revert** of a member restore its whole group from one
+  commit (the database with its `-wal` or `-journal`), in one operation.
+  Stop the workload first (see the runbook).
+- **Limits.** A hard link to a member under a name the pattern does not
+  match is an ordinary file.
 
 ## 15. Troubleshooting
 

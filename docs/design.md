@@ -942,17 +942,26 @@ naming the line), rather than being ignored as git ignores unknown values.
   with unrecorded changes is captured one interval after its first change
   since the last capture, and never sooner than one interval after the
   last attempt.
-- The close (FLUSH) of a member's handle, if the group changed (trigger
-  `close`; a failure fails the `close` with `EIO`, as for any file), and
-  the release of the group's last handle (trigger `release`).
+- The close (FLUSH) of the group's last open handle, if the group changed
+  (trigger `close`; a failure fails the `close` with `EIO`, as for any
+  file), and the release of the group's last handle (trigger `release`).
+  Closing one member while another stays open records nothing: SQLite in
+  DELETE mode creates and closes its `-journal` on every transaction while
+  the database stays open, and capturing each of those closes would defeat
+  the interval.
 - Unmount: every group with changes is captured after the sweep thread
   stops (`unmount: N database group(s) captured`).
 - A rename, unlink, link or size change of a member is not recorded on
   its own, which could split the group: it marks the group changed, and
   the next capture of the whole group records it, at most one interval
-  later. The exception is an operator operation through the mount
-  (`agentfs restore`, `revert`, §15), whose changes capture their groups
-  at once.
+  later.
+- An operator operation through the mount (`agentfs restore`, `revert`,
+  §15): a group the operation's process changes is held back from every
+  trigger above while the operation runs, and captured once, whole, when
+  it ends (trigger `restore`, the operator as author), before the
+  operation's commit. A restore that writes the database and then its
+  `-wal` therefore never records the mix of the two versions. If that
+  capture fails the operation reports an error.
 - `agentfs record <path>` (§17.1) records a member's whole group in one
   record. It is meant for a stopped workload: it does not hold writes.
 
@@ -968,6 +977,21 @@ naming the line), rather than being ignored as git ignores unknown values.
   SQLite recovers from. Renames are kept out by the mount's name lock,
   which a capture holds for reading. The gate prefers the capture, so a
   busy writer cannot starve it; writes wait for the length of one copy.
+- **The cost of a capture is mount-wide for namespace changes.** The name
+  lock is the mount's, not the group's: while a group is being copied,
+  every rename, unlink, link, `mkdir`, `rmdir` and create *anywhere on the
+  mount* waits for the copy to finish. Reads and writes of other files do
+  not wait. A 1 GiB database copied at 500 MB/s holds renames for about
+  two seconds once per interval; keep large databases on volumes whose
+  workload is not rename-heavy, or raise `agentfs.coalesce`.
+- A member is read at capture time by its current name. A member that is
+  gone (`ENOENT`, `ENOTDIR`) is recorded as removed; any other error
+  (`EACCES`, `EIO`, …) fails the capture, which raises `RecordFailed` and
+  leaves the group changed, rather than recording a removal that did not
+  happen.
+- A handle's group is found again after any rename on the mount, so a
+  database whose directory was renamed while it was open is captured
+  under its new path.
 - The writeback cache is never enabled (§2.1), so the daemon sees writes
   as they happen. Writes through a shared mapping reach it when the kernel
   writes the pages back, and are captured from then on.
@@ -975,7 +999,13 @@ naming the line), rather than being ignored as git ignores unknown values.
   marked atomic in the journal. If any member is refused (a check of §3.4,
   `agentfs.maxSize`, a path rule), at record time the others are skipped
   (`SkipReason::GroupRefused`), and at commit time the whole record is
-  dropped. A restored database plus its `-wal` or `-journal` therefore
+  dropped. A member that a path rule skips (`info/exclude` matching
+  `*-wal`, say) refuses the group too (`PathRefused` with reason
+  `group_member_skipped`) rather than dropping out of it, since a database
+  recorded without its WAL is not one point in time. `-shm` is the one
+  member always left out. `agentfs.maxSize` is enforced when a capture is
+  recorded (on the size on disk and on the frozen copy), not again at
+  commit time. A restored database plus its `-wal` or `-journal` therefore
   always comes from one capture.
 - A capture that fails leaves the group changed, so the timer tries again
   one interval later. A refused capture counts as done, as a refused close
@@ -995,36 +1025,62 @@ naming the line), rather than being ignored as git ignores unknown values.
 - **Repack.** libgit2 writes each version as a full compressed loose
   object and has no repack. Every `agentfs.repackInterval` (default 1h,
   `0` or `off` disables, at least 1m) the commit loop runs
-  `git repack -d -q --geometric=2` (with bitmaps off, system and global
-  git config ignored) between commits, so versions of a database are
-  delta-compressed into packs. It never prunes. It takes every remote's
-  push lock without waiting and skips the round if a push is running; a
-  failure raises `RepackFailed` (§13) and is tried again an interval later.
-  The container image ships the `git` CLI for this; without it, every
-  round fails with `RepackFailed`.
+  `git repack -d -q --geometric=2` between commits, so versions of a
+  database are delta-compressed into packs. It never prunes. It takes
+  every remote's push lock without waiting and skips the round if a push
+  is running; a failure raises `RepackFailed` (§13) and is tried again an
+  interval later. The container image ships the `git` CLI for this;
+  without it, every round fails with `RepackFailed`.
+  - *Bounded.* A round with no loose objects is skipped without starting
+    git. git runs with one thread, `pack.windowMemory=64m`,
+    `pack.deltaCacheSize=16m`, `core.bigFileThreshold=64m` (larger blobs
+    are stored whole, not delta-searched) and `core.packedGitLimit=128m`,
+    bitmaps off. Its memory is roughly 256 MiB plus the largest object it
+    must read whole; budget that on top of the daemon in the container's
+    memory limit.
+  - *Isolated.* git's environment is cleared: only `PATH`, `LC_ALL=C`,
+    `HOME` (the history directory), `GIT_DIR`, `GIT_CONFIG_NOSYSTEM=1`,
+    `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_TERMINAL_PROMPT=0` are set, so
+    no `GIT_*` variable of the daemon's environment and no system or
+    global config changes what it does.
+  - *Cancellable.* It runs on the commit thread, which polls it: a stop
+    (shutdown, unmount) kills it, and the round counts as stopped, not
+    failed. A killed repack leaves at most temporary `tmp_pack_*` files,
+    which git ignores (nothing removes them). Commits wait while a repack runs.
 
 **Guarantee.** For this class "before return" weakens to "at most one interval
 late": a change to a member is in a journaled record no later than one
 `agentfs.coalesce` after it was made (plus the time of the capture), or
-at the member's close or unmount, whichever comes first, and it reaches a
+at the group's last close or unmount, whichever comes first, and it reaches a
 commit `commitWindow` later. This is deliberate. An `fsync` returning does
 not mean its data is recorded.
 
+**What a crash loses.** Which groups changed since their last capture is
+kept in the daemon's memory only. If the daemon or node dies, the changes
+made since each group's last capture (up to one interval of them) are in
+the files, which SQLite recovers as usual, but not in history; the journal
+holds everything that was captured. The restarted daemon does not compare
+the files with history, so those changes are recorded only when the
+database next changes (its next capture records the whole current state),
+and a database that is never written again keeps them out of history.
+Run `agentfs record <path>` on such a database (with the workload
+stopped) to record it.
+
 **Not built, and known limits.**
 
-- `agentfs restore` and `agentfs revert` do not expand groups: restore
-  the database's directory, or each member, with the workload stopped
-  ([runbook](runbooks/recovery-and-undo.md#7-restoring-a-database)). Through
-  a running mount, a restore writes members one at a time and each write
-  may be captured, so history can hold intermediate versions that mix two
-  versions of the group; the final one is whole.
-- A member's group is found when it is opened. A handle opened before its
-  directory was renamed keeps the old group until it is closed; a hard
-  link to a member under a name outside the class is an ordinary file.
+- `agentfs restore` and `agentfs revert` expand fsync-class groups (§15):
+  restoring or reverting `app.db` restores its `-wal` or `-journal` from
+  the same commit, in one operation and one commit. A member the plan
+  cannot account for (untracked but present) refuses the operation.
+  Restoring a live database still needs the workload stopped
+  ([runbook](runbooks/recovery-and-undo.md#7-restoring-a-database)),
+  since SQLite does not expect its files to change under it.
+- A hard link to a member under a name outside the class is an ordinary
+  file.
 - The class is per mount: a passthrough handle on the inode opened under a
   non-class name (a hard link) is not held by the gate.
 - No per-group storage budget beyond `agentfs.maxSize`, and no pruning of
-  old versions.
+  old versions. Repack runs on the commit thread, so commits wait for it.
 
 ## 9. Commit metadata
 
@@ -1514,6 +1570,14 @@ operator runbooks ([runbooks/](runbooks/)):
    - `agentfs revert <commit>` applies the inverse of the commit's diff
      against its first parent (the empty tree for a root commit), without
      rename detection. Merge commits are refused.
+   - **Database groups.** A path in the `fsync` class (§8) brings its whole
+     group: restoring or reverting `app.db` also restores `app.db-wal` and
+     `app.db-journal` (each from the same commit, or removed if the commit
+     has none), so the database and its log always come from one capture.
+     A member present in the tree but not in history refuses the
+     operation. In direct mode each group is recorded as one atomic
+     record; through a mount the group is captured once, at the end of
+     the operation (§8).
    - `<commit>` is any git revision; `HEAD` means the volume's branch. It
      must be on the branch (the head or an ancestor); other commits,
      including diverged refs, are restored with plain git.
@@ -1915,9 +1979,11 @@ too, with the databases in the `fsync` class (every recorded version
 restored with its `-wal` or `-journal` and checked), and as
 `ci/e2e-sqlite.sh` in the same job: long-lived Python writers, the
 history catching up within one `agentfs.coalesce` of a WAL writer's last
-commit while it is still open, every version checked with
-`PRAGMA integrity_check` and whole transactions, and a restore of an
-older version by the runbook. Test 11 also runs as `ci/e2e-recovery.sh` in the
+commit while it is still open, captures at least one interval apart (a
+DELETE-mode writer's per-transaction `-journal` closes capture nothing),
+every version checked with `PRAGMA integrity_check` and whole
+transactions, and restores of one member by the runbook, live through
+the mount and directly, each bringing its whole group in one commit. Test 11 also runs as `ci/e2e-recovery.sh` in the
 same job (the recovery runbook end to end, ending with a push of the
 restore commits), and without a mount in `crates/agentfs/tests/cli_restore.rs`;
 the divergence and history-rewrite runbooks run in the `e2e-runbooks` job.
@@ -2000,10 +2066,10 @@ runners). Not automated yet: test 3 (a kill at every step), 13
 | LFS client and TLS | agentfs's own client over `ureq` 3, pure Rust by default; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, system trust store, as libgit2). An explicit https endpoint without the feature is a misconfigured remote; a derived one fails at push time as `local` (§7, §17.3) |
 | `fsync` class: opting in | Operator `info/attributes` only; `agentfs.commit`, `agentfs.coalesce` (at least 1s) and `agentfs.maxSize` values are validated at open, and a bad one fails the volume naming the line (§4.2, §8) |
 | `fsync` class: groups | Same directory, same `agentfs.group`, same stem (`db`, `db-wal`, `db-journal`), every member in the class; no group is a group of one; the smallest member interval wins; `-shm` never recorded (§8) |
-| `fsync` class: capture | Class handles are never passthrough; every content or name change of a member holds a writer-preferring gate around its syscall, and a capture freezes the gate and copies every member as one atomic record. Triggers: `fsync` (rate-limited, and a capture failure does not fail the `fsync`), a trailing timer at max(first change, last attempt) + interval, close (`EIO` on failure), last release, unmount. A member's own namespace changes are folded into the next capture, except during an operator operation (§8) |
-| Atomic records | A journal record flag: at record time a refused member skips the rest of the group (`GroupRefused`), at commit time a refused change drops the whole record; a refused capture counts as done (§3.4, §8) |
-| `agentfs.maxSize` | An operator attribute for any path, refusing larger content (`max_size`) whatever the store, checked on the size on disk and on the frozen copy (§4.2, §8) |
-| Repack | `git repack -d -q --geometric=2` with bitmaps off and system and global config ignored, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); skipped while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
+| `fsync` class: capture | Class handles are never passthrough; every content or name change of a member holds a writer-preferring gate around its syscall, and a capture freezes the gate and copies every member as one atomic record. Triggers: `fsync` (rate-limited, and a capture failure does not fail the `fsync`), a trailing timer at max(first change, last attempt) + interval, the group's last close (`EIO` on failure), last release, unmount. A member's own namespace changes are folded into the next capture; a group an operator operation changes is captured once, at the operation's end. The capture holds the mount's name lock, so namespace changes anywhere on the mount wait for the copy. A member read error other than `ENOENT`/`ENOTDIR` fails the capture (§8) |
+| Atomic records | A journal record flag: at record time a refused member, or one a path rule skips (`group_member_skipped`), skips the rest of the group (`GroupRefused`), at commit time a refused change drops the whole record; a refused capture counts as done (§3.4, §8) |
+| `agentfs.maxSize` | An operator attribute for any path, refusing larger content (`max_size`) whatever the store, checked on the size on disk and on the frozen copy at record time, not again at commit (§4.2, §8) |
+| Repack | `git repack -d -q --geometric=2` with bitmaps off, one thread, bounded window, delta cache and big-file threshold (about 256 MiB), a cleared environment and system and global config ignored, skipped when nothing is loose, killed on stop, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); skipped while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
 | LFS test server | CI uses git-lfs's `lfs-test-server` (pinned by commit, built with `go install`) behind the git server's nginx, which authenticates with separate users per host; rudolfs (no auth or verify) and giftless (JWT setup) were not used (§18) |
 
 ### 19.2 Open questions

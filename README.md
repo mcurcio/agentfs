@@ -76,17 +76,23 @@ nested repository detection. Also:
 - **Databases: the `fsync` class** (phase 2): files changed in place, such
   as SQLite databases, are captured whole (the database with its `-wal` or
   `-journal`, never `-shm`) at `fsync`, at most once per interval, by a
-  trailing timer, at close and at unmount, while writes to them are held
-  for the length of the copy. Every recorded version opens and passes
-  `PRAGMA integrity_check`; a change is in history at most one interval
-  late. Opt in from the operator's `info/attributes`:
+  trailing timer, at the group's last close and at unmount, while writes
+  to them are held for the length of the copy (and renames anywhere on the
+  mount wait for it). Each capture is one point in time, as a crash would
+  leave the files, which SQLite recovers from; CI opens every recorded
+  version and runs `PRAGMA integrity_check`. A change is in history at
+  most one interval late; if the daemon crashes, the changes since a
+  group's last capture are recorded only when the database next changes.
+  `restore` and `revert` bring a database's whole group. Opt in from the
+  operator's `info/attributes`:
 
   ```text
   *.db* agentfs.commit=fsync agentfs.group=sqlite
   ```
 
   The history is repacked with `git repack --geometric=2` every hour
-  (`agentfs.repackInterval`), and `agentfs.maxSize` caps a path's size.
+  (`agentfs.repackInterval`, about 256 MiB of memory while it runs), and
+  `agentfs.maxSize` caps a path's size.
   See [Databases](docs/operator-guide.md#14-databases-the-fsync-class).
 - **Deployment:** a container image (`ghcr.io/mcurcio/agentfs`) and
   example Kubernetes manifests for the phase 1 sidecar, tested end to end
@@ -122,9 +128,9 @@ the CSI driver (phase 4), asking a running mount to push now, and
 restarting a pod automatically after its sidecar crashes. SSH remotes do
 not support ssh-agent, passphrase-protected keys or `@cert-authority`
 host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
-resumable transfers, proxy settings or pruning. `restore` and `revert` do
-not expand a database's group: restore its directory with the workload
-stopped ([runbook](docs/runbooks/recovery-and-undo.md#7-restoring-a-database)).
+resumable transfers, proxy settings or pruning. Restoring a database needs
+its workload stopped
+([runbook](docs/runbooks/recovery-and-undo.md#7-restoring-a-database)).
 
 ## Mounting
 
@@ -381,9 +387,11 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   [`ci/e2e-sqlite.sh`](ci/e2e-sqlite.sh) (with
   [`sqlite-writer.py`](ci/sqlite-writer.py) and
   [`sqlite-check.py`](ci/sqlite-check.py)) checks that history catches up
-  within one interval while a WAL writer stays open, that every version
-  passes `PRAGMA integrity_check` with whole transactions, and the
-  database restore runbook.
+  within one interval while a WAL writer stays open, that captures are
+  at least one interval apart (a DELETE-mode writer does not capture
+  per transaction), that every version passes `PRAGMA integrity_check`
+  with whole transactions, and the database restore runbook, live and
+  direct, restoring one member and getting its whole group.
 - **e2e runbooks** ([`ci/e2e-runbooks.sh`](ci/e2e-runbooks.sh)): runs the
   shell blocks of the [divergence](docs/runbooks/divergence.md) and
   [history-rewrite](docs/runbooks/history-rewrite.md) runbooks exactly as

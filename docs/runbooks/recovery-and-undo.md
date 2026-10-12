@@ -212,10 +212,11 @@ A database in the `fsync` class
 [operator guide](../operator-guide.md#14-databases-the-fsync-class)) is
 recorded as a group: `app.db` with its `-wal` or `-journal`, captured at
 one point in time. Every commit holds a consistent group, which SQLite
-opens as it would after a crash. `-shm` is never recorded. A restore must
-bring back the whole group from one commit, and `restore` does not do
-that by itself: it restores the path it is given. `ci/e2e-sqlite.sh` runs
-this procedure in CI.
+opens as it would after a crash. `-shm` is never recorded. `restore` and
+`revert` of any member bring back the whole group from one commit: the
+members the commit has are written, the ones it lacks are removed, and
+the result is one restore commit. `ci/e2e-sqlite.sh` runs this procedure
+in CI, both through a mount and directly.
 
 1. **Find the version.** List the commits that changed the database, then
    check one before restoring it (optional; `ci/sqlite-check.py` checks
@@ -231,37 +232,28 @@ this procedure in CI.
    sqlite3 /tmp/v/app.db 'PRAGMA integrity_check'
    ```
 
-2. **Stop everything** (§2, "Stop everything"): the database's writer
-   must be gone, and no mount should run. Through a running mount a
-   restore writes the members one at a time, each write may be captured,
-   and history then holds versions that mix two groups (the final state
-   is whole, and the restore refuses a member open for writing anyway).
+2. **Stop the database's writer.** SQLite does not expect its files to
+   change under an open connection, and the restore refuses a member open
+   for writing. The mount may keep running: through it, the group is
+   captured once, whole, when the restore ends. Without a mount, stop
+   everything (§2, "Stop everything").
 
-3. **Restore the group in direct mode.** If the database has a directory
-   to itself, restore the directory; it writes the members the commit has
-   and removes those it does not:
+3. **Restore the database** (any member names the group):
 
    ```sh
-   agentfs --state "$STATE" --root "$BACKING" restore data <commit>
+   agentfs --state "$STATE" restore "$DB" <commit>                    # through the running mount
+   agentfs --state "$STATE" --root "$BACKING" restore "$DB" <commit>  # directly, no mount
    ```
 
-   Otherwise restore each of `app.db`, `app.db-wal` and `app.db-journal`
-   that the commit or the branch head has (a name the commit lacks is
-   removed):
-
-   ```sh
-   for s in "" -wal -journal; do
-     agentfs --state "$STATE" --root "$BACKING" restore "$DB$s" <commit>
-   done
-   ```
-
-   A name neither has is refused as nothing to restore; skip it.
+   A file in the tree that history does not have at a member's name (an
+   untracked `app.db-journal` left by a crash, say) refuses the restore:
+   look at it, move it aside, and run the restore again.
 
 4. **Remove the stale `-shm`**, which belongs to the old state, then start
    the workload again:
 
    ```sh
-   rm -f "$BACKING/$DB-shm"
+   rm -f "$BACKING/$DB-shm"     # or "$MOUNT/$DB-shm" through the mount
    ```
 
 The next open replays the restored `-wal` (or rolls back the `-journal`)

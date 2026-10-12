@@ -72,7 +72,7 @@ suffix (`512k`, `100m`).
 | `agentfs.commitWindow` | duration | `200ms` | Records this close in time become one commit (§3.4) |
 | `agentfs.pushInterval` | duration | `60s` | How often each remote is pushed; also the base of the failure backoff, which doubles up to `max(pushInterval, 15m)` (§11.2) |
 | `agentfs.sweepInterval` | duration, at least `1s` | `30s` | How often the mount records files held open and retries failed records (§3.1, §3.5) |
-| `agentfs.repackInterval` | duration, at least `1m`, or `0`/`off` | `1h` | How often the commit loop (`mount`, `run`) repacks the history with `git repack -d --geometric=2`, delta-compressing versions of files changed in place (§8). Needs the `git` CLI; skipped while a push runs; a failure raises `RepackFailed`. `0` or `off` never repacks |
+| `agentfs.repackInterval` | duration, at least `1m`, or `0`/`off` | `1h` | How often the commit loop (`mount`, `run`) repacks the history with `git repack -d --geometric=2`, delta-compressing versions of files changed in place (§8). Needs the `git` CLI; skipped while a push runs or when nothing is loose; a failure raises `RepackFailed`. git runs with one thread and bounded windows, about 256 MiB, in a cleared environment; commits wait while it runs, and a stop kills it. `0` or `off` never repacks |
 | `agentfs.lfsThreshold` | positive size | unset: no size rule | Content larger than this (strictly `>`) is stored as Git LFS instead of a git blob (§7). Unset, only `agentfs.store=lfs` and `filter=lfs` in `info/attributes` select LFS. Setting it needs an LFS server for every remote (see [Git LFS](#git-lfs)) |
 
 Operator path rules are not config keys: they are `<state>/git/info/exclude`
@@ -109,7 +109,7 @@ count only there, never in a tracked `.gitattributes`, whatever
 |---|---|---|---|
 | `-agentfs` | | | Never record this path's content (a removal of a tracked path is still recorded) (§4.2) |
 | `agentfs.store` | `blob` or `lfs` | §7 | Force a git blob or Git LFS; `blob` does not override `filter=lfs` ([Git LFS](#git-lfs)) |
-| `agentfs.commit` | `close` or `fsync` | `close` | `fsync` puts the path in the `fsync` class for databases (§8): recorded as a whole group, at `fsync`, by a timer, at close and at unmount |
+| `agentfs.commit` | `close` or `fsync` | `close` | `fsync` puts the path in the `fsync` class for databases (§8): recorded as a whole group, at `fsync`, by a timer, at the group's last close and at unmount |
 | `agentfs.coalesce` | duration, at least `1s` | `30s` | For the `fsync` class: the least time between two captures of a group at `fsync`, and the timer's delay, so the most a change waits. A group uses its members' smallest |
 | `agentfs.group` | name | unset: the path alone | For the `fsync` class: paths in one directory with the same group and the same stem (`app.db`, `app.db-wal`, `app.db-journal`) are captured together |
 | `agentfs.maxSize` | positive size (`k`, `m`, `g`: powers of 1024) | unset | Any path: content larger than this is refused (`PathRefused`, reason `max_size`), whether stored as a blob or LFS. In a group, it refuses the whole capture |
