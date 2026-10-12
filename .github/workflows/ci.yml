@@ -233,9 +233,7 @@ jobs:
           set -o pipefail
           {
             echo "### History service round trip (passthrough ${{ matrix.passthrough }} job; no FUSE)"
-            echo '```'
             cargo test --locked --release -p agentfs-core --test history_service -- --ignored --nocapture round_trip_cost
-            echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: daemon logs
         if: failure()
