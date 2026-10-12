@@ -356,6 +356,7 @@ that operator rules always apply:
     nested = exclude           # §5
     commitWindow = 200ms       # group journal entries this close in time
     pushInterval = 60s         # §11
+    sweepInterval = 30s        # §3.1: backstop for files left open; min 1s
     lfsThreshold = 8m          # phase 2, §7
 
 [remote "origin"]               # one section per push remote (§11)

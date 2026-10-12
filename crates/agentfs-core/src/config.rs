@@ -33,6 +33,12 @@ pub enum ConfigError {
     BadName { key: String, value: String },
     #[error("{key}: {value:?} is not a positive size (use e.g. 512k, 100m, 2g)")]
     BadSize { key: String, value: String },
+    #[error("{key}: {value:?} is shorter than the minimum, {min:?}")]
+    TooShort {
+        key: String,
+        value: String,
+        min: Duration,
+    },
     #[error("{key}: {value:?} must be an absolute path")]
     RelativePath { key: String, value: String },
 }
@@ -83,6 +89,10 @@ pub struct Settings {
     pub nested: Nested,
     pub commit_window: Duration,
     pub push_interval: Duration,
+    /// `agentfs.sweepInterval`: how often the FUSE layer's sweep records
+    /// files that stay open and changed, and retries failed records (design
+    /// §3.1, §3.5). At least [`MIN_SWEEP_INTERVAL`].
+    pub sweep_interval: Duration,
     pub identity: Templates,
     /// Push remotes, sorted by name.
     pub remotes: Vec<RemoteSettings>,
@@ -122,6 +132,7 @@ impl Settings {
             },
             commit_window: duration(config, "agentfs.commitWindow")?
                 .unwrap_or(Duration::from_millis(200)),
+            sweep_interval: sweep_interval(config)?,
             push_interval: duration(config, "agentfs.pushInterval")?
                 .unwrap_or(Duration::from_secs(60)),
             identity: Templates {
@@ -271,6 +282,25 @@ fn duration(config: &git2::Config, key: &str) -> Result<Option<Duration>, Config
         })
 }
 
+/// The shortest `agentfs.sweepInterval` accepted.
+pub const MIN_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `agentfs.sweepInterval`, default 30s. Shorter than
+/// [`MIN_SWEEP_INTERVAL`] is an error: a sweep fstats every open, written
+/// file, so a tiny interval would cost the daemon for no real gain.
+fn sweep_interval(config: &git2::Config) -> Result<Duration, ConfigError> {
+    let key = "agentfs.sweepInterval";
+    match duration(config, key)? {
+        None => Ok(Duration::from_secs(30)),
+        Some(d) if d >= MIN_SWEEP_INTERVAL => Ok(d),
+        Some(_) => Err(ConfigError::TooShort {
+            key: key.into(),
+            value: string(config, key)?.unwrap_or_default(),
+            min: MIN_SWEEP_INTERVAL,
+        }),
+    }
+}
+
 /// Parses `<integer><unit>` with unit `ms`, `s`, `m` or `h`.
 pub fn parse_duration(value: &str) -> Option<Duration> {
     let value = value.trim();
@@ -307,6 +337,7 @@ mod tests {
         assert_eq!(s.nested, Nested::Exclude);
         assert_eq!(s.commit_window, Duration::from_millis(200));
         assert_eq!(s.push_interval, Duration::from_secs(60));
+        assert_eq!(s.sweep_interval, Duration::from_secs(30));
         assert_eq!(s.identity, Templates::default());
     }
 
@@ -314,7 +345,7 @@ mod tests {
     fn overrides() {
         let (_d, c) = config_with(
             "[agentfs]\n\tvolume = v\n\tbranch = custom\n\trespectTreeRules = true\n\
-             \tnested = working-tree\n\tcommitWindow = 50ms\n\tpushInterval = 5m\n\
+             \tnested = working-tree\n\tcommitWindow = 50ms\n\tpushInterval = 5m\n\tsweepInterval = 5s\n\
              [agentfs \"identity\"]\n\tcommitterName = bot {replica}\n",
         );
         let s = Settings::from_config(&c).unwrap();
@@ -323,6 +354,7 @@ mod tests {
         assert_eq!(s.nested, Nested::WorkingTree);
         assert_eq!(s.commit_window, Duration::from_millis(50));
         assert_eq!(s.push_interval, Duration::from_secs(300));
+        assert_eq!(s.sweep_interval, Duration::from_secs(5));
         assert_eq!(s.identity.committer_name, "bot {replica}");
     }
 
@@ -343,6 +375,23 @@ mod tests {
             Settings::from_config(&c),
             Err(ConfigError::BadChoice { .. })
         ));
+        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n\tsweepInterval = abc\n");
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::BadDuration { .. })
+        ));
+        for bad in ["0s", "500ms"] {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n\tsweepInterval = {bad}\n"
+            ));
+            assert!(
+                matches!(
+                    Settings::from_config(&c),
+                    Err(ConfigError::TooShort { .. })
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
