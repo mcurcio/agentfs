@@ -22,5 +22,20 @@ It is built in two layers:
 
 ## Status
 
-Design, draft 2. See [docs/design.md](docs/design.md) and the
-[review record](docs/reviews/2026-10-12-adversarial.md). No code yet.
+Phase 1 in progress. See [docs/design.md](docs/design.md) and the
+[review record](docs/reviews/2026-10-12-adversarial.md).
+
+Built so far, in `agentfs-core`: path checks, the journal (group commit,
+crash recovery), frozen copies (reflink, else copy), the commit builder,
+identity templates and settings. The `agentfs` command has `init`, `status`,
+`flush` and `record`; `record` stands in for the FUSE layer, which is next.
+
+## Building
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+libgit2 is built from source, so a C compiler is needed. HTTPS and SSH
+support for pushing are not enabled yet.
