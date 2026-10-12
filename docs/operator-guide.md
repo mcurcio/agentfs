@@ -110,6 +110,14 @@ Global flags (every command):
 | `--root DIR` | `AGENTFS_ROOT` | | The backing tree, for `record`, `flush` and `run`, and for `restore` and `revert` when no mount is running. With `mount` it must match the positional backing tree |
 | `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s` | Wait this long for another process to release the state area instead of exiting 75 (§9) |
 
+`agentfs init` takes `--volume NAME` (`AGENTFS_VOLUME`), `--branch NAME`
+and `--include FILE` (repeatable: operator config fragments, set as the
+config's `include.path` entries), and creates `--root` when it is missing.
+It is safe to re-run: for the same volume it exits 0 and changes nothing
+but missing directories and the includes; for another volume or branch
+it exits 1 and changes nothing
+([configuration reference](configuration.md#agentfs-init)).
+
 `agentfs mount BACKING MOUNTPOINT`:
 
 | Flag | Environment | Default | Meaning |

@@ -147,6 +147,13 @@ so a crash never leaves a stale lock.
   take the lock and write the backing tree directly. While `run`,
   `record`, `flush` or `push` holds the lock they exit 75: `run` serves
   no restores.
+- `agentfs init` takes the lock when the state area already exists. It is
+  safe to re-run, as a pod's init container does at every start: for the
+  same volume (and branch, if given) it exits 0 and only re-creates
+  missing directories and, with `--include`, sets the config includes;
+  for another volume or branch it exits 1 and changes nothing, so a PVC
+  mix-up never repurposes a history. (It used to overwrite
+  `agentfs.volume`.)
 - `agentfs status` takes no lock and changes nothing: it reads history and
   the journal without recovery (it used to run recovery, which could
   truncate the journal or prune frozen copies under a running daemon). It

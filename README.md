@@ -69,7 +69,11 @@ checks refuse, with the reason. It needs `--root` (or `AGENTFS_ROOT`),
 since a path missing from the backing tree is recorded as removed. `push`
 pushes once; `run` runs the commit and push loops until SIGINT or SIGTERM.
 `restore` and `revert` write content from history back into the tree
-([Recovery](#recovery)).
+([Recovery](#recovery)). `init` is safe to re-run: for the same volume it
+exits 0 and changes nothing, for another volume it refuses; `--include
+FILE` keeps settings and remotes in an operator-owned config fragment
+(`include.path`, for example a ConfigMap; see the
+[configuration reference](docs/configuration.md#where-settings-live)).
 Alarms are printed to stderr, and exported as telemetry when it is enabled.
 
 Only one process uses a state area at a time. `mount`, `run`, `record`,

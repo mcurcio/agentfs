@@ -171,24 +171,7 @@ impl History {
     /// repository's own config, in order (design §4.3). The settings of
     /// this `History` are not reloaded; open it again to see them.
     pub fn set_includes(&self, includes: &[PathBuf]) -> Result<(), HistoryError> {
-        let mut config = self.repo.config()?.open_level(git2::ConfigLevel::Local)?;
-        match config.remove_multivar("include.path", ".*") {
-            Ok(()) => {}
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        for path in includes {
-            let Some(value) = path.to_str() else {
-                return Err(git2::Error::from_str(&format!(
-                    "include path {} is not UTF-8",
-                    path.display()
-                ))
-                .into());
-            };
-            // A pattern no existing value matches appends a new entry.
-            config.set_multivar("include.path", "^$", value)?;
-        }
-        Ok(())
+        write_includes(self.repo.path(), includes)
     }
 
     pub fn repo(&self) -> &Repository {
@@ -429,6 +412,31 @@ fn message(records: &[Record], context: &Context) -> String {
 }
 
 /// Reads the `Agentfs-Seq` trailer from a commit message.
+/// [`History::set_includes`] on the repository at `git_dir`, without
+/// loading its settings first, so a missing or bad include can be
+/// replaced.
+pub fn write_includes(git_dir: &Path, includes: &[PathBuf]) -> Result<(), HistoryError> {
+    init_libgit2();
+    let mut config = git2::Config::open(&git_dir.join("config"))?;
+    match config.remove_multivar("include.path", ".*") {
+        Ok(()) => {}
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    for path in includes {
+        let Some(value) = path.to_str() else {
+            return Err(git2::Error::from_str(&format!(
+                "include path {} is not UTF-8",
+                path.display()
+            ))
+            .into());
+        };
+        // A pattern no existing value matches appends a new entry.
+        config.set_multivar("include.path", "^$", value)?;
+    }
+    Ok(())
+}
+
 pub fn seq_from_message(message: &str) -> Option<u64> {
     let prefix = format!("{SEQ_TRAILER}: ");
     message

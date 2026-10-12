@@ -26,7 +26,7 @@ mod daemon;
 mod otel;
 mod recovery;
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -72,14 +72,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new state area.
+    /// Create a state area, or check an existing one: safe to run at every
+    /// start (exit 0 when it already belongs to the volume, 1 when it
+    /// belongs to another volume or branch). With --root, also creates the
+    /// backing tree directory.
     Init {
         /// The volume's name, unique within any repository it pushes to.
-        #[arg(long)]
+        #[arg(long, env = "AGENTFS_VOLUME")]
         volume: String,
         /// History branch (default: agentfs/<volume>).
         #[arg(long)]
         branch: Option<String>,
+        /// An operator config fragment to include (`include.path`, design
+        /// §4.3); repeatable. When given, these become exactly the
+        /// state area's includes.
+        #[arg(long = "include", value_name = "FILE")]
+        includes: Vec<PathBuf>,
     },
     /// Show the branch head, the last committed sequence and the backlog.
     Status(Pod),
@@ -220,11 +228,18 @@ fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let state = StateDir::new(&cli.state);
     match cli.command {
-        Command::Init { volume, branch } => {
-            volume::init(&state, &volume, branch.as_deref())
-                .with_context(|| format!("initialising {}", state.root().display()))?;
-            println!("initialised volume {volume} in {}", state.root().display());
-        }
+        Command::Init {
+            volume,
+            branch,
+            includes,
+        } => init(
+            &state,
+            cli.root.as_deref(),
+            cli.wait_lock,
+            &volume,
+            branch,
+            includes,
+        )?,
         Command::Status(_pod) => {
             // Read-only: no recovery, no lock, so it is safe beside a
             // running `mount` or `run` (design §2.3).
@@ -363,6 +378,56 @@ fn real_main() -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `agentfs init`: creates the state area or checks an existing one
+/// (design §2.3, §17.1), and creates `--root` when it is missing.
+fn init(
+    state: &StateDir,
+    root: Option<&Path>,
+    wait_lock: Duration,
+    volume: &str,
+    branch: Option<String>,
+    includes: Vec<PathBuf>,
+) -> Result<()> {
+    // An existing state area may be in use: take its lock. A new one is
+    // created whole, so there is nothing to lock yet (and a refused name
+    // leaves nothing behind).
+    let _lock = if state.git().join("config").exists() {
+        Some(StateLock::acquire(state, "init", wait_lock)?)
+    } else {
+        None
+    };
+    let includes = includes
+        .iter()
+        .map(std::path::absolute)
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("resolving --include")?;
+    let includes = (!includes.is_empty()).then_some(includes.as_slice());
+    let outcome = volume::init_with(state, volume, branch.as_deref(), includes)
+        .with_context(|| format!("initialising {}", state.root().display()))?;
+    if let Some(root) = root
+        && !root.exists()
+    {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(root)
+            .with_context(|| format!("creating the backing tree {}", root.display()))?;
+        println!("created the backing tree {}", root.display());
+    }
+    match outcome {
+        volume::Init::Created => {
+            println!("initialised volume {volume} in {}", state.root().display());
+        }
+        volume::Init::AlreadyInitialised => {
+            println!(
+                "volume {volume} already initialised in {}",
+                state.root().display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `agentfs push`: one attempt per selected remote, in name order.

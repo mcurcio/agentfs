@@ -173,6 +173,16 @@ pub enum VolumeError {
     Rules(#[from] RulesError),
     #[error(transparent)]
     ActorBusy(#[from] ActorBusy),
+    #[error(
+        "this state area belongs to volume {found:?}, not {wanted:?}; nothing was changed \
+         (check which volume or PVC is mounted)"
+    )]
+    OtherVolume { found: String, wanted: String },
+    #[error(
+        "this state area's branch is {found:?}, not {wanted:?}; nothing was changed (the \
+         branch cannot be changed by init)"
+    )]
+    OtherBranch { found: String, wanted: String },
 }
 
 /// One path's new state, as the FUSE layer sees it.
@@ -213,14 +223,109 @@ pub struct Recovery {
     pub pruned_pending: usize,
 }
 
-/// Creates a new state area for `volume`.
-pub fn init(state: &StateDir, volume: &str, branch: Option<&str>) -> Result<(), VolumeError> {
+/// What [`init`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Init {
+    /// A new state area was created.
+    Created,
+    /// The state area already belonged to this volume (and branch); missing
+    /// directories were re-created and nothing else changed, apart from
+    /// the includes when they were given.
+    AlreadyInitialised,
+}
+
+/// Creates a state area for `volume`, or accepts one that already belongs
+/// to it ([`init_with`] without includes).
+pub fn init(state: &StateDir, volume: &str, branch: Option<&str>) -> Result<Init, VolumeError> {
+    init_with(state, volume, branch, None)
+}
+
+/// Creates a state area for `volume`, or accepts an existing one, so it
+/// can run at every start of a pod (design §2.3, §17.1).
+///
+/// - A state area whose config already names `volume` (and `branch`, when
+///   given) is [`Init::AlreadyInitialised`]: missing directories are
+///   re-created, nothing else is touched.
+/// - One that names another volume or branch is refused
+///   ([`VolumeError::OtherVolume`], [`VolumeError::OtherBranch`]) and left
+///   unchanged: a PVC or ConfigMap mix-up must not repurpose history.
+/// - A git directory without `agentfs.volume` (one a container runtime
+///   created to mount `info/exclude` into, say) counts as new; files
+///   already in `info/` are kept.
+///
+/// `includes`, when given, become exactly the config's `include.path`
+/// entries ([`History::set_includes`]). The result is opened once, so a bad
+/// fragment fails here rather than at the first mount. On an existing
+/// state area the caller holds the state-area lock.
+pub fn init_with(
+    state: &StateDir,
+    volume: &str,
+    branch: Option<&str>,
+    includes: Option<&[PathBuf]>,
+) -> Result<Init, VolumeError> {
     validate_name("agentfs.volume", volume).map_err(config_error)?;
-    History::init(&state.git(), volume, branch)?;
+    let git = state.git();
+    let existing = existing_identity(&git)?;
+    let outcome = match existing {
+        Some((found, _)) if found != volume => {
+            return Err(VolumeError::OtherVolume {
+                found,
+                wanted: volume.to_owned(),
+            });
+        }
+        Some((_, found_branch)) => {
+            if let Some(wanted) = branch
+                && found_branch != wanted
+            {
+                return Err(VolumeError::OtherBranch {
+                    found: found_branch,
+                    wanted: wanted.to_owned(),
+                });
+            }
+            for name in ["exclude", "attributes"] {
+                let path = git.join("info").join(name);
+                if !path.exists() {
+                    std::fs::create_dir_all(git.join("info"))?;
+                    std::fs::write(path, "")?;
+                }
+            }
+            Init::AlreadyInitialised
+        }
+        None => {
+            History::init(&git, volume, branch)?;
+            Init::Created
+        }
+    };
     std::fs::create_dir_all(state.journal().parent().expect("journal has a parent"))?;
     PendingStore::open(state.pending())?;
     std::fs::create_dir_all(state.push_dir())?;
-    Ok(())
+    if let Some(includes) = includes {
+        crate::history::write_includes(&git, includes)?;
+    }
+    History::open(&git)?;
+    Ok(outcome)
+}
+
+/// The volume and branch an existing state area's own config names, or
+/// `None` if it has no config or no `agentfs.volume`. Read without
+/// checking includes, so `init --include` can repair a bad one.
+fn existing_identity(git: &Path) -> Result<Option<(String, String)>, VolumeError> {
+    let path = git.join("config");
+    if !path.exists() {
+        return Ok(None);
+    }
+    crate::history::init_libgit2();
+    let config = git2::Config::open(&path).map_err(HistoryError::from)?;
+    let get = |key: &str| match config.get_string(key) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(VolumeError::History(e.into())),
+    };
+    let Some(volume) = get("agentfs.volume")? else {
+        return Ok(None);
+    };
+    let branch = get("agentfs.branch")?.unwrap_or_else(|| format!("agentfs/{volume}"));
+    Ok(Some((volume, branch)))
 }
 
 fn config_error(e: ConfigError) -> VolumeError {
@@ -1942,6 +2047,100 @@ mod tests {
         assert!(state.push_dir().is_dir());
         assert_eq!(state.push_state("r"), state.push_dir().join("r.json"));
         assert_eq!(state.push_lock("r"), state.push_dir().join("r.lock"));
+    }
+
+    #[test]
+    fn init_is_idempotent_for_the_same_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path().join("state"));
+        assert_eq!(init(&state, "vol", None).unwrap(), Init::Created);
+        let config = || std::fs::read(state.git().join("config")).unwrap();
+        let before = config();
+        std::fs::remove_dir_all(state.push_dir()).unwrap();
+        std::fs::remove_file(state.git().join("info/attributes")).unwrap();
+        assert_eq!(init(&state, "vol", None).unwrap(), Init::AlreadyInitialised);
+        assert_eq!(
+            init(&state, "vol", Some("agentfs/vol")).unwrap(),
+            Init::AlreadyInitialised
+        );
+        assert_eq!(config(), before);
+        assert!(state.push_dir().is_dir(), "missing directories re-created");
+        assert!(state.git().join("info/attributes").is_file());
+    }
+
+    #[test]
+    fn init_refuses_another_volume_or_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path().join("state"));
+        init(&state, "vol", Some("custom")).unwrap();
+        let before = std::fs::read(state.git().join("config")).unwrap();
+        let err = init(&state, "other", None).unwrap_err();
+        assert!(
+            matches!(&err, VolumeError::OtherVolume { found, wanted }
+                if found == "vol" && wanted == "other"),
+            "{err}"
+        );
+        let err = init(&state, "vol", Some("agentfs/vol")).unwrap_err();
+        assert!(
+            matches!(&err, VolumeError::OtherBranch { found, wanted }
+                if found == "custom" && wanted == "agentfs/vol"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(state.git().join("config")).unwrap(), before);
+        // Without --branch, the stored branch is accepted.
+        assert_eq!(init(&state, "vol", None).unwrap(), Init::AlreadyInitialised);
+    }
+
+    #[test]
+    fn init_keeps_rule_files_a_runtime_created_first() {
+        // A container runtime that bind-mounts info/exclude creates the
+        // git directory and the file before init runs.
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path().join("state"));
+        let info = state.git().join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), "*.log\n").unwrap();
+        std::fs::write(info.join("attributes"), "secrets/** -agentfs\n").unwrap();
+        assert_eq!(init(&state, "vol", None).unwrap(), Init::Created);
+        assert_eq!(
+            std::fs::read_to_string(info.join("exclude")).unwrap(),
+            "*.log\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(info.join("attributes")).unwrap(),
+            "secrets/** -agentfs\n"
+        );
+    }
+
+    #[test]
+    fn init_sets_and_repairs_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path().join("state"));
+        let fragment = dir.path().join("fragment");
+        std::fs::write(&fragment, "[agentfs]\n\tpushInterval = 9s\n").unwrap();
+        let includes = [fragment.clone()];
+        assert_eq!(
+            init_with(&state, "vol", None, Some(&includes)).unwrap(),
+            Init::Created
+        );
+        let settings = History::open(&state.git()).unwrap().settings().clone();
+        assert_eq!(settings.push_interval, Duration::from_secs(9));
+        // The fragment disappears: the volume no longer opens, and a
+        // re-run with the include given again fails too...
+        std::fs::remove_file(&fragment).unwrap();
+        assert!(History::open(&state.git()).is_err());
+        let err = init_with(&state, "vol", None, Some(&includes)).unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        // ...while one with another include repairs it.
+        let other = dir.path().join("other");
+        std::fs::write(&other, "[agentfs]\n\tpushInterval = 3s\n").unwrap();
+        assert_eq!(
+            init_with(&state, "vol", None, Some(&[other])).unwrap(),
+            Init::AlreadyInitialised
+        );
+        let settings = History::open(&state.git()).unwrap().settings().clone();
+        assert_eq!(settings.push_interval, Duration::from_secs(3));
+        assert_eq!(settings.includes.len(), 1);
     }
 
     #[test]

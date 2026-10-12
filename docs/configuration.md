@@ -267,7 +267,7 @@ flags, most with an environment equivalent:
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | all |
-| `--root DIR` | `AGENTFS_ROOT` | | `record`, `flush`, `run`; `restore` and `revert` without a mount; must match the backing tree for `mount` |
+| `--root DIR` | `AGENTFS_ROOT` | | `record`, `flush`, `run`; `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
 | `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s` | all that take the state-area lock |
 | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--replica` defaults to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push` |
 | `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount` |
@@ -276,7 +276,31 @@ flags, most with an environment equivalent:
 | `--unmount-grace DURATION` | | `10s` | `mount` |
 | `--push-grace DURATION` | | `5s` | `mount`, `run` |
 | `--remote NAME` (repeatable) | | every remote | `push` |
+| `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init` |
+| `--branch NAME` | | `agentfs/<volume>` | `init` |
+| `--include FILE` (repeatable) | | keep the existing includes | `init`: exactly these `include.path` entries |
 
 Telemetry uses the standard `OTEL_*` variables; see the
 [README](../README.md#telemetry). The [operator guide](operator-guide.md)
 §4 describes the mount flags in full.
+
+### `agentfs init`
+
+`init` writes `agentfs.volume` (and `agentfs.branch` with `--branch`) and
+creates the state area. It is safe to run at every start, as a
+Kubernetes init container does:
+
+- **New state area** (no `<state>/git/config`, or one without
+  `agentfs.volume`): created, printing `initialised volume V in S`. Rule
+  files already in `<state>/git/info/` are kept.
+- **Same volume** (and the same branch, if `--branch` is given): exit 0,
+  printing `volume V already initialised in S`. It takes the state-area
+  lock (exit 75 while a mount holds it, or wait with `--wait-lock`),
+  re-creates missing directories, and with `--include` makes those files
+  exactly the config's `include.path` entries. Nothing else changes.
+- **Another volume or branch**: exit 1, nothing changed. A volume's name
+  and branch cannot be changed by `init`.
+- `--root DIR` (or `AGENTFS_ROOT`) also creates the backing tree directory
+  when it is missing.
+- The result is opened once before `init` exits, so a bad setting or
+  include fails `init`, not the first mount.
