@@ -530,13 +530,18 @@ mod tests {
         let slow = {
             let dir = dir.clone();
             std::thread::spawn(move || {
-                call(
-                    &dir,
-                    &Request {
-                        commit: "slow".into(),
-                        ..request()
-                    },
-                )
+                let slow = Request {
+                    commit: "slow".into(),
+                    ..request()
+                };
+                // It can arrive while one of the probes below is served,
+                // and be the one told busy: then it asks again.
+                loop {
+                    match call(&dir, &slow) {
+                        Ok(Reply::Busy(_)) => std::thread::sleep(Duration::from_millis(1)),
+                        other => return other,
+                    }
+                }
             })
         };
         // Wait until the slow request holds the daemon.

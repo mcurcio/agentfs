@@ -1276,21 +1276,13 @@ fn restore_refuses_an_unrecorded_write_through_the_mount() {
     v.expect(&tree(&[("f", f("v2"))]));
     let head = v.head_id();
 
-    // A writer that has written f and holds it open: nothing recorded.
-    let mut holder = Command::new("sh")
-        .arg("-c")
-        .arg("exec 3>f; printf dirty >&3; echo ready; exec sleep 60")
-        .current_dir(v.mnt())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    // A writer that has written f and holds it open: nothing recorded. (A
+    // shell redirection would close a duplicate of the descriptor, and
+    // that close is a change boundary the mount records.)
+    let mut holder = fs::File::create(v.mnt().join("f")).unwrap();
     {
-        use std::io::BufRead as _;
-        let mut line = String::new();
-        std::io::BufReader::new(holder.stdout.as_mut().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        assert_eq!(line.trim(), "ready");
+        use std::io::Write as _;
+        holder.write_all(b"dirty").unwrap();
     }
     for force in [&[][..], &["--force"][..]] {
         let mut args = vec!["restore"];
@@ -1305,8 +1297,7 @@ fn restore_refuses_an_unrecorded_write_through_the_mount() {
     }
     assert_eq!(v.head_id(), head, "nothing committed");
     // Closed, the workload's write is recorded as usual.
-    let _ = holder.kill();
-    let _ = holder.wait();
+    drop(holder);
     v.expect(&tree(&[("f", f("dirty"))]));
     m.stop();
 }
