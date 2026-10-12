@@ -24,7 +24,9 @@
 #     under the git server's own users (htpasswd);
 #   http://127.0.0.1:8081/...  a separate LFS host with its own users
 #     (htpasswd-lfs), proxied to 127.0.0.1:9001;
-# and logs every request as `$msec $server_port $remote_user "$request" $status`
+# and logs every request as
+# `$msec $server_port $remote_user "$request" $status $request_time` ($msec is when
+# the request ended, so it started at $msec - $request_time)
 # to logs/access.log, for ordering and per-host credential checks. It also
 # prints GIT_SERVER_LFS_HTPASSWD, LFS_SEPARATE_BASE and GIT_SERVER_ACCESS_LOG.
 #
@@ -82,7 +84,7 @@ lfs_locations=""
 lfs_server=""
 if [ "${GIT_SERVER_LFS:-}" = 1 ]; then
   : >"$dir/htpasswd-lfs"
-  log_format="log_format agentfs '\$msec \$server_port \$remote_user \"\$request\" \$status';"
+  log_format="log_format agentfs '\$msec \$server_port \$remote_user \"\$request\" \$status \$request_time';"
   access_log="access_log $dir/logs/access.log agentfs;"
   lfs_locations="
     location ~ ^/git/([^/]+)\\.git/info/lfs/(.*)\$ {

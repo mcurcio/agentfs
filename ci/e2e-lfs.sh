@@ -100,15 +100,24 @@ before=$(log_lines)
 agentfs push --remote sep
 assert_eq "$(local_head demo)" "$(remote_ref "$SEP_REPO" refs/heads/agentfs/demo)" "sep has the branch"
 log_since "$before" >"$VOL/push.log"
+# nginx logs $msec when a request ends; it started $request_time (the
+# last field) earlier. The push opens with GET info/refs?service=
+# git-receive-pack: every PUT must have ended before the first such
+# request (or the receive-pack POST) started.
 puts=$(awk '$2 == 8081 && $4 == "\"PUT" {print $1}' "$VOL/push.log")
 assert_eq 4 "$(wc -l <<<"$puts")" "four objects uploaded to the LFS host"
-receive=$(awk '$2 == 8080 && $4 == "\"POST" && $5 ~ /git-receive-pack/ {print $1; exit}' "$VOL/push.log")
-[ -n "$receive" ] || fail "no git-receive-pack in the log: $(cat "$VOL/push.log")"
+grep -q '^[0-9.]* 8080 [^ ]* "GET /git/sep.git/info/refs?service=git-receive-pack ' "$VOL/push.log" ||
+  fail "no info/refs?service=git-receive-pack in the log: $(cat "$VOL/push.log")"
+push_start=$(awk '$2 == 8080 && $5 ~ /git-receive-pack/ {
+    start = $1 - $NF
+    if (first == "" || start < first) first = start
+  } END { if (first != "") printf "%.3f\n", first }' "$VOL/push.log")
+[ -n "$push_start" ] || fail "no git-receive-pack in the log: $(cat "$VOL/push.log")"
 for put in $puts; do
-  awk -v a="$put" -v b="$receive" 'BEGIN { exit !(a < b) }' ||
-    fail "an LFS PUT at $put ended after git-receive-pack at $receive"
+  awk -v a="$put" -v b="$push_start" 'BEGIN { exit !(a <= b) }' ||
+    fail "an LFS PUT ended at $put, after the git push started at $push_start"
 done
-pass "all PUTs ended before git-receive-pack"
+pass "all PUTs ended before the git push started"
 for path in "${LFS_PATHS[@]}"; do
   oid=$(show "$path" | sed -n 2p | sed 's/^oid sha256://')
   # lfs-test-server stores <content>/aa/bb/<the rest of the oid>.
