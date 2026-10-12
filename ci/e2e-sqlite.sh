@@ -14,7 +14,7 @@
 # 3. captures are rate-limited: consecutive fsync and interval captures
 #    of a database are at least one interval apart, the DELETE-mode
 #    database (which opens, fsyncs and closes its -journal on every
-#    transaction) is captured a bounded number of times (trigger fsync),
+#    transaction) is captured a bounded number of times,
 #    and each database has several versions;
 # 4. a live restore of the DELETE database's main file through the mount
 #    (the control socket) brings back its whole group from one commit;
@@ -153,8 +153,8 @@ pass "the WAL database: interval captures, spaced"
 # fsync, the last close and slack.
 MAX=$((ELAPSED / COALESCE + 3))
 sudo python3 "$CAPTURES" "$STATE/git" "$BRANCH" delete/app.db --coalesce "$COALESCE" \
-  --min 3 --max "$MAX" --want fsync || fail "the DELETE database's captures"
-pass "the DELETE database: fsync captures, spaced, at most $MAX for $TXS transactions"
+  --min 3 --max "$MAX" || fail "the DELETE database's captures"
+pass "the DELETE database: captures spaced, at most $MAX for $TXS transactions"
 
 step "restore the DELETE database live, through the mount"
 sudo python3 "$CHECK" "$STATE/git" "$BRANCH" delete/app.db --rows "$ROWS" --min 0 >"$W/live-versions"

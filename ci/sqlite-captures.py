@@ -5,10 +5,12 @@ Lists every commit on BRANCH that changed PATH, PATH-wal or PATH-journal,
 oldest first, with its author time (the time of its last record, whole
 seconds) and its Agentfs-Trigger. Fails if:
 
-- a commit with trigger fsync or interval follows the group's previous
-  commit by less than COALESCE - 1 seconds (captures are at least one
-  interval apart; one second is allowed for the commit window and the
-  rounding of commit times);
+- a commit whose triggers are all fsync or interval follows the group's
+  previous commit by less than COALESCE - 1 seconds (captures are at
+  least one interval apart; one second is allowed for the commit window
+  and the rounding of commit times). A commit grouping records of two
+  groups lists both groups' triggers, so one that also lists close or
+  release is not checked;
 - fewer than MIN or more than MAX commits changed the group;
 - a trigger given with --want was never seen.
 
@@ -54,10 +56,11 @@ def main():
     previous = None
     seen = set()
     for commit, time, trigger in commits:
-        seen.add(trigger)
+        triggers = set(trigger.split(","))
+        seen |= triggers
         gap = "" if previous is None else f" (+{time - previous}s)"
         print(f"{commit} {time} {trigger}{gap}")
-        if previous is not None and trigger in ("fsync", "interval"):
+        if previous is not None and triggers <= {"fsync", "interval"}:
             if time - previous < a.coalesce - 1:
                 failures.append(
                     f"{commit}: a {trigger} capture {time - previous}s after the "
