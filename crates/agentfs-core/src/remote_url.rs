@@ -188,6 +188,66 @@ pub fn has_password(url: &str) -> bool {
     url.contains("://") && userinfo(url).is_some_and(|i| i.contains(':'))
 }
 
+/// The password of a `scheme://user:password@host/…` URL, percent-decoded.
+pub fn url_password(url: &str) -> Option<String> {
+    if !url.contains("://") {
+        return None;
+    }
+    let (_, password) = userinfo(url)?.split_once(':')?;
+    Some(percent_decode(password)).filter(|p| !p.is_empty())
+}
+
+/// `url` without the userinfo of a `scheme://userinfo@host/…` URL.
+pub fn without_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_owned(),
+    }
+}
+
+/// The origin of an `http(s)://` URL: its lowercased scheme and authority,
+/// without the scheme's default port. `None` for anything else.
+pub fn origin(url: &str) -> Option<(String, String)> {
+    let scheme = match transport(url) {
+        Transport::Http => "http",
+        Transport::Https => "https",
+        _ => return None,
+    };
+    let authority = authority(url)?;
+    let default = if scheme == "https" { ":443" } else { ":80" };
+    let authority = authority
+        .strip_suffix(default)
+        .map_or(authority.clone(), str::to_owned);
+    Some((scheme.to_owned(), authority))
+}
+
+/// `%XX` escapes decoded; anything malformed is kept as it is.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(Some(h)), Some(Some(l))) = (
+                bytes.get(i + 1).map(|b| hex(*b)),
+                bytes.get(i + 2).map(|b| hex(*b)),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +350,28 @@ mod tests {
         assert!(!has_password("ssh://u@h/p"));
         assert!(!has_password("git@h:p"));
         assert!(!has_password("/srv/u:p@x"));
+    }
+
+    #[test]
+    fn lfs_url_helpers() {
+        assert_eq!(
+            url_password("https://u:p%40ss@h/r").as_deref(),
+            Some("p@ss")
+        );
+        assert_eq!(url_password("https://u@h/r"), None);
+        assert_eq!(url_password("u:p@h:r"), None);
+        assert_eq!(without_userinfo("https://u:p@h:1/r@x"), "https://h:1/r@x");
+        assert_eq!(without_userinfo("/srv/r.git"), "/srv/r.git");
+        let o = |u: &str| origin(u).map(|(s, a)| format!("{s} {a}"));
+        assert_eq!(
+            o("HTTPS://Git.Example:443/r").as_deref(),
+            Some("https git.example")
+        );
+        assert_eq!(o("http://h:80/r").as_deref(), Some("http h"));
+        assert_eq!(o("http://h:8080/r").as_deref(), Some("http h:8080"));
+        assert_eq!(origin("https://h/r"), Some(("https".into(), "h".into())));
+        assert_ne!(o("http://h/r"), o("https://h/r"));
+        assert_eq!(o("ssh://h/r"), None);
+        assert_eq!(o("/srv/x"), None);
     }
 }

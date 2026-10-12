@@ -1,0 +1,469 @@
+//! Where a remote's LFS objects go, and with which credentials (design
+//! §7, §11.1).
+//!
+//! **Endpoints** follow git-lfs's precedence, from operator config only
+//! (never a tracked `.lfsconfig`):
+//!
+//! | Uploads | Downloads |
+//! |---|---|
+//! | `lfs.pushurl` | |
+//! | `lfs.url` | `lfs.url` |
+//! | `remote.<name>.lfspushurl` | |
+//! | `remote.<name>.lfsurl` | `remote.<name>.lfsurl` |
+//! | derived from `pushurl`, else `url` | derived from `url` |
+//!
+//! An explicit `http(s)` URL is the endpoint as written. A remote URL
+//! derives one as git-lfs does: `<url>/info/lfs` when it ends in `.git`,
+//! else `<url>.git/info/lfs`. A local path or `file://` URL (explicit or
+//! derived) uses git-lfs's standalone-file layout, the objects directory
+//! of that repository (`<git dir>/lfs/objects`). SSH and `git://` remotes
+//! derive nothing: agentfs has no `git-lfs-authenticate`, so they need an
+//! explicit `lfsurl`.
+//!
+//! **Credentials** are bound to the endpoint's origin (scheme, host and
+//! port) and offered nowhere else:
+//!
+//! 1. `remote.<name>.agentfsLfsCredentials`, if set;
+//! 2. else, when the endpoint has the push URL's origin (as GitHub's
+//!    derived endpoints do), `remote.<name>.agentfsCredentials`;
+//! 3. else a password in the endpoint URL;
+//! 4. else none.
+//!
+//! So a separate LFS host never sees the git host's credentials, and an
+//! `http` endpoint never gets those of an `https` push URL.
+
+use std::path::{Path, PathBuf};
+
+use super::LfsError;
+use crate::config::{RemoteSettings, Settings};
+use crate::push::redact_url;
+use crate::remote_url::{self, Transport};
+
+/// Which way objects move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Before a push.
+    Upload,
+    /// For a restore.
+    Download,
+}
+
+impl Direction {
+    /// The batch API's `operation`.
+    pub fn operation(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Download => "download",
+        }
+    }
+}
+
+/// What authenticates requests to an HTTP endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointAuth {
+    /// Anonymous.
+    None,
+    /// A credential file, re-read when it changes.
+    File { key: &'static str, path: PathBuf },
+    /// The password in the endpoint URL.
+    Url { username: String, password: String },
+}
+
+/// How an endpoint is reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointKind {
+    /// The batch API at `url` (without userinfo).
+    Http { url: String, auth: EndpointAuth },
+    /// git-lfs's standalone-file layout: `<git_dir>/lfs/objects`.
+    File { git_dir: PathBuf },
+}
+
+/// A remote's LFS endpoint for one direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LfsEndpoint {
+    /// The endpoint URL or path, with any userinfo redacted.
+    pub display_url: String,
+    /// Where it came from: a config key, or `derived from remote.<n>.url`.
+    pub source: String,
+    pub kind: EndpointKind,
+}
+
+impl LfsEndpoint {
+    /// A one-line description for `agentfs status` and messages.
+    pub fn describe(&self) -> String {
+        let auth = match &self.kind {
+            EndpointKind::File { .. } => String::new(),
+            EndpointKind::Http { auth, .. } => match auth {
+                EndpointAuth::None => ", anonymous".to_owned(),
+                EndpointAuth::File { key, .. } => format!(", credentials from {key}"),
+                EndpointAuth::Url { .. } => ", credentials from the URL".to_owned(),
+            },
+        };
+        format!("{} ({}{auth})", self.display_url, self.source)
+    }
+}
+
+/// `remote`'s LFS endpoint for `direction` (see the module documentation).
+pub fn resolve(
+    settings: &Settings,
+    remote: &RemoteSettings,
+    direction: Direction,
+) -> Result<LfsEndpoint, LfsError> {
+    let name = &remote.name;
+    let upload = direction == Direction::Upload;
+    let explicit = [
+        (upload, "lfs.pushurl".to_owned(), &settings.lfs.push_url),
+        (true, "lfs.url".to_owned(), &settings.lfs.url),
+        (
+            upload,
+            format!("remote.{name}.lfspushurl"),
+            &remote.lfs_push_url,
+        ),
+        (true, format!("remote.{name}.lfsurl"), &remote.lfs_url),
+    ];
+    for (applies, key, value) in explicit {
+        if let (true, Some(url)) = (applies, value) {
+            return endpoint(remote, key, url.trim_end_matches('/').to_owned());
+        }
+    }
+    let (key, url) = match direction {
+        Direction::Upload if remote.push_url.is_some() => ("pushurl", remote.push_url()),
+        _ => ("url", remote.url.as_str()),
+    };
+    let source = format!("derived from remote.{name}.{key}");
+    match remote_url::transport(url) {
+        Transport::Http | Transport::Https => {
+            let base = url.trim_end_matches('/');
+            let derived = if base.ends_with(".git") {
+                format!("{base}/info/lfs")
+            } else {
+                format!("{base}.git/info/lfs")
+            };
+            endpoint(remote, source, derived)
+        }
+        Transport::Local => endpoint(remote, source, url.to_owned()),
+        Transport::Ssh | Transport::Other => Err(LfsError::local(format!(
+            "remote {name} pushes over {}, which has no LFS endpoint agentfs can derive (it \
+             has no git-lfs-authenticate); set remote.{name}.lfsurl to the server's https LFS \
+             endpoint",
+            match remote_url::transport(url) {
+                Transport::Ssh => "ssh",
+                _ => "git:// or an unknown scheme",
+            }
+        ))),
+    }
+}
+
+/// The endpoint `url` (an explicit key's value, or derived from the remote
+/// URL), with its credentials.
+fn endpoint(remote: &RemoteSettings, source: String, url: String) -> Result<LfsEndpoint, LfsError> {
+    let display_url = redact_url(&url);
+    match remote_url::transport(&url) {
+        Transport::Http | Transport::Https => {
+            let auth = auth_for(remote, &url);
+            Ok(LfsEndpoint {
+                display_url,
+                source,
+                kind: EndpointKind::Http {
+                    url: remote_url::without_userinfo(&url),
+                    auth,
+                },
+            })
+        }
+        Transport::Local => {
+            let path = local_path(&url);
+            let git_dir = git_dir_of(&path).map_err(|e| {
+                LfsError::local(format!(
+                    "the LFS endpoint {display_url} ({source}) is not a git repository agentfs \
+                     can open: {e}"
+                ))
+            })?;
+            Ok(LfsEndpoint {
+                display_url,
+                source,
+                kind: EndpointKind::File { git_dir },
+            })
+        }
+        Transport::Ssh | Transport::Other => Err(LfsError::local(format!(
+            "{source}: {display_url} is not an http(s) or file LFS endpoint"
+        ))),
+    }
+}
+
+/// The credentials for the HTTP endpoint `url` (see the module docs).
+fn auth_for(remote: &RemoteSettings, url: &str) -> EndpointAuth {
+    if let Some(path) = &remote.lfs_credentials {
+        return EndpointAuth::File {
+            key: "agentfsLfsCredentials",
+            path: path.clone(),
+        };
+    }
+    let same_origin = remote_url::origin(url).is_some()
+        && remote_url::origin(url) == remote_url::origin(remote.push_url());
+    if same_origin && let Some(path) = &remote.credentials {
+        return EndpointAuth::File {
+            key: "agentfsCredentials",
+            path: path.clone(),
+        };
+    }
+    if let Some(password) = remote_url::url_password(url) {
+        return EndpointAuth::Url {
+            username: remote_url::url_username(url)
+                .unwrap_or(crate::credentials::DEFAULT_USERNAME)
+                .to_owned(),
+            password,
+        };
+    }
+    EndpointAuth::None
+}
+
+/// The filesystem path of a local remote: a path, or a `file://` URL.
+fn local_path(url: &str) -> PathBuf {
+    match url.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("file") => {
+            // `file:///srv/x` and `file://localhost/srv/x`.
+            let path = rest.strip_prefix("localhost").unwrap_or(rest);
+            PathBuf::from(path)
+        }
+        _ => PathBuf::from(url),
+    }
+}
+
+/// The git directory of the repository at `path` (bare: `path` itself;
+/// with a working tree: its `.git`).
+fn git_dir_of(path: &Path) -> Result<PathBuf, git2::Error> {
+    crate::history::init_libgit2();
+    let repo = git2::Repository::open_ext(
+        path,
+        git2::RepositoryOpenFlags::NO_SEARCH,
+        std::iter::empty::<&std::ffi::OsStr>(),
+    )?;
+    Ok(repo.path().to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LfsSettings;
+
+    fn remote(url: &str) -> RemoteSettings {
+        RemoteSettings {
+            name: "origin".into(),
+            url: url.into(),
+            push_url: None,
+            max_blob_size: None,
+            credentials: None,
+            ssh_key: None,
+            known_hosts: None,
+            lfs_url: None,
+            lfs_push_url: None,
+            lfs_credentials: None,
+        }
+    }
+
+    fn settings(lfs: LfsSettings) -> Settings {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config"), "[agentfs]\n\tvolume = v\n").unwrap();
+        let mut s = Settings::load(dir.path()).unwrap();
+        s.lfs = lfs;
+        s
+    }
+
+    fn http_url(e: &LfsEndpoint) -> &str {
+        match &e.kind {
+            EndpointKind::Http { url, .. } => url,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn auth(e: &LfsEndpoint) -> &EndpointAuth {
+        match &e.kind {
+            EndpointKind::Http { auth, .. } => auth,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn derived_endpoints() {
+        let s = settings(LfsSettings::default());
+        for (url, expected) in [
+            (
+                "https://github.com/acme/r.git",
+                "https://github.com/acme/r.git/info/lfs",
+            ),
+            (
+                "https://github.com/acme/r",
+                "https://github.com/acme/r.git/info/lfs",
+            ),
+            (
+                "https://github.com/acme/r/",
+                "https://github.com/acme/r.git/info/lfs",
+            ),
+            (
+                "http://h:8080/git/r.git/",
+                "http://h:8080/git/r.git/info/lfs",
+            ),
+            ("https://u:secret@h/r.git", "https://h/r.git/info/lfs"),
+        ] {
+            let e = resolve(&s, &remote(url), Direction::Upload).unwrap();
+            assert_eq!(http_url(&e), expected, "{url}");
+            assert!(!e.display_url.contains("secret"), "{e:?}");
+            assert_eq!(e.source, "derived from remote.origin.url");
+        }
+        // pushurl for uploads, url for downloads.
+        let mut r = remote("https://read.example/r");
+        r.push_url = Some("https://write.example/r".into());
+        let up = resolve(&s, &r, Direction::Upload).unwrap();
+        assert_eq!(http_url(&up), "https://write.example/r.git/info/lfs");
+        assert_eq!(up.source, "derived from remote.origin.pushurl");
+        let down = resolve(&s, &r, Direction::Download).unwrap();
+        assert_eq!(http_url(&down), "https://read.example/r.git/info/lfs");
+    }
+
+    #[test]
+    fn precedence_follows_git_lfs() {
+        let all = LfsSettings {
+            threshold: None,
+            url: Some("http://global/url".into()),
+            push_url: Some("http://global/push".into()),
+        };
+        let mut r = remote("https://h/r.git");
+        r.lfs_url = Some("http://remote/url".into());
+        r.lfs_push_url = Some("http://remote/push".into());
+        let pick = |lfs: &LfsSettings, r: &RemoteSettings, d| {
+            http_url(&resolve(&settings(lfs.clone()), r, d).unwrap()).to_owned()
+        };
+        use Direction::{Download, Upload};
+        assert_eq!(pick(&all, &r, Upload), "http://global/push");
+        assert_eq!(pick(&all, &r, Download), "http://global/url");
+        let no_push = LfsSettings {
+            push_url: None,
+            ..all.clone()
+        };
+        assert_eq!(pick(&no_push, &r, Upload), "http://global/url");
+        let none = LfsSettings::default();
+        assert_eq!(pick(&none, &r, Upload), "http://remote/push");
+        assert_eq!(pick(&none, &r, Download), "http://remote/url");
+        r.lfs_push_url = None;
+        assert_eq!(pick(&none, &r, Upload), "http://remote/url");
+        r.lfs_url = None;
+        assert_eq!(pick(&none, &r, Upload), "https://h/r.git/info/lfs");
+        // lfs.pushurl never applies to downloads.
+        let only_push = LfsSettings {
+            push_url: Some("http://global/push".into()),
+            ..LfsSettings::default()
+        };
+        assert_eq!(pick(&only_push, &r, Download), "https://h/r.git/info/lfs");
+        // An explicit URL is used as written (no /info/lfs), less a final /.
+        r.lfs_url = Some("http://lfs.example/acme/sep/".into());
+        assert_eq!(pick(&none, &r, Upload), "http://lfs.example/acme/sep");
+    }
+
+    #[test]
+    fn local_remotes_use_the_standalone_file_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare.git");
+        git2::Repository::init_bare(&bare).unwrap();
+        let work = dir.path().join("work");
+        git2::Repository::init(&work).unwrap();
+        let s = settings(LfsSettings::default());
+        for (url, git_dir) in [
+            (bare.display().to_string(), bare.clone()),
+            (format!("file://{}", bare.display()), bare.clone()),
+            (work.display().to_string(), work.join(".git")),
+        ] {
+            let e = resolve(&s, &remote(&url), Direction::Upload).unwrap();
+            match e.kind {
+                EndpointKind::File { git_dir: got } => {
+                    assert_eq!(got.canonicalize().unwrap(), git_dir.canonicalize().unwrap())
+                }
+                other => panic!("{url}: {other:?}"),
+            }
+        }
+        let err = resolve(&s, &remote("/nonexistent/r.git"), Direction::Upload).unwrap_err();
+        assert_eq!(err.kind, crate::events::PushFailureKind::Local);
+        assert!(err.message.contains("not a git repository"), "{err}");
+    }
+
+    #[test]
+    fn ssh_remotes_need_an_explicit_endpoint() {
+        let s = settings(LfsSettings::default());
+        for url in ["ssh://git@h/r.git", "git@h:r.git", "git://h/r.git"] {
+            let err = resolve(&s, &remote(url), Direction::Upload).unwrap_err();
+            assert_eq!(err.kind, crate::events::PushFailureKind::Local, "{url}");
+            assert!(err.message.contains("set remote.origin.lfsurl"), "{err}");
+        }
+        let mut r = remote("ssh://git@h/r.git");
+        r.lfs_url = Some("https://h/r.git/info/lfs".into());
+        assert_eq!(
+            http_url(&resolve(&s, &r, Direction::Upload).unwrap()),
+            "https://h/r.git/info/lfs"
+        );
+    }
+
+    #[test]
+    fn credentials_are_bound_to_their_origin() {
+        let s = settings(LfsSettings::default());
+        let mut r = remote("https://git.example/r.git");
+        r.credentials = Some("/run/secrets/git".into());
+        // A derived endpoint on the push URL's origin reuses the git
+        // credentials.
+        let e = resolve(&s, &r, Direction::Upload).unwrap();
+        assert_eq!(
+            auth(&e),
+            &EndpointAuth::File {
+                key: "agentfsCredentials",
+                path: "/run/secrets/git".into()
+            }
+        );
+        assert!(
+            e.describe().contains("credentials from agentfsCredentials"),
+            "{}",
+            e.describe()
+        );
+        // Another host, another port, or http for an https push URL: never.
+        for url in [
+            "https://lfs.example/r",
+            "https://git.example:8443/r",
+            "http://git.example/r",
+        ] {
+            r.lfs_url = Some(url.into());
+            let e = resolve(&s, &r, Direction::Upload).unwrap();
+            assert_eq!(auth(&e), &EndpointAuth::None, "{url}");
+        }
+        // The explicit default port is the same origin.
+        r.lfs_url = Some("https://git.example:443/r/info/lfs".into());
+        let e = resolve(&s, &r, Direction::Upload).unwrap();
+        assert!(matches!(
+            auth(&e),
+            EndpointAuth::File {
+                key: "agentfsCredentials",
+                ..
+            }
+        ));
+        // The LFS credential file, wherever the endpoint is.
+        r.lfs_url = Some("https://lfs.example/r".into());
+        r.lfs_credentials = Some("/run/secrets/lfs".into());
+        let e = resolve(&s, &r, Direction::Upload).unwrap();
+        assert_eq!(
+            auth(&e),
+            &EndpointAuth::File {
+                key: "agentfsLfsCredentials",
+                path: "/run/secrets/lfs".into()
+            }
+        );
+        // A password in the URL, used only without a file.
+        r.lfs_credentials = None;
+        r.lfs_url = Some("https://bob:pw%21@lfs.example/r".into());
+        let e = resolve(&s, &r, Direction::Upload).unwrap();
+        assert_eq!(
+            auth(&e),
+            &EndpointAuth::Url {
+                username: "bob".into(),
+                password: "pw!".into()
+            }
+        );
+        assert_eq!(http_url(&e), "https://lfs.example/r");
+        assert!(!e.display_url.contains("pw"), "{}", e.display_url);
+    }
+}

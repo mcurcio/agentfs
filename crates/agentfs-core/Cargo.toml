@@ -29,6 +29,9 @@ serde_json = "1.0.154"
 sha1_smol = "1"
 # SHA-256 object ids of Git LFS content (design §7); pure Rust.
 sha2 = "0.11"
+# The Git LFS batch API client (design §7): synchronous and pure Rust, with no
+# TLS unless the `https` feature adds native-tls (OpenSSL, as libgit2 uses).
+ureq = { version = "3.4", default-features = false }
 thiserror = "2.0.21"
 
 [dev-dependencies]
@@ -37,9 +40,10 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 tempfile = "3.27.0"
 
 [features]
-# Push to https:// remotes: libgit2 with TLS (links OpenSSL). Local,
+# Push to https:// remotes and https LFS endpoints: libgit2 and ureq with TLS
+# (both link OpenSSL and use the system trust store). Local,
 # file:// and plain http:// remotes need no feature.
-https = ["git2/https"]
+https = ["git2/https", "ureq/native-tls"]
 # Push to ssh:// and scp-like remotes: libgit2 with libssh2 (links
 # OpenSSL). Without it an ssh remote is reported as misconfigured (design
 # §11.1).

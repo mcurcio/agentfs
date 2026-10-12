@@ -9,7 +9,9 @@
 //!   git-lfs's layout;
 //! - [`attributes`]: the block of `filter=lfs` lines agentfs keeps at the
 //!   end of the root `.gitattributes` in history, as `git lfs track` would;
-//! - [`policy`]: which store a recorded file goes to.
+//! - [`policy`]: which store a recorded file goes to;
+//! - [`endpoint`]: each remote's LFS endpoint and credentials;
+//! - [`client`]: the batch API client and the standalone-file transfer.
 //!
 //! What is stored as LFS is decided when a file is recorded and saved in
 //! the journal; the content is hashed and cached when it is committed, and
@@ -17,6 +19,10 @@
 
 pub mod attributes;
 pub mod cache;
+pub mod client;
+pub mod endpoint;
+#[cfg(test)]
+pub(crate) mod fake;
 pub mod pointer;
 pub mod policy;
 
@@ -25,6 +31,8 @@ use std::fmt;
 use crate::events::PushFailureKind;
 
 pub use cache::ObjectCache;
+pub use client::{Transfer, UploadReport, transfer_for};
+pub use endpoint::Direction;
 pub use pointer::{LfsOid, Pointer};
 pub use policy::{Store, StorePolicy};
 
