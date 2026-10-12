@@ -19,7 +19,7 @@
 //! committer checks every change again before committing it, for records
 //! journaled before the limits changed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +34,7 @@ use crate::events::{CheckStage, Event, Events};
 use crate::history::{Committed, History, HistoryError};
 use crate::identity::{Context, IdentityRenderer};
 use crate::journal::{Journal, OpenReport};
+use crate::nested;
 use crate::paths::{PathError, RepoPath};
 use crate::pending::{PendingId, PendingStore};
 use crate::record::{Caller, Change, Draft, Record, Trigger};
@@ -253,7 +254,7 @@ pub fn open(
     let pruned_pending = pending.prune_except(&keep)?;
     pending.sync_dir()?;
 
-    let rules = Rules::load(&state.git(), tree, history.settings().into())?;
+    let rules = Arc::new(Rules::load(&state.git(), tree, history.settings().into())?);
     let head_tree = history
         .head()?
         .map(|c| c.tree())
@@ -276,7 +277,7 @@ pub fn open(
     let recorder = Recorder {
         journal: journal.clone(),
         pending: pending.clone(),
-        rules: Arc::new(rules),
+        rules: rules.clone(),
         tracked: Arc::new(tracked),
         claims: Arc::new(PathClaims::default()),
         checks: checks.clone(),
@@ -290,6 +291,8 @@ pub fn open(
         identities,
         context,
         checks,
+        rules,
+        tree_known: true,
         events,
         telemetry: telemetry.clone(),
     };
@@ -581,6 +584,9 @@ pub struct Committer {
     identities: IdentityRenderer,
     context: Context,
     checks: Arc<Checks>,
+    rules: Arc<Rules>,
+    /// Whether `rules.tree()` is the real backing tree.
+    tree_known: bool,
     events: Events,
     telemetry: Telemetry,
 }
@@ -593,6 +599,9 @@ pub struct CommitReport {
     pub last_seq: Option<u64>,
     /// Changes dropped by the commit-time checks (design §3.4).
     pub refused: usize,
+    /// Writes dropped because their directory has since become a git
+    /// directory (design §5).
+    pub git_dir_dropped: usize,
 }
 
 impl Committer {
@@ -669,10 +678,17 @@ impl Committer {
                 ]
             });
             let checked = match self.recheck(group) {
-                Ok((checked, refused)) => {
-                    report.refused += refused;
-                    span.set(KeyValue::new("agentfs.refused", refused as i64));
-                    checked
+                Ok(rechecked) => {
+                    report.refused += rechecked.refused;
+                    report.git_dir_dropped += rechecked.git_dir_dropped;
+                    span.set(KeyValue::new("agentfs.refused", rechecked.refused as i64));
+                    if rechecked.git_dir_dropped > 0 {
+                        span.set(KeyValue::new(
+                            "agentfs.git_dir_dropped",
+                            rechecked.git_dir_dropped as i64,
+                        ));
+                    }
+                    rechecked.records
                 }
                 Err(e) => {
                     span.error(&e);
@@ -720,9 +736,26 @@ impl Committer {
     /// returns it without the changes they refuse, with the count refused.
     /// This catches records journaled before the limits changed, such as
     /// records recovered after a remount with a stricter remote.
-    fn recheck(&self, group: &[Record]) -> Result<(Vec<Record>, usize), VolumeError> {
-        let mut refused = 0;
-        let mut out = Vec::with_capacity(group.len());
+    ///
+    /// With the backing tree known ([`Committer::set_tree_known`]), it
+    /// also drops, silently, every write or symlink at a path new to
+    /// history whose ancestor directory has since become a git directory
+    /// (a bare layout, design §5): git's own data written by a custom
+    /// template before `HEAD` existed, which the recorder could not yet
+    /// tell from ordinary files.
+    fn recheck(&self, group: &[Record]) -> Result<Rechecked, VolumeError> {
+        let mut rechecked = Rechecked {
+            records: Vec::with_capacity(group.len()),
+            refused: 0,
+            git_dir_dropped: 0,
+        };
+        let head = self.history.head()?;
+        let head_tree = head
+            .as_ref()
+            .map(|c| c.tree())
+            .transpose()
+            .map_err(HistoryError::from)?;
+        let mut git_dirs: HashMap<String, bool> = HashMap::new();
         for record in group {
             let mut record = record.clone();
             let mut kept = Vec::with_capacity(record.draft.changes.len());
@@ -736,22 +769,87 @@ impl Committer {
                     Change::Symlink { path, target } => self.checks.check_symlink(path, target),
                     Change::Remove { .. } => None,
                 };
-                match refusal {
-                    Some(reason) => {
-                        refused += 1;
-                        self.events.emit(Event::PathRefused {
-                            path: change.path().to_string(),
-                            reason,
-                            stage: CheckStage::Commit,
-                        });
-                    }
-                    None => kept.push(change),
+                if let Some(reason) = refusal {
+                    rechecked.refused += 1;
+                    self.events.emit(Event::PathRefused {
+                        path: change.path().to_string(),
+                        reason,
+                        stage: CheckStage::Commit,
+                    });
+                    continue;
                 }
+                if self.tree_known
+                    && !matches!(change, Change::Remove { .. })
+                    && !in_tree(head_tree.as_ref(), change.path())?
+                    && self.under_git_dir(change.path(), &mut git_dirs)?
+                {
+                    rechecked.git_dir_dropped += 1;
+                    continue;
+                }
+                kept.push(change);
             }
             record.draft.changes = kept;
-            out.push(record);
+            rechecked.records.push(record);
         }
-        Ok((out, refused))
+        Ok(rechecked)
+    }
+
+    /// Whether a proper ancestor directory of `path` (never the root) is a
+    /// git directory in the backing tree, caching each directory's answer
+    /// in `cache` for one pass.
+    fn under_git_dir(
+        &self,
+        path: &RepoPath,
+        cache: &mut HashMap<String, bool>,
+    ) -> Result<bool, VolumeError> {
+        let components: Vec<&str> = path.components().collect();
+        let mut prefix = String::new();
+        for component in &components[..components.len() - 1] {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            let bare = match cache.get(&prefix) {
+                Some(bare) => *bare,
+                None => {
+                    let bare = nested::detect(self.rules.tree(), &prefix)?
+                        == Some(nested::NestedKind::Bare);
+                    cache.insert(prefix.clone(), bare);
+                    bare
+                }
+            };
+            if bare {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the backing tree this volume was opened with is the real
+    /// one, so the commit-time recheck of nested git directories can probe
+    /// it (default `true`). `flush` and `run` without an explicit `--root`
+    /// do not know the tree and turn it off.
+    pub fn set_tree_known(&mut self, known: bool) {
+        self.tree_known = known;
+    }
+}
+
+/// What [`Committer::recheck`] kept and dropped.
+struct Rechecked {
+    records: Vec<Record>,
+    refused: usize,
+    git_dir_dropped: usize,
+}
+
+/// Whether `path` is an entry of `tree`.
+fn in_tree(tree: Option<&git2::Tree<'_>>, path: &RepoPath) -> Result<bool, VolumeError> {
+    let Some(tree) = tree else {
+        return Ok(false);
+    };
+    match tree.get_path(Path::new(path.as_str())) {
+        Ok(_) => Ok(true),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(false),
+        Err(e) => Err(HistoryError::from(e).into()),
     }
 }
 
@@ -1852,6 +1950,81 @@ mod tests {
              [remote \"origin\"]\n\turl = https://token@example.com/r.git\n",
         );
         out
+    }
+
+    /// Records `rel` (written in the tree first) as a close.
+    fn close_in_tree(rec: &Recorder, tree: &Path, rel: &str, content: &str) -> Recorded {
+        let input = write_in_tree(tree, rel, content);
+        rec.record(Trigger::Close, CALLER, vec![input]).unwrap()
+    }
+
+    /// Turns `dir` into a bare git directory: what `git init --bare` with a
+    /// custom template writes after the template's files.
+    fn make_head(tree: &Path, dir: &str) {
+        fs::create_dir_all(tree.join(dir)).unwrap();
+        fs::write(tree.join(dir).join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn custom_template_files_are_dropped_at_commit_time() {
+        let (dir, state) = setup();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let (rec, com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
+        // A custom template's files, written before HEAD: nothing marks the
+        // directory as a git directory yet, so they are recorded.
+        for rel in ["r.git/hooks/custom", "r.git/info/x", "keep.txt"] {
+            assert!(close_in_tree(&rec, &tree, rel, "x").seq.is_some(), "{rel}");
+        }
+        make_head(&tree, "r.git");
+        let report = com.commit_pending().unwrap();
+        assert_eq!(report.git_dir_dropped, 2);
+        assert_eq!(report.refused, 0);
+        assert_eq!(tree_paths(&com), ["keep.txt"]);
+        assert_eq!(com.backlog(), 0);
+    }
+
+    #[test]
+    fn the_git_dir_recheck_keeps_history_and_working_trees() {
+        let (dir, state) = setup();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let (rec, com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
+        // Committed before the directory became a git directory: tracked,
+        // so later writes stay recorded (design §5).
+        close_in_tree(&rec, &tree, "store/notes", "1");
+        com.commit_pending().unwrap();
+        make_head(&tree, "store");
+        close_in_tree(&rec, &tree, "store/notes", "2");
+        // A working tree (`git init` makes `.git`): its files are kept.
+        close_in_tree(&rec, &tree, "proj/src.rs", "fn main() {}");
+        make_head(&tree, "proj/.git");
+        fs::create_dir_all(tree.join("proj/.git/objects")).unwrap();
+        fs::create_dir_all(tree.join("proj/.git/refs")).unwrap();
+        // Removals are never dropped.
+        fs::remove_file(tree.join("store/notes")).unwrap();
+        let report = com.commit_pending().unwrap();
+        assert_eq!(report.git_dir_dropped, 0);
+        assert_eq!(tree_paths(&com), ["proj/src.rs", "store/notes"]);
+        assert_eq!(blob(&com, "store/notes"), b"2");
+        rec.record(Trigger::Unlink, CALLER, vec![remove("store/notes")])
+            .unwrap();
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["proj/src.rs"]);
+    }
+
+    #[test]
+    fn the_git_dir_recheck_is_off_without_a_known_tree() {
+        let (dir, state) = setup();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let (rec, mut com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
+        com.set_tree_known(false);
+        close_in_tree(&rec, &tree, "r.git/hooks/custom", "x");
+        make_head(&tree, "r.git");
+        let report = com.commit_pending().unwrap();
+        assert_eq!(report.git_dir_dropped, 0);
+        assert_eq!(tree_paths(&com), ["r.git/hooks/custom"]);
     }
 
     #[test]

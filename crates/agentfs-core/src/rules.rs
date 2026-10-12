@@ -241,6 +241,11 @@ impl Rules {
         Ok(Self::new(tree, options, &exclude, &attributes))
     }
 
+    /// The backing tree the rules read.
+    pub fn tree(&self) -> &Path {
+        &self.tree
+    }
+
     pub fn options(&self) -> RuleOptions {
         self.options
     }

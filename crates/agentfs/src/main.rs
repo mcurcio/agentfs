@@ -225,8 +225,10 @@ fn real_main() -> Result<ExitCode> {
         Command::Flush(pod) => {
             let _lock = StateLock::acquire(&state, "flush", cli.wait_lock)?;
             let session = Session::start(&state, &pod)?;
-            let (_, committer, _) =
+            let (_, mut committer, _) =
                 session.open(&state, cli.root.as_deref().unwrap_or(Path::new(".")), &pod)?;
+            // Without --root the tree is a guess: no commit-time probes of it.
+            committer.set_tree_known(cli.root.is_some());
             let report = committer.commit_pending()?;
             println!(
                 "{} record(s) into {} commit(s)",
@@ -288,10 +290,9 @@ fn real_main() -> Result<ExitCode> {
             return Ok(code);
         }
         Command::Run { pod, push_grace } => {
-            let root = cli.root.as_deref().unwrap_or(Path::new("."));
             let daemon = Daemon::start()?;
             let _lock = StateLock::acquire(&state, "run", cli.wait_lock)?;
-            return run(daemon, &state, root, &pod, push_grace);
+            return run(daemon, &state, cli.root.as_deref(), &pod, push_grace);
         }
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
@@ -413,13 +414,16 @@ fn remote_line(remote: &RemoteStatus) -> String {
 fn run(
     daemon: Daemon,
     state: &StateDir,
-    root: &Path,
+    root: Option<&Path>,
     pod: &Pod,
     push_grace: Duration,
 ) -> Result<ExitCode> {
     let session = Session::start(state, pod)?;
     let events = session.events.clone();
-    let (_recorder, committer, recovery) = session.open(state, root, pod)?;
+    let (_recorder, mut committer, recovery) =
+        session.open(state, root.unwrap_or(Path::new(".")), pod)?;
+    // Without --root the tree is a guess: no commit-time probes of it.
+    committer.set_tree_known(root.is_some());
     let settings = committer.history().settings().clone();
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();

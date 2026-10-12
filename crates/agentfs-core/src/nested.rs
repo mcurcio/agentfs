@@ -18,7 +18,9 @@
 //! `description`, `info/exclude`, or a sample hook (`hooks/<name>.sample`
 //! starting with `#!`). git copies the template in directory order, which
 //! differs between filesystems, so any of them can come first. Only a
-//! custom template's files written before `HEAD` can still be recorded.
+//! custom template's files written before `HEAD` can still be recorded; the
+//! committer drops them at commit time once `HEAD` exists
+//! ([`crate::volume::Committer`], design §5).
 //!
 //! **Where `gitdir:` and `.git` symlinks point.** Their targets are paths in
 //! the workload's view of the mount, never followed on the host. A relative

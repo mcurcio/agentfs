@@ -534,8 +534,23 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
   (`hooks/<name>.sample` starting with `#!`). git copies the template in
   directory order, which differs between filesystems, so any of these may be
   written first: the FUSE tests caught `git clone --bare` recording its
-  sample hooks before `description` existed. Only a custom template's files
-  written before `HEAD` can still be recorded.
+  sample hooks before `description` existed.
+- **Commit-time recheck.** A custom template's files written before `HEAD`
+  match none of these marks, so the recorder journals them. When their
+  records are committed, every write or symlink at a path new to history
+  is checked again: if a proper ancestor directory has become a git
+  directory (a bare layout) meanwhile, the change is dropped silently, like
+  git's own data, and counted on the commit span
+  (`agentfs.git_dir_dropped`). Paths already in history and removals are
+  never dropped, and working trees (`.git` beneath) are not affected. The
+  recheck needs the real backing tree, so it runs for `mount`, `record`
+  and `restore`, and for `flush` and `run` only with an explicit `--root`.
+  Two limits remain: a custom template's files committed before `HEAD`
+  appears (a commit window of 200 ms, by default, between them) stay in
+  history, and a new file recorded into an ordinary directory that becomes
+  a bare repository within the commit window (`git init --bare` into a
+  non-empty directory) is dropped. The in-memory tracked set keeps a
+  dropped path until the next open, as it does a refused one.
 - **`.git` files and symlinks.** A `.git` file counts only if its first line is
   `gitdir: <path>`; a `.git` symlink is read, never followed. Either target
   must be a git directory inside the backing tree: `HEAD` plus `objects/` and
@@ -1318,6 +1333,7 @@ every step), 11 (restore is not built), 13 (performance) and 16.
 | `st_ino` | The FUSE node id, stable while mounted and shared by hard links, not across remounts (§6) |
 | `.gitmodules` checks | git fsck's `gitmodulesParse`, `Name`, `Url`, `Path`, `Update` and `Large` are refused at record and commit time (`gitmodulesParse` too, though git only reports it); a port of git's config parser and URL checks, tested against the `git` binary; `http(s)` URLs must pass both git 2.39's and 2.40+'s checks (§3.4) |
 | Synchronous-step bound | Content scans of special files run at record time only up to 1 MiB, the tree rule file bound; larger files are scanned in full at commit time. Size checks always run at record time (§3.4) |
+| Nested custom-template gap | At commit time, a write at a path new to history under a directory that has since become a bare git directory is dropped silently; only with the real backing tree known (§5) |
 
 ### 19.2 Open questions
 
