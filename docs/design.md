@@ -1,6 +1,6 @@
 # agentfs design
 
-Status: draft 2, 2026-10-12. Nothing here is implemented. Draft 1 was reviewed
+Status: draft 2, 2026-10-12, updated as phase 1 is built. Draft 1 was reviewed
 adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
 for the findings and what changed because of them.
 
@@ -187,9 +187,41 @@ volumes should use XFS. The phase 1 benchmark (§18) measures this.
   `nested = working-tree` (§5), its `index.lock` bounds a group, with a timeout
   for stale locks.
 - **Commit metadata** is in §9.
-- **Every commit is checked before it is made** against git's fsck rules and the
-  configured limits of each remote (§11.3). Paths that would fail are not
-  recorded. They stay in the backing tree, and an alarm is raised (§13).
+- **Every path is checked twice** against git's fsck rules and the configured
+  limits of the remotes (§11.3):
+  - **at record time**, in the synchronous step. This is the gate: a path that
+    fails is never journaled or tracked, its frozen copy is removed at once,
+    and the rest of the record carries on;
+  - **again at commit time**, as a backstop for records journaled before the
+    limits changed, for example records recovered after a remount with a
+    stricter remote. A refused change is dropped from its commit.
+
+  A refused path stays in the backing tree, its last recorded content (if
+  any) stays in history, and an alarm is raised (`PathRefused`, §13).
+- **The checks**, beyond the path rules of §5:
+
+  | Rule | Threshold | git fsck id |
+  |---|---|---|
+  | Path length | over 4096 bytes | none: agentfs's own (`PATH_MAX` at checkout) |
+  | Symlinked `.gitmodules`, `.gitattributes`, `.gitignore`, `.mailmap`, in any NTFS or HFS+ spelling, including 8.3 short names (`gitmod~1`, `gi7eba~1`) | | `gitmodulesSymlink`, `gitattributesSymlink`, `gitignoreSymlink`, `mailmapSymlink` |
+  | Symlink target length | over 4096 bytes | `symlinkTargetLength` |
+  | Symlink target with a `.git` component, in any spelling | | `symlinkPointsToGitDir` |
+  | `.gitattributes` size | over 100 MiB | `gitattributesLarge` |
+  | `.gitattributes` line length | 2048 bytes or more (git's test is `>=`) | `gitattributesLineLength` |
+  | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize` | none: remote policy |
+
+  There is one history for every remote, so the blob limit that applies is the
+  smallest across remotes. Changing a remote's limits takes a remount. A path
+  refused at commit time stays in the in-memory tracked set (§4) until the
+  next open.
+- **Not yet checked:** the content rules for `.gitmodules` (`gitmodulesParse`,
+  `gitmodulesUrl`, `gitmodulesPath`, `gitmodulesName`, `gitmodulesLarge`). A
+  remote with `receive.fsckObjects` may refuse a commit carrying a hostile
+  `.gitmodules`, leaving that remote alarming until an operator rewrites
+  history.
+- `symlinkPointsToGitDir` is only a warning in default git. agentfs always
+  refuses it, so a workload symlink into a nested repository's `.git` is not
+  recorded.
 
 ### 3.5 When recording fails
 
@@ -341,9 +373,10 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
 - **Tracked paths stay tracked** (§4). If `git init` runs in a directory whose
   files are already recorded, those files keep being recorded. Only new paths
   under it are excluded. Nothing is deleted from history because of nesting.
-- **Paths git refuses** are not recorded, and each raises an alarm. This includes
-  any `.git` component and its NTFS and HFS look-alikes, such as `.GIT`,
-  `git~1` and `.git.`.
+- **Paths git refuses** are not recorded, and each raises an alarm
+  (`PathRefused`, §13). This includes any `.git` component and its NTFS and HFS
+  look-alikes, such as `.GIT`, `git~1` and `.git.`, and the checks of §3.4. A
+  refused path is reported per path; it never fails the rest of its record.
 
 **Detection details.**
 
@@ -650,6 +683,23 @@ journal sequence numbers and commit ids.
 
 **Logs.** Structured events for every alarm condition, with commit, path and
 reason.
+
+**Events.** The engine reports alarm conditions as events to a sink
+(`agentfs_core::events::EventSink`), which the telemetry layer turns into the
+metrics and logs above; until then the CLI prints alarms to stderr.
+
+| Event | Raised when |
+|---|---|
+| `PathRefused` | A path fails the checks of §3.4 or §5, at record or commit time |
+| `RecordFailed` | The synchronous step fails (§3.5) |
+| `CommitFailed` | Turning records into a commit fails; the records stay journaled and are retried |
+| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `non_fast_forward`, `refused`, `local`), the head, the last pushed commit, the consecutive failure count and the next retry |
+| `Diverged` | The local head was saved under a diverged ref (§11.3) |
+| `PushSucceeded` | A push attempt succeeded, including one with nothing new (not an alarm; sinks filter) |
+
+A sink is called from the synchronous step, on the FUSE threads, so it must
+never block. Backlog gauges (`unpushed_commits`, `oldest_unpushed_age`) come
+from each remote's push state, not from events.
 
 **Alarms** are alert rules on these metrics in the consumer's monitoring stack.
 agentfs emits the signals; it does not page anyone itself. The CSI driver may

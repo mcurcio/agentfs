@@ -1,0 +1,534 @@
+//! Checks before a path is recorded and committed (design §3.4).
+//!
+//! A commit no remote accepts can never be pushed, so every path is checked
+//! against git's fsck rules and the remotes' limits before it is journaled
+//! (at record time, the gate) and again before it is committed (a backstop
+//! for records journaled before the limits changed). A path that fails is
+//! not recorded; its earlier content, if any, stays in history.
+//!
+//! Rules, beyond those [`crate::paths::RepoPath`] already enforces:
+//!
+//! | Rule | Threshold | git fsck id |
+//! |---|---|---|
+//! | Path length | over [`MAX_PATH_BYTES`] | none (agentfs's own: `PATH_MAX` at checkout) |
+//! | Symlinked `.gitmodules`, `.gitattributes`, `.gitignore`, `.mailmap`, any NTFS/HFS+ spelling | | `gitmodulesSymlink` and siblings |
+//! | Symlink target length | over [`MAX_SYMLINK_TARGET`] | `symlinkTargetLength` |
+//! | Symlink target with a `.git` component | | `symlinkPointsToGitDir` |
+//! | `.gitattributes` size | over [`ATTR_MAX_FILE_SIZE`] | `gitattributesLarge` |
+//! | `.gitattributes` line length | [`ATTR_MAX_LINE_LENGTH`] or more | `gitattributesLineLength` |
+//! | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize` | none (remote policy) |
+//!
+//! There is one history for every remote, so the blob limit that applies is
+//! the smallest across remotes. Checks are pure: they read only the frozen
+//! copy they are given, so one [`Checks`] is shared by the recorder's
+//! threads and the committer.
+
+use std::fmt;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use std::path::Path;
+
+use crate::config::RemoteSettings;
+use crate::paths::{PathError, RepoPath, SpecialFile, is_dotgit, special_file};
+
+/// Longest path recorded, in bytes.
+pub const MAX_PATH_BYTES: usize = 4096;
+/// Longest symlink target git's fsck accepts (`PATH_MAX`).
+pub const MAX_SYMLINK_TARGET: usize = 4096;
+/// Largest `.gitattributes` git's fsck accepts.
+pub const ATTR_MAX_FILE_SIZE: u64 = 100 << 20;
+/// A `.gitattributes` line this long or longer is refused by git's fsck.
+pub const ATTR_MAX_LINE_LENGTH: usize = 2048;
+
+/// The blob size limit in force, and the remote it comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobLimit {
+    pub bytes: u64,
+    pub remote: String,
+}
+
+/// Limits from the configured remotes (design §11.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub max_blob_size: Option<BlobLimit>,
+}
+
+impl Limits {
+    /// The strictest limits across `remotes`. Ties go to the first remote
+    /// by name.
+    pub fn from_remotes(remotes: &[RemoteSettings]) -> Self {
+        let max_blob_size = remotes
+            .iter()
+            .filter_map(|r| r.max_blob_size.map(|bytes| (bytes, &r.name)))
+            .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
+            .map(|(bytes, remote)| BlobLimit {
+                bytes,
+                remote: remote.clone(),
+            });
+        Self { max_blob_size }
+    }
+}
+
+/// Why a path is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The path itself is not one git can store (for example a `.git`
+    /// component); reported by the caller that could not build a
+    /// [`RepoPath`].
+    InvalidPath(PathError),
+    PathTooLong {
+        bytes: usize,
+    },
+    SymlinkedSpecialFile {
+        file: SpecialFile,
+    },
+    SymlinkTargetTooLong {
+        bytes: usize,
+    },
+    SymlinkIntoGitDir {
+        target: String,
+    },
+    GitattributesTooLarge {
+        bytes: u64,
+    },
+    GitattributesLineTooLong {
+        /// 1-based.
+        line: usize,
+        bytes: usize,
+    },
+    BlobTooLarge {
+        bytes: u64,
+        limit: u64,
+        remote: String,
+    },
+}
+
+impl Refusal {
+    /// A stable label for logs and metrics.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::InvalidPath(_) => "invalid_path",
+            Self::PathTooLong { .. } => "path_too_long",
+            Self::SymlinkedSpecialFile { .. } => "symlinked_special_file",
+            Self::SymlinkTargetTooLong { .. } => "symlink_target_too_long",
+            Self::SymlinkIntoGitDir { .. } => "symlink_into_git_dir",
+            Self::GitattributesTooLarge { .. } => "gitattributes_too_large",
+            Self::GitattributesLineTooLong { .. } => "gitattributes_line_too_long",
+            Self::BlobTooLarge { .. } => "blob_too_large",
+        }
+    }
+
+    /// The git fsck message id this rule mirrors, if there is one.
+    pub fn fsck_id(&self) -> Option<&'static str> {
+        match self {
+            Self::InvalidPath(PathError::DotGit(_)) => Some("hasDotgit"),
+            Self::InvalidPath(_) | Self::PathTooLong { .. } | Self::BlobTooLarge { .. } => None,
+            Self::SymlinkedSpecialFile { file } => Some(match file {
+                SpecialFile::Gitmodules => "gitmodulesSymlink",
+                SpecialFile::Gitattributes => "gitattributesSymlink",
+                SpecialFile::Gitignore => "gitignoreSymlink",
+                SpecialFile::Mailmap => "mailmapSymlink",
+            }),
+            Self::SymlinkTargetTooLong { .. } => Some("symlinkTargetLength"),
+            Self::SymlinkIntoGitDir { .. } => Some("symlinkPointsToGitDir"),
+            Self::GitattributesTooLarge { .. } => Some("gitattributesLarge"),
+            Self::GitattributesLineTooLong { .. } => Some("gitattributesLineLength"),
+        }
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPath(e) => write!(f, "{e}"),
+            Self::PathTooLong { bytes } => {
+                write!(f, "path is {bytes} bytes, over {MAX_PATH_BYTES}")
+            }
+            Self::SymlinkedSpecialFile { file } => {
+                write!(f, "{file} must be a regular file, not a symlink")
+            }
+            Self::SymlinkTargetTooLong { bytes } => {
+                write!(
+                    f,
+                    "symlink target is {bytes} bytes, over {MAX_SYMLINK_TARGET}"
+                )
+            }
+            Self::SymlinkIntoGitDir { target } => {
+                write!(f, "symlink target {target:?} points into a .git directory")
+            }
+            Self::GitattributesTooLarge { bytes } => {
+                write!(
+                    f,
+                    ".gitattributes is {bytes} bytes, over {ATTR_MAX_FILE_SIZE}"
+                )
+            }
+            Self::GitattributesLineTooLong { line, bytes } => write!(
+                f,
+                ".gitattributes line {line} is {bytes} bytes (limit {})",
+                ATTR_MAX_LINE_LENGTH - 1
+            ),
+            Self::BlobTooLarge {
+                bytes,
+                limit,
+                remote,
+            } => write!(
+                f,
+                "{bytes} bytes is over the {limit}-byte limit of remote {remote}"
+            ),
+        }
+    }
+}
+
+/// The pre-commit checks, for one set of limits.
+#[derive(Debug, Clone, Default)]
+pub struct Checks {
+    limits: Limits,
+}
+
+impl Checks {
+    pub fn new(limits: Limits) -> Self {
+        Self { limits }
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    /// Rules on the path alone.
+    pub fn check_path(&self, path: &RepoPath) -> Option<Refusal> {
+        let bytes = path.as_str().len();
+        (bytes > MAX_PATH_BYTES).then_some(Refusal::PathTooLong { bytes })
+    }
+
+    /// Rules for a symlink at `path` pointing to `target`.
+    pub fn check_symlink(&self, path: &RepoPath, target: &str) -> Option<Refusal> {
+        if let Some(refusal) = self.check_path(path) {
+            return Some(refusal);
+        }
+        if let Some(file) = special_file(path.file_name()) {
+            return Some(Refusal::SymlinkedSpecialFile { file });
+        }
+        if target.len() > MAX_SYMLINK_TARGET {
+            return Some(Refusal::SymlinkTargetTooLong {
+                bytes: target.len(),
+            });
+        }
+        // `is_dotgit` also splits on `\`, as git's fsck does for targets.
+        if target.split('/').any(is_dotgit) {
+            return Some(Refusal::SymlinkIntoGitDir {
+                target: target.to_owned(),
+            });
+        }
+        self.check_blob_size(target.len() as u64)
+    }
+
+    /// Rules for a regular file at `path` whose content is the frozen copy
+    /// at `content`. Reads only a `.gitattributes`, and only up to
+    /// [`ATTR_MAX_FILE_SIZE`].
+    pub fn check_file(&self, path: &RepoPath, content: &Path) -> io::Result<Option<Refusal>> {
+        if let Some(refusal) = self.check_path(path) {
+            return Ok(Some(refusal));
+        }
+        let bytes = std::fs::metadata(content)?.len();
+        if let Some(refusal) = self.check_blob_size(bytes) {
+            return Ok(Some(refusal));
+        }
+        if special_file(path.file_name()) == Some(SpecialFile::Gitattributes) {
+            if bytes > ATTR_MAX_FILE_SIZE {
+                return Ok(Some(Refusal::GitattributesTooLarge { bytes }));
+            }
+            return long_attribute_line(content);
+        }
+        Ok(None)
+    }
+
+    fn check_blob_size(&self, bytes: u64) -> Option<Refusal> {
+        let limit = self.limits.max_blob_size.as_ref()?;
+        (bytes > limit.bytes).then(|| Refusal::BlobTooLarge {
+            bytes,
+            limit: limit.bytes,
+            remote: limit.remote.clone(),
+        })
+    }
+}
+
+/// The first line of [`ATTR_MAX_LINE_LENGTH`] bytes or more (excluding its
+/// `\n`), as git's fsck measures it.
+fn long_attribute_line(content: &Path) -> io::Result<Option<Refusal>> {
+    let mut reader = BufReader::new(File::open(content)?);
+    let mut line = 0;
+    loop {
+        line += 1;
+        let mut len = 0;
+        let mut ended = false;
+        loop {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
+            }
+            let (used, found) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (buf.len(), false),
+            };
+            len += used - usize::from(found);
+            reader.consume(used);
+            if found {
+                ended = true;
+                break;
+            }
+        }
+        if len >= ATTR_MAX_LINE_LENGTH {
+            return Ok(Some(Refusal::GitattributesLineTooLong { line, bytes: len }));
+        }
+        if !ended {
+            return Ok(None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::Instant;
+
+    use super::*;
+
+    fn p(path: &str) -> RepoPath {
+        RepoPath::new(path).unwrap()
+    }
+
+    fn remote(name: &str, max: Option<u64>) -> RemoteSettings {
+        RemoteSettings {
+            name: name.into(),
+            url: "/x".into(),
+            push_url: None,
+            max_blob_size: max,
+            credentials: None,
+        }
+    }
+
+    #[test]
+    fn path_length_limit() {
+        let c = Checks::default();
+        let ok = format!("d/{}", "a".repeat(MAX_PATH_BYTES - 2));
+        assert_eq!(c.check_path(&p(&ok)), None);
+        let long = format!("{ok}b");
+        assert_eq!(
+            c.check_path(&p(&long)),
+            Some(Refusal::PathTooLong { bytes: 4097 })
+        );
+        assert_eq!(
+            c.check_symlink(&p(&long), "t").unwrap().label(),
+            "path_too_long"
+        );
+    }
+
+    #[test]
+    fn symlinked_special_files_in_every_spelling() {
+        let c = Checks::default();
+        for name in [
+            ".gitmodules",
+            "x/.GITMODULES",
+            ".gitmodules.",
+            ".gitmodules ",
+            ".gitmodules:x",
+            "gitmod~1",
+            "GI7EBA~3",
+            ".g\u{200c}itmodules",
+            ".gitattributes",
+            "gitatt~2",
+            ".gitignore",
+            ".mailmap",
+        ] {
+            let refusal = c.check_symlink(&p(name), "target");
+            assert!(
+                matches!(refusal, Some(Refusal::SymlinkedSpecialFile { .. })),
+                "{name:?}: {refusal:?}"
+            );
+        }
+        for name in ["gitmodules", ".gitmodulesx", "gitmod~5", "x/link"] {
+            assert_eq!(c.check_symlink(&p(name), "target"), None, "{name:?}");
+        }
+        assert_eq!(
+            c.check_symlink(&p("a/.gitmodules"), "t").unwrap().fsck_id(),
+            Some("gitmodulesSymlink")
+        );
+        assert_eq!(
+            c.check_symlink(&p(".mailmap"), "t").unwrap().fsck_id(),
+            Some("mailmapSymlink")
+        );
+    }
+
+    #[test]
+    fn symlink_targets() {
+        let c = Checks::default();
+        let link = p("link");
+        assert_eq!(c.check_symlink(&link, &"t".repeat(4096)), None);
+        let long = c.check_symlink(&link, &"t".repeat(4097)).unwrap();
+        assert_eq!(long, Refusal::SymlinkTargetTooLong { bytes: 4097 });
+        assert_eq!(long.fsck_id(), Some("symlinkTargetLength"));
+        for target in [
+            "../.git/config",
+            "sub/.GIT/HEAD",
+            "a\\.git",
+            "x/git~1/y",
+            ".git",
+        ] {
+            let r = c.check_symlink(&link, target);
+            assert!(
+                matches!(r, Some(Refusal::SymlinkIntoGitDir { .. })),
+                "{target}: {r:?}"
+            );
+            assert_eq!(r.unwrap().fsck_id(), Some("symlinkPointsToGitDir"));
+        }
+        for target in [".github/x", "git/x", "/abs/path", "../up", ".gitignore"] {
+            assert_eq!(c.check_symlink(&link, target), None, "{target}");
+        }
+    }
+
+    #[test]
+    fn gitattributes_line_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Checks::default();
+        let file = |content: &[u8]| {
+            let path = dir.path().join("content");
+            fs::write(&path, content).unwrap();
+            path
+        };
+
+        let ok = file(format!("{}\nshort\n", "a".repeat(2047)).as_bytes());
+        assert_eq!(c.check_file(&p(".gitattributes"), &ok).unwrap(), None);
+
+        let long = file(format!("* text\n{}\nmore\n", "b".repeat(2048)).as_bytes());
+        let refusal = Refusal::GitattributesLineTooLong {
+            line: 2,
+            bytes: 2048,
+        };
+        assert_eq!(refusal.fsck_id(), Some("gitattributesLineLength"));
+        let expected = Some(refusal);
+        for name in [
+            ".gitattributes",
+            "d/.gitattributes",
+            "gitatt~1",
+            ".GitAttributes.",
+        ] {
+            assert_eq!(c.check_file(&p(name), &long).unwrap(), expected, "{name}");
+        }
+        for name in [".gitignore", "a.txt"] {
+            assert_eq!(c.check_file(&p(name), &long).unwrap(), None, "{name}");
+        }
+
+        // A last line without a newline is still checked.
+        let last = file(format!("x\n{}", "c".repeat(3000)).as_bytes());
+        assert_eq!(
+            c.check_file(&p(".gitattributes"), &last).unwrap(),
+            Some(Refusal::GitattributesLineTooLong {
+                line: 2,
+                bytes: 3000
+            })
+        );
+        // CR is a byte of the line, as in git.
+        let crlf = file(format!("{}\r\n", "d".repeat(2047)).as_bytes());
+        assert_eq!(
+            c.check_file(&p(".gitattributes"), &crlf).unwrap(),
+            Some(Refusal::GitattributesLineTooLong {
+                line: 1,
+                bytes: 2048
+            })
+        );
+        // Lines longer than the reader's buffer.
+        let huge = file(format!("x\n\n{}\n", "e".repeat(20_000)).as_bytes());
+        assert_eq!(
+            c.check_file(&p(".gitattributes"), &huge).unwrap(),
+            Some(Refusal::GitattributesLineTooLong {
+                line: 3,
+                bytes: 20_000
+            })
+        );
+        let empty = file(b"");
+        assert_eq!(c.check_file(&p(".gitattributes"), &empty).unwrap(), None);
+    }
+
+    #[test]
+    fn gitattributes_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        // Sparse: one line of 100 MiB + 1 that is never read.
+        File::create(&path)
+            .unwrap()
+            .set_len(ATTR_MAX_FILE_SIZE + 1)
+            .unwrap();
+        let start = Instant::now();
+        let refusal = Checks::default()
+            .check_file(&p(".gitattributes"), &path)
+            .unwrap();
+        assert_eq!(
+            refusal,
+            Some(Refusal::GitattributesTooLarge {
+                bytes: ATTR_MAX_FILE_SIZE + 1
+            })
+        );
+        assert_eq!(refusal.unwrap().fsck_id(), Some("gitattributesLarge"));
+        assert!(start.elapsed().as_secs() < 2, "the file must not be read");
+    }
+
+    #[test]
+    fn blob_limit_is_the_smallest_across_remotes() {
+        let limits = Limits::from_remotes(&[
+            remote("a", Some(10)),
+            remote("b", Some(5)),
+            remote("c", None),
+            remote("d", Some(5)),
+        ]);
+        assert_eq!(
+            limits.max_blob_size,
+            Some(BlobLimit {
+                bytes: 5,
+                remote: "b".into()
+            })
+        );
+        let c = Checks::new(limits);
+        let dir = tempfile::tempdir().unwrap();
+        let five = dir.path().join("five");
+        fs::write(&five, b"12345").unwrap();
+        let six = dir.path().join("six");
+        fs::write(&six, b"123456").unwrap();
+        assert_eq!(c.check_file(&p("f"), &five).unwrap(), None);
+        let refused = c.check_file(&p("f"), &six).unwrap().unwrap();
+        assert_eq!(
+            refused,
+            Refusal::BlobTooLarge {
+                bytes: 6,
+                limit: 5,
+                remote: "b".into()
+            }
+        );
+        assert_eq!(refused.fsck_id(), None);
+        assert!(refused.to_string().contains("remote b"), "{refused}");
+        assert_eq!(
+            c.check_symlink(&p("l"), "123456"),
+            Some(Refusal::BlobTooLarge {
+                bytes: 6,
+                limit: 5,
+                remote: "b".into()
+            })
+        );
+        assert_eq!(c.check_symlink(&p("l"), "12345"), None);
+
+        assert_eq!(Limits::from_remotes(&[]), Limits::default());
+        assert_eq!(
+            Limits::from_remotes(&[remote("c", None)]).max_blob_size,
+            None
+        );
+    }
+
+    #[test]
+    fn missing_content_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            Checks::default()
+                .check_file(&p("a"), &dir.path().join("missing"))
+                .is_err()
+        );
+    }
+}

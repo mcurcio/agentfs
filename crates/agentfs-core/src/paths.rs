@@ -116,14 +116,74 @@ fn is_hfs_ignorable(c: char) -> bool {
     )
 }
 
-/// True for names git expects to be regular files, never symlinks. git's
-/// fsck rejects a symlinked `.gitmodules`; the others are refused here too so
-/// tracked rule files are always readable content.
+/// Files git gives meaning to by name, which its fsck refuses as symlinks
+/// (`gitmodulesSymlink`, `gitattributesSymlink`, `gitignoreSymlink`,
+/// `mailmapSymlink`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpecialFile {
+    Gitmodules,
+    Gitattributes,
+    Gitignore,
+    Mailmap,
+}
+
+impl SpecialFile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gitmodules => ".gitmodules",
+            Self::Gitattributes => ".gitattributes",
+            Self::Gitignore => ".gitignore",
+            Self::Mailmap => ".mailmap",
+        }
+    }
+}
+
+impl fmt::Display for SpecialFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which special file `component` names, in any spelling git's fsck treats
+/// as that file on NTFS or HFS+ (git's `is_ntfs_dot_generic` and
+/// `is_hfs_dot_generic`): any case, HFS+ ignorable code points, trailing
+/// spaces and dots, an NTFS stream suffix (`:x`), and the 8.3 short names
+/// (`gitmod~1` to `~4`, or the hashed fallback `gi7eba~1` to `~9`).
+pub fn special_file(component: &str) -> Option<SpecialFile> {
+    let stripped: String = component
+        .chars()
+        .filter(|c| !is_hfs_ignorable(*c))
+        .collect();
+    let stream_cut = stripped.split(':').next().unwrap_or_default();
+    let name = stream_cut.trim_end_matches([' ', '.']).to_ascii_lowercase();
+    // (file, full name, 8.3 prefix taking ~1-4, hashed 8.3 prefix taking ~1-9)
+    const NAMES: [(SpecialFile, &str, &str, &str); 4] = [
+        (SpecialFile::Gitmodules, ".gitmodules", "gitmod", "gi7eba"),
+        (
+            SpecialFile::Gitattributes,
+            ".gitattributes",
+            "gitatt",
+            "gi7d29",
+        ),
+        (SpecialFile::Gitignore, ".gitignore", "gitign", "gi250a"),
+        (SpecialFile::Mailmap, ".mailmap", "mailma", "maba30"),
+    ];
+    let short_name = |prefix: &str, max: u8| {
+        name.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('~'))
+            .is_some_and(|n| matches!(n.as_bytes(), [d] if (b'1'..=max).contains(d)))
+    };
+    NAMES.into_iter().find_map(|(file, full, short, hashed)| {
+        (name == full || short_name(short, b'4') || short_name(hashed, b'9')).then_some(file)
+    })
+}
+
+/// True for names git expects to be regular files, never symlinks, in any
+/// spelling [`special_file`] recognises. git's fsck rejects these as
+/// symlinks, and refusing them also keeps tracked rule files readable
+/// content.
 pub fn must_not_be_symlink(path: &RepoPath) -> bool {
-    matches!(
-        path.file_name().to_ascii_lowercase().as_str(),
-        ".gitmodules" | ".gitattributes" | ".gitignore" | ".mailmap"
-    )
+    special_file(path.file_name()).is_some()
 }
 
 #[cfg(test)]
@@ -188,10 +248,60 @@ mod tests {
     }
 
     #[test]
+    fn special_file_spellings() {
+        for (name, file) in [
+            (".gitmodules", SpecialFile::Gitmodules),
+            (".GITMODULES", SpecialFile::Gitmodules),
+            (".gitmodules.", SpecialFile::Gitmodules),
+            (".gitmodules . ", SpecialFile::Gitmodules),
+            (".gitmodules:$DATA", SpecialFile::Gitmodules),
+            ("gitmod~4", SpecialFile::Gitmodules),
+            ("GI7EBA~9", SpecialFile::Gitmodules),
+            (".g\u{200c}itmodules", SpecialFile::Gitmodules),
+            ("\u{feff}.gitattributes", SpecialFile::Gitattributes),
+            ("gitatt~1", SpecialFile::Gitattributes),
+            ("gi7d29~2", SpecialFile::Gitattributes),
+            (".GitIgnore", SpecialFile::Gitignore),
+            ("gitign~3", SpecialFile::Gitignore),
+            ("gi250a~1", SpecialFile::Gitignore),
+            (".mailmap", SpecialFile::Mailmap),
+            ("mailma~2", SpecialFile::Mailmap),
+            ("maba30~5", SpecialFile::Mailmap),
+        ] {
+            assert_eq!(special_file(name), Some(file), "{name:?}");
+        }
+        for name in [
+            "gitmodules",
+            ".gitmodulesx",
+            "x.gitmodules",
+            "gitmod~5",
+            "gitmod~0",
+            "gitmod~10",
+            "gi7eba~0",
+            "gitmod1",
+            ".mailmap2",
+            "",
+            ".",
+        ] {
+            assert_eq!(special_file(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
     fn symlink_rule_files() {
-        assert!(must_not_be_symlink(
-            &RepoPath::new("x/.gitmodules").unwrap()
-        ));
+        for p in [
+            "x/.gitmodules",
+            ".GITATTRIBUTES",
+            "d/gitign~1",
+            ".mailmap.",
+            ".gitmodules:x",
+            ".g\u{200d}itignore",
+        ] {
+            assert!(must_not_be_symlink(&RepoPath::new(p).unwrap()), "{p:?}");
+        }
         assert!(!must_not_be_symlink(&RepoPath::new("x/link").unwrap()));
+        assert!(!must_not_be_symlink(
+            &RepoPath::new(".gitmodules/inner").unwrap()
+        ));
     }
 }

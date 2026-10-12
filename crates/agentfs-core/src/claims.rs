@@ -122,13 +122,15 @@ mod tests {
         assert!(!conflicts(&held, "ab"));
     }
 
-    /// Spawns a thread that claims `path`, reporting when it has it.
+    /// Spawns a thread that claims `path`, reporting once it has had it (the
+    /// claim is released before the report, so the caller can check that
+    /// nothing is left held).
     fn claim_in_thread(claims: &Arc<PathClaims>, path: &str) -> mpsc::Receiver<()> {
         let (tx, rx) = mpsc::channel();
         let claims = claims.clone();
         let path = p(path);
         std::thread::spawn(move || {
-            let _c = claims.claim([&path]);
+            drop(claims.claim([&path]));
             tx.send(()).unwrap();
         });
         rx

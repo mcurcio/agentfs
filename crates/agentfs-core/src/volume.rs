@@ -12,6 +12,12 @@
 //! rules only ever affect untracked paths. Each record claims its paths
 //! ([`crate::claims`]) from the decision until the tracked set is updated, so
 //! records touching the same path are decided and journaled in order.
+//!
+//! Kept inputs then go through the pre-commit checks ([`crate::checks`],
+//! design §3.4). A refused path is skipped with [`SkipReason::Refused`] and
+//! raises [`Event::PathRefused`]; the rest of the record carries on. The
+//! committer checks every change again before committing it, for records
+//! journaled before the limits changed.
 
 use std::collections::HashSet;
 use std::io;
@@ -19,11 +25,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::checks::{Checks, Limits, Refusal};
 use crate::claims::PathClaims;
+use crate::config::{ConfigError, validate_name};
+use crate::events::{CheckStage, Event, Events};
 use crate::history::{Committed, History, HistoryError};
 use crate::identity::{Context, IdentityRenderer};
 use crate::journal::{Journal, OpenReport};
-use crate::paths::{PathError, RepoPath, must_not_be_symlink};
+use crate::paths::{PathError, RepoPath};
 use crate::pending::{PendingId, PendingStore};
 use crate::record::{Caller, Change, Draft, Record, Trigger};
 use crate::rules::{Decision, Rules, RulesError, SkipReason};
@@ -55,6 +64,26 @@ impl StateDir {
     pub fn pending(&self) -> PathBuf {
         self.root.join("pending")
     }
+
+    /// The daemon's own bookkeeping.
+    pub fn meta(&self) -> PathBuf {
+        self.root.join("meta")
+    }
+
+    /// Per-remote push state (design §11.2).
+    pub fn push_dir(&self) -> PathBuf {
+        self.meta().join("push")
+    }
+
+    /// `remote`'s persisted push state.
+    pub fn push_state(&self, remote: &str) -> PathBuf {
+        self.push_dir().join(format!("{remote}.json"))
+    }
+
+    /// The lock that keeps two processes from pushing `remote` at once.
+    pub fn push_lock(&self, remote: &str) -> PathBuf {
+        self.push_dir().join(format!("{remote}.lock"))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -65,8 +94,6 @@ pub enum VolumeError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Path(#[from] PathError),
-    #[error("{0} must be a regular file, not a symlink")]
-    SymlinkNotAllowed(RepoPath),
     #[error(transparent)]
     Rules(#[from] RulesError),
 }
@@ -111,19 +138,30 @@ pub struct Recovery {
 
 /// Creates a new state area for `volume`.
 pub fn init(state: &StateDir, volume: &str, branch: Option<&str>) -> Result<(), VolumeError> {
+    validate_name("agentfs.volume", volume).map_err(config_error)?;
     History::init(&state.git(), volume, branch)?;
     std::fs::create_dir_all(state.journal().parent().expect("journal has a parent"))?;
     PendingStore::open(state.pending())?;
+    std::fs::create_dir_all(state.push_dir())?;
     Ok(())
 }
 
-/// Opens an existing state area for the backing tree at `tree`.
+fn config_error(e: ConfigError) -> VolumeError {
+    VolumeError::History(HistoryError::Config(e))
+}
+
+/// Opens an existing state area for the backing tree at `tree`. Alarms go to
+/// `events` (design §13).
 pub fn open(
     state: &StateDir,
     tree: &Path,
     context: Context,
+    events: Events,
 ) -> Result<(Recorder, Committer, Recovery), VolumeError> {
     let history = History::open(&state.git())?;
+    let checks = Arc::new(Checks::new(Limits::from_remotes(
+        &history.settings().remotes,
+    )));
     let identities = IdentityRenderer::new(history.settings().identity.clone(), &context)
         .map_err(HistoryError::from)?;
     let committed_through = history.head_seq()?;
@@ -168,6 +206,8 @@ pub fn open(
         rules: Arc::new(rules),
         tracked: Arc::new(tracked),
         claims: Arc::new(PathClaims::default()),
+        checks: checks.clone(),
+        events: events.clone(),
     };
     let committer = Committer {
         history,
@@ -175,6 +215,8 @@ pub fn open(
         pending,
         identities,
         context,
+        checks,
+        events,
     };
     Ok((recorder, committer, recovery))
 }
@@ -203,6 +245,8 @@ pub struct Recorder {
     rules: Arc<Rules>,
     tracked: Arc<Tracked>,
     claims: Arc<PathClaims>,
+    checks: Arc<Checks>,
+    events: Events,
 }
 
 impl Recorder {
@@ -215,6 +259,13 @@ impl Recorder {
     /// path, and are never filtered by rules, so history always follows the
     /// tree for tracked paths.
     ///
+    /// Writes and symlinks the rules keep then go through the pre-commit
+    /// checks (design §3.4). A refused input is skipped with
+    /// [`SkipReason::Refused`], its frozen copy is removed at once, and
+    /// [`Event::PathRefused`] is raised; the other inputs are still
+    /// recorded. Removals are never refused. If the record fails,
+    /// [`Event::RecordFailed`] is raised as well as returning the error.
+    ///
     /// The record holds its paths, and so excludes every path above or below
     /// them, from the decision until the tracked set is updated
     /// ([`crate::claims`]). A removal racing an in-flight first write of the
@@ -226,6 +277,24 @@ impl Recorder {
     /// so a first write racing an edit of the `.gitignore` that covers it may
     /// be decided by either version of the rules.
     pub fn record(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        inputs: Vec<Input>,
+    ) -> Result<Recorded, VolumeError> {
+        let paths: Vec<RepoPath> = inputs.iter().map(|i| i.path().clone()).collect();
+        let result = self.record_inner(trigger, caller, inputs);
+        if let Err(e) = &result {
+            self.events.emit(Event::RecordFailed {
+                trigger,
+                paths,
+                error: e.to_string(),
+            });
+        }
+        result
+    }
+
+    fn record_inner(
         &self,
         trigger: Trigger,
         caller: Caller,
@@ -251,14 +320,26 @@ impl Recorder {
         let mut frozen = Vec::new();
         let result = (|| {
             for input in kept {
-                changes.push(match input {
+                let change = match input {
                     Input::Write {
                         path,
                         backing,
                         executable,
                     } => {
+                        if let Some(refusal) = self.checks.check_path(&path) {
+                            self.refuse(&mut skipped, path, refusal);
+                            continue;
+                        }
                         let (id, _) = self.pending.freeze(&backing)?;
                         frozen.push(id);
+                        if let Some(refusal) =
+                            self.checks.check_file(&path, &self.pending.path(id))?
+                        {
+                            frozen.pop();
+                            self.pending.remove([id])?;
+                            self.refuse(&mut skipped, path, refusal);
+                            continue;
+                        }
                         Change::Write {
                             path,
                             pending: id,
@@ -266,13 +347,18 @@ impl Recorder {
                         }
                     }
                     Input::Symlink { path, target } => {
-                        if must_not_be_symlink(&path) {
-                            return Err(VolumeError::SymlinkNotAllowed(path));
+                        if let Some(refusal) = self.checks.check_symlink(&path, &target) {
+                            self.refuse(&mut skipped, path, refusal);
+                            continue;
                         }
                         Change::Symlink { path, target }
                     }
                     Input::Remove { path } => Change::Remove { path },
-                });
+                };
+                changes.push(change);
+            }
+            if changes.is_empty() {
+                return Ok(None);
             }
             let draft = Draft {
                 trigger,
@@ -280,17 +366,14 @@ impl Recorder {
                 time_ms: now_ms(),
                 changes: changes.clone(),
             };
-            Ok(self.journal.record(draft)?)
+            Ok(Some(self.journal.record(draft)?))
         })();
         match result {
             Ok(seq) => {
                 for change in &changes {
                     self.tracked.apply(change);
                 }
-                Ok(Recorded {
-                    seq: Some(seq),
-                    skipped,
-                })
+                Ok(Recorded { seq, skipped })
             }
             Err(e) => {
                 // Copies frozen for a record that never became durable.
@@ -298,6 +381,34 @@ impl Recorder {
                 Err(e)
             }
         }
+    }
+
+    fn refuse(&self, skipped: &mut Vec<Skipped>, path: RepoPath, refusal: Refusal) {
+        self.events.emit(Event::PathRefused {
+            path: path.to_string(),
+            reason: refusal.clone(),
+            stage: CheckStage::Record,
+        });
+        skipped.push(Skipped {
+            path,
+            reason: SkipReason::Refused(refusal),
+        });
+    }
+
+    /// Reports a path the caller could not record at all because git cannot
+    /// store it (design §5): a `.git` component or one of its look-alikes,
+    /// or another [`PathError`]. Raises [`Event::PathRefused`].
+    pub fn refuse_invalid(&self, raw: &str, error: PathError) {
+        self.events.emit(Event::PathRefused {
+            path: raw.to_owned(),
+            reason: Refusal::InvalidPath(error),
+            stage: CheckStage::Record,
+        });
+    }
+
+    /// Where this volume's events go.
+    pub fn events(&self) -> &Events {
+        &self.events
     }
 
     fn decide(&self, input: &Input) -> Result<Decision, VolumeError> {
@@ -323,14 +434,18 @@ pub struct Committer {
     pending: Arc<PendingStore>,
     identities: IdentityRenderer,
     context: Context,
+    checks: Arc<Checks>,
+    events: Events,
 }
 
-/// What one [`Committer::commit_pending`] pass did.
+/// What one commit pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CommitReport {
     pub records: usize,
     pub commits: usize,
     pub last_seq: Option<u64>,
+    /// Changes dropped by the commit-time checks (design §3.4).
+    pub refused: usize,
 }
 
 impl Committer {
@@ -347,13 +462,70 @@ impl Committer {
     /// within the configured commit window into one commit.
     pub fn commit_pending(&self) -> Result<CommitReport, VolumeError> {
         let records = self.journal.uncommitted();
-        let window_ms = self.history.settings().commit_window.as_millis() as u64;
+        let groups = group_by_window(&records, self.window_ms());
+        self.commit_groups(&records, &groups)
+    }
+
+    /// Like [`Committer::commit_pending`], but leaves the last group alone
+    /// while more records could still join it: until `now_ms` is past its
+    /// first record's time plus the commit window. A group whose first
+    /// record is later than `now_ms` (the clock stepped back) counts as
+    /// settled, so a clock step cannot stall commits.
+    pub fn commit_settled(&self, now_ms: u64) -> Result<CommitReport, VolumeError> {
+        let records = self.journal.uncommitted();
+        let window_ms = self.window_ms();
+        let mut groups = group_by_window(&records, window_ms);
+        if let Some(last) = groups.last() {
+            let first = last[0].draft.time_ms;
+            let settled = now_ms > first.saturating_add(window_ms) || now_ms < first;
+            if !settled {
+                groups.pop();
+            }
+        }
+        self.commit_groups(&records, &groups)
+    }
+
+    fn window_ms(&self) -> u64 {
+        self.history.settings().commit_window.as_millis() as u64
+    }
+
+    /// Commits `groups`, a prefix of `records` split into runs.
+    fn commit_groups(
+        &self,
+        records: &[Record],
+        groups: &[&[Record]],
+    ) -> Result<CommitReport, VolumeError> {
+        let result = self.commit_groups_inner(records, groups);
+        if let Err(e) = &result {
+            self.events.emit(Event::CommitFailed {
+                error: e.to_string(),
+                backlog: self.backlog(),
+            });
+        }
+        result
+    }
+
+    fn commit_groups_inner(
+        &self,
+        records: &[Record],
+        groups: &[&[Record]],
+    ) -> Result<CommitReport, VolumeError> {
         let mut report = CommitReport::default();
         let mut result = Ok(());
-        for group in group_by_window(&records, window_ms) {
+        for group in groups {
+            let checked = match self.recheck(group) {
+                Ok((checked, refused)) => {
+                    report.refused += refused;
+                    checked
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
             match self
                 .history
-                .commit(group, &self.pending, &self.identities, &self.context)
+                .commit(&checked, &self.pending, &self.identities, &self.context)
             {
                 Ok(Committed { commit, last_seq }) => {
                     report.records += group.len();
@@ -376,6 +548,42 @@ impl Committer {
             self.pending.sync_dir()?;
         }
         result.map(|()| report)
+    }
+
+    /// Runs the pre-commit checks again over `group` (design §3.4) and
+    /// returns it without the changes they refuse, with the count refused.
+    /// This catches records journaled before the limits changed, such as
+    /// records recovered after a remount with a stricter remote.
+    fn recheck(&self, group: &[Record]) -> Result<(Vec<Record>, usize), VolumeError> {
+        let mut refused = 0;
+        let mut out = Vec::with_capacity(group.len());
+        for record in group {
+            let mut record = record.clone();
+            let mut kept = Vec::with_capacity(record.draft.changes.len());
+            for change in record.draft.changes {
+                let refusal = match &change {
+                    Change::Write { path, pending, .. } => {
+                        self.checks.check_file(path, &self.pending.path(*pending))?
+                    }
+                    Change::Symlink { path, target } => self.checks.check_symlink(path, target),
+                    Change::Remove { .. } => None,
+                };
+                match refusal {
+                    Some(reason) => {
+                        refused += 1;
+                        self.events.emit(Event::PathRefused {
+                            path: change.path().to_string(),
+                            reason,
+                            stage: CheckStage::Commit,
+                        });
+                    }
+                    None => kept.push(change),
+                }
+            }
+            record.draft.changes = kept;
+            out.push(record);
+        }
+        Ok((out, refused))
     }
 }
 
@@ -408,6 +616,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::events::{MemorySink, NullSink};
     use crate::rules::RuleSource;
 
     const CALLER: Caller = Caller {
@@ -423,6 +632,10 @@ mod tests {
             pod_uid: "u".into(),
             ..Context::default()
         }
+    }
+
+    fn null() -> Events {
+        Arc::new(NullSink)
     }
 
     fn setup() -> (tempfile::TempDir, StateDir) {
@@ -460,7 +673,7 @@ mod tests {
     #[test]
     fn record_then_commit() {
         let (dir, state) = setup();
-        let (rec, com, recovery) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, recovery) = open(&state, dir.path(), context(), null()).unwrap();
         assert_eq!(recovery.committed_through, None);
 
         rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
@@ -480,7 +693,7 @@ mod tests {
     #[test]
     fn content_is_what_it_was_at_the_boundary() {
         let (dir, state) = setup();
-        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
         let input = write(dir.path(), "a", "at close");
         rec.record(Trigger::Close, CALLER, vec![input]).unwrap();
         fs::write(dir.path().join("a"), "changed later").unwrap();
@@ -496,7 +709,7 @@ mod tests {
     fn recorded_but_uncommitted_survives_a_crash() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
             rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             com.commit_pending().unwrap();
@@ -504,7 +717,7 @@ mod tests {
                 .unwrap();
             // Crash: the second record is durable but never committed.
         }
-        let (rec, com, recovery) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, recovery) = open(&state, dir.path(), context(), null()).unwrap();
         assert_eq!(recovery.committed_through, Some(0));
         assert_eq!(recovery.uncommitted, 1);
 
@@ -522,7 +735,7 @@ mod tests {
     fn crash_after_commit_before_truncate_does_not_duplicate() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
             rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             // Commit without letting the committer truncate: simulates a crash
@@ -532,7 +745,7 @@ mod tests {
                 .commit(&records, &com.pending, &com.identities, &com.context)
                 .unwrap();
         }
-        let (_, com, recovery) = open(&state, dir.path(), context()).unwrap();
+        let (_, com, recovery) = open(&state, dir.path(), context(), null()).unwrap();
         assert_eq!(recovery.committed_through, Some(0));
         assert_eq!(recovery.uncommitted, 0);
         assert_eq!(recovery.pruned_pending, 1);
@@ -544,20 +757,349 @@ mod tests {
     #[test]
     fn failed_record_leaves_no_frozen_copy() {
         let (dir, state) = setup();
-        let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
+        let sink = Arc::new(MemorySink::new());
+        let (rec, _, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
         let err = rec.record(
             Trigger::Close,
             CALLER,
             vec![
                 write(dir.path(), "a", "1"),
-                Input::Symlink {
-                    path: RepoPath::new(".gitmodules").unwrap(),
-                    target: "x".into(),
+                Input::Write {
+                    path: RepoPath::new("b").unwrap(),
+                    backing: dir.path().join("missing"),
+                    executable: false,
                 },
             ],
         );
-        assert!(matches!(err, Err(VolumeError::SymlinkNotAllowed(_))));
+        assert!(matches!(err, Err(VolumeError::Io(_))), "{err:?}");
         assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+        let events = sink.take();
+        assert!(
+            matches!(
+                &events[..],
+                [Event::RecordFailed { trigger: Trigger::Close, paths, .. }]
+                    if paths.len() == 2 && paths[1].as_str() == "b"
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn symlinked_gitmodules_is_refused_not_an_error() {
+        let (dir, state) = setup();
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![
+                    write(dir.path(), "a", "1"),
+                    Input::Symlink {
+                        path: RepoPath::new("sub/.GITMODULES.").unwrap(),
+                        target: "x".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, Some(0));
+        let refusal = Refusal::SymlinkedSpecialFile {
+            file: crate::paths::SpecialFile::Gitmodules,
+        };
+        assert_eq!(
+            recorded.skipped,
+            [skipped(
+                "sub/.GITMODULES.",
+                SkipReason::Refused(refusal.clone())
+            )]
+        );
+        assert_eq!(
+            sink.take(),
+            [Event::PathRefused {
+                path: "sub/.GITMODULES.".into(),
+                reason: refusal,
+                stage: CheckStage::Record,
+            }]
+        );
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["a"]);
+    }
+
+    #[test]
+    fn refused_path_does_not_stop_the_record() {
+        let (dir, state) = setup();
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let attrs = format!("* text\n{}\n", "x".repeat(3000));
+        let recorded = rec
+            .record(
+                Trigger::Rename,
+                CALLER,
+                vec![
+                    write(dir.path(), "ok.txt", "fine"),
+                    write(dir.path(), ".gitattributes", &attrs),
+                ],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, Some(0));
+        assert_eq!(
+            recorded.skipped,
+            [skipped(
+                ".gitattributes",
+                SkipReason::Refused(Refusal::GitattributesLineTooLong {
+                    line: 2,
+                    bytes: 3000
+                })
+            )]
+        );
+        // Only the kept input's frozen copy is waiting.
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 1);
+        let events = sink.take();
+        assert!(
+            matches!(&events[..], [Event::PathRefused { path, stage: CheckStage::Record, .. }] if path == ".gitattributes"),
+            "{events:?}"
+        );
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["ok.txt"]);
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+        // A refused path is not tracked: removing it records nothing.
+        let recorded = rec
+            .record(Trigger::Unlink, CALLER, vec![remove(".gitattributes")])
+            .unwrap();
+        assert_eq!(recorded.seq, None);
+    }
+
+    fn set_remote_limit(state: &StateDir, remote: &str, limit: u64) {
+        let mut config = git2::Config::open(&state.git().join("config")).unwrap();
+        config
+            .set_str(&format!("remote.{remote}.url"), "/nowhere")
+            .unwrap();
+        config
+            .set_i64(&format!("remote.{remote}.agentfsMaxBlobSize"), limit as i64)
+            .unwrap();
+    }
+
+    fn blob(com: &Committer, path: &str) -> Vec<u8> {
+        let head = com.history().head().unwrap().unwrap();
+        let id = head.tree().unwrap().get_path(Path::new(path)).unwrap().id();
+        com.history()
+            .repo()
+            .find_blob(id)
+            .unwrap()
+            .content()
+            .to_vec()
+    }
+
+    #[test]
+    fn refusing_a_tracked_path_keeps_its_last_content() {
+        let (dir, state) = setup();
+        {
+            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "a.bin", "abc")],
+            )
+            .unwrap();
+            com.commit_pending().unwrap();
+        }
+        set_remote_limit(&state, "r", 2);
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let recorded = rec
+            .record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "a.bin", "abcde")],
+            )
+            .unwrap();
+        assert_eq!(recorded.seq, None);
+        assert_eq!(
+            recorded.skipped[0].reason,
+            SkipReason::Refused(Refusal::BlobTooLarge {
+                bytes: 5,
+                limit: 2,
+                remote: "r".into()
+            })
+        );
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+        assert_eq!(com.commit_pending().unwrap(), CommitReport::default());
+        assert_eq!(blob(&com, "a.bin"), b"abc");
+        assert_eq!(sink.take().len(), 1);
+    }
+
+    #[test]
+    fn commit_time_recheck() {
+        let (dir, state) = setup();
+        {
+            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "keep", "1")])
+                .unwrap();
+            com.commit_pending().unwrap();
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![
+                    write(dir.path(), "big", "0123456789"),
+                    write(dir.path(), "small", "12"),
+                ],
+            )
+            .unwrap();
+            // Crash before committing; the remount brings a stricter remote.
+        }
+        set_remote_limit(&state, "r", 5);
+        let sink = Arc::new(MemorySink::new());
+        let (_, com, recovery) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        assert_eq!(recovery.uncommitted, 1);
+        let report = com.commit_pending().unwrap();
+        assert_eq!(report.refused, 1);
+        assert_eq!(report.records, 1);
+        assert_eq!(report.commits, 1);
+        assert_eq!(tree_paths(&com), ["keep", "small"]);
+        assert_eq!(com.backlog(), 0);
+        assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
+        let events = sink.take();
+        assert!(
+            matches!(
+                &events[..],
+                [Event::PathRefused { path, stage: CheckStage::Commit, reason: Refusal::BlobTooLarge { bytes: 10, .. } }]
+                    if path == "big"
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_with_every_change_refused_at_commit_is_consumed() {
+        let (dir, state) = setup();
+        {
+            let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![write(dir.path(), "big", "0123456789")],
+            )
+            .unwrap();
+        }
+        set_remote_limit(&state, "r", 5);
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let report = com.commit_pending().unwrap();
+        // With no branch yet, an empty root commit carries the sequence.
+        assert_eq!((report.records, report.commits, report.refused), (1, 1, 1));
+        assert_eq!(report.last_seq, Some(0));
+        assert_eq!(com.history().head_seq().unwrap(), Some(0));
+        assert!(tree_paths(&com).is_empty());
+        assert_eq!(com.backlog(), 0);
+        // Sequence numbers continue after the consumed record.
+        let seq = rec
+            .record(Trigger::Close, CALLER, vec![write(dir.path(), "s", "1")])
+            .unwrap()
+            .seq;
+        assert_eq!(seq, Some(1));
+    }
+
+    fn set_window(state: &StateDir, window: &str) {
+        git2::Config::open(&state.git().join("config"))
+            .unwrap()
+            .set_str("agentfs.commitWindow", window)
+            .unwrap();
+    }
+
+    /// Journals a record at `time_ms` directly, as if the clock read that.
+    fn record_at(rec: &Recorder, dir: &Path, name: &str, time_ms: u64) {
+        let backing = dir.join(name);
+        fs::write(&backing, name).unwrap();
+        let (id, _) = rec.pending.freeze(&backing).unwrap();
+        let change = Change::Write {
+            path: RepoPath::new(name).unwrap(),
+            pending: id,
+            executable: false,
+        };
+        rec.journal
+            .record(Draft {
+                trigger: Trigger::Close,
+                caller: CALLER,
+                time_ms,
+                changes: vec![change.clone()],
+            })
+            .unwrap();
+        rec.tracked.apply(&change);
+    }
+
+    #[test]
+    fn commit_settled_leaves_the_open_group() {
+        let (dir, state) = setup();
+        set_window(&state, "200ms");
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
+        let t = 1_700_000_000_000;
+        record_at(&rec, dir.path(), "a", t);
+        record_at(&rec, dir.path(), "b", t + 50);
+        assert_eq!(
+            com.commit_settled(t + 100).unwrap(),
+            CommitReport::default()
+        );
+        assert_eq!(
+            com.commit_settled(t + 200).unwrap(),
+            CommitReport::default()
+        );
+        assert_eq!(com.backlog(), 2);
+        let report = com.commit_settled(t + 300).unwrap();
+        assert_eq!((report.records, report.commits), (2, 1));
+        assert_eq!(tree_paths(&com), ["a", "b"]);
+
+        // Earlier groups are committed even while the last one is open.
+        record_at(&rec, dir.path(), "c", t + 1000);
+        record_at(&rec, dir.path(), "d", t + 2000);
+        let report = com.commit_settled(t + 2100).unwrap();
+        assert_eq!(report.records, 1);
+        assert_eq!(com.backlog(), 1);
+
+        // After the clock steps back, the group counts as settled.
+        let report = com.commit_settled(t).unwrap();
+        assert_eq!(report.records, 1);
+        assert_eq!(com.backlog(), 0);
+        assert_eq!(tree_paths(&com), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn refuse_invalid_emits_an_alarm() {
+        let (dir, state) = setup();
+        let sink = Arc::new(MemorySink::new());
+        let (rec, _, _) = open(&state, dir.path(), context(), sink.clone()).unwrap();
+        let err = RepoPath::new("sub/.git/config").unwrap_err();
+        rec.refuse_invalid("sub/.git/config", err.clone());
+        let events = sink.take();
+        assert_eq!(
+            events,
+            [Event::PathRefused {
+                path: "sub/.git/config".into(),
+                reason: Refusal::InvalidPath(err),
+                stage: CheckStage::Record,
+            }]
+        );
+        assert!(events[0].to_string().contains(".git"), "{}", events[0]);
+        rec.events().emit(Event::CommitFailed {
+            error: "x".into(),
+            backlog: 0,
+        });
+        assert_eq!(sink.take().len(), 1);
+    }
+
+    #[test]
+    fn init_validates_the_volume_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path().join("state"));
+        assert!(matches!(
+            init(&state, "a/b", None),
+            Err(VolumeError::History(HistoryError::Config(
+                ConfigError::BadName { .. }
+            )))
+        ));
+        assert!(!state.root().exists(), "nothing is created");
+        init(&state, "ok", None).unwrap();
+        assert!(state.push_dir().is_dir());
+        assert_eq!(state.push_state("r"), state.push_dir().join("r.json"));
+        assert_eq!(state.push_lock("r"), state.push_dir().join("r.lock"));
     }
 
     #[test]
@@ -607,7 +1149,7 @@ mod tests {
     fn excluded_untracked_path_is_skipped_without_cost() {
         let (dir, state) = setup();
         exclude(&state, "*.log\n");
-        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -636,7 +1178,7 @@ mod tests {
     fn rename_into_an_excluded_path_records_only_the_removal() {
         let (dir, state) = setup();
         exclude(&state, "ignored/\n");
-        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
         rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "src", "1")])
             .unwrap();
         com.commit_pending().unwrap();
@@ -659,7 +1201,7 @@ mod tests {
     #[test]
     fn removals_need_something_tracked() {
         let (dir, state) = setup();
-        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
         let recorded = rec
             .record(Trigger::Unlink, CALLER, vec![remove("never")])
             .unwrap();
@@ -686,7 +1228,7 @@ mod tests {
     fn uncommitted_records_stay_tracked_across_recovery() {
         let (dir, state) = setup();
         {
-            let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
+            let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
             rec.record(
                 Trigger::Close,
                 CALLER,
@@ -696,7 +1238,7 @@ mod tests {
             // Crash before committing.
         }
         exclude(&state, "*.log\n");
-        let (rec, com, recovery) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, recovery) = open(&state, dir.path(), context(), null()).unwrap();
         assert_eq!(recovery.uncommitted, 1);
         let recorded = rec
             .record(
@@ -724,7 +1266,7 @@ mod tests {
     fn committed_paths_stay_tracked_after_an_exclude() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
             rec.record(
                 Trigger::Close,
                 CALLER,
@@ -734,7 +1276,7 @@ mod tests {
             com.commit_pending().unwrap();
         }
         exclude(&state, "*.log\n");
-        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -755,7 +1297,7 @@ mod tests {
         let (dir, state) = setup();
         fs::create_dir_all(dir.path().join("sub/.git")).unwrap();
         {
-            let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
+            let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
             let recorded = rec
                 .record(
                     Trigger::Close,
@@ -773,7 +1315,7 @@ mod tests {
             .unwrap()
             .set_str("agentfs.nested", "working-tree")
             .unwrap();
-        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -793,7 +1335,7 @@ mod tests {
         use std::time::Duration;
 
         let (dir, state) = setup();
-        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
         // Freezing from a FIFO blocks until it is written and closed, which
         // stands in for a large file whose copy takes a while.
         let fifo = dir.path().join("fifo");
@@ -927,7 +1469,7 @@ mod tests {
                 .unwrap()
                 .set_str("agentfs.nested", nested)
                 .unwrap();
-            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
             for recorded in replay_git_init_bare(&rec, dir.path(), template) {
                 assert_eq!(recorded.seq, None, "{nested}, template {template}");
                 for s in &recorded.skipped {
@@ -946,7 +1488,7 @@ mod tests {
     fn never_record_skips_writes_but_not_removals_of_tracked_paths() {
         let (dir, state) = setup();
         {
-            let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+            let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
             rec.record(
                 Trigger::Close,
                 CALLER,
@@ -960,7 +1502,7 @@ mod tests {
             "secret -agentfs\n",
         )
         .unwrap();
-        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,
@@ -990,7 +1532,7 @@ mod tests {
     fn symlinks_go_through_the_rules() {
         let (dir, state) = setup();
         exclude(&state, "*.log\n");
-        let (rec, com, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, com, _) = open(&state, dir.path(), context(), null()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Symlink,
@@ -1017,7 +1559,7 @@ mod tests {
         let (dir, state) = setup();
         fs::write(dir.path().join(".gitignore"), "*.tmp\n").unwrap();
         {
-            let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
+            let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
             let recorded = rec
                 .record(
                     Trigger::Close,
@@ -1031,7 +1573,7 @@ mod tests {
             .unwrap()
             .set_bool("agentfs.respectTreeRules", true)
             .unwrap();
-        let (rec, _, _) = open(&state, dir.path(), context()).unwrap();
+        let (rec, _, _) = open(&state, dir.path(), context(), null()).unwrap();
         let recorded = rec
             .record(
                 Trigger::Close,

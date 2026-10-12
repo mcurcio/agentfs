@@ -35,6 +35,7 @@ use gix_attributes::search::{MetadataCollection, Outcome};
 use gix_ignore::glob::pattern::Case;
 use gix_ignore::search::Ignore;
 
+use crate::checks::Refusal;
 use crate::config::{Nested, Settings};
 use crate::nested::{self, NestedKind};
 use crate::paths::RepoPath;
@@ -109,6 +110,9 @@ pub enum SkipReason {
     Nested { repo: RepoPath, kind: NestedKind },
     /// A removal of a path with nothing tracked at or below it.
     Untracked,
+    /// git's fsck or a remote's limit would refuse the path (design §3.4,
+    /// [`crate::checks`]).
+    Refused(Refusal),
 }
 
 impl fmt::Display for SkipReason {
@@ -120,6 +124,7 @@ impl fmt::Display for SkipReason {
                 write!(f, "inside nested repository {repo} ({})", kind.describe())
             }
             Self::Untracked => f.write_str("nothing tracked at this path"),
+            Self::Refused(refusal) => write!(f, "refused: {refusal}"),
         }
     }
 }

@@ -7,10 +7,12 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
+use agentfs_core::events::{Event, Events};
 use agentfs_core::history::History;
 use agentfs_core::identity::Context;
 use agentfs_core::paths::{PathError, RepoPath};
@@ -148,7 +150,8 @@ fn main() -> Result<()> {
                 let input = match input_for(root, &path) {
                     Ok(input) => input,
                     Err(e) => match e.downcast_ref::<PathError>() {
-                        Some(PathError::DotGit(_)) => {
+                        Some(err @ PathError::DotGit(_)) => {
+                            recorder.refuse_invalid(&path, err.clone());
                             println!("skipped {path}: {e}");
                             continue;
                         }
@@ -188,7 +191,21 @@ fn open(
         .settings()
         .volume
         .clone();
-    Ok(volume::open(state, root, pod.context(&volume))?)
+    Ok(volume::open(
+        state,
+        root,
+        pod.context(&volume),
+        stderr_sink(),
+    )?)
+}
+
+/// Prints alarms (design §13) to stderr until telemetry exports them.
+fn stderr_sink() -> Events {
+    Arc::new(|event: Event| {
+        if event.is_alarm() {
+            eprintln!("alarm: {event}");
+        }
+    })
 }
 
 fn input_for(root: &Path, path: &str) -> Result<Input> {

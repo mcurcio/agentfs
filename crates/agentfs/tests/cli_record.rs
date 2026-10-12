@@ -209,3 +209,31 @@ fn record_needs_an_explicit_root() {
     let out = v.run_raw(&["status".into()]);
     assert!(out.status.success(), "{}", stderr(&out));
 }
+
+#[test]
+fn refused_paths_are_reported() {
+    let v = Volume::new();
+    v.file(".gitattributes", &format!("* text\n{}\n", "x".repeat(3000)));
+    v.file("a.txt", "a");
+    v.file("sub/.git/config", "[core]\n");
+    let out = v.run(&["record", ".gitattributes", "a.txt", "sub/.git/config"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(
+            "skipped .gitattributes: refused: .gitattributes line 2 is 3000 bytes (limit 2047)"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("recorded a.txt as seq 0"), "{stdout}");
+    let err = stderr(&out);
+    assert!(
+        err.contains("alarm: path refused at record: .gitattributes: "),
+        "{err}"
+    );
+    assert!(
+        err.contains("alarm: path refused at record: sub/.git/config: "),
+        "{err}"
+    );
+    assert_eq!(v.head_paths(), ["a.txt"]);
+}

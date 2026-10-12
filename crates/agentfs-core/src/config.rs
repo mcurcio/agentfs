@@ -1,9 +1,13 @@
-//! Operator settings from the history repository's git config (design §4.3).
+//! Operator settings from the history repository's git config (design §4.3,
+//! §11.1).
 //!
 //! Only the repository's own config file is read: system and global git
-//! config never influence a volume.
+//! config never influence a volume. Remotes are the standard
+//! `[remote "<name>"]` sections with `url` (and optionally `pushurl`), plus
+//! agentfs's own per-remote keys.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::identity::Templates;
@@ -22,6 +26,15 @@ pub enum ConfigError {
         value: String,
         allowed: &'static str,
     },
+    #[error(
+        "{key}: {value:?} is not a valid name (letters, digits, `.`, `_` and `-`, \
+         starting with a letter or digit, without `..` or a `.lock` suffix)"
+    )]
+    BadName { key: String, value: String },
+    #[error("{key}: {value:?} is not a positive size (use e.g. 512k, 100m, 2g)")]
+    BadSize { key: String, value: String },
+    #[error("{key}: {value:?} must be an absolute path")]
+    RelativePath { key: String, value: String },
 }
 
 /// How nested repositories are handled (design §5).
@@ -29,6 +42,29 @@ pub enum ConfigError {
 pub enum Nested {
     Exclude,
     WorkingTree,
+}
+
+/// One push remote (design §11.1, §11.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSettings {
+    pub name: String,
+    /// `remote.<name>.url`.
+    pub url: String,
+    /// `remote.<name>.pushurl`, which wins over `url` for pushing, as in git.
+    pub push_url: Option<String>,
+    /// `remote.<name>.agentfsMaxBlobSize`: the largest blob this remote
+    /// accepts, in bytes.
+    pub max_blob_size: Option<u64>,
+    /// `remote.<name>.agentfsCredentials`: an absolute path to the
+    /// credential file ([`crate::credentials`]).
+    pub credentials: Option<PathBuf>,
+}
+
+impl RemoteSettings {
+    /// The URL pushes go to.
+    pub fn push_url(&self) -> &str {
+        self.push_url.as_deref().unwrap_or(&self.url)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +77,8 @@ pub struct Settings {
     pub commit_window: Duration,
     pub push_interval: Duration,
     pub identity: Templates,
+    /// Push remotes, sorted by name.
+    pub remotes: Vec<RemoteSettings>,
 }
 
 impl Settings {
@@ -52,6 +90,7 @@ impl Settings {
 
     pub fn from_config(config: &git2::Config) -> Result<Self, ConfigError> {
         let volume = string(config, "agentfs.volume")?.ok_or(ConfigError::MissingVolume)?;
+        validate_name("agentfs.volume", &volume)?;
         let branch =
             string(config, "agentfs.branch")?.unwrap_or_else(|| format!("agentfs/{volume}"));
         let defaults = Templates::default();
@@ -83,7 +122,86 @@ impl Settings {
                 author_email: string(config, "agentfs.identity.authorEmail")?
                     .unwrap_or(defaults.author_email),
             },
+            remotes: remotes(config)?,
             volume,
+        })
+    }
+}
+
+/// Every `[remote "<name>"]` with a `url`, sorted by name.
+fn remotes(config: &git2::Config) -> Result<Vec<RemoteSettings>, ConfigError> {
+    let mut names = BTreeSet::new();
+    {
+        let mut entries = config.entries(Some(r"^remote\..*\.url$"))?;
+        while let Some(entry) = entries.next() {
+            let entry = entry?;
+            let Ok(full) = entry.name() else { continue };
+            if let Some(name) = full
+                .strip_prefix("remote.")
+                .and_then(|rest| rest.strip_suffix(".url"))
+            {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            validate_name(&format!("remote.{name}"), &name)?;
+            let key = |k: &str| format!("remote.{name}.{k}");
+            let Some(url) = string(config, &key("url"))? else {
+                return Err(git2::Error::from_str("remote url vanished while reading").into());
+            };
+            let max_blob_size = match int(config, &key("agentfsMaxBlobSize"))? {
+                None => None,
+                Some(n) if n > 0 => Some(n as u64),
+                Some(n) => {
+                    return Err(ConfigError::BadSize {
+                        key: key("agentfsMaxBlobSize"),
+                        value: n.to_string(),
+                    });
+                }
+            };
+            let credentials = match string(config, &key("agentfsCredentials"))? {
+                None => None,
+                Some(path) if Path::new(&path).is_absolute() => Some(PathBuf::from(path)),
+                Some(path) => {
+                    return Err(ConfigError::RelativePath {
+                        key: key("agentfsCredentials"),
+                        value: path,
+                    });
+                }
+            };
+            Ok(RemoteSettings {
+                push_url: string(config, &key("pushurl"))?,
+                url,
+                max_blob_size,
+                credentials,
+                name,
+            })
+        })
+        .collect()
+}
+
+/// Checks a volume or remote name (design §11.4). Names become ref path
+/// components (`refs/agentfs/<volume>/…`) and state file names, so they are
+/// limited to `[A-Za-z0-9][A-Za-z0-9._-]*`, without `..` or a `.lock`
+/// suffix. A `/` would let one volume's namespace contain another's.
+pub fn validate_name(key: &str, value: &str) -> Result<(), ConfigError> {
+    let bytes = value.as_bytes();
+    let ok = bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !value.contains("..")
+        && !value.ends_with(".lock")
+        && !value.ends_with('.');
+    if ok {
+        Ok(())
+    } else {
+        Err(ConfigError::BadName {
+            key: key.into(),
+            value: value.into(),
         })
     }
 }
@@ -98,6 +216,15 @@ fn string(config: &git2::Config, key: &str) -> Result<Option<String>, git2::Erro
 
 fn boolean(config: &git2::Config, key: &str) -> Result<Option<bool>, git2::Error> {
     match config.get_bool(key) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// An integer with git's `k`, `m` and `g` suffixes, as for `lfsThreshold`.
+fn int(config: &git2::Config, key: &str) -> Result<Option<i64>, git2::Error> {
+    match config.get_i64(key) {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -188,6 +315,79 @@ mod tests {
             Settings::from_config(&c),
             Err(ConfigError::BadChoice { .. })
         ));
+    }
+
+    #[test]
+    fn remotes_are_parsed() {
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n\
+             [remote \"zeta\"]\n\turl = /srv/zeta.git\n\tagentfsMaxBlobSize = 100m\n\
+             [remote \"alpha\"]\n\turl = https://example.com/a.git\n\
+             \tpushurl = https://push.example.com/a.git\n\
+             \tagentfsCredentials = /run/secrets/alpha\n\
+             [remote \"nourl\"]\n\tpushurl = /nowhere\n\
+             [remote \"a.b\"]\n\turl = file:///srv/ab.git\n",
+        );
+        let s = Settings::from_config(&c).unwrap();
+        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["a.b", "alpha", "zeta"]);
+        let alpha = &s.remotes[1];
+        assert_eq!(alpha.url, "https://example.com/a.git");
+        assert_eq!(alpha.push_url(), "https://push.example.com/a.git");
+        assert_eq!(
+            alpha.credentials.as_deref(),
+            Some(Path::new("/run/secrets/alpha"))
+        );
+        assert_eq!(alpha.max_blob_size, None);
+        let zeta = &s.remotes[2];
+        assert_eq!(zeta.push_url(), "/srv/zeta.git");
+        assert_eq!(zeta.max_blob_size, Some(104_857_600));
+        assert_eq!(s.remotes[0].url, "file:///srv/ab.git");
+
+        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n");
+        assert!(Settings::from_config(&c).unwrap().remotes.is_empty());
+    }
+
+    #[test]
+    fn remote_and_volume_errors() {
+        for size in ["0", "-1"] {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n[remote \"r\"]\n\turl = /x\n\tagentfsMaxBlobSize = {size}\n"
+            ));
+            assert!(
+                matches!(Settings::from_config(&c), Err(ConfigError::BadSize { .. })),
+                "{size}"
+            );
+        }
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n[remote \"r\"]\n\turl = /x\n\tagentfsMaxBlobSize = lots\n",
+        );
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::Git(_))
+        ));
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n[remote \"r\"]\n\turl = /x\n\tagentfsCredentials = token\n",
+        );
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::RelativePath { .. })
+        ));
+        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n[remote \"x/y\"]\n\turl = /x\n");
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::BadName { .. })
+        ));
+        for volume in ["a/b", "-v", "\"\"", ".v", "a..b", "v.lock", "v.", "v*"] {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = {volume}\n"));
+            assert!(
+                matches!(Settings::from_config(&c), Err(ConfigError::BadName { .. })),
+                "{volume}"
+            );
+        }
+        for ok in ["v", "hermes-0", "a.b_c", "9"] {
+            validate_name("k", ok).unwrap();
+        }
     }
 
     #[test]
