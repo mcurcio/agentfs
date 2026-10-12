@@ -1,4 +1,5 @@
-//! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7 and 11, plus SQLite,
+//! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7 and 11, plus SQLite
+//! in and out of the fsync class (design §8),
 //! git on the mount, restores through the mount, the daemon's lifecycle, and
 //! `probe` and `--on-stale-mount hold` after a crash (design §17.1).
 //!
@@ -817,6 +818,145 @@ fn sqlite_on_the_mount() {
     m.stop();
 }
 
+// ---- the fsync class (design §8) ----
+
+/// The attribute line that puts SQLite databases in the fsync class.
+const SQLITE_CLASS: &str = "*.db* agentfs.commit=fsync agentfs.group=sqlite agentfs.coalesce=1s\n";
+
+/// Writes `db` in `mode` from one long-lived `sqlite3` process: `txs`
+/// transactions of 50 rows, `pause` apart, so captures land while the
+/// database (and its WAL) is open and in use.
+fn sqlite_slowly(v: &Vol, db: &str, mode: &str, txs: u32, pause: &str) {
+    v.sh_as(
+        Some(UID),
+        &format!(
+            "( echo 'PRAGMA journal_mode={mode};'; echo 'PRAGMA synchronous=NORMAL;'; \
+               echo 'CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);'; \
+               i=0; while [ $i -lt {txs} ]; do \
+                 echo 'BEGIN;'; \
+                 j=0; while [ $j -lt 50 ]; do echo \"INSERT INTO t(v) VALUES ('$i-$j');\"; j=$((j+1)); done; \
+                 echo 'COMMIT;'; sleep {pause}; i=$((i+1)); \
+               done ) | sqlite3 u/{db} > /dev/null"
+        ),
+        true,
+    );
+}
+
+/// Every version of `u/<db>` in the branch's history, with its `-wal` and
+/// `-journal` from the same commit, restored into a scratch directory and
+/// checked with `PRAGMA integrity_check`. Returns the distinct row counts
+/// seen, each a whole number of transactions.
+fn check_every_version(v: &Vol, db: &str) -> std::collections::BTreeSet<u64> {
+    let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    let mut walk = repo.revwalk().unwrap();
+    walk.push_ref("refs/heads/agentfs/demo").unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut versions = std::collections::BTreeSet::new();
+    for id in walk {
+        let tree = repo.find_commit(id.unwrap()).unwrap().tree().unwrap();
+        let mut files = Vec::new();
+        for suffix in ["", "-wal", "-journal", "-shm"] {
+            let path = format!("u/{db}{suffix}");
+            if let Ok(entry) = tree.get_path(Path::new(&path)) {
+                assert_ne!(suffix, "-shm", "{path} was recorded");
+                files.push((
+                    suffix,
+                    repo.find_blob(entry.id()).unwrap().content().to_vec(),
+                ));
+            }
+        }
+        if files.first().is_none_or(|(s, _)| !s.is_empty()) {
+            continue;
+        };
+        if !versions.insert(files.clone()) {
+            continue;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        for (suffix, content) in &files {
+            fs::write(scratch.path().join(format!("{db}{suffix}")), content).unwrap();
+        }
+        let out = Command::new("sqlite3")
+            .arg(scratch.path().join(db))
+            .arg("PRAGMA integrity_check; SELECT count(*) FROM t;")
+            .output()
+            .unwrap();
+        let stdout = text(&out.stdout);
+        let mut lines = stdout.lines();
+        assert_eq!(
+            lines.next(),
+            Some("ok"),
+            "{db} at {id:?}: {stdout}{}",
+            text(&out.stderr),
+            id = tree.id()
+        );
+        // A brand new database may not have its table yet.
+        if let Some(count) = lines.next().and_then(|c| c.parse::<u64>().ok()) {
+            assert_eq!(count % 50, 0, "{db}: a torn transaction ({count} rows)");
+            seen.insert(count);
+        }
+    }
+    seen
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn sqlite_in_the_fsync_class() {
+    let v = Vol::new("sqlite-fsync");
+    fs::write(v.state().join("git/info/attributes"), SQLITE_CLASS).unwrap();
+    let m = v.mount(&[]);
+    v.sh("mkdir u && chown 10000:10000 u");
+    sqlite_slowly(&v, "wal.db", "WAL", 12, "0.3");
+    sqlite_slowly(&v, "delete.db", "DELETE", 12, "0.3");
+    check_sqlite_rows(&v, "wal.db", 600);
+    check_sqlite_rows(&v, "delete.db", 600);
+    let log = m.stop();
+    assert!(!log.contains("alarm:"), "{log}");
+
+    for db in ["wal.db", "delete.db"] {
+        let counts = check_every_version(&v, db);
+        // The final version is whole, and captures landed mid-run.
+        assert_eq!(counts.last(), Some(&600), "{db}: {counts:?}");
+        assert!(counts.len() >= 2, "{db}: only {counts:?}");
+    }
+    // -shm never reaches the history; the journal and WAL of a closed
+    // database are gone from the head.
+    let head = v.history();
+    assert!(head.contains_key("u/wal.db") && head.contains_key("u/delete.db"));
+    assert!(head.keys().all(|p| !p.ends_with("-shm")), "{head:?}");
+    assert!(!head.contains_key("u/wal.db-wal"), "{head:?}");
+    assert!(!head.contains_key("u/delete.db-journal"), "{head:?}");
+}
+
+/// With a coalesce longer than the run, fsyncs after the first capture
+/// nothing, yet closing the database records its final state whole.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn sqlite_fsync_class_records_on_close() {
+    let v = Vol::new("sqlite-fsync-close");
+    fs::write(
+        v.state().join("git/info/attributes"),
+        "*.db* agentfs.commit=fsync agentfs.group=sqlite agentfs.coalesce=1h\n",
+    )
+    .unwrap();
+    let m = v.mount(&[]);
+    v.sh("mkdir u && chown 10000:10000 u");
+    sqlite_slowly(&v, "wal.db", "WAL", 3, "0");
+    m.stop();
+    let counts = check_every_version(&v, "wal.db");
+    assert_eq!(counts.last(), Some(&150), "{counts:?}");
+    let m = v.mount(&[]);
+    check_sqlite_rows(&v, "wal.db", 150);
+    m.stop();
+}
+
+fn check_sqlite_rows(v: &Vol, db: &str, rows: u64) {
+    let out = v.sh_as(
+        Some(UID),
+        &format!("sqlite3 u/{db} 'PRAGMA integrity_check; SELECT count(*) FROM t;'"),
+        true,
+    );
+    assert_eq!(out, format!("ok\n{rows}\n"), "{db}");
+}
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn git_works_on_the_mount() {
