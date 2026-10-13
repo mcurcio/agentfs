@@ -1411,14 +1411,16 @@ mod tests {
             0,
         )
         .unwrap();
+        // The timeout also covers the commit made first: long enough for
+        // it on a loaded CI runner (500 ms was not, once).
         let started = Instant::now();
         let report = service
             .handle()
-            .push_now(&[], Duration::from_millis(500))
+            .push_now(&[], Duration::from_secs(2))
             .unwrap();
         let took = started.elapsed();
-        assert!(took >= Duration::from_millis(400), "{took:?}");
-        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert!(took >= Duration::from_millis(1900), "{took:?}");
+        assert!(took < Duration::from_secs(10), "{took:?}");
         assert_eq!(report.committed.unwrap().commits, 1);
         assert!(local_head(&state).is_some());
         assert!(report.remotes.is_empty());
