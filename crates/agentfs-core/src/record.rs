@@ -82,13 +82,31 @@ pub enum Change {
     Symlink { path: RepoPath, target: String },
     /// `path`, and anything recorded beneath it, no longer exists.
     Remove { path: RepoPath },
+    /// Whatever is recorded at and beneath `from` is now at and beneath
+    /// `to`, unchanged, and whatever was recorded at and beneath `to` is
+    /// gone: a directory rename, recorded in O(1) (design §3.1). The tree
+    /// under `to` is reconciled afterwards ([`crate::reconcile`]). Older
+    /// agentfs versions cannot read it: `agentfs flush` before a
+    /// downgrade.
+    Move { from: RepoPath, to: RepoPath },
 }
 
 impl Change {
+    /// The path whose state the change sets: for a move, its destination.
     pub fn path(&self) -> &RepoPath {
         match self {
             Self::Write { path, .. } | Self::Symlink { path, .. } | Self::Remove { path } => path,
+            Self::Move { to, .. } => to,
         }
+    }
+
+    /// Every path the change touches: a move's source and destination.
+    pub fn paths(&self) -> impl Iterator<Item = &RepoPath> {
+        let from = match self {
+            Self::Move { from, .. } => Some(from),
+            _ => None,
+        };
+        from.into_iter().chain(std::iter::once(self.path()))
     }
 
     pub fn pending(&self) -> Option<PendingId> {

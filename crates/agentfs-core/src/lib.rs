@@ -33,6 +33,7 @@ pub mod paths;
 pub mod pending;
 pub mod probe;
 pub mod push;
+pub mod reconcile;
 pub mod record;
 pub mod remote_auth;
 pub mod remote_url;

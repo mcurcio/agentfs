@@ -266,6 +266,11 @@ and write through the mount, so the workload sees the result at once
 - **Upgrading agentfs:** change the image tag; the rollout (Recreate)
   stops the old pod, whose sidecar makes its final commit, and the new
   pod mounts the same volume.
+- **Downgrading agentfs:** a newer version can journal changes an older
+  one cannot read (a directory move): the older one then refuses to open
+  the state area with an error naming `agentfs flush`. Stop the pod
+  normally (its final commit empties the journal), or run `agentfs flush`
+  with the newer image against the state area, before rolling back.
 - **Changing rules or remotes:** edit `config/`, apply; the pod rolls
   (§4 above).
 - **Pushes failing:** [stuck-pushes.md](runbooks/stuck-pushes.md).

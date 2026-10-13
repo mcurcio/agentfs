@@ -642,7 +642,7 @@ whole, consistent groups instead.
   again, or recorded by hand with `agentfs --root <backing> record <path>`. Many programs ignore errors from `close`, so
   watch the alarms.
 - **Alarms** are printed to stderr and exported as telemetry logs (see the
-  README): `PathRefused`, `RecordFailed`, `CommitFailed`, `PushFailed`,
+  README): `PathRefused`, `RecordFailed`, `CommitFailed`, `ReconcileFailed`, `PushFailed`,
   `Diverged`, `RemoteMisconfigured`, `PatchBlocked`, `PatchFetchFailed`,
   `PatchIgnored` (a warning: a stale inbox entry that is never applied).
 - **`patches: blocked at N (<reason>)`** at mount: patch N could not be

@@ -2,7 +2,9 @@
 //!
 //! Each record is framed as `magic | length | crc32 | JSON payload`. A torn or
 //! corrupt frame ends the log: its call never returned, so nothing was
-//! promised about it, and everything after it is discarded on open.
+//! promised about it, and everything after it is discarded on open. An
+//! intact frame this version cannot parse (a newer change kind) is an
+//! error instead, never discarded.
 //!
 //! [`Journal::record`] uses a group commit. The first caller to find no
 //! flush in progress writes every queued record and `fsync`s once; callers
@@ -75,7 +77,7 @@ impl Journal {
             .open(&path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let (records, valid_len) = decode_all(&bytes);
+        let (records, valid_len) = decode_all(&bytes, &path)?;
         let discarded = bytes.len() - valid_len;
         if discarded > 0 {
             file.set_len(valid_len as u64)?;
@@ -287,16 +289,33 @@ pub fn read_records(path: &Path) -> io::Result<(Vec<Record>, u64)> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(e),
     };
-    let (records, valid) = decode_all(&bytes);
+    let (records, valid) = decode_all(&bytes, path)?;
     Ok((records, (bytes.len() - valid) as u64))
 }
 
 /// Decodes frames until the first invalid one. Returns the records and the
 /// length of the valid prefix.
-fn decode_all(bytes: &[u8]) -> (Vec<Record>, usize) {
+///
+/// A frame whose checksum holds but whose record does not parse was written
+/// whole by a newer version (a change this one does not know, such as a
+/// move): it is an error, never a torn tail to discard, so a downgrade
+/// cannot silently drop records. `agentfs flush` with the version that
+/// wrote them commits them first.
+fn decode_all(bytes: &[u8], path: &Path) -> io::Result<(Vec<Record>, usize)> {
     let mut records = Vec::new();
     let mut offset = 0;
     while let Some((record, next)) = decode_one(bytes, offset) {
+        let record = record.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: record at byte {offset} is intact but cannot be read ({e}); it was \
+                     probably written by a newer agentfs: run that version again and \
+                     `agentfs flush` before downgrading",
+                    path.display()
+                ),
+            )
+        })?;
         // Sequence numbers only grow; anything else is corruption.
         if records.last().is_some_and(|r: &Record| r.seq >= record.seq) {
             break;
@@ -304,10 +323,13 @@ fn decode_all(bytes: &[u8]) -> (Vec<Record>, usize) {
         records.push(record);
         offset = next;
     }
-    (records, offset)
+    Ok((records, offset))
 }
 
-fn decode_one(bytes: &[u8], offset: usize) -> Option<(Record, usize)> {
+type Decoded = (Result<Record, serde_json::Error>, usize);
+
+/// The frame at `offset`, `None` if there is no intact one.
+fn decode_one(bytes: &[u8], offset: usize) -> Option<Decoded> {
     let header = bytes.get(offset..offset + HEADER_LEN)?;
     if header[..4] != MAGIC {
         return None;
@@ -322,8 +344,7 @@ fn decode_one(bytes: &[u8], offset: usize) -> Option<(Record, usize)> {
     if crc32fast::hash(payload) != crc {
         return None;
     }
-    let record = serde_json::from_slice(payload).ok()?;
-    Some((record, start + len))
+    Some((serde_json::from_slice(payload), start + len))
 }
 
 /// Atomically replaces the journal with `records`, returning the new file
@@ -559,6 +580,31 @@ mod tests {
     }
 
     #[test]
+    fn an_intact_record_this_version_cannot_read_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let (j, _) = Journal::open(&path, 0, no_hook()).unwrap();
+        j.record(draft("a")).unwrap();
+        drop(j);
+        // A change kind from a newer version, framed whole.
+        let payload = br#"{"seq":9,"trigger":"close","caller":{"uid":1,"gid":2,"pid":3},"time_ms":5,"changes":[{"op":"teleport","path":"a"}]}"#;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC);
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+        frame.extend_from_slice(payload);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&frame).unwrap();
+        drop(file);
+        let len = fs::metadata(&path).unwrap().len();
+        let e = read_records(&path).unwrap_err();
+        assert!(e.to_string().contains("agentfs flush"), "{e}");
+        let e = Journal::open(&path, 0, no_hook()).map(|_| ()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::metadata(&path).unwrap().len(), len, "never truncated");
+    }
+
+    #[test]
     fn records_from_before_operations_still_decode() {
         // A frame as journals written before `operation` existed hold it.
         let payload = br#"{"seq":7,"trigger":"close","caller":{"uid":1,"gid":2,"pid":3},"time_ms":5,"changes":[{"op":"remove","path":"a"}]}"#;
@@ -567,7 +613,7 @@ mod tests {
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
         frame.extend_from_slice(payload);
-        let (records, valid) = decode_all(&frame);
+        let (records, valid) = decode_all(&frame, Path::new("j")).unwrap();
         assert_eq!(valid, frame.len());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].seq, 7);

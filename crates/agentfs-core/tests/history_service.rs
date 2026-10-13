@@ -73,7 +73,7 @@ struct Service {
 
 impl Service {
     fn start(env: &Env) -> Self {
-        let (mut recorder, committer, _) = volume::open(
+        let (recorder, committer, _) = volume::open(
             &env.state,
             &env.tree,
             service_context(),
@@ -1569,4 +1569,47 @@ fn a_listener_comes_back_after_the_service_restarts() {
     fronts.settle().unwrap();
     assert_eq!(*hooks.settles.lock().unwrap(), 1);
     listener.stop();
+}
+
+#[test]
+fn a_fronts_directory_move_is_one_record_reconciled_by_the_service() {
+    // A front journals a directory rename as one move; the service
+    // reconciles the tree beneath it before committing it (design §3.1).
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    assert!(a.recorder.history_client().unwrap().supports("move"));
+    close(&env, &a.recorder, "d/x", "x").unwrap().unwrap();
+    close(&env, &a.recorder, "d/e/y", "y").unwrap().unwrap();
+    service.committer.commit_pending().unwrap();
+    std::fs::write(env.tree.join("d/untracked"), "u").unwrap();
+    std::fs::rename(env.tree.join("d"), env.tree.join("m")).unwrap();
+    let outcome = a
+        .recorder
+        .record_move(
+            Trigger::Rename,
+            CALLER,
+            RepoPath::new("d").unwrap(),
+            RepoPath::new("m").unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(outcome, volume::MoveOutcome::Journaled(_)));
+    // The service tracks the moved paths at once.
+    let tracked = service.recorder.tracked_query(&[
+        RepoPath::new("m/e/y").unwrap(),
+        RepoPath::new("d/x").unwrap(),
+    ]);
+    assert_eq!(tracked, [true, false]);
+    let before = service.commits().len();
+    let report = service.committer.commit_pending().unwrap();
+    assert_eq!(report.commits, 1);
+    assert_eq!(service.commits().len(), before + 1);
+    assert_eq!(
+        service.commits().last().unwrap().1.as_deref(),
+        Some("pod-a")
+    );
+    assert_eq!(service.head_blob("m/x").unwrap(), b"x");
+    assert_eq!(service.head_blob("m/e/y").unwrap(), b"y");
+    assert_eq!(service.head_blob("m/untracked").unwrap(), b"u");
+    assert_eq!(service.head_blob("d/x"), None);
 }

@@ -494,7 +494,7 @@ fn directory_renames_move_every_file() {
 }
 
 #[test]
-fn large_directory_renames_are_chunked() {
+fn a_directory_rename_is_one_record() {
     let fx = Fx::with(OpsConfig {
         granularity_ns: 0,
         chunk: 3,
@@ -505,13 +505,90 @@ fn large_directory_renames_are_chunked() {
     }
     fx.history();
     fx.rename("big", "big2", 0).unwrap();
-    assert_eq!(fx.backlog(), 3, "8 files in chunks of 3");
+    assert_eq!(fx.backlog(), 1, "one move, whatever is beneath");
     let history = fx.history();
     assert_eq!(history.len(), 8);
     assert!(
         history.keys().all(|k| k.starts_with("big2/")),
         "{history:?}"
     );
+}
+
+#[test]
+fn large_directory_exchanges_are_chunked() {
+    let fx = Fx::with(OpsConfig {
+        granularity_ns: 0,
+        chunk: 3,
+    });
+    fx.mkdir("a");
+    fx.mkdir("b");
+    for i in 0..5 {
+        fx.put(&format!("a/f{i}"), "a");
+    }
+    for i in 0..3 {
+        fx.put(&format!("b/g{i}"), "b");
+    }
+    fx.history();
+    fx.rename("a", "b", RenameFlags::EXCHANGE.bits()).unwrap();
+    assert_eq!(fx.backlog(), 3, "8 files in chunks of 3");
+    let history = fx.history();
+    assert_eq!(history.len(), 8);
+    assert!(history.keys().filter(|k| k.starts_with("b/f")).count() == 5);
+    assert!(history.keys().filter(|k| k.starts_with("a/g")).count() == 3);
+}
+
+#[test]
+fn a_write_in_flight_across_a_directory_rename_lands_at_the_new_path() {
+    let fx = Fx::new();
+    fx.mkdir("d");
+    fx.put("d/x", "1");
+    fx.history();
+    let fh = fx.open("d/x", O_WRONLY | O_APPEND);
+    fx.ops.write(fh, 1, b"2", C).unwrap();
+    fx.rename("d", "m", 0).unwrap();
+    fx.close(fh);
+    assert_eq!(fx.history(), map(&[("m/x", file("12"))]));
+}
+
+#[test]
+fn directory_renames_follow_the_rules_at_the_new_path() {
+    let fx = Fx::new();
+    let exclude = fx.state().git().join("info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, "ignored/\n").unwrap();
+    // Rules are read when the volume opens.
+    let dir = {
+        let Fx { dir, .. } = fx;
+        dir
+    };
+    let fx = Fx::open_on(
+        dir,
+        OpsConfig {
+            granularity_ns: 0,
+            chunk: RENAME_CHUNK,
+        },
+    );
+    fx.mkdir("src");
+    fx.put("src/a", "a");
+    fx.mkdir("ignored");
+    fx.put("ignored/b", "b");
+    assert_eq!(fx.history(), map(&[("src/a", file("a"))]));
+    // Into an ignored directory: dropped, as recording it there would.
+    fx.rename("src", "ignored/src", 0).unwrap();
+    assert_eq!(fx.history(), map(&[]));
+    // An ignored directory renamed to where nothing ignores it: recorded.
+    fx.rename("ignored", "kept", 0).unwrap();
+    assert_eq!(
+        fx.history(),
+        map(&[("kept/b", file("b")), ("kept/src/a", file("a"))])
+    );
+    // Within an ignored tree nothing is journaled at all.
+    fx.mkdir("kept/ignored");
+    fx.mkdir("kept/ignored/x");
+    fx.put("kept/ignored/x/c", "c");
+    fx.history();
+    fx.rename("kept/ignored/x", "kept/ignored/y", 0).unwrap();
+    assert_eq!(fx.backlog(), 0);
 }
 
 #[test]

@@ -470,6 +470,8 @@ Metrics (design §13):
 | `agentfs.history_service.resyncs` | counter | |
 | `agentfs.fuse.create_as_caller_fallbacks` | counter | |
 | `agentfs.fuse.racy_rechecks` | counter | `outcome` |
+| `agentfs.reconcile.records` | counter | |
+| `agentfs.reconcile.failures` | counter | |
 
 Spans are `agentfs.record`, `agentfs.commit` and `agentfs.push`, carrying
 journal sequence numbers and commit ids. Every alarm is also a log record

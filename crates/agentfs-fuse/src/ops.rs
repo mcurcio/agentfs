@@ -68,7 +68,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Instant;
 
 use agentfs_core::record::{Caller, Origin, Trigger};
-use agentfs_core::volume::{Recorded, Recorder, VolumeError};
+use agentfs_core::volume::{MoveOutcome, Recorded, Recorder, VolumeError};
 use fuser::{Errno, FileAttr, FileType, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
 
@@ -1410,6 +1410,24 @@ impl Ops {
             .rename(parent, name, newparent, newname, exchange);
         // Open fsync-class handles find their group again (design §8).
         self.renames.fetch_add(1, Ordering::AcqRel);
+        let is_dir = Kind::from_mode(mode_of(&src)) == Kind::Dir;
+        if is_dir && !exchange {
+            // One move, O(1) in the paths beneath (design §3.1), journaled
+            // before any other boundary can name a path beneath either
+            // directory: the names stay locked until it is durable.
+            match self
+                .boundary
+                .record_move(Trigger::Rename, caller, &src_path, &dst_path)
+            {
+                Ok(MoveOutcome::Journaled(_) | MoveOutcome::Nothing) => return Ok(()),
+                Ok(MoveOutcome::Unsupported) => {}
+                Err(_) => {
+                    drop(names);
+                    self.boundary.queue_repair([src_path, dst_path], caller);
+                    return Err(Errno::EIO);
+                }
+            }
+        }
         drop(names);
 
         let _names = self.read_names();
@@ -1418,7 +1436,7 @@ impl Ops {
                 vec![src_path.clone(), dst_path.clone()],
                 vec![src_path.clone(), dst_path.clone()],
             )
-        } else if Kind::from_mode(mode_of(&src)) == Kind::Dir {
+        } else if is_dir {
             (
                 vec![src_path.clone(), dst_path.clone()],
                 vec![dst_path.clone()],

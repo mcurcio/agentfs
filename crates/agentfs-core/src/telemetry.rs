@@ -70,6 +70,8 @@ pub mod names {
     pub const HISTORY_SERVICE_RESYNCS: &str = "agentfs.history_service.resyncs";
     pub const FUSE_CREATE_AS_CALLER_FALLBACKS: &str = "agentfs.fuse.create_as_caller_fallbacks";
     pub const FUSE_RACY_RECHECKS: &str = "agentfs.fuse.racy_rechecks";
+    pub const RECONCILE_RECORDS: &str = "agentfs.reconcile.records";
+    pub const RECONCILE_FAILURES: &str = "agentfs.reconcile.failures";
     /// Recorded by the binary, which owns the exporters (design §13).
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -122,6 +124,8 @@ struct Inner {
     commit_count: Counter<u64>,
     commit_failures: Counter<u64>,
     repack_failures: Counter<u64>,
+    reconcile_failures: Counter<u64>,
+    reconcile_records: Counter<u64>,
     push_failures: Counter<u64>,
     rejected_paths: Counter<u64>,
     front_round_trip: Histogram<f64>,
@@ -187,6 +191,18 @@ impl Telemetry {
                 names::REPACK_FAILURES,
                 "{failure}",
                 "Periodic repacks of the history that failed",
+            ),
+            reconcile_failures: counter(
+                names::RECONCILE_FAILURES,
+                "{move}",
+                "Moved trees given up on after repeated failures to reconcile them (design \
+                 §3.1); each also raises ReconcileFailed",
+            ),
+            reconcile_records: counter(
+                names::RECONCILE_RECORDS,
+                "{record}",
+                "Records made by reconciling moved trees: files the rules decide differently \
+                 at the new path, or changed around the move (design §3.1)",
             ),
             push_failures: counter(
                 names::PUSH_FAILURES,
@@ -448,6 +464,13 @@ impl Telemetry {
         }
     }
 
+    /// Counts a record made by reconciling a moved tree (design §3.1).
+    pub fn reconcile_record(&self) {
+        if let Some(inner) = &self.inner {
+            inner.reconcile_records.add(1, &[]);
+        }
+    }
+
     /// Counts one boundary that found a file unchanged but racy (design
     /// §3.1): `skipped` if its bytes were proven recorded, else `recorded`.
     pub fn racy_recheck(&self, skipped: bool) {
@@ -633,6 +656,7 @@ impl EventSink for TelemetrySink {
                 .add(1, &[KeyValue::new("trigger", trigger.as_str())]),
             Event::CommitFailed { .. } => inner.commit_failures.add(1, &[]),
             Event::RepackFailed { .. } => inner.repack_failures.add(1, &[]),
+            Event::ReconcileFailed { .. } => inner.reconcile_failures.add(1, &[]),
             Event::PushFailed {
                 remote,
                 kind,
@@ -691,6 +715,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::RecordFailed { .. } => "agentfs.record_failed",
         Event::CommitFailed { .. } => "agentfs.commit_failed",
         Event::RepackFailed { .. } => "agentfs.repack_failed",
+        Event::ReconcileFailed { .. } => "agentfs.reconcile_failed",
         Event::PushFailed { .. } => "agentfs.push_failed",
         Event::Diverged { .. } => "agentfs.diverged",
         Event::RemoteMisconfigured { .. } => "agentfs.remote_misconfigured",
@@ -738,6 +763,11 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             out.push(("agentfs.backlog", AnyValue::Int(*backlog as i64)));
         }
         Event::RepackFailed { error } => out.push(("agentfs.error", s(error))),
+        Event::ReconcileFailed { from, to, error } => {
+            out.push(("agentfs.from", s(from.as_str())));
+            out.push(("agentfs.path", s(to.as_str())));
+            out.push(("agentfs.error", s(error)));
+        }
         Event::PushFailed {
             remote,
             kind,

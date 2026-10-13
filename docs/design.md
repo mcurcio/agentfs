@@ -213,7 +213,7 @@ so a crash never leaves a stale lock.
 | Event (FUSE op) | Recorded | Before return? |
 |---|---|---|
 | `close` (FLUSH) of a file changed since its last record | its content and executable bit | yes |
-| `rename` | source removed, destination added | yes |
+| `rename` | source removed, destination added (a directory: one move, reconciled before commit) | yes |
 | `unlink`, `rmdir` | removal | yes |
 | `link`, `symlink` | new path | yes |
 | `setattr` changing size (`truncate`) or the executable bit | new content or mode | yes |
@@ -278,15 +278,45 @@ Rules that make this precise:
   record time. A hard link made before the mount and never looked up is not
   known, so a change through another name is not recorded at it.
 - **Renames.** A file rename records the source's removal and the
-  destination's content in one record. A directory rename records the
-  removal of both names and then every regular file and symlink under the
-  destination, never inside a `.git` directory; past 4096 files it is
-  several consecutive records, the first carrying the removals, holding one
-  descriptor per file while each is made (the daemon raises its open-file
-  limit at start). `RENAME_EXCHANGE` removes both names and records both
-  trees. Renaming one hard link over another of the same inode changes
-  nothing and records nothing. The cost is O(files) in the synchronous
-  step; a tree-move change type is a follow-up.
+  destination's content in one record. A directory rename is journaled as
+  one *move* change (`{op: "move", from, to}`), under the mount's name lock
+  so no other boundary can name a path beneath either directory until it
+  is durable: history carries whatever it holds beneath the source to the
+  destination, replacing what was there, in O(1) in the synchronous step
+  (the tracked set is a tree of path components). A move is journaled only
+  if something is tracked beneath either name or the rules do not exclude
+  everything beneath the destination, so a rename inside `node_modules`
+  records nothing.
+  Each move leaves a *reconcile duty*: before each commit pass the commit
+  loop walks the destination in the backing tree (never inside a `.git`
+  directory, never through a symlink) and records, in records of at most
+  4096 changes as the move's caller and pod, what recording every file
+  there would have decided differently: moved files the rules exclude at
+  their new path are removed (renamed into an ignored directory or a
+  nested repository), files there that were not tracked and that the
+  rules record are added (an ignored directory renamed to where nothing
+  ignores it), tracked paths no longer in the tree are removed, and a
+  tracked file changed within 60 s of the move whose freeze stamp is not
+  the one last journaled at its path is recorded as it is (another
+  front's write that raced the rename and was skipped as gone, or a change
+  made outside the mount). Records are committed only below the oldest
+  move not yet reconciled, and a move's commit includes the records that
+  reconcile it when they are the same pod's, so history never shows a
+  moved tree without its corrections. Duties are rebuilt at open from the
+  uncommitted journal, so a crash before reconciling redoes it (records
+  hold absolute state). A duty that fails 5 times raises
+  `reconcile_failed` and stops holding commits back; the move is
+  committed as journaled. A move into a git directory (§5) commits as the
+  source's removal. Without the backing tree (`agentfs flush` offline)
+  moves are committed as journaled.
+  `RENAME_EXCHANGE` of directories, a rename to or from a path the mount
+  never records (inside `.git`, an invalid name), and a front whose
+  history service predates the `move` feature still record both names'
+  removal and then every regular file and symlink under the destination;
+  past 4096 files it is several consecutive records, the first carrying
+  the removals, holding one descriptor per file while each is made (the
+  daemon raises its open-file limit at start). Renaming one hard link over
+  another of the same inode changes nothing and records nothing.
 - **`mknod` of a regular file** has no FLUSH to follow, so it is recorded at
   once (trigger `close`). FIFOs, sockets and devices are never recorded.
 - **RELEASE** of the last handle that could write records the inode if it
@@ -348,8 +378,15 @@ returned call is as durable as in single-process mode.
 
 - Entries hold **absolute state** (path → pending content and mode, or a
   removal), never deltas, so replaying an entry twice gives the same result.
+  The one exception is a directory move (§3.1), which is why a commit
+  skips entries at or below the head's `Agentfs-Seq`.
 - **Torn entries.** A torn final entry, which fails its checksum, is discarded.
   Its call never returned, so nothing was promised.
+- **Unknown entries.** An intact entry (its checksum holds) that does not
+  parse was written by a newer agentfs, for example a `move`: opening or
+  reading the journal fails with an error naming `agentfs flush`, and
+  nothing is discarded. Run `agentfs flush` with the newer version before
+  downgrading.
 - **Commits record the last journal sequence number they include,** as a trailer
   (`Agentfs-Seq: <n>`).
 - **Truncation.** The journal and `pending/` are truncated only after the commit
@@ -1728,6 +1765,8 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.history_service.resyncs` | counter | Paths the history service recorded again as the backing tree has them, after a front's change it could not order (identical stamps from two slots, a late removal or symlink, §14.1) |
 | `agentfs.fuse.create_as_caller_fallbacks` | counter | Objects a root daemon created as itself and then gave to the caller, because creating as the caller was refused (a device node, or a caller whose groups are unknown) or could not be set up (§6) |
 | `agentfs.fuse.racy_rechecks` | counter, per outcome | Boundaries that would have recorded a file again only because its last record was racy: `skipped` when its bytes were that record's frozen copy, still the last state journaled at its path, else `recorded` (§3.1) |
+| `agentfs.reconcile.records` | counter | Records made reconciling moved directories (§3.1) |
+| `agentfs.reconcile.failures` | counter | Moved directories given up on after 5 failed reconciliations (`reconcile_failed`, §3.1) |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
@@ -1772,6 +1811,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PathRefused` | A path fails the checks of §3.4 or §5, at record or commit time |
 | `RecordFailed` | The synchronous step fails (§3.5) |
 | `CommitFailed` | Turning records into a commit fails; the records stay journaled and are retried |
+| `ReconcileFailed` | Reconciling a moved directory (§3.1) failed 5 times, with both paths and the error: the move is committed as journaled, and files beneath the destination that recording the tree would have added, dropped or recorded again differ from the tree until each changes again or is recorded with `agentfs record` |
 | `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7), the head, the last pushed commit, the consecutive failure count and the next retry; stage `queue` for the patch remote's status, applied and inbox refs (§11.3), which never counts against the branch |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
@@ -1874,6 +1914,9 @@ Messages are frames of a u32 big-endian length and a JSON body (at most
   journaled at `path` is still the write of the front's frozen copy
   `copy`, so a RELEASE may skip re-recording it (§3.1). No `fsync`;
   feature `still_last`, and a front never asks a service without it.
+- A `Record` may carry one `move` change (a directory rename, §3.1);
+  feature `move`. A front whose service lacks it records the tree
+  instead, and a move is never part of an fsync-class group.
 
 A front keeps a pool of synchronous connections (one request at a time on
 each, up to 64 idle ones kept for at most 20 s, each checked with a
@@ -2988,6 +3031,8 @@ runner.
 | One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `serve-history`, `record`, `flush`, and `push`, `restore` and `revert` in direct mode (when no daemon answers on the control socket); exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
 | FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
 | Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close. A boundary that would record a file again only because its last record was racy compares it with that record's frozen copy, kept open, and skips the record if the bytes are equal and the copy is still the last state journaled at the path (2026-10-13; §3.1, §19.2 item 4) |
+| Directory renames | One `move` change in the synchronous step, then reconciled on the commit thread before the move is committed: excluded paths dropped, newly recorded paths added, and files changed within 60 s of the move whose stamp is not the last journaled recorded again; the move and its reconciliation share a commit (2026-10-13; §3.1) |
+| Journal compatibility | A newer change kind in an intact journal frame is an error for an older binary, never a torn tail: flush before downgrading (2026-10-13; §3.3) |
 | `.git` paths | An exact `.git` component that is a git directory or gitfile is skipped without an alarm; any other `.git`, look-alikes and invalid names raise `PathRefused` (§5) |
 | Layout | The state area, backing tree and mount point are separate; credentials are never under the backing tree. `mount` refuses otherwise (§17.1) |
 | Passthrough | `auto` by default: used when the kernel and privileges allow, off with the reason reported otherwise, and switched off per inode (not per mount) if registering its backing file fails; `on` fails the mount instead (§17.1) |
@@ -3045,7 +3090,7 @@ runner.
 | Unorderable front changes (2026-10-13) | Identical stamps from two slots, a removal of a path present again, and a symlink whose target the tree no longer has are journaled, then resynced: the service records the path as the backing tree has it, as its own `sweep` record under the path claim (`agentfs.history_service.resyncs`). Chosen over comparing frozen copies' content, which cannot order two states the file no longer holds (§14.1) |
 | Creating as the caller (2026-10-13) | A daemon with `CAP_SETUID`/`CAP_SETGID`/`CAP_CHOWN`/`CAP_FOWNER` creates as the caller by switching the worker thread's fsuid, fsgid and supplementary groups (read from `/proc/<pid>/status`) for the one creating call; refusals fall back to create-then-chown (`agentfs.fuse.create_as_caller_fallbacks`). The CSI node plugin runs with `hostPID: true` so callers' pids, and so their groups, are visible (§6, §14.1, §14.2) |
 | Repair origins (2026-10-13) | A repair keeps the pod that failed to record it; the service trusts an origin a front names only on `sweep` records whose committer renders, and journals the front's own otherwise (§3.5, §14.1) |
-| Protocol evolution (2026-10-13) | Protocol stays version 1: additions are optional fields and new variants only, and the service lists what it supports in `Welcome.features` (`stamps`, `repair_origin`, `listen`, `still_last`) (§14.1) |
+| Protocol evolution (2026-10-13) | Protocol stays version 1: additions are optional fields and new variants only, and the service lists what it supports in `Welcome.features` (`stamps`, `repair_origin`, `listen`, `still_last`, `move`) (§14.1) |
 | Locks across fronts | POSIX and BSD locks are per FUSE mount, so not shared between pods; a lock-coordinated database (SQLite, the `fsync` class) must be written from one pod (§14) |
 | CSI driver shape | One binary, `agentfs-csi` (`--mode` controller, node or all), in the agentfs image; tonic over a Unix socket, the spec compiled without `protoc`; the node plugin spawns the `agentfs` binary for the service and each front instead of linking FUSE in-process (§14.2, §17.2) |
 | CSI volumes | PersistentVolumes only (no inline ephemeral volumes); `<basePath>/<pv>/{backing,state,csi.json}`; basePath one filesystem seen by the controller and every node; size recorded, not enforced (§14.2) |

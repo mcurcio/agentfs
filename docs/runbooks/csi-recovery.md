@@ -93,6 +93,11 @@ Per node:
 5. Restart containers without `HostToContainer` propagation, then
    `kubectl uncordon <node>`.
 
+To roll back to an older image, do the same: the final commits in step 3
+empty every journal. A state area whose journal still holds a change the
+older version cannot read (a directory move) fails to open with an error
+naming `agentfs flush`; run it there with the newer image, then retry.
+
 ## A node reboot
 
 Nothing to do in the common case: the records under

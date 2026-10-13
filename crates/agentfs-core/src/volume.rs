@@ -42,6 +42,7 @@ use crate::nested;
 use crate::operations::{ActorBusy, OperationGuard, Operations};
 use crate::paths::{PathError, RepoPath};
 use crate::pending::{PendingId, PendingStore};
+use crate::reconcile::{self, Duties, Duty};
 use crate::record::{
     Caller, Change, Draft, Operation, OperationKind, Origin, PatchAuthor, Record, Trigger,
 };
@@ -253,6 +254,18 @@ pub enum VolumeError {
     OtherBranch { found: String, wanted: String },
 }
 
+/// What [`Recorder::record_move`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveOutcome {
+    /// Journaled as this record.
+    Journaled(u64),
+    /// Nothing to record: nothing tracked moved, and nothing beneath the
+    /// destination is recorded.
+    Nothing,
+    /// The history service cannot take a move: record the tree instead.
+    Unsupported,
+}
+
 /// One path's new state, as the FUSE layer sees it.
 #[derive(Debug, Clone)]
 pub enum Input {
@@ -457,8 +470,23 @@ pub fn open(
         .map_err(HistoryError::from)?;
     let tracked = Tracked::from_tree(head_tree.as_ref()).map_err(HistoryError::from)?;
     drop(head_tree);
-    for change in uncommitted.iter().flat_map(|r| &r.draft.changes) {
-        tracked.apply(change);
+    let duties = Arc::new(Duties::new());
+    for record in &uncommitted {
+        for change in &record.draft.changes {
+            tracked.apply(change);
+            // A move journaled before the crash is reconciled again
+            // (design §3.1).
+            if let Change::Move { from, to } = change {
+                duties.add(Duty {
+                    seq: record.seq,
+                    from: from.clone(),
+                    to: to.clone(),
+                    caller: record.draft.caller,
+                    origin: record.draft.origin.clone(),
+                    at_ms: record.draft.time_ms,
+                });
+            }
+        }
     }
 
     let operations = Arc::new(Operations::default());
@@ -486,10 +514,13 @@ pub fn open(
         events: events.clone(),
         telemetry: telemetry.clone(),
         reclaim: Arc::default(),
-        stamps: None,
+        stamps: Arc::default(),
         last_writes: Arc::default(),
+        duties: duties.clone(),
     };
     let committer = Committer {
+        reconciler: Some(recorder.clone()),
+        duties,
         history,
         journal,
         operations,
@@ -542,8 +573,9 @@ pub fn open_front(
         events,
         telemetry: telemetry.clone(),
         reclaim: Arc::default(),
-        stamps: None,
+        stamps: Arc::default(),
         last_writes: Arc::default(),
+        duties: Arc::default(),
     })
 }
 
@@ -660,10 +692,12 @@ pub struct Recorder {
     reclaim: Arc<RwLock<()>>,
     /// The last journaled freeze stamp of each path, in the history
     /// service ([`Recorder::enable_stamps`], design §14.1).
-    stamps: Option<Arc<StampBook>>,
+    stamps: Arc<std::sync::OnceLock<StampBook>>,
     /// The frozen copy of the last write journaled at each recently
     /// written path, where this process journals (design §3.1).
     last_writes: Arc<LastWrites>,
+    /// Moves journaled here and not yet reconciled (design §3.1).
+    duties: Arc<Duties>,
 }
 
 /// Where a [`Recorder`]'s records go.
@@ -934,11 +968,12 @@ impl Recorder {
                 if let Backend::Local { tracked, .. } = &self.backend {
                     for change in &changes {
                         tracked.apply(change);
-                        self.last_writes.journaled(change.path(), change.pending());
+                        let stamp = stamps.iter().find(|s| &s.path == change.path());
+                        self.note_journaled(change, stamp.map(|s| s.stamp));
                     }
                     // This process's own writes (a restore the service
                     // applies) order fronts' records too (design §14.1).
-                    if let Some(book) = &self.stamps
+                    if let Some(book) = self.stamps.get()
                         && seq.is_some()
                     {
                         for s in stamps {
@@ -1123,7 +1158,9 @@ impl Recorder {
             ));
         }
         let _reclaim = self.reclaim.read().unwrap_or_else(PoisonError::into_inner);
-        let _claim = self.claims.claim(draft.changes.iter().map(Change::path));
+        let _claim = self
+            .claims
+            .claim(draft.changes.iter().flat_map(Change::paths));
         for change in &draft.changes {
             if let Change::Write { path, pending, .. } = change {
                 if pending.slot() != slot {
@@ -1152,6 +1189,18 @@ impl Recorder {
         let tree = self.rules.tree();
         for change in std::mem::take(&mut draft.changes) {
             let decision = match &change {
+                Change::Move { .. } if draft.atomic => {
+                    return Err(VolumeError::FrontRecord(
+                        "a move cannot be part of an fsync-class group".into(),
+                    ));
+                }
+                Change::Move { from, to } => {
+                    if self.move_needed(tracked, from, to)? {
+                        Decision::Record
+                    } else {
+                        Decision::Skip(SkipReason::Untracked)
+                    }
+                }
                 Change::Remove { path } => {
                     if tracked.contains_or_under(path) {
                         // Another front made the path again since this
@@ -1267,13 +1316,35 @@ impl Recorder {
         let paths: Vec<RepoPath> = draft.changes.iter().map(|c| c.path().clone()).collect();
         let changes = draft.changes.clone();
         let trigger = draft.trigger;
-        match journal.record(draft) {
+        let moves: Vec<Duty> = changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::Move { from, to } => Some(Duty {
+                    seq: 0,
+                    from: from.clone(),
+                    to: to.clone(),
+                    caller: draft.caller,
+                    origin: Some(origin.clone()),
+                    at_ms: draft.time_ms,
+                }),
+                _ => None,
+            })
+            .collect();
+        let mut adding = (!moves.is_empty()).then(|| self.duties.adding());
+        let journaled = journal.record(draft);
+        if let (Ok(seq), Some(adding)) = (&journaled, adding.as_mut()) {
+            for duty in moves {
+                adding.add(Duty { seq: *seq, ..duty });
+            }
+        }
+        drop(adding);
+        match journaled {
             Ok(seq) => {
                 for change in &changes {
                     tracked.apply(change);
-                    self.last_writes.journaled(change.path(), change.pending());
+                    self.note_journaled(change, stamp_of.get(change.path()).map(|s| **s));
                 }
-                if let Some(book) = &self.stamps {
+                if let Some(book) = self.stamps.get() {
                     for change in &changes {
                         if let Change::Write { path, .. } = change
                             && let Some(stamp) = stamp_of.get(path)
@@ -1329,10 +1400,10 @@ impl Recorder {
     /// Keeps the freeze stamp of the last write journaled at each path, so
     /// [`Recorder::sequence`] skips a front's write frozen before it
     /// (design §14.1). The history service turns it on before it serves;
-    /// clones made before share nothing of it.
-    pub fn enable_stamps(&mut self) {
+    /// every clone shares it.
+    pub fn enable_stamps(&self) {
         if matches!(self.backend, Backend::Local { .. }) {
-            self.stamps = Some(Arc::new(StampBook::new()));
+            let _ = self.stamps.set(StampBook::new());
         }
     }
 
@@ -1360,7 +1431,7 @@ impl Recorder {
         {
             return Judged::Skip(SkipReason::Gone);
         }
-        let Some(book) = self.stamps.as_ref() else {
+        let Some(book) = self.stamps.get() else {
             return Judged::Journal;
         };
         match book.judge(path, stamp, slot, now) {
@@ -1403,6 +1474,199 @@ impl Recorder {
     /// service.
     pub fn last_write_is(&self, path: &RepoPath, copy: PendingId) -> bool {
         matches!(self.backend, Backend::Local { .. }) && self.last_writes.is_last(path, copy)
+    }
+
+    /// Notes a journaled change in [`LastWrites`].
+    fn note_journaled(&self, change: &Change, stamp: Option<FreezeStamp>) {
+        match change {
+            Change::Move { from, to } => self.last_writes.moved(from, to),
+            _ => self
+                .last_writes
+                .journaled(change.path(), change.pending(), stamp),
+        }
+    }
+
+    /// Records the rename of directory `from` to `to` as one
+    /// [`Change::Move`] (design §3.1): O(1) in the number of paths beneath
+    /// it. The tree beneath `to` is reconciled by the commit loop before
+    /// the move is committed. Nothing is journaled when nothing is tracked
+    /// at or beneath either path and the rules exclude everything beneath
+    /// `to` (an ignored or nested directory).
+    ///
+    /// The caller must hold off every other boundary that could name a
+    /// path beneath either directory until this returns (the FUSE layer
+    /// holds its rename lock), so no record of the old names lands after
+    /// the move. A front whose history service cannot take a move gets
+    /// [`MoveOutcome::Unsupported`] and records the tree itself.
+    pub fn record_move(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        from: RepoPath,
+        to: RepoPath,
+    ) -> Result<MoveOutcome, VolumeError> {
+        let start = Instant::now();
+        let paths = vec![from.clone(), to.clone()];
+        let result = self.record_move_inner(trigger, caller, from, to);
+        if let Err(e) = &result {
+            self.events.emit(Event::RecordFailed {
+                trigger,
+                paths,
+                error: e.to_string(),
+            });
+        }
+        self.telemetry.record_duration(trigger, start.elapsed());
+        result
+    }
+
+    fn record_move_inner(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        from: RepoPath,
+        to: RepoPath,
+    ) -> Result<MoveOutcome, VolumeError> {
+        let draft = |from: RepoPath, to: RepoPath| Draft {
+            trigger,
+            caller,
+            time_ms: now_ms(),
+            changes: vec![Change::Move { from, to }],
+            operation: None,
+            atomic: false,
+            origin: None,
+        };
+        match &self.backend {
+            Backend::Front { client } => {
+                if !client.supports("move") {
+                    return Ok(MoveOutcome::Unsupported);
+                }
+                let recorded = client.record(draft(from, to), Vec::new())?;
+                Ok(recorded
+                    .seq
+                    .map_or(MoveOutcome::Nothing, MoveOutcome::Journaled))
+            }
+            Backend::Local { journal, tracked } => {
+                let _claim = self.claims.claim([&from, &to]);
+                if !self.move_needed(tracked, &from, &to)? {
+                    return Ok(MoveOutcome::Nothing);
+                }
+                let draft = draft(from.clone(), to.clone());
+                let at_ms = draft.time_ms;
+                let change = draft.changes[0].clone();
+                let mut adding = self.duties.adding();
+                let seq = journal.record(draft)?;
+                adding.add(Duty {
+                    seq,
+                    from,
+                    to,
+                    caller,
+                    origin: None,
+                    at_ms,
+                });
+                tracked.apply(&change);
+                self.note_journaled(&change, None);
+                Ok(MoveOutcome::Journaled(seq))
+            }
+        }
+    }
+
+    /// Whether a move of `from` to `to` changes anything history could
+    /// hold.
+    fn move_needed(
+        &self,
+        tracked: &Tracked,
+        from: &RepoPath,
+        to: &RepoPath,
+    ) -> Result<bool, VolumeError> {
+        Ok(tracked.contains_or_under(from)
+            || tracked.contains_or_under(to)
+            || !self.rules.excludes_dir(to)?)
+    }
+
+    /// Reconciles the tree beneath a move's destination (design §3.1,
+    /// [`crate::reconcile`]): records what recording every file beneath it
+    /// would have decided differently from moving what history held.
+    /// Returns the last record made, if any.
+    pub fn reconcile(&self, duty: &Duty) -> Result<Option<u64>, VolumeError> {
+        use std::os::unix::fs::MetadataExt;
+        let Backend::Local { tracked, .. } = &self.backend else {
+            return Ok(None);
+        };
+        let tree = self.rules.tree();
+        let leaves = reconcile::leaves(tree, &duty.to).map_err(|e| {
+            VolumeError::Io(io::Error::new(
+                e.kind(),
+                format!("walking {}: {e}", duty.to),
+            ))
+        })?;
+        let recent_ns = i64::try_from(
+            u128::from(
+                duty.at_ms
+                    .saturating_sub(reconcile::RECENT.as_millis() as u64),
+            ) * 1_000_000,
+        )
+        .unwrap_or(i64::MAX);
+        let mut inputs = Vec::new();
+        let mut seen = HashSet::new();
+        for (path, meta) in leaves {
+            seen.insert(path.as_str().to_owned());
+            if tracked.contains(&path) {
+                // Excluded at its new path: recording the tree would not
+                // have recorded it.
+                if self.rules.decide(&path, false)? != Decision::Record {
+                    inputs.push(Input::Remove { path });
+                    continue;
+                }
+                let ctime_ns = meta.ctime().saturating_mul(1_000_000_000) + meta.ctime_nsec();
+                if ctime_ns < recent_ns {
+                    continue;
+                }
+                // Changed around the move: unless its journaled state is
+                // the one it has, record it as it is.
+                if meta.is_file()
+                    && self.last_writes.stamp_of(&path) == Some(FreezeStamp::from_metadata(&meta))
+                {
+                    continue;
+                }
+            } else if self.rules.decide(&path, false)? != Decision::Record {
+                continue;
+            }
+            if let Some(input) = backing_input(tree, &path) {
+                inputs.push(input);
+            }
+        }
+        // Moved paths no longer in the tree: recording it would not have
+        // brought them along.
+        for path in tracked.under(&duty.to) {
+            if !seen.contains(&path)
+                && let Ok(path) = RepoPath::new(path)
+            {
+                inputs.push(Input::Remove { path });
+            }
+        }
+        let mut last = None;
+        while !inputs.is_empty() {
+            let rest = inputs.split_off(inputs.len().min(reconcile::CHUNK));
+            let chunk = std::mem::replace(&mut inputs, rest);
+            let recorded = self.record_inner(
+                Trigger::Rename,
+                duty.caller,
+                chunk,
+                None,
+                false,
+                duty.origin.clone(),
+            )?;
+            if recorded.seq.is_some() {
+                self.telemetry.reconcile_record();
+                last = recorded.seq;
+            }
+        }
+        Ok(last)
+    }
+
+    /// The moves journaled here and not yet reconciled.
+    pub fn duties(&self) -> &Arc<Duties> {
+        &self.duties
     }
 
     pub fn tracked_query(&self, paths: &[RepoPath]) -> Vec<bool> {
@@ -1711,6 +1975,10 @@ enum FrontDecision {
 
 /// Turns recorded changes into commits.
 pub struct Committer {
+    /// Reconciles moved trees before each commit pass (design §3.1): the
+    /// recorder of the journal it commits.
+    reconciler: Option<Recorder>,
+    duties: Arc<Duties>,
     history: History,
     journal: Arc<Journal>,
     operations: Arc<Operations>,
@@ -1777,8 +2045,8 @@ impl Committer {
     /// Commits every durable record, grouping records whose times fall
     /// within the configured commit window into one commit.
     pub fn commit_pending(&self) -> Result<CommitReport, VolumeError> {
-        let records = self.journal.uncommitted();
-        let groups = group_by_window(&records, self.window_ms());
+        let records = self.reconciled_records();
+        let groups = self.groups(&records, self.window_ms());
         self.commit_groups(&records, &groups)
     }
 
@@ -1790,9 +2058,9 @@ impl Committer {
     /// record is later than `now_ms` (the clock stepped back) counts as
     /// settled, so a clock step cannot stall commits.
     pub fn commit_settled(&self, now_ms: u64) -> Result<CommitReport, VolumeError> {
-        let records = self.journal.uncommitted();
+        let records = self.reconciled_records();
         let window_ms = self.window_ms();
-        let mut groups = group_by_window(&records, window_ms);
+        let mut groups = self.groups(&records, window_ms);
         if let Some(last) = groups.last() {
             let first = last[0].draft.time_ms;
             let settled = match &last[0].draft.operation {
@@ -1813,6 +2081,64 @@ impl Committer {
     /// `agentfs push` against a running daemon commits first (§2.3).
     pub fn commit_now(&self) -> Result<CommitReport, VolumeError> {
         self.commit_settled(u64::MAX)
+    }
+
+    /// Carries out the open reconcile duties ([`crate::reconcile`]), then
+    /// returns the uncommitted records below the oldest move still not
+    /// reconciled: a move is never committed without the records that
+    /// reconcile it.
+    fn reconciled_records(&self) -> Vec<Record> {
+        self.reconcile_duties();
+        let mut records = self.journal.uncommitted();
+        if let Some(gate) = self.duties.gate() {
+            records.retain(|r| r.seq < gate);
+        }
+        records
+    }
+
+    fn reconcile_duties(&self) {
+        let open = self.duties.open();
+        if open.is_empty() {
+            return;
+        }
+        let reconciler = self.reconciler.as_ref().filter(|_| self.tree_known);
+        for duty in open {
+            // Without the backing tree (an offline flush) there is nothing
+            // to reconcile against: the move is committed as journaled.
+            let Some(reconciler) = reconciler else {
+                self.duties.finished(duty.seq, None);
+                continue;
+            };
+            match reconciler.reconcile(&duty) {
+                Ok(last) => self.duties.finished(duty.seq, last),
+                Err(e) => {
+                    let failures = self.duties.failed(duty.seq);
+                    eprintln!(
+                        "reconciling the move of {} to {} failed (attempt {failures}): {e}",
+                        duty.from, duty.to
+                    );
+                    if failures >= reconcile::MAX_FAILURES {
+                        self.events.emit(Event::ReconcileFailed {
+                            from: duty.from.clone(),
+                            to: duty.to.clone(),
+                            error: e.to_string(),
+                        });
+                        self.duties.finished(duty.seq, None);
+                    }
+                    // Later duties wait behind this one anyway.
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The commit groups of `records`: [`group_by_window`], with a move's
+    /// group extended through the records reconciling it when they are
+    /// the same origin's and no operation's.
+    fn groups<'r>(&self, records: &'r [Record], window_ms: u64) -> Vec<&'r [Record]> {
+        merge_moves(records, group_by_window(records, window_ms), |seq| {
+            self.duties.reconciled_through(seq)
+        })
     }
 
     fn window_ms(&self) -> u64 {
@@ -1962,6 +2288,7 @@ impl Committer {
         }
         if let Some(seq) = report.last_seq {
             self.journal.truncate_through(seq)?;
+            self.duties.committed_through(seq);
             let done = records
                 .iter()
                 .take_while(|r| r.seq <= seq)
@@ -2015,6 +2342,7 @@ impl Committer {
                     )?,
                     Change::Symlink { path, target } => self.checks.check_symlink(path, target),
                     Change::Remove { .. } => None,
+                    Change::Move { .. } => None,
                 };
                 if let Some(reason) = refusal {
                     refused_any = true;
@@ -2032,6 +2360,10 @@ impl Committer {
                     && self.under_git_dir(change.path(), &mut git_dirs)?
                 {
                     rechecked.git_dir_dropped += 1;
+                    // A tree moved into one leaves history all the same.
+                    if let Change::Move { from, .. } = change {
+                        kept.push(Change::Remove { path: from });
+                    }
                     continue;
                 }
                 kept.push(change);
@@ -2206,6 +2538,48 @@ fn group_by_window(records: &[Record], window_ms: u64) -> Vec<&[Record]> {
         groups.push(&records[start..]);
     }
     groups
+}
+
+/// Joins each group holding a move with the groups after it, up to the
+/// last record reconciling the move (`through`), while they are the same
+/// origin's and none is an operation's. `groups` split `records` in order.
+fn merge_moves<'r>(
+    records: &'r [Record],
+    groups: Vec<&'r [Record]>,
+    through: impl Fn(u64) -> Option<u64>,
+) -> Vec<&'r [Record]> {
+    let mut out = Vec::with_capacity(groups.len());
+    let (mut start, mut end) = (0, 0);
+    let mut reach: Option<u64> = None;
+    for group in groups {
+        if end > start {
+            let first = &records[start];
+            let joins = reach.is_some_and(|r| records[end - 1].seq < r)
+                && first.draft.operation.is_none()
+                && group[0].draft.operation.is_none()
+                && group[0].draft.origin == first.draft.origin;
+            if !joins {
+                out.push(&records[start..end]);
+                start = end;
+                reach = None;
+            }
+        }
+        for record in group {
+            let moves = record
+                .draft
+                .changes
+                .iter()
+                .any(|c| matches!(c, Change::Move { .. }));
+            if moves && let Some(last) = through(record.seq) {
+                reach = Some(reach.map_or(last, |r| r.max(last)));
+            }
+        }
+        end += group.len();
+    }
+    if end > start {
+        out.push(&records[start..end]);
+    }
+    out
 }
 
 /// [`Refusal::MaxSize`] if `bytes` is over the path's `agentfs.maxSize`.
@@ -5023,5 +5397,215 @@ mod tests {
             assert!(!state.pending().join(copy).exists());
         }
         assert_eq!(rec.journal_for_tests().backlog(), 0);
+    }
+    // ---- directory moves (design §3.1) ----
+
+    fn path(s: &str) -> RepoPath {
+        RepoPath::new(s).unwrap()
+    }
+
+    fn tree_volume() -> (tempfile::TempDir, StateDir, PathBuf, Recorder, Committer) {
+        let (dir, state) = setup();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let (rec, com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
+        (dir, state, tree, rec, com)
+    }
+
+    #[test]
+    fn a_directory_move_is_one_record_and_one_commit() {
+        let (_dir, _state, tree, rec, com) = tree_volume();
+        close_in_tree(&rec, &tree, "d/a", "a");
+        close_in_tree(&rec, &tree, "d/e/b", "b");
+        close_in_tree(&rec, &tree, "m/old", "old");
+        com.commit_pending().unwrap();
+        fs::remove_dir_all(tree.join("m")).unwrap();
+        fs::rename(tree.join("d"), tree.join("m")).unwrap();
+        let outcome = rec
+            .record_move(Trigger::Rename, CALLER, path("d"), path("m"))
+            .unwrap();
+        assert!(matches!(outcome, MoveOutcome::Journaled(_)));
+        assert_eq!(com.backlog(), 1);
+        assert!(rec.tracked_query(&[path("m/e/b")])[0]);
+        assert!(!rec.tracked_query(&[path("d/a")])[0]);
+        let report = com.commit_pending().unwrap();
+        assert_eq!((report.records, report.commits), (1, 1));
+        assert_eq!(tree_paths(&com), ["m/a", "m/e/b"]);
+        assert_eq!(blob(&com, "m/e/b"), b"b");
+        let message = commits(&com).pop().unwrap().2;
+        assert!(message.starts_with("rename: d -> m\n"), "{message}");
+    }
+
+    #[test]
+    fn a_move_is_committed_with_the_records_that_reconcile_it() {
+        let (_dir, _state, tree, rec, com) = tree_volume();
+        close_in_tree(&rec, &tree, "d/a", "1");
+        close_in_tree(&rec, &tree, "d/same", "s");
+        com.commit_pending().unwrap();
+        let before = commits(&com).len();
+        // Changed outside the mount, and a file never recorded.
+        fs::write(tree.join("d/a"), "22").unwrap();
+        fs::write(tree.join("d/new"), "n").unwrap();
+        fs::rename(tree.join("d"), tree.join("m")).unwrap();
+        rec.record_move(Trigger::Rename, CALLER, path("d"), path("m"))
+            .unwrap();
+        let report = com.commit_pending().unwrap();
+        assert_eq!(report.commits, 1, "the move and its reconciliation");
+        assert_eq!(commits(&com).len(), before + 1);
+        assert_eq!(tree_paths(&com), ["m/a", "m/new", "m/same"]);
+        assert_eq!(blob(&com, "m/a"), b"22");
+        assert_eq!(com.backlog(), 0);
+        // A record reconciling a move: nothing to do the second time.
+        assert_eq!(com.commit_pending().unwrap().records, 0);
+    }
+
+    #[test]
+    fn an_unreconciled_move_is_reconciled_after_a_crash() {
+        let (dir, state, tree, rec, com) = tree_volume();
+        close_in_tree(&rec, &tree, "d/a", "a");
+        com.commit_pending().unwrap();
+        fs::rename(tree.join("d"), tree.join("m")).unwrap();
+        rec.record_move(Trigger::Rename, CALLER, path("d"), path("m"))
+            .unwrap();
+        fs::write(tree.join("m/late"), "l").unwrap();
+        drop((rec, com));
+        let (_rec, com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["m/a", "m/late"]);
+        drop(dir);
+    }
+
+    #[test]
+    fn moves_of_nothing_tracked_into_ignored_trees_journal_nothing() {
+        let (dir, state) = setup();
+        fs::write(state.git().join("info/exclude"), "node_modules/\n").unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(tree.join("node_modules/x")).unwrap();
+        fs::write(tree.join("node_modules/x/f"), "f").unwrap();
+        let (rec, com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
+        fs::rename(tree.join("node_modules/x"), tree.join("node_modules/y")).unwrap();
+        let outcome = rec
+            .record_move(
+                Trigger::Rename,
+                CALLER,
+                path("node_modules/x"),
+                path("node_modules/y"),
+            )
+            .unwrap();
+        assert_eq!(outcome, MoveOutcome::Nothing);
+        assert_eq!(com.backlog(), 0);
+        // Out of the ignored tree: recorded by reconciling the move.
+        fs::rename(tree.join("node_modules/y"), tree.join("y")).unwrap();
+        rec.record_move(Trigger::Rename, CALLER, path("node_modules/y"), path("y"))
+            .unwrap();
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["y/f"]);
+    }
+
+    #[test]
+    fn a_move_into_a_git_directory_removes_the_tree() {
+        let (_dir, _state, tree, rec, com) = tree_volume();
+        close_in_tree(&rec, &tree, "d/a", "a");
+        com.commit_pending().unwrap();
+        make_head(&tree, "r.git");
+        fs::rename(tree.join("d"), tree.join("r.git/d")).unwrap();
+        rec.record_move(Trigger::Rename, CALLER, path("d"), path("r.git/d"))
+            .unwrap();
+        com.commit_pending().unwrap();
+        assert!(tree_paths(&com).is_empty(), "{:?}", tree_paths(&com));
+    }
+
+    #[test]
+    fn a_fronts_write_skipped_as_gone_across_a_move_is_reconciled() {
+        let (dir, state) = setup();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let (rec, com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
+        rec.enable_stamps();
+        close_in_tree(&rec, &tree, "d/a", "1");
+        com.commit_pending().unwrap();
+        // Front A writes d/a and freezes it; front B renames d before A's
+        // record reaches the service.
+        fs::write(tree.join("d/a"), "22").unwrap();
+        let stamp = FreezeStamp::from_metadata(&fs::metadata(tree.join("d/a")).unwrap());
+        let write = front_write(&state, dir.path(), 3, "d/a", "22");
+        fs::rename(tree.join("d"), tree.join("m")).unwrap();
+        let mv = Change::Move {
+            from: path("d"),
+            to: path("m"),
+        };
+        let moved = rec
+            .sequence(&pod("pod-b"), 4, front_draft(vec![mv], false), &[])
+            .unwrap();
+        assert!(moved.seq.is_some());
+        let stamps = [PathStamp {
+            path: path("d/a"),
+            stamp,
+        }];
+        let late = rec
+            .sequence(&pod("pod-a"), 3, front_draft(vec![write], false), &stamps)
+            .unwrap();
+        assert_eq!(late.seq, None, "gone at its old path");
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["m/a"]);
+        assert_eq!(blob(&com, "m/a"), b"22", "the write is not lost");
+        assert_eq!(commits(&com).last().unwrap().0, "pod-b");
+    }
+
+    #[test]
+    fn a_move_cannot_join_an_atomic_group() {
+        let (dir, state) = setup();
+        let (rec, _com, _) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        let mv = Change::Move {
+            from: path("d"),
+            to: path("m"),
+        };
+        assert!(matches!(
+            rec.sequence(&pod("pod-a"), 3, front_draft(vec![mv], true), &[]),
+            Err(VolumeError::FrontRecord(_))
+        ));
+    }
+
+    #[test]
+    fn merge_moves_joins_a_moves_group_through_its_reconciliation() {
+        let rec = |seq, origin: Option<Origin>, moves: bool| Record {
+            seq,
+            draft: Draft {
+                trigger: Trigger::Rename,
+                caller: CALLER,
+                time_ms: seq * 1000,
+                changes: vec![if moves {
+                    Change::Move {
+                        from: path("a"),
+                        to: path("b"),
+                    }
+                } else {
+                    Change::Remove { path: path("x") }
+                }],
+                operation: None,
+                atomic: false,
+                origin,
+            },
+        };
+        let records = vec![
+            rec(1, None, false),
+            rec(2, None, true),
+            rec(3, None, false),
+            rec(4, None, false),
+            rec(5, Some(pod("p")), false),
+        ];
+        let lens = |through: Option<u64>| -> Vec<usize> {
+            merge_moves(&records, group_by_window(&records, 0), |s| {
+                (s == 2).then_some(through).flatten()
+            })
+            .iter()
+            .map(|g| g.len())
+            .collect()
+        };
+        assert_eq!(lens(None), [1, 1, 1, 1, 1]);
+        assert_eq!(lens(Some(4)), [1, 3, 1]);
+        // Never across origins.
+        assert_eq!(lens(Some(5)), [1, 3, 1]);
     }
 }

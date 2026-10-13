@@ -234,6 +234,9 @@ impl History {
     ///
     /// Dropped changes are listed in [`Committed::refused`], for
     /// `PathRefused` alarms with stage `commit`.
+    ///
+    /// Records at or below the head's `Agentfs-Seq` are already in history
+    /// and are skipped.
     pub fn commit(
         &self,
         records: &[Record],
@@ -245,6 +248,21 @@ impl History {
     ) -> Result<Committed, HistoryError> {
         let last = records.last().expect("commit needs at least one record");
         let head = self.head()?;
+        // Records already in history (a crash between a commit and the
+        // journal's truncation) are not applied again: a move is not
+        // idempotent.
+        let done = head
+            .as_ref()
+            .and_then(|h| seq_from_message(h.message_raw().unwrap_or_default()));
+        let records = &records[records.partition_point(|r| done.is_some_and(|d| r.seq <= d))..];
+        if records.is_empty() {
+            return Ok(Committed {
+                commit: None,
+                last_seq: last.seq,
+                refused: Vec::new(),
+                lfs_as_blobs: 0,
+            });
+        }
         let head_tree = head.as_ref().map(|h| h.tree()).transpose()?;
         let managed = match &head_tree {
             Some(tree) => attributes::managed_paths(&self.repo, tree)?,
@@ -293,7 +311,7 @@ impl History {
                     lfs_as_blobs += 1;
                 }
                 self.apply(&mut index, change, pending, lfs, lfs_as_blob)?;
-                written.note(change, lfs_as_blob);
+                written.note(change, lfs_as_blob, &managed);
             }
             if fallback == Fallback::KeepHeadAttributes {
                 break (index, refused, lfs_as_blobs);
@@ -412,6 +430,7 @@ impl History {
                 make_room(index, path)?;
                 index.add(&entry(path, blob, MODE_SYMLINK))?;
             }
+            Change::Move { from, to } => move_all(index, from, to)?,
         }
         Ok(())
     }
@@ -545,7 +564,7 @@ struct Written {
 impl Written {
     /// Notes `change`; with `lfs_as_blob`, an LFS write was stored as a
     /// blob.
-    fn note(&mut self, change: &Change, lfs_as_blob: bool) {
+    fn note(&mut self, change: &Change, lfs_as_blob: bool, managed: &BTreeSet<RepoPath>) {
         match change {
             Change::Write {
                 path,
@@ -560,8 +579,75 @@ impl Written {
                 self.other.insert(path.clone());
             }
             Change::Remove { .. } => {}
+            Change::Move { from, to } => self.note_move(from, to, managed),
         }
     }
+
+    /// A move carries each LFS path beneath `from` to its place beneath `to`,
+    /// managed line and all (a pointer without its line would check out as
+    /// a plain file), and what was managed beneath `to` stops being.
+    fn note_move(&mut self, from: &RepoPath, to: &RepoPath, managed: &BTreeSet<RepoPath>) {
+        let at_or_under = |p: &RepoPath, dir: &RepoPath| {
+            p == dir
+                || p.as_str()
+                    .strip_prefix(dir.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        };
+        let moved: Vec<RepoPath> = managed
+            .iter()
+            .filter(|p| !self.other.contains(*p))
+            .chain(self.lfs.iter())
+            .filter(|p| at_or_under(p, from))
+            .filter_map(|p| reroot(p, from, to))
+            .collect();
+        let gone: Vec<RepoPath> = managed
+            .iter()
+            .chain(self.lfs.iter())
+            .chain(self.other.iter())
+            .filter(|p| at_or_under(p, to) || at_or_under(p, from))
+            .cloned()
+            .collect();
+        for p in gone {
+            self.lfs.remove(&p);
+            self.other.insert(p);
+        }
+        for p in moved {
+            self.other.remove(&p);
+            self.lfs.insert(p);
+        }
+    }
+}
+
+/// `path`, at or beneath `from`, at its place beneath `to`.
+pub(crate) fn reroot(path: &RepoPath, from: &RepoPath, to: &RepoPath) -> Option<RepoPath> {
+    let rest = path.as_str().strip_prefix(from.as_str())?;
+    if rest.is_empty() {
+        return Some(to.clone());
+    }
+    let rest = rest.strip_prefix('/')?;
+    RepoPath::new(format!("{to}/{rest}")).ok()
+}
+
+/// Moves every entry at and beneath `from` to its place beneath `to`,
+/// replacing whatever was at and beneath `to` (design §3.1): same blob,
+/// same mode.
+fn move_all(index: &mut Index, from: &RepoPath, to: &RepoPath) -> Result<(), git2::Error> {
+    let prefix = format!("{from}/");
+    let moved: Vec<IndexEntry> = index
+        .iter()
+        .filter(|e| e.path == from.as_str().as_bytes() || e.path.starts_with(prefix.as_bytes()))
+        .collect();
+    remove_all(index, from)?;
+    remove_all(index, to)?;
+    make_room(index, to)?;
+    for mut e in moved {
+        let rest = &e.path[from.as_str().len()..];
+        let mut path = to.as_str().as_bytes().to_vec();
+        path.extend_from_slice(rest);
+        e.path = path;
+        index.add(&e)?;
+    }
+    Ok(())
 }
 
 /// How far [`History::commit`] has fallen back because the managed block
@@ -782,6 +868,9 @@ fn message(records: &[Record], context: &Context) -> String {
     let operation = records.first().and_then(|r| r.draft.operation.as_ref());
     let summary = match (operation, changes.as_slice()) {
         (Some(op), _) => op.summary.clone(),
+        (None, [(r, Change::Move { from, to })]) => {
+            format!("{}: {from} -> {to}", r.draft.trigger.as_str())
+        }
         (None, [(r, c)]) => format!("{}: {}", r.draft.trigger.as_str(), c.path()),
         (None, _) => format!("{} changes", changes.len()),
     };
@@ -793,6 +882,7 @@ fn message(records: &[Record], context: &Context) -> String {
                 Change::Write { path, .. } => format!("write   {path}\n"),
                 Change::Symlink { path, target } => format!("symlink {path} -> {target}\n"),
                 Change::Remove { path } => format!("remove  {path}\n"),
+                Change::Move { from, to } => format!("move    {from} -> {to}\n"),
             };
             out.push_str(&line);
         }
@@ -1408,6 +1498,64 @@ mod tests {
         let r = f.record(Trigger::Unlink, vec![remove("stays.bin")]);
         f.commit(&[r]);
         assert_eq!(f.read(".gitattributes"), None);
+    }
+
+    fn mv(from: &str, to: &str) -> Change {
+        Change::Move {
+            from: RepoPath::new(from).unwrap(),
+            to: RepoPath::new(to).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_move_carries_the_tree_and_its_managed_lines() {
+        let mut f = Fixture::new();
+        let changes = vec![
+            f.write_lfs("d/big.bin", b"1111"),
+            f.write("d/e/small", b"s", true),
+            f.write_lfs("x/old.bin", b"2222"),
+            f.write("dx", b"sibling", false),
+        ];
+        let r = f.record(Trigger::Close, changes);
+        f.commit(&[r]);
+        let big = f.read("d/big.bin").unwrap();
+        let r = f.record(Trigger::Rename, vec![mv("d", "x")]);
+        let c = f.commit(std::slice::from_ref(&r));
+        assert!(c.commit.is_some());
+        assert_eq!(f.read("x/big.bin").unwrap(), big);
+        assert_eq!(f.read("x/e/small").unwrap(), (b"s".to_vec(), 0o100755));
+        assert_eq!(f.read("x/old.bin"), None, "the destination is replaced");
+        assert_eq!(f.read("d/big.bin"), None);
+        assert_eq!(f.read("dx").unwrap().0, b"sibling");
+        assert_eq!(
+            f.read(".gitattributes").unwrap().0,
+            attributes_with(b"", &["x/big.bin"])
+        );
+        let msg = f
+            .history
+            .head()
+            .unwrap()
+            .unwrap()
+            .message()
+            .unwrap()
+            .to_owned();
+        assert!(msg.starts_with("rename: d -> x\n"), "{msg}");
+        // Replayed after a crash: nothing changes.
+        assert_eq!(f.commit(&[r]).commit, None);
+        // Moved and changed in one commit; a move of nothing clears the
+        // destination; a move into a new parent replaces a file there.
+        let w = f.write("y/e/small", b"t", false);
+        let r1 = f.record(Trigger::Rename, vec![mv("x", "y")]);
+        let r2 = f.record(Trigger::Rename, vec![w, mv("none", "dx")]);
+        let r3 = f.record(Trigger::Rename, vec![mv("y/e", "z/e")]);
+        f.commit(&[r1, r2, r3]);
+        assert_eq!(f.read("z/e/small").unwrap().0, b"t");
+        assert_eq!(f.read("dx"), None);
+        assert!(f.read("y/big.bin").is_some());
+        assert_eq!(
+            f.read(".gitattributes").unwrap().0,
+            attributes_with(b"", &["y/big.bin"])
+        );
     }
 
     #[test]

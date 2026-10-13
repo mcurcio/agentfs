@@ -40,7 +40,7 @@ use agentfs_core::fsync_class::GroupMembers;
 use agentfs_core::nested;
 use agentfs_core::paths::PathError;
 use agentfs_core::record::{Caller, Origin, Trigger};
-use agentfs_core::volume::{Input, Recorded, Recorder, VolumeError};
+use agentfs_core::volume::{Input, MoveOutcome, Recorded, Recorder, VolumeError};
 
 use crate::names::{Class, classify};
 
@@ -216,6 +216,59 @@ impl Boundary {
             .record_as(trigger, caller, inputs, Some(origin.clone()))?
             .seq
             .is_some())
+    }
+
+    /// Records the rename of directory `from` to `to` as one move
+    /// ([`Recorder::record_move`], design §3.1). Repairs queued beneath
+    /// `from` are queued again beneath `to`, where the files now are.
+    /// [`MoveOutcome::Unsupported`] when either path is not one to record
+    /// (inside a `.git`, or not a valid name) or the history service
+    /// cannot take moves: the caller records the tree instead.
+    pub fn record_move(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        from: &[u8],
+        to: &[u8],
+    ) -> Result<MoveOutcome, VolumeError> {
+        let (Class::Record(from_path), Class::Record(to_path)) = (classify(from), classify(to))
+        else {
+            return Ok(MoveOutcome::Unsupported);
+        };
+        let outcome = self
+            .recorder
+            .record_move(trigger, caller, from_path, to_path)?;
+        if outcome != MoveOutcome::Unsupported {
+            self.reroot_repairs(from, to);
+        }
+        Ok(outcome)
+    }
+
+    /// Queues again beneath `to` every repair queued at or beneath `from`.
+    /// The entries at `from` stay: their repair records the removal.
+    fn reroot_repairs(&self, from: &[u8], to: &[u8]) {
+        let mut repairs = self.lock();
+        let moved: Vec<(Vec<u8>, Entry)> = repairs
+            .queue
+            .iter()
+            .filter_map(|(path, entry)| {
+                let rest = path.strip_prefix(from)?;
+                (rest.is_empty() || rest[0] == b'/').then(|| {
+                    let mut new = to.to_vec();
+                    new.extend_from_slice(rest);
+                    (new, entry.clone())
+                })
+            })
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        for (path, mut entry) in moved {
+            entry.generation = repairs.next;
+            repairs.next += 1;
+            repairs.queue.insert(path, entry);
+        }
+        repairs.save();
     }
 
     /// Records an fsync-class group's members as one all-or-nothing record

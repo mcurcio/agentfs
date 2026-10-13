@@ -394,6 +394,31 @@ impl Rules {
     /// As in git, once a directory is excluded nothing beneath it can be
     /// re-included, so each directory on the way down is checked first.
     pub fn ignored(&self, path: &RepoPath) -> Result<Option<SkipReason>, RulesError> {
+        self.ignored_as(path, false)
+    }
+
+    /// Whether nothing untracked beneath directory `dir` could be recorded
+    /// (design §3.1): `dir` or a directory above it is ignored, or lies in a
+    /// nested repository. Rules that name files beneath it are not looked
+    /// at, so `false` only means something might be recorded.
+    pub fn excludes_dir(&self, dir: &RepoPath) -> Result<bool, RulesError> {
+        let child = RepoPath::new(format!("{dir}/probe")).map_err(|e| RulesError::Io {
+            path: self.tree.join(dir.as_str()),
+            source: io::Error::new(io::ErrorKind::InvalidInput, e.to_string()),
+        })?;
+        if self.nested_ancestor(&child)?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.ignored_as(&child, true)?.is_some())
+    }
+
+    /// [`Rules::ignored`]; with `dirs_only`, the last component is not
+    /// looked at.
+    fn ignored_as(
+        &self,
+        path: &RepoPath,
+        dirs_only: bool,
+    ) -> Result<Option<SkipReason>, RulesError> {
         let components: Vec<&str> = path.components().collect();
         let mut tree_search = if self.options.respect_tree_rules {
             let mut search = gix_ignore::Search::default();
@@ -409,6 +434,9 @@ impl Rules {
             }
             prefix.push_str(component);
             let is_dir = i + 1 < components.len();
+            if dirs_only && !is_dir {
+                break;
+            }
             let rela = prefix.as_bytes().as_bstr();
 
             if let Some(m) = self.operator_ignore.pattern_matching_relative_path(

@@ -73,7 +73,7 @@ pub(crate) fn serve(
     };
     let session = Session::start(state, pod)?;
     let events = session.events.clone();
-    let (mut recorder, committer, recovery) = session.open(state, &backing, pod)?;
+    let (recorder, committer, recovery) = session.open(state, &backing, pod)?;
     let commit_window = committer.history().settings().commit_window;
     // Orders fronts' records that race for one path (design §14.1).
     recorder.enable_stamps();

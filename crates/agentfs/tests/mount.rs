@@ -2435,7 +2435,7 @@ fn restores_through_the_service_reach_every_front() {
     service.stop();
 }
 
-// ---- design §3.1: one record per close, ----
+// ---- design §3.1: one record per close, directory moves ----
 
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
@@ -2471,4 +2471,38 @@ fn a_close_is_recorded_once() {
     );
     let want: Vec<(&str, Item)> = want.iter().map(|(p, i)| (p.as_str(), i.clone())).collect();
     v.expect(&tree(&want));
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn directory_renames_are_one_move() {
+    let v = Vol::new("mvdir");
+    let exclude = v.state().join("git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, "ignored/\n").unwrap();
+    let m = v.mount(&[]);
+    v.sh("mkdir -p d/e ignored && printf a > d/a && printf b > d/e/b && printf i > ignored/i");
+    v.expect(&tree(&[("d/a", f("a")), ("d/e/b", f("b"))]));
+    v.sh("mv d m");
+    v.expect(&tree(&[("m/a", f("a")), ("m/e/b", f("b"))]));
+    let (_, message) = v.head();
+    assert!(message.starts_with("rename: d -> m\n"), "{message}");
+    // Into an ignored directory: dropped. Out of one: recorded.
+    v.sh("mv m ignored/m");
+    v.expect(&tree(&[]));
+    v.sh("mv ignored kept");
+    v.expect(&tree(&[
+        ("kept/i", f("i")),
+        ("kept/m/a", f("a")),
+        ("kept/m/e/b", f("b")),
+    ]));
+    // A file held open across its directory's rename is recorded at the
+    // new path when it is closed.
+    v.sh("exec 3>>kept/m/a; mv kept k2; printf 2 >&3; exec 3>&-");
+    v.expect(&tree(&[
+        ("k2/i", f("i")),
+        ("k2/m/a", f("a2")),
+        ("k2/m/e/b", f("b")),
+    ]));
+    m.stop();
 }

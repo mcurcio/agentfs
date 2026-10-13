@@ -222,30 +222,39 @@ fn judge(last: &Entry, incoming: &FreezeStamp, slot: u16, now: Option<&FreezeSta
     }
 }
 
-/// How long [`LastWrites`] remembers a path's last frozen copy: RELEASE
-/// follows the last close at once, so far longer than it ever waits.
-pub const LAST_WRITE_HORIZON: Duration = Duration::from_secs(60);
+/// How long [`LastWrites`] remembers a path's last write: RELEASE follows
+/// the last close at once, and a move's reconciliation looks back
+/// [`crate::reconcile::RECENT`] from the move; both far less than this.
+pub const LAST_WRITE_HORIZON: Duration = Duration::from_secs(120);
 
 /// The most paths [`LastWrites`] holds; past it, it forgets everything
 /// (a forgotten path only costs one record more).
 const LAST_WRITE_CAP: usize = 1 << 16;
 
-/// The frozen copy of the last change journaled at each recently written
-/// path (design §3.1): what lets RELEASE skip re-recording a file whose
-/// close was just recorded, when the bytes it holds are that copy's. Kept
-/// by whoever journals (a single-process daemon, or the history service
-/// for its fronts); any later change at the path, or above or below it,
-/// forgets it, so [`LastWrites::is_last`] is true only while the path's
-/// last journaled state is that copy. Forgetting is always safe: the
-/// caller then records again.
+/// The last write journaled at each recently written path: its frozen
+/// copy and the stamp taken before the freeze. Kept by whoever journals (a
+/// single-process daemon, or the history service for its fronts). It lets
+/// a RELEASE skip re-recording a file whose close was just recorded
+/// ([`LastWrites::is_last`], design §3.1), and a move's reconciliation
+/// skip files whose journaled state is the one they have
+/// ([`LastWrites::stamp_of`]). Any later change at the path, or above or
+/// below it, forgets it; a move carries it along. Forgetting is always
+/// safe: the caller then records again.
 #[derive(Default)]
 pub struct LastWrites {
     inner: Mutex<LastInner>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Last {
+    copy: PendingId,
+    stamp: Option<FreezeStamp>,
+    at: Instant,
+}
+
 #[derive(Default)]
 struct LastInner {
-    last: BTreeMap<RepoPath, (PendingId, Instant)>,
+    last: BTreeMap<RepoPath, Last>,
     pruned: Option<Instant>,
 }
 
@@ -255,16 +264,39 @@ impl LastWrites {
     }
 
     /// A change at `path` was journaled: `Some(copy)` for a write of that
-    /// frozen copy, `None` for anything else (a symlink, a removal).
-    /// Entries above and below `path` are forgotten: their paths changed
-    /// too.
-    pub fn journaled(&self, path: &RepoPath, copy: Option<PendingId>) {
+    /// frozen copy (frozen after `stamp` was taken), `None` for anything
+    /// else (a symlink, a removal). Entries above and below `path` are
+    /// forgotten: their paths changed too.
+    pub fn journaled(&self, path: &RepoPath, copy: Option<PendingId>, stamp: Option<FreezeStamp>) {
         let now = Instant::now();
         let mut inner = self.lock();
         inner.prune(now);
         inner.forget_around(path);
         if let Some(copy) = copy {
-            inner.last.insert(path.clone(), (copy, now));
+            inner.last.insert(
+                path.clone(),
+                Last {
+                    copy,
+                    stamp,
+                    at: now,
+                },
+            );
+        }
+    }
+
+    /// A move of `from` to `to` was journaled: what was noted at and
+    /// beneath `to` is forgotten, and what was noted at and beneath `from`
+    /// is now at its place beneath `to`.
+    pub fn moved(&self, from: &RepoPath, to: &RepoPath) {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.prune(now);
+        let moved = inner.forget_around(from);
+        inner.forget_around(to);
+        for (path, last) in moved {
+            if let Some(path) = crate::history::reroot(&path, from, to) {
+                inner.last.insert(path, last);
+            }
         }
     }
 
@@ -273,7 +305,17 @@ impl LastWrites {
         self.lock()
             .last
             .get(path)
-            .is_some_and(|(c, at)| *c == copy && at.elapsed() < LAST_WRITE_HORIZON)
+            .is_some_and(|l| l.copy == copy && l.at.elapsed() < LAST_WRITE_HORIZON)
+    }
+
+    /// The freeze stamp of the last write journaled at `path`, if it is
+    /// remembered.
+    pub fn stamp_of(&self, path: &RepoPath) -> Option<FreezeStamp> {
+        self.lock()
+            .last
+            .get(path)
+            .filter(|l| l.at.elapsed() < LAST_WRITE_HORIZON)
+            .and_then(|l| l.stamp)
     }
 
     /// How many paths are held (for tests).
@@ -297,7 +339,7 @@ impl LastInner {
             .is_none_or(|p| now.duration_since(p) >= PRUNE_EVERY)
         {
             self.last
-                .retain(|_, (_, at)| now.duration_since(*at) < LAST_WRITE_HORIZON);
+                .retain(|_, l| now.duration_since(l.at) < LAST_WRITE_HORIZON);
             self.pruned = Some(now);
         }
         if self.last.len() >= LAST_WRITE_CAP {
@@ -305,16 +347,20 @@ impl LastInner {
         }
     }
 
-    /// Forgets `path`, its ancestors and everything below it.
-    pub(crate) fn forget_around(&mut self, path: &RepoPath) {
+    /// Forgets `path`, its ancestors and everything below it, returning
+    /// what was at and below it.
+    fn forget_around(&mut self, path: &RepoPath) -> Vec<(RepoPath, Last)> {
         let s = path.as_str();
-        self.last.remove(path);
         for (i, b) in s.bytes().enumerate() {
             if b == b'/'
                 && let Ok(ancestor) = RepoPath::new(&s[..i])
             {
                 self.last.remove(&ancestor);
             }
+        }
+        let mut gone = Vec::new();
+        if let Some(last) = self.last.remove(path) {
+            gone.push((path.clone(), last));
         }
         let below: Vec<RepoPath> = self
             .last
@@ -328,8 +374,11 @@ impl LastInner {
             .cloned()
             .collect();
         for p in below {
-            self.last.remove(&p);
+            if let Some(last) = self.last.remove(&p) {
+                gone.push((p, last));
+            }
         }
+        gone
     }
 }
 
@@ -503,29 +552,47 @@ mod tests {
         let last = LastWrites::new();
         let p = |s: &str| RepoPath::new(s).unwrap();
         let (a, b, c) = (PendingId(1), PendingId(2), PendingId(3));
-        last.journaled(&p("d/f"), Some(a));
+        last.journaled(&p("d/f"), Some(a), None);
         assert!(last.is_last(&p("d/f"), a));
         assert!(!last.is_last(&p("d/f"), b), "another copy");
         assert!(!last.is_last(&p("d/g"), a), "another path");
         // A later write of the path replaces it.
-        last.journaled(&p("d/f"), Some(b));
+        last.journaled(&p("d/f"), Some(b), None);
         assert!(!last.is_last(&p("d/f"), a));
         assert!(last.is_last(&p("d/f"), b));
         // A removal forgets it.
-        last.journaled(&p("d/f"), None);
+        last.journaled(&p("d/f"), None, None);
         assert!(!last.is_last(&p("d/f"), b));
         // A change of an ancestor forgets everything below it, but not
         // siblings that only share a prefix.
-        last.journaled(&p("d/f"), Some(a));
-        last.journaled(&p("d-x"), Some(c));
-        last.journaled(&p("d"), None);
+        last.journaled(&p("d/f"), Some(a), None);
+        last.journaled(&p("d-x"), Some(c), None);
+        last.journaled(&p("d"), None, None);
         assert!(!last.is_last(&p("d/f"), a));
         assert!(last.is_last(&p("d-x"), c));
         // A change below a path forgets the path.
-        last.journaled(&p("e"), Some(a));
-        last.journaled(&p("e/f"), Some(b));
+        last.journaled(&p("e"), Some(a), None);
+        last.journaled(&p("e/f"), Some(b), None);
         assert!(!last.is_last(&p("e"), a));
         assert!(last.is_last(&p("e/f"), b));
         assert_eq!(last.len(), 2);
+    }
+
+    #[test]
+    fn last_writes_follow_a_move() {
+        let last = LastWrites::new();
+        let p = |s: &str| RepoPath::new(s).unwrap();
+        let s = stamp(7, 100, 3);
+        last.journaled(&p("d/e/f"), Some(PendingId(1)), Some(s));
+        last.journaled(&p("x/old"), Some(PendingId(2)), None);
+        last.moved(&p("d"), &p("x"));
+        assert_eq!(last.stamp_of(&p("x/e/f")), Some(s));
+        assert!(last.is_last(&p("x/e/f"), PendingId(1)));
+        assert_eq!(last.stamp_of(&p("d/e/f")), None);
+        assert!(
+            !last.is_last(&p("x/old"), PendingId(2)),
+            "the destination is replaced"
+        );
+        assert_eq!(last.len(), 1);
     }
 }

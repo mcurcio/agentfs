@@ -147,6 +147,16 @@ pub enum Event {
     /// (design §8); it is retried one `agentfs.repackInterval` later.
     /// History is intact, only less compact.
     RepackFailed { error: String },
+    /// A moved tree could not be reconciled (design §3.1) after
+    /// [`crate::reconcile::MAX_FAILURES`] attempts: the move commits as
+    /// journaled, so history may hold files the rules exclude at `to`,
+    /// or miss files beneath it that were never tracked, until their next
+    /// change.
+    ReconcileFailed {
+        from: RepoPath,
+        to: RepoPath,
+        error: String,
+    },
     /// A push attempt failed (design §11.3).
     PushFailed {
         remote: String,
@@ -247,6 +257,7 @@ impl Event {
             Self::RecordFailed { .. } => "record_failed",
             Self::CommitFailed { .. } => "commit_failed",
             Self::RepackFailed { .. } => "repack_failed",
+            Self::ReconcileFailed { .. } => "reconcile_failed",
             Self::PushFailed { .. } => "push_failed",
             Self::Diverged { .. } => "diverged",
             Self::RemoteMisconfigured { .. } => "remote_misconfigured",
@@ -291,6 +302,9 @@ impl fmt::Display for Event {
                 write!(f, "commit failed, {backlog} record(s) waiting: {error}")
             }
             Self::RepackFailed { error } => write!(f, "repack failed: {error}"),
+            Self::ReconcileFailed { from, to, error } => {
+                write!(f, "reconciling the move of {from} to {to} failed: {error}")
+            }
             Self::PushFailed {
                 remote,
                 kind,

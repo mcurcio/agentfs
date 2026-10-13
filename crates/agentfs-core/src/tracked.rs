@@ -6,9 +6,13 @@
 //! tracked from the moment its record is durable, not only once it reaches
 //! the branch head. The set is rebuilt at open from the branch head plus the
 //! uncommitted journal, then kept current by the recorder.
+//!
+//! It is a tree of path components, so a move ([`Change::Move`], a
+//! directory rename) detaches one subtree and attaches it elsewhere: its
+//! cost depends on the depth of the two paths, not on how many paths are
+//! beneath them (design §3.1).
 
-use std::collections::BTreeSet;
-use std::ops::Bound;
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use crate::paths::RepoPath;
@@ -17,7 +21,80 @@ use crate::record::Change;
 /// Tracked file and symlink paths. Safe to share across threads.
 #[derive(Debug, Default)]
 pub struct Tracked {
-    paths: RwLock<BTreeSet<String>>,
+    root: RwLock<Node>,
+}
+
+/// One path component: a tracked file or symlink (`leaf`), or a directory
+/// holding tracked paths (`children`), never both. Empty directories are
+/// pruned, so a node with no children is a leaf.
+#[derive(Debug, Default)]
+struct Node {
+    leaf: bool,
+    children: BTreeMap<String, Node>,
+}
+
+impl Node {
+    fn is_empty(&self) -> bool {
+        !self.leaf && self.children.is_empty()
+    }
+
+    fn get(&self, path: &str) -> Option<&Node> {
+        let mut node = self;
+        for c in path.split('/') {
+            node = node.children.get(c)?;
+        }
+        Some(node)
+    }
+
+    /// The node at `path`, made if missing; ancestors that were files stop
+    /// being files.
+    fn make(&mut self, path: &str) -> &mut Node {
+        let mut node = self;
+        for c in path.split('/') {
+            node.leaf = false;
+            node = node.children.entry(c.to_owned()).or_default();
+        }
+        node
+    }
+
+    /// Detaches and returns the subtree at `path`, pruning directories it
+    /// leaves empty.
+    fn take(&mut self, path: &str) -> Option<Node> {
+        let (first, rest) = match path.split_once('/') {
+            Some((first, rest)) => (first, Some(rest)),
+            None => (path, None),
+        };
+        let taken = match rest {
+            None => self.children.remove(first),
+            Some(rest) => {
+                let child = self.children.get_mut(first)?;
+                let taken = child.take(rest);
+                if child.is_empty() {
+                    self.children.remove(first);
+                }
+                taken
+            }
+        };
+        taken.filter(|n| !n.is_empty())
+    }
+
+    fn count(&self) -> usize {
+        usize::from(self.leaf) + self.children.values().map(Node::count).sum::<usize>()
+    }
+
+    fn collect(&self, prefix: &str, out: &mut Vec<String>) {
+        if self.leaf {
+            out.push(prefix.to_owned());
+        }
+        for (name, child) in &self.children {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            child.collect(&path, out);
+        }
+    }
 }
 
 impl Tracked {
@@ -26,90 +103,78 @@ impl Tracked {
     /// Names that are not UTF-8 cannot be [`RepoPath`]s and so can never be
     /// looked up; they are kept lossily.
     pub fn from_tree(tree: Option<&git2::Tree<'_>>) -> Result<Self, git2::Error> {
-        let mut paths = BTreeSet::new();
+        let mut root = Node::default();
         if let Some(tree) = tree {
-            tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
                 if entry.kind() == Some(git2::ObjectType::Blob) {
                     let name = String::from_utf8_lossy(entry.name_bytes());
-                    paths.insert(format!("{root}{name}"));
+                    root.make(&format!("{dir}{name}")).leaf = true;
                 }
                 git2::TreeWalkResult::Ok
             })?;
         }
         Ok(Self {
-            paths: RwLock::new(paths),
+            root: RwLock::new(root),
         })
     }
 
     /// True if `path` itself is a tracked file or symlink.
     pub fn contains(&self, path: &RepoPath) -> bool {
-        self.read().contains(path.as_str())
+        self.read().get(path.as_str()).is_some_and(|n| n.leaf)
     }
 
     /// True if `path` is tracked, or is a directory holding tracked paths.
     pub fn contains_or_under(&self, path: &RepoPath) -> bool {
-        let paths = self.read();
-        paths.contains(path.as_str()) || has_under(&paths, path.as_str())
+        self.read().get(path.as_str()).is_some()
     }
 
     /// Updates the set for a durable change, mirroring how history applies
     /// it (`history::apply`).
     pub fn apply(&self, change: &Change) {
-        let mut paths = self.write();
+        let mut root = self.write();
         match change {
             Change::Write { path, .. } | Change::Symlink { path, .. } => {
-                remove_under(&mut paths, path.as_str());
-                let mut prefix = String::new();
-                let components: Vec<&str> = path.components().collect();
-                for component in &components[..components.len() - 1] {
-                    if !prefix.is_empty() {
-                        prefix.push('/');
-                    }
-                    prefix.push_str(component);
-                    paths.remove(&prefix);
-                }
-                paths.insert(path.as_str().to_owned());
+                let node = root.make(path.as_str());
+                node.children.clear();
+                node.leaf = true;
             }
             Change::Remove { path } => {
-                paths.remove(path.as_str());
-                remove_under(&mut paths, path.as_str());
+                root.take(path.as_str());
+            }
+            Change::Move { from, to } => {
+                let moved = root.take(from.as_str());
+                root.take(to.as_str());
+                if let Some(moved) = moved {
+                    *root.make(to.as_str()) = moved;
+                }
             }
         }
     }
 
+    /// Every tracked path at or beneath `path`, sorted (O(paths beneath)).
+    pub fn under(&self, path: &RepoPath) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(node) = self.read().get(path.as_str()) {
+            node.collect(path.as_str(), &mut out);
+        }
+        out
+    }
+
+    /// How many paths are tracked (O(paths)).
     pub fn len(&self) -> usize {
-        self.read().len()
+        self.read().count()
     }
 
     pub fn is_empty(&self) -> bool {
         self.read().is_empty()
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
-        self.paths.read().expect("tracked set lock poisoned")
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Node> {
+        self.root.read().expect("tracked set lock poisoned")
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeSet<String>> {
-        self.paths.write().expect("tracked set lock poisoned")
-    }
-}
-
-/// The paths strictly beneath directory `dir`.
-fn under<'a>(paths: &'a BTreeSet<String>, dir: &str) -> impl Iterator<Item = &'a String> + 'a {
-    let prefix = format!("{dir}/");
-    paths
-        .range::<String, _>((Bound::Included(prefix.clone()), Bound::Unbounded))
-        .take_while(move |p| p.starts_with(&prefix))
-}
-
-fn has_under(paths: &BTreeSet<String>, dir: &str) -> bool {
-    under(paths, dir).next().is_some()
-}
-
-fn remove_under(paths: &mut BTreeSet<String>, dir: &str) {
-    let doomed: Vec<String> = under(paths, dir).cloned().collect();
-    for p in doomed {
-        paths.remove(&p);
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Node> {
+        self.root.write().expect("tracked set lock poisoned")
     }
 }
 
@@ -132,7 +197,10 @@ mod tests {
     }
 
     fn all(t: &Tracked) -> Vec<String> {
-        t.read().iter().cloned().collect()
+        let mut out = Vec::new();
+        t.read().collect("", &mut out);
+        out.sort();
+        out
     }
 
     fn sample() -> (tempfile::TempDir, Tracked) {
@@ -196,5 +264,33 @@ mod tests {
         t.apply(&Change::Remove { path: p("a") });
         assert_eq!(all(&t), ["ab", "d", "link", "s/l"]);
         assert_eq!(t.len(), 4);
+    }
+
+    fn mv(from: &str, to: &str) -> Change {
+        Change::Move {
+            from: p(from),
+            to: p(to),
+        }
+    }
+
+    #[test]
+    fn a_move_carries_the_subtree_and_replaces_the_destination() {
+        let (_d, t) = sample();
+        t.apply(&write("d/e/f"));
+        t.apply(&write("x/old"));
+        t.apply(&mv("d", "x"));
+        assert_eq!(all(&t), ["a", "link", "x/b", "x/e/f"]);
+        assert!(!t.contains_or_under(&p("d")));
+        assert_eq!(t.under(&p("x")), ["x/b", "x/e/f"]);
+        // Into a new parent; an ancestor that was a file stops being one.
+        t.apply(&mv("x/e", "a/e"));
+        assert_eq!(all(&t), ["a/e/f", "link", "x/b"]);
+        // A move of nothing clears the destination.
+        t.apply(&mv("nothing", "x"));
+        assert_eq!(all(&t), ["a/e/f", "link"]);
+        // A file moves too.
+        t.apply(&mv("link", "l2"));
+        assert_eq!(all(&t), ["a/e/f", "l2"]);
+        assert_eq!(t.len(), 2);
     }
 }
