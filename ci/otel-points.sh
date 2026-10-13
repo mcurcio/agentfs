@@ -6,14 +6,14 @@
 #
 #   ci/otel-points.sh FILE METRIC
 #
-# Needs jq.
+# A line the collector is still writing is skipped. Needs jq.
 
 set -euo pipefail
 
 file=${1:?usage: ci/otel-points.sh FILE METRIC}
 metric=${2:?usage: ci/otel-points.sh FILE METRIC}
-jq -r --arg name "$metric" '
-  .resourceMetrics[]?.scopeMetrics[]?.metrics[]?
+jq -rR --arg name "$metric" '
+  fromjson? | .resourceMetrics[]?.scopeMetrics[]?.metrics[]?
   | select(.name == $name)
   | (.gauge // .sum // .histogram).dataPoints[]?
   | [ (.asInt // .asDouble // .count // "" | tostring),

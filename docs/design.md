@@ -2931,7 +2931,21 @@ restartable (§14.2). The controller runs no children.
 2. **Before return.** Killing the daemon right after `close` returns, then
    remounting, shows the change in history.
 3. **Crash safety.** Killing the daemon or node at every step of record → commit
-   → ref update loses nothing and duplicates nothing.
+   → ref update → push loses nothing and duplicates nothing. Automated
+   with failpoints (`agentfs_core::failpoints`, the `failpoints` cargo
+   feature, test builds only) in three tiers, each checked by one oracle
+   (`crates/agentfs-core/tests/support/crash_oracle.rs`: every promised
+   record committed exactly once, first-parent `Agentfs-Seq` strictly
+   increasing, no empty commits, `git fsck`, nothing left in `pending/`,
+   remotes at or behind the head with any diverged head saved once): the
+   engine killed or failed at every point a workload reaches
+   (`crash_points.rs`, also a failure then a kill), the processes
+   (`record`, `run`, `push`, `serve-history` and a front, `patch apply`;
+   `crash_daemon.rs`), and a FUSE mount (`crash_mount.rs`). Power loss is
+   tested apart: `dm-log-writes` records every write and flush of a
+   workload on ext4 and XFS, and xfstests' `replay-log` replays the log to
+   every FUA (or flush) point, where the same promises are checked on a
+   snapshot (`ci/power-loss.sh`).
 4. **Any user.** Root and UID 10000 in one pod read and write with normal
    permission semantics. `chmod 600` persists.
 5. **Invisible.** No history, journal, state or credential is reachable through
@@ -3003,9 +3017,13 @@ the mount and directly, each bringing its whole group in one commit. Test 11 als
 same job (the recovery runbook end to end, ending with a push of the
 restore commits), and without a mount in `crates/agentfs/tests/cli_restore.rs`;
 the divergence and history-rewrite runbooks run in the `e2e-runbooks` job.
-Tests 8 and 12 (all but the record, commit and repack failure counters, plus the
-export-failure counter) run in the `e2e` jobs against a real git server
-and OpenTelemetry Collector; test 8 runs over smart HTTP and HTTPS
+Tests 8 and 12 run in the `e2e` jobs against a real git server
+and OpenTelemetry Collector (test 12 with real failures for the record,
+commit and repack failure counters, and a real `serve-history` with FUSE
+fronts for `agentfs.history_service.fronts`, `agentfs.front.round_trip`
+and `agentfs.front.service_failures` (`timeout` and `connect`); the
+export-failure counter against a dead endpoint; and without a collector
+binary in `crates/agentfs/tests/cli_telemetry.rs`); test 8 runs over smart HTTP and HTTPS
 (`e2e-remotes`) and over SSH (`e2e-ssh`, against OpenSSH's sshd). The
 `e2e-kind` job (`ci/e2e-kind.sh`, in the `image` workflow) runs the
 phase 1 deployment in a kind cluster with the image just built: test 4
@@ -3079,8 +3097,25 @@ the other after a container restart), the refusals of inline volumes and
 `ReadWriteMany`, and teardown through DeleteVolume.
 Test 13 runs in the `bench` workflow (`ci/bench.sh`, on fresh XFS and
 ext4 loop filesystems; [performance.md](performance.md)).
-Not automated yet: test 3 (a kill at every step), test 16
-across two nodes, and the CSI driver over a shared filesystem, on
+Test 3 runs in the `crash` job (`ci/crash-tests.sh`: the engine matrix,
+the process tests, and the mount tests as root) and in the `power-loss`
+workflow (`.github/workflows/power-loss.yml`, ext4 and XFS, every FUA by
+default and every flush on demand); a killed repack is a unit test
+(`repack.rs`). Test 7's "nothing deleted by nesting" runs through a mount
+and through a front in the `fuse` job (`nothing_is_deleted_by_nesting`).
+Test 8's "the filesystem keeps working" runs through a live FUSE mount in
+the `e2e-shared-remotes` job (`ci/e2e-remote-failures.sh`: unreachable,
+hung, refused, auth, diverged and untrusted remotes at once, close
+latency against a healthy baseline, recovery, and the hung push
+abandoned at SIGTERM), and test 10's two volumes on one repository there
+too (`ci/e2e-shared-remote.sh`: two FUSE mounts pushing at once to one
+HTTP and one local repository, overlapping on the server) and as a unit
+test (`push.rs`, with a same-named rival). Test 10's identity templates
+run in `crates/agentfs/tests/cli_identity.rs` (every variable, the
+fallbacks, refusals, fronts, a template change across a service
+restart), through a mount and a front in the `fuse` job, and with custom
+templates checked exactly in `e2e-kind` and `e2e-csi`.
+Not automated yet: test 16 across two nodes, and the CSI driver over a shared filesystem, on
 hardened node images (Talos) and across node reboots.
 
 The `fuse` job also runs README's quick start as written, as root
@@ -3187,6 +3222,8 @@ runner.
 | CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2): NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it, and runs with `hostPID: true` so its fronts can read callers' groups, §6); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
 | CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |
+| Crash testing (2026-10-13) | Failpoints in the durable path (`agentfs_core::failpoints`), compiled only with the `failpoints` cargo feature (release builds have none; such a build says `+failpoints` in `--version` and warns when `AGENTFS_FAILPOINTS` is set), configured by `AGENTFS_FAILPOINTS` (`name=kill\|error\|panic\|sleep(ms)[@n]`); three harness tiers with one oracle, run in the `crash` job; power loss by `dm-log-writes` and `replay-log` in the `power-loss` workflow (§18 test 3) |
+| Crash findings (2026-10-13) | Found by the harnesses and fixed: objects and `objects/` are synced before the ref names them; the journal keeps appending to the file a failed truncation renamed in; a record whose frozen copies are gone is dropped with `RecordFailed` instead of failing every later commit; a repair queue left in its temporary file is loaded; ref lock files a crash left are removed at open (§3.3, §3.5) |
 
 ### 19.2 Open questions
 
@@ -3246,6 +3283,14 @@ runner.
      mount mode); a restore stopped at shutdown leaves the one path it was
      writing, if that outlasts `--shutdown-grace`, written and
      unrecorded.
+6. **Power-loss coverage** (§18 test 3). The `power-loss` workflow
+   replays `dm-log-writes` logs in write order and checks at every FUA
+   (or every flush, on demand): a disk may also reorder the writes
+   between two flushes, which in-order replay never shows. The commit
+   path's fsync order (§3.3) does not rely on order within an epoch, but
+   only reviews say so: replaying random subsets of each epoch's writes
+   is open, as is a power cut through a FUSE mount rather than the CLI's
+   `record`.
 
 ## 20. Prior art
 

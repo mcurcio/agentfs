@@ -109,3 +109,12 @@ origin: still running at the push grace's end; abandoned`). A failed
 final push prints its reason (`final push: origin: failed (...)`), and
 `--push-grace 0s` skips it (`final push: origin: skipped, ...`). Nothing
 is lost; the commits are pushed by the next start.
+
+## A remote that hangs
+
+A remote that accepts the connection and then never answers holds only
+its own push: recording, committing and the other remotes go on (CI's
+`e2e-shared-remotes` job checks this through a live mount). Its status
+keeps the previous `last pushed` until libgit2 gives up (5 minutes
+without progress), which counts as `unreachable`; a shutdown meanwhile
+abandons it at the push grace's end, as above.

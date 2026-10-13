@@ -510,6 +510,11 @@ The FUSE layer uses fuser's pure-Rust mount code, so building needs no
 libfuse or pkg-config; running a mount needs `/dev/fuse` (and `fusermount3`
 from the `fuse3` package for a non-root daemon).
 
+Tests only: `cargo test --workspace --features agentfs/failpoints` adds
+the crash-injection failpoints (design §18 test 3, `AGENTFS_FAILPOINTS`
+in the [configuration reference](docs/configuration.md)). Never ship such a
+build: its `--version` ends in `+failpoints`.
+
 The container image:
 
 ```sh
