@@ -39,11 +39,13 @@ def main():
     n = int(argv[2]) if len(argv) > 2 else 1000
     label = argv[3] if len(argv) > 3 else directory
     os.makedirs(directory, exist_ok=True)
-    payload = os.urandom(4096)
+    payload = bytearray(os.urandom(4096))
     closes = []
     for i in range(n):
         path = os.path.join(directory, "f%d" % (i % 50))
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        # New content every time, so every close is a change to record.
+        payload[:8] = i.to_bytes(8, "little")
         os.write(fd, payload)
         start = time.perf_counter_ns()
         os.close(fd)

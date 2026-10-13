@@ -25,7 +25,9 @@ import os
 import statistics
 import sys
 
-# The main metric of each workload: (field, unit, lower is better).
+# The main metric of each workload: (field, unit). A plain close of a big
+# file costs next to nothing, so a ratio against it means nothing: those
+# workloads (NO_RATIO) are compared with the cost of a copy instead.
 METRICS = {
     "close4k": ("p50_us", "µs p50"),
     "clone": ("seconds", "s"),
@@ -35,6 +37,8 @@ METRICS = {
     "bigclose-dirty": ("close_s", "s close(2)"),
     "bigclose-fsync": ("close_s", "s close(2)"),
 }
+
+NO_RATIO = {"bigclose-dirty", "bigclose-fsync"}
 
 ORDER = list(METRICS)
 
@@ -90,7 +94,7 @@ def workload_rows(results, fs):
             "runs": len(mine),
             "baseline": b,
             "agentfs": a,
-            "ratio": (a / b) if a is not None and b else None,
+            "ratio": (a / b) if a is not None and b and name not in NO_RATIO else None,
             "drain_s": median([r.get("drain_s") for r in mine]),
             "records": median([r.get("records") for r in mine]),
             "commits": median([r.get("commits") for r in mine]),

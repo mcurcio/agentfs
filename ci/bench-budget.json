@@ -1,18 +1,21 @@
 {
-  "comment": "Advisory performance budget (docs/performance.md): ci/bench-report.py warns when a result exceeds one, and never fails the job. Calibrated on GitHub's ubuntu-latest runners; see docs/performance.md for the measured numbers and the headroom left for runner noise.",
+  "comment": "Advisory performance budget (design §19.2 item 1, docs/performance.md): ci/bench-report.py warns when a result exceeds one and never fails the job. Set on 2026-10-13 from the first CI run (GitHub ubuntu-latest, 4 CPUs, loop filesystems) at about 1.5 to 2 times the slower filesystem's result, so runner noise stays under it and a real regression does not.",
   "budgets": [
-    {"match": {"suite": "record_step", "case": "record close 4k"}, "metric": "p50_us", "max": 2000, "why": "§3.2: a small file's change boundary"},
-    {"match": {"suite": "record_step", "case": "record close 4k"}, "metric": "p99_us", "max": 10000, "why": "§3.2 tail"},
-    {"match": {"suite": "record_step", "case": "record close 4k, 8 thread(s)"}, "metric": "p99_us", "max": 30000, "why": "group commit under concurrency"},
-    {"match": {"suite": "record_step", "case": "record unlink"}, "metric": "p50_us", "max": 2000, "why": "a removal is a journal append and fsync"},
-    {"match": {"suite": "record_step", "fs": "xfs", "case": "record close 16m"}, "metric": "p50_us", "max": 5000, "why": "§3.2: with reflink the step does not depend on file size"},
-    {"match": {"suite": "e2e", "workload": "close4k"}, "metric": "agentfs", "max": 3000, "why": "§3.2 through FUSE, p50"},
-    {"match": {"suite": "e2e", "workload": "clone"}, "metric": "ratio", "max": 6, "why": "a git clone into a recorded working tree"},
-    {"match": {"suite": "e2e", "workload": "npm"}, "metric": "ratio", "max": 4, "why": "excluded paths pay FUSE only"},
-    {"match": {"suite": "e2e", "workload": "create"}, "metric": "ratio", "max": 40, "why": "every small file's close is recorded"},
-    {"match": {"suite": "e2e", "workload": "rm"}, "metric": "ratio", "max": 40, "why": "every unlink is recorded"},
-    {"match": {"suite": "e2e", "fs": "xfs", "workload": "bigclose-fsync"}, "metric": "agentfs", "max": 1, "why": "§3.2: a reflink freeze of 1 GiB"},
-    {"match": {"suite": "e2e", "fs": "xfs", "workload": "bigclose-dirty"}, "metric": "agentfs", "max": 10, "why": "the reflink waits for writeback of the dirty pages"},
-    {"match": {"suite": "e2e", "fs": "ext4", "workload": "bigclose-fsync"}, "metric": "agentfs", "max": 20, "why": "§3.2: ext4 copies 1 GiB"}
+    {"match": {"suite": "record_step", "case": "record close 4k, 1 thread(s)"}, "metric": "p50_us", "max": 3000, "why": "§3.2: a small file's change boundary (measured 1.3 ms XFS, 1.9 ms ext4)"},
+    {"match": {"suite": "record_step", "case": "record close 4k, 1 thread(s)"}, "metric": "p99_us", "max": 10000, "why": "§3.2 tail (measured 3.6 ms XFS, 5.7 ms ext4)"},
+    {"match": {"suite": "record_step", "case": "record close 4k, 8 thread(s)"}, "metric": "p99_us", "max": 12000, "why": "group commit under concurrency (measured 5.0 ms XFS, 6.1 ms ext4)"},
+    {"match": {"suite": "record_step", "case": "record unlink"}, "metric": "p50_us", "max": 1500, "why": "a removal: journal append and fsync (measured 0.45 ms XFS, 0.84 ms ext4)"},
+    {"match": {"suite": "record_step", "fs": "xfs", "case": "freeze 16m"}, "metric": "p50_us", "max": 1000, "why": "§3.2: a reflink does not depend on size (measured 0.44 ms)"},
+    {"match": {"suite": "record_step", "fs": "xfs", "case": "record close 16m"}, "metric": "p50_us", "max": 3000, "why": "§3.2: with reflink the step does not depend on size (measured 1.4 ms)"},
+    {"match": {"suite": "e2e", "workload": "close4k"}, "metric": "agentfs", "max": 4000, "why": "§3.2 through FUSE, p50 (measured 1.8 ms XFS, 2.4 ms ext4)"},
+    {"match": {"suite": "e2e", "workload": "clone"}, "metric": "ratio", "max": 32, "why": "git clone into a recorded working tree (measured 17x XFS, 21x ext4)"},
+    {"match": {"suite": "e2e", "workload": "npm"}, "metric": "ratio", "max": 30, "why": "small files into an excluded path (measured 17x XFS, 20x ext4)"},
+    {"match": {"suite": "e2e", "workload": "create"}, "metric": "ratio", "max": 125, "why": "100k small files, each recorded (measured 63x XFS, 83x ext4)"},
+    {"match": {"suite": "e2e", "workload": "create"}, "metric": "drain_s", "max": 720, "why": "commit catch-up after 100k files (measured 483 s XFS, 474 s ext4)"},
+    {"match": {"suite": "e2e", "workload": "rm"}, "metric": "ratio", "max": 75, "why": "rm -rf of 100k recorded files (measured 14x XFS, 50x ext4)"},
+    {"match": {"suite": "e2e", "fs": "xfs", "workload": "bigclose-fsync"}, "metric": "agentfs", "max": 0.5, "why": "§3.2: reflink freeze of a clean 1 GiB file (measured 3 ms)"},
+    {"match": {"suite": "e2e", "fs": "xfs", "workload": "bigclose-dirty"}, "metric": "agentfs", "max": 5, "why": "reflink of a dirty 1 GiB file waits for writeback (measured 2.6 s)"},
+    {"match": {"suite": "e2e", "fs": "ext4", "workload": "bigclose-fsync"}, "metric": "agentfs", "max": 6, "why": "§3.2: ext4 copies 1 GiB (measured 2.9 s)"},
+    {"match": {"suite": "e2e", "fs": "ext4", "workload": "bigclose-dirty"}, "metric": "agentfs", "max": 10, "why": "ext4 copies 1 GiB of dirty pages (measured 5.4 s)"}
   ]
 }

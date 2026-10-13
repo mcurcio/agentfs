@@ -194,8 +194,8 @@ unmount_volume() {
   sudo rm -rf "$FSDIR/vols/$NAME"
 }
 
-committed_seq() {
-  af status | sed -n 's/^committed: through seq \([0-9]*\).*/\1/p' | grep . || echo 0
+committed_seq() { # -1 before the first commit: sequence numbers start at 0
+  af status | sed -n 's/^committed: through seq \([0-9]*\).*/\1/p' | grep . || echo -1
 }
 
 backlog() { af status | sed -n 's/^backlog: *\([0-9]*\).*/\1/p'; }
