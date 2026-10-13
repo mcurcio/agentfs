@@ -81,6 +81,7 @@ sudo "$CSI_SANITY" \
   --ginkgo.v \
   --ginkgo.no-color
 pass "csi-sanity"
+assert_contains "$(cat "$LOG")" "history service started" "the driver staged volumes with real history services"
 
 step "nothing left behind"
 assert_eq 0 "$(agentfs_mounts)" "no agentfs mounts left"
@@ -88,7 +89,7 @@ left=$(sudo find "$W/node/published" -name '*.json' 2>/dev/null | wc -l)
 assert_eq 0 "$left" "no published records left"
 left=$(sudo find "$W/node/staged" -name '*.json' 2>/dev/null | wc -l)
 assert_eq 0 "$left" "no staged records left"
-left=$(sudo sh -c "ls '$W/base' 2>/dev/null | grep -v '^\.'" | wc -l)
+left=$(sudo find "$W/base" -mindepth 1 -maxdepth 1 ! -name ".*" | wc -l)
 assert_eq 0 "$left" "every volume directory deleted (onDelete: delete)"
 
 step "stop the driver"

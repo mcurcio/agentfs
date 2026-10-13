@@ -1,0 +1,37 @@
+# Refused by CreateVolume: one node per volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rwx
+spec:
+  storageClassName: agentfs-ci
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# WaitForFirstConsumer: provisioning starts once a pod uses the claim.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rwx-user
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: ghcr.io/mcurcio/agentfs
+      imagePullPolicy: IfNotPresent
+      command: [sleep, infinity]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: rwx, mountPath: /data }
+  volumes:
+    - name: rwx
+      persistentVolumeClaim: { claimName: rwx }

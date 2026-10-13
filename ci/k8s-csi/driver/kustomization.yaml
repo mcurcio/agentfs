@@ -1,0 +1,28 @@
+# The CI overlay of deploy/csi for the e2e-csi job (ci/e2e-csi.sh): the
+# image built by the job, a `ci` profile pushing to the runner's git server
+# every 2 seconds, and its credentials.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../deploy/csi
+  - git-server.yaml
+
+images:
+  - name: ghcr.io/mcurcio/agentfs
+    newName: agentfs
+    newTag: ci
+
+configMapGenerator:
+  - name: agentfs-csi-profiles
+    namespace: agentfs-csi
+    behavior: merge
+    options:
+      disableNameSuffixHash: true
+    files:
+      - profiles/ci.config
+      - profiles/ci.exclude
+      - profiles/ci.attributes
+
+patches:
+  - path: credentials-patch.yaml

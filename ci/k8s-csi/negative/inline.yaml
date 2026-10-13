@@ -1,0 +1,27 @@
+# Refused by the kubelet: the CSIDriver lists only Persistent.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inline
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: ghcr.io/mcurcio/agentfs
+      imagePullPolicy: IfNotPresent
+      command: [sleep, infinity]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: inline, mountPath: /data }
+  volumes:
+    - name: inline
+      csi:
+        driver: agentfs.mcurcio.github.io
+        volumeAttributes: { profile: ci }

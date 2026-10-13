@@ -1,0 +1,15 @@
+# The e2e-csi workloads (ci/e2e-csi.sh): two restricted pods on one RWO
+# claim of the `ci` profile.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - storageclass.yaml
+  - pvc.yaml
+  - writers.yaml
+
+images:
+  - name: ghcr.io/mcurcio/agentfs
+    newName: agentfs
+    newTag: ci

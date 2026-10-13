@@ -1,0 +1,14 @@
+# The runner's git server (ci/git-http-server.sh), reached from the node
+# plugin through the kind network's gateway. No selector: ci/e2e-csi.sh
+# writes the EndpointSlice with the gateway's address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-server
+  namespace: agentfs-csi
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

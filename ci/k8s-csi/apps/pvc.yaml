@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared
+  namespace: agentfs-csi-e2e-apps
+spec:
+  storageClassName: agentfs-ci
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi

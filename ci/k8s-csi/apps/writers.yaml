@@ -1,0 +1,60 @@
+# writer-a mounts with HostToContainer (a replaced front reaches it live);
+# writer-b without propagation (it sees a replaced front after a container
+# restart). Different uids, one fsGroup.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer-a
+  namespace: agentfs-csi-e2e-apps
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    runAsGroup: 10000
+    fsGroup: 10000
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: writer
+      image: ghcr.io/mcurcio/agentfs
+      imagePullPolicy: IfNotPresent
+      command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: shared, mountPath: /data, mountPropagation: HostToContainer }
+  volumes:
+    - name: shared
+      persistentVolumeClaim: { claimName: shared }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer-b
+  namespace: agentfs-csi-e2e-apps
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10000
+    fsGroup: 10000
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: writer
+      image: ghcr.io/mcurcio/agentfs
+      imagePullPolicy: IfNotPresent
+      command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: shared, mountPath: /data }
+  volumes:
+    - name: shared
+      persistentVolumeClaim: { claimName: shared }
