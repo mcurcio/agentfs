@@ -821,6 +821,14 @@ fn nested_repositories() {
     v.sh("git init -q .");
     v.sh("printf n > new");
     v.expect(&tree(&[("keep", f("k")), ("new", f("n"))]));
+    // A clone that stops being one (its `.git` removed): its paths are
+    // new paths like any other, recorded at their next change.
+    v.sh("rm -rf work/.git && printf h2 > work/README");
+    v.expect(&tree(&[
+        ("keep", f("k")),
+        ("new", f("n")),
+        ("work/README", f("h2")),
+    ]));
     let log = m.stop();
     assert!(!log.contains("alarm:"), "{log}");
 
@@ -830,11 +838,117 @@ fn nested_repositories() {
     v.expect(&tree(&[
         ("keep", f("k")),
         ("new", f("n")),
+        ("work/README", f("h2")),
         ("wt/README", f("hello")),
         ("wt/lib/code.rs", f("fn main() {}")),
     ]));
     let log = m.stop();
     assert!(!log.contains("alarm:"), "{log}");
+}
+
+/// Paths ever deleted on the branch's history (design §5: nothing is
+/// deleted from history by nesting).
+fn deleted_paths(v: &Vol) -> String {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(v.state().join("git"))
+        .args([
+            "log",
+            "--diff-filter=D",
+            "--name-only",
+            "--format=",
+            "refs/heads/agentfs/demo",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    text(&out.stdout)
+}
+
+/// Design §5 and §18 test 7: tracked paths stay tracked when a directory
+/// around them becomes a nested repository (`git init`, `git init
+/// --bare`, a `git worktree add` gitfile), only new paths under it are
+/// left out (or, with `nested = working-tree`, its working files are
+/// recorded), and nothing is ever deleted from history: under
+/// `exclude`, then `working-tree`, then `exclude` again. Through a
+/// single-process mount, or a front of a history service.
+fn nothing_is_deleted_by_nesting_in(name: &'static str, front: bool) {
+    let v = Vol::new(name);
+    let start = |v: &Vol| -> Vec<Mounted> {
+        if front {
+            let service = start_history_service(v);
+            let front = start_front(v, &v.mnt(), "pod-n");
+            vec![front, service]
+        } else {
+            vec![v.mount(&[])]
+        }
+    };
+    let stop = |ms: Vec<Mounted>| {
+        for m in ms {
+            let log = m.stop();
+            assert!(!log.contains("alarm:"), "{log}");
+        }
+    };
+    let git = "git -c user.name=t -c user.email=t@example.com -c init.defaultBranch=main";
+
+    let ms = start(&v);
+    v.sh("mkdir -p a/sub t && printf x1 > a/x && printf y > a/sub/y && printf z > t/z");
+    let mut want = tree(&[("a/x", f("x1")), ("a/sub/y", f("y")), ("t/z", f("z"))]);
+    v.expect(&want);
+
+    // Nest: a working tree at a/, a bare repository inside it, and a
+    // linked worktree (a `.git` file) in the tracked t/.
+    v.sh(&format!(
+        "{git} -C a init -q && {git} init -q --bare a/sub/bare.git && \
+         {git} -C a commit -q --allow-empty -m init && {git} -C a worktree add -q ../t/wt"
+    ));
+    v.sh("printf x2 > a/x && printf new > a/new.txt && printf new > t/wt/new.txt");
+    v.sh("printf b > a/sub/bare.git/description && printf z2 > t/z");
+    want.insert("a/x".into(), f("x2"));
+    want.insert("t/z".into(), f("z2"));
+    v.expect(&want);
+    assert_eq!(deleted_paths(&v), "");
+    stop(ms);
+
+    // Working files of nested repositories are recorded; still nothing
+    // tracked goes.
+    v.config("agentfs.nested", "working-tree");
+    let ms = start(&v);
+    v.sh("printf x3 > a/x && printf wt > a/wt.txt && printf wt > t/wt/wt.txt");
+    want.insert("a/x".into(), f("x3"));
+    want.insert("a/wt.txt".into(), f("wt"));
+    want.insert("t/wt/wt.txt".into(), f("wt"));
+    v.expect(&want);
+    assert_eq!(deleted_paths(&v), "");
+    stop(ms);
+
+    // Back to `exclude`: what was recorded stays tracked, new paths under
+    // the nested repositories are left out.
+    v.config("agentfs.nested", "exclude");
+    let ms = start(&v);
+    v.sh("printf x4 > a/x && printf wt2 > a/wt.txt && printf later > a/later.txt");
+    want.insert("a/x".into(), f("x4"));
+    want.insert("a/wt.txt".into(), f("wt2"));
+    v.expect(&want);
+    assert_eq!(deleted_paths(&v), "");
+    let head = v.history();
+    assert!(
+        head.contains_key("a/sub/y") && head.contains_key("t/z"),
+        "{head:#?}"
+    );
+    stop(ms);
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn nothing_is_deleted_by_nesting() {
+    nothing_is_deleted_by_nesting_in("nesting", false);
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn nothing_is_deleted_by_nesting_through_a_front() {
+    nothing_is_deleted_by_nesting_in("nesting-front", true);
 }
 
 // ---- workloads ----
