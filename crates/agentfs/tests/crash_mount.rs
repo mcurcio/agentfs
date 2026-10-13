@@ -204,8 +204,10 @@ impl Vol {
 fn killed_after_a_close_was_recorded() {
     let v = Vol::new();
     let child = v.mount("fuse.after_record=kill@1");
-    // The close fails (the daemon is gone); what it recorded stays.
-    let _ = v.sh("printf 'x\\n' > a.txt");
+    // One open, write and close (a shell redirect would close a dup
+    // first, recording the empty file). The close fails, the daemon being
+    // gone; what it recorded stays.
+    let _ = fs::write(v.mnt().join("a.txt"), "x\n");
     v.reap_killed(child, "fuse.after_record");
     v.ok("", &["flush"]);
     assert_eq!(v.committed("a.txt").as_deref(), Some("x\n"));
