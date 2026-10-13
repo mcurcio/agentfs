@@ -5,11 +5,11 @@
 `/workspace/main/.git/worktrees/wt`. agentfs maps it to a directory in
 the tree through the places it knows the tree is seen (its *views*,
 design [§5](../design.md#5-nested-repositories)). When the path is under
-none of them, or its exact mapping names no git directory, agentfs tries
-each suffix of the path from the tree root instead (`main/.git/...`,
-then `.git/...`, and so on). That usually finds the right repository,
-but it can be fooled: two repositories whose admin directories end the
-same way, or a path the workload never meant.
+none of them, agentfs tries each suffix of the path from the tree root
+instead (`main/.git/...`, then `.git/...`, and so on). That usually
+finds the right repository, but it can be fooled: two repositories
+whose admin directories end the same way, or a path the workload never
+meant.
 
 ## Symptoms
 
@@ -43,10 +43,12 @@ A sidecar whose workload container mounts the shared volume at another
 - **CSI:** set the `workloadMounts` StorageClass parameter (or the
   static PV's volume attribute) to the `mountPath`s pods use, comma
   separated, with the same `PATH[=DIR]` syntax
-  ([csi.md §5](../csi.md#5-parameters)). It reaches fronts started after
-  the change (a new publish, or a front restarted by the node plugin);
-  existing PVs keep the volume context they were provisioned with, so
-  edit a static PV or re-provision.
+  ([csi.md §5](../csi.md#5-parameters)). A StorageClass change reaches
+  only PVs provisioned after it: each PV keeps the volume context it was
+  provisioned with (a PV's `csi` source is immutable), so recreate a
+  static PV with the attribute added, or re-provision.
+  A front takes the value when its pod is published (a front the node
+  plugin restarts keeps it), so restart the pods afterwards.
 
 The counter is cumulative per process: after the fix it stops growing,
 and starts from zero at the next restart. Nothing in history needs
@@ -58,5 +60,8 @@ repair unless files were recorded or skipped wrongly; check with
 
 Views are one list per process, only ever added to. Two fronts of one
 volume that see different directories at the same path (pods with
-different `subPath`s at one `mountPath`) are both tried, and the suffixes
-after them; a view is not dropped when its front stops.
+different `subPath`s at one `mountPath`) are both tried, never the
+suffixes; a view is not dropped when its front stops. A path under a
+known view that maps to no git directory is not nested, even if one of
+its suffixes names one: its files are recorded rather than risk leaving
+an ordinary directory unrecorded.

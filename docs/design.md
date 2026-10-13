@@ -806,10 +806,11 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
     `main/.git/worktrees/wt`. Views are process-wide and only ever added
     to: when several views share the deepest path (fronts of one volume
     whose pods mount different `subPath`s at the same `mountPath`), each
-    one's mapping is tried. A target under no view, or whose exact
-    mappings name no git directory, falls back to trying each of its
-    suffixes from the tree root, and each such match counts in
-    `agentfs.nested.gitdir_heuristic`: a nonzero count means a workload
+    one's mapping is tried, and nothing else: a suffix that happened to
+    name a git directory would make an ordinary directory nested and
+    leave its files unrecorded. A target under no view falls back to
+    trying each of its suffixes from the tree root, and each such match
+    counts in `agentfs.nested.gitdir_heuristic`: a nonzero count means a workload
     mounts the tree where agentfs was not told
     ([runbook](runbooks/worktree-heuristic.md)). Views are not yet keyed by
     front, nor dropped when a front's lease ends.
@@ -1813,7 +1814,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.fuse.racy_rechecks` | counter, per outcome | Boundaries that would have recorded a file again only because its last record was racy: `skipped` when its bytes were that record's frozen copy, still the last state journaled at its path, else `recorded` (§3.1) |
 | `agentfs.reconcile.records` | counter | Records made reconciling moved directories (§3.1) |
 | `agentfs.reconcile.failures` | counter | Moved directories given up on after 5 failed reconciliations over at least 30 s (`reconcile_failed`, §3.1) |
-| `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree (or whose exact mapping names no git directory), found by trying their suffixes (§5); set `--workload-mount` (CSI: `workloadMounts`) |
+| `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree, found by trying their suffixes (§5); set `--workload-mount` (CSI: `workloadMounts`) |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or

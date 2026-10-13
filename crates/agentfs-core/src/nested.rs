@@ -226,9 +226,9 @@ fn gitdir_from_symlink(tree: &Path, dir: &str, link: &Path) -> io::Result<bool> 
 }
 
 /// True if `target`, as written in `dir`, names a git directory in the tree.
-/// An absolute target whose exact mapping through the views names none
-/// (a view of another pod's `subPath` at the same path) falls back to the
-/// suffix heuristic, counted as such.
+/// A target under a known view is mapped exactly, never by its suffixes:
+/// a suffix that happens to name a git directory would make an ordinary
+/// directory nested, and its files would go unrecorded.
 fn any_git_dir(tree: &Path, dir: &str, target: &str) -> io::Result<bool> {
     let views = VIEWS.read().unwrap_or_else(PoisonError::into_inner).clone();
     git_dir_through(&views, tree, dir, target)
@@ -243,15 +243,6 @@ fn git_dir_through(views: &[View], tree: &Path, dir: &str, target: &str) -> io::
                 HEURISTIC.fetch_add(1, Ordering::Relaxed);
             }
             return Ok(true);
-        }
-    }
-    if exact && Path::new(target).is_absolute() && !views.is_empty() {
-        let (suffixes, _) = self::candidates(&[], dir, target);
-        for candidate in suffixes.iter().filter(|c| !candidates.contains(c)) {
-            if is_git_dir(&tree.join(candidate))? {
-                HEURISTIC.fetch_add(1, Ordering::Relaxed);
-                return Ok(true);
-            }
         }
     }
     Ok(false)
@@ -570,13 +561,11 @@ mod tests {
         assert!(suffixes.contains(&"worktrees/wt".to_owned()));
         let (mapped, exact) = candidates(&views, "wt", "/workspace/x/.git/worktrees/wt");
         assert!(exact);
-        // Mapped exactly first; only if that names no git directory are
-        // the suffixes tried ([`git_dir_through`]).
-        assert_eq!(mapped, ["x/.git/worktrees/wt"]);
+        assert_eq!(mapped, ["x/.git/worktrees/wt"], "no fallback to main/...");
     }
 
     #[test]
-    fn views_at_one_path_are_all_tried_then_the_suffixes() {
+    fn views_at_one_path_are_all_tried() {
         // Two fronts see different directories at /workspace (subPaths).
         let t = tempfile::tempdir().unwrap();
         let admin = t.path().join("main/.git/worktrees/wt");
@@ -594,13 +583,11 @@ mod tests {
             mapped,
             ["main/.git/worktrees/wt", "proj/main/.git/worktrees/wt"]
         );
-        let before = heuristic_matches();
-        assert!(git_dir_through(&views[1..], t.path(), "wt", target).unwrap());
-        assert!(
-            heuristic_matches() > before,
-            "found by its suffix, after the exact mapping named no git directory"
-        );
+        // Either pod's mapping finds it; one view alone maps exactly, and
+        // only that.
         assert!(git_dir_through(&views, t.path(), "wt", target).unwrap());
+        assert!(git_dir_through(&views[..1], t.path(), "wt", target).unwrap());
+        assert!(!git_dir_through(&views[1..], t.path(), "wt", target).unwrap());
         assert!(!git_dir_through(&views, t.path(), "wt", "/workspace/none/wt").unwrap());
     }
 

@@ -293,4 +293,83 @@ mod tests {
         assert_eq!(all(&t), ["a/e/f", "l2"]);
         assert_eq!(t.len(), 2);
     }
+
+    /// The trie against a model: a set of paths, changed as history
+    /// changes its index (`history::apply`), over thousands of random
+    /// writes, removals and moves on a small namespace, so files replace
+    /// directories and moves land on, in and above each other.
+    #[test]
+    fn apply_matches_a_set_model() {
+        use std::collections::BTreeSet;
+        let at_or_under =
+            |e: &str, p: &str| e == p || e.strip_prefix(p).is_some_and(|r| r.starts_with('/'));
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let random_path = |next: &mut dyn FnMut(u64) -> u64| {
+            let depth = 1 + next(3);
+            (0..depth)
+                .map(|_| ["a", "b", "c"][next(3) as usize])
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        for _round in 0..20 {
+            let t = Tracked::default();
+            let mut model: BTreeSet<String> = BTreeSet::new();
+            for _step in 0..500 {
+                let path = random_path(&mut next);
+                let change = match next(4) {
+                    0 | 1 => write(&path),
+                    2 => Change::Remove { path: p(&path) },
+                    _ => Change::Move {
+                        from: p(&path),
+                        to: p(&random_path(&mut next)),
+                    },
+                };
+                match &change {
+                    Change::Write { path, .. } => {
+                        let path = path.as_str();
+                        model.retain(|e| !at_or_under(e, path) && !at_or_under(path, e));
+                        model.insert(path.to_owned());
+                    }
+                    Change::Remove { path } => model.retain(|e| !at_or_under(e, path.as_str())),
+                    Change::Move { from, to } => {
+                        let (from, to) = (from.as_str(), to.as_str());
+                        let moved: Vec<String> = model
+                            .iter()
+                            .filter(|e| at_or_under(e, from))
+                            .map(|e| format!("{to}{}", &e[from.len()..]))
+                            .collect();
+                        model.retain(|e| !at_or_under(e, from) && !at_or_under(e, to));
+                        if !moved.is_empty() {
+                            model.retain(|e| !at_or_under(to, e));
+                            model.extend(moved);
+                        }
+                    }
+                    Change::Symlink { .. } => unreachable!(),
+                }
+                t.apply(&change);
+                let want: Vec<String> = model.iter().cloned().collect();
+                assert_eq!(all(&t), want, "after {change:?}");
+                let probe = random_path(&mut next);
+                assert_eq!(t.contains(&p(&probe)), model.contains(&probe), "{probe}");
+                assert_eq!(
+                    t.contains_or_under(&p(&probe)),
+                    model.iter().any(|e| at_or_under(e, &probe)),
+                    "{probe}"
+                );
+                let under: Vec<String> = model
+                    .iter()
+                    .filter(|e| at_or_under(e, &probe))
+                    .cloned()
+                    .collect();
+                assert_eq!(t.under(&p(&probe)), under, "{probe}");
+                assert_eq!(t.len(), model.len());
+            }
+        }
+    }
 }
