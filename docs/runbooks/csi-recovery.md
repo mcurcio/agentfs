@@ -28,7 +28,7 @@ the volume keep working. The plugin log says:
 
 ```
 [front <ns>/<pod> <key>] ...
-front for <ns>/<pod> exited (signal 9); restarting in 1s in slot 3
+front for <ns>/<pod> exited (killed by SIGKILL); restarting in 1s in slot 3
 front for <ns>/<pod> restarted in slot 3; its mount is stacked over the stale one at /var/lib/kubelet/pods/.../mount
 ```
 

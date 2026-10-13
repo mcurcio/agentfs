@@ -644,8 +644,11 @@ impl Supervisor {
         let key = target_key(&target);
         let source = self.layout().front_source(&handle, &key);
         fs::create_dir_all(&source).or_else(|e| {
-            // A stale mount answers ENOTCONN; it is detached below.
-            if e.raw_os_error() == Some(rustix::io::Errno::NOTCONN.raw_os_error()) {
+            // A stale mount is detached below. `mkdir` on it fails with
+            // EEXIST, and create_dir_all then cannot stat it (ENOTCONN).
+            if e.kind() == io::ErrorKind::AlreadyExists
+                || e.raw_os_error() == Some(rustix::io::Errno::NOTCONN.raw_os_error())
+            {
                 Ok(())
             } else {
                 Err(Error::io(format!("creating {}", source.display()), e))
