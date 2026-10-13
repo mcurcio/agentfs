@@ -29,12 +29,13 @@ use std::time::{Duration, Instant};
 use super::Address;
 use super::lease::{FrontLease, MAX_SLOT};
 use super::protocol::{
-    FrontInfo, Reply, Request, WireSkip, WireSkipReason, parse_hello, read_frame, read_frame_bytes,
-    write_frame,
+    FEATURES, FrontInfo, Reply, Request, WireSkip, WireSkipReason, parse_hello, read_frame,
+    read_frame_bytes, write_frame,
 };
 use crate::config::Settings;
 use crate::identity::{IdentityRenderer, Templates};
 use crate::local_socket;
+use crate::record::{Draft, Origin, Trigger};
 use crate::telemetry::Telemetry;
 use crate::volume::{Recorder, Skipped, StateDir};
 
@@ -370,6 +371,7 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
         volume: shared.volume.clone(),
         branch: shared.branch.clone(),
         service_pid: std::process::id(),
+        features: FEATURES.iter().map(|f| (*f).to_owned()).collect(),
     };
     // Counted before the welcome, so a front that has its welcome is
     // counted.
@@ -392,8 +394,12 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
             Request::Tracked { paths } => Reply::Tracked {
                 tracked: shared.recorder.tracked_query(&paths),
             },
-            Request::Record { draft } => {
-                match shared.recorder.sequence(&front.origin, front.slot, *draft) {
+            Request::Record { draft, stamps } => {
+                let origin = record_origin(shared, &front, &draft);
+                match shared
+                    .recorder
+                    .sequence(&origin, front.slot, *draft, &stamps)
+                {
                     Ok(recorded) => Reply::Recorded {
                         seq: recorded.seq,
                         skipped: recorded.skipped.into_iter().map(wire_skip).collect(),
@@ -404,9 +410,45 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
                 }
             }
             Request::Ping => Reply::Pong,
+            Request::Listen => Reply::Error {
+                message: "this history service does not call fronts".into(),
+            },
         };
         if write_frame(&mut stream, &reply).is_err() {
             return;
+        }
+    }
+}
+
+/// The origin a front's record is journaled with: the front's own, or,
+/// for a sweep record that names another (a repair the front inherited
+/// from a dead predecessor in its slot, design §14.1), that one, if the
+/// volume's identity templates render for it. A record of any other
+/// trigger that names another origin is journaled as the front's own.
+fn record_origin(shared: &Shared, front: &FrontInfo, draft: &Draft) -> Origin {
+    let Some(claimed) = draft.origin.as_ref().filter(|o| **o != front.origin) else {
+        return front.origin.clone();
+    };
+    if draft.trigger != Trigger::Sweep {
+        eprintln!(
+            "history service: a {} record from {} names origin {}; only sweep records may \
+             (repairs a front inherited): recorded as {}",
+            draft.trigger.as_str(),
+            front.origin.replica,
+            claimed.replica,
+            front.origin.replica
+        );
+        return front.origin.clone();
+    }
+    match IdentityRenderer::new(shared.identity.clone(), &claimed.context(&shared.volume)) {
+        Ok(_) => claimed.clone(),
+        Err(e) => {
+            eprintln!(
+                "history service: a repair from {} names origin {}, whose committer does not \
+                 render ({e}): recorded as {}",
+                front.origin.replica, claimed.replica, front.origin.replica
+            );
+            front.origin.clone()
         }
     }
 }

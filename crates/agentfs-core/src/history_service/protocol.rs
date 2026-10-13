@@ -16,6 +16,16 @@
 //!      with the front's origin, and answers `Recorded` only once it is
 //!      durable.
 //!    - `Ping`: liveness and round-trip time.
+//!    - `Listen`: turns the connection around (answered `Listening`): from
+//!      then on the *service* sends [`FrontCall`]s and the front answers
+//!      each with a [`FrontAnswer`] of the same id. A front keeps one such
+//!      connection open so the service can serve restores live (design
+//!      §15): `Settle` (record what is dirty now), `OpenForWriting`,
+//!      `Invalidate` (drop kernel caches of restored paths) and `Ping`.
+//!
+//! Additions since the first release are optional fields and new variants
+//! only, so `PROTOCOL_VERSION` stays 1; a service lists what it supports in
+//! `Welcome.features` ([`FEATURES`]).
 //!
 //! The service closes a connection it cannot parse. Nothing is ever resent:
 //! a front that loses its connection mid-request reports the boundary as
@@ -31,12 +41,18 @@ use crate::nested::NestedKind;
 use crate::paths::RepoPath;
 use crate::record::{Draft, Origin};
 use crate::rules::{RuleSource, SkipReason};
+use crate::stamps::FreezeStamp;
 
 /// The protocol version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The largest frame accepted: the journal's bound on one record.
 pub const MAX_FRAME: usize = 64 << 20;
+
+/// What this build's service supports beyond protocol 1 as first released:
+/// `stamps` (freeze stamps on records, design §14.1) and `repair_origin`
+/// (a repair's own origin on a sweep record, design §14.1).
+pub const FEATURES: &[&str] = &["stamps", "repair_origin"];
 
 /// The first frame on a connection, from the front.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,9 +81,26 @@ pub struct FrontInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
-    Tracked { paths: Vec<RepoPath> },
-    Record { draft: Box<Draft> },
+    Tracked {
+        paths: Vec<RepoPath>,
+    },
+    Record {
+        draft: Box<Draft>,
+        /// The stamp of each write's backing file, taken just before its
+        /// freeze (design §14.1). Absent from older fronts.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stamps: Vec<PathStamp>,
+    },
     Ping,
+    /// Turns the connection around for [`FrontCall`]s.
+    Listen,
+}
+
+/// A write's freeze stamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathStamp {
+    pub path: RepoPath,
+    pub stamp: FreezeStamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +110,9 @@ pub enum Reply {
         volume: String,
         branch: String,
         service_pid: u32,
+        /// [`FEATURES`] of the service; absent from older services.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     Tracked {
         tracked: Vec<bool>,
@@ -87,6 +123,8 @@ pub enum Reply {
         skipped: Vec<WireSkip>,
     },
     Pong,
+    /// The answer to [`Request::Listen`]: the service sends calls now.
+    Listening,
     /// The service will not serve this front; the connection is closed.
     Refused {
         reason: String,
@@ -129,6 +167,8 @@ pub enum WireSkipReason {
     SharedMemory,
     /// The path left the backing tree before the record was journaled.
     Gone,
+    /// A newer state of the path was already journaled (design §14.1).
+    Superseded,
     GroupRefused {
         member: RepoPath,
     },
@@ -189,6 +229,7 @@ impl WireSkipReason {
             SkipReason::Untracked => Self::Untracked,
             SkipReason::SharedMemory => Self::SharedMemory,
             SkipReason::Gone => Self::Gone,
+            SkipReason::Superseded => Self::Superseded,
             SkipReason::GroupRefused { member } => Self::GroupRefused {
                 member: member.clone(),
             },
@@ -215,12 +256,65 @@ impl WireSkipReason {
             Self::Untracked => SkipReason::Untracked,
             Self::SharedMemory => SkipReason::SharedMemory,
             Self::Gone => SkipReason::Gone,
+            Self::Superseded => SkipReason::Superseded,
             Self::GroupRefused { member } => SkipReason::GroupRefused { member },
             Self::GroupMemberSkipped { reason } => {
                 SkipReason::Refused(Refusal::GroupMemberSkipped { reason })
             }
         }
     }
+}
+
+/// A call from the service to a listening front ([`Request::Listen`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontCall {
+    pub id: u64,
+    pub call: Call,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Call {
+    /// Record now what changed through the front and is not recorded yet
+    /// (its sweep: the repair queue, then every inode open for writing
+    /// that changed), and answer once that is journaled.
+    Settle,
+    /// Whether each path has a handle open for writing through the front.
+    OpenForWriting {
+        paths: Vec<RepoPath>,
+    },
+    /// The service changed these paths in the backing tree: drop the
+    /// kernel's cached entries, attributes and pages of each.
+    Invalidate {
+        paths: Vec<RepoPath>,
+    },
+    Ping,
+}
+
+/// A front's answer to the [`FrontCall`] with the same id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontAnswer {
+    pub id: u64,
+    pub answer: Answer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Answer {
+    /// The sweep is done: `recorded` inodes recorded, `failed` paths still
+    /// waiting for a repair (their records failed).
+    Settled {
+        recorded: usize,
+        failed: usize,
+    },
+    Open {
+        open: Vec<bool>,
+    },
+    Invalidated,
+    Pong,
+    Error {
+        message: String,
+    },
 }
 
 /// Why a frame could not be read.
@@ -320,6 +414,96 @@ mod tests {
         RepoPath::new(p).unwrap()
     }
 
+    fn stamp() -> FreezeStamp {
+        FreezeStamp {
+            dev: 1,
+            ino: 2,
+            size: 3,
+            mtime_ns: 4,
+            ctime_ns: 5,
+        }
+    }
+
+    #[test]
+    fn older_peers_frames_still_parse() {
+        // A record and a welcome as the first release sent them.
+        let record = r#"{"record":{"draft":{"trigger":"close","caller":{"uid":1,"gid":2,"pid":3},"time_ms":9,"changes":[]}}}"#;
+        match serde_json::from_str::<Request>(record).unwrap() {
+            Request::Record { stamps, .. } => assert!(stamps.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        let welcome = r#"{"welcome":{"volume":"v","branch":"b","service_pid":1}}"#;
+        match serde_json::from_str::<Reply>(welcome).unwrap() {
+            Reply::Welcome { features, .. } => assert!(features.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // And this build sends them the same way when it has nothing new.
+        let draft = match serde_json::from_str::<Request>(record).unwrap() {
+            Request::Record { draft, .. } => draft,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            serde_json::to_string(&Request::Record {
+                draft,
+                stamps: Vec::new()
+            })
+            .unwrap(),
+            record
+        );
+        // An older service cannot parse `listen`: it closes the
+        // connection, which the listener takes as "not supported".
+        assert_eq!(
+            serde_json::to_string(&Request::Listen).unwrap(),
+            r#""listen""#
+        );
+    }
+
+    #[test]
+    fn calls_and_answers_round_trip() {
+        let calls = [
+            Call::Settle,
+            Call::OpenForWriting {
+                paths: vec![path("a"), path("b/c")],
+            },
+            Call::Invalidate {
+                paths: vec![path("a")],
+            },
+            Call::Ping,
+        ];
+        for (id, call) in calls.into_iter().enumerate() {
+            let call = FrontCall {
+                id: id as u64,
+                call,
+            };
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &call).unwrap();
+            assert_eq!(read_frame::<FrontCall>(&mut &buf[..]).unwrap(), call);
+        }
+        let answers = [
+            Answer::Settled {
+                recorded: 2,
+                failed: 1,
+            },
+            Answer::Open {
+                open: vec![true, false],
+            },
+            Answer::Invalidated,
+            Answer::Pong,
+            Answer::Error {
+                message: "m".into(),
+            },
+        ];
+        for (id, answer) in answers.into_iter().enumerate() {
+            let answer = FrontAnswer {
+                id: id as u64,
+                answer,
+            };
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &answer).unwrap();
+            assert_eq!(read_frame::<FrontAnswer>(&mut &buf[..]).unwrap(), answer);
+        }
+    }
+
     fn hello() -> Hello {
         Hello {
             v: PROTOCOL_VERSION,
@@ -363,6 +547,10 @@ mod tests {
             },
             Request::Record {
                 draft: Box::new(draft.clone()),
+                stamps: vec![PathStamp {
+                    path: path("a/b"),
+                    stamp: stamp(),
+                }],
             },
             Request::Ping,
         ] {
@@ -380,7 +568,11 @@ mod tests {
         assert_eq!(
             read_frame::<Request>(&mut r).unwrap(),
             Request::Record {
-                draft: Box::new(draft)
+                draft: Box::new(draft),
+                stamps: vec![PathStamp {
+                    path: path("a/b"),
+                    stamp: stamp(),
+                }],
             }
         );
         assert_eq!(read_frame::<Request>(&mut r).unwrap(), Request::Ping);
@@ -394,7 +586,9 @@ mod tests {
                 volume: "v".into(),
                 branch: "b".into(),
                 service_pid: 1,
+                features: FEATURES.iter().map(|f| f.to_string()).collect(),
             },
+            Reply::Listening,
             Reply::Tracked {
                 tracked: vec![true, false],
             },
@@ -473,6 +667,7 @@ mod tests {
             SkipReason::Untracked,
             SkipReason::SharedMemory,
             SkipReason::Gone,
+            SkipReason::Superseded,
             SkipReason::GroupRefused { member: path("m") },
             SkipReason::Refused(Refusal::GroupMemberSkipped { reason: "r".into() }),
         ];

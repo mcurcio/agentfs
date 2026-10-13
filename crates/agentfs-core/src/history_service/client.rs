@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use super::Address;
 use super::protocol::{
-    FrameError, FrontInfo, Hello, PROTOCOL_VERSION, Reply, Request, read_frame, write_frame,
+    FrameError, FrontInfo, Hello, PROTOCOL_VERSION, PathStamp, Reply, Request, read_frame,
+    write_frame,
 };
 use crate::events::{Event, Events};
 use crate::local_socket;
@@ -206,11 +207,14 @@ impl HistoryClient {
     }
 
     /// Hands `draft` to the service and waits until it is durable there.
-    /// The service decides each change again and stamps the record with
-    /// this front's origin.
-    pub fn record(&self, draft: Draft) -> Result<Recorded, ClientError> {
+    /// The service decides each change again, skips writes older than the
+    /// state it last journaled at their path (by `stamps`, design §14.1),
+    /// and stamps the record with this front's origin (or, for a sweep
+    /// record, the origin the draft carries, if it can render it).
+    pub fn record(&self, draft: Draft, stamps: Vec<PathStamp>) -> Result<Recorded, ClientError> {
         let request = Request::Record {
             draft: Box::new(draft),
+            stamps,
         };
         match self.call("record", &request)? {
             Reply::Recorded { seq, skipped } => Ok(Recorded {

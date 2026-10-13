@@ -63,7 +63,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Instant;
 
-use agentfs_core::record::{Caller, Trigger};
+use agentfs_core::record::{Caller, Origin, Trigger};
 use agentfs_core::volume::{Recorder, VolumeError};
 use fuser::{Errno, FileAttr, FileType, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
@@ -465,8 +465,20 @@ impl Ops {
         caller: Caller,
         changes: Vec<Change>,
     ) -> Result<bool, VolumeError> {
+        self.record_as(trigger, caller, changes, None)
+    }
+
+    /// [`Ops::record`] as the pod `origin`, when given: an inherited repair
+    /// (design §14.1).
+    fn record_as(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        changes: Vec<Change>,
+        origin: Option<&Origin>,
+    ) -> Result<bool, VolumeError> {
         if !self.boundary.recorder().has_fsync_class() {
-            return self.boundary.record(trigger, caller, changes);
+            return self.boundary.record_as(trigger, caller, changes, origin);
         }
         let changes: Vec<Change> = changes
             .into_iter()
@@ -481,7 +493,7 @@ impl Ops {
         if changes.is_empty() {
             return Ok(false);
         }
-        self.boundary.record(trigger, caller, changes)
+        self.boundary.record_as(trigger, caller, changes, origin)
     }
 
     /// Captures `group` (design §8) if `when` says it is due: freezes its
@@ -1356,7 +1368,7 @@ impl Ops {
             (vec![src_path.clone()], vec![dst_path.clone()])
         };
         if self
-            .record_tree(Trigger::Rename, caller, removed, &roots)
+            .record_tree(Trigger::Rename, caller, removed, &roots, None)
             .is_err()
         {
             self.boundary.queue_repair([src_path, dst_path], caller);
@@ -1379,6 +1391,7 @@ impl Ops {
         caller: Caller,
         removed: Vec<Vec<u8>>,
         roots: &[Vec<u8>],
+        origin: Option<&Origin>,
     ) -> Result<(), ()> {
         let mut leaves = Vec::new();
         for root in roots {
@@ -1399,7 +1412,7 @@ impl Ops {
         let mut chunks = leaves.chunks(chunk).peekable();
         if chunks.peek().is_none() {
             return self
-                .record(trigger, caller, first)
+                .record_as(trigger, caller, first, origin)
                 .map(|_| ())
                 .map_err(|_| ());
         }
@@ -1411,7 +1424,8 @@ impl Ops {
                     changes.push(change);
                 }
             }
-            self.record(trigger, caller, changes).map_err(|_| ())?;
+            self.record_as(trigger, caller, changes, origin)
+                .map_err(|_| ())?;
             drop(fds);
         }
         Ok(())
@@ -2081,7 +2095,13 @@ impl Ops {
             let removed = vec![path.clone()];
             let roots = std::slice::from_ref(&path);
             if self
-                .record_tree(REPAIR_TRIGGER, repair.caller, removed, roots)
+                .record_tree(
+                    REPAIR_TRIGGER,
+                    repair.caller,
+                    removed,
+                    roots,
+                    repair.origin.as_ref(),
+                )
                 .is_ok()
             {
                 done.push(repair);

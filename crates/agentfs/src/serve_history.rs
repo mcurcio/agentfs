@@ -66,7 +66,9 @@ pub(crate) fn serve(
     };
     let session = Session::start(state, pod)?;
     let events = session.events.clone();
-    let (recorder, committer, recovery) = session.open(state, &backing, pod)?;
+    let (mut recorder, committer, recovery) = session.open(state, &backing, pod)?;
+    // Orders fronts' records that race for one path (design §14.1).
+    recorder.enable_stamps();
     let settings = committer.history().settings().clone();
     if std::fs::metadata(state.repairs()).is_ok_and(|m| m.len() > 0) {
         eprintln!(

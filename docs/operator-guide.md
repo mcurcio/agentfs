@@ -802,8 +802,12 @@ next start or an `agentfs push`.
   through one front only, and the `fsync` class (§14) is per front.
 - Patches are applied only when the service starts with no front
   running.
-- If two fronts change one path at the same instant, history can keep the
-  earlier one's state until that path's next change.
+- Two fronts changing one path at nearly the same instant are ordered by
+  freeze stamps: the service skips a write frozen before a state it
+  already journaled ("superseded"; `agentfs.history_service.superseded`),
+  so history ends on the newer state. Two states within one tick of the
+  filesystem's timestamp clock, of the same size and mtime, cannot be
+  ordered and are journaled in arrival order, as before.
 - A file open in one front that another front renames or removes: the
   first front's later close records it under its current name, or not
   at all once it is removed, so history never gets back a path the tree
@@ -817,9 +821,9 @@ next start or an `agentfs push`.
   removes the slot's copies older than the new lease that no journaled
   record references. A front that keeps running keeps such copies (each
   as large as the file it froze) until it restarts. A slot's repair
-  queue is drained only by the next front in that slot, and those
-  repairs are committed as that front's pod, not the pod that made the
-  change.
+  queue is drained only by the next front in that slot, which commits
+  each entry as the pod that made the change (files written by older
+  versions name no pod: their entries are committed as the new front's).
 - The service serves at most 1024 connections at once (one thread each).
   A front holds about as many as it has boundaries in flight at once
   (at most its FUSE threads plus its sweep, 17 by default on a 16-CPU

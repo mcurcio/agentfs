@@ -35,6 +35,7 @@ missing from these tables or a row names a module that no longer exists;
 | `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` (§3.2, §3.3) |
 | `pending.rs` | Frozen copies in `pending/`: `FICLONE` reflink, else copy plus `fsync`; slot-numbered ids for fronts (§3.2 step 1) |
 | `claims.rs` | Per-path ordering: a record claims its paths from decision to tracked-set update (§3.2, §4) |
+| `stamps.rs` | Freeze stamps: the history service orders fronts' writes of one path by the backing file's stat stamp at freeze (§14.1) |
 | `tracked.rs` | The tracked set, git's index in agentfs: branch head plus durable records (§4) |
 | `rules.rs` | Path rules: recorded or skipped, and why, from `info/exclude`, `info/attributes` and optionally tree rules (§4, §5) |
 | `nested.rs` | Detects nested git repositories, including ones being created (§5) |

@@ -86,6 +86,7 @@ dependencies = [
  "fuser",
  "git2",
  "rustix",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

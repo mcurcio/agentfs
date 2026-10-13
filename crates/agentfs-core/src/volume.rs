@@ -33,6 +33,7 @@ use crate::config::{ConfigError, validate_name};
 use crate::events::{CheckStage, Event, Events};
 use crate::fsync_class::{self, FsyncClass, GroupMembers};
 use crate::history::{Committed, History, HistoryError};
+use crate::history_service::protocol::PathStamp;
 use crate::history_service::{ClientError, FrontLease, HistoryClient};
 use crate::identity::{Context, IdentityRenderer};
 use crate::journal::{Journal, OpenReport};
@@ -45,6 +46,7 @@ use crate::record::{
     Caller, Change, Draft, Operation, OperationKind, Origin, PatchAuthor, Record, Trigger,
 };
 use crate::rules::{Decision, Rules, RulesError, SkipReason};
+use crate::stamps::{self, FreezeStamp, StampBook, Verdict};
 use crate::telemetry::{Telemetry, spans};
 use crate::tracked::Tracked;
 
@@ -484,6 +486,7 @@ pub fn open(
         events: events.clone(),
         telemetry: telemetry.clone(),
         reclaim: Arc::default(),
+        stamps: None,
     };
     let committer = Committer {
         history,
@@ -538,6 +541,7 @@ pub fn open_front(
         events,
         telemetry: telemetry.clone(),
         reclaim: Arc::default(),
+        stamps: None,
     })
 }
 
@@ -648,6 +652,9 @@ pub struct Recorder {
     /// [`Recorder::reclaim_slot`], so no copy a front's record is about to
     /// journal is reclaimed meanwhile.
     reclaim: Arc<RwLock<()>>,
+    /// The last journaled freeze stamp of each path, in the history
+    /// service ([`Recorder::enable_stamps`], design §14.1).
+    stamps: Option<Arc<StampBook>>,
 }
 
 /// Where a [`Recorder`]'s records go.
@@ -696,7 +703,7 @@ impl Recorder {
         caller: Caller,
         inputs: Vec<Input>,
     ) -> Result<Recorded, VolumeError> {
-        self.record_with(trigger, caller, inputs, false)
+        self.record_with(trigger, caller, inputs, false, None)
     }
 
     /// Records an fsync-class group (design §8) as one all-or-nothing
@@ -712,7 +719,23 @@ impl Recorder {
         caller: Caller,
         inputs: Vec<Input>,
     ) -> Result<Recorded, VolumeError> {
-        self.record_with(trigger, caller, inputs, true)
+        self.record_with(trigger, caller, inputs, true, None)
+    }
+
+    /// Records like [`Recorder::record`], for the pod `origin` rather than
+    /// this front's own: a repair a front inherited from a dead predecessor
+    /// in its slot, recorded with the trigger `sweep` (design §14.1). The
+    /// history service accepts the origin only for sweep records whose
+    /// committer it can render, and uses the front's own otherwise. A
+    /// local recorder journals it as given.
+    pub fn record_as(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        inputs: Vec<Input>,
+        origin: Option<Origin>,
+    ) -> Result<Recorded, VolumeError> {
+        self.record_with(trigger, caller, inputs, false, origin)
     }
 
     fn record_with(
@@ -721,6 +744,7 @@ impl Recorder {
         caller: Caller,
         inputs: Vec<Input>,
         atomic: bool,
+        origin: Option<Origin>,
     ) -> Result<Recorded, VolumeError> {
         let start = Instant::now();
         // A record by an operation's actor is part of that operation (design
@@ -741,7 +765,7 @@ impl Recorder {
             ]
         });
         let paths: Vec<RepoPath> = inputs.iter().map(|i| i.path().clone()).collect();
-        let result = self.record_inner(trigger, caller, inputs, operation, atomic);
+        let result = self.record_inner(trigger, caller, inputs, operation, atomic, origin);
         match &result {
             Ok(recorded) => {
                 if let Some(seq) = recorded.seq {
@@ -777,6 +801,7 @@ impl Recorder {
         inputs: Vec<Input>,
         operation: Option<Operation>,
         atomic: bool,
+        origin: Option<Origin>,
     ) -> Result<Recorded, VolumeError> {
         let _claim = self.claims.claim(inputs.iter().map(Input::path));
         let decisions = self.decide_all(&inputs)?;
@@ -813,6 +838,7 @@ impl Recorder {
 
         let mut changes = Vec::with_capacity(kept.len());
         let mut frozen = Vec::new();
+        let mut stamps = Vec::new();
         let result = (|| {
             for input in kept {
                 let change = match input {
@@ -821,7 +847,15 @@ impl Recorder {
                         backing,
                         executable,
                     } => match self.prepare_write(path, &backing, executable, &mut frozen)? {
-                        Ok(change) => change,
+                        Ok((change, stamp)) => {
+                            if let Some(stamp) = stamp {
+                                stamps.push(PathStamp {
+                                    path: change.path().clone(),
+                                    stamp,
+                                });
+                            }
+                            change
+                        }
                         Err((path, refusal)) => {
                             self.refuse(&mut skipped, path, refusal);
                             continue;
@@ -869,7 +903,7 @@ impl Recorder {
                 changes: changes.clone(),
                 operation,
                 atomic,
-                origin: None,
+                origin,
             };
             match &self.backend {
                 Backend::Local { journal, .. } => Ok(Recorded {
@@ -878,7 +912,7 @@ impl Recorder {
                 }),
                 // The service decides again and journals (design §14); its
                 // skips come back with the reply.
-                Backend::Front { client } => Ok(client.record(draft)?),
+                Backend::Front { client } => Ok(client.record(draft, std::mem::take(&mut stamps))?),
             }
         })();
         match result {
@@ -889,6 +923,15 @@ impl Recorder {
                 if let Backend::Local { tracked, .. } = &self.backend {
                     for change in &changes {
                         tracked.apply(change);
+                    }
+                    // This process's own writes (a restore the service
+                    // applies) order fronts' records too (design §14.1).
+                    if let Some(book) = &self.stamps
+                        && seq.is_some()
+                    {
+                        for s in stamps {
+                            book.note(&s.path, s.stamp);
+                        }
                     }
                 }
                 for skip in by_service {
@@ -922,14 +965,17 @@ impl Recorder {
     /// on the path, `agentfs.maxSize` and the blob limit on the size on
     /// disk, the freeze, then `agentfs.maxSize` and the content checks on
     /// the frozen copy, and the store. The copy is pushed to `frozen`
-    /// unless refused, in which case it is already removed.
+    /// unless refused, in which case it is already removed. The backing
+    /// file's stamp, taken before the freeze, comes with the change
+    /// (design §14.1).
+    #[allow(clippy::type_complexity)]
     fn prepare_write(
         &self,
         path: RepoPath,
         backing: &Path,
         executable: bool,
         frozen: &mut Vec<PendingId>,
-    ) -> Result<Result<Change, (RepoPath, Refusal)>, VolumeError> {
+    ) -> Result<Result<(Change, Option<FreezeStamp>), (RepoPath, Refusal)>, VolumeError> {
         if let Some(refusal) = self.checks.check_path(&path) {
             return Ok(Err((path, refusal)));
         }
@@ -937,7 +983,9 @@ impl Recorder {
         // first by the size on disk, so a file far over the limit is never
         // copied, then by the frozen copy's, which is what is journaled.
         let attrs = self.rules.attributes(&path)?;
-        let on_disk = std::fs::metadata(backing).map_or(0, |m| m.len());
+        let meta = std::fs::metadata(backing).ok();
+        let stamp = meta.as_ref().map(FreezeStamp::from_metadata);
+        let on_disk = meta.map_or(0, |m| m.len());
         // `agentfs.maxSize` the same way: on disk, then frozen.
         let max_size = self.rules.max_size(&path);
         if let Some(refusal) = over_max_size(on_disk, max_size) {
@@ -967,12 +1015,15 @@ impl Recorder {
             self.pending.remove([id])?;
             return Ok(Err((path, refusal)));
         }
-        Ok(Ok(Change::Write {
-            path,
-            pending: id,
-            executable,
-            store,
-        }))
+        Ok(Ok((
+            Change::Write {
+                path,
+                pending: id,
+                executable,
+                store,
+            },
+            stamp,
+        )))
     }
 
     /// Journals a front's record (design §14): the history service's side
@@ -986,7 +1037,11 @@ impl Recorder {
     /// is no longer in the backing tree as sent is skipped
     /// ([`SkipReason::Gone`]): another front removed or renamed it after
     /// this front froze it, and that front's boundary, journaled after
-    /// this check under the same claim, records it. Every write's copy must exist
+    /// this check under the same claim, records it. A write frozen before
+    /// a newer state of its path that is already journaled is skipped
+    /// ([`SkipReason::Superseded`], by its freeze stamp in `stamps`, once
+    /// [`Recorder::enable_stamps`] is on; design §14.1). Atomic groups are
+    /// recorded whole: neither check applies to them. Every write's copy must exist
     /// and be in the front's `slot`; operations come only from this
     /// process. The record is journaled with `origin`, so it commits with
     /// the front's committer (design §9), and this returns once it is
@@ -996,6 +1051,7 @@ impl Recorder {
         origin: &Origin,
         slot: u16,
         mut draft: Draft,
+        stamps: &[PathStamp],
     ) -> Result<Recorded, VolumeError> {
         let Backend::Local { journal, tracked } = &self.backend else {
             return Err(VolumeError::FrontRecord(
@@ -1028,6 +1084,8 @@ impl Recorder {
         let mut kept = Vec::with_capacity(draft.changes.len());
         let mut dropped = Vec::new();
         let mut skipped = Vec::new();
+        let stamp_of: HashMap<&RepoPath, &FreezeStamp> =
+            stamps.iter().map(|s| (&s.path, &s.stamp)).collect();
         let mut refused_member = None;
         for change in std::mem::take(&mut draft.changes) {
             let decision = match &change {
@@ -1038,15 +1096,18 @@ impl Recorder {
                         Decision::Skip(SkipReason::Untracked)
                     }
                 }
-                Change::Write { path, .. } | Change::Symlink { path, .. }
-                    if !draft.atomic
-                        && !still_in_backing(
-                            self.rules.tree(),
-                            path,
-                            matches!(change, Change::Symlink { .. }),
-                        ) =>
-                {
-                    Decision::Skip(SkipReason::Gone)
+                Change::Write { path, .. } | Change::Symlink { path, .. } if !draft.atomic => {
+                    let symlink = matches!(change, Change::Symlink { .. });
+                    match in_backing(self.rules.tree(), path, symlink) {
+                        None => Decision::Skip(SkipReason::Gone),
+                        Some(now) => {
+                            let stamp = stamp_of.get(path).copied().filter(|_| !symlink);
+                            match self.judge_write(path, stamp, now.as_ref()) {
+                                Some(reason) => Decision::Skip(reason),
+                                None => self.rules.decide(path, tracked.contains(path))?,
+                            }
+                        }
+                    }
                 }
                 Change::Write { path, .. } | Change::Symlink { path, .. } => {
                     self.rules.decide(path, tracked.contains(path))?
@@ -1110,6 +1171,15 @@ impl Recorder {
                 for change in &changes {
                     tracked.apply(change);
                 }
+                if let Some(book) = &self.stamps {
+                    for change in &changes {
+                        if let Change::Write { path, .. } = change
+                            && let Some(stamp) = stamp_of.get(path)
+                        {
+                            book.note(path, **stamp);
+                        }
+                    }
+                }
                 let _ = self.pending.remove(dropped);
                 Ok(Recorded {
                     seq: Some(seq),
@@ -1128,6 +1198,50 @@ impl Recorder {
                 Err(e)
             }
         }
+    }
+
+    /// Keeps the freeze stamp of the last write journaled at each path, so
+    /// [`Recorder::sequence`] skips a front's write frozen before it
+    /// (design §14.1). The history service turns it on before it serves;
+    /// clones made before share nothing of it.
+    pub fn enable_stamps(&mut self) {
+        if matches!(self.backend, Backend::Local { .. }) {
+            self.stamps = Some(Arc::new(StampBook::new()));
+        }
+    }
+
+    /// Whether a front's write of `path`, frozen with `stamp`, is out of
+    /// date (design §14.1), given `now`, the path's metadata in the backing
+    /// tree: [`SkipReason::Gone`] if another file has replaced the one it
+    /// froze (a rename over the path: whoever did that records it), and
+    /// [`SkipReason::Superseded`] if a newer state is already journaled
+    /// ([`stamps`], once [`Recorder::enable_stamps`] is on).
+    fn judge_write(
+        &self,
+        path: &RepoPath,
+        stamp: Option<&FreezeStamp>,
+        now: Option<&std::fs::Metadata>,
+    ) -> Option<SkipReason> {
+        let stamp = stamp?;
+        let now = now.map(FreezeStamp::from_metadata);
+        if let Some(now) = &now
+            && now.dev == stamp.dev
+            && now.ino != stamp.ino
+        {
+            return Some(SkipReason::Gone);
+        }
+        let book = self.stamps.as_ref()?;
+        let superseded = match book.judge(path, stamp) {
+            Verdict::Journal => false,
+            Verdict::Superseded => true,
+            Verdict::Tie(journaled) => {
+                stamps::resolve_tie(&journaled, now.as_ref()) == Verdict::Superseded
+            }
+        };
+        superseded.then(|| {
+            self.telemetry.superseded();
+            SkipReason::Superseded
+        })
     }
 
     /// Whether each of `paths` is tracked now: the history service's answer
@@ -1173,6 +1287,12 @@ impl Recorder {
             Backend::Front { client } => Some(client),
             Backend::Local { .. } => None,
         }
+    }
+
+    /// The pod a front records for (design §9, §14); `None` for a local
+    /// recorder.
+    pub fn front_origin(&self) -> Option<&Origin> {
+        self.history_client().map(|c| &c.front().origin)
     }
 
     fn refuse(&self, skipped: &mut Vec<Skipped>, path: RepoPath, refusal: Refusal) {
@@ -1831,20 +1951,21 @@ fn in_tree(tree: Option<&git2::Tree<'_>>, path: &RepoPath) -> Result<bool, Volum
 /// recorded it (design §14): a regular file (or, with `symlink`, a
 /// symlink) whose every directory is a real directory. Another front
 /// that removed or renamed the path since records that itself, so a late
-/// write must not bring it back. A failure other than a missing path
-/// counts as present.
-fn still_in_backing(tree: &Path, path: &RepoPath, symlink: bool) -> bool {
+/// write must not bring it back. `None`: gone. A failure other than a
+/// missing path counts as present, with no metadata (`Some(None)`).
+fn in_backing(tree: &Path, path: &RepoPath, symlink: bool) -> Option<Option<std::fs::Metadata>> {
     let mut at = tree.to_path_buf();
     let parts: Vec<&str> = path.as_str().split('/').collect();
+    let mut last = None;
     for (i, part) in parts.iter().enumerate() {
         at.push(part);
         let meta = match std::fs::symlink_metadata(&at) {
             Ok(meta) => meta,
             Err(e) => {
-                return !matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                );
+                return match e.kind() {
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => None,
+                    _ => Some(None),
+                };
             }
         };
         let ty = meta.file_type();
@@ -1856,10 +1977,11 @@ fn still_in_backing(tree: &Path, path: &RepoPath, symlink: bool) -> bool {
             ty.is_file()
         };
         if !ok {
-            return false;
+            return None;
         }
+        last = Some(meta);
     }
-    true
+    Some(last)
 }
 
 /// Splits records into runs where each record is within `window_ms` of the
@@ -4566,7 +4688,7 @@ mod tests {
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let change = front_write(&state, dir.path(), 3, "a", "1");
         let recorded = rec
-            .sequence(&pod("pod-a"), 3, front_draft(vec![change], false))
+            .sequence(&pod("pod-a"), 3, front_draft(vec![change], false), &[])
             .unwrap();
         assert_eq!(recorded.seq, Some(0));
         assert!(recorded.skipped.is_empty());
@@ -4611,6 +4733,7 @@ mod tests {
                     ],
                     false,
                 ),
+                &[],
             )
             .unwrap();
 
@@ -4646,7 +4769,7 @@ mod tests {
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let foreign = front_write(&state, dir.path(), 4, "a", "1");
         let err = rec
-            .sequence(&pod("pod-a"), 3, front_draft(vec![foreign], false))
+            .sequence(&pod("pod-a"), 3, front_draft(vec![foreign], false), &[])
             .unwrap_err();
         assert!(
             err.to_string().contains("not in the front's slot 3"),
@@ -4656,7 +4779,7 @@ mod tests {
         let missing = front_write(&state, dir.path(), 3, "b", "1");
         fs::remove_file(state.pending().join(pending_of(&missing))).unwrap();
         let err = rec
-            .sequence(&pod("pod-a"), 3, front_draft(vec![missing], false))
+            .sequence(&pod("pod-a"), 3, front_draft(vec![missing], false), &[])
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
 
@@ -4671,7 +4794,7 @@ mod tests {
             author: None,
         });
         assert!(matches!(
-            rec.sequence(&pod("pod-a"), 3, with_op),
+            rec.sequence(&pod("pod-a"), 3, with_op, &[]),
             Err(VolumeError::FrontRecord(_))
         ));
         assert_eq!(rec.journal_for_tests().backlog(), 0);
@@ -4687,7 +4810,7 @@ mod tests {
         let wal = front_write(&state, dir.path(), 1, "db-wal", "2");
         let copies = [pending_of(&db), pending_of(&wal)];
         let recorded = rec
-            .sequence(&pod("pod-a"), 1, front_draft(vec![db, wal], true))
+            .sequence(&pod("pod-a"), 1, front_draft(vec![db, wal], true), &[])
             .unwrap();
         assert_eq!(recorded.seq, None);
         assert_eq!(recorded.skipped.len(), 2);

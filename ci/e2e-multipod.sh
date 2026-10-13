@@ -4,7 +4,9 @@
 # feeding one `agentfs serve-history`. Checks that every commit carries the
 # committer and pod trailers of the mount that made the change, that a
 # service outage fails the boundary with EIO and an alarm and that history
-# catches up once it is back (front a reconnecting by itself), that a file
+# catches up once it is back (front a reconnecting by itself), that a
+# close a front failed before it died commits as that front's pod when
+# another pod's front takes over its slot, that a file
 # open in one front and renamed or removed through the other is recorded
 # under its new name or not at all, that a concurrent burst on one path
 # from both fronts converges, that a change whose close returned (journaled,
@@ -111,7 +113,7 @@ kill_service() {
 start_front() { # pod mountpoint log -> sets FRONT_PID
   local before
   before=$(grep -c '^mounted ' "$3" || true)
-  sudo env AGENTFS_POD="$1" AGENTFS_POD_UID="$1-uid" AGENTFS_NODE=node-1 \
+  sudo env ${FRONT_SLOT:+AGENTFS_HISTORY_SLOT=$FRONT_SLOT} AGENTFS_POD="$1" AGENTFS_POD_UID="$1-uid" AGENTFS_NODE=node-1 \
     AGENTFS_NAMESPACE=agents AGENTFS_REPLICA="$1" \
     "$AGENTFS_BIN" --state "$STATE" mount --passthrough "$P" --unmount-grace 5s \
     --history-service "$SOCK" --history-timeout 5s --history-wait 30s \
@@ -264,13 +266,10 @@ wait "$BURST_B" || fail "pod-b's burst failed"
 TREE=$(sudo cat "$BACKING/burst.txt")
 # commitWindow is 200ms: give the burst's records time to commit.
 sleep 3
-if [ "$(sgit show refs/heads/agentfs/demo:burst.txt)" = "$TREE" ]; then
-  pass "after the burst, HEAD has the tree's burst.txt ($TREE)"
-else
-  # Two boundaries of one path at the same instant may journal in the
-  # other order than their freezes (design §14); the next boundary fixes it.
-  echo "note: after the burst HEAD has $(sgit show refs/heads/agentfs/demo:burst.txt), the tree $TREE"
-fi
+# Freeze stamps order the racing records (design §14.1): HEAD ends on the
+# tree's last state, with no later boundary to fix it.
+assert_eq "$TREE" "$(sgit show refs/heads/agentfs/demo:burst.txt)" \
+  "after the burst, HEAD has the tree's burst.txt"
 N_BURST=$(sgit log --format=%cn refs/heads/agentfs/demo -- burst.txt | wc -l)
 [ "$N_BURST" -ge 2 ] || fail "only $N_BURST commits of burst.txt"
 pass "$N_BURST commits of burst.txt"
@@ -315,6 +314,44 @@ wait_history after-restart.txt back
 # Front a's sweep retries its failed close, so it reaches the service too.
 wait_for 30 grep -q "is reachable again" "$A_LOG" || fail "front a never saw the service back"
 pass "front a saw the service back"
+
+
+step "a repair inherited from a dead front commits as its pod"
+# Front a fails a close while the service is down, then dies (kill -9)
+# before it can retry; a front of another pod takes its slot and repairs
+# the path, under pod a's committer (design §14.1).
+A_SLOT=$(sed -n 's/^mounted .* slot \([0-9]*\),.*/\1/p' "$A_LOG" | tail -n 1)
+[ -n "$A_SLOT" ] || fail "no slot in front a's startup line"
+kill_service
+OUT=$(sudo setpriv --reuid=10000 --regid=10000 --clear-groups -- python3 -c '
+import errno, os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fd, b"inherited")
+try:
+    os.close(fd)
+    print("closed")
+except OSError as e:
+    print(errno.errorcode.get(e.errno, e.errno))
+' "$MNT_A/inherited.txt")
+assert_eq EIO "$OUT" "the close fails with EIO"
+REPAIRS=$(sudo cat "$STATE/meta/fronts/slot-$A_SLOT.repairs")
+echo "$REPAIRS"
+assert_contains "$REPAIRS" "@origin " "the repair file names its pod"
+# [h]: the pattern must not match this pkill's own sudo.
+sudo pkill -KILL -f -- "[h]istory-wait 30s $BACKING $MNT_A" || true
+wait "$A_PID" 2>/dev/null || true
+A_PID=
+sudo umount -l "$MNT_A" 2>/dev/null || true
+start_service
+FRONT_SLOT=$A_SLOT start_front pod-c "$MNT_A" "$A_LOG"
+A_PID=$FRONT_PID
+wait_history inherited.txt inherited
+assert_eq pod-a "$(committer_of inherited.txt)" "the repair commits as pod-a"
+POD=$(sgit log -1 --format='%(trailers:key=Agentfs-Pod,valueonly)' refs/heads/agentfs/demo -- inherited.txt)
+assert_contains "$POD" "pod-a" "with pod-a's trailer"
+as_agent "$MNT_A" 'printf mine > from-c.txt'
+wait_history from-c.txt mine
+assert_eq pod-c "$(committer_of from-c.txt)" "pod-c's own writes are its own"
 
 step "kill -9 the service right after a close returns"
 # A long commit window, so the record is journaled but not committed when

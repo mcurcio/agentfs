@@ -66,6 +66,7 @@ pub mod names {
     pub const FRONT_ROUND_TRIP: &str = "agentfs.front.round_trip";
     pub const FRONT_SERVICE_FAILURES: &str = "agentfs.front.service_failures";
     pub const HISTORY_SERVICE_FRONTS: &str = "agentfs.history_service.fronts";
+    pub const HISTORY_SERVICE_SUPERSEDED: &str = "agentfs.history_service.superseded";
     /// Recorded by the binary, which owns the exporters (design §13).
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -122,6 +123,7 @@ struct Inner {
     rejected_paths: Counter<u64>,
     front_round_trip: Histogram<f64>,
     front_service_failures: Counter<u64>,
+    superseded: Counter<u64>,
 }
 
 impl fmt::Debug for Telemetry {
@@ -202,6 +204,12 @@ impl Telemetry {
                 names::FRONT_SERVICE_FAILURES,
                 "{failure}",
                 "Requests a front could not get answered by the history service, by stage",
+            ),
+            superseded: counter(
+                names::HISTORY_SERVICE_SUPERSEDED,
+                "{write}",
+                "Front writes the history service skipped because a newer state of the path was \
+                 already journaled (design §14.1)",
             ),
             meter: meter.clone(),
             tracer,
@@ -389,6 +397,13 @@ impl Telemetry {
             inner
                 .front_service_failures
                 .add(1, &[KeyValue::new("stage", stage)]);
+        }
+    }
+
+    /// Counts one front write skipped as superseded (design §14.1).
+    pub(crate) fn superseded(&self) {
+        if let Some(inner) = &self.inner {
+            inner.superseded.add(1, &[]);
         }
     }
 

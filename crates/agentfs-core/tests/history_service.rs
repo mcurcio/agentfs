@@ -12,16 +12,20 @@ use std::time::{Duration, Instant};
 
 use agentfs_core::events::{Event, Events, MemorySink, NullSink};
 use agentfs_core::history_service::protocol::{
-    FrontInfo, Reply, read_frame, read_frame_bytes, write_frame,
+    FrontInfo, PathStamp, Reply, read_frame, read_frame_bytes, write_frame,
 };
 use agentfs_core::history_service::{
     Address, ClientConfig, ClientError, FrontLease, HistoryClient, HistoryServer,
 };
 use agentfs_core::identity::Context;
+use agentfs_core::lfs::Store;
 use agentfs_core::paths::RepoPath;
-use agentfs_core::record::{Caller, Origin, Trigger};
+use agentfs_core::pending::PendingId;
+use agentfs_core::record::{Caller, Change, Draft, Origin, Trigger};
+use agentfs_core::rules::SkipReason;
+use agentfs_core::stamps::FreezeStamp;
 use agentfs_core::telemetry::Telemetry;
-use agentfs_core::volume::{self, Committer, Input, Recorder, StateDir, VolumeError};
+use agentfs_core::volume::{self, Committer, Input, Recorded, Recorder, StateDir, VolumeError};
 
 const CALLER: Caller = Caller {
     uid: 1000,
@@ -68,7 +72,7 @@ struct Service {
 
 impl Service {
     fn start(env: &Env) -> Self {
-        let (recorder, committer, _) = volume::open(
+        let (mut recorder, committer, _) = volume::open(
             &env.state,
             &env.tree,
             service_context(),
@@ -76,6 +80,8 @@ impl Service {
             &Telemetry::noop(),
         )
         .unwrap();
+        // As `serve-history` does (design §14.1).
+        recorder.enable_stamps();
         let mut service = Self {
             recorder,
             committer,
@@ -357,10 +363,7 @@ fn a_write_whose_path_another_front_removed_meanwhile_is_skipped() {
         .unwrap();
     assert_eq!(recorded.seq, None);
     assert_eq!(recorded.skipped.len(), 1);
-    assert_eq!(
-        recorded.skipped[0].reason,
-        agentfs_core::rules::SkipReason::Gone
-    );
+    assert_eq!(recorded.skipped[0].reason, SkipReason::Gone);
     // The same when the path's directory became a symlink.
     std::fs::create_dir(env.tree.join("real")).unwrap();
     std::os::unix::fs::symlink("real", env.tree.join("d")).unwrap();
@@ -524,6 +527,7 @@ fn a_hung_service_times_out() {
                     volume: "vol".into(),
                     branch,
                     service_pid: 1,
+                    features: Vec::new(),
                 },
             )
             .unwrap();
@@ -593,6 +597,7 @@ fn a_busy_service_fails_the_boundary_without_an_outage_alarm() {
                 volume: "vol".into(),
                 branch,
                 service_pid: 1,
+                features: Vec::new(),
             },
         )
         .unwrap();
@@ -759,6 +764,307 @@ fn a_dead_fronts_orphaned_copies_are_reclaimed_when_its_slot_is_leased_again() {
     assert_eq!(service.head_blob("kept").unwrap(), b"1");
     assert_eq!(service.head_blob("new").unwrap(), b"2");
     assert_eq!(slot_copies(&env, slot), 0);
+}
+
+/// A write of `path` frozen from `backing` (outside the tree: a front's
+/// open descriptor, frozen earlier than it is recorded).
+fn write_from(path: &str, backing: &Path) -> Input {
+    Input::Write {
+        path: RepoPath::new(path).unwrap(),
+        backing: backing.to_owned(),
+        executable: false,
+    }
+}
+
+/// Long enough for the coarse clock behind `ctime` to move.
+const TICK: Duration = Duration::from_millis(30);
+
+static NEXT_COPY: AtomicU64 = AtomicU64::new(0xff00);
+
+/// Sends `front`'s record of a write of `path` with `content`, frozen with
+/// `stamp`: a front whose freeze happened at `stamp`'s time and whose
+/// record arrives now.
+fn send_frozen(
+    env: &Env,
+    front: &Front,
+    path: &str,
+    content: &str,
+    stamp: FreezeStamp,
+) -> Recorded {
+    let id = PendingId::in_slot(
+        front._lease.slot(),
+        NEXT_COPY.fetch_add(1, Ordering::Relaxed),
+    );
+    std::fs::write(env.state.pending().join(format!("{:016x}", id.0)), content).unwrap();
+    let path = RepoPath::new(path).unwrap();
+    let draft = Draft {
+        trigger: Trigger::Close,
+        caller: CALLER,
+        time_ms: 1,
+        changes: vec![Change::Write {
+            path: path.clone(),
+            pending: id,
+            executable: false,
+            store: Store::Blob,
+        }],
+        operation: None,
+        atomic: false,
+        origin: None,
+    };
+    front
+        .recorder
+        .history_client()
+        .unwrap()
+        .record(draft, vec![PathStamp { path, stamp }])
+        .unwrap()
+}
+
+fn stamp_of(env: &Env, path: &str) -> FreezeStamp {
+    FreezeStamp::from_metadata(&std::fs::metadata(env.tree.join(path)).unwrap())
+}
+
+#[test]
+fn a_write_frozen_before_a_newer_journaled_one_is_superseded() {
+    // Front A froze `shared` and its record is late; front B wrote and
+    // recorded a newer state meanwhile. A's late record must not put HEAD
+    // back on A's state (design §14.1).
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let b = front(&env, "pod-b");
+    close(&env, &b.recorder, "shared", "bb").unwrap().unwrap();
+    let journaled = stamp_of(&env, "shared");
+    let older = FreezeStamp {
+        ctime_ns: journaled.ctime_ns - 1_000_000,
+        size: 1,
+        ..journaled
+    };
+    let late = send_frozen(&env, &a, "shared", "a", older);
+    assert_eq!(late.seq, None, "{late:?}");
+    assert_eq!(late.skipped[0].reason, SkipReason::Superseded);
+    // The same tick, another state: the file still has the journaled
+    // stamp, so the incoming one is older.
+    let tie = FreezeStamp {
+        size: 7,
+        ..journaled
+    };
+    let late = send_frozen(&env, &a, "shared", "a", tie);
+    assert_eq!(late.skipped[0].reason, SkipReason::Superseded);
+    // The identical stamp (the racy-timestamp re-record) is journaled.
+    assert!(
+        send_frozen(&env, &a, "shared", "bb", journaled)
+            .seq
+            .is_some()
+    );
+    assert_eq!(
+        slot_copies(&env, a._lease.slot()),
+        1,
+        "skipped copies are dropped"
+    );
+    // A's next write is newer, and is journaled.
+    std::thread::sleep(TICK);
+    close(&env, &a.recorder, "shared", "ccc").unwrap().unwrap();
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("shared").unwrap(), b"ccc");
+
+    // In the other order (the older first), both are journaled, the newer
+    // last.
+    std::fs::write(env.tree.join("other"), "d").unwrap();
+    let first = stamp_of(&env, "other");
+    std::thread::sleep(TICK);
+    assert!(send_frozen(&env, &a, "other", "d", first).seq.is_some());
+    close(&env, &b.recorder, "other", "ee").unwrap().unwrap();
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("other").unwrap(), b"ee");
+}
+
+#[test]
+fn a_write_of_a_file_renamed_over_meanwhile_is_skipped() {
+    // Front A froze `f` from its descriptor; front B renamed a new file
+    // over `f` before A's record arrived: A's file is no longer at the
+    // path (design §14.1).
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let b = front(&env, "pod-b");
+    std::fs::write(env.tree.join("f"), "old").unwrap();
+    let held = env.tree.parent().unwrap().join("held");
+    std::fs::hard_link(env.tree.join("f"), &held).unwrap();
+    std::fs::write(env.tree.join("f.tmp"), "new").unwrap();
+    std::fs::rename(env.tree.join("f.tmp"), env.tree.join("f")).unwrap();
+    close(&env, &b.recorder, "f", "new").unwrap().unwrap();
+    let late = a
+        .recorder
+        .record(Trigger::Close, CALLER, vec![write_from("f", &held)])
+        .unwrap();
+    assert_eq!(late.seq, None, "{late:?}");
+    assert_eq!(late.skipped[0].reason, SkipReason::Gone);
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("f").unwrap(), b"new");
+}
+
+#[test]
+fn the_services_own_writes_supersede_older_front_writes() {
+    // A restore the service applies records through its local recorder:
+    // a front's record frozen before it is older (design §14.1, §15).
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    service
+        .recorder
+        .record(Trigger::Restore, CALLER, vec![write(&env, "f", "restored")])
+        .unwrap();
+    let restored = stamp_of(&env, "f");
+    let before = FreezeStamp {
+        ctime_ns: restored.ctime_ns - 1_000_000,
+        size: 8,
+        ..restored
+    };
+    let late = send_frozen(&env, &a, "f", "workload", before);
+    assert_eq!(late.seq, None, "{late:?}");
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("f").unwrap(), b"restored");
+}
+
+#[test]
+fn atomic_groups_are_never_superseded() {
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let b = front(&env, "pod-b");
+    let stale = env.tree.parent().unwrap().join("a-descriptor");
+    std::fs::write(&stale, "old").unwrap();
+    std::thread::sleep(TICK);
+    close(&env, &b.recorder, "g", "new").unwrap().unwrap();
+    let group = a
+        .recorder
+        .record_group(Trigger::Fsync, CALLER, vec![write_from("g", &stale)])
+        .unwrap();
+    assert!(group.seq.is_some(), "a group is recorded whole: {group:?}");
+    drop(service);
+}
+
+/// How many rounds the race tests run (`AGENTFS_RACE_ITERS`).
+fn race_iterations() -> usize {
+    std::env::var("AGENTFS_RACE_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25)
+}
+
+/// A well-mixed pseudo-random number from `x`.
+fn splitmix(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Two fronts, two threads each, write `shared` `writes` times per thread
+/// with `write_one(n, front)`, a different length each time so no two
+/// states share a stamp; after each round HEAD must be what the tree
+/// holds, whatever order the records reached the service in (design
+/// §14.1).
+fn race(writes: usize, write_one: impl Fn(&Env, &Recorder, usize) + Sync) {
+    let env = env();
+    let service = Service::start(&env);
+    let fronts = [front(&env, "pod-a"), front(&env, "pod-b")];
+    let next = AtomicU64::new(1);
+    for round in 0..race_iterations() {
+        std::thread::scope(|s| {
+            for front in fronts.iter().chain(&fronts) {
+                let (env, next, write_one) = (&env, &next, &write_one);
+                s.spawn(move || {
+                    for _ in 0..writes {
+                        let n = next.fetch_add(1, Ordering::Relaxed) as usize;
+                        write_one(env, &front.recorder, n);
+                    }
+                });
+            }
+        });
+        service.committer.commit_pending().unwrap();
+        assert_eq!(
+            service.head_blob("shared").unwrap().len(),
+            std::fs::read(env.tree.join("shared")).unwrap().len(),
+            "round {round}: HEAD is not the tree's last state"
+        );
+    }
+    for front in &fronts {
+        assert_eq!(slot_copies(&env, front._lease.slot()), 0);
+    }
+}
+
+#[test]
+fn racing_in_place_writes_leave_head_on_the_trees_last_state() {
+    race(10, |env, recorder, n| {
+        let backing = env.tree.join("shared");
+        std::fs::write(&backing, "x".repeat(n)).unwrap();
+        recorder
+            .record(Trigger::Close, CALLER, vec![write_from("shared", &backing)])
+            .unwrap();
+    });
+}
+
+#[test]
+fn racing_renames_over_a_path_leave_head_on_the_trees_last_state() {
+    // Each writer renames a new file over `shared` (as editors and atomic
+    // writers do), then records that file from its own descriptor after a
+    // random delay: a late record of a file already replaced, or older
+    // than one journaled, must not reach HEAD.
+    let scratch = tempfile::tempdir().unwrap();
+    race(2, |env, recorder, n| {
+        let tmp = env.tree.join(format!(".tmp-{n}"));
+        let held = scratch.path().join(format!("held-{n}"));
+        std::fs::write(&tmp, "x".repeat(n)).unwrap();
+        // The writer's open descriptor, as a path to the same inode.
+        std::fs::hard_link(&tmp, &held).unwrap();
+        std::fs::rename(&tmp, env.tree.join("shared")).unwrap();
+        let delay = splitmix(n as u64) % 30_000;
+        std::thread::sleep(Duration::from_micros(delay));
+        recorder
+            .record(Trigger::Rename, CALLER, vec![write_from("shared", &held)])
+            .unwrap();
+        std::fs::remove_file(&held).unwrap();
+    });
+}
+
+#[test]
+fn an_inherited_repair_commits_as_the_pod_that_failed_it() {
+    let env = env();
+    let service = Service::start(&env);
+    let b = front(&env, "pod-b");
+    // A sweep record naming its predecessor's pod: committed as that pod.
+    b.recorder
+        .record_as(
+            Trigger::Sweep,
+            CALLER,
+            vec![write(&env, "inherited", "1")],
+            Some(pod("pod-a")),
+        )
+        .unwrap();
+    service.committer.commit_pending().unwrap();
+    // Any other trigger cannot claim another pod.
+    b.recorder
+        .record_as(
+            Trigger::Close,
+            CALLER,
+            vec![write(&env, "own", "2")],
+            Some(pod("pod-a")),
+        )
+        .unwrap();
+    service.committer.commit_pending().unwrap();
+    // Its own origin, named, is its own.
+    b.recorder
+        .record_as(
+            Trigger::Sweep,
+            CALLER,
+            vec![write(&env, "own-sweep", "3")],
+            Some(pod("pod-b")),
+        )
+        .unwrap();
+    service.committer.commit_pending().unwrap();
+    let committers: Vec<String> = service.commits().into_iter().map(|(c, _)| c).collect();
+    assert_eq!(committers, ["pod-a", "pod-b", "pod-b"]);
 }
 
 #[test]

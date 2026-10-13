@@ -23,6 +23,12 @@
 //! serves any request. If that file cannot be written either (the state
 //! area is full), shutdown lists the paths: history differs from the
 //! backing tree there until each is changed again.
+//!
+//! A front of a history service (design §14) keeps its queue in its slot's
+//! file, which the next front leasing the slot loads. Each entry keeps the
+//! pod that failed to record it (`@origin` lines), so a repair a front
+//! inherits from a dead predecessor is committed as that pod's
+//! ([`Recorder::record_as`]), not as the front's own.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -33,7 +39,7 @@ use std::sync::Mutex;
 use agentfs_core::fsync_class::GroupMembers;
 use agentfs_core::nested;
 use agentfs_core::paths::PathError;
-use agentfs_core::record::{Caller, Trigger};
+use agentfs_core::record::{Caller, Origin, Trigger};
 use agentfs_core::volume::{Input, Recorder, VolumeError};
 
 use crate::names::{Class, classify};
@@ -83,12 +89,25 @@ pub struct Boundary {
 /// older entry never drops a newer one.
 #[derive(Default)]
 struct Repairs {
-    queue: BTreeMap<Vec<u8>, (Caller, u64)>,
+    queue: BTreeMap<Vec<u8>, Entry>,
+    /// This front's own pod, written for its own entries so the next
+    /// holder of the slot commits them as this pod's.
+    own: Option<Origin>,
     next: u64,
     /// Where the queue is kept across mounts, if anywhere.
     store: Option<PathBuf>,
     /// The last save failed, with this message.
     save_error: Option<String>,
+}
+
+/// One queued path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    caller: Caller,
+    generation: u64,
+    /// The pod that failed to record it, if not this process's own: a
+    /// predecessor in the slot.
+    origin: Option<Origin>,
 }
 
 /// What [`Boundary::record`] learned about `.git` directories, by the path
@@ -109,6 +128,8 @@ const GIT_DIRS_MAX: usize = 4096;
 pub struct Repair {
     pub path: Vec<u8>,
     pub caller: Caller,
+    /// The pod it is committed as, if not this process's own.
+    pub origin: Option<Origin>,
     generation: u64,
 }
 
@@ -116,10 +137,14 @@ impl Boundary {
     /// The recorder for the backing tree at `tree`, with an empty repair
     /// queue kept only in memory.
     pub fn new(recorder: Recorder, tree: PathBuf) -> Self {
+        let own = recorder.front_origin().cloned();
         Self {
             recorder,
             tree,
-            repairs: Mutex::new(Repairs::default()),
+            repairs: Mutex::new(Repairs {
+                own,
+                ..Repairs::default()
+            }),
             git_dirs: Mutex::new(GitDirs::default()),
         }
     }
@@ -136,10 +161,16 @@ impl Boundary {
         let mut repairs = self.lock();
         repairs.store = Some(store);
         let n = loaded.len();
-        for (path, caller) in loaded {
+        for (path, caller, origin) in loaded {
             let generation = repairs.next;
             repairs.next += 1;
-            repairs.queue.entry(path).or_insert((caller, generation));
+            // This pod's own entries (a restart in the same pod) are its own.
+            let origin = origin.filter(|o| Some(o) != repairs.own.as_ref());
+            repairs.queue.entry(path).or_insert(Entry {
+                caller,
+                generation,
+                origin,
+            });
         }
         Ok(n)
     }
@@ -162,6 +193,29 @@ impl Boundary {
             return Ok(false);
         }
         Ok(self.recorder.record(trigger, caller, inputs)?.seq.is_some())
+    }
+
+    /// Records `changes` like [`Boundary::record`], as the pod `origin`
+    /// when given ([`Recorder::record_as`]): an inherited repair.
+    pub fn record_as(
+        &self,
+        trigger: Trigger,
+        caller: Caller,
+        changes: Vec<Change>,
+        origin: Option<&Origin>,
+    ) -> Result<bool, VolumeError> {
+        let Some(origin) = origin else {
+            return self.record(trigger, caller, changes);
+        };
+        let inputs = self.inputs(changes);
+        if inputs.is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .recorder
+            .record_as(trigger, caller, inputs, Some(origin.clone()))?
+            .seq
+            .is_some())
     }
 
     /// Records an fsync-class group's members as one all-or-nothing record
@@ -287,7 +341,14 @@ impl Boundary {
         for path in paths {
             let generation = repairs.next;
             repairs.next += 1;
-            repairs.queue.insert(path, (caller, generation));
+            repairs.queue.insert(
+                path,
+                Entry {
+                    caller,
+                    generation,
+                    origin: None,
+                },
+            );
         }
         repairs.save();
     }
@@ -298,10 +359,11 @@ impl Boundary {
         self.lock()
             .queue
             .iter()
-            .map(|(path, (caller, generation))| Repair {
+            .map(|(path, e)| Repair {
                 path: path.clone(),
-                caller: *caller,
-                generation: *generation,
+                caller: e.caller,
+                origin: e.origin.clone(),
+                generation: e.generation,
             })
             .collect()
     }
@@ -314,7 +376,7 @@ impl Boundary {
             if repairs
                 .queue
                 .get(&r.path)
-                .is_some_and(|(_, g)| *g == r.generation)
+                .is_some_and(|e| e.generation == r.generation)
             {
                 repairs.queue.remove(&r.path);
             }
@@ -365,7 +427,7 @@ impl Repairs {
                 _ => Ok(()),
             }
         } else {
-            write_atomic(store, &format_repairs(&self.queue))
+            write_atomic(store, &format_repairs(&self.queue, self.own.as_ref()))
         };
         match result {
             Ok(()) => self.save_error = None,
@@ -394,36 +456,70 @@ fn write_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// One line per path: `uid gid pid <path in hex>`.
-fn format_repairs(queue: &BTreeMap<Vec<u8>, (Caller, u64)>) -> Vec<u8> {
+/// One line per path, `uid gid pid <path in hex>`, after an
+/// `@origin <JSON>` line naming the pod its entries are committed as
+/// (`@origin -`: the loading process's own). Each entry of this process
+/// is written with `own`, so the next holder of the slot commits it as
+/// this pod's. Older builds skip the `@origin` lines (they are not four
+/// fields), and so commit every entry as their own, as before.
+fn format_repairs(queue: &BTreeMap<Vec<u8>, Entry>, own: Option<&Origin>) -> Vec<u8> {
     let mut out = String::new();
-    for (path, (c, _)) in queue {
+    let mut current: Option<&Origin> = None;
+    for (path, e) in queue {
+        let origin = e.origin.as_ref().or(own);
+        if origin != current {
+            match origin {
+                Some(o) => {
+                    let json = serde_json::to_string(o).expect("an origin serializes");
+                    out.push_str(&format!("@origin {json}\n"));
+                }
+                None => out.push_str("@origin -\n"),
+            }
+            current = origin;
+        }
+        let c = e.caller;
         let hex: String = path.iter().map(|b| format!("{b:02x}")).collect();
         out.push_str(&format!("{} {} {} {hex}\n", c.uid, c.gid, c.pid));
     }
     out.into_bytes()
 }
 
-/// The entries of a saved queue; malformed lines are skipped.
-fn parse_repairs(bytes: &[u8]) -> Vec<(Vec<u8>, Caller)> {
+/// The entries of a saved queue, each with the origin it was saved
+/// under; malformed lines are skipped (a malformed `@origin` line counts
+/// as `@origin -`).
+fn parse_repairs(bytes: &[u8]) -> Vec<(Vec<u8>, Caller, Option<Origin>)> {
     let text = String::from_utf8_lossy(bytes);
-    text.lines()
-        .filter_map(|line| {
-            let mut f = line.split(' ');
-            let uid = f.next()?.parse().ok()?;
-            let gid = f.next()?.parse().ok()?;
-            let pid = f.next()?.parse().ok()?;
-            let hex = f.next()?;
-            if f.next().is_some() || hex.len() % 2 != 0 {
-                return None;
-            }
-            let path = (0..hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-                .collect::<Option<Vec<u8>>>()?;
-            Some((path, Caller { uid, gid, pid }))
-        })
-        .collect()
+    let mut origin: Option<Origin> = None;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("@origin ") {
+            origin = match rest {
+                "-" => None,
+                json => serde_json::from_str(json).ok(),
+            };
+            continue;
+        }
+        if let Some((path, caller)) = parse_entry(line) {
+            out.push((path, caller, origin.clone()));
+        }
+    }
+    out
+}
+
+fn parse_entry(line: &str) -> Option<(Vec<u8>, Caller)> {
+    let mut f = line.split(' ');
+    let uid = f.next()?.parse().ok()?;
+    let gid = f.next()?.parse().ok()?;
+    let pid = f.next()?.parse().ok()?;
+    let hex = f.next()?;
+    if f.next().is_some() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let path = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some((path, Caller { uid, gid, pid }))
 }
 
 /// The trigger a recorded change gets when the sweep repairs it.
@@ -433,6 +529,24 @@ pub const REPAIR_TRIGGER: Trigger = Trigger::Sweep;
 mod tests {
     use super::*;
 
+    fn entry(caller: Caller, generation: u64, origin: Option<Origin>) -> Entry {
+        Entry {
+            caller,
+            generation,
+            origin,
+        }
+    }
+
+    fn pod(name: &str) -> Origin {
+        Origin {
+            namespace: "ns".into(),
+            pod: name.into(),
+            pod_uid: format!("{name}-uid"),
+            node: "n".into(),
+            replica: name.into(),
+        }
+    }
+
     #[test]
     fn saved_queues_round_trip() {
         let c = Caller {
@@ -441,18 +555,85 @@ mod tests {
             pid: 7,
         };
         let mut q = BTreeMap::new();
-        q.insert(b"big.log".to_vec(), (c, 0));
-        q.insert(b"dir/with space/\xff".to_vec(), (NOBODY_CALLER, 1));
-        let text = format_repairs(&q);
+        q.insert(b"big.log".to_vec(), entry(c, 0, None));
+        q.insert(
+            b"dir/with space/\xff".to_vec(),
+            entry(NOBODY_CALLER, 1, None),
+        );
+        let text = format_repairs(&q, None);
+        assert!(!String::from_utf8_lossy(&text).contains("@origin {"));
         let parsed = parse_repairs(&text);
         assert_eq!(
             parsed,
             vec![
-                (b"big.log".to_vec(), c),
-                (b"dir/with space/\xff".to_vec(), NOBODY_CALLER),
+                (b"big.log".to_vec(), c, None),
+                (b"dir/with space/\xff".to_vec(), NOBODY_CALLER, None),
             ]
         );
         assert!(parse_repairs(b"garbage\n1 2 3 zz\n1 2 3 abc\n").is_empty());
+    }
+
+    #[test]
+    fn saved_queues_keep_each_entrys_pod() {
+        let c = Caller {
+            uid: 1000,
+            gid: 100,
+            pid: 7,
+        };
+        let mut q = BTreeMap::new();
+        // Inherited from pod-a; queued by this front (pod-b) itself.
+        q.insert(b"a1".to_vec(), entry(c, 0, Some(pod("pod-a"))));
+        q.insert(b"a2".to_vec(), entry(c, 1, Some(pod("pod-a"))));
+        q.insert(b"b1".to_vec(), entry(c, 2, None));
+        let text = format_repairs(&q, Some(&pod("pod-b")));
+        let lines = String::from_utf8(text.clone()).unwrap();
+        assert_eq!(lines.matches("@origin ").count(), 2, "{lines}");
+        assert_eq!(
+            parse_repairs(&text),
+            vec![
+                (b"a1".to_vec(), c, Some(pod("pod-a"))),
+                (b"a2".to_vec(), c, Some(pod("pod-a"))),
+                (b"b1".to_vec(), c, Some(pod("pod-b"))),
+            ]
+        );
+        // Single-process mode (no own pod) after an inherited entry.
+        let text = format_repairs(&q, None);
+        let parsed = parse_repairs(&text);
+        assert_eq!(parsed[2], (b"b1".to_vec(), c, None));
+        assert!(String::from_utf8(text).unwrap().contains("@origin -\n"));
+        // A malformed origin line counts as none; older files have none.
+        assert_eq!(
+            parse_repairs(b"@origin {nope\n1 2 3 61\n"),
+            vec![(
+                b"a".to_vec(),
+                Caller {
+                    uid: 1,
+                    gid: 2,
+                    pid: 3
+                },
+                None
+            )]
+        );
+    }
+
+    #[test]
+    fn an_older_build_reads_entries_and_skips_origin_lines() {
+        // What an older build's parser accepted: exactly four fields.
+        let mut q = BTreeMap::new();
+        let c = Caller {
+            uid: 1,
+            gid: 2,
+            pid: 3,
+        };
+        q.insert(b"a".to_vec(), entry(c, 0, Some(pod("pod-a"))));
+        let text = String::from_utf8(format_repairs(&q, None)).unwrap();
+        let four_fields: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                l.split(' ').count() == 4 && l.split(' ').next().unwrap().parse::<u32>().is_ok()
+            })
+            .collect();
+        assert_eq!(four_fields, vec!["1 2 3 61"]);
     }
 
     const NOBODY_CALLER: Caller = Caller {

@@ -114,4 +114,5 @@ not each version. Nothing acknowledged before the outage is lost: a
 boundary that returned success was in the service's journal, and a
 restarted service commits it. A path that changed during the outage and
 whose front stopped before the service came back is recorded by the next
-front in that slot (its repair queue), or by any later change to it.
+front in that slot (its repair queue, committed as the pod that made the
+change), or by any later change to it.

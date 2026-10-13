@@ -1168,6 +1168,39 @@ fn the_repair_queue_survives_the_process() {
 }
 
 #[test]
+fn an_inherited_repair_keeps_the_pod_that_failed_it() {
+    // A slot's repair file left by a dead front (pod-a): its entries are
+    // recorded as pod-a's, by a sweep (design §14.1).
+    let fx = Fx::new();
+    fx.put("a.log", "data");
+    let store = fx.state().fronts_dir().join("slot-1.repairs");
+    let origin = agentfs_core::record::Origin {
+        namespace: "ns".into(),
+        pod: "pod-a".into(),
+        pod_uid: "uid-a".into(),
+        node: "n".into(),
+        replica: "pod-a".into(),
+    };
+    let json = serde_json::to_string(&origin).unwrap();
+    fs::write(&store, format!("@origin {json}\n1000 1000 7 612e6c6f67\n")).unwrap();
+    fs::write(fx.backing().join("a.log"), "changed").unwrap();
+    assert_eq!(fx.ops.boundary().persist_repairs(store.clone()).unwrap(), 1);
+    assert_eq!(
+        fx.ops.boundary().repairs()[0].origin.as_ref(),
+        Some(&origin)
+    );
+    let before = fx.journal().len();
+    let report = fx.ops.sweep(false);
+    assert_eq!((report.repaired, report.still_queued), (1, 0));
+    let journal = fx.journal();
+    assert_eq!(journal.len(), before + 1);
+    let record = journal.last().unwrap();
+    assert_eq!(record.draft.trigger, Trigger::Sweep);
+    assert_eq!(record.draft.origin.as_ref(), Some(&origin));
+    assert!(!store.exists());
+}
+
+#[test]
 fn a_repair_never_drops_a_path_queued_again_meanwhile() {
     let fx = Fx::new();
     fx.ops.boundary().queue_repair([b"a".to_vec()], C);

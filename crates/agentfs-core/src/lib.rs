@@ -40,6 +40,7 @@ pub mod repack;
 pub mod restore;
 pub mod rules;
 pub mod service;
+pub mod stamps;
 pub mod telemetry;
 pub mod tracked;
 pub mod volume;

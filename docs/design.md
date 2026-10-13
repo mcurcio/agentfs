@@ -453,7 +453,9 @@ RELEASE whose record fails queues its paths too, since no handle is left to
 record from.
 
 The queue outlives the daemon. It is kept in `meta/repairs` in the state
-area (one line per path: the caller's uid, gid and pid and the path in hex),
+area (one line per path: the caller's uid, gid and pid and the path in hex;
+a front's file also has `@origin <JSON>` lines naming the pod the entries
+after it are committed as, below),
 rewritten whenever it changes, and the next `agentfs mount` repairs what it
 lists from the backing tree before it serves any request. A repair made
 from an older entry never drops one queued again meanwhile. Paths still
@@ -468,7 +470,12 @@ the same way: `EIO` from FLUSH (or the operation's own error with a
 repair entry), `RecordFailed`, and `HistoryServiceUnavailable` once per
 outage (`HistoryServiceRestored` when a request succeeds again). A
 front's repair queue is `meta/fronts/slot-N.repairs`, for its slot, and
-its sweep retries it, so history catches up once the service is back. A
+its sweep retries it, so history catches up once the service is back. The
+file keeps the pod each entry is for: a front writes its own pod before
+its entries, and a front that inherits the file from a dead predecessor
+in the slot records that pod's entries as that pod's (a `sweep` record
+naming the origin, which the service accepts only for sweep records
+whose committer it can render, §14.1). A
 draft is never sent twice: a request that timed out may still have been
 journaled, which is harmless because records hold absolute state, while a
 resend could journal one frozen copy twice.
@@ -1679,6 +1686,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.front.round_trip` | histogram, by request | A front's round trip to the history service (`record`, `tracked`, `ping`), in seconds (§14) |
 | `agentfs.front.service_failures` | counter, by stage | A front's failed requests to the history service: `connect`, `timeout`, `request` (connection lost or malformed reply), `refused`, `service` (§3.5, §14) |
 | `agentfs.history_service.fronts` | gauge | Fronts connected to this history service (§14) |
+| `agentfs.history_service.superseded` | counter | Front writes the history service skipped because a newer state of the path was already journaled (freeze stamps, §14.1) |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
@@ -1872,10 +1880,14 @@ while a resend could journal one frozen copy twice); frozen copies are
 removed on the front only when the request was certainly not sent.
 Repairs go to the slot's `meta/fronts/slot-N.repairs`, which the front's
 sweep retries, and which the next front leasing that slot loads at start.
-Repairs hold paths only, not the pod that failed to record them, so
-repairs a front inherits from a dead predecessor in its slot are
-committed as its own pod; per-repair origins would need the service to
-accept a per-record origin from a front, a follow-up.
+Each entry keeps the pod that failed to record it (§3.5), so a repair a
+front inherits from a dead predecessor in its slot is committed as the
+predecessor's pod: the front sends it as a `sweep` record naming that
+origin, and the service journals the named origin for a sweep record if
+the volume's identity templates render for it, and the front's own
+otherwise (with a warning), as it does for any other trigger. Files
+written by older fronts have no origins, and their entries are committed
+as the loading front's pod, as before.
 
 **Recovery.** A front that crashes leaves a stale mount, handled as for
 the phase 1 sidecar (§17.1); its lease is released by the kernel. A service
@@ -1893,11 +1905,29 @@ push` is served by the service. The patch queue (§12) is applied by `serve-hist
 listens, and only when no front lease is live, because patches write the
 backing tree that live fronts serve. POSIX and BSD locks stay in each FUSE
 mount's kernel and are not shared between fronts, so a SQLite or other
-lock-coordinated database must be written from one pod. If two pods hit
-one path at the same instant, the race between freeze and journal can
-leave HEAD on the earlier pod's state until that path's next boundary;
-per-path freeze stamps are a follow-up.
-Each front learns of another front's renames and removals only at its
+lock-coordinated database must be written from one pod.
+
+**Freeze stamps** (`agentfs_core::stamps`). Each front freezes under its
+own path claim but the service journals under its own, so two pods
+writing one path at nearly the same instant can reach the service in
+the opposite order to their freezes. Each write therefore carries the
+stat stamp (device, inode, size, mtime, ctime) of its backing file,
+taken just before the freeze, so never newer than the content frozen.
+The service keeps the stamp of the last write it journaled at each path
+(five minutes, far past any request timeout) and, under the path claim,
+skips a write whose stamp has an older `ctime` (`superseded by a newer
+state another front already recorded`, counted by
+`agentfs.history_service.superseded`); its copy is removed. `ctime`
+moves on every write, chmod and rename of an inode, from one clock per
+filesystem, so it orders a replacement against its predecessor too.
+Identical stamps are both journaled (the racy-timestamp rule records a
+file twice on purpose, §3.1); stamps with the same `ctime` that differ
+otherwise are settled by the backing file: if it still has the
+journaled stamp, the incoming write is older. The service's own writes
+(a live restore, §15; patches) note their stamps too. Atomic groups
+(§8) are recorded whole and never judged.
+
+**Renames and removals across fronts.** Each front learns of another front's renames and removals only at its
 next lookup (entries are cached 1 s); a name a front knew that no longer
 leads to the file it looks up (moved away, or its inode number reused by
 the filesystem) is dropped then, so opens use the current name. A record
@@ -1917,9 +1947,11 @@ path claim, and skips it (`no longer in the backing tree`) if the path is
 gone or no longer a file (or symlink) under real directories. B's removal
 is sent only after the tree changed and journals under the same claim, so
 it either sees A's write journaled first or A's write sees the path gone.
-A path that another front replaced with a new file between A's check and
-the service's is not caught: A's late state can then be in HEAD until
-that path's next boundary, as for two writers at one instant above.
+A path that another front replaced with a new file (a rename over it)
+between A's check and the service's is caught by A's freeze stamp: the
+file at the path is another inode, so A's write is skipped the same way
+(`no longer in the backing tree`), and the rename's own record, from the
+front that made it, journals the new file.
 A daemon running as root creates a new file as root and then gives it to
 its caller (§6), so for that instant another front's open of the same
 name as the caller can fail with `EACCES` (seen in the e2e's concurrent
