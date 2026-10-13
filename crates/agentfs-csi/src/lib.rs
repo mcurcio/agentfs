@@ -29,5 +29,7 @@ pub mod controller;
 pub mod identity;
 pub mod launcher;
 pub mod mounter;
+pub mod node;
 pub mod server;
+pub mod supervisor;
 pub mod volume;

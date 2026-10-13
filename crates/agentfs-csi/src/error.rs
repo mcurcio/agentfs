@@ -17,6 +17,9 @@ pub enum Error {
     /// The call cannot succeed in the current state (`FAILED_PRECONDITION`).
     #[error("{0}")]
     FailedPrecondition(String),
+    /// Another call on the same object got in first (`ABORTED`).
+    #[error("{0}")]
+    Aborted(String),
     /// Not ready yet; the CO retries (`UNAVAILABLE`).
     #[error("{0}")]
     Unavailable(String),
@@ -39,6 +42,7 @@ impl From<Error> for tonic::Status {
             Error::NotFound(m) => tonic::Status::not_found(m),
             Error::AlreadyExists(m) => tonic::Status::already_exists(m),
             Error::FailedPrecondition(m) => tonic::Status::failed_precondition(m),
+            Error::Aborted(m) => tonic::Status::aborted(m),
             Error::Unavailable(m) => tonic::Status::unavailable(m),
             Error::Internal(m) => tonic::Status::internal(m),
         }
@@ -62,6 +66,7 @@ mod tests {
                 Error::FailedPrecondition("a".into()),
                 tonic::Code::FailedPrecondition,
             ),
+            (Error::Aborted("a".into()), tonic::Code::Aborted),
             (Error::Unavailable("a".into()), tonic::Code::Unavailable),
             (Error::Internal("a".into()), tonic::Code::Internal),
         ];

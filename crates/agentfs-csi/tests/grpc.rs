@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
@@ -17,17 +18,17 @@ use agentfs_core::history::History;
 use agentfs_csi::controller::ControllerService;
 use agentfs_csi::csi::v1::controller_client::ControllerClient;
 use agentfs_csi::csi::v1::identity_client::IdentityClient;
-use agentfs_csi::csi::v1::node_server::Node;
+use agentfs_csi::csi::v1::node_client::NodeClient;
 use agentfs_csi::csi::v1::volume_capability::access_mode::Mode;
 use agentfs_csi::csi::v1::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
 use agentfs_csi::csi::v1::*;
 use agentfs_csi::identity::IdentityService;
+use agentfs_csi::launcher::AgentfsLauncher;
 use agentfs_csi::layout::Layout;
+use agentfs_csi::mounter::KernelMounter;
+use agentfs_csi::node::NodeService;
 use agentfs_csi::server;
-
-/// No Node service in these tests.
-struct NoNode;
-impl Node for NoNode {}
+use agentfs_csi::supervisor::{NodeConfig, Supervisor};
 
 struct Driver {
     dir: tempfile::TempDir,
@@ -61,12 +62,20 @@ impl Driver {
         let task = tokio::spawn({
             let socket = socket.clone();
             let controller = ControllerService::new(layout.clone());
+            // The validation tests never get as far as starting a child.
+            let node = NodeService::new(Supervisor::new(
+                NodeConfig::new("node-1", layout.clone()),
+                Arc::new(AgentfsLauncher {
+                    bin: "/bin/false".into(),
+                }),
+                Arc::new(KernelMounter),
+            ));
             async move {
                 server::serve(
                     &socket,
                     IdentityService::new(true),
                     Some(controller),
-                    None::<NoNode>,
+                    Some(node),
                     async {
                         let _ = stopped.await;
                     },
@@ -509,5 +518,132 @@ async fn validate_volume_capabilities() {
         .validate_volume_capabilities(req("", vec![mount_cap(Mode::SingleNodeWriter)]))
         .await;
     assert_eq!(code(r), Code::InvalidArgument);
+    d.stop().await;
+}
+
+fn stage_req(id: &str, staging: &str) -> NodeStageVolumeRequest {
+    NodeStageVolumeRequest {
+        volume_id: id.into(),
+        staging_target_path: staging.into(),
+        volume_capability: Some(mount_cap(Mode::SingleNodeWriter)),
+        ..Default::default()
+    }
+}
+
+fn node_publish_req(id: &str, target: &str) -> NodePublishVolumeRequest {
+    NodePublishVolumeRequest {
+        volume_id: id.into(),
+        staging_target_path: "/staging".into(),
+        target_path: target.into(),
+        volume_capability: Some(mount_cap(Mode::SingleNodeWriter)),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn node_calls_are_validated() {
+    let d = Driver::start().await;
+    let mut n = NodeClient::new(d.channel.clone());
+    let info = n
+        .node_get_info(NodeGetInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.node_id, "node-1");
+    let caps = n
+        .node_get_capabilities(NodeGetCapabilitiesRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(caps.capabilities.len(), 2);
+
+    let ephemeral = HashMap::from([("csi.storage.k8s.io/ephemeral".to_owned(), "true".to_owned())]);
+    let mut stage_cases = vec![
+        ("no id", stage_req("", "/staging")),
+        ("no staging path", stage_req("v", "")),
+        ("relative staging path", stage_req("v", "staging")),
+    ];
+    let mut r = stage_req("v", "/staging");
+    r.volume_capability = None;
+    stage_cases.push(("no capability", r));
+    let mut r = stage_req("v", "/staging");
+    r.volume_capability.as_mut().unwrap().access_type = Some(AccessType::Block(BlockVolume {}));
+    stage_cases.push(("block", r));
+    let mut r = stage_req("v", "/staging");
+    r.volume_context = ephemeral.clone();
+    stage_cases.push(("ephemeral", r));
+    for (what, req) in stage_cases {
+        assert_eq!(
+            code(n.node_stage_volume(req).await),
+            Code::InvalidArgument,
+            "{what}"
+        );
+    }
+    // A volume that does not exist, and one without a profile.
+    assert_eq!(
+        code(n.node_stage_volume(stage_req("missing", "/staging")).await),
+        Code::NotFound
+    );
+
+    let mut publish_cases = vec![
+        ("no id", node_publish_req("", "/t")),
+        ("no target", node_publish_req("v", "")),
+        ("relative target", node_publish_req("v", "t")),
+    ];
+    let mut r = node_publish_req("v", "/t");
+    r.volume_capability = None;
+    publish_cases.push(("no capability", r));
+    let mut r = node_publish_req("v", "/t");
+    r.volume_capability = Some(mount_cap(Mode::MultiNodeMultiWriter));
+    publish_cases.push(("RWX", r));
+    let mut r = node_publish_req("v", "/t");
+    r.volume_context = ephemeral;
+    publish_cases.push(("ephemeral", r));
+    for (what, req) in publish_cases {
+        let err = n.node_publish_volume(req).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{what}: {err:?}");
+        if what == "ephemeral" {
+            assert!(err.message().contains("ephemeral"), "{}", err.message());
+        }
+    }
+    // Published before staged.
+    assert_eq!(
+        code(n.node_publish_volume(node_publish_req("v", "/t")).await),
+        Code::FailedPrecondition
+    );
+
+    let unpublish = |id: &str, target: &str| NodeUnpublishVolumeRequest {
+        volume_id: id.into(),
+        target_path: target.into(),
+    };
+    assert_eq!(
+        code(n.node_unpublish_volume(unpublish("", "/t")).await),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        code(n.node_unpublish_volume(unpublish("v", "")).await),
+        Code::InvalidArgument
+    );
+    // Nothing published there: done already.
+    let target = d.dir.path().join("pods/x/mount");
+    fs::create_dir_all(&target).unwrap();
+    n.node_unpublish_volume(unpublish("v", target.to_str().unwrap()))
+        .await
+        .unwrap();
+    assert!(!target.exists(), "the target directory is removed");
+
+    let unstage = |id: &str, path: &str| NodeUnstageVolumeRequest {
+        volume_id: id.into(),
+        staging_target_path: path.into(),
+    };
+    assert_eq!(
+        code(n.node_unstage_volume(unstage("", "/s")).await),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        code(n.node_unstage_volume(unstage("v", "")).await),
+        Code::InvalidArgument
+    );
+    n.node_unstage_volume(unstage("v", "/s")).await.unwrap();
     d.stop().await;
 }
