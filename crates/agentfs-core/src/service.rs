@@ -535,6 +535,13 @@ impl Service {
 
         let mut pending: Vec<PushThread> = self.pushes;
         let mut final_pushes = Vec::new();
+        let mut take = |pending: &mut Vec<PushThread>, (done, result): (String, FinalPush)| {
+            if let Some(i) = pending.iter().position(|p| p.name == done) {
+                let thread = pending.swap_remove(i);
+                let _ = thread.handle.join();
+            }
+            final_pushes.push((done, result));
+        };
         // Past the deadline, a remote that is not inside an attempt is only
         // deciding (it finds the deadline passed and skips): wait a little
         // for that decision rather than call it abandoned.
@@ -549,23 +556,23 @@ impl Service {
             } else if deciding {
                 settle
             } else {
-                break;
+                now
             };
             let remaining = until.saturating_duration_since(now);
             if remaining.is_zero() {
+                // Whatever was reported already, from threads that have
+                // since finished too.
+                while let Ok(done) = self.push_done.try_recv() {
+                    take(&mut pending, done);
+                }
                 break;
             }
-            let (done, result) = match self.push_done.recv_timeout(remaining) {
-                Ok(done) => done,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            match self.push_done.recv_timeout(remaining) {
+                Ok(done) => take(&mut pending, done),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 // Every sender gone: the rest panicked; join reports it.
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            };
-            if let Some(i) = pending.iter().position(|p| p.name == done) {
-                let thread = pending.swap_remove(i);
-                let _ = thread.handle.join();
             }
-            final_pushes.push((done, result));
         }
         // Threads that finished without reporting (a panic) are not
         // abandoned; reap them.

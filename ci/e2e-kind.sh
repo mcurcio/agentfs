@@ -335,7 +335,7 @@ echo "$recovered" | grep -E '^(stacked|mounted) ' || true
 assert_contains "$recovered" "stacked over a stale mount left by a crashed daemon at $WS" "the sidecar stacked over the stale mount"
 assert_eq "live agentfs mount (agentfs:$VOLUME)" "$(in_sidecar agentfs probe "$WS")" "probe sees the new mount"
 in_root "printf after > $WS/after-crash.txt"
-in_user 'printf after-subpath > /workspace/after-crash-subpath.txt'
+in_user 'printf after-subpath > /workspace/u10000/after-crash-subpath.txt'
 assert_eq after "$(in_user 'cat /workspace/after-crash.txt')" "the subPath writer reaches the new mount"
 assert_eq "$user_restarts" "$(writer_restarts writer-10000)" "the subPath writer was not restarted"
 out=$(in_sidecar agentfs push --timeout 60s) || fail "agentfs push through the daemon failed: $out"
@@ -343,7 +343,7 @@ echo "$out"
 assert_contains "$out" "through the running daemon (pid " "agentfs push asked the running daemon"
 assert_contains "$out" "origin: " "agentfs push reported the remote"
 wait_remote after-crash.txt after
-wait_remote after-crash-subpath.txt after-subpath
+wait_remote u10000/after-crash-subpath.txt after-subpath
 assert_contains "$(remote_message after-crash.txt)" "Agentfs-Pod: $POD" "the recovered daemon records and pushes"
 rgit cat-file -e "$BRANCH:before-crash.txt" || fail "before-crash.txt left history"
 if [ "$during" = refused ]; then
@@ -369,7 +369,7 @@ subgap() { # tries the restarted subPath writer once; sets sub
   [ -z "$sub" ] || return 0
   [ "$(writer_restarts writer-10000)" -gt "$user_restarts" ] || return 0
   local sout
-  if sout=$(in_user 'printf subgap > /workspace/subgap.txt' 2>&1); then
+  if sout=$(in_user 'printf subgap > /workspace/u10000/subgap.txt' 2>&1); then
     sub=wrote
   else
     case "$sout" in
@@ -417,23 +417,23 @@ done
 case "$sub" in
 refused)
   pass "the subPath writer restarted in the gap was refused (EACCES on the sealed mount point)"
-  if in_sidecar test -e /data/backing/subgap.txt; then fail "subgap.txt reached the backing tree"; fi
-  if rgit cat-file -e "$BRANCH:subgap.txt" 2>/dev/null; then fail "subgap.txt is in history"; fi
+  if in_sidecar test -e /data/backing/u10000/subgap.txt; then fail "subgap.txt reached the backing tree"; fi
+  if rgit cat-file -e "$BRANCH:u10000/subgap.txt" 2>/dev/null; then fail "subgap.txt is in history"; fi
   ;;
 wrote)
   # The sidecar was back before the writer: the write went to the new mount.
-  wait_remote subgap.txt subgap
+  wait_remote u10000/subgap.txt subgap
   pass "the subPath writer restarted after the gap and its write was recorded"
   ;;
 esac
 # Its liveness probe restarts it onto the new mount (if it is not on it).
 deadline=$((SECONDS + 240))
-until in_user 'printf post-gap-subpath > /workspace/post-gap-subpath.txt' 2>/dev/null; do
+until in_user 'printf post-gap-subpath > /workspace/u10000/post-gap-subpath.txt' 2>/dev/null; do
   [ $SECONDS -lt $deadline ] || fail "the subPath writer never reached the new mount"
   sleep 2
 done
 k wait --for=condition=Ready "pod/$POD" --timeout=120s >/dev/null || fail "the pod never became Ready"
-wait_remote post-gap-subpath.txt post-gap-subpath
+wait_remote u10000/post-gap-subpath.txt post-gap-subpath
 pass "the subPath writer restarted onto the new mount"
 
 step "deleting the recovered pod leaves nothing mounted"
