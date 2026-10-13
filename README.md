@@ -22,9 +22,55 @@ It is built in two layers:
 
 ## Status
 
-Phases 1 to 3 built; phase 4 built for one node per volume (the CSI
-driver). See [docs/design.md](docs/design.md) and the
-[review record](docs/reviews/2026-10-12-adversarial.md).
+| Phase | Scope ([design §1.3](docs/design.md#13-baseline-extras-phases)) | State |
+|---|---|---|
+| 1 | The recorder as a sidecar for one pod: recording, commits, interval push to any remote, path rules, push checks, OpenTelemetry, recovery | Built; tested end to end in CI, including a kind cluster |
+| 2 | Git LFS (§7) and the `fsync` class for databases (§8) | Built |
+| 3 | The ordered patch queue for iac (§12) | Built |
+| 4 | The CSI driver, with volumes several pods mount at once (§14) | Built for one node per volume; several nodes per volume open (§19.2) |
+
+Performance is benchmarked in CI on XFS and ext4 against a budget; see
+[docs/performance.md](docs/performance.md). Not built yet: see
+[the end of Features](#not-built-yet). The design was reviewed
+adversarially ([review record](docs/reviews/2026-10-12-adversarial.md)).
+
+## Quick start
+
+On Linux 5.6+ with `/dev/fuse`, as root (see [Building](#building)):
+
+```sh
+cargo build --release -p agentfs
+export PATH=$PWD/target/release:$PATH
+mkdir -p /data/backing /workspace
+agentfs --state /data/state init --volume demo
+git init --bare /data/remote.git
+git --git-dir /data/state/git config remote.origin.url /data/remote.git
+agentfs --state /data/state mount /data/backing /workspace &
+
+echo hello > /workspace/notes.txt              # recorded before close returns
+agentfs --state /data/state status              # head, committed seq, backlog
+git --git-dir /data/state/git log --stat refs/heads/agentfs/demo
+kill %1                                         # final commit and push, unmount
+git --git-dir /data/remote.git log --oneline agentfs/demo
+```
+
+Then [Mounting](#mounting) and the [operator guide](docs/operator-guide.md)
+for a real deployment, or [Deploying on Kubernetes](#deploying-on-kubernetes).
+
+## Documentation
+
+| Document | For |
+|---|---|
+| [design.md](docs/design.md) | The specification: what is recorded when, guarantees, decisions and open questions |
+| [architecture.md](docs/architecture.md) | Crates, every module, the data flow of a change, the crash model |
+| [operator-guide.md](docs/operator-guide.md) | Requirements, layout, flags, settings, permissions, shutdown and crashes |
+| [configuration.md](docs/configuration.md) | Every git config key, operator attribute, flag and environment variable (checked against the code in CI) |
+| [performance.md](docs/performance.md) | Measured costs, the benchmark and the performance budget |
+| [deployment.md](docs/deployment.md) | The container image and the Kubernetes sidecar |
+| [csi.md](docs/csi.md) | The CSI driver |
+| [runbooks/](docs/runbooks/) | Recovery and undo, divergence, stuck pushes, history rewrite, patch queue, crashed sidecar, history service down, CSI recovery |
+
+## Features
 
 Built so far, in `agentfs-core`: path checks, the journal (group commit,
 crash recovery), frozen copies (reflink, else copy), the commit builder,
@@ -145,7 +191,9 @@ with status 75 if another process holds it, naming the holder;
 lock and changes nothing, so it works beside a running daemon, and shows
 who holds the lock.
 
-Not built yet: several mounts of one volume across nodes, asking a running mount to push now, and
+### Not built yet
+
+Several mounts of one volume across nodes, asking a running mount to push now, and
 restarting a pod automatically after its sidecar crashes (the CSI driver
 does restart crashed fronts). SSH remotes do
 not support ssh-agent, passphrase-protected keys or `@cert-authority`
@@ -530,6 +578,14 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   written (with `git filter-repo`), against a `file://` remote, and checks
   the secret is gone locally and remotely and pushes are fast-forwards
   again.
+- **docs:** checks the documentation against the code: every git config
+  key agentfs reads (`config::KEYS`, filled by a test that records every
+  read), every operator attribute, every flag and environment variable of
+  `agentfs` and `agentfs-csi` (walking their clap definitions) and every
+  OpenTelemetry variable is documented in
+  [configuration.md](docs/configuration.md), and nothing documented is
+  gone; every module is in [architecture.md](docs/architecture.md)'s map;
+  and every relative link and anchor in README.md and docs/ resolves.
 
 [`.github/workflows/image.yml`](.github/workflows/image.yml) builds and
 tests the container image on every push:
@@ -565,6 +621,20 @@ tests the container image on every push:
 - **publish** (main only, after both kind tests): pushes the tested image to
   `ghcr.io/mcurcio/agentfs` as `<commit sha>` and `latest`.
 
+[`.github/workflows/bench.yml`](.github/workflows/bench.yml) runs the
+benchmark ([`ci/bench.sh`](ci/bench.sh), design §18 test 13) on every
+push to main that changes code, and on demand, once on a fresh XFS
+(reflink) and once on a fresh ext4 (copy) loop filesystem: the
+synchronous record step without FUSE
+([`record_step`](crates/agentfs-core/benches/record_step.rs)), then
+workloads through a real mount beside a plain-directory baseline (4 KiB
+closes, a `git clone` with `nested=working-tree`, npm-style small files
+into an excluded `node_modules/`, creating and `rm -rf` of 100,000 files,
+closing a 1 GiB file), each checked against the history afterwards.
+Results go to the job summary and a `bench-<fs>` artifact kept 90 days;
+[`ci/bench-budget.json`](ci/bench-budget.json) adds warnings, never
+failures. See [docs/performance.md](docs/performance.md).
+
 The e2e scripts run locally too: start the server with
 `ci/git-http-server.sh start <dir>` and source its output, run the
 collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run
@@ -577,3 +647,6 @@ and passwordless sudo. `ci/e2e-runbooks.sh` needs only `git-filter-repo`.
 `ci/e2e-kind.sh` and `ci/e2e-csi.sh` run on any Linux host with docker,
 kind, kubectl, nginx and fcgiwrap; their headers list the commands.
 `ci/csi-sanity.sh` needs FUSE, passwordless sudo and `csi-sanity`.
+`ci/bench.sh dir PATH` benchmarks the filesystem PATH is on with FUSE and
+passwordless sudo; `cargo bench -p agentfs-core --bench record_step`
+needs neither.
