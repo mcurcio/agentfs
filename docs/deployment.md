@@ -456,10 +456,16 @@ alert on `agentfs.patch.blocked`. See
 ## 11. Limitations
 
 - `linux/amd64` images only.
-- Recording costs about 2 ms per changed small file, and closing a large
+- Recording costs about 2 to 4 ms per changed small file, and closing a large
   file costs a copy on ext4 (2.9 s per clean GiB; 3 ms on XFS): put the
   backing volume on XFS when files are large, and keep bulk trees such as
   `node_modules/` off the mount. See [performance.md](performance.md).
+- A file written and closed at once is recorded twice (at the close and
+  again at RELEASE), which doubles the journal records, frozen copies and
+  commit work of bulk writes, though not the close's latency: about
+  200,000 records for 100,000 new files, and a 1 GiB file just written
+  frozen and committed twice. See
+  [performance.md](performance.md#known-costs).
 - The pod restart after a crash is manual (§7).
 - A sidecar exit that is not a crash is not held (§7).
 - The privileged sidecar (§9); the CSI driver ([csi.md](csi.md)) needs no

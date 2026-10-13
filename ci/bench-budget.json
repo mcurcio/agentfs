@@ -1,5 +1,5 @@
 {
-  "comment": "Advisory performance budget (design §19.2 item 1, docs/performance.md): ci/bench-report.py warns when a result exceeds one and never fails the job. Set on 2026-10-13 from the first two CI runs (GitHub ubuntu-latest, 4 CPUs, loop filesystems) at about 1.5 to 2 times the slower result. Workloads are budgeted in absolute time: the plain-directory baselines varied threefold between runners, so ratios against them are reported but not budgeted.",
+  "comment": "Advisory performance budget (design §19.2 item 1, docs/performance.md): ci/bench-report.py warns when a result exceeds one and never fails the job. Recalibrated on 2026-10-13 from the first three CI runs (six jobs; GitHub ubuntu-latest, 4 CPUs, loop filesystems), which drew two CPU types, AMD EPYC 7763 and Intel Xeon 6973P-C, with fsync-bound results up to about 1.7 times apart: each limit is about 1.5 times the slowest of the six. Workloads are budgeted in absolute time: the plain-directory baselines varied threefold between runners, so ratios against them are reported but not budgeted. The record counts the workloads produce include the FLUSH+RELEASE double record (docs/performance.md, Known costs).",
   "budgets": [
     {
       "match": {
@@ -7,8 +7,8 @@
         "case": "record close 4k, 1 thread(s)"
       },
       "metric": "p50_us",
-      "max": 3000,
-      "why": "§3.2: a small file's change boundary (measured 1.3 ms XFS, 1.9 ms ext4)"
+      "max": 3500,
+      "why": "§3.2: a small file's change boundary (measured 1.3 to 2.3 ms)"
     },
     {
       "match": {
@@ -17,7 +17,7 @@
       },
       "metric": "p99_us",
       "max": 10000,
-      "why": "§3.2 tail (measured 3.6 ms XFS, 5.7 ms ext4)"
+      "why": "§3.2 tail (measured 2.8 to 5.7 ms)"
     },
     {
       "match": {
@@ -26,7 +26,7 @@
       },
       "metric": "p99_us",
       "max": 12000,
-      "why": "group commit under concurrency (measured 5.0 ms XFS, 6.1 ms ext4)"
+      "why": "group commit under concurrency (measured 4.4 to 6.6 ms)"
     },
     {
       "match": {
@@ -34,8 +34,8 @@
         "case": "record unlink"
       },
       "metric": "p50_us",
-      "max": 1500,
-      "why": "a removal: journal append and fsync (measured 0.45 ms XFS, 0.84 ms ext4)"
+      "max": 2000,
+      "why": "a removal: journal append and fsync (measured 0.45 to 1.2 ms)"
     },
     {
       "match": {
@@ -45,7 +45,7 @@
       },
       "metric": "p50_us",
       "max": 1000,
-      "why": "§3.2: a reflink does not depend on size (measured 0.44 ms)"
+      "why": "§3.2: a reflink does not depend on size (measured 0.44 to 0.58 ms)"
     },
     {
       "match": {
@@ -55,7 +55,7 @@
       },
       "metric": "p50_us",
       "max": 3000,
-      "why": "§3.2: with reflink the step does not depend on size (measured 1.4 ms)"
+      "why": "§3.2: with reflink the step does not depend on size (measured 1.3 to 1.6 ms)"
     },
     {
       "match": {
@@ -63,8 +63,8 @@
         "workload": "close4k"
       },
       "metric": "agentfs",
-      "max": 4000,
-      "why": "§3.2 through FUSE, p50 (measured 1.8 ms XFS, 2.4 ms ext4)"
+      "max": 6000,
+      "why": "§3.2 through FUSE, p50, microseconds (measured 1.8 to 4.0 ms)"
     },
     {
       "match": {
@@ -72,8 +72,8 @@
         "workload": "clone"
       },
       "metric": "agentfs",
-      "max": 25,
-      "why": "git clone of 4,524 files into a recorded working tree, seconds (measured 12.7 to 16.0 s)"
+      "max": 30,
+      "why": "git clone of 4,524 files into a recorded working tree, seconds (measured 12.5 to 18.9 s)"
     },
     {
       "match": {
@@ -82,7 +82,7 @@
       },
       "metric": "agentfs",
       "max": 30,
-      "why": "30,000 small files into an excluded path, seconds (measured 17.2 to 19.0 s)"
+      "why": "30,000 small files into an excluded path, seconds (measured 17.1 to 19.0 s)"
     },
     {
       "match": {
@@ -90,8 +90,8 @@
         "workload": "create"
       },
       "metric": "agentfs",
-      "max": 500,
-      "why": "100,000 small files, each recorded, seconds (measured 230 to 330 s)"
+      "max": 600,
+      "why": "100,000 small files, each recorded, seconds (measured 230 to 384 s)"
     },
     {
       "match": {
@@ -100,7 +100,7 @@
       },
       "metric": "drain_s",
       "max": 720,
-      "why": "commit catch-up after 100k files (measured 483 s XFS, 474 s ext4)"
+      "why": "commit catch-up after 100k files, about 200k records with the double record (measured 119 to 484 s: about 130 s on Intel runners, 450 to 485 s on AMD ones)"
     },
     {
       "match": {
@@ -108,8 +108,8 @@
         "workload": "rm"
       },
       "metric": "agentfs",
-      "max": 200,
-      "why": "rm -rf of 100,000 recorded files, seconds (measured 78 to 132 s)"
+      "max": 270,
+      "why": "rm -rf of 100,000 recorded files, seconds (measured 78 to 177 s)"
     },
     {
       "match": {
@@ -119,7 +119,7 @@
       },
       "metric": "agentfs",
       "max": 0.5,
-      "why": "§3.2: reflink freeze of a clean 1 GiB file (measured 3 ms)"
+      "why": "§3.2: reflink freeze of a clean 1 GiB file (measured 2 to 10 ms)"
     },
     {
       "match": {
@@ -129,7 +129,7 @@
       },
       "metric": "agentfs",
       "max": 8,
-      "why": "reflink of a dirty 1 GiB file waits for writeback (measured 2.6 and 5.3 s)"
+      "why": "reflink of a dirty 1 GiB file waits for writeback (measured 2.5 to 5.4 s)"
     },
     {
       "match": {
@@ -138,8 +138,8 @@
         "workload": "bigclose-fsync"
       },
       "metric": "agentfs",
-      "max": 6,
-      "why": "§3.2: ext4 copies 1 GiB (measured 2.9 s)"
+      "max": 7,
+      "why": "§3.2: ext4 copies 1 GiB (measured 2.8 to 4.3 s)"
     },
     {
       "match": {
@@ -148,8 +148,8 @@
         "workload": "bigclose-dirty"
       },
       "metric": "agentfs",
-      "max": 10,
-      "why": "ext4 copies 1 GiB of dirty pages (measured 5.4 s)"
+      "max": 12,
+      "why": "ext4 copies 1 GiB of dirty pages (measured 4.9 to 8.1 s)"
     }
   ]
 }

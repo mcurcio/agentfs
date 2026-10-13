@@ -35,7 +35,7 @@ what to do when something goes wrong. The design behind it is
   state area: recording freezes a file's content with a reflink, which costs
   the same whatever the file's size. On ext4 it is a copy (§3.2): measured
   on CI, closing a clean 1 GiB file takes 3 ms on XFS and 2.9 s on ext4,
-  while a small file's change costs about 2 ms through the mount on both.
+  while a small file's change costs about 2 to 4 ms through the mount on both.
   Workloads of many small files run 14 to 83 times slower than in a plain
   directory, and excluded paths still pay about 0.6 ms per file in FUSE.
   See [performance.md](performance.md) for the numbers and the budget.

@@ -223,15 +223,36 @@ commits() {
   sgit rev-list --count "refs/heads/agentfs/$NAME" 2>/dev/null || echo 0
 }
 
-# Runs a workload in the mount and records its result with the drain.
+# Runs a workload in the mount and records its result with the drain. The
+# result line is also left in $LAST for checks. The drain is assigned on
+# its own line: inside the argument list its failure would only end the
+# command substitution, and the script would go on.
+LAST=
 measured() { # workload-name workload-args...
   local name=$1; shift
-  local seq commits_before json
+  local seq commits_before json drained
   seq=$(committed_seq)
   commits_before=$(commits)
   drop_caches
   json=$(workload "$@")
-  echo "$json" | result "$name" agentfs "$(drain "$seq" "$commits_before")"
+  drained=$(drain "$seq" "$commits_before")
+  LAST=$(echo "$json" | result "$name" agentfs "$drained")
+  echo "$LAST"
+}
+
+# Bounds the records a workload of N change boundaries made (design §3.1):
+# at least one per boundary, and at most two, since a file written and
+# closed at once is recorded at FLUSH and again at RELEASE by the
+# racy-timestamp rule (docs/performance.md, "Known costs"). Whether the
+# second record happens depends on timing, so the count is a range; a
+# small slack covers the sweep recording files still open.
+check_records() { # label boundaries
+  local records
+  records=$(echo "$LAST" | jq .records)
+  local lo=$2 hi=$((2 * $2 + $2 / 100 + 10))
+  [ "$records" -ge "$lo" ] && [ "$records" -le "$hi" ] ||
+    fail "$1: $records records for $2 boundaries, expected $lo to $hi"
+  pass "$1: $records records for $2 boundaries ($(awk -v r="$records" -v n="$2" 'BEGIN { printf "%.2f", r / n }') per boundary)"
 }
 
 baseline() { # workload-name workload-args...
@@ -259,7 +280,10 @@ mount_volume close4k
 drop_caches
 before=$(committed_seq)
 json=$(sudo python3 "$HERE/boundary-latency.py" --json "$MNT/lat" "$CLOSES" agentfs)
-echo "$json" | result close4k agentfs "$(drain "$before" 0)"
+drained=$(drain "$before" 0)
+LAST=$(echo "$json" | result close4k agentfs "$drained")
+echo "$LAST"
+check_records close4k "$CLOSES"
 check_history
 unmount_volume
 
@@ -292,8 +316,28 @@ for i in $(seq "$RUNS"); do
 done
 EXCLUDE=node_modules/ mount_volume npm
 echo '{"name": "app"}' | sudo tee "$MNT/package.json" >/dev/null
+# package.json is recorded; commit it first, so each run's count is its own.
+drained=$(drain -1 0)
 for i in $(seq "$RUNS"); do
+  seq_before=$(committed_seq)
   measured npm npm "$MNT/npm-$i/node_modules" --files "$NPM_FILES"
+  # Excluded paths are decided at record time: nothing frozen or
+  # journaled. The committed sequence alone cannot show that, since a
+  # record whose commit changes nothing (one the committer drops) does
+  # not move it. So write a recorded marker afterwards: its commit carries
+  # its own sequence number, which counts every record journaled before
+  # it. The marker makes one or two records (FLUSH, and RELEASE by the
+  # racy-timestamp rule: docs/performance.md, "Known costs"), and the
+  # previous file written (package.json or the last marker) may add a
+  # late RELEASE record of its own: at most 4, against thousands if the
+  # excluded files were journaled.
+  assert_eq 0 "$(echo "$LAST" | jq .records)" "npm-$i: the excluded files made no commits"
+  echo "$i" | sudo tee "$MNT/npm-marker" >/dev/null
+  drained=$(drain "$seq_before" 0)
+  made=$(echo "$drained" | jq .records)
+  [ "$made" -ge 1 ] && [ "$made" -le 4 ] ||
+    fail "npm-$i: $made records journaled with the marker, expected 1 to 4: the excluded files were journaled"
+  pass "npm-$i: the excluded files were not journaled ($made records with the marker)"
   n=$(sudo find "$BACKING/npm-$i/node_modules" -type f | wc -l)
   assert_eq "$NPM_FILES" "$n" "npm-$i: every file reached the backing tree"
 done
@@ -309,6 +353,7 @@ baseline create create "$PLAIN/many" "$MANY"
 baseline rm rm "$PLAIN/many"
 mount_volume many
 measured create create "$MNT/many" "$MANY"
+check_records create "$MANY"
 n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^many/' || true)
 assert_eq "$MANY" "$n" "every created file is in the history"
 measured rm rm "$MNT/many"

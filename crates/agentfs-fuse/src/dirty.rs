@@ -12,7 +12,10 @@
 //! within one tick leave the stamp unchanged. git's racy-timestamp rule
 //! closes that gap: when the last record's stamp is within the clock's
 //! granularity of the record time, a write could have followed the freeze
-//! without moving the stamp, so the next FLUSH records regardless.
+//! without moving the stamp, so the next FLUSH or RELEASE records regardless.
+//! RELEASE follows the last close at once, so a file written and closed
+//! within the window is recorded twice (design §19.2 item 4): RELEASE is
+//! the only backstop for a same-tick write through a shared mapping.
 
 use agentfs_core::record::Caller;
 use rustix::fs::Stat;

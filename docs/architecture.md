@@ -199,6 +199,53 @@ frozen copies), runs the patch phase (`patch_cmd.rs`, `patch/fetch.rs`,
 one commit (`operations.rs`); without a mount they write the backing tree
 directly through `confined.rs` and record in-process.
 
+### The push loop
+
+One loop per remote (`service.rs`), every `pushInterval`, with backoff
+after failures (§11.2). Each attempt (`push.rs`, `push_once`), in this
+order:
+
+1. takes the remote's push lock (a repack skips its round while any push
+   holds one, so a push never reads a pack being deleted) and reloads the
+   remote's push state, since another process may have pushed;
+2. **LFS objects first** (`lfs/upload.rs`, `lfs/client.rs`): every
+   object referenced at a managed path by a commit the remote lacks is
+   uploaded through the batch API before any ref, so a ref never reaches
+   the remote ahead of its objects (§7). A failure ends the attempt at
+   stage `lfs` with no ref pushed;
+3. **refs**: the branch and the volume's `diverged/*` refs, never forced;
+   a non-fast-forward the remote's history explains is a divergence
+   (§11.3); the push state records the last pushed commit;
+4. **the queue**, for the patch remote only and after every branch
+   attempt, failed or not (§12): the status ref (forced, a snapshot) and,
+   only when the branch push worked, the `applied/<n>` refs; then, once
+   those are on the remote, the deletion of each applied `inbox/<n>`,
+   leased on the oid listed. Its failures never count against the branch.
+
+### Shutdown
+
+SIGINT, SIGTERM or an external unmount start it (`daemon.rs`); a second
+signal exits at once with status 130, which the journal makes safe. For
+`mount` (`main.rs`, `mount.rs` `Mounted::shutdown`, `service.rs`):
+
+1. a restore in progress through the control socket gets up to
+   `--unmount-grace` to finish (`control.rs`);
+2. the mount is unmounted (lazily if busy) and the FUSE session gets up
+   to `--unmount-grace` to end; files still open after that are
+   abandoned, and their later changes are not recorded;
+3. the sweep and the fsync-class timer stop; a final sweep records every
+   armed inode with a handle still open and retries the repair queue,
+   and every changed fsync-class group is captured (§3.1, §8);
+4. paths still unrepaired are saved in `meta/repairs` and listed on exit
+   (§3.5);
+5. the commit loop stops after a final commit of everything journaled
+   (exit status 1 if it fails: the records stay journaled for the next
+   open);
+6. pushes in progress get up to `--push-grace`, then are abandoned.
+   `serve-history` also pushes once more within the grace, since nothing
+   else would push its final commit (§14.2); `mount` and `run` leave
+   that to the next start.
+
 ## Crash model
 
 What a crash at each point leaves, and what the next open does (§3.3,
@@ -215,6 +262,16 @@ What a crash at each point leaves, and what the next open does (§3.3,
 | A front's process (§14) | Its leased slot's frozen copies; maybe a request in flight | The kernel releases the lease. A request that may have been journaled is never resent; the boundary failed with `EIO`. A restarted front passes its old slot to drain it |
 | The history service | Fronts' requests fail with `EIO` until it is back | The service reopens the volume as above; fronts reconnect |
 | A restore | Some paths written, each recorded as an ordinary boundary | The partial apply is recorded and committed; re-running the restore finishes the job (§15) |
+| A push, after the LFS upload and before the ref push | Objects on the LFS server that no pushed ref references yet | The next attempt computes the objects again from the commits the remote lacks; the batch API skips those the server already has (§7) |
+| A push, between the branch push and the queue push | The branch on the remote; the queue refs as they were | The queue push follows the next attempt. Inbox refs are deleted only after their applied refs are on the remote, so the highest inbox number there never goes down (§11.3, §12) |
+| A repack (`repack.rs`; also a stop, which kills it) | git writes new packs before it deletes old ones, so every object is still in some pack or loose; maybe a temporary pack file | Nothing to do: the next round repacks again and ignores the temporary file. A repack never prunes, so nothing the journal or a ref needs is lost (§8) |
+| The patch phase at mount, after a patch's tree write and before its record (`patch/queue.rs`) | The backing tree holds the patch's content; history does not; `meta/patch.json` names the patch in flight | The next run's check finds those paths already written and records them as the patch. If the producer replaced or withdrew the patch meanwhile, the paths are put back to the branch head's state first (§12) |
+| The patch phase, after the record and before its commit | A journaled patch record | Journal replay commits it with its `Agentfs-Inbox` trailer, and the trailer scan finds it applied; it is never applied twice (§12) |
+| The patch phase, after the commit and before the ref moves | The commit on the branch; `inbox/<n>` still there, no `applied/<n>` | The next run finds the commit by its trailers and finishes the ref moves (`applied/<n>` set, `inbox/<n>` deleted): what is applied is decided by the branch, never by refs (§12) |
+| A namespace record that failed (`EIO`), with paths on the repair queue | `meta/repairs`, rewritten whenever the queue changes (`meta/fronts/slot-N.repairs` for a front) | The next mount (or the front reusing the slot) re-derives each path's absolute state from the backing tree and records it before it serves any request (§3.5) |
+| The daemon of a mount in a pod (§17.1) | A stale FUSE mount: the workload's calls fail with `ENOTCONN`, never reaching the bare directory beneath | The restarted sidecar runs `mount --on-stale-mount hold`: it mounts nothing, takes no lock and keeps the pod NotReady; at pod termination it detaches the stale mount. The next pod mounts afresh and replays the journal ([runbook](runbooks/crashed-sidecar.md)) |
+| A CSI front or service (§14.2) | A stale mount at the pod's target, or fronts failing with `EIO` | The supervisor restarts it with backoff (1 s to 30 s): a front in its predecessor's slot, its new mount bind-stacked over the stale target; a service replays its journal |
+| The CSI node plugin (deleted, upgraded or crashed) | Its children stop with it (with final commits when it is stopped gracefully); the staged and published records on the hostPath | Reconcile at plugin start: services for staged volumes (journal replay), fronts recovered for targets whose mount is still there, live or stale; targets the kubelet removed are forgotten. Containers that mount with `HostToContainer` see the new mount; others after a container restart (§14.2, [runbook](runbooks/csi-recovery.md)) |
 
 The daemon never holds the only copy of anything a returned call
 promised: content is in `pending/` and the journal, both `fsync`ed, until

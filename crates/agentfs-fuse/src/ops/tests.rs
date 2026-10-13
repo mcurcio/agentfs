@@ -287,6 +287,33 @@ fn same_size_rewrites_are_caught_by_the_racy_rule() {
     }
 }
 
+/// The known cost of design §3.1 and §19.2 item 4 (docs/performance.md,
+/// "Known costs"): a file written and closed within the racy-timestamp
+/// window is recorded at FLUSH and again at RELEASE, since RELEASE cannot
+/// tell a same-tick write through a shared mapping from no change. The
+/// window is made huge here so the test does not depend on timing; the
+/// benchmark bounds the same count (between one and two records per
+/// boundary). A fix that skips the duplicate safely changes the second
+/// assertion to 1.
+#[test]
+fn a_racy_close_is_recorded_again_at_release() {
+    let fx = Fx::with(OpsConfig {
+        granularity_ns: 3_600 * 1_000_000_000,
+        chunk: RENAME_CHUNK,
+    });
+    let (_, fh) = fx.create("a");
+    fx.ops.write(fh, 0, b"hello", C).unwrap();
+    fx.ops.flush(fh, C).unwrap();
+    assert_eq!(fx.backlog(), 1, "flush records the close");
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.backlog(), 2, "release records the racy stamp again");
+    // The duplicate changes nothing in the tree.
+    assert_eq!(fx.history(), map(&[("a", file("hello"))]));
+
+    // Outside the window (as after a long fsync) release adds nothing:
+    // `create_write_close_records_once` with granularity 0.
+}
+
 #[test]
 fn exec_bit_and_other_metadata() {
     let fx = Fx::new();

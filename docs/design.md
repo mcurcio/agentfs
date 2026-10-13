@@ -206,7 +206,7 @@ so a crash never leaves a stale lock.
 | `setattr` changing size (`truncate`) or the executable bit | new content or mode | yes |
 | `fsync` on a path marked `agentfs.commit=fsync` | its whole group (§8), coalesced | yes, at most once per interval |
 | the trailing timer of an `fsync`-class group | its whole group (§8) | **no**: at most one `agentfs.coalesce` late |
-| RELEASE (all handles and mappings gone) | content, if changed after the last FLUSH | **no**: backstop for mmap and late writes |
+| RELEASE (all handles and mappings gone) | content, if changed after the last FLUSH or that record's stamp was racy (below) | **no**: backstop for mmap and late writes |
 | periodic sweep | content of files still open and changed | **no**: backstop for files never closed |
 
 Rules that make this precise:
@@ -231,7 +231,13 @@ Rules that make this precise:
   mode) differs from the one taken just before the last freeze. Timestamps
   come from a coarse clock, so git's racy-timestamp rule applies: if the
   last record's stamp is within twice the coarse clock's resolution of the
-  record time, the next FLUSH records regardless. A created file is
+  record time, the next FLUSH or RELEASE records regardless. RELEASE
+  follows the last close at once, so a file written and closed within
+  that window (nearly every file a program writes and closes) is
+  recorded twice: at FLUSH and again, after `close` has returned, at
+  RELEASE. This is a known cost (§3.2, §19.2 item 4): RELEASE is the
+  only backstop for a write through a shared mapping in the same clock
+  tick as the FLUSH freeze, which leaves the stamp unchanged. A created file is
   recorded at its first FLUSH even when empty (`touch`); a write-open of an
   existing file takes its stamp at open, so opening and closing without a
   change records nothing.
@@ -296,7 +302,13 @@ CI runners, medians): the step for a small file takes 1.3 ms on XFS and
 FUSE. On XFS it does not depend on size: a 16 MiB freeze takes 0.44 ms and
 closing a clean 1 GiB file 3 ms (2.6 s with its pages still dirty, as
 the reflink waits for writeback). On ext4 the copy takes 44 ms for 16 MiB
-and 2.9 s for a clean 1 GiB file. The performance budget is §19.2 item 1.
+and 2.9 s for a clean 1 GiB file. A file written and closed at once is
+frozen and journaled a second time at RELEASE (§3.1), outside the
+call's latency but doubling its journal `fsync`s, freezes and commit
+work: 100,000 new files make about 200,000 records, and a 1 GiB file
+just written is copied twice on ext4 and hashed and compressed twice by
+the commit loop ([performance.md](performance.md#known-costs)). The
+performance budget is §19.2 item 1.
 
 **Through a front (§14).** A front mount splits the step with the history
 service. The front decides the path rules (asking the service with a
@@ -2651,7 +2663,9 @@ unaffected, the front back in its slot and live through
 pushed), and deletion of the node plugin pod (reconcile; one pod live,
 the other after a container restart), the refusals of inline volumes and
 `ReadWriteMany`, and teardown through DeleteVolume.
-Not automated yet: test 3 (a kill at every step), 13 (performance), 16
+Test 13 runs in the `bench` workflow (`ci/bench.sh`, on fresh XFS and
+ext4 loop filesystems; [performance.md](performance.md)).
+Not automated yet: test 3 (a kill at every step), test 16
 across two nodes, and the CSI driver over a shared filesystem, on
 hardened node images (Talos) and across node reboots.
 
@@ -2672,10 +2686,10 @@ hardened node images (Talos) and across node reboots.
 | Repository layout | Several volumes may share a repository, each with its own branch and ref namespace (§11.4) |
 | Identity | Configurable templates with defaults (§9) |
 | Backing filesystem | Both supported. XFS (reflink) makes the synchronous step size-independent; ext4 falls back to a copy. Recommendation, from the benchmark (§3.2, §18 test 13): XFS (or btrfs) for volumes holding large files, where ext4 costs about 2.9 s per clean GiB at close; either for small files, where the journal `fsync` dominates on both |
-| Performance budget | Advisory, checked by every benchmark run (`ci/bench-budget.json`, [performance.md](performance.md#performance-budget)): about 1.5 to 2 times the first CI measurements, for example 3 ms for a small file's step at the median; a result over budget warns and never fails CI (2026-10-13) |
+| Performance budget | Advisory, checked by every benchmark run (`ci/bench-budget.json`, [performance.md](performance.md#performance-budget)): about 1.5 times the slowest of the first three CI runs (six jobs on two CPU types), for example 3.5 ms for a small file's step at the median; a result over budget warns and never fails CI (2026-10-13) |
 | One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `record`, `flush`, `push`, and `restore` and `revert` in direct mode; exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
 | FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
-| Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close (§3.1) |
+| Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close. A file written and closed within the racy window is recorded again at RELEASE: a known cost, with a follow-up in §19.2 item 4 (§3.1) |
 | `.git` paths | An exact `.git` component that is a git directory or gitfile is skipped without an alarm; any other `.git`, look-alikes and invalid names raise `PathRefused` (§5) |
 | Layout | The state area, backing tree and mount point are separate; credentials are never under the backing tree. `mount` refuses otherwise (§17.1) |
 | Passthrough | `auto` by default: used when the kernel and privileges allow, off with the reason reported otherwise, and switched off per inode (not per mount) if registering its backing file fails; `on` fails the mount instead (§17.1) |
@@ -2763,6 +2777,18 @@ hardened node images (Talos) and across node reboots.
    whether a read-only history view for operators is worth building,
    whether undo through the patch queue (§12) replaces manual restores for
    iac, and asking a running daemon to push now.
+4. **The FLUSH+RELEASE double record** (§3.1, §3.2). A file written and
+   closed within the racy-timestamp window is recorded at FLUSH and again
+   at RELEASE, because RELEASE cannot tell a same-tick write through a
+   shared mapping from no change. Measured by the benchmark: about
+   200,000 records for 100,000 new files, and twice the freeze and commit
+   work for a 1 GiB file just written
+   ([performance.md](performance.md#known-costs)). Known and accepted for
+   now (2026-10-13); open: how to skip the duplicate safely, for example
+   by comparing the file with its frozen copy at RELEASE while the copy
+   is still in `pending/`, or by waiting out the window at FLUSH above
+   some size. The benchmark bounds the count between one and two records
+   per boundary, so a fix shows as a drop to one.
 
 ## 20. Prior art
 

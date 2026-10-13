@@ -201,6 +201,12 @@ host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
 resumable transfers, proxy settings or pruning. Restoring a database needs
 its workload stopped
 ([runbook](docs/runbooks/recovery-and-undo.md#7-restoring-a-database)).
+A file written and closed at once is recorded twice, at the close and
+again when its last reference goes (the racy-timestamp rule): the close
+is not slower, but bulk writes take twice the journal records, frozen
+copies and commit work
+([known costs](docs/performance.md#known-costs)).
+
 
 ## Mounting
 
