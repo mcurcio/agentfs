@@ -20,6 +20,10 @@
 //!   local head is pushed once per divergence to
 //!   `refs/agentfs/<volume>/diverged/<UTC timestamp>`, and every attempt
 //!   raises [`Event::PushFailed`] until an operator resolves it.
+//! - **Over the push size limit** (`agentfsMaxPushSize`, [`crate::push_size`]):
+//!   a backlog that does not fit is pushed in first-parent steps, raising
+//!   [`Event::PushLimited`], with the next attempt at once; a single commit
+//!   that does not fit fails as `too_large` before connecting.
 //! - **Anything else** (unreachable, authentication, an untrusted host,
 //!   refused) raises
 //!   [`Event::PushFailed`] and backs off: the delay doubles from
@@ -63,6 +67,7 @@ use crate::events::{Event, Events, PushFailureKind, PushStage};
 use crate::history::init_libgit2;
 use crate::lfs::upload::objects_to_upload;
 use crate::lfs::{Direction, LfsError, ObjectCache, Transfer, UploadReport, transfer_for};
+use crate::push_size::Step;
 #[cfg(test)]
 use crate::remote_auth::CredentialAnswer;
 use crate::remote_auth::{AuthState, RemoteAuth};
@@ -162,12 +167,14 @@ pub enum PushOutcome {
     /// The branch does not exist yet.
     NothingToPush,
     /// The remote already had every ref.
-    UpToDate {
-        head: Oid,
-    },
+    UpToDate { head: Oid },
     Pushed {
         from: Option<Oid>,
         to: Oid,
+        /// Set when the backlog was larger than the remote's
+        /// `agentfsMaxPushSize`: only up to `to` was pushed, and this many
+        /// first-parent commits are left for the next steps (design §11.3).
+        limited: Option<usize>,
     },
     /// Someone else wrote the remote branch. `diverged_ref` is where the
     /// local head was saved, if that push has succeeded.
@@ -224,6 +231,18 @@ impl QueuePush {
 }
 
 impl PushOutcome {
+    /// A push that sent only part of the backlog (design §11.3); the next
+    /// step should follow at once.
+    pub fn is_limited(&self) -> bool {
+        matches!(
+            self,
+            Self::Pushed {
+                limited: Some(_),
+                ..
+            }
+        )
+    }
+
     pub fn is_success(&self) -> bool {
         matches!(
             self,
@@ -285,6 +304,9 @@ pub struct RemotePusher {
     patch_remote: bool,
     /// What the last attempt's queue push did.
     queue: Option<QueuePush>,
+    /// The last attempt pushed only part of the backlog (design §11.3):
+    /// the next follows at once.
+    step_pending: bool,
 }
 
 impl RemotePusher {
@@ -321,6 +343,7 @@ impl RemotePusher {
                 .patch_remote()
                 .is_some_and(|p| p.name == remote.name),
             queue: None,
+            step_pending: false,
         })
     }
 
@@ -339,8 +362,12 @@ impl RemotePusher {
     }
 
     /// How long to wait before the next attempt: `pushInterval` after a
-    /// success, the backoff after failures.
+    /// success, the backoff after failures, and none after a push that
+    /// sent only part of the backlog (design §11.3).
     pub fn next_delay(&self) -> Duration {
+        if self.step_pending {
+            return Duration::ZERO;
+        }
         backoff(
             self.push_interval,
             self.state.consecutive_failures,
@@ -439,12 +466,16 @@ impl RemotePusher {
         // Another process may have pushed since this one last looked.
         self.state = PushState::load(&self.state_path);
         self.state.last_attempt_ms = Some(now_ms());
+        self.step_pending = false;
         let outcome = self.branch_push(head_out, lfs_out);
+        let limited = outcome.is_limited();
+        self.step_pending = limited;
         // The queue push follows every branch attempt, failed or not
         // (design §12): the status ref reaches the remote even while the
-        // branch cannot; applied refs wait for a branch push that worked.
+        // branch cannot; applied refs wait for a branch push that worked,
+        // and for the last step of a limited one (design §11.3).
         if self.patch_remote {
-            self.queue = self.queue_push(outcome.is_success());
+            self.queue = self.queue_push(outcome.is_success() && !limited);
         }
         outcome
     }
@@ -462,6 +493,52 @@ impl RemotePusher {
             Err(e) => return self.failed(PushFailureKind::Local, e.to_string(), None),
         };
         *head_out = Some(head);
+        // A maximum push size (design §11.3): measured before connecting.
+        let mut step = None;
+        if let Some(limit) = self.remote.max_push_size {
+            let base = self.state.last_pushed_oid();
+            match crate::push_size::largest_step(&self.repo, head, base, limit) {
+                Ok(Step::All) => {}
+                Ok(Step::UpTo {
+                    commit,
+                    commits_left,
+                }) => step = Some((commit, commits_left, limit)),
+                Ok(Step::None {
+                    first,
+                    size_at_least,
+                }) => {
+                    let message = match base {
+                        Some(base)
+                            if !self.repo.graph_descendant_of(head, base).unwrap_or(false)
+                                && base != head =>
+                        {
+                            format!(
+                                "the commits since {base} take at least {size_at_least} bytes, \
+                                 over remote.{name}.agentfsMaxPushSize ({limit}), and cannot \
+                                 be pushed in steps: {base}, the last commit pushed, is not \
+                                 an ancestor of the head; raise the limit",
+                                name = self.remote.name
+                            )
+                        }
+                        _ => format!(
+                            "commit {first} alone takes at least {size_at_least} bytes to \
+                             push, over remote.{name}.agentfsMaxPushSize ({limit}); raise the \
+                             limit, or move large files to LFS from now on (see the \
+                             stuck-pushes runbook)",
+                            name = self.remote.name
+                        ),
+                    };
+                    return self.failed(PushFailureKind::TooLarge, message, Some(head));
+                }
+                Err(e) => {
+                    let message = format!("measuring the push: {}", e.message());
+                    return self.failed(PushFailureKind::Local, message, Some(head));
+                }
+            }
+        }
+        if let Some((commit, commits_left, limit)) = step {
+            return self.step_push(head, commit, commits_left, limit, lfs_out);
+        }
         let refspecs = match self.refspecs(head) {
             Ok(refspecs) => refspecs,
             Err(e) => return self.failed(PushFailureKind::Local, e.to_string(), Some(head)),
@@ -481,6 +558,56 @@ impl RemotePusher {
             );
         }
         let attempt = self.attempt(&refspecs, &[]);
+        self.conclude(head, &refspecs, attempt)
+    }
+
+    /// One step of a backlog larger than the remote's `agentfsMaxPushSize`
+    /// (design §11.3): the branch alone, up to `commit`, with the LFS
+    /// objects of that step only. Diverged refs wait for the full push.
+    fn step_push(
+        &mut self,
+        head: Oid,
+        commit: Oid,
+        commits_left: usize,
+        limit: u64,
+        lfs_out: &mut Option<UploadReport>,
+    ) -> PushOutcome {
+        match self.upload_lfs(commit) {
+            Ok(report) => *lfs_out = report,
+            Err(e) => return self.failed_at(e.kind, e.message, Some(commit), PushStage::Lfs),
+        }
+        let refspecs = vec![format!("{commit}:{}", self.branch_ref)];
+        let attempt = self.attempt(&refspecs, &[]);
+        let outcome = self.conclude(commit, &refspecs, attempt);
+        match outcome {
+            PushOutcome::Pushed { from, to, .. } => {
+                self.events.emit(Event::PushLimited {
+                    remote: self.remote.name.clone(),
+                    limit,
+                    pushed: to,
+                    head,
+                    commits_left,
+                });
+                PushOutcome::Pushed {
+                    from,
+                    to,
+                    limited: Some(commits_left),
+                }
+            }
+            // The remote already had the step (pushed by another process
+            // since): the next step follows at once too.
+            PushOutcome::UpToDate { head: to } => PushOutcome::Pushed {
+                from: Some(to),
+                to,
+                limited: Some(commits_left),
+            },
+            other => other,
+        }
+    }
+
+    /// The outcome of the branch push `attempt` of `refspecs`, whose
+    /// branch head is `head`.
+    fn conclude(&mut self, head: Oid, refspecs: &[String], attempt: Attempt) -> PushOutcome {
         let remote_branch = attempt
             .updates
             .iter()
@@ -936,6 +1063,7 @@ impl RemotePusher {
             PushOutcome::Pushed {
                 from: previous,
                 to: head,
+                limited: None,
             }
         }
     }
@@ -1612,7 +1740,8 @@ mod tests {
                 outcome,
                 PushOutcome::Pushed {
                     from: None,
-                    to: head
+                    to: head,
+                    limited: None
                 },
                 "file url: {file_url}"
             );
@@ -1641,7 +1770,8 @@ mod tests {
                 pusher.push_once(),
                 PushOutcome::Pushed {
                     from: Some(head),
-                    to: next
+                    to: next,
+                    limited: None
                 }
             );
             assert_eq!(pusher.next_delay(), v.settings.push_interval);
@@ -1825,7 +1955,8 @@ mod tests {
             outcome,
             PushOutcome::Pushed {
                 from: Some(c1),
-                to: c2
+                to: c2,
+                limited: None
             }
         );
         let queue = pusher.queue().unwrap();
@@ -1902,6 +2033,174 @@ mod tests {
             None
         );
         assert_eq!(pusher.state().queue_synced_status, None);
+    }
+
+    /// Incompressible bytes: a xorshift stream.
+    fn random(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_backlog_over_the_push_size_limit_goes_out_in_steps() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::with_config(
+            "vol",
+            &[("origin", &remote.display().to_string())],
+            &[
+                ("remote.origin.agentfsMaxPushSize", "1m"),
+                ("agentfs.patchRemote", "origin"),
+            ],
+        );
+        let first = v.commit();
+        let mut chain = Vec::new();
+        for i in 0..5 {
+            chain.push(v.commit_file(&format!("big{i}"), &random(400 << 10, i + 1)));
+        }
+        let repo = v.com.history().repo();
+        repo.reference("refs/agentfs/vol/applied/0000000001", first, false, "t")
+            .unwrap();
+        repo.reference("refs/agentfs/vol/status", first, false, "t")
+            .unwrap();
+        let head = v.head();
+        let (events, sink_events) = sink();
+        let mut pusher = v.pusher("origin", sink_events);
+        let mut steps = Vec::new();
+        loop {
+            let outcome = pusher.push_once();
+            match outcome {
+                PushOutcome::Pushed {
+                    to,
+                    limited: Some(left),
+                    ..
+                } => {
+                    assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(to));
+                    assert_eq!(pusher.next_delay(), Duration::ZERO);
+                    // Applied refs wait for the full push.
+                    let queue = pusher.queue().unwrap();
+                    assert!(queue.held_back, "{queue:?}");
+                    assert_eq!(
+                        remote_ref(remote, "refs/agentfs/vol/applied/0000000001"),
+                        None
+                    );
+                    steps.push((to, left));
+                }
+                PushOutcome::Pushed {
+                    to, limited: None, ..
+                } => {
+                    assert_eq!(to, head);
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(steps.len() < 10, "{steps:?}");
+        }
+        // 400 KiB each in 1 MiB: two commits per step (the first, small one
+        // rides along with the first step).
+        assert_eq!(steps, [(chain[1], 3), (chain[3], 1)]);
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(head));
+        assert_eq!(
+            remote_ref(remote, "refs/agentfs/vol/applied/0000000001"),
+            Some(first)
+        );
+        assert_eq!(pusher.next_delay(), v.settings.push_interval);
+        let limited: Vec<_> = events
+            .take()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::PushLimited {
+                    pushed,
+                    head: h,
+                    commits_left,
+                    limit,
+                    ..
+                } => Some((pushed, h, commits_left, limit)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            limited,
+            [(chain[1], head, 3, 1 << 20), (chain[3], head, 1, 1 << 20)]
+        );
+        assert_eq!(pusher.push_once(), PushOutcome::UpToDate { head });
+    }
+
+    #[test]
+    fn a_commit_over_the_push_size_limit_fails_as_too_large() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::with_config(
+            "vol",
+            &[("origin", &remote.display().to_string())],
+            &[("remote.origin.agentfsMaxPushSize", "1m")],
+        );
+        let small = v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(matches!(
+            pusher.push_once(),
+            PushOutcome::Pushed { limited: None, .. }
+        ));
+        let big = v.commit_file("big", &random(2 << 20, 3));
+        let (events, sink_events) = sink();
+        let mut pusher = v.pusher("origin", sink_events);
+        let outcome = pusher.push_once();
+        let PushOutcome::Failed {
+            kind,
+            message,
+            stage,
+            retry_in,
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(kind, PushFailureKind::TooLarge);
+        assert_eq!(stage, PushStage::Git);
+        assert_eq!(retry_in, v.settings.push_interval);
+        assert!(message.contains(&big.to_string()), "{message}");
+        assert!(message.contains("agentfsMaxPushSize"), "{message}");
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(small));
+        assert_eq!(pusher.state().consecutive_failures, 1);
+        assert!(matches!(
+            events.take().as_slice(),
+            [Event::PushFailed {
+                kind: PushFailureKind::TooLarge,
+                ..
+            }]
+        ));
+        // Backs off like any failure.
+        assert!(matches!(
+            pusher.push_once(),
+            PushOutcome::Failed {
+                kind: PushFailureKind::TooLarge,
+                ..
+            }
+        ));
+        assert_eq!(pusher.next_delay(), v.settings.push_interval * 2);
+    }
+
+    #[test]
+    fn remotes_without_a_push_size_limit_push_everything() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        assert_eq!(v.settings.remotes[0].max_push_size, None);
+        let head = v.commit_file("big", &random(2 << 20, 5));
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(matches!(
+            pusher.push_once(),
+            PushOutcome::Pushed { limited: None, to, .. } if to == head
+        ));
     }
 
     #[test]
@@ -2087,7 +2386,8 @@ mod tests {
             pusher.push_once(),
             PushOutcome::Pushed {
                 from: Some(pushed),
-                to: ours
+                to: ours,
+                limited: None
             }
         );
         assert_eq!(pusher.state().diverged, None);
@@ -2198,7 +2498,8 @@ mod tests {
             outcome,
             PushOutcome::Pushed {
                 from: Some(first),
-                to: second
+                to: second,
+                limited: None
             }
         );
         assert!(diverged_refs(remote, "vol").is_empty());

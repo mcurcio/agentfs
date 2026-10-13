@@ -557,6 +557,7 @@ mod tests {
             url: "/x".into(),
             push_url: None,
             max_blob_size: max,
+            max_push_size: None,
             credentials: None,
             ssh_key: None,
             known_hosts: None,

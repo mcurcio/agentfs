@@ -35,13 +35,14 @@ with the next successful push. Design:
 | `refused` | Connected and authenticated, but the push was rejected | The message says why: branch protection or rules on `agentfs/*`, a server-side hook, `receive.fsckObjects` (agentfs checks git's fsck rules before committing, §3.4, so this points at another policy), a file size limit lower than `remote.<name>.agentfsMaxBlobSize`, a quota |
 | `non_fast_forward` | Someone else moved the branch | [divergence.md](divergence.md) |
 | `local` | A problem on this side: the per-remote lock, reading the branch, or saving `meta/push/<remote>.json` | Disk space and permissions of the state area |
+| `too_large` | One commit's git pack is larger than the remote's `agentfsMaxPushSize`, so it cannot be pushed even in steps (or the last pushed commit is not an ancestor of the head, so the backlog cannot be stepped). Nothing was sent | The message names the commit, the size reached and the limit. If the server takes more, raise `remote.<name>.agentfsMaxPushSize`. If it does not: route large files to LFS from now on (`agentfs.lfsThreshold`, [Git LFS](../configuration.md#git-lfs)); a commit already made can only go out by [rewriting history](history-rewrite.md) |
 
 **`RemoteMisconfigured`**: the `[remote "<name>"]` section is invalid, so
 it is left out: a name that is not a valid agentfs name, a relative
 `agentfsCredentials`, `agentfsSshKey`, `agentfsKnownHosts` or
 `agentfsLfsCredentials`, an LFS endpoint (`lfsurl`, `lfspushurl`,
 `lfs.url`, `lfs.pushurl`) that is not `http(s)`, `file://` or a path, an
-`agentfsMaxBlobSize` that is not a size; for an SSH push URL, a missing
+`agentfsMaxBlobSize` or `agentfsMaxPushSize` that is not a size; for an SSH push URL, a missing
 `agentfsSshKey` or `agentfsKnownHosts`, an `agentfsCredentials`, a
 password in the URL, or a binary built without the `ssh` feature; for
 any other push URL, an `agentfsSshKey` or `agentfsKnownHosts`. The alarm
@@ -49,6 +50,19 @@ names the key; the full list is in the
 [configuration reference](../configuration.md#remote-name). Fix the
 section in `<state>/git/config`; the change takes effect at the next
 start of the mount (or the next `agentfs push`).
+
+## Pushed in steps
+
+`PushLimited` warnings (log `agentfs.push_limited`, counter
+`agentfs.push.limited{remote}`) are not failures: the backlog was larger
+than the remote's `agentfsMaxPushSize`, so the push sent the longest run
+of first-parent commits that fits and the next step follows at once. The
+warning gives the commit pushed and how many commits are left. Diverged
+refs and the patch queue's `applied/<n>` refs wait for the last step.
+`agentfs push` prints one `pushed <a>..<b> (push size limit: N commit(s)
+left, ...)` line per step and keeps going until the remote is up to date.
+Steps that keep coming mean the workload writes faster than the limit
+allows per attempt: raise the limit or send large files to LFS.
 
 ## LFS stage failures
 

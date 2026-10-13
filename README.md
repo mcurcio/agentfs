@@ -105,6 +105,10 @@ nested repository detection. Also:
 - **Interval push:** only the volume's own refs, fast-forward only, never
   forced. A divergence saves the local head under
   `refs/agentfs/<volume>/diverged/<timestamp>` and keeps alarming.
+- **Push size limit:** `remote.<name>.agentfsMaxPushSize` keeps every
+  push under a host's limit: a larger backlog goes out in first-parent
+  steps (`PushLimited`), and a single commit over it fails as `too_large`
+  without sending anything.
 - **The service:** the commit loop and one push loop per remote, with clean
   shutdown.
 - **Alarm events** (`agentfs_core::events`).
@@ -459,6 +463,7 @@ Metrics (design §13):
 | `agentfs.push.oldest_unpushed_age` | gauge, seconds | `remote` |
 | `agentfs.push.failures` | counter | `remote`, `reason`, `stage` (`git`, `lfs` for LFS uploads, or `queue`) |
 | `agentfs.push.diverged` | gauge, 0 or 1 | `remote` |
+| `agentfs.push.limited` | counter | `remote` |
 | `agentfs.remote.misconfigured` | gauge | `remote` |
 | `agentfs.precheck.rejected_paths` | counter | `stage`, `reason` |
 | `agentfs.patch.queue_depth` | gauge | |

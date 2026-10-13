@@ -41,6 +41,7 @@ fn remote(url: &str) -> RemoteSettings {
         url: url.into(),
         push_url: None,
         max_blob_size: None,
+        max_push_size: None,
         credentials: None,
         ssh_key: None,
         known_hosts: None,

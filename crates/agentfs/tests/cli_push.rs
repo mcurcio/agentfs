@@ -544,3 +544,107 @@ fn push_without_a_daemon_pushes_directly() {
     assert!(!text.contains("through the running daemon"), "{text}");
     assert_eq!(branch(&remote), Some(v.head()));
 }
+
+/// Incompressible bytes: a xorshift stream.
+fn random(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+/// A volume with a 1 MiB push size limit on `origin` and five commits of
+/// 400 KiB of random data each.
+fn limited_backlog() -> (Volume, PathBuf) {
+    let v = Volume::new();
+    let remote = v.dir.path().join("remote.git");
+    bare(&remote);
+    v.config(&[
+        ("agentfs.pushInterval", "1h"),
+        ("remote.origin.url", &remote.display().to_string()),
+        ("remote.origin.agentfsMaxPushSize", "1m"),
+    ]);
+    for i in 0..5 {
+        let name = format!("big{i}");
+        fs::write(v.tree().join(&name), random(400 << 10, i + 1)).unwrap();
+        let out = v.run(&["record", &name]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    (v, remote)
+}
+
+/// A backlog over `agentfsMaxPushSize` is pushed in steps until the remote
+/// is up to date; a single commit over it fails as `too_large` (design
+/// §11.3).
+#[test]
+fn push_steps_through_a_push_size_limit() {
+    let (v, remote) = limited_backlog();
+    let out = v.run(&["push"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    let steps = text
+        .lines()
+        .filter(|l| l.contains("(push size limit: "))
+        .count();
+    assert_eq!(steps, 2, "{text}");
+    assert!(text.contains("1 commit(s) left"), "{text}");
+    let head = v.head();
+    assert!(
+        text.lines().last().unwrap().ends_with(&head.to_string()),
+        "{text}"
+    );
+    assert_eq!(branch(&remote), Some(head));
+    assert!(
+        stderr(&out).contains("alarm: push to origin limited to 1048576 bytes"),
+        "{}",
+        stderr(&out)
+    );
+
+    // One commit alone over the limit: too_large, exit 1, nothing sent.
+    fs::write(v.tree().join("huge"), random(2 << 20, 99)).unwrap();
+    let out = v.run(&["record", "huge"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = v.run(&["push"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("origin: failed (too_large): commit "),
+        "{text}"
+    );
+    assert!(text.contains("agentfsMaxPushSize"), "{text}");
+    assert_eq!(branch(&remote), Some(head));
+
+    // Raising the limit lets it through.
+    v.config(&[("remote.origin.agentfsMaxPushSize", "8m")]);
+    let out = v.run(&["push"]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert_eq!(branch(&remote), Some(v.head()));
+}
+
+/// Through a running daemon, `agentfs push` also ends up to date.
+#[test]
+fn push_now_steps_through_a_push_size_limit() {
+    let (v, remote) = limited_backlog();
+    let mut child = spawn_run_with(&v, "1s");
+    wait_until_running(&mut child);
+    let out = v.run(&["push", "--timeout", "60s"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert!(text.contains("through the running daemon (pid "), "{text}");
+    let head = v.head();
+    assert!(
+        text.lines()
+            .last()
+            .is_some_and(|l| l.contains(&head.to_string())),
+        "{text}"
+    );
+    assert_eq!(branch(&remote), Some(head));
+    signal(&child, rustix::process::Signal::TERM);
+    let status = wait_with_timeout(&mut child, Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+}

@@ -67,6 +67,10 @@ pub enum PushFailureKind {
     Refused,
     /// A problem on this side: the history repository or the push state.
     Local,
+    /// A single commit's git pack is larger than the remote's
+    /// `agentfsMaxPushSize` (design §11.3), so it can never be pushed in
+    /// steps; nothing was sent.
+    TooLarge,
 }
 
 impl PushFailureKind {
@@ -78,6 +82,7 @@ impl PushFailureKind {
             Self::NonFastForward => "non_fast_forward",
             Self::Refused => "refused",
             Self::Local => "local",
+            Self::TooLarge => "too_large",
         }
     }
 }
@@ -180,6 +185,18 @@ pub enum Event {
         remote_head: Option<Oid>,
         diverged_ref: String,
     },
+    /// The backlog was larger than the remote's `agentfsMaxPushSize`, so
+    /// only part of it was pushed (design §11.3): the branch now stands at
+    /// `pushed`, a first-parent ancestor of `head`, with `commits_left`
+    /// first-parent commits to go. The next attempt follows at once. A
+    /// warning.
+    PushLimited {
+        remote: String,
+        limit: u64,
+        pushed: Oid,
+        head: Oid,
+        commits_left: usize,
+    },
     /// A `[remote "<name>"]` section is invalid, so the remote is never
     /// pushed; recording and other remotes carry on (design §11.1).
     RemoteMisconfigured { remote: String, error: String },
@@ -261,6 +278,7 @@ impl Event {
             Self::ReconcileFailed { .. } => "reconcile_failed",
             Self::PushFailed { .. } => "push_failed",
             Self::Diverged { .. } => "diverged",
+            Self::PushLimited { .. } => "push_limited",
             Self::RemoteMisconfigured { .. } => "remote_misconfigured",
             Self::PushSucceeded { .. } => "push_succeeded",
             Self::PatchApplied { .. } => "patch_applied",
@@ -337,6 +355,18 @@ impl fmt::Display for Event {
                 "{remote} diverged: remote branch is at {}, local head {local_head} \
                  saved as {diverged_ref}",
                 oid_or(*remote_head, "unknown"),
+            ),
+            Self::PushLimited {
+                remote,
+                limit,
+                pushed,
+                head,
+                commits_left,
+            } => write!(
+                f,
+                "push to {remote} limited to {limit} bytes (agentfsMaxPushSize): pushed up to \
+                 {pushed}, {commits_left} commit(s) left before head {head}; the next step \
+                 follows at once"
             ),
             Self::RemoteMisconfigured { remote, error } => {
                 write!(
@@ -557,6 +587,7 @@ mod tests {
             PushFailureKind::NonFastForward,
             PushFailureKind::Refused,
             PushFailureKind::Local,
+            PushFailureKind::TooLarge,
         ] {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{}\"", kind.as_str()));

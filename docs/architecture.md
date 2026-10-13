@@ -49,6 +49,7 @@ missing from these tables or a row names a module that no longer exists;
 | `identity.rs` | Committer and author identities from templates (§9) |
 | `service.rs` | The background loops: commit loop, one push loop per remote, repack (§3.4, §11.2) |
 | `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
+| `push_size.rs` | Measuring a push's git pack against `agentfsMaxPushSize` before connecting, and the first-parent step that fits (§11.3) |
 | `remote_auth.rs` | Credentials and host-key checks for one remote, shared by push and patch fetch (§11.1) |
 | `remote_url.rs` | Pure URL helpers: transport, host, port, userinfo, as libgit2 sees them (§11.1) |
 | `credentials.rs` | Credential and SSH key files for remotes (§11.1) |
@@ -219,6 +220,11 @@ order:
 1. takes the remote's push lock (a repack skips its round while any push
    holds one, so a push never reads a pack being deleted) and reloads the
    remote's push state, since another process may have pushed;
+   with `agentfsMaxPushSize` set, measures the pack the remote lacks
+   (`push_size.rs`) before connecting: over the limit, only the longest
+   first-parent step that fits is pushed below (branch only, its LFS
+   objects, applied refs held), and a single commit over it fails as
+   `too_large` (§11.3);
 2. **LFS objects first** (`lfs/upload.rs`, `lfs/client.rs`): every
    object referenced at a managed path by a commit the remote lacks is
    uploaded through the batch API before any ref, so a ref never reaches

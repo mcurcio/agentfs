@@ -669,7 +669,13 @@ fn push_once(state: &StateDir, only: &[String], session: &Session) -> Result<Exi
     for remote in selected {
         let mut pusher =
             RemotePusher::open(state, settings, remote, events.clone(), session.telemetry())?;
-        let outcome = pusher.push_once();
+        // A backlog over the push size limit goes out in steps (design
+        // §11.3): each limited step is followed at once by the next.
+        let mut outcome = pusher.push_once();
+        while outcome.is_limited() {
+            println!("{}: {}", remote.name, describe(&outcome));
+            outcome = pusher.push_once();
+        }
         ok &= outcome.is_success();
         println!("{}: {}", remote.name, describe(&outcome));
         if let Some(queue) = pusher.queue() {
@@ -688,10 +694,16 @@ fn describe(outcome: &PushOutcome) -> String {
     match outcome {
         PushOutcome::NothingToPush => "nothing to push".into(),
         PushOutcome::UpToDate { head } => format!("up to date at {head}"),
-        PushOutcome::Pushed { from, to } => match from {
-            Some(from) => format!("pushed {from}..{to}"),
-            None => format!("pushed none..{to}"),
-        },
+        PushOutcome::Pushed { from, to, limited } => {
+            let from = from.map_or_else(|| "none".to_owned(), |f| f.to_string());
+            match limited {
+                None => format!("pushed {from}..{to}"),
+                Some(left) => format!(
+                    "pushed {from}..{to} (push size limit: {left} commit(s) left, pushing the \
+                     next step)"
+                ),
+            }
+        }
         PushOutcome::Diverged {
             local_head,
             diverged_ref: Some(saved),

@@ -57,6 +57,7 @@ pub mod names {
     pub const PUSH_UNPUSHED_COMMITS: &str = "agentfs.push.unpushed_commits";
     pub const PUSH_OLDEST_UNPUSHED_AGE: &str = "agentfs.push.oldest_unpushed_age";
     pub const PUSH_FAILURES: &str = "agentfs.push.failures";
+    pub const PUSH_LIMITED: &str = "agentfs.push.limited";
     pub const PUSH_DIVERGED: &str = "agentfs.push.diverged";
     pub const PRECHECK_REJECTED_PATHS: &str = "agentfs.precheck.rejected_paths";
     pub const STATE_BYTES: &str = "agentfs.state.bytes";
@@ -128,6 +129,7 @@ struct Inner {
     reconcile_failures: Counter<u64>,
     reconcile_records: Counter<u64>,
     push_failures: Counter<u64>,
+    push_limited: Counter<u64>,
     rejected_paths: Counter<u64>,
     front_round_trip: Histogram<f64>,
     front_service_failures: Counter<u64>,
@@ -209,6 +211,12 @@ impl Telemetry {
                 names::PUSH_FAILURES,
                 "{failure}",
                 "Failed push attempts, by remote, reason and stage (git or lfs)",
+            ),
+            push_limited: counter(
+                names::PUSH_LIMITED,
+                "{push}",
+                "Pushes that sent only part of the backlog because it was larger than the \
+                 remote's agentfsMaxPushSize, by remote (design §11.3)",
             ),
             rejected_paths: counter(
                 names::PRECHECK_REJECTED_PATHS,
@@ -681,6 +689,7 @@ impl EventSink for TelemetrySink {
                     KeyValue::new("stage", stage.as_str()),
                 ],
             ),
+            Event::PushLimited { remote, .. } => inner.push_limited.add(1, &[remote_attr(remote)]),
             // Their gauges are read from state.
             Event::Diverged { .. }
             | Event::RemoteMisconfigured { .. }
@@ -729,6 +738,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::ReconcileFailed { .. } => "agentfs.reconcile_failed",
         Event::PushFailed { .. } => "agentfs.push_failed",
         Event::Diverged { .. } => "agentfs.diverged",
+        Event::PushLimited { .. } => "agentfs.push_limited",
         Event::RemoteMisconfigured { .. } => "agentfs.remote_misconfigured",
         Event::PushSucceeded { .. } => "agentfs.push_succeeded",
         Event::PatchApplied { .. } => "agentfs.patch_applied",
@@ -821,6 +831,22 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             }
             out.push(("agentfs.diverged_ref", s(diverged_ref)));
         }
+        Event::PushLimited {
+            remote,
+            limit,
+            pushed,
+            head,
+            commits_left,
+        } => {
+            out.push(("agentfs.remote", s(remote)));
+            out.push(("agentfs.push.limit", AnyValue::Int(*limit as i64)));
+            out.push(("agentfs.push.pushed", oid(pushed)));
+            out.push(("agentfs.head", oid(head)));
+            out.push((
+                "agentfs.push.commits_left",
+                AnyValue::Int(*commits_left as i64),
+            ));
+        }
         Event::RemoteMisconfigured { remote, error } => {
             out.push(("agentfs.remote", s(remote)));
             out.push(("agentfs.error", s(error)));
@@ -908,7 +934,8 @@ impl<L: Logger + Send + Sync> AlarmLog for OtelAlarmLog<L> {
             | Event::HistoryServiceRestored { .. } => (Severity::Info, "INFO"),
             Event::PatchFetchFailed { .. }
             | Event::PatchIgnored { .. }
-            | Event::IdentityFallback { .. } => (Severity::Warn, "WARN"),
+            | Event::IdentityFallback { .. }
+            | Event::PushLimited { .. } => (Severity::Warn, "WARN"),
             _ => (Severity::Error, "ERROR"),
         };
         let name = event_name(event);

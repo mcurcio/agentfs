@@ -20,7 +20,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agentfs_core::service::{PushNowError, PushNowReport, RemoteResult, ServiceHandle};
 use agentfs_core::volume::StateDir;
@@ -114,7 +114,48 @@ fn serve_push(
             Err(e @ PushNowError::Stopping) => return Reply::Error(e.to_string()),
         }
     };
+    let report = follow_steps(service, report, timeout);
     Reply::Pushed(render(report, bad))
+}
+
+/// Pushes again, at once, every remote whose attempt in `report` sent
+/// only part of its backlog because of its push size limit (design
+/// §11.3), until each is up to date, fails, or `timeout` (from now) runs
+/// out. Each remote's steps are kept in its result, in order.
+fn follow_steps(
+    service: &ServiceHandle,
+    mut report: PushNowReport,
+    timeout: Duration,
+) -> PushNowReport {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let limited: Vec<String> = report
+            .remotes
+            .iter()
+            .filter(|r| r.outcome.is_limited())
+            .map(|r| r.name.clone())
+            .collect();
+        let left = deadline.saturating_duration_since(Instant::now());
+        if limited.is_empty() || left.is_zero() {
+            return report;
+        }
+        let Ok(next) = service.push_now(&limited, left.max(MIN_TIMEOUT)) else {
+            return report;
+        };
+        for result in next.remotes {
+            if let Some(at) = report.remotes.iter_mut().find(|r| r.name == result.name) {
+                let mut steps = std::mem::take(&mut at.steps);
+                steps.push(at.outcome.clone());
+                *at = RemoteResult { steps, ..result };
+            }
+        }
+        for name in next.still_running {
+            report.remotes.retain(|r| r.name != name);
+            if !report.still_running.contains(&name) {
+                report.still_running.push(name);
+            }
+        }
+    }
 }
 
 /// The reply for `report`.
@@ -135,7 +176,12 @@ fn render(report: PushNowReport, misconfigured: Vec<String>) -> PushReply {
 }
 
 fn remote_reply(result: &RemoteResult) -> RemoteReply {
-    let mut lines = vec![format!("{}: {}", result.name, describe(&result.outcome))];
+    let mut lines: Vec<String> = result
+        .steps
+        .iter()
+        .chain(std::iter::once(&result.outcome))
+        .map(|outcome| format!("{}: {}", result.name, describe(outcome)))
+        .collect();
     let mut ok = result.outcome.is_success();
     if let Some(queue) = &result.queue {
         ok &= queue.error.is_none();
@@ -249,6 +295,7 @@ mod tests {
             outcome: agentfs_core::push::PushOutcome::NothingToPush,
             queue: None,
             unpushed: None,
+            steps: Vec::new(),
         };
         let reply = remote_reply(&result);
         assert!(reply.ok);

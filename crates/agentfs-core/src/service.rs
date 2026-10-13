@@ -136,6 +136,10 @@ pub struct RemoteResult {
     /// Commits the remote still lacks after the attempt; `None` if unknown
     /// or there is no branch yet.
     pub unpushed: Option<usize>,
+    /// Earlier attempts of the same request that each sent only part of
+    /// the backlog (design §11.3), oldest first; filled by callers that
+    /// follow the steps, empty from the service.
+    pub steps: Vec<PushOutcome>,
 }
 
 /// What [`ServiceHandle::push_now`] did.
@@ -618,6 +622,7 @@ fn push_loop(pusher: &mut RemotePusher, signal: &Signal, pushing: &AtomicBool) {
             outcome,
             queue: pusher.queue().cloned(),
             unpushed: pusher.unpushed().ok().flatten(),
+            steps: Vec::new(),
         };
         served = served.max(generation);
         signal.update(|s| {

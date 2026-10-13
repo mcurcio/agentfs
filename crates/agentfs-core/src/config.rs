@@ -130,6 +130,7 @@ pub const KEYS: &[&str] = &[
     "remote.<name>.url",
     "remote.<name>.pushurl",
     "remote.<name>.agentfsMaxBlobSize",
+    "remote.<name>.agentfsMaxPushSize",
     "remote.<name>.agentfsCredentials",
     "remote.<name>.agentfsSshKey",
     "remote.<name>.agentfsKnownHosts",
@@ -197,6 +198,10 @@ pub struct RemoteSettings {
     /// `remote.<name>.agentfsMaxBlobSize`: the largest blob this remote
     /// accepts, in bytes.
     pub max_blob_size: Option<u64>,
+    /// `remote.<name>.agentfsMaxPushSize`: the largest git pack one push
+    /// to this remote may send, in bytes (design §11.3,
+    /// [`crate::push_size`]). LFS uploads are not counted.
+    pub max_push_size: Option<u64>,
     /// `remote.<name>.agentfsCredentials`: an absolute path to the
     /// credential file ([`crate::credentials`]). Not for ssh remotes.
     pub credentials: Option<PathBuf>,
@@ -533,16 +538,7 @@ fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigErr
     let Some(url) = string(config, &key("url"))? else {
         return Err(git2::Error::from_str("remote url vanished while reading").into());
     };
-    let max_blob_size = match int(config, &key("agentfsMaxBlobSize"))? {
-        None => None,
-        Some(n) if n > 0 => Some(n as u64),
-        Some(n) => {
-            return Err(ConfigError::BadSize {
-                key: key("agentfsMaxBlobSize"),
-                value: n.to_string(),
-            });
-        }
-    };
+    let max_blob_size = positive_size(config, &key("agentfsMaxBlobSize"))?;
     let path = |k: &str| match string(config, &key(k))? {
         None => Ok(None),
         Some(path) if Path::new(&path).is_absolute() => Ok(Some(PathBuf::from(path))),
@@ -555,6 +551,7 @@ fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigErr
         push_url: string(config, &key("pushurl"))?,
         url,
         max_blob_size,
+        max_push_size: positive_size(config, &key("agentfsMaxPushSize"))?,
         credentials: path("agentfsCredentials")?,
         ssh_key: path("agentfsSshKey")?,
         known_hosts: path("agentfsKnownHosts")?,
@@ -689,6 +686,18 @@ fn boolean(config: &git2::Config, key: &str) -> Result<Option<bool>, git2::Error
         Ok(v) => Ok(Some(v)),
         Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// A size with `k`, `m` or `g` suffixes that must be positive when set.
+fn positive_size(config: &git2::Config, key: &str) -> Result<Option<u64>, ConfigError> {
+    match int(config, key)? {
+        None => Ok(None),
+        Some(n) if n > 0 => Ok(Some(n as u64)),
+        Some(n) => Err(ConfigError::BadSize {
+            key: key.to_owned(),
+            value: n.to_string(),
+        }),
     }
 }
 
@@ -1006,6 +1015,7 @@ mod tests {
         let (_d, c) = config_with(
             "[agentfs]\n\tvolume = v\n\
              [remote \"zeta\"]\n\turl = /srv/zeta.git\n\tagentfsMaxBlobSize = 100m\n\
+             \tagentfsMaxPushSize = 2g\n\
              [remote \"alpha\"]\n\turl = https://example.com/a.git\n\
              \tpushurl = https://push.example.com/a.git\n\
              \tagentfsCredentials = /run/secrets/alpha\n\
@@ -1026,6 +1036,8 @@ mod tests {
         let zeta = &s.remotes[2];
         assert_eq!(zeta.push_url(), "/srv/zeta.git");
         assert_eq!(zeta.max_blob_size, Some(104_857_600));
+        assert_eq!(zeta.max_push_size, Some(2 << 30));
+        assert_eq!(alpha.max_push_size, None);
         assert_eq!(s.remotes[0].url, "file:///srv/ab.git");
 
         let (_d, c) = config_with("[agentfs]\n\tvolume = v\n");
@@ -1052,6 +1064,15 @@ mod tests {
             ));
             assert_eq!(bad.name, "r");
             assert!(bad.error.contains("agentfsMaxBlobSize"), "{bad:?}");
+        }
+        for size in ["0", "-5m", "big"] {
+            let bad = invalid(&format!(
+                "[remote \"r\"]\n\turl = /x\n\tagentfsMaxPushSize = {size}\n"
+            ));
+            assert_eq!(bad.name, "r");
+            if size != "big" {
+                assert!(bad.error.contains("agentfsMaxPushSize"), "{bad:?}");
+            }
         }
         let bad = invalid("[remote \"r\"]\n\turl = /x\n\tagentfsMaxBlobSize = lots\n");
         assert_eq!(bad.name, "r");

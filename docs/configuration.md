@@ -189,6 +189,7 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `url` | URL or path | none: required | Where the remote is |
 | `pushurl` | URL or path | `url` | Where pushes go; wins over `url`, as in git. Everything below is checked against the push URL |
 | `agentfsMaxBlobSize` | positive size | no limit | The largest blob this remote accepts. Checked before each commit; with several remotes the smallest limit applies (§3.4, §11.3) |
+| `agentfsMaxPushSize` | positive size | no limit | The largest git pack one push to this remote may send, measured before connecting. A larger backlog is pushed in first-parent steps (`PushLimited`); a single commit over it fails as `too_large`. LFS uploads are not counted (see [Push size](#push-size), §11.3) |
 | `agentfsCredentials` | absolute path | none | HTTP and HTTPS only: a file holding a token or `username=`/`password=` lines (see [HTTPS](#https-and-http-remotes)) |
 | `agentfsSshKey` | absolute path | none | SSH only, and required there: the private key (see [SSH](#ssh-remotes)) |
 | `agentfsKnownHosts` | absolute path | none | SSH only, and required there: the known_hosts file the server's host key is checked against |
@@ -206,6 +207,7 @@ state file and appears in metrics.
 |---|---|
 | the name is not a valid agentfs name | `remote.<name>` |
 | `agentfsMaxBlobSize` is not a positive size | `remote.<name>.agentfsMaxBlobSize` |
+| `agentfsMaxPushSize` is not a positive size | `remote.<name>.agentfsMaxPushSize` |
 | `agentfsCredentials`, `agentfsSshKey`, `agentfsKnownHosts` or `agentfsLfsCredentials` is not an absolute path | the key |
 | the push URL is SSH and `agentfsSshKey` or `agentfsKnownHosts` is not set | the missing key |
 | the push URL is SSH and `agentfsCredentials` is set | `agentfsCredentials` |
@@ -226,6 +228,37 @@ missing or unreadable known_hosts file as `untrusted_host`.
 when any remote section, valid or not, names a credentials, key or
 known_hosts file under the backing tree or the mount point: the workload
 could read the secret, or rewrite known_hosts to trust any host.
+
+### Push size
+
+Some hosts refuse pushes over a size (GitHub: 2 GiB per push).
+`agentfsMaxPushSize` keeps every push to a remote under its limit:
+
+```sh
+git --git-dir /data/state/git config remote.origin.agentfsMaxPushSize 1g
+```
+
+Before each attempt, agentfs packs the commits the remote lacks (since
+the last commit pushed) with libgit2 and counts the bytes, stopping as
+soon as the limit is passed; nothing is sent until it fits.
+
+- **Everything fits:** the push goes out as usual.
+- **The backlog does not fit** (it grew during an outage): only the
+  longest run of commits along the branch's first-parent chain that fits
+  is pushed, with the LFS objects those commits reference. A `PushLimited`
+  warning (log `agentfs.push_limited`, metric `agentfs.push.limited`) says
+  how many commits are left, and the next step follows at once. Diverged
+  refs and the patch queue's applied refs wait for the last step.
+  `agentfs push` keeps stepping until the remote is up to date (`pushed
+  <a>..<b> (push size limit: N commit(s) left, ...)` per step).
+- **One commit alone does not fit:** the push fails as `too_large`
+  (`PushFailed`, an error alarm, with backoff) and nothing is sent. Raise
+  the limit, or move large files to LFS from now on
+  ([stuck pushes](runbooks/stuck-pushes.md)).
+
+Only the git pack counts: LFS objects go to their own server. The pack
+libgit2 then sends can differ slightly from the one measured, so leave
+some headroom under a hard server limit.
 
 ### Transports
 

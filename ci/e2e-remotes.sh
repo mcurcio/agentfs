@@ -102,6 +102,36 @@ assert_eq "$THEIRS" "$(remote_ref "$HTTP_REPO" refs/heads/agentfs/demo)" "the ot
 saved=$(git --git-dir "$HTTP_REPO" for-each-ref --format='%(objectname)' 'refs/agentfs/demo/diverged/')
 assert_eq "$(local_head demo)" "$saved" "local head saved under refs/agentfs/demo/diverged/"
 
+step "a push size limit steps a backlog and refuses a commit over it"
+new_volume sized
+SIZED_REPO=$(server_repo sized)
+volume_config remote.sized.url "$GIT_HTTP_BASE/sized.git"
+volume_config remote.sized.agentfsCredentials "$CREDS/alice"
+volume_config remote.sized.agentfsMaxPushSize 1m
+for n in 1 2 3 4 5; do
+  head -c 409600 /dev/urandom >"$TREE/r$n.bin"
+  agentfs record "r$n.bin" >/dev/null
+done
+out=$(agentfs push 2>&1) || { echo "$out"; fail "the stepped push failed"; }
+echo "$out"
+steps=$(grep -c '(push size limit: ' <<<"$out")
+[ "$steps" -ge 2 ] || fail "expected at least two limited steps, got $steps"
+pass "pushed in $steps limited step(s)"
+assert_contains "$out" "alarm: push to sized limited to 1048576 bytes" "PushLimited is raised"
+assert_eq "$(local_head sized)" "$(remote_ref "$SIZED_REPO" refs/heads/agentfs/sized)" "the remote reached the head"
+BEFORE=$(remote_ref "$SIZED_REPO" refs/heads/agentfs/sized)
+head -c 2097152 /dev/urandom >"$TREE/huge.bin"
+agentfs record huge.bin >/dev/null
+set +e
+out=$(agentfs push 2>&1); code=$?
+set -e
+assert_eq 1 "$code" "a commit over the limit fails the push"
+assert_contains "$out" "sized: failed (too_large)" "it is too_large"
+assert_eq "$BEFORE" "$(remote_ref "$SIZED_REPO" refs/heads/agentfs/sized)" "the remote ref is unchanged"
+volume_config remote.sized.agentfsMaxPushSize 8m
+agentfs push >/dev/null
+assert_eq "$(local_head sized)" "$(remote_ref "$SIZED_REPO" refs/heads/agentfs/sized)" "a raised limit lets it through"
+
 if [ "${E2E_HTTPS:-0}" = 1 ]; then
   : "${GIT_HTTPS_BASE:?}" "${GIT_HTTPS_UNTRUSTED_BASE:?}"
   step "https with certificate verification"

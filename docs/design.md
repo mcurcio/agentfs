@@ -694,6 +694,7 @@ that operator rules always apply:
     url = https://github.com/acme/agent-history.git
     pushurl = …                 # optional; wins over url, as in git
     agentfsMaxBlobSize = 50m    # optional; §3.4, §11.3
+    agentfsMaxPushSize = 1g     # optional; §11.3
     agentfsCredentials = /run/secrets/agentfs/origin   # optional; §11.1
     lfsurl = …                  # optional; the LFS endpoint, unless lfs.url (§7)
     agentfsLfsCredentials = /run/secrets/agentfs/origin-lfs   # optional; §7
@@ -1439,7 +1440,8 @@ agentfs does not scan content for secrets and does not hold pushes.
   - its name is not a valid agentfs name (§11.4, e.g. `team/backup`, which
     git accepts);
   - `agentfsCredentials`, `agentfsSshKey` or `agentfsKnownHosts` is not an
-    absolute path, or `agentfsMaxBlobSize` is not a positive size;
+    absolute path, or `agentfsMaxBlobSize` or `agentfsMaxPushSize` is not a
+    positive size;
   - its push URL is SSH and `agentfsSshKey` or `agentfsKnownHosts` is
     missing, `agentfsCredentials` is set, the URL carries a password, or
     the URL has no host or a bad port;
@@ -1573,12 +1575,39 @@ agentfs does not scan content for secrets and does not hold pushes.
 
 ### 11.3 Limits and rejected pushes
 
-- **Limits are configured per remote.** For now the only one is
-  `remote.<name>.agentfsMaxBlobSize`. Commits are checked against it before
-  they are made (§3.4); because one history goes to every remote, the
-  smallest limit applies. git's fsck rules are always enforced, not per
-  remote: history may later go to a stricter remote, and a commit no remote
-  accepts can never be pushed. A maximum push size is deferred.
+- **Limits are configured per remote.** `remote.<name>.agentfsMaxBlobSize`:
+  commits are checked against it before they are made (§3.4); because one
+  history goes to every remote, the smallest limit applies. git's fsck
+  rules are always enforced, not per remote: history may later go to a
+  stricter remote, and a commit no remote accepts can never be pushed.
+- **A maximum push size** (`remote.<name>.agentfsMaxPushSize`, a positive
+  size, decided 2026-10-13) keeps each push under a host's limit:
+  - Before connecting, the attempt packs the commits since the remote's
+    last pushed commit with libgit2's pack builder and counts the bytes,
+    stopping once the limit is passed (`agentfs_core::push_size`). Only
+    the git pack counts; LFS uploads (§7) go to their own servers.
+  - A backlog that fits is pushed as usual.
+  - A backlog that does not fit (one that grew during an outage would
+    otherwise never go out) is pushed in **steps**: the longest prefix of
+    the first-parent chain from the last pushed commit that fits, found by
+    bisection. A step pushes the branch alone, uploads the LFS objects of
+    its commits only, holds the diverged refs and the patch queue's
+    `applied/<n>` refs back for the full push, raises `PushLimited` (a
+    warning, §13) with the commits left, and makes the next attempt
+    follow at once instead of after `pushInterval`. `agentfs push` keeps
+    stepping until the remote is up to date. A divergence found during a
+    step saves the step's commit, not the head.
+  - A single commit over the limit cannot be stepped, nor can a backlog
+    whose last pushed commit is not on the head's first-parent chain:
+    the attempt fails as `too_large` (`PushFailed`, an error, with
+    backoff) and nothing is sent. The operator raises the limit, or sends
+    large files to LFS from then on; a commit already made can only go
+    out by rewriting history (§15).
+  - The pack libgit2 sends can differ slightly from the measured one: the
+    base comes from the push state, not from the refs the remote
+    advertises. Measuring costs a second pack computation per attempt,
+    and a few more while stepping; remotes without a limit measure
+    nothing.
 - **A rejected push never affects the filesystem.** Rejected means refused,
   non-fast-forward, authentication failure, an untrusted host (an SSH host
   key or TLS certificate that fails verification), an unreachable remote,
@@ -1832,8 +1861,9 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.repack.failures` | counter | Periodic repacks that failed (§8) |
 | `agentfs.push.unpushed_commits` | gauge, per remote | Backlog |
 | `agentfs.push.oldest_unpushed_age` | gauge, per remote | Backlog age, the main push alarm |
-| `agentfs.push.failures` | counter, per remote, reason and stage | Rejected, non-fast-forward, authentication, untrusted host, network; stage `git`, `lfs` for the LFS upload before the git push (§7), or `queue` for the patch remote's queue refs (§11.3, §12) |
+| `agentfs.push.failures` | counter, per remote, reason and stage | Rejected, non-fast-forward, authentication, untrusted host, network, too large (`too_large`, §11.3); stage `git`, `lfs` for the LFS upload before the git push (§7), or `queue` for the patch remote's queue refs (§11.3, §12) |
 | `agentfs.push.diverged` | gauge, per remote | 1 while diverged |
+| `agentfs.push.limited` | counter, per remote | Pushes that sent only part of the backlog because it was over `agentfsMaxPushSize` (§11.3) |
 | `agentfs.remote.misconfigured` | gauge, per remote | 1 for each invalid `[remote]` section (§11.1) |
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
 | `agentfs.patch.queue_depth` | gauge | Patches queued after the last applied one, the blocked one included (§12) |
@@ -1880,7 +1910,8 @@ patch remote carries the queue push's result as `agentfs.push.queue`.
 
 **Logs.** A structured log record for every alarm condition: the event name
 (`agentfs.path_refused`, `agentfs.push_failed`, ...), WARN for a refused
-path, a failed patch fetch and an ignored patch, and ERROR otherwise, the event's message as the body and its fields
+path, a failed patch fetch, an ignored patch, an identity fallback and a
+limited push, and ERROR otherwise, the event's message as the body and its fields
 (path, reason, remote, kind, heads, ...) as attributes; a push failure
 carries its stage as `agentfs.push.stage`.
 
@@ -1895,8 +1926,9 @@ and logs above; the CLI also prints alarms to stderr.
 | `RecordFailed` | The synchronous step fails (§3.5) |
 | `CommitFailed` | Turning records into a commit fails; the records stay journaled and are retried |
 | `ReconcileFailed` | Reconciling a moved directory (§3.1) failed 5 times over at least 30 s, with both paths and the error: the move is committed as journaled, and files beneath the destination that recording the tree would have added, dropped or recorded again differ from the tree until each changes again or is recorded with `agentfs record` |
-| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7), the head, the last pushed commit, the consecutive failure count and the next retry; stage `queue` for the patch remote's status, applied and inbox refs (§11.3), which never counts against the branch |
+| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`, `too_large`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7), the head, the last pushed commit, the consecutive failure count and the next retry; stage `queue` for the patch remote's status, applied and inbox refs (§11.3), which never counts against the branch |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
+| `PushLimited` | A push sent only part of the backlog because it was over the remote's `agentfsMaxPushSize`: the commit pushed, the head, the limit and the first-parent commits left; the next step follows at once (§11.3); a warning |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
 | `RepackFailed` | The periodic `git repack` (§8) failed, or refreshing the object database after it; tried again an interval later |
 | `PushSucceeded` | A push attempt succeeded, including one with nothing new (not an alarm; sinks filter) |
@@ -3140,6 +3172,7 @@ runner.
 | Storage model | Real backing tree with FUSE passthrough; the projection is logical only |
 | Several pods on one volume | Supported by the CSI driver, one committer identity per replica (§14, §9); built at single-node level as `serve-history` and front mounts (§14.1), started per volume and per pod by the CSI driver, one node per volume (§14.2) |
 | Rejected pushes | Alarm, retry, keep operating (§11.3) |
+| Push size limit | `remote.<name>.agentfsMaxPushSize`, measured before connecting with libgit2's pack builder (git pack only, not LFS); a backlog over it pushed in first-parent steps with `PushLimited` and the next step at once, applied and diverged refs held for the full push; a single commit over it fails as `too_large` with backoff, nothing sent; `agentfs push` steps until up to date (§11.3, 2026-10-13) |
 | Remotes | Any git remote, several at once (§11.1) |
 | Push timing | Intervals, independent of pod lifecycle, plus one bounded push at shutdown in `mount`, `run` and `serve-history`: after the final commit, one attempt per remote that lacks commits, within `--push-grace` (5 s; `0s` skips it), never retried and never extending shutdown past the grace. This sits beside the earlier decision that pushes run at intervals and that a pod's stop never waits on a push: the stop waits at most the grace, and what stays unpushed goes out on the next start (§11.2, 2026-10-13) |
 | Recovery | `agentfs restore` and `agentfs revert`, plus operator runbooks; further tooling discovered from use (§15) |

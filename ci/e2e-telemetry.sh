@@ -77,6 +77,26 @@ for name in agentfs.path_refused agentfs.push_failed agentfs.diverged \
 done
 assert_contains "$(cat "$OTEL_OUT")" '"agentfs-ci"' "service.name is set"
 
+step "a push over the size limit is stepped (PushLimited)"
+TINY=$(mktemp -d)/tiny.git
+git init -q --bare "$TINY"
+volume_config remote.tiny.url "$TINY"
+agentfs push --remote tiny >/dev/null # the history so far
+volume_config remote.tiny.agentfsMaxPushSize 6k
+for n in 1 2 3; do
+  head -c 4000 /dev/urandom >"$TREE/rand-$n.bin"
+  agentfs record "rand-$n.bin" >/dev/null
+done
+OUT=$(agentfs push --remote tiny 2>&1) || { echo "$OUT"; fail "the stepped push failed"; }
+assert_contains "$OUT" "(push size limit: " "agentfs push stepped through the limit"
+[ "$(git --git-dir "$TINY" rev-parse refs/heads/agentfs/telem)" = "$(git --git-dir "$STATE/git" rev-parse refs/heads/agentfs/telem)" ] ||
+  fail "the tiny remote is not at the head"
+wait_for 20 grep -q '"agentfs.push.limited"' "$OTEL_OUT" || fail "metric agentfs.push.limited never arrived"
+pass "metric agentfs.push.limited"
+wait_for 20 grep -q agentfs.push_limited "$OTEL_OUT" || fail "log agentfs.push_limited never arrived"
+pass "log agentfs.push_limited"
+git --git-dir "$STATE/git" config --unset remote.tiny.agentfsMaxPushSize
+
 step "a failing exporter is reported, and counted over metrics"
 # Traces go to a port nothing listens on; metrics still reach the collector.
 echo again >"$TREE/again.txt"
