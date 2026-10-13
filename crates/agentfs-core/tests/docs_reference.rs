@@ -4,7 +4,8 @@
 //!   its section of docs/configuration.md, and every key row there is a
 //!   key agentfs reads;
 //! - the same for the operator attributes ([`rules::OPERATOR_ATTRIBUTES`]);
-//! - every relative link and `#anchor` in README.md and docs/ resolves.
+//! - every relative link and `#anchor` in README.md and docs/ resolves;
+//! - every CI job runs on the pinned runner, `ubuntu-24.04` (design §18).
 //!
 //! The flags and environment variables are checked by the binaries' own
 //! unit tests (`crates/agentfs/src/reference_tests.rs`, and the
@@ -332,4 +333,56 @@ fn slugs_follow_github() {
         links("see [x](a.md#b) and `[y](not)` [z]: c.md\n[ref]: d.md\n"),
         ["a.md#b", "d.md"]
     );
+}
+
+/// The runner every CI job uses (design §18). Pinned, not `-latest`, so a
+/// new image cannot change the kernel, FUSE, kind or nginx under the
+/// tests.
+const RUNNER: &str = "ubuntu-24.04";
+
+#[test]
+fn workflows_pin_runners() {
+    let dir = workspace().join(".github/workflows");
+    let mut problems = Vec::new();
+    let mut jobs = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        for (n, line) in text.lines().enumerate() {
+            let Some(value) = line.trim().strip_prefix("runs-on:") else {
+                continue;
+            };
+            jobs += 1;
+            let value = value.split('#').next().unwrap_or("").trim();
+            if value != RUNNER {
+                problems.push(format!("{name}:{}: runs-on: {value} (use {RUNNER})", n + 1));
+            }
+        }
+        if text.contains("ubuntu-latest") {
+            problems.push(format!("{name} mentions ubuntu-latest"));
+        }
+    }
+    assert!(jobs > 0, "no runs-on lines found in {}", dir.display());
+    // The docs name the runner the numbers were measured on. A line may
+    // name ubuntu-latest only to explain the pin.
+    for path in markdown_files() {
+        if path.components().any(|c| c.as_os_str() == "reviews") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            if line.contains("ubuntu-latest") && !line.contains(RUNNER) {
+                problems.push(format!(
+                    "{}:{}: names ubuntu-latest; CI runs on {RUNNER}",
+                    path.display(),
+                    n + 1
+                ));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

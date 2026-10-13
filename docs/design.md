@@ -1918,7 +1918,7 @@ asserts thresholds.
   by the freeze and the journal's `fsync`, which both modes pay, so a
   front adds about 6 % at the median.
 - CI: the `e2e-multipod` jobs of run 38315269924 for commit 0b35370
-  (GitHub `ubuntu-latest`, x86_64, kernel 6.17.0-1022-azure, backing tree and state area on ext4, which has
+  (GitHub `ubuntu-24.04`, x86_64, kernel 6.17.0-1022-azure, backing tree and state area on ext4, which has
   no reflink, so every freeze is a copy), microseconds:
 
   | Measurement | Passthrough | p50 | p90 | p99 |
@@ -2373,7 +2373,7 @@ one-time migration of Hermes' existing data and the initial import in
     the privilege, fails at INIT without kernel support, and if a
     registration fails later it fails that open with `EIO` and stops the
     mount (exit status 1); `off` never asks. The startup line reports the
-    result and the reason. CI's `ubuntu-latest` kernel negotiates it (the
+    result and the reason. CI's `ubuntu-24.04` kernel negotiates it (the
     `fuse` job runs `auto`, `on` and `off`, and asserts no open fell back).
   - **Restores.** After mounting it serves `restore` and `revert` on its
     control socket (§15).
@@ -2669,6 +2669,12 @@ Not automated yet: test 3 (a kill at every step), test 16
 across two nodes, and the CSI driver over a shared filesystem, on
 hardened node images (Talos) and across node reboots.
 
+Every CI job runs on GitHub's runner image pinned by name,
+`ubuntu-24.04` rather than `ubuntu-latest` (which moves to Ubuntu 26 on 2026-10-19):
+the kernel, FUSE, kind and nginx the tests rely on change only when the pin
+does. `crates/agentfs-core/tests/docs_reference.rs` fails on any other
+runner.
+
 ## 19. Decisions and open questions
 
 ### 19.1 Decisions (2026-10-12)
@@ -2716,6 +2722,7 @@ hardened node images (Talos) and across node reboots.
 | `agentfs init` re-runs | Safe at every pod start: exit 0 for its own volume (taking the lock), 1 for another volume or branch with nothing changed; `--include` sets the includes declaratively; `--root` creates the backing tree (§2.3) |
 | Image user | Root. The sidecar needs privileged for Bidirectional propagation, `CAP_SYS_ADMIN` for mount(2), `/dev/fuse` and passthrough, `CAP_CHOWN`/`CAP_FOWNER` for ownership, and to own the state area for libgit2. The init container drops every capability; workloads run as non-root (§17.1) |
 | Image publishing | `linux/amd64`, published from `main` only after the kind e2e passes, pushing the tested image itself; tags: the full commit sha and `latest` (§17.3) |
+| CI runners | Every job on `ubuntu-24.04`, pinned by name and checked by a test, so a runner image change is a deliberate commit (§18, 2026-10-13) |
 | Kind e2e git server | The runner's nginx + `git http-backend`, reached from pods through a selector-less Service and an EndpointSlice on the kind network's gateway, so the credential Secret is exercised over HTTP basic auth and the bare repository stays on the runner for assertions; the daemon is killed from the node (PID 1 ignores SIGKILL from inside its namespace) |
 | LFS store selection | Decided at record time on the frozen size and journaled with the write (older journals read as blob): always blob for empty files, special files, `.lfsconfig` and unnameable paths; then `filter=lfs` (operator, or tree only with `respectTreeRules`), which `agentfs.store=blob` cannot override; then `agentfs.store`; then `size > agentfs.lfsThreshold`, which is unset by default. The blob limit does not apply to LFS content (§7) |
 | LFS `.gitattributes` | A block at the end of the root `.gitattributes`, in history only, rebuilt every commit: one anchored, escaped line per LFS path with `git lfs track`'s attributes; the workload's lines are kept and forged blocks (exact BEGIN through END) replaced; a file holding only the block is agentfs's own. A pointer is never committed without its line: when the block cannot be written, that commit's LFS writes are blobs, then its `.gitattributes` writes are dropped, then the head's file is kept; a commit never fails for it. A directory named `.gitattributes` or `.gitmodules` is refused (`gitattributesBlob`, `gitmodulesBlob`) (§3.4, §7) |
@@ -2768,7 +2775,7 @@ hardened node images (Talos) and across node reboots.
    upgrading the node plugin without interrupting its mounts. The round trip
    per boundary is measured at single-node level (§14.1): a Unix-socket
    round trip costs tens of microseconds, against about a millisecond
-   for the freeze and `fsync` both modes pay: on CI (`ubuntu-latest`,
+   for the freeze and `fsync` both modes pay: on CI (`ubuntu-24.04`,
    ext4) the socket round trip is 15–25 µs and a front close is 48–90 µs
    slower than a single-process close at the median, of about 1 ms. The
    cost of a network round trip between nodes stays open with the

@@ -11,7 +11,7 @@ cost of both parts, the benchmark that measures them (design §18 test
 Unless a section says otherwise, the numbers below are from the first
 CI run of the benchmark, on 2026-10-13 (commit `699bbb7`, run
 [38334925092](https://github.com/mcurcio/agentfs/actions/runs/38334925092)):
-GitHub's `ubuntu-latest` runner, 4 vCPUs (AMD EPYC 7763), 16 GiB, kernel
+GitHub's `ubuntu-24.04` runner, 4 vCPUs (AMD EPYC 7763), 16 GiB, kernel
 6.17, FUSE passthrough on, each filesystem a fresh 20 GiB loop device on
 the runner's disk, no remotes configured (so no pushes). They are one
 run on a shared machine; the next two runs, some on a different CPU,
