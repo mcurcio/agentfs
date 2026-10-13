@@ -571,6 +571,50 @@ impl History {
         }
         Ok(())
     }
+
+    /// Removes the ref lock files a crash left: `HEAD.lock`,
+    /// `packed-refs.lock` and every `refs/**/*.lock` (design §3.3). A ref
+    /// update writes `<ref>.lock` and renames it over the ref; a process
+    /// killed, or a power cut, in between leaves the lock, and libgit2
+    /// then refuses every later update of that ref, so no commit could
+    /// ever be made again. Only the holder of the state-area lock may call
+    /// this (design §2.3): it is the one process that writes the history,
+    /// so any lock it finds at open is stale. Returns what it removed.
+    pub fn remove_stale_ref_locks(&self) -> io::Result<Vec<PathBuf>> {
+        let git_dir = self.repo.path();
+        let mut removed = Vec::new();
+        for name in ["HEAD.lock", "packed-refs.lock"] {
+            let path = git_dir.join(name);
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+                std::fs::remove_file(&path)?;
+                removed.push(path);
+            }
+        }
+        let mut dirs = vec![git_dir.join("refs")];
+        while let Some(dir) = dirs.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                let path = entry.path();
+                if kind.is_dir() {
+                    dirs.push(path);
+                } else if kind.is_file() && path.extension().is_some_and(|e| e == "lock") {
+                    std::fs::remove_file(&path)?;
+                    removed.push(path);
+                }
+            }
+        }
+        if !removed.is_empty() {
+            File::open(git_dir)?.sync_all()?;
+        }
+        removed.sort();
+        Ok(removed)
+    }
 }
 
 /// What one commit wrote, for the managed `.gitattributes` block: the

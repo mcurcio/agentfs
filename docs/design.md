@@ -447,6 +447,14 @@ returned call is as durable as in single-process mode.
 - **Failed truncation.** When rewriting the journal fails after the new
   file replaced the old one, the journal keeps appending to the new file,
   never to the unlinked old one, so later records stay durable.
+- **Stale ref locks.** A ref update writes `<ref>.lock` and renames it
+  over the ref; a crash or power cut in between leaves the lock, and
+  libgit2 then refuses every later update of that ref. Opening the volume
+  (always under the state-area lock, §2.3, so no other process writes the
+  history) removes `HEAD.lock`, `packed-refs.lock` and every
+  `refs/**/*.lock`, with a warning naming each. Found by the power-loss
+  workflow (§18): a cut in the branch update left
+  `refs/heads/agentfs/<volume>.lock` and no commit was possible after it.
 
 ### 3.4 Commits
 

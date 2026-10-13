@@ -567,10 +567,15 @@ fn a_queue_that_cannot_run_reads_as_blocked() {
     let s = Setup::new();
     s.record("a.txt", "a0\n");
     s.ok(&["patch", "apply", "--no-fetch"]);
-    // The status ref is locked.
-    let refs = s.state().join("git/refs/agentfs/demo");
-    fs::create_dir_all(&refs).unwrap();
-    fs::write(refs.join("status.lock"), "").unwrap();
+    // The status ref cannot be written: a ref sits beneath its name. (A
+    // lock file would not do: the open removes it as a crash's.)
+    let repo = Repository::open_bare(s.state().join("git")).unwrap();
+    let head = repo.refname_to_id("refs/heads/agentfs/demo").unwrap();
+    if let Ok(mut r) = repo.find_reference("refs/agentfs/demo/status") {
+        r.delete().unwrap();
+    }
+    repo.reference("refs/agentfs/demo/status/x", head, true, "block")
+        .unwrap();
     let out = s.agentfs(&["patch", "apply", "--no-fetch"]);
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");

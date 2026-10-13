@@ -317,6 +317,9 @@ pub struct Recovery {
     pub uncommitted: usize,
     /// Frozen copies removed because nothing referred to them.
     pub pruned_pending: usize,
+    /// Ref lock files a crash left in the history, removed
+    /// ([`History::remove_stale_ref_locks`]).
+    pub removed_ref_locks: Vec<PathBuf>,
 }
 
 /// What [`init`] found.
@@ -443,6 +446,8 @@ pub fn open(
     telemetry: &Telemetry,
 ) -> Result<(Recorder, Committer, Recovery), VolumeError> {
     let history = History::open(&state.git())?;
+    // The caller holds the state-area lock: a ref lock is a crash's.
+    let removed_ref_locks = history.remove_stale_ref_locks()?;
     // A bad remote section only stops that remote's pushes (design §11.1).
     for bad in &history.settings().invalid_remotes {
         events.emit(Event::RemoteMisconfigured {
@@ -512,6 +517,7 @@ pub fn open(
         committed_through,
         uncommitted: uncommitted.len(),
         pruned_pending,
+        removed_ref_locks,
     };
     let recorder = Recorder {
         backend: Backend::Local {
@@ -3731,6 +3737,46 @@ mod tests {
             ),
             "{events:?}"
         );
+    }
+
+    /// A power cut inside a ref update leaves `<ref>.lock` (found by the
+    /// power-loss workflow): the next open removes it, or no commit could
+    /// ever update the branch again.
+    #[test]
+    fn ref_locks_a_crash_left_are_removed_at_open() {
+        let (dir, state) = setup();
+        {
+            let (rec, com, _) =
+                open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+                .unwrap();
+            com.commit_pending().unwrap();
+            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "b", "2")])
+                .unwrap();
+        }
+        let git = state.git();
+        let branch_lock = git.join("refs/heads/agentfs/vol.lock");
+        let other_lock = git.join("refs/agentfs/x/y.lock");
+        fs::write(&branch_lock, "").unwrap();
+        fs::create_dir_all(other_lock.parent().unwrap()).unwrap();
+        fs::write(&other_lock, "").unwrap();
+        fs::write(git.join("packed-refs.lock"), "").unwrap();
+        // Not a ref lock: left alone.
+        fs::write(git.join("config.lock"), "").unwrap();
+
+        let (_, com, recovery) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        assert_eq!(
+            recovery.removed_ref_locks,
+            [git.join("packed-refs.lock"), other_lock, branch_lock]
+        );
+        assert!(git.join("config.lock").exists());
+        assert_eq!(recovery.uncommitted, 1);
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["a", "b"]);
+        let (_, _, recovery) =
+            open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
+        assert!(recovery.removed_ref_locks.is_empty());
     }
 
     #[test]

@@ -1352,6 +1352,12 @@ impl Session {
             self.events.clone(),
             self.telemetry(),
         )?;
+        for lock in &opened.2.removed_ref_locks {
+            eprintln!(
+                "warning: removed {}, a ref lock a crash left in the history",
+                lock.display()
+            );
+        }
         self.telemetry()
             .observe_volume(state, opened.1.history().settings());
         Ok(opened)

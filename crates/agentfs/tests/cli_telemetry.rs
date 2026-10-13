@@ -639,10 +639,16 @@ fn a_queue_that_cannot_run_sets_the_blocked_gauge() {
     assert!(out.status.success(), "{}", stderr(&out));
     let out = v.run(&["patch", "apply", "--no-fetch"], &[]);
     assert!(out.status.success(), "{}", stderr(&out));
-    // The status ref is locked: the run fails as a whole.
-    let refs = v.dir.path().join("state/git/refs/agentfs/demo");
-    fs::create_dir_all(&refs).unwrap();
-    fs::write(refs.join("status.lock"), "").unwrap();
+    // The status ref cannot be written (a ref sits beneath its name; a
+    // lock file the open would remove as a crash's): the run fails as a
+    // whole.
+    let repo = git2::Repository::open_bare(v.dir.path().join("state/git")).unwrap();
+    let head = repo.refname_to_id("refs/heads/agentfs/demo").unwrap();
+    if let Ok(mut r) = repo.find_reference("refs/agentfs/demo/status") {
+        r.delete().unwrap();
+    }
+    repo.reference("refs/agentfs/demo/status/x", head, true, "block")
+        .unwrap();
     let out = v.run(
         &["patch", "apply", "--no-fetch"],
         &[("OTEL_EXPORTER_OTLP_ENDPOINT", &collector.endpoint())],

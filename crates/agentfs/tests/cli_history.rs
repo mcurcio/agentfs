@@ -529,6 +529,14 @@ impl Volume {
         Some(String::from_utf8_lossy(blob.content()).into_owned())
     }
 
+    /// The branch head's commit id.
+    fn head_id(&self) -> String {
+        let repo = git2::Repository::open_bare(self.state().git()).unwrap();
+        repo.refname_to_id("refs/heads/agentfs/demo")
+            .unwrap()
+            .to_string()
+    }
+
     fn wait_head(&self, path: &str, content: &str) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while self.head_has(path).as_deref() != Some(content) {
@@ -568,7 +576,7 @@ fn the_history_service_restores_and_reverts_live() {
     }
 
     // No front runs: written straight into the backing tree.
-    let out = v.run(["restore", "a", "HEAD~1"]);
+    let out = v.run(["restore", ".", "HEAD~1"]);
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     assert!(
         stdout(&out).contains("restored 1 path(s)"),
@@ -635,6 +643,9 @@ fn the_history_service_restores_and_reverts_live() {
 fn a_file_opened_during_a_live_restore_is_left_alone() {
     let v = Volume::new();
     let service = v.serve();
+    // Each path is its own record, maybe its own commit: the restores
+    // name the commit where both were "one", not `HEAD~n`.
+    let mut first = None;
     for content in ["one", "two"] {
         fs::write(v.tree().join("a"), content).unwrap();
         fs::write(v.tree().join("z"), content).unwrap();
@@ -642,12 +653,14 @@ fn a_file_opened_during_a_live_restore_is_left_alone() {
         assert!(out.status.success(), "{}", stderr(&out));
         v.wait_head("a", content);
         v.wait_head("z", content);
+        first.get_or_insert_with(|| v.head_id());
     }
+    let first = first.unwrap();
     let front = v.listening_front("pod-b");
     // `z` is opened once `a` has been restored: after the check, before
     // `z`'s own step.
     *front.hooks.open_when.lock().unwrap() = Some((v.tree().join("a"), "one".into(), "z".into()));
-    let out = v.run(["restore", ".", "HEAD~1"]);
+    let out = v.run(["restore", ".", &first]);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -674,7 +687,7 @@ fn a_file_opened_during_a_live_restore_is_left_alone() {
     assert!(*front.hooks.settles.lock().unwrap() > settles);
     // A front that cannot settle: busy (75), nothing written.
     *front.hooks.settle_error.lock().unwrap() = Some("sweep failed".into());
-    let out = v.run(["restore", "z", "HEAD~2"]);
+    let out = v.run(["restore", "z", &first]);
     assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
     assert!(stderr(&out).contains("sweep failed"), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(v.tree().join("z")).unwrap(), "two");
