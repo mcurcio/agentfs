@@ -396,8 +396,10 @@ jobs:
           GOBIN="$RUNNER_TEMP/bin" go install github.com/git-lfs/lfs-test-server@d27ad23fddc1949ecd9a4ba6a3d074bc6a567084
           echo "LFS_TEST_SERVER=$RUNNER_TEMP/bin/lfs-test-server" >>"$GITHUB_ENV"
       - run: cargo build --locked -p agentfs --features ssh
+      # --trust-ca: lfs-server.sh also starts (and checks) the https LFS
+      # server, whose certificate the throwaway CA signs.
       - name: start git server with LFS routes
-        run: GIT_SERVER_LFS=1 ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
+        run: GIT_SERVER_LFS=1 ci/git-http-server.sh start "$RUNNER_TEMP/git-server" --trust-ca >>"$GITHUB_ENV"
       - name: start LFS servers
         run: ci/lfs-server.sh start "$RUNNER_TEMP/lfs-server" >>"$GITHUB_ENV"
       - name: start ssh server with git-lfs-authenticate
