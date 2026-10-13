@@ -15,16 +15,21 @@
 #     11);
 #   - deleting the pod makes the final commit and pushes it;
 #   - after `kill -9` of the daemon, writes fail with ENOTCONN, the kubelet
-#     restarts the sidecar, which stacks a new mount over the stale one
+#     restarts the sidecar (a write that races the recovery and succeeds
+#     must be recorded), which stacks a new mount over the stale one
 #     (`--on-stale-mount recover`) with no manual step; both writers
 #     (HostToContainer and subPath) reach it without a restart, and
 #     everything written before and after the kill reaches the remote
 #     (test 2 in a pod); the failed write is nowhere;
 #   - `agentfs push` in the sidecar asks the running daemon to push now;
+#   - the sidecar seals the bare mount point (root's, mode 0000; checked
+#     from the node through a non-recursive bind of the emptyDir);
 #   - a clean exit of the sidecar mid-pod: writes in the gap fail with
-#     EROFS (the workload's read-only emptyDir) and reach nothing, the
-#     subPath writer restarts through its liveness probe, and both write
-#     through the restarted sidecar's mount;
+#     EROFS (the workload's read-only emptyDir) and reach nothing; the
+#     subPath writer, restarted inside the gap, gets EACCES from the sealed
+#     mount point (or, if the sidecar was back first, writes through the
+#     new mount and is recorded), its liveness probe restarts it onto the
+#     new mount, and both write through the restarted sidecar's mount;
 #   - deleting the recovered pod leaves nothing mounted on the node.
 #
 # Needs docker, kind and kubectl (ci/install-kind.sh), a kind cluster
@@ -267,6 +272,11 @@ sidecar_pid() {
   cid=$(k get pod "$POD" -o jsonpath='{.status.initContainerStatuses[?(@.name=="agentfs")].containerID}')
   docker exec "$NODE" crictl inspect --output go-template --template '{{.info.pid}}' "${cid#*://}"
 }
+container_pid() { # container
+  local cid
+  cid=$(k get pod "$POD" -o jsonpath="{.status.containerStatuses[?(@.name==\"$1\")].containerID}")
+  docker exec "$NODE" crictl inspect --output go-template --template '{{.info.pid}}' "${cid#*://}"
+}
 # Signals the sidecar from the node (PID 1 ignores SIGKILL from inside its
 # own namespace) and waits until it is gone.
 signal_sidecar() { # signal
@@ -292,14 +302,33 @@ wait_sidecar_restarted() { # previous-count
   pass "the kubelet restarted the sidecar and the pod is Ready, with no manual step"
 }
 
+step "the sidecar sealed the bare mount point (design §17.1)"
+# A non-recursive bind of the emptyDir shows the directory under the FUSE
+# mount, whatever is mounted on it.
+POD_UID=$(k get pod "$POD" -o jsonpath='{.metadata.uid}')
+EMPTYDIR=/var/lib/kubelet/pods/$POD_UID/volumes/kubernetes.io~empty-dir/agentfs-mount
+docker exec "$NODE" sh -c "mkdir -p /tmp/peek && mount --bind $EMPTYDIR /tmp/peek"
+sealed=$(docker exec "$NODE" stat -c '%a %u' /tmp/peek/workspace)
+out=$(docker exec -u 10000:10000 "$NODE" sh -c 'printf x > /tmp/peek/workspace/x' 2>&1) && sealout=wrote || sealout=$out
+docker exec "$NODE" umount /tmp/peek
+assert_eq "0 0" "$sealed" "the bare mount point is root's with mode 0000"
+assert_contains "$sealout" "Permission denied" "uid 10000 cannot write to the bare mount point"
+
 step "kill -9 the daemon: the restarted sidecar recovers in place (design §18 test 2)"
 in_root "printf before > $WS/before-crash.txt"
 wait_remote before-crash.txt before
 restarts=$(sidecar_restarts)
 user_restarts=$(writer_restarts writer-10000)
 signal_sidecar KILL
-out=$(in_root "printf x > $WS/during.txt" 2>&1) && fail "a write succeeded with the daemon dead"
-assert_contains "$out" "Transport endpoint is not connected" "a write after the crash fails with ENOTCONN"
+# The kubelet restarts the sidecar at once after a first exit, and recovery
+# can win the race against this write: then it must be recorded.
+if out=$(in_root "printf x > $WS/during.txt" 2>&1); then
+  during=recorded
+  echo "the sidecar recovered before the write; during.txt must be recorded"
+else
+  during=refused
+  assert_contains "$out" "Transport endpoint is not connected" "a write after the crash fails with ENOTCONN"
+fi
 wait_sidecar_restarted "$restarts"
 recovered=$(k logs "$POD" -c agentfs)
 echo "$recovered" | grep -E '^(stacked|mounted) ' || true
@@ -317,21 +346,46 @@ wait_remote after-crash.txt after
 wait_remote after-crash-subpath.txt after-subpath
 assert_contains "$(remote_message after-crash.txt)" "Agentfs-Pod: $POD" "the recovered daemon records and pushes"
 rgit cat-file -e "$BRANCH:before-crash.txt" || fail "before-crash.txt left history"
-if rgit cat-file -e "$BRANCH:during.txt" 2>/dev/null; then fail "during.txt is in history"; fi
-if in_sidecar test -e /data/backing/during.txt; then fail "during.txt reached the backing tree"; fi
-pass "the write that failed is nowhere"
+if [ "$during" = refused ]; then
+  if rgit cat-file -e "$BRANCH:during.txt" 2>/dev/null; then fail "during.txt is in history"; fi
+  if in_sidecar test -e /data/backing/during.txt; then fail "during.txt reached the backing tree"; fi
+  pass "the write that failed is nowhere"
+else
+  wait_remote during.txt x
+fi
 
-step "a clean exit mid-pod: the read-only emptyDir fences the gap"
+step "a clean exit mid-pod: the read-only emptyDir and the sealed mount point fence the gap"
 restarts=$(sidecar_restarts)
 user_restarts=$(writer_restarts writer-10000)
 signal_sidecar TERM
+# Restart the subPath writer inside the gap (the sidecar's second restart
+# waits out the kubelet's backoff): its subPath is bound to the bare,
+# sealed directory.
+docker exec "$NODE" kill -KILL "$(container_pid writer-10000)"
 gaps=0
 n=0
+sub=""
+subgap() { # tries the restarted subPath writer once; sets sub
+  [ -z "$sub" ] || return 0
+  [ "$(writer_restarts writer-10000)" -gt "$user_restarts" ] || return 0
+  local sout
+  if sout=$(in_user 'printf subgap > /workspace/subgap.txt' 2>&1); then
+    sub=wrote
+  else
+    case "$sout" in
+    *"Permission denied"*) sub=refused ;;
+    # Not running yet, or its first bind was the dead mount.
+    *"Transport endpoint is not connected"* | *"container not found"* | *"not running"* | *"stopped"* | *"unable to upgrade"*) ;;
+    *) fail "the restarted subPath writer failed unexpectedly: $sout" ;;
+    esac
+  fi
+}
 until out=$(in_root "printf gap > $WS/gap-$n.txt" 2>&1); do
   case "$out" in
   *"Read-only file system"* | *"Transport endpoint is not connected"*) ;;
   *) fail "a write in the gap failed unexpectedly: $out" ;;
   esac
+  subgap
   gaps=$((gaps + 1))
   n=$((n + 1))
   [ $gaps -lt 600 ] || fail "writes never worked again"
@@ -354,13 +408,31 @@ while [ $i -lt "$n" ]; do
   i=$((i + 1))
 done
 pass "no refused write reached history or the backing tree"
-deadline=$((SECONDS + 180))
-until [ "$(writer_restarts writer-10000)" -gt "$user_restarts" ]; do
-  [ $SECONDS -lt $deadline ] || fail "the subPath writer's liveness probe never restarted it"
+deadline=$((SECONDS + 120))
+until [ -n "$sub" ]; do
+  [ $SECONDS -lt $deadline ] || fail "the subPath writer never came back after its restart"
+  sleep 1
+  subgap
+done
+case "$sub" in
+refused)
+  pass "the subPath writer restarted in the gap was refused (EACCES on the sealed mount point)"
+  if in_sidecar test -e /data/backing/subgap.txt; then fail "subgap.txt reached the backing tree"; fi
+  if rgit cat-file -e "$BRANCH:subgap.txt" 2>/dev/null; then fail "subgap.txt is in history"; fi
+  ;;
+wrote)
+  # The sidecar was back before the writer: the write went to the new mount.
+  wait_remote subgap.txt subgap
+  pass "the subPath writer restarted after the gap and its write was recorded"
+  ;;
+esac
+# Its liveness probe restarts it onto the new mount (if it is not on it).
+deadline=$((SECONDS + 240))
+until in_user 'printf post-gap-subpath > /workspace/post-gap-subpath.txt' 2>/dev/null; do
+  [ $SECONDS -lt $deadline ] || fail "the subPath writer never reached the new mount"
   sleep 2
 done
 k wait --for=condition=Ready "pod/$POD" --timeout=120s >/dev/null || fail "the pod never became Ready"
-in_user 'printf post-gap-subpath > /workspace/post-gap-subpath.txt'
 wait_remote post-gap-subpath.txt post-gap-subpath
 pass "the subPath writer restarted onto the new mount"
 

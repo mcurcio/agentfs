@@ -1861,6 +1861,62 @@ fn mount_creates_a_missing_mount_point() {
     assert!(v.mnt().is_dir());
 }
 
+/// `--seal-mountpoint` (design §17.1): the bare mount point is root's with
+/// mode 0000, so between mounts a non-root writer is refused; the mount on
+/// top is unaffected, and a sealed mount point mounts again.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn a_sealed_mount_point_refuses_writes_between_mounts() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let v = Vol::new("seal");
+    let m = v.mount(&["--seal-mountpoint"]);
+    v.sh("printf x > x");
+    v.expect(&tree(&[("x", f("x"))]));
+    m.stop();
+    let meta = fs::metadata(v.mnt()).unwrap();
+    assert_eq!((meta.mode() & 0o7777, meta.uid()), (0, 0));
+    let probe = "if printf y > y; then echo wrote; else echo refused; fi 2>/dev/null";
+    assert_eq!(v.sh_as(Some(10000), probe, false), "refused\n");
+    assert!(!v.mnt().join("y").exists());
+    let m = v.mount(&["--seal-mountpoint"]);
+    assert_eq!(v.sh("cat x"), "x");
+    m.stop();
+}
+
+// ---- design §11.2: the final push at shutdown ----
+
+/// Stopping `agentfs mount` pushes what the push interval had not yet sent
+/// (design §11.2), here a whole hour of it.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn mount_pushes_its_final_commit_at_shutdown() {
+    let v = Vol::new("final_push");
+    let remote = v.p("remote.git");
+    git2::Repository::init_bare(&remote).unwrap();
+    v.config("remote.origin.url", &format!("file://{}", remote.display()));
+    v.config("agentfs.pushInterval", "1h");
+    let m = v.mount(&["--push-grace", "30s"]);
+    v.sh("printf late > late.txt");
+    v.expect(&tree(&[("late.txt", f("late"))]));
+    let remote_head = || {
+        git2::Repository::open_bare(&remote)
+            .unwrap()
+            .refname_to_id("refs/heads/agentfs/demo")
+            .ok()
+            .map(|id| id.to_string())
+    };
+    // Committed, but the next push is an hour away.
+    assert_eq!(remote_head(), None);
+    let log = m.stop();
+    let head = v.head_id();
+    assert!(
+        log.contains(&format!("final push: origin: pushed none..{head}")),
+        "{log}"
+    );
+    assert_eq!(remote_head(), Some(head));
+}
+
 // ---- design §18 test 15: the patch queue at mount (design §12) ----
 
 /// Queues patch `n` in the volume's own repository: `parent` with `path`

@@ -129,10 +129,14 @@ not. That is the fence for the moments no daemon is mounted (a sidecar
 that exited and is being restarted, §7): writes fail with `EROFS`
 instead of landing where nothing records them. A container that mounts
 the workspace itself through `subPath` cannot be fenced this way (a
-read-only subPath would make the FUSE mount read-only); give it the
-liveness probe commented in the example (its mount point must be a FUSE
-mount: `stat -f -c %T` prints `fuseblk`), so it is restarted onto the
-new mount after a clean exit of the daemon.
+read-only subPath would make the FUSE mount read-only); for it the
+sidecar **seals the mount point** (`AGENTFS_SEAL_MOUNTPOINT=true`): the
+bare directory under the mount is root's with mode 0000, so a non-root
+container (or root without `CAP_DAC_OVERRIDE`) that binds it while no
+daemon is mounted gets `EACCES`. Give it the liveness probe commented in
+the example too (its mount point must be a FUSE mount: `stat -f -c %T`
+prints `fuseblk`), so it is restarted onto the new mount after a clean
+exit of the daemon.
 
 **Crash recovery.** `AGENTFS_ON_STALE_MOUNT=recover`: when the kubelet
 restarts a crashed sidecar, it mounts over the stale mount the dead
@@ -323,9 +327,13 @@ keeps the dead mount, failing with `ENOTCONN`, until it restarts. Give
 it the liveness probe commented in the example (the mount point must be
 a live FUSE mount), so the kubelet restarts it onto the new mount. If it
 restarts before the sidecar has mounted again, its `subPath` binds the
-bare directory, writable: writes then are not recorded and are hidden
-once the probe restarts it onto the new mount (the next mount warns that
-the mount point is not empty). The read-only `emptyDir` has no such gap.
+bare directory, which the sidecar sealed: a non-root container's writes
+fail with `EACCES` ("Permission denied"). A root container with
+`CAP_DAC_OVERRIDE` (the default capabilities) still writes there: those
+writes are not recorded and are hidden once the probe restarts it onto
+the new mount (the next mount warns that the mount point is not empty).
+Run `subPath` consumers as non-root, or with `capabilities: {drop:
+[ALL]}`, or use the read-only `emptyDir`, which has no such gap.
 
 **Limits:**
 
@@ -357,8 +365,9 @@ HTTP with the credential Secret, a restore through `kubectl exec`, the
 final commit and push when the pod is deleted, the in-place recovery of
 §7 after `kill -9` of the daemon from the node (both writers carry on
 without a restart, and `agentfs push` in the sidecar pushes at once), and
-the clean-exit fence (`EROFS` in the gap, the subPath writer restarted by
-its liveness probe). `kubectl apply --dry-run=server`
+the sealed mount point (checked from the node), and the clean-exit fence
+(`EROFS` in the gap; the subPath writer, restarted inside the gap, refused
+with `EACCES`, then restarted onto the new mount by its liveness probe). `kubectl apply --dry-run=server`
 validates `deploy/sidecar` itself. It runs locally on any Linux host with
 docker, kind, kubectl, nginx and fcgiwrap (see the script's header).
 
@@ -454,10 +463,11 @@ Starting from Hermes' own workload:
 
   The e2e test's uid 10000 writer uses exactly this pattern, with the
   liveness probe a subPath consumer needs (§3, with `/opt/data`) so a
-  clean exit of the daemon restarts it onto the new mount. (The
-  alternative, which the read-only fence covers, is to mount the
-  `emptyDir` read-only at `/agentfs` and set
-  `HERMES_HOME=/agentfs/workspace`.)
+  clean exit of the daemon restarts it onto the new mount. Hermes'
+  start-up runs as root, which the sealed mount point does not stop
+  (§7); where every write must be recorded, use the alternative the
+  read-only fence covers: mount the `emptyDir` read-only at `/agentfs`
+  and set `HERMES_HOME=/agentfs/workspace`.
 - **The docker-in-docker sidecar** that runs Hermes' file and terminal
   tools mounts it the same way, so tool containers see the same files,
   and the `docker_volumes` pin in the iac workload changes to pass the
@@ -522,9 +532,10 @@ alert on `agentfs.patch.blocked`. See
   [performance.md](performance.md#known-costs).
 - A hung daemon is not detected, and passthrough descriptors opened
   before a crash write unrecorded until closed (§7).
-- A `subPath` consumer restarted while the daemon is being restarted
-  after a clean exit can write to the bare directory, unrecorded; the
-  read-only `emptyDir` has no such gap (§7).
+- A `subPath` consumer that runs as root with `CAP_DAC_OVERRIDE`,
+  restarted while the daemon is being restarted after a clean exit, can
+  write to the bare directory, unrecorded; the sealed mount point stops
+  every other one, and the read-only `emptyDir` has no such gap (§7).
 - The privileged sidecar (§9); the CSI driver ([csi.md](csi.md)) needs no
   privilege in workload pods.
 - One pod per volume. The sidecar stays single-process (`agentfs mount`

@@ -69,6 +69,11 @@ spec:
             # (design §17.1, docs/runbooks/crashed-sidecar.md). `hold`
             # instead waits for you to restart the pod.
             - { name: AGENTFS_ON_STALE_MOUNT, value: recover }
+            # The bare /agentfs/workspace (what a workload sees while no
+            # daemon is mounted) becomes root's with mode 0000: a non-root
+            # workload whose subPath is bound in that gap gets EACCES
+            # instead of writing where nothing records it (design §17.1).
+            - { name: AGENTFS_SEAL_MOUNTPOINT, value: "true" }
             # Commit trailers, committer identity and telemetry resource.
             - name: AGENTFS_POD
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
@@ -153,9 +158,11 @@ spec:
               readOnly: true
               recursiveReadOnly: Disabled
           # With a subPath mount of the workspace instead (the mount itself
-          # at a fixed path), the fence above cannot apply: give the
-          # container this probe, so it restarts onto the new mount after
-          # the daemon exited (docs/deployment.md §3).
+          # at a fixed path), the read-only fence cannot apply; the sealed
+          # mount point (AGENTFS_SEAL_MOUNTPOINT) refuses the writes of a
+          # non-root container (or root without CAP_DAC_OVERRIDE) in the
+          # gap. Give the container this probe too, so it restarts onto the
+          # new mount after the daemon exited (docs/deployment.md §3).
           # livenessProbe:
           #   exec:
           #     # Fails on the dead mount (ENOTCONN) and on a bare directory.

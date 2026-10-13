@@ -485,13 +485,13 @@ fn run_push_grace_zero_skips_final_push() {
         text.contains("final commit: 1 record(s) into 1 commit(s)"),
         "{text}"
     );
-    // Reported as skipped, or abandoned if the thread had not reported by
-    // the (zero) deadline; never pushed.
+    // Reported as skipped (no attempt started, so nothing is abandoned);
+    // never pushed.
     assert!(
-        text.contains("final push: origin: skipped, push grace spent (1 commit(s)")
-            || text.contains("final push: origin: still running"),
+        text.contains("final push: origin: skipped, push grace spent (1 commit(s)"),
         "{text}"
     );
+    assert!(!text.contains("still running"), "{text}");
     assert_eq!(branch(&remote), None);
 }
 

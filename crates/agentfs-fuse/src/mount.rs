@@ -116,6 +116,20 @@ pub enum PreflightError {
     /// `--on-stale-mount recover` found no stale agentfs mount to stack over.
     #[error("{} is not a stale agentfs mount: nothing to stack over", .0.display())]
     NotStale(PathBuf),
+    /// `--on-stale-mount recover` found the stale mount of another volume:
+    /// stacking over it would send that volume's workloads into this one's
+    /// history.
+    #[error(
+        "{} is a stale mount of {found}, not of this volume ({expected}); refusing to stack \
+         over it; detach it first if it is no longer wanted: umount -l {}",
+        path.display(),
+        path.display()
+    )]
+    OtherVolume {
+        path: PathBuf,
+        found: String,
+        expected: String,
+    },
     #[error("{a} and {b} are the same directory ({})", path.display())]
     Same {
         a: &'static str,
@@ -240,7 +254,7 @@ pub fn preflight(
 /// `mountpoint` (`--on-stale-mount recover`, design §17.1): the same
 /// checks, with the mount point resolved through its parent, since a
 /// stale mount answers every `stat` with `ENOTCONN`. Refuses anything but
-/// a stale agentfs mount there.
+/// a stale agentfs mount of this volume (source `agentfs:<volume>`) there.
 pub fn preflight_stacked(
     state: &StateDir,
     settings: &Settings,
@@ -257,10 +271,23 @@ pub fn preflight_stacked(
     };
     let resolved = canonical_dir(MOUNTPOINT, parent)?.join(name);
     match mount_state(&resolved) {
-        Ok(MountState::Stale { .. }) => {}
+        Ok(MountState::Stale { source }) => same_volume(&resolved, source, &settings.volume)?,
         _ => return Err(PreflightError::NotStale(resolved)),
     }
     check_layout(state, settings, backing, resolved)
+}
+
+/// Refuses a stale mount at `path` whose source is not `agentfs:<volume>`.
+fn same_volume(path: &Path, source: String, volume: &str) -> Result<(), PreflightError> {
+    let expected = format!("agentfs:{volume}");
+    if source == expected {
+        return Ok(());
+    }
+    Err(PreflightError::OtherVolume {
+        path: path.to_path_buf(),
+        found: source,
+        expected,
+    })
 }
 
 /// The checks of [`preflight`] past the mount point's own.
@@ -448,7 +475,12 @@ fn resolve_mountpoint(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn mount_state_in(entries: &[MountEntry], path: &Path) -> io::Result<MountState> {
-    let resolved = resolve_mountpoint(path)?;
+    // A path whose parent does not exist yet has nothing mounted on it.
+    let resolved = match resolve_mountpoint(path) {
+        Ok(resolved) => resolved,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(MountState::NotMounted),
+        Err(e) => return Err(e),
+    };
     let Some(entry) = entries.iter().rev().find(|e| e.mountpoint == resolved) else {
         return Ok(MountState::NotMounted);
     };
@@ -513,10 +545,12 @@ pub fn agentfs_layers(path: &Path) -> io::Result<usize> {
 /// between mounting and detaching it left, and creates it (mode 0700) as
 /// an empty directory.
 fn prepare_stack_source(source: &Path) -> io::Result<()> {
-    detach_stale_layers(source, 16)?;
+    // The parent first: on a fresh state area it does not exist yet, and
+    // looking for stale layers resolves the source through it.
     if let Some(parent) = source.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    detach_stale_layers(source, 16)?;
     match std::fs::DirBuilder::new().mode(0o700).create(source) {
         Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
         _ => {}
@@ -1258,6 +1292,12 @@ garbage line
             mount_state_in(&stack, &root.join("missing")).unwrap(),
             MountState::NotMounted
         );
+        // So is a path whose parent is missing too (a fresh state area's
+        // stack source).
+        assert_eq!(
+            mount_state_in(&stack, &root.join("no/such/dir")).unwrap(),
+            MountState::NotMounted
+        );
         // This process's real mountinfo parses and has the root.
         assert!(matches!(
             mount_state(Path::new("/")).unwrap(),
@@ -1307,6 +1347,34 @@ garbage line
         )
         .unwrap_err();
         assert!(matches!(err, PreflightError::Missing { .. }), "{err}");
+    }
+
+    #[test]
+    fn stack_source_is_prepared_on_a_fresh_state_area() {
+        // The parent (`<state>/meta`) does not exist yet: looking for stale
+        // layers must not fail on it (it once did, so every first recover
+        // failed with ENOENT).
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("state/meta/stack");
+        prepare_stack_source(&source).unwrap();
+        assert!(source.is_dir());
+        // Again, over the empty directory it left.
+        prepare_stack_source(&source).unwrap();
+        fs::write(source.join("f"), "x").unwrap();
+        assert!(prepare_stack_source(&source).is_err());
+    }
+
+    #[test]
+    fn stacking_refuses_another_volume() {
+        let p = Path::new("/mnt");
+        same_volume(p, "agentfs:vol".into(), "vol").unwrap();
+        let err = same_volume(p, "agentfs:other".into(), "vol").unwrap_err();
+        assert!(matches!(err, PreflightError::OtherVolume { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agentfs:other") && msg.contains("agentfs:vol"),
+            "{msg}"
+        );
     }
 
     #[test]

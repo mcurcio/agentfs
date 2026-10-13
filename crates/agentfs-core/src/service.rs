@@ -39,9 +39,10 @@
 //! Signals are a process concern: the binary decides when to call
 //! [`Service::shutdown`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -57,6 +58,15 @@ pub const COMMIT_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 /// The shortest wait between loop iterations, whatever the settings say.
 const MIN_DELAY: Duration = Duration::from_millis(10);
+
+/// How long past the push grace [`Service::shutdown`] still waits for a
+/// remote that is not inside a push attempt to report its final push
+/// decision (a local read: whether the remote lacks commits).
+const DECISION_SETTLE: Duration = Duration::from_secs(2);
+
+/// How many push-now commit results are kept for the waiters still to
+/// read them.
+const COMMIT_RESULTS_KEPT: usize = 64;
 
 /// A stop flag loops can sleep on.
 #[derive(Debug, Default)]
@@ -168,7 +178,10 @@ struct SignalState {
     closed: bool,
     commit_requested: u64,
     commit_done: u64,
-    commit_result: Option<Result<CommitReport, String>>,
+    /// The results of the last push-now commits, oldest first, each with
+    /// the request generation it served: a waiter reads the first that
+    /// served its own, so a later request cannot overwrite it.
+    commit_results: VecDeque<(u64, Result<CommitReport, String>)>,
     push_requested: HashMap<String, u64>,
     push_done: HashMap<String, PushDone>,
 }
@@ -303,9 +316,10 @@ impl ServiceHandle {
             });
         }
         let committed = state
-            .commit_result
-            .clone()
-            .unwrap_or_else(|| Ok(CommitReport::default()));
+            .commit_results
+            .iter()
+            .find(|(served, _)| *served >= commit_generation)
+            .map_or_else(|| Ok(CommitReport::default()), |(_, r)| r.clone());
         drop(state);
 
         let mut generations = Vec::with_capacity(chosen.len());
@@ -358,6 +372,16 @@ impl ServiceHandle {
     }
 }
 
+/// One remote's push thread.
+struct PushThread {
+    name: String,
+    handle: JoinHandle<()>,
+    /// Set while the thread is inside a push attempt (network I/O); clear
+    /// while it sleeps or decides its final push, which reads only local
+    /// state.
+    pushing: Arc<AtomicBool>,
+}
+
 /// The running commit and push loops.
 pub struct Service {
     /// Kills a repack in progress at shutdown.
@@ -371,7 +395,7 @@ pub struct Service {
     /// is released.
     deadline: Arc<Mutex<Option<Instant>>>,
     commit: JoinHandle<Result<CommitReport, VolumeError>>,
-    pushes: Vec<(String, JoinHandle<()>)>,
+    pushes: Vec<PushThread>,
     push_done: mpsc::Receiver<(String, FinalPush)>,
     events: Events,
 }
@@ -427,20 +451,26 @@ impl Service {
             let committed_flag = committed.clone();
             let deadline = deadline.clone();
             let done = done_tx.clone();
+            let pushing = Arc::new(AtomicBool::new(false));
+            let pushing_flag = pushing.clone();
             let spawned = thread::Builder::new()
                 .name(format!("agentfs-push-{name}"))
                 .spawn(move || {
-                    push_loop(&mut pusher, &signal_flag);
+                    push_loop(&mut pusher, &signal_flag, &pushing_flag);
                     // The final commit may hold what this remote lacks.
                     while !committed_flag.wait(Duration::from_secs(3600)) {}
                     let deadline = *deadline
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let result = final_push(&mut pusher, deadline);
+                    let result = final_push(&mut pusher, deadline, &pushing_flag);
                     let _ = done.send((pusher.name().to_owned(), result));
                 });
             match spawned {
-                Ok(handle) => pushes.push((name, handle)),
+                Ok(handle) => pushes.push(PushThread {
+                    name,
+                    handle,
+                    pushing,
+                }),
                 Err(e) => {
                     // Wind down what already started before reporting.
                     stop.stop();
@@ -465,7 +495,7 @@ impl Service {
 
     /// Remotes with a push loop.
     pub fn remotes(&self) -> impl Iterator<Item = &str> {
-        self.pushes.iter().map(|(name, _)| name.as_str())
+        self.pushes.iter().map(|p| p.name.as_str())
     }
 
     /// A handle that asks the loops to commit and push now.
@@ -503,30 +533,48 @@ impl Service {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
         self.committed.stop();
 
-        let mut pending: Vec<(String, JoinHandle<()>)> = self.pushes;
+        let mut pending: Vec<PushThread> = self.pushes;
         let mut final_pushes = Vec::new();
+        // Past the deadline, a remote that is not inside an attempt is only
+        // deciding (it finds the deadline passed and skips): wait a little
+        // for that decision rather than call it abandoned.
+        let settle = deadline + DECISION_SETTLE;
         while !pending.is_empty() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            let deciding = pending
+                .iter()
+                .any(|p| !p.pushing.load(Ordering::SeqCst) && !p.handle.is_finished());
+            let until = if now < deadline {
+                deadline
+            } else if deciding {
+                settle
+            } else {
+                break;
+            };
+            let remaining = until.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
             let (done, result) = match self.push_done.recv_timeout(remaining) {
                 Ok(done) => done,
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 // Every sender gone: the rest panicked; join reports it.
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            if let Some(i) = pending.iter().position(|(name, _)| *name == done) {
-                let (_, handle) = pending.swap_remove(i);
-                let _ = handle.join();
+            if let Some(i) = pending.iter().position(|p| p.name == done) {
+                let thread = pending.swap_remove(i);
+                let _ = thread.handle.join();
             }
             final_pushes.push((done, result));
         }
         // Threads that finished without reporting (a panic) are not
         // abandoned; reap them.
         let mut abandoned = Vec::new();
-        for (name, handle) in pending {
-            if handle.is_finished() {
-                let _ = handle.join();
+        for thread in pending {
+            if thread.handle.is_finished() {
+                let _ = thread.handle.join();
             } else {
-                abandoned.push(name);
+                abandoned.push(thread.name);
             }
         }
         abandoned.sort();
@@ -541,18 +589,23 @@ impl Service {
 
 /// One remote's push loop until the stop: an attempt, then a sleep of
 /// [`RemotePusher::next_delay`] that a push-now request cuts short.
-fn push_loop(pusher: &mut RemotePusher, signal: &Signal) {
+/// `pushing` is set for the length of each attempt.
+fn push_loop(pusher: &mut RemotePusher, signal: &Signal, pushing: &AtomicBool) {
     let name = pusher.name().to_owned();
     let mut served = 0u64;
     loop {
         // The request this attempt serves: every one made before it starts.
-        let generation = signal
-            .lock()
-            .push_requested
-            .get(&name)
-            .copied()
-            .unwrap_or(0);
+        // No attempt starts once the stop is set: the final push follows.
+        let generation = {
+            let s = signal.lock();
+            if s.stop {
+                return;
+            }
+            s.push_requested.get(&name).copied().unwrap_or(0)
+        };
+        pushing.store(true, Ordering::SeqCst);
         let outcome = pusher.push_once();
+        pushing.store(false, Ordering::SeqCst);
         let result = RemoteResult {
             name: name.clone(),
             outcome,
@@ -583,8 +636,14 @@ fn push_loop(pusher: &mut RemotePusher, signal: &Signal) {
 }
 
 /// The final push of one remote: one attempt if it lacks commits and the
-/// deadline has not passed.
-fn final_push(pusher: &mut RemotePusher, deadline: Option<Instant>) -> FinalPush {
+/// deadline has not passed. `pushing` is set for the length of the attempt,
+/// so [`Service::shutdown`] tells an attempt still running (abandoned) from
+/// a decision not yet reported (skipped).
+fn final_push(
+    pusher: &mut RemotePusher,
+    deadline: Option<Instant>,
+    pushing: &AtomicBool,
+) -> FinalPush {
     let unpushed = match pusher.unpushed() {
         Ok(None | Some(0)) => return FinalPush::NothingNew,
         Ok(Some(n)) => Some(n),
@@ -592,7 +651,10 @@ fn final_push(pusher: &mut RemotePusher, deadline: Option<Instant>) -> FinalPush
         Err(_) => None,
     };
     if deadline.is_some_and(|d| Instant::now() < d) {
-        FinalPush::Pushed(pusher.push_once())
+        pushing.store(true, Ordering::SeqCst);
+        let outcome = pusher.push_once();
+        pushing.store(false, Ordering::SeqCst);
+        FinalPush::Pushed(outcome)
     } else {
         FinalPush::Skipped {
             unpushed: unpushed.unwrap_or(0),
@@ -660,7 +722,11 @@ fn commit_loop(
             }
             signal.update(|s| {
                 s.commit_done = s.commit_done.max(generation);
-                s.commit_result = Some(result.map_err(|e| e.to_string()));
+                if s.commit_results.len() >= COMMIT_RESULTS_KEPT {
+                    s.commit_results.pop_front();
+                }
+                s.commit_results
+                    .push_back((generation, result.map_err(|e| e.to_string())));
             });
             continue;
         }
@@ -1016,15 +1082,77 @@ mod tests {
         assert_eq!(commit.commits, 1);
         assert!(local_head(&state).is_some());
         assert_eq!(remote_head(remote.path()), None);
-        // The push thread may or may not report before the zero deadline;
-        // either way nothing was pushed.
-        match report.final_pushes.as_slice() {
-            [] => assert_eq!(report.abandoned_pushes, ["origin"]),
-            [(name, FinalPush::Skipped { unpushed })] => {
-                assert_eq!((name.as_str(), *unpushed), ("origin", 1));
+        // No attempt started, so nothing is abandoned: the remote reports
+        // its skip, though the deadline passed before it could.
+        assert!(
+            report.abandoned_pushes.is_empty(),
+            "{:?}",
+            report.abandoned_pushes
+        );
+        assert_eq!(
+            report.final_pushes,
+            [("origin".to_owned(), FinalPush::Skipped { unpushed: 1 })]
+        );
+    }
+
+    /// A grace of zero with a remote that has everything reports nothing
+    /// new, not an abandoned push.
+    #[test]
+    fn zero_grace_with_nothing_new_is_not_abandoned() {
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let (_dir, _state, _rec, service) = idle_service(remote.path());
+        let report = service.shutdown(Duration::ZERO);
+        assert!(report.abandoned_pushes.is_empty(), "{report:?}");
+        assert_eq!(
+            report.final_pushes,
+            [("origin".to_owned(), FinalPush::NothingNew)]
+        );
+    }
+
+    /// Two push-now requests served one after the other each read their
+    /// own commit's result, though both are served before either waiter
+    /// runs.
+    #[test]
+    fn concurrent_push_now_requests_read_their_own_commit() {
+        let signal = Arc::new(Signal::default());
+        let handle = ServiceHandle {
+            signal: signal.clone(),
+            remotes: Arc::new(Vec::new()),
+        };
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let handle = handle.clone();
+                thread::spawn(move || handle.push_now(&[], Duration::from_secs(30)).unwrap())
+            })
+            .collect();
+        // A stand-in commit loop: once both requests are in, it serves
+        // generation 1 (5 records) and then 2 (none) under one lock, so no
+        // waiter can read between them.
+        let (state, both) = signal.wait_until(Instant::now() + Duration::from_secs(30), |s| {
+            s.commit_requested == 2
+        });
+        assert!(both);
+        drop(state);
+        signal.update(|s| {
+            for (generation, records) in [(1, 5), (2, 0)] {
+                s.commit_done = generation;
+                s.commit_results.push_back((
+                    generation,
+                    Ok(CommitReport {
+                        records,
+                        commits: usize::from(records > 0),
+                        ..CommitReport::default()
+                    }),
+                ));
             }
-            other => panic!("{other:?}"),
-        }
+        });
+        let mut records: Vec<usize> = waiters
+            .into_iter()
+            .map(|w| w.join().unwrap().committed.unwrap().records)
+            .collect();
+        records.sort_unstable();
+        assert_eq!(records, [0, 5]);
     }
 
     /// The final push is abandoned at the deadline when the remote hangs.

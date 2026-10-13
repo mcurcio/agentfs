@@ -51,7 +51,7 @@ Each crash recovered this way leaves one dead layer under the live mount
 until the sidecar stops. To see them, on the node:
 
 ```sh
-findmnt -t fuse.agentfs     # one live mount on top, plus one entry per dead layer
+findmnt -t fuse,fuse.agentfs -S agentfs:<volume>   # one live mount on top, plus one entry per dead layer
 ```
 
 Find out why it died from the previous log. An OOM kill means the
@@ -69,6 +69,12 @@ report it with the log.
   a mount needs CAP_SYS_ADMIN` (a sidecar that is not privileged) and the
   container exits 1. Run it privileged, as the example does, or switch to
   `hold` and recover by deleting the pod (below).
+- **Another volume's stale mount**: the log says `is a stale mount of
+  agentfs:<other>, not of this volume` and the container exits 1. The
+  mount point holds a dead mount of a different volume (a reused mount
+  point); stacking over it would send that volume's workloads into this
+  one's history. Delete the pod, or detach that mount on the node (below)
+  if nothing uses it.
 - **A hung daemon**: alive, but calls under the mount hang. Nothing
   restarts it (there is no liveness probe). Delete the pod; if the
   daemon is stuck in the kernel, the node may need the mount detached
@@ -83,7 +89,10 @@ report it with the log.
   containers that mount the `emptyDir` read-only (the example) got
   `EROFS` in the gap. A container with a `subPath` of the mount keeps the
   dead mount until its liveness probe restarts it; without that probe,
-  restart it by hand.
+  restart it by hand. If it restarts inside the gap, its `subPath` is the
+  bare directory, which the sidecar sealed (`AGENTFS_SEAL_MOUNTPOINT`:
+  root's, mode 0000): a non-root container gets `EACCES` there, but a
+  root one with `CAP_DAC_OVERRIDE` still writes, unrecorded.
 
 ## Recover by hand (hold mode, or as a fallback)
 
@@ -127,7 +136,7 @@ umount -l /var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~empty-dir/agentf
   workload. With the example's read-only `emptyDir` writes then fail
   with `EROFS`; a `subPath` consumer, or a workload without the
   read-only mount, would write there unrecorded (hidden again by the
-  next mount).
+  next mount; the sealed mount point refuses non-root writers).
 - **Do not add a liveness probe** to the sidecar: the kubelet already
   restarts a daemon that dies, and a probe would kill a slow but live one
   (a long journal recovery).

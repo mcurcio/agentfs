@@ -236,7 +236,10 @@ serves anything. A missing mount point is created. Flags: `--passthrough auto|on
 `--no-allow-other`, `--unmount-grace`, `--push-grace`,
 `--on-stale-mount refuse|hold|recover` (a restarted Kubernetes sidecar
 mounts over the dead mount its predecessor left, so the workload carries
-on without a pod restart; `hold` waits for one instead). `agentfs probe MOUNTPOINT`
+on without a pod restart; `hold` waits for one instead; a dead mount of
+another volume is refused), `--seal-mountpoint` (make the bare mount
+point root's with mode 0000 before mounting, so nothing non-root writes
+there unrecorded between mounts). `agentfs probe MOUNTPOINT`
 exits 0 only for a live agentfs mount, for Kubernetes probes.
 
 It needs Linux 5.6+ and `/dev/fuse`, and should run as root for multi-user
@@ -306,7 +309,8 @@ crashes, the workload's calls fail with `ENOTCONN` (nothing goes
 unrecorded) until the kubelet restarts the sidecar, which mounts over the
 dead mount and carries on with no manual step; the workload mounts the
 `emptyDir` read-only, so writes while no daemon is mounted fail instead of
-going unrecorded.
+going unrecorded, and the sidecar seals the bare mount point (root's,
+mode 0000) for containers that bind the mount itself through `subPath`.
 [docs/deployment.md](docs/deployment.md) explains the layout, the
 configuration, operations, the security trade-offs of the privileged
 sidecar and the Hermes example ([`deploy/examples/hermes`](deploy/examples/hermes));
@@ -624,10 +628,13 @@ tests the container image on every push:
   the FUSE mount), operator rules, the invisible state area, authors and
   pod, namespace and node trailers in commits pushed over HTTP with the
   credential Secret, a restore through `kubectl exec`, the final commit
-  when the pod is deleted, and recovery after `kill -9` of the daemon:
-  `ENOTCONN` for the workload, a holding sidecar and a NotReady pod,
-  `kubectl delete pod` completing, and the new pod pushing what was
-  written before the kill.
+  and final push when the pod is deleted, in-place recovery after `kill
+  -9` of the daemon (`ENOTCONN` for the workload, the kubelet restarting
+  the sidecar, which stacks over the dead mount, both writers carrying on
+  without a restart), `agentfs push` through the running daemon, the
+  sealed mount point, the clean-exit fence (`EROFS` for the read-only
+  `emptyDir`, `EACCES` for a `subPath` writer restarted in the gap), and a
+  pod deletion leaving nothing mounted on the node.
 - **e2e CSI driver** ([`ci/e2e-csi.sh`](ci/e2e-csi.sh)): the same image in
   another kind cluster, with [`deploy/csi`](deploy/csi) through its CI
   overlay [`ci/k8s-csi`](ci/k8s-csi). It validates the manifests, checks

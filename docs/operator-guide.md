@@ -136,7 +136,8 @@ it exits 1 and changes nothing
 | `--no-allow-other` | | | Only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | At shutdown, how long to wait for open files on a busy mount after detaching it |
 | `--push-grace DURATION` | | `5s` | At shutdown, how long to spend on pushes in progress and one last push of the final commit to each remote that lacks commits; `0s` skips the last push (§8) |
-| `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | When the mount point is an agentfs mount whose daemon died: `refuse` exits 1 with the command that clears it; `recover` (the shipped sidecar, §10) mounts over the stale mount, so every copy of it reaches the new daemon, and detaches the stale layers when it stops (needs `CAP_SYS_ADMIN`; refused for fronts); `hold` mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then detaches the stale mount and exits 1. With nothing stale, `recover` and `hold` mount normally |
+| `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | When the mount point is an agentfs mount whose daemon died: `refuse` exits 1 with the command that clears it; `recover` (the shipped sidecar, §10) mounts over the stale mount, if it is a mount of this volume (another volume's is refused, exit 1), so every copy of it reaches the new daemon, and detaches the stale layers when it stops (needs `CAP_SYS_ADMIN`; refused for fronts); `hold` mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then detaches the stale mount and exits 1. With nothing stale, `recover` and `hold` mount normally |
+| `--seal-mountpoint` | `AGENTFS_SEAL_MOUNTPOINT` | off | Before mounting, make the bare mount point root's with mode 0000 (needs root). The mount on top is unaffected; between mounts (a sidecar restarting after a clean exit), a non-root process, or root without `CAP_DAC_OVERRIDE`, that reaches the bare directory, such as a `subPath` bound in that gap, gets `EACCES` instead of writing unrecorded. The shipped sidecar sets it (§10) |
 
 A missing mount point is created (mode `0755`; its parent must exist), so
 a sidecar can mount into a subdirectory of a fresh `emptyDir`.
@@ -276,7 +277,8 @@ and up to one interval late: see [Databases](#14-databases-the-fsync-class).
      lacks commits, all within `--push-grace` (pushes in progress
      included), printing `final push: <remote>: ...` per remote; a remote
      still pushing at the deadline is left (`... abandoned`), and with
-     `--push-grace 0s` nothing more is pushed;
+     `--push-grace 0s` nothing more is pushed (`... skipped, push grace
+     spent`, or `nothing new`);
   5. flushes telemetry and releases the lock.
   A second signal exits at once.
 - **Unmounted from outside** (`umount`, `fusermount3 -u`): the daemon

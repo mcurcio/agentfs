@@ -153,6 +153,9 @@ pub(crate) fn mount_front(
         .clone();
     crate::create_mountpoint(&args.mountpoint)?;
     let (backing, mountpoint) = preflight(state, &settings, &args.backing, &args.mountpoint)?;
+    if args.seal_mountpoint {
+        crate::seal_mountpoint(&mountpoint)?;
+    }
     // Before mounting: a missing service exits without a mount.
     let front = connect(
         state,

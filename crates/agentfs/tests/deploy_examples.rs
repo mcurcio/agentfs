@@ -243,6 +243,19 @@ fn the_sidecar_recovers_stale_mounts() {
     );
 }
 
+/// The shipped sidecar seals the bare mount point, the fence for subPath
+/// consumers while no daemon is mounted (design §17.1).
+#[test]
+fn the_sidecar_seals_the_mount_point() {
+    let lines = sidecar_manifest();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("name: AGENTFS_SEAL_MOUNTPOINT") && l.contains("value: \"true\"")),
+        "deploy/sidecar/deployment.yaml must set AGENTFS_SEAL_MOUNTPOINT to \"true\""
+    );
+}
+
 /// The workload mounts the shared emptyDir read-only: the fence while no
 /// daemon is mounted (design §17.1).
 #[test]

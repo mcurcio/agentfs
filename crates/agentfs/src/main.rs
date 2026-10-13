@@ -924,6 +924,12 @@ struct MountArgs {
         value_enum
     )]
     on_stale_mount: OnStaleMount,
+    /// Seal the bare mount point before mounting: owned by root, mode 0000,
+    /// so a non-root workload that reaches it while no daemon is mounted
+    /// (a `subPath` bound while the sidecar restarts) gets EACCES instead
+    /// of writing where nothing records it. Needs root (design §17.1).
+    #[arg(long, env = "AGENTFS_SEAL_MOUNTPOINT")]
+    seal_mountpoint: bool,
     #[command(flatten)]
     history: HistoryArgs,
 }
@@ -1002,6 +1008,25 @@ fn create_mountpoint(mountpoint: &Path) -> Result<()> {
     }
 }
 
+/// `--seal-mountpoint`: makes the bare mount point root's with mode 0000
+/// (design §17.1). The mount on top is unaffected; what it hides is a
+/// directory no non-root process (nor root without `CAP_DAC_OVERRIDE`) can
+/// write, so a workload that binds it while no daemon is mounted (a
+/// `subPath` bound while the sidecar restarts) gets EACCES instead of
+/// writing where nothing records it.
+fn seal_mountpoint(mountpoint: &Path) -> Result<()> {
+    if !rustix::process::geteuid().is_root() {
+        bail!(
+            "--seal-mountpoint (AGENTFS_SEAL_MOUNTPOINT) needs root: the sealed mount point is \
+             owned by root"
+        );
+    }
+    std::os::unix::fs::chown(mountpoint, Some(0), Some(0))
+        .and_then(|()| std::fs::set_permissions(mountpoint, std::fs::Permissions::from_mode(0o000)))
+        .with_context(|| format!("sealing the mount point {}", mountpoint.display()))?;
+    Ok(())
+}
+
 /// `agentfs mount`: the FUSE filesystem, the commit loop and the push loops
 /// in one process, until SIGINT, SIGTERM or an unmount.
 fn mount(
@@ -1043,6 +1068,9 @@ fn mount(
                  recorded (a workload wrote there while no daemon was mounted?)",
                 mountpoint.display()
             );
+        }
+        if args.seal_mountpoint {
+            seal_mountpoint(&mountpoint)?;
         }
         (backing, mountpoint, None)
     };

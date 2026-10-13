@@ -291,3 +291,31 @@ fn hold_without_a_stale_mount_behaves_like_refuse() {
     );
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
 }
+
+/// `--seal-mountpoint` needs root, and says so before anything is mounted
+/// (design §17.1). Root (as in the FUSE job) seals instead: `mount.rs`.
+#[test]
+fn seal_mountpoint_needs_root() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let l = Layout::new();
+    let state = l.p("state");
+    l.init(&state);
+    let out = run(
+        &state,
+        &[
+            "mount",
+            "--seal-mountpoint",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+        ],
+    );
+    refused(
+        &out,
+        "--seal-mountpoint (AGENTFS_SEAL_MOUNTPOINT) needs root",
+    );
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(l.p("mnt")).unwrap().permissions().mode();
+    assert_ne!(mode & 0o777, 0, "the mount point was sealed");
+}
