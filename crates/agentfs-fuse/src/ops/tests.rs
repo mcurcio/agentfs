@@ -1051,8 +1051,7 @@ fn xattrs_pass_through() {
 #[test]
 fn created_objects_keep_the_requested_mode() {
     let fx = Fx::new();
-    // Not root: ownership stays the daemon's; the mode is exact even with
-    // a umask that would clear group write.
+    // The mode is exact even with a umask that would clear group write.
     let (parent, _) = fx.split("x");
     let (entry, fh, _) = fx.ops.create(parent, b"g", 0o100664, O_WRONLY, C).unwrap();
     fx.close(fh);
@@ -1067,8 +1066,18 @@ fn created_objects_keep_the_requested_mode() {
         0o775
     );
     let _ = d;
-    let me = rustix::process::geteuid().as_raw();
-    assert_eq!(fs::metadata(fx.backing().join("g")).unwrap().uid(), me);
+    let g = fs::metadata(fx.backing().join("g")).unwrap();
+    if crate::privileges::Privileges::current().can_create_as_caller() {
+        // Root (or the same capabilities): objects are created as their
+        // caller, so the backing file is the caller's.
+        assert_eq!((g.uid(), g.gid()), (C.uid, C.gid));
+        let dir = fs::metadata(fx.backing().join("dir")).unwrap();
+        assert_eq!((dir.uid(), dir.gid()), (C.uid, C.gid));
+    } else {
+        // Not root: ownership stays the daemon's.
+        let me = rustix::process::geteuid().as_raw();
+        assert_eq!(g.uid(), me);
+    }
 }
 
 #[test]
