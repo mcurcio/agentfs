@@ -4,6 +4,52 @@ Guidance for coding agents working in this repository. Humans should start with 
 
 agentfs is a FUSE filesystem. It records every change a workload makes into git history that the workload cannot see. It pushes that history to remotes and applies patches queued by iac. It ships as a sidecar and as a CSI driver.
 
+## What agentfs is for
+
+- **Origin.** The owner (mcurcio) runs AI agents on a Kubernetes cluster managed by [mcurcio/iac](https://github.com/mcurcio/iac). The first agent is Hermes (`workloads/hermes` there). Two problems needed solving:
+  - **Configuration.** The agent must edit its own and its sub-agents' configuration (prompts, profiles, skills) at runtime, yet iac also owns that configuration. Overwriting whole files from iac would destroy the agent's changes.
+  - **Audit.** Every change the agent makes should be on record, and that record should be out of the agent's sight and reach.
+- **The earlier attempt.** An earlier attempt, ArtifactFS (iac PR 197), stalled on mounting one FUSE volume that both root and non-root processes could use. agentfs was redesigned from first principles. Its design was reviewed adversarially (`docs/reviews/`) before any code was written.
+- **The goal is general.** agentfs is meant as a general tool for the cluster: any workload whose directory should carry an audit trail and accept versioned patches. Hermes is the first consumer, used to validate the design (design §16), not the design target. Don't specialise the code for it.
+
+## Principles
+
+These are the owner's priorities. When a choice is unclear, decide by them. Each links to where the design applies it.
+
+1. **Recording is the baseline; everything else is an extra.** A change that reached the filesystem must be recorded before the call returns, or fail loudly (§1.2, §3). Never trade recording for a feature, a speedup or convenience.
+2. **Invisible and untouchable by the workload.** No history, journal, state or credential is reachable through the mount, and nothing in the tree can turn recording off (§1.1, §4). The threat is an agent's mistakes, not malice, so don't over-engineer against an adversary.
+3. **Git idioms, not invented configuration.** Use `.gitignore`, `.gitattributes`, `.lfsconfig`, `$GIT_DIR/info/*` and git-config syntax. Operator policy lives in the git directory, which iac sets. Rule files in the tree only classify untracked paths (§4).
+4. **Native libraries, not shelling out.** Use libgit2 through git2-rs, and agentfs's own LFS, HTTP and SSH clients (§17.3). The exceptions are documented, for example `git repack` and operator runbooks.
+5. **Keep operating.** A failed push, an unreachable remote or a divergence raises an alarm and is retried. The filesystem keeps working (§11.3). Recording failures are the only failures that surface to the workload.
+6. **Any remote, or none.** GitHub is one option, not an assumption (§11.1). Several volumes may share one repository (§11.4).
+7. **History is the product.** Never rewrite history or force-push automatically. A divergence is saved and an alarm is raised, never overwritten (§11.3). History rewrites are manual operator procedures (§15).
+8. **Recovery is manual but supported.** Recovery uses `restore`, `revert` and the runbooks. Further undo tooling is added as real use shows the need (§15).
+9. **Merging is an extra.** The core records history. The patch queue applies iac's changes only at mount: in order, stopping at the first failure, with the rest left queued (§12).
+10. **Rust in two layers.** The core and daemon form the first layer, and the CSI driver is the second (§17). OpenTelemetry is used for everything observable (§13).
+
+## Working with the owner
+
+- **Decisions.** The owner's decisions are recorded, dated, in design §19.1. Don't reopen them without new evidence. Record new ones there in the same commit.
+- **Ask about what is genuinely the owner's call**: policy, security trade-offs, cost. Examples are relaxing iac's `docker_volumes` pin for Hermes, or choosing a licence. Decide the rest with the principles above, and say what you decided.
+- **Large multi-agent runs need an explicit request.** Workflows and fan-outs are expensive. Describe the scale first.
+- **Reports must be honest.** Say what is untested, tested only locally, or cut, with the reason.
+
+## How these notes are organised
+
+Every fact has one home, and other files link to it rather than copying it.
+
+| Home | Holds |
+|---|---|
+| `README.md` | What users need: pitch, install, quick start |
+| `docs/design.md` | The authoritative what and why: behaviour, guarantees, decisions (§19.1, dated) and open questions (§19.2) |
+| `docs/architecture.md`, `docs/configuration.md` | Code map and reference. Tests check them against the code |
+| `docs/runbooks/` | Operator procedures for each failure mode |
+| `docs/reviews/` | Adversarial reviews and what changed because of them |
+| `AGENTS.md` (this file) | Orientation for agents: purpose, principles, norms, environment, and links to the homes above. Keep it short: it is loaded into every session |
+| `.claude/skills/` | Procedures agents run, such as milestone orchestration |
+
+When you learn something durable, write it to its home in the same commit. Never leave it only in a conversation or a PR description.
+
 ## Read first
 
 - `docs/design.md` is authoritative. Decisions are in §19.1 and open questions in §19.2. The acceptance tests are in §18.
