@@ -1044,12 +1044,7 @@ fn the_lock_holds_while_mounted() {
     let v = Vol::new("lock");
     let m = v.mount(&[]);
     let root = v.backing().to_str().unwrap().to_owned();
-    for args in [
-        &["run"][..],
-        &["push"],
-        &["flush"],
-        &["--root", &root, "record", "f"],
-    ] {
+    for args in [&["run"][..], &["flush"], &["--root", &root, "record", "f"]] {
         let out = v.agentfs(args);
         assert_eq!(
             out.status.code(),
@@ -1058,6 +1053,14 @@ fn the_lock_holds_while_mounted() {
             text(&out.stderr)
         );
     }
+    // `push` is not refused: the mount pushes for it (design §2.3).
+    let out = v.agentfs(&["push", "--timeout", "10s"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("through the running daemon"),
+        "{}",
+        text(&out.stdout)
+    );
     let out = v.agentfs(&["status"]);
     assert!(out.status.success());
     assert!(

@@ -380,3 +380,47 @@ fn a_front_prefers_the_slot_it_is_given() {
     drop(held);
     service.stop();
 }
+
+/// The history service answers `agentfs push` over the control socket,
+/// and refuses restores with exit 75 (design §2.3).
+#[test]
+fn the_history_service_pushes_now() {
+    let v = Volume::new();
+    let remote = v.dir.path().join("remote.git");
+    git2::Repository::init_bare(&remote).unwrap();
+    let mut config = git2::Config::open(&v.state().git().join("config")).unwrap();
+    config.set_str("agentfs.pushInterval", "1h").unwrap();
+    config
+        .set_str("remote.origin.url", &remote.display().to_string())
+        .unwrap();
+    let service = v.serve();
+
+    fs::write(v.tree().join("a"), "from a").unwrap();
+    let out = v.front_record("pod-a", &["a"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = v.run(["push", "--timeout", "30s"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert!(text.contains("through the running daemon (pid "), "{text}");
+    assert!(text.contains("origin: pushed none.."), "{text}");
+    let pushed = git2::Repository::open_bare(&remote)
+        .unwrap()
+        .refname_to_id("refs/heads/agentfs/demo")
+        .unwrap();
+    let local = git2::Repository::open_bare(v.state().git())
+        .unwrap()
+        .refname_to_id("refs/heads/agentfs/demo")
+        .unwrap();
+    assert_eq!(pushed, local);
+
+    let out = v.run(["restore", "a", "HEAD"]);
+    assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("serves no restores"),
+        "{}",
+        stderr(&out)
+    );
+
+    let log = service.stop();
+    assert!(log.contains("final push: origin: nothing new"), "{log}");
+}

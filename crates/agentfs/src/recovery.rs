@@ -101,6 +101,8 @@ impl Ask {
             commit: commit.clone(),
             force: self.force,
             dry_run: self.dry_run,
+            remotes: Vec::new(),
+            timeout_ms: None,
         }
     }
 
@@ -113,6 +115,7 @@ impl Ask {
                 None => Err(RestoreError::MissingPath),
             },
             Op::Revert => Ok(Self::revert(r.commit, r.force, r.dry_run)),
+            Op::Push => Err(other("a push is not a restore or revert")),
         }
     }
 
@@ -262,6 +265,10 @@ fn print_reply(command: &str, reply: Reply) -> ExitCode {
         }
         Reply::Error(message) => {
             eprintln!("{command} failed: {message}");
+            ExitCode::FAILURE
+        }
+        Reply::Pushed(_) => {
+            eprintln!("{command} failed: the daemon answered with a push's reply");
             ExitCode::FAILURE
         }
     }
@@ -560,6 +567,8 @@ mod tests {
             commit: "HEAD~5".into(),
             force: false,
             dry_run: false,
+            remotes: Vec::new(),
+            timeout_ms: None,
         }
     }
 

@@ -123,9 +123,8 @@ Case B is not exercised in CI; rehearse it on a copy first.
 ## 5. Verify
 
 The next push of that remote is a fast-forward (or up to date), and the
-divergence clears. With no mount running, push now; with one running,
-wait for its next push (`pushInterval`, or the backoff, up to
-`max(pushInterval, 15m)`), or restart the mount to push at once.
+divergence clears. Push now: `agentfs push` pushes directly with no mount running,
+and asks the running mount (or `run`) to push at once otherwise.
 
 <!-- ci: divergence-verify -->
 ```sh

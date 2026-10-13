@@ -292,8 +292,9 @@ commit and its push always happen. Pushing never delays shutdown beyond
 
 ## 9. The state-area lock
 
-One process uses a state area at a time (§2.3). `mount`, `run`, `record`,
-`flush`, `push`, and `restore` and `revert` when no mount runs, take an
+One process uses a state area at a time (§2.3). `mount`, `run`,
+`serve-history`, `record`, `flush`, and `push`, `restore` and `revert`
+when no daemon answers on the control socket, take an
 exclusive lock on `<state>/meta/lock` before
 opening the volume; a second one exits with status 75 and names the
 holder:
@@ -310,12 +311,31 @@ holder:
 lock:      held by pid=4711 command=mount since=20261012T110302Z
 ```
 
-While mounted, `agentfs push` is therefore refused: the mount's own push
-loop pushes every `pushInterval`. `agentfs restore` and `agentfs revert`
-are not refused: they go to the mount over its control socket (section 12).
-While `agentfs run` holds the lock they exit 75: `run` serves no
-restores. The kernel releases the lock when the holder dies, even after
-`kill -9`.
+While a daemon runs, `agentfs push`, `agentfs restore` and `agentfs
+revert` are not refused: they go to it over its control socket. `push`
+asks `mount`, `run` or `serve-history` to commit and push now (below);
+restores and reverts are served by a mount (section 12), while `run` and
+`serve-history` answer that they serve none (exit 75). The kernel
+releases the lock when the holder dies, even after `kill -9`.
+
+**Pushing now.** `agentfs push [--remote NAME]... [--timeout DURATION]`
+against a running daemon commits everything recorded and wakes each
+chosen remote's push loop at once, past `pushInterval` and any backoff:
+
+```
+$ agentfs --state /data/state push
+through the running daemon (pid 4711): 3 record(s) into 1 commit(s)
+origin: pushed 1a2b3c4..5d6e7f8
+```
+
+It waits up to `--timeout` (default `120s`, 1s to 10m) and exits 0 only
+when every chosen remote succeeded in time; a remote still pushing then
+(`origin: still pushing after 120s; it continues in the background`)
+makes it exit 1, and `agentfs status` shows how that push ended. A remote
+the daemon does not know is refused (exit 1, with the configured
+remotes). With no daemon running, `push` takes the lock and pushes
+directly, as before. In Kubernetes: `kubectl exec -c agentfs <pod> --
+agentfs push`.
 
 ## 10. Crashes and stale mounts
 
@@ -409,8 +429,9 @@ agentfs --state /data/state revert <commit>
   `kubectl exec -c agentfs <pod> -- agentfs restore ...` in the sidecar.
 - **Nothing is running**: the command takes the state-area lock and
   writes the backing tree (`--root`) itself.
-- **`agentfs run`, `record`, `flush` or `push` holds the state area**:
-  exit 75. One restore runs at a time per mount; a second one also exits
+- **`agentfs run` or `serve-history` runs**: it answers that it serves no
+  restores; exit 75.
+- **`record`, `flush` or a direct `push` holds the state area**: exit 75. One restore runs at a time per mount; a second one also exits
   75.
 
 Exit status: `0` done (or `already matches: nothing to do`), `1` refused
@@ -633,8 +654,9 @@ whole, consistent groups instead.
 - **A hard link made before the mount** is only known by its names once
   each has been looked up through the mount; a change through one name is
   recorded at the names the mount has seen.
-- **Exit status 75** from `push`, `flush`, `record` or `run`: the volume is
-  mounted (or another command is running). Use `--wait-lock`, or stop the
+- **Exit status 75** from `flush`, `record` or `run` (or a `push` that
+  found no daemon to ask): the volume is mounted (or another command is
+  running). Use `--wait-lock`, or stop the
   mount first. From `restore` or `revert`: `agentfs run` (or another
   command) holds the state area, or the mount is already running a
   restore; retry when it is done.

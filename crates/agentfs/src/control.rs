@@ -1,10 +1,12 @@
-//! The control socket of a running mount (design §2.2, §15).
+//! The control socket of a running daemon (design §2.2, §2.3, §15).
 //!
-//! `agentfs mount` listens on `<state>/meta/control/agentfs.sock` so that
-//! `agentfs restore` and `agentfs revert` can ask it to write through its
-//! own mount while it holds the state-area lock. The directory is `0700`
-//! and the socket `0600`, and each connection's peer credentials
-//! (`SO_PEERCRED`) must be root or the daemon's own user.
+//! `agentfs mount`, `agentfs run` and `agentfs serve-history` listen on
+//! `<state>/meta/control/agentfs.sock` while they hold the state-area
+//! lock, so that `agentfs push` can ask them to commit and push now, and
+//! `agentfs restore` and `agentfs revert` can ask a mount to write through
+//! its own mount (`run` and `serve-history` answer those `busy`). The
+//! directory is `0700` and the socket `0600`, and each connection's peer
+//! credentials (`SO_PEERCRED`) must be root or the daemon's own user.
 //!
 //! Both ends address the socket as `/proc/self/fd/<dir fd>/agentfs.sock`,
 //! so a long state-area path never hits the 108-byte `sun_path` limit.
@@ -12,13 +14,20 @@
 //! **Protocol v1**, JSON lines, one request per connection:
 //!
 //! - request: `{"v":1,"op":"restore"|"revert","path":...,"commit":...,
-//!   "force":false,"dry_run":false}` (`path` for restore only), at most
-//!   [`MAX_REQUEST`] bytes, read within [`READ_TIMEOUT`];
-//! - reply: `{"ok":{...}}`, `{"refused":{"kind":...,"message":...,
-//!   "hint":...}}`, `{"busy":"..."}` (another restore is running) or
-//!   `{"error":"..."}`.
+//!   "force":false,"dry_run":false}` (`path` for restore only), or
+//!   `{"v":1,"op":"push","remotes":[...],"timeout_ms":N}` (both
+//!   optional), at most [`MAX_REQUEST`] bytes, read within
+//!   [`READ_TIMEOUT`];
+//! - reply: `{"ok":{...}}` (a restore or revert), `{"pushed":{...}}` (a
+//!   push), `{"refused":{"kind":...,"message":...,"hint":...}}`,
+//!   `{"busy":"..."}` (another restore is running, or this daemon serves
+//!   no restores) or `{"error":"..."}`.
 //!
-//! One restore or revert runs at a time; a second gets `busy`.
+//! One restore or revert runs at a time; a second gets `busy`. Pushes run
+//! beside them and each other. `push` was added to v1 with optional
+//! fields only: a daemon from before it answers `{"error":"malformed
+//! request: unknown variant ..."}`, and `agentfs push` then falls back to
+//! pushing directly (which the lock refuses with exit 75).
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
@@ -46,6 +55,15 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Op {
     Restore,
     Revert,
+    /// Commit and push now (design §2.3): every daemon serves it.
+    Push,
+}
+
+impl Op {
+    /// Restores and reverts write through the mount: one at a time.
+    fn exclusive(self) -> bool {
+        matches!(self, Self::Restore | Self::Revert)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,11 +72,66 @@ pub struct Request {
     pub op: Op,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Restore and revert: the commit. Empty for a push.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub commit: String,
     #[serde(default)]
     pub force: bool,
     #[serde(default)]
     pub dry_run: bool,
+    /// Push: the remotes to push (every remote when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<String>,
+    /// Push: how long the daemon waits for the attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl Request {
+    /// A push request.
+    pub fn push(remotes: Vec<String>, timeout: Duration) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            op: Op::Push,
+            path: None,
+            commit: String::new(),
+            force: false,
+            dry_run: false,
+            remotes,
+            timeout_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+        }
+    }
+}
+
+/// One remote's result in a [`PushReply`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteReply {
+    pub name: String,
+    pub ok: bool,
+    /// What `agentfs push` prints for it, as the daemon rendered them.
+    pub lines: Vec<String>,
+    /// Commits it still lacks after the attempt, if known.
+    #[serde(default)]
+    pub unpushed: Option<u64>,
+}
+
+/// A finished push request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushReply {
+    /// The daemon's process id.
+    pub pid: u32,
+    /// What the commit before the push did, or why it failed.
+    pub records: u64,
+    pub commits: u64,
+    #[serde(default)]
+    pub commit_error: Option<String>,
+    pub remotes: Vec<RemoteReply>,
+    /// Chosen remotes that are misconfigured, and why: never pushed.
+    #[serde(default)]
+    pub misconfigured: Vec<String>,
+    /// Remotes still pushing at the timeout.
+    #[serde(default)]
+    pub still_running: Vec<String>,
 }
 
 /// A finished restore or revert.
@@ -83,6 +156,7 @@ pub struct Outcome {
 #[serde(rename_all = "snake_case")]
 pub enum Reply {
     Ok(Outcome),
+    Pushed(PushReply),
     Refused {
         kind: String,
         message: String,
@@ -268,12 +342,21 @@ fn serve_one(mut stream: UnixStream, handler: &Handler, busy: &Mutex<()>, euid: 
             return;
         }
     };
-    let Ok(_running) = busy.try_lock() else {
-        write_reply(
-            &mut stream,
-            &Reply::Busy("another restore or revert is running on this mount".into()),
-        );
-        return;
+    // Pushes run beside a restore and each other: the service's push
+    // loops serialize them.
+    let _running = if request.op.exclusive() {
+        match busy.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                write_reply(
+                    &mut stream,
+                    &Reply::Busy("another restore or revert is running on this mount".into()),
+                );
+                return;
+            }
+        }
+    } else {
+        None
     };
     let reply = handler(request, peer);
     write_reply(&mut stream, &reply);
@@ -338,6 +421,8 @@ mod tests {
             commit: "HEAD~1".into(),
             force: false,
             dry_run: true,
+            remotes: Vec::new(),
+            timeout_ms: None,
         }
     }
 
@@ -372,6 +457,20 @@ mod tests {
                 message: "m".into(),
                 hint: Some("h".into()),
             },
+            Reply::Pushed(PushReply {
+                pid: 7,
+                records: 2,
+                commits: 1,
+                commit_error: None,
+                remotes: vec![RemoteReply {
+                    name: "origin".into(),
+                    ok: true,
+                    lines: vec!["origin: pushed none..abc".into()],
+                    unpushed: Some(0),
+                }],
+                misconfigured: vec!["bad: no url".into()],
+                still_running: vec!["slow".into()],
+            }),
             Reply::Busy("b".into()),
             Reply::Error("e".into()),
         ] {
@@ -387,6 +486,94 @@ mod tests {
                 .unwrap()
                 .starts_with(r#"{"busy":"#)
         );
+    }
+
+    #[test]
+    fn push_requests_round_trip() {
+        let all = Request::push(Vec::new(), Duration::from_secs(120));
+        let json = serde_json::to_string(&all).unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"op":"push","force":false,"dry_run":false,"timeout_ms":120000}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), all);
+        let some = Request::push(vec!["a".into(), "b".into()], Duration::from_millis(5));
+        let json = serde_json::to_string(&some).unwrap();
+        assert!(json.contains(r#""remotes":["a","b"]"#), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), some);
+        // The minimal form a hand-written client sends.
+        let bare: Request = serde_json::from_str(r#"{"v":1,"op":"push"}"#).unwrap();
+        assert_eq!(
+            (
+                bare.op,
+                bare.commit.as_str(),
+                bare.remotes.len(),
+                bare.timeout_ms
+            ),
+            (Op::Push, "", 0, None)
+        );
+        assert!(
+            serde_json::to_string(&Reply::Pushed(PushReply::default()))
+                .unwrap()
+                .starts_with(r#"{"pushed":{"#)
+        );
+    }
+
+    /// A push is served while a restore holds the daemon.
+    #[test]
+    fn pushes_run_beside_a_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("control");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let handler: Handler = Arc::new(move |request: Request, _| match request.op {
+            Op::Push => Reply::Pushed(PushReply {
+                pid: 1,
+                ..PushReply::default()
+            }),
+            _ => {
+                if request.commit == "slow" {
+                    let _ = wait.lock().unwrap().recv();
+                }
+                Reply::Ok(Outcome::default())
+            }
+        });
+        let server = Server::start(&dir, handler).unwrap();
+        let slow = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let slow = Request {
+                    commit: "slow".into(),
+                    ..request()
+                };
+                // A probe below may hold the daemon when it arrives.
+                loop {
+                    match call(&dir, &slow) {
+                        Ok(Reply::Busy(_)) => std::thread::sleep(Duration::from_millis(1)),
+                        other => return other,
+                    }
+                }
+            })
+        };
+        // Wait until the slow restore holds the daemon.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(call(&dir, &request()).unwrap(), Reply::Busy(_)) {
+            assert!(Instant::now() < deadline, "never busy");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let push = Request::push(Vec::new(), Duration::from_secs(1));
+        for _ in 0..2 {
+            assert_eq!(
+                call(&dir, &push).unwrap(),
+                Reply::Pushed(PushReply {
+                    pid: 1,
+                    ..PushReply::default()
+                })
+            );
+        }
+        release.send(()).unwrap();
+        assert!(matches!(slow.join().unwrap(), Ok(Reply::Ok(_))));
+        assert!(server.shutdown(Duration::from_secs(5)));
     }
 
     #[test]

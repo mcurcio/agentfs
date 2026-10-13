@@ -59,7 +59,9 @@ git --git-dir /data/remote.git log --oneline agentfs/demo
 Stopping the mount prints `final commit:` and a `final push: origin: ...`
 line: the last commit is pushed before the mount exits, within
 `--push-grace` (5s), so the remote's log shows it straight away. Remotes
-are otherwise pushed every `agentfs.pushInterval` (60s).
+are otherwise pushed every `agentfs.pushInterval` (60s), or at once with
+`agentfs --state /data/state push`, which asks the running mount to
+commit and push now.
 
 Then [Mounting](#mounting) and the [operator guide](docs/operator-guide.md)
 for a real deployment, or [Deploying on Kubernetes](#deploying-on-kubernetes).
@@ -181,7 +183,9 @@ directly, without a mount, and reports the paths the rules skip or the
 checks refuse, with the reason; a database in the `fsync` class is
 recorded with its whole group. It needs `--root` (or `AGENTFS_ROOT`),
 since a path missing from the backing tree is recorded as removed. `push`
-pushes once; `run` runs the commit and push loops until SIGINT or SIGTERM.
+pushes once, or, with `mount`, `run` or `serve-history` running, asks it
+over its control socket to commit and push now (`--timeout`, 120s); `run`
+runs the commit and push loops until SIGINT or SIGTERM.
 `restore` and `revert` write content from history back into the tree
 ([Recovery](#recovery)). `init` is safe to re-run: for the same volume it
 exits 0 and changes nothing, for another volume it refuses; `--include
@@ -190,8 +194,9 @@ FILE` keeps settings and remotes in an operator-owned config fragment
 [configuration reference](docs/configuration.md#where-settings-live)).
 Alarms are printed to stderr, and exported as telemetry when it is enabled.
 
-Only one process uses a state area at a time. `mount`, `run`, `record`,
-`flush`, `push`, and `restore` and `revert` when no mount runs, take an
+Only one process uses a state area at a time. `mount`, `run`,
+`serve-history`, `record`, `flush`, and `push`, `restore` and `revert`
+when no daemon answers on the control socket, take an
 exclusive lock on `<state>/meta/lock` and exit
 with status 75 if another process holds it, naming the holder;
 `--wait-lock 30s` (or `AGENTFS_WAIT_LOCK`) waits instead. `status` takes no
@@ -200,7 +205,7 @@ who holds the lock.
 
 ### Not built yet
 
-Several mounts of one volume across nodes, asking a running mount to push now, and
+Several mounts of one volume across nodes, and
 restarting a pod automatically after its sidecar crashes (the CSI driver
 does restart crashed fronts). SSH remotes do
 not support ssh-agent, passphrase-protected keys or `@cert-authority`

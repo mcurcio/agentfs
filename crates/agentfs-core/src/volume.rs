@@ -1447,7 +1447,7 @@ pub struct Committer {
 }
 
 /// What one commit pass did.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommitReport {
     pub records: usize,
     pub commits: usize,
@@ -1521,6 +1521,14 @@ impl Committer {
             }
         }
         self.commit_groups(&records, &groups)
+    }
+
+    /// Commits everything recorded so far, as [`Committer::commit_pending`]
+    /// does, except the group of an operation still running (a restore,
+    /// design §15), which would otherwise be published half done. What
+    /// `agentfs push` against a running daemon commits first (§2.3).
+    pub fn commit_now(&self) -> Result<CommitReport, VolumeError> {
+        self.commit_settled(u64::MAX)
     }
 
     fn window_ms(&self) -> u64 {

@@ -89,10 +89,13 @@ attempts. A success resets it. The alarm's `next retry` says when.
 - **No mount or `run` is running**: `agentfs --state "$STATE" push`
   pushes every remote once (or `--remote <name>`), prints the outcome and
   exits 1 unless all succeeded.
-- **A mount is running**: `agentfs push` exits 75 (the mount holds the
-  state area). Wait for the next attempt, or restart the mount (the first
-  push of each remote happens at start). Asking a running daemon to push
-  now is a follow-up.
+- **A mount, `run` or `serve-history` is running**: the same command asks
+  it over its control socket to commit and push now, past the interval
+  and any backoff. It waits up to `--timeout` (120 s) and prints
+  `through the running daemon (pid N): ...` and each remote's outcome; a
+  push still running then carries on in the background, and `agentfs
+  status` shows how it ended. In a sidecar: `kubectl exec <pod> -c agentfs
+  -- agentfs push`.
 
 After fixing a credentials, key or known_hosts file alone, nothing is
 needed: they are re-read at the next attempt.

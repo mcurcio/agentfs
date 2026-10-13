@@ -69,8 +69,10 @@ Set them with `git config`:
 git --git-dir /data/state/git config agentfs.pushInterval 30s
 ```
 
-`mount` and `run` read the settings when they start; changing a key takes a
-restart. `push`, `record`, `flush` and `status` read them at every run. The
+`mount`, `run` and `serve-history` read the settings when they start;
+changing a key takes a restart. `push` (when no daemon runs), `record`,
+`flush` and `status` read them at every run; `push` against a running
+daemon uses the daemon's settings. The
 *files* that remote keys point to (credentials, SSH keys, known_hosts) are
 different: they are re-read whenever they change, without a restart.
 
@@ -494,6 +496,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--history-slot N` | `AGENTFS_HISTORY_SLOT` | the lowest free slot | `mount`, `record` with `--history-service`: lease pending slot N (1 to 1023) when it is free, else the lowest free slot; a front restarted after a crash passes its predecessor's slot to drain that slot's repairs |
 | `--allow-stale` | | | `probe`: exit 0 for a stale agentfs mount too |
 | `--remote NAME` (repeatable) | | every remote | `push`: push only these remotes |
+| `--timeout DURATION` | | `120s` | `push` through a running daemon: how long to wait for its pushes (clamped to 1s..10m); a push still running then carries on in the background. Pushing directly ignores it |
 | `--force` | | | `restore`: write even files open for writing through the mount; `revert`: also revert paths changed again since the commit, and write files open for writing (§15) |
 | `--dry-run` | | | `restore`, `revert`: print the plan and write nothing |
 | `--no-fetch` | | | `patch apply`: apply what is already fetched, without contacting the patch remote |

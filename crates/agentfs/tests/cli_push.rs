@@ -494,3 +494,53 @@ fn run_push_grace_zero_skips_final_push() {
     );
     assert_eq!(branch(&remote), None);
 }
+
+/// `agentfs push` asks a running `run` to commit and push now, past its
+/// push interval (design §2.3, §11.2).
+#[test]
+fn push_now_reaches_a_running_run() {
+    let (v, remote) = idle_remote();
+    let mut child = spawn_run_with(&v, "1s");
+    wait_until_running(&mut child);
+    assert_eq!(branch(&remote), None);
+
+    let out = v.run(&["push", "--timeout", "30s"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert!(text.contains("through the running daemon (pid "), "{text}");
+    assert!(text.contains("1 record(s) into 1 commit(s)"), "{text}");
+    let head = v.head();
+    assert!(
+        text.contains(&format!("origin: pushed none..{head}")),
+        "{text}"
+    );
+    assert_eq!(branch(&remote), Some(head));
+
+    // A remote the daemon does not know is refused, and the daemon runs on.
+    let out = v.run(&["push", "--remote", "nope"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("push refused: "), "{err}");
+    assert!(err.contains("nope"), "{err}");
+    assert!(err.contains("configured remotes: origin"), "{err}");
+
+    signal(&child, rustix::process::Signal::TERM);
+    let status = wait_with_timeout(&mut child, Duration::from_secs(30));
+    let out = child.wait_with_output().unwrap();
+    assert!(status.success(), "{status:?}");
+    let text = stdout(&out);
+    assert!(text.contains("final push: origin: nothing new"), "{text}");
+}
+
+/// Without a daemon, `agentfs push` pushes directly, as before.
+#[test]
+fn push_without_a_daemon_pushes_directly() {
+    let (v, remote) = idle_remote();
+    let out = v.run(&["record", "late.txt"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = v.run(&["push", "--timeout", "5s"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert!(!text.contains("through the running daemon"), "{text}");
+    assert_eq!(branch(&remote), Some(v.head()));
+}

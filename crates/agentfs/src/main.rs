@@ -6,7 +6,9 @@
 //! directory directly, through the same recorder, including its path rules:
 //! paths the rules exclude are reported as skipped, with the reason.
 //!
-//! `push` pushes once to the configured remotes; `run` runs the commit and
+//! `push` pushes once to the configured remotes, or asks a running daemon
+//! (`mount`, `run`, `serve-history`) to commit and push now over its
+//! control socket ([`push_now`], design §2.3); `run` runs the commit and
 //! push loops in the foreground until SIGINT or SIGTERM (design §11.2).
 //!
 //! `restore` and `revert` write content from history back into the tree,
@@ -25,8 +27,8 @@
 //! only writer of the journal and branch, and each front records its pod's
 //! changes through it, carrying its pod's committer.
 //!
-//! `mount`, `run`, `record`, `flush`, `push`, `serve-history`, and
-//! `restore` and `revert` when no mount runs, take the state-area lock
+//! `mount`, `run`, `record`, `flush`, `serve-history`, and `push`,
+//! `restore` and `revert` when no daemon answers, take the state-area lock
 //! (design §2.3) and exit 75 while another process holds it; fronts take
 //! no lock; `status` is read-only and takes no lock.
 //!
@@ -43,6 +45,7 @@ mod front;
 mod hold;
 mod otel;
 mod patch_cmd;
+mod push_now;
 mod recovery;
 #[cfg(test)]
 mod reference_tests;
@@ -151,12 +154,19 @@ enum Command {
         #[arg(long, default_value = "10s", value_parser = parse_grace)]
         shutdown_grace: Duration,
     },
-    /// Push the volume's refs to its remotes once. Exits 1 unless every
-    /// selected remote succeeded.
+    /// Push the volume's refs to its remotes once. With a daemon running
+    /// (`mount`, `run`, `serve-history`), asks it to commit and push now
+    /// over its control socket; otherwise pushes directly. Exits 1 unless
+    /// every selected remote succeeded.
     Push {
         /// Push only this remote; repeatable (default: every remote).
         #[arg(long = "remote", value_name = "NAME")]
         remotes: Vec<String>,
+        /// How long to wait for a running daemon's push (1s to 10m); a push
+        /// still running then carries on in the background. Pushing
+        /// directly ignores it.
+        #[arg(long, default_value = "120s", value_parser = parse_grace, value_name = "DURATION")]
+        timeout: Duration,
         #[command(flatten)]
         pod: Pod,
     },
@@ -455,7 +465,15 @@ fn real_main() -> Result<ExitCode> {
                 shutdown_grace,
             );
         }
-        Command::Push { remotes, pod } => {
+        Command::Push {
+            remotes,
+            timeout,
+            pod,
+        } => {
+            // A running daemon pushes for us (design §2.3).
+            if let Some(code) = push_now::client(&state, &remotes, timeout) {
+                return Ok(code);
+            }
             let _lock = StateLock::acquire(&state, "push", cli.wait_lock)?;
             let session = Session::start(&state, &pod)?;
             let code = push_once(&state, &remotes, &session)?;
@@ -716,6 +734,16 @@ fn run(
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
     let service = Service::start(committer, pushers, events).context("starting the service")?;
+    // `agentfs push` asks it to push now; restores are refused (design
+    // §2.3).
+    let control = start_control(
+        state,
+        push_now::handler(
+            service.handle(),
+            misconfigured(&settings),
+            push_now::Restores::Refuse(push_now::RUN_SERVES_NO_RESTORES),
+        ),
+    );
     eprintln!(
         "running volume {} ({} uncommitted record(s) recovered; remotes: {}); \
          stop with SIGINT or SIGTERM",
@@ -729,9 +757,44 @@ fn run(
         "{}: stopping (waiting up to {push_grace:?} for the final push; signal again to exit now)",
         describe_wake(wake)
     );
+    stop_control(&service, control);
     let code = stop_service(service, push_grace);
     session.finish();
     Ok(code)
+}
+
+/// The remotes the settings refused, with why: `agentfs push` reports them.
+fn misconfigured(settings: &agentfs_core::config::Settings) -> Vec<(String, String)> {
+    settings
+        .invalid_remotes
+        .iter()
+        .map(|r| (r.name.clone(), r.error.clone()))
+        .collect()
+}
+
+/// Starts the control socket (design §2.2), or warns: the daemon works
+/// without it, but `agentfs push` then pushes directly and the lock
+/// refuses it.
+fn start_control(state: &StateDir, handler: control::Handler) -> Option<control::Server> {
+    match control::Server::start(&state.control_dir(), handler) {
+        Ok(server) => Some(server),
+        Err(e) => {
+            eprintln!(
+                "warning: control socket in {}: {e}; `agentfs push` cannot reach this daemon",
+                state.control_dir().display()
+            );
+            None
+        }
+    }
+}
+
+/// Stops the control socket of `run` or `serve-history`: requests waiting
+/// on the service return first.
+fn stop_control(service: &Service, control: Option<control::Server>) {
+    service.handle().close();
+    if let Some(control) = control {
+        control.shutdown(push_now::CONTROL_GRACE);
+    }
 }
 
 fn list(names: &[String]) -> String {
@@ -966,26 +1029,20 @@ fn mount(
     };
     // Restores and reverts through the mount (design §15). Without the
     // socket the mount still works; restores then need it stopped.
-    let control = {
-        let handler = recovery::Daemon {
-            state: state.clone(),
-            recorder: restorer,
-            view: mounted.view(),
-            commit_window: settings.commit_window,
-        };
-        let handler: control::Handler = Arc::new(move |request, peer| handler.serve(request, peer));
-        match control::Server::start(&state.control_dir(), handler) {
-            Ok(server) => Some(server),
-            Err(e) => {
-                eprintln!(
-                    "warning: control socket in {}: {e}; restore and revert need the mount \
-                     stopped",
-                    state.control_dir().display()
-                );
-                None
-            }
-        }
-    };
+    // `agentfs push` through it too (design §2.3).
+    let control = start_control(
+        state,
+        push_now::handler(
+            service.handle(),
+            misconfigured(&settings),
+            push_now::Restores::Serve(recovery::Daemon {
+                state: state.clone(),
+                recorder: restorer,
+                view: mounted.view(),
+                commit_window: settings.commit_window,
+            }),
+        ),
+    );
     daemon.watch(mounted.ended(), Wake::Unmounted)?;
     daemon.watch(mounted.failed(), Wake::PassthroughFailed)?;
     let startup = mounted.startup_repairs();
@@ -1020,7 +1077,9 @@ fn mount(
         args.unmount_grace,
         args.push_grace
     );
-    // Before the unmount: a restore writes through the mount.
+    // Before the unmount: a restore writes through the mount. Push
+    // requests waiting on the service return first.
+    service.handle().close();
     if let Some(control) = control
         && !control.shutdown(args.unmount_grace)
     {

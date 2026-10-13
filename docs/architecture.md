@@ -104,12 +104,13 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push`, `run` and `mount` |
+| `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push` (direct), `run` and `mount` |
 | `daemon.rs` | Signals and shutdown for `run` and `mount` |
 | `front.rs` | `mount --history-service`: a front of a history service (§14) |
 | `serve_history.rs` | `agentfs serve-history`: the history service of a volume (§14) |
 | `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount |
-| `control.rs` | The control socket of a running mount, through which `restore` and `revert` act (§2.2, §15) |
+| `control.rs` | The control socket of a running daemon (`mount`, `run`, `serve-history`), through which `push`, `restore` and `revert` act (§2.2, §2.3, §15) |
+| `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
 | `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount or directly (§15) |
 | `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters and the environment it reads (§13) |

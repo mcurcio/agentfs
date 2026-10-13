@@ -440,7 +440,8 @@ fn spawn_run(v: &Volume) -> Child {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !stdout(&v.raw(&["status"])).contains("command=run") {
+    let socket = v.state().join("meta/control/agentfs.sock");
+    while !stdout(&v.raw(&["status"])).contains("command=run") || !socket.exists() {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
@@ -462,8 +463,7 @@ fn a_busy_state_area_exits_75() {
     let _ = run.wait();
     assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
     let err = stderr(&out);
-    assert!(err.contains("is in use"), "{err}");
-    assert!(err.contains("`agentfs run` holds it"), "{err}");
+    assert!(err.contains("serves no restores"), "{err}");
 }
 
 impl Volume {

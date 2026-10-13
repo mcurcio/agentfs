@@ -124,7 +124,7 @@ through the mount:
     push/<remote>.lock   flock held while pushing that remote
     repairs              paths a mount could not record, for the next one (§3.5)
     patch.json           the patch queue's last run, a cache (§12)
-    control/agentfs.sock the running mount's control socket for restores (§15);
+    control/agentfs.sock the running daemon's control socket (§2.3, §15);
                          directory 0700, socket 0600
     history/history.sock the history service's socket for fronts (§14);
                          directory 0700, socket 0600
@@ -154,15 +154,26 @@ so a crash never leaves a stale lock.
 - A command that finds the lock held exits with status 75 (`EX_TEMPFAIL`)
   and names the holder, unless `--wait-lock <duration>`
   (`AGENTFS_WAIT_LOCK`) lets it wait.
-- So `agentfs push` while a volume is mounted is refused: the mount's own
-  push loops push. A way to ask a running daemon to push now is a
-  follow-up.
-- `restore` and `revert` (§15) first try the running mount's control socket
-  (`meta/control/agentfs.sock`, §2.2): a mount holds the lock and serves
-  them itself, writing through its own mount. With nothing listening they
-  take the lock and write the backing tree directly. While `run`,
-  `record`, `flush` or `push` holds the lock they exit 75: `run` serves
-  no restores.
+- Every long-running daemon (`mount`, `run`, `serve-history`) serves the
+  control socket (`meta/control/agentfs.sock`, §2.2) while it holds the
+  lock. Its operations are `push`, `restore` and `revert`; a push runs
+  beside a restore, restores and reverts one at a time.
+- `agentfs push` first asks the running daemon over that socket: the
+  daemon commits everything recorded (but the group of a restore still
+  running), wakes each chosen remote's push loop past its interval or
+  backoff, and waits up to `--timeout` (default 120s, clamped to 1s..10m)
+  for the pushes it started. It prints the same lines as a direct push,
+  under a `through the running daemon (pid N)` header, and exits 1 unless
+  every chosen remote succeeded in time; a push still running then
+  carries on in the background. A remote the daemon does not know is
+  refused (exit 1). With nothing listening (or a daemon from before the
+  `push` operation) it takes the lock and pushes directly.
+- `restore` and `revert` (§15) first try the same socket: a mount serves
+  them itself, writing through its own mount. `run` and `serve-history`
+  answer that they serve no restores, and the command exits 75. With
+  nothing listening they take the lock and write the backing tree
+  directly; while `record`, `flush` or a direct `push` holds the lock they
+  exit 75.
 - `agentfs init` takes the lock when the state area already exists. It is
   safe to re-run, as a pod's init container does at every start: for the
   same volume (and branch, if given) it exits 0 and only re-creates
@@ -184,9 +195,9 @@ so a crash never leaves a stale lock.
   lock holder and the only writer of the journal and the branch. Fronts
   (`mount --history-service`) take no lock: they write only `pending/`
   (in their own slot) and `meta/fronts/`. While the service runs, every
-  single-process command exits 75 as above, and so do `restore` and
-  `revert`: fronts serve no control socket, and restores through the
-  service are a follow-up.
+  single-process command exits 75 as above but `push`, which the service
+  serves; so do `restore` and `revert`: the service answers that it
+  serves no restores (a follow-up), and fronts serve no control socket.
 - Under the CSI driver (§14.2) the node plugin starts the volume's
   `serve-history` at NodeStage, so the service holds the lock while the
   volume is staged on a node. The controller takes the lock only briefly,
@@ -1380,11 +1391,16 @@ agentfs does not scan content for secrets and does not hold pushes.
   or unreadable file is treated as empty.
 - **A per-remote lock** (`flock` on `meta/push/<remote>.lock`) keeps two
   push attempts on one remote from overlapping. Since the state-area lock
-  (§2.3) a manual `agentfs push` can no longer run beside the service, so
-  this guards only pushes within one process.
+  (§2.3) a direct `agentfs push` can no longer run beside the service (it
+  asks the running daemon instead), so this guards only pushes within one
+  process.
 - **Backoff.** After a failure the next attempt waits `pushInterval` doubled
   for each consecutive failure after the first, up to
   `max(pushInterval, 15m)`. A success resets it.
+- **Push now.** `agentfs push` against a running daemon (§2.3) commits
+  what is recorded and wakes each chosen remote's loop at once, past its
+  interval and any backoff; the attempt then counts like any other (a
+  failure doubles the backoff, a success resets it).
 
 ### 11.3 Limits and rejected pushes
 
@@ -1866,8 +1882,9 @@ recorded by the fronts' repairs, RELEASE and the sweep, but intermediate
 states are lost.
 
 **What fronts do not do.** They serve no control socket: `restore` and
-`revert` exit 75 while the service runs (restores through the service are
-a follow-up). The patch queue (§12) is applied by `serve-history` before it
+`revert` exit 75 while the service runs (the service answers that it
+serves no restores; restores through it are a follow-up), and `agentfs
+push` is served by the service. The patch queue (§12) is applied by `serve-history` before it
 listens, and only when no front lease is live, because patches write the
 backing tree that live fronts serve. POSIX and BSD locks stay in each FUSE
 mount's kernel and are not shared between fronts, so a SQLite or other
@@ -2124,7 +2141,8 @@ operator runbooks ([runbooks/](runbooks/)):
 
 **Two modes, one engine** (`agentfs_core::restore`: plan, check, apply):
 
-- **Through a running mount.** `agentfs mount` listens on
+- **Through a running mount.** `agentfs mount` (like `run` and
+  `serve-history`, which serve only `push`, §2.3) listens on
   `meta/control/agentfs.sock` (§2.2): directory `0700`, socket `0600`,
   and each connection's `SO_PEERCRED` must be root or the daemon's user.
   Both ends address it as `/proc/self/fd/<dir fd>/agentfs.sock`, so a long
@@ -2134,7 +2152,8 @@ operator runbooks ([runbooks/](runbooks/)):
   lines, version 1, one request per connection, at most 64 KiB, read
   within 10 s; a restore request must name its path (`.` for the whole
   tree; a missing path is refused, never taken as the root); one restore
-  runs at a time and a second gets `busy` (exit 75). The daemon waits
+  or revert runs at a time and a second gets `busy` (exit 75); a `push`
+  request runs beside it. The daemon waits
   until every record made before the request, including one still being
   written to the journal, is committed (at least 10 s, or 20 commit windows; otherwise refused as
   history being behind), checks against its mount point, and writes
@@ -2231,8 +2250,8 @@ history, such as a recorded secret (§10). It is a documented procedure,
   operator, plus deleting the volume's other refs there and the host's
   own purge.
 
-**Not built yet** (§19.2): a read-only history view for operators, undo
-through the patch queue (§12), and asking a running daemon to push now.
+**Not built yet** (§19.2): a read-only history view for operators, and undo
+through the patch queue (§12).
 
 ## 16. First consumer: Hermes
 
@@ -2305,8 +2324,10 @@ one-time migration of Hermes' existing data and the initial import in
     `/proc/self/mountinfo` and a `statfs`; no lock, no state area. It is
     the sidecar's startup and readiness probe;
   - `push` pushes once to every remote (or those named with `--remote`) and
-    exits 1 unless all succeeded; `run` runs the service in the foreground
-    until SIGINT or SIGTERM, makes a final commit, gives each remote that
+    exits 1 unless all succeeded; with a daemon running it asks the daemon
+    over the control socket instead, waiting up to `--timeout` (§2.3);
+    `run` runs the service in the foreground, serving `push` on the
+    control socket, until SIGINT or SIGTERM, makes a final commit, gives each remote that
     lacks commits one more push within `--push-grace` (default 5s, §11.2),
     and exits at once on a second signal. `mount`, `flush`, `record`, `push` and `run` export
     telemetry (§13) and take the pod flags (`AGENTFS_POD`, ...), so every
@@ -2399,7 +2420,8 @@ one-time migration of Hermes' existing data and the initial import in
   a volume (§14), for fronts on the same node. It takes the state-area
   lock (holder `command=serve-history`), opens the volume (journal
   replay), applies the patch queue only when no front lease is live (else
-  it says why not), starts the commit and push loops, then listens on
+  it says why not), starts the commit and push loops and the control
+  socket (`push` only, §2.3), then listens on
   `--listen` (`AGENTFS_HISTORY_LISTEN`, default
   `unix:<state>/meta/history/history.sock`) and writes the address to
   `meta/history/address` for `status`. On SIGINT or SIGTERM it stops
@@ -2705,7 +2727,7 @@ runner.
 | Identity | Configurable templates with defaults (§9) |
 | Backing filesystem | Both supported. XFS (reflink) makes the synchronous step size-independent; ext4 falls back to a copy. Recommendation, from the benchmark (§3.2, §18 test 13): XFS (or btrfs) for volumes holding large files, where ext4 costs about 2.9 s per clean GiB at close; either for small files, where the journal `fsync` dominates on both |
 | Performance budget | Advisory, checked by every benchmark run (`ci/bench-budget.json`, [performance.md](performance.md#performance-budget)): about 1.5 times the slowest of the first three CI runs (six jobs on two CPU types), for example 3.5 ms for a small file's step at the median; a result over budget warns and never fails CI (2026-10-13) |
-| One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `record`, `flush`, `push`, and `restore` and `revert` in direct mode; exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
+| One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `serve-history`, `record`, `flush`, and `push`, `restore` and `revert` in direct mode (when no daemon answers on the control socket); exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
 | FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
 | Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close. A file written and closed within the racy window is recorded again at RELEASE: a known cost, with a follow-up in §19.2 item 4 (§3.1) |
 | `.git` paths | An exact `.git` component that is a git directory or gitfile is skipped without an alarm; any other `.git`, look-alikes and invalid names raise `PathRefused` (§5) |
@@ -2718,11 +2740,11 @@ runner.
 | Synchronous-step bound | Content scans of special files run at record time only up to 1 MiB, the tree rule file bound; larger files are scanned in full at commit time. Size checks always run at record time (§3.4) |
 | Nested custom-template gap | At commit time, a write at a path new to history under a directory that has since become a bare git directory is dropped silently; only with the real backing tree known (§5) |
 | Telemetry export failures | Each OTLP exporter is wrapped: a stderr warning at once, then at most once a minute with a count, a recovery line, and the counter `agentfs.telemetry.export_failures{signal}`; telemetry still never stops a command (§13) |
-| Restore modes | Live restore is supported: with a mount running, `restore` and `revert` ask it over the control socket and it writes through its own mount, so caches and dirty detection stay coherent; with nothing running they take the lock and write the backing tree directly; `run` serves none (exit 75) (§15) |
+| Restore modes | Live restore is supported: with a mount running, `restore` and `revert` ask it over the control socket and it writes through its own mount, so caches and dirty detection stay coherent; with nothing running they take the lock and write the backing tree directly; `run` and `serve-history` serve none (exit 75) (§15) |
 | Restore semantics | `git restore --source=<commit> -- <path>` for restore, the inverse of the first-parent diff for revert; only commits on the volume's branch; untracked files never touched (§15) |
 | Restore safety | Every check before any write; content not in history is never overwritten, even with `--force`; `--force` overrides only what loses nothing (later recorded changes to a reverted path, files open for writing through the mount); each path is re-checked just before it changes; a partial apply is recorded, a tree already holding the target is recorded (direct) or refused (mount), and a re-run finishes the job (§15) |
 | Operation commits | The applying process or thread is registered as an actor; its records get trigger `restore`, the operator as author, and the operation in the journal record; each operation is its own commit with `Agentfs-Restore` or `Agentfs-Revert` (§9, §15) |
-| Control socket | `meta/control/agentfs.sock`, directory 0700, socket 0600, peer root or the daemon's user, addressed through `/proc/self/fd`; JSON lines, protocol v1, one operation at a time (§2.2, §15) |
+| Control socket | `meta/control/agentfs.sock`, directory 0700, socket 0600, peer root or the daemon's user, addressed through `/proc/self/fd`; served by `mount`, `run` and `serve-history`; JSON lines, protocol v1, operations `push`, `restore` and `revert` (additive fields; one restore or revert at a time, a push beside it) (§2.2, §2.3, §15) |
 | History rewrite | A documented procedure with `git filter-repo --prune-empty never` in a mirror clone, then a force-push with lease per remote by an operator; not a command (§10, §15) |
 | SSH remotes | Built with the `ssh` cargo feature (libssh2). Each SSH remote names an unencrypted private key (`agentfsSshKey`) and a known_hosts file (`agentfsKnownHosts`), both required and both re-read when they change; the key is bound to the push URL's host and port and offered once per connection, as the URL's user, else `git`. No ssh-agent, no passphrases, no global or `~/.ssh` files (§11.1) |
 | Host key verification | Done by agentfs against `agentfsKnownHosts`, in libgit2's certificate callback, before any authentication; plain and hashed names, `[host]:port`, wildcards, negation and `@revoked` honoured, `@cert-authority` not supported; unknown, changed, unlisted-type and revoked keys refused, never learned (§11.1) |
@@ -2795,7 +2817,8 @@ runner.
 3. **Recovery tooling** beyond `restore`, `revert` and the runbooks (§15):
    whether a read-only history view for operators is worth building,
    whether undo through the patch queue (§12) replaces manual restores for
-   iac, and asking a running daemon to push now.
+   iac. (Asking a running daemon to push now is built: `agentfs push`
+   goes through the control socket, §2.3.)
 4. **The FLUSH+RELEASE double record** (§3.1, §3.2). A file written and
    closed within the racy-timestamp window is recorded at FLUSH and again
    at RELEASE, because RELEASE cannot tell a same-tick write through a

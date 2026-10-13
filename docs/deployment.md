@@ -247,8 +247,8 @@ and write through the mount, so the workload sees the result at once
 - **Changing rules or remotes:** edit `config/`, apply; the pod rolls
   (§4 above).
 - **Pushes failing:** [stuck-pushes.md](runbooks/stuck-pushes.md).
-  `agentfs push` is refused while mounted; the mount's own push loop
-  retries.
+  `agentfs push` (run in the sidecar) asks the running mount to push
+  now; otherwise the mount's own push loop retries.
 - **Alerts:** page on `agentfs.push.oldest_unpushed_age` (history not
   leaving the pod), the sidecar's readiness (a dead daemon), its restart
   count, the `RecordFailed` and `CommitFailed` alarms, and

@@ -7,7 +7,9 @@
 //!
 //! Start order: lock, open (recovery), the patch queue (only when no front
 //! holds a lease: patches write the backing tree, which live fronts serve),
-//! the commit and push loops, then the socket. On SIGINT or SIGTERM it
+//! the commit and push loops, the control socket (`agentfs push` asks it
+//! to push now; restores get `busy`, design §2.3), then the socket fronts
+//! use. On SIGINT or SIGTERM it
 //! stops accepting, lets fronts' requests in progress finish (up to
 //! `--shutdown-grace`), then makes the final commit and pushes it, as every
 //! long-running mode does: every remote that lacks commits gets one more
@@ -27,7 +29,10 @@ use agentfs_core::service::Service;
 use agentfs_core::volume::StateDir;
 
 use crate::daemon::Daemon;
-use crate::{Pod, Session, describe_wake, list, patch_cmd, stop_service};
+use crate::{
+    Pod, Session, describe_wake, list, misconfigured, patch_cmd, push_now, start_control,
+    stop_control, stop_service,
+};
 
 /// Where the running service's address is written for `agentfs status`.
 const ADDRESS_FILE: &str = "address";
@@ -104,6 +109,16 @@ pub(crate) fn serve(
                 return Err(e).with_context(|| format!("listening on {address}"));
             }
         };
+    // `agentfs push` asks it to push now; restores are refused (design
+    // §2.3, §14).
+    let control = start_control(
+        state,
+        push_now::handler(
+            service.handle(),
+            misconfigured(&settings),
+            push_now::Restores::Refuse(push_now::HISTORY_SERVICE_SERVES_NO_RESTORES),
+        ),
+    );
     let address_file = state.history_dir().join(ADDRESS_FILE);
     if let Err(e) = std::fs::create_dir_all(state.history_dir())
         .and_then(|()| std::fs::write(&address_file, format!("{address}\n")))
@@ -131,6 +146,7 @@ pub(crate) fn serve(
         eprintln!("fronts' requests were still running at shutdown; they fail with EIO");
     }
     let _ = std::fs::remove_file(&address_file);
+    stop_control(&service, control);
     let code = stop_service(service, push_grace);
     session.finish();
     Ok(code)
