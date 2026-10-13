@@ -92,6 +92,7 @@ missing from these tables or a row names a module that no longer exists;
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |
 | `boundary.rs` | Recording a change boundary: builds the inputs and calls the recorder, or a front's client (§3.1, §3.2, §3.5) |
+| `creds.rs` | Creating as the caller: a worker thread's filesystem uid, gid and groups switched for one system call (§6) |
 | `dirty.rs` | Whether an inode changed since it was last recorded, so clean closes record nothing |
 | `inodes.rs` | The inode table: FUSE node ids, backing inodes and their paths |
 | `names.rs` | What a path in the mount is, for recording (§5) |

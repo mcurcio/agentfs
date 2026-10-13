@@ -747,23 +747,37 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
     and so are extended attributes (on regular files and directories).
     `chmod` of a symlink is not supported (Linux has no `lchmod`).
   - **Ownership of new objects.** The daemon performs each operation with
-    its own privileges once the kernel has checked the caller's. With
-    `CAP_CHOWN` and `CAP_FOWNER` (root, or a non-root daemon given both;
-    decided from the effective capability set, not the uid), it then gives
-    every file, directory, symlink and device it creates to the caller: the caller's group, except under a setgid
-    directory, where the backing filesystem already chose the directory's
-    group. It then sets exactly the mode the caller asked for, so the
-    daemon's own umask never applies. Without those capabilities everything
-    it creates belongs to its own user. Owner and mode are always set on a
-    descriptor of the new object (opened with `O_PATH | O_NOFOLLOW` and
-    checked to be what was just created: the right type, owned by the
-    daemon, one link unless a directory), never by name, so a name swapped
-    for a symlink or hard link in the backing tree meanwhile is refused
-    with `ESTALE` and nothing outside is touched. `create` makes the backing
-    file with `O_EXCL`: if another writer made the name first, an exclusive
-    create fails with `EEXIST`, and any other opens the existing file as
-    `open` would (checking the caller against its mode bits, with the
-    caller's primary group only), without changing its owner or mode.
+    its own privileges once the kernel has checked the caller's, except
+    creating. With `CAP_SETUID`, `CAP_SETGID`, `CAP_CHOWN` and `CAP_FOWNER`
+    (root, or a non-root daemon given them; decided from the effective
+    capability set, not the uid), it creates every file, directory,
+    symlink and FIFO **as the caller**: for the one creating system call,
+    the worker thread switches its own filesystem uid and gid
+    (`setfsuid(2)`, `setfsgid(2)`) and supplementary groups (read from the
+    caller's `/proc/<pid>/status`) to the caller's, with a umask of 0 in a
+    filesystem context of its own (`unshare(CLONE_FS)`), and switches back
+    (the process aborts if it cannot). The kernel drops the thread's
+    filesystem capabilities meanwhile, so the creation is checked as the
+    caller's would be, and the object is the caller's from the instant it
+    exists: another front opening the same name as the caller never finds
+    it root's for a moment (§14.1). A creation refused as the caller
+    (`EACCES` or `EPERM`: a device node needs `CAP_MKNOD`) is made as the
+    daemon instead, which, with `CAP_CHOWN` and `CAP_FOWNER`, then gives it
+    to the caller: the caller's group, except under a setgid directory,
+    where the backing filesystem already chose the directory's group. The
+    daemon then sets exactly the mode the caller asked for, so its own
+    umask never applies. Without those capabilities everything it creates
+    belongs to its own user. Owner and mode are always set on a descriptor
+    of the new object (opened with `O_PATH | O_NOFOLLOW` and checked to be
+    what was just created: the right type, owned by the daemon or the
+    caller it was made as, one link unless a directory), never by name, so
+    a name swapped for a symlink or hard link in the backing tree meanwhile
+    is refused with `ESTALE` and nothing outside is touched. `create` makes
+    the backing file with `O_EXCL`: if another writer made the name first,
+    an exclusive create fails with `EEXIST`, and any other opens the
+    existing file as `open` would (checking the caller against its mode
+    bits, with the caller's primary and supplementary groups), without
+    changing its owner or mode.
   - **POSIX ACLs are not enforced** through the mount (`FUSE_POSIX_ACL` is
     not negotiated); only mode bits are.
   - **Inode numbers.** fuser sends the attribute's inode number as the FUSE
@@ -1952,11 +1966,10 @@ between A's check and the service's is caught by A's freeze stamp: the
 file at the path is another inode, so A's write is skipped the same way
 (`no longer in the backing tree`), and the rename's own record, from the
 front that made it, journals the new file.
-A daemon running as root creates a new file as root and then gives it to
-its caller (§6), so for that instant another front's open of the same
-name as the caller can fail with `EACCES` (seen in the e2e's concurrent
-burst); creating with the caller's filesystem uid would close the window
-and is a follow-up.
+A daemon running as root creates each new object as its caller (§6), so
+another front's open of a name just created, as the same caller, never
+finds a root-owned file and fails with `EACCES` (the e2e's concurrent
+burst and same-name creates check this).
 
 **Measured cost per boundary** (open question §19.2 item 2, single node).
 These numbers are indicative: the CI runners are shared, and nothing
@@ -2861,7 +2874,7 @@ runner.
 | Layout | The state area, backing tree and mount point are separate; credentials are never under the backing tree. `mount` refuses otherwise (§17.1) |
 | Passthrough | `auto` by default: used when the kernel and privileges allow, off with the reason reported otherwise, and switched off per inode (not per mount) if registering its backing file fails; `on` fails the mount instead (§17.1) |
 | Failed namespace records | `EIO` plus a repair queue the sweep drains from the backing tree's current state, kept in `meta/repairs` across mounts and drained before the next mount serves (§3.5) |
-| Privileges | Decided from the effective capabilities, not the uid: `CAP_CHOWN` + `CAP_FOWNER` to give new objects to their caller, `CAP_SYS_ADMIN` in the initial user namespace for passthrough (§6, §17.1) |
+| Privileges | Decided from the effective capabilities, not the uid: `CAP_SETUID` + `CAP_SETGID` (with the two below) to create new objects as their caller, `CAP_CHOWN` + `CAP_FOWNER` to give the rest to their caller, `CAP_SYS_ADMIN` in the initial user namespace for passthrough (§6, §17.1) |
 | `st_ino` | The FUSE node id, stable while mounted and shared by hard links, not across remounts (§6) |
 | `.gitmodules` checks | git fsck's `gitmodulesParse`, `Name`, `Url`, `Path`, `Update` and `Large` are refused at record and commit time (`gitmodulesParse` too, though git only reports it); a port of git's config parser and URL checks, tested against the `git` binary; `http(s)` URLs must pass both git 2.39's and 2.40+'s checks (§3.4) |
 | Synchronous-step bound | Content scans of special files run at record time only up to 1 MiB, the tree rule file bound; larger files are scanned in full at commit time. Size checks always run at record time (§3.4) |

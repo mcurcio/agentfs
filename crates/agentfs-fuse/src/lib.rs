@@ -22,6 +22,7 @@
 
 pub mod backing;
 pub mod boundary;
+pub mod creds;
 pub mod dirty;
 pub mod fuse;
 pub mod groups;

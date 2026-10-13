@@ -85,6 +85,7 @@ dependencies = [
  "agentfs-core",
  "fuser",
  "git2",
+ "libc",
  "rustix",
  "serde_json",
  "tempfile",

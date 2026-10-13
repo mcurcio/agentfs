@@ -614,6 +614,71 @@ fn any_user() {
     m.stop();
 }
 
+// A daemon running as root creates each object as its caller (design §6):
+// it is the caller's from the instant it exists, never root's first, and
+// a directory the caller reaches through a supplementary group works.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn new_objects_are_the_callers_from_the_start() {
+    let v = Vol::new("callers_from_the_start");
+    let m = v.mount(&[]);
+    v.sh("mkdir u && chown 10000:10000 u && mkdir g && chown 0:4242 g && chmod 770 g");
+    let out = Command::new("setpriv")
+        .args(["--reuid=10000", "--regid=10000", "--groups=4242", "--"])
+        .args([
+            "sh",
+            "-c",
+            "umask 0 && printf a > g/f && mkdir g/d && ln -s f g/l && mkfifo g/p",
+        ])
+        .current_dir(v.mnt())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    for (name, mode) in [
+        ("f", Some(0o666)),
+        ("d", Some(0o777)),
+        ("l", None),
+        ("p", Some(0o666)),
+    ] {
+        let meta = fs::symlink_metadata(v.backing().join("g").join(name)).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (UID, UID), "g/{name}");
+        if let Some(mode) = mode {
+            assert_eq!(meta.mode() & 0o7777, mode, "g/{name}");
+        }
+    }
+    v.expect(&tree(&[("g/f", f("a")), ("g/l", Link("f".into()))]));
+
+    // Watch the backing tree while the caller creates and removes one
+    // name through the mount: the file is never root's.
+    let mut creator = Command::new("setpriv")
+        .args(["--reuid=10000", "--regid=10000", "--clear-groups", "--"])
+        .args([
+            "sh",
+            "-c",
+            "for i in $(seq 1 1500); do printf x > race; rm race; done",
+        ])
+        .current_dir(v.mnt().join("u"))
+        .spawn()
+        .unwrap();
+    let race = v.backing().join("u/race");
+    let (mut seen, mut roots) = (0u64, 0u64);
+    while creator.try_wait().unwrap().is_none() {
+        if let Ok(meta) = fs::symlink_metadata(&race) {
+            seen += 1;
+            if meta.uid() != UID {
+                roots += 1;
+            }
+        }
+    }
+    assert!(creator.wait().unwrap().success());
+    assert!(seen > 0, "never saw the file");
+    assert_eq!(
+        roots, 0,
+        "the file was someone else's {roots} of {seen} times"
+    );
+    m.stop();
+}
+
 // ---- design §18 test 5: invisible ----
 
 fn walk(root: &Path) -> Vec<String> {

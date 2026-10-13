@@ -9,7 +9,9 @@
 # another pod's front takes over its slot, that a file
 # open in one front and renamed or removed through the other is recorded
 # under its new name or not at all, that a concurrent burst on one path
-# from both fronts converges, that a change whose close returned (journaled,
+# from both fronts converges on the tree's last state, that both fronts
+# creating the same new names at once never fail (each creates as the
+# caller), that a change whose close returned (journaled,
 # not yet committed: commitWindow is raised for it) survives a
 # kill -9 of the service, and that the service pushes. Then measures the
 # per-close cost, single-process against front (ci/boundary-latency.py).
@@ -252,10 +254,11 @@ VERSIONS=$(sgit log --format=%cn refs/heads/agentfs/demo -- shared.txt | tr '\n'
 assert_eq "pod-b pod-a pod-b pod-a " "$VERSIONS" "every boundary of shared.txt is in history"
 
 step "a shared file, written by both at once"
-# A create racing the other front's create of the same name can fail with
-# EACCES for an instant (design §14): a lost write, not a lost record.
+# Every write must succeed: each front creates as the caller (design §6),
+# so a create racing the other front's create of the same name never finds
+# a file that is root's for an instant (EACCES).
 burst() { # mountpoint pod
-  as_agent "$1" "for i in \$(seq 1 40); do printf '$2-%s' \$i > burst.txt; done"
+  as_agent "$1" "set -e; for i in \$(seq 1 40); do printf '$2-%s' \$i > burst.txt; done"
 }
 burst "$MNT_A" pod-a &
 BURST_A=$!
@@ -275,6 +278,24 @@ N_BURST=$(sgit log --format=%cn refs/heads/agentfs/demo -- burst.txt | wc -l)
 pass "$N_BURST commits of burst.txt"
 as_agent "$MNT_A" 'printf final > burst.txt'
 wait_history burst.txt final
+
+step "both fronts create the same new names at once"
+# Each name is new to both fronts: one creates it, the other finds it made
+# meanwhile and opens it, which needs it to be the caller's already.
+create_race() { # mountpoint pod
+  as_agent "$1" "set -e; mkdir -p fresh; for i in \$(seq 1 60); do printf '$2' > fresh/n-\$i.txt; done"
+}
+create_race "$MNT_A" pod-a &
+RACE_A=$!
+create_race "$MNT_B" pod-b &
+RACE_B=$!
+wait "$RACE_A" || fail "a create in pod-a failed"
+wait "$RACE_B" || fail "a create in pod-b failed"
+OWNERS=$(sudo stat -c %u "$BACKING"/fresh/n-*.txt | sort -u | tr '\n' ' ')
+assert_eq "10000 " "$OWNERS" "every new file is the caller's"
+wait_history fresh/n-60.txt "$(sudo cat "$BACKING/fresh/n-60.txt")"
+as_agent "$MNT_A" 'rm -r fresh'
+wait_history fresh/n-60.txt -
 
 step "every commit's committer is its pod"
 LOG=$(sgit log --format='%cn|%(trailers:key=Agentfs-Pod,valueonly,separator=%x2C)' \

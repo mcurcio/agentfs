@@ -387,7 +387,8 @@ the node. The namespace has to allow it (Pod Security Admission
 - `mount(2)` and opening `/dev/fuse` need `CAP_SYS_ADMIN` (and the
   device);
 - FUSE passthrough needs `CAP_SYS_ADMIN` in the initial user namespace;
-- giving new files to their creators needs `CAP_CHOWN` and `CAP_FOWNER`.
+- creating new files as their creators needs `CAP_SETUID` and `CAP_SETGID`,
+  and giving them to their creators `CAP_CHOWN` and `CAP_FOWNER`.
 
 **Mitigations in the example:**
 

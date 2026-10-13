@@ -973,19 +973,24 @@ fn a_new_objects_name_swapped_for_a_symlink_or_link_is_never_followed() {
     // tree before the mode was set.
     std::os::unix::fs::symlink(&outside, fx.backing().join("x")).unwrap();
     for kind in [Kind::Dir, Kind::File, Kind::Other] {
-        assert_eq!(
-            fx.ops.own_new(&dir, b"x", None, &pst, C, 0o4777, kind),
-            Err(estale())
-        );
+        for as_caller in [false, true] {
+            assert_eq!(
+                fx.ops
+                    .own_new(&dir, b"x", None, &pst, C, 0o4777, kind, as_caller),
+                Err(estale())
+            );
+        }
     }
     assert_eq!(mode_of_path(&outside), 0o600);
     // mknod made `y`, then it was replaced by a hard link to another file.
     fs::hard_link(&outside, fx.backing().join("y")).unwrap();
-    assert_eq!(
-        fx.ops
-            .own_new(&dir, b"y", None, &pst, C, 0o4777, Kind::File),
-        Err(estale())
-    );
+    for as_caller in [false, true] {
+        assert_eq!(
+            fx.ops
+                .own_new(&dir, b"y", None, &pst, C, 0o4777, Kind::File, as_caller),
+            Err(estale())
+        );
+    }
     assert_eq!(mode_of_path(&outside), 0o600);
     // The real thing still works.
     fx.ops.mkdir(ROOT, b"d", 0o1777, C).unwrap();
@@ -1691,4 +1696,32 @@ fn a_member_the_rules_leave_out_refuses_the_whole_group() {
     fx.ops.unlink(ROOT, b"s.db-wal", C).unwrap();
     assert_eq!(fx.later(6), 1);
     assert_eq!(fx.history(), map(&[("s.db", file("db"))]));
+}
+
+#[test]
+fn may_open_counts_the_callers_supplementary_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f");
+    fs::write(&path, "x").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+    let st = rustix::fs::stat(&path).unwrap();
+    let stranger = Caller {
+        uid: st.st_uid + 1,
+        gid: st.st_gid + 1,
+        pid: 1,
+    };
+    assert!(!may_open(&st, stranger, &[], 2, false));
+    assert!(!may_open(&st, stranger, &[st.st_gid + 7], 0, false));
+    assert!(may_open(
+        &st,
+        stranger,
+        &[st.st_gid + 7, st.st_gid],
+        2,
+        true
+    ));
+    let member = Caller {
+        gid: st.st_gid,
+        ..stranger
+    };
+    assert!(may_open(&st, member, &[], 1, false));
 }

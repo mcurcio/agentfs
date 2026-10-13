@@ -8,6 +8,9 @@
 //! - **Giving new objects to their caller** needs `CAP_CHOWN` (to `fchown`
 //!   the object) and `CAP_FOWNER` (to set its mode once it is no longer the
 //!   daemon's).
+//! - **Creating as the caller** ([`crate::creds`]) needs, besides those,
+//!   `CAP_SETUID` and `CAP_SETGID` (to switch a thread's filesystem uid,
+//!   gid and groups).
 //! - **Passthrough** needs `CAP_SYS_ADMIN` in the *initial* user namespace:
 //!   the kernel checks `capable(CAP_SYS_ADMIN)` when a backing file is
 //!   registered. Root in a rootless container (a user namespace) has the
@@ -21,6 +24,8 @@ use std::fs;
 pub const CAP_CHOWN: u32 = 0;
 pub const CAP_DAC_OVERRIDE: u32 = 1;
 pub const CAP_FOWNER: u32 = 3;
+pub const CAP_SETGID: u32 = 6;
+pub const CAP_SETUID: u32 = 7;
 pub const CAP_SYS_ADMIN: u32 = 21;
 
 /// The daemon's privileges.
@@ -55,6 +60,11 @@ impl Privileges {
     /// New objects can be given to their caller with the mode it asked for.
     pub fn can_chown_new(&self) -> bool {
         self.has(CAP_CHOWN) && self.has(CAP_FOWNER)
+    }
+
+    /// New objects can be created with the caller's filesystem identity.
+    pub fn can_create_as_caller(&self) -> bool {
+        self.can_chown_new() && self.has(CAP_SETUID) && self.has(CAP_SETGID)
     }
 
     /// Registering FUSE backing files (passthrough) is allowed.
@@ -114,6 +124,7 @@ mod tests {
             initial_userns: true,
         };
         assert!(all.can_chown_new() && all.can_passthrough() && all.can_unmount());
+        assert!(all.can_create_as_caller());
         assert_eq!(all.passthrough_refusal(), None);
         let in_userns = Privileges {
             initial_userns: false,
@@ -132,6 +143,7 @@ mod tests {
             initial_userns: true,
         };
         assert!(!chown_only.can_chown_new(), "needs CAP_FOWNER too");
+        assert!(!chown_only.can_create_as_caller());
         let caps = Privileges {
             effective: (1 << CAP_CHOWN)
                 | (1 << CAP_FOWNER)
@@ -140,6 +152,15 @@ mod tests {
             initial_userns: true,
         };
         assert!(caps.can_chown_new() && caps.can_passthrough());
+        assert!(
+            !caps.can_create_as_caller(),
+            "needs CAP_SETUID and CAP_SETGID"
+        );
+        let setid = Privileges {
+            effective: caps.effective | (1 << CAP_SETUID) | (1 << CAP_SETGID),
+            ..caps
+        };
+        assert!(setid.can_create_as_caller());
         assert!(
             Privileges::default()
                 .passthrough_refusal()

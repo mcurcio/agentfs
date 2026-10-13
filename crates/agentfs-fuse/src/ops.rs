@@ -37,8 +37,12 @@
 //!
 //! **Permissions** (design §6) are checked by the kernel
 //! (`default_permissions`) before a request arrives; the daemon then acts
-//! with its own privileges. When it has `CAP_CHOWN` and `CAP_FOWNER` (root;
-//! [`crate::privileges`]) it gives new objects to the caller, keeping the
+//! with its own privileges. When it also has `CAP_SETUID` and `CAP_SETGID`
+//! (root) it creates each new object as the caller ([`crate::creds`]), so
+//! the object is the caller's from the instant it exists; a creation the
+//! caller is refused (a device node) is made as the daemon. When it has
+//! `CAP_CHOWN` and `CAP_FOWNER` ([`crate::privileges`]) it gives an object
+//! it made itself to the caller, keeping the
 //! group the backing filesystem chose under a setgid directory, then sets
 //! the exact mode the caller asked for. Both are done on a descriptor of
 //! the new object, opened without following and checked to be the object
@@ -70,6 +74,7 @@ use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps}
 
 use crate::backing::{self, Backing, attr, join, proc_path};
 use crate::boundary::{Boundary, Change, REPAIR_TRIGGER, State};
+use crate::creds;
 use crate::dirty::{Stamp, now_ns, timestamp_granularity_ns};
 use crate::groups::{Group, Groups};
 use crate::inodes::{InodeTable, Kind, ROOT};
@@ -255,7 +260,10 @@ pub struct Ops {
     /// The daemon may give new objects to their caller
     /// ([`crate::privileges`]).
     chown_new: bool,
-    /// The daemon's effective uid: the owner of every object it creates.
+    /// The daemon creates new objects as their caller ([`crate::creds`]).
+    create_as_caller: bool,
+    /// The daemon's effective uid: the owner of every object it creates
+    /// as itself.
     euid: u32,
 }
 
@@ -303,16 +311,16 @@ fn check_name(name: &[u8]) -> OpResult<()> {
 }
 
 /// Whether `caller` may open the file `st` with access mode `acc`
-/// (`O_RDONLY`, `O_WRONLY`, `O_RDWR`), and `truncate`, by its mode bits.
-/// Root (uid 0) always may.
-fn may_open(st: &Stat, caller: Caller, acc: i32, truncate: bool) -> bool {
+/// (`O_RDONLY`, `O_WRONLY`, `O_RDWR`), and `truncate`, by its mode bits;
+/// `groups` are the caller's supplementary groups. Root (uid 0) always may.
+fn may_open(st: &Stat, caller: Caller, groups: &[u32], acc: i32, truncate: bool) -> bool {
     if caller.uid == 0 {
         return true;
     }
     let mode = mode_of(st);
     let bits = if st.st_uid == caller.uid {
         (mode >> 6) & 0o7
-    } else if st.st_gid == caller.gid {
+    } else if st.st_gid == caller.gid || groups.contains(&st.st_gid) {
         (mode >> 3) & 0o7
     } else {
         mode & 0o7
@@ -361,6 +369,7 @@ impl Ops {
         let st = rustix::fs::fstat(backing.root())?;
         let (dev, ino) = dev_ino(&st);
         let tree = backing.path().to_path_buf();
+        let privileges = Privileges::current();
         Ok(Self {
             backing,
             table: Mutex::new(InodeTable::new(dev, ino)),
@@ -375,7 +384,8 @@ impl Ops {
             },
             boundary: Boundary::new(recorder, tree),
             config,
-            chown_new: Privileges::current().can_chown_new(),
+            chown_new: privileges.can_chown_new(),
+            create_as_caller: privileges.can_create_as_caller(),
             euid: rustix::process::geteuid().as_raw(),
         })
     }
@@ -1029,7 +1039,8 @@ impl Ops {
     // ---- creating ----
 
     /// Gives a new object to its caller and sets the mode it asked for
-    /// (design §6). `fd` is the object itself when it is open; otherwise
+    /// (design §6); an object made `as_caller` ([`crate::creds`]) is
+    /// already the caller's. `fd` is the object itself when it is open; otherwise
     /// `name` in `dir` is opened first ([`Ops::open_new`]), so neither the
     /// owner nor the mode is ever changed by name: a name swapped for a
     /// symlink in the backing tree meanwhile is never followed.
@@ -1043,19 +1054,21 @@ impl Ops {
         caller: Caller,
         mode: u32,
         kind: Kind,
+        as_caller: bool,
     ) -> OpResult<()> {
-        if !self.chown_new && kind == Kind::Symlink {
+        if (as_caller || !self.chown_new) && kind == Kind::Symlink {
             return Ok(());
         }
+        let owner = if as_caller { caller.uid } else { self.euid };
         let opened;
         let fd = match fd {
             Some(fd) => fd,
             None => {
-                opened = self.open_new(dir, name, kind)?;
+                opened = self.open_new(dir, name, kind, owner)?;
                 &opened
             }
         };
-        if self.chown_new {
+        if self.chown_new && !as_caller {
             let uid = Some(rustix::fs::Uid::from_raw(caller.uid));
             // Under a setgid directory the filesystem already chose the group.
             let gid =
@@ -1088,11 +1101,11 @@ impl Ops {
 
     /// Opens `name` in `dir`, just created as a `kind`, without following
     /// it (`O_PATH | O_NOFOLLOW`), and checks it is still the object this
-    /// daemon made: of that type, owned by the daemon and, unless a
-    /// directory, with a single link. Anything else means the name was
+    /// daemon made: of that type, owned by `owner` (the daemon, or the
+    /// caller it was made as) and, unless a directory, with a single link. Anything else means the name was
     /// replaced in the backing tree between the creation and now (a symlink
     /// or hard link to a file elsewhere): `ESTALE`, and nothing is changed.
-    fn open_new(&self, dir: &OwnedFd, name: &[u8], kind: Kind) -> OpResult<OwnedFd> {
+    fn open_new(&self, dir: &OwnedFd, name: &[u8], kind: Kind, owner: u32) -> OpResult<OwnedFd> {
         let fd = rustix::fs::openat(
             dir,
             OsStr::from_bytes(name),
@@ -1102,7 +1115,7 @@ impl Ops {
         .eno()?;
         let st = rustix::fs::fstat(&fd).eno()?;
         let same_kind = Kind::from_mode(mode_of(&st)) == kind;
-        let ours = st.st_uid == self.euid;
+        let ours = st.st_uid == owner;
         let single = kind == Kind::Dir || st.st_nlink == 1;
         if !(same_kind && ours && single) {
             return Err(estale());
@@ -1120,13 +1133,15 @@ impl Ops {
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
-        rustix::fs::mkdirat(
-            &dir,
-            OsStr::from_bytes(name),
-            Mode::from_raw_mode(mode & 0o7777),
-        )
-        .eno()?;
-        self.own_new(&dir, name, None, &pst, caller, mode, Kind::Dir)?;
+        let (made, as_caller) = creds::create_as(self.create_as_caller, caller, || {
+            rustix::fs::mkdirat(
+                &dir,
+                OsStr::from_bytes(name),
+                Mode::from_raw_mode(mode & 0o7777),
+            )
+        });
+        made.eno()?;
+        self.own_new(&dir, name, None, &pst, caller, mode, Kind::Dir, as_caller)?;
         let st =
             rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
         Ok(self.entry(parent, name, &st))
@@ -1147,16 +1162,20 @@ impl Ops {
         let kind = Kind::from_mode(mode);
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
-        rustix::fs::mknodat(
-            &dir,
-            OsStr::from_bytes(name),
-            rustix::fs::FileType::from_raw_mode(mode),
-            Mode::from_raw_mode(mode & 0o7777),
-            u64::from(rdev),
-        )
-        .eno()?;
+        // A device node needs CAP_MKNOD, which the caller lacks: refused
+        // as the caller, it is made by the daemon.
+        let (made, as_caller) = creds::create_as(self.create_as_caller, caller, || {
+            rustix::fs::mknodat(
+                &dir,
+                OsStr::from_bytes(name),
+                rustix::fs::FileType::from_raw_mode(mode),
+                Mode::from_raw_mode(mode & 0o7777),
+                u64::from(rdev),
+            )
+        });
+        made.eno()?;
         drop(hold);
-        self.own_new(&dir, name, None, &pst, caller, mode, kind)?;
+        self.own_new(&dir, name, None, &pst, caller, mode, kind, as_caller)?;
         let st =
             rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
         let entry = self.entry(parent, name, &st);
@@ -1194,9 +1213,21 @@ impl Ops {
         let pst = rustix::fs::fstat(&dir).eno()?;
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
-        rustix::fs::symlinkat(OsStr::from_bytes(target), &dir, OsStr::from_bytes(name)).eno()?;
+        let (made, as_caller) = creds::create_as(self.create_as_caller, caller, || {
+            rustix::fs::symlinkat(OsStr::from_bytes(target), &dir, OsStr::from_bytes(name))
+        });
+        made.eno()?;
         drop(hold);
-        self.own_new(&dir, name, None, &pst, caller, 0o777, Kind::Symlink)?;
+        self.own_new(
+            &dir,
+            name,
+            None,
+            &pst,
+            caller,
+            0o777,
+            Kind::Symlink,
+            as_caller,
+        )?;
         let st =
             rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
         let entry = self.entry(parent, name, &st);
@@ -1614,12 +1645,14 @@ impl Ops {
         // Creating or truncating a member changes its group: held.
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
-        let created = rustix::fs::openat(
-            &dir,
-            OsStr::from_bytes(name),
-            base | OFlags::CREATE | OFlags::EXCL,
-            Mode::from_raw_mode(mode & 0o7777),
-        );
+        let (created, as_caller) = creds::create_as(self.create_as_caller, caller, || {
+            rustix::fs::openat(
+                &dir,
+                OsStr::from_bytes(name),
+                base | OFlags::CREATE | OFlags::EXCL,
+                Mode::from_raw_mode(mode & 0o7777),
+            )
+        });
         let write = flags & 0o3 != 0;
         let (fd, new) = match created {
             Ok(fd) => (fd, true),
@@ -1639,9 +1672,10 @@ impl Ops {
                 }
                 // The kernel checked permission to create, not to open
                 // this file: check that as the kernel would, from the
-                // mode bits (the caller's supplementary groups are not
-                // known, so only its primary group counts).
-                if !may_open(&st, caller, flags & 0o3, requested.contains(OFlags::TRUNC)) {
+                // mode bits and the caller's groups.
+                let groups = creds::caller_groups(caller.pid);
+                let truncate = requested.contains(OFlags::TRUNC);
+                if !may_open(&st, caller, &groups, flags & 0o3, truncate) {
                     return Err(Errno::EACCES);
                 }
                 let fd =
@@ -1652,7 +1686,16 @@ impl Ops {
             Err(e) => return Err(errno(e)),
         };
         if new {
-            self.own_new(&dir, name, Some(&fd), &pst, caller, mode, Kind::File)?;
+            self.own_new(
+                &dir,
+                name,
+                Some(&fd),
+                &pst,
+                caller,
+                mode,
+                Kind::File,
+                as_caller,
+            )?;
         }
         let st = rustix::fs::fstat(&fd).eno()?;
         let entry = self.entry(parent, name, &st);

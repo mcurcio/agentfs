@@ -11,7 +11,8 @@ agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 # Default features only: pure Rust (mount(2) as root, fusermount3
 # otherwise), no libfuse or pkg-config needed to build (design §17.1).
 fuser = "0.18.0"
-rustix = { version = "1.1.5", features = ["fs", "process", "mount", "time"] }
+libc = "0.2.190"
+rustix = { version = "1.1.5", features = ["fs", "process", "mount", "thread", "time"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 
