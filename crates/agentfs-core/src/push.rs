@@ -21,9 +21,10 @@
 //!   `refs/agentfs/<volume>/diverged/<UTC timestamp>`, and every attempt
 //!   raises [`Event::PushFailed`] until an operator resolves it.
 //! - **Over the push size limit** (`agentfsMaxPushSize`, [`crate::push_size`]):
-//!   a backlog that does not fit is pushed in first-parent steps, raising
-//!   [`Event::PushLimited`], with the next attempt at once; a single commit
-//!   that does not fit fails as `too_large` before connecting.
+//!   measured from the branch the remote advertises (the push state can lag
+//!   it), a backlog that does not fit is pushed in first-parent steps,
+//!   raising [`Event::PushLimited`], with the next attempt at once; a single
+//!   commit that does not fit fails as `too_large` before anything is sent.
 //! - **Anything else** (unreachable, authentication, an untrusted host,
 //!   refused) raises
 //!   [`Event::PushFailed`] and backs off: the delay doubles from
@@ -491,10 +492,11 @@ impl RemotePusher {
             Err(e) => return self.failed(PushFailureKind::Local, e.to_string(), None),
         };
         *head_out = Some(head);
-        // A maximum push size (design §11.3): measured before connecting.
+        // A maximum push size (design §11.3): measured before pushing, from
+        // the branch the remote advertises.
         let mut step = None;
         if let Some(limit) = self.remote.max_push_size {
-            let base = self.state.last_pushed_oid();
+            let base = self.measure_base(head);
             match crate::push_size::largest_step(&self.repo, head, base, limit) {
                 Ok(Step::All) => {}
                 Ok(Step::UpTo {
@@ -889,17 +891,53 @@ impl RemotePusher {
     /// The remote's `refs/agentfs/<volume>/*` refs, as its receive side
     /// advertises them.
     fn list_remote(&self) -> Result<BTreeMap<String, Oid>, (PushFailureKind, String)> {
+        let prefix = format!("refs/agentfs/{}/", self.volume);
+        self.list_remote_refs(|name| name.starts_with(&prefix))
+    }
+
+    /// Where a measured push starts (design §11.3): the branch the remote
+    /// advertises, when this repository has that commit and it is the head
+    /// or an ancestor of it. It is then recorded as the last pushed commit:
+    /// the push state can lag the remote (deleted by the history-rewrite
+    /// runbook, a renamed remote, a crash between a push and the state
+    /// save), and stepping from a commit behind the remote would push
+    /// commits it has over newer ones, a false divergence at every attempt.
+    /// No branch on the remote: everything counts. Otherwise (the remote
+    /// cannot be listed, or holds a commit that is unknown here or not an
+    /// ancestor of the head) the push state's commit, and the push reports
+    /// the real failure or divergence.
+    fn measure_base(&mut self, head: Oid) -> Option<Oid> {
+        let recorded = self.state.last_pushed_oid();
+        let branch = self.branch_ref.clone();
+        let Ok(listed) = self.list_remote_refs(|name| name == branch) else {
+            return recorded;
+        };
+        let remote = listed.get(&self.branch_ref).copied()?;
+        let known = self.repo.odb().is_ok_and(|odb| odb.exists(remote));
+        if known && (remote == head || self.repo.graph_descendant_of(head, remote).unwrap_or(false))
+        {
+            self.state.last_pushed = Some(remote.to_string());
+            return Some(remote);
+        }
+        recorded
+    }
+
+    /// The remote's refs whose names pass `keep`, as its receive side
+    /// advertises them.
+    fn list_remote_refs(
+        &self,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<BTreeMap<String, Oid>, (PushFailureKind, String)> {
         let auth = AuthState::new();
         let _scope = self.auth.ssh_scope(&auth);
         let listed = (|| {
             let mut remote = self.repo.remote_anonymous(self.remote.push_url())?;
             let callbacks = self.auth.callbacks(&auth);
             let connection = remote.connect_auth(git2::Direction::Push, Some(callbacks), None)?;
-            let prefix = format!("refs/agentfs/{}/", self.volume);
             Ok(connection
                 .list()?
                 .iter()
-                .filter(|head| head.name().starts_with(&prefix))
+                .filter(|head| keep(head.name()))
                 .map(|head| (head.name().to_owned(), head.oid()))
                 .collect())
         })();
@@ -2188,6 +2226,80 @@ mod tests {
             pusher.push_once(),
             PushOutcome::Pushed { limited: None, to, .. } if to == head
         ));
+    }
+
+    /// The push state lagging the remote (deleted as the history-rewrite
+    /// runbook says, a renamed remote, a crash before the state save) must
+    /// not make a limited push step from behind the remote: that pushes
+    /// commits it has over newer ones, a false divergence every attempt.
+    #[test]
+    fn a_limited_push_measures_from_the_remote_branch() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        v.commit();
+        for i in 0..5 {
+            v.commit_file(&format!("big{i}"), &random(400 << 10, i + 1));
+        }
+        // One commit alone over the limit, already on the remote.
+        let pushed = v.commit_file("huge", &random(2 << 20, 9));
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(matches!(
+            pusher.push_once(),
+            PushOutcome::Pushed { limited: None, to, .. } if to == pushed
+        ));
+        let forget = |v: &Vol| {
+            let path = v.state.push_state("origin");
+            assert!(path.exists());
+            fs::remove_file(path).unwrap();
+        };
+        forget(&v);
+        v.settings.remotes[0].max_push_size = Some(1 << 20);
+
+        // Up to date already: nothing measured, nothing refused.
+        let (events, sink_events) = sink();
+        let mut pusher = v.pusher("origin", sink_events);
+        assert_eq!(pusher.push_once(), PushOutcome::UpToDate { head: pushed });
+        assert_eq!(pusher.state().last_pushed_oid(), Some(pushed));
+        assert_eq!(pusher.state().consecutive_failures, 0);
+        assert!(diverged_refs(remote, "vol").is_empty());
+        assert!(
+            !events
+                .take()
+                .iter()
+                .any(|e| matches!(e, Event::PushFailed { .. } | Event::Diverged { .. })),
+        );
+
+        // A backlog over the limit on top of the remote: stepped from the
+        // remote's branch, not from the start of history.
+        let mut chain = Vec::new();
+        for i in 0..4 {
+            chain.push(v.commit_file(&format!("more{i}"), &random(400 << 10, 20 + i)));
+        }
+        forget(&v);
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        let mut steps = Vec::new();
+        loop {
+            match pusher.push_once() {
+                PushOutcome::Pushed {
+                    from,
+                    to,
+                    limited: Some(left),
+                } => steps.push((from, to, left)),
+                PushOutcome::Pushed {
+                    to, limited: None, ..
+                } => {
+                    assert_eq!(to, chain[3]);
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(steps.len() < 10, "{steps:?}");
+        }
+        assert_eq!(steps, [(Some(pushed), chain[1], 2)]);
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(chain[3]));
+        assert!(diverged_refs(remote, "vol").is_empty());
     }
 
     #[test]

@@ -21,7 +21,12 @@
 //! ([`ExportHealth`]): a rate-limited warning on stderr and the counter
 //! `agentfs.telemetry.export_failures{signal}`.
 //!
-//! The rest of the configuration (headers, timeouts, compression, batch
+//! `OTEL_EXPORTER_OTLP_[<SIGNAL>_]TIMEOUT` is checked by [`plan`] for
+//! every endpoint (milliseconds, else the signal is off with a warning)
+//! and applied by agentfs to its own HTTPS client; the plain HTTP and gRPC
+//! exporters read it themselves.
+//!
+//! The rest of the configuration (headers, compression, batch
 //! sizes, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_TRACES_SAMPLER`,
 //! `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`) is read by the
 //! OpenTelemetry SDK and exporter themselves.
@@ -322,6 +327,27 @@ pub fn plan(env: &dyn Fn(&str) -> Option<String>) -> Plan {
                 }
             },
         };
+        // The signal's own setting, else the general one: `(var, value)`.
+        let either = |suffix: &str| {
+            let own = format!("OTEL_EXPORTER_OTLP_{upper}_{suffix}");
+            let general = format!("OTEL_EXPORTER_OTLP_{suffix}");
+            get(&own)
+                .map(|v| (own, v))
+                .or_else(|| get(&general).map(|v| (general, v)))
+        };
+        // Checked for every endpoint, so a bad value warns the same over
+        // http and gRPC, whose exporters then read it themselves.
+        let timeout = match either("TIMEOUT") {
+            None => DEFAULT_EXPORT_TIMEOUT,
+            Some((var, value)) => match value.parse::<u64>() {
+                Ok(ms) => Duration::from_millis(ms),
+                Err(_) => {
+                    return Decision::warn(format!(
+                        "{var}={value} is not a timeout in milliseconds"
+                    ));
+                }
+            },
+        };
         let https = endpoint
             .get(..8)
             .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
@@ -331,14 +357,6 @@ pub fn plan(env: &dyn Fn(&str) -> Option<String>) -> Plan {
                 tls: None,
             });
         }
-        // The signal's own setting, else the general one: `(var, value)`.
-        let either = |suffix: &str| {
-            let own = format!("OTEL_EXPORTER_OTLP_{upper}_{suffix}");
-            let general = format!("OTEL_EXPORTER_OTLP_{suffix}");
-            get(&own)
-                .map(|v| (own, v))
-                .or_else(|| get(&general).map(|v| (general, v)))
-        };
         let ca = either("CERTIFICATE").map(|(_, v)| PathBuf::from(v));
         let client = match (either("CLIENT_CERTIFICATE"), either("CLIENT_KEY")) {
             (Some((_, cert)), Some((_, key))) => Some((PathBuf::from(cert), PathBuf::from(key))),
@@ -353,17 +371,6 @@ pub fn plan(env: &dyn Fn(&str) -> Option<String>) -> Plan {
                     "{var} is set without the matching {missing} (set both for mutual TLS)"
                 ));
             }
-        };
-        let timeout = match either("TIMEOUT") {
-            None => DEFAULT_EXPORT_TIMEOUT,
-            Some((var, value)) => match value.parse::<u64>() {
-                Ok(ms) => Duration::from_millis(ms),
-                Err(_) => {
-                    return Decision::warn(format!(
-                        "{var}={value} is not a timeout in milliseconds"
-                    ));
-                }
-            },
         };
         if !cfg!(feature = "otlp-tls") {
             return Decision::warn(format!(
@@ -1176,6 +1183,23 @@ mod tests {
                 matches!(&p.traces, Decision::Disabled { warning: Some(w) } if w.starts_with(expect)),
                 "{p:?}"
             );
+        }
+        // A bad timeout warns over plain http and gRPC too.
+        for (endpoint, protocol) in [
+            ("http://collector:4318", "http/protobuf"),
+            ("http://collector:4317", "grpc"),
+        ] {
+            let p = plan_of(&[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", protocol),
+                ("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "10s"),
+            ]);
+            assert!(
+                matches!(&p.logs, Decision::Disabled { warning: Some(w) }
+                    if w.starts_with("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT=10s is not a timeout")),
+                "{p:?}"
+            );
+            assert!(matches!(p.traces, Decision::Enabled(_)), "{p:?}");
         }
         // Over plain http the TLS settings are not used.
         assert_eq!(

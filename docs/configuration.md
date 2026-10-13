@@ -592,7 +592,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--history-slot N` | `AGENTFS_HISTORY_SLOT` | the lowest free slot | `mount`, `record` with `--history-service`: lease pending slot N (1 to 1023) when it is free, else the lowest free slot; a front restarted after a crash passes its predecessor's slot to drain that slot's repairs |
 | `--allow-stale` | | | `probe`: exit 0 for a stale agentfs mount too |
 | `--remote NAME` (repeatable) | | every remote | `push`: push only these remotes |
-| `--timeout DURATION` | | `120s` | `push` through a running daemon: how long to wait for its pushes (clamped to 1s..10m); a push still running then carries on in the background. Pushing directly ignores it |
+| `--timeout DURATION` | | `120s` | `push` through a running daemon: how long to wait for its pushes (clamped to 1s..10m); a push still running then carries on in the background, and the command exits 1 (also when a push stepped under `agentfsMaxPushSize` still has commits left). Pushing directly ignores it and keeps stepping until up to date or a failure |
 | `--force` | | | `restore`: write even files open for writing through the mount; `revert`: also revert paths changed again since the commit, and write files open for writing (§15) |
 | `--dry-run` | | | `restore`, `revert`: print the plan and write nothing |
 | `--no-fetch` | | | `patch apply`: apply what is already fetched, without contacting the patch remote |
@@ -677,7 +677,7 @@ and costs nothing. agentfs itself reads these to decide what to export:
 | `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE`, `OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE`, `OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE` | For an `https://` endpoint: a PEM file of CA certificates, the only ones trusted for the collector. Unset: the system store (`SSL_CERT_FILE`, `SSL_CERT_DIR` move it) |
 | `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE` | For an `https://` endpoint: a PEM client certificate (chain) for mutual TLS. Needs the key; one without the other turns that signal off with a warning |
 | `OTEL_EXPORTER_OTLP_CLIENT_KEY`, `OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY`, `OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY`, `OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY` | The client certificate's PEM private key (PKCS#8, PKCS#1 or SEC1) |
-| `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`, `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`, `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Milliseconds an export may take (default 10000). agentfs applies it to its own HTTPS client; the plain HTTP and gRPC exporters read it themselves. Not a number: that signal is off, with a warning |
+| `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`, `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`, `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Milliseconds an export may take (default 10000). agentfs applies it to its own HTTPS client; the plain HTTP and gRPC exporters read it themselves. Not a number (`10s`, say): that signal is off, with a warning, whatever the endpoint |
 
 An `https://` endpoint needs a binary built with the `otlp-tls` cargo
 feature (the image is; rustls on ring, no OpenSSL); without it the

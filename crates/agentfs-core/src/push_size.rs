@@ -3,8 +3,8 @@
 //!
 //! A remote with a maximum push size has the git pack of every attempt
 //! measured before agentfs connects: libgit2's pack builder packs the
-//! commits the remote lacks (the walk from the head, hiding the last pushed
-//! commit) and the bytes it writes are counted, stopping as soon as the
+//! commits the remote lacks (the walk from the head, hiding the base: the
+//! branch the remote advertises, see `RemotePusher`) and the bytes it writes are counted, stopping as soon as the
 //! count passes the limit, so a huge backlog is never written out in full.
 //!
 //! When the whole backlog does not fit, [`largest_step`] finds the longest
@@ -15,8 +15,8 @@
 //!
 //! Only the git pack is measured: LFS objects go to their own servers
 //! (design §7). The pack libgit2 then sends can differ slightly from the
-//! measured one, since the base comes from the push state, not from the
-//! refs the remote advertises.
+//! measured one, since libgit2 negotiates against every ref the remote
+//! advertises, not the branch alone.
 
 use git2::{ErrorCode, Oid, Repository};
 

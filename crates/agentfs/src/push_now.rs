@@ -183,6 +183,20 @@ fn remote_reply(result: &RemoteResult) -> RemoteReply {
         .map(|outcome| format!("{}: {}", result.name, describe(outcome)))
         .collect();
     let mut ok = result.outcome.is_success();
+    // Still limited: the timeout ran out between steps (design §11.3). The
+    // remote lacks commits, so this is not success; the push loop carries
+    // on with the next step at once.
+    if let agentfs_core::push::PushOutcome::Pushed {
+        limited: Some(left),
+        ..
+    } = &result.outcome
+    {
+        ok = false;
+        lines.push(format!(
+            "{}: timed out with {left} commit(s) left; the next steps continue in the background",
+            result.name
+        ));
+    }
     if let Some(queue) = &result.queue {
         ok &= queue.error.is_none();
         lines.push(format!("{}: queue: {}", result.name, queue.summary()));
@@ -305,5 +319,25 @@ mod tests {
             ..result
         };
         assert!(!remote_reply(&failed).ok);
+        // A stepped push cut short by the timeout is not up to date.
+        let limited = RemoteResult {
+            outcome: agentfs_core::push::PushOutcome::Pushed {
+                from: None,
+                to: git2::Oid::ZERO_SHA1,
+                limited: Some(3),
+            },
+            ..failed
+        };
+        let reply = remote_reply(&limited);
+        assert!(!reply.ok);
+        assert!(
+            reply
+                .lines
+                .last()
+                .unwrap()
+                .contains("timed out with 3 commit(s) left"),
+            "{:?}",
+            reply.lines
+        );
     }
 }

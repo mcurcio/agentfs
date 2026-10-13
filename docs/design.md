@@ -1651,8 +1651,8 @@ agentfs does not scan content for secrets and does not hold pushes.
   stricter remote, and a commit no remote accepts can never be pushed.
 - **A maximum push size** (`remote.<name>.agentfsMaxPushSize`, a positive
   size, decided 2026-10-13) keeps each push under a host's limit:
-  - Before connecting, the attempt packs the commits since the remote's
-    last pushed commit with libgit2's pack builder and counts the bytes,
+  - Before pushing, the attempt lists the remote's branch, packs the
+    commits since it with libgit2's pack builder and counts the bytes,
     stopping once the limit is passed (`agentfs_core::push_size`). Only
     the git pack counts; LFS uploads (§7) go to their own servers.
   - A backlog that fits is pushed as usual.
@@ -1672,11 +1672,22 @@ agentfs does not scan content for secrets and does not hold pushes.
     backoff) and nothing is sent. The operator raises the limit, or sends
     large files to LFS from then on; a commit already made can only go
     out by rewriting history (§15).
-  - The pack libgit2 sends can differ slightly from the measured one: the
-    base comes from the push state, not from the refs the remote
-    advertises. Measuring costs a second pack computation per attempt,
-    and a few more while stepping; remotes without a limit measure
+  - The pack libgit2 sends can differ slightly from the measured one
+    (libgit2 negotiates against every ref the remote advertises).
+    Measuring costs one more connection (the listing) and a second pack
+    computation per attempt, and a few more while stepping; remotes
+    without a limit measure
     nothing.
+  - The branch the remote advertises is the base when this repository
+    has it and it is the head or one of its ancestors, and it is recorded
+    as the last pushed commit: the push state can lag the remote (deleted
+    by the history-rewrite runbook, a renamed remote, a crash between a
+    push and the state save), and stepping from behind the remote would
+    push commits it already has over newer ones, a false divergence at
+    every attempt. A remote without the branch counts everything; one
+    that cannot be listed, or holds a commit unknown here or not an
+    ancestor, falls back to the push state, and the push itself reports
+    the failure or divergence.
 - **A rejected push never affects the filesystem.** Rejected means refused,
   non-fast-forward, authentication failure, an untrusted host (an SSH host
   key or TLS certificate that fails verification), an unreachable remote,
@@ -2036,14 +2047,17 @@ used. A client certificate and key (`OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`,
 `..._CLIENT_KEY`), set together, give mutual TLS; one without the other is a
 misconfiguration. Every file is read and parsed when the exporter is built,
 so a bad file turns its signal off with a warning naming it at start rather
-than failing every export; rotating a certificate takes a restart. For the
+than failing every export; rotating a certificate takes a restart (§19.2
+item 7). For the
 HTTP exporters agentfs builds its own blocking client with that rustls
 configuration and so applies `OTEL_EXPORTER_OTLP_TIMEOUT` itself; the gRPC
 exporter gets tonic's TLS settings from the same files. Without the feature
 an `https` endpoint is reported as needing it.
 
-An unknown protocol, an `https` endpoint in a build without `otlp-tls`, or
-TLS settings that cannot be used are reported with a warning and that
+An unknown protocol, an `https` endpoint in a build without `otlp-tls`, an
+`OTEL_EXPORTER_OTLP_TIMEOUT` that is not a number of milliseconds (checked
+for every endpoint), or TLS settings that cannot be used are reported
+with a warning and that
 signal stays off: a
 telemetry misconfiguration never stops a command, in keeping with telemetry
 never affecting the filesystem. Telemetry is flushed at exit, waiting at
@@ -3424,6 +3438,12 @@ runner.
    only reviews say so: replaying random subsets of each epoch's writes
    is open, as is a power cut through a FUSE mount rather than the CLI's
    `record`.
+7. **Reloading OTLP TLS files** (§13). The collector CA bundle, client
+   certificate and key are read once, when the exporter is built, so
+   rotating one (a cert-manager renewal, say) takes a restart of the
+   daemon. Open: watching the files and rebuilding the exporter, or
+   resolving them per connection, as the git credentials are re-read
+   when they change (§11.1).
 
 ## 20. Prior art
 

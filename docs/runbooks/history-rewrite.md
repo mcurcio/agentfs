@@ -125,7 +125,9 @@ rewrite; the checks must print nothing and succeed.
 ## 8. Forget the push bookkeeping
 
 Each remote's push state names commits that no longer exist. It is only
-bookkeeping (§11.2), rebuilt on the next push:
+bookkeeping (§11.2), rebuilt on the next push. A remote with
+`agentfsMaxPushSize` measures that push from the branch the remote
+advertises (§11.3), so an up-to-date remote is not pushed again in steps:
 
 <!-- ci: rewrite-push-state -->
 ```sh

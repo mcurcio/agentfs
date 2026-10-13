@@ -188,7 +188,9 @@ checks refuse, with the reason; a database in the `fsync` class is
 recorded with its whole group. It needs `--root` (or `AGENTFS_ROOT`),
 since a path missing from the backing tree is recorded as removed. `push`
 pushes once, or, with `mount`, `run` or `serve-history` running, asks it
-over its control socket to commit and push now (`--timeout`, 120s); `run`
+over its control socket to commit and push now (`--timeout`, 120s; it exits
+0 only when every remote is up to date, so a stepped push still short of the
+head when the timeout ends exits 1); `run`
 runs the commit and push loops until SIGINT or SIGTERM.
 `restore` and `revert` write content from history back into the tree
 ([Recovery](#recovery)). `init` is safe to re-run: for the same volume it
