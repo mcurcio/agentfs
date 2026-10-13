@@ -83,6 +83,8 @@ git init -q --bare "$TINY"
 volume_config remote.tiny.url "$TINY"
 agentfs push --remote tiny >/dev/null # the history so far
 volume_config remote.tiny.agentfsMaxPushSize 6k
+# "small" would refuse these files outright (its 8-byte blob limit).
+git --git-dir "$STATE/git" config --unset remote.small.agentfsMaxBlobSize
 for n in 1 2 3; do
   head -c 4000 /dev/urandom >"$TREE/rand-$n.bin"
   agentfs record "rand-$n.bin" >/dev/null
