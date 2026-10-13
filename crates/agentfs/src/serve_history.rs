@@ -10,8 +10,11 @@
 //! the commit and push loops, the socket fronts use, then the control
 //! socket (`agentfs push` asks it to push now; `restore` and `revert` it
 //! serves live, writing the backing tree with its fronts' help, design
-//! §2.3, §15). On SIGINT or SIGTERM it stops the control socket (waiting
-//! for a restore in progress), stops accepting fronts, lets their
+//! §2.3, §15). On SIGINT or SIGTERM it stops the control socket: a
+//! restore in progress stops before its next path, records what it wrote
+//! and replies, and the service waits for that (up to `--shutdown-grace`,
+//! and at least the control socket's own grace). Then it stops accepting
+//! fronts, lets their
 //! requests in progress finish (up to `--shutdown-grace`), then makes the
 //! final commit and pushes it, as every
 //! long-running mode does: every remote that lacks commits gets one more
@@ -21,6 +24,8 @@
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -33,7 +38,7 @@ use agentfs_core::volume::StateDir;
 use crate::daemon::Daemon;
 use crate::{
     Pod, Session, describe_wake, list, misconfigured, patch_cmd, push_now, recovery, start_control,
-    stop_control, stop_service,
+    stop_control_within, stop_service,
 };
 
 /// Where the running service's address is written for `agentfs status`.
@@ -121,6 +126,8 @@ pub(crate) fn serve(
     };
     // `agentfs push` asks it to push now; restores and reverts it writes
     // into the backing tree, calling its fronts (design §2.3, §15).
+    // Set at shutdown: a restore in progress stops before its next path.
+    let stopping = Arc::new(AtomicBool::new(false));
     let control = start_control(
         state,
         push_now::handler(
@@ -132,6 +139,7 @@ pub(crate) fn serve(
                 fronts: server.listening_fronts(),
                 backing: backing.clone(),
                 commit_window,
+                stopping: stopping.clone(),
             }),
         ),
     );
@@ -159,7 +167,20 @@ pub(crate) fn serve(
         describe_wake(wake)
     );
     // The control socket first: a restore in progress still calls fronts.
-    stop_control(&service, control);
+    // It stops before its next path and records what it wrote; that, and
+    // its reply, are waited for.
+    stopping.store(true, Ordering::SeqCst);
+    if !stop_control_within(
+        &service,
+        control,
+        shutdown_grace.max(push_now::CONTROL_GRACE),
+    ) {
+        eprintln!(
+            "a restore or revert was still writing one path at shutdown: what it wrote and \
+             did not record yet differs from history until it is run again (it then checks \
+             anew) or those paths change again"
+        );
+    }
     if !server.shutdown(shutdown_grace) {
         eprintln!("fronts' requests were still running at shutdown; they fail with EIO");
     }

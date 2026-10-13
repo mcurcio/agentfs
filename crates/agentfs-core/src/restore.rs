@@ -707,6 +707,12 @@ pub trait Liveness {
     /// records them), rather than the caller recording what [`apply`]
     /// reports (the backing tree, written directly).
     fn records_its_writes(&self) -> bool;
+    /// Whether [`apply`] must stop before its next step: the daemon
+    /// writing is shutting down. What was applied is still returned (in the
+    /// error), so it can be recorded.
+    fn stopping(&self) -> bool {
+        false
+    }
 }
 
 /// No mount: nothing can be open through one, and the caller records.
@@ -1060,6 +1066,14 @@ impl ApplyError {
 
 /// Why [`apply`] stopped before changing a path: it no longer holds what
 /// [`check`] saw, or a workload opened it for writing since.
+/// [`apply`] stopped early: the daemon is shutting down.
+fn stopping() -> io::Error {
+    io::Error::other(
+        "stopped before this path: the daemon is shutting down; what was written before it is \
+         recorded, and running the command again finishes it",
+    )
+}
+
 fn changed_since_check(what: &str) -> io::Error {
     io::Error::other(format!(
         "{what} since the check, so it was left alone; run the command again to check anew"
@@ -1136,6 +1150,9 @@ pub fn apply(
     let mut emptied: BTreeSet<String> = BTreeSet::new();
     for step in removals {
         let path = step.path.as_str();
+        if live.stopping() {
+            return Err(fail(&mut applied, path, stopping(), false));
+        }
         match recheck(repo, tree, step, live, force) {
             Ok(Current::Absent) => {}
             Ok(_) => {
@@ -1172,6 +1189,9 @@ pub fn apply(
     writes.sort_by_key(|s| s.path.components().count());
     for step in writes {
         let path = step.path.as_str();
+        if live.stopping() {
+            return Err(fail(&mut applied, path, stopping(), false));
+        }
         let Some(target) = step.target else { continue };
         let current = match recheck(repo, tree, step, live, force) {
             Ok(current) => current,

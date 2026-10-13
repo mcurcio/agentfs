@@ -456,12 +456,20 @@ Metrics (design §13):
 | `agentfs.repack.failures` | counter | |
 | `agentfs.push.unpushed_commits` | gauge | `remote` |
 | `agentfs.push.oldest_unpushed_age` | gauge, seconds | `remote` |
-| `agentfs.push.failures` | counter | `remote`, `reason`, `stage` (`git`, or `lfs` for LFS uploads) |
+| `agentfs.push.failures` | counter | `remote`, `reason`, `stage` (`git`, `lfs` for LFS uploads, or `queue`) |
 | `agentfs.push.diverged` | gauge, 0 or 1 | `remote` |
 | `agentfs.remote.misconfigured` | gauge | `remote` |
 | `agentfs.precheck.rejected_paths` | counter | `stage`, `reason` |
+| `agentfs.patch.queue_depth` | gauge | |
+| `agentfs.patch.blocked` | gauge, 0 or 1 | |
 | `agentfs.state.bytes` | gauge, bytes | `part` |
 | `agentfs.telemetry.export_failures` | counter | `signal` (`traces`, `metrics`, `logs`) |
+| `agentfs.front.round_trip` | histogram, seconds | `request` |
+| `agentfs.front.service_failures` | counter | `stage` |
+| `agentfs.history_service.fronts` | gauge | |
+| `agentfs.history_service.superseded` | counter | |
+| `agentfs.history_service.resyncs` | counter | |
+| `agentfs.fuse.create_as_caller_fallbacks` | counter | |
 
 Spans are `agentfs.record`, `agentfs.commit` and `agentfs.push`, carrying
 journal sequence numbers and commit ids. Every alarm is also a log record
@@ -640,12 +648,14 @@ tests the container image on every push:
   another kind cluster, with [`deploy/csi`](deploy/csi) through its CI
   overlay [`ci/k8s-csi`](ci/k8s-csi). It validates the manifests, checks
   the driver's registration and its RBAC inventory with `kubectl auth
-  can-i`, runs two restricted pods (uid 10000 and 10001) on one claim and
-  checks their distinct committers, trailers and authors on the runner's
-  git server, kills one pod's front (the other pod unaffected, the front
-  back in its slot and live), the history service right after a write,
-  and the node plugin pod, each recovered, checks that inline volumes and
-  `ReadWriteMany` are refused, and tears down through DeleteVolume.
+  can-i`, runs two restricted pods (uid 10000 and 10001, primary groups
+  other than their shared `fsGroup`) on one claim, has them create the
+  same new names at once, checks their distinct committers, trailers and
+  authors on the runner's git server, kills one pod's front (the other
+  pod unaffected, the front back in its slot and live), the history
+  service right after a write, and the node plugin pod, each recovered,
+  checks that inline volumes and `ReadWriteMany` are refused, and tears
+  down through DeleteVolume.
 - **publish** (main only, after both kind tests): pushes the tested image to
   `ghcr.io/mcurcio/agentfs` as `<commit sha>` and `latest`.
 

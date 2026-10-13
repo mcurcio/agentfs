@@ -407,6 +407,24 @@ impl Ops {
         &self.boundary
     }
 
+    /// [`creds::create_as`] with this mount's setting; an object made as
+    /// the daemon when it was to be made as the caller is counted
+    /// (`agentfs.fuse.create_as_caller_fallbacks`, design §6).
+    fn create_as<T>(
+        &self,
+        caller: Caller,
+        create: impl FnMut() -> rustix::io::Result<T>,
+    ) -> (rustix::io::Result<T>, bool) {
+        let (made, as_caller) = creds::create_as(self.create_as_caller, caller, create);
+        if self.create_as_caller && !as_caller && made.is_ok() {
+            self.boundary
+                .recorder()
+                .telemetry()
+                .create_as_caller_fallback();
+        }
+        (made, as_caller)
+    }
+
     pub fn groups(&self) -> &Groups {
         &self.groups
     }
@@ -1142,7 +1160,7 @@ impl Ops {
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
-        let (made, as_caller) = creds::create_as(self.create_as_caller, caller, || {
+        let (made, as_caller) = self.create_as(caller, || {
             rustix::fs::mkdirat(
                 &dir,
                 OsStr::from_bytes(name),
@@ -1173,7 +1191,7 @@ impl Ops {
         let hold = group.as_ref().map(|g| g.hold());
         // A device node needs CAP_MKNOD, which the caller lacks: refused
         // as the caller, it is made by the daemon.
-        let (made, as_caller) = creds::create_as(self.create_as_caller, caller, || {
+        let (made, as_caller) = self.create_as(caller, || {
             rustix::fs::mknodat(
                 &dir,
                 OsStr::from_bytes(name),
@@ -1222,7 +1240,7 @@ impl Ops {
         let pst = rustix::fs::fstat(&dir).eno()?;
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
-        let (made, as_caller) = creds::create_as(self.create_as_caller, caller, || {
+        let (made, as_caller) = self.create_as(caller, || {
             rustix::fs::symlinkat(OsStr::from_bytes(target), &dir, OsStr::from_bytes(name))
         });
         made.eno()?;
@@ -1654,7 +1672,7 @@ impl Ops {
         // Creating or truncating a member changes its group: held.
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
-        let (created, as_caller) = creds::create_as(self.create_as_caller, caller, || {
+        let (created, as_caller) = self.create_as(caller, || {
             rustix::fs::openat(
                 &dir,
                 OsStr::from_bytes(name),

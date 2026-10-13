@@ -731,6 +731,56 @@ fn apply_rechecks_each_path() {
     assert_eq!(fs::read(fx.tree.join("b")).unwrap(), b"1");
 }
 
+/// Stops after its first path, as a daemon shutting down does.
+struct StopsAfterOne(std::cell::Cell<usize>);
+
+impl Liveness for StopsAfterOne {
+    fn open_for_writing(&self, _: &RepoPath) -> bool {
+        false
+    }
+
+    fn records_its_writes(&self) -> bool {
+        false
+    }
+
+    fn stopping(&self) -> bool {
+        let asked = self.0.get();
+        self.0.set(asked + 1);
+        asked >= 1
+    }
+}
+
+/// A daemon shutting down stops the apply between paths, and what was
+/// written before is reported, so it can be recorded.
+#[test]
+fn apply_stops_between_paths_when_the_daemon_stops() {
+    let fx = Fixture::new();
+    let c1 = fx.commit(&[("a", File("1")), ("b", File("1"))], "v1");
+    fx.commit(&[("a", File("2")), ("b", File("2"))], "v2");
+    fx.checkout(&[("a", File("2")), ("b", File("2"))]);
+    let plan = check(
+        fx.plan(&fx.restore(".", c1)).unwrap(),
+        &fx.repo,
+        &Policy::default(),
+        &NoLfs,
+        &fx.dir(),
+        &NotLive,
+        false,
+    )
+    .unwrap();
+    let live = StopsAfterOne(std::cell::Cell::new(0));
+    let err = apply(&plan, &fx.repo, &NoLfs, &fx.dir(), &live, true).unwrap_err();
+    assert_eq!((err.path.as_str(), err.started), ("b", false));
+    assert!(
+        err.error.to_string().contains("shutting down"),
+        "{}",
+        err.error
+    );
+    assert_eq!(err.applied.written, [RepoPath::new("a").unwrap()]);
+    assert_eq!(fs::read(fx.tree.join("a")).unwrap(), b"1");
+    assert_eq!(fs::read(fx.tree.join("b")).unwrap(), b"2");
+}
+
 #[test]
 fn check_ancestors_and_policies() {
     let fx = Fixture::new();

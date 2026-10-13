@@ -104,11 +104,15 @@ plain git (§5).
   the command asks the service over the same control socket. Every live
   front must be listening for the service's calls (otherwise exit status
   75: a front from an older release, or one reconnecting; retry, or
-  restart it). The service has each front record what is dirty in it,
-  waits until history has caught up, refuses a path any front holds open
-  for writing (unless `--force`), writes the backing tree itself, records
-  it, and has every front drop its kernel's caches of the paths written:
-  every pod sees the restored files at once. `--root` is not needed.
+  restart it; also 75 when a front cannot record what is dirty in it).
+  The service has each front record what is dirty in it (a `--dry-run`
+  too), waits until history has caught up, refuses a path any front holds
+  open for writing (unless `--force`), writes the backing tree itself,
+  asking the fronts again just before each path, records it, and has
+  every front drop its kernel's caches of the paths written: every pod
+  sees the restored files at once. `--root` is not needed. Stopping the
+  service during a restore stops it before its next path, with what it
+  wrote recorded: run it again.
 - **`agentfs run` (or `record`, `flush`, `push`) holds the state area**:
   exit status 75. `run` serves no restores: stop it (or mount instead).
 
@@ -150,8 +154,8 @@ nothing.
 | `history is behind the tree` | Records are not being committed (see `CommitFailed` alarms) | Fix that first (`agentfs status`) |
 
 Each path is re-checked just before it is written. If the workload
-changed it, or opened it for writing through the mount, since the
-checks, it is left alone and the command stops with `... since the
+changed it, or opened it for writing through the mount (any pod's front,
+under the history service), since the checks, it is left alone and the command stops with `... since the
 check, so it was left alone`: run it again to check anew. A workload
 that opens and writes a file in the moment between that re-check and
 the write, without closing it, loses those unrecorded writes: pause the

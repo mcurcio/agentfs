@@ -798,7 +798,10 @@ next start or an `agentfs push`.
   listen for the service's calls; they exit 75 while one does not (a
   front from an older release, or one reconnecting). A front that fails
   to drop its caches after a restore is named in a warning and may show
-  old content until its kernel's cache times out.
+  old content until its kernel's cache times out. The service asks the
+  fronts again just before each path it writes, so a file opened for
+  writing meanwhile is left alone; one opened after that ask, before the
+  write, is not seen (it is still recorded when that front closes it).
 - POSIX and BSD locks are kept by each mount's kernel and are not shared
   between fronts. A database or any lock-coordinated file must be written
   through one front only, and the `fsync` class (§14) is per front.
@@ -809,7 +812,10 @@ next start or an `agentfs push`.
   already journaled ("superseded"; `agentfs.history_service.superseded`),
   so history ends on the newer state. Two states within one tick of the
   filesystem's timestamp clock, of the same size and mtime, cannot be
-  ordered and are journaled in arrival order, as before.
+  ordered: the service records the path again as the backing tree has
+  it, so history still ends on the tree's state
+  (`agentfs.history_service.resyncs`). The same holds for a removal or
+  symlink that arrives after the path was made again.
 - A file open in one front that another front renames or removes: the
   first front's later close records it under its current name, or not
   at all once it is removed, so history never gets back a path the tree

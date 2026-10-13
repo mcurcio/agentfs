@@ -760,7 +760,8 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
     filesystem capabilities meanwhile, so the creation is checked as the
     caller's would be, and the object is the caller's from the instant it
     exists: another front opening the same name as the caller never finds
-    it root's for a moment (§14.1). A creation refused as the caller
+    it root's for a moment (§14.1), as long as the caller's groups are
+    known (below). A creation refused as the caller
     (`EACCES` or `EPERM`: a device node needs `CAP_MKNOD`) is made as the
     daemon instead, which, with `CAP_CHOWN` and `CAP_FOWNER`, then gives it
     to the caller: the caller's group, except under a setgid directory,
@@ -778,6 +779,20 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
     existing file as `open` would (checking the caller against its mode
     bits, with the caller's primary and supplementary groups), without
     changing its owner or mode.
+  - **Callers whose groups are unknown.** FUSE reports pid 0 for a
+    caller outside the daemon's pid namespace: a pod's process seen from
+    a CSI node plugin that does not share the host's (the shipped
+    manifest sets `hostPID: true` for this reason, §14.2). Its
+    supplementary groups cannot be read then (the daemon says so once on
+    stderr), so a creation that only a supplementary group allows (a
+    directory whose group is the pod's `fsGroup`, and the pod's primary
+    group another) is refused as the caller and made as the daemon, then
+    given to the caller: another front's racing open of that name can
+    still find it the daemon's and fail with `EACCES`, and `create`'s
+    check of a file another writer made first counts the primary group
+    only. Every object made as the daemon when it was to be made as the
+    caller (device nodes included) is counted by
+    `agentfs.fuse.create_as_caller_fallbacks`.
   - **POSIX ACLs are not enforced** through the mount (`FUSE_POSIX_ACL` is
     not negotiated); only mode bits are.
   - **Inode numbers.** fuser sends the attribute's inode number as the FUSE
@@ -1701,6 +1716,8 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.front.service_failures` | counter, by stage | A front's failed requests to the history service: `connect`, `timeout`, `request` (connection lost or malformed reply), `refused`, `service` (§3.5, §14) |
 | `agentfs.history_service.fronts` | gauge | Fronts connected to this history service (§14) |
 | `agentfs.history_service.superseded` | counter | Front writes the history service skipped because a newer state of the path was already journaled (freeze stamps, §14.1) |
+| `agentfs.history_service.resyncs` | counter | Paths the history service recorded again as the backing tree has them, after a front's change it could not order (identical stamps from two slots, a late removal or symlink, §14.1) |
+| `agentfs.fuse.create_as_caller_fallbacks` | counter | Objects a root daemon created as itself and then gave to the caller, because creating as the caller was refused (a device node, or a caller whose groups are unknown) or could not be set up (§6) |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
@@ -1946,19 +1963,41 @@ writing one path at nearly the same instant can reach the service in
 the opposite order to their freezes. Each write therefore carries the
 stat stamp (device, inode, size, mtime, ctime) of its backing file,
 taken just before the freeze, so never newer than the content frozen.
-The service keeps the stamp of the last write it journaled at each path
-(five minutes, far past any request timeout) and, under the path claim,
-skips a write whose stamp has an older `ctime` (`superseded by a newer
-state another front already recorded`, counted by
+The service keeps the stamp of the last write it journaled at each path,
+with the slot it came from (five minutes, far past any request timeout;
+an older entry no longer counts) and, under the path claim, skips a
+write whose stamp has an older `ctime` (`superseded by a newer state
+another front already recorded`, counted by
 `agentfs.history_service.superseded`); its copy is removed. `ctime`
 moves on every write, chmod and rename of an inode, from one clock per
 filesystem, so it orders a replacement against its predecessor too.
-Identical stamps are both journaled (the racy-timestamp rule records a
-file twice on purpose, §3.1); stamps with the same `ctime` that differ
-otherwise are settled by the backing file: if it still has the
-journaled stamp, the incoming write is older. The service's own writes
-(a live restore, §15; patches) note their stamps too. Atomic groups
-(§8) are recorded whole and never judged.
+The backing file's stamp now is consulted as well:
+
+- a write whose stamp is the file's current one is never skipped, and
+  replaces the noted stamp: it froze the file as it still is. `ctime`
+  follows the wall clock, so after a backward step (NTP, a VM resume)
+  every later write of a recently journaled path would otherwise look
+  older than the noted one;
+- stamps with the same `ctime` that differ otherwise are settled by the
+  file: if it still has the journaled stamp, the incoming write is
+  older;
+- identical stamps from one slot are that front's own re-record (the
+  racy-timestamp rule records a file twice on purpose, §3.1), ordered by
+  its own claim, and are journaled;
+- identical stamps from two slots (or a front and the service) cannot be
+  ordered: two same-size writes within one tick of a coarse timestamp
+  clock (kernels before 6.13, or filesystems without multigrain
+  timestamps, tick every few milliseconds). The write is journaled, and
+  then the service **resyncs** the path: once the record is journaled
+  and its claims released, it records the path as the backing tree has
+  it now, as a `sweep` record of its own under the path's claim (frozen
+  again; nothing is committed if the content is what was just
+  journaled), counted by `agentfs.history_service.resyncs`. HEAD then
+  ends on the tree's state whichever record arrived last.
+
+The service's own writes (a live restore, §15; patches; resyncs) note
+their stamps too. Atomic groups (§8) are recorded whole and never
+judged.
 
 **Renames and removals across fronts.** Each front learns of another front's renames and removals only at its
 next lookup (entries are cached 1 s); a name a front knew that no longer
@@ -1985,10 +2024,23 @@ between A's check and the service's is caught by A's freeze stamp: the
 file at the path is another inode, so A's write is skipped the same way
 (`no longer in the backing tree`), and the rename's own record, from the
 front that made it, journals the new file.
+The other way round, a late removal or symlink can arrive after another
+front made the path again: front B unlinks `lock.json` and is
+descheduled, front A creates, writes and records it, then B's removal
+arrives. Removals are not judged by stamps (they have none), so the
+service journals a removal of a tracked path, and if the path is a file
+or symlink in the backing tree again it resyncs it (above); likewise a
+symlink whose target is not the one the tree has now. HEAD then ends on
+the tree's state.
 A daemon running as root creates each new object as its caller (§6), so
 another front's open of a name just created, as the same caller, never
 finds a root-owned file and fails with `EACCES` (the e2e's concurrent
-burst and same-name creates check this).
+burst and same-name creates check this, and the CSI e2e does with pods
+whose primary group is not their `fsGroup`). This needs the caller's
+supplementary groups, which FUSE does not give for a caller outside the
+daemon's pid namespace (pid 0): the CSI node plugin therefore runs with
+`hostPID: true`, and without it the window and the refusals of §6
+("Callers whose groups are unknown") remain.
 
 **Measured cost per boundary** (open question §19.2 item 2, single node).
 These numbers are indicative: the CI runners are shared, and nothing
@@ -2139,7 +2191,9 @@ reasons is in [csi.md](csi.md#10-security); `ci/e2e-csi.sh` checks it with
 `kubectl auth can-i`.
 
 **Pod Security inventory.** The driver's namespace enforces `privileged`
-(warn and audit `baseline`): the node plugin is privileged and root (FUSE
+(warn and audit `baseline`): the node plugin is privileged and root, and
+shares the host's pid namespace (`hostPID`, so its fronts see callers'
+real pids and can read their supplementary groups, §6) (FUSE
 mounts, `Bidirectional` propagation into `/var/lib/kubelet`, passthrough's
 `CAP_SYS_ADMIN`, `CAP_CHOWN`/`CAP_FOWNER` for ownership); the controller's
 `agentfs-csi` is root with only `DAC_OVERRIDE` and `FOWNER` and a
@@ -2237,17 +2291,30 @@ operator runbooks ([runbooks/](runbooks/)):
   one that is reconnecting; otherwise the request is refused as busy
   (exit 75), since a front the service cannot reach could neither settle
   nor drop its stale caches. The service has each front settle (record
-  what is dirty in it, journaled before it answers), waits until history
-  has caught up as above, and checks the backing tree, asking the fronts
-  in batches which paths any of them holds open for writing (a path a
-  front failed to answer for counts as open). It then writes the backing
-  tree itself, as direct mode does, records what it wrote as one operation
+  what is dirty in it, journaled before it answers; a front that fails
+  to, or does not answer in time, makes the request busy, 75, with
+  nothing written), waits until history has caught up as above, and
+  checks the backing tree, asking the fronts in batches which paths any
+  of them holds open for writing (a path a front failed to answer for
+  counts as open). A dry run settles the fronts too, so it checks what a
+  real run would; what they record is what their next sweep would have
+  recorded anyway. The service then writes the backing tree itself, as
+  direct mode does, asking every front again about each path just before
+  writing it (one round trip per front and path), so a file a pod opens
+  for writing while a long restore runs is refused at its own step unless
+  `--force`; a pod that opens it between that question and the write is
+  not seen, as in mount mode. It records what it wrote as one operation
   (operator: the socket peer; actor: the service), and has every front
   drop its kernel's cached entries, attributes and pages of every path
   written or removed. A front that fails that call keeps serving and is
   named in a warning: it may show old content until its kernel's cache
   times out. Records a front's settle or sweep makes during the operation
-  are its own, not the operation's.
+  are its own, not the operation's. When the service is stopped during a
+  restore, the restore stops before its next path, records what it wrote
+  and fails part way (rerun it); the service waits for that up to
+  `--shutdown-grace` (at least 5 s) before it stops serving fronts. Only
+  a single path still being written at the end of that grace (a large
+  LFS object) is left written and unrecorded.
 - **Directly.** With nothing listening, no mount (and so no workload
   through one) can be running. The command takes the state-area lock
   (§2.3), commits what is journaled, writes the backing tree (`--root`)
@@ -2700,7 +2767,7 @@ restartable (§14.2). The controller runs no children.
 | Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `reqwest-blocking-client`, no TLS) in the binary | OTLP http/protobuf export. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
 | Patch submission | the `git` CLI on the producer's side (`ls-remote`, `fetch`, `commit-tree`, `push --force-with-lease`) | Runs in the producer's repository with its own credentials and config, so agentfs needs none of them; the lease makes a number create-only (§12) |
 | Repack | the `git` CLI (`git repack --geometric=2`, git 2.32 or later) | libgit2 has no repack or gc. Run by the commit loop with system and global config off (§8); the image ships `git` |
-| Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates`, `git` and `tini`; built on `rust:1.99-trixie`; both pinned by digest. Ships `agentfs` and `agentfs-csi` | Not distroless: the daemon runs `git repack` (§8), and operators follow the runbooks with `git` through `kubectl exec`. `tini` is the CSI node plugin's PID 1, reaping its children's orphans. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after both kind e2e jobs pass |
+| Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates`, `git` and `tini`; built on `rust:1.99-trixie`; both pinned by digest. Ships `agentfs` and `agentfs-csi` | Not distroless: the daemon runs `git repack` (§8), and operators follow the runbooks with `git` through `kubectl exec`. `tini` (`-s`, a subreaper: the node plugin shares the host's pid namespace) reaps the CSI node plugin's children's orphans. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after both kind e2e jobs pass |
 | CSI gRPC | `tonic` 0.14 and `tonic-prost`, `prost` 0.14, `prost-types`, on `tokio` (only in `agentfs-csi`) | Transport and codegen features, no TLS: the socket is local. The front/service protocol stays a plain socket (§14.1) |
 | CSI codegen | `protox` 0.10 and `tonic-prost-build` 0.14 in `build.rs` | A pure-Rust protobuf compiler with the well-known types bundled: no `protoc` on build hosts or in the image |
 | CSI spec | `csi.proto` v1.13.0, vendored in `crates/agentfs-csi/proto` | Pinned by copy; updating it is a deliberate change |
@@ -2959,7 +3026,12 @@ runner.
 | Front failures | Service unreachable, hung (`--history-timeout`) or refusing: `EIO` at the boundary, `RecordFailed`, `HistoryServiceUnavailable` once per outage; repairs in the slot's file; a draft is never resent (§3.5, §14) |
 | Committer of a front's records | The front's origin (namespace, pod, pod uid, node, replica) is journaled in the record, so replays keep it; the service renders the identity templates per origin and refuses a front whose identity does not render; a commit never mixes origins (§9, §14) |
 | Patches with fronts | Applied by `serve-history` before it listens, only when no front lease is live; otherwise skipped with a message (§12, §14) |
-| Restores with fronts | Served live by `serve-history`: every live front must listen (else busy, 75); fronts settle, answer which paths are open for writing, and drop their kernel caches of the paths the service wrote to the backing tree (§14.1, §15) |
+| Restores with fronts | Served live by `serve-history`: every live front must listen (else busy, 75); fronts settle (a front that cannot is busy, 75; dry runs settle too), answer which paths are open for writing (in batches for the check, then per path just before each write), and drop their kernel caches of the paths the service wrote to the backing tree; at shutdown a restore stops before its next path and records what it wrote (§14.1, §15) |
+| Freeze stamps (2026-10-13) | Each front write carries its backing file's pre-freeze stat stamp; the service, under the path claim, skips a write whose `ctime` is older than the last journaled at that path (5 min horizon) unless it is the file's current stamp (clock steps); same-`ctime` stamps are settled by the file; identical stamps from one slot are journaled (racy re-record) (§14.1) |
+| Unorderable front changes (2026-10-13) | Identical stamps from two slots, a removal of a path present again, and a symlink whose target the tree no longer has are journaled, then resynced: the service records the path as the backing tree has it, as its own `sweep` record under the path claim (`agentfs.history_service.resyncs`). Chosen over comparing frozen copies' content, which cannot order two states the file no longer holds (§14.1) |
+| Creating as the caller (2026-10-13) | A daemon with `CAP_SETUID`/`CAP_SETGID`/`CAP_CHOWN`/`CAP_FOWNER` creates as the caller by switching the worker thread's fsuid, fsgid and supplementary groups (read from `/proc/<pid>/status`) for the one creating call; refusals fall back to create-then-chown (`agentfs.fuse.create_as_caller_fallbacks`). The CSI node plugin runs with `hostPID: true` so callers' pids, and so their groups, are visible (§6, §14.1, §14.2) |
+| Repair origins (2026-10-13) | A repair keeps the pod that failed to record it; the service trusts an origin a front names only on `sweep` records whose committer renders, and journals the front's own otherwise (§3.5, §14.1) |
+| Protocol evolution (2026-10-13) | Protocol stays version 1: additions are optional fields and new variants only, and the service lists what it supports in `Welcome.features` (`stamps`, `repair_origin`, `listen`) (§14.1) |
 | Locks across fronts | POSIX and BSD locks are per FUSE mount, so not shared between pods; a lock-coordinated database (SQLite, the `fsync` class) must be written from one pod (§14) |
 | CSI driver shape | One binary, `agentfs-csi` (`--mode` controller, node or all), in the agentfs image; tonic over a Unix socket, the spec compiled without `protoc`; the node plugin spawns the `agentfs` binary for the service and each front instead of linking FUSE in-process (§14.2, §17.2) |
 | CSI volumes | PersistentVolumes only (no inline ephemeral volumes); `<basePath>/<pv>/{backing,state,csi.json}`; basePath one filesystem seen by the controller and every node; size recorded, not enforced (§14.2) |
@@ -2970,7 +3042,7 @@ runner.
 | CSI RBAC | csi-provisioner and csi-attacher's minimal ClusterRoles plus leader-election leases; no Secrets, pods or snapshots; the node plugin has no API access and no token (§14.2, [csi.md](csi.md#10-security)) |
 | CSI volume names | The default `volumeName` is `{pvcNamespace}.{pvcName}.{pvName}`: unique per volume, so a claim deleted and created again starts a new branch instead of a root commit on the old one, which every push would find diverged (§11.3, §11.4); a template without `{pvName}` is the operator's choice and documented as unsafe. A static PV's `volumeName` (or `volume`) is literal, and its unknown attributes are refused (§14.2, [csi.md](csi.md#5-parameters)) |
 | CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2): NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
-| CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
+| CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it, and runs with `hostPID: true` so its fronts can read callers' groups, §6); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
 | CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |
 
 ### 19.2 Open questions
@@ -3008,6 +3080,31 @@ runner.
    is still in `pending/`, or by waiting out the window at FLUSH above
    some size. The benchmark bounds the count between one and two records
    per boundary, so a fix shows as a drop to one.
+5. **Residuals of multi-front ordering and live restores** (§6, §14.1,
+   §15), known and accepted for now (2026-10-13):
+   - *Same-tick writes on a coarse clock.* Two fronts' same-size writes
+     within one `ctime` tick are resynced, so HEAD ends on the tree's
+     state; the commits in between may hold the other pod's state for a
+     moment, and the resync commit carries the service's committer, not
+     the pod's that wrote last (the service cannot tell which did).
+   - *Callers' groups at pid 0.* Without `hostPID` on the CSI node plugin
+     (or any FUSE daemon in another pid namespace than its callers), a
+     caller's supplementary groups are unknown: creations that only a
+     supplementary group (a pod's `fsGroup`) allows fall back to the
+     daemon, a racing open from another front can fail with `EACCES`,
+     and `create`'s check of an existing file counts the primary group
+     only. The shipped manifest sets `hostPID: true`; the fallbacks are
+     counted.
+   - *Clock steps.* A write that is the file's current state is never
+     superseded, so a backward step of the wall clock no longer drops the
+     last state; a late record frozen before the step and racing writes
+     after it are still ordered by `ctime`, which the step makes
+     arbitrary for up to the step's length.
+   - *Live restores.* A pod that opens a file for writing between the
+     service's per-path question and the write itself is not seen (as in
+     mount mode); a restore stopped at shutdown leaves the one path it was
+     writing, if that outlasts `--shutdown-grace`, written and
+     unrecorded.
 
 ## 20. Prior art
 

@@ -179,6 +179,13 @@ kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
   pod lists the fronts by slot; one restarting comes back within
   seconds, so retry. A front from an older plugin image cannot listen:
   restart its pod after the upgrade.
+- **Exit status 75, a front could not record what is dirty in it**: the
+  restore did not start (a `--dry-run` asks the fronts too). Retry once
+  the front is healthy; its pod's front log says why.
+- **Exit status 1 partway, `opened for writing`**: the service asks the
+  fronts again before each path; a pod opened that one for writing after
+  the first check. The paths before it are restored and recorded; pause
+  the workload and run the restore again.
 - **A warning that a front could not drop its caches**: the restore is
   done and recorded, but that pod may show the old content until its
   kernel's cache times out; restarting the pod clears it.

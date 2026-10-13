@@ -31,13 +31,20 @@ spec:
       # Longer than --unpublish-grace (20s) + --unstage-grace (30s): a
       # stopped plugin lets its children make their final commits.
       terminationGracePeriodSeconds: 60
+      # The workloads' processes must be visible to the fronts: FUSE reports
+      # a caller outside the plugin's pid namespace as pid 0, whose
+      # supplementary groups (a pod's fsGroup) are then unknown, and new
+      # files are created as root before being given to the pod (design §6,
+      # docs/csi.md "Pod Security").
+      hostPID: true
       tolerations:
         - operator: Exists
       containers:
         - name: agentfs-csi
           image: ghcr.io/mcurcio/agentfs
-          # tini reaps whatever the children leave behind (design §14.2).
-          command: [tini, --, agentfs-csi]
+          # tini reaps whatever the children leave behind (design §14.2); with
+          # hostPID it is not PID 1, so it registers as a subreaper (-s).
+          command: [tini, -s, --, agentfs-csi]
           args:
             - --mode=node
             - --endpoint=unix:///csi/csi.sock

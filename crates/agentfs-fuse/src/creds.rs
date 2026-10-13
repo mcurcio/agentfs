@@ -143,8 +143,28 @@ fn own_fs_context() -> bool {
     })
 }
 
-/// The supplementary groups of process `pid` (`Groups:` in its status).
+/// The supplementary groups of process `pid` (`Groups:` in its status);
+/// none if they cannot be read.
+///
+/// FUSE reports pid 0 for a caller outside the daemon's pid namespace (a
+/// pod's process, seen from a CSI node plugin without `hostPID`): its
+/// groups are unknown, said once on stderr. Creating as such a caller
+/// then succeeds only through its primary group, else falls back to the
+/// daemon (design §6, §14.1).
 pub fn caller_groups(pid: u32) -> Vec<u32> {
+    if pid == 0 {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            eprintln!(
+                "agentfs: a caller's process id is 0 (its pid namespace is not visible to this \
+                 daemon), so its supplementary groups are unknown: a new object it may create \
+                 only through one (a pod's fsGroup) is created as the daemon and then given to \
+                 it, and another front's racing open of that name may fail with EACCES; run \
+                 the CSI node plugin with hostPID: true (design §6)"
+            );
+        });
+        return Vec::new();
+    }
     fs::read_to_string(format!("/proc/{pid}/status"))
         .ok()
         .and_then(|s| parse_groups(&s))

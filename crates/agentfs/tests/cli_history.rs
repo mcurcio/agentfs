@@ -437,21 +437,36 @@ struct TestFront {
 #[derive(Default)]
 struct Noting {
     open: Mutex<Vec<String>>,
+    /// `(file, content, path)`: `path` is open for writing once `file`
+    /// holds `content` (a pod opening it while a restore runs).
+    open_when: Mutex<Option<(PathBuf, String, String)>>,
     settles: Mutex<usize>,
+    settle_error: Mutex<Option<String>>,
     invalidated: Mutex<Vec<String>>,
 }
 
 impl FrontHooks for Noting {
     fn settle(&self) -> Result<(usize, usize), String> {
         *self.settles.lock().unwrap() += 1;
-        Ok((0, 0))
+        match self.settle_error.lock().unwrap().clone() {
+            Some(e) => Err(e),
+            None => Ok((0, 0)),
+        }
     }
 
     fn open_for_writing(&self, paths: &[RepoPath]) -> Vec<bool> {
         let open = self.open.lock().unwrap();
+        let late = self
+            .open_when
+            .lock()
+            .unwrap()
+            .clone()
+            .and_then(|(file, content, path)| {
+                (fs::read_to_string(file).ok().as_deref() == Some(content.as_str())).then_some(path)
+            });
         paths
             .iter()
-            .map(|p| open.contains(&p.to_string()))
+            .map(|p| open.contains(&p.to_string()) || late.as_deref() == Some(p.as_str()))
             .collect()
     }
 
@@ -609,5 +624,59 @@ fn the_history_service_restores_and_reverts_live() {
     drop(lease);
     let out = v.run(["restore", "a", "HEAD~1"]);
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    service.stop();
+}
+
+/// A file a pod opens for writing while a live restore is already writing
+/// (after the check) is refused at its own step: the service asks the
+/// fronts again just before writing each path (design §15).
+#[test]
+fn a_file_opened_during_a_live_restore_is_left_alone() {
+    let v = Volume::new();
+    let service = v.serve();
+    for content in ["one", "two"] {
+        fs::write(v.tree().join("a"), content).unwrap();
+        fs::write(v.tree().join("z"), content).unwrap();
+        let out = v.front_record("pod-a", &["a", "z"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        v.wait_head("a", content);
+        v.wait_head("z", content);
+    }
+    let front = v.listening_front("pod-b");
+    // `z` is opened once `a` has been restored: after the check, before
+    // `z`'s own step.
+    *front.hooks.open_when.lock().unwrap() = Some((v.tree().join("a"), "one".into(), "z".into()));
+    let out = v.run(["restore", ".", "HEAD~1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("opened for writing"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(fs::read_to_string(v.tree().join("a")).unwrap(), "one");
+    assert_eq!(fs::read_to_string(v.tree().join("z")).unwrap(), "two");
+    // What was written is recorded, and the front drops its caches of it.
+    v.wait_head("a", "one");
+    assert_eq!(v.head_has("z").as_deref(), Some("two"));
+    assert_eq!(*front.hooks.invalidated.lock().unwrap(), ["a"]);
+    // A dry run settles the fronts too: what it checks is what a real run
+    // would.
+    let settles = *front.hooks.settles.lock().unwrap();
+    let out = v.run(["revert", "--dry-run", "HEAD"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(*front.hooks.settles.lock().unwrap() > settles);
+    // A front that cannot settle: busy (75), nothing written.
+    *front.hooks.settle_error.lock().unwrap() = Some("sweep failed".into());
+    let out = v.run(["restore", "z", "HEAD~2"]);
+    assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
+    assert!(stderr(&out).contains("sweep failed"), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(v.tree().join("z")).unwrap(), "two");
+    drop(front);
     service.stop();
 }

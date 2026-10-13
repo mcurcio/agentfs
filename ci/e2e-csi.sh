@@ -5,11 +5,13 @@
 #
 #   - deploy/csi passes server-side validation, the driver registers on
 #     the node, and the RBAC inventory holds (`kubectl auth can-i`);
-#   - two restricted pods (uid 10000 and 10001, one fsGroup) on one RWO
-#     claim both write; the remote branch on the runner's git server gets
-#     commits from both, with distinct committers, pod trailers and uid
-#     authors; `agentfs status` in the node plugin shows the service and
-#     two fronts;
+#   - two restricted pods (uid 10000 and 10001, primary groups 3000 and
+#     3001, one fsGroup) on one RWO claim both write; the remote branch
+#     on the runner's git server gets commits from both, with distinct
+#     committers, pod trailers and uid authors; `agentfs status` in the
+#     node plugin shows the service and two fronts;
+#   - both pods create the same new names at once, through their
+#     supplementary fsGroup, without an error (the plugin's hostPID);
 #   - kill -9 of writer-a's front: writer-b is unaffected, writer-a's
 #     front restarts in the same slot and its mount comes back live
 #     (HostToContainer), and what it writes is pushed;
@@ -300,6 +302,27 @@ assert_contains "$status" "pod=writer-a" "status lists writer-a's front"
 assert_contains "$status" "pod=writer-b" "status lists writer-b's front"
 SLOT_A=$(sed -n 's/^fronts: *slot \([0-9]*\): .*pod=writer-a .*/\1/p' <<<"$status")
 [ -n "$SLOT_A" ] || fail "no slot for writer-a in: $status"
+
+step "(e2) both pods create the same new names at once (design §6)"
+# runAsGroup is not the fsGroup: each pod may create in the shared
+# directory only through its supplementary fsGroup, which its front sees
+# through the node plugin's hostPID. Each loop opens f$i with O_CREAT and
+# no O_EXCL: one pod creates, the other opens what the first made, and
+# neither may get EACCES from a file briefly root's.
+in_pod writer-a 'umask 002 && mkdir -p /data/race'
+race_loop='umask 002; i=0; while [ $i -lt 40 ]; do echo x >> /data/race/f$i || exit 1; i=$((i+1)); done'
+in_pod writer-a "$race_loop" >"$LOGS/race-a.log" 2>&1 & race_a=$!
+in_pod writer-b "$race_loop" >"$LOGS/race-b.log" 2>&1 & race_b=$!
+wait "$race_a" || fail "writer-a's creates failed: $(cat "$LOGS/race-a.log")"
+wait "$race_b" || fail "writer-b's creates failed: $(cat "$LOGS/race-b.log")"
+pass "40 racing creates from each pod all succeeded"
+assert_eq "x x" "$(in_pod writer-b 'cat /data/race/f39' | xargs)" "both pods appended to f39"
+assert_eq 10000 "$(in_pod writer-a 'stat -c %g /data/race/f0 /data/race/f39 | sort -u')" \
+  "the racing files carry the fsGroup"
+if plugin_log | grep -q "process id is 0"; then
+  fail "a front could not see a pod's process (hostPID): $(plugin_log | grep 'process id is 0')"
+fi
+pass "every front saw its callers' groups"
 
 step "(f) kill -9 writer-a's front: it restarts in its slot, live"
 node_kill "*--pod-uid $UID_A *" || fail "no front of writer-a to kill"

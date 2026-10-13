@@ -945,6 +945,137 @@ fn atomic_groups_are_never_superseded() {
     drop(service);
 }
 
+#[test]
+fn identical_stamps_from_two_fronts_end_on_the_trees_state() {
+    // A coarse timestamp clock (design §14.1): two fronts write the same
+    // number of bytes to one path within one tick, so both freezes carry
+    // the same stamp; the tree ends on B's "BBBB". Whichever record
+    // arrives last, HEAD must end on what the tree holds.
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let b = front(&env, "pod-b");
+    for (n, b_first) in [(0, true), (1, false)] {
+        let path = format!("counter-{n}");
+        std::fs::write(env.tree.join(&path), "BBBB").unwrap();
+        let tick = stamp_of(&env, &path);
+        let order: [(&Front, &str); 2] = if b_first {
+            [(&b, "BBBB"), (&a, "AAAA")]
+        } else {
+            [(&a, "AAAA"), (&b, "BBBB")]
+        };
+        for (front, content) in order {
+            let recorded = send_frozen(&env, front, &path, content, tick);
+            assert!(recorded.seq.is_some(), "{recorded:?}");
+        }
+        service.committer.commit_pending().unwrap();
+        assert_eq!(
+            service.head_blob(&path).unwrap(),
+            b"BBBB",
+            "B's record first: {b_first}"
+        );
+    }
+    // One front's own re-record of an identical stamp is not resynced.
+    std::fs::write(env.tree.join("own"), "1111").unwrap();
+    let tick = stamp_of(&env, "own");
+    assert!(send_frozen(&env, &a, "own", "1111", tick).seq.is_some());
+    std::fs::write(env.tree.join("own"), "2222").unwrap();
+    assert!(send_frozen(&env, &a, "own", "1111", tick).seq.is_some());
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("own").unwrap(), b"1111");
+}
+
+#[test]
+fn a_late_removal_of_a_path_made_again_ends_on_the_trees_state() {
+    // Front B removed `lock.json`, and its record is late; front A made
+    // the path again and recorded it meanwhile. B's removal is journaled,
+    // then the service records the path as the tree has it (design §14.1).
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let b = front(&env, "pod-b");
+    close(&env, &a.recorder, "lock.json", "old")
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(env.tree.join("lock.json")).unwrap();
+    close(&env, &a.recorder, "lock.json", "new")
+        .unwrap()
+        .unwrap();
+    let late = b
+        .recorder
+        .record(
+            Trigger::Unlink,
+            CALLER,
+            vec![Input::Remove {
+                path: RepoPath::new("lock.json").unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(late.seq.is_some(), "{late:?}");
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("lock.json").unwrap(), b"new");
+
+    // A symlink record whose target the tree no longer has.
+    std::os::unix::fs::symlink("new-target", env.tree.join("link")).unwrap();
+    let late = b
+        .recorder
+        .record(
+            Trigger::Symlink,
+            CALLER,
+            vec![Input::Symlink {
+                path: RepoPath::new("link").unwrap(),
+                target: "old-target".into(),
+            }],
+        )
+        .unwrap();
+    assert!(late.seq.is_some(), "{late:?}");
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("link").unwrap(), b"new-target");
+
+    // A removal of a path still absent is journaled alone.
+    std::fs::remove_file(env.tree.join("lock.json")).unwrap();
+    b.recorder
+        .record(
+            Trigger::Unlink,
+            CALLER,
+            vec![Input::Remove {
+                path: RepoPath::new("lock.json").unwrap(),
+            }],
+        )
+        .unwrap();
+    service.committer.commit_pending().unwrap();
+    assert!(service.head_blob("lock.json").is_none());
+}
+
+#[test]
+fn a_backward_clock_step_does_not_supersede_the_files_current_state() {
+    // The wall clock, which ctime follows, stepped back after `f` was
+    // journaled: later writes have older ctimes than the noted one, but
+    // a write that froze the file as it still is must be journaled.
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let b = front(&env, "pod-b");
+    std::fs::write(env.tree.join("f"), "before").unwrap();
+    let real = stamp_of(&env, "f");
+    let future = FreezeStamp {
+        ctime_ns: real.ctime_ns + 60_000_000_000,
+        mtime_ns: real.mtime_ns + 60_000_000_000,
+        ..real
+    };
+    assert!(send_frozen(&env, &b, "f", "before", future).seq.is_some());
+    std::thread::sleep(TICK);
+    close(&env, &a.recorder, "f", "after the step")
+        .unwrap()
+        .expect("the file's current state is journaled");
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("f").unwrap(), b"after the step");
+    std::thread::sleep(TICK);
+    close(&env, &a.recorder, "f", "and again").unwrap().unwrap();
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("f").unwrap(), b"and again");
+}
+
 /// How many rounds the race tests run (`AGENTFS_RACE_ITERS`).
 fn race_iterations() -> usize {
     std::env::var("AGENTFS_RACE_ITERS")
@@ -962,8 +1093,7 @@ fn splitmix(x: u64) -> u64 {
 }
 
 /// Two fronts, two threads each, write `shared` `writes` times per thread
-/// with `write_one(n, front)`, a different length each time so no two
-/// states share a stamp; after each round HEAD must be what the tree
+/// with `write_one(n, front)`; after each round HEAD must be what the tree
 /// holds, whatever order the records reached the service in (design
 /// §14.1).
 fn race(writes: usize, write_one: impl Fn(&Env, &Recorder, usize) + Sync) {
@@ -985,8 +1115,8 @@ fn race(writes: usize, write_one: impl Fn(&Env, &Recorder, usize) + Sync) {
         });
         service.committer.commit_pending().unwrap();
         assert_eq!(
-            service.head_blob("shared").unwrap().len(),
-            std::fs::read(env.tree.join("shared")).unwrap().len(),
+            service.head_blob("shared").unwrap(),
+            std::fs::read(env.tree.join("shared")).unwrap(),
             "round {round}: HEAD is not the tree's last state"
         );
     }
@@ -1000,6 +1130,19 @@ fn racing_in_place_writes_leave_head_on_the_trees_last_state() {
     race(10, |env, recorder, n| {
         let backing = env.tree.join("shared");
         std::fs::write(&backing, "x".repeat(n)).unwrap();
+        recorder
+            .record(Trigger::Close, CALLER, vec![write_from("shared", &backing)])
+            .unwrap();
+    });
+}
+
+#[test]
+fn racing_same_size_writes_leave_head_on_the_trees_last_state() {
+    // Every state has the same size: only ctime (and, within one tick of a
+    // coarse clock, the resync) orders them (design §14.1).
+    race(10, |env, recorder, n| {
+        let backing = env.tree.join("shared");
+        std::fs::write(&backing, format!("{n:08}")).unwrap();
         recorder
             .record(Trigger::Close, CALLER, vec![write_from("shared", &backing)])
             .unwrap();

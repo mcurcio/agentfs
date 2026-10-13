@@ -821,10 +821,18 @@ fn start_control(state: &StateDir, handler: control::Handler) -> Option<control:
 /// Stops the control socket of `run` or `serve-history`: requests waiting
 /// on the service return first.
 fn stop_control(service: &Service, control: Option<control::Server>) {
+    stop_control_within(service, control, push_now::CONTROL_GRACE);
+}
+
+/// Stops the control socket, waiting up to `grace` for the requests in
+/// progress; whether they all finished.
+fn stop_control_within(
+    service: &Service,
+    control: Option<control::Server>,
+    grace: Duration,
+) -> bool {
     service.handle().close();
-    if let Some(control) = control {
-        control.shutdown(push_now::CONTROL_GRACE);
-    }
+    control.is_none_or(|control| control.shutdown(grace))
 }
 
 fn list(names: &[String]) -> String {

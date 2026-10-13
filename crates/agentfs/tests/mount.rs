@@ -2319,6 +2319,8 @@ fn two_fronts_one_service() {
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn restores_through_the_service_reach_every_front() {
     let v = Vol::new("live-restore");
+    // Only a close or a settle records a write; the sweep never runs.
+    v.config("agentfs.sweepInterval", "1h");
     let mnt2 = v.p("mnt2");
     fs::create_dir_all(&mnt2).unwrap();
     fs::set_permissions(&mnt2, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2391,6 +2393,40 @@ fn restores_through_the_service_reach_every_front() {
     assert_eq!(read(&mnt2, "f.txt").as_deref(), Some("v1"));
     write_and_close(&mnt2.join("f.txt"), "after").unwrap();
     v.expect(&tree(&[("f.txt", f("after"))]));
+
+    // Fronts settle first (design §15): a write through a front that is
+    // not closed yet, which only its sweep would record (an hour away
+    // here), is recorded and committed before the restore's commit.
+    write_and_close(&mnt2.join("k.txt"), "k1").unwrap();
+    v.expect(&tree(&[("f.txt", f("after")), ("k.txt", f("k1"))]));
+    let k1 = v.head_id();
+    write_and_close(&mnt2.join("k.txt"), "k2").unwrap();
+    v.expect(&tree(&[("f.txt", f("after")), ("k.txt", f("k2"))]));
+    let mut armed = fs::File::create(v.mnt().join("h.txt")).unwrap();
+    armed.write_all(b"armed").unwrap();
+    let out = v.ok(&["restore", "k.txt", &k1]);
+    assert!(out.contains("restored 1 path(s)"), "{out}");
+    let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    let head = repo
+        .find_reference("refs/heads/agentfs/demo")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert!(
+        head.message()
+            .unwrap_or("")
+            .contains("Agentfs-Trigger: restore"),
+        "{:?}",
+        head.message()
+    );
+    let before = head.parent(0).unwrap().tree().unwrap();
+    let entry = before.get_path(Path::new("h.txt")).unwrap();
+    assert_eq!(
+        repo.find_blob(entry.id()).unwrap().content(),
+        b"armed",
+        "the open file's write is committed before the restore"
+    );
+    drop(armed);
 
     a.stop();
     b.stop();

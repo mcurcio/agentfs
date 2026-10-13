@@ -67,6 +67,8 @@ pub mod names {
     pub const FRONT_SERVICE_FAILURES: &str = "agentfs.front.service_failures";
     pub const HISTORY_SERVICE_FRONTS: &str = "agentfs.history_service.fronts";
     pub const HISTORY_SERVICE_SUPERSEDED: &str = "agentfs.history_service.superseded";
+    pub const HISTORY_SERVICE_RESYNCS: &str = "agentfs.history_service.resyncs";
+    pub const FUSE_CREATE_AS_CALLER_FALLBACKS: &str = "agentfs.fuse.create_as_caller_fallbacks";
     /// Recorded by the binary, which owns the exporters (design §13).
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -124,6 +126,8 @@ struct Inner {
     front_round_trip: Histogram<f64>,
     front_service_failures: Counter<u64>,
     superseded: Counter<u64>,
+    resyncs: Counter<u64>,
+    create_as_caller_fallbacks: Counter<u64>,
 }
 
 impl fmt::Debug for Telemetry {
@@ -210,6 +214,18 @@ impl Telemetry {
                 "{write}",
                 "Front writes the history service skipped because a newer state of the path was \
                  already journaled (design §14.1)",
+            ),
+            resyncs: counter(
+                names::HISTORY_SERVICE_RESYNCS,
+                "{record}",
+                "Paths the history service recorded again as the backing tree has them, after a \
+                 front's change it could not order against another's (design §14.1)",
+            ),
+            create_as_caller_fallbacks: counter(
+                names::FUSE_CREATE_AS_CALLER_FALLBACKS,
+                "{object}",
+                "Objects a root daemon created as itself and then gave to the caller, because \
+                 creating as the caller was refused or could not be set up (design §6)",
             ),
             meter: meter.clone(),
             tracer,
@@ -404,6 +420,22 @@ impl Telemetry {
     pub(crate) fn superseded(&self) {
         if let Some(inner) = &self.inner {
             inner.superseded.add(1, &[]);
+        }
+    }
+
+    /// Counts one path recorded again as the backing tree has it (design
+    /// §14.1).
+    pub(crate) fn resynced(&self) {
+        if let Some(inner) = &self.inner {
+            inner.resyncs.add(1, &[]);
+        }
+    }
+
+    /// Counts one object created as the daemon, then given to its caller,
+    /// because creating it as the caller failed (design §6).
+    pub fn create_as_caller_fallback(&self) {
+        if let Some(inner) = &self.inner {
+            inner.create_as_caller_fallbacks.add(1, &[]);
         }
     }
 

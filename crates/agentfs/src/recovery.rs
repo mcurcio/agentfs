@@ -34,7 +34,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -559,18 +560,49 @@ pub const LISTEN_GRACE: Duration = Duration::from_secs(5);
 /// 1. every slot whose lease is held must have a listening front (else
 ///    `busy`, exit 75: a front that cannot be settled or told to drop its
 ///    caches would serve stale content);
-/// 2. each front records what is dirty in it, and history catches up;
+/// 2. each front records what is dirty in it (a front that fails to is
+///    `busy` too), and history catches up; a dry run settles the same
+///    way, so it checks what a real run would;
 /// 3. the plan is checked against the backing tree, with the fronts
 ///    saying which paths are open for writing (refused without `--force`);
-/// 4. the service writes the backing tree and records what it wrote as
-///    the operation, by the operator, then commits;
+/// 4. the service writes the backing tree, asking the fronts again about
+///    each path just before writing it, and records what it wrote as the
+///    operation, by the operator, then commits;
 /// 5. each front drops its kernel's caches of the paths written.
+///
+/// When the service stops (`stopping`), a restore in progress stops
+/// before its next path and records what it wrote.
 pub struct ServiceDaemon {
     pub state: StateDir,
     pub recorder: Recorder,
     pub fronts: Fronts,
     pub backing: PathBuf,
     pub commit_window: Duration,
+    pub stopping: Arc<AtomicBool>,
+}
+
+/// Why the service could not serve a restore.
+enum Failure {
+    Restore(RestoreError),
+    /// A front could not be called: retry later (exit 75).
+    Busy(String),
+}
+
+impl From<RestoreError> for Failure {
+    fn from(e: RestoreError) -> Self {
+        Self::Restore(e)
+    }
+}
+
+impl From<FrontsError> for Failure {
+    fn from(e: FrontsError) -> Self {
+        match e {
+            FrontsError::Call { .. } | FrontsError::NotListening(_) => Self::Busy(format!(
+                "{e}; the restore did not start: retry once the front answers"
+            )),
+            FrontsError::Leases(e) => Self::Restore(RestoreError::Io(e)),
+        }
+    }
 }
 
 impl ServiceDaemon {
@@ -580,15 +612,17 @@ impl ServiceDaemon {
             Ok(ask) => ask,
             Err(e) => return refusal_reply(&e),
         };
-        match self.fronts.require_all(LISTEN_GRACE) {
-            Ok(_) => {}
-            Err(e @ FrontsError::NotListening(_)) => return Reply::Busy(e.to_string()),
-            Err(e) => return Reply::Error(e.to_string()),
+        if let Err(e) = self.fronts.require_all(LISTEN_GRACE) {
+            return match Failure::from(e) {
+                Failure::Busy(message) => Reply::Busy(message),
+                Failure::Restore(e) => Reply::Error(e.to_string()),
+            };
         }
         match self.serve_ask(&ask, peer) {
             Ok(done) => Reply::Ok(done),
-            Err(e) if e.is_refusal() => refusal_reply(&e),
-            Err(e) => Reply::Error(e.to_string()),
+            Err(Failure::Busy(message)) => Reply::Busy(message),
+            Err(Failure::Restore(e)) if e.is_refusal() => refusal_reply(&e),
+            Err(Failure::Restore(e)) => Reply::Error(e.to_string()),
         }
     }
 
@@ -596,10 +630,10 @@ impl ServiceDaemon {
         (self.commit_window * 20).max(MIN_HISTORY_WAIT)
     }
 
-    fn serve_ask(&self, ask: &Ask, peer: control::Peer) -> Result<Outcome, RestoreError> {
+    fn serve_ask(&self, ask: &Ask, peer: control::Peer) -> Result<Outcome, Failure> {
         // What the fronts have not recorded yet, then everything recorded,
         // must be in history before the tree is compared with it.
-        let waiting = self.fronts.settle().map_err(other)?;
+        let waiting = self.fronts.settle()?;
         if waiting > 0 {
             eprintln!(
                 "{}: {waiting} path(s) still wait for a front's repair; a plan that touches \
@@ -610,22 +644,23 @@ impl ServiceDaemon {
         if let Some(seq) = self.recorder.last_seq()
             && !self.recorder.wait_committed(seq, self.history_wait())
         {
-            return Err(RestoreError::HistoryBehind);
+            return Err(RestoreError::HistoryBehind.into());
         }
         let history = History::open(&self.state.git()).map_err(other)?;
         let repo = history.repo();
-        let tree = Dir::open(&self.backing)?;
+        let tree = Dir::open(&self.backing).map_err(RestoreError::from)?;
         let plan = restore::plan(repo, &history.settings().branch_ref, &ask.request)?;
-        let live = FrontsLiveness::new(&self.fronts);
-        live.ask(plan.steps.iter().map(|s| &s.path))?;
-        let objects = Objects::new(&self.state, history.settings(), ask.dry_run)?;
+        let asked = FrontsLiveness::asked(&self.fronts, &self.stopping);
+        asked.ask(plan.steps.iter().map(|s| &s.path))?;
+        let objects = Objects::new(&self.state, history.settings(), ask.dry_run)
+            .map_err(RestoreError::from)?;
         let plan = restore::check(
             plan,
             repo,
             &self.recorder,
             objects.get(),
             &tree,
-            &live,
+            &asked,
             ask.force,
         )?;
         let mut done = Outcome {
@@ -638,9 +673,10 @@ impl ServiceDaemon {
         if ask.dry_run || plan.steps.is_empty() {
             return Ok(done);
         }
-        // Asked again just before writing: a file opened since the check
-        // is refused by the recheck of its step.
-        live.ask(plan.steps.iter().map(|s| &s.path))?;
+        // From here on the fronts are asked about each path just before
+        // it is written: a file opened since the check is refused by the
+        // recheck of its step.
+        let live = FrontsLiveness::per_step(&self.fronts, &self.stopping);
         let operator = Caller {
             uid: peer.uid,
             gid: peer.gid,
@@ -709,54 +745,103 @@ impl ServiceDaemon {
                 "failed part way: {e}; the {} path(s) written and {} removed before it are \
                  recorded",
                 done.written, done.removed
-            ))),
+            ))
+            .into()),
             (None, Err(e)) => Err(other(format!(
                 "the {} path(s) were written, but recording them failed: {e}",
                 done.written + done.removed
-            ))),
+            ))
+            .into()),
         }
     }
 }
 
-/// Which paths the fronts hold open for writing, asked of every front in
-/// batches ([`FrontsLiveness::ask`]) and answered from that. A path not
-/// asked about, or asked when a front failed to answer, counts as open:
-/// the safe answer, refused without `--force`.
+/// Which paths the fronts hold open for writing ([`Fronts::open_for_writing`]).
+trait AskFronts {
+    fn open_for_writing(&self, paths: &[RepoPath]) -> Result<Vec<bool>, FrontsError>;
+}
+
+impl AskFronts for Fronts {
+    fn open_for_writing(&self, paths: &[RepoPath]) -> Result<Vec<bool>, FrontsError> {
+        Fronts::open_for_writing(self, paths)
+    }
+}
+
+/// Which paths the fronts hold open for writing, for [`restore::check`]
+/// and [`restore::apply`].
+///
+/// - [`FrontsLiveness::asked`], for the check: every front is asked about
+///   the plan's paths in batches ([`FrontsLiveness::ask`]), and answers
+///   come from that.
+/// - [`FrontsLiveness::per_step`], for the apply: every front is asked
+///   about each path when the apply rechecks it, just before writing it,
+///   so a file opened during a long apply is seen (one round trip per
+///   front and path).
+///
+/// A path not asked about, or asked when a front failed to answer, counts
+/// as open: the safe answer, refused without `--force`.
 struct FrontsLiveness<'a> {
-    fronts: &'a Fronts,
-    open: Mutex<HashMap<RepoPath, bool>>,
+    fronts: &'a dyn AskFronts,
+    /// The batch answers; `None`: ask at each call.
+    asked: Option<Mutex<HashMap<RepoPath, bool>>>,
+    stopping: &'a AtomicBool,
 }
 
 impl<'a> FrontsLiveness<'a> {
-    fn new(fronts: &'a Fronts) -> Self {
+    fn asked(fronts: &'a dyn AskFronts, stopping: &'a AtomicBool) -> Self {
         Self {
             fronts,
-            open: Mutex::new(HashMap::new()),
+            asked: Some(Mutex::new(HashMap::new())),
+            stopping,
         }
     }
 
-    fn ask<'p>(&self, paths: impl Iterator<Item = &'p RepoPath>) -> Result<(), RestoreError> {
+    fn per_step(fronts: &'a dyn AskFronts, stopping: &'a AtomicBool) -> Self {
+        Self {
+            fronts,
+            asked: None,
+            stopping,
+        }
+    }
+
+    fn ask<'p>(&self, paths: impl Iterator<Item = &'p RepoPath>) -> Result<(), FrontsError> {
+        let Some(asked) = &self.asked else {
+            return Ok(());
+        };
         let paths: Vec<RepoPath> = paths.cloned().collect();
-        let answers = self.fronts.open_for_writing(&paths).map_err(other)?;
-        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
-        open.extend(paths.into_iter().zip(answers));
+        let answers = self.fronts.open_for_writing(&paths)?;
+        let mut asked = asked.lock().unwrap_or_else(PoisonError::into_inner);
+        asked.extend(paths.into_iter().zip(answers));
         Ok(())
     }
 }
 
 impl Liveness for FrontsLiveness<'_> {
     fn open_for_writing(&self, path: &RepoPath) -> bool {
-        self.open
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(path)
-            .copied()
-            .unwrap_or(true)
+        match &self.asked {
+            Some(asked) => asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(path)
+                .copied()
+                .unwrap_or(true),
+            None => match self.fronts.open_for_writing(std::slice::from_ref(path)) {
+                Ok(open) => open.first().copied().unwrap_or(true),
+                Err(e) => {
+                    eprintln!("asking the fronts whether {path} is open for writing: {e}");
+                    true
+                }
+            },
+        }
     }
 
     /// The service writes the backing tree directly and records itself.
     fn records_its_writes(&self) -> bool {
         false
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 }
 
@@ -794,6 +879,64 @@ mod tests {
             remotes: Vec::new(),
             timeout_ms: None,
         }
+    }
+
+    /// Fronts whose open files change between calls.
+    #[derive(Default)]
+    struct FakeFronts {
+        open: Mutex<Vec<String>>,
+        fail: AtomicBool,
+        calls: Mutex<usize>,
+    }
+
+    impl AskFronts for FakeFronts {
+        fn open_for_writing(&self, paths: &[RepoPath]) -> Result<Vec<bool>, FrontsError> {
+            *self.calls.lock().unwrap() += 1;
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(FrontsError::Call {
+                    slot: 1,
+                    pod: "pod-a".into(),
+                    message: "gone".into(),
+                });
+            }
+            let open = self.open.lock().unwrap();
+            Ok(paths
+                .iter()
+                .map(|p| open.contains(&p.to_string()))
+                .collect())
+        }
+    }
+
+    #[test]
+    fn the_apply_asks_the_fronts_at_each_step() {
+        let fronts = FakeFronts::default();
+        let stopping = AtomicBool::new(false);
+        let a = RepoPath::new("a").unwrap();
+        let asked = FrontsLiveness::asked(&fronts, &stopping);
+        asked.ask([&a].into_iter()).unwrap();
+        assert!(!asked.open_for_writing(&a));
+        // Not asked about: open.
+        assert!(asked.open_for_writing(&RepoPath::new("b").unwrap()));
+        // A pod opens `a` after the batch was asked: the check's answers
+        // are from before, the apply's are asked anew.
+        fronts.open.lock().unwrap().push("a".into());
+        assert!(!asked.open_for_writing(&a));
+        let live = FrontsLiveness::per_step(&fronts, &stopping);
+        let before = *fronts.calls.lock().unwrap();
+        assert!(live.open_for_writing(&a));
+        assert_eq!(*fronts.calls.lock().unwrap(), before + 1);
+        fronts.open.lock().unwrap().clear();
+        assert!(!live.open_for_writing(&a));
+        // A front that cannot answer: open.
+        fronts.fail.store(true, Ordering::SeqCst);
+        assert!(live.open_for_writing(&a));
+        assert!(matches!(
+            Failure::from(asked.ask([&a].into_iter()).unwrap_err()),
+            Failure::Busy(_)
+        ));
+        assert!(!live.stopping());
+        stopping.store(true, Ordering::SeqCst);
+        assert!(live.stopping());
     }
 
     #[test]

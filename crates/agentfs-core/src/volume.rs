@@ -46,7 +46,7 @@ use crate::record::{
     Caller, Change, Draft, Operation, OperationKind, Origin, PatchAuthor, Record, Trigger,
 };
 use crate::rules::{Decision, Rules, RulesError, SkipReason};
-use crate::stamps::{self, FreezeStamp, StampBook, Verdict};
+use crate::stamps::{FreezeStamp, StampBook, Verdict};
 use crate::telemetry::{Telemetry, spans};
 use crate::tracked::Tracked;
 
@@ -930,7 +930,7 @@ impl Recorder {
                         && seq.is_some()
                     {
                         for s in stamps {
-                            book.note(&s.path, s.stamp);
+                            book.note(&s.path, s.stamp, 0, false);
                         }
                     }
                 }
@@ -1041,17 +1041,45 @@ impl Recorder {
     /// a newer state of its path that is already journaled is skipped
     /// ([`SkipReason::Superseded`], by its freeze stamp in `stamps`, once
     /// [`Recorder::enable_stamps`] is on; design §14.1). Atomic groups are
-    /// recorded whole: neither check applies to them. Every write's copy must exist
-    /// and be in the front's `slot`; operations come only from this
-    /// process. The record is journaled with `origin`, so it commits with
-    /// the front's committer (design §9), and this returns once it is
+    /// recorded whole: neither check applies to them. Every write's copy
+    /// must exist and be in the front's `slot`; operations come only from
+    /// this process. The record is journaled with `origin`, so it commits
+    /// with the front's committer (design §9), and this returns once it is
     /// durable.
+    ///
+    /// Some journaled changes cannot be ordered against the tree (design
+    /// §14.1): a write whose freeze stamp is identical to the last one
+    /// journaled at its path from another slot, a removal of a path that
+    /// is in the backing tree again, and a symlink whose target is not the
+    /// one the tree has now. For each, once the record is journaled and
+    /// its claims released, the service records the path as the backing
+    /// tree has it now ([`Recorder::resync`]), so HEAD ends on the tree's
+    /// state whichever front's record arrived last.
     pub fn sequence(
+        &self,
+        origin: &Origin,
+        slot: u16,
+        draft: Draft,
+        stamps: &[PathStamp],
+    ) -> Result<Recorded, VolumeError> {
+        let caller = draft.caller;
+        let mut resync = Vec::new();
+        let recorded = self.sequence_inner(origin, slot, draft, stamps, &mut resync)?;
+        if recorded.seq.is_some() {
+            for path in resync {
+                self.resync(&path, caller);
+            }
+        }
+        Ok(recorded)
+    }
+
+    fn sequence_inner(
         &self,
         origin: &Origin,
         slot: u16,
         mut draft: Draft,
         stamps: &[PathStamp],
+        resync: &mut Vec<RepoPath>,
     ) -> Result<Recorded, VolumeError> {
         let Backend::Local { journal, tracked } = &self.backend else {
             return Err(VolumeError::FrontRecord(
@@ -1086,25 +1114,63 @@ impl Recorder {
         let mut skipped = Vec::new();
         let stamp_of: HashMap<&RepoPath, &FreezeStamp> =
             stamps.iter().map(|s| (&s.path, &s.stamp)).collect();
+        // The backing file's stamp now, of each write judged.
+        let mut now_of: HashMap<RepoPath, FreezeStamp> = HashMap::new();
+        let mut unordered = Vec::new();
         let mut refused_member = None;
+        let tree = self.rules.tree();
         for change in std::mem::take(&mut draft.changes) {
             let decision = match &change {
                 Change::Remove { path } => {
                     if tracked.contains_or_under(path) {
+                        // Another front made the path again since this
+                        // front removed it, and its record may be in
+                        // already.
+                        if !draft.atomic
+                            && (in_backing(tree, path, false).is_some()
+                                || in_backing(tree, path, true).is_some())
+                        {
+                            unordered.push(path.clone());
+                        }
                         Decision::Record
                     } else {
                         Decision::Skip(SkipReason::Untracked)
                     }
                 }
-                Change::Write { path, .. } | Change::Symlink { path, .. } if !draft.atomic => {
-                    let symlink = matches!(change, Change::Symlink { .. });
-                    match in_backing(self.rules.tree(), path, symlink) {
+                Change::Symlink { path, target } if !draft.atomic => {
+                    match in_backing(tree, path, true) {
+                        None => Decision::Skip(SkipReason::Gone),
+                        Some(_) => {
+                            let decision = self.rules.decide(path, tracked.contains(path))?;
+                            let now = std::fs::read_link(tree.join(path.as_str())).ok();
+                            if decision == Decision::Record
+                                && now.is_some_and(|t| t.as_os_str() != target.as_str())
+                            {
+                                unordered.push(path.clone());
+                            }
+                            decision
+                        }
+                    }
+                }
+                Change::Write { path, .. } if !draft.atomic => {
+                    match in_backing(tree, path, false) {
                         None => Decision::Skip(SkipReason::Gone),
                         Some(now) => {
-                            let stamp = stamp_of.get(path).copied().filter(|_| !symlink);
-                            match self.judge_write(path, stamp, now.as_ref()) {
-                                Some(reason) => Decision::Skip(reason),
-                                None => self.rules.decide(path, tracked.contains(path))?,
+                            let now = now.as_ref().map(FreezeStamp::from_metadata);
+                            if let Some(now) = now {
+                                now_of.insert(path.clone(), now);
+                            }
+                            let stamp = stamp_of.get(path).copied();
+                            match self.judge_write(path, slot, stamp, now.as_ref()) {
+                                Judged::Skip(reason) => Decision::Skip(reason),
+                                judged => {
+                                    let decision =
+                                        self.rules.decide(path, tracked.contains(path))?;
+                                    if judged == Judged::Resync && decision == Decision::Record {
+                                        unordered.push(path.clone());
+                                    }
+                                    decision
+                                }
                             }
                         }
                     }
@@ -1176,10 +1242,12 @@ impl Recorder {
                         if let Change::Write { path, .. } = change
                             && let Some(stamp) = stamp_of.get(path)
                         {
-                            book.note(path, **stamp);
+                            let current = now_of.get(path) == Some(*stamp);
+                            book.note(path, **stamp, slot, current);
                         }
                     }
                 }
+                resync.extend(unordered);
                 let _ = self.pending.remove(dropped);
                 Ok(Recorded {
                     seq: Some(seq),
@@ -1200,6 +1268,27 @@ impl Recorder {
         }
     }
 
+    /// Records `path` as the backing tree has it now, as the service's own
+    /// `sweep` record by `caller` (design §14.1): after a front's change
+    /// that cannot be ordered against the tree ([`Recorder::sequence`]).
+    /// A file is frozen again, a symlink read again; a path that is
+    /// neither now records nothing (its removal is another front's to
+    /// record). Takes the path's claim; content equal to what was just
+    /// journaled leaves the tree, and so history, unchanged. A failure
+    /// leaves the path to its next change, with a warning.
+    fn resync(&self, path: &RepoPath, caller: Caller) {
+        let Some(input) = backing_input(self.rules.tree(), path) else {
+            return;
+        };
+        self.telemetry.resynced();
+        if let Err(e) = self.record_inner(Trigger::Sweep, caller, vec![input], None, false, None) {
+            eprintln!(
+                "history service: recording {path} as the backing tree has it, after fronts' \
+                 changes that could not be ordered, failed: {e}; its next change records it"
+            );
+        }
+    }
+
     /// Keeps the freeze stamp of the last write journaled at each path, so
     /// [`Recorder::sequence`] skips a front's write frozen before it
     /// (design §14.1). The history service turns it on before it serves;
@@ -1210,38 +1299,46 @@ impl Recorder {
         }
     }
 
-    /// Whether a front's write of `path`, frozen with `stamp`, is out of
-    /// date (design §14.1), given `now`, the path's metadata in the backing
-    /// tree: [`SkipReason::Gone`] if another file has replaced the one it
-    /// froze (a rename over the path: whoever did that records it), and
-    /// [`SkipReason::Superseded`] if a newer state is already journaled
-    /// ([`stamps`], once [`Recorder::enable_stamps`] is on).
+    /// Whether a front's write of `path` from `slot`, frozen with `stamp`,
+    /// is out of date (design §14.1), given `now`, the backing file's
+    /// stamp at the path: skipped as [`SkipReason::Gone`] if another file
+    /// has replaced the one it froze (a rename over the path: whoever did
+    /// that records it), and as [`SkipReason::Superseded`] if a newer state
+    /// is already journaled ([`stamps`], once [`Recorder::enable_stamps`]
+    /// is on); [`Judged::Resync`] if it cannot be ordered against the
+    /// journaled one.
     fn judge_write(
         &self,
         path: &RepoPath,
+        slot: u16,
         stamp: Option<&FreezeStamp>,
-        now: Option<&std::fs::Metadata>,
-    ) -> Option<SkipReason> {
-        let stamp = stamp?;
-        let now = now.map(FreezeStamp::from_metadata);
-        if let Some(now) = &now
+        now: Option<&FreezeStamp>,
+    ) -> Judged {
+        let Some(stamp) = stamp else {
+            return Judged::Journal;
+        };
+        if let Some(now) = now
             && now.dev == stamp.dev
             && now.ino != stamp.ino
         {
-            return Some(SkipReason::Gone);
+            return Judged::Skip(SkipReason::Gone);
         }
-        let book = self.stamps.as_ref()?;
-        let superseded = match book.judge(path, stamp) {
-            Verdict::Journal => false,
-            Verdict::Superseded => true,
-            Verdict::Tie(journaled) => {
-                stamps::resolve_tie(&journaled, now.as_ref()) == Verdict::Superseded
-            }
+        let Some(book) = self.stamps.as_ref() else {
+            return Judged::Journal;
         };
-        superseded.then(|| {
-            self.telemetry.superseded();
-            SkipReason::Superseded
-        })
+        match book.judge(path, stamp, slot, now) {
+            Verdict::Journal => Judged::Journal,
+            Verdict::Resync => Judged::Resync,
+            Verdict::Superseded => {
+                self.telemetry.superseded();
+                Judged::Skip(SkipReason::Superseded)
+            }
+        }
+    }
+
+    /// The telemetry this recorder reports to.
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.telemetry
     }
 
     /// Whether each of `paths` is tracked now: the history service's answer
@@ -1945,6 +2042,40 @@ fn in_tree(tree: Option<&git2::Tree<'_>>, path: &RepoPath) -> Result<bool, Volum
         Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(false),
         Err(e) => Err(HistoryError::from(e).into()),
     }
+}
+
+/// What [`Recorder::judge_write`] says about a front's write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Judged {
+    Journal,
+    Skip(SkipReason),
+    /// Journal it, then record the path as the tree has it now.
+    Resync,
+}
+
+/// The input that records `path` as the backing tree at `tree` has it
+/// now: a regular file or a symlink under real directories (design
+/// §14.1). `None` for anything else, or a target that is not UTF-8.
+fn backing_input(tree: &Path, path: &RepoPath) -> Option<Input> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(meta) = in_backing(tree, path, false) {
+        let meta = meta?;
+        return Some(Input::Write {
+            path: path.clone(),
+            backing: tree.join(path.as_str()),
+            executable: meta.permissions().mode() & 0o111 != 0,
+        });
+    }
+    in_backing(tree, path, true)?;
+    let target = std::fs::read_link(tree.join(path.as_str()))
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()?;
+    Some(Input::Symlink {
+        path: path.clone(),
+        target,
+    })
 }
 
 /// Whether `path` is still in the backing tree at `tree` as a front

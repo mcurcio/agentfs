@@ -68,7 +68,11 @@ binary, exactly the ones the single-node tests exercise:
   kubelet's target.
 
 A crashed child does not take the plugin down; the plugin restarts it
-(§8). `tini` is the container's PID 1 and reaps what the children leave.
+(§8). `tini` reaps what the children leave: the plugin shares the host's
+pid namespace (`hostPID: true`), so `tini` is not PID 1 and runs as a
+subreaper (`-s`). The fronts need that namespace: FUSE reports a caller
+in a pod's own pid namespace as pid 0, and its supplementary groups (the
+pod's `fsGroup`) are then unknown (design §6).
 
 **On disk.** Under `--base-path` (default `/var/lib/agentfs-csi/volumes`),
 one directory per volume, named after the PV:
@@ -235,6 +239,12 @@ See `deploy/csi/example/deployment.yaml`.
   the pod's `fsGroup` through the mount. Use `fsGroupChangePolicy:
   OnRootMismatch`, so the walk happens once, not at every pod start (each
   chown is a recorded metadata change).
+  Pods whose primary group is not their `fsGroup` create files through a
+  supplementary group: the node plugin's `hostPID` lets their fronts see
+  it (design §6). A plugin deployed without it still works, but such
+  creates fall back to root-then-chown
+  (`agentfs.fuse.create_as_caller_fallbacks`), and two pods creating the
+  same new name at once can see `EACCES`.
 - **mountPropagation: HostToContainer.** Set it on the volume mount. When a
   front crashes, the plugin mounts its replacement over the dead one; with
   `HostToContainer` the container sees the new mount at once, without it
@@ -344,11 +354,14 @@ kubectl -n agentfs-csi exec <node plugin pod> -c agentfs-csi -- \
 ```
 
 The service has every pod's front record what is dirty in it, refuses a
-path any pod holds open for writing (unless `--force`), writes the
+path any pod holds open for writing (unless `--force`; the fronts are
+asked again just before each path is written, so a file opened during a
+long restore is refused at its own step), writes the
 volume and has every front drop its kernel's caches of what it wrote, so
 each pod sees the restored files at once. Exit status 75 means a front
-is not listening (an older plugin image, or one restarting): retry, or
-restart that pod. With the volume unstaged, `agentfs restore` runs
+is not listening (an older plugin image, or one restarting) or could not
+record what is dirty in it: retry, or restart that pod. With the volume
+unstaged, `agentfs restore` runs
 directly instead, with `--root <basePath>/<pv>/backing` as well.
 
 **Pushes after the last pod.** The service pushes on its interval while
@@ -402,7 +415,7 @@ projected token only into the two sidecars that use the API; the
 
 | Namespace | Pod | Level | Why |
 |---|---|---|---|
-| `agentfs-csi` (enforce `privileged`, warn and audit `baseline`) | node plugin `agentfs-csi` | privileged, root | FUSE `mount(2)`, `Bidirectional` propagation into `/var/lib/kubelet`, hostPath volumes, passthrough (`CAP_SYS_ADMIN`), giving files to their owners (`CAP_CHOWN`, `CAP_FOWNER`) |
+| `agentfs-csi` (enforce `privileged`, warn and audit `baseline`) | node plugin `agentfs-csi` | privileged, root, `hostPID` | FUSE `mount(2)`, the workloads' real pids so fronts create files as their callers with their supplementary groups (design §6), `Bidirectional` propagation into `/var/lib/kubelet`, hostPath volumes, passthrough (`CAP_SYS_ADMIN`), giving files to their owners (`CAP_CHOWN`, `CAP_FOWNER`) |
 | | node-driver-registrar, livenessprobe | root, no capabilities, read-only root filesystem | reach the root-owned 0660 CSI socket |
 | | controller `agentfs-csi` | root with `DAC_OVERRIDE` and `FOWNER` only, read-only root filesystem, hostPath basePath | create volume directories; delete files the workloads' uids own |
 | | csi-provisioner, csi-attacher, livenessprobe | root, no capabilities, read-only root filesystem, RuntimeDefault seccomp | reach the CSI socket |
