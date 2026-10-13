@@ -252,8 +252,14 @@ for i in 1 2 3 4; do
   assert_eq "$pod" "$(committer_of shared.txt)" "version $i is $pod's"
 done
 assert_eq 4 "$(sudo cat "$BACKING/shared.txt")" "last writer wins in the tree"
-VERSIONS=$(sgit log --format=%cn refs/heads/agentfs/demo -- shared.txt | tr '\n' ' ')
-assert_eq "pod-b pod-a pod-b pod-a " "$VERSIONS" "every boundary of shared.txt is in history"
+# Each version, with the pod that committed it. A front's late record
+# (RELEASE) can catch the other front's O_TRUNC before its write and
+# commit that empty state as its own (design §14.1): skipped here.
+VERSIONS=$(for c in $(sgit log --format=%H refs/heads/agentfs/demo -- shared.txt); do
+  content=$(sgit show "$c:shared.txt" 2>/dev/null) || continue
+  if [ -n "$content" ]; then printf '%s:%s ' "$(sgit log -1 --format=%cn "$c")" "$content"; fi
+done)
+assert_eq "pod-b:4 pod-a:3 pod-b:2 pod-a:1 " "$VERSIONS" "every boundary of shared.txt is in history"
 
 step "a shared file, written by both at once"
 # Every write must succeed: each front creates as the caller (design §6),

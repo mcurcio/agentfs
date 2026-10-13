@@ -1932,7 +1932,13 @@ while fronts are live (§15).
 listens, and only when no front lease is live, because patches write the
 backing tree that live fronts serve. POSIX and BSD locks stay in each FUSE
 mount's kernel and are not shared between fronts, so a SQLite or other
-lock-coordinated database must be written from one pod.
+lock-coordinated database must be written from one pod. A front does not
+know what other fronts write: a late record of its own (RELEASE, or the
+sweep while it holds the file open) of a path another pod is writing at
+that moment captures that pod's state, for example the empty file
+between its `O_TRUNC` and its write, under its own committer. Freeze
+stamps keep the order right and the other pod's close then records its
+final state; only the intermediate commit's attribution is wrong.
 
 **Freeze stamps** (`agentfs_core::stamps`). Each front freezes under its
 own path claim but the service journals under its own, so two pods
