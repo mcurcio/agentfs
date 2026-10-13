@@ -1060,9 +1060,11 @@ fn git_works_on_the_mount() {
 fn sigterm_with_a_file_open_for_writing() {
     let v = Vol::new("sigterm_open");
     let mut m = v.mount(&[]);
-    // A writer that never closes its file.
+    // A writer that never closes its file after writing. (`printf >&3`
+    // would close a duplicate of it afterwards: a FLUSH that records the
+    // data, leaving the final sweep nothing to record, design §3.1.)
     let mut writer = Command::new("sh")
-        .args(["-c", "exec 3>held; printf data >&3; exec sleep 60"])
+        .args(["-c", "exec 3>held; exec 1>&3; printf data; exec sleep 60"])
         .current_dir(v.mnt())
         .spawn()
         .unwrap();
@@ -2431,4 +2433,42 @@ fn restores_through_the_service_reach_every_front() {
     a.stop();
     b.stop();
     service.stop();
+}
+
+// ---- design §3.1: one record per close, ----
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn a_close_is_recorded_once() {
+    // A file written and closed within one timestamp tick is recorded at
+    // the close, racily; its RELEASE finds the same bytes and records
+    // nothing more (design §3.1, §19.2 item 4).
+    let v = Vol::new("one_record");
+    v.config("agentfs.commitWindow", "10m");
+    let src = v.p("src");
+    fs::create_dir_all(&src).unwrap();
+    let mut want = Vec::new();
+    for i in 0..20 {
+        fs::write(src.join(format!("f{i}")), format!("content {i}")).unwrap();
+        want.push((format!("f{i}"), f(&format!("content {i}"))));
+    }
+    let m = v.mount(&[]);
+    // `dd` opens, writes and closes once: one FLUSH, one RELEASE.
+    v.sh(&format!(
+        "for i in $(seq 0 19); do dd if={}/f$i of=f$i status=none; done",
+        src.display()
+    ));
+    // Every RELEASE has arrived (they follow the closes asynchronously).
+    std::thread::sleep(Duration::from_secs(2));
+    let log = m.stop();
+    let line = log
+        .lines()
+        .find(|l| l.starts_with("final commit: "))
+        .unwrap_or_else(|| panic!("{log}"));
+    assert!(
+        line.starts_with("final commit: 20 record(s)"),
+        "one record per file: {line}\n{log}"
+    );
+    let want: Vec<(&str, Item)> = want.iter().map(|(p, i)| (p.as_str(), i.clone())).collect();
+    v.expect(&tree(&want));
 }
