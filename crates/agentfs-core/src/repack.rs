@@ -331,6 +331,92 @@ mod tests {
         assert_eq!(run().unwrap(), RepackOutcome::NothingToDo);
     }
 
+    /// git killed at every stage of a repack (as a crash or a stop would)
+    /// loses nothing: the history stays whole and the next repack runs.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_killed_repack_loses_nothing() {
+        if !git_available() {
+            eprintln!("git is not installed: skipped");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path().join("state"));
+        volume::init(&state, "vol", None).unwrap();
+        let repo = git2::Repository::open_bare(state.git()).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let mut parent: Option<git2::Oid> = None;
+        for i in 0..20 {
+            let blob = repo
+                .blob(format!("version {i}\n").repeat(500).as_bytes())
+                .unwrap();
+            let mut tree = repo.treebuilder(None).unwrap();
+            tree.insert("a", blob, 0o100644).unwrap();
+            let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+            let parents: Vec<git2::Commit<'_>> = parent
+                .map(|p| repo.find_commit(p).unwrap())
+                .into_iter()
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            parent = Some(
+                repo.commit(
+                    Some("refs/heads/agentfs/vol"),
+                    &sig,
+                    &sig,
+                    "c",
+                    &tree,
+                    &refs,
+                )
+                .unwrap(),
+            );
+        }
+        let run = |stop: &Stop| repack(Path::new("git"), &state.git(), &[], stop);
+        let fsck = || {
+            let out = Command::new("git")
+                .args(["fsck", "--full", "--strict", "--no-progress"])
+                .env("GIT_DIR", state.git())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        // Killed at once (a crash right after the spawn).
+        {
+            let _guard = crate::failpoints::configure("repack.running=error").unwrap();
+            let failed = run(&Stop::default());
+            assert!(matches!(failed, Err(RepackError::Spawn(_))), "{failed:?}");
+            fsck();
+        }
+        // Killed by a stop after 1, 5, 20 and 50 ms of work.
+        for ms in [1, 5, 20, 50] {
+            let stop = Stop::default();
+            let outcome = std::thread::scope(|s| {
+                s.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    stop.stop();
+                });
+                run(&stop)
+            });
+            assert!(outcome.is_ok(), "{ms} ms: {outcome:?}");
+            fsck();
+        }
+        // A later round packs everything (unless a stopped one finished).
+        let last = run(&Stop::default()).unwrap();
+        assert!(
+            matches!(last, RepackOutcome::Done(_) | RepackOutcome::NothingToDo),
+            "{last:?}"
+        );
+        assert_eq!(loose_objects(&state.git()), 0);
+        fsck();
+        let head = repo.refname_to_id("refs/heads/agentfs/vol").unwrap();
+        assert_eq!(Some(head), parent);
+    }
+
     #[test]
     fn git_runs_bounded_in_an_environment_of_its_own() {
         let dir = with_a_loose_object();

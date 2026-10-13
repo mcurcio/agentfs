@@ -553,8 +553,12 @@ The queue outlives the daemon. It is kept in `meta/repairs` in the state
 area (one line per path: the caller's uid, gid and pid and the path in hex;
 a front's file also has `@origin <JSON>` lines naming the pod the entries
 after it are committed as, below),
-rewritten whenever it changes, and the next `agentfs mount` repairs what it
-lists from the backing tree before it serves any request. A repair made
+rewritten whenever it changes (a temporary file, fsynced, renamed over
+it), and the next `agentfs mount` repairs what it lists from the backing
+tree before it serves any request. A crash between the write and the
+rename leaves the new queue in `repairs.tmp`; the next mount loads its
+complete lines as well, since a repair is idempotent (found by the
+`repairs.before_rename` failpoint, §18). A repair made
 from an older entry never drops one queued again meanwhile. Paths still
 queued at unmount are listed on exit with where they are saved; if the file
 cannot be written either (the state area is full or unwritable), the exit

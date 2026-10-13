@@ -283,7 +283,7 @@ What a crash at each point leaves, and what the next open does (§3.3,
 | The patch phase at mount, after a patch's tree write and before its record (`patch/queue.rs`) | The backing tree holds the patch's content; history does not; `meta/patch.json` names the patch in flight | The next run's check finds those paths already written and records them as the patch. If the producer replaced or withdrew the patch meanwhile, the paths are put back to the branch head's state first (§12) | `patch.after_tree_write` |
 | The patch phase, after the record and before its commit | A journaled patch record | Journal replay commits it with its `Agentfs-Inbox` trailer, and the trailer scan finds it applied; it is never applied twice (§12) | `patch.after_record` |
 | The patch phase, after the commit and before the ref moves | The commit on the branch; `inbox/<n>` still there, no `applied/<n>` | The next run finds the commit by its trailers and finishes the ref moves (`applied/<n>` set, `inbox/<n>` deleted): what is applied is decided by the branch, never by refs (§12) | `patch.after_commit`, `queue.after_status` |
-| A namespace record that failed (`EIO`), with paths on the repair queue | `meta/repairs`, rewritten whenever the queue changes (`meta/fronts/slot-N.repairs` for a front) | The next mount (or the front reusing the slot) re-derives each path's absolute state from the backing tree and records it before it serves any request (§3.5) | `repairs.before_rename` |
+| A namespace record that failed (`EIO`), with paths on the repair queue | `meta/repairs`, rewritten whenever the queue changes (`meta/fronts/slot-N.repairs` for a front) | The next mount (or the front reusing the slot) re-derives each path's absolute state from the backing tree and records it before it serves any request; a queue left in the temporary file (a crash before its rename) is loaded too (§3.5) | `repairs.before_rename` |
 | The daemon of a mount in a pod (§17.1) | A stale FUSE mount: the workload's calls fail with `ENOTCONN`, never reaching the bare directory beneath | The kubelet restarts the sidecar, which runs `mount --on-stale-mount recover`: it takes the lock, replays the journal and bind-stacks a new mount over the stale one, which propagation carries into the workload containers; at its stop it detaches the stale layers. With `hold` it mounts nothing and the pod is restarted by hand ([runbook](runbooks/crashed-sidecar.md)) | none |
 | A CSI front or service (§14.2) | A stale mount at the pod's target, or fronts failing with `EIO` | The supervisor restarts it with backoff (1 s to 30 s): a front in its predecessor's slot, its new mount bind-stacked over the stale target; a service replays its journal | none |
 | The CSI node plugin (deleted, upgraded or crashed) | Its children stop with it (with final commits when it is stopped gracefully); the staged and published records on the hostPath | Reconcile at plugin start: services for staged volumes (journal replay), fronts recovered for targets whose mount is still there, live or stale; targets the kubelet removed are forgotten. Containers that mount with `HostToContainer` see the new mount; others after a container restart (§14.2, [runbook](runbooks/csi-recovery.md)) | none |
@@ -291,7 +291,10 @@ What a crash at each point leaves, and what the next open does (§3.3,
 The Failpoint column names the failpoints (`agentfs_core::failpoints`,
 test builds only) that stop the process at that point; the crash
 harnesses of design §18 test 3 kill or fail at each of them and check
-that nothing promised is lost and nothing is committed twice. `none`:
+that nothing promised is lost and nothing is committed twice: the engine
+matrix in `agentfs-core/tests/crash_points.rs`, the processes in
+`agentfs/tests/crash_daemon.rs` and the FUSE mount in
+`agentfs/tests/crash_mount.rs` (run by `ci/crash-tests.sh`). `none`:
 covered by the process-level tests named in design §18 instead.
 
 The daemon never holds the only copy of anything a returned call

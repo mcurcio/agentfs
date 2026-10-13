@@ -231,6 +231,23 @@ jobs:
         if: always()
         run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
 
+  # Crash injection (design §18 test 3): the failpoint harness, built with
+  # the `failpoints` feature (never in release builds), including the
+  # mount tests that need root and /dev/fuse.
+  crash:
+    name: e2e (crash injection at every failpoint)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: crash
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 jq
+      - run: ci/crash-tests.sh
+
   e2e-multipod:
     name: e2e (two FUSE mounts, one history service, passthrough ${{ matrix.passthrough }})
     runs-on: ubuntu-24.04

@@ -153,9 +153,24 @@ impl Boundary {
     /// loading what a previous mount left there (design §3.5). Returns how
     /// many paths were loaded.
     pub fn persist_repairs(&self, store: PathBuf) -> io::Result<usize> {
-        let loaded = match fs::read(&store) {
+        let mut loaded = match fs::read(&store) {
             Ok(bytes) => parse_repairs(&bytes),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        // A crash between writing the new queue and renaming it over the
+        // store leaves the new queue in the temporary file: its complete
+        // lines are loaded too. A repair is idempotent, so an entry loaded
+        // twice, or one already repaired, costs a sweep record at most.
+        let tmp = store.with_extension("tmp");
+        let had_tmp = match fs::read(&tmp) {
+            Ok(mut bytes) => {
+                let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                bytes.truncate(complete);
+                loaded.extend(parse_repairs(&bytes));
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e),
         };
         let mut repairs = self.lock();
@@ -171,6 +186,17 @@ impl Boundary {
                 generation,
                 origin,
             });
+        }
+        if had_tmp {
+            // Into the store (renaming the temporary file over it), or
+            // gone when nothing is queued.
+            repairs.save();
+            if repairs.queue.is_empty() {
+                match fs::remove_file(&tmp) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+            }
         }
         Ok(n)
     }

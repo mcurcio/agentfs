@@ -605,6 +605,23 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   mount and through a front ([`boundary-latency.py`](ci/boundary-latency.py))
   and the socket round trip, into the job summary. The `fuse` job also
   runs `two_fronts_one_service` from `mount.rs`.
+- **e2e crash injection** ([`ci/crash-tests.sh`](ci/crash-tests.sh),
+  design §18 test 3): a build with the `failpoints` feature (test builds
+  only; `AGENTFS_FAILPOINTS` names where to kill or fail) runs
+  [`crash_points.rs`](crates/agentfs-core/tests/crash_points.rs), a
+  workload of writes, a directory move, LFS content, commits and pushes to
+  a plain and a diverged remote, killed and failed at the 1st and 3rd hit
+  of every engine failpoint (and failed then killed at the next commit),
+  each recovered and checked: nothing promised lost, nothing committed
+  twice or out of order, no empty commit, journal and `pending/` empty,
+  the remote at the head, one saved diverged head at most, and
+  `git fsck --full --strict` on every repository.
+  [`crash_daemon.rs`](crates/agentfs/tests/crash_daemon.rs) kills
+  `record`, `push`, `run`, `serve-history`, a `record --history-service`
+  front and `patch apply` at their failpoints, and
+  [`crash_mount.rs`](crates/agentfs/tests/crash_mount.rs) a real FUSE
+  mount after a recorded close and while saving its repair queue. The
+  `test (all)` job runs the first two as well.
 - **e2e csi-sanity** ([`ci/csi-sanity.sh`](ci/csi-sanity.sh)): the
   Kubernetes CSI conformance suite csi-test (`csi-sanity` v5.6.0, pinned)
   against `agentfs-csi --mode all` with real history services and FUSE
@@ -687,7 +704,8 @@ collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run
 `ci/e2e-ssh.sh` with its output in the environment, or run
 `ci/fuse-tests.sh`, `ci/e2e-recovery.sh` and (with the HTTP server)
 `ci/e2e-patches.sh` on any Linux host with FUSE
-and passwordless sudo. `ci/e2e-runbooks.sh` needs only `git-filter-repo`.
+and passwordless sudo. `ci/crash-tests.sh` needs only git without FUSE
+(it then skips the mount crash tests). `ci/e2e-runbooks.sh` needs only `git-filter-repo`.
 `ci/e2e-kind.sh` and `ci/e2e-csi.sh` run on any Linux host with docker,
 kind, kubectl, nginx and fcgiwrap; their headers list the commands.
 `ci/csi-sanity.sh` needs FUSE, passwordless sudo and `csi-sanity`.

@@ -1368,6 +1368,35 @@ fn the_repair_queue_survives_the_process() {
     assert!(!store.exists(), "an empty queue leaves no file");
 }
 
+/// A crash after the new queue was written to the temporary file but
+/// before the rename (failpoint `repairs.before_rename`): the next mount
+/// loads the temporary file's complete lines too, and repairs them.
+#[test]
+fn a_queue_left_in_the_temporary_file_is_repaired() {
+    let fx = Fx::new();
+    fx.put("a.log", "a");
+    fx.put("b.log", "b");
+    fx.put("keep", "k");
+    let store = fx.state().repairs();
+    let tmp = store.with_extension("tmp");
+    let Fx { dir, ops, .. } = fx;
+    drop(ops);
+    // Both removed from the tree; the old store names a.log, the new
+    // queue in the temporary file names b.log, then a torn line.
+    fs::remove_file(dir.path().join("backing/a.log")).unwrap();
+    fs::remove_file(dir.path().join("backing/b.log")).unwrap();
+    fs::write(&store, "0 0 1 612e6c6f67\n").unwrap();
+    fs::write(&tmp, "0 0 1 622e6c6f67\n0 0 1 6b65").unwrap();
+
+    let fx = Fx::open_on(dir, OpsConfig::default());
+    assert_eq!(fx.ops.boundary().persist_repairs(store.clone()).unwrap(), 2);
+    assert!(!tmp.exists(), "renamed over the store");
+    let report = fx.ops.sweep(false);
+    assert_eq!((report.repaired, report.still_queued), (2, 0));
+    assert_eq!(fx.history(), map(&[("keep", file("k"))]));
+    assert!(!store.exists() && !tmp.exists());
+}
+
 #[test]
 fn an_inherited_repair_keeps_the_pod_that_failed_it() {
     // A slot's repair file left by a dead front (pod-a): its entries are
