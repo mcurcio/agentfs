@@ -24,7 +24,8 @@
 #     remote added after the prune needs `lfs fetch --all` before its
 #     push; a misconfigured remote refuses the prune;
 # 18. proxies (with ci/proxy-server.sh): remote.<name>.proxy carries the git
-#     push and the LFS uploads and downloads; a dead http.proxy fails at
+#     LFS uploads and downloads (and https git pushes; plain http:// git
+#     remotes connect directly, a libgit2 limitation); a dead http.proxy fails at
 #     stage lfs as unreachable, and an empty remote.<name>.proxy bypasses
 #     it; with E2E_HTTPS=1, https git and LFS servers through CONNECT, and
 #     an untrusted certificate still refused through the proxy.
@@ -334,8 +335,14 @@ agentfs push --remote sep
 assert_eq "$(local_head prox)" "$(remote_ref "$REPO" refs/heads/agentfs/prox)" "pushed through the proxy"
 on_lfs_host "$(oid_of p.bin)" || fail "p.bin is not on the LFS host"
 through=$(proxy_since "$before")
-assert_contains "$through" "localhost:8080" "the git push went through the proxy"
 assert_contains "$through" "127.0.0.1:8081" "the LFS upload went through the proxy"
+# libgit2 (1.9) does not proxy plain http:// git remotes, so agentfs gives
+# it no proxy for them: the git push connects directly (https is proxied,
+# below).
+case "$through" in
+*localhost:8080*) fail "the http:// git push went through the proxy: $through" ;;
+*) pass "the http:// git push connected directly, as documented" ;;
+esac
 rm -rf "$STATE/lfs/objects"
 before=$(proxy_lines)
 agentfs lfs fetch --remote sep

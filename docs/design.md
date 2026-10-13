@@ -1588,11 +1588,16 @@ agentfs does not scan content for secrets and does not hold pushes.
   (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`) are never read. A
   proxy is a plain HTTP proxy, `http://host[:port]` (a bare `host[:port]`
   too; port 1080 by default, as in git). It carries the remote's libgit2
-  `http(s)` traffic (the push, the listing that measures a limited push,
-  the patch fetch; libgit2's `GIT_PROXY_SPECIFIED`) and all of its LFS
-  requests (explicit, derived and SSH-authenticated endpoints, and their
-  action hrefs) through `ureq`'s `CONNECT`, so TLS is still verified end
-  to end. SSH git traffic never goes through it. Refused, so no proxy
+  `https` traffic (the push, the listing that measures a limited push,
+  the patch fetch; libgit2's `GIT_PROXY_SPECIFIED`, `CONNECT`) and all of
+  its LFS requests (explicit, derived and SSH-authenticated endpoints, and
+  their action hrefs, `http` or `https`) through `ureq`'s `CONNECT`, so
+  TLS is still verified end to end. SSH git traffic never goes through
+  it, and neither does a plain `http://` git remote's: libgit2 1.9 writes
+  the proxy's absolute-form request line but opens the connection to the
+  server itself (found by the CI test against tinyproxy), so agentfs
+  gives libgit2 no proxy for `http://` URLs, and `agentfs status` says
+  `LFS only` for such a remote. Refused, so no proxy
   secret ever sits in config: a user or password (proxy authentication is
   not built), `https://` and SOCKS proxies, a path. A bad `http.proxy`
   misconfigures every remote; a bad `remote.<name>.proxy` that remote. A
@@ -3458,7 +3463,7 @@ runner.
 | LFS store selection | Decided at record time on the frozen size and journaled with the write (older journals read as blob): always blob for empty files, special files, `.lfsconfig` and unnameable paths; then `filter=lfs` (operator, or tree only with `respectTreeRules`), which `agentfs.store=blob` cannot override; then `agentfs.store`; then `size > agentfs.lfsThreshold`, which is unset by default. The blob limit does not apply to LFS content (§7) |
 | LFS `.gitattributes` | A block at the end of the root `.gitattributes`, in history only, rebuilt every commit: one anchored, escaped line per LFS path with `git lfs track`'s attributes; the workload's lines are kept and forged blocks (exact BEGIN through END) replaced; a file holding only the block is agentfs's own. A pointer is never committed without its line: when the block cannot be written, that commit's LFS writes are blobs, then its `.gitattributes` writes are dropped, then the head's file is kept; a commit never fails for it. A directory named `.gitattributes` or `.gitmodules` is refused (`gitattributesBlob`, `gitmodulesBlob`) (§3.4, §7) |
 | LFS endpoints and credentials | git-lfs's precedence (`lfs.pushurl`, `lfs.url`, `remote.<n>.lfspushurl`, `remote.<n>.lfsurl`, then derived `<url>.git/info/lfs`), from operator config only; local and `file://` remotes use the standalone-file layout; SSH remotes without `lfsurl` use `git-lfs-authenticate` over agentfs's own SSH transport (the push URL's path for uploads, `url`'s on the same host for downloads; its header is the credential, else `agentfsLfsCredentials`; reused until 5 s before it expires, else per attempt; no fallback; `git-lfs-transfer` not built), `git://` needs `lfsurl`. Credentials: `agentfsLfsCredentials`, else `agentfsCredentials` on the push URL's own origin, else the URL's password; bound to the origin, sent to action hrefs only on that origin and without a server-given `Authorization`; no redirects; the remote's proxy if set (§7, §11.1) |
-| Proxies | git's `http.proxy` and `remote.<name>.proxy` (empty: none), from the state area's config only, never the environment; a plain `http://host:port` proxy (1080 by default), no authentication, no `https://` or SOCKS proxies; carries the remote's libgit2 `http(s)` traffic and all its LFS requests (`CONNECT`), never SSH; a bad value misconfigures the remote (every remote for `http.proxy`) (§11.1, 2026-10) |
+| Proxies | git's `http.proxy` and `remote.<name>.proxy` (empty: none), from the state area's config only, never the environment; a plain `http://host:port` proxy (1080 by default), no authentication, no `https://` or SOCKS proxies; carries the remote's libgit2 `https` traffic and all its LFS requests (`CONNECT`), never SSH, and not plain `http://` git traffic, which libgit2 1.9 cannot proxy (it connects to the server directly); a bad value misconfigures the remote (every remote for `http.proxy`) (§11.1, 2026-10) |
 | LFS uploads | Before every push attempt, for the objects the commits the remote lacks reference at managed paths; a failure is a `PushFailed` with stage `lfs` and no ref pushed. Batch API, `basic` transfer only, batches of 100 in sequence, `verify` when offered (§7) |
 | LFS transfers | `lfs.concurrenttransfers` (git-lfs's key, default 8, 1 to 64) objects at once within a batch, per remote, on scoped threads; an upload stops starting objects at its first failure and lets those in flight finish; restores prefetch every object they need concurrently, each remote in name order taking what the earlier ones could not provide. Downloads resume by byte (`Range`, from `<state>/lfs/incomplete/<oid>`, 3 tries on `unreachable`); uploads resume by object (the batch API skips what an earlier attempt finished); `tus` byte-level uploads are not built, since no testable server implements them (§7, §15, 2026-10) |
 | LFS cache and retention | `<state>/lfs/objects/aa/bb/<oid>`, written at commit time; nothing is ever deleted on servers, and the local cache is pruned only by `agentfs lfs prune`, run by an operator (§7) |

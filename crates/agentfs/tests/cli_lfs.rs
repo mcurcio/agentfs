@@ -476,11 +476,11 @@ fn status_shows_derived_endpoints_and_why_there_is_none() {
     ]);
     let status = v.ok(&["status"]);
     assert!(
-        status.contains("proxy: http://proxy.example:3128 (http.proxy)"),
+        status.contains("proxy: http://proxy.example:3128 (http.proxy), LFS only"),
         "{status}"
     );
     assert!(
-        status.contains("proxy: http://web-proxy.example:8080 (remote.web.proxy)"),
+        status.contains("proxy: http://web-proxy.example:8080 (remote.web.proxy), git and LFS"),
         "{status}"
     );
     // local and web (and ssh, in an ssh build); git turns it off.

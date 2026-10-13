@@ -7,10 +7,12 @@
 //!
 //! A proxy is a plain HTTP proxy, `http://host[:port]` (git's syntax; a
 //! bare `host[:port]` means the same, and the port defaults to 1080, as in
-//! git). It carries libgit2's `http(s)` pushes, listings and patch fetches
-//! and every LFS request of the remote; `https` targets are tunnelled with
-//! `CONNECT`, so TLS is still verified end to end. SSH remotes' git traffic
-//! never goes through it. Refused, so a proxy secret never sits in config:
+//! git). It carries libgit2's `https` pushes, listings and patch fetches
+//! and every LFS request of the remote, tunnelled with `CONNECT`, so TLS
+//! is still verified end to end. A plain `http://` git remote connects
+//! directly: libgit2 (1.9) writes a proxy's absolute-form request but
+//! opens the connection to the server itself, so it is not given the
+//! proxy at all. SSH remotes' git traffic never goes through it. Refused, so a proxy secret never sits in config:
 //! a user or password (proxy authentication is not supported), and
 //! `https://` or SOCKS proxies. A path or query is refused too.
 
@@ -110,20 +112,23 @@ pub fn redact(value: &str) -> String {
     }
 }
 
+/// Whether libgit2 sends a connection to `url` through a proxy: `https`
+/// only (see the module documentation).
+pub fn git_uses_proxy(url: &str) -> bool {
+    crate::remote_url::transport(url) == crate::remote_url::Transport::Https
+}
+
 /// libgit2's proxy options for a connection to `url` with `proxy`: the
-/// proxy for an `http(s)` URL, none for any other (SSH's own transport,
-/// local paths). Without a proxy, libgit2 uses none and reads no
-/// environment.
+/// proxy for an `https` URL, none for any other (plain `http`, SSH's own
+/// transport, local paths). Without a proxy, libgit2 uses none and reads
+/// no environment.
 pub(crate) fn git_options<'a>(
     proxy: Option<&'a ProxySetting>,
     url: &str,
 ) -> git2::ProxyOptions<'a> {
     let mut options = git2::ProxyOptions::new();
     if let Some(proxy) = proxy
-        && matches!(
-            crate::remote_url::transport(url),
-            crate::remote_url::Transport::Http | crate::remote_url::Transport::Https
-        )
+        && git_uses_proxy(url)
     {
         options.url(&proxy.url);
     }
@@ -151,6 +156,10 @@ mod tests {
         assert_eq!(redact("u:pw@p:1"), "***@p:1");
         assert_eq!(redact("p:1"), "p:1");
         assert_eq!(parse("").unwrap(), None);
+        assert!(git_uses_proxy("https://h/r.git"));
+        for url in ["http://h/r.git", "ssh://h/r.git", "/srv/r.git"] {
+            assert!(!git_uses_proxy(url), "{url}");
+        }
         assert_eq!(parse("  ").unwrap(), None);
         for (value, why) in [
             ("https://proxy.example:3128", "https:// proxies"),

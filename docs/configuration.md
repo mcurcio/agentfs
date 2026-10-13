@@ -210,7 +210,7 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `lfsurl` | `http(s)://` URL, `file://` URL or path | derived from the remote's URL | The Git LFS endpoint for this remote, as in git-lfs, unless `lfs.url` is set (see [Git LFS](#git-lfs)) |
 | `lfspushurl` | as `lfsurl` | `lfsurl` | Where LFS uploads go, unless `lfs.pushurl` or `lfs.url` is set |
 | `agentfsLfsCredentials` | absolute path | none | The credential file (same format as `agentfsCredentials`) for an LFS endpoint on another host or port than the push URL; never sent to any other host |
-| `proxy` | as `http.proxy`, or empty | `http.proxy` | This remote's HTTP proxy, as in git; an empty value means no proxy for this remote. It carries the remote's `http(s)` git traffic and all its LFS requests, never SSH (see [Proxies](#proxies)) |
+| `proxy` | as `http.proxy`, or empty | `http.proxy` | This remote's HTTP proxy, as in git; an empty value means no proxy for this remote. It carries the remote's `https` git traffic and all its LFS requests, never SSH or plain `http://` git traffic (see [Proxies](#proxies)) |
 
 The remote's name must be a valid agentfs name (as for `agentfs.volume`;
 git accepts `team/backup`, agentfs does not), because it names the push
@@ -315,16 +315,18 @@ volume's config (or an included fragment):
 - `remote.<name>.proxy` wins over `http.proxy`; an empty value turns the
   proxy off for that remote (agentfs never reads `NO_PROXY`, nor any
   other proxy environment variable).
-- A proxy is a plain HTTP proxy. It carries the remote's `http://` and
-  `https://` git traffic (libgit2) and every LFS request of the remote,
-  wherever its endpoint is; `https` goes through it with `CONNECT`, so
-  certificates are still verified against the system trust store. SSH
-  remotes' git traffic never uses it.
+- A proxy is a plain HTTP proxy. It carries the remote's `https://` git
+  traffic (libgit2) and every LFS request of the remote, wherever its
+  endpoint is, with `CONNECT`, so certificates are still verified against
+  the system trust store. SSH remotes' git traffic never uses it, nor
+  does a plain `http://` git remote's: libgit2 connects to such a server
+  directly, so only its LFS requests use the proxy (`agentfs status`
+  says `LFS only`).
 - Not supported, and refused as a misconfiguration: a user or password
   (proxy authentication), `https://` and SOCKS proxies.
 - A proxy that is down or refuses the connection fails pushes as
   `unreachable`. `agentfs status` prints `proxy: <url> (<key>)` under each
-  remote that has one.
+  remote that has one, with `git and LFS` or `LFS only`.
 
 ### HTTPS and HTTP remotes
 

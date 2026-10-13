@@ -418,7 +418,12 @@ fn real_main() -> Result<ExitCode> {
                         Err(e) => println!("           lfs: none ({e})"),
                     }
                     if let Some(proxy) = &r.proxy {
-                        println!("           proxy: {proxy}");
+                        let scope = if agentfs_core::proxy::git_uses_proxy(r.push_url()) {
+                            "git and LFS"
+                        } else {
+                            "LFS only"
+                        };
+                        println!("           proxy: {proxy}, {scope}");
                     }
                 }
             }
