@@ -2536,3 +2536,68 @@ fn absolute_gitdirs_map_exactly_through_the_views() {
     v.expect(&tree(&[("elsewhere/f", f("e"))]));
     m.stop();
 }
+
+/// The head commit's committer and author, each `name <email>`.
+fn head_identities(v: &Vol) -> (String, String) {
+    let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    let commit = repo
+        .find_reference("refs/heads/agentfs/demo")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let sig =
+        |s: git2::Signature| format!("{} <{}>", s.name().unwrap_or(""), s.email().unwrap_or(""));
+    (sig(commit.committer()), sig(commit.author()))
+}
+
+/// Design §9 and §18 test 10: custom identity templates through a
+/// single-process mount and through a front of a history service, with
+/// a uid 10000 writer: the committer is the mount's (or the front's)
+/// pod, the author the writer's uid and gid.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn identity_templates_through_mount() {
+    let v = Vol::new("identity");
+    v.config("agentfs.identity.committerName", "{pod} in {namespace}");
+    v.config(
+        "agentfs.identity.committerEmail",
+        "{podUid}@{volume}.mount.invalid",
+    );
+    v.config("agentfs.identity.authorName", "writer {uid}:{gid}");
+    v.config(
+        "agentfs.identity.authorEmail",
+        "uid-{uid}.gid-{gid}@{pod}.invalid",
+    );
+
+    let m = v.mount_with(&[], |mut c| {
+        c.env("AGENTFS_POD", "solo")
+            .env("AGENTFS_POD_UID", "solo-uid")
+            .env("AGENTFS_NAMESPACE", "ns-1");
+        c
+    });
+    v.sh("mkdir u && chown 10000:10000 u");
+    v.sh_as(Some(UID), "printf 1 > u/solo.txt", true);
+    v.expect(&tree(&[("u/solo.txt", f("1"))]));
+    assert_eq!(
+        head_identities(&v),
+        (
+            "solo in ns-1 <solo-uid@demo.mount.invalid>".to_owned(),
+            "writer 10000:10000 <uid-10000.gid-10000@solo.invalid>".to_owned()
+        )
+    );
+    m.stop();
+
+    let service = start_history_service(&v);
+    let front = start_front(&v, &v.mnt(), "pod-f");
+    v.sh_as(Some(UID), "printf 2 > u/front.txt", true);
+    v.expect(&tree(&[("u/solo.txt", f("1")), ("u/front.txt", f("2"))]));
+    assert_eq!(
+        head_identities(&v),
+        (
+            "pod-f in agents <pod-f-uid@demo.mount.invalid>".to_owned(),
+            "writer 10000:10000 <uid-10000.gid-10000@pod-f.invalid>".to_owned()
+        )
+    );
+    front.stop();
+    service.stop();
+}

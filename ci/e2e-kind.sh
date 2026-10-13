@@ -138,6 +138,7 @@ wait_remote() { # path content [seconds]
 # The message of the newest remote commit that touched <path>.
 remote_message() { rgit log -1 --format=%B "$BRANCH" -- "$1"; }
 remote_author() { rgit log -1 --format=%an "$BRANCH" -- "$1"; }
+remote_ident() { rgit log -1 --format="$2" "$BRANCH" -- "$1"; } # path format
 
 set_password() { # user password
   local others
@@ -224,6 +225,12 @@ wait_remote root.txt root
 wait_remote u10000/user.txt user
 assert_eq uid-0 "$(remote_author root.txt)" "root.txt authored by uid-0"
 assert_eq uid-10000 "$(remote_author u10000/user.txt)" "u10000/user.txt authored by uid-10000"
+# The identity templates of ci/k8s/config/config, rendered exactly.
+POD_UID=$(k get pod "$POD" -o jsonpath="{.metadata.uid}")
+assert_eq "$POD on $NODE_NAME" "$(remote_ident u10000/user.txt %cn)" "committer name from {pod} on {node}"
+assert_eq "$POD_UID@$NS.$VOLUME.ci.invalid" "$(remote_ident u10000/user.txt %ce)" "committer email from {podUid}@{namespace}.{volume}"
+assert_eq "uid-10000.gid-10000@$VOLUME.ci.invalid" "$(remote_ident u10000/user.txt %ae)" "author email from uid-{uid}.gid-{gid}"
+assert_eq "uid-0.gid-0@$VOLUME.ci.invalid" "$(remote_ident root.txt %ae)" "root's author email"
 msg=$(remote_message u10000/user.txt)
 assert_contains "$msg" "Agentfs-Pod: $POD" "pod trailer"
 assert_contains "$msg" "Agentfs-Namespace: $NS" "namespace trailer"

@@ -288,7 +288,8 @@ email_a=$(remote_committer_email a.txt)
 email_b=$(remote_committer_email b.txt)
 [ "$email_a" != "$email_b" ] || fail "the committers share an email: $email_a"
 pass "distinct committer emails ($email_a, $email_b)"
-assert_contains "$email_a" "$UID_A" "writer-a's email carries its pod uid"
+assert_eq "writer-a.$UID_A@$APPS.$VOLUME.csi.invalid" "$email_a" "writer-a's email from {pod}.{podUid}@{namespace}.{volume}"
+assert_eq "writer-b.$UID_B@$APPS.$VOLUME.csi.invalid" "$email_b" "writer-b's email from the same template"
 assert_eq uid-10000 "$(remote_author a.txt)" "a.txt authored by uid-10000"
 assert_eq uid-10001 "$(remote_author b.txt)" "b.txt authored by uid-10001"
 msg=$(remote_message b.txt)
