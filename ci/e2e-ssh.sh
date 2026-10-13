@@ -172,6 +172,8 @@ echo "$out"
 case "$out" in
 *"fetching the patch queue from ssh failed"*) fail "the inbox fetch failed" ;;
 esac
-assert_eq "$THEIRS" "$(remote_ref "$STATE/git" refs/agentfs/demo/inbox/0000000001)" "inbox ref fetched over ssh"
+# The inbox ref existed only on the ssh remote, so applying it means it was
+# fetched over ssh (the applied inbox ref is then removed locally).
+assert_contains "$out" "patch 1 applied" "inbox patch fetched over ssh and applied"
 
 step "all ssh scenarios passed"
