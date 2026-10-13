@@ -27,6 +27,8 @@ jobs:
           kubectl version --client
           kubectl kustomize deploy/sidecar >/dev/null
           kubectl kustomize ci/k8s >/dev/null
+          kubectl kustomize deploy/csi >/dev/null
+          kubectl kustomize deploy/csi/example >/dev/null
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -57,6 +59,8 @@ jobs:
           docker image ls agentfs
           docker run --rm agentfs:ci --version
           docker run --rm --entrypoint sh agentfs:ci -c 'id; fusermount3 -V; git --version'
+          docker run --rm --entrypoint agentfs-csi agentfs:ci --version
+          docker run --rm --entrypoint tini agentfs:ci --version
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agentfs-image

@@ -1,10 +1,12 @@
 # syntax=docker/dockerfile:1
 #
 # The agentfs image: the `agentfs` binary built with the `https` and `ssh`
-# features, on Debian trixie with fuse3, git and the CA certificates. It
-# runs as root, deliberately: the phase 1 sidecar must be root and
-# privileged to mount FUSE with Bidirectional propagation (design §17.1,
-# docs/deployment.md "Security trade-offs").
+# features and the `agentfs-csi` CSI driver, on Debian trixie with fuse3,
+# git, tini and the CA certificates. It runs as root, deliberately: the
+# phase 1 sidecar must be root and privileged to mount FUSE with
+# Bidirectional propagation (design §17.1, docs/deployment.md "Security
+# trade-offs"). The CSI node plugin runs it as `tini -- agentfs-csi`, root
+# and privileged in the driver's namespace only (docs/csi.md).
 #
 #   docker build -t agentfs .
 #
@@ -26,31 +28,38 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/agentfs-core/Cargo.toml crates/agentfs-core/
 COPY crates/agentfs-fuse/Cargo.toml crates/agentfs-fuse/
 COPY crates/agentfs/Cargo.toml crates/agentfs/
-COPY crates/agentfs-csi/Cargo.toml crates/agentfs-csi/
+# The CSI crate's build script and the CSI spec it compiles (tonic, prost,
+# protox) are dependencies too.
+COPY crates/agentfs-csi/Cargo.toml crates/agentfs-csi/build.rs crates/agentfs-csi/
+COPY crates/agentfs-csi/proto crates/agentfs-csi/proto
 RUN mkdir -p crates/agentfs-core/src crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src \
  && touch crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs/src/main.rs \
- && cargo build --release --locked -p agentfs --features https,ssh
+ && echo 'fn main() { std::process::exit(1) }' > crates/agentfs-csi/src/main.rs \
+ && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh
 
 COPY crates crates
 # COPY keeps the sources' old mtimes, older than the stub artifacts: touch
 # them so cargo rebuilds the workspace crates instead of shipping the stub.
 RUN find crates -name '*.rs' -exec touch {} + \
- && cargo build --release --locked -p agentfs --features https,ssh \
- && install -m 0755 target/release/agentfs /usr/local/bin/agentfs
+ && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh \
+ && install -m 0755 target/release/agentfs target/release/agentfs-csi /usr/local/bin/
 
 FROM ${RUNTIME_IMAGE}
 # fuse3: fusermount3 and /etc/fuse.conf (a non-root daemon); libssl3t64:
 # the `https` and `ssh` transports link OpenSSL; ca-certificates: the TLS
 # trust store; git: the daemon repacks the history with it (design §8),
-# and operators follow the runbooks (git log, show) with kubectl exec.
+# and operators follow the runbooks (git log, show) with kubectl exec;
+# tini: PID 1 of the CSI node plugin, reaping the orphans its children
+# leave (design §14.2).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends fuse3 libssl3t64 ca-certificates git \
+ && apt-get install -y --no-install-recommends fuse3 libssl3t64 ca-certificates git tini \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=build /usr/local/bin/agentfs /usr/local/bin/agentfs
-# Fails the build if a shared library is missing, or the stub (which exits
+COPY --from=build /usr/local/bin/agentfs /usr/local/bin/agentfs-csi /usr/local/bin/
+# Fails the build if a shared library is missing, or a stub (which exits
 # 1) was shipped.
-RUN agentfs --version && agentfs probe --help >/dev/null
+RUN agentfs --version && agentfs probe --help >/dev/null \
+ && agentfs-csi --version && tini --version
 
 LABEL org.opencontainers.image.source="https://github.com/mcurcio/agentfs" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
