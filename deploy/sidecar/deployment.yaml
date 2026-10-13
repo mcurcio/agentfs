@@ -63,9 +63,12 @@ spec:
           env:
             - { name: AGENTFS_STATE, value: /data/state }
             - { name: AGENTFS_ROOT, value: /data/backing }
-            # Restarted after a crash: hold instead of remounting; the
-            # recovery is a pod restart (docs/runbooks/crashed-sidecar.md).
-            - { name: AGENTFS_ON_STALE_MOUNT, value: hold }
+            # Restarted by the kubelet after a crash: mount over the stale
+            # mount the dead daemon left, so the workload's copies of it
+            # (and subPath binds) reach the new daemon with no manual step
+            # (design §17.1, docs/runbooks/crashed-sidecar.md). `hold`
+            # instead waits for you to restart the pod.
+            - { name: AGENTFS_ON_STALE_MOUNT, value: recover }
             # Commit trailers, committer identity and telemetry resource.
             - name: AGENTFS_POD
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
@@ -101,8 +104,8 @@ spec:
             - { name: config, mountPath: /etc/agentfs, readOnly: true }
             - { name: credentials, mountPath: /run/secrets/agentfs, readOnly: true }
           # Gates the workload containers until the mount is live. It also
-          # passes for a sidecar holding after a crash, so the kubelet does
-          # not kill it. 5 minutes for journal recovery at start.
+          # passes for the stale mount a crash left, so the kubelet does not
+          # kill a restarted sidecar while it recovers (or holds). 5 minutes for journal recovery at start.
           startupProbe:
             exec:
               command: [agentfs, probe, --allow-stale, /agentfs/workspace]
@@ -114,8 +117,9 @@ spec:
               command: [agentfs, probe, /agentfs/workspace]
             periodSeconds: 10
             timeoutSeconds: 5
-          # No livenessProbe: a restart cannot remount safely while the
-          # workload holds the old mount; the recovery is a pod restart.
+          # No livenessProbe: the kubelet already restarts a daemon that
+          # exits or crashes, and killing a live one that is slow (a long
+          # journal recovery, a big commit) would only interrupt it.
           resources:
             requests:
               cpu: 50m
@@ -138,8 +142,26 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           volumeMounts:
-            # Use /agentfs/workspace.
-            - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: HostToContainer }
+            # Use /agentfs/workspace. Read-only is the fence: the FUSE
+            # mount propagated into it stays writable, but while no daemon
+            # is mounted (it exited and is being restarted) a write to the
+            # bare directory fails with EROFS instead of landing where
+            # nothing records it.
+            - name: agentfs-mount
+              mountPath: /agentfs
+              mountPropagation: HostToContainer
+              readOnly: true
+              recursiveReadOnly: Disabled
+          # With a subPath mount of the workspace instead (the mount itself
+          # at a fixed path), the fence above cannot apply: give the
+          # container this probe, so it restarts onto the new mount after
+          # the daemon exited (docs/deployment.md §3).
+          # livenessProbe:
+          #   exec:
+          #     # Fails on the dead mount (ENOTCONN) and on a bare directory.
+          #     command: [sh, -c, 'test "$(stat -f -c %T /workspace)" = fuseblk']
+          #   periodSeconds: 10
+          #   failureThreshold: 6
       volumes:
         - name: data
           persistentVolumeClaim:

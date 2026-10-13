@@ -122,6 +122,23 @@ propagates to the host and from there to the other containers, which
 mount the same `emptyDir` with `HostToContainer`. Kubernetes allows
 `Bidirectional` only in privileged containers.
 
+**The workload mounts the `emptyDir` read-only** (`readOnly: true`,
+`recursiveReadOnly: Disabled`). The FUSE mount propagated into it is a
+mount of its own and stays writable; the bare directory underneath is
+not. That is the fence for the moments no daemon is mounted (a sidecar
+that exited and is being restarted, §7): writes fail with `EROFS`
+instead of landing where nothing records them. A container that mounts
+the workspace itself through `subPath` cannot be fenced this way (a
+read-only subPath would make the FUSE mount read-only); give it the
+liveness probe commented in the example (its mount point must be a FUSE
+mount: `stat -f -c %T` prints `fuseblk`), so it is restarted onto the
+new mount after a clean exit of the daemon.
+
+**Crash recovery.** `AGENTFS_ON_STALE_MOUNT=recover`: when the kubelet
+restarts a crashed sidecar, it mounts over the stale mount the dead
+daemon left, and mount propagation carries the new mount into the
+workload containers (§7).
+
 **Startup order.** The sidecar is a native sidecar: an init container
 with `restartPolicy: Always`. The kubelet starts it after `agentfs-init`
 and starts the workload containers only once its **startup probe**
@@ -129,8 +146,9 @@ and starts the workload containers only once its **startup probe**
 the mount is live. The probe allows 5 minutes (`periodSeconds: 2`,
 `failureThreshold: 150`) for journal recovery at start. Its **readiness
 probe** (`agentfs probe /agentfs/workspace`) makes a dead daemon visible
-as a NotReady pod. There is **no liveness probe**: restarting the sidecar
-cannot remount safely (§6 below).
+as a NotReady pod. There is **no liveness probe**: the kubelet already restarts a
+daemon that exits or crashes, and killing a slow but live one (a long
+journal recovery) would only interrupt it.
 
 **One writer.** `ReadWriteOncePod` lets only one pod in the cluster use
 the volume, and the Deployment's `Recreate` strategy stops the old pod
@@ -258,43 +276,72 @@ and write through the mount, so the workload sees the result at once
 ## 7. A crashed daemon
 
 Every change the workload saw succeed was journaled first, so a crash
-loses nothing that returned. What phase 1 does about the dead mount:
+loses nothing that returned. What happens to the dead mount, with no
+manual step:
 
 1. The workload's file calls under `/agentfs/workspace` fail with
    `ENOTCONN` ("Transport endpoint is not connected"). agentfs never
    uses `auto_unmount`, so nothing can be written to the empty directory
    underneath, where it would not be recorded.
-2. The kubelet restarts the sidecar container. It runs with
-   `AGENTFS_ON_STALE_MOUNT=hold`: it sees that the mount point is an
-   agentfs mount whose daemon died, **does not remount** (the workload
-   containers still hold the dead mount, and swapping it under them is
-   not safe), takes no lock and waits. Its startup probe passes
-   (`--allow-stale`), its readiness probe fails: **the pod is NotReady**.
-3. An operator (or your automation) **deletes the pod**:
-   `kubectl delete pod <pod>`. The workload containers stop first; the
-   holding sidecar then gets SIGTERM, detaches the stale mount so the
-   kubelet can remove the `emptyDir`, and exits.
-4. The new pod's sidecar recovers the journal (`N uncommitted record(s)
-   recovered` in its startup line), commits and pushes.
+2. The kubelet restarts the sidecar container (`restartPolicy: Always`;
+   after repeated crashes with its usual backoff). It runs with
+   `AGENTFS_ON_STALE_MOUNT=recover`: it sees that the mount point is an
+   agentfs mount whose daemon died, takes the state-area lock (the kernel
+   released it with the dead process), recovers the journal (`N
+   uncommitted record(s) recovered`), mounts FUSE at a private directory
+   of the state area (`meta/stack/mnt`) and **bind-mounts it over the
+   stale mount**. Detaching the dead mount instead would expose the bare
+   directory to the workload; stacking over it never does.
+3. Mount propagation carries the new layer into every copy of the stale
+   mount: the workload containers' `HostToContainer` mounts and the
+   kubelet's `subPath` binds. The workload's next calls reach the new
+   daemon; no container restarts. The sidecar logs `stacked over a stale
+   mount left by a crashed daemon at /agentfs/workspace (N stale layer(s)
+   below)` and the pod is Ready again once its readiness probe passes.
+4. When that sidecar stops, it unmounts its own layer and detaches the
+   stale layers beneath it (`detached N stale layer(s)`), so pod deletion
+   leaves nothing mounted.
 
-The [crashed sidecar runbook](runbooks/crashed-sidecar.md) has the
-commands. The kind end-to-end test does exactly this after `kill -9` of
-the daemon.
+`--on-stale-mount hold` is the manual alternative: the restarted sidecar
+mounts nothing, the pod stays NotReady with the workload failing with
+`ENOTCONN`, and deleting the pod recovers. The
+[crashed sidecar runbook](runbooks/crashed-sidecar.md) covers both, and
+when to step in. The kind end-to-end test checks recovery after `kill -9`
+of the daemon from the node.
 
-**Known gaps:**
+**A clean exit mid-pod** (an operator sends the sidecar SIGTERM,
+something unmounts the mount, a `--passthrough on` failure) leaves no
+stale mount: the daemon unmounts, makes its final commit and push, and
+the kubelet restarts it into a fresh mount. In the gap the workload's
+`/agentfs` is the bare `emptyDir`, which it mounts **read-only**
+(`readOnly: true`, with `recursiveReadOnly: Disabled` so the FUSE mount
+propagated into it stays writable): writes fail with `EROFS` ("Read-only
+file system") instead of landing where nothing records them. A workload
+that mounts the workspace itself through `subPath` cannot be fenced that
+way (a read-only subPath would make the FUSE mount read-only too); it
+keeps the dead mount, failing with `ENOTCONN`, until it restarts. Give
+it the liveness probe commented in the example (the mount point must be
+a live FUSE mount), so the kubelet restarts it onto the new mount. If it
+restarts before the sidecar has mounted again, its `subPath` binds the
+bare directory, writable: writes then are not recorded and are hidden
+once the probe restarts it onto the new mount (the next mount warns that
+the mount point is not empty). The read-only `emptyDir` has no such gap.
 
-- The pod restart is manual in phase 1. Automating it (a controller, or
-  Kubernetes' container-restart rules once they can restart a whole pod)
-  is a follow-up.
-- **A clean exit while the pod runs** is not held: if the daemon exits
-  on its own (an operator sends it SIGTERM, something unmounts the
-  mount, a `--passthrough on` failure), the restarted sidecar finds no
-  stale mount and mounts again at once. Writes the workload made in
-  between landed in the bare `emptyDir` directory and are hidden by the
-  new mount, unrecorded. Do not signal the sidecar; delete the pod.
-  The example uses `--passthrough auto` for this reason.
-- Sending SIGTERM to a holding sidecar while the workload runs detaches
-  the stale mount and exposes the bare directory the same way.
+**Limits:**
+
+- Files opened before a crash with kernel passthrough (`--passthrough
+  auto` as root) keep writing to their backing file after the daemon
+  died, unrecorded, for as long as the workload holds them open; a
+  recovered sidecar does not notice those changes until the file is
+  changed again through the mount or the sweep sees it. With in-place
+  recovery the workload keeps running, so such a descriptor can live
+  longer than under a pod restart. Use `--passthrough off` where every
+  write must be recorded.
+- A hung daemon (alive, not answering) is not detected: there is no
+  liveness probe on the sidecar, since killing a slow but live daemon
+  would interrupt its recovery or commits. See the runbook.
+- Repeated crashes put the sidecar in `CrashLoopBackOff` (10 s, 20 s, ...
+  up to 5 minutes between restarts); alert on its restart count.
 
 ## 8. How it is tested
 
@@ -307,8 +354,11 @@ and uid 10000 through a `subPath` mount of the FUSE root at
 the operator rules, that the state area is invisible, authors and
 `Agentfs-Pod`/`-Namespace`/`-Node` trailers in the commits pushed over
 HTTP with the credential Secret, a restore through `kubectl exec`, the
-final commit when the pod is deleted, and the crash recovery of §7 after
-`kill -9` of the daemon from the node. `kubectl apply --dry-run=server`
+final commit and push when the pod is deleted, the in-place recovery of
+§7 after `kill -9` of the daemon from the node (both writers carry on
+without a restart, and `agentfs push` in the sidecar pushes at once), and
+the clean-exit fence (`EROFS` in the gap, the subPath writer restarted by
+its liveness probe). `kubectl apply --dry-run=server`
 validates `deploy/sidecar` itself. It runs locally on any Linux host with
 docker, kind, kubectl, nginx and fcgiwrap (see the script's header).
 
@@ -402,8 +452,11 @@ Starting from Hermes' own workload:
       mountPropagation: HostToContainer
   ```
 
-  The e2e test's uid 10000 writer uses exactly this pattern. (The
-  alternative is to mount the `emptyDir` at `/agentfs` and set
+  The e2e test's uid 10000 writer uses exactly this pattern, with the
+  liveness probe a subPath consumer needs (§3, with `/opt/data`) so a
+  clean exit of the daemon restarts it onto the new mount. (The
+  alternative, which the read-only fence covers, is to mount the
+  `emptyDir` read-only at `/agentfs` and set
   `HERMES_HOME=/agentfs/workspace`.)
 - **The docker-in-docker sidecar** that runs Hermes' file and terminal
   tools mounts it the same way, so tool containers see the same files,
@@ -467,8 +520,11 @@ alert on `agentfs.patch.blocked`. See
   200,000 records for 100,000 new files, and a 1 GiB file just written
   frozen and committed twice. See
   [performance.md](performance.md#known-costs).
-- The pod restart after a crash is manual (§7).
-- A sidecar exit that is not a crash is not held (§7).
+- A hung daemon is not detected, and passthrough descriptors opened
+  before a crash write unrecorded until closed (§7).
+- A `subPath` consumer restarted while the daemon is being restarted
+  after a clean exit can write to the bare directory, unrecorded; the
+  read-only `emptyDir` has no such gap (§7).
 - The privileged sidecar (§9); the CSI driver ([csi.md](csi.md)) needs no
   privilege in workload pods.
 - One pod per volume. The sidecar stays single-process (`agentfs mount`

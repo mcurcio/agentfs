@@ -118,6 +118,12 @@ impl StateDir {
         self.meta().join("control")
     }
 
+    /// Where a mount recovering over a stale one mounts FUSE before it
+    /// stacks it over the mount point (design §2.2, §17.1).
+    pub fn stack_source(&self) -> PathBuf {
+        self.meta().join("stack").join("mnt")
+    }
+
     /// The control socket in [`StateDir::control_dir`].
     pub fn control_socket(&self) -> PathBuf {
         self.control_dir().join(CONTROL_SOCKET)

@@ -1,5 +1,6 @@
 # CI: its own volume name, no telemetry, and two writers instead of the
-# workload: root (default capabilities) through the emptyDir at /agentfs,
+# workload: root (default capabilities) through the emptyDir at /agentfs
+# (read-only, the fence),
 # and uid 10000 with the mount itself at a fixed path (subPath workspace),
 # the pattern Hermes needs for /opt/data (docs/deployment.md).
 apiVersion: apps/v1
@@ -26,7 +27,12 @@ spec:
             runAsUser: 0
             runAsGroup: 0
           volumeMounts:
-            - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: HostToContainer }
+            # Read-only: the fence while no daemon is mounted (EROFS).
+            - name: agentfs-mount
+              mountPath: /agentfs
+              mountPropagation: HostToContainer
+              readOnly: true
+              recursiveReadOnly: Disabled
         - name: writer-10000
           image: ghcr.io/mcurcio/agentfs
           command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
@@ -41,3 +47,11 @@ spec:
               type: RuntimeDefault
           volumeMounts:
             - { name: agentfs-mount, mountPath: /workspace, subPath: workspace, mountPropagation: HostToContainer }
+          # A subPath of the mount cannot be fenced read-only: restart onto
+          # the new mount once the daemon has exited (docs/deployment.md §3).
+          livenessProbe:
+            exec:
+              # Fails on the dead mount (ENOTCONN) and on a bare directory.
+              command: [sh, -c, 'test "$(stat -f -c %T /workspace)" = fuseblk']
+            periodSeconds: 10
+            failureThreshold: 6

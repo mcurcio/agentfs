@@ -17,9 +17,9 @@
 //! `init` creates a state area or accepts one that already belongs to the
 //! volume, so a pod can run it at every start; `probe` reports whether a
 //! mount point holds a live agentfs mount, for Kubernetes probes; and
-//! `mount --on-stale-mount hold` makes a sidecar restarted after a crash
-//! wait for the pod restart instead of remounting ([`hold`], design
-//! §17.1).
+//! `mount --on-stale-mount recover` makes a sidecar restarted after a crash
+//! mount over the stale mount its predecessor left, and `hold` makes it
+//! wait for a pod restart instead ([`hold`], design §17.1).
 //!
 //! `serve-history` is a volume's history service and `mount
 //! --history-service` and `record --history-service` are its fronts, one
@@ -73,8 +73,13 @@ use agentfs_core::service::{FinalPush, Service};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
 use agentfs_fuse::{
-    Mount, MountConfig, MountState, Passthrough, UnmountReport, mount_state, preflight,
+    Mount, MountConfig, MountState, Passthrough, StackOver, UnmountReport, agentfs_layers,
+    detach_stale_layers, mount_state, preflight, preflight_stacked,
 };
+
+/// Most stale layers a stop (or a hold) detaches at the mount point: one
+/// per crash recovered by stacking (design §17.1).
+pub const STALE_LAYERS: usize = 16;
 
 use crate::daemon::{Daemon, Wake};
 
@@ -516,19 +521,43 @@ fn real_main() -> Result<ExitCode> {
         }
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
-            // A restarted sidecar whose daemon died: hold, mount nothing
-            // and take no lock (design §17.1).
-            if args.on_stale_mount == OnStaleMount::Hold
-                && let Ok(MountState::Stale { source }) = mount_state(&args.mountpoint)
-            {
-                return Ok(hold::hold(daemon, &args.mountpoint, &source));
+            // A restarted sidecar whose daemon died (design §17.1).
+            let stale = match mount_state(&args.mountpoint) {
+                Ok(MountState::Stale { source }) => Some(source),
+                _ => None,
+            };
+            let mut stacked = false;
+            if let Some(source) = &stale {
+                match args.on_stale_mount {
+                    // Mount nothing and take no lock.
+                    OnStaleMount::Hold => return Ok(hold::hold(daemon, &args.mountpoint, source)),
+                    OnStaleMount::Recover => {
+                        if let Some(refusal) = recover_refusal(&args) {
+                            eprintln!(
+                                "error: --on-stale-mount recover: {refusal}; {} is a stale \
+                                 agentfs mount ({source}) and is left as it is",
+                                args.mountpoint.display()
+                            );
+                            eprintln!(
+                                "hint: use --on-stale-mount hold (and restart the pod), or \
+                                 detach it: umount -l {}",
+                                args.mountpoint.display()
+                            );
+                            return Ok(ExitCode::FAILURE);
+                        }
+                        stacked = true;
+                    }
+                    // preflight reports it, with the command that clears it.
+                    OnStaleMount::Refuse => {}
+                }
             }
             if let Some(address) = &args.history.history_service {
                 // A front takes no lock: the history service holds it.
                 return front::mount_front(daemon, &state, cli.root.as_deref(), &args, address);
             }
+            // The dead daemon's lock went with it.
             let _lock = StateLock::acquire(&state, "mount", cli.wait_lock)?;
-            return mount(daemon, &state, cli.root.as_deref(), &args);
+            return mount(daemon, &state, cli.root.as_deref(), &args, stacked);
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -883,9 +912,11 @@ struct MountArgs {
     #[arg(long, default_value = "10s", value_parser = parse_grace)]
     unmount_grace: Duration,
     /// What to do when MOUNTPOINT is an agentfs mount whose daemon died:
-    /// `refuse` (exit 1 with the command that clears it) or `hold` (a
+    /// `refuse` (exit 1 with the command that clears it), `hold` (a
     /// restarted sidecar: mount nothing, wait for SIGTERM, then detach the
-    /// stale mount; design §17.1).
+    /// stale mount) or `recover` (a restarted sidecar: mount over the stale
+    /// mount, so the workload's copies of it reach the new daemon; needs
+    /// CAP_SYS_ADMIN; design §17.1).
     #[arg(
         long,
         env = "AGENTFS_ON_STALE_MOUNT",
@@ -902,6 +933,19 @@ struct MountArgs {
 enum OnStaleMount {
     Refuse,
     Hold,
+    Recover,
+}
+
+/// Why `--on-stale-mount recover` cannot stack over a stale mount here.
+fn recover_refusal(args: &MountArgs) -> Option<&'static str> {
+    if args.history.history_service.is_some() {
+        // A front's mount is the CSI driver's to stack (design §14.2).
+        Some("fronts (--history-service) do not recover in place")
+    } else if !agentfs_fuse::privileges::Privileges::current().can_unmount() {
+        Some("stacking a mount needs CAP_SYS_ADMIN (run as root)")
+    } else {
+        None
+    }
 }
 
 fn parse_passthrough(value: &str) -> Result<Passthrough, String> {
@@ -965,6 +1009,7 @@ fn mount(
     state: &StateDir,
     root: Option<&Path>,
     args: &MountArgs,
+    stacked: bool,
 ) -> Result<ExitCode> {
     if let Some(root) = root {
         let same = match (root.canonicalize(), args.backing.canonicalize()) {
@@ -984,8 +1029,23 @@ fn mount(
         .with_context(|| format!("opening {}", state.root().display()))?
         .settings()
         .clone();
-    create_mountpoint(&args.mountpoint)?;
-    let (backing, mountpoint) = preflight(state, &settings, &args.backing, &args.mountpoint)?;
+    let (backing, mountpoint, stale_layers) = if stacked {
+        let (backing, mountpoint) =
+            preflight_stacked(state, &settings, &args.backing, &args.mountpoint)?;
+        let layers = agentfs_layers(&mountpoint).unwrap_or(1);
+        (backing, mountpoint, Some(layers))
+    } else {
+        create_mountpoint(&args.mountpoint)?;
+        let (backing, mountpoint) = preflight(state, &settings, &args.backing, &args.mountpoint)?;
+        if std::fs::read_dir(&mountpoint).is_ok_and(|mut d| d.next().is_some()) {
+            eprintln!(
+                "warning: {} is not empty: the files in it are hidden by the mount and not \
+                 recorded (a workload wrote there while no daemon was mounted?)",
+                mountpoint.display()
+            );
+        }
+        (backing, mountpoint, None)
+    };
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
     // The patch queue, before anything can see the tree (design §12). A
@@ -1017,6 +1077,9 @@ fn mount(
         threads: args.threads,
         sweep_interval: settings.sweep_interval,
         repair_store: Some(state.repairs()),
+        stack_over: stacked.then(|| StackOver {
+            source: state.stack_source(),
+        }),
     };
     let mounted = match Mount::start(recorder, config) {
         Ok(mounted) => mounted,
@@ -1053,6 +1116,13 @@ fn mount(
             startup.loaded, startup.repaired, startup.still_queued
         );
     }
+    if let Some(layers) = stale_layers {
+        eprintln!(
+            "stacked over a stale mount left by a crashed daemon at {} ({layers} stale \
+             layer(s) below): the workload's copies of the mount now reach this daemon",
+            mountpoint.display()
+        );
+    }
     eprintln!(
         "mounted {} at {} (volume {}, passthrough: {}, threads {}, {} uncommitted record(s) \
          recovered, remotes: {}); stop with SIGINT or SIGTERM",
@@ -1087,6 +1157,15 @@ fn mount(
     }
     let report = mounted.shutdown(args.unmount_grace);
     print_unmount(&report, args.unmount_grace);
+    // The layers earlier crashes left under a stacked mount.
+    match detach_stale_layers(&mountpoint, STALE_LAYERS) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("detached {n} stale layer(s) at {}", mountpoint.display()),
+        Err(e) => eprintln!(
+            "could not detach the stale layers at {}: {e}",
+            mountpoint.display()
+        ),
+    }
     let code = stop_service(service, args.push_grace);
     session.finish();
     Ok(if failed { ExitCode::FAILURE } else { code })

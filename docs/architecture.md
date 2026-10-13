@@ -98,7 +98,7 @@ missing from these tables or a row names a module that no longer exists;
 | `groups.rs` | fsync-class groups: holding writes while a group is captured, and scheduling captures (§8) |
 | `sweep.rs` | The periodic sweep: files held open, failed records, the fsync-class timer (§3.1, §3.5) |
 | `privileges.rs` | What the daemon may do as the caller or as itself (§6) |
-| `mount.rs` | Layout checks, mounting, unmounting, and reading mount state from `/proc/self/mountinfo` |
+| `mount.rs` | Layout checks, mounting (also stacked over a stale mount, for `--on-stale-mount recover`), unmounting, detaching stale layers, and reading mount state from `/proc/self/mountinfo` |
 
 ### `agentfs`
 
@@ -108,7 +108,7 @@ missing from these tables or a row names a module that no longer exists;
 | `daemon.rs` | Signals and shutdown for `run` and `mount` |
 | `front.rs` | `mount --history-service`: a front of a history service (§14) |
 | `serve_history.rs` | `agentfs serve-history`: the history service of a volume (§14) |
-| `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount |
+| `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount (`recover`, which mounts over it, is in `main.rs`) |
 | `control.rs` | The control socket of a running daemon (`mount`, `run`, `serve-history`), through which `push`, `restore` and `revert` act (§2.2, §2.3, §15) |
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
 | `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount or directly (§15) |
@@ -273,7 +273,7 @@ What a crash at each point leaves, and what the next open does (§3.3,
 | The patch phase, after the record and before its commit | A journaled patch record | Journal replay commits it with its `Agentfs-Inbox` trailer, and the trailer scan finds it applied; it is never applied twice (§12) |
 | The patch phase, after the commit and before the ref moves | The commit on the branch; `inbox/<n>` still there, no `applied/<n>` | The next run finds the commit by its trailers and finishes the ref moves (`applied/<n>` set, `inbox/<n>` deleted): what is applied is decided by the branch, never by refs (§12) |
 | A namespace record that failed (`EIO`), with paths on the repair queue | `meta/repairs`, rewritten whenever the queue changes (`meta/fronts/slot-N.repairs` for a front) | The next mount (or the front reusing the slot) re-derives each path's absolute state from the backing tree and records it before it serves any request (§3.5) |
-| The daemon of a mount in a pod (§17.1) | A stale FUSE mount: the workload's calls fail with `ENOTCONN`, never reaching the bare directory beneath | The restarted sidecar runs `mount --on-stale-mount hold`: it mounts nothing, takes no lock and keeps the pod NotReady; at pod termination it detaches the stale mount. The next pod mounts afresh and replays the journal ([runbook](runbooks/crashed-sidecar.md)) |
+| The daemon of a mount in a pod (§17.1) | A stale FUSE mount: the workload's calls fail with `ENOTCONN`, never reaching the bare directory beneath | The kubelet restarts the sidecar, which runs `mount --on-stale-mount recover`: it takes the lock, replays the journal and bind-stacks a new mount over the stale one, which propagation carries into the workload containers; at its stop it detaches the stale layers. With `hold` it mounts nothing and the pod is restarted by hand ([runbook](runbooks/crashed-sidecar.md)) |
 | A CSI front or service (§14.2) | A stale mount at the pod's target, or fronts failing with `EIO` | The supervisor restarts it with backoff (1 s to 30 s): a front in its predecessor's slot, its new mount bind-stacked over the stale target; a service replays its journal |
 | The CSI node plugin (deleted, upgraded or crashed) | Its children stop with it (with final commits when it is stopped gracefully); the staged and published records on the hostPath | Reconcile at plugin start: services for staged volumes (journal replay), fronts recovered for targets whose mount is still there, live or stale; targets the kubelet removed are forgotten. Containers that mount with `HostToContainer` see the new mount; others after a container restart (§14.2, [runbook](runbooks/csi-recovery.md)) |
 

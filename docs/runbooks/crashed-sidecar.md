@@ -2,107 +2,134 @@
 
 The agentfs daemon in a pod's sidecar died (a crash, an OOM kill, `kill
 -9`). Every change the workload saw succeed was journaled before its call
-returned, so nothing is lost, but the mount is dead until the pod is
-restarted. Phase 1 recovers by restarting the pod, by hand. Design:
+returned, so nothing is lost. The shipped sidecar recovers by itself:
+the kubelet restarts the container, and it mounts over the dead mount
+(`AGENTFS_ON_STALE_MOUNT=recover`). This runbook is for checking that
+recovery, and for the cases where it does not happen. Design:
 [§17.1](../design.md#171-layer-1-core-and-daemon-rust); deployment:
 [deployment.md](../deployment.md#7-a-crashed-daemon).
 
-## Symptoms
+## What automatic recovery looks like
 
-- The workload's file calls under the mount fail with **"Transport
-  endpoint is not connected"** (`ENOTCONN`). This is deliberate: agentfs
-  never exposes the empty directory beneath a dead mount, where writes
-  would go unrecorded.
-- The pod is **NotReady**: the sidecar's readiness probe (`agentfs probe
-  /agentfs/workspace`) fails.
-- The sidecar container has restarted (`RESTARTS` ≥ 1 on the `agentfs`
-  container) and its log says it is holding:
+1. For a few seconds the workload's file calls under the mount fail with
+   **"Transport endpoint is not connected"** (`ENOTCONN`). This is
+   deliberate: agentfs never exposes the empty directory beneath a dead
+   mount, where writes would go unrecorded.
+2. The kubelet restarts the `agentfs` container (`RESTARTS` goes up by
+   one). The new daemon takes the state-area lock, recovers the journal,
+   and stacks a new mount over the dead one. Its log shows:
 
-  ```
-  /agentfs/workspace is an agentfs mount (agentfs:<volume>) whose daemon died: not remounting while workloads may still hold it. Phase 1 recovers by restarting the pod (kubectl delete pod <pod>); its next start recovers the journal. Holding until SIGTERM, then detaching the stale mount.
-  ```
+   ```
+   stacked over a stale mount left by a crashed daemon at /agentfs/workspace (1 stale layer(s) below): the workload's copies of the mount now reach this daemon
+   mounted /data/backing at /agentfs/workspace (volume ..., 3 uncommitted record(s) recovered, ...)
+   ```
 
-- Telemetry: no metrics from the pod since the crash, and
-  `agentfs.push.oldest_unpushed_age` stops being reported. Alert on the
-  sidecar's readiness and restarts.
+3. The pod is Ready again. The workload containers were not restarted:
+   their next calls reach the new daemon.
+4. When that sidecar later stops (pod deletion, a rollout), it detaches
+   the dead layer beneath its own mount (`detached 1 stale layer(s) at
+   /agentfs/workspace`).
 
 ## Check
 
 ```sh
 NS=<namespace> POD=<pod>
-kubectl -n "$NS" get pod "$POD" -o wide
 kubectl -n "$NS" get pod "$POD" \
   -o jsonpath='{range .status.initContainerStatuses[*]}{.name}{" restarts="}{.restartCount}{" ready="}{.ready}{"\n"}{end}'
+kubectl -n "$NS" logs "$POD" -c agentfs | grep -E '^(stacked|mounted) '
 kubectl -n "$NS" exec "$POD" -c agentfs -- agentfs probe /agentfs/workspace
-# stale agentfs mount (daemon gone)
+# live agentfs mount (agentfs:<volume>)
+kubectl -n "$NS" exec "$POD" -c agentfs -- agentfs status
+# backlog:   0 record(s)
+# lock:      held by pid=1 command=mount since=...
+kubectl -n "$NS" exec "$POD" -c agentfs -- agentfs push      # push now, do not wait for pushInterval
 kubectl -n "$NS" logs "$POD" -c agentfs --previous | tail -n 50   # why it died
 kubectl -n "$NS" describe pod "$POD" | grep -A5 'Last State'       # OOMKilled?
 ```
 
-`agentfs status` works in the holding sidecar and shows what is waiting
-(it takes no lock and reads the journal without changing it):
+Each crash recovered this way leaves one dead layer under the live mount
+until the sidecar stops. To see them, on the node:
 
 ```sh
-kubectl -n "$NS" exec "$POD" -c agentfs -- agentfs status
-# backlog:   3 record(s)
-# lock:      free
+findmnt -t fuse.agentfs     # one live mount on top, plus one entry per dead layer
 ```
 
-## Recover
+Find out why it died from the previous log. An OOM kill means the
+sidecar's memory limit is too low for the volume; a panic is a bug:
+report it with the log.
 
-1. **Restart the pod.** With the example's `Recreate` strategy and a
-   `ReadWriteOncePod` volume, the old pod is gone before the new one
-   mounts the volume:
+## When to step in
 
-   ```sh
-   kubectl -n "$NS" delete pod "$POD" --timeout=120s
-   ```
+- **`CrashLoopBackOff`**: the daemon crashes again at every start (a
+  corrupt state area, a full disk, an OOM during journal recovery). Each
+  restart waits longer (up to 5 minutes), and the workload's calls fail
+  meanwhile. Read the previous log, fix the cause, then delete the pod.
+  Each crash adds a dead layer; a stop detaches up to 16.
+- **Recovery refused**: the log says `--on-stale-mount recover: stacking
+  a mount needs CAP_SYS_ADMIN` (a sidecar that is not privileged) and the
+  container exits 1. Run it privileged, as the example does, or switch to
+  `hold` and recover by deleting the pod (below).
+- **A hung daemon**: alive, but calls under the mount hang. Nothing
+  restarts it (there is no liveness probe). Delete the pod; if the
+  daemon is stuck in the kernel, the node may need the mount detached
+  (below).
+- **Files open with passthrough at the crash**: with `--passthrough auto`
+  as root, writes through descriptors the workload opened before the
+  crash go straight to the backing file and are not recorded until the
+  file changes again through the mount. If every write must be recorded,
+  restart the workload after a crash, or run with `--passthrough off`.
+- **A clean exit while the pod runs** (someone sent the sidecar SIGTERM,
+  or unmounted it): the kubelet restarts it into a fresh mount. Workload
+  containers that mount the `emptyDir` read-only (the example) got
+  `EROFS` in the gap. A container with a `subPath` of the mount keeps the
+  dead mount until its liveness probe restarts it; without that probe,
+  restart it by hand.
 
-   The workload containers stop first; the holding sidecar then gets
-   SIGTERM, detaches the stale mount (`detached stale mount
-   /agentfs/workspace` in its log) and exits, so the kubelet can remove
-   the pod's volumes.
+## Recover by hand (hold mode, or as a fallback)
 
-2. **Check the new pod.** It becomes Ready once the mount is live. Its
-   sidecar's startup line reports the records the crash left
-   uncommitted:
+With `AGENTFS_ON_STALE_MOUNT=hold` the restarted sidecar mounts nothing:
+its log says `Holding until SIGTERM, then detaching the stale mount`, the
+pod is NotReady, and the workload's calls keep failing with `ENOTCONN`.
+Restart the pod. With the example's `Recreate` strategy and a
+`ReadWriteOncePod` volume, the old pod is gone before the new one mounts
+the volume:
 
-   ```sh
-   NEW=$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=agentfs-example -o name | head -n1)
-   kubectl -n "$NS" logs "$NEW" -c agentfs | grep '^mounted '
-   # mounted /data/backing at /agentfs/workspace (volume ..., 3 uncommitted record(s) recovered, ...)
-   kubectl -n "$NS" exec "$NEW" -c agentfs -- agentfs status
-   ```
+```sh
+kubectl -n "$NS" delete pod "$POD" --timeout=120s
+```
 
-   `backlog: 0` and, after the next `pushInterval`, each remote's
-   `0 unpushed` mean everything is in history and pushed.
-
-3. **Find out why it died** from the previous log (`--previous` on the
-   old pod, or your log store). An OOM kill means the sidecar's memory
-   limit is too low for the volume; a panic is a bug: report it with
-   the log.
+The workload containers stop first; the holding sidecar then gets
+SIGTERM, detaches every dead layer (`detached stale mount
+/agentfs/workspace (N layer(s))`) and exits, so the kubelet can remove the
+pod's volumes. The new pod's startup line reports the records the crash
+left uncommitted; `backlog: 0` in `agentfs status` and `0 unpushed` per
+remote mean everything is in history and pushed. Deleting the pod works
+the same in recover mode.
 
 ## If the pod is stuck Terminating
 
 The kubelet cannot remove the pod's `emptyDir` while a dead FUSE mount
-is still attached there. The holding sidecar detaches it at SIGTERM; if
-the sidecar was not holding (an older image, or `AGENTFS_ON_STALE_MOUNT`
-not set to `hold`), detach it on the node:
+is still attached there. The sidecar detaches dead layers when it stops;
+if it could not (an older image, `AGENTFS_ON_STALE_MOUNT` unset, or the
+sidecar crashed again at the end), detach them on the node:
 
 ```sh
 # on the node (or: kubectl debug node/<node> -it --image=busybox -- chroot /host sh)
 findmnt -t fuse,fuse.agentfs      # source agentfs:<volume>
 umount -l /var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~empty-dir/agentfs-mount/workspace
+# repeat while findmnt still lists it
 ```
 
 ## What not to do
 
-- **Do not unmount the stale mount by hand while the workload runs**,
-  and do not send SIGTERM to a holding sidecar while the pod should keep
-  running: detaching it exposes the bare directory under the mount
-  point to the workload, and anything written there is not recorded (and
-  is hidden again by the next mount). Delete the pod instead.
-- **Do not add a liveness probe** to the sidecar: a restart cannot
-  remount safely, so it would only restart into the same hold.
+- **Do not unmount the dead mount by hand while the workload runs**:
+  detaching it exposes the bare directory under the mount point to the
+  workload. With the example's read-only `emptyDir` writes then fail
+  with `EROFS`; a `subPath` consumer, or a workload without the
+  read-only mount, would write there unrecorded (hidden again by the
+  next mount).
+- **Do not add a liveness probe** to the sidecar: the kubelet already
+  restarts a daemon that dies, and a probe would kill a slow but live one
+  (a long journal recovery).
 - Do not delete the PVC or the state area: the uncommitted records are in
   the journal there.

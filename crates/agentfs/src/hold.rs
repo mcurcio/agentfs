@@ -1,12 +1,15 @@
 //! `mount --on-stale-mount hold`: what a restarted sidecar does when its
 //! previous daemon died and left the mount point stale (design §17.1).
 //!
-//! Phase 1 recovers a crashed daemon by restarting the pod. Remounting in
-//! place is not safe: workload containers still hold the dead mount
-//! (`ENOTCONN`), and detaching it while they run would let their writes
-//! land in the bare directory beneath, where nothing records them. So the
-//! restarted sidecar mounts nothing and takes no lock. It reports the
-//! situation and waits:
+//! `--on-stale-mount recover` (the shipped sidecar's mode) mounts over the
+//! stale mount instead (design §17.1); hold is for operators who want to
+//! recover by hand. With hold, phase 1 recovers a crashed daemon by
+//! restarting the pod. Detaching the dead mount
+//! and mounting afresh is not safe: workload containers still hold the
+//! dead mount (`ENOTCONN`), and detaching it while they run would let their
+//! writes land in the bare directory beneath, where nothing records them
+//! (recover stacks over it instead). So the restarted sidecar mounts
+//! nothing and takes no lock. It reports the situation and waits:
 //!
 //! - its readiness probe (`agentfs probe`) fails, so the pod shows
 //!   NotReady, and the workload's writes keep failing with `ENOTCONN`;
@@ -20,8 +23,9 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use agentfs_fuse::{MountState, detach, mount_state};
+use agentfs_fuse::{MountState, detach_stale_layers, mount_state};
 
+use crate::STALE_LAYERS;
 use crate::daemon::Daemon;
 
 /// Holds until SIGINT or SIGTERM, then detaches `mountpoint` if it is
@@ -37,8 +41,12 @@ pub fn hold(daemon: Daemon, mountpoint: &Path, source: &str) -> ExitCode {
     let wake = daemon.wait();
     eprintln!("{}: stopping the hold", crate::describe_wake(wake));
     match mount_state(mountpoint) {
-        Ok(MountState::Stale { .. }) => match detach(mountpoint) {
-            Ok(()) => eprintln!("detached stale mount {}", mountpoint.display()),
+        // Every layer: crashes recovered by stacking leave one each.
+        Ok(MountState::Stale { .. }) => match detach_stale_layers(mountpoint, STALE_LAYERS) {
+            Ok(n) => eprintln!(
+                "detached stale mount {} ({n} layer(s))",
+                mountpoint.display()
+            ),
             Err(e) => eprintln!(
                 "could not detach the stale mount {}: {e}",
                 mountpoint.display()

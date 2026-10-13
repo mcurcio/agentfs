@@ -205,9 +205,7 @@ who holds the lock.
 
 ### Not built yet
 
-Several mounts of one volume across nodes, and
-restarting a pod automatically after its sidecar crashes (the CSI driver
-does restart crashed fronts). SSH remotes do
+Several mounts of one volume across nodes. SSH remotes do
 not support ssh-agent, passphrase-protected keys or `@cert-authority`
 host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
 resumable transfers, proxy settings or pruning. Restoring a database needs
@@ -236,8 +234,9 @@ pushes it once more within `--push-grace` and exits. Paths whose record failed a
 saved in `<state>/meta/repairs` and recorded by the next mount before it
 serves anything. A missing mount point is created. Flags: `--passthrough auto|on|off`, `--threads`,
 `--no-allow-other`, `--unmount-grace`, `--push-grace`,
-`--on-stale-mount refuse|hold` (a restarted Kubernetes sidecar holds
-instead of remounting over a dead mount). `agentfs probe MOUNTPOINT`
+`--on-stale-mount refuse|hold|recover` (a restarted Kubernetes sidecar
+mounts over the dead mount its predecessor left, so the workload carries
+on without a pod restart; `hold` waits for one instead). `agentfs probe MOUNTPOINT`
 exits 0 only for a live agentfs mount, for Kubernetes probes.
 
 It needs Linux 5.6+ and `/dev/fuse`, and should run as root for multi-user
@@ -304,7 +303,10 @@ and the state area live on a `ReadWriteOncePod` PVC it never sees.
 Settings and remotes come from a ConfigMap (`agentfs init --include`),
 rules from the same ConfigMap, credentials from a Secret. If the daemon
 crashes, the workload's calls fail with `ENOTCONN` (nothing goes
-unrecorded), the pod turns NotReady, and deleting the pod recovers.
+unrecorded) until the kubelet restarts the sidecar, which mounts over the
+dead mount and carries on with no manual step; the workload mounts the
+`emptyDir` read-only, so writes while no daemon is mounted fail instead of
+going unrecorded.
 [docs/deployment.md](docs/deployment.md) explains the layout, the
 configuration, operations, the security trade-offs of the privileged
 sidecar and the Hermes example ([`deploy/examples/hermes`](deploy/examples/hermes));

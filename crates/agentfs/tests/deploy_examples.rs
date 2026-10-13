@@ -1,7 +1,9 @@
 //! The operator files under `deploy/` (design §16, §17.1), checked through
 //! the CLI exactly as the init container and the sidecar use them: the
 //! config fragment is included with `agentfs init --include`, and the rule
-//! files become `<state>/git/info/exclude` and `info/attributes`.
+//! files become `<state>/git/info/exclude` and `info/attributes`. The
+//! sidecar manifest is checked for its crash recovery: `recover` mode and the
+//! read-only emptyDir fence.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -217,4 +219,57 @@ fn the_csi_example_profile_loads() {
     assert_eq!(recorded, set(&kept));
     assert_eq!(skipped, set(&dropped));
     assert_eq!(v.history(), set(&kept));
+}
+
+/// The lines of `deploy/sidecar/deployment.yaml` without comments.
+fn sidecar_manifest() -> Vec<String> {
+    std::fs::read_to_string(repo_root().join("deploy/sidecar/deployment.yaml"))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The shipped sidecar recovers in place after a crash (design §17.1).
+#[test]
+fn the_sidecar_recovers_stale_mounts() {
+    let lines = sidecar_manifest();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("name: AGENTFS_ON_STALE_MOUNT") && l.contains("value: recover")),
+        "deploy/sidecar/deployment.yaml must set AGENTFS_ON_STALE_MOUNT to recover"
+    );
+}
+
+/// The workload mounts the shared emptyDir read-only: the fence while no
+/// daemon is mounted (design §17.1).
+#[test]
+fn the_workload_mounts_the_emptydir_read_only() {
+    let lines = sidecar_manifest();
+    let start = lines
+        .iter()
+        .position(|l| l.trim() == "containers:")
+        .expect("a containers: section");
+    let workload = &lines[start..];
+    let mount = workload
+        .iter()
+        .position(|l| l.contains("name: agentfs-mount"))
+        .expect("the workload mounts agentfs-mount");
+    let block: Vec<&String> = workload[mount..]
+        .iter()
+        .take_while(|l| !l.contains("volumes:"))
+        .take(6)
+        .collect();
+    assert!(
+        block.iter().any(|l| l.trim() == "readOnly: true"),
+        "the workload's agentfs-mount must be readOnly: true: {block:?}"
+    );
+    assert!(
+        block
+            .iter()
+            .any(|l| l.trim() == "recursiveReadOnly: Disabled"),
+        "{block:?}"
+    );
 }

@@ -173,6 +173,7 @@ pub(crate) fn mount_front(
         threads: args.threads,
         sweep_interval: settings.sweep_interval,
         repair_store: Some(state.front_repairs(slot)),
+        stack_over: None,
     };
     let mounted = Mount::start(front.recorder.clone(), config)?;
     daemon.watch(mounted.ended(), Wake::Unmounted)?;

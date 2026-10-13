@@ -1,7 +1,7 @@
 //! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7, 11 and 15, plus SQLite
 //! in and out of the fsync class (design §8),
 //! git on the mount, restores through the mount, the daemon's lifecycle, and
-//! `probe` and `--on-stale-mount hold` after a crash (design §17.1), and two
+//! `probe`, `--on-stale-mount hold` and `recover` after a crash (design §17.1), and two
 //! front mounts of one backing tree feeding one history service (design §14).
 //!
 //! Every test needs `/dev/fuse` and root, so all are `#[ignore]`d; the
@@ -1642,6 +1642,210 @@ fn probe_hold_and_detach_after_a_crash() {
     v.sh("printf after > after");
     v.expect(&tree(&[("after", f("after")), ("before", f("before"))]));
     m.stop();
+}
+
+/// Runs `cmd` under `setpriv` with CAP_SYS_ADMIN dropped from the bounding
+/// set, so root's exec gets every capability but that one.
+fn without_sys_admin(cmd: Command) -> Command {
+    let mut wrapped = Command::new("setpriv");
+    wrapped
+        .args(["--bounding-set=-sys_admin", "--inh-caps=-sys_admin", "--"])
+        .arg(cmd.get_program())
+        .args(cmd.get_args());
+    for (name, value) in cmd.get_envs() {
+        match value {
+            Some(value) => wrapped.env(name, value),
+            None => wrapped.env_remove(name),
+        };
+    }
+    wrapped
+}
+
+/// How many agentfs mounts the kernel lists at `mnt` (stacked layers).
+fn layers(mnt: &Path) -> usize {
+    let info = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let mnt = mnt.to_str().unwrap();
+    info.lines()
+        .filter(|l| l.split(' ').nth(4).is_some_and(|m| m == mnt) && l.contains(" agentfs:"))
+        .count()
+}
+
+/// Kills the daemon with SIGKILL and checks the mount point went stale.
+fn crash(m: &mut Mounted) {
+    m.signal(rustix::process::Signal::KILL);
+    m.wait_exit(Duration::from_secs(10));
+    assert_eq!(
+        rustix::fs::stat(&m.mnt).unwrap_err(),
+        rustix::io::Errno::NOTCONN
+    );
+}
+
+/// `--on-stale-mount recover` (design §17.1): a daemon killed with -9 is
+/// replaced by one stacked over its stale mount, which every copy of the
+/// stale mount then reaches: a bind of it (as a kubelet subPath) and a
+/// slave mount namespace (as a workload container). Refused without
+/// CAP_SYS_ADMIN and for fronts; a hold detaches every stale layer.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn recover_stacks_over_a_crashed_mount() {
+    let v = Vol::new("recover");
+    let mnt = v.mnt();
+    let mnt_s = mnt.to_str().unwrap().to_owned();
+    let subpath = v.p("subpath");
+    fs::create_dir(&subpath).unwrap();
+    let mut first = v.mount(&[]);
+    // Shared, as under a Bidirectional emptyDir, so copies are peers and
+    // slaves of it.
+    let ok = |cmd: &mut Command| {
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{cmd:?}: {}", text(&out.stderr));
+    };
+    ok(Command::new("mount").arg("--make-shared").arg(&mnt));
+    ok(Command::new("mount").arg("--bind").arg(&mnt).arg(&subpath));
+    let mut holder = Command::new("unshare")
+        .args(["-m", "--propagation", "slave", "sleep", "600"])
+        .spawn()
+        .unwrap();
+    let holder_pid = holder.id().to_string();
+    v.sh("printf before > before");
+    v.expect(&tree(&[("before", f("before"))]));
+    crash(&mut first);
+    assert_eq!(
+        rustix::fs::stat(&subpath).unwrap_err(),
+        rustix::io::Errno::NOTCONN
+    );
+
+    // Refused without CAP_SYS_ADMIN, and for fronts; the stale mount is
+    // left as it is.
+    let out = without_sys_admin(v.mount_command(&["--on-stale-mount", "recover"]))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("CAP_SYS_ADMIN"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = v
+        .mount_command(&[
+            "--on-stale-mount",
+            "recover",
+            "--history-service",
+            "unix:/nonexistent.sock",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("fronts"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(layers(&mnt), 1);
+
+    // Recover: stacked over the stale mount, it serves every copy.
+    let mut second = v.mount(&["--on-stale-mount", "recover"]);
+    let log = second.log();
+    assert!(
+        log.contains(&format!(
+            "stacked over a stale mount left by a crashed daemon at {mnt_s} (1 stale layer(s) below)"
+        )),
+        "{log}"
+    );
+    assert_eq!(layers(&mnt), 2);
+    let out = v.agentfs(&["probe", &mnt_s]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(fs::read_to_string(mnt.join("before")).unwrap(), "before");
+    v.sh("printf after > after");
+    v.expect(&tree(&[("after", f("after")), ("before", f("before"))]));
+    assert_eq!(fs::read_to_string(subpath.join("after")).unwrap(), "after");
+    fs::write(subpath.join("via-subpath"), "s").unwrap();
+    let out = Command::new("nsenter")
+        .args(["-m", "-t", &holder_pid, "cat"])
+        .arg(mnt.join("after"))
+        .output()
+        .unwrap();
+    assert_eq!(text(&out.stdout), "after", "{}", text(&out.stderr));
+    let out = Command::new("nsenter")
+        .args(["-m", "-t", &holder_pid, "sh", "-c"])
+        .arg(format!("printf ns > {mnt_s}/via-namespace"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    v.expect(&tree(&[
+        ("after", f("after")),
+        ("before", f("before")),
+        ("via-namespace", f("ns")),
+        ("via-subpath", f("s")),
+    ]));
+
+    // A second crash leaves two stale layers; a hold detaches both.
+    crash(&mut second);
+    assert_eq!(layers(&mnt), 2);
+    let child = v
+        .mount_command(&["--on-stale-mount", "hold"])
+        .spawn()
+        .unwrap();
+    let mut held = Mounted {
+        child: Some(child),
+        mnt: mnt.clone(),
+        log: v.log_path(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !held.log().contains("Holding until SIGTERM") {
+        assert!(
+            Instant::now() < deadline,
+            "never held; log:\n{}",
+            held.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    held.signal(rustix::process::Signal::TERM);
+    assert_eq!(held.wait_exit(Duration::from_secs(20)).code(), Some(1));
+    assert!(
+        held.log()
+            .contains(&format!("detached stale mount {mnt_s} (2 layer(s))")),
+        "{}",
+        held.log()
+    );
+    assert_eq!(layers(&mnt), 0, "{}", held.log());
+
+    // Recover again, stop: the stop detaches the stale layer under it.
+    let mut third = v.mount(&[]);
+    crash(&mut third);
+    let fourth = v.mount(&["--on-stale-mount", "recover"]);
+    v.sh("printf last > last");
+    let log = fourth.stop();
+    assert!(
+        log.contains(&format!("detached 1 stale layer(s) at {mnt_s}")),
+        "{log}"
+    );
+    assert_eq!(layers(&mnt), 0, "{log}");
+
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let _ = Command::new("umount").arg("-l").arg(&subpath).status();
+    let _ = Command::new("umount").arg("-l").arg(&subpath).status();
+}
+
+/// With nothing stale, `recover` is a normal mount; files left in the bare
+/// mount point are warned about (design §17.1).
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn recover_on_a_healthy_mount_point_is_a_normal_mount() {
+    let v = Vol::new("recover_healthy");
+    fs::write(v.mnt().join("left-behind"), "x").unwrap();
+    let m = v.mount(&["--on-stale-mount", "recover"]);
+    let log = m.log();
+    assert!(!log.contains("stacked over"), "{log}");
+    assert!(log.contains("is not empty"), "{log}");
+    assert_eq!(layers(&v.mnt()), 1);
+    m.stop();
+    fs::remove_file(v.mnt().join("left-behind")).unwrap();
 }
 
 #[test]

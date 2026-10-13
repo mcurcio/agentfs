@@ -13,11 +13,19 @@
 #     the runner's git server over HTTP with the credential Secret (test 8);
 #   - `kubectl exec ... agentfs restore` through the control socket (test
 #     11);
-#   - deleting the pod makes the final commit;
-#   - after `kill -9` of the daemon, writes fail with ENOTCONN, the
-#     restarted sidecar holds and the pod goes NotReady, `kubectl delete
-#     pod` completes, and the new pod recovers and pushes what was written
-#     before the kill (test 2 in a pod); the failed write is nowhere.
+#   - deleting the pod makes the final commit and pushes it;
+#   - after `kill -9` of the daemon, writes fail with ENOTCONN, the kubelet
+#     restarts the sidecar, which stacks a new mount over the stale one
+#     (`--on-stale-mount recover`) with no manual step; both writers
+#     (HostToContainer and subPath) reach it without a restart, and
+#     everything written before and after the kill reaches the remote
+#     (test 2 in a pod); the failed write is nowhere;
+#   - `agentfs push` in the sidecar asks the running daemon to push now;
+#   - a clean exit of the sidecar mid-pod: writes in the gap fail with
+#     EROFS (the workload's read-only emptyDir) and reach nothing, the
+#     subPath writer restarts through its liveness probe, and both write
+#     through the restarted sidecar's mount;
+#   - deleting the recovered pod leaves nothing mounted on the node.
 #
 # Needs docker, kind and kubectl (ci/install-kind.sh), a kind cluster
 # $KIND_CLUSTER (default agentfs-e2e) with the image agentfs:ci loaded, and
@@ -247,63 +255,125 @@ wait_remote final.txt final
 assert_contains "$(remote_message final.txt)" "Agentfs-Pod: $OLD" "final.txt was committed by the deleted pod"
 assert_contains "$(k logs "$POD" -c agentfs-init)" "volume $VOLUME already initialised" "init accepted the existing state area"
 
-step "kill -9 the daemon: the pod restart recovers (design §18 test 2)"
+# Restart counts and the sidecar's pid on the node.
+sidecar_restarts() {
+  k get pod "$POD" -o jsonpath='{.status.initContainerStatuses[?(@.name=="agentfs")].restartCount}'
+}
+writer_restarts() { # container
+  k get pod "$POD" -o jsonpath="{.status.containerStatuses[?(@.name==\"$1\")].restartCount}"
+}
+sidecar_pid() {
+  local cid
+  cid=$(k get pod "$POD" -o jsonpath='{.status.initContainerStatuses[?(@.name=="agentfs")].containerID}')
+  docker exec "$NODE" crictl inspect --output go-template --template '{{.info.pid}}' "${cid#*://}"
+}
+# Signals the sidecar from the node (PID 1 ignores SIGKILL from inside its
+# own namespace) and waits until it is gone.
+signal_sidecar() { # signal
+  local pid
+  pid=$(sidecar_pid)
+  [ -n "$pid" ] || fail "no pid for the sidecar"
+  docker exec "$NODE" kill "-$1" "$pid"
+  local deadline=$((SECONDS + 60))
+  while docker exec "$NODE" kill -0 "$pid" 2>/dev/null; do
+    [ $SECONDS -lt $deadline ] || fail "the sidecar (pid $pid) did not exit after SIG$1"
+    sleep 0.2
+  done
+  pass "SIG$1 to the sidecar (pid $pid on the node); it is gone"
+}
+wait_sidecar_restarted() { # previous-count
+  local deadline=$((SECONDS + 180))
+  until [ "$(sidecar_restarts)" -gt "$1" ]; do
+    [ $SECONDS -lt $deadline ] || fail "the kubelet never restarted the sidecar"
+    sleep 1
+  done
+  k wait --for=condition=Ready "pod/$POD" --timeout=180s >/dev/null ||
+    fail "the pod never became Ready again"
+  pass "the kubelet restarted the sidecar and the pod is Ready, with no manual step"
+}
+
+step "kill -9 the daemon: the restarted sidecar recovers in place (design §18 test 2)"
 in_root "printf before > $WS/before-crash.txt"
-cid=$(k get pod "$POD" -o jsonpath='{.status.initContainerStatuses[?(@.name=="agentfs")].containerID}')
-cid=${cid#*://}
-pid=$(docker exec "$NODE" crictl inspect --output go-template --template '{{.info.pid}}' "$cid")
-[ -n "$pid" ] || fail "no pid for the sidecar container $cid"
-# SIGKILL from the node: PID 1 ignores it from inside its own namespace.
-docker exec "$NODE" kill -9 "$pid"
-pass "killed the daemon (pid $pid on the node)"
-deadline=$((SECONDS + 30))
-until out=$(in_root "printf x > $WS/during.txt" 2>&1; echo "exit=$?") && [ "${out##*exit=}" != 0 ]; do
-  [ $SECONDS -lt $deadline ] || fail "writes still succeed after the kill: $out"
-  sleep 0.5
-done
-assert_contains "$out" "Transport endpoint is not connected" "a write after the crash fails with ENOTCONN"
-deadline=$((SECONDS + 120))
-until [ "$(k get pod "$POD" -o jsonpath='{.status.initContainerStatuses[?(@.name=="agentfs")].restartCount}')" -ge 1 ] &&
-  k logs "$POD" -c agentfs 2>/dev/null | grep -q 'Holding until SIGTERM'; do
-  [ $SECONDS -lt $deadline ] || fail "the sidecar never restarted into hold"
-  sleep 1
-done
-pass "the restarted sidecar holds"
-deadline=$((SECONDS + 60))
-until [ "$(k get pod "$POD" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = False ]; do
-  [ $SECONDS -lt $deadline ] || fail "the pod never went NotReady"
-  sleep 1
-done
-pass "the pod is NotReady"
-assert_eq "stale agentfs mount (daemon gone)" "$(in_sidecar agentfs probe "$WS" || true)" "probe reports the stale mount"
-out=$(in_root "cat $WS/root.txt" 2>&1 || true)
-assert_contains "$out" "Transport endpoint is not connected" "reads fail with ENOTCONN too"
-follow_log "$POD" agentfs hold
-CRASHED=$POD
-CRASHED_UID=$(k get pod "$POD" -o jsonpath='{.metadata.uid}')
-if ! k delete pod "$POD" --wait --timeout=120s; then
-  docker exec "$NODE" sh -c "grep -E 'agentfs|fuse' /proc/self/mountinfo" || true
-  fail "the crashed pod could not be deleted"
-fi
-pass "kubectl delete pod completed"
-end_follow
-assert_contains "$(cat "$LOGS/hold.log")" "detached stale mount $WS" "the holding sidecar detached the stale mount"
-if docker exec "$NODE" grep "/pods/$CRASHED_UID/" /proc/self/mountinfo; then
-  fail "mounts of the deleted pod were left on the node"
-fi
-pass "nothing of the deleted pod is left mounted on the node"
-wait_ready
-[ "$POD" != "$CRASHED" ] || fail "the pod was not replaced"
-recovered=$(k logs "$POD" -c agentfs | grep '^mounted ')
-echo "sidecar: $recovered"
-assert_contains "$recovered" "uncommitted record(s) recovered" "the new sidecar ran recovery"
 wait_remote before-crash.txt before
+restarts=$(sidecar_restarts)
+user_restarts=$(writer_restarts writer-10000)
+signal_sidecar KILL
+out=$(in_root "printf x > $WS/during.txt" 2>&1) && fail "a write succeeded with the daemon dead"
+assert_contains "$out" "Transport endpoint is not connected" "a write after the crash fails with ENOTCONN"
+wait_sidecar_restarted "$restarts"
+recovered=$(k logs "$POD" -c agentfs)
+echo "$recovered" | grep -E '^(stacked|mounted) ' || true
+assert_contains "$recovered" "stacked over a stale mount left by a crashed daemon at $WS" "the sidecar stacked over the stale mount"
+assert_eq "live agentfs mount (agentfs:$VOLUME)" "$(in_sidecar agentfs probe "$WS")" "probe sees the new mount"
+in_root "printf after > $WS/after-crash.txt"
+in_user 'printf after-subpath > /workspace/after-crash-subpath.txt'
+assert_eq after "$(in_user 'cat /workspace/after-crash.txt')" "the subPath writer reaches the new mount"
+assert_eq "$user_restarts" "$(writer_restarts writer-10000)" "the subPath writer was not restarted"
+out=$(in_sidecar agentfs push --timeout 60s) || fail "agentfs push through the daemon failed: $out"
+echo "$out"
+assert_contains "$out" "through the running daemon (pid " "agentfs push asked the running daemon"
+assert_contains "$out" "origin: " "agentfs push reported the remote"
+wait_remote after-crash.txt after
+wait_remote after-crash-subpath.txt after-subpath
+assert_contains "$(remote_message after-crash.txt)" "Agentfs-Pod: $POD" "the recovered daemon records and pushes"
+rgit cat-file -e "$BRANCH:before-crash.txt" || fail "before-crash.txt left history"
 if rgit cat-file -e "$BRANCH:during.txt" 2>/dev/null; then fail "during.txt is in history"; fi
 if in_sidecar test -e /data/backing/during.txt; then fail "during.txt reached the backing tree"; fi
 pass "the write that failed is nowhere"
-in_root "printf after > $WS/after-crash.txt"
-wait_remote after-crash.txt after
-assert_contains "$(remote_message after-crash.txt)" "Agentfs-Pod: $POD" "the new pod records and pushes"
-echo "first pod $FIRST_POD, crashed $CRASHED, now $POD"
+
+step "a clean exit mid-pod: the read-only emptyDir fences the gap"
+restarts=$(sidecar_restarts)
+user_restarts=$(writer_restarts writer-10000)
+signal_sidecar TERM
+gaps=0
+n=0
+until out=$(in_root "printf gap > $WS/gap-$n.txt" 2>&1); do
+  case "$out" in
+  *"Read-only file system"* | *"Transport endpoint is not connected"*) ;;
+  *) fail "a write in the gap failed unexpectedly: $out" ;;
+  esac
+  gaps=$((gaps + 1))
+  n=$((n + 1))
+  [ $gaps -lt 600 ] || fail "writes never worked again"
+  sleep 0.5
+done
+echo "$gaps write(s) refused in the gap; gap-$n.txt went to the new mount"
+[ "$gaps" -ge 1 ] || fail "no write was refused in the gap"
+pass "writes in the gap fail (EROFS) instead of landing unrecorded"
+wait_sidecar_restarted "$restarts"
+previous=$(k logs "$POD" -c agentfs --previous)
+assert_contains "$previous" "final commit:" "the stopped sidecar made its final commit"
+assert_contains "$previous" "detached 1 stale layer(s) at $WS" "it detached the layer the crash left"
+in_root "printf post-gap > $WS/post-gap.txt"
+wait_remote post-gap.txt post-gap
+wait_remote "gap-$n.txt" gap
+i=0
+while [ $i -lt "$n" ]; do
+  if rgit cat-file -e "$BRANCH:gap-$i.txt" 2>/dev/null; then fail "gap-$i.txt is in history"; fi
+  if in_sidecar test -e "/data/backing/gap-$i.txt"; then fail "gap-$i.txt reached the backing tree"; fi
+  i=$((i + 1))
+done
+pass "no refused write reached history or the backing tree"
+deadline=$((SECONDS + 180))
+until [ "$(writer_restarts writer-10000)" -gt "$user_restarts" ]; do
+  [ $SECONDS -lt $deadline ] || fail "the subPath writer's liveness probe never restarted it"
+  sleep 2
+done
+k wait --for=condition=Ready "pod/$POD" --timeout=120s >/dev/null || fail "the pod never became Ready"
+in_user 'printf post-gap-subpath > /workspace/post-gap-subpath.txt'
+wait_remote post-gap-subpath.txt post-gap-subpath
+pass "the subPath writer restarted onto the new mount"
+
+step "deleting the recovered pod leaves nothing mounted"
+follow_log "$POD" agentfs last
+LAST_UID=$(k get pod "$POD" -o jsonpath='{.metadata.uid}')
+k delete pod "$POD" --wait --timeout=120s || fail "the pod could not be deleted"
+end_follow
+assert_contains "$(cat "$LOGS/last.log")" "final push: " "the last sidecar pushed at shutdown"
+if docker exec "$NODE" grep "/pods/$LAST_UID/" /proc/self/mountinfo; then
+  fail "mounts of the deleted pod were left on the node"
+fi
+pass "nothing of the deleted pod is left mounted on the node"
+echo "first pod $FIRST_POD, recovered in place: $POD"
 
 step "e2e-kind passed"

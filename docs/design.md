@@ -126,6 +126,8 @@ through the mount:
     patch.json           the patch queue's last run, a cache (§12)
     control/agentfs.sock the running daemon's control socket (§2.3, §15);
                          directory 0700, socket 0600
+    stack/mnt            where a mount recovering over a stale one mounts FUSE
+                         before stacking it over the mount point (§17.1)
     history/history.sock the history service's socket for fronts (§14);
                          directory 0700, socket 0600
     history/address      the address it serves, for `agentfs status`
@@ -2099,7 +2101,7 @@ operator runbooks ([runbooks/](runbooks/)):
 | [divergence.md](runbooks/divergence.md) | Resolving `refs/agentfs/<volume>/diverged/*` (§11.3) |
 | [history-rewrite.md](runbooks/history-rewrite.md) | Removing a recorded secret from the state area and each remote (§10) |
 | [stuck-pushes.md](runbooks/stuck-pushes.md) | Pushes that keep failing |
-| [crashed-sidecar.md](runbooks/crashed-sidecar.md) | A sidecar whose daemon died: `ENOTCONN`, a holding sidecar, the pod restart (§17.1) |
+| [crashed-sidecar.md](runbooks/crashed-sidecar.md) | A sidecar whose daemon died: automatic recovery by stacking, when to step in, the pod restart (§17.1) |
 | [patch-queue.md](runbooks/patch-queue.md) | Submitting patches (with agentfs or plain git), a blocked queue, replacing or skipping a patch (§12) |
 
 **The supported path:**
@@ -2373,10 +2375,36 @@ one-time migration of Hermes' existing data and the initial import in
     phase (§12: fetch the inbox with `agentfs.patchFetchTimeout`, apply the
     queue, block on the first failure), then the service and the push
     loops, then the FUSE session. A blocked queue never stops the mount.
-  - **A stale mount point with `--on-stale-mount hold`** (a sidecar
-    restarted after its daemon died): it mounts nothing and takes no
-    lock, says so, waits for SIGINT or SIGTERM, then lazily detaches the
-    mount point if it is still a stale agentfs mount, and exits 1.
+  - **A stale mount point with `--on-stale-mount recover`** (a sidecar
+    restarted after its daemon died; the shipped sidecar's mode): it
+    takes the lock (the kernel released the dead daemon's), opens the
+    volume as usual (journal replay, repairs, the patch phase), then
+    mounts FUSE at `<state>/meta/stack/mnt` (private, 0700, cleared of
+    stale layers and required empty), bind-mounts it over the stale
+    mount point, makes the new layer shared (best effort) and lazily
+    detaches the private directory. The layout preflight resolves the
+    mount point through its parent, since the stale mount answers every
+    `stat` with `ENOTCONN`. It never detaches the stale mount first:
+    workload containers hold copies of it, and between a detach and a
+    new mount their writes would reach the bare directory. Mount
+    propagation carries the new layer into every copy instead (peers of
+    the stale mount, such as a kubelet `subPath` bind, and their slaves,
+    such as the workload containers' `HostToContainer` mounts), as the
+    CSI node plugin's bind stacking does (§14.2). It logs `stacked over a
+    stale mount left by a crashed daemon at <path> (N stale layer(s)
+    below)`. It needs `CAP_SYS_ADMIN` and is refused for fronts (the CSI
+    driver stacks those); refused, it exits 1 and leaves the stale mount.
+    With nothing stale, `recover` (like `hold`) is a normal mount.
+  - **At every stop**, after its own unmount, a mount detaches the stale
+    layers (at most 16) still at its mount point, so a recovered
+    sidecar leaves nothing mounted.
+  - **A stale mount point with `--on-stale-mount hold`**: it mounts
+    nothing and takes no lock, says so, waits for SIGINT or SIGTERM,
+    then lazily detaches every stale layer at the mount point, and exits
+    1; recovery is then a pod restart, by hand.
+  - **A mount point that is not empty** (and not stale) is mounted over
+    with a warning: what is in it is hidden and not recorded (a workload
+    wrote there while no daemon was mounted).
   - **Kernel options.** fuser, multi-threaded (`--threads`, default the CPU
     count between 2 and 16) with a cloned `/dev/fuse` descriptor per thread;
     `default_permissions`, `allow_other` (unless `--no-allow-other`),
@@ -2459,30 +2487,58 @@ one-time migration of Hermes' existing data and the initial import in
   - **Mount.** The sidecar mounts the FUSE filesystem at
     `/agentfs/workspace`, a subdirectory of an `emptyDir` it mounts at
     `/agentfs` with Bidirectional propagation; workload containers mount
-    the `emptyDir` with HostToContainer propagation (or the mount itself
-    with `subPath: workspace` at a fixed path, as Hermes needs, §16). A
+    the `emptyDir` read-only with HostToContainer propagation (or the
+    mount itself with `subPath: workspace` at a fixed path, as Hermes
+    needs, §16). A
     subdirectory, not the `emptyDir`'s root, so that a dead daemon leaves
     only the subdirectory answering `ENOTCONN`: a restarted sidecar can
     still be created, and the kubelet can still tear the pod down.
   - **Probes.** Startup: `agentfs probe --allow-stale /agentfs/workspace`
     (workload containers start once the mount is live; 5 minutes for
     journal recovery). Readiness: `agentfs probe /agentfs/workspace` (a
-    dead daemon shows as a NotReady pod). No liveness probe.
+    dead daemon shows as a NotReady pod). No liveness probe on the
+    sidecar: the kubelet restarts a daemon that dies, and a probe would
+    only add kills of a slow but live one (a long journal recovery). A
+    workload container with a `subPath` of the mount gets one instead
+    (its mount point must be a live FUSE mount: `stat -f -c %T` prints
+    `fuseblk`), so a clean exit of the daemon restarts it onto the new
+    mount.
   - **Configuration.** Settings and remotes from a ConfigMap fragment
     (`include.path`, §4.3); the operator rules from the same ConfigMap,
     mounted read-only over `info/exclude` and `info/attributes` in the
     sidecar (a change rolls the pod through the generated name's hash);
     credentials from a Secret; the pod flags from the downward API.
-  - **A crashed daemon.** The workload's calls fail with `ENOTCONN`
-    (nothing is written where it would not be recorded). The kubelet
-    restarts the sidecar, which runs with `--on-stale-mount hold`: it does
-    not remount while the workload holds the dead mount, so the pod goes
-    NotReady. The recovery is a pod restart, by hand in phase 1
-    (`kubectl delete pod`, [runbook](runbooks/crashed-sidecar.md)): the
-    holding sidecar, stopped after the workload containers, detaches the
-    stale mount so the pod's volumes can be removed, and the new pod
-    recovers the journal and pushes. A sidecar that exits cleanly while
-    the pod runs is not held (a known gap, [deployment.md](deployment.md#7-a-crashed-daemon)).
+  - **A crashed daemon** recovers with no manual step. The workload's
+    calls fail with `ENOTCONN` (nothing is written where it would not be
+    recorded). The kubelet restarts the sidecar (`restartPolicy:
+    Always`, with its backoff after repeated crashes), which runs with
+    `--on-stale-mount recover`: it recovers the journal and stacks a new
+    mount over the dead one, and propagation carries it into the
+    workload containers and `subPath` binds, which are not restarted.
+    The kind test checks this after `kill -9` from the node (§18).
+    `--on-stale-mount hold` remains for operators who want to recover
+    by hand ([runbook](runbooks/crashed-sidecar.md)).
+  - **A clean exit while the pod runs** (SIGTERM to the sidecar, an
+    unmount from outside, a `--passthrough on` failure) leaves no stale
+    mount: the daemon unmounts, commits and pushes, and the kubelet
+    restarts it into a fresh mount. The gap is fenced by the workload's
+    read-only `emptyDir` mount (`readOnly: true`, `recursiveReadOnly:
+    Disabled`): the FUSE mount propagated into it is a mount of its own
+    and stays writable, but while none is mounted, writes to the bare
+    directory fail with `EROFS`. A `subPath` consumer cannot be fenced
+    that way (a read-only bind of the FUSE root would make the mount
+    read-only); it keeps the dead mount (`ENOTCONN`) until its liveness
+    probe restarts it, and if it restarts before the sidecar has mounted
+    again it binds the bare directory, writable: a documented gap. SIGTERM
+    stays final for the daemon (it never waits for a remount): the pod
+    may be terminating, and the kubelet decides whether it comes back.
+  - **Limits of in-place recovery.** Descriptors the workload opened
+    with kernel passthrough before the crash keep writing to the backing
+    file, unrecorded, until closed; since the workload keeps running,
+    such a descriptor can outlive the crash longer than under a pod
+    restart (`--passthrough off` where every write must be recorded). A
+    hung daemon (alive, not answering) is not detected. Each crash adds
+    one stale layer until the sidecar stops.
   - **Privilege.** `privileged: true` is what Bidirectional propagation
     requires; its cost and mitigations are in
     [deployment.md](deployment.md#9-security-trade-offs-of-the-privileged-sidecar).
@@ -2642,11 +2698,19 @@ a `subPath` of the FUSE mount), test 5 for the writers (no `/data`,
 nothing but the tree under the mount), the operator-rules part of test
 6, test 8 over HTTP from a pod with the credential Secret (authors and
 pod, namespace and node trailers checked on the remote), test 11 through
-`kubectl exec` and the control socket, the final commit on pod
+`kubectl exec` and the control socket, the final commit and push on pod
 deletion, and test 2 in a pod: `kill -9` of the daemon from the node,
-`ENOTCONN` for the workload, the holding sidecar and NotReady pod,
-`kubectl delete pod` completing, and the new pod recovering and pushing
-the pre-crash write. Test 14's LFS part runs in the `e2e-lfs` job
+`ENOTCONN` for the workload, the kubelet restarting the sidecar, which
+stacks over the stale mount with no manual step, both writers carrying
+on without a restart (the `subPath` one included), and the pre-crash
+and post-crash writes reaching the remote; then `agentfs push` through
+the recovered daemon, the clean-exit fence (SIGTERM to the sidecar:
+`EROFS` in the gap, nothing of it in history or the backing tree, the
+`subPath` writer restarted by its liveness probe) and a pod deletion
+leaving nothing mounted on the node. The ignored root tests in
+`crates/agentfs/tests/mount.rs` stack over a crashed mount with a
+`subPath`-like bind and a slave mount namespace, refuse without
+`CAP_SYS_ADMIN` and for fronts, and detach every stale layer. Test 14's LFS part runs in the `e2e-lfs` job
 (`ci/e2e-lfs.sh`: git-lfs's `lfs-test-server` behind nginx, the real
 git-lfs client, `git clone` plus `git lfs pull`, over http and https)
 and without a server in `crates/agentfs/tests/cli_lfs.rs` (local and
@@ -2750,8 +2814,8 @@ runner.
 | Host key verification | Done by agentfs against `agentfsKnownHosts`, in libgit2's certificate callback, before any authentication; plain and hashed names, `[host]:port`, wildcards, negation and `@revoked` honoured, `@cert-authority` not supported; unknown, changed, unlisted-type and revoked keys refused, never learned (§11.1) |
 | Untrusted host reason | SSH host key refusals and TLS certificates libgit2 refuses (`GIT_ECERTIFICATE`: a self-signed or unknown CA, a host name the certificate does not cover) fail the push as `untrusted_host`, apart from `unreachable`, so a possible interception alarms differently from a network problem. A TLS handshake that fails before any certificate check (a server that drops it, as for a certificate host mismatch reached over an IP address in CI) stays `unreachable` (§11.3, §13) |
 | Phase 1 pod layout | One `ReadWriteOncePod` PVC mounted once at `/data` (`backing/`, `state/`: reflinks fail across mounts), `Recreate` strategy; the FUSE mount at `/agentfs/workspace`, a subdirectory of a shared `emptyDir` (Bidirectional in the sidecar, HostToContainer in workloads), so a dead daemon does not block the restarted sidecar or the pod's teardown (§17.1) |
-| Crashed daemon in a pod | Recovery is a pod restart, manual in phase 1. The restarted sidecar runs `mount --on-stale-mount hold`: no remount, no lock, NotReady pod, writes keep failing with `ENOTCONN`; on SIGTERM (after the workload containers stop) it detaches the stale mount. Automatic restart and fencing a clean exit are follow-ups (§17.1) |
-| Sidecar probes | Startup `agentfs probe --allow-stale` (gates workloads; passes while holding), readiness `agentfs probe` (live only); no liveness probe, since a restart cannot remount safely; a shell-free subcommand reading mountinfo and `statfs` (§17.1) |
+| Crashed daemon in a pod | Automatic: the kubelet restarts the sidecar, which runs `mount --on-stale-mount recover` and bind-stacks a new mount over the stale one; propagation reaches the workload containers and `subPath` binds without restarting them, and a stop detaches the stale layers. A clean exit mid-pod is fenced by the workload's read-only `emptyDir` (`EROFS`); `subPath` consumers restart through a liveness probe. `hold` (manual pod restart) remains (§17.1) |
+| Sidecar probes | Startup `agentfs probe --allow-stale` (gates workloads; passes on a stale mount, so a restarted sidecar can recover), readiness `agentfs probe` (live only); no liveness probe on the sidecar, since the kubelet restarts a dead daemon and a probe would only kill slow live ones; a `subPath` workload gets one (`stat -f -c %T` is `fuseblk`); a shell-free subcommand reading mountinfo and `statfs` (§17.1) |
 | Operator config in Kubernetes | Rules: the ConfigMap's `exclude` and `attributes` subPath-mounted read-only over `info/*` in the sidecar; settings and remotes: a git-config fragment in the same ConfigMap named by `include.path`, so `kubectl exec` commands and `git` see them. Includes must be absolute, exist, not set `agentfs.volume`/`agentfs.branch`, and stay outside the backing tree and mount point; `includeIf` is refused (§4.3) |
 | `agentfs init` re-runs | Safe at every pod start: exit 0 for its own volume (taking the lock), 1 for another volume or branch with nothing changed; `--include` sets the includes declaratively; `--root` creates the backing tree (§2.3) |
 | Image user | Root. The sidecar needs privileged for Bidirectional propagation, `CAP_SYS_ADMIN` for mount(2), `/dev/fuse` and passthrough, `CAP_CHOWN`/`CAP_FOWNER` for ownership, and to own the state area for libgit2. The init container drops every capability; workloads run as non-root (§17.1) |

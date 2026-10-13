@@ -34,12 +34,22 @@
 //! ([`MountConfig::repair_store`], design §3.5), and refuses
 //! `--passthrough on` without the privilege for it ([`crate::privileges`]).
 //!
+//! With [`MountConfig::stack_over`] (`--on-stale-mount recover`, design
+//! §17.1) the mount point is a stale agentfs mount: FUSE is mounted at a
+//! private directory of the state area, bind-mounted over the stale mount
+//! (made shared, so propagation carries it into every copy of the stale
+//! mount: workload containers, subPath binds), and the private directory is
+//! detached. [`preflight_stacked`] checks the layout without touching the
+//! stale mount point, and [`detach_stale_layers`] clears the layers crashes
+//! leave under it.
+//!
 //! [`Mount::shutdown`] unmounts (lazily if the mount is busy), waits a grace
 //! period for the session to end, stops the sweep and runs a final one.
 
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -73,6 +83,18 @@ pub struct MountConfig {
     /// Where the repair queue is kept across mounts (design §3.5); `None`
     /// keeps it in memory only.
     pub repair_store: Option<PathBuf>,
+    /// Mount over the stale agentfs mount at `mountpoint` instead of on it
+    /// (`--on-stale-mount recover`, design §17.1); `None` mounts normally.
+    pub stack_over: Option<StackOver>,
+}
+
+/// How a mount is stacked over a stale one: FUSE is mounted at `source`, a
+/// private empty directory, then bind-mounted over the mount point, where
+/// mount propagation carries it into every copy of the stale mount
+/// (workload containers, subPath binds), and `source` is detached.
+#[derive(Debug, Clone)]
+pub struct StackOver {
+    pub source: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -91,6 +113,9 @@ pub enum PreflightError {
         p = .0.display()
     )]
     StaleMount(PathBuf),
+    /// `--on-stale-mount recover` found no stale agentfs mount to stack over.
+    #[error("{} is not a stale agentfs mount: nothing to stack over", .0.display())]
+    NotStale(PathBuf),
     #[error("{a} and {b} are the same directory ({})", path.display())]
     Same {
         a: &'static str,
@@ -207,9 +232,46 @@ pub fn preflight(
     {
         return Err(PreflightError::StaleMount(mountpoint.to_path_buf()));
     }
+    let mountpoint = canonical_dir(MOUNTPOINT, mountpoint)?;
+    check_layout(state, settings, backing, mountpoint)
+}
+
+/// [`preflight`] for a mount stacked over the stale agentfs mount at
+/// `mountpoint` (`--on-stale-mount recover`, design §17.1): the same
+/// checks, with the mount point resolved through its parent, since a
+/// stale mount answers every `stat` with `ENOTCONN`. Refuses anything but
+/// a stale agentfs mount there.
+pub fn preflight_stacked(
+    state: &StateDir,
+    settings: &Settings,
+    backing: &Path,
+    mountpoint: &Path,
+) -> Result<(PathBuf, PathBuf), PreflightError> {
+    let (Some(parent), Some(name)) = (mountpoint.parent(), mountpoint.file_name()) else {
+        return Err(PreflightError::NotStale(mountpoint.to_path_buf()));
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let resolved = canonical_dir(MOUNTPOINT, parent)?.join(name);
+    match mount_state(&resolved) {
+        Ok(MountState::Stale { .. }) => {}
+        _ => return Err(PreflightError::NotStale(resolved)),
+    }
+    check_layout(state, settings, backing, resolved)
+}
+
+/// The checks of [`preflight`] past the mount point's own.
+fn check_layout(
+    state: &StateDir,
+    settings: &Settings,
+    backing: &Path,
+    mountpoint: PathBuf,
+) -> Result<(PathBuf, PathBuf), PreflightError> {
     let state = canonical_dir(STATE, state.root())?;
     let backing = canonical_dir(BACKING, backing)?;
-    let mountpoint = canonical_dir(MOUNTPOINT, mountpoint)?;
     let dirs = [
         (STATE, &state),
         (BACKING, &backing),
@@ -366,8 +428,10 @@ pub fn mount_state(path: &Path) -> io::Result<MountState> {
     mount_state_in(&parse_mountinfo(&info), path)
 }
 
-fn mount_state_in(entries: &[MountEntry], path: &Path) -> io::Result<MountState> {
-    let resolved = match path.canonicalize() {
+/// `path` resolved as mountinfo names it, through its parent when the path
+/// itself cannot be reached (a stale mount).
+fn resolve_mountpoint(path: &Path) -> io::Result<PathBuf> {
+    Ok(match path.canonicalize() {
         Ok(p) => p,
         Err(_) => match (path.parent(), path.file_name()) {
             (Some(parent), Some(name)) => {
@@ -380,7 +444,11 @@ fn mount_state_in(entries: &[MountEntry], path: &Path) -> io::Result<MountState>
             }
             _ => std::path::absolute(path)?,
         },
-    };
+    })
+}
+
+fn mount_state_in(entries: &[MountEntry], path: &Path) -> io::Result<MountState> {
+    let resolved = resolve_mountpoint(path)?;
     let Some(entry) = entries.iter().rev().find(|e| e.mountpoint == resolved) else {
         return Ok(MountState::NotMounted);
     };
@@ -418,6 +486,72 @@ pub fn detach(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Detaches the stale agentfs mounts at `path`, topmost first, until the
+/// topmost is not one, at most `max`; returns how many it detached. Each
+/// crash of a recovered daemon leaves one stale layer under the mount
+/// stacked over it (design §17.1).
+pub fn detach_stale_layers(path: &Path, max: usize) -> io::Result<usize> {
+    let mut n = 0;
+    while n < max && matches!(mount_state(path)?, MountState::Stale { .. }) {
+        detach(path)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Counts the agentfs mounts at `path` (stacked layers included).
+pub fn agentfs_layers(path: &Path) -> io::Result<usize> {
+    let info = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let resolved = resolve_mountpoint(path)?;
+    Ok(parse_mountinfo(&info)
+        .iter()
+        .filter(|e| e.mountpoint == resolved && e.is_agentfs())
+        .count())
+}
+
+/// Prepares `source` for a stacked mount: clears stale mounts a crash
+/// between mounting and detaching it left, and creates it (mode 0700) as
+/// an empty directory.
+fn prepare_stack_source(source: &Path) -> io::Result<()> {
+    detach_stale_layers(source, 16)?;
+    if let Some(parent) = source.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(source) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    if std::fs::read_dir(source)?.next().is_some() {
+        return Err(io::Error::other(format!(
+            "{} is not empty",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Bind-mounts the mount at `source` over `target`, makes the new layer
+/// shared (best effort: under a Bidirectional emptyDir it already is) so it
+/// propagates, then detaches `source`.
+fn stack(source: &Path, target: &Path) -> io::Result<()> {
+    use rustix::mount::{MountPropagationFlags, UnmountFlags};
+    rustix::mount::mount_bind(source, target)?;
+    if let Err(e) = rustix::mount::mount_change(target, MountPropagationFlags::SHARED) {
+        eprintln!(
+            "agentfs: making {} shared failed ({e}); copies of the stale mount may not see the \
+             new one",
+            target.display()
+        );
+    }
+    if let Err(e) = rustix::mount::unmount(source, UnmountFlags::DETACH) {
+        // Take the new layer off again, so the caller can unmount the
+        // source and leave everything as it was.
+        let _ = rustix::mount::unmount(target, UnmountFlags::DETACH);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// `fusermount3`, or `fusermount` where only the old one is installed.
 fn fusermount() -> &'static str {
     ["fusermount3", "fusermount"]
@@ -440,6 +574,9 @@ pub enum MountError {
     /// `--passthrough on` cannot be honoured with these privileges.
     #[error("--passthrough on: {0}")]
     Passthrough(&'static str),
+    /// Stacking over the stale mount failed (design §17.1).
+    #[error("stacking over the stale mount at {}", path.display())]
+    Stack { path: PathBuf, source: io::Error },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -576,14 +713,35 @@ impl Mount {
         );
         let fuser_config = fuser_config(&config);
         let threads = fuser_config.n_threads.unwrap_or(1);
-        // Session::new mounts and completes INIT before it returns.
-        let session =
-            fuser::spawn_mount(fs, &config.mountpoint, &fuser_config).map_err(|source| {
-                MountError::Mount {
+        // Stacked over a stale mount: FUSE goes to a private directory
+        // first, since the stale mount point answers ENOTCONN.
+        let at = match &config.stack_over {
+            Some(stack) => {
+                prepare_stack_source(&stack.source).map_err(|source| MountError::Stack {
                     path: config.mountpoint.clone(),
                     source,
-                }
+                })?;
+                stack.source.clone()
+            }
+            None => config.mountpoint.clone(),
+        };
+        // Session::new mounts and completes INIT before it returns.
+        let session =
+            fuser::spawn_mount(fs, &at, &fuser_config).map_err(|source| MountError::Mount {
+                path: at.clone(),
+                source,
             })?;
+        if config.stack_over.is_some()
+            && let Err(source) = stack(&at, &config.mountpoint)
+        {
+            // Nothing is left stacked; unmounting the source ends the
+            // session.
+            let _ = session.umount_and_join();
+            return Err(MountError::Stack {
+                path: config.mountpoint.clone(),
+                source,
+            });
+        }
         let ended = Arc::new(Stop::default());
         {
             let ended = ended.clone();
@@ -1152,6 +1310,20 @@ garbage line
     }
 
     #[test]
+    fn stacking_needs_a_stale_mount() {
+        let l = Layout::new();
+        let err = preflight_stacked(
+            &StateDir::new(l.p("state")),
+            &settings(vec![]),
+            &l.p("backing"),
+            &l.p("mnt"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PreflightError::NotStale(_)), "{err}");
+        assert_eq!(detach_stale_layers(&l.p("mnt"), 4).unwrap(), 0);
+    }
+
+    #[test]
     fn fuser_configuration() {
         let mut config = MountConfig {
             volume: "vol".into(),
@@ -1162,6 +1334,7 @@ garbage line
             threads: 0,
             sweep_interval: Duration::from_secs(30),
             repair_store: None,
+            stack_over: None,
         };
         let c = fuser_config(&config);
         assert!(

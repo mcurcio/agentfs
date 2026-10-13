@@ -136,7 +136,7 @@ it exits 1 and changes nothing
 | `--no-allow-other` | | | Only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | At shutdown, how long to wait for open files on a busy mount after detaching it |
 | `--push-grace DURATION` | | `5s` | At shutdown, how long to spend on pushes in progress and one last push of the final commit to each remote that lacks commits; `0s` skips the last push (§8) |
-| `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | When the mount point is an agentfs mount whose daemon died: `refuse` exits 1 with the command that clears it; `hold` (a restarted Kubernetes sidecar, §10) mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then detaches the stale mount and exits 1 |
+| `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | When the mount point is an agentfs mount whose daemon died: `refuse` exits 1 with the command that clears it; `recover` (the shipped sidecar, §10) mounts over the stale mount, so every copy of it reaches the new daemon, and detaches the stale layers when it stops (needs `CAP_SYS_ADMIN`; refused for fronts); `hold` mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then detaches the stale mount and exits 1. With nothing stale, `recover` and `hold` mount normally |
 
 A missing mount point is created (mode `0755`; its parent must exist), so
 a sidecar can mount into a subdirectory of a fresh `emptyDir`.
@@ -361,16 +361,27 @@ stopped.
   `agentfs mount` refuses a stale mount point with exactly this advice.
 - At start, records in the journal that are not in history yet are
   committed (`N uncommitted record(s) recovered` in the startup line).
-- In Kubernetes, phase 1 recovers by restarting the pod (§17.1). The
-  sidecar container restarts on its own, but runs with
-  `--on-stale-mount hold`: it does not remount while the workload
-  containers still hold the dead mount, its readiness probe fails (the pod
-  shows NotReady) and the workload's writes keep failing with `ENOTCONN`,
-  so nothing goes unrecorded. Delete the pod (`kubectl delete pod <pod>`);
-  the holding sidecar detaches the stale mount when it is stopped, and the
-  new pod recovers the journal and pushes. See the
+- In Kubernetes the shipped sidecar recovers by itself (design §17.1).
+  The kubelet restarts the crashed container, which runs with
+  `--on-stale-mount recover`: it takes the lock the dead daemon's exit
+  released, recovers the journal, mounts FUSE at a private directory
+  (`<state>/meta/stack/mnt`) and bind-mounts it over the stale mount.
+  Mount propagation carries the new mount into the workload containers
+  and subPath binds, so their next calls reach the new daemon without a
+  restart. It logs `stacked over a stale mount left by a crashed daemon
+  at ...`. Until then the workload's calls fail with `ENOTCONN`, so
+  nothing goes unrecorded. At its next stop the sidecar detaches the
+  stale layer beneath. Stacking needs `CAP_SYS_ADMIN` (the sidecar is
+  privileged); `--on-stale-mount hold` keeps the old behaviour (the
+  sidecar waits, NotReady, for `kubectl delete pod`). See the
   [crashed sidecar runbook](runbooks/crashed-sidecar.md) and
   [deployment.md](deployment.md#7-a-crashed-daemon).
+- A sidecar that exits cleanly mid-pod (SIGTERM, or the mount was
+  unmounted from outside) is restarted by the kubelet and mounts afresh.
+  In the gap, the workload's read-only `emptyDir` mount makes writes fail
+  with `EROFS` instead of landing in the bare directory. A workload with a
+  `subPath` of the mount keeps the old, dead mount (`ENOTCONN`) until it
+  restarts: give it the liveness probe from `deploy/sidecar`.
 
 ## 11. Kubernetes
 
@@ -387,11 +398,14 @@ and [deployment.md](deployment.md) explains them. In short:
   `agentfs mount /data/backing /agentfs/workspace`: the mount point is a
   subdirectory of an `emptyDir` mounted at `/agentfs` with
   `Bidirectional` propagation; workload containers mount the `emptyDir`
-  with `HostToContainer` and use `/agentfs/workspace`;
+  read-only with `HostToContainer` and use `/agentfs/workspace` (the FUSE
+  mount in it stays writable; the bare directory, while no daemon is
+  mounted, does not);
 - `agentfs probe --allow-stale /agentfs/workspace` is its startup probe
   (workloads start once the mount is live), `agentfs probe` its readiness
-  probe, and there is no liveness probe; `AGENTFS_ON_STALE_MOUNT=hold`
-  makes a sidecar restarted after a crash wait for the pod restart (§10);
+  probe, and there is no liveness probe; `AGENTFS_ON_STALE_MOUNT=recover`
+  makes a sidecar restarted after a crash mount over the stale mount
+  (§10);
 - settings and remotes come from a ConfigMap fragment (`include.path`),
   the rules from the same ConfigMap mounted over `info/exclude` and
   `info/attributes`, credentials from a Secret outside the backing tree

@@ -486,7 +486,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | `mount` |
 | `--no-allow-other` | | | `mount`: only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | `mount`: how long shutdown waits for a busy mount |
-| `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount` |
+| `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount`: when the mount point is an agentfs mount whose daemon died, `refuse` exits 1, `hold` waits for SIGTERM and detaches it, `recover` mounts over it (needs `CAP_SYS_ADMIN`; not for fronts) |
 | `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it |
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
 | `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
