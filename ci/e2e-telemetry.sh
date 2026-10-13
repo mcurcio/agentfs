@@ -2,7 +2,7 @@
 # End-to-end test of telemetry (design §13) against a real OpenTelemetry
 # Collector: every metric, span and alarm log the README lists must arrive.
 # The failure counters come from real failures (an unreadable file, an
-# unwritable object store, a git that fails the repack), and the history
+# unwritable object store, an unwritable pack directory for the repack), and the history
 # service's fronts gauge, a front's round trip and its service failures
 # (a hung service: `timeout`; a stopped one: `connect`) from a real
 # `serve-history` and FUSE front mounts.
@@ -103,14 +103,13 @@ agentfs record commit-fails.txt 2>"$VOL/commit.err" || true
 chmod -R u+w "$STATE/git/objects"
 agentfs flush >/dev/null
 assert_contains "$(agentfs status)" "backlog:   0 record(s)" "the record stayed journaled and was committed later"
-# A repack whose git fails: a git that refuses, first in PATH for `run`.
-FAKE=$(mktemp -d)
-printf '#!/bin/sh\necho "fake git refuses" >&2\nexit 1\n' >"$FAKE/git"
-chmod +x "$FAKE/git"
+# A repack that fails: git cannot write its pack (git runs with a fixed
+# PATH, so a fake git would not be found).
 volume_config agentfs.repackInterval 1m
 echo r >"$TREE/repack.txt"
 agentfs record repack.txt >/dev/null
-PATH=$FAKE:$PATH agentfs_start "$VOL/repack.log" run
+chmod a-w "$STATE/git/objects/pack"
+agentfs_start "$VOL/repack.log" run
 RUN=$AGENTFS_PID
 counted() { # metric attr-substring
   ci/otel-points.sh "$OTEL_OUT" "$1" | grep -- "$2" | awk '$1 >= 1 { found = 1 } END { exit !found }'
@@ -120,11 +119,12 @@ pass "agentfs.record.failures from an unreadable file"
 wait_for 20 counted agentfs.commit.failures "" || fail "agentfs.commit.failures never counted"
 pass "agentfs.commit.failures from unwritable objects"
 wait_for 100 counted agentfs.repack.failures "" || { cat "$VOL/repack.log"; fail "agentfs.repack.failures never counted"; }
-pass "agentfs.repack.failures from a failing git"
+pass "agentfs.repack.failures from an unwritable pack directory"
 wait_for 20 grep -q agentfs.repack_failed "$OTEL_OUT" || fail "log agentfs.repack_failed never arrived"
 pass "log agentfs.repack_failed"
 kill -TERM "$RUN"
 wait "$RUN" || { cat "$VOL/repack.log"; fail "run did not exit cleanly"; }
+chmod u+w "$STATE/git/objects/pack"
 
 step "fronts and the history service (FUSE)"
 [ -c /dev/fuse ] || fail "/dev/fuse is missing: this step needs FUSE"

@@ -50,7 +50,7 @@ git_ fsck --full --strict --no-progress >/dev/null 2>&1 ||
 git --git-dir "$m/remote.git" fsck --full --strict --no-progress >/dev/null 2>&1 ||
   fail "git fsck of the remote"
 
-last=$(grep '^R ' "$promises" | tail -n 1 | cut -d' ' -f2)
+last=$(sed -n 's/^R //p' "$promises" | tail -n 1 | cut -d' ' -f1)
 last=${last:-0}
 
 if git_ rev-parse -q --verify "$branch" >/dev/null; then
@@ -97,7 +97,7 @@ for path in $(cut -d' ' -f2 "$MANIFEST" | sort -u); do
   fi
 done
 
-for oid in $(grep '^U ' "$promises" | cut -d' ' -f2); do
+for oid in $(sed -n 's/^U //p' "$promises"); do
   git --git-dir "$m/remote.git" merge-base --is-ancestor "$oid" "$branch" 2>/dev/null ||
     fail "pushed head $oid is not on the remote branch"
 done

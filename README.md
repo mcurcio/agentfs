@@ -567,7 +567,7 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   `agentfs.telemetry.export_failures` over metrics. The failure counters
   come from real failures: an unreadable file (`agentfs.record.failures`),
   an unwritable object store (`agentfs.commit.failures`, the record
-  committed later) and a git that fails the repack
+  committed later) and a pack directory the repack cannot write
   (`agentfs.repack.failures`). A real `serve-history` with FUSE front
   mounts shows `agentfs.history_service.fronts` going 0, 1, 2, 1, a
   front's `agentfs.front.round_trip`, and its
