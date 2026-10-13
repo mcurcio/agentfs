@@ -14,9 +14,11 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 signal-hook = "0.4.5"
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
-# OTLP over http/protobuf with a blocking client and no TLS: pure Rust, no
-# protoc, no C (design §13, §17.3).
-opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
+# OTLP over http/protobuf, http/json (a blocking client) and gRPC (tonic):
+# pure Rust, no protoc, no C (design §13, §17.3).
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client", "trace", "metrics", "logs"] }
+# The runtime the gRPC exporter runs on (one worker, started only for gRPC).
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "time"] }
 # The restore thread's id (`thread`), and signals in tests (`process`).
 rustix = { version = "1.1.5", features = ["fs", "process", "thread"] }
 # close(2) and its errno in the FUSE tests (a front failing a boundary with
@@ -31,9 +33,11 @@ thiserror = "2.0.21"
 # Drives a real `agentfs serve-history` through the CSI supervisor
 # (csi_service.rs).
 agentfs-csi = { version = "0.1.0", path = "../agentfs-csi" }
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "net"] }
 # Decodes OTLP payloads in the fake collector of the telemetry test.
-opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs"] }
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic", "with-serde", "trace", "metrics", "logs"] }
+# The fake gRPC collector.
+tonic = { version = "0.14", default-features = false, features = ["server", "router"] }
 prost = "0.14"
 git2 = { version = "0.21.0", default-features = false }
 tempfile = "3.27.0"

@@ -1949,9 +1949,15 @@ exported only when an OTLP endpoint is set for it
 (`OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT`);
 with none, with `OTEL_SDK_DISABLED=true`, or with
 `OTEL_<SIGNAL>_EXPORTER=none`, telemetry is a no-op and nothing is built.
-This build exports OTLP http/protobuf over plain http only, which is what an
-in-cluster collector needs; gRPC, JSON and TLS (`https`) endpoints are
-deferred. They are reported with a warning and that signal stays off: a
+Each signal goes over the protocol `OTEL_EXPORTER_OTLP_<SIGNAL>_PROTOCOL`,
+else `OTEL_EXPORTER_OTLP_PROTOCOL`, names: `http/protobuf` (the default),
+`http/json`, or `grpc`. The HTTP exporters use a blocking client on the
+SDK's batch threads; the gRPC exporter (tonic) needs a tokio runtime, so a
+one-worker runtime (`agentfs-otlp`) is started only when a signal uses gRPC,
+and the batch threads drive each export to completion on it. Headers
+(`OTEL_EXPORTER_OTLP_HEADERS`) go out as HTTP headers or gRPC metadata. TLS
+(`https`) endpoints are not built in this step. An unknown protocol or an
+`https` endpoint is reported with a warning and that signal stays off: a
 telemetry misconfiguration never stops a command, in keeping with telemetry
 never affecting the filesystem. Telemetry is flushed at exit, waiting at
 most 5 seconds.
@@ -2939,7 +2945,7 @@ restartable (§14.2). The controller runs no children.
 | SSH host keys | agentfs's own known_hosts parser over `base64` and `sha1_smol` (HMAC-SHA1 for hashed names, written by hand and tested against RFC 2202) | Pure Rust. libgit2's own check reads `~/.ssh/known_hosts` only, so agentfs checks in the certificate callback instead (§11.1) |
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
 | LFS | none exists: implemented in agentfs (§7) over `ureq` 3 (default features off: pure Rust, no TLS) and `sha2` 0.11; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, as `git2/https`; its webpki root bundle is compiled in but unused: the platform verifier reads the system store) | ureq's `native-tls-no-default` feature does not compile the native-tls connector in 3.4 (its code is behind the `native-tls` feature), hence `native-tls`. `reqwest` stays in the binary only, for OTLP |
-| Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `reqwest-blocking-client`, no TLS) in the binary | OTLP http/protobuf export. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
+| Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `http-json`, `grpc-tonic`, `reqwest-blocking-client`, no TLS) in the binary, with `tokio` (one worker, started only for gRPC) | OTLP http/protobuf, http/json and gRPC export. tonic and prost were already in the workspace for the CSI driver, and the OTLP gRPC code comes pre-generated in `opentelemetry-proto`: no protoc. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
 | Patch submission | the `git` CLI on the producer's side (`ls-remote`, `fetch`, `commit-tree`, `push --force-with-lease`) | Runs in the producer's repository with its own credentials and config, so agentfs needs none of them; the lease makes a number create-only (§12) |
 | Repack | the `git` CLI (`git repack --geometric=2`, git 2.32 or later) | libgit2 has no repack or gc. Run by the commit loop with system and global config off (§8); the image ships `git` |
 | Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates`, `git` and `tini`; built on `rust:1.99-trixie`; both pinned by digest. Ships `agentfs` and `agentfs-csi` | Not distroless: the daemon runs `git repack` (§8), and operators follow the runbooks with `git` through `kubectl exec`. `tini` (`-s`, a subreaper: the node plugin shares the host's pid namespace) reaps the CSI node plugin's children's orphans. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after both kind e2e jobs pass |
@@ -3056,7 +3062,8 @@ and OpenTelemetry Collector (test 12 with real failures for the record,
 commit and repack failure counters, and a real `serve-history` with FUSE
 fronts for `agentfs.history_service.fronts`, `agentfs.front.round_trip`
 and `agentfs.front.service_failures` (`timeout` and `connect`); the
-export-failure counter against a dead endpoint; and without a collector
+export-failure counter against a dead endpoint; every OTLP transport,
+http/protobuf, http/json and gRPC, in `ci/e2e-otlp-transports.sh`; and without a collector
 binary in `crates/agentfs/tests/cli_telemetry.rs`); test 8 runs over smart HTTP and HTTPS
 (`e2e-remotes`) and over SSH (`e2e-ssh`, against OpenSSH's sshd). The
 `e2e-kind` job (`ci/e2e-kind.sh`, in the `image` workflow) runs the

@@ -222,7 +222,8 @@ feature, which https LFS servers need. LFS objects are cached under
 (§9, §13).
 
 **Telemetry.** Set `OTEL_EXPORTER_OTLP_ENDPOINT` to your collector (OTLP
-http/protobuf over plain http), or `OTEL_SDK_DISABLED=true`. The example
+http/protobuf by default; `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` with the
+collector's port 4317, or `http/json`; plain http), or `OTEL_SDK_DISABLED=true`. The example
 samples 1% of traces (`parentbased_traceidratio`, `0.01`); metrics and
 alarm logs are not sampled. See the [README](../README.md#telemetry).
 

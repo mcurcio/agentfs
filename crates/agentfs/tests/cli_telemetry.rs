@@ -335,9 +335,9 @@ fn unsupported_settings_warn_and_carry_on() {
         (
             vec![
                 ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str()),
-                ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "thrift"),
             ],
-            "OTEL_EXPORTER_OTLP_PROTOCOL=grpc is not built",
+            "OTEL_EXPORTER_OTLP_PROTOCOL=thrift is not an OTLP protocol",
         ),
         (
             vec![("OTEL_EXPORTER_OTLP_ENDPOINT", https.as_str())],
@@ -921,4 +921,250 @@ fn the_fronts_gauge_and_a_fronts_round_trip_are_exported() {
         "the front's round trip was exported"
     );
     drop(service);
+}
+
+#[test]
+fn exports_over_otlp_http_json() {
+    let collector = Collector::start();
+    let v = Volume::new();
+    let endpoint = collector.endpoint();
+    let out = v.record(&[
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json"),
+    ]);
+    let err = stderr(&out);
+    assert!(!err.contains("warning: telemetry"), "{err}");
+
+    let mut metric_names = BTreeSet::new();
+    for body in collector.bodies("/v1/metrics") {
+        let request: ExportMetricsServiceRequest = serde_json::from_slice(&body)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&body)));
+        for rm in request.resource_metrics {
+            for sm in rm.scope_metrics {
+                metric_names.extend(sm.metrics.into_iter().map(|m| m.name));
+            }
+        }
+    }
+    assert!(
+        metric_names.contains("agentfs.record.duration"),
+        "{metric_names:?}"
+    );
+    let mut span_names = BTreeSet::new();
+    for body in collector.bodies("/v1/traces") {
+        let request: ExportTraceServiceRequest = serde_json::from_slice(&body).unwrap();
+        for rs in request.resource_spans {
+            for ss in rs.scope_spans {
+                span_names.extend(ss.spans.into_iter().map(|s| s.name));
+            }
+        }
+    }
+    assert!(span_names.contains("agentfs.record"), "{span_names:?}");
+    let mut events = Vec::new();
+    for body in collector.bodies("/v1/logs") {
+        let request: ExportLogsServiceRequest = serde_json::from_slice(&body).unwrap();
+        for rl in request.resource_logs {
+            for sl in rl.scope_logs {
+                events.extend(sl.log_records.into_iter().map(|r| r.event_name));
+            }
+        }
+    }
+    assert!(
+        events.iter().any(|e| e == "agentfs.path_refused"),
+        "{events:?}"
+    );
+}
+
+/// A fake OTLP/gRPC collector on a local port: keeps every request, with
+/// the value of its `x-test-header` metadata.
+mod grpc {
+    use std::sync::{Arc, Mutex};
+
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
+        LogsService, LogsServiceServer,
+    };
+    use opentelemetry_proto::tonic::collector::logs::v1::{
+        ExportLogsServiceRequest, ExportLogsServiceResponse,
+    };
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::{
+        MetricsService, MetricsServiceServer,
+    };
+    use opentelemetry_proto::tonic::collector::metrics::v1::{
+        ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    };
+    use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::{
+        TraceService, TraceServiceServer,
+    };
+    use opentelemetry_proto::tonic::collector::trace::v1::{
+        ExportTraceServiceRequest, ExportTraceServiceResponse,
+    };
+    use tonic::{Request, Response, Status};
+
+    #[derive(Default)]
+    pub struct Received {
+        pub traces: Vec<ExportTraceServiceRequest>,
+        pub metrics: Vec<ExportMetricsServiceRequest>,
+        pub logs: Vec<ExportLogsServiceRequest>,
+        pub headers: Vec<Option<String>>,
+    }
+
+    #[derive(Clone, Default)]
+    pub struct Collector(pub Arc<Mutex<Received>>);
+
+    impl Collector {
+        fn note<T>(&self, request: &Request<T>) {
+            let header = request
+                .metadata()
+                .get("x-test-header")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            self.0.lock().unwrap().headers.push(header);
+        }
+    }
+
+    #[tonic::async_trait]
+    impl TraceService for Collector {
+        async fn export(
+            &self,
+            request: Request<ExportTraceServiceRequest>,
+        ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+            self.note(&request);
+            self.0.lock().unwrap().traces.push(request.into_inner());
+            Ok(Response::new(ExportTraceServiceResponse::default()))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl MetricsService for Collector {
+        async fn export(
+            &self,
+            request: Request<ExportMetricsServiceRequest>,
+        ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
+            self.note(&request);
+            self.0.lock().unwrap().metrics.push(request.into_inner());
+            Ok(Response::new(ExportMetricsServiceResponse::default()))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl LogsService for Collector {
+        async fn export(
+            &self,
+            request: Request<ExportLogsServiceRequest>,
+        ) -> Result<Response<ExportLogsServiceResponse>, Status> {
+            self.note(&request);
+            self.0.lock().unwrap().logs.push(request.into_inner());
+            Ok(Response::new(ExportLogsServiceResponse::default()))
+        }
+    }
+
+    /// Starts the collector on its own runtime thread; returns it and its
+    /// port.
+    pub fn start() -> (Collector, u16) {
+        let collector = Collector::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let served = collector.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap().port()).unwrap();
+                tonic::transport::Server::builder()
+                    .add_service(TraceServiceServer::new(served.clone()))
+                    .add_service(MetricsServiceServer::new(served.clone()))
+                    .add_service(LogsServiceServer::new(served))
+                    .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener))
+                    .await
+                    .unwrap();
+            });
+        });
+        (collector, rx.recv().unwrap())
+    }
+}
+
+#[test]
+fn exports_over_otlp_grpc_with_headers() {
+    let (collector, port) = grpc::start();
+    let v = Volume::new();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let out = v.record(&[
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+        ("OTEL_EXPORTER_OTLP_HEADERS", "x-test-header=secret%20value"),
+    ]);
+    let err = stderr(&out);
+    assert!(!err.contains("warning: telemetry"), "{err}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 record(s) into 1 commit(s)"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let received = collector.0.lock().unwrap();
+    let metric_names: BTreeSet<String> = received
+        .metrics
+        .iter()
+        .flat_map(|r| &r.resource_metrics)
+        .flat_map(|rm| &rm.scope_metrics)
+        .flat_map(|sm| &sm.metrics)
+        .map(|m| m.name.clone())
+        .collect();
+    assert!(
+        metric_names.contains("agentfs.record.duration"),
+        "{metric_names:?}"
+    );
+    let span_names: BTreeSet<String> = received
+        .traces
+        .iter()
+        .flat_map(|r| &r.resource_spans)
+        .flat_map(|rs| &rs.scope_spans)
+        .flat_map(|ss| &ss.spans)
+        .map(|s| s.name.clone())
+        .collect();
+    assert!(span_names.contains("agentfs.record"), "{span_names:?}");
+    let events: Vec<&str> = received
+        .logs
+        .iter()
+        .flat_map(|r| &r.resource_logs)
+        .flat_map(|rl| &rl.scope_logs)
+        .flat_map(|sl| &sl.log_records)
+        .map(|r| r.event_name.as_str())
+        .collect();
+    assert!(events.contains(&"agentfs.path_refused"), "{events:?}");
+    assert!(!received.headers.is_empty());
+    assert!(
+        received
+            .headers
+            .iter()
+            .all(|h| h.as_deref() == Some("secret value")),
+        "OTEL_EXPORTER_OTLP_HEADERS arrives as metadata, decoded: {:?}",
+        received.headers
+    );
+}
+
+#[test]
+fn a_grpc_collector_that_is_down_never_fails_the_command() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let v = Volume::new();
+    let start = std::time::Instant::now();
+    let out = v.record(&[
+        (
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            &format!("http://127.0.0.1:{port}"),
+        ),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+    ]);
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 record(s) into 1 commit(s)"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }

@@ -191,7 +191,7 @@ jobs:
       - name: start collector
         run: |
           mkdir -p "$RUNNER_TEMP/otel" && chmod 777 "$RUNNER_TEMP/otel"
-          docker run -d --name otelcol -p 4318:4318 \
+          docker run -d --name otelcol -p 4318:4318 -p 4317:4317 \
             -v "$PWD/ci/otelcol.yaml:/etc/otelcol-contrib/config.yaml:ro" \
             -v "$RUNNER_TEMP/otel:/out" \
             otel/opentelemetry-collector-contrib:0.162.0
@@ -200,6 +200,9 @@ jobs:
             sleep 1
           done
       - run: ci/e2e-telemetry.sh
+        env:
+          OTEL_OUT: ${{ runner.temp }}/otel/otel.jsonl
+      - run: ci/e2e-otlp-transports.sh
         env:
           OTEL_OUT: ${{ runner.temp }}/otel/otel.jsonl
       - name: collector logs

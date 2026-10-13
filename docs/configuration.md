@@ -608,9 +608,9 @@ and costs nothing. agentfs itself reads these to decide what to export:
 
 | Variable | Meaning |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables every signal, at `/v1/traces`, `/v1/metrics` and `/v1/logs` under it |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables every signal; over HTTP at `/v1/traces`, `/v1/metrics` and `/v1/logs` under it |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | A full URL: enables only that signal, and wins over the general endpoint |
-| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | Only `http/protobuf` is built; another value turns that signal off with a `warning: telemetry:` line |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | `http/protobuf` (the default), `http/json` or `grpc`; the per-signal form wins. Another value turns that signal off with a `warning: telemetry:` line. With `grpc` the endpoint is the collector's gRPC address (`http://otel-collector:4317`), with no `/v1/...` path |
 | `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER` | `none` turns that signal off; only `otlp` is built |
 | `OTEL_SDK_DISABLED` | `true` turns everything off |
 

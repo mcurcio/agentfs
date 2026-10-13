@@ -430,9 +430,10 @@ agentfs run
 
 - **Variables:** an endpoint enables export, per signal or for all;
   `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none` or `OTEL_SDK_DISABLED=true`
-  turn it off. This build speaks OTLP **http/protobuf over plain http**
-  only, which suits an in-cluster collector; anything else is reported
-  with a `warning: telemetry:` line on stderr and that signal stays off.
+  turn it off. `OTEL_EXPORTER_OTLP_PROTOCOL` picks **http/protobuf** (the default),
+  **http/json** or **grpc** (per signal too), over plain http; anything
+  else is reported with a `warning: telemetry:` line on stderr and that
+  signal stays off.
   Telemetry problems never stop a command. Every variable agentfs and the
   OpenTelemetry SDK read, including sampling (`OTEL_TRACES_SAMPLER`: on a
   busy volume, sample), is in the
