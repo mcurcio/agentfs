@@ -26,6 +26,7 @@ use super::protocol::{
 use crate::events::{Event, Events};
 use crate::local_socket;
 use crate::paths::RepoPath;
+use crate::pending::PendingId;
 use crate::record::Draft;
 use crate::telemetry::Telemetry;
 use crate::volume::{Recorded, Skipped};
@@ -134,6 +135,8 @@ pub struct HistoryClient {
     /// Idle connections and when each went idle.
     idle: Mutex<Vec<(UnixStream, Instant)>>,
     down: AtomicBool,
+    /// `Welcome.features` of the service, as of the last connection made.
+    features: Mutex<Vec<String>>,
     events: Events,
     telemetry: Telemetry,
 }
@@ -162,6 +165,7 @@ impl HistoryClient {
             branch: branch.to_owned(),
             idle: Mutex::new(Vec::new()),
             down: AtomicBool::new(false),
+            features: Mutex::new(Vec::new()),
             events,
             telemetry,
         };
@@ -226,7 +230,35 @@ impl HistoryClient {
                         reason: s.reason.into_reason(),
                     })
                     .collect(),
+                written: Vec::new(),
             }),
+            other => Err(self.unexpected(&other)),
+        }
+    }
+
+    /// Whether the service supports `feature` (`Welcome.features`), as of
+    /// the last connection this client made.
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|f| f == feature)
+    }
+
+    /// Whether the last change the service journaled at `path` is still
+    /// the write of this front's frozen copy `copy` (design §3.1). False,
+    /// without asking, from a service without the `still_last` feature.
+    pub fn still_last(&self, path: &RepoPath, copy: PendingId) -> Result<bool, ClientError> {
+        if !self.supports("still_last") {
+            return Ok(false);
+        }
+        let request = Request::StillLast {
+            path: path.clone(),
+            copy,
+        };
+        match self.call("still_last", &request)? {
+            Reply::StillLast { last } => Ok(last),
             other => Err(self.unexpected(&other)),
         }
     }
@@ -414,7 +446,12 @@ impl HistoryClient {
                 other => other,
             })?;
         match reply {
-            Reply::Welcome { volume, branch, .. } => {
+            Reply::Welcome {
+                volume,
+                branch,
+                features,
+                ..
+            } => {
                 if volume != self.hello.volume || branch != self.branch {
                     return Err(ClientError::Refused {
                         address: self.address.clone(),
@@ -424,6 +461,10 @@ impl HistoryClient {
                         ),
                     });
                 }
+                *self
+                    .features
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = features;
                 Ok(stream)
             }
             other => Err(self.unexpected(&other)),

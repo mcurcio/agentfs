@@ -244,16 +244,28 @@ Rules that make this precise:
   mode) differs from the one taken just before the last freeze. Timestamps
   come from a coarse clock, so git's racy-timestamp rule applies: if the
   last record's stamp is within twice the coarse clock's resolution of the
-  record time, the next FLUSH or RELEASE records regardless. RELEASE
-  follows the last close at once, so a file written and closed within
-  that window (nearly every file a program writes and closes) is
-  recorded twice: at FLUSH and again, after `close` has returned, at
-  RELEASE. This is a known cost (§3.2, §19.2 item 4): RELEASE is the
-  only backstop for a write through a shared mapping in the same clock
-  tick as the FLUSH freeze, which leaves the stamp unchanged. A created file is
-  recorded at its first FLUSH even when empty (`touch`); a write-open of an
-  existing file takes its stamp at open, so opening and closing without a
-  change records nothing.
+  record time, the next boundary looks at it again even if the stamp
+  did not move. RELEASE follows the last close at once, so a file
+  written and closed within that window (nearly every file a program
+  writes and closes) would be recorded twice: RELEASE is the only
+  backstop for a write through a shared mapping in the same clock tick
+  as the FLUSH freeze, which leaves the stamp unchanged. Instead, a racy
+  record keeps its frozen copy open, and a boundary that would record
+  only because of the racy rule (stamp unchanged, nothing forcing it)
+  compares the file's bytes with that copy and records nothing if they
+  are equal, the file still has the one name the copy was recorded at,
+  and the copy is still the last state journaled at that path (no later
+  write, symlink, removal or rename there, above or below it, by
+  anything). Whoever journals keeps the frozen copy of the last write at
+  each recently written path for 60 s to answer that; a front asks its
+  history service (`StillLast`, §14). Any doubt (an unreadable file, a
+  forgotten path, an older service) records, as before. The comparison
+  reads both files, mostly from the page cache, which is far cheaper
+  than a second freeze and a second hash and compression by the commit
+  loop (`agentfs.fuse.racy_rechecks{outcome}` counts both outcomes). A
+  created file is recorded at its first FLUSH even when empty (`touch`);
+  a write-open of an existing file takes its stamp at open, so opening
+  and closing without a change records nothing.
 - **`O_TRUNC`.** `FUSE_ATOMIC_O_TRUNC` is negotiated, so a shell `>` is one
   open with `O_TRUNC` and one record at close, even when nothing is written
   after the truncation. `truncate`/`ftruncate` remain setattr boundaries.
@@ -316,12 +328,9 @@ FUSE. On XFS it does not depend on size: a 16 MiB freeze takes 0.44 ms and
 closing a clean 1 GiB file 3 ms (2.6 s with its pages still dirty, as
 the reflink waits for writeback). On ext4 the copy takes 44 ms for 16 MiB
 and 2.9 s for a clean 1 GiB file. A file written and closed at once is
-frozen and journaled a second time at RELEASE (§3.1), outside the
-call's latency but doubling its journal `fsync`s, freezes and commit
-work: 100,000 new files make about 200,000 records, and a 1 GiB file
-just written is copied twice on ext4 and hashed and compressed twice by
-the commit loop ([performance.md](performance.md#known-costs)). The
-performance budget is §19.2 item 1.
+recorded once: RELEASE compares it with the copy FLUSH froze rather than
+freezing and journaling it again (§3.1), so 100,000 new files make
+about 100,000 records. The performance budget is §19.2 item 1.
 
 **Through a front (§14).** A front mount splits the step with the history
 service. The front decides the path rules (asking the service with a
@@ -1718,6 +1727,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.history_service.superseded` | counter | Front writes the history service skipped because a newer state of the path was already journaled (freeze stamps, §14.1) |
 | `agentfs.history_service.resyncs` | counter | Paths the history service recorded again as the backing tree has them, after a front's change it could not order (identical stamps from two slots, a late removal or symlink, §14.1) |
 | `agentfs.fuse.create_as_caller_fallbacks` | counter | Objects a root daemon created as itself and then gave to the caller, because creating as the caller was refused (a device node, or a caller whose groups are unknown) or could not be set up (§6) |
+| `agentfs.fuse.racy_rechecks` | counter, per outcome | Boundaries that would have recorded a file again only because its last record was racy: `skipped` when its bytes were that record's frozen copy, still the last state journaled at its path, else `recorded` (§3.1) |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
@@ -1860,6 +1870,10 @@ Messages are frames of a u32 big-endian length and a JSON body (at most
   set. No `fsync`.
 - `Record {draft}` → `Recorded {seq, skipped}`, or `Error {message}`.
 - `Ping` → `Pong`.
+- `StillLast {path, copy}` → `StillLast {last}`: whether the last change
+  journaled at `path` is still the write of the front's frozen copy
+  `copy`, so a RELEASE may skip re-recording it (§3.1). No `fsync`;
+  feature `still_last`, and a front never asks a service without it.
 
 A front keeps a pool of synchronous connections (one request at a time on
 each, up to 64 idle ones kept for at most 20 s, each checked with a
@@ -2973,7 +2987,7 @@ runner.
 | Performance budget | Advisory, checked by every benchmark run (`ci/bench-budget.json`, [performance.md](performance.md#performance-budget)): about 1.5 times the slowest of the first three CI runs (six jobs on two CPU types), for example 3.5 ms for a small file's step at the median; a result over budget warns and never fails CI (2026-10-13) |
 | One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `serve-history`, `record`, `flush`, and `push`, `restore` and `revert` in direct mode (when no daemon answers on the control socket); exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
 | FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
-| Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close. A file written and closed within the racy window is recorded again at RELEASE: a known cost, with a follow-up in §19.2 item 4 (§3.1) |
+| Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close. A boundary that would record a file again only because its last record was racy compares it with that record's frozen copy, kept open, and skips the record if the bytes are equal and the copy is still the last state journaled at the path (2026-10-13; §3.1, §19.2 item 4) |
 | `.git` paths | An exact `.git` component that is a git directory or gitfile is skipped without an alarm; any other `.git`, look-alikes and invalid names raise `PathRefused` (§5) |
 | Layout | The state area, backing tree and mount point are separate; credentials are never under the backing tree. `mount` refuses otherwise (§17.1) |
 | Passthrough | `auto` by default: used when the kernel and privileges allow, off with the reason reported otherwise, and switched off per inode (not per mount) if registering its backing file fails; `on` fails the mount instead (§17.1) |
@@ -3031,7 +3045,7 @@ runner.
 | Unorderable front changes (2026-10-13) | Identical stamps from two slots, a removal of a path present again, and a symlink whose target the tree no longer has are journaled, then resynced: the service records the path as the backing tree has it, as its own `sweep` record under the path claim (`agentfs.history_service.resyncs`). Chosen over comparing frozen copies' content, which cannot order two states the file no longer holds (§14.1) |
 | Creating as the caller (2026-10-13) | A daemon with `CAP_SETUID`/`CAP_SETGID`/`CAP_CHOWN`/`CAP_FOWNER` creates as the caller by switching the worker thread's fsuid, fsgid and supplementary groups (read from `/proc/<pid>/status`) for the one creating call; refusals fall back to create-then-chown (`agentfs.fuse.create_as_caller_fallbacks`). The CSI node plugin runs with `hostPID: true` so callers' pids, and so their groups, are visible (§6, §14.1, §14.2) |
 | Repair origins (2026-10-13) | A repair keeps the pod that failed to record it; the service trusts an origin a front names only on `sweep` records whose committer renders, and journals the front's own otherwise (§3.5, §14.1) |
-| Protocol evolution (2026-10-13) | Protocol stays version 1: additions are optional fields and new variants only, and the service lists what it supports in `Welcome.features` (`stamps`, `repair_origin`, `listen`) (§14.1) |
+| Protocol evolution (2026-10-13) | Protocol stays version 1: additions are optional fields and new variants only, and the service lists what it supports in `Welcome.features` (`stamps`, `repair_origin`, `listen`, `still_last`) (§14.1) |
 | Locks across fronts | POSIX and BSD locks are per FUSE mount, so not shared between pods; a lock-coordinated database (SQLite, the `fsync` class) must be written from one pod (§14) |
 | CSI driver shape | One binary, `agentfs-csi` (`--mode` controller, node or all), in the agentfs image; tonic over a Unix socket, the spec compiled without `protoc`; the node plugin spawns the `agentfs` binary for the service and each front instead of linking FUSE in-process (§14.2, §17.2) |
 | CSI volumes | PersistentVolumes only (no inline ephemeral volumes); `<basePath>/<pv>/{backing,state,csi.json}`; basePath one filesystem seen by the controller and every node; size recorded, not enforced (§14.2) |
@@ -3068,18 +3082,14 @@ runner.
    whether undo through the patch queue (§12) replaces manual restores for
    iac. (Asking a running daemon to push now is built: `agentfs push`
    goes through the control socket, §2.3.)
-4. **The FLUSH+RELEASE double record** (§3.1, §3.2). A file written and
-   closed within the racy-timestamp window is recorded at FLUSH and again
-   at RELEASE, because RELEASE cannot tell a same-tick write through a
-   shared mapping from no change. Measured by the benchmark: about
-   200,000 records for 100,000 new files, and twice the freeze and commit
-   work for a 1 GiB file just written
-   ([performance.md](performance.md#known-costs)). Known and accepted for
-   now (2026-10-13); open: how to skip the duplicate safely, for example
-   by comparing the file with its frozen copy at RELEASE while the copy
-   is still in `pending/`, or by waiting out the window at FLUSH above
-   some size. The benchmark bounds the count between one and two records
-   per boundary, so a fix shows as a drop to one.
+4. **The FLUSH+RELEASE double record** (§3.1, §3.2). *Decided
+   (2026-10-13)*: a racy record keeps its frozen copy open, and a
+   boundary that would record only because of the racy rule compares the
+   file with it, skipping the record when the bytes are equal and the
+   copy is still the last state journaled at the path (asked of the
+   history service by a front, `StillLast`). The benchmark now bounds
+   the count at one record per boundary
+   ([performance.md](performance.md#known-costs)).
 5. **Residuals of multi-front ordering and live restores** (§6, §14.1,
    §15), known and accepted for now (2026-10-13):
    - *Same-tick writes on a coarse clock.* Two fronts' same-size writes

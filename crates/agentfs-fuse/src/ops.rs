@@ -68,14 +68,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Instant;
 
 use agentfs_core::record::{Caller, Origin, Trigger};
-use agentfs_core::volume::{Recorder, VolumeError};
+use agentfs_core::volume::{Recorded, Recorder, VolumeError};
 use fuser::{Errno, FileAttr, FileType, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
 
 use crate::backing::{self, Backing, attr, join, proc_path};
 use crate::boundary::{Boundary, Change, REPAIR_TRIGGER, State};
 use crate::creds;
-use crate::dirty::{Stamp, now_ns, timestamp_granularity_ns};
+use crate::dirty::{FrozenRef, Stamp, now_ns, same_bytes, timestamp_granularity_ns};
 use crate::groups::{Group, Groups};
 use crate::inodes::{InodeTable, Kind, ROOT};
 use crate::names::is_git_dir_name;
@@ -1015,6 +1015,7 @@ impl Ops {
                     if let Some(node) = self.table().get_mut(id) {
                         node.dirty
                             .after_record(stamp(&after), now, self.config.granularity_ns);
+                        node.dirty.frozen = None;
                     }
                 }
                 Err(_) => {
@@ -1821,7 +1822,7 @@ impl Ops {
         }
         let st = rustix::fs::fstat(fd).eno()?;
         let current = stamp(&st);
-        {
+        let pinned = {
             let table = self.table();
             let Some(node) = table.get(id) else {
                 return Ok(false);
@@ -1829,10 +1830,23 @@ impl Ops {
             if node.kind != Kind::File || !node.dirty.needs_record(&current) {
                 return Ok(false);
             }
-        }
+            node.dirty
+                .racy_only(&current)
+                .then(|| node.dirty.frozen.clone())
+        };
         // Never a cached name another front has since moved or removed
         // (design §14).
         let paths = self.record_paths(id, fd, &st);
+        if let Some(pinned) = pinned {
+            // Recording again only because the last record was racy: not
+            // if the bytes are the copy that record froze, and that copy
+            // is still the last state journaled at the path (design §3.1).
+            let skip = pinned.is_some_and(|pin| self.still_recorded(&pin, &paths, fd, &st));
+            self.boundary.recorder().telemetry().racy_recheck(skip);
+            if skip {
+                return Ok(false);
+            }
+        }
         let now = now_ns();
         let changes: Vec<Change> = paths
             .iter()
@@ -1847,17 +1861,62 @@ impl Ops {
         let recorded = if changes.is_empty() {
             // No name left (unlinked here, or removed by another front):
             // nowhere to record it.
-            false
+            Recorded::default()
         } else {
             self.boundary
                 .record(trigger, caller, changes)
                 .map_err(|_| Errno::EIO)?
         };
+        let racy = now - current.changed_ns() < self.config.granularity_ns;
+        // A racy record's copy is pinned for the next boundary to compare
+        // with: only one written at the file's one name.
+        let frozen = match (racy, paths.as_slice(), recorded.written.as_slice()) {
+            (true, [name], [(path, copy)]) => {
+                self.boundary
+                    .recorder()
+                    .open_copy(*copy)
+                    .ok()
+                    .map(|file| FrozenRef {
+                        name: name.clone(),
+                        path: path.clone(),
+                        copy: *copy,
+                        file: Arc::new(file),
+                    })
+            }
+            _ => None,
+        };
         if let Some(node) = self.table().get_mut(id) {
             node.dirty
                 .after_record(current, now, self.config.granularity_ns);
+            node.dirty.frozen = frozen;
         }
-        Ok(recorded)
+        Ok(recorded.seq.is_some())
+    }
+
+    /// Whether node's content, open as `fd` with stat `st` and named
+    /// `paths` now, is exactly the copy `pin` a racy record froze, and
+    /// that copy is still the last state journaled at its path (design
+    /// §3.1). Any doubt is a no: the boundary records.
+    fn still_recorded(
+        &self,
+        pin: &FrozenRef,
+        paths: &[Vec<u8>],
+        fd: &impl AsFd,
+        st: &Stat,
+    ) -> bool {
+        let size = u64::try_from(st.st_size).unwrap_or(u64::MAX);
+        if paths != std::slice::from_ref(&pin.name) {
+            return false;
+        }
+        if pin.file.metadata().map(|m| m.len()).ok() != Some(size) {
+            return false;
+        }
+        // The handle may be write-only: read through a new descriptor.
+        let Ok(now) = std::fs::File::open(proc_path(fd)) else {
+            return false;
+        };
+        same_bytes(&pin.file, &now, size).unwrap_or(false)
+            && self.boundary.recorder().still_last(&pin.path, pin.copy)
     }
 
     /// The last reference to an open file is gone. If it was the last
@@ -1905,6 +1964,9 @@ impl Ops {
                         && node.write_handles == 0
                     {
                         node.dirty.armed = false;
+                        // Nothing can write it unseen any more but a
+                        // mapping, which RELEASE already covered.
+                        node.dirty.frozen = None;
                     }
                 }
                 Err(e) => {

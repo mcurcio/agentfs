@@ -241,15 +241,14 @@ measured() { # workload-name workload-args...
 }
 
 # Bounds the records a workload of N change boundaries made (design §3.1):
-# at least one per boundary, and at most two, since a file written and
-# closed at once is recorded at FLUSH and again at RELEASE by the
-# racy-timestamp rule (docs/performance.md, "Known costs"). Whether the
-# second record happens depends on timing, so the count is a range; a
-# small slack covers the sweep recording files still open.
+# one per boundary. A file written and closed at once is racy at RELEASE,
+# which compares it with the copy FLUSH froze rather than recording it
+# again (design §19.2 item 4); a small slack covers the sweep recording
+# files still open and a comparison that could not be made.
 check_records() { # label boundaries
   local records
   records=$(echo "$LAST" | jq .records)
-  local lo=$2 hi=$((2 * $2 + $2 / 100 + 10))
+  local lo=$2 hi=$(($2 + $2 / 100 + 10))
   [ "$records" -ge "$lo" ] && [ "$records" -le "$hi" ] ||
     fail "$1: $records records for $2 boundaries, expected $lo to $hi"
   pass "$1: $records records for $2 boundaries ($(awk -v r="$records" -v n="$2" 'BEGIN { printf "%.2f", r / n }') per boundary)"

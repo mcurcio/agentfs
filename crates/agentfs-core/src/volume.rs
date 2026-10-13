@@ -46,7 +46,7 @@ use crate::record::{
     Caller, Change, Draft, Operation, OperationKind, Origin, PatchAuthor, Record, Trigger,
 };
 use crate::rules::{Decision, Rules, RulesError, SkipReason};
-use crate::stamps::{FreezeStamp, StampBook, Verdict};
+use crate::stamps::{FreezeStamp, LastWrites, StampBook, Verdict};
 use crate::telemetry::{Telemetry, spans};
 use crate::tracked::Tracked;
 
@@ -487,6 +487,7 @@ pub fn open(
         telemetry: telemetry.clone(),
         reclaim: Arc::default(),
         stamps: None,
+        last_writes: Arc::default(),
     };
     let committer = Committer {
         history,
@@ -542,6 +543,7 @@ pub fn open_front(
         telemetry: telemetry.clone(),
         reclaim: Arc::default(),
         stamps: None,
+        last_writes: Arc::default(),
     })
 }
 
@@ -593,12 +595,16 @@ pub struct Skipped {
 }
 
 /// What one [`Recorder::record`] call did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recorded {
     /// The record's sequence number, or `None` if every input was skipped
     /// and nothing was journaled.
     pub seq: Option<u64>,
     pub skipped: Vec<Skipped>,
+    /// The frozen copy of each write journaled, by path: what
+    /// [`Recorder::still_last`] asks about (design §3.1). Filled by the
+    /// recorder that froze them; empty in the service's answer to a front.
+    pub written: Vec<(RepoPath, PendingId)>,
 }
 
 /// What an operator operation is, before it has an id (see
@@ -655,6 +661,9 @@ pub struct Recorder {
     /// The last journaled freeze stamp of each path, in the history
     /// service ([`Recorder::enable_stamps`], design §14.1).
     stamps: Option<Arc<StampBook>>,
+    /// The frozen copy of the last write journaled at each recently
+    /// written path, where this process journals (design §3.1).
+    last_writes: Arc<LastWrites>,
 }
 
 /// Where a [`Recorder`]'s records go.
@@ -833,7 +842,11 @@ impl Recorder {
             }
         }
         if kept.is_empty() {
-            return Ok(Recorded { seq: None, skipped });
+            return Ok(Recorded {
+                seq: None,
+                skipped,
+                ..Recorded::default()
+            });
         }
 
         let mut changes = Vec::with_capacity(kept.len());
@@ -891,10 +904,7 @@ impl Recorder {
                 }
             }
             if changes.is_empty() {
-                return Ok(Recorded {
-                    seq: None,
-                    skipped: Vec::new(),
-                });
+                return Ok(Recorded::default());
             }
             let draft = Draft {
                 trigger,
@@ -908,7 +918,7 @@ impl Recorder {
             match &self.backend {
                 Backend::Local { journal, .. } => Ok(Recorded {
                     seq: Some(journal.record(draft)?),
-                    skipped: Vec::new(),
+                    ..Recorded::default()
                 }),
                 // The service decides again and journals (design §14); its
                 // skips come back with the reply.
@@ -919,10 +929,12 @@ impl Recorder {
             Ok(Recorded {
                 seq,
                 skipped: by_service,
+                ..
             }) => {
                 if let Backend::Local { tracked, .. } = &self.backend {
                     for change in &changes {
                         tracked.apply(change);
+                        self.last_writes.journaled(change.path(), change.pending());
                     }
                     // This process's own writes (a restore the service
                     // applies) order fronts' records too (design §14.1).
@@ -944,7 +956,26 @@ impl Recorder {
                     }
                     skipped.push(skip);
                 }
-                Ok(Recorded { seq, skipped })
+                let written = if seq.is_some() {
+                    changes
+                        .iter()
+                        .filter_map(|c| match c {
+                            Change::Write { path, pending, .. }
+                                if !skipped.iter().any(|s| &s.path == path) =>
+                            {
+                                Some((path.clone(), *pending))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Ok(Recorded {
+                    seq,
+                    skipped,
+                    written,
+                })
             }
             Err(e) => {
                 // Copies frozen for a record that never became durable. A
@@ -1217,7 +1248,11 @@ impl Recorder {
         }
         if kept.is_empty() {
             self.pending.remove(dropped)?;
-            return Ok(Recorded { seq: None, skipped });
+            return Ok(Recorded {
+                seq: None,
+                skipped,
+                ..Recorded::default()
+            });
         }
         draft.changes = kept;
         draft.origin = Some(origin.clone());
@@ -1236,6 +1271,7 @@ impl Recorder {
             Ok(seq) => {
                 for change in &changes {
                     tracked.apply(change);
+                    self.last_writes.journaled(change.path(), change.pending());
                 }
                 if let Some(book) = &self.stamps {
                     for change in &changes {
@@ -1252,6 +1288,7 @@ impl Recorder {
                 Ok(Recorded {
                     seq: Some(seq),
                     skipped,
+                    ..Recorded::default()
                 })
             }
             Err(e) => {
@@ -1344,6 +1381,30 @@ impl Recorder {
     /// Whether each of `paths` is tracked now: the history service's answer
     /// to a front's `Tracked` query (design §14). A front has no tracked
     /// set and answers `false` for each.
+    /// Opens the frozen copy `copy` for reading, while it is still pending
+    /// (design §3.1): an open copy outlives its removal at commit.
+    pub fn open_copy(&self, copy: PendingId) -> io::Result<std::fs::File> {
+        std::fs::File::open(self.pending.path(copy))
+    }
+
+    /// Whether the last change journaled at `path` is still the write of
+    /// the frozen copy `copy` (design §3.1): no later change at the path,
+    /// above or below it, by anyone. A front asks its history service; a
+    /// service too old to answer, or any failure, is a no, which only
+    /// costs one record more.
+    pub fn still_last(&self, path: &RepoPath, copy: PendingId) -> bool {
+        match &self.backend {
+            Backend::Local { .. } => self.last_writes.is_last(path, copy),
+            Backend::Front { client } => client.still_last(path, copy).unwrap_or(false),
+        }
+    }
+
+    /// The answer to a front's [`Recorder::still_last`], in the history
+    /// service.
+    pub fn last_write_is(&self, path: &RepoPath, copy: PendingId) -> bool {
+        matches!(self.backend, Backend::Local { .. }) && self.last_writes.is_last(path, copy)
+    }
+
     pub fn tracked_query(&self, paths: &[RepoPath]) -> Vec<bool> {
         match &self.backend {
             Backend::Local { tracked, .. } => paths.iter().map(|p| tracked.contains(p)).collect(),
@@ -3961,6 +4022,7 @@ mod tests {
                         pattern: "*.log".into(),
                     }
                 )],
+                written: vec![],
             }
         );
         assert_eq!(com.backlog(), 0);
@@ -4192,6 +4254,7 @@ mod tests {
             Recorded {
                 seq: Some(1),
                 skipped: vec![],
+                written: vec![],
             }
         );
         com.commit_pending().unwrap();
@@ -4395,6 +4458,7 @@ mod tests {
             Recorded {
                 seq: None,
                 skipped: vec![skipped("secret", SkipReason::NeverRecord)],
+                written: vec![],
             }
         );
         assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);

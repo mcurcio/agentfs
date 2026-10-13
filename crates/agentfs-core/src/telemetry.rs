@@ -69,6 +69,7 @@ pub mod names {
     pub const HISTORY_SERVICE_SUPERSEDED: &str = "agentfs.history_service.superseded";
     pub const HISTORY_SERVICE_RESYNCS: &str = "agentfs.history_service.resyncs";
     pub const FUSE_CREATE_AS_CALLER_FALLBACKS: &str = "agentfs.fuse.create_as_caller_fallbacks";
+    pub const FUSE_RACY_RECHECKS: &str = "agentfs.fuse.racy_rechecks";
     /// Recorded by the binary, which owns the exporters (design §13).
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -128,6 +129,7 @@ struct Inner {
     superseded: Counter<u64>,
     resyncs: Counter<u64>,
     create_as_caller_fallbacks: Counter<u64>,
+    racy_rechecks: Counter<u64>,
 }
 
 impl fmt::Debug for Telemetry {
@@ -226,6 +228,13 @@ impl Telemetry {
                 "{object}",
                 "Objects a root daemon created as itself and then gave to the caller, because \
                  creating as the caller was refused or could not be set up (design §6)",
+            ),
+            racy_rechecks: counter(
+                names::FUSE_RACY_RECHECKS,
+                "{boundary}",
+                "Boundaries that would have recorded a file again only because its last record \
+                 was racy, by outcome: skipped (its bytes were the frozen copy still last \
+                 journaled at its path) or recorded (design §3.1)",
             ),
             meter: meter.clone(),
             tracer,
@@ -436,6 +445,17 @@ impl Telemetry {
     pub fn create_as_caller_fallback(&self) {
         if let Some(inner) = &self.inner {
             inner.create_as_caller_fallbacks.add(1, &[]);
+        }
+    }
+
+    /// Counts one boundary that found a file unchanged but racy (design
+    /// §3.1): `skipped` if its bytes were proven recorded, else `recorded`.
+    pub fn racy_recheck(&self, skipped: bool) {
+        if let Some(inner) = &self.inner {
+            let outcome = if skipped { "skipped" } else { "recorded" };
+            inner
+                .racy_rechecks
+                .add(1, &[KeyValue::new("outcome", outcome)]);
         }
     }
 

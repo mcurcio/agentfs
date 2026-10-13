@@ -422,6 +422,9 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
                 }
             }
             Request::Ping => Reply::Pong,
+            Request::StillLast { path, copy } => Reply::StillLast {
+                last: shared.recorder.last_write_is(&path, copy),
+            },
             Request::Listen => {
                 // The connection is the front's link from now on: the
                 // service calls, the front answers (design §15).

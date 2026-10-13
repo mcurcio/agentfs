@@ -36,12 +36,11 @@ disk.
 - **Workloads of many small files run 14–83 times slower** than in a
   plain directory: about 2.8–3.5 ms per file for a `git clone`, 2.3–3.3
   ms per created file, 0.8–1.3 ms per removed file.
-- **A file written and closed at once is recorded twice**: once at its
-  close (FLUSH) and again, asynchronously, at RELEASE, through the
-  racy-timestamp rule. This doubles the journal records, the frozen
-  copies and the commit work of such files, though not the latency of the
-  close. It is a known cost with a follow-up: see
-  [Known costs](#known-costs).
+- **A file written and closed at once is recorded once.** Until
+  2026-10-13 it was recorded again at RELEASE through the racy-timestamp
+  rule, doubling the records and commit work of the workloads below,
+  which were measured then; RELEASE now compares the file with the copy
+  its close froze instead. See [Known costs](#known-costs).
 - **Excluded paths still pay FUSE**: about 0.63 ms per small file written
   into an excluded `node_modules/`, against 0.035 ms in a plain
   directory, and nothing is recorded.
@@ -105,8 +104,8 @@ rm (1 run):
 *Records* is per run, over all three CI runs (the first run's close4k
 count was not captured): the change boundaries are one per close, file
 or removal, so every workload that writes a file and closes it at once
-shows about twice as many records as boundaries. That is the double
-record of [Known costs](#known-costs).
+showed about twice as many records as boundaries in these runs: the
+double record of [Known costs](#known-costs), since removed.
 
 For comparison, copying the 1 GiB file and `fsync`ing the copy in the
 plain directory took 2.6–2.9 s (clean) and 3.8–5.4 s (dirty): ext4's
@@ -150,7 +149,7 @@ What the numbers mean:
 
 ## Known costs
 
-### A file written and closed at once is recorded twice
+### Racy closes, and how they stay single records
 
 Change detection compares the inode's stamp (size, mtime, ctime, mode)
 with the one taken before the last freeze (design §3.1). File timestamps
@@ -158,51 +157,41 @@ come from a coarse clock, so a write in the same clock tick as the
 freeze would not move the stamp. git's racy-timestamp rule covers that:
 when the recorded stamp is within twice the clock's resolution (at least
 1 ms, typically 8 ms) of the time the freeze started, the next boundary
-records again even if the stamp is unchanged.
+looks at the file again even if the stamp is unchanged.
 
 A program that writes a file and closes it right away (an editor's save,
-`git clone`, a compiler, `cp`) always lands in that window. Its `close`
-records at FLUSH, and the RELEASE that follows the last close a moment
-later finds the stamp still racy and records again. The benchmark shows
-it in every workload that writes files:
+`git clone`, a compiler, `cp`) always lands in that window, and the
+RELEASE that follows the last close a moment later is the only backstop
+for a write through a shared memory mapping in the same tick, which
+reaches the file without the daemon seeing it and leaves the stamp
+unchanged. Until 2026-10-13 RELEASE therefore recorded every such file a
+second time: about 200,000 records for 100,000 new files, a second
+freeze and journal `fsync` for each, and a 1 GiB file just written
+frozen, hashed and compressed twice (design §19.2 item 4).
 
-- close4k rewrites 50 existing files 2,000 times and makes 4,000 records;
-- create makes about 200,000 records for 100,000 files, and clone about
-  9,046 for 4,524;
-- bigclose, dirty, makes 2 records and takes 56 s to commit, while
-  bigclose, fsynced, whose 2.6 s `fsync` takes the stamp out of the
-  window, makes 1 and takes 28 s.
+Now a racy record keeps its frozen copy open, and a boundary that would
+record only because of the racy rule compares the file with that copy.
+It records nothing when the bytes are equal, the file still has the one
+name the copy was recorded at, and the copy is still the last state
+journaled at that path; otherwise it records, as before. What that
+costs:
 
-What it costs:
+- **Reading both files** at RELEASE, after `close` has returned, mostly
+  from the page cache: far less than a second freeze (a 1 GiB copy on
+  ext4) and the commit loop's second hash and compression.
+- **One descriptor per racy file** between its FLUSH and its RELEASE.
+- **A front's RELEASE asks its history service** whether the copy is
+  still the last state (`StillLast`, no `fsync`): one socket round trip,
+  tens of microseconds (design §14.1).
+- **Anything in doubt records**: an unreadable file, a second name, a
+  path the journaling side no longer remembers (it keeps the last write
+  of each path for 60 s), or a history service too old to answer.
+  `agentfs.fuse.racy_rechecks{outcome}` counts skipped and recorded
+  outcomes.
 
-- **Not the latency of the call.** The second record is made at RELEASE,
-  after `close` has returned (design §3.1), so the per-close numbers
-  above do not include it.
-- **The daemon's work and the disk's.** Each duplicate is a second freeze
-  and a second journal `fsync`. For small files that doubles the
-  `fsync`s; for a 1 GiB file on ext4 it is a second 1 GiB copy (about
-  5 s) and a second 1 GiB file in `pending/` until the commit.
-- **Commit catch-up.** The commit loop hashes and compresses the content
-  twice, so the catch-up after bulk creation or a large file is about
-  twice what one record per file would take. The catch-up budget below
-  includes it. The duplicate changes nothing in the tree, so it adds no
-  commit.
-
-Why it is not simply skipped: RELEASE is the backstop for writes through a
-shared memory mapping (design §3.1), which reach the file without the
-daemon seeing them and can follow the FLUSH within the same clock tick.
-Such a write leaves the stamp unchanged; only the racy rule records it.
-Skipping the RELEASE record would lose it.
-
-Follow-up (design §19.2 item 4): skip the duplicate when RELEASE can
-show that nothing changed since the FLUSH freeze, for example by
-comparing the file with its frozen copy while that copy is still in
-`pending/` (cheap for small files, and with a reflink often by extent),
-or by waiting out the window at FLUSH for files above a size where a few
-milliseconds of latency are cheaper than a second freeze. The benchmark
-checks the record counts of close4k and create lie between one and two
-per boundary, so a fix shows as a drop to one, and a regression past two
-fails the job.
+The benchmark checks that close4k and create make one record per
+boundary (plus 1 % and 10 of slack for the sweep), so a regression to
+the double record fails the job.
 
 ## Performance budget
 
@@ -339,9 +328,9 @@ directory (default `./bench-out`).
 - *Commit catch-up*: from the end of the workload until `agentfs status`
   shows an empty backlog.
 - *Records*: how far the committed journal sequence (`Agentfs-Seq` of the
-  branch head) moved: the records journaled during the workload,
-  including the RELEASE duplicates of [Known costs](#known-costs). A
-  last record whose commit would change nothing (such as a duplicate
-  committed on its own) leaves no commit and does not move the sequence,
+  branch head) moved: the records journaled during the workload (before
+  2026-10-13, including the RELEASE duplicates of
+  [Known costs](#known-costs)). A last record whose commit would change
+  nothing (such as a duplicate committed on its own) leaves no commit and does not move the sequence,
   so this can be a little lower than the records journaled.
 - *Commits*: commits added to the branch.

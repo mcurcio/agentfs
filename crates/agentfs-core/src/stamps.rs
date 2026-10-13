@@ -40,8 +40,13 @@
 //!
 //! Entries count for [`HORIZON`]: far longer than any request may take,
 //! so a record frozen before an entry was dropped has long timed out.
+//!
+//! [`LastWrites`] is the other per-path memory of whoever journals: the
+//! frozen copy of the last write at each recently written path, which
+//! lets a RELEASE skip re-recording a file whose close was just recorded
+//! with the same bytes (design §3.1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Mutex, PoisonError};
@@ -50,6 +55,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::RepoPath;
+use crate::pending::PendingId;
 
 /// How long the book keeps a path's last stamp.
 pub const HORIZON: Duration = Duration::from_secs(300);
@@ -216,6 +222,117 @@ fn judge(last: &Entry, incoming: &FreezeStamp, slot: u16, now: Option<&FreezeSta
     }
 }
 
+/// How long [`LastWrites`] remembers a path's last frozen copy: RELEASE
+/// follows the last close at once, so far longer than it ever waits.
+pub const LAST_WRITE_HORIZON: Duration = Duration::from_secs(60);
+
+/// The most paths [`LastWrites`] holds; past it, it forgets everything
+/// (a forgotten path only costs one record more).
+const LAST_WRITE_CAP: usize = 1 << 16;
+
+/// The frozen copy of the last change journaled at each recently written
+/// path (design §3.1): what lets RELEASE skip re-recording a file whose
+/// close was just recorded, when the bytes it holds are that copy's. Kept
+/// by whoever journals (a single-process daemon, or the history service
+/// for its fronts); any later change at the path, or above or below it,
+/// forgets it, so [`LastWrites::is_last`] is true only while the path's
+/// last journaled state is that copy. Forgetting is always safe: the
+/// caller then records again.
+#[derive(Default)]
+pub struct LastWrites {
+    inner: Mutex<LastInner>,
+}
+
+#[derive(Default)]
+struct LastInner {
+    last: BTreeMap<RepoPath, (PendingId, Instant)>,
+    pruned: Option<Instant>,
+}
+
+impl LastWrites {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A change at `path` was journaled: `Some(copy)` for a write of that
+    /// frozen copy, `None` for anything else (a symlink, a removal).
+    /// Entries above and below `path` are forgotten: their paths changed
+    /// too.
+    pub fn journaled(&self, path: &RepoPath, copy: Option<PendingId>) {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.prune(now);
+        inner.forget_around(path);
+        if let Some(copy) = copy {
+            inner.last.insert(path.clone(), (copy, now));
+        }
+    }
+
+    /// Whether the last change journaled at `path` is the write of `copy`.
+    pub fn is_last(&self, path: &RepoPath, copy: PendingId) -> bool {
+        self.lock()
+            .last
+            .get(path)
+            .is_some_and(|(c, at)| *c == copy && at.elapsed() < LAST_WRITE_HORIZON)
+    }
+
+    /// How many paths are held (for tests).
+    pub fn len(&self) -> usize {
+        self.lock().last.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LastInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl LastInner {
+    fn prune(&mut self, now: Instant) {
+        if self
+            .pruned
+            .is_none_or(|p| now.duration_since(p) >= PRUNE_EVERY)
+        {
+            self.last
+                .retain(|_, (_, at)| now.duration_since(*at) < LAST_WRITE_HORIZON);
+            self.pruned = Some(now);
+        }
+        if self.last.len() >= LAST_WRITE_CAP {
+            self.last.clear();
+        }
+    }
+
+    /// Forgets `path`, its ancestors and everything below it.
+    pub(crate) fn forget_around(&mut self, path: &RepoPath) {
+        let s = path.as_str();
+        self.last.remove(path);
+        for (i, b) in s.bytes().enumerate() {
+            if b == b'/'
+                && let Ok(ancestor) = RepoPath::new(&s[..i])
+            {
+                self.last.remove(&ancestor);
+            }
+        }
+        let below: Vec<RepoPath> = self
+            .last
+            .range((
+                std::ops::Bound::Excluded(path.clone()),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(p, _)| p)
+            .take_while(|p| p.as_str().starts_with(s))
+            .filter(|p| p.as_str().as_bytes().get(s.len()) == Some(&b'/'))
+            .cloned()
+            .collect();
+        for p in below {
+            self.last.remove(&p);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +496,36 @@ mod tests {
         assert!(s.ctime_ns > 0 && s.mtime_ns > 0);
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<FreezeStamp>(&json).unwrap(), s);
+    }
+
+    #[test]
+    fn last_writes_forget_any_later_change_around_a_path() {
+        let last = LastWrites::new();
+        let p = |s: &str| RepoPath::new(s).unwrap();
+        let (a, b, c) = (PendingId(1), PendingId(2), PendingId(3));
+        last.journaled(&p("d/f"), Some(a));
+        assert!(last.is_last(&p("d/f"), a));
+        assert!(!last.is_last(&p("d/f"), b), "another copy");
+        assert!(!last.is_last(&p("d/g"), a), "another path");
+        // A later write of the path replaces it.
+        last.journaled(&p("d/f"), Some(b));
+        assert!(!last.is_last(&p("d/f"), a));
+        assert!(last.is_last(&p("d/f"), b));
+        // A removal forgets it.
+        last.journaled(&p("d/f"), None);
+        assert!(!last.is_last(&p("d/f"), b));
+        // A change of an ancestor forgets everything below it, but not
+        // siblings that only share a prefix.
+        last.journaled(&p("d/f"), Some(a));
+        last.journaled(&p("d-x"), Some(c));
+        last.journaled(&p("d"), None);
+        assert!(!last.is_last(&p("d/f"), a));
+        assert!(last.is_last(&p("d-x"), c));
+        // A change below a path forgets the path.
+        last.journaled(&p("e"), Some(a));
+        last.journaled(&p("e/f"), Some(b));
+        assert!(!last.is_last(&p("e"), a));
+        assert!(last.is_last(&p("e/f"), b));
+        assert_eq!(last.len(), 2);
     }
 }

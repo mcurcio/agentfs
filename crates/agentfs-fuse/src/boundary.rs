@@ -40,7 +40,7 @@ use agentfs_core::fsync_class::GroupMembers;
 use agentfs_core::nested;
 use agentfs_core::paths::PathError;
 use agentfs_core::record::{Caller, Origin, Trigger};
-use agentfs_core::volume::{Input, Recorder, VolumeError};
+use agentfs_core::volume::{Input, Recorded, Recorder, VolumeError};
 
 use crate::names::{Class, classify};
 
@@ -179,20 +179,20 @@ impl Boundary {
         &self.recorder
     }
 
-    /// Records `changes` as one record. Returns whether anything was
-    /// journaled; an error means nothing was (and `RecordFailed` was
-    /// raised).
+    /// Records `changes` as one record. Returns what was journaled (its
+    /// `seq` is `None` if nothing was); an error means nothing was (and
+    /// `RecordFailed` was raised).
     pub fn record(
         &self,
         trigger: Trigger,
         caller: Caller,
         changes: Vec<Change>,
-    ) -> Result<bool, VolumeError> {
+    ) -> Result<Recorded, VolumeError> {
         let inputs = self.inputs(changes);
         if inputs.is_empty() {
-            return Ok(false);
+            return Ok(Recorded::default());
         }
-        Ok(self.recorder.record(trigger, caller, inputs)?.seq.is_some())
+        self.recorder.record(trigger, caller, inputs)
     }
 
     /// Records `changes` like [`Boundary::record`], as the pod `origin`
@@ -205,7 +205,7 @@ impl Boundary {
         origin: Option<&Origin>,
     ) -> Result<bool, VolumeError> {
         let Some(origin) = origin else {
-            return self.record(trigger, caller, changes);
+            return Ok(self.record(trigger, caller, changes)?.seq.is_some());
         };
         let inputs = self.inputs(changes);
         if inputs.is_empty() {

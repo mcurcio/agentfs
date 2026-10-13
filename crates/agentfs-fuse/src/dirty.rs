@@ -13,10 +13,19 @@
 //! closes that gap: when the last record's stamp is within the clock's
 //! granularity of the record time, a write could have followed the freeze
 //! without moving the stamp, so the next FLUSH or RELEASE records regardless.
-//! RELEASE follows the last close at once, so a file written and closed
-//! within the window is recorded twice (design §19.2 item 4): RELEASE is
-//! the only backstop for a same-tick write through a shared mapping.
+//! RELEASE follows the last close at once, and is the only backstop for a
+//! same-tick write through a shared mapping, so a file written and closed
+//! within the window would be recorded twice. Instead, a racy record pins
+//! its frozen copy ([`FrozenRef`]); a boundary that would record again only
+//! because of the racy rule compares the file's bytes with that copy, and
+//! skips the record if they are equal and the copy is still the last state
+//! journaled at the path ([`DirtyState::racy_only`], design §3.1).
 
+use std::fs::File;
+use std::sync::Arc;
+
+use agentfs_core::paths::RepoPath;
+use agentfs_core::pending::PendingId;
 use agentfs_core::record::Caller;
 use rustix::fs::Stat;
 
@@ -37,8 +46,8 @@ impl Stamp {
             dev: u64::from(st.st_dev),
             ino: u64::from(st.st_ino),
             size: i64::from(st.st_size),
-            mtime_ns: nanos(i64::from(st.st_mtime), u64::from(st.st_mtime_nsec)),
-            ctime_ns: nanos(i64::from(st.st_ctime), u64::from(st.st_ctime_nsec)),
+            mtime_ns: coarse(nanos(i64::from(st.st_mtime), u64::from(st.st_mtime_nsec))),
+            ctime_ns: coarse(nanos(i64::from(st.st_ctime), u64::from(st.st_ctime_nsec))),
             mode: u32::from(st.st_mode),
         }
     }
@@ -51,6 +60,27 @@ impl Stamp {
 
 fn nanos(secs: i64, nsecs: u64) -> i128 {
     i128::from(secs) * 1_000_000_000 + i128::from(nsecs)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A coarser timestamp clock for this thread's stamps (tests only): every
+    /// change within one tick of it leaves the stamp unchanged, as the
+    /// kernel's coarse clock does to writes within one of its ticks.
+    pub static TEST_TICK_NS: std::cell::Cell<i128> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn coarse(ns: i128) -> i128 {
+    match TEST_TICK_NS.with(std::cell::Cell::get) {
+        0 => ns,
+        tick => ns - ns.rem_euclid(tick),
+    }
+}
+
+#[cfg(not(test))]
+fn coarse(ns: i128) -> i128 {
+    ns
 }
 
 /// One inode's recording state.
@@ -72,7 +102,29 @@ pub struct DirtyState {
     /// the author of late records (RELEASE, sweep), whose requests carry no
     /// useful caller.
     pub last_writer: Option<Caller>,
+    /// The frozen copy of the last record, pinned open while that record
+    /// is racy (design §3.1).
+    pub frozen: Option<FrozenRef>,
 }
+
+/// The frozen copy a racy record journaled, held open so it outlives its
+/// removal at commit.
+#[derive(Debug, Clone)]
+pub struct FrozenRef {
+    /// The one name it was recorded at, as the boundary named it.
+    pub name: Vec<u8>,
+    pub path: RepoPath,
+    pub copy: PendingId,
+    pub file: Arc<File>,
+}
+
+impl PartialEq for FrozenRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.copy == other.copy && self.name == other.name
+    }
+}
+
+impl Eq for FrozenRef {}
 
 impl DirtyState {
     /// Something may change the inode from now on (a write-open, a write,
@@ -106,6 +158,35 @@ impl DirtyState {
         self.force = false;
         self.racy = now_ns - stamp.changed_ns() < granularity_ns;
     }
+
+    /// Whether a boundary that [`DirtyState::needs_record`] needs it only
+    /// because of the racy-timestamp rule: the stamp is the last record's,
+    /// nothing forces a record. Only then may the record be skipped when
+    /// the bytes are proven to be the pinned copy's (design §3.1).
+    pub fn racy_only(&self, current: &Stamp) -> bool {
+        self.armed && !self.force && self.racy && self.baseline.as_ref() == Some(current)
+    }
+}
+
+/// Whether the first `len` bytes of `a` and `b` are equal, and neither
+/// ends early.
+pub fn same_bytes(a: &File, b: &File, len: u64) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    const CHUNK: usize = 1 << 20;
+    let mut x = vec![0u8; CHUNK.min(len as usize).max(1)];
+    let mut y = vec![0u8; x.len()];
+    let mut at = 0u64;
+    while at < len {
+        let want = x.len().min((len - at) as usize);
+        let (xs, ys) = (&mut x[..want], &mut y[..want]);
+        a.read_exact_at(xs, at)?;
+        b.read_exact_at(ys, at)?;
+        if xs != ys {
+            return Ok(false);
+        }
+        at += want as u64;
+    }
+    Ok(true)
 }
 
 /// Twice the resolution of the coarse realtime clock, which is what file
@@ -213,6 +294,42 @@ mod tests {
         d.after_record(s, 2_000_000_000, GRAN);
         assert!(!d.force);
         assert!(!d.needs_record(&s));
+    }
+
+    #[test]
+    fn racy_only_needs_racy_unforced_and_unchanged() {
+        let mut d = DirtyState::default();
+        d.arm(W);
+        let s = stamp(3, 1_000_000_000);
+        d.after_record(s, 1_001_000_000, GRAN);
+        assert!(d.racy_only(&s));
+        assert!(!d.racy_only(&stamp(4, 1_000_000_000)), "changed");
+        d.force = true;
+        assert!(!d.racy_only(&s), "forced");
+        d.force = false;
+        d.after_record(s, 2_000_000_000, GRAN);
+        assert!(!d.racy_only(&s), "not racy");
+    }
+
+    #[test]
+    fn same_bytes_compares_every_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, data: &[u8]| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, data).unwrap();
+            File::open(p).unwrap()
+        };
+        let big: Vec<u8> = (0..(3 << 20) + 7).map(|i| (i % 251) as u8).collect();
+        let mut other = big.clone();
+        *other.last_mut().unwrap() ^= 1;
+        let (a, b, c) = (write("a", &big), write("b", &big), write("c", &other));
+        let len = big.len() as u64;
+        assert!(same_bytes(&a, &b, len).unwrap());
+        assert!(!same_bytes(&a, &c, len).unwrap(), "the last byte differs");
+        assert!(same_bytes(&a, &c, len - 1).unwrap());
+        assert!(same_bytes(&a, &b, 0).unwrap());
+        let short = write("d", &big[..10]);
+        assert!(same_bytes(&a, &short, len).is_err(), "ends early");
     }
 
     #[test]

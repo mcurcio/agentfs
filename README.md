@@ -211,10 +211,9 @@ host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
 resumable transfers, proxy settings or pruning. Restoring a database needs
 its workload stopped
 ([runbook](docs/runbooks/recovery-and-undo.md#7-restoring-a-database)).
-A file written and closed at once is recorded twice, at the close and
-again when its last reference goes (the racy-timestamp rule): the close
-is not slower, but bulk writes take twice the journal records, frozen
-copies and commit work
+A file written and closed at once is recorded once: when its last
+reference goes, the racy-timestamp rule compares it with the copy its
+close froze rather than recording it again
 ([known costs](docs/performance.md#known-costs)).
 
 
@@ -470,6 +469,7 @@ Metrics (design §13):
 | `agentfs.history_service.superseded` | counter | |
 | `agentfs.history_service.resyncs` | counter | |
 | `agentfs.fuse.create_as_caller_fallbacks` | counter | |
+| `agentfs.fuse.racy_rechecks` | counter | `outcome` |
 
 Spans are `agentfs.record`, `agentfs.commit` and `agentfs.push`, carrying
 journal sequence numbers and commit ids. Every alarm is also a log record

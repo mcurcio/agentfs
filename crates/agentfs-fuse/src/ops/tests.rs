@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -287,31 +287,120 @@ fn same_size_rewrites_are_caught_by_the_racy_rule() {
     }
 }
 
-/// The known cost of design §3.1 and §19.2 item 4 (docs/performance.md,
-/// "Known costs"): a file written and closed within the racy-timestamp
-/// window is recorded at FLUSH and again at RELEASE, since RELEASE cannot
-/// tell a same-tick write through a shared mapping from no change. The
-/// window is made huge here so the test does not depend on timing; the
-/// benchmark bounds the same count (between one and two records per
-/// boundary). A fix that skips the duplicate safely changes the second
-/// assertion to 1.
-#[test]
-fn a_racy_close_is_recorded_again_at_release() {
-    let fx = Fx::with(OpsConfig {
-        granularity_ns: 3_600 * 1_000_000_000,
+/// A fixture whose file timestamps (this thread's stamps) and racy window
+/// are both far coarser than the test: every record is racy, and a write
+/// of the same size leaves the stamp unchanged, as a write within one tick
+/// of the kernel's coarse clock does (design §3.1).
+fn coarse_clock() -> Fx {
+    const TICK: i128 = 1_000_000 * 1_000_000_000;
+    crate::dirty::TEST_TICK_NS.with(|t| t.set(TICK));
+    Fx::with(OpsConfig {
+        granularity_ns: 2 * TICK,
         chunk: RENAME_CHUNK,
-    });
+    })
+}
+
+/// Writes `content` over the backing file at `path` behind the daemon's
+/// back, as a write through a shared mapping does.
+fn write_behind(fx: &Fx, path: &str, content: &str) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(fx.backing().join(path))
+        .unwrap()
+        .write_all_at(content.as_bytes(), 0)
+        .unwrap();
+}
+
+/// Design §3.1 and §19.2 item 4: a file written and closed within the
+/// racy-timestamp window is recorded once. RELEASE finds its stamp
+/// unchanged but racy, compares its bytes with the copy FLUSH froze, and
+/// skips the record since they are equal and that copy is still the last
+/// state journaled at the path.
+#[test]
+fn a_racy_close_is_not_recorded_again_at_release() {
+    let fx = coarse_clock();
     let (_, fh) = fx.create("a");
     fx.ops.write(fh, 0, b"hello", C).unwrap();
     fx.ops.flush(fh, C).unwrap();
     assert_eq!(fx.backlog(), 1, "flush records the close");
     fx.ops.release(fh).unwrap();
-    assert_eq!(fx.backlog(), 2, "release records the racy stamp again");
-    // The duplicate changes nothing in the tree.
+    assert_eq!(fx.backlog(), 1, "release proves the bytes recorded");
     assert_eq!(fx.history(), map(&[("a", file("hello"))]));
+}
 
-    // Outside the window (as after a long fsync) release adds nothing:
-    // `create_write_close_records_once` with granularity 0.
+/// The race the RELEASE record is for: a write in the same tick as the
+/// close's record (through a shared mapping) leaves the stamp unchanged;
+/// the bytes differ from the frozen copy, so RELEASE records them.
+#[test]
+fn a_same_tick_write_after_a_racy_close_is_recorded_at_release() {
+    let fx = coarse_clock();
+    let (_, fh) = fx.create("a");
+    fx.ops.write(fh, 0, b"hello", C).unwrap();
+    fx.ops.flush(fh, C).unwrap();
+    let before = fs::metadata(fx.backing().join("a")).unwrap();
+    write_behind(&fx, "a", "jello");
+    let after = fs::metadata(fx.backing().join("a")).unwrap();
+    assert_eq!(before.size(), after.size());
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.backlog(), 2, "the same-tick write is recorded");
+    assert_eq!(fx.history(), map(&[("a", file("jello"))]));
+}
+
+/// The same, with a close in between: a second FLUSH that finds the stamp
+/// unchanged but racy compares too.
+#[test]
+fn a_same_tick_write_is_recorded_at_the_next_close() {
+    let fx = coarse_clock();
+    let (_, fh) = fx.create("a");
+    fx.ops.write(fh, 0, b"hello", C).unwrap();
+    fx.ops.flush(fh, C).unwrap();
+    fx.ops.flush(fh, C).unwrap();
+    assert_eq!(fx.backlog(), 1, "an unchanged racy close records nothing");
+    write_behind(&fx, "a", "jello");
+    fx.ops.flush(fh, C).unwrap();
+    assert_eq!(fx.backlog(), 2);
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.backlog(), 2);
+    assert_eq!(fx.history(), map(&[("a", file("jello"))]));
+}
+
+/// A later record of the path by anything else (here the sweep's repair,
+/// which freezes its own copy) means the pinned copy is no longer the last
+/// state journaled: the next boundary (here the same sweep's check of the
+/// open file) records, so history ends on the file's bytes whatever the
+/// order of the two. That record pins its own copy, so RELEASE skips.
+#[test]
+fn release_records_when_the_pinned_copy_is_no_longer_last() {
+    let fx = coarse_clock();
+    let (_, fh) = fx.create("a");
+    fx.ops.write(fh, 0, b"hello", C).unwrap();
+    fx.ops.flush(fh, C).unwrap();
+    fx.ops.boundary().queue_repair([b"a".to_vec()], C);
+    fx.ops.sweep(false);
+    assert_eq!(fx.backlog(), 3, "the repair, then the open file again");
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.backlog(), 3, "the sweep's copy is the last");
+    assert_eq!(fx.history(), map(&[("a", file("hello"))]));
+}
+
+/// The pinned copy outlives its removal by a commit in between.
+#[test]
+fn a_commit_between_close_and_release_does_not_lose_the_pin() {
+    let fx = coarse_clock();
+    let (_, fh) = fx.create("a");
+    fx.ops.write(fh, 0, b"hello", C).unwrap();
+    fx.ops.flush(fh, C).unwrap();
+    assert_eq!(fx.history(), map(&[("a", file("hello"))]));
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.backlog(), 0, "nothing recorded again");
+    // And a same-tick write after a commit is still caught.
+    let fh = fx.open("a", O_WRONLY);
+    fx.ops.write(fh, 0, b"hallo", C).unwrap();
+    fx.ops.flush(fh, C).unwrap();
+    fx.history();
+    write_behind(&fx, "a", "jallo");
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.history(), map(&[("a", file("jallo"))]));
 }
 
 #[test]

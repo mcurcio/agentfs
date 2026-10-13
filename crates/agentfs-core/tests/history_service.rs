@@ -1229,6 +1229,54 @@ fn ping_measures_a_round_trip() {
     assert_eq!(client.address(), &env.address);
 }
 
+#[test]
+fn the_service_says_whether_a_fronts_copy_is_still_last() {
+    // A front's RELEASE skips re-recording a racy close only while the
+    // copy it froze is the last state the service journaled at the path
+    // (design §3.1).
+    let env = env();
+    let _service = Service::start(&env);
+    let a = front(&env, "a");
+    let b = front(&env, "b");
+    let client = a.recorder.history_client().unwrap();
+    assert!(client.supports("still_last"));
+    let recorded = a
+        .recorder
+        .record(Trigger::Close, CALLER, vec![write(&env, "f", "one")])
+        .unwrap();
+    let [(path, copy)] = recorded.written.as_slice() else {
+        panic!("one write: {recorded:?}");
+    };
+    assert_eq!(path.as_str(), "f");
+    assert!(a.recorder.still_last(path, *copy));
+    assert!(!a.recorder.still_last(&RepoPath::new("g").unwrap(), *copy));
+    // A frozen copy that is no longer pending can still be read while open.
+    let pinned = a.recorder.open_copy(*copy).unwrap();
+    // Another front's later write of the path: no longer last.
+    std::thread::sleep(TICK);
+    close(&env, &b.recorder, "f", "two").unwrap();
+    assert!(!a.recorder.still_last(path, *copy));
+    assert_eq!(pinned.metadata().unwrap().len(), 3);
+    // Nor after a removal of a parent's subtree.
+    let recorded = a
+        .recorder
+        .record(Trigger::Close, CALLER, vec![write(&env, "d/f", "x")])
+        .unwrap();
+    let (path, copy) = recorded.written[0].clone();
+    assert!(a.recorder.still_last(&path, copy));
+    std::fs::remove_dir_all(env.tree.join("d")).unwrap();
+    b.recorder
+        .record(
+            Trigger::Unlink,
+            CALLER,
+            vec![Input::Remove {
+                path: RepoPath::new("d").unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(!a.recorder.still_last(&path, copy));
+}
+
 fn percentiles(mut samples: Vec<Duration>) -> String {
     samples.sort();
     let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize].as_secs_f64() * 1e6;

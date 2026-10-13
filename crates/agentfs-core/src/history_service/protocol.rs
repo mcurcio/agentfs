@@ -16,6 +16,10 @@
 //!      with the front's origin, and answers `Recorded` only once it is
 //!      durable.
 //!    - `Ping`: liveness and round-trip time.
+//!    - `StillLast{path, copy}`: whether the last change journaled at
+//!      `path` is still the write of the front's frozen copy `copy`, so a
+//!      RELEASE may skip re-recording it (design §3.1). Answered from
+//!      memory, no fsync. Feature `still_last`.
 //!    - `Listen`: turns the connection around (answered `Listening`): from
 //!      then on the *service* sends [`FrontCall`]s and the front answers
 //!      each with a [`FrontAnswer`] of the same id. A front keeps one such
@@ -39,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::checks::Refusal;
 use crate::nested::NestedKind;
 use crate::paths::RepoPath;
+use crate::pending::PendingId;
 use crate::record::{Draft, Origin};
 use crate::rules::{RuleSource, SkipReason};
 use crate::stamps::FreezeStamp;
@@ -52,8 +57,9 @@ pub const MAX_FRAME: usize = 64 << 20;
 /// What this build's service supports beyond protocol 1 as first released:
 /// `stamps` (freeze stamps on records, design §14.1), `repair_origin`
 /// (a repair's own origin on a sweep record, design §14.1) and `listen`
-/// ([`Request::Listen`], design §15).
-pub const FEATURES: &[&str] = &["stamps", "repair_origin", "listen"];
+/// ([`Request::Listen`], design §15) and `still_last`
+/// ([`Request::StillLast`], design §3.1).
+pub const FEATURES: &[&str] = &["stamps", "repair_origin", "listen", "still_last"];
 
 /// The first frame on a connection, from the front.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +101,11 @@ pub enum Request {
     Ping,
     /// Turns the connection around for [`FrontCall`]s.
     Listen,
+    /// Whether the last change journaled at `path` is the write of `copy`.
+    StillLast {
+        path: RepoPath,
+        copy: PendingId,
+    },
 }
 
 /// A write's freeze stamp.
@@ -124,6 +135,10 @@ pub enum Reply {
         skipped: Vec<WireSkip>,
     },
     Pong,
+    /// The answer to [`Request::StillLast`].
+    StillLast {
+        last: bool,
+    },
     /// The answer to [`Request::Listen`]: the service sends calls now.
     Listening,
     /// The service will not serve this front; the connection is closed.

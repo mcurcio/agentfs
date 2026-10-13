@@ -525,12 +525,6 @@ alert on `agentfs.patch.blocked`. See
   file costs a copy on ext4 (2.9 s per clean GiB; 3 ms on XFS): put the
   backing volume on XFS when files are large, and keep bulk trees such as
   `node_modules/` off the mount. See [performance.md](performance.md).
-- A file written and closed at once is recorded twice (at the close and
-  again at RELEASE), which doubles the journal records, frozen copies and
-  commit work of bulk writes, though not the close's latency: about
-  200,000 records for 100,000 new files, and a 1 GiB file just written
-  frozen and committed twice. See
-  [performance.md](performance.md#known-costs).
 - A hung daemon is not detected, and passthrough descriptors opened
   before a crash write unrecorded until closed (§7).
 - A `subPath` consumer that runs as root with `CAP_DAC_OVERRIDE`,
