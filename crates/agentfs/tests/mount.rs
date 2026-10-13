@@ -2453,9 +2453,10 @@ fn a_close_is_recorded_once() {
         want.push((format!("f{i}"), f(&format!("content {i}"))));
     }
     let m = v.mount(&[]);
-    // `dd` opens, writes and closes once: one FLUSH, one RELEASE.
+    // `tee` opens with O_TRUNC, writes and closes once: one FLUSH, one
+    // RELEASE. (`dd` truncates with ftruncate, a record of its own.)
     v.sh(&format!(
-        "for i in $(seq 0 19); do dd if={}/f$i of=f$i status=none; done",
+        "for i in $(seq 0 19); do tee f$i < {}/f$i > /dev/null; done",
         src.display()
     ));
     // Every RELEASE has arrived (they follow the closes asynchronously).
