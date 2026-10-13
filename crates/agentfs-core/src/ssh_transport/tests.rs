@@ -60,6 +60,17 @@ impl TestServer {
     /// A server on 127.0.0.1 with host key `host`, accepting `authorized`
     /// for user `git`.
     fn start(host: PrivateKey, authorized: Vec<PublicKey>, mode: Mode) -> Self {
+        Self::start_with_certificates(host, Vec::new(), authorized, mode)
+    }
+
+    /// [`TestServer::start`], also presenting host `certificates` to
+    /// clients that ask for them.
+    fn start_with_certificates(
+        host: PrivateKey,
+        certificates: Vec<Certificate>,
+        authorized: Vec<PublicKey>,
+        mode: Mode,
+    ) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -68,6 +79,7 @@ impl TestServer {
         let host_key = host.public_key().clone();
         let config = Arc::new(server::Config {
             keys: vec![host],
+            certificates,
             methods: MethodSet::from(&[MethodKind::PublicKey][..]),
             auth_rejection_time: Duration::from_millis(1),
             auth_rejection_time_initial: Some(Duration::from_millis(1)),
@@ -299,6 +311,8 @@ impl Fixture {
             lfs_url: None,
             lfs_push_url: None,
             lfs_credentials: None,
+            ssh_agent: None,
+            ssh_key_passphrase: None,
         }
     }
 
@@ -590,4 +604,323 @@ fn the_patch_queue_fetches_its_inbox_over_ssh() {
         Some(PushFailureKind::UntrustedHost),
         "{outcome:?}"
     );
+}
+
+/// Test-only randomness for key encryption: a counter, not random.
+struct CounterRng(u64);
+
+impl russh::keys::ssh_key::rand_core::TryRng for CounterRng {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        self.try_next_u64().map(|v| v as u32)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+        Ok(self.0)
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        for b in dst {
+            *b = self.try_next_u64()? as u8;
+        }
+        Ok(())
+    }
+}
+
+impl russh::keys::ssh_key::rand_core::TryCryptoRng for CounterRng {}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A host certificate of `host`'s key for `principal`, signed by `ca`.
+fn host_cert(
+    host: &PrivateKey,
+    ca: &PrivateKey,
+    principal: &str,
+    after: u64,
+    before: u64,
+) -> Certificate {
+    use russh::keys::ssh_key::certificate::{Builder, CertType};
+    let mut builder = Builder::new(
+        [7u8; 16].to_vec(),
+        host.public_key().key_data().clone(),
+        after,
+        before,
+    )
+    .unwrap();
+    builder.cert_type(CertType::Host).unwrap();
+    builder.key_id("test host").unwrap();
+    builder.valid_principal(principal).unwrap();
+    builder.sign(ca).unwrap()
+}
+
+#[test]
+fn host_certificates_are_checked_against_cert_authorities() {
+    let f = Fixture::new();
+    let client = ed25519(1);
+    let (host, ca, other_ca) = (ed25519(9), ed25519(20), ed25519(21));
+    let ca_line = |ca: &PrivateKey, port: u16| {
+        format!(
+            "@cert-authority [127.0.0.1]:{port} {}",
+            ca.public_key().to_openssh().unwrap()
+        )
+    };
+
+    // A valid certificate, with only the CA in known_hosts.
+    let server = TestServer::start_with_certificates(
+        host.clone(),
+        vec![host_cert(
+            &host,
+            &ca,
+            "127.0.0.1",
+            now() - 300,
+            now() + 7200,
+        )],
+        vec![client.public_key().clone()],
+        Mode::Git,
+    );
+    let settings = f.remote(&server.url(&f.served), &client, &ca_line(&ca, server.port));
+    let (result, state) = f.push(&settings);
+    result.unwrap();
+    assert!(state.host_key_failure().is_none());
+    assert_eq!(f.served_head(), Some(f.head));
+    // A CA from another line is unknown.
+    let settings = f.remote(
+        &server.url(&f.served),
+        &client,
+        &ca_line(&other_ca, server.port),
+    );
+    let (result, state) = f.push(&settings);
+    let err = result.unwrap_err();
+    assert_eq!(classify(&err, false), PushFailureKind::UntrustedHost);
+    let why = state.host_key_failure().unwrap();
+    assert!(why.contains("no @cert-authority line"), "{why}");
+    assert!(why.contains(&fingerprint(ca.public_key())), "{why}");
+    // A @revoked CA.
+    let revoked = format!(
+        "{}\n@revoked * {}\n",
+        ca_line(&ca, server.port),
+        ca.public_key().to_openssh().unwrap()
+    );
+    let settings = f.remote(&server.url(&f.served), &client, &revoked);
+    let (_, state) = f.push(&settings);
+    assert!(
+        state.host_key_failure().unwrap().contains("@revoked"),
+        "{:?}",
+        state.host_key_failure()
+    );
+    // A plain key line still works when the server has a certificate too.
+    let settings = f.remote(&server.url(&f.served), &client, &server.known_hosts_line());
+    f.push(&settings).0.unwrap();
+    assert_eq!(server.offered().len(), 2, "{:?}", server.offered());
+
+    // Expired, and for another host.
+    for (cert, says) in [
+        (
+            host_cert(&host, &ca, "127.0.0.1", now() - 7200, now() - 3600),
+            "expired",
+        ),
+        (
+            host_cert(&host, &ca, "otherhost", now() - 300, now() + 7200),
+            "is for otherhost, not 127.0.0.1",
+        ),
+    ] {
+        let server = TestServer::start_with_certificates(
+            host.clone(),
+            vec![cert],
+            vec![client.public_key().clone()],
+            Mode::Git,
+        );
+        let settings = f.remote(&server.url(&f.served), &client, &ca_line(&ca, server.port));
+        let (result, state) = f.push(&settings);
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Certificate, "{err}");
+        assert_eq!(classify(&err, false), PushFailureKind::UntrustedHost);
+        let why = state.host_key_failure().unwrap();
+        assert!(why.contains(says), "{why}");
+        assert!(why.contains("ssh-keygen -L -f"), "{why}");
+        assert!(server.offered().is_empty(), "{:?}", server.offered());
+    }
+}
+
+#[test]
+fn encrypted_keys_are_decrypted_with_their_passphrase() {
+    let f = Fixture::new();
+    let client = ed25519(1);
+    let server = TestServer::start(ed25519(9), vec![client.public_key().clone()], Mode::Git);
+    let mut settings = f.remote(&server.url(&f.served), &client, &server.known_hosts_line());
+    let key_path = settings.ssh_key.clone().unwrap();
+    let openssh = client
+        .encrypt(&mut CounterRng(1), "two words")
+        .unwrap()
+        .to_openssh(LineEnding::LF)
+        .unwrap()
+        .to_string();
+    let mut pkcs8 = Vec::new();
+    russh::keys::encode_pkcs8_pem_encrypted(&client, b"two words", 16, &mut pkcs8).unwrap();
+    let pass = f.dir.path().join("passphrase");
+    for text in [openssh.into_bytes(), pkcs8] {
+        fs::write(&key_path, &text).unwrap();
+        let offered = server.offered().len();
+        // Without a passphrase: refused before connecting.
+        settings.ssh_key_passphrase = None;
+        let (result, state) = f.push(&settings);
+        let err = result.unwrap_err();
+        assert!(state.auth_failed());
+        assert!(err.message().contains("agentfsSshKeyPassphrase"), "{err}");
+        // A wrong passphrase: refused before connecting.
+        fs::write(&pass, "wrong\n").unwrap();
+        settings.ssh_key_passphrase = Some(pass.clone());
+        let (result, state) = f.push(&settings);
+        let err = result.unwrap_err();
+        assert!(state.auth_failed());
+        assert_eq!(classify(&err, false), PushFailureKind::Auth);
+        assert!(err.message().contains("cannot decrypt"), "{err}");
+        assert_eq!(server.offered().len(), offered, "{:?}", server.offered());
+        // The right one.
+        fs::write(&pass, "two words\n").unwrap();
+        f.push(&settings).0.unwrap();
+    }
+    assert_eq!(f.served_head(), Some(f.head));
+    assert_eq!(
+        server.offered(),
+        [
+            fingerprint(client.public_key()),
+            fingerprint(client.public_key())
+        ]
+    );
+}
+
+/// An in-process ssh-agent on a Unix socket in `dir`, holding `keys`.
+struct TestAgent {
+    socket: PathBuf,
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+#[derive(Clone)]
+struct AllowAll;
+
+impl russh::keys::agent::server::Agent for AllowAll {}
+
+impl TestAgent {
+    fn start(dir: &Path, keys: &[PrivateKey]) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let socket = dir.join(format!("agent-{}.sock", keys.len()));
+        let _ = fs::remove_file(&socket);
+        let listener = {
+            let _guard = runtime.enter();
+            tokio::net::UnixListener::bind(&socket).unwrap()
+        };
+        let connections = futures::stream::unfold(listener, |listener| async move {
+            let accepted = listener.accept().await.map(|(stream, _)| stream);
+            Some((accepted, listener))
+        });
+        runtime.spawn(russh::keys::agent::server::serve(
+            Box::pin(connections),
+            AllowAll,
+        ));
+        let socket_path = socket.clone();
+        let keys = keys.to_vec();
+        runtime.block_on(async move {
+            let mut client = AgentClient::connect_uds(&socket_path).await.unwrap();
+            for key in &keys {
+                client.add_identity(key, &[]).await.unwrap();
+            }
+        });
+        Self {
+            socket,
+            runtime: Some(runtime),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+impl Drop for TestAgent {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[test]
+fn an_agent_offers_each_identity_once() {
+    let f = Fixture::new();
+    let (wrong, right) = (ed25519(2), ed25519(1));
+    let server = TestServer::start(ed25519(9), vec![right.public_key().clone()], Mode::Git);
+    let mut settings = f.remote(&server.url(&f.served), &right, &server.known_hosts_line());
+    settings.ssh_key = None;
+
+    // The identity the server authorizes is accepted.
+    let mut agent = TestAgent::start(f.dir.path(), &[wrong.clone(), right.clone()]);
+    settings.ssh_agent = Some(agent.socket.clone());
+    let (result, state) = f.push(&settings);
+    result.unwrap();
+    assert!(!state.auth_failed());
+    assert_eq!(f.served_head(), Some(f.head));
+    // The test agent keeps its keys in a hash map, so their order varies:
+    // offered once each, up to the accepted one.
+    let offered = server.offered();
+    assert_eq!(
+        offered.last(),
+        Some(&fingerprint(right.public_key())),
+        "{offered:?}"
+    );
+    let wrong_first = [
+        fingerprint(wrong.public_key()),
+        fingerprint(right.public_key()),
+    ];
+    assert!(
+        offered == wrong_first[1..] || offered == wrong_first,
+        "{offered:?}"
+    );
+    agent.stop();
+
+    // Only a refused identity: auth, naming what was offered.
+    let only_wrong = TestAgent::start(f.dir.path(), std::slice::from_ref(&wrong));
+    settings.ssh_agent = Some(only_wrong.socket.clone());
+    let (result, state) = f.push(&settings);
+    let err = result.unwrap_err();
+    assert!(state.auth_failed());
+    assert_eq!(classify(&err, false), PushFailureKind::Auth);
+    assert!(err.message().contains("rejected every identity"), "{err}");
+    assert!(
+        err.message().contains(&fingerprint(wrong.public_key())),
+        "{err}"
+    );
+
+    // An empty agent, and a dead socket: auth, naming the socket.
+    let empty = TestAgent::start(f.dir.path(), &[]);
+    let dead = f.dir.path().join("dead.sock");
+    for (socket, says) in [
+        (empty.socket.clone(), "holds no identity"),
+        (dead.clone(), "ssh-agent at"),
+    ] {
+        settings.ssh_agent = Some(socket.clone());
+        let before = server.offered().len();
+        let (result, state) = f.push(&settings);
+        let err = result.unwrap_err();
+        assert!(state.auth_failed());
+        assert_eq!(classify(&err, false), PushFailureKind::Auth);
+        assert!(err.message().contains(says), "{err}");
+        assert!(
+            err.message().contains(&socket.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(server.offered().len(), before);
+    }
 }

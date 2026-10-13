@@ -701,7 +701,8 @@ that operator rules always apply:
 
 [remote "backup"]               # an SSH remote (§11.1)
     url = ssh://git@git.example.com/acme/agent-history.git
-    agentfsSshKey = /run/secrets/agentfs/backup/ssh-privatekey   # required for SSH
+    agentfsSshKey = /run/secrets/agentfs/backup/ssh-privatekey   # this or agentfsSshAgent
+    agentfsSshKeyPassphrase = /run/secrets/agentfs/backup/passphrase   # if the key is encrypted
     agentfsKnownHosts = /run/secrets/agentfs/backup/known_hosts  # required for SSH
 ```
 
@@ -1439,13 +1440,16 @@ agentfs does not scan content for secrets and does not hold pushes.
   left out (never pushed, and its limit does not apply) when:
   - its name is not a valid agentfs name (§11.4, e.g. `team/backup`, which
     git accepts);
-  - `agentfsCredentials`, `agentfsSshKey` or `agentfsKnownHosts` is not an
-    absolute path, or `agentfsMaxBlobSize` or `agentfsMaxPushSize` is not a
+  - `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`,
+    `agentfsSshAgent` or `agentfsKnownHosts` is not an absolute path, or `agentfsMaxBlobSize` or `agentfsMaxPushSize` is not a
     positive size;
-  - its push URL is SSH and `agentfsSshKey` or `agentfsKnownHosts` is
-    missing, `agentfsCredentials` is set, the URL carries a password, or
+  - its push URL is SSH and `agentfsKnownHosts` is missing, not exactly
+    one of `agentfsSshKey` and `agentfsSshAgent` is set,
+    `agentfsSshKeyPassphrase` is set without `agentfsSshKey`,
+    `agentfsCredentials` is set, the URL carries a password, or
     the URL has no host or a bad port;
-  - its push URL is not SSH and `agentfsSshKey` or `agentfsKnownHosts` is
+  - its push URL is not SSH and `agentfsSshKey`,
+    `agentfsSshKeyPassphrase`, `agentfsSshAgent` or `agentfsKnownHosts` is
     set;
   - its push URL is SSH and the binary was built without the `ssh` cargo
     feature;
@@ -1494,15 +1498,37 @@ agentfs does not scan content for secrets and does not hold pushes.
   transport through a scope held on the pushing thread around each push
   or fetch; a connection with no scope, or to another host or port than
   the push URL's, fails closed.
-  - `remote.<name>.agentfsSshKey` is an absolute path to an unencrypted
-    private key, OpenSSH (`BEGIN OPENSSH PRIVATE KEY`) or PEM (`RSA`, `EC`,
-    PKCS#8; not DSA), decoded by agentfs, so no public key file is needed.
-    Encrypted keys and `.pub` files are refused with an `auth` failure
-    that says why. There is no ssh-agent and no passphrase support. The key
-    is read and decoded before connecting: a key that cannot be is an
-    `auth` failure with nothing sent. It is offered once per connection;
-    a refusal is an `auth` failure naming its SHA256 fingerprint and the
+  - An SSH remote authenticates with exactly one of a key file and an
+    ssh-agent (2026-10).
+  - `remote.<name>.agentfsSshKey` is an absolute path to a private key,
+    OpenSSH (`BEGIN OPENSSH PRIVATE KEY`) or PEM (`RSA`, `EC`, PKCS#8; not
+    DSA), decoded by agentfs, so no public key file is needed. `.pub`
+    files are refused with an `auth` failure that says why. The key is
+    read and decoded before connecting: a key that cannot be is an `auth`
+    failure with nothing sent. It is offered once per connection; a
+    refusal is an `auth` failure naming its SHA256 fingerprint and the
     user.
+  - An encrypted key (OpenSSH, PKCS#8 `ENCRYPTED PRIVATE KEY`, or legacy
+    RSA PEM with AES-128-CBC, the formats russh decrypts) needs
+    `remote.<name>.agentfsSshKeyPassphrase`, an absolute path to a file
+    holding the passphrase (one trailing newline dropped; 64 KiB at most;
+    bound to the push URL's host and port like the key; re-read when it
+    changes). It is decrypted before connecting: no passphrase file, or a
+    wrong passphrase ("cannot decrypt <key> with <file>"), is an `auth`
+    failure and the key is never offered. A passphrase file set for an
+    unencrypted key is not read. Other legacy PEM encryption is refused
+    with a hint to rewrite the key in OpenSSH format. The decrypted key is
+    kept in memory while both files are unchanged, as decryption is
+    deliberately slow.
+  - `remote.<name>.agentfsSshAgent` is an absolute path to an ssh-agent's
+    Unix socket, used instead of a key file. The environment's
+    `SSH_AUTH_SOCK` is never read: an agent is per remote and explicit.
+    The agent is asked for its identities after the host key check; each
+    (a key or a certificate) is offered once, in the agent's order, until
+    the server accepts one, as OpenSSH does, so sshd's `MaxAuthTries`
+    (default 6) bounds how many are useful. A socket that cannot be
+    reached, an empty agent, or every identity refused is an `auth`
+    failure naming the socket and the fingerprints offered.
   - The user is the URL's, else `git`.
   - Connecting times out after 30 s, and the handshake, authentication
     and every read or write of the git command after 5 min without
@@ -1517,13 +1543,28 @@ agentfs does not scan content for secrets and does not hold pushes.
     as the push URL's host, or `[host]:port` on a port other than 22, and
     the host libgit2 connected to must be that host. Plain and hashed
     (`|1|…`) names, comma lists, `*` and `?` wildcards, `!` negation and
-    `@revoked` are honoured; `@cert-authority` (host certificates) is not
-    supported. An unknown host, a changed key, a key type the file does
+    `@revoked` are honoured. An unknown host, a changed key, a key type the file does
     not list for the host and a revoked key are all refused, so the key is
     never offered to that host, and the push fails as `untrusted_host` with
     the file, the name looked up, the key type, its SHA256 fingerprint and
     the `ssh-keyscan` command that lists the server's keys. Nothing is ever
     accepted on first use or written back.
+  - Host certificates (2026-10): an `@cert-authority` line trusts the
+    host certificates its CA signed for the hosts the line matches. When a
+    `@cert-authority` line matches the host as looked up, the transport
+    asks for host certificates first (the certificate types of every key
+    type russh supports), then plain keys, so a plain key line for the
+    host still works with a server that has no certificate. A presented
+    certificate is trusted only if all of these hold, as for OpenSSH: it
+    is a host certificate; its CA is on a matching `@cert-authority` line
+    and is not `@revoked`; the certified key is not `@revoked`; the CA's
+    signature verifies; now is within its validity; its principals
+    include the push URL's host, without the port, compared
+    case-insensitively (an empty list, valid for any host, is refused);
+    and it has no critical options. A plain key line never trusts a
+    certificate, and an `@cert-authority` line never trusts a plain key.
+    A refusal is `untrusted_host` before any authentication, naming the
+    CA's SHA256 fingerprint and suggesting `ssh-keygen -L -f <cert>`.
   - The host key types known_hosts lists for the host are asked for
     first, in file order, then every other type russh supports, as
     OpenSSH does. So a server with several host keys presents one the
@@ -1540,9 +1581,13 @@ agentfs does not scan content for secrets and does not hold pushes.
   key-only authentication): Ed25519 OpenSSH and RSA PEM keys, plain and
   hashed known_hosts, a wrong key, unknown and changed host keys (the key
   is never offered: the sshd log shows no attempt with it), a key rotated
-  under a running `agentfs run`, and a divergence over SSH. The
-  transport's own tests (`ssh_transport/tests.rs`) run the same cases,
-  plus scp-like URLs, a patch-queue fetch, a missing repository, a
+  under a running `agentfs run`, a divergence over SSH, host certificates
+  (accepted from a CA-only known_hosts; an unknown or revoked CA, an
+  expired certificate and a wrong principal refused before any key is
+  offered), ssh-agent identities (accepted, all refused, a dead agent),
+  and passphrase-protected OpenSSH, PKCS#8 and RSA PEM keys (missing,
+  wrong and rotated passphrases). The transport's own tests
+  (`ssh_transport/tests.rs`) run the same cases, plus scp-like URLs, a patch-queue fetch, a missing repository, a
   stalled server and the fail-closed cases, against an in-process russh
   server running the real `git upload-pack` and `git receive-pack`.
   Git LFS (§7) in `ci/e2e-lfs.sh` against git-lfs's `lfs-test-server`
@@ -2737,8 +2782,9 @@ one-time migration of Hermes' existing data and the initial import in
   - **Preflight.** Before anything is mounted it refuses a state area,
     backing tree and mount point that are not three separate directories
     (none inside another, after resolving symlinks), any remote section's
-    `agentfsCredentials`, `agentfsSshKey`, `agentfsKnownHosts` or
-    `agentfsLfsCredentials` file under
+    `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`,
+    `agentfsSshAgent`, `agentfsKnownHosts` or `agentfsLfsCredentials` file
+    under
     the backing tree or the mount point, invalid sections included (an
     error, not `RemoteMisconfigured`: carrying on would expose the secret,
     or let the workload rewrite known_hosts to trust any host), a
@@ -3255,8 +3301,8 @@ runner.
 | Operation commits | The applying process or thread is registered as an actor; its records get trigger `restore`, the operator as author, and the operation in the journal record; each operation is its own commit with `Agentfs-Restore` or `Agentfs-Revert` (§9, §15) |
 | Control socket | `meta/control/agentfs.sock`, directory 0700, socket 0600, peer root or the daemon's user, addressed through `/proc/self/fd`; served by `mount`, `run` and `serve-history`; JSON lines, protocol v1, operations `push`, `restore` and `revert` (additive fields; one restore or revert at a time, a push beside it) (§2.2, §2.3, §15) |
 | History rewrite | A documented procedure with `git filter-repo --prune-empty never` in a mirror clone, then a force-push with lease per remote by an operator; not a command (§10, §15) |
-| SSH remotes | Built with the `ssh` cargo feature: agentfs's own transport on russh (2026-10, replacing libssh2). Each SSH remote names an unencrypted private key (`agentfsSshKey`) and a known_hosts file (`agentfsKnownHosts`), both required and both re-read when they change; the key is bound to the push URL's host and port and offered once per connection, as the URL's user, else `git`. No ssh-agent, no passphrases, no global or `~/.ssh` files (§11.1) |
-| Host key verification | Done by agentfs against `agentfsKnownHosts`, in the SSH transport, before any authentication; plain and hashed names, `[host]:port`, wildcards, negation and `@revoked` honoured, `@cert-authority` not supported; unknown, changed, unlisted-type and revoked keys refused, never learned; the host key types known_hosts lists are asked for first (§11.1) |
+| SSH remotes | Built with the `ssh` cargo feature: agentfs's own transport on russh (2026-10, replacing libssh2). Each SSH remote names a known_hosts file (`agentfsKnownHosts`) and exactly one of a private key (`agentfsSshKey`, with `agentfsSshKeyPassphrase`, a passphrase file, if it is encrypted) and an ssh-agent socket (`agentfsSshAgent`); every file is re-read when it changes. The key is bound to the push URL's host and port, decrypted before connecting and offered once per connection; an agent's identities are offered once each, in its order (sshd's `MaxAuthTries` applies); as the URL's user, else `git`. `SSH_AUTH_SOCK`, global and `~/.ssh` files are never read (2026-10, §11.1) |
+| Host key verification | Done by agentfs against `agentfsKnownHosts`, in the SSH transport, before any authentication; plain and hashed names, `[host]:port`, wildcards, negation and `@revoked` honoured; unknown, changed, unlisted-type and revoked keys refused, never learned; the host key types known_hosts lists are asked for first. Host certificates (2026-10): with a matching `@cert-authority` line, certificates are asked for first and trusted only if host type, CA listed and not revoked, signature, validity, principal (the URL's host) and no critical options all check out, as for OpenSSH (§11.1) |
 | Untrusted host reason | SSH host key refusals and TLS certificates libgit2 refuses (`GIT_ECERTIFICATE`: a self-signed or unknown CA, a host name the certificate does not cover) fail the push as `untrusted_host`, apart from `unreachable`, so a possible interception alarms differently from a network problem. A TLS handshake that fails before any certificate check (a server that drops it, as for a certificate host mismatch reached over an IP address in CI) stays `unreachable` (§11.3, §13) |
 | Phase 1 pod layout | One `ReadWriteOncePod` PVC mounted once at `/data` (`backing/`, `state/`: reflinks fail across mounts), `Recreate` strategy; the FUSE mount at `/agentfs/workspace`, a subdirectory of a shared `emptyDir` (Bidirectional in the sidecar, HostToContainer in workloads), so a dead daemon does not block the restarted sidecar or the pod's teardown (§17.1) |
 | Crashed daemon in a pod | Automatic: the kubelet restarts the sidecar, which runs `mount --on-stale-mount recover` and bind-stacks a new mount over the stale one; propagation reaches the workload containers and `subPath` binds without restarting them, and a stop detaches the stale layers. A clean exit mid-pod is fenced by the workload's read-only `emptyDir` (`EROFS`) and, for `subPath` consumers, by the sealed mount point (`--seal-mountpoint`: root's, mode 0000, `EACCES` for non-root); they restart onto the new mount through a liveness probe. A stale mount of another volume is refused. `hold` (manual pod restart) remains (§17.1) |

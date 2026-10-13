@@ -7,11 +7,15 @@
 //! - a bare token, used as the password (one trailing newline is dropped).
 //!
 //! `remote.<name>.agentfsSshKey` names an SSH remote's private key: an
-//! unencrypted OpenSSH (`BEGIN OPENSSH PRIVATE KEY`) or PEM (`RSA`, `EC`, or
-//! PKCS#8 `PRIVATE KEY`) file, decoded by the SSH transport. Encrypted keys
-//! and public keys are refused with a clear error.
+//! OpenSSH (`BEGIN OPENSSH PRIVATE KEY`) or PEM (`RSA`, `EC`, or PKCS#8
+//! `PRIVATE KEY`) file, decoded by the SSH transport. A key encrypted with a
+//! passphrase (OpenSSH, PKCS#8 `ENCRYPTED PRIVATE KEY`, or legacy RSA PEM
+//! with AES-128-CBC) needs `remote.<name>.agentfsSshKeyPassphrase`, a
+//! [`PassphraseFile`] holding the passphrase; other legacy PEM encryption
+//! and public keys are refused with a clear error. A passphrase set for an
+//! unencrypted key is not read.
 //!
-//! Both files are re-read whenever their stat stamp changes
+//! All three files are re-read whenever their stat stamp changes
 //! ([`crate::watched`]), so whatever rotates them only has to rewrite or
 //! replace them.
 //!
@@ -53,10 +57,17 @@ pub enum CredentialError {
     )]
     NotAPrivateKey,
     #[error(
-        "the SSH key is encrypted with a passphrase, which is not supported; write it \
-         unencrypted (ssh-keygen -p -N '' -f <file>)"
+        "the SSH key is encrypted with a passphrase and no passphrase file is set; set \
+         agentfsSshKeyPassphrase to a file holding it, or use agentfsSshAgent"
     )]
     EncryptedKey,
+    #[error(
+        "the SSH key uses legacy PEM encryption other than AES-128-CBC for an RSA key, \
+         which cannot be decrypted; rewrite it in OpenSSH format (ssh-keygen -p -f <file>)"
+    )]
+    UnsupportedEncryption,
+    #[error("the passphrase file {path} is empty")]
+    EmptyPassphrase { path: PathBuf },
     #[error("credentials are bound to host {expected:?}, not {got:?}")]
     HostMismatch {
         expected: Option<String>,
@@ -208,17 +219,87 @@ fn parse(content: &str) -> Result<Parsed, CredentialError> {
 /// and Gitea expect.
 pub const DEFAULT_SSH_USERNAME: &str = "git";
 
-/// An SSH private key, as the file holds it.
+/// An SSH private key, as the file holds it, with its passphrase if it is
+/// encrypted.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SshKey {
     pub text: String,
+    /// Encrypted with a passphrase.
+    pub encrypted: bool,
+    /// The passphrase, for an encrypted key.
+    pub passphrase: Option<Passphrase>,
 }
 
 impl std::fmt::Debug for SshKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SshKey")
             .field("text", &"<redacted>")
+            .field("encrypted", &self.encrypted)
+            .field("passphrase", &self.passphrase)
             .finish()
+    }
+}
+
+/// An SSH key's passphrase, never printed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Passphrase(String);
+
+impl Passphrase {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Passphrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Passphrase(<redacted>)")
+    }
+}
+
+/// The passphrase of one SSH remote's key
+/// (`remote.<name>.agentfsSshKeyPassphrase`): the whole file but one
+/// trailing newline, bound to the push URL's host and port like the key.
+pub struct PassphraseFile {
+    file: WatchedFile<Passphrase>,
+    bound: Option<String>,
+}
+
+impl PassphraseFile {
+    pub fn new(path: impl Into<PathBuf>, bound_url: &str) -> Self {
+        Self {
+            file: WatchedFile::new(path, MAX_CREDENTIAL_FILE),
+            bound: authority(bound_url),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
+
+    /// How many times the file has been read.
+    pub fn reloads(&self) -> usize {
+        self.file.reloads()
+    }
+
+    /// The passphrase, for a connection to `url` only.
+    pub fn passphrase_for(&self, url: &str) -> Result<Passphrase, CredentialError> {
+        check_bound(self.bound.as_deref(), url)?;
+        let path = self.path();
+        self.file
+            .load(|bytes| {
+                let text = utf8(path, bytes)?;
+                let text = text
+                    .strip_suffix('\n')
+                    .map(|t| t.strip_suffix('\r').unwrap_or(t))
+                    .unwrap_or(&text);
+                if text.is_empty() {
+                    return Err(CredentialError::EmptyPassphrase {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Ok(Passphrase(text.to_owned()))
+            })
+            .map_err(|e| flatten(path, e))
     }
 }
 
@@ -246,21 +327,41 @@ impl SshKeyFile {
         self.file.reloads()
     }
 
-    /// The key for a connection to `url`. Refuses any host other than the
-    /// one the file is bound to.
-    pub fn key_for(&self, url: &str) -> Result<SshKey, CredentialError> {
+    /// The key for a connection to `url`, with its passphrase from
+    /// `passphrase` if it is encrypted. Refuses any host other than the one
+    /// the file is bound to, and an encrypted key without a passphrase.
+    pub fn key_for(
+        &self,
+        url: &str,
+        passphrase: Option<&PassphraseFile>,
+    ) -> Result<SshKey, CredentialError> {
         check_bound(self.bound.as_deref(), url)?;
         let path = self.path();
-        self.file
+        let mut key = self
+            .file
             .load(|bytes| parse_ssh_key(utf8(path, bytes)?))
-            .map_err(|e| flatten(path, e))
+            .map_err(|e| flatten(path, e))?;
+        if key.encrypted {
+            let file = passphrase.ok_or(CredentialError::EncryptedKey)?;
+            key.passphrase = Some(file.passphrase_for(url)?);
+        }
+        Ok(key)
+    }
+}
+
+fn key(text: String, encrypted: bool) -> SshKey {
+    SshKey {
+        text,
+        encrypted,
+        passphrase: None,
     }
 }
 
 /// The magic at the start of an OpenSSH private key's body.
 const OPENSSH_MAGIC: &[u8] = b"openssh-key-v1\0";
 
-/// Accepts an unencrypted private key in OpenSSH or PEM format.
+/// Accepts a private key in OpenSSH or PEM format, noting whether it is
+/// encrypted.
 fn parse_ssh_key(text: String) -> Result<SshKey, CredentialError> {
     if text.trim().is_empty() {
         return Err(CredentialError::Empty);
@@ -285,7 +386,7 @@ fn parse_ssh_key(text: String) -> Result<SshKey, CredentialError> {
         .ok_or(CredentialError::NotAPrivateKey)?;
     let body = &lines[begin + 1..end];
     match label {
-        "ENCRYPTED PRIVATE KEY" => Err(CredentialError::EncryptedKey),
+        "ENCRYPTED PRIVATE KEY" => Ok(key(text, true)),
         "OPENSSH PRIVATE KEY" => {
             let blob = base64::engine::general_purpose::STANDARD
                 .decode(body.concat())
@@ -301,20 +402,21 @@ fn parse_ssh_key(text: String) -> Result<SshKey, CredentialError> {
             let cipher = rest
                 .get(4..4 + len)
                 .ok_or(CredentialError::NotAPrivateKey)?;
-            if cipher == b"none" {
-                Ok(SshKey { text })
-            } else {
-                Err(CredentialError::EncryptedKey)
-            }
+            Ok(key(text, cipher != b"none"))
         }
         "RSA PRIVATE KEY" | "EC PRIVATE KEY" | "DSA PRIVATE KEY" | "PRIVATE KEY" => {
-            if body
+            if !body
                 .iter()
                 .any(|l| l.starts_with("Proc-Type:") && l.contains("ENCRYPTED"))
             {
-                Err(CredentialError::EncryptedKey)
+                Ok(key(text, false))
+            } else if label == "RSA PRIVATE KEY"
+                && body.iter().any(|l| l.starts_with("DEK-Info: AES-128-CBC,"))
+            {
+                // The only legacy PEM encryption russh decrypts.
+                Ok(key(text, true))
             } else {
-                Ok(SshKey { text })
+                Err(CredentialError::UnsupportedEncryption)
             }
         }
         _ => Err(CredentialError::NotAPrivateKey),
@@ -517,26 +619,38 @@ mod tests {
                 format!("\n{}", openssh("none")),
             ] {
                 let (_d, f) = key_file(text.as_bytes());
-                let key = f.key_for(SSH_URL).unwrap_or_else(|e| panic!("{e}: {text}"));
+                let key = f
+                    .key_for(SSH_URL, None)
+                    .unwrap_or_else(|e| panic!("{e}: {text}"));
                 assert_eq!(key.text, text);
                 assert!(!format!("{key:?}").contains("BEGIN"), "{key:?}");
             }
         }
 
         #[test]
-        fn refuses_encrypted_and_public_keys() {
+        fn refuses_encrypted_without_a_passphrase_and_public_keys() {
+            for text in encrypted() {
+                let (_d, f) = key_file(text.as_bytes());
+                let err = f.key_for(SSH_URL, None).unwrap_err();
+                assert!(matches!(err, CredentialError::EncryptedKey), "{err:?}");
+                assert!(err.to_string().contains("agentfsSshKeyPassphrase"), "{err}");
+            }
             for text in [
-                openssh("aes256-ctr"),
                 pem(
                     "RSA PRIVATE KEY",
+                    "Proc-Type: 4,ENCRYPTED\nDEK-Info: DES-EDE3-CBC,818C7722D3B01F21\n\n",
+                ),
+                pem(
+                    "EC PRIVATE KEY",
                     "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,818C7722D3B01F21\n\n",
                 ),
-                pem("ENCRYPTED PRIVATE KEY", ""),
             ] {
                 let (_d, f) = key_file(text.as_bytes());
-                let err = f.key_for(SSH_URL).unwrap_err();
-                assert!(matches!(err, CredentialError::EncryptedKey), "{err:?}");
-                assert!(err.to_string().contains("passphrase"), "{err}");
+                let err = f.key_for(SSH_URL, None).unwrap_err();
+                assert!(
+                    matches!(err, CredentialError::UnsupportedEncryption),
+                    "{err:?}"
+                );
             }
             for text in [
                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA== me@host\n".to_owned(),
@@ -554,7 +668,7 @@ mod tests {
                 "a token, not a key\n".to_owned(),
             ] {
                 let (_d, f) = key_file(text.as_bytes());
-                let err = f.key_for(SSH_URL).unwrap_err();
+                let err = f.key_for(SSH_URL, None).unwrap_err();
                 assert!(
                     matches!(err, CredentialError::NotAPrivateKey),
                     "{err:?}: {text}"
@@ -562,34 +676,136 @@ mod tests {
             }
         }
 
+        fn encrypted() -> [String; 3] {
+            [
+                openssh("aes256-ctr"),
+                pem(
+                    "RSA PRIVATE KEY",
+                    "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,818C7722D3B01F21\n\n",
+                ),
+                pem("ENCRYPTED PRIVATE KEY", ""),
+            ]
+        }
+
+        fn passphrase_file(dir: &Path, content: &[u8]) -> PassphraseFile {
+            let path = dir.join("passphrase");
+            fs::write(&path, content).unwrap();
+            PassphraseFile::new(&path, SSH_URL)
+        }
+
+        #[test]
+        fn encrypted_keys_get_their_passphrase() {
+            for text in encrypted() {
+                let (dir, f) = key_file(text.as_bytes());
+                let p = passphrase_file(dir.path(), b"two words\n");
+                let key = f.key_for(SSH_URL, Some(&p)).unwrap();
+                assert!(key.encrypted);
+                assert_eq!(key.passphrase.as_ref().unwrap().expose(), "two words");
+                assert!(!format!("{key:?}").contains("two words"), "{key:?}");
+            }
+            // An unencrypted key never reads the passphrase file.
+            let (dir, f) = key_file(openssh("none").as_bytes());
+            let p = PassphraseFile::new(dir.path().join("missing"), SSH_URL);
+            let key = f.key_for(SSH_URL, Some(&p)).unwrap();
+            assert!(!key.encrypted && key.passphrase.is_none());
+            assert_eq!(p.reloads(), 0);
+        }
+
+        #[test]
+        fn passphrase_files() {
+            let (dir, f) = key_file(openssh("aes256-ctr").as_bytes());
+            // One trailing newline is dropped, nothing else.
+            for (content, expected) in [
+                (&b"pw"[..], "pw"),
+                (b"pw\r\n", "pw"),
+                (b" pw \n\n", " pw \n"),
+            ] {
+                let p = passphrase_file(dir.path(), content);
+                let key = f.key_for(SSH_URL, Some(&p)).unwrap();
+                assert_eq!(key.passphrase.unwrap().expose(), expected);
+            }
+            for content in [&b""[..], b"\n"] {
+                let p = passphrase_file(dir.path(), content);
+                let err = f.key_for(SSH_URL, Some(&p)).unwrap_err();
+                assert!(
+                    matches!(err, CredentialError::EmptyPassphrase { .. }),
+                    "{err:?}"
+                );
+                assert!(err.to_string().contains("passphrase"), "{err}");
+            }
+            let p = PassphraseFile::new(dir.path().join("missing"), SSH_URL);
+            assert!(matches!(
+                f.key_for(SSH_URL, Some(&p)),
+                Err(CredentialError::Io { .. })
+            ));
+            // Bound to the push URL's host and port.
+            let p = passphrase_file(dir.path(), b"pw");
+            assert!(matches!(
+                p.passphrase_for("ssh://git@evil.example:2222/o/r.git"),
+                Err(CredentialError::HostMismatch { .. })
+            ));
+        }
+
+        #[test]
+        fn passphrase_rotation_is_seen() {
+            let (dir, f) = key_file(openssh("aes256-ctr").as_bytes());
+            let p = passphrase_file(dir.path(), b"old\n");
+            assert_eq!(
+                f.key_for(SSH_URL, Some(&p))
+                    .unwrap()
+                    .passphrase
+                    .unwrap()
+                    .expose(),
+                "old"
+            );
+            let tmp = dir.path().join("tmp");
+            fs::write(&tmp, b"new\n").unwrap();
+            fs::rename(&tmp, p.path()).unwrap();
+            assert_eq!(
+                f.key_for(SSH_URL, Some(&p))
+                    .unwrap()
+                    .passphrase
+                    .unwrap()
+                    .expose(),
+                "new"
+            );
+            assert_eq!(p.reloads(), 2);
+        }
+
         #[test]
         fn refuses_unreadable_files() {
             let (_d, f) = key_file(b"");
-            assert!(matches!(f.key_for(SSH_URL), Err(CredentialError::Empty)));
+            assert!(matches!(
+                f.key_for(SSH_URL, None),
+                Err(CredentialError::Empty)
+            ));
             let (_d, f) = key_file(b" \n");
-            assert!(matches!(f.key_for(SSH_URL), Err(CredentialError::Empty)));
+            assert!(matches!(
+                f.key_for(SSH_URL, None),
+                Err(CredentialError::Empty)
+            ));
             let mut nul = openssh("none").into_bytes();
             nul.insert(40, 0);
             let (_d, f) = key_file(&nul);
             assert!(matches!(
-                f.key_for(SSH_URL),
+                f.key_for(SSH_URL, None),
                 Err(CredentialError::NotAPrivateKey)
             ));
             let (_d, f) = key_file(b"\xff\xfe-----BEGIN");
             assert!(matches!(
-                f.key_for(SSH_URL),
+                f.key_for(SSH_URL, None),
                 Err(CredentialError::Io { .. })
             ));
             let big = "x".repeat(MAX_CREDENTIAL_FILE as usize + 1);
             let (_d, f) = key_file(big.as_bytes());
             assert!(matches!(
-                f.key_for(SSH_URL),
+                f.key_for(SSH_URL, None),
                 Err(CredentialError::Io { .. })
             ));
             let dir = tempfile::tempdir().unwrap();
             let f = SshKeyFile::new(dir.path().join("missing"), SSH_URL);
             assert!(matches!(
-                f.key_for(SSH_URL),
+                f.key_for(SSH_URL, None),
                 Err(CredentialError::Io { .. })
             ));
         }
@@ -597,8 +813,9 @@ mod tests {
         #[test]
         fn bound_to_host_and_port() {
             let (_d, f) = key_file(openssh("none").as_bytes());
-            f.key_for(SSH_URL).unwrap();
-            f.key_for("ssh://other-user@GIT.example:2222/x").unwrap();
+            f.key_for(SSH_URL, None).unwrap();
+            f.key_for("ssh://other-user@GIT.example:2222/x", None)
+                .unwrap();
             for url in [
                 "ssh://git@evil.example:2222/o/r.git",
                 "ssh://git@git.example/o/r.git",
@@ -606,7 +823,10 @@ mod tests {
                 "git@git.example:o/r.git",
             ] {
                 assert!(
-                    matches!(f.key_for(url), Err(CredentialError::HostMismatch { .. })),
+                    matches!(
+                        f.key_for(url, None),
+                        Err(CredentialError::HostMismatch { .. })
+                    ),
                     "{url}"
                 );
             }
@@ -615,8 +835,8 @@ mod tests {
             let path = dir.path().join("id");
             fs::write(&path, openssh("none")).unwrap();
             let f = SshKeyFile::new(&path, "git@github.com:o/r.git");
-            f.key_for("ssh://git@github.com/o/r.git").unwrap();
-            assert!(f.key_for("ssh://git@gitlab.com/o/r.git").is_err());
+            f.key_for("ssh://git@github.com/o/r.git", None).unwrap();
+            assert!(f.key_for("ssh://git@gitlab.com/o/r.git", None).is_err());
         }
 
         #[test]
@@ -624,14 +844,14 @@ mod tests {
             let (one, two) = (pem("EC PRIVATE KEY", ""), openssh("none"));
             let (dir, f) = key_file(one.as_bytes());
             let path = f.path().to_owned();
-            assert_eq!(f.key_for(SSH_URL).unwrap().text, one);
-            assert_eq!(f.key_for(SSH_URL).unwrap().text, one);
+            assert_eq!(f.key_for(SSH_URL, None).unwrap().text, one);
+            assert_eq!(f.key_for(SSH_URL, None).unwrap().text, one);
             assert_eq!(f.reloads(), 1);
             // Renamed over: a new inode.
             let tmp = dir.path().join("tmp");
             fs::write(&tmp, &two).unwrap();
             fs::rename(&tmp, &path).unwrap();
-            assert_eq!(f.key_for(SSH_URL).unwrap().text, two);
+            assert_eq!(f.key_for(SSH_URL, None).unwrap().text, two);
             assert_eq!(f.reloads(), 2);
             // A symlink swap, as kubelet does for Secret volumes.
             let (a, b) = (dir.path().join("a"), dir.path().join("b"));
@@ -640,11 +860,11 @@ mod tests {
             let link = dir.path().join("link");
             std::os::unix::fs::symlink(&a, &link).unwrap();
             let f = SshKeyFile::new(&link, SSH_URL);
-            assert_eq!(f.key_for(SSH_URL).unwrap().text, one);
+            assert_eq!(f.key_for(SSH_URL, None).unwrap().text, one);
             let tmp_link = dir.path().join("link.tmp");
             std::os::unix::fs::symlink(&b, &tmp_link).unwrap();
             fs::rename(&tmp_link, &link).unwrap();
-            assert_eq!(f.key_for(SSH_URL).unwrap().text, two);
+            assert_eq!(f.key_for(SSH_URL, None).unwrap().text, two);
             assert_eq!(f.reloads(), 2);
         }
     }

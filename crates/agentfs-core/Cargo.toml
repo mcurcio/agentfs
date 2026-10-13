@@ -45,6 +45,9 @@ tokio = { version = "1.53", default-features = false, features = ["rt", "net", "
 # In-memory exporters for the telemetry tests.
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["testing"] }
 tempfile = "3.27.0"
+# The in-process ssh-agent of the transport tests (`ssh` feature): its
+# connection stream.
+futures = { version = "0.3.34", default-features = false, features = ["std"] }
 # The in-process SSH server of the transport tests (`ssh` feature).
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "process", "io-util", "time", "macros"] }
 

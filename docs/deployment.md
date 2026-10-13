@@ -203,8 +203,10 @@ ConfigMap edited in place would not reach the `subPath` mounts.
 (mode `0400`): `remote.origin.agentfsCredentials =
 /run/secrets/agentfs/origin`. The file is re-read whenever it changes, so
 rotating the Secret needs no restart. For an SSH remote, keep the private
-key and a known_hosts file in the Secret and name them with
-`agentfsSshKey` and `agentfsKnownHosts`
+key, its passphrase file if it is encrypted, and a known_hosts file in
+the Secret and name them with `agentfsSshKey`, `agentfsSshKeyPassphrase`
+and `agentfsKnownHosts` (or name an ssh-agent socket with
+`agentfsSshAgent` instead of a key)
 ([SSH remotes](configuration.md#ssh-remotes)); the commented example in
 `config/config` shows the keys.
 With Git LFS on (`agentfs.lfsThreshold`, design §7), an LFS server on

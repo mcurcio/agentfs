@@ -155,7 +155,9 @@ volume is staged.
 **Credentials.** The `agentfs-csi-credentials` Secret is mounted into the
 node plugin at `/etc/agentfs-csi/credentials` (mode 0400). A profile names
 a key: `agentfsCredentials = /etc/agentfs-csi/credentials/<key>` (or
-`agentfsSshKey`, `agentfsKnownHosts`; docs/configuration.md). The kubelet
+`agentfsSshKey`, `agentfsSshKeyPassphrase`, `agentfsKnownHosts`;
+docs/configuration.md). A passphrase-protected SSH key keeps its
+passphrase file in the same Secret, beside the key. The kubelet
 refreshes the files when the Secret changes, and agentfs re-reads them at
 each push: rotation needs no restart.
 

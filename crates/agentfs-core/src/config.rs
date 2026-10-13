@@ -61,6 +61,18 @@ pub enum ConfigError {
     SshOnly { key: String },
     #[error("{key} must be set for an ssh remote: an absolute path (design §11.1)")]
     SshNeeds { key: String },
+    #[error(
+        "{remote}.agentfsSshKey or {remote}.agentfsSshAgent must be set for an ssh remote: an \
+         absolute path (design §11.1)"
+    )]
+    SshNoIdentity { remote: String },
+    #[error(
+        "{remote}.agentfsSshKey and {remote}.agentfsSshAgent are both set; an ssh remote uses \
+         one of them"
+    )]
+    SshKeyAndAgent { remote: String },
+    #[error("{key} needs {remote}.agentfsSshKey: it is the passphrase of that key")]
+    SshPassphraseWithoutKey { key: String, remote: String },
     #[error("{key}: ssh remotes authenticate with agentfsSshKey, not agentfsCredentials")]
     SshCredentials { key: String },
     #[error(
@@ -134,6 +146,8 @@ pub const KEYS: &[&str] = &[
     "remote.<name>.agentfsCredentials",
     "remote.<name>.agentfsSshKey",
     "remote.<name>.agentfsKnownHosts",
+    "remote.<name>.agentfsSshAgent",
+    "remote.<name>.agentfsSshKeyPassphrase",
     "remote.<name>.lfsurl",
     "remote.<name>.lfspushurl",
     "remote.<name>.agentfsLfsCredentials",
@@ -206,14 +220,22 @@ pub struct RemoteSettings {
     /// credential file ([`crate::credentials`]). Not for ssh remotes.
     pub credentials: Option<PathBuf>,
     /// `remote.<name>.agentfsSshKey`: an absolute path to the private key
-    /// of an ssh remote ([`crate::credentials::SshKeyFile`]). Required for
-    /// ssh remotes, refused for any other.
+    /// of an ssh remote ([`crate::credentials::SshKeyFile`]). An ssh remote
+    /// needs this or `agentfsSshAgent`; refused for any other remote.
     pub ssh_key: Option<PathBuf>,
     /// `remote.<name>.agentfsKnownHosts`: an absolute path to the
     /// known_hosts file an ssh remote's host key is checked against
     /// ([`crate::known_hosts`]). Required for ssh remotes, refused for any
     /// other.
     pub known_hosts: Option<PathBuf>,
+    /// `remote.<name>.agentfsSshAgent`: an absolute path to the socket of
+    /// the ssh-agent an ssh remote authenticates with, instead of
+    /// `agentfsSshKey` (design §11.1).
+    pub ssh_agent: Option<PathBuf>,
+    /// `remote.<name>.agentfsSshKeyPassphrase`: an absolute path to the
+    /// file holding the passphrase of `agentfsSshKey`
+    /// ([`crate::credentials::PassphraseFile`]).
+    pub ssh_key_passphrase: Option<PathBuf>,
     /// `remote.<name>.lfsurl`: the LFS endpoint for this remote, unless
     /// `lfs.url` is set (design §7).
     pub lfs_url: Option<String>,
@@ -228,11 +250,13 @@ pub struct RemoteSettings {
 
 /// The agentfs keys of a remote section that name files, which the mount
 /// preflight keeps out of the backing tree (design §17.1).
-pub const REMOTE_FILE_KEYS: [&str; 4] = [
+pub const REMOTE_FILE_KEYS: [&str; 6] = [
     "agentfsCredentials",
     "agentfsSshKey",
     "agentfsKnownHosts",
     "agentfsLfsCredentials",
+    "agentfsSshAgent",
+    "agentfsSshKeyPassphrase",
 ];
 
 /// A `[remote "<name>"]` section that is left out because it is invalid.
@@ -266,6 +290,8 @@ impl RemoteSettings {
                 &self.ssh_key,
                 &self.known_hosts,
                 &self.lfs_credentials,
+                &self.ssh_agent,
+                &self.ssh_key_passphrase,
             ])
             .filter_map(|(key, path)| Some((key, path.as_deref()?)))
             .collect()
@@ -555,6 +581,8 @@ fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigErr
         credentials: path("agentfsCredentials")?,
         ssh_key: path("agentfsSshKey")?,
         known_hosts: path("agentfsKnownHosts")?,
+        ssh_agent: path("agentfsSshAgent")?,
+        ssh_key_passphrase: path("agentfsSshKeyPassphrase")?,
         lfs_url: string(config, &key("lfsurl"))?,
         lfs_push_url: string(config, &key("lfspushurl"))?,
         lfs_credentials: path("agentfsLfsCredentials")?,
@@ -565,8 +593,9 @@ fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigErr
 }
 
 /// Checks the agentfs keys against the push URL's transport (design
-/// §11.1): ssh remotes need a key and a known_hosts file and take no
-/// password or token; other remotes take no ssh keys.
+/// §11.1): ssh remotes need a known_hosts file and either a key (with an
+/// optional passphrase file) or an ssh-agent socket, and take no password
+/// or token; other remotes take none of the ssh keys.
 fn validate_transport(remote: &RemoteSettings) -> Result<(), ConfigError> {
     let key = |k: &str| format!("remote.{}.{k}", remote.name);
     let url_key = key(if remote.push_url.is_some() {
@@ -578,6 +607,11 @@ fn validate_transport(remote: &RemoteSettings) -> Result<(), ConfigError> {
         for (k, set) in [
             ("agentfsSshKey", remote.ssh_key.is_some()),
             ("agentfsKnownHosts", remote.known_hosts.is_some()),
+            ("agentfsSshAgent", remote.ssh_agent.is_some()),
+            (
+                "agentfsSshKeyPassphrase",
+                remote.ssh_key_passphrase.is_some(),
+            ),
         ] {
             if set {
                 return Err(ConfigError::SshOnly { key: key(k) });
@@ -600,13 +634,22 @@ fn validate_transport(remote: &RemoteSettings) -> Result<(), ConfigError> {
             key: key("agentfsCredentials"),
         });
     }
-    for (k, set) in [
-        ("agentfsSshKey", remote.ssh_key.is_some()),
-        ("agentfsKnownHosts", remote.known_hosts.is_some()),
-    ] {
-        if !set {
-            return Err(ConfigError::SshNeeds { key: key(k) });
-        }
+    let section = format!("remote.{}", remote.name);
+    match (remote.ssh_key.is_some(), remote.ssh_agent.is_some()) {
+        (false, false) => return Err(ConfigError::SshNoIdentity { remote: section }),
+        (true, true) => return Err(ConfigError::SshKeyAndAgent { remote: section }),
+        _ => {}
+    }
+    if remote.ssh_key_passphrase.is_some() && remote.ssh_key.is_none() {
+        return Err(ConfigError::SshPassphraseWithoutKey {
+            key: key("agentfsSshKeyPassphrase"),
+            remote: section,
+        });
+    }
+    if remote.known_hosts.is_none() {
+        return Err(ConfigError::SshNeeds {
+            key: key("agentfsKnownHosts"),
+        });
     }
     if !cfg!(feature = "ssh") {
         return Err(ConfigError::SshUnsupported { key: url_key });
@@ -1147,6 +1190,18 @@ mod tests {
                 ));
                 assert_eq!(s.remotes.len(), 2, "{url}: {:?}", s.invalid_remotes);
             }
+            // An agent instead of a key, and a key with a passphrase file.
+            for identity in [
+                "\tagentfsSshAgent = /run/agent.sock\n",
+                "\tagentfsSshKey = /k\n\tagentfsSshKeyPassphrase = /run/p\n",
+            ] {
+                let s = one_remote(&format!(
+                    "\turl = ssh://h/r\n{identity}\tagentfsKnownHosts = /kh\n"
+                ));
+                assert_eq!(s.remotes.len(), 2, "{identity}: {:?}", s.invalid_remotes);
+                let r = s.remotes.iter().find(|r| r.name == "r").unwrap();
+                assert_eq!(r.files().len(), 2 + usize::from(r.ssh_key.is_some()));
+            }
         } else {
             let bad = invalid_error(full);
             assert!(bad.error.contains("`ssh` cargo feature"), "{bad:?}");
@@ -1175,7 +1230,30 @@ mod tests {
             // An ssh remote missing either file.
             (
                 "\turl = ssh://h/r\n\tagentfsKnownHosts = /kh\n",
-                "remote.r.agentfsSshKey must be set",
+                "remote.r.agentfsSshKey or remote.r.agentfsSshAgent must be set",
+            ),
+            // A key and an agent, or a passphrase without a key.
+            (
+                "\turl = ssh://h/r\n\tagentfsSshKey = /k\n\tagentfsSshAgent = /a.sock\n\
+                 \tagentfsKnownHosts = /kh\n",
+                "are both set",
+            ),
+            (
+                "\turl = ssh://h/r\n\tagentfsSshAgent = /a.sock\n\
+                 \tagentfsSshKeyPassphrase = /p\n\tagentfsKnownHosts = /kh\n",
+                "remote.r.agentfsSshKeyPassphrase needs remote.r.agentfsSshKey",
+            ),
+            (
+                "\turl = https://h/r\n\tagentfsSshAgent = /a.sock\n",
+                "remote.r.agentfsSshAgent applies only to ssh remotes",
+            ),
+            (
+                "\turl = /srv/r.git\n\tagentfsSshKeyPassphrase = /p\n",
+                "remote.r.agentfsSshKeyPassphrase applies only to ssh remotes",
+            ),
+            (
+                "\turl = ssh://h/r\n\tagentfsSshAgent = agent.sock\n\tagentfsKnownHosts = /kh\n",
+                "must be an absolute path",
             ),
             (
                 "\turl = git@h:r\n\tagentfsSshKey = /k\n",

@@ -209,9 +209,7 @@ who holds the lock.
 
 ### Not built yet
 
-Several mounts of one volume across nodes. SSH remotes do
-not support ssh-agent, passphrase-protected keys or `@cert-authority`
-host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
+Several mounts of one volume across nodes. LFS has no SSH (`git-lfs-authenticate`), concurrent or
 resumable transfers, proxy settings or pruning. Restoring a database needs
 its workload stopped
 ([runbook](docs/runbooks/recovery-and-undo.md#7-restoring-a-database)).
@@ -514,9 +512,10 @@ A third, `otlp-tls`, exports telemetry to `https://` collectors (rustls on
 ring: no OpenSSL; `ci/check-deps.sh` checks what each feature set links).
 
 A binary built without `ssh` reports SSH remotes as misconfigured and
-pushes its other remotes. SSH remotes need `agentfsSshKey` (an unencrypted
-private key) and `agentfsKnownHosts` (an OpenSSH known_hosts file with the
-server's host keys); see the
+pushes its other remotes. SSH remotes need `agentfsKnownHosts` (an OpenSSH known_hosts file with the
+server's host keys, or `@cert-authority` lines for host certificates) and
+either `agentfsSshKey` (a private key, with `agentfsSshKeyPassphrase` if it
+is encrypted) or `agentfsSshAgent` (an ssh-agent socket); see the
 [configuration reference](docs/configuration.md#ssh-remotes).
 
 The FUSE layer uses fuser's pure-Rust mount code, so building needs no
@@ -582,14 +581,22 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   move, and a replaced patch unblocking it, with the producer as author.
 - **e2e ssh remotes** ([`ci/e2e-ssh.sh`](ci/e2e-ssh.sh)): pushes to a real
   OpenSSH server ([`ci/git-ssh-server.sh`](ci/git-ssh-server.sh): its own
-  sshd on 127.0.0.1:2222, key-only authentication, a `git-shell` user),
+  sshd on localhost:2222, key-only authentication, a `git-shell` user,
+  host certificates from a CA, and two more sshd with an expired
+  certificate and one for another name),
   with a binary built with `--features ssh` (agentfs's russh transport).
   Covers Ed25519 OpenSSH and RSA
   PEM keys, plain and hashed known_hosts, a wrong key that fails only its
   own remote, unknown and changed host keys refused before the key is
   offered (checked in the sshd log), a key rotated under a running
-  `agentfs run`, a clean SIGTERM, divergence over SSH, and a patch-queue
-  inbox fetch (`agentfs patch apply`).
+  `agentfs run`, a clean SIGTERM, divergence over SSH, a patch-queue
+  inbox fetch (`agentfs patch apply`), host certificates (a CA-only
+  known_hosts; an unknown or revoked CA, an expired certificate and a
+  wrong principal refused before the key is offered), ssh-agent
+  identities (a second identity accepted, an agent of refused keys and a
+  dead agent failing as `auth`), and passphrase-protected OpenSSH, PKCS#8
+  and RSA PEM keys (missing and wrong passphrases never offering the key,
+  and a passphrase rotated under `agentfs run`).
 - **e2e Git LFS** ([`ci/e2e-lfs.sh`](ci/e2e-lfs.sh)): git-lfs's reference
   `lfs-test-server` (pinned, [`ci/lfs-server.sh`](ci/lfs-server.sh)) behind
   the same nginx, with a separate LFS host that has its own users, and the

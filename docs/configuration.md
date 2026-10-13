@@ -191,7 +191,9 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `agentfsMaxBlobSize` | positive size | no limit | The largest blob this remote accepts. Checked before each commit; with several remotes the smallest limit applies (§3.4, §11.3) |
 | `agentfsMaxPushSize` | positive size | no limit | The largest git pack one push to this remote may send, measured before connecting. A larger backlog is pushed in first-parent steps (`PushLimited`); a single commit over it fails as `too_large`. LFS uploads are not counted (see [Push size](#push-size), §11.3) |
 | `agentfsCredentials` | absolute path | none | HTTP and HTTPS only: a file holding a token or `username=`/`password=` lines (see [HTTPS](#https-and-http-remotes)) |
-| `agentfsSshKey` | absolute path | none | SSH only, and required there: the private key (see [SSH](#ssh-remotes)) |
+| `agentfsSshKey` | absolute path | none | SSH only: the private key (see [SSH](#ssh-remotes)). An SSH remote needs exactly one of this and `agentfsSshAgent` |
+| `agentfsSshKeyPassphrase` | absolute path | none | SSH only, with `agentfsSshKey`: a file holding the key's passphrase (one trailing newline dropped). Needed for an encrypted key; not read for an unencrypted one |
+| `agentfsSshAgent` | absolute path | none | SSH only: the Unix socket of an ssh-agent whose identities are offered instead of a key file. `SSH_AUTH_SOCK` is never read |
 | `agentfsKnownHosts` | absolute path | none | SSH only, and required there: the known_hosts file the server's host key is checked against |
 | `lfsurl` | `http(s)://` URL, `file://` URL or path | derived from the remote's URL | The Git LFS endpoint for this remote, as in git-lfs, unless `lfs.url` is set (see [Git LFS](#git-lfs)) |
 | `lfspushurl` | as `lfsurl` | `lfsurl` | Where LFS uploads go, unless `lfs.pushurl` or `lfs.url` is set |
@@ -208,12 +210,14 @@ state file and appears in metrics.
 | the name is not a valid agentfs name | `remote.<name>` |
 | `agentfsMaxBlobSize` is not a positive size | `remote.<name>.agentfsMaxBlobSize` |
 | `agentfsMaxPushSize` is not a positive size | `remote.<name>.agentfsMaxPushSize` |
-| `agentfsCredentials`, `agentfsSshKey`, `agentfsKnownHosts` or `agentfsLfsCredentials` is not an absolute path | the key |
-| the push URL is SSH and `agentfsSshKey` or `agentfsKnownHosts` is not set | the missing key |
+| `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`, `agentfsSshAgent`, `agentfsKnownHosts` or `agentfsLfsCredentials` is not an absolute path | the key |
+| the push URL is SSH and `agentfsKnownHosts` is not set | `agentfsKnownHosts` |
+| the push URL is SSH and neither or both of `agentfsSshKey` and `agentfsSshAgent` are set | both keys |
+| `agentfsSshKeyPassphrase` is set without `agentfsSshKey` | `agentfsSshKeyPassphrase` |
 | the push URL is SSH and `agentfsCredentials` is set | `agentfsCredentials` |
 | the push URL is SSH and carries a password (`ssh://user:pw@host/…`) | `url` or `pushurl` |
 | the push URL is SSH and has no host or a non-numeric port | `url` or `pushurl` |
-| the push URL is not SSH and `agentfsSshKey` or `agentfsKnownHosts` is set | the key |
+| the push URL is not SSH and `agentfsSshKey`, `agentfsSshKeyPassphrase`, `agentfsSshAgent` or `agentfsKnownHosts` is set | the key |
 | the push URL is SSH and the binary was built without the `ssh` feature | `url` or `pushurl` |
 | `lfsurl`, `lfspushurl`, or the global `lfs.url` or `lfs.pushurl`, is not an `http(s)://` URL, a `file://` URL or a path (SSH and `git://` are refused) | the key; a bad global key misconfigures every remote |
 | one of those is `https://` and the binary was built without the `https` feature | the key |
@@ -221,8 +225,9 @@ state file and appears in metrics.
 Problems with the files themselves (missing, unreadable, malformed) are
 not misconfigurations: they fail each push attempt, with the usual alarm
 and backoff, so a Secret mounted late or being rotated starts working as
-soon as it is right. A missing or bad credential or key fails as `auth`; a
-missing or unreadable known_hosts file as `untrusted_host`.
+soon as it is right. A missing or bad credential, key or passphrase, or an ssh-agent that cannot
+be reached, fails as `auth`; a missing or unreadable known_hosts file as
+`untrusted_host`.
 
 `agentfs mount` additionally refuses to start (an error, not an alarm)
 when any remote section, valid or not, names a credentials, key or
@@ -311,13 +316,48 @@ checked (a server that drops it) is `unreachable`. libgit2 uses the system's CA 
   `--features https,ssh`). Without it, SSH remotes are reported as
   misconfigured.
 - **User:** the URL's (`git@` above), else `git`.
-- **The key** is an **unencrypted** private key, OpenSSH format
+- **The key** is a private key in OpenSSH format
   (`BEGIN OPENSSH PRIVATE KEY`, what `ssh-keygen` writes by default) or
   PEM (`RSA`, `EC`, PKCS#8 `PRIVATE KEY`; not DSA). No `.pub` file is
   needed. Ed25519 is recommended: RSA signing uses the pure-Rust `rsa`
   crate, which has a timing side-channel advisory (RUSTSEC-2023-0071).
-  Encrypted keys are refused (agentfs has no passphrase or ssh-agent
-  support); remove a passphrase with `ssh-keygen -p -N '' -f <file>`.
+- **A key with a passphrase** needs `agentfsSshKeyPassphrase`, a file
+  holding the passphrase (one trailing newline is dropped). OpenSSH
+  format, PKCS#8 `ENCRYPTED PRIVATE KEY` (`ssh-keygen -m PKCS8`) and
+  legacy RSA PEM with AES-128-CBC (`ssh-keygen -m PEM`) are decrypted;
+  other legacy PEM encryption is refused with a hint to rewrite the key
+  (`ssh-keygen -p -f <file>` writes OpenSSH format). The key is decrypted
+  before connecting: without a passphrase file, or with a wrong
+  passphrase ("cannot decrypt <key> with <file>"), the push fails as
+  `auth` and nothing is offered. Both files are re-read when they change;
+  after `ssh-keygen -p`, update the passphrase file too.
+
+  ```ini
+  [remote "origin"]
+      url = ssh://git@git.example.com/acme/agent-history.git
+      agentfsSshKey = /run/secrets/agentfs/origin-ssh/ssh-privatekey
+      agentfsSshKeyPassphrase = /run/secrets/agentfs/origin-ssh/passphrase
+      agentfsKnownHosts = /run/secrets/agentfs/origin-ssh/known_hosts
+  ```
+
+- **An ssh-agent** instead of a key file: `agentfsSshAgent` names its
+  socket (an agent the operator runs, for example a sidecar that holds a
+  hardware-backed key). It is connected after the host key check; each
+  of its identities (keys and certificates) is offered once, in the
+  agent's order, until the server accepts one. sshd counts each offer
+  against `MaxAuthTries` (default 6), so keep a remote's agent to a few
+  identities. A socket that cannot be reached, an empty agent, or an agent
+  whose identities are all refused fails the push as `auth`, naming the
+  socket and the fingerprints offered. The environment's `SSH_AUTH_SOCK`
+  is never read: an agent is used only where it is configured.
+
+  ```ini
+  [remote "origin"]
+      url = ssh://git@git.example.com/acme/agent-history.git
+      agentfsSshAgent = /run/agentfs/ssh-agent.sock
+      agentfsKnownHosts = /run/secrets/agentfs/origin-ssh/known_hosts
+  ```
+
   Make one for the volume and add its public half as a deploy key with
   write access:
 
@@ -343,27 +383,47 @@ checked (a server that drops it) is `unreachable`. libgit2 uses the system's CA 
 - **What is checked:** before any authentication, the server's host key
   is looked up for the push URL's host (`[host]:port` on a port other
   than 22). Plain and hashed names, comma lists, `*` and `?` wildcards,
-  `!` negation and `@revoked` lines are honoured; `@cert-authority` lines
-  (host certificates) are not supported. An unknown host, a changed key,
+  `!` negation and `@revoked` lines are honoured. An unknown host, a changed key,
   a key type the file does not list for the host, or a revoked key fails
   the push as `untrusted_host`, and the key is never offered to that
   host. The message names the file, the host as looked up, the key type,
   its `SHA256:` fingerprint and the `ssh-keyscan` command to list the
   server's keys. Nothing is ever learned or written back; a changed key
   may be an attack, so confirm it before updating the file.
-- **Rotation:** replace either file atomically (write a new file and
+- **Host certificates:** an `@cert-authority` line trusts every host
+  certificate its CA signed for the hosts it matches. When one matches
+  the push URL's host, agentfs asks the server for a certificate first
+  (a plain key line for the host still works with a server that has no
+  certificate). A certificate is trusted only if it is a host
+  certificate, its CA is on a matching `@cert-authority` line, neither the
+  CA nor the certified key is `@revoked`, the CA's signature verifies, it
+  is within its validity period, its principals include the URL's host
+  (without the port, case-insensitively; a certificate with no principals
+  is refused), and it has no critical options. Otherwise the push fails as
+  `untrusted_host` before any key is offered, with the CA's fingerprint
+  and a hint to inspect the certificate with `ssh-keygen -L -f`.
+
+  ```sh
+  # The CA's public key, from the server's administrator
+  printf '@cert-authority *.git.example.com,[git.example.com]:2222 %s\n' \
+    "$(cut -d' ' -f1,2 host_ca.pub)" > known_hosts
+  ```
+
+- **Rotation:** replace any of the files atomically (write a new file and
   rename it over the old one, or update the Secret); the next push uses
   it, without a restart. Like credentials, a key is given only to the
   push URL's host and port, once per connection; a rejected key fails
   as `auth`.
 
-**In Kubernetes,** keep both files in a Secret mounted outside the backing
-tree. The `kubernetes.io/ssh-auth` type uses the `ssh-privatekey` key:
+**In Kubernetes,** keep the files in a Secret mounted outside the backing
+tree. The `kubernetes.io/ssh-auth` type uses the `ssh-privatekey` key; a
+passphrase goes in the same Secret:
 
 ```sh
 kubectl create secret generic agentfs-origin-ssh \
   --type=kubernetes.io/ssh-auth \
   --from-file=ssh-privatekey=./ssh-privatekey \
+  --from-file=passphrase=./passphrase \
   --from-file=known_hosts=./known_hosts
 ```
 

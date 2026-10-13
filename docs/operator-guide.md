@@ -61,7 +61,7 @@ A volume is three directories, side by side:
 |---|---|
 | the state area is inside the backing tree (or the reverse, or they are the same directory) | history, journal and credentials would be visible through the mount |
 | the mount point is inside the backing tree or the state area, or either is inside the mount point | the mount would recurse into itself, or the daemon would reach its own files through its own mount |
-| a remote's `agentfsCredentials`, `agentfsSshKey` or `agentfsKnownHosts` file is under the backing tree or the mount point, for any `[remote]` section, valid or not | the workload could read the secret, or rewrite known_hosts to trust any host (a man in the middle). This is an error, not an alarm |
+| a remote's `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`, `agentfsSshAgent`, `agentfsKnownHosts` or `agentfsLfsCredentials` file is under the backing tree or the mount point, for any `[remote]` section, valid or not | the workload could read the secret, or rewrite known_hosts to trust any host (a man in the middle). This is an error, not an alarm |
 | `--root` / `AGENTFS_ROOT` is set and is not the backing tree | the two would disagree about which tree is recorded |
 | the mount point is a stale FUSE mount (`ENOTCONN`) | a daemon died; see §10 |
 
@@ -83,9 +83,9 @@ git --git-dir /data/state/git config remote.origin.agentfsCredentials /run/secre
 agentfs --state /data/state mount /data/backing /workspace
 ```
 
-Over SSH instead (a binary built with `--features ssh`), name a private key
-and a known_hosts file; both are required, and neither may be under the
-backing tree:
+Over SSH instead (a binary built with `--features ssh`), name a known_hosts
+file and either a private key or an ssh-agent socket; none of them may be
+under the backing tree or the mount point:
 
 ```sh
 git --git-dir /data/state/git config remote.origin.url git@github.com:acme/agent-history.git
@@ -93,9 +93,15 @@ git --git-dir /data/state/git config remote.origin.agentfsSshKey /run/secrets/ag
 git --git-dir /data/state/git config remote.origin.agentfsKnownHosts /run/secrets/agentfs/origin-ssh/known_hosts
 ```
 
-The key must be unencrypted, and known_hosts must list every host key type
-the server has (`ssh-keyscan github.com`, fingerprints checked against the
-provider's). Every remote key is described in the
+An encrypted key also needs `agentfsSshKeyPassphrase`, a file holding its
+passphrase (keep it in the same Secret). `agentfsSshAgent` names an
+ssh-agent socket instead of a key (`SSH_AUTH_SOCK` is never read); each
+of its identities is offered once, so keep to fewer than sshd's
+`MaxAuthTries` (6). known_hosts must list the host keys the server has
+(`ssh-keyscan github.com`, fingerprints checked against the provider's),
+or hold an `@cert-authority` line for a server with host certificates.
+Every SSH failure says which file to fix: `auth` for the key, passphrase
+or agent, `untrusted_host` for known_hosts. Every remote key is described in the
 [configuration reference](configuration.md).
 
 The daemon stays in the foreground. Its first line says what it mounted

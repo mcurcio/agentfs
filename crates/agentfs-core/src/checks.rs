@@ -564,6 +564,8 @@ mod tests {
             lfs_url: None,
             lfs_push_url: None,
             lfs_credentials: None,
+            ssh_agent: None,
+            ssh_key_passphrase: None,
         }
     }
 

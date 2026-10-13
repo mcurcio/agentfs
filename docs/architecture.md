@@ -51,10 +51,10 @@ missing from these tables or a row names a module that no longer exists;
 | `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
 | `push_size.rs` | Measuring a push's git pack against `agentfsMaxPushSize` before connecting, and the first-parent step that fits (§11.3) |
 | `remote_auth.rs` | Credentials and host-key checks for one remote, shared by push and patch fetch, and the scope that hands an SSH remote to the transport (§11.1) |
-| `ssh_transport.rs` | `ssh` feature: agentfs's libgit2 subtransport for SSH URLs over russh: host key check before authentication, the key, timeouts (§11.1) |
+| `ssh_transport.rs` | `ssh` feature: agentfs's libgit2 subtransport for SSH URLs over russh: host key or certificate check before authentication, the key (decrypted) or ssh-agent identities, timeouts (§11.1) |
 | `remote_url.rs` | Pure URL helpers: transport, host, port, userinfo, SSH path, as libgit2 sees them (§11.1) |
-| `credentials.rs` | Credential and SSH key files for remotes (§11.1) |
-| `known_hosts.rs` | OpenSSH known_hosts parsing and matching (§11.1) |
+| `credentials.rs` | Credential, SSH key and passphrase files for remotes (§11.1) |
+| `known_hosts.rs` | OpenSSH known_hosts parsing and matching, and `@cert-authority` host certificate checks (§11.1) |
 | `watched.rs` | Files re-read when their stat stamp changes: credentials, keys, known_hosts |
 | `repack.rs` | Periodic `git repack --geometric=2` of the history (§8) |
 | `restore.rs` | Restore and revert: plan from history, check, apply to a tree (§15) |

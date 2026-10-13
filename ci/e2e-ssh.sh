@@ -3,7 +3,11 @@
 # OpenSSH and RSA PEM keys with plain and hashed known_hosts, a wrong key
 # that fails only its own remote, unknown and changed host keys refused
 # before the key is ever offered, a key rotated under a running
-# `agentfs run`, divergence over SSH, and a patch-queue inbox fetch.
+# `agentfs run`, divergence over SSH, a patch-queue inbox fetch, host
+# certificates through @cert-authority (valid, unknown CA, expired, wrong
+# principal, revoked CA), ssh-agent identities (accepted, refused, dead
+# agent), and passphrase-protected keys in OpenSSH, PKCS#8 and legacy PEM
+# format (missing, wrong and rotated passphrases).
 #
 # Needs a binary built with --features ssh and a server from
 # ci/git-ssh-server.sh with its GIT_SSH_* variables. Uses sudo to manage
@@ -13,7 +17,8 @@
 
 : "${GIT_SSH_BASE:?start ci/git-ssh-server.sh first}"
 : "${GIT_SSH_USER:?}" "${GIT_SSH_REPOS:?}" "${GIT_SSH_AUTHORIZED:?}" "${GIT_SSH_LOG:?}"
-: "${GIT_SSH_KNOWN_HOSTS:?}" "${GIT_SSH_KNOWN_HOSTS_HASHED:?}"
+: "${GIT_SSH_KNOWN_HOSTS:?}" "${GIT_SSH_KNOWN_HOSTS_HASHED:?}" "${GIT_SSH_DIR:?}"
+: "${GIT_SSH_KNOWN_HOSTS_CA:?}" "${GIT_SSH_HOST_CA:?}" "${GIT_SSH_BASE_EXPIRED:?}" "${GIT_SSH_BASE_WRONGNAME:?}"
 
 # git on the server side, as the server's user (its repositories are its
 # own, so no safe.directory exceptions are needed).
@@ -175,5 +180,141 @@ esac
 # The inbox ref existed only on the ssh remote, so applying it means it was
 # fetched over ssh (the applied inbox ref is then removed locally).
 assert_contains "$out" "patch 1 applied" "inbox patch fetched over ssh and applied"
+
+authorize_more() { cat "$@" | sudo tee -a "$GIT_SSH_AUTHORIZED" >/dev/null; }
+all_sshd_logs() { sudo cat "$GIT_SSH_DIR"/sshd*.log; }
+never_offered() { # public-key-file message
+  case "$(all_sshd_logs)" in
+  *"$(fingerprint "$1")"*) fail "$2" ;;
+  *) pass "$2" ;;
+  esac
+}
+push_fails() { # kind remote...
+  local kind=$1; shift
+  local args=() r
+  for r in "$@"; do args+=(--remote "$r"); done
+  set +e
+  out=$(agentfs push "${args[@]}" 2>&1); code=$?
+  set -e
+  echo "$out"
+  assert_eq 1 "$code" "push exits 1"
+  for r in "$@"; do assert_contains "$out" "$r: failed ($kind)" "$r fails as $kind"; done
+}
+
+step "host certificates are trusted through @cert-authority"
+for k in certkey certprobe; do ssh-keygen -q -t ed25519 -N '' -C "$k" -f "$KEYS/$k"; done
+authorize_more "$KEYS/certkey.pub" "$KEYS/certprobe.pub"
+CERT_REPO=$(server_repo cert)
+for r in certwrongca certexpired certwrongname certrevoked; do server_repo "$r" >/dev/null; done
+volume_config remote.cert.url "$GIT_SSH_BASE/cert.git"
+volume_config remote.cert.agentfsSshKey "$KEYS/certkey"
+volume_config remote.cert.agentfsKnownHosts "$GIT_SSH_KNOWN_HOSTS_CA"
+agentfs push --remote cert
+assert_eq "$(local_head demo)" "$(srv_ref "$CERT_REPO" refs/heads/agentfs/demo)" "pushed with only a CA in known_hosts"
+ssh-keygen -q -t ed25519 -N '' -f "$KEYS/other_ca"
+printf '@cert-authority [localhost]:2222 %s\n' "$(cut -d' ' -f1,2 "$KEYS/other_ca.pub")" >"$KEYS/wrong_ca_hosts"
+{ cat "$GIT_SSH_KNOWN_HOSTS_CA"; printf '@revoked * %s\n' "$(cut -d' ' -f1,2 "$GIT_SSH_HOST_CA")"; } >"$KEYS/revoked_ca_hosts"
+volume_config remote.certwrongca.url "$GIT_SSH_BASE/certwrongca.git"
+volume_config remote.certwrongca.agentfsKnownHosts "$KEYS/wrong_ca_hosts"
+volume_config remote.certexpired.url "$GIT_SSH_BASE_EXPIRED/certexpired.git"
+volume_config remote.certexpired.agentfsKnownHosts "$GIT_SSH_KNOWN_HOSTS_CA"
+volume_config remote.certwrongname.url "$GIT_SSH_BASE_WRONGNAME/certwrongname.git"
+volume_config remote.certwrongname.agentfsKnownHosts "$GIT_SSH_KNOWN_HOSTS_CA"
+volume_config remote.certrevoked.url "$GIT_SSH_BASE/certrevoked.git"
+volume_config remote.certrevoked.agentfsKnownHosts "$KEYS/revoked_ca_hosts"
+for r in certwrongca certexpired certwrongname certrevoked; do
+  volume_config "remote.$r.agentfsSshKey" "$KEYS/certprobe"
+done
+push_fails untrusted_host certwrongca certexpired certwrongname certrevoked
+assert_contains "$out" "which no @cert-authority line" "an unknown CA is named"
+assert_contains "$out" "$(ssh-keygen -lf "$GIT_SSH_HOST_CA" | awk '{print $2}')" "messages carry the CA fingerprint"
+assert_contains "$out" "is expired" "an expired certificate is refused"
+assert_contains "$out" "is for otherhost, not localhost" "a certificate for another host is refused"
+assert_contains "$out" "is marked @revoked" "a revoked CA is refused"
+assert_contains "$out" "ssh-keygen -L -f" "messages say how to inspect the certificate"
+never_offered "$KEYS/certprobe.pub" "the key was never offered to a host with an untrusted certificate"
+
+step "ssh-agent identities"
+for k in agentkey agentwrong; do ssh-keygen -q -t ed25519 -N '' -C "$k" -f "$KEYS/$k"; done
+authorize_more "$KEYS/agentkey.pub"
+AGENT_REPO=$(server_repo agent)
+server_repo agentwrong >/dev/null
+start_agent() { # socket keys...
+  local socket=$1; shift
+  ssh-agent -a "$socket" -s | grep -o 'SSH_AGENT_PID=[0-9]*' | cut -d= -f2
+  for k in "$@"; do SSH_AUTH_SOCK=$socket ssh-add -q "$k"; done
+}
+AGENT_PID=$(start_agent "$KEYS/agent.sock")
+SSH_AUTH_SOCK=$KEYS/agent.sock ssh-add -q "$KEYS/agentwrong" "$KEYS/agentkey"
+WRONG_AGENT_PID=$(start_agent "$KEYS/wrong-agent.sock")
+SSH_AUTH_SOCK=$KEYS/wrong-agent.sock ssh-add -q "$KEYS/agentwrong"
+volume_config remote.agent.url "$GIT_SSH_BASE/agent.git"
+volume_config remote.agent.agentfsSshAgent "$KEYS/agent.sock"
+volume_config remote.agent.agentfsKnownHosts "$GIT_SSH_KNOWN_HOSTS"
+volume_config remote.agentwrong.url "$GIT_SSH_BASE/agentwrong.git"
+volume_config remote.agentwrong.agentfsSshAgent "$KEYS/wrong-agent.sock"
+volume_config remote.agentwrong.agentfsKnownHosts "$GIT_SSH_KNOWN_HOSTS"
+# agentfs never reads SSH_AUTH_SOCK: only the configured socket is used.
+SSH_AUTH_SOCK=$KEYS/wrong-agent.sock agentfs push --remote agent
+assert_eq "$(local_head demo)" "$(srv_ref "$AGENT_REPO" refs/heads/agentfs/demo)" "pushed with the agent's second identity"
+assert_contains "$(sshd_log)" "$(fingerprint "$KEYS/agentkey.pub")" "sshd accepted the agent's key"
+push_fails auth agentwrong
+assert_contains "$out" "rejected every identity of the ssh-agent at $KEYS/wrong-agent.sock" "a refused agent names its socket"
+assert_contains "$out" "$(fingerprint "$KEYS/agentwrong.pub")" "and the identities it offered"
+kill "$AGENT_PID" "$WRONG_AGENT_PID"
+echo agent >"$TREE/agent.txt"
+agentfs record agent.txt
+push_fails auth agent
+assert_contains "$out" "ssh-agent at $KEYS/agent.sock" "a dead agent is an auth failure naming the socket"
+
+step "keys encrypted with a passphrase"
+ssh-keygen -q -t ed25519 -N 'two words' -C pp -f "$KEYS/pp"
+ssh-keygen -q -t ecdsa -m PKCS8 -N 'two words' -C pp8 -f "$KEYS/pp8"
+ssh-keygen -q -t rsa -b 3072 -m PEM -N 'two words' -C pppem -f "$KEYS/pppem"
+grep -q 'BEGIN OPENSSH PRIVATE KEY' "$KEYS/pp" || fail "pp is not an OpenSSH key"
+grep -q 'BEGIN ENCRYPTED PRIVATE KEY' "$KEYS/pp8" || fail "pp8 is not an encrypted PKCS#8 key"
+grep -q 'DEK-Info: AES-128-CBC' "$KEYS/pppem" || fail "pppem is not an AES-128-CBC PEM key"
+authorize_more "$KEYS"/{pp,pp8,pppem}.pub
+printf 'wrong\n' >"$KEYS/wrong-passphrase"
+printf 'two words\n' >"$KEYS/passphrase"
+for r in pp pp8 pppem; do
+  server_repo "$r" >/dev/null
+  volume_config "remote.$r.url" "$GIT_SSH_BASE/$r.git"
+  volume_config "remote.$r.agentfsSshKey" "$KEYS/$r"
+  volume_config "remote.$r.agentfsKnownHosts" "$GIT_SSH_KNOWN_HOSTS"
+done
+push_fails auth pp
+assert_contains "$out" "set agentfsSshKeyPassphrase" "an encrypted key needs a passphrase"
+for r in pp pp8 pppem; do
+  volume_config "remote.$r.agentfsSshKeyPassphrase" "$KEYS/wrong-passphrase"
+done
+push_fails auth pp pp8 pppem
+assert_contains "$out" "cannot decrypt $KEYS/pp with $KEYS/wrong-passphrase" "a wrong passphrase is named"
+for r in pp pp8 pppem; do
+  never_offered "$KEYS/$r.pub" "the $r key was never offered with a wrong passphrase"
+  volume_config "remote.$r.agentfsSshKeyPassphrase" "$KEYS/passphrase"
+done
+agentfs push --remote pp --remote pp8 --remote pppem
+for r in pp pp8 pppem; do
+  assert_eq "$(local_head demo)" "$(srv_ref "$GIT_SSH_REPOS/$r.git" refs/heads/agentfs/demo)" "pushed with the decrypted $r key"
+done
+
+step "a running service picks up a rotated passphrase"
+ssh-keygen -q -p -P 'two words' -N 'new words' -f "$KEYS/pp"
+echo three >"$TREE/pp.txt"
+agentfs record pp.txt
+HEAD=$(local_head demo)
+LOG=$VOL/run-pp.log
+agentfs_start "$LOG" run
+RUN=$AGENTFS_PID
+wait_for 30 grep -q "push to pp failed (auth).*cannot decrypt" "$LOG" || { cat "$LOG"; fail "run never reported the stale passphrase"; }
+pass "run reports the stale passphrase"
+printf 'new words\n' >"$KEYS/passphrase.new"
+mv "$KEYS/passphrase.new" "$KEYS/passphrase"
+pp_has_head() { [ "$(srv_ref "$GIT_SSH_REPOS/pp.git" refs/heads/agentfs/demo)" = "$HEAD" ]; }
+wait_for 60 pp_has_head || { cat "$LOG"; fail "rotated passphrase never used"; }
+pass "pushed with the rotated passphrase, without a restart"
+kill -TERM "$RUN"
+wait "$RUN" || { cat "$LOG"; fail "run did not exit cleanly on SIGTERM"; }
 
 step "all ssh scenarios passed"

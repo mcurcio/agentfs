@@ -7,8 +7,10 @@
 //!   separate directories, none inside another. The state area under the
 //!   backing tree would be visible through the mount; anything under the
 //!   mount point would be reached through the mount by the daemon itself;
-//! - no remote's `agentfsCredentials` file may be under the backing tree
-//!   (it would be readable through the mount) or the mount point. This is a
+//! - no file a remote names (`agentfsCredentials`, `agentfsSshKey`,
+//!   `agentfsSshKeyPassphrase`, `agentfsSshAgent`, `agentfsKnownHosts`,
+//!   `agentfsLfsCredentials`) may be under the backing tree (it would be
+//!   readable through the mount) or the mount point. This is a
 //!   hard error, not a `RemoteMisconfigured` alarm: carrying on would hand
 //!   the secret to the workload;
 //! - a mount point left by a crashed daemon (`ENOTCONN`) is reported with
@@ -161,7 +163,8 @@ pub enum PreflightError {
     CredentialsExposed {
         remote: String,
         /// The config key naming the file (`agentfsCredentials`,
-        /// `agentfsSshKey` or `agentfsKnownHosts`).
+        /// `agentfsSshKey`, `agentfsSshKeyPassphrase`, `agentfsSshAgent`,
+        /// `agentfsKnownHosts` or `agentfsLfsCredentials`).
         key: &'static str,
         path: PathBuf,
         outer: &'static str,
@@ -1084,6 +1087,8 @@ mod tests {
             lfs_url: None,
             lfs_push_url: None,
             lfs_credentials: None,
+            ssh_agent: None,
+            ssh_key_passphrase: None,
         }
     }
 
@@ -1097,6 +1102,8 @@ mod tests {
             lfs_url: None,
             lfs_push_url: None,
             lfs_credentials: None,
+            ssh_agent: None,
+            ssh_key_passphrase: None,
             credentials: None,
             ssh_key: Some(key),
             known_hosts: Some(known_hosts),
@@ -1243,6 +1250,26 @@ mod tests {
                 "{err}"
             );
             assert!(err.to_string().contains(expected), "{err}");
+        }
+        // A passphrase file, and an ssh-agent socket the workload could
+        // replace with its own agent.
+        for (expected, path) in [
+            ("agentfsSshKeyPassphrase", l.p("backing/passphrase")),
+            ("agentfsSshAgent", l.p("mnt/agent.sock")),
+        ] {
+            let mut remote = ssh_remote(key.clone(), kh.clone());
+            if expected == "agentfsSshAgent" {
+                remote.ssh_agent = Some(path);
+            } else {
+                remote.ssh_key_passphrase = Some(path);
+            }
+            let err = l
+                .check_with("state", "backing", "mnt", &settings(vec![remote]))
+                .unwrap_err();
+            assert!(
+                matches!(&err, PreflightError::CredentialsExposed { key, .. } if *key == expected),
+                "{err}"
+            );
         }
     }
 

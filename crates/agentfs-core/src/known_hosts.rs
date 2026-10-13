@@ -18,8 +18,15 @@
 //! [`KnownHosts::check`] decides whether a presented host key is trusted.
 //! Nothing is ever learned or accepted on first use: an unknown host, a
 //! changed key, a key type the file does not list and a revoked key are
-//! all refused. `@cert-authority` lines (host certificates) are not
-//! supported; a host only they match is unknown, with a hint.
+//! all refused.
+//!
+//! [`KnownHosts::check_certificate`] decides whether a host certificate is
+//! trusted, from a [`HostCertificate`] the SSH transport decodes: an
+//! `@cert-authority` line matching the host must list the signing CA, and
+//! the certificate must be a valid, unexpired host certificate for the
+//! host's name, with no critical options. A `@revoked` CA or certified key
+//! is refused. A plain key line never trusts a certificate, and a
+//! `@cert-authority` line never trusts a plain key.
 //!
 //! The file is re-read when its stat stamp changes ([`crate::watched`]).
 
@@ -28,7 +35,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use sha2::Digest as _;
 
 use crate::watched::{WatchedError, WatchedFile};
 
@@ -44,12 +52,8 @@ pub enum HostKeyError {
         #[source]
         source: io::Error,
     },
-    #[error("host {name} is unknown: known_hosts has no entry for it{}", hint.map(|h| format!(" ({h})")).unwrap_or_default())]
-    Unknown {
-        name: String,
-        key_type: String,
-        hint: Option<&'static str>,
-    },
+    #[error("host {name} is unknown: known_hosts has no entry for it")]
+    Unknown { name: String, key_type: String },
     #[error(
         "host {name} presented a {key_type} key, but known_hosts lists only {} for it; add \
          its {key_type} key (ssh-keyscan lists every type the server has)",
@@ -67,13 +71,93 @@ pub enum HostKeyError {
     Mismatch { name: String, key_type: String },
     #[error("the presented {key_type} host key is marked @revoked in known_hosts")]
     Revoked { key_type: String },
+    #[error("host {name} presented a {key_type} certificate, not a host certificate; {CERT_HINT}")]
+    CertType { name: String, key_type: String },
+    #[error(
+        "the host certificate of {name} is signed by CA {ca}, which no @cert-authority line \
+         for it lists{}; {CERT_HINT}",
+        if *plain_keys { " (only plain keys are listed for it)" } else { "" }
+    )]
+    CertUnknownCa {
+        name: String,
+        ca: String,
+        plain_keys: bool,
+    },
+    #[error("the host certificate of {name} is signed by CA {ca}, which is marked @revoked")]
+    CertRevokedCa { name: String, ca: String },
+    #[error("the signature of the host certificate of {name} (CA {ca}) does not verify")]
+    CertSignature { name: String, ca: String },
+    #[error(
+        "the host certificate of {name} (CA {ca}) is {when}: valid from {valid_after} to \
+         {valid_before} (Unix time), now {now}; {CERT_HINT}"
+    )]
+    CertExpired {
+        name: String,
+        ca: String,
+        when: &'static str,
+        valid_after: u64,
+        valid_before: u64,
+        now: u64,
+    },
+    #[error(
+        "the host certificate of {name} (CA {ca}) is for {}, not {host}; {CERT_HINT}",
+        if principals.is_empty() { "no principal (any host), which is refused".to_owned() } else { principals.join(", ") }
+    )]
+    CertPrincipal {
+        name: String,
+        host: String,
+        ca: String,
+        principals: Vec<String>,
+    },
+    #[error(
+        "the host certificate of {name} (CA {ca}) has critical options {}, which host \
+         certificates must not have; {CERT_HINT}",
+        options.join(", ")
+    )]
+    CertCriticalOption {
+        name: String,
+        ca: String,
+        options: Vec<String>,
+    },
     #[error("malformed host key: {reason}")]
     Malformed { reason: &'static str },
 }
 
-/// The hint for a host only `@cert-authority` lines match.
-const CERT_AUTHORITY_HINT: &str =
-    "only @cert-authority lines match it, and host certificates are not supported";
+/// How to see what a certificate holds.
+const CERT_HINT: &str = "inspect it with `ssh-keygen -L -f <certificate>`";
+
+/// A host certificate as the SSH server presented it, decoded by the SSH
+/// transport (OpenSSH PROTOCOL.certkeys). Key blobs are SSH wire-format
+/// public keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCertificate {
+    /// The certificate algorithm, for messages
+    /// (`ssh-ed25519-cert-v01@openssh.com`, ...).
+    pub key_type: String,
+    /// A host certificate, not a user one.
+    pub is_host: bool,
+    /// The certified host key.
+    pub key: Vec<u8>,
+    /// The CA key that signed it.
+    pub ca_key: Vec<u8>,
+    /// Whether the CA's signature over the certificate verifies.
+    pub signature_valid: bool,
+    pub principals: Vec<String>,
+    /// Unix seconds; valid while `valid_after <= now < valid_before`.
+    pub valid_after: u64,
+    pub valid_before: u64,
+    /// The names of its critical options.
+    pub critical_options: Vec<String>,
+}
+
+/// `SHA256:<base64>` of an SSH wire-format public key blob, as
+/// `ssh-keygen -l` prints it.
+pub fn fingerprint(blob: &[u8]) -> String {
+    format!(
+        "SHA256:{}",
+        STANDARD_NO_PAD.encode(sha2::Sha256::digest(blob))
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Marker {
@@ -181,12 +265,10 @@ impl KnownHosts {
         }
         let name = lookup_name(host, port);
         let mut mismatch = false;
-        let mut cert_authority = false;
         let mut known_types: Vec<String> = Vec::new();
         for entry in self.entries.iter().filter(|e| e.hosts.matches(&name)) {
             match entry.marker {
-                Marker::Revoked => {}
-                Marker::CertAuthority => cert_authority = true,
+                Marker::Revoked | Marker::CertAuthority => {}
                 Marker::None if entry.blob == presented => return Ok(()),
                 Marker::None if entry.key_type == key_type => mismatch = true,
                 Marker::None => {
@@ -205,11 +287,7 @@ impl KnownHosts {
                 known_types,
             })
         } else {
-            Err(HostKeyError::Unknown {
-                name,
-                key_type,
-                hint: cert_authority.then_some(CERT_AUTHORITY_HINT),
-            })
+            Err(HostKeyError::Unknown { name, key_type })
         }
     }
 }
@@ -230,6 +308,107 @@ impl KnownHosts {
             }
         }
         types
+    }
+
+    /// The CA keys of the `@cert-authority` lines matching `host` on
+    /// `port`, in file order.
+    pub fn cert_authorities(&self, host: &str, port: Option<u16>) -> Vec<&[u8]> {
+        let name = lookup_name(host, port);
+        self.entries
+            .iter()
+            .filter(|e| e.marker == Marker::CertAuthority && e.hosts.matches(&name))
+            .map(|e| e.blob.as_slice())
+            .collect()
+    }
+
+    fn revoked(&self, blob: &[u8]) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.marker == Marker::Revoked && e.blob == blob)
+    }
+
+    /// Whether `cert` is a trusted host certificate of `host` on `port` at
+    /// Unix time `now` (design §11.1). All of these must hold, as for
+    /// OpenSSH: it is a host certificate; neither its key nor its CA is
+    /// `@revoked`; a `@cert-authority` line matching the host lists its CA;
+    /// the CA's signature verifies; `now` is within its validity; its
+    /// principals name the host (without the port, case-insensitively; an
+    /// empty list is refused); and it has no critical options.
+    pub fn check_certificate(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        cert: &HostCertificate,
+        now: u64,
+    ) -> Result<(), HostKeyError> {
+        let name = lookup_name(host, port);
+        let ca = fingerprint(&cert.ca_key);
+        if !cert.is_host {
+            return Err(HostKeyError::CertType {
+                name,
+                key_type: cert.key_type.clone(),
+            });
+        }
+        if self.revoked(&cert.key) {
+            return Err(HostKeyError::Revoked {
+                key_type: cert.key_type.clone(),
+            });
+        }
+        if self.revoked(&cert.ca_key) {
+            return Err(HostKeyError::CertRevokedCa { name, ca });
+        }
+        if !self
+            .cert_authorities(host, port)
+            .contains(&cert.ca_key.as_slice())
+        {
+            let plain_keys = !self.key_types(host, port).is_empty();
+            return Err(HostKeyError::CertUnknownCa {
+                name,
+                ca,
+                plain_keys,
+            });
+        }
+        if !cert.signature_valid {
+            return Err(HostKeyError::CertSignature { name, ca });
+        }
+        let when = if now < cert.valid_after {
+            Some("not yet valid")
+        } else if now >= cert.valid_before {
+            Some("expired")
+        } else {
+            None
+        };
+        if let Some(when) = when {
+            return Err(HostKeyError::CertExpired {
+                name,
+                ca,
+                when,
+                valid_after: cert.valid_after,
+                valid_before: cert.valid_before,
+                now,
+            });
+        }
+        let wanted = host.to_ascii_lowercase();
+        if !cert
+            .principals
+            .iter()
+            .any(|p| p.to_ascii_lowercase() == wanted)
+        {
+            return Err(HostKeyError::CertPrincipal {
+                name,
+                host: wanted,
+                ca,
+                principals: cert.principals.clone(),
+            });
+        }
+        if !cert.critical_options.is_empty() {
+            return Err(HostKeyError::CertCriticalOption {
+                name,
+                ca,
+                options: cert.critical_options.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -395,6 +574,17 @@ impl KnownHostsFile {
         presented: &[u8],
     ) -> Result<(), HostKeyError> {
         self.load()?.check(host, port, presented)
+    }
+
+    /// [`KnownHosts::check_certificate`] against the file's current content.
+    pub fn check_certificate(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        cert: &HostCertificate,
+        now: u64,
+    ) -> Result<(), HostKeyError> {
+        self.load()?.check_certificate(host, port, cert, now)
     }
 }
 
@@ -601,7 +791,7 @@ pub(crate) mod tests {
         kh.check("host", None, &k2).unwrap();
         // Unknown host, and an empty file.
         let err = kh.check("elsewhere", None, &k1).unwrap_err();
-        assert!(matches!(&err, HostKeyError::Unknown { hint: None, .. }));
+        assert!(matches!(&err, HostKeyError::Unknown { .. }));
         assert!(err.to_string().contains("unknown"), "{err}");
         assert!(matches!(
             KnownHosts::parse("").check("host", None, &k1),
@@ -635,11 +825,139 @@ pub(crate) mod tests {
         // A @cert-authority line never trusts a plain key.
         let kh = KnownHosts::parse(&format!("@cert-authority {}\n", line("*.example", &k2)));
         let err = kh.check("a.example", None, &k2).unwrap_err();
+        assert!(matches!(err, HostKeyError::Unknown { .. }), "{err:?}");
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    /// A valid host certificate of `localhost`, key `ed25519(1)`, signed by
+    /// CA `ed25519(9)`.
+    fn cert() -> HostCertificate {
+        HostCertificate {
+            key_type: "ssh-ed25519-cert-v01@openssh.com".to_owned(),
+            is_host: true,
+            key: ed25519(1),
+            ca_key: ed25519(9),
+            signature_valid: true,
+            principals: vec!["LocalHost".to_owned()],
+            valid_after: NOW - 60,
+            valid_before: NOW + 3600,
+            critical_options: Vec::new(),
+        }
+    }
+
+    fn ca_line(hosts: &str, ca: &[u8]) -> String {
+        format!("@cert-authority {}", line(hosts, ca))
+    }
+
+    #[test]
+    fn host_certificates() {
+        let ca = ed25519(9);
+        let kh = KnownHosts::parse(&ca_line("[localhost]:2222,*.example", &ca));
+        kh.check_certificate("localhost", Some(2222), &cert(), NOW)
+            .unwrap();
+        assert_eq!(kh.cert_authorities("localhost", Some(2222)), [&ca[..]]);
+        assert!(kh.cert_authorities("localhost", None).is_empty());
+        // The CA line must match the lookup name, port included.
+        let err = kh
+            .check_certificate("localhost", None, &cert(), NOW)
+            .unwrap_err();
+        assert!(matches!(err, HostKeyError::CertUnknownCa { .. }), "{err:?}");
+        assert!(err.to_string().contains(&fingerprint(&ca)), "{err}");
+        assert!(err.to_string().contains("ssh-keygen -L -f"), "{err}");
+        // A hashed CA host pattern.
+        let kh = KnownHosts::parse(&ca_line(&hashed("[localhost]:2222", b"salt"), &ca));
+        kh.check_certificate("localhost", Some(2222), &cert(), NOW)
+            .unwrap();
+
+        let kh = KnownHosts::parse(&ca_line("[localhost]:2222", &ca));
+        let check = |c: &HostCertificate, now: u64| {
+            kh.check_certificate("localhost", Some(2222), c, now)
+                .unwrap_err()
+        };
+        let mut c = cert();
+        c.ca_key = ed25519(8);
+        assert!(matches!(check(&c, NOW), HostKeyError::CertUnknownCa { .. }));
+        let mut c = cert();
+        c.signature_valid = false;
+        assert!(matches!(check(&c, NOW), HostKeyError::CertSignature { .. }));
+        let err = check(&cert(), NOW + 3600);
         assert!(
-            matches!(err, HostKeyError::Unknown { hint: Some(_), .. }),
+            matches!(
+                err,
+                HostKeyError::CertExpired {
+                    when: "expired",
+                    ..
+                }
+            ),
             "{err:?}"
         );
-        assert!(err.to_string().contains("not supported"), "{err}");
+        let err = check(&cert(), NOW - 61);
+        assert!(
+            matches!(
+                err,
+                HostKeyError::CertExpired {
+                    when: "not yet valid",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let mut c = cert();
+        c.principals = vec!["otherhost".to_owned(), "[localhost]:2222".to_owned()];
+        let err = check(&c, NOW);
+        assert!(matches!(err, HostKeyError::CertPrincipal { .. }), "{err:?}");
+        assert!(err.to_string().contains("otherhost"), "{err}");
+        c.principals.clear();
+        assert!(matches!(check(&c, NOW), HostKeyError::CertPrincipal { .. }));
+        let mut c = cert();
+        c.is_host = false;
+        assert!(matches!(check(&c, NOW), HostKeyError::CertType { .. }));
+        let mut c = cert();
+        c.critical_options = vec!["force-command".to_owned()];
+        assert!(matches!(
+            check(&c, NOW),
+            HostKeyError::CertCriticalOption { .. }
+        ));
+
+        // A plain key line never trusts a certificate.
+        let kh = KnownHosts::parse(&line("[localhost]:2222", &ed25519(1)));
+        let err = kh
+            .check_certificate("localhost", Some(2222), &cert(), NOW)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HostKeyError::CertUnknownCa {
+                    plain_keys: true,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn revoked_certificates() {
+        let ca = ed25519(9);
+        let kh = KnownHosts::parse(&format!(
+            "{}\n@revoked {}\n",
+            ca_line("*", &ca),
+            line("*", &ca)
+        ));
+        let err = kh
+            .check_certificate("localhost", Some(2222), &cert(), NOW)
+            .unwrap_err();
+        assert!(matches!(err, HostKeyError::CertRevokedCa { .. }), "{err:?}");
+        let kh = KnownHosts::parse(&format!(
+            "{}\n@revoked {}\n",
+            ca_line("*", &ca),
+            line("nowhere", &ed25519(1))
+        ));
+        let err = kh
+            .check_certificate("localhost", Some(2222), &cert(), NOW)
+            .unwrap_err();
+        assert!(matches!(err, HostKeyError::Revoked { .. }), "{err:?}");
     }
 
     #[test]

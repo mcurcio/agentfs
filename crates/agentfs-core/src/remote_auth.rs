@@ -9,7 +9,8 @@
 //! SSH remotes never go through libgit2's callbacks: agentfs's own SSH
 //! transport (`ssh_transport`, `ssh` feature) checks the host key against
 //! `agentfsKnownHosts` before any authentication and then offers only the
-//! key from `agentfsSshKey`. It finds the remote's [`SshRemote`] and the
+//! key from `agentfsSshKey` (decrypted with `agentfsSshKeyPassphrase`) or
+//! the identities of the ssh-agent at `agentfsSshAgent`. It finds the remote's [`SshRemote`] and the
 //! connection's [`AuthState`] through [`RemoteAuth::ssh_scope`], held
 //! around each libgit2 call that may connect.
 
@@ -22,8 +23,8 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use git2::{Cred, CredentialType, Error as GitError, ErrorClass, ErrorCode, RemoteCallbacks};
 
 use crate::config::RemoteSettings;
-use crate::credentials::{Credential, CredentialFile, SshKey, SshKeyFile};
-use crate::known_hosts::{self, KnownHostsFile};
+use crate::credentials::{Credential, CredentialFile, PassphraseFile, SshKey, SshKeyFile};
+use crate::known_hosts::{self, HostCertificate, KnownHostsFile};
 use crate::remote_url::{Endpoint, ssh_endpoint};
 
 /// What one connection's authentication saw, read once libgit2 returns.
@@ -74,6 +75,12 @@ pub struct SshRemote {
     name: String,
     endpoint: Endpoint,
     key: Option<SshKeyFile>,
+    passphrase: Option<PassphraseFile>,
+    agent: Option<std::path::PathBuf>,
+    /// The last key decoded, reused while the key and passphrase files
+    /// hold the same content (decryption is deliberately slow).
+    #[cfg(feature = "ssh")]
+    decoded: Mutex<Option<(SshKey, Arc<russh::keys::PrivateKey>)>>,
     known_hosts: Option<KnownHostsFile>,
 }
 
@@ -102,8 +109,57 @@ impl SshRemote {
                 "{url} needs a key and remote.{name}.agentfsSshKey is not set"
             ));
         };
-        file.key_for(url)
+        file.key_for(url, self.passphrase.as_ref())
             .map_err(|e| format!("{}: {e}", file.path().display()))
+    }
+
+    /// The `agentfsSshAgent` socket, if set: authenticate with its
+    /// identities instead of a key file.
+    pub fn agent(&self) -> Option<&std::path::Path> {
+        self.agent.as_deref()
+    }
+
+    /// The `agentfsSshKeyPassphrase` file, if set.
+    pub fn passphrase_path(&self) -> Option<&std::path::Path> {
+        self.passphrase.as_ref().map(PassphraseFile::path)
+    }
+
+    /// The decoded private key for a connection to `url`
+    /// ([`SshRemote::key`], decrypted with its passphrase). The error names
+    /// the files; a wrong passphrase says "cannot decrypt".
+    #[cfg(feature = "ssh")]
+    pub(crate) fn private_key(&self, url: &str) -> Result<Arc<russh::keys::PrivateKey>, String> {
+        let key = self.key(url)?;
+        let mut decoded = self.decoded.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, private)) = decoded.as_ref()
+            && *cached == key
+        {
+            return Ok(Arc::clone(private));
+        }
+        let key_path = self
+            .key_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let private = match &key.passphrase {
+            Some(passphrase) => {
+                russh::keys::decode_secret_key(&key.text, Some(passphrase.expose())).map_err(
+                    |e| {
+                        format!(
+                            "cannot decrypt {key_path} with {}: {e} (is it the key's \
+                             passphrase?)",
+                            self.passphrase_path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default()
+                        )
+                    },
+                )?
+            }
+            None => russh::keys::decode_secret_key(&key.text, None)
+                .map_err(|e| format!("{key_path}: the SSH key cannot be decoded: {e}"))?,
+        };
+        let private = Arc::new(private);
+        *decoded = Some((key, Arc::clone(&private)));
+        Ok(private)
     }
 
     /// The key types `agentfsKnownHosts` lists for the remote's host and
@@ -138,18 +194,7 @@ impl SshRemote {
                 "host key of {lookup} not checked: remote.{name}.agentfsKnownHosts is not set"
             ));
         };
-        let connected = hostname
-            .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(hostname)
-            .to_ascii_lowercase();
-        if connected != endpoint.host {
-            return Err(format!(
-                "connected to host {hostname:?}, not {:?} from the push URL; its host key is \
-                 not trusted",
-                endpoint.host
-            ));
-        }
+        self.check_hostname(hostname)?;
         let Some(raw) = raw else {
             return Err(format!(
                 "the SSH server at {lookup} presented no host key that could be checked"
@@ -173,6 +218,73 @@ impl SshRemote {
                 endpoint.host
             )
         })
+    }
+
+    /// Whether `agentfsKnownHosts` has a `@cert-authority` line for the
+    /// remote's host and port, so that the transport asks for host
+    /// certificates. False if the file cannot be read.
+    pub(crate) fn has_cert_authority(&self) -> bool {
+        let Some(file) = &self.known_hosts else {
+            return false;
+        };
+        file.load()
+            .map(|hosts| {
+                !hosts
+                    .cert_authorities(&self.endpoint.host, self.endpoint.port)
+                    .is_empty()
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether the SSH server's host certificate is trusted at Unix time
+    /// `now` (design §11.1, [`KnownHosts::check_certificate`]): as for
+    /// [`SshRemote::check_host_key`], the host connected to must be the
+    /// push URL's. The error says which file, CA and certified key, and
+    /// how to inspect the certificate.
+    ///
+    /// [`KnownHosts::check_certificate`]: crate::known_hosts::KnownHosts::check_certificate
+    pub(crate) fn check_host_certificate(
+        &self,
+        hostname: &str,
+        cert: &HostCertificate,
+        now: u64,
+    ) -> Result<(), String> {
+        let name = &self.name;
+        let endpoint = &self.endpoint;
+        let lookup = known_hosts::lookup_name(&endpoint.host, endpoint.port);
+        let Some(file) = &self.known_hosts else {
+            return Err(format!(
+                "host certificate of {lookup} not checked: remote.{name}.agentfsKnownHosts is \
+                 not set"
+            ));
+        };
+        self.check_hostname(hostname)?;
+        file.check_certificate(&endpoint.host, endpoint.port, cert, now)
+            .map_err(|e| {
+                format!(
+                    "{} host certificate of {lookup} (host key {}) refused by {}: {e}",
+                    cert.key_type,
+                    known_hosts::fingerprint(&cert.key),
+                    file.path().display(),
+                )
+            })
+    }
+
+    /// The host connected to must be the push URL's.
+    fn check_hostname(&self, hostname: &str) -> Result<(), String> {
+        let connected = hostname
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(hostname)
+            .to_ascii_lowercase();
+        if connected != self.endpoint.host {
+            return Err(format!(
+                "connected to host {hostname:?}, not {:?} from the push URL; its host key is \
+                 not trusted",
+                self.endpoint.host
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -211,6 +323,13 @@ impl RemoteAuth {
                         .ssh_key
                         .as_ref()
                         .map(|path| SshKeyFile::new(path, url)),
+                    passphrase: remote
+                        .ssh_key_passphrase
+                        .as_ref()
+                        .map(|path| PassphraseFile::new(path, url)),
+                    agent: remote.ssh_agent.clone(),
+                    #[cfg(feature = "ssh")]
+                    decoded: Mutex::new(None),
                     known_hosts: remote.known_hosts.as_ref().map(KnownHostsFile::new),
                 })
             }),
@@ -282,7 +401,7 @@ impl RemoteAuth {
         if self.ssh.is_some() {
             return Err(format!(
                 "{url} asked libgit2 for credentials; ssh remotes authenticate only in \
-                 agentfs's SSH transport, with remote.{name}.agentfsSshKey"
+                 agentfs's SSH transport, with remote.{name}.agentfsSshKey or agentfsSshAgent"
             ));
         }
         calls.set(calls.get() + 1);

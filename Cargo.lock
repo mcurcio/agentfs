@@ -76,6 +76,7 @@ dependencies = [
  "base64 0.23.1",
  "bstr",
  "crc32fast",
+ "futures",
  "git2",
  "gix-attributes",
  "gix-ignore",

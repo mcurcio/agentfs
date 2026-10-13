@@ -48,6 +48,8 @@ fn remote(url: &str) -> RemoteSettings {
         lfs_url: None,
         lfs_push_url: None,
         lfs_credentials: None,
+        ssh_agent: None,
+        ssh_key_passphrase: None,
     }
 }
 

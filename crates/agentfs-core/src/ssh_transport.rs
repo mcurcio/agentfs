@@ -17,15 +17,21 @@
 //!
 //! In order, a connection:
 //!
-//! 1. reads the key from `agentfsSshKey` (a key that cannot be read or
-//!    decoded is an `auth` failure, and nothing is sent);
-//! 2. connects within [`SERVER_CONNECT_TIMEOUT_MS`], asking for the host key
-//!    types `agentfsKnownHosts` lists for the host first, as OpenSSH does;
-//! 3. checks the host key with
-//!    [`SshRemote::check_host_key`](crate::remote_auth::SshRemote) before
-//!    any authentication, recording a refusal in the connection's
+//! 1. reads the key from `agentfsSshKey`, decrypted with the passphrase in
+//!    `agentfsSshKeyPassphrase` if it is encrypted (a key that cannot be
+//!    read, decoded or decrypted is an `auth` failure, and nothing is sent);
+//! 2. connects within [`SERVER_CONNECT_TIMEOUT_MS`], asking for host
+//!    certificates first if a `@cert-authority` line of `agentfsKnownHosts`
+//!    matches the host, then the host key types it lists for the host, as
+//!    OpenSSH does;
+//! 3. checks the host key or certificate with
+//!    [`SshRemote`](crate::remote_auth::SshRemote) before any
+//!    authentication, recording a refusal in the connection's
 //!    [`AuthState`];
-//! 4. offers that one key, once, as the URL's user (else `git`);
+//! 4. authenticates as the URL's user (else `git`): offers the key once,
+//!    or, with `agentfsSshAgent`, asks that agent for its identities and
+//!    offers each once, in the agent's order, until one is accepted (the
+//!    environment's `SSH_AUTH_SOCK` is never read);
 //! 5. runs the git command, with every read and write bounded by
 //!    [`SERVER_IO_TIMEOUT_MS`] (libgit2's own timeouts do not apply to
 //!    custom transports).
@@ -40,18 +46,21 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD_NO_PAD;
 use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream, Transport};
 use git2::{Error as GitError, ErrorClass, ErrorCode};
 use russh::client::{self, Handle};
-use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::keys::agent::AgentIdentity;
+use russh::keys::agent::client::AgentClient;
+use russh::keys::{
+    Algorithm, Certificate, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey,
+    PublicKeyOrCertificate,
+};
 use russh::{Channel, ChannelMsg, Disconnect, Preferred};
 use tokio::runtime::Runtime;
 
 use crate::credentials::DEFAULT_SSH_USERNAME;
 use crate::history::{SERVER_CONNECT_TIMEOUT_MS, SERVER_IO_TIMEOUT_MS};
-use crate::known_hosts::lookup_name;
+use crate::known_hosts::{HostCertificate, fingerprint, lookup_name};
 use crate::remote_auth::{AuthState, SshRemote};
 use crate::remote_url::{self, Endpoint};
 
@@ -252,12 +261,14 @@ impl client::Handler for Client {
                 self.remote
                     .check_host_key(&host, raw.as_deref(), sha256.as_ref())
             }
-            PublicKeyOrCertificate::Certificate(cert) => Err(format!(
-                "the SSH server at {} presented a {} host certificate, which agentfs did not \
-                 ask for",
-                lookup_name(&host, self.remote.endpoint().port),
-                cert.algorithm()
-            )),
+            PublicKeyOrCertificate::Certificate(cert) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                self.remote
+                    .check_host_certificate(&host, &host_certificate(cert), now)
+            }
         };
         match verdict {
             Ok(()) => Ok(true),
@@ -267,6 +278,36 @@ impl client::Handler for Client {
             }
         }
     }
+}
+
+/// The SSH wire-format blob of a public key.
+fn key_blob(key: &russh::keys::ssh_key::public::KeyData) -> Vec<u8> {
+    PublicKey::new(key.clone(), "")
+        .to_bytes()
+        .unwrap_or_default()
+}
+
+/// What [`crate::known_hosts`] checks of a host certificate.
+fn host_certificate(cert: &Certificate) -> HostCertificate {
+    HostCertificate {
+        key_type: cert.algorithm().to_certificate_type(),
+        is_host: cert.cert_type().is_host(),
+        key: key_blob(cert.public_key()),
+        ca_key: key_blob(cert.signature_key()),
+        signature_valid: cert.verify_signature().is_ok(),
+        principals: cert.valid_principals().to_vec(),
+        valid_after: cert.valid_after(),
+        valid_before: cert.valid_before(),
+        critical_options: cert.critical_options().keys().cloned().collect(),
+    }
+}
+
+/// How a connection authenticates.
+enum Credentials {
+    /// The remote's key, decoded.
+    Key(Arc<PrivateKey>),
+    /// The identities of the ssh-agent at this socket.
+    Agent(std::path::PathBuf),
 }
 
 /// One running git command over SSH, as libgit2 reads and writes it.
@@ -318,13 +359,10 @@ impl Stream {
             state.fail_auth();
             ssh_error(ErrorCode::Auth, message)
         };
-        let key = remote.key(url).map_err(auth_error)?;
-        let key_path = remote
-            .key_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let key = russh::keys::decode_secret_key(&key.text, None)
-            .map_err(|e| auth_error(format!("{key_path}: the SSH key cannot be decoded: {e}")))?;
+        let credentials = match remote.agent() {
+            Some(socket) => Credentials::Agent(socket.to_path_buf()),
+            None => Credentials::Key(remote.private_key(url).map_err(auth_error)?),
+        };
         let user = remote_url::url_username(url)
             .unwrap_or(DEFAULT_SSH_USERNAME)
             .to_owned();
@@ -342,7 +380,13 @@ impl Stream {
             })?;
         let io_timeout = io_timeout();
         let connected = runtime.block_on(connect(
-            remote, state, &endpoint, &user, key, &command, io_timeout,
+            remote,
+            state,
+            &endpoint,
+            &user,
+            credentials,
+            &command,
+            io_timeout,
         ));
         let (session, channel) = connected?;
         Ok(Self {
@@ -415,7 +459,7 @@ async fn connect(
     state: &Arc<AuthState>,
     endpoint: &Endpoint,
     user: &str,
-    key: PrivateKey,
+    credentials: Credentials,
     command: &str,
     io_timeout: Duration,
 ) -> Result<(Handle<Client>, Channel<client::Msg>), GitError> {
@@ -439,6 +483,11 @@ async fn connect(
     let config = client::Config {
         preferred: Preferred {
             key: Cow::Owned(host_key_preference(&remote.known_key_types())),
+            host_key_certificates: if remote.has_cert_authority() {
+                Preferred::DEFAULT.key
+            } else {
+                Cow::Borrowed(&[])
+            },
             ..Preferred::default()
         },
         inactivity_timeout: None,
@@ -464,32 +513,17 @@ async fn connect(
             return Err(unreachable(format!("SSH handshake with {lookup}: {e}")));
         }
     };
-    let fingerprint = format!(
-        "SHA256:{}",
-        STANDARD_NO_PAD.encode(key.public_key().fingerprint(HashAlg::Sha256).as_bytes())
-    );
-    let hash = if key.algorithm().is_rsa() {
-        match session.best_supported_rsa_hash().await {
-            Ok(Some(hash)) => hash,
-            _ => Some(HashAlg::Sha256),
+    let accepted = match credentials {
+        Credentials::Key(key) => {
+            authenticate_key(&mut session, remote, &lookup, user, key, io_timeout).await?
         }
-    } else {
-        None
+        Credentials::Agent(socket) => {
+            authenticate_agent(&mut session, remote, &lookup, user, &socket, io_timeout).await?
+        }
     };
-    let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
-    let auth = tokio::time::timeout(io_timeout, session.authenticate_publickey(user, key))
-        .await
-        .map_err(|_| timed_out("authenticating to", io_timeout))?
-        .map_err(|e| unreachable(format!("authenticating to {lookup}: {e}")))?;
-    if !auth.success() {
+    if let Err(why) = accepted {
         state.fail_auth();
-        return Err(ssh_error(
-            ErrorCode::Auth,
-            format!(
-                "{lookup} rejected the SSH key {fingerprint} of remote {} for user {user}",
-                remote.name()
-            ),
-        ));
+        return Err(ssh_error(ErrorCode::Auth, why));
     }
     let start = async {
         let channel = session.channel_open_session().await?;
@@ -501,6 +535,152 @@ async fn connect(
         .map_err(|_| timed_out("starting the git command on", io_timeout))?
         .map_err(|e| unreachable(format!("starting `{command}` on {lookup}: {e}")))?;
     Ok((session, channel))
+}
+
+/// `SHA256:<base64>` of a public key, as `ssh-keygen -l` prints it.
+fn public_fingerprint(key: &PublicKey) -> String {
+    fingerprint(&key.to_bytes().unwrap_or_default())
+}
+
+/// The RSA signature hash to use with `algorithm`, if it is RSA: the best
+/// the server supports, else SHA-256.
+async fn rsa_hash(session: &mut Handle<Client>, algorithm: &Algorithm) -> Option<HashAlg> {
+    if !algorithm.clone().is_rsa() {
+        return None;
+    }
+    match session.best_supported_rsa_hash().await {
+        Ok(Some(hash)) => hash,
+        _ => Some(HashAlg::Sha256),
+    }
+}
+
+fn auth_timeout(lookup: &str, after: Duration) -> GitError {
+    ssh_error(
+        ErrorCode::Timeout,
+        format!(
+            "authenticating to {lookup}: no answer within {} s",
+            after.as_secs()
+        ),
+    )
+}
+
+/// Offers the remote's key once. The inner error is the server's refusal.
+async fn authenticate_key(
+    session: &mut Handle<Client>,
+    remote: &SshRemote,
+    lookup: &str,
+    user: &str,
+    key: Arc<PrivateKey>,
+    io_timeout: Duration,
+) -> Result<Result<(), String>, GitError> {
+    let fingerprint = public_fingerprint(key.public_key());
+    let hash = rsa_hash(session, &key.algorithm()).await;
+    let key = PrivateKeyWithHashAlg::new(key, hash);
+    let auth = tokio::time::timeout(io_timeout, session.authenticate_publickey(user, key))
+        .await
+        .map_err(|_| auth_timeout(lookup, io_timeout))?
+        .map_err(|e| {
+            ssh_error(
+                ErrorCode::GenericError,
+                format!("authenticating to {lookup}: {e}"),
+            )
+        })?;
+    if auth.success() {
+        return Ok(Ok(()));
+    }
+    Ok(Err(format!(
+        "{lookup} rejected the SSH key {fingerprint} of remote {} for user {user}",
+        remote.name()
+    )))
+}
+
+/// Offers each identity of the ssh-agent at `socket` once, in the agent's
+/// order, until the server accepts one. The inner error says why none was
+/// accepted: the agent could not be asked, held no identity, or every
+/// identity was refused (listed by fingerprint).
+async fn authenticate_agent(
+    session: &mut Handle<Client>,
+    remote: &SshRemote,
+    lookup: &str,
+    user: &str,
+    socket: &std::path::Path,
+    io_timeout: Duration,
+) -> Result<Result<(), String>, GitError> {
+    let name = remote.name();
+    let agent_error = |e: &dyn std::fmt::Display| {
+        format!(
+            "ssh-agent at {} (remote.{name}.agentfsSshAgent): {e}",
+            socket.display()
+        )
+    };
+    let asked = tokio::time::timeout(io_timeout, async {
+        let mut agent = AgentClient::connect_uds(socket).await?;
+        let identities = agent.request_identities().await?;
+        Ok::<_, russh::keys::Error>((agent, identities))
+    })
+    .await;
+    let (mut agent, identities) = match asked {
+        Ok(Ok(asked)) => asked,
+        Ok(Err(e)) => return Ok(Err(agent_error(&e))),
+        Err(_) => return Ok(Err(agent_error(&"no answer within the I/O timeout"))),
+    };
+    if identities.is_empty() {
+        return Ok(Err(agent_error(&"the agent holds no identity")));
+    }
+    let mut offered = Vec::new();
+    for identity in identities {
+        let (public, comment) = match &identity {
+            AgentIdentity::PublicKey { key, comment } => (key.clone(), comment.clone()),
+            AgentIdentity::Certificate {
+                certificate,
+                comment,
+            } => (
+                PublicKey::new(certificate.public_key().clone(), ""),
+                comment.clone(),
+            ),
+        };
+        let hash = rsa_hash(session, &public.algorithm()).await;
+        let attempt = async {
+            match identity {
+                AgentIdentity::PublicKey { key, .. } => {
+                    session
+                        .authenticate_publickey_with(user, key, hash, &mut agent)
+                        .await
+                }
+                AgentIdentity::Certificate { certificate, .. } => {
+                    session
+                        .authenticate_certificate_with(user, certificate, hash, &mut agent)
+                        .await
+                }
+            }
+        };
+        let auth = match tokio::time::timeout(io_timeout, attempt).await {
+            Err(_) => return Err(auth_timeout(lookup, io_timeout)),
+            Ok(Err(russh::AgentAuthError::Send(e))) => {
+                return Err(ssh_error(
+                    ErrorCode::GenericError,
+                    format!("authenticating to {lookup}: {e}"),
+                ));
+            }
+            Ok(Err(russh::AgentAuthError::Key(e))) => return Ok(Err(agent_error(&e))),
+            Ok(Ok(auth)) => auth,
+        };
+        if auth.success() {
+            return Ok(Ok(()));
+        }
+        let comment = if comment.is_empty() {
+            String::new()
+        } else {
+            format!(" ({comment})")
+        };
+        offered.push(format!("{}{comment}", public_fingerprint(&public)));
+    }
+    Ok(Err(format!(
+        "{lookup} rejected every identity of the ssh-agent at {} for remote {name}, user \
+         {user}: {}",
+        socket.display(),
+        offered.join(", ")
+    )))
 }
 
 impl Read for Stream {
