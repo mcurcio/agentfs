@@ -2268,6 +2268,102 @@ mod tests {
         assert_eq!(remote_ref(remote, "refs/heads/agentfs/b"), Some(b_head2));
     }
 
+    /// Volumes committing and pushing to one remote at the same time (design
+    /// §11.3, §18): two volumes, and a third misconfigured with `a`'s name.
+    /// Each volume's branch ends at its head, never overwritten; of the two
+    /// `a`s the first to push owns the branch and the other diverges, saved
+    /// once; the remote passes `git fsck --full --strict`.
+    #[test]
+    fn concurrent_pushes_to_one_shared_remote() {
+        const COMMITS: usize = 40;
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path().to_path_buf();
+        bare(&remote);
+        let url = remote.display().to_string();
+        let vols = vec![
+            Vol::new("a", &[("shared", &url)]),
+            Vol::new("b", &[("shared", &url)]),
+            Vol::new("a", &[("shared", &url)]),
+        ];
+        let barrier = Arc::new(std::sync::Barrier::new(vols.len()));
+        let threads: Vec<_> = vols
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut v)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    v.n = i * 1000; // distinct content per writer
+                    let mut pusher = v.pusher("shared", Arc::new(NullSink));
+                    let mut diverged = false;
+                    barrier.wait();
+                    for _ in 0..COMMITS {
+                        v.commit();
+                        // A ref lock held by another writer's push fails the
+                        // attempt; the push loop would retry it.
+                        let mut done = false;
+                        for _ in 0..50 {
+                            match pusher.push_once() {
+                                PushOutcome::Pushed { .. } | PushOutcome::UpToDate { .. } => {
+                                    assert!(!diverged, "pushed after diverging");
+                                    done = true;
+                                }
+                                PushOutcome::Diverged { .. } => {
+                                    diverged = true;
+                                    done = true;
+                                }
+                                PushOutcome::Failed { .. } | PushOutcome::Busy => {
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                                PushOutcome::NothingToPush => unreachable!("committed"),
+                            }
+                            if done {
+                                break;
+                            }
+                        }
+                        assert!(done, "writer {i} never got an answer from the remote");
+                    }
+                    (v, diverged)
+                })
+            })
+            .collect();
+        let results: Vec<(Vol, bool)> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+
+        let (b, b_diverged) = &results[1];
+        assert!(!b_diverged, "b shares the remote with no one");
+        assert_eq!(remote_ref(&remote, "refs/heads/agentfs/b"), Some(b.head()));
+        let (winner, loser) = match (results[0].1, results[2].1) {
+            (false, true) => (&results[0].0, &results[2].0),
+            (true, false) => (&results[2].0, &results[0].0),
+            other => panic!("exactly one `a` owns the branch; diverged: {other:?}"),
+        };
+        assert_eq!(
+            remote_ref(&remote, "refs/heads/agentfs/a"),
+            Some(winner.head())
+        );
+        let saved = diverged_refs(&remote, "a");
+        assert_eq!(saved.len(), 1, "saved once: {saved:?}");
+        let loser_repo = loser.com.history().repo();
+        assert!(
+            saved[0].1 == loser.head()
+                || loser_repo
+                    .graph_descendant_of(loser.head(), saved[0].1)
+                    .unwrap(),
+            "the saved head is the loser's"
+        );
+        let fsck = std::process::Command::new("git")
+            .args(["fsck", "--full", "--strict"])
+            .env("GIT_DIR", &remote)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            fsck.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+    }
+
     #[test]
     fn state_survives_reopen() {
         let missing = tempfile::tempdir().unwrap().path().join("nope");

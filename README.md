@@ -536,6 +536,23 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   running `agentfs run`, divergence, and TLS certificate verification (a
   certificate for another host fails, and a self-signed one fails as
   `untrusted_host`).
+- **e2e shared and failing remotes**
+  ([`ci/e2e-shared-remote.sh`](ci/e2e-shared-remote.sh),
+  [`ci/e2e-remote-failures.sh`](ci/e2e-remote-failures.sh)), through real
+  FUSE mounts. Two volumes push every second, and in ten rounds of
+  `agentfs push` started together, to one smart-HTTP repository (as
+  different users, a slow hook making their pushes overlap, as the server's
+  access log shows) and to one local bare repository: no push fails, each
+  branch ends at its volume's head, nothing is saved as diverged, and both
+  repositories pass `git fsck --strict`. Then one mount with a good remote
+  and six failing ones (nothing listening, a server that never answers
+  ([`ci/hung-server.sh`](ci/hung-server.sh)), a refusing hook, a wrong
+  password, a diverged branch, an untrusted certificate) keeps serving: the
+  close latency stays within max(3x a healthy baseline, 50 ms) at p99,
+  renames, directories and a `git clone` work, everything reaches history
+  and the good remote, `agentfs status` and the alarms name each failure's
+  kind, the fixed remotes catch up, and SIGTERM ends the mount within its
+  push grace, abandoning the hung push.
 - **e2e patches** ([`ci/e2e-patches.sh`](ci/e2e-patches.sh)): the patch
   queue against the same smart-HTTP server and a real FUSE mount, following
   the [runbook](docs/runbooks/patch-queue.md): two producers racing

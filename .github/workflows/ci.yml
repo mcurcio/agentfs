@@ -101,6 +101,38 @@ jobs:
       - if: always()
         run: ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
 
+  e2e-shared-remotes:
+    name: e2e (shared and failing remotes, FUSE)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: shared-remotes
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config nginx fcgiwrap fuse3 jq python3 socat
+      - run: cargo build --locked --release -p agentfs --features https
+      - name: start git server
+        run: ci/git-http-server.sh start "$RUNNER_TEMP/git-server" --trust-ca >>"$GITHUB_ENV"
+      - name: two volumes push to one remote at once
+        run: ci/e2e-shared-remote.sh
+        env:
+          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
+      - name: the mount keeps working while remotes fail
+        run: ci/e2e-remote-failures.sh
+        env:
+          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
+      - name: server logs
+        if: failure()
+        run: tail -n 100 "$RUNNER_TEMP"/git-server/logs/*.log
+      - if: always()
+        run: ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
+      - name: clean up mounts
+        if: always()
+        run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
+
   e2e-patches:
     name: e2e (patch queue over http, FUSE)
     runs-on: ubuntu-24.04

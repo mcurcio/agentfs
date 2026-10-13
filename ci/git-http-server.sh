@@ -10,7 +10,12 @@
 #
 # `start` prints environment assignments for the test scripts:
 #   GIT_SERVER_REPOS, GIT_SERVER_HTPASSWD, GIT_HTTP_BASE, GIT_HTTPS_BASE,
-#   GIT_HTTPS_UNTRUSTED_BASE (a self-signed certificate nothing trusts).
+#   GIT_HTTPS_UNTRUSTED_BASE (a self-signed certificate nothing trusts),
+#   GIT_SERVER_ACCESS_LOG.
+# Every request is logged to logs/access.log as
+# `$msec $server_port $remote_user "$request" $status $request_time` ($msec is when
+# the request ended, so it started at $msec - $request_time), for ordering,
+# per-host credential and concurrency checks.
 # --trust-ca installs the throwaway CA into the system trust store (sudo),
 # which is where libgit2's OpenSSL backend looks.
 #
@@ -24,11 +29,7 @@
 #     under the git server's own users (htpasswd);
 #   http://127.0.0.1:8081/...  a separate LFS host with its own users
 #     (htpasswd-lfs), proxied to 127.0.0.1:9001;
-# and logs every request as
-# `$msec $server_port $remote_user "$request" $status $request_time` ($msec is when
-# the request ended, so it started at $msec - $request_time)
-# to logs/access.log, for ordering and per-host credential checks. It also
-# prints GIT_SERVER_LFS_HTPASSWD, LFS_SEPARATE_BASE and GIT_SERVER_ACCESS_LOG.
+# and prints GIT_SERVER_LFS_HTPASSWD and LFS_SEPARATE_BASE.
 #
 # Needs nginx, fcgiwrap, git and openssl. Everything runs as the calling
 # user except --trust-ca.
@@ -78,14 +79,14 @@ if [ -n "${GIT_SERVER_EXTRA_LISTEN:-}" ]; then
   extra_listen="listen ${GIT_SERVER_EXTRA_LISTEN}:8080;"
 fi
 
-log_format=""
-access_log="access_log $dir/logs/access.log;"
+# Every request, timed (for ordering, per-host credential and concurrency
+# checks): $msec is when it ended, so it started at $msec - $request_time.
+log_format="log_format agentfs '\$msec \$server_port \$remote_user \"\$request\" \$status \$request_time';"
+access_log="access_log $dir/logs/access.log agentfs;"
 lfs_locations=""
 lfs_server=""
 if [ "${GIT_SERVER_LFS:-}" = 1 ]; then
   : >"$dir/htpasswd-lfs"
-  log_format="log_format agentfs '\$msec \$server_port \$remote_user \"\$request\" \$status \$request_time';"
-  access_log="access_log $dir/logs/access.log agentfs;"
   lfs_locations="
     location ~ ^/git/([^/]+)\\.git/info/lfs/(.*)\$ {
       auth_basic \"git\";
@@ -175,11 +176,11 @@ GIT_SERVER_HTPASSWD=$dir/htpasswd
 GIT_HTTP_BASE=http://localhost:8080/git
 GIT_HTTPS_BASE=https://localhost:8443/git
 GIT_HTTPS_UNTRUSTED_BASE=https://localhost:8444/git
+GIT_SERVER_ACCESS_LOG=$dir/logs/access.log
 EOF
 if [ "${GIT_SERVER_LFS:-}" = 1 ]; then
   cat <<EOF
 GIT_SERVER_LFS_HTPASSWD=$dir/htpasswd-lfs
 LFS_SEPARATE_BASE=http://127.0.0.1:8081
-GIT_SERVER_ACCESS_LOG=$dir/logs/access.log
 EOF
 fi
