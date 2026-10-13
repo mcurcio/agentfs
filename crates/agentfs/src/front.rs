@@ -82,6 +82,8 @@ fn connect(
         instance: nanos ^ (u64::from(std::process::id()) << 32),
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        // Where its workloads see the tree, as this process knows (design §5).
+        views: agentfs_core::nested::views(),
     };
     let client = HistoryClient::connect(
         ClientConfig {
@@ -177,6 +179,9 @@ pub(crate) fn mount_front(
     if args.seal_mountpoint {
         crate::seal_mountpoint(&mountpoint)?;
     }
+    // Where its workloads see the tree, for this front and the service
+    // (design §5).
+    agentfs_core::nested::add_views(crate::workload_views(&mountpoint, args));
     // Before mounting: a missing service exits without a mount.
     let front = connect(
         state,
@@ -200,6 +205,7 @@ pub(crate) fn mount_front(
         stack_over: None,
     };
     let mounted = Mount::start(front.recorder.clone(), config)?;
+    crate::add_mounted_views(&mountpoint);
     daemon.watch(mounted.ended(), Wake::Unmounted)?;
     daemon.watch(mounted.failed(), Wake::PassthroughFailed)?;
     // The service calls the mount on this for restores (design §15).

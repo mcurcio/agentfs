@@ -406,7 +406,7 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
 }
 
 /// Decodes the kernel's `\ooo` escapes (space, tab, newline, backslash).
-fn unescape(field: &str) -> Vec<u8> {
+pub(crate) fn unescape(field: &str) -> Vec<u8> {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

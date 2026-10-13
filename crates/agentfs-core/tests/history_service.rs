@@ -165,6 +165,7 @@ fn front_info(lease: &FrontLease, origin: Origin) -> FrontInfo {
             | NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
         pid: std::process::id(),
         version: "test".into(),
+        views: Vec::new(),
     }
 }
 

@@ -501,6 +501,7 @@ impl Volume {
                 instance: u64::from(std::process::id()) << 16 | u64::from(lease.slot()),
                 pid: std::process::id(),
                 version: "test".into(),
+                views: Vec::new(),
             },
             Arc::new(NullSink),
             Telemetry::noop(),

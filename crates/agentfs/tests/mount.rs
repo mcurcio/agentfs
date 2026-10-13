@@ -2507,3 +2507,32 @@ fn directory_renames_are_one_move() {
     ]));
     m.stop();
 }
+
+// ---- design §5: absolute gitdir targets ----
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn absolute_gitdirs_map_exactly_through_the_views() {
+    let v = Vol::new("views");
+    let m = v.mount(&["--workload-mount", "/workspace"]);
+    let script = "set -e
+        git init -q main
+        cd main
+        git -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m one
+        git worktree add -q ../wt
+        cd ..
+        printf w > wt/f
+        mkdir -p seen elsewhere
+        printf 'gitdir: /workspace/main/.git/worktrees/wt\\n' > seen/.git
+        printf s > seen/f
+        printf 'gitdir: /workspace/x/main/.git/worktrees/wt\\n' > elsewhere/.git
+        printf e > elsewhere/f
+        head -c 7 wt/.git";
+    assert_eq!(v.sh(script), "gitdir:");
+    // `wt` (gitdir under the mount point) and `seen` (under the workload
+    // mount) are worktrees of `main`: nested. `elsewhere` names a path
+    // under /workspace that is no git directory: not nested, although a
+    // suffix of its target is one.
+    v.expect(&tree(&[("elsewhere/f", f("e"))]));
+    m.stop();
+}

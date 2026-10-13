@@ -72,6 +72,7 @@ pub mod names {
     pub const FUSE_RACY_RECHECKS: &str = "agentfs.fuse.racy_rechecks";
     pub const RECONCILE_RECORDS: &str = "agentfs.reconcile.records";
     pub const RECONCILE_FAILURES: &str = "agentfs.reconcile.failures";
+    pub const NESTED_GITDIR_HEURISTIC: &str = "agentfs.nested.gitdir_heuristic";
     /// Recorded by the binary, which owns the exporters (design §13).
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -256,6 +257,16 @@ impl Telemetry {
             tracer,
             alarms,
         };
+        meter
+            .u64_observable_counter(names::NESTED_GITDIR_HEURISTIC)
+            .with_unit("{target}")
+            .with_description(
+                "Absolute gitdir: or .git symlink targets under no known view of the tree, found \
+                 by trying their suffixes (design §5); configure --workload-mount to map them \
+                 exactly",
+            )
+            .with_callback(|observer| observer.observe(crate::nested::heuristic_matches(), &[]))
+            .build();
         Self {
             inner: Some(Arc::new(inner)),
         }

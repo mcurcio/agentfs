@@ -99,6 +99,7 @@ missing from these tables or a row names a module that no longer exists;
 | `dirty.rs` | Whether an inode changed since it was last recorded, so clean closes record nothing |
 | `inodes.rs` | The inode table: FUSE node ids, backing inodes and their paths |
 | `names.rs` | What a path in the mount is, for recording (§5) |
+| `views.rs` | Where workloads see the mount: the mount point, its bind mounts from `/proc/self/mountinfo`, `--workload-mount` (§5) |
 | `backing.rs` | Confined access to the backing tree (§2.1, §6) |
 | `groups.rs` | fsync-class groups: holding writes while a group is captured, and scheduling captures (§8) |
 | `sweep.rs` | The periodic sweep: files held open, failed records, the fsync-class timer (§3.1, §3.5) |

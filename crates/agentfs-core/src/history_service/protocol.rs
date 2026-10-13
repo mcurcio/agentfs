@@ -41,7 +41,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::checks::Refusal;
-use crate::nested::NestedKind;
+use crate::nested::{NestedKind, View};
 use crate::paths::RepoPath;
 use crate::pending::PendingId;
 use crate::record::{Draft, Origin};
@@ -84,6 +84,10 @@ pub struct FrontInfo {
     pub pid: u32,
     /// The front's agentfs version, for the service's log.
     pub version: String,
+    /// Where its workloads see the tree (design §5): absolute `gitdir:`
+    /// targets under these map exactly. Absent from older fronts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<View>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +541,7 @@ mod tests {
                 instance: 42,
                 pid: 7,
                 version: "0.1.0".into(),
+                views: Vec::new(),
             },
         }
     }

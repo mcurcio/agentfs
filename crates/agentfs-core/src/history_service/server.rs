@@ -379,6 +379,8 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
         return refuse(&mut stream, reason);
     }
     reclaim(shared, &hello.front);
+    // Its workloads' views of the tree, for nested repositories (design §5).
+    crate::nested::add_views(hello.front.views.iter().cloned());
     let welcome = Reply::Welcome {
         volume: shared.volume.clone(),
         branch: shared.branch.clone(),

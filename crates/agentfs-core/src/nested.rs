@@ -26,9 +26,16 @@
 //! the workload's view of the mount, never followed on the host. A relative
 //! target is resolved lexically against the directory holding `.git` and
 //! must stay inside the tree. An absolute target (what `git worktree add`
-//! writes by default) has an unknown mount-point prefix, so each of its
-//! suffixes is tried as a path from the tree root: `/workspace/main/.git/x`
-//! is found as `main/.git/x` in a tree mounted at `/workspace`.
+//! writes by default) is mapped exactly through the workload's views of
+//! the tree ([`View`], [`add_views`]): the mount point, the paths given
+//! with `--workload-mount`, the bind mounts of the mount the daemon sees,
+//! and the fronts' views at a history service. A target under none of
+//! them (a container path nobody named) falls back to trying each of its
+//! suffixes as a path from the tree root: `/workspace/main/.git/x` is
+//! found as `main/.git/x` in a tree mounted at `/workspace`; each such
+//! match is counted ([`heuristic_matches`]).
+//!
+//! The views are process-wide: one process serves one backing tree.
 //!
 //! Every file is read with [`probe::read_regular`]: regular files only, never
 //! through a symlink, without blocking, and only up to a few KiB.
@@ -36,8 +43,64 @@
 use std::fs;
 use std::io;
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{PoisonError, RwLock};
+
+use serde::{Deserialize, Serialize};
 
 use crate::probe;
+
+/// Where a workload sees the tree, or part of it: the absolute path `at`
+/// shows the tree-relative directory `root` (`""`, the whole tree; a
+/// bind mount or `subPath` of a subdirectory otherwise).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct View {
+    pub at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
+}
+
+impl View {
+    /// A view, normalized: `at` absolute and lexical (no `.` or `..`, no
+    /// trailing `/`), `root` without leading or trailing `/`. `None` if
+    /// `at` is not absolute or `root` climbs out of the tree.
+    pub fn new(at: &str, root: &str) -> Option<Self> {
+        let at_path = Path::new(at);
+        if !at_path.is_absolute() {
+            return None;
+        }
+        let at = normalize(Vec::new(), at_path, false)?;
+        let root = normalize(Vec::new(), Path::new(root.trim_start_matches('/')), true)?;
+        Some(Self {
+            at: format!("/{}", at.join("/")),
+            root: root.join("/"),
+        })
+    }
+}
+
+static VIEWS: RwLock<Vec<View>> = RwLock::new(Vec::new());
+static HEURISTIC: AtomicU64 = AtomicU64::new(0);
+
+/// Adds where workloads see this process's tree (see the module docs).
+pub fn add_views(views: impl IntoIterator<Item = View>) {
+    let mut known = VIEWS.write().unwrap_or_else(PoisonError::into_inner);
+    for view in views {
+        if !known.contains(&view) {
+            known.push(view);
+        }
+    }
+}
+
+/// The views added so far.
+pub fn views() -> Vec<View> {
+    VIEWS.read().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// How many absolute `gitdir:` or `.git` symlink targets under no known
+/// view were found by trying their suffixes (`agentfs.nested.gitdir_heuristic`).
+pub fn heuristic_matches() -> u64 {
+    HEURISTIC.load(Ordering::Relaxed)
+}
 
 /// Why a directory counts as a nested repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,8 +227,13 @@ fn gitdir_from_symlink(tree: &Path, dir: &str, link: &Path) -> io::Result<bool> 
 
 /// True if `target`, as written in `dir`, names a git directory in the tree.
 fn any_git_dir(tree: &Path, dir: &str, target: &str) -> io::Result<bool> {
-    for candidate in candidates(dir, target) {
+    let views = VIEWS.read().unwrap_or_else(PoisonError::into_inner).clone();
+    let (candidates, exact) = candidates(&views, dir, target);
+    for candidate in candidates {
         if is_git_dir(&tree.join(candidate))? {
+            if !exact {
+                HEURISTIC.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(true);
         }
     }
@@ -173,22 +241,46 @@ fn any_git_dir(tree: &Path, dir: &str, target: &str) -> io::Result<bool> {
 }
 
 /// The tree-relative paths `target`, found in `dir`, may refer to (see the
-/// module docs). Never the root, and never outside the tree.
-fn candidates(dir: &str, target: &str) -> Vec<String> {
+/// module docs), and whether they are exact (not the suffix heuristic).
+/// Never the root, and never outside the tree.
+fn candidates(views: &[View], dir: &str, target: &str) -> (Vec<String>, bool) {
     if target.is_empty() {
-        return Vec::new();
+        return (Vec::new(), true);
     }
     let target = Path::new(target);
     if target.is_absolute() {
         let Some(parts) = normalize(Vec::new(), target, false) else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
-        (0..parts.len()).map(|i| parts[i..].join("/")).collect()
+        // The deepest view holding the target.
+        let mapped = views
+            .iter()
+            .filter_map(|v| {
+                let at: Vec<&str> = v.at.split('/').filter(|c| !c.is_empty()).collect();
+                parts.starts_with(&at).then_some((at.len(), v))
+            })
+            .max_by_key(|(depth, _)| *depth);
+        if let Some((depth, view)) = mapped {
+            let path: Vec<&str> = view
+                .root
+                .split('/')
+                .filter(|c| !c.is_empty())
+                .chain(parts[depth..].iter().copied())
+                .collect();
+            return match path.is_empty() {
+                true => (Vec::new(), true),
+                false => (vec![path.join("/")], true),
+            };
+        }
+        (
+            (0..parts.len()).map(|i| parts[i..].join("/")).collect(),
+            false,
+        )
     } else {
         let base = dir.split('/').filter(|c| !c.is_empty()).collect();
         match normalize(base, target, true) {
-            Some(parts) if !parts.is_empty() => vec![parts.join("/")],
-            _ => Vec::new(),
+            Some(parts) if !parts.is_empty() => (vec![parts.join("/")], true),
+            _ => (Vec::new(), true),
         }
     }
 }
@@ -401,14 +493,62 @@ mod tests {
             fs::write(tree.join("w/.git"), format!("gitdir: {target}\n")).unwrap();
             assert_eq!(detect(&tree, "w").unwrap(), None, "{target}");
         }
-        assert_eq!(candidates("w", "../.."), Vec::<String>::new());
+        let c = |dir, target| candidates(&[], dir, target).0;
+        assert_eq!(c("w", "../.."), Vec::<String>::new());
+        assert_eq!(c("w", ".."), Vec::<String>::new(), "never the root");
+        assert_eq!(c("a/b", "../c"), ["a/c"]);
+        assert_eq!(c("", "/x/../y/z"), ["y/z", "z"]);
+    }
+
+    #[test]
+    fn absolute_targets_map_exactly_through_views() {
+        let views = [
+            View::new("/workspace/", "").unwrap(),
+            View::new("/src", "proj/").unwrap(),
+            View::new("/workspace/deep", "other").unwrap(),
+        ];
+        assert_eq!(views[0].at, "/workspace");
+        assert_eq!(views[1].root, "proj");
+        let c = |target| candidates(&views, "w", target);
         assert_eq!(
-            candidates("w", ".."),
-            Vec::<String>::new(),
-            "never the root"
+            c("/workspace/main/.git/worktrees/wt"),
+            (vec!["main/.git/worktrees/wt".to_owned()], true)
         );
-        assert_eq!(candidates("a/b", "../c"), ["a/c"]);
-        assert_eq!(candidates("", "/x/../y/z"), ["y/z", "z"]);
+        // A subdirectory's view; the deepest view wins.
+        assert_eq!(c("/src/.git"), (vec!["proj/.git".to_owned()], true));
+        assert_eq!(c("/workspace/deep/x"), (vec!["other/x".to_owned()], true));
+        // The view's root itself is never a candidate.
+        assert_eq!(c("/workspace"), (vec![], true));
+        // Under no view: every suffix, not exact.
+        assert_eq!(
+            c("/elsewhere/a"),
+            (vec!["elsewhere/a".to_owned(), "a".to_owned()], false)
+        );
+        // A prefix only by name is not a view.
+        assert!(!c("/workspaces/a").1);
+        assert_eq!(View::new("relative", ""), None);
+        assert_eq!(View::new("/x", "../up"), None);
+    }
+
+    #[test]
+    fn a_view_rules_out_a_suffix_match_elsewhere() {
+        // `/workspace/wt/.git` names `wt/.git`, never a git directory that
+        // only a suffix of it would find.
+        let t = tempfile::tempdir().unwrap();
+        let admin = t.path().join("main/.git/worktrees/wt");
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(admin.join("HEAD"), "ref: refs/heads/wt\n").unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        fs::create_dir(t.path().join("wt")).unwrap();
+        let views = [View::new("/workspace", "").unwrap()];
+        let target = "/workspace/main/.git/worktrees/wt";
+        let (exact, _) = candidates(&views, "wt", target);
+        assert_eq!(exact, ["main/.git/worktrees/wt"]);
+        let (suffixes, _) = candidates(&views, "wt", "/elsewhere/worktrees/wt");
+        assert!(suffixes.contains(&"worktrees/wt".to_owned()));
+        let (mapped, exact) = candidates(&views, "wt", "/workspace/x/.git/worktrees/wt");
+        assert!(exact);
+        assert_eq!(mapped, ["x/.git/worktrees/wt"], "no fallback to main/...");
     }
 
     #[test]

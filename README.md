@@ -472,6 +472,7 @@ Metrics (design §13):
 | `agentfs.fuse.racy_rechecks` | counter | `outcome` |
 | `agentfs.reconcile.records` | counter | |
 | `agentfs.reconcile.failures` | counter | |
+| `agentfs.nested.gitdir_heuristic` | counter | |
 
 Spans are `agentfs.record`, `agentfs.commit` and `agentfs.push`, carrying
 journal sequence numbers and commit ids. Every alarm is also a log record

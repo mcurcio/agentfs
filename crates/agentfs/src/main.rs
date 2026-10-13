@@ -939,8 +939,40 @@ struct MountArgs {
     /// of writing where nothing records it. Needs root (design §17.1).
     #[arg(long, env = "AGENTFS_SEAL_MOUNTPOINT")]
     seal_mountpoint: bool,
+    /// Where a workload sees the mount when not at MOUNTPOINT (a container's
+    /// `mountPath`): `PATH`, or `PATH=DIR` for the tree's directory DIR (a
+    /// `subPath`). Absolute `gitdir:` targets under it, written by `git
+    /// worktree add`, then map exactly (design §5). Repeatable; the variable
+    /// takes a comma-separated list.
+    #[arg(
+        long = "workload-mount",
+        env = "AGENTFS_WORKLOAD_MOUNTS",
+        value_delimiter = ',',
+        value_parser = agentfs_fuse::views::parse_workload_mount
+    )]
+    workload_mounts: Vec<agentfs_core::nested::View>,
     #[command(flatten)]
     history: HistoryArgs,
+}
+
+/// Where workloads see the tree before it is mounted (design §5): the mount
+/// point and `--workload-mount`.
+fn workload_views(mountpoint: &Path, args: &MountArgs) -> Vec<agentfs_core::nested::View> {
+    mountpoint
+        .to_str()
+        .and_then(|at| agentfs_core::nested::View::new(at, ""))
+        .into_iter()
+        .chain(args.workload_mounts.iter().cloned())
+        .collect()
+}
+
+/// Adds the other mounts of the mount at `mountpoint` this namespace shows
+/// (bind mounts) to the views (design §5).
+fn add_mounted_views(mountpoint: &Path) {
+    match agentfs_fuse::views::mounted_views(mountpoint) {
+        Ok(views) => agentfs_core::nested::add_views(views),
+        Err(e) => eprintln!("warning: reading the mount's bind mounts: {e}"),
+    }
 }
 
 /// `mount --on-stale-mount`.
@@ -1083,6 +1115,7 @@ fn mount(
         }
         (backing, mountpoint, None)
     };
+    agentfs_core::nested::add_views(workload_views(&mountpoint, args));
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
     // The patch queue, before anything can see the tree (design §12). A
@@ -1143,6 +1176,7 @@ fn mount(
             }),
         ),
     );
+    add_mounted_views(&mountpoint);
     daemon.watch(mounted.ended(), Wake::Unmounted)?;
     daemon.watch(mounted.failed(), Wake::PassthroughFailed)?;
     let startup = mounted.startup_repairs();

@@ -761,12 +761,19 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
   host:
   - a relative target is resolved lexically against the directory holding
     `.git`, and is ignored if it climbs out of the tree;
-  - an absolute target (what `git worktree add` writes by default) carries
-    the mount point, which agentfs does not know, so each of its suffixes is
-    tried from the tree root: `/workspace/main/.git/worktrees/wt` is found as
-    `main/.git/worktrees/wt` in a tree mounted at `/workspace`. The FUSE
-    layer now knows its mount point, so this can become an exact mapping;
-    that is a follow-up.
+  - an absolute target (what `git worktree add` writes by default) is a
+    path in the workload's view of the mount, mapped exactly through the
+    *views* agentfs knows: the mount point, every other mount of the same
+    FUSE filesystem in the daemon's mount namespace (bind mounts, at the
+    tree directory each shows), the paths given with `--workload-mount`
+    (`PATH` or `PATH=DIR` for a `subPath`; a container's `mountPath`,
+    which only the pod spec knows), and, at a history service, the views
+    each front sends in its hello (`FrontInfo.views`). Under the deepest
+    matching view, `/workspace/main/.git/worktrees/wt` is
+    `main/.git/worktrees/wt` and nothing else. A target under no view
+    falls back to trying each of its suffixes from the tree root, and each
+    such match counts in `agentfs.nested.gitdir_heuristic`: a nonzero
+    count means a workload mounts the tree where agentfs was not told.
 - **Bounded reads.** These files are workload-controlled and read in the
   synchronous step, so they are opened without following symlinks and
   without blocking (a FIFO cannot hang the daemon), must be regular files,
@@ -1767,6 +1774,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.fuse.racy_rechecks` | counter, per outcome | Boundaries that would have recorded a file again only because its last record was racy: `skipped` when its bytes were that record's frozen copy, still the last state journaled at its path, else `recorded` (§3.1) |
 | `agentfs.reconcile.records` | counter | Records made reconciling moved directories (§3.1) |
 | `agentfs.reconcile.failures` | counter | Moved directories given up on after 5 failed reconciliations (`reconcile_failed`, §3.1) |
+| `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree, found by trying their suffixes (§5); set `--workload-mount` |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
@@ -1895,8 +1903,9 @@ driver (§14.2) starts these per volume and per pod.
 Messages are frames of a u32 big-endian length and a JSON body (at most
 64 MiB), protocol version 1, reusing the journal's serde types:
 
-- `Hello {v, volume, front: {origin, slot, instance, pid, version}}`, the
-  first frame on every connection. The service checks, in this order, the
+- `Hello {v, volume, front: {origin, slot, instance, pid, version, views}}`,
+  the first frame on every connection (`views`, where the front's workloads
+  see the tree, §5, is optional; older services ignore it). The service checks, in this order, the
   peer's credentials (root or the service's own euid, as for the control
   socket), the protocol version, the volume name, that the slot is in
   1..=1023 and leased (below), and that the volume's identity templates

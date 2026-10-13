@@ -8,7 +8,10 @@
 # close a front failed before it died commits as that front's pod when
 # another pod's front takes over its slot, that a file
 # open in one front and renamed or removed through the other is recorded
-# under its new name or not at all, that a concurrent burst on one path
+# under its new name or not at all, that a directory rename through a
+# front is one move the service reconciles (a file held open across it in
+# the other front lands at its new path), that absolute gitdir targets map
+# exactly through the fronts' workload mounts, that a concurrent burst on one path
 # from both fronts converges on the tree's last state, that both fronts
 # creating the same new names at once never fail (each creates as the
 # caller), that a restore and a revert served by the service reach both
@@ -117,7 +120,7 @@ kill_service() {
 start_front() { # pod mountpoint log -> sets FRONT_PID
   local before
   before=$(grep -c '^mounted ' "$3" || true)
-  sudo env ${FRONT_SLOT:+AGENTFS_HISTORY_SLOT=$FRONT_SLOT} AGENTFS_POD="$1" AGENTFS_POD_UID="$1-uid" AGENTFS_NODE=node-1 \
+  sudo env ${FRONT_SLOT:+AGENTFS_HISTORY_SLOT=$FRONT_SLOT} AGENTFS_WORKLOAD_MOUNTS=/workspace AGENTFS_POD="$1" AGENTFS_POD_UID="$1-uid" AGENTFS_NODE=node-1 \
     AGENTFS_NAMESPACE=agents AGENTFS_REPLICA="$1" \
     "$AGENTFS_BIN" --state "$STATE" mount --passthrough "$P" --unmount-grace 5s \
     --history-service "$SOCK" --history-timeout 5s --history-wait 30s \
@@ -243,6 +246,43 @@ wait_history dir2/sub/f x
 wait_history dir2/g y
 wait_history dir/sub/f -
 wait_history dir/g -
+# One move, journaled by pod-b's front, reconciled by the service (design
+# §3.1).
+assert_eq "rename: dir -> dir2" "$(sgit log -1 --format=%s refs/heads/agentfs/demo -- dir2/g)" \
+  "the directory rename is one move"
+assert_eq pod-b "$(committer_of dir2/g)" "the move is pod-b's"
+
+step "a file open in a while b renames its directory, then written and closed in a"
+as_agent "$MNT_A" 'mkdir -p held && printf 1 > held/f'
+wait_history held/f 1
+sudo setpriv --reuid=10000 --regid=10000 --clear-groups -- python3 -c '
+import os, sys
+a, b = sys.argv[1], sys.argv[2]
+fd = os.open(a + "/held/f", os.O_WRONLY | os.O_APPEND)
+os.rename(b + "/held", b + "/held2")  # pod b renames the directory
+os.write(fd, b"2")
+os.close(fd)
+' "$MNT_A" "$MNT_B"
+wait_history held2/f 12
+wait_history held/f -
+
+step "absolute gitdir targets map exactly through the fronts' views"
+# Fronts run with AGENTFS_WORKLOAD_MOUNTS=/workspace (design §5).
+as_agent "$MNT_A" 'set -e
+  git init -q wsmain
+  cd wsmain
+  git -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m one
+  git worktree add -q ../wswt
+  cd ..
+  printf w > wswt/f
+  mkdir -p ws-seen ws-else
+  printf "gitdir: /workspace/wsmain/.git/worktrees/wswt\n" > ws-seen/.git
+  printf s > ws-seen/f
+  printf "gitdir: /workspace/x/wsmain/.git/worktrees/wswt\n" > ws-else/.git
+  printf e > ws-else/f'
+wait_history ws-else/f e
+wait_history ws-seen/f -
+wait_history wswt/f -
 
 step "a shared file, written by both in turn"
 for i in 1 2 3 4; do

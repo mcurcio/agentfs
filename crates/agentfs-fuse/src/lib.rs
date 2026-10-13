@@ -32,6 +32,7 @@ pub mod names;
 pub mod ops;
 pub mod privileges;
 pub mod sweep;
+pub mod views;
 
 pub use fuse::{Passthrough, PassthroughStatus};
 pub use mount::{
