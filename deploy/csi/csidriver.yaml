@@ -1,0 +1,23 @@
+# How Kubernetes calls the driver (design §14.2, docs/csi.md).
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: agentfs.mcurcio.github.io
+spec:
+  # ControllerPublish is called (and tracks the node) only so that the
+  # attach/detach controller enforces one node per volume: its
+  # Multi-Attach check refuses a second node while the first one holds
+  # the VolumeAttachment.
+  attachRequired: true
+  # NodePublish gets the pod's name, namespace, uid and service account:
+  # each pod's front commits under its own identity.
+  podInfoOnMount: true
+  # PersistentVolumes only: inline (ephemeral) volumes would let a pod
+  # author choose the parameters, which are the operator's.
+  volumeLifecycleModes: [Persistent]
+  # The kubelet applies a pod's fsGroup through the mount (the front
+  # records the chown/chmod as metadata changes).
+  fsGroupPolicy: File
+  requiresRepublish: false
+  storageCapacity: false
+  seLinuxMount: false

@@ -19,11 +19,29 @@ impl Volume {
     /// A volume set up from `deploy/<rules>`: `config` included, `exclude`
     /// and `attributes` copied over the state area's own.
     fn new(rules: &str) -> Self {
+        let rules = repo_root().join(rules);
+        Self::from_files(
+            &rules.join("config"),
+            &rules.join("exclude"),
+            &rules.join("attributes"),
+        )
+    }
+
+    /// A CSI profile: `deploy/csi/profiles/<name>.{config,exclude,attributes}`,
+    /// included and installed as the driver does (design §14.2).
+    fn profile(name: &str) -> Self {
+        let dir = repo_root().join("deploy/csi/profiles");
+        Self::from_files(
+            &dir.join(format!("{name}.config")),
+            &dir.join(format!("{name}.exclude")),
+            &dir.join(format!("{name}.attributes")),
+        )
+    }
+
+    fn from_files(config: &Path, exclude: &Path, attributes: &Path) -> Self {
         let v = Self {
             dir: tempfile::tempdir().unwrap(),
         };
-        let rules = repo_root().join(rules);
-        let config = rules.join("config");
         let out = v.run(&[
             "init",
             "--volume",
@@ -32,12 +50,8 @@ impl Volume {
             config.to_str().unwrap(),
         ]);
         assert!(out.status.success(), "{}", text(&out.stderr));
-        for name in ["exclude", "attributes"] {
-            std::fs::copy(
-                rules.join(name),
-                v.dir.path().join("state/git/info").join(name),
-            )
-            .unwrap();
+        for (name, from) in [("exclude", exclude), ("attributes", attributes)] {
+            std::fs::copy(from, v.dir.path().join("state/git/info").join(name)).unwrap();
         }
         v
     }
@@ -180,6 +194,25 @@ fn the_hermes_rules_record_only_definitions() {
         "skills/a/cache.sqlite3",
         "profiles/p/skills/checkpoints/c",
     ];
+    let (recorded, skipped) = v.record(&[&kept[..], &dropped[..]].concat());
+    assert_eq!(recorded, set(&kept));
+    assert_eq!(skipped, set(&dropped));
+    assert_eq!(v.history(), set(&kept));
+}
+
+#[test]
+fn the_csi_example_profile_loads() {
+    let v = Volume::profile("example");
+    let out = v.run(&["status"]);
+    let status = text(&out.stdout);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        status.contains("remote:    origin https://git.example.com/acme/agent-history.git"),
+        "{status}"
+    );
+    assert!(!status.contains("misconfigured"), "{status}");
+    let kept = ["notes.md", "src/main.rs"];
+    let dropped = ["app.log", "tmp/scratch", "secrets/token"];
     let (recorded, skipped) = v.record(&[&kept[..], &dropped[..]].concat());
     assert_eq!(recorded, set(&kept));
     assert_eq!(skipped, set(&dropped));

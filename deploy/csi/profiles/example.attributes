@@ -1,0 +1,4 @@
+# The `example` profile's <state>/git/info/attributes (design §4.2).
+# `-agentfs` is never recorded, even when tracked. A directory pattern does
+# not cover its contents: write `dir/**`.
+secrets/** -agentfs

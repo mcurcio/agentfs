@@ -1,0 +1,13 @@
+# One node per volume: ReadWriteOnce (several pods on one node) or
+# ReadWriteOncePod. ReadWriteMany is refused. The size is not enforced.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workspace
+  namespace: agentfs-example
+spec:
+  storageClassName: agentfs
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi

@@ -1,0 +1,19 @@
+# Every setting of a volume is the operator's: the StorageClass names a
+# profile from the agentfs-csi-profiles ConfigMap (docs/csi.md
+# "Parameters"). Pod authors only choose the class.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: agentfs
+provisioner: agentfs.mcurcio.github.io
+parameters:
+  profile: example
+  # The agentfs volume name; the history branch is agentfs/<volumeName>.
+  volumeName: "{pvcNamespace}.{pvcName}"
+  # DeleteVolume keeps the files and history (reusable through a static
+  # PV); `delete` removes them.
+  onDelete: retain
+reclaimPolicy: Retain
+# Provisioned once a pod is scheduled, on that pod's node.
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false

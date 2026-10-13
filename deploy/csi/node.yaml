@@ -1,0 +1,126 @@
+# The node plugin: `agentfs-csi --mode node` under tini on every node,
+# with node-driver-registrar and livenessprobe (design §14.2, docs/csi.md
+# "Architecture"). NodeStage starts one `agentfs serve-history` per volume,
+# NodePublish one `agentfs mount --history-service` front per pod,
+# bind-mounted onto the kubelet's target.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: agentfs-csi-node
+  namespace: agentfs-csi
+  labels:
+    app.kubernetes.io/name: agentfs-csi-node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentfs-csi-node
+  # Restarting the plugin stops the fronts it runs: the mounts on that node
+  # answer ENOTCONN until the new plugin recovers them. Roll it by hand,
+  # one drained node at a time (docs/runbooks/csi-recovery.md).
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentfs-csi-node
+    spec:
+      serviceAccountName: agentfs-csi-node
+      # The node plugin never talks to the API server.
+      automountServiceAccountToken: false
+      priorityClassName: system-node-critical
+      # Longer than --unpublish-grace (20s) + --unstage-grace (30s): a
+      # stopped plugin lets its children make their final commits.
+      terminationGracePeriodSeconds: 60
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: agentfs-csi
+          image: ghcr.io/mcurcio/agentfs
+          # tini reaps whatever the children leave behind (design §14.2).
+          command: [tini, --, agentfs-csi]
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+            - --base-path=/var/lib/agentfs-csi/volumes
+            - --node-state=/var/lib/agentfs-csi/node
+            - --mount-dir=/run/agentfs-csi/mounts
+            - --profiles-dir=/etc/agentfs-csi/profiles
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: AGENTFS_CSI_POD
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: AGENTFS_CSI_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            # OpenTelemetry (README "Telemetry"), inherited by every
+            # service and front: point it at your collector.
+            - { name: OTEL_SDK_DISABLED, value: "true" }
+          ports:
+            - { name: healthz, containerPort: 9808 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: healthz }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          # FUSE mounts and Bidirectional propagation into the kubelet's
+          # directory need privileged (design §14.2 "Pod Security").
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+            # The kubelet's targets: the binds made here must reach the
+            # host, and the workloads' containers.
+            - { name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional }
+            - { name: base, mountPath: /var/lib/agentfs-csi/volumes, mountPropagation: HostToContainer }
+            # Staged and published records: what a restarted plugin
+            # reconciles from.
+            - { name: node-state, mountPath: /var/lib/agentfs-csi/node }
+            # The fronts' FUSE mounts (sources of the binds).
+            - { name: mounts, mountPath: /run/agentfs-csi }
+            - { name: profiles, mountPath: /etc/agentfs-csi/profiles, readOnly: true }
+            - { name: credentials, mountPath: /etc/agentfs-csi/credentials, readOnly: true }
+            - { name: dev-fuse, mountPath: /dev/fuse }
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/agentfs.mcurcio.github.io/csi.sock
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+            - { name: registration-dir, mountPath: /registration }
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe
+          args: [--csi-address=/csi/csi.sock, --http-endpoint=:9808]
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+      volumes:
+        - name: plugin-dir
+          hostPath: { path: /var/lib/kubelet/plugins/agentfs.mcurcio.github.io, type: DirectoryOrCreate }
+        - name: registration-dir
+          hostPath: { path: /var/lib/kubelet/plugins_registry, type: Directory }
+        - name: kubelet-dir
+          hostPath: { path: /var/lib/kubelet, type: Directory }
+        - name: base
+          hostPath: { path: /var/lib/agentfs-csi/volumes, type: DirectoryOrCreate }
+        - name: node-state
+          hostPath: { path: /var/lib/agentfs-csi/node, type: DirectoryOrCreate }
+        - name: mounts
+          emptyDir: {}
+        - name: dev-fuse
+          hostPath: { path: /dev/fuse, type: CharDevice }
+        - name: profiles
+          configMap: { name: agentfs-csi-profiles }
+        - name: credentials
+          secret: { secretName: agentfs-csi-credentials, defaultMode: 0400 }

@@ -1,0 +1,122 @@
+# The driver's whole RBAC inventory (design §14.2, docs/csi.md
+# "Security"). No rule grants secrets, pods or snapshots: credentials are
+# a Secret mounted into the driver's own pods, never read through the API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentfs-csi-controller
+  namespace: agentfs-csi
+---
+# The node plugin talks only to the kubelet (over its socket) and never to
+# the API server: this account has no bindings, and the DaemonSet does not
+# mount its token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentfs-csi-node
+  namespace: agentfs-csi
+automountServiceAccountToken: false
+---
+# csi-provisioner: turns PVCs of agentfs StorageClasses into PVs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agentfs-csi-provisioner
+rules:
+  # Creates the PV for a claim, and deletes it after DeleteVolume.
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, watch, create, patch, delete]
+  # Watches claims to provision, and marks them (annotations, finalizer).
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, watch, update]
+  # Reads the StorageClass parameters (the profile) of a claim.
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
+  # Reports provisioning progress and failures on the claim.
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [list, watch, create, update, patch]
+  # WaitForFirstConsumer: the selected node's topology.
+  - apiGroups: [storage.k8s.io]
+    resources: [csinodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+---
+# csi-attacher: turns VolumeAttachments into ControllerPublish and
+# ControllerUnpublish calls (one node per volume).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agentfs-csi-attacher
+rules:
+  # Reads the PV of an attachment, and its finalizer.
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, watch, patch]
+  # Maps a node to the driver's node id.
+  - apiGroups: [storage.k8s.io]
+    resources: [csinodes]
+    verbs: [get, list, watch]
+  # The attachments themselves, their finalizer and their status.
+  - apiGroups: [storage.k8s.io]
+    resources: [volumeattachments]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [storage.k8s.io]
+    resources: [volumeattachments/status]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agentfs-csi-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: agentfs-csi-controller
+    namespace: agentfs-csi
+roleRef:
+  kind: ClusterRole
+  name: agentfs-csi-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agentfs-csi-attacher
+subjects:
+  - kind: ServiceAccount
+    name: agentfs-csi-controller
+    namespace: agentfs-csi
+roleRef:
+  kind: ClusterRole
+  name: agentfs-csi-attacher
+  apiGroup: rbac.authorization.k8s.io
+---
+# Leader election of the two sidecars, in the driver's namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agentfs-csi-leader-election
+  namespace: agentfs-csi
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, watch, list, delete, update, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agentfs-csi-leader-election
+  namespace: agentfs-csi
+subjects:
+  - kind: ServiceAccount
+    name: agentfs-csi-controller
+    namespace: agentfs-csi
+roleRef:
+  kind: Role
+  name: agentfs-csi-leader-election
+  apiGroup: rbac.authorization.k8s.io
