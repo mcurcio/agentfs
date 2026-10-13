@@ -1,0 +1,4 @@
+# CreateVolume parameters for csi-sanity (ci/csi-sanity.sh): the profile in
+# ci/csi-sanity/profiles.
+profile: sanity
+onDelete: delete

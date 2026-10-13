@@ -279,3 +279,32 @@ jobs:
         run: |
           ci/lfs-server.sh stop "$RUNNER_TEMP/lfs-server"
           ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
+
+  csi-sanity:
+    name: e2e (csi-sanity against agentfs-csi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: csi
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - name: install csi-sanity (pinned)
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
+          echo "CSI_SANITY=$RUNNER_TEMP/bin/csi-sanity" >>"$GITHUB_ENV"
+      - run: cargo build --locked --release -p agentfs -p agentfs-csi
+      - run: ci/csi-sanity.sh
+      - name: driver logs
+        if: failure()
+        run: tail -n 400 "$RUNNER_TEMP"/agentfs-csi-logs/*.log
+      - name: clean up mounts
+        if: always()
+        run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
