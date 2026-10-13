@@ -51,6 +51,9 @@ pub struct PublishedRecord {
     /// The front's pending slot, preferred again after a crash.
     pub slot: Option<u16>,
     pub front_pid: Option<u32>,
+    /// `--workload-mount` values for the front (`workloadMounts`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workload_mounts: Vec<String>,
 }
 
 /// Reads a record; `None` if there is none.
@@ -124,6 +127,7 @@ mod tests {
             volume: "v".into(),
             branch: None,
             on_delete: OnDelete::Delete,
+            workload_mounts: Vec::new(),
         }
     }
 
@@ -198,6 +202,7 @@ mod tests {
             }),
             slot: Some(3),
             front_pid: Some(42),
+            workload_mounts: vec!["/workspace".into()],
         };
         store(&path, &rec).unwrap();
         assert_eq!(load::<PublishedRecord>(&path).unwrap(), Some(rec));

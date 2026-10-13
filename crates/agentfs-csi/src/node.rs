@@ -18,7 +18,7 @@ use crate::csi::v1::{
 };
 use crate::error::Error;
 use crate::layout::validate_handle;
-use crate::params::{PodInfo, is_ephemeral};
+use crate::params::{self, PodInfo, is_ephemeral};
 use crate::supervisor::{PublishRequest, StageRequest, Supervisor};
 use crate::volume::check_capability;
 
@@ -133,6 +133,8 @@ impl Node for NodeService {
                 readonly: req.readonly || mode == Mode::SingleNodeReaderOnly,
                 single_writer: mode == Mode::SingleNodeSingleWriter,
                 pod: PodInfo::from_context(&req.volume_context),
+                workload_mounts: params::workload_mounts(&req.volume_context)
+                    .map_err(|e| Error::InvalidArgument(e.to_string()))?,
             })
             .await?;
         Ok(Response::new(NodePublishVolumeResponse {}))

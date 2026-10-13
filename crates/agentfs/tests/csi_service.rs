@@ -137,6 +137,7 @@ async fn the_supervisor_runs_and_recovers_a_real_history_service() {
         volume: "demo".into(),
         branch: None,
         on_delete: OnDelete::Delete,
+        workload_mounts: Vec::new(),
     };
     agentfs_csi::volume::create(&layout, "pvc-1", &params, 0, false).unwrap();
 

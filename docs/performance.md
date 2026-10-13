@@ -40,7 +40,6 @@ them, are from two later runs, after the double record was removed
   plain directory (whose times vary threefold between runners): about
   2.1–3.2 ms per file for a `git clone`, 1.8–2.9 ms per created file,
   0.8–1.7 ms per removed file.
-- **A file written and closed at once is recorded once.** Until
 - **A file written and closed at once is recorded once** (since
   2026-10-13; before, RELEASE recorded it a second time through the
   racy-timestamp rule). RELEASE compares the file with the copy its close

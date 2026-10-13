@@ -1859,9 +1859,21 @@ impl Ops {
             // Recording again only because the last record was racy: not
             // if the bytes are the copy that record froze, and that copy
             // is still the last state journaled at the path (design §3.1).
+            // The bytes compared were read after `before`, so the proof
+            // stands for the stamp as of then, as a record would.
+            let before = now_ns();
             let skip = pinned.is_some_and(|pin| self.still_recorded(&pin, &paths, fd, &st));
             self.boundary.recorder().telemetry().racy_recheck(skip);
             if skip {
+                if let Some(node) = self.table().get_mut(id) {
+                    node.dirty
+                        .after_record(current, before, self.config.granularity_ns);
+                    // No longer racy: no later boundary compares with the
+                    // pinned copy, whose space goes once committed.
+                    if !node.dirty.racy {
+                        node.dirty.frozen = None;
+                    }
+                }
                 return Ok(false);
             }
         }

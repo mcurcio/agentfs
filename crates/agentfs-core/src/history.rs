@@ -17,7 +17,7 @@ use std::sync::Once;
 
 use git2::{Index, IndexEntry, IndexTime, Oid, Repository, Signature, Time};
 
-use crate::checks::{Checks, Refusal};
+use crate::checks::{Checks, Refusal, path_refusal};
 use crate::config::{ConfigError, Settings};
 use crate::events::CheckStage;
 use crate::identity::{Context, IdentityError, IdentityRenderer};
@@ -599,6 +599,8 @@ impl Written {
             .chain(self.lfs.iter())
             .filter(|p| at_or_under(p, from))
             .filter_map(|p| reroot(p, from, to))
+            // Left out of the index by `move_all`.
+            .filter(|p| path_refusal(p).is_none())
             .collect();
         let gone: Vec<RepoPath> = managed
             .iter()
@@ -630,7 +632,11 @@ pub(crate) fn reroot(path: &RepoPath, from: &RepoPath, to: &RepoPath) -> Option<
 
 /// Moves every entry at and beneath `from` to its place beneath `to`,
 /// replacing whatever was at and beneath `to` (design §3.1): same blob,
-/// same mode.
+/// same mode. An entry the path rules refuse at its new place
+/// ([`crate::checks::path_refusal`]: beneath a `.gitmodules` or
+/// `.gitattributes`, or too long) leaves history instead: recording it
+/// there would have refused it, and git's fsck rejects such a tree. The
+/// move's reconciliation reports it ([`crate::reconcile`]).
 fn move_all(index: &mut Index, from: &RepoPath, to: &RepoPath) -> Result<(), git2::Error> {
     let prefix = format!("{from}/");
     let moved: Vec<IndexEntry> = index
@@ -644,6 +650,13 @@ fn move_all(index: &mut Index, from: &RepoPath, to: &RepoPath) -> Result<(), git
         let rest = &e.path[from.as_str().len()..];
         let mut path = to.as_str().as_bytes().to_vec();
         path.extend_from_slice(rest);
+        let refused = std::str::from_utf8(&path)
+            .ok()
+            .and_then(|p| RepoPath::new(p).ok())
+            .is_none_or(|p| path_refusal(&p).is_some());
+        if refused {
+            continue;
+        }
         e.path = path;
         index.add(&e)?;
     }
@@ -1505,6 +1518,49 @@ mod tests {
             from: RepoPath::new(from).unwrap(),
             to: RepoPath::new(to).unwrap(),
         }
+    }
+
+    #[test]
+    fn a_move_leaves_out_what_the_path_rules_refuse_at_its_destination() {
+        let mut f = Fixture::new();
+        // Deep enough that a longer prefix takes it past MAX_PATH_BYTES.
+        let deep = format!("{}/f", vec!["x".repeat(200); 20].join("/"));
+        let changes = vec![
+            f.write("d/f", b"1", false),
+            f.write("d/sub/g", b"2", false),
+            f.write("a/h", b"3", false),
+            f.write_lfs("a/big.bin", b"4444"),
+            f.write(&format!("l/{deep}"), b"5", false),
+        ];
+        let r = f.record(Trigger::Close, changes);
+        f.commit(&[r]);
+        let r = f.record(
+            Trigger::Rename,
+            vec![
+                mv("d", ".gitmodules"),
+                mv("a", "x/.gitattributes"),
+                mv("l", &"y".repeat(200)),
+            ],
+        );
+        f.commit(&[r]);
+        for gone in [".gitmodules/f", ".gitmodules/sub/g", "x/.gitattributes/h"] {
+            assert_eq!(f.read(gone), None, "{gone}");
+        }
+        assert_eq!(f.read(&format!("{}/{deep}", "y".repeat(200))), None);
+        // Nothing of them is left anywhere, and no managed line follows the
+        // LFS file that was left out.
+        let head = f.history.head().unwrap().unwrap();
+        let mut paths = Vec::new();
+        head.tree()
+            .unwrap()
+            .walk(git2::TreeWalkMode::PreOrder, |dir, e| {
+                if e.kind() == Some(git2::ObjectType::Blob) {
+                    paths.push(format!("{dir}{}", e.name().unwrap()));
+                }
+                git2::TreeWalkResult::Ok
+            })
+            .unwrap();
+        assert!(paths.is_empty(), "{paths:?}");
     }
 
     #[test]

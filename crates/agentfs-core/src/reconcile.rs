@@ -24,17 +24,25 @@
 //! last record when both are one origin's. Duties are rebuilt at open
 //! from the uncommitted journal, so a crash between the move and its
 //! reconciliation redoes it (the records are absolute state, so doing it
-//! twice changes nothing). A duty that fails [`MAX_FAILURES`] times
-//! raises [`crate::events::Event::ReconcileFailed`] and stops holding
-//! commits back.
+//! twice changes nothing). A file that vanishes between the walk and its
+//! record is skipped, not a failure: whoever removed it records that. A
+//! duty that fails anyway (an I/O error) is retried with a backoff
+//! ([`BACKOFF_FIRST`] doubling to [`BACKOFF_MAX`]); once it has failed
+//! [`MAX_FAILURES`] times over at least [`GIVE_UP_AFTER`] it raises
+//! [`crate::events::Event::ReconcileFailed`] and stops holding commits
+//! back.
 
 use std::collections::BTreeMap;
 use std::fs::Metadata;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use rustix::fs::{Mode, OFlags};
+
+use crate::confined;
 use crate::paths::{RepoPath, is_dotgit};
 use crate::record::{Caller, Origin};
 
@@ -43,8 +51,19 @@ use crate::record::{Caller, Origin};
 /// of a front, so a write in flight across the rename is covered.
 pub const RECENT: Duration = Duration::from_secs(60);
 
-/// How many failed attempts a duty gets before it is given up.
+/// How many failed attempts a duty gets before it is given up, at the
+/// least ([`GIVE_UP_AFTER`]).
 pub const MAX_FAILURES: u32 = 5;
+
+/// How long a duty keeps being retried after its first failure before it
+/// is given up, at the least ([`MAX_FAILURES`]): long enough for a burst
+/// of changes under the destination (a build still writing) to settle.
+pub const GIVE_UP_AFTER: Duration = Duration::from_secs(30);
+
+/// The wait before retrying a failed duty: doubled per failure from
+/// [`BACKOFF_FIRST`], at most [`BACKOFF_MAX`].
+pub const BACKOFF_FIRST: Duration = Duration::from_millis(500);
+pub const BACKOFF_MAX: Duration = Duration::from_secs(8);
 
 /// Most changes per reconciling record.
 pub const CHUNK: usize = 4096;
@@ -73,10 +92,18 @@ pub struct Duties {
 #[derive(Debug, Default)]
 struct Inner {
     /// Open duties by the move's seq, with their failed attempts.
-    open: BTreeMap<u64, (Duty, u32)>,
+    open: BTreeMap<u64, (Duty, Attempts)>,
     /// Reconciled moves not yet committed: the move's seq and the last
     /// record of its reconciliation.
     done: BTreeMap<u64, u64>,
+}
+
+/// A duty's failed attempts.
+#[derive(Debug, Default, Clone, Copy)]
+struct Attempts {
+    failures: u32,
+    first_failed: Option<Instant>,
+    retry_at: Option<Instant>,
 }
 
 /// Holds the duties while a move is journaled, so the commit loop never
@@ -85,7 +112,7 @@ pub struct Adding<'a>(MutexGuard<'a, Inner>);
 
 impl Adding<'_> {
     pub fn add(&mut self, duty: Duty) {
-        self.0.open.insert(duty.seq, (duty, 0));
+        self.0.open.insert(duty.seq, (duty, Attempts::default()));
     }
 }
 
@@ -126,16 +153,33 @@ impl Duties {
         }
     }
 
-    /// An attempt at the move `seq` failed; returns how many have.
-    pub fn failed(&self, seq: u64) -> u32 {
+    /// An attempt at the move `seq` failed at `now`: it is retried after a
+    /// backoff ([`Duties::due`]). Returns how many attempts have failed
+    /// and whether it is time to give up: [`MAX_FAILURES`] failures over
+    /// at least [`GIVE_UP_AFTER`].
+    pub fn failed(&self, seq: u64, now: Instant) -> (u32, bool) {
         let mut inner = self.lock();
-        match inner.open.get_mut(&seq) {
-            Some((_, failures)) => {
-                *failures += 1;
-                *failures
-            }
-            None => 0,
-        }
+        let Some((_, attempts)) = inner.open.get_mut(&seq) else {
+            return (0, false);
+        };
+        attempts.failures += 1;
+        let first = *attempts.first_failed.get_or_insert(now);
+        let shift = attempts.failures.saturating_sub(1).min(16);
+        let wait = BACKOFF_FIRST.saturating_mul(1 << shift).min(BACKOFF_MAX);
+        attempts.retry_at = Some(now + wait);
+        let give_up =
+            attempts.failures >= MAX_FAILURES && now.duration_since(first) >= GIVE_UP_AFTER;
+        (attempts.failures, give_up)
+    }
+
+    /// Whether the move `seq` may be attempted at `now`: not while it backs
+    /// off after a failure.
+    pub fn due(&self, seq: u64, now: Instant) -> bool {
+        self.lock()
+            .open
+            .get(&seq)
+            .and_then(|(_, a)| a.retry_at)
+            .is_none_or(|at| now >= at)
     }
 
     /// The last record reconciling the move `seq`, if it needed any.
@@ -157,26 +201,29 @@ impl Duties {
 /// at `tree`, with its metadata, never inside a `.git` directory, never
 /// through a symlink. Names that are not repository paths (not UTF-8) are
 /// left out. Nothing if `dir` is gone, or not under real directories.
+///
+/// The workload may change the tree throughout: every directory is
+/// opened with `openat2` beneath the root, never through a symlink
+/// ([`confined::Dir`]), and every entry is examined (`lstat`) by its one
+/// name in its opened directory. Nothing is opened for reading: the
+/// records that follow open each leaf confined again
+/// ([`crate::volume::Input::Tree`]).
 pub fn leaves(tree: &Path, dir: &RepoPath) -> io::Result<Vec<(RepoPath, Metadata)>> {
+    let root = confined::Dir::open(tree)?;
     let mut out = Vec::new();
-    // Every component must be a real directory (the last may be a leaf).
-    let mut at = tree.to_path_buf();
-    let parts: Vec<&str> = dir.components().collect();
-    let mut meta = None;
-    for (i, part) in parts.iter().enumerate() {
-        at.push(part);
-        let m = match std::fs::symlink_metadata(&at) {
-            Ok(m) => m,
-            Err(e) if is_gone(&e) => return Ok(out),
-            Err(e) => return Err(e),
-        };
-        if i + 1 < parts.len() && !m.is_dir() {
-            return Ok(out);
-        }
-        meta = Some(m);
-    }
-    let Some(meta) = meta else {
-        return Ok(out);
+    let (parent, name) = match dir.as_str().rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", dir.as_str()),
+    };
+    let parent_fd = match root.open_at(parent, OFlags::PATH | OFlags::DIRECTORY, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) if confined::is_gone(&e) => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    let meta = match lstat_in(&parent_fd, name) {
+        Ok(m) => m,
+        Err(e) if confined::is_gone(&e) => return Ok(out),
+        Err(e) => return Err(e),
     };
     if meta.is_file() || meta.is_symlink() {
         out.push((dir.clone(), meta));
@@ -187,27 +234,34 @@ pub fn leaves(tree: &Path, dir: &RepoPath) -> io::Result<Vec<(RepoPath, Metadata
     }
     let mut stack = vec![dir.clone()];
     while let Some(d) = stack.pop() {
-        let entries = match std::fs::read_dir(tree.join(d.as_str())) {
-            Ok(entries) => entries,
+        let fd = match root.open_at(
+            d.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
             // Gone or replaced meanwhile: whoever did that records it.
-            Err(e) if is_gone(&e) => continue,
+            Err(e) if confined::is_gone(&e) => continue,
             Err(e) => return Err(e),
         };
-        for entry in entries {
+        for entry in rustix::fs::Dir::read_from(&fd)? {
             let entry = entry?;
-            let Ok(name) = entry.file_name().into_string() else {
+            let Ok(name) = std::str::from_utf8(entry.file_name().to_bytes()) else {
                 continue;
             };
+            if name == "." || name == ".." {
+                continue;
+            }
             let Ok(path) = RepoPath::new(format!("{d}/{name}")) else {
                 continue;
             };
-            let m = match std::fs::symlink_metadata(entry.path()) {
+            let m = match lstat_in(&fd, name) {
                 Ok(m) => m,
-                Err(e) if is_gone(&e) => continue,
+                Err(e) if confined::is_gone(&e) => continue,
                 Err(e) => return Err(e),
             };
             if m.is_dir() {
-                if !is_dotgit(&name) {
+                if !is_dotgit(name) {
                     stack.push(path);
                 }
             } else if m.is_file() || m.is_symlink() {
@@ -219,11 +273,11 @@ pub fn leaves(tree: &Path, dir: &RepoPath) -> io::Result<Vec<(RepoPath, Metadata
     Ok(out)
 }
 
-fn is_gone(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-    )
+/// The status of `name` in the opened directory `dir`, never following a
+/// final symlink: `lstat` of one name, through the directory's
+/// `/proc/self/fd` link, so no path beneath the root is resolved again.
+fn lstat_in(dir: &OwnedFd, name: &str) -> io::Result<Metadata> {
+    std::fs::symlink_metadata(confined::proc_path(dir).join(name))
 }
 
 #[cfg(test)]
@@ -257,8 +311,20 @@ mod tests {
         d.add(duty(9));
         assert_eq!(d.gate(), Some(5));
         assert_eq!(d.open().len(), 2);
-        assert_eq!(d.failed(5), 1);
-        assert_eq!(d.failed(5), 2);
+        let t0 = Instant::now();
+        assert!(d.due(5, t0));
+        assert_eq!(d.failed(5, t0), (1, false));
+        assert!(!d.due(5, t0), "backing off");
+        assert!(d.due(5, t0 + BACKOFF_FIRST));
+        assert_eq!(d.failed(5, t0 + BACKOFF_FIRST), (2, false));
+        // Five failures in quick succession are not enough to give up.
+        for n in 3..=MAX_FAILURES {
+            assert_eq!(d.failed(5, t0 + BACKOFF_FIRST), (n, false));
+        }
+        // Only once they span GIVE_UP_AFTER.
+        assert_eq!(d.failed(5, t0 + GIVE_UP_AFTER), (MAX_FAILURES + 1, true));
+        assert!(!d.due(5, t0 + GIVE_UP_AFTER), "capped backoff");
+        assert!(d.due(5, t0 + GIVE_UP_AFTER + BACKOFF_MAX));
         d.finished(5, Some(7));
         assert_eq!(d.gate(), Some(9));
         assert_eq!(d.reconciled_through(5), Some(7));

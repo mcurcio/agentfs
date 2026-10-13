@@ -63,10 +63,14 @@ pub enum ParamError {
          ending with a letter or digit, at most 63 characters"
     )]
     BadProfile(String),
-    #[error("unknown StorageClass parameter {0:?} (known: profile, volumeName, branch, onDelete)")]
+    #[error(
+        "unknown StorageClass parameter {0:?} (known: profile, volumeName, branch, onDelete, \
+         workloadMounts)"
+    )]
     UnknownKey(String),
     #[error(
-        "unknown volume attribute {0:?} (known: profile, volumeName (or volume), branch, onDelete)"
+        "unknown volume attribute {0:?} (known: profile, volumeName (or volume), branch, onDelete, \
+         workloadMounts)"
     )]
     UnknownAttribute(String),
     #[error("the volume attributes name two volumes, {a:?} and {b:?} (volume and volumeName)")]
@@ -87,6 +91,8 @@ pub enum ParamError {
     BadBranch(String),
     #[error("onDelete {0:?} must be retain or delete")]
     BadOnDelete(String),
+    #[error("workloadMounts: {0}")]
+    BadWorkloadMount(String),
 }
 
 /// What DeleteVolume does with the volume's directory.
@@ -131,6 +137,11 @@ pub struct VolumeParams {
     /// The history branch; `None` is `agentfs/<volume>`.
     pub branch: Option<String>,
     pub on_delete: OnDelete,
+    /// Where pods mount the volume (`workloadMounts`: comma-separated
+    /// `PATH` or `PATH=DIR`), passed to every front as `--workload-mount`
+    /// so absolute worktree `gitdir:` targets map exactly (design §5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workload_mounts: Vec<String>,
 }
 
 impl VolumeParams {
@@ -144,12 +155,14 @@ impl VolumeParams {
         let mut template = None;
         let mut branch = None;
         let mut on_delete = OnDelete::default();
+        let mut workload_mounts = Vec::new();
         for (key, value) in parameters {
             match key.as_str() {
                 "profile" => profile = Some(value.clone()),
                 "volumeName" => template = Some(value.clone()),
                 "branch" => branch = Some(value.clone()),
                 "onDelete" => on_delete = value.parse()?,
+                "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
                 k if k.starts_with(CO_PREFIX) => {}
                 other => return Err(ParamError::UnknownKey(other.to_owned())),
             }
@@ -179,13 +192,15 @@ impl VolumeParams {
             volume,
             branch,
             on_delete,
+            workload_mounts,
         })
     }
 
     /// From a volume context: what CreateVolume returned, or a static PV's
     /// `volumeAttributes`: `profile` (required), `volumeName` (a literal
     /// name, not a template; `volume`, as CreateVolume returns it, is the
-    /// same; default: the volume handle), `branch` and `onDelete`. Keys
+    /// same; default: the volume handle), `branch`, `onDelete` and
+    /// `workloadMounts`. Keys
     /// under the CO's prefixes (`csi.storage.k8s.io/`,
     /// `storage.kubernetes.io/csiProvisionerIdentity`) are ignored; any
     /// other key is refused, so a typo in a static PV fails loudly rather
@@ -198,12 +213,14 @@ impl VolumeParams {
         let mut names: Vec<&str> = Vec::new();
         let mut branch = None;
         let mut on_delete = OnDelete::default();
+        let mut workload_mounts = Vec::new();
         for (key, value) in context {
             match key.as_str() {
                 "profile" => profile = Some(value.clone()),
                 "volume" | "volumeName" => names.push(value),
                 "branch" => branch = Some(value.clone()).filter(|b| !b.is_empty()),
                 "onDelete" => on_delete = value.parse()?,
+                "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
                 k if CO_CONTEXT_PREFIXES.iter().any(|p| k.starts_with(p)) => {}
                 other => return Err(ParamError::UnknownAttribute(other.to_owned())),
             }
@@ -235,6 +252,7 @@ impl VolumeParams {
             volume,
             branch,
             on_delete,
+            workload_mounts,
         })
     }
 
@@ -248,13 +266,43 @@ impl VolumeParams {
     /// The volume context CreateVolume returns, which every node call
     /// carries back.
     pub fn to_context(&self) -> HashMap<String, String> {
-        HashMap::from([
+        let mut context = HashMap::from([
             ("profile".to_owned(), self.profile.clone()),
             ("volume".to_owned(), self.volume.clone()),
             ("branch".to_owned(), self.branch_name()),
             ("onDelete".to_owned(), self.on_delete.to_string()),
-        ])
+        ]);
+        if !self.workload_mounts.is_empty() {
+            context.insert(WORKLOAD_MOUNTS.to_owned(), self.workload_mounts.join(","));
+        }
+        context
     }
+}
+
+/// The StorageClass parameter and volume attribute naming where pods mount
+/// the volume.
+pub const WORKLOAD_MOUNTS: &str = "workloadMounts";
+
+/// `workloadMounts`: comma-separated `PATH` or `PATH=DIR` (design §5),
+/// each as `agentfs mount --workload-mount` takes it.
+pub fn parse_workload_mounts(value: &str) -> Result<Vec<String>, ParamError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            agentfs_fuse::views::parse_workload_mount(v)
+                .map(|_| v.to_owned())
+                .map_err(ParamError::BadWorkloadMount)
+        })
+        .collect()
+}
+
+/// The `workloadMounts` of a NodePublish volume context; none if absent.
+pub fn workload_mounts(context: &HashMap<String, String>) -> Result<Vec<String>, ParamError> {
+    context
+        .get(WORKLOAD_MOUNTS)
+        .map_or(Ok(Vec::new()), |v| parse_workload_mounts(v))
 }
 
 /// `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, at most [`MAX_PROFILE_LEN`].
@@ -518,6 +566,37 @@ mod tests {
             &map(&[("profile", "p"), ("csi.storage.k8s.io/fstype", "ext4")]),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn workload_mounts_reach_the_volume_context_and_back() {
+        let p = VolumeParams::from_create(
+            "pv-1",
+            &map(&[
+                ("profile", "p"),
+                ("workloadMounts", "/workspace, /src=proj"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(p.workload_mounts, ["/workspace", "/src=proj"]);
+        let context = p.to_context();
+        assert_eq!(context["workloadMounts"], "/workspace,/src=proj");
+        let back = VolumeParams::from_context("pv-1", &context).unwrap();
+        assert_eq!(back.workload_mounts, p.workload_mounts);
+        assert_eq!(
+            workload_mounts(&context).unwrap(),
+            ["/workspace", "/src=proj"]
+        );
+        assert!(workload_mounts(&map(&[])).unwrap().is_empty());
+        for bad in ["workspace", "/w=../up"] {
+            assert!(matches!(
+                VolumeParams::from_create("v", &map(&[("profile", "p"), ("workloadMounts", bad)])),
+                Err(ParamError::BadWorkloadMount(_))
+            ));
+        }
+        // Without it, the context is as before.
+        let p = VolumeParams::from_create("v", &map(&[("profile", "p")])).unwrap();
+        assert!(!p.to_context().contains_key("workloadMounts"));
     }
 
     #[test]

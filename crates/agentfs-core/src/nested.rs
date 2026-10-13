@@ -226,15 +226,32 @@ fn gitdir_from_symlink(tree: &Path, dir: &str, link: &Path) -> io::Result<bool> 
 }
 
 /// True if `target`, as written in `dir`, names a git directory in the tree.
+/// An absolute target whose exact mapping through the views names none
+/// (a view of another pod's `subPath` at the same path) falls back to the
+/// suffix heuristic, counted as such.
 fn any_git_dir(tree: &Path, dir: &str, target: &str) -> io::Result<bool> {
     let views = VIEWS.read().unwrap_or_else(PoisonError::into_inner).clone();
-    let (candidates, exact) = candidates(&views, dir, target);
-    for candidate in candidates {
+    git_dir_through(&views, tree, dir, target)
+}
+
+/// [`any_git_dir`] through `views`.
+fn git_dir_through(views: &[View], tree: &Path, dir: &str, target: &str) -> io::Result<bool> {
+    let (candidates, exact) = candidates(views, dir, target);
+    for candidate in &candidates {
         if is_git_dir(&tree.join(candidate))? {
             if !exact {
                 HEURISTIC.fetch_add(1, Ordering::Relaxed);
             }
             return Ok(true);
+        }
+    }
+    if exact && Path::new(target).is_absolute() && !views.is_empty() {
+        let (suffixes, _) = self::candidates(&[], dir, target);
+        for candidate in suffixes.iter().filter(|c| !candidates.contains(c)) {
+            if is_git_dir(&tree.join(candidate))? {
+                HEURISTIC.fetch_add(1, Ordering::Relaxed);
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -252,25 +269,30 @@ fn candidates(views: &[View], dir: &str, target: &str) -> (Vec<String>, bool) {
         let Some(parts) = normalize(Vec::new(), target, false) else {
             return (Vec::new(), true);
         };
-        // The deepest view holding the target.
-        let mapped = views
+        // The deepest views holding the target: every one of them, when
+        // several fronts see different directories at the same path.
+        let held: Vec<(usize, &View)> = views
             .iter()
             .filter_map(|v| {
                 let at: Vec<&str> = v.at.split('/').filter(|c| !c.is_empty()).collect();
                 parts.starts_with(&at).then_some((at.len(), v))
             })
-            .max_by_key(|(depth, _)| *depth);
-        if let Some((depth, view)) = mapped {
-            let path: Vec<&str> = view
-                .root
-                .split('/')
-                .filter(|c| !c.is_empty())
-                .chain(parts[depth..].iter().copied())
-                .collect();
-            return match path.is_empty() {
-                true => (Vec::new(), true),
-                false => (vec![path.join("/")], true),
-            };
+            .collect();
+        if let Some(depth) = held.iter().map(|(depth, _)| *depth).max() {
+            let mut mapped: Vec<String> = Vec::new();
+            for (_, view) in held.iter().filter(|(d, _)| *d == depth) {
+                let path: Vec<&str> = view
+                    .root
+                    .split('/')
+                    .filter(|c| !c.is_empty())
+                    .chain(parts[depth..].iter().copied())
+                    .collect();
+                let path = path.join("/");
+                if !path.is_empty() && !mapped.contains(&path) {
+                    mapped.push(path);
+                }
+            }
+            return (mapped, true);
         }
         (
             (0..parts.len()).map(|i| parts[i..].join("/")).collect(),
@@ -548,7 +570,38 @@ mod tests {
         assert!(suffixes.contains(&"worktrees/wt".to_owned()));
         let (mapped, exact) = candidates(&views, "wt", "/workspace/x/.git/worktrees/wt");
         assert!(exact);
-        assert_eq!(mapped, ["x/.git/worktrees/wt"], "no fallback to main/...");
+        // Mapped exactly first; only if that names no git directory are
+        // the suffixes tried ([`git_dir_through`]).
+        assert_eq!(mapped, ["x/.git/worktrees/wt"]);
+    }
+
+    #[test]
+    fn views_at_one_path_are_all_tried_then_the_suffixes() {
+        // Two fronts see different directories at /workspace (subPaths).
+        let t = tempfile::tempdir().unwrap();
+        let admin = t.path().join("main/.git/worktrees/wt");
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(admin.join("HEAD"), "ref: refs/heads/wt\n").unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let views = [
+            View::new("/workspace", "").unwrap(),
+            View::new("/workspace", "proj").unwrap(),
+        ];
+        let target = "/workspace/main/.git/worktrees/wt";
+        let (mapped, exact) = candidates(&views, "wt", target);
+        assert!(exact);
+        assert_eq!(
+            mapped,
+            ["main/.git/worktrees/wt", "proj/main/.git/worktrees/wt"]
+        );
+        let before = heuristic_matches();
+        assert!(git_dir_through(&views[1..], t.path(), "wt", target).unwrap());
+        assert!(
+            heuristic_matches() > before,
+            "found by its suffix, after the exact mapping named no git directory"
+        );
+        assert!(git_dir_through(&views, t.path(), "wt", target).unwrap());
+        assert!(!git_dir_through(&views, t.path(), "wt", "/workspace/none/wt").unwrap());
     }
 
     #[test]

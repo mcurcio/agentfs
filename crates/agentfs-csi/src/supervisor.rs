@@ -148,6 +148,9 @@ pub struct PublishRequest {
     /// SINGLE_NODE_SINGLE_WRITER (ReadWriteOncePod).
     pub single_writer: bool,
     pub pod: Option<PodInfo>,
+    /// `--workload-mount` values for the front (the `workloadMounts`
+    /// volume attribute, design §5).
+    pub workload_mounts: Vec<String>,
 }
 
 /// What [`Supervisor::reconcile`] found.
@@ -648,6 +651,7 @@ impl Supervisor {
                     pod: req.pod.clone(),
                     slot: None,
                     front_pid: None,
+                    workload_mounts: req.workload_mounts.clone(),
                 };
                 self.start_front(record, None, true).await?;
             }
@@ -771,6 +775,7 @@ impl Supervisor {
             record.slot,
             &self.cfg.node_id,
             &self.cfg.front,
+            &record.workload_mounts,
         );
         let spawned = self
             .launcher

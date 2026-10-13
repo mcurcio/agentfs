@@ -262,8 +262,8 @@ impl Telemetry {
             .with_unit("{target}")
             .with_description(
                 "Absolute gitdir: or .git symlink targets under no known view of the tree, found \
-                 by trying their suffixes (design §5); configure --workload-mount to map them \
-                 exactly",
+                 by trying their suffixes (design §5); configure --workload-mount (CSI: the workloadMounts \
+                 parameter) to map them exactly",
             )
             .with_callback(|observer| observer.observe(crate::nested::heuristic_matches(), &[]))
             .build();

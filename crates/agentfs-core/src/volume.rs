@@ -30,6 +30,7 @@ use opentelemetry::KeyValue;
 use crate::checks::{Checks, Limits, Refusal};
 use crate::claims::PathClaims;
 use crate::config::{ConfigError, validate_name};
+use crate::confined;
 use crate::events::{CheckStage, Event, Events};
 use crate::fsync_class::{self, FsyncClass, GroupMembers};
 use crate::history::{Committed, History, HistoryError};
@@ -282,12 +283,26 @@ pub enum Input {
     Remove {
         path: RepoPath,
     },
+    /// `path` as the backing tree has it when it is recorded: a regular
+    /// file's content or a symlink's target, reached with `openat2`
+    /// beneath the tree root, never through a symlink, and never opening
+    /// a FIFO or a device ([`confined::Dir::leaf_at`]). Skipped as
+    /// [`SkipReason::Gone`] if nothing is there as a plain path. For
+    /// paths the engine finds itself in a tree the workload may be
+    /// changing (a moved tree's reconciliation, a resync), where the FUSE
+    /// layer has no confined descriptor to hand over.
+    Tree {
+        path: RepoPath,
+    },
 }
 
 impl Input {
     pub fn path(&self) -> &RepoPath {
         match self {
-            Self::Write { path, .. } | Self::Symlink { path, .. } | Self::Remove { path } => path,
+            Self::Write { path, .. }
+            | Self::Symlink { path, .. }
+            | Self::Remove { path }
+            | Self::Tree { path } => path,
         }
     }
 }
@@ -887,7 +902,59 @@ impl Recorder {
         let mut frozen = Vec::new();
         let mut stamps = Vec::new();
         let result = (|| {
+            // Opened once for every [`Input::Tree`] of the record.
+            let tree = if kept.iter().any(|i| matches!(i, Input::Tree { .. })) {
+                Some(confined::Dir::open(self.rules.tree())?)
+            } else {
+                None
+            };
             for input in kept {
+                let input = match (input, &tree) {
+                    (Input::Tree { path }, Some(tree)) => match tree.leaf_at(path.as_str())? {
+                        Some(confined::Leaf::File { fd, executable }) => {
+                            // Frozen from the pinned inode while `fd` lives.
+                            match self.prepare_write(
+                                path,
+                                &confined::proc_path(&fd),
+                                executable,
+                                &mut frozen,
+                            )? {
+                                Ok((change, stamp)) => {
+                                    if let Some(stamp) = stamp {
+                                        stamps.push(PathStamp {
+                                            path: change.path().clone(),
+                                            stamp,
+                                        });
+                                    }
+                                    changes.push(change);
+                                }
+                                Err((path, refusal)) => self.refuse(&mut skipped, path, refusal),
+                            }
+                            continue;
+                        }
+                        Some(confined::Leaf::Symlink { target }) => match String::from_utf8(target)
+                        {
+                            Ok(target) => Input::Symlink { path, target },
+                            Err(_) => {
+                                skipped.push(Skipped {
+                                    path,
+                                    reason: SkipReason::Gone,
+                                });
+                                continue;
+                            }
+                        },
+                        // Removed or replaced since it was found: whoever
+                        // did that records it.
+                        None => {
+                            skipped.push(Skipped {
+                                path,
+                                reason: SkipReason::Gone,
+                            });
+                            continue;
+                        }
+                    },
+                    (input, _) => input,
+                };
                 let change = match input {
                     Input::Write {
                         path,
@@ -916,6 +983,8 @@ impl Recorder {
                         Change::Symlink { path, target }
                     }
                     Input::Remove { path } => Change::Remove { path },
+                    // Resolved above: `tree` is open whenever one is kept.
+                    Input::Tree { .. } => continue,
                 };
                 changes.push(change);
             }
@@ -1385,9 +1454,9 @@ impl Recorder {
     /// journaled leaves the tree, and so history, unchanged. A failure
     /// leaves the path to its next change, with a warning.
     fn resync(&self, path: &RepoPath, caller: Caller) {
-        let Some(input) = backing_input(self.rules.tree(), path) else {
-            return;
-        };
+        // Read confined when recorded (design §6 "Confinement"): the
+        // workload may change the tree at any moment.
+        let input = Input::Tree { path: path.clone() };
         self.telemetry.resynced();
         if let Err(e) = self.record_inner(Trigger::Sweep, caller, vec![input], None, false, None) {
             eprintln!(
@@ -1617,6 +1686,24 @@ impl Recorder {
                     inputs.push(Input::Remove { path });
                     continue;
                 }
+                // Refused at its new path (beneath a `.gitmodules`, too
+                // long, over its `agentfs.maxSize`): the move carried it
+                // there unchecked, so it leaves history, as recording the
+                // tree would have refused it (design §3.1).
+                let refusal = self.checks.check_path(&path).or_else(|| {
+                    meta.is_file()
+                        .then(|| over_max_size(meta.len(), self.rules.max_size(&path)))
+                        .flatten()
+                });
+                if let Some(reason) = refusal {
+                    self.events.emit(Event::PathRefused {
+                        path: path.to_string(),
+                        reason,
+                        stage: CheckStage::Record,
+                    });
+                    inputs.push(Input::Remove { path });
+                    continue;
+                }
                 let ctime_ns = meta.ctime().saturating_mul(1_000_000_000) + meta.ctime_nsec();
                 if ctime_ns < recent_ns {
                     continue;
@@ -1631,12 +1718,14 @@ impl Recorder {
             } else if self.rules.decide(&path, false)? != Decision::Record {
                 continue;
             }
-            if let Some(input) = backing_input(tree, &path) {
-                inputs.push(input);
-            }
+            // Opened confined only when recorded: the workload may have
+            // replaced anything since the walk.
+            inputs.push(Input::Tree { path });
         }
         // Moved paths no longer in the tree: recording it would not have
-        // brought them along.
+        // brought them along. Neither would a path refused there, which a
+        // move into a refused name carried along (history leaves it out
+        // already, [`crate::history`]).
         for path in tracked.under(&duty.to) {
             if !seen.contains(&path)
                 && let Ok(path) = RepoPath::new(path)
@@ -1896,7 +1985,7 @@ impl Recorder {
         for input in inputs {
             let decision = match input {
                 Input::Remove { .. } => Decision::Record,
-                Input::Write { path, .. } | Input::Symlink { path, .. } => {
+                Input::Write { path, .. } | Input::Symlink { path, .. } | Input::Tree { path } => {
                     match self.front_decide(path)? {
                         FrontDecision::Final(decision) => decision,
                         FrontDecision::IfUntracked(skip) => {
@@ -1961,7 +2050,9 @@ impl Recorder {
                 }
                 _ => Decision::Record,
             },
-            Input::Write { path, .. } | Input::Symlink { path, .. } => self.decide_write(path)?,
+            Input::Write { path, .. } | Input::Symlink { path, .. } | Input::Tree { path } => {
+                self.decide_write(path)?
+            }
         })
     }
 }
@@ -2109,15 +2200,19 @@ impl Committer {
                 self.duties.finished(duty.seq, None);
                 continue;
             };
+            // Backing off after a failure: later duties wait behind it.
+            if !self.duties.due(duty.seq, Instant::now()) {
+                break;
+            }
             match reconciler.reconcile(&duty) {
                 Ok(last) => self.duties.finished(duty.seq, last),
                 Err(e) => {
-                    let failures = self.duties.failed(duty.seq);
+                    let (failures, give_up) = self.duties.failed(duty.seq, Instant::now());
                     eprintln!(
                         "reconciling the move of {} to {} failed (attempt {failures}): {e}",
                         duty.from, duty.to
                     );
-                    if failures >= reconcile::MAX_FAILURES {
+                    if give_up {
                         self.events.emit(Event::ReconcileFailed {
                             from: duty.from.clone(),
                             to: duty.to.clone(),
@@ -2444,31 +2539,6 @@ enum Judged {
     Skip(SkipReason),
     /// Journal it, then record the path as the tree has it now.
     Resync,
-}
-
-/// The input that records `path` as the backing tree at `tree` has it
-/// now: a regular file or a symlink under real directories (design
-/// §14.1). `None` for anything else, or a target that is not UTF-8.
-fn backing_input(tree: &Path, path: &RepoPath) -> Option<Input> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(meta) = in_backing(tree, path, false) {
-        let meta = meta?;
-        return Some(Input::Write {
-            path: path.clone(),
-            backing: tree.join(path.as_str()),
-            executable: meta.permissions().mode() & 0o111 != 0,
-        });
-    }
-    in_backing(tree, path, true)?;
-    let target = std::fs::read_link(tree.join(path.as_str()))
-        .ok()?
-        .into_os_string()
-        .into_string()
-        .ok()?;
-    Some(Input::Symlink {
-        path: path.clone(),
-        target,
-    })
 }
 
 /// Whether `path` is still in the backing tree at `tree` as a front
@@ -5550,6 +5620,165 @@ mod tests {
         assert_eq!(tree_paths(&com), ["m/a"]);
         assert_eq!(blob(&com, "m/a"), b"22", "the write is not lost");
         assert_eq!(commits(&com).last().unwrap().0, "pod-b");
+    }
+
+    fn tree_input(s: &str) -> Input {
+        Input::Tree { path: path(s) }
+    }
+
+    fn mkfifo(at: &Path) {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            at,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+    }
+
+    /// `rec.record(inputs)` on another thread, failing the test rather
+    /// than hanging if it blocks.
+    fn record_within(rec: &Recorder, inputs: Vec<Input>) -> Recorded {
+        let rec = rec.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(rec.record(Trigger::Rename, CALLER, inputs));
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("recording blocked")
+            .unwrap()
+    }
+
+    #[test]
+    fn tree_inputs_never_follow_a_symlinked_component() {
+        let (dir, _state, tree, rec, com) = tree_volume();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("f"), "secret").unwrap();
+        // Found as d/f by a walk; then d becomes a symlink out of the tree
+        // before the record.
+        fs::create_dir_all(tree.join("d")).unwrap();
+        fs::write(tree.join("d/f"), "mine").unwrap();
+        fs::remove_dir_all(tree.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("d")).unwrap();
+        let recorded = record_within(&rec, vec![tree_input("d/f")]);
+        assert_eq!(recorded.seq, None);
+        assert_eq!(recorded.skipped, [skipped("d/f", SkipReason::Gone)]);
+        // A leaf that became a symlink is recorded as the symlink it is.
+        fs::create_dir_all(tree.join("e")).unwrap();
+        std::os::unix::fs::symlink(outside.join("f"), tree.join("e/f")).unwrap();
+        let recorded = record_within(&rec, vec![tree_input("e/f")]);
+        assert!(recorded.seq.is_some());
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["e/f"]);
+        assert_eq!(
+            blob(&com, "e/f"),
+            outside.join("f").to_str().unwrap().as_bytes()
+        );
+    }
+
+    #[test]
+    fn tree_inputs_never_open_a_fifo_and_skip_what_vanished() {
+        let (_dir, _state, tree, rec, com) = tree_volume();
+        fs::create_dir_all(tree.join("d")).unwrap();
+        fs::write(tree.join("d/a"), "a").unwrap();
+        // Found as a file by a walk; replaced by a FIFO, or removed, before
+        // the record.
+        mkfifo(&tree.join("d/p"));
+        let recorded = record_within(
+            &rec,
+            vec![tree_input("d/a"), tree_input("d/p"), tree_input("d/gone")],
+        );
+        assert!(recorded.seq.is_some(), "the rest is still recorded");
+        assert_eq!(
+            recorded.skipped,
+            [
+                skipped("d/p", SkipReason::Gone),
+                skipped("d/gone", SkipReason::Gone)
+            ]
+        );
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["d/a"]);
+    }
+
+    #[test]
+    fn reconciling_a_moved_tree_stays_confined_to_it() {
+        let (dir, _state, tree, rec, com) = tree_volume();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("f"), "secret").unwrap();
+        close_in_tree(&rec, &tree, "d/a", "a");
+        com.commit_pending().unwrap();
+        // Untracked things under the moved tree: a FIFO, and a symlink to a
+        // directory outside it.
+        mkfifo(&tree.join("d/p"));
+        std::os::unix::fs::symlink(&outside, tree.join("d/out")).unwrap();
+        fs::write(tree.join("d/new"), "n").unwrap();
+        fs::rename(tree.join("d"), tree.join("m")).unwrap();
+        rec.record_move(Trigger::Rename, CALLER, path("d"), path("m"))
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(com.commit_pending().map(|_| com));
+        });
+        let com = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the commit loop blocked")
+            .unwrap();
+        assert_eq!(tree_paths(&com), ["m/a", "m/new", "m/out"]);
+        assert_eq!(blob(&com, "m/out"), outside.to_str().unwrap().as_bytes());
+    }
+
+    #[test]
+    fn moves_into_refused_names_leave_history_with_an_alarm() {
+        let (dir, state) = setup();
+        fs::write(
+            state.git().join("info/attributes"),
+            "assets/** agentfs.maxSize=4\n",
+        )
+        .unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let sink = Arc::new(MemorySink::new());
+        let (rec, com, _) =
+            open(&state, &tree, context(), sink.clone(), &Telemetry::noop()).unwrap();
+        close_in_tree(&rec, &tree, "d/f", "1");
+        close_in_tree(&rec, &tree, "a/g", "2");
+        close_in_tree(&rec, &tree, "big/f", "0123456789");
+        close_in_tree(&rec, &tree, "big/small", "s");
+        com.commit_pending().unwrap();
+        sink.take();
+        fs::rename(tree.join("d"), tree.join(".gitmodules")).unwrap();
+        rec.record_move(Trigger::Rename, CALLER, path("d"), path(".gitmodules"))
+            .unwrap();
+        fs::create_dir_all(tree.join("x")).unwrap();
+        fs::rename(tree.join("a"), tree.join("x/.gitattributes")).unwrap();
+        rec.record_move(Trigger::Rename, CALLER, path("a"), path("x/.gitattributes"))
+            .unwrap();
+        fs::create_dir_all(tree.join("assets")).unwrap();
+        fs::rename(tree.join("big"), tree.join("assets/big")).unwrap();
+        rec.record_move(Trigger::Rename, CALLER, path("big"), path("assets/big"))
+            .unwrap();
+        com.commit_pending().unwrap();
+        assert_eq!(tree_paths(&com), ["assets/big/small"]);
+        let mut refused: Vec<(String, String)> = sink
+            .take()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::PathRefused { path, reason, .. } => Some((path, format!("{reason:?}"))),
+                _ => None,
+            })
+            .collect();
+        refused.sort();
+        assert_eq!(refused.len(), 3, "{refused:?}");
+        assert_eq!(refused[0].0, ".gitmodules/f");
+        assert!(refused[0].1.contains("SpecialFileNotBlob"), "{refused:?}");
+        assert_eq!(refused[1].0, "assets/big/f");
+        assert!(refused[1].1.contains("MaxSize"), "{refused:?}");
+        assert_eq!(refused[2].0, "x/.gitattributes/g");
+        // No longer tracked: nothing is left to remove later.
+        assert!(!rec.tracked_query(&[path(".gitmodules/f")])[0]);
     }
 
     #[test]

@@ -246,7 +246,9 @@ pub fn anonymous_replica(key: &str) -> String {
     format!("publish-{key}")
 }
 
-/// `agentfs --state S mount --history-service unix:<socket> ... B <source>`
+/// `agentfs --state S mount --history-service unix:<socket> ... B <source>`,
+/// with a `--workload-mount` for each of `workload_mounts` (design §5).
+#[allow(clippy::too_many_arguments)]
 pub fn front_spec(
     layout: &Layout,
     handle: &str,
@@ -255,6 +257,7 @@ pub fn front_spec(
     slot: Option<u16>,
     node: &str,
     options: &FrontOptions,
+    workload_mounts: &[String],
 ) -> ProcessSpec {
     let mut args = vec![
         os("--state"),
@@ -292,6 +295,11 @@ pub fn front_spec(
         os(node),
         os("--replica"),
         os(replica),
+    ]);
+    for mount in workload_mounts {
+        args.extend([os("--workload-mount"), os(mount.as_str())]);
+    }
+    args.extend([
         layout.backing(handle).into_os_string(),
         layout.front_source(handle, key).into_os_string(),
     ]);
@@ -356,7 +364,16 @@ mod tests {
             uid: "u-1".into(),
             service_account: "sa".into(),
         };
-        let spec = front_spec(&layout(), "v", "k", Some(&pod), Some(3), "n1", &options);
+        let spec = front_spec(
+            &layout(),
+            "v",
+            "k",
+            Some(&pod),
+            Some(3),
+            "n1",
+            &options,
+            &[],
+        );
         assert_eq!(spec.label, "front ns/web-0 k");
         assert_eq!(
             strings(&spec).join(" "),
@@ -365,8 +382,15 @@ mod tests {
              --namespace ns --pod web-0 --pod-uid u-1 --node n1 --replica web-0 /b/v/backing \
              /m/v/k"
         );
-        let spec = front_spec(&layout(), "v", "k", None, None, "n1", &options);
+        let mounts = ["/workspace".to_owned(), "/src=proj".to_owned()];
+        let spec = front_spec(&layout(), "v", "k", None, None, "n1", &options, &mounts);
         let args = strings(&spec);
+        assert!(
+            args.join(" ").ends_with(
+                "--workload-mount /workspace --workload-mount /src=proj /b/v/backing /m/v/k"
+            ),
+            "{args:?}"
+        );
         assert!(!args.contains(&"--history-slot".to_owned()), "{args:?}");
         let replica = args.iter().position(|a| a == "--replica").unwrap();
         assert_eq!(args[replica + 1], "publish-k");

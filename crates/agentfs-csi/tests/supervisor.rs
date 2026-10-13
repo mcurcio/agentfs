@@ -294,6 +294,7 @@ fn params(volume: &str) -> VolumeParams {
         volume: volume.into(),
         branch: None,
         on_delete: OnDelete::Delete,
+        workload_mounts: Vec::new(),
     }
 }
 
@@ -362,6 +363,7 @@ impl Node {
                     uid: "uid-0".into(),
                     service_account: "default".into(),
                 }),
+                workload_mounts: vec!["/workspace".into()],
             })
             .await
     }
@@ -467,6 +469,12 @@ async fn publish_binds_a_live_front_and_records_its_slot() {
     assert_eq!(arg_after(spec, "--pod-uid").unwrap(), "uid-0");
     assert_eq!(arg_after(spec, "--replica").unwrap(), "web-0");
     assert_eq!(arg_after(spec, "--node").unwrap(), "node-1");
+    assert_eq!(arg_after(spec, "--workload-mount").unwrap(), "/workspace");
+    assert_eq!(
+        rec.workload_mounts,
+        ["/workspace"],
+        "kept for a recovered front"
+    );
     assert_eq!(PathBuf::from(spec.args.last().unwrap()), source);
 
     // Idempotent.
@@ -528,6 +536,10 @@ async fn a_crashed_front_is_restarted_in_its_slot_and_stacked_over_the_target() 
     assert_eq!(arg_after(respawn, "--history-slot").as_deref(), Some("2"));
     assert_eq!(arg_after(respawn, "--pod").as_deref(), Some("web-0"));
     assert_eq!(arg_after(respawn, "--pod-uid").as_deref(), Some("uid-0"));
+    assert_eq!(
+        arg_after(respawn, "--workload-mount").as_deref(),
+        Some("/workspace")
+    );
     let events = n.fake.events();
     let crash = position(&events, "crash");
     let source = n.layout.front_source("v", &target_key(&target));
@@ -779,6 +791,7 @@ async fn a_pending_publish_does_not_hold_up_another_pods_recovery() {
                 readonly: false,
                 single_writer: false,
                 pod: None,
+                workload_mounts: Vec::new(),
             })
             .await
         })
@@ -806,6 +819,7 @@ async fn publishing_a_target_again_with_other_flags_is_already_exists() {
         readonly,
         single_writer,
         pod: None,
+        workload_mounts: Vec::new(),
     };
     let err = n.sup.publish(again(true, false)).await.unwrap_err();
     assert!(matches!(err, Error::AlreadyExists(_)), "{err:?}");

@@ -148,7 +148,8 @@ pub enum Event {
     /// History is intact, only less compact.
     RepackFailed { error: String },
     /// A moved tree could not be reconciled (design §3.1) after
-    /// [`crate::reconcile::MAX_FAILURES`] attempts: the move commits as
+    /// [`crate::reconcile::MAX_FAILURES`] attempts over at least
+    /// [`crate::reconcile::GIVE_UP_AFTER`]: the move commits as
     /// journaled, so history may hold files the rules exclude at `to`,
     /// or miss files beneath it that were never tracked, until their next
     /// change.

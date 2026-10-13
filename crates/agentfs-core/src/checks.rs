@@ -51,6 +51,26 @@ use crate::paths::{PathError, RepoPath, SpecialFile, is_dotgit, special_file};
 
 /// Longest path recorded, in bytes.
 pub const MAX_PATH_BYTES: usize = 4096;
+
+/// Rules on a path alone, whatever its content and remote: at most
+/// [`MAX_PATH_BYTES`], and no `.gitmodules` or `.gitattributes` as a
+/// directory (git's fsck rejects them as trees).
+pub fn path_refusal(path: &RepoPath) -> Option<Refusal> {
+    let bytes = path.as_str().len();
+    if bytes > MAX_PATH_BYTES {
+        return Some(Refusal::PathTooLong { bytes });
+    }
+    let components: Vec<&str> = path.components().collect();
+    components[..components.len() - 1]
+        .iter()
+        .find_map(|c| match special_file(c) {
+            Some(file @ (SpecialFile::Gitmodules | SpecialFile::Gitattributes)) => {
+                Some(Refusal::SpecialFileNotBlob { file })
+            }
+            _ => None,
+        })
+}
+
 /// Longest symlink target git's fsck accepts (`PATH_MAX`).
 pub const MAX_SYMLINK_TARGET: usize = 4096;
 /// Largest `.gitattributes` git's fsck accepts.
@@ -315,21 +335,9 @@ impl Checks {
         &self.limits
     }
 
-    /// Rules on the path alone.
+    /// Rules on the path alone ([`path_refusal`]).
     pub fn check_path(&self, path: &RepoPath) -> Option<Refusal> {
-        let bytes = path.as_str().len();
-        if bytes > MAX_PATH_BYTES {
-            return Some(Refusal::PathTooLong { bytes });
-        }
-        let components: Vec<&str> = path.components().collect();
-        components[..components.len() - 1]
-            .iter()
-            .find_map(|c| match special_file(c) {
-                Some(file @ (SpecialFile::Gitmodules | SpecialFile::Gitattributes)) => {
-                    Some(Refusal::SpecialFileNotBlob { file })
-                }
-                _ => None,
-            })
+        path_refusal(path)
     }
 
     /// Rules for a symlink at `path` pointing to `target`.

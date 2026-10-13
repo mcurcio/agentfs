@@ -1,8 +1,10 @@
 //! Confined access to a directory tree, for restores (design §6
-//! "Confinement", §15).
+//! "Confinement", §15) and for the history engine's own reads of the
+//! backing tree (a moved tree's reconciliation and resyncs, §3.1, §14.1).
 //!
 //! A restore reads and writes a tree the workload may change at any
-//! moment: the backing tree when no mount runs, or the mount point itself.
+//! moment: the backing tree when no mount runs, or the mount point itself;
+//! the engine reads the backing tree while the workload writes it.
 //! Every path is resolved from a directory descriptor with `openat2` and
 //! `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, so no
 //! path can leave the tree or follow a symlink, and every change is made
@@ -370,6 +372,57 @@ impl Dir {
             Err(rustix::io::Errno::NOTEMPTY | rustix::io::Errno::EXIST) => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// Whether `e`, from resolving a path beneath a [`Dir`], says nothing is
+/// there as a plain path: missing, under a non-directory (`ENOTDIR`), or
+/// under a symlink (`ELOOP`).
+pub fn is_gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    ) || e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+}
+
+/// A regular file or symlink found beneath a [`Dir`] by
+/// [`Dir::leaf_at`].
+#[derive(Debug)]
+pub enum Leaf {
+    /// A regular file, pinned by an `O_PATH` descriptor: its
+    /// [`proc_path`] opens exactly this inode, whatever is renamed over
+    /// its path meanwhile.
+    File {
+        fd: OwnedFd,
+        executable: bool,
+    },
+    Symlink {
+        target: Vec<u8>,
+    },
+}
+
+impl Dir {
+    /// The regular file or symlink at `rel`, resolved without following
+    /// any symlink and without opening anything that could block (a FIFO
+    /// or a device is never opened for reading). `None` if nothing is
+    /// there as a plain path ([`is_gone`]) or it is something else.
+    pub fn leaf_at(&self, rel: &str) -> io::Result<Option<Leaf>> {
+        let (fd, st) = match self.stat_at(rel) {
+            Ok(Some(found)) => found,
+            Ok(None) => return Ok(None),
+            Err(e) if is_gone(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(match kind_of(&st) {
+            Kind::File => Some(Leaf::File {
+                fd,
+                executable: u32::from(st.st_mode) & 0o111 != 0,
+            }),
+            Kind::Symlink => Some(Leaf::Symlink {
+                target: read_link_fd(&fd)?,
+            }),
+            _ => None,
+        })
     }
 }
 

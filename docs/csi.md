@@ -169,6 +169,7 @@ A StorageClass's `parameters`:
 | `volumeName` | the agentfs volume name (commit trailers, identity templates), a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}` | `{pvcNamespace}.{pvcName}.{pvName}` (the provisioner runs with `--extra-create-metadata`), else the PV name |
 | `branch` | the history branch | `agentfs/<volumeName>` |
 | `onDelete` | what DeleteVolume does: `retain` keeps the directory (renaming `csi.json` to `csi.retained.json`), `delete` removes it, and refuses while a remote lacks commits of the branch (§9) | `retain` |
+| `workloadMounts` | where pods mount the volume, comma-separated `PATH` or `PATH=DIR` (a `subPath` of the tree's directory `DIR`): passed to every front as `--workload-mount`, so the absolute `gitdir:` that `git worktree add` writes maps exactly to its repository (design §5). The node plugin cannot learn a container's `mountPath` otherwise; without it worktree paths are resolved by their suffixes and counted in `agentfs.nested.gitdir_heuristic` ([runbook](runbooks/worktree-heuristic.md)) | none |
 
 Keys under `csi.storage.k8s.io/` are the provisioner's and are otherwise
 ignored; any other key is refused (`InvalidArgument`). The requested size
@@ -199,6 +200,7 @@ hold:
 | `volumeName` | the agentfs volume name, literally (not a template); `volume` is the same key (it is what CreateVolume returns) | the volume handle |
 | `branch` | the history branch | `agentfs/<volumeName>` |
 | `onDelete` | as above | `retain` |
+| `workloadMounts` | as above | none |
 
 Any other key, except the CO's own (`csi.storage.k8s.io/…`,
 `storage.kubernetes.io/…`), is refused (`InvalidArgument`), so a typo
@@ -469,6 +471,9 @@ transport for fronts on several nodes is open (design §19.2).
 - No inline ephemeral volumes: a pod author would choose the parameters.
 - The plugin's flags (`--stage-wait`, `--publish-wait`, the graces) are
   per node, not per volume.
+- Worktree `gitdir:` paths map exactly only through `workloadMounts`,
+  which is per StorageClass or PV, not per pod: pods of one volume that
+  mount it at different paths need each path listed.
 
 ## 13. How it is tested
 

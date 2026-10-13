@@ -605,6 +605,7 @@ under `/etc/agentfs-csi/credentials/` in the driver's pods.
 | `volumeName` | `{pvcNamespace}.{pvcName}.{pvName}`, else the PV name | the agentfs volume name; a template over `{pvcNamespace}`, `{pvcName}`, `{pvName}`. Keep `{pvName}` in it: a claim deleted and created again must not reuse the old branch (docs/csi.md §5). In a static PV's attributes, a literal name (`volume` is the same key), default the volume handle |
 | `branch` | `agentfs/<volumeName>` | the history branch |
 | `onDelete` | `retain` | `retain` keeps the volume directory at DeleteVolume, `delete` removes it, and refuses while a remote lacks commits of the branch |
+| `workloadMounts` | none | where pods mount the volume: comma-separated `PATH` or `PATH=DIR`, passed to every front as `--workload-mount` so worktree `gitdir:` paths map exactly (design §5, docs/csi.md §5) |
 
 **`agentfs-csi` flags:**
 

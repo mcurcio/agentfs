@@ -257,12 +257,16 @@ Rules that make this precise:
   and the copy is still the last state journaled at that path (no later
   write, symlink, removal or rename there, above or below it, by
   anything). Whoever journals keeps the frozen copy of the last write at
-  each recently written path for 60 s to answer that; a front asks its
+  each recently written path for 120 s to answer that; a front asks its
   history service (`StillLast`, §14). Any doubt (an unreadable file, a
   forgotten path, an older service) records, as before. The comparison
   reads both files, mostly from the page cache, which is far cheaper
   than a second freeze and a second hash and compression by the commit
   loop (`agentfs.fuse.racy_rechecks{outcome}` counts both outcomes). A
+  boundary that proves the bytes unchanged recomputes the racy flag as a
+  record would, as of a time taken before the comparison: once the
+  window has passed, later boundaries trust the stamp, stop comparing and
+  release the pinned copy. A
   created file is recorded at its first FLUSH even when empty (`touch`);
   a write-open of an existing file takes its stamp at open, so opening
   and closing without a change records nothing.
@@ -289,7 +293,9 @@ Rules that make this precise:
   records nothing.
   Each move leaves a *reconcile duty*: before each commit pass the commit
   loop walks the destination in the backing tree (never inside a `.git`
-  directory, never through a symlink) and records, in records of at most
+  directory, never through a symlink: every directory opened with
+  `openat2` beneath the root, every entry examined by its one name in its
+  opened directory) and records, in records of at most
   4096 changes as the move's caller and pod, what recording every file
   there would have decided differently: moved files the rules exclude at
   their new path are removed (renamed into an ignored directory or a
@@ -299,18 +305,37 @@ Rules that make this precise:
   tracked file changed within 60 s of the move whose freeze stamp is not
   the one last journaled at its path is recorded as it is (another
   front's write that raced the rename and was skipped as gone, or a change
-  made outside the mount). Records are committed only below the oldest
-  move not yet reconciled, and a move's commit includes the records that
-  reconcile it when they are the same pod's, so history never shows a
+  made outside the mount). A moved file the path rules refuse at its new
+  path (a directory renamed to `.gitmodules` or `x/.gitattributes`, or
+  onto a prefix that takes a path past 4096 bytes) or that is over its
+  `agentfs.maxSize` there is removed with a `path_refused` alarm, as
+  recording it there would have refused it; history leaves such entries
+  out of the move itself too, so no commit holds them even before the
+  reconciliation. Every file the walk found is opened again for its
+  record with `openat2` beneath the root (`RESOLVE_NO_SYMLINKS`), pinned
+  by an `O_PATH` descriptor and frozen from it only if it is a regular
+  file: a component the workload swaps for a symlink, or a leaf swapped
+  for a FIFO or device, is skipped, never followed or opened (the daemon
+  may run as root). A file that is gone by then is skipped too (whoever
+  removed it records that), not a failure. Records are committed only
+  below the oldest move not yet reconciled, and a move's commit includes
+  the records that reconcile it when they are the same pod's, so history never shows a
   moved tree without its corrections. Duties are rebuilt at open from the
   uncommitted journal, so a crash before reconciling redoes it (records
-  hold absolute state). A duty that fails 5 times raises
-  `reconcile_failed` and stops holding commits back; the move is
-  committed as journaled. A move into a git directory (§5) commits as the
-  source's removal. Without the backing tree (`agentfs flush` offline)
-  moves are committed as journaled. Measured (§18 test 13): renaming a
-  directory of 100,000 recorded files takes 23 to 24 ms through a mount and
+  hold absolute state). A duty that fails (an I/O error) is retried
+  after a backoff from 0.5 s doubling to 8 s; once it has failed 5 times
+  over at least 30 s it raises `reconcile_failed` and stops holding
+  commits back; the move is committed as journaled
+  ([runbook](runbooks/reconcile-failed.md)). A move into a git directory
+  (§5) commits as the source's removal. Without the backing tree
+  (`agentfs flush` offline) moves are committed as journaled. Measured
+  (§18 test 13): renaming a directory of 100,000 recorded files takes 23 to 24 ms through a mount and
   makes one record, committed with its reconciliation in 3.4 to 7.9 s.
+  Through a front (§14) the move is a request to the history service
+  made while the name lock is held, so while the service is slow every
+  lookup, open and readdir on that mount waits with the rename, for at
+  most `--history-timeout` (an unreachable service fails at once); the
+  rename then fails with `EIO` and its paths are queued for repair.
   `RENAME_EXCHANGE` of directories, a rename to or from a path the mount
   never records (inside `.git`, an invalid name), and a front whose
   history service predates the `move` feature still record both names'
@@ -773,12 +798,21 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
     tree directory each shows), the paths given with `--workload-mount`
     (`PATH` or `PATH=DIR` for a `subPath`; a container's `mountPath`,
     which only the pod spec knows), and, at a history service, the views
-    each front sends in its hello (`FrontInfo.views`). Under the deepest
+    each front sends in its hello (`FrontInfo.views`). A CSI volume gets
+    its fronts' `--workload-mount` from the `workloadMounts` StorageClass
+    parameter or volume attribute (docs/csi.md §5); the node plugin never
+    learns a container's `mountPath` otherwise. Under the deepest
     matching view, `/workspace/main/.git/worktrees/wt` is
-    `main/.git/worktrees/wt` and nothing else. A target under no view
-    falls back to trying each of its suffixes from the tree root, and each
-    such match counts in `agentfs.nested.gitdir_heuristic`: a nonzero
-    count means a workload mounts the tree where agentfs was not told.
+    `main/.git/worktrees/wt`. Views are process-wide and only ever added
+    to: when several views share the deepest path (fronts of one volume
+    whose pods mount different `subPath`s at the same `mountPath`), each
+    one's mapping is tried. A target under no view, or whose exact
+    mappings name no git directory, falls back to trying each of its
+    suffixes from the tree root, and each such match counts in
+    `agentfs.nested.gitdir_heuristic`: a nonzero count means a workload
+    mounts the tree where agentfs was not told
+    ([runbook](runbooks/worktree-heuristic.md)). Views are not yet keyed by
+    front, nor dropped when a front's lease ends.
 - **Bounded reads.** These files are workload-controlled and read in the
   synchronous step, so they are opened without following symlinks and
   without blocking (a FIFO cannot hang the daemon), must be regular files,
@@ -1778,8 +1812,8 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.fuse.create_as_caller_fallbacks` | counter | Objects a root daemon created as itself and then gave to the caller, because creating as the caller was refused (a device node, or a caller whose groups are unknown) or could not be set up (§6) |
 | `agentfs.fuse.racy_rechecks` | counter, per outcome | Boundaries that would have recorded a file again only because its last record was racy: `skipped` when its bytes were that record's frozen copy, still the last state journaled at its path, else `recorded` (§3.1) |
 | `agentfs.reconcile.records` | counter | Records made reconciling moved directories (§3.1) |
-| `agentfs.reconcile.failures` | counter | Moved directories given up on after 5 failed reconciliations (`reconcile_failed`, §3.1) |
-| `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree, found by trying their suffixes (§5); set `--workload-mount` |
+| `agentfs.reconcile.failures` | counter | Moved directories given up on after 5 failed reconciliations over at least 30 s (`reconcile_failed`, §3.1) |
+| `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree (or whose exact mapping names no git directory), found by trying their suffixes (§5); set `--workload-mount` (CSI: `workloadMounts`) |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
@@ -1824,7 +1858,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PathRefused` | A path fails the checks of §3.4 or §5, at record or commit time |
 | `RecordFailed` | The synchronous step fails (§3.5) |
 | `CommitFailed` | Turning records into a commit fails; the records stay journaled and are retried |
-| `ReconcileFailed` | Reconciling a moved directory (§3.1) failed 5 times, with both paths and the error: the move is committed as journaled, and files beneath the destination that recording the tree would have added, dropped or recorded again differ from the tree until each changes again or is recorded with `agentfs record` |
+| `ReconcileFailed` | Reconciling a moved directory (§3.1) failed 5 times over at least 30 s, with both paths and the error: the move is committed as journaled, and files beneath the destination that recording the tree would have added, dropped or recorded again differ from the tree until each changes again or is recorded with `agentfs record` |
 | `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7), the head, the last pushed commit, the consecutive failure count and the next retry; stage `queue` for the patch remote's status, applied and inbox refs (§11.3), which never counts against the branch |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
@@ -2062,9 +2096,11 @@ The backing file's stamp now is consulted as well:
   then the service **resyncs** the path: once the record is journaled
   and its claims released, it records the path as the backing tree has
   it now, as a `sweep` record of its own under the path's claim (frozen
-  again; nothing is committed if the content is what was just
-  journaled), counted by `agentfs.history_service.resyncs`. HEAD then
-  ends on the tree's state whichever record arrived last.
+  again, reached with `openat2` beneath the tree root, never through a
+  symlink and never opening a FIFO or device, §3.1; nothing is committed
+  if the content is what was just journaled), counted by
+  `agentfs.history_service.resyncs`. HEAD then ends on the tree's state
+  whichever record arrived last.
 
 The service's own writes (a live restore, §15; patches; resyncs) note
 their stamps too. Atomic groups (§8) are recorded whole and never
@@ -3045,7 +3081,7 @@ runner.
 | One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `serve-history`, `record`, `flush`, and `push`, `restore` and `revert` in direct mode (when no daemon answers on the control socket); exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
 | FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
 | Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close. A boundary that would record a file again only because its last record was racy compares it with that record's frozen copy, kept open, and skips the record if the bytes are equal and the copy is still the last state journaled at the path (2026-10-13; §3.1, §19.2 item 4) |
-| Directory renames | One `move` change in the synchronous step, then reconciled on the commit thread before the move is committed: excluded paths dropped, newly recorded paths added, and files changed within 60 s of the move whose stamp is not the last journaled recorded again; the move and its reconciliation share a commit (2026-10-13; §3.1) |
+| Directory renames | One `move` change in the synchronous step, then reconciled on the commit thread before the move is committed: excluded paths dropped, newly recorded paths added, and files changed within 60 s of the move whose stamp is not the last journaled recorded again; paths refused at the destination (path rules, `agentfs.maxSize`) left out with `path_refused`; every reconciling read confined with `openat2`, never through a symlink or into a FIFO; failures retried with backoff for at least 30 s; the move and its reconciliation share a commit (2026-10-13; §3.1) |
 | Journal compatibility | A newer change kind in an intact journal frame is an error for an older binary, never a torn tail: flush before downgrading (2026-10-13; §3.3) |
 | `.git` paths | An exact `.git` component that is a git directory or gitfile is skipped without an alarm; any other `.git`, look-alikes and invalid names raise `PathRefused` (§5) |
 | Layout | The state area, backing tree and mount point are separate; credentials are never under the backing tree. `mount` refuses otherwise (§17.1) |
@@ -3086,7 +3122,7 @@ runner.
 | `fsync` class: groups | Same directory, same `agentfs.group`, same stem (`db`, `db-wal`, `db-journal`), every member in the class; no group is a group of one; the smallest member interval wins; `-shm` never recorded (§8) |
 | `fsync` class: capture | Class handles are never passthrough; every content or name change of a member holds a writer-preferring gate around its syscall, and a capture freezes the gate and copies every member as one atomic record. Triggers: `fsync` (rate-limited, and a capture failure does not fail the `fsync`), a trailing timer at max(first change, last attempt) + interval, the group's last close (`EIO` on failure), last release, unmount. A member's own namespace changes are folded into the next capture; a group an operator operation changes is captured once, at the operation's end. The capture holds the mount's name lock, so namespace changes anywhere on the mount wait for the copy. A member read error other than `ENOENT`/`ENOTDIR` fails the capture (§8) |
 | Atomic records | A journal record flag: at record time a refused member, or one a path rule skips (`group_member_skipped`), skips the rest of the group (`GroupRefused`), at commit time a refused change drops the whole record; a refused capture counts as done (§3.4, §8) |
-| `agentfs.maxSize` | An operator attribute for any path, refusing larger content (`max_size`) whatever the store, checked on the size on disk and on the frozen copy at record time, not again at commit (§4.2, §8) |
+| `agentfs.maxSize` | An operator attribute for any path, refusing larger content (`max_size`) whatever the store, checked on the size on disk and on the frozen copy at record time, not again at commit; a file moved by a directory rename is checked against its new path's limit by the move's reconciliation and removed if over it (§3.1, §4.2, §8) |
 | Repack | `git repack -d -q --geometric=2` with bitmaps off, one thread, bounded window, delta cache and big-file threshold (about 256 MiB), a cleared environment and system and global config ignored, skipped when nothing is loose, killed on stop, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); skipped while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
 | Patch submission | A patch is a single commit pushed to `inbox/<n>` with a create-only lease (`--force-with-lease=<ref>:`); a race loses and takes `n+1`. `agentfs patch submit` wraps the producer's `git`; plain git works the same (§12, [runbook](runbooks/patch-queue.md)) |
 | Patch application | At mount only, after journal replay and before the service and FUSE start; a cherry-pick through the restore engine's checks, recorded as one atomic operation of kind `patch` with the patch's author and agentfs as committer; the first failure blocks the queue, raises `PatchBlocked`, and the volume mounts anyway (§12) |

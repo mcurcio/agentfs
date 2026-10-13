@@ -328,6 +328,36 @@ fn a_racy_close_is_not_recorded_again_at_release() {
     assert_eq!(fx.history(), map(&[("a", file("hello"))]));
 }
 
+/// A boundary that proves a racy record's bytes unchanged recomputes
+/// `racy` as a record would: once the window has passed, later boundaries
+/// trust the stamp and stop comparing, and the pinned copy is let go.
+#[test]
+fn a_proven_racy_skip_clears_racy_once_the_window_passed() {
+    const TICK: i128 = 200_000_000;
+    crate::dirty::TEST_TICK_NS.with(|t| t.set(TICK));
+    let fx = Fx::with(OpsConfig {
+        granularity_ns: 2 * TICK,
+        chunk: RENAME_CHUNK,
+    });
+    let (id, fh) = fx.create("a");
+    fx.ops.write(fh, 0, b"hello", C).unwrap();
+    fx.ops.flush(fh, C).unwrap();
+    assert_eq!(fx.backlog(), 1);
+    let racy = |fx: &Fx| {
+        let table = fx.ops.table();
+        let node = table.get(id).unwrap();
+        (node.dirty.racy, node.dirty.frozen.is_some())
+    };
+    assert_eq!(racy(&fx), (true, true), "recorded within the window");
+    std::thread::sleep(std::time::Duration::from_nanos(3 * TICK as u64));
+    fx.ops.flush(fh, C).unwrap();
+    assert_eq!(fx.backlog(), 1, "proven unchanged: skipped");
+    assert_eq!(racy(&fx), (false, false), "and no longer racy");
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.backlog(), 1);
+    assert_eq!(fx.history(), map(&[("a", file("hello"))]));
+}
+
 /// The race the RELEASE record is for: a write in the same tick as the
 /// close's record (through a shared mapping) leaves the stamp unchanged;
 /// the bytes differ from the frozen copy, so RELEASE records them.

@@ -77,7 +77,7 @@ for a real deployment, or [Deploying on Kubernetes](#deploying-on-kubernetes).
 | [performance.md](docs/performance.md) | Measured costs, the benchmark and the performance budget |
 | [deployment.md](docs/deployment.md) | The container image and the Kubernetes sidecar |
 | [csi.md](docs/csi.md) | The CSI driver |
-| [runbooks/](docs/runbooks/) | Recovery and undo, divergence, stuck pushes, history rewrite, patch queue, crashed sidecar, history service down, CSI recovery |
+| [runbooks/](docs/runbooks/) | Recovery and undo, divergence, stuck pushes, history rewrite, patch queue, crashed sidecar, history service down, CSI recovery, a failed directory-move reconciliation, worktree paths found by the heuristic |
 
 ## Features
 
@@ -373,8 +373,10 @@ Runbooks: [recovery and undo](docs/runbooks/recovery-and-undo.md),
 [removing a recorded secret](docs/runbooks/history-rewrite.md) (history
 rewrite with `git filter-repo`, the one documented force-push), and
 [pushes that keep failing](docs/runbooks/stuck-pushes.md),
-[the patch queue](docs/runbooks/patch-queue.md), and
-[the history service is down](docs/runbooks/history-service-down.md).
+[the patch queue](docs/runbooks/patch-queue.md),
+[the history service is down](docs/runbooks/history-service-down.md),
+[a moved directory that could not be reconciled](docs/runbooks/reconcile-failed.md),
+and [worktree paths found by the heuristic](docs/runbooks/worktree-heuristic.md).
 
 ## Patches
 

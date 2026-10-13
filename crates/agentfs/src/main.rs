@@ -1394,7 +1394,7 @@ fn record_paths(recorder: &volume::Recorder, root: &Path, paths: &[String]) -> R
         let trigger = match input {
             Input::Remove { .. } => Trigger::Unlink,
             Input::Symlink { .. } => Trigger::Symlink,
-            Input::Write { .. } => Trigger::Close,
+            Input::Write { .. } | Input::Tree { .. } => Trigger::Close,
         };
         let recorded = recorder.record(trigger, caller, vec![input])?;
         if let Some(seq) = recorded.seq {
