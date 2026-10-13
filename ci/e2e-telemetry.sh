@@ -190,13 +190,20 @@ pass "agentfs.front.round_trip for a record"
 sudo kill -STOP "$(cat "$VOL/service.pid")"
 sudo sh -c "echo two >'$MNT_A/two.txt'" 2>/dev/null || true
 sudo kill -CONT "$(cat "$VOL/service.pid")"
+# sudo (use_pty) stops itself when its command stops: continue it too, or
+# it never reaps the service, which then looks alive to `kill -0`.
+sudo pkill -CONT -x sudo || true
 wait_for 20 counted agentfs.front.service_failures stage=timeout ||
   fail "agentfs.front.service_failures{stage=timeout} never counted"
 pass "agentfs.front.service_failures: timeout"
 
 # The service gone: the front cannot connect.
 sudo kill -TERM "$(cat "$VOL/service.pid")"
-wait_for 30 gone "$VOL/service.pid" || fail "the service never stopped"
+wait_for 30 gone "$VOL/service.pid" || {
+  ps -o pid,ppid,stat,wchan:30,cmd -p "$(cat "$VOL/service.pid")" || true
+  cat "$VOL/service.log"
+  fail "the service never stopped"
+}
 for n in 1 2 3; do
   sudo sh -c "echo three-$n >'$MNT_A/three.txt'" 2>/dev/null || true
 done

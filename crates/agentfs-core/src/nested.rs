@@ -35,6 +35,10 @@
 //! found as `main/.git/x` in a tree mounted at `/workspace`; each such
 //! match is counted ([`heuristic_matches`]).
 //!
+//! A linked worktree's admin dir (`<git dir>/worktrees/<name>`) counts as
+//! soon as it holds `gitdir`: `git worktree add` writes the worktree's
+//! `.git` file before the admin dir's `HEAD` and `commondir`.
+//!
 //! The views are process-wide: one process serves one backing tree.
 //!
 //! Every file is read with [`probe::read_regular`]: regular files only, never
@@ -238,7 +242,8 @@ fn any_git_dir(tree: &Path, dir: &str, target: &str) -> io::Result<bool> {
 fn git_dir_through(views: &[View], tree: &Path, dir: &str, target: &str) -> io::Result<bool> {
     let (candidates, exact) = candidates(views, dir, target);
     for candidate in &candidates {
-        if is_git_dir(&tree.join(candidate))? {
+        let path = tree.join(candidate);
+        if is_git_dir(&path)? || is_worktree_admin_being_created(&path)? {
             if !exact {
                 HEURISTIC.fetch_add(1, Ordering::Relaxed);
             }
@@ -322,6 +327,23 @@ fn is_git_dir(p: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     Ok((is_dir(&p.join("objects"))? && is_dir(&p.join("refs"))?) || is_file(&p.join("commondir"))?)
+}
+
+/// True if `p` is a linked worktree's admin dir that `git worktree add` is
+/// still writing: `<git dir>/worktrees/<name>` holding `gitdir`. git writes
+/// the worktree's `.git` file before the admin dir's `HEAD` and
+/// `commondir`, so the complete layout would come too late.
+fn is_worktree_admin_being_created(p: &Path) -> io::Result<bool> {
+    let Some(worktrees) = p.parent() else {
+        return Ok(false);
+    };
+    if worktrees.file_name().is_none_or(|n| n != "worktrees") || !is_file(&p.join("gitdir"))? {
+        return Ok(false);
+    }
+    match worktrees.parent() {
+        Some(git_dir) => is_git_dir(git_dir),
+        None => Ok(false),
+    }
 }
 
 /// True if `p` is a git directory, complete or being created (see the module
@@ -494,6 +516,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d(&t, "wt"), Some(NestedKind::GitFile));
+    }
+
+    #[test]
+    fn a_worktree_being_added_is_nested_before_its_head() {
+        // `git worktree add` writes `gitdir` in the admin dir, then the
+        // worktree's `.git`, then the admin dir's `HEAD` and `commondir`.
+        let t = tempfile::tempdir().unwrap();
+        bare_layout(&t.path().join("main/.git"));
+        let admin = t.path().join("main/.git/worktrees/wt");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir(t.path().join("wt")).unwrap();
+        let gitfile = "gitdir: /workspace/main/.git/worktrees/wt\n";
+        fs::write(t.path().join("wt/.git"), gitfile).unwrap();
+        assert_eq!(d(&t, "wt"), None, "no gitdir file yet");
+        fs::write(admin.join("gitdir"), "/workspace/wt/.git\n").unwrap();
+        assert_eq!(d(&t, "wt"), Some(NestedKind::GitFile));
+        // Not under a git dir's worktrees/: an ordinary directory.
+        let plain = t.path().join("plain/worktrees/wt");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("gitdir"), "x\n").unwrap();
+        fs::write(
+            t.path().join("wt/.git"),
+            "gitdir: /workspace/plain/worktrees/wt\n",
+        )
+        .unwrap();
+        assert_eq!(d(&t, "wt"), None);
     }
 
     #[test]

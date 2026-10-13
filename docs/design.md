@@ -819,7 +819,9 @@ directory is not, and the inner `index.lock` bounds commit groups (§3.4).
 - **`.git` files and symlinks.** A `.git` file counts only if its first line is
   `gitdir: <path>`; a `.git` symlink is read, never followed. Either target
   must be a git directory inside the backing tree: `HEAD` plus `objects/` and
-  `refs/`, or `HEAD` plus `commondir` (a linked worktree). Targets are paths
+  `refs/`, or `HEAD` plus `commondir` (a linked worktree), or a linked
+  worktree's admin dir `<git dir>/worktrees/<name>` holding `gitdir` (`git
+  worktree add` writes the `.git` file before its `HEAD`). Targets are paths
   in the workload's view of the mount, so they are never resolved on the
   host:
   - a relative target is resolved lexically against the directory holding
