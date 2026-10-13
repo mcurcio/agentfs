@@ -16,6 +16,7 @@
 # CHECK_DM, MANIFEST, CHECK_COUNT, FS, AGENTFS_BIN.
 
 set -euo pipefail
+trap 'echo "power-cut check FAILED: line $LINENO: $BASH_COMMAND" >&2' ERR
 
 fail() { printf 'power-cut check FAILED: %s\n' "$*" >&2; exit 1; }
 

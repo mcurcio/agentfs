@@ -121,9 +121,15 @@ export REPLAY_DEV=$replay COW_DEV=$cow CHECK_MNT=$work/check MANIFEST=$manifest 
 export CHECK_COUNT=$work/checks FS=$fs AGENTFS_BIN
 : >"$CHECK_COUNT"
 "$REPLAY_LOG" --log "$log" --replay "$replay" --end-mark mkfs
-"$REPLAY_LOG" --log "$log" --replay "$replay" --start-mark mkfs \
-  --check "$check" --fsck "$PWD/ci/power-loss-check.sh" ||
+if ! "$REPLAY_LOG" --log "$log" --replay "$replay" --start-mark mkfs \
+  --check "$check" --fsck "$PWD/ci/power-loss-check.sh"; then
+  # replay-log stops at the failing entry: check it again, traced.
+  echo "---- the failing check again, traced"
+  bash -x ci/power-loss-check.sh || true
+  echo "---- dmesg"
+  dmesg | tail -n 40 || true
   fail "a check failed (above); the log is in $work"
+fi
 
 step "the final state: everything promised"
 CHECK_FINAL=1 ci/power-loss-check.sh || fail "the final state failed its check"
