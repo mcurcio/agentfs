@@ -1,13 +1,14 @@
 # agentfs design
 
-Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer,
-`agentfs mount`, `agentfs restore` and `agentfs revert`, the container
-image and the Kubernetes sidecar deployment exist), and from phase 2 Git
-LFS (§7) and the `fsync` class for databases (§8), and from phase 3 the
-patch queue (§12), and from phase 4 the history service and fronts
-(§14.1) and the CSI driver (§14.2, one node per volume). Draft 1 was
-reviewed adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
-for the findings and what changed because of them.
+Status: draft 2 (2026-10-12), kept current with the code. Phases 1 to 3
+are built; phase 4 is built for one node per volume (the history service
+and fronts, §14.1, and the CSI driver, §14.2); several nodes per volume
+are open (§19.2). §1.3 gives each phase's state, and
+[performance.md](performance.md) the measured costs and the performance
+budget (§18 test 13, §19.2 item 1). Draft 1 was reviewed adversarially:
+see [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
+for the findings and what changed because of them. How the code is
+organised: [architecture.md](architecture.md).
 
 ## 1. Objective
 
@@ -52,12 +53,12 @@ be recorded after the fact; §3.1 lists them.
 
 ### 1.3 Baseline, extras, phases
 
-| Phase | Contents |
-|---|---|
-| 1 | The recorder as a native sidecar for one pod: recording, commits, interval push to any remote, path rules, operator-only safety settings, push checks, OpenTelemetry, a supported manual recovery path |
-| 2 | Git LFS (§7), and the `fsync` class for databases (§8); both built |
-| 3 | The ordered patch queue for iac (§12); built |
-| 4 | The CSI driver, including volumes mounted by several pods at once (§14); built for one node per volume at a time (§14.2); several nodes per volume open (§19.2) |
+| Phase | Contents | State |
+|---|---|---|
+| 1 | The recorder as a native sidecar for one pod: recording, commits, interval push to any remote, path rules, operator-only safety settings, push checks, OpenTelemetry, a supported manual recovery path | Built: the FUSE layer, `agentfs mount`, recovery (§15), the container image and the Kubernetes sidecar, tested end to end in CI (§18) |
+| 2 | Git LFS (§7), and the `fsync` class for databases (§8) | Built |
+| 3 | The ordered patch queue for iac (§12) | Built |
+| 4 | The CSI driver, including volumes mounted by several pods at once (§14) | Built for one node per volume at a time (§14.1, §14.2); several nodes per volume open (§19.2) |
 
 ### 1.4 Not goals
 
@@ -288,7 +289,14 @@ The work done before the call returns must not depend on file size:
 Hashing, compression, object writes and commits happen afterwards (§3.4):
 LFS content is hashed into the object cache when it is committed, and
 uploaded when it is pushed (§7). Without reflink support, step 1 costs a
-copy of the file, so recorded volumes should use XFS. The phase 1 benchmark (§18) measures this.
+copy of the file, so recorded volumes that hold large files should use
+XFS. Measured by the benchmark (§18 test 13, [performance.md](performance.md);
+CI runners, medians): the step for a small file takes 1.3 ms on XFS and
+1.9 ms on ext4, mostly the journal `fsync`, and 1.8 to 2.4 ms through
+FUSE. On XFS it does not depend on size: a 16 MiB freeze takes 0.44 ms and
+closing a clean 1 GiB file 3 ms (2.6 s with its pages still dirty, as
+the reflink waits for writeback). On ext4 the copy takes 44 ms for 16 MiB
+and 2.9 s for a clean 1 GiB file. The performance budget is §19.2 item 1.
 
 **Through a front (§14).** A front mount splits the step with the history
 service. The front decides the path rules (asking the service with a
@@ -2266,7 +2274,9 @@ one-time migration of Hermes' existing data and the initial import in
     stays a thin CLI.
 - **`agentfs`, a binary:**
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
-    `restore`, `revert` and `patch` (`submit`, `apply`, `status`);
+    `serve-history` (§14), `restore`, `revert` and `patch` (`submit`,
+    `apply`, `status`); a test (`crates/agentfs/src/reference_tests.rs`)
+    checks this list against the CLI;
   - `init` is safe to re-run (§2.3): exit 0 for the volume it already
     holds, 1 for another volume or branch; `--include` sets the config's
     `include.path` entries (§4.3), and `--root` creates the backing tree;
@@ -2541,6 +2551,11 @@ restartable (§14.2). The controller runs no children.
     - `npm install` into an excluded path;
     - `rm -rf` of 100k files;
     - closing a 1 GB file, on XFS (reflink) and ext4 (copy).
+    Automated: `.github/workflows/bench.yml` runs `ci/bench.sh` on fresh
+    XFS and ext4 loop filesystems on every push to main, with the
+    synchronous step without FUSE (`record_step` bench), a 4 KiB close and
+    100k creates as well, checks the history after each workload, and
+    publishes the results; see [performance.md](performance.md).
 14. **Phase 2.** SQLite in WAL mode with `synchronous=NORMAL`, and in DELETE mode:
     every recorded version restores and passes `PRAGMA integrity_check`. LFS
     content is readable through an ordinary `git clone` plus `git lfs pull`.
@@ -2656,7 +2671,8 @@ hardened node images (Talos) and across node reboots.
 | Secret scanning | Not in scope (§10) |
 | Repository layout | Several volumes may share a repository, each with its own branch and ref namespace (§11.4) |
 | Identity | Configurable templates with defaults (§9) |
-| Backing filesystem | Both supported. XFS (reflink) makes the synchronous step size-independent; ext4 falls back to a copy. The phase 1 benchmark sets the documented recommendation (§3.2) |
+| Backing filesystem | Both supported. XFS (reflink) makes the synchronous step size-independent; ext4 falls back to a copy. Recommendation, from the benchmark (§3.2, §18 test 13): XFS (or btrfs) for volumes holding large files, where ext4 costs about 2.9 s per clean GiB at close; either for small files, where the journal `fsync` dominates on both |
+| Performance budget | Advisory, checked by every benchmark run (`ci/bench-budget.json`, [performance.md](performance.md#performance-budget)): about 1.5 to 2 times the first CI measurements, for example 3 ms for a small file's step at the median; a result over budget warns and never fails CI (2026-10-13) |
 | One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `record`, `flush`, `push`, and `restore` and `revert` in direct mode; exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
 | FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
 | Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close (§3.1) |
@@ -2728,7 +2744,9 @@ hardened node images (Talos) and across node reboots.
 ### 19.2 Open questions
 
 1. **Performance budget** for the synchronous step, set after the phase 1
-   benchmark (§18 test 13).
+   benchmark (§18 test 13). *Decided (2026-10-13)*: an advisory budget
+   from the first CI measurements, in §19.1 and
+   [performance.md](performance.md#performance-budget).
 2. **Multi-pod (§14):** RBAC and Pod Security are settled by the CSI
    driver (§14.2). Open: a cross-node transport with authentication (so
    several nodes can mount one volume), verifying the state lock, slot

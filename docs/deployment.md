@@ -456,6 +456,10 @@ alert on `agentfs.patch.blocked`. See
 ## 11. Limitations
 
 - `linux/amd64` images only.
+- Recording costs about 2 ms per changed small file, and closing a large
+  file costs a copy on ext4 (2.9 s per clean GiB; 3 ms on XFS): put the
+  backing volume on XFS when files are large, and keep bulk trees such as
+  `node_modules/` off the mount. See [performance.md](performance.md).
 - The pod restart after a crash is manual (§7).
 - A sidecar exit that is not a crash is not held (§7).
 - The privileged sidecar (§9); the CSI driver ([csi.md](csi.md)) needs no

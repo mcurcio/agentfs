@@ -115,6 +115,62 @@ fn every_operator_attribute_is_documented() {
     );
 }
 
+/// The `.rs` files under a crate's `src/`, relative to it, without the
+/// `tests.rs` files of test-only submodules.
+fn modules(krate: &str) -> BTreeSet<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().is_some_and(|n| n != "tests.rs")
+            {
+                let rel = path.strip_prefix(root).unwrap();
+                out.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let root = workspace().join("crates").join(krate).join("src");
+    let mut out = BTreeSet::new();
+    walk(&root, &root, &mut out);
+    out
+}
+
+#[test]
+fn every_module_is_in_the_architecture_map() {
+    let sections = doc_tables::sections(&doc_tables::read_doc(
+        env!("CARGO_MANIFEST_DIR"),
+        "architecture.md",
+    ));
+    let mut problems = Vec::new();
+    for krate in ["agentfs-core", "agentfs-fuse", "agentfs", "agentfs-csi"] {
+        let heading = format!("`{krate}`");
+        let Some(section) = doc_tables::section(&sections, &heading) else {
+            problems.push(format!(
+                "add a section headed ### {heading} with a module table"
+            ));
+            continue;
+        };
+        let documented = key_cells(section);
+        let actual = modules(krate);
+        assert!(actual.len() > 3, "no modules found for {krate}");
+        for module in actual.difference(&documented) {
+            problems.push(format!("{krate}: add a row for `{module}`"));
+        }
+        for module in documented.difference(&actual) {
+            problems.push(format!(
+                "{krate}: remove the row for `{module}`: no such file"
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "docs/architecture.md's module map is out of date:\n  {}",
+        problems.join("\n  ")
+    );
+}
+
 /// Every markdown file the link check covers: README.md and docs/**.
 fn markdown_files() -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
