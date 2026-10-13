@@ -34,6 +34,7 @@ use crate::events::PushFailureKind;
 /// The object cache of one state area.
 #[derive(Debug)]
 pub struct ObjectCache {
+    dir: PathBuf,
     objects: PathBuf,
     tmp: PathBuf,
     incomplete: PathBuf,
@@ -68,10 +69,16 @@ impl ObjectCache {
         fs::create_dir_all(&tmp)?;
         fs::create_dir_all(&incomplete)?;
         Ok(Self {
+            dir,
             objects,
             tmp,
             incomplete,
         })
+    }
+
+    /// The cache's directory, `<state>/lfs`.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// `<state>/lfs/incomplete`, where resumable downloads are written.

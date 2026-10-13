@@ -119,6 +119,8 @@ through the mount:
     objects/aa/bb/<oid>  cached objects, git-lfs's layout; never pruned
     tmp/                 objects being written
     incomplete/<oid>     resumable downloads (0600), each under its own flock
+    lock                 flock: shared by restores and fetches, exclusive
+                         while `agentfs lfs prune` deletes
   meta/      the daemon's own bookkeeping
     lock                 flock held by the one process using the state area (§2.3)
     push/<remote>.json   each remote's push state (§11.2)
@@ -1147,7 +1149,13 @@ cache object, no endpoint, no `https` feature).
 **Cache.** `<state>/lfs/objects/aa/bb/<oid>`, git-lfs's layout, with
 `<state>/lfs/tmp/` for objects being written: written to `tmp/`, fsynced,
 renamed into place, directories fsynced. `agentfs.state.bytes{part="lfs"}`
-measures it.
+measures it. `agentfs lfs fetch` fills it from the remotes: the objects
+the branch head references, those of given revisions, or every object of
+the branch (`--all`), each remote in name order taking what the earlier
+ones lack; `--dry-run` reports what is missing without contacting a
+server. Readers that write objects into the tree (restores, reverts,
+patch applies) and `lfs fetch` hold `<state>/lfs/lock` shared while they
+use the cache.
 
 **Restore and revert** (§15) are LFS-aware: a pointer at a managed path is
 checked out as its object's content, from the cache or else downloaded
@@ -2774,8 +2782,8 @@ one-time migration of Hermes' existing data and the initial import in
     stays a thin CLI.
 - **`agentfs`, a binary:**
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
-    `serve-history` (§14), `restore`, `revert` and `patch` (`submit`,
-    `apply`, `status`); a test (`crates/agentfs/src/reference_tests.rs`)
+    `serve-history` (§14), `restore`, `revert`, `patch` (`submit`,
+    `apply`, `status`) and `lfs` (`fetch`); a test (`crates/agentfs/src/reference_tests.rs`)
     checks this list against the CLI;
   - `init` is safe to re-run (§2.3): exit 0 for the volume it already
     holds, 1 for another volume or branch; `--include` sets the config's
@@ -2816,7 +2824,13 @@ one-time migration of Hermes' existing data and the initial import in
     with the volume stopped (it takes the lock; exit 1 when blocked);
     `patch status` reads `meta/patch.json` and the status ref, like
     `status`, which prints a `patches:` line. `push` prints a `queue:`
-    line for the patch remote (§11.3).
+    line for the patch remote (§11.3);
+  - `lfs fetch [REVISION...] [--all] [--remote NAME]... [--dry-run]`
+    downloads into the LFS cache the objects the branch head references
+    (or the trees of the revisions given, or every commit with `--all`),
+    from the remotes in name order (§7). It takes no state-area lock, so
+    it runs beside a daemon, and holds the cache lock shared; exit 1
+    unless every object is cached afterwards.
 - **`agentfs mount <backing> <mountpoint>`** runs the FUSE session, the
   commit loop and the push loops in one process.
   - **Preflight.** Before anything is mounted it refuses a state area,

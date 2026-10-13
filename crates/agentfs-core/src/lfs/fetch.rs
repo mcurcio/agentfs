@@ -1,5 +1,9 @@
-//! LFS objects for restores and reverts (design §7, §15): from the local
-//! cache, else downloaded from the remotes, in name order, into it.
+//! LFS objects for restores, reverts and `agentfs lfs fetch` (design §7,
+//! §15): from the local cache, else downloaded from the remotes, in name
+//! order, into it. Every user holds the cache lock shared
+//! ([`super::lock::CacheLock`]) while it uses the cache, so `agentfs lfs
+//! prune` never deletes an object between a restore's check and its
+//! write.
 //!
 //! A restore makes sure every LFS object it writes is available before it
 //! writes anything, so a missing object refuses the restore instead of
@@ -15,8 +19,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 
+use super::lock::CacheLock;
 use super::{Direction, LfsError, LfsOid, ObjectCache, Pointer, Transfer, transfer_for};
-use crate::config::Settings;
+use crate::config::{RemoteSettings, Settings};
 use crate::volume::StateDir;
 
 /// Where a restore gets LFS content.
@@ -33,12 +38,27 @@ pub trait LfsObjects {
 }
 
 /// The cache alone: nothing is downloaded.
-pub struct CacheOnly(pub ObjectCache);
+pub struct CacheOnly {
+    cache: ObjectCache,
+    _lock: CacheLock,
+}
+
+impl CacheOnly {
+    /// The cache, with its lock held shared for as long as this lives.
+    pub fn new(cache: ObjectCache) -> io::Result<Self> {
+        let lock = CacheLock::shared(cache.dir())?;
+        Ok(Self { cache, _lock: lock })
+    }
+
+    pub fn cache(&self) -> &ObjectCache {
+        &self.cache
+    }
+}
 
 impl LfsObjects for CacheOnly {
     fn ensure(&self, pointer: &Pointer) -> Result<PathBuf, LfsError> {
-        if self.0.contains(pointer) {
-            Ok(self.0.path(&pointer.oid))
+        if self.cache.contains(pointer) {
+            Ok(self.cache.path(&pointer.oid))
         } else {
             Err(LfsError::local(format!(
                 "LFS object {} is not in the local cache",
@@ -93,16 +113,22 @@ pub struct Fetcher {
     /// What every remote said about objects a prefetch could not get, so
     /// `ensure` reports it without asking again.
     failed: RefCell<BTreeMap<LfsOid, Vec<String>>>,
+    _lock: CacheLock,
 }
 
 impl Fetcher {
-    /// A fetcher for the state area's cache and the volume's remotes.
+    /// A fetcher for the state area's cache and the volume's remotes. It
+    /// holds the cache lock shared for as long as it lives, waiting while
+    /// a prune holds it.
     pub fn new(state: &StateDir, settings: &Settings) -> io::Result<Self> {
+        let cache = ObjectCache::at(state.lfs())?;
+        let lock = CacheLock::shared(cache.dir())?;
         Ok(Self {
-            cache: ObjectCache::at(state.lfs())?,
+            cache,
             settings: settings.clone(),
             transfers: RefCell::new(BTreeMap::new()),
             failed: RefCell::new(BTreeMap::new()),
+            _lock: lock,
         })
     }
 
@@ -114,7 +140,7 @@ impl Fetcher {
     /// time.
     fn with_transfer<R>(
         &self,
-        remote: &crate::config::RemoteSettings,
+        remote: &RemoteSettings,
         f: impl FnOnce(&dyn Transfer) -> R,
     ) -> Result<R, LfsError> {
         let mut transfers = self.transfers.borrow_mut();
@@ -142,42 +168,15 @@ impl Fetcher {
 
 impl LfsObjects for Fetcher {
     fn prefetch(&self, pointers: &[Pointer]) {
-        let mut left: Vec<Pointer> = Vec::new();
-        for p in pointers {
-            if !self.cache.contains(p) && !left.iter().any(|q| q.oid == p.oid) {
-                left.push(*p);
-            }
-        }
-        let mut problems: BTreeMap<LfsOid, Vec<String>> = BTreeMap::new();
-        for remote in &self.settings.remotes {
-            if left.is_empty() {
-                break;
-            }
-            let results = self.with_transfer(remote, |t| {
-                t.download_many(&left, &self.cache, &self.settings.branch_ref)
-            });
-            let results = match results {
-                Ok(results) => results,
-                Err(e) => left.iter().map(|_| Err(e.clone())).collect(),
-            };
-            let mut still = Vec::new();
-            for (pointer, result) in left.iter().zip(results) {
-                if let Err(e) = result {
-                    problems
-                        .entry(pointer.oid)
-                        .or_default()
-                        .push(format!("{}: {e}", remote.name));
-                    still.push(*pointer);
-                }
-            }
-            left = still;
-        }
+        let remotes: Vec<&RemoteSettings> = self.settings.remotes.iter().collect();
+        let report = download(&self.cache, &remotes, pointers, |remote, left| {
+            self.with_transfer(remote, |t| {
+                t.download_many(left, &self.cache, &self.settings.branch_ref)
+            })
+        });
         let mut failed = self.failed.borrow_mut();
-        for pointer in &left {
-            failed.insert(
-                pointer.oid,
-                problems.remove(&pointer.oid).unwrap_or_default(),
-            );
+        for (pointer, problems) in report.failures {
+            failed.insert(pointer.oid, problems);
         }
     }
 
@@ -200,6 +199,141 @@ impl LfsObjects for Fetcher {
         }
         Err(Self::not_found(pointer, &problems))
     }
+}
+
+/// What one remote did for a fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteFetch {
+    pub remote: String,
+    /// Objects downloaded from it, and their bytes.
+    pub fetched: usize,
+    pub bytes: u64,
+    /// Objects asked of it that it could not provide.
+    pub failed: usize,
+    /// Why it could not be asked at all, if it could not (no endpoint).
+    pub unavailable: Option<String>,
+}
+
+/// What a fetch did ([`fetch`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchReport {
+    /// Distinct objects asked for, and their bytes.
+    pub objects: usize,
+    pub object_bytes: u64,
+    /// Of those, already in the cache.
+    pub cached: usize,
+    /// Each remote asked, in order.
+    pub remotes: Vec<RemoteFetch>,
+    /// Objects no remote could provide, with what each remote said.
+    pub failures: Vec<(Pointer, Vec<String>)>,
+}
+
+impl FetchReport {
+    /// Objects downloaded, and their bytes.
+    pub fn fetched(&self) -> (usize, u64) {
+        self.remotes
+            .iter()
+            .fold((0, 0), |(n, b), r| (n + r.fetched, b + r.bytes))
+    }
+}
+
+/// The distinct objects of `pointers`, in order.
+fn distinct(pointers: &[Pointer]) -> Vec<Pointer> {
+    let mut seen = std::collections::BTreeSet::new();
+    pointers
+        .iter()
+        .filter(|p| seen.insert(p.oid))
+        .copied()
+        .collect()
+}
+
+/// Downloads into `cache` each of `pointers` it lacks: from each of
+/// `remotes` in order, each taking the objects the ones before it could
+/// not provide. `get` downloads from one remote (one result per object),
+/// or says why the remote cannot be asked.
+fn download(
+    cache: &ObjectCache,
+    remotes: &[&RemoteSettings],
+    pointers: &[Pointer],
+    get: impl Fn(&RemoteSettings, &[Pointer]) -> Result<Vec<Result<(), LfsError>>, LfsError>,
+) -> FetchReport {
+    let mut report = FetchReport::default();
+    let mut left: Vec<Pointer> = Vec::new();
+    for p in distinct(pointers) {
+        report.objects += 1;
+        report.object_bytes += p.size;
+        if cache.contains(&p) {
+            report.cached += 1;
+        } else {
+            left.push(p);
+        }
+    }
+    let mut problems: BTreeMap<LfsOid, Vec<String>> = BTreeMap::new();
+    for remote in remotes {
+        if left.is_empty() {
+            break;
+        }
+        let mut done = RemoteFetch {
+            remote: remote.name.clone(),
+            ..RemoteFetch::default()
+        };
+        let results = match get(remote, &left) {
+            Ok(results) => results,
+            Err(e) => {
+                done.unavailable = Some(e.to_string());
+                left.iter().map(|_| Err(e.clone())).collect()
+            }
+        };
+        let mut still = Vec::new();
+        for (pointer, result) in left.iter().zip(results) {
+            match result {
+                Ok(()) => {
+                    done.fetched += 1;
+                    done.bytes += pointer.size;
+                }
+                Err(e) => {
+                    if done.unavailable.is_none() {
+                        done.failed += 1;
+                    }
+                    problems
+                        .entry(pointer.oid)
+                        .or_default()
+                        .push(format!("{}: {e}", remote.name));
+                    still.push(*pointer);
+                }
+            }
+        }
+        report.remotes.push(done);
+        left = still;
+    }
+    report.failures = left
+        .into_iter()
+        .map(|p| (p, problems.remove(&p.oid).unwrap_or_default()))
+        .collect();
+    report
+}
+
+/// `agentfs lfs fetch` (design §7): downloads into the cache at `state`
+/// each of `pointers` it lacks, from `remotes` (names; every valid remote
+/// when `None`), in name order. Holds the cache lock shared meanwhile and
+/// no state-area lock, so it runs beside a daemon.
+pub fn fetch(
+    state: &StateDir,
+    settings: &Settings,
+    pointers: &[Pointer],
+    remotes: Option<&[String]>,
+) -> io::Result<FetchReport> {
+    let cache = ObjectCache::at(state.lfs())?;
+    let _lock = CacheLock::shared(cache.dir())?;
+    let chosen: Vec<&RemoteSettings> = settings
+        .remotes
+        .iter()
+        .filter(|r| remotes.is_none_or(|names| names.contains(&r.name)))
+        .collect();
+    Ok(download(&cache, &chosen, pointers, |remote, left| {
+        let transfer = transfer_for(settings, remote, Direction::Download)?;
+        Ok(transfer.download_many(left, &cache, &settings.branch_ref))
+    }))
 }
 
 #[cfg(test)]
@@ -242,7 +376,7 @@ mod tests {
         let err = fetcher.ensure(&absent).unwrap_err();
         assert!(err.message.contains("a: "), "{err}");
         assert!(err.message.contains("b: "), "{err}");
-        let only = CacheOnly(ObjectCache::at(state.lfs()).unwrap());
+        let only = CacheOnly::new(ObjectCache::at(state.lfs()).unwrap()).unwrap();
         assert!(only.ensure(&pointer).is_ok());
         assert!(only.ensure(&absent).is_err());
         // A dry run's probe downloads nothing and notes what is missing.

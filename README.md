@@ -131,7 +131,10 @@ nested repository detection. Also:
 
   Objects are uploaded before the commits that reference them are pushed,
   to the endpoint derived from the remote (`<url>.git/info/lfs`) or the
-  one configured, with credentials bound to that host. See
+  one configured, with credentials bound to that host, up to
+  `lfs.concurrenttransfers` (8) objects at once; interrupted downloads
+  resume where they stopped. `agentfs lfs fetch` fills the local cache
+  with the objects the head (or any revision, or `--all`) references. See
   [Git LFS](docs/configuration.md#git-lfs).
 - **Databases: the `fsync` class** (phase 2): files changed in place, such
   as SQLite databases, are captured whole (the database with its `-wal` or
@@ -211,8 +214,8 @@ who holds the lock.
 
 ### Not built yet
 
-Several mounts of one volume across nodes. LFS has no SSH (`git-lfs-authenticate`), concurrent or
-resumable transfers, proxy settings or pruning. Restoring a database needs
+Several mounts of one volume across nodes. LFS has no SSH
+(`git-lfs-authenticate`), proxy settings or pruning. Restoring a database needs
 its workload stopped
 ([runbook](docs/runbooks/recovery-and-undo.md#7-restoring-a-database)).
 A file written and closed at once is recorded once: when its last

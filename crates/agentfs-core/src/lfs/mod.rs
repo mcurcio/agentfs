@@ -13,8 +13,12 @@
 //! - [`endpoint`]: each remote's LFS endpoint and credentials;
 //! - [`client`]: the batch API client and the standalone-file transfer;
 //! - [`pool`]: the worker pool that moves objects concurrently;
+//! - [`referenced`]: which objects commits reference;
 //! - [`upload`]: the objects a push must upload first;
-//! - [`fetch`]: objects for restores, from the cache or a remote.
+//! - [`fetch`]: objects for restores and `agentfs lfs fetch`, from the
+//!   cache or a remote;
+//! - [`lock`]: the cache lock that keeps a prune from deleting objects in
+//!   use.
 //!
 //! What is stored as LFS is decided when a file is recorded and saved in
 //! the journal; the content is hashed and cached when it is committed, and
@@ -27,9 +31,11 @@ pub mod endpoint;
 #[cfg(test)]
 pub(crate) mod fake;
 pub mod fetch;
+pub mod lock;
 pub mod pointer;
 pub mod policy;
 pub mod pool;
+pub mod referenced;
 pub mod upload;
 
 use std::fmt;

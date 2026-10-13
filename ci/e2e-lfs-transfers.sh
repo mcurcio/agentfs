@@ -13,6 +13,8 @@
 # 14. downloads resume by byte: a download killed halfway leaves a partial
 #     in <state>/lfs/incomplete/, and the next one asks for the rest with
 #     Range (lfs-test-server answers 206).
+# 16. agentfs lfs fetch: the head's objects, a revision's, --all, and a
+#     dry run; a restore after a fetch downloads nothing.
 #
 # Needs ci/git-http-server.sh started with GIT_SERVER_LFS=1, ci/lfs-server.sh,
 # and git-lfs.
@@ -185,5 +187,40 @@ held_now=$(grep -o '"bytes=[0-9]*-"' <<<"$ranged" | head -n1 | tr -dc 0-9)
 assert_contains "$ranged" " 206 \"bytes=$held_now-\"" "lfs-test-server answered the Range with 206"
 assert_eq "$HUGE" "$(sha256sum "$STATE/lfs/objects/${HUGE:0:2}/${HUGE:2:2}/$HUGE" | cut -d' ' -f1)" "the cached object's hash"
 assert_eq 0 "$(find "$STATE/lfs/incomplete" -type f | wc -l)" "lfs/incomplete is empty"
+
+step "16. agentfs lfs fetch"
+lfs_volume fetchv
+gets_since() { log_since "$1" | awk '$2 == 8081 && $4 == "\"GET" && $5 ~ /\/objects\//' | wc -l; }
+head -c 3000 /dev/urandom >"$TREE/a.bin"
+agentfs record a.bin
+FIRST=$(local_head fetchv)
+cp "$TREE/a.bin" "$VOL/a.first"
+head -c 3000 /dev/urandom >"$TREE/a.bin"
+head -c 3000 /dev/urandom >"$TREE/b.bin"
+agentfs record a.bin b.bin
+agentfs push --remote sep
+rm -rf "$STATE/lfs/objects"
+before=$(log_lines)
+out=$(agentfs lfs fetch --dry-run)
+assert_contains "$out" "would fetch 2 object(s), 6000 byte(s)" "a dry run counts the head's objects"
+assert_eq 0 "$(gets_since "$before")" "a dry run downloads nothing"
+out=$(agentfs lfs fetch)
+assert_contains "$out" "sep: fetched 2 object(s)" "the head's two objects"
+assert_eq 2 "$(gets_since "$before")" "two downloads"
+before=$(log_lines)
+out=$(agentfs lfs fetch "$FIRST")
+assert_contains "$out" "sep: fetched 1 object(s)" "the first commit's object"
+assert_eq 1 "$(gets_since "$before")" "one download for the revision"
+rm -rf "$STATE/lfs/objects"
+before=$(log_lines)
+out=$(agentfs lfs fetch --all)
+assert_contains "$out" "3 object(s), 9000 byte(s) referenced" "--all: every object of the branch"
+assert_eq 3 "$(gets_since "$before")" "three downloads"
+rm "$TREE/a.bin"
+agentfs record a.bin
+before=$(log_lines)
+agentfs restore a.bin "$FIRST"
+cmp "$TREE/a.bin" "$VOL/a.first" && pass "restored from the fetched cache"
+assert_eq 0 "$(gets_since "$before")" "the restore downloaded nothing"
 
 step "all LFS transfer checks passed"

@@ -566,6 +566,25 @@ git --git-dir /data/state/git config lfs.concurrenttransfers 16
   uploaded halfway and continued later (no LFS server agentfs can test
   supports git-lfs's experimental `tus` uploads).
 
+### The local cache
+
+Every LFS object is kept in `<state>/lfs/objects` when it is committed,
+and pushes upload from there. `agentfs lfs fetch` downloads objects into
+it from the remotes, for example after the cache was lost, or before a
+push to a new remote of commits whose objects are no longer cached:
+
+```sh
+agentfs lfs fetch                  # the objects the branch head references
+agentfs lfs fetch agentfs/demo~5   # those of another commit's tree
+agentfs lfs fetch --all            # every object of every commit on the branch
+agentfs lfs fetch --all --dry-run  # what is missing, contacting no server
+```
+
+Remotes are asked in name order (or only those named with `--remote`),
+each for the objects the ones before it could not provide. It takes no
+state-area lock, so it runs beside a mount, and exits 1 unless every
+object is cached afterwards.
+
 ### When uploads fail
 
 Uploads run before every push attempt of each remote, for the objects the
@@ -620,10 +639,11 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | `mount`, `record` with `--history-service`: how long to wait for the service at start |
 | `--history-slot N` | `AGENTFS_HISTORY_SLOT` | the lowest free slot | `mount`, `record` with `--history-service`: lease pending slot N (1 to 1023) when it is free, else the lowest free slot; a front restarted after a crash passes its predecessor's slot to drain that slot's repairs |
 | `--allow-stale` | | | `probe`: exit 0 for a stale agentfs mount too |
-| `--remote NAME` (repeatable) | | every remote | `push`: push only these remotes |
+| `--remote NAME` (repeatable) | | every remote | `push`: push only these remotes; `lfs fetch`: fetch only from these (in name order) |
 | `--timeout DURATION` | | `120s` | `push` through a running daemon: how long to wait for its pushes (clamped to 1s..10m); a push still running then carries on in the background, and the command exits 1 (also when a push stepped under `agentfsMaxPushSize` still has commits left). Pushing directly ignores it and keeps stepping until up to date or a failure |
 | `--force` | | | `restore`: write even files open for writing through the mount; `revert`: also revert paths changed again since the commit, and write files open for writing (§15) |
-| `--dry-run` | | | `restore`, `revert`: print the plan and write nothing |
+| `--dry-run` | | | `restore`, `revert`: print the plan and write nothing; `lfs fetch`: report the objects (and bytes) missing from the cache, contacting no server |
+| `--all` | | the branch head | `lfs fetch`: every object any commit on the branch references, instead of the head's (or the revisions given) |
 | `--no-fetch` | | | `patch apply`: apply what is already fetched, without contacting the patch remote |
 | `--json` | | | `patch status`: the status document and the local cache as JSON |
 | `--remote NAME\|URL` | | `origin` | `patch submit`: the remote the volume pushes to |

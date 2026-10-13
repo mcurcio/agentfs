@@ -82,8 +82,10 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs/endpoint.rs` | Each remote's LFS endpoint and credentials, in git-lfs's precedence |
 | `lfs/client.rs` | The batch API client (basic transfer) and the standalone-file transfer |
 | `lfs/pool.rs` | The worker pool that moves up to `lfs.concurrenttransfers` objects at once |
+| `lfs/referenced.rs` | Which LFS objects commits reference: one tree, or a range of history |
+| `lfs/lock.rs` | The cache lock, `<state>/lfs/lock`: shared by restores and fetches, exclusive for a prune |
 | `lfs/upload.rs` | Which LFS objects a push must upload first |
-| `lfs/fetch.rs` | LFS objects for restores: cache first, then the remotes |
+| `lfs/fetch.rs` | LFS objects for restores and `agentfs lfs fetch`: cache first, then the remotes |
 | `lfs/fake.rs` | An in-process LFS server for tests |
 | `patch/mod.rs` | The patch queue for iac (§12) |
 | `patch/submit.rs` | `agentfs patch submit`: the producer side, driving the producer's own `git` |
@@ -123,6 +125,7 @@ missing from these tables or a row names a module that no longer exists;
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
 | `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly (§15) |
 | `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
+| `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache (§7) |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads (§13) |
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters (§13) |
 | `doc_tables.rs` | Test only: a small markdown reader for the documentation tests |

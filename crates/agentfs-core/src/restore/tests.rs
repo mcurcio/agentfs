@@ -1088,7 +1088,7 @@ mod lfs {
     impl Lfs {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let cache = CacheOnly(ObjectCache::open(dir.path().join("lfs")).unwrap());
+            let cache = CacheOnly::new(ObjectCache::open(dir.path().join("lfs")).unwrap()).unwrap();
             Self {
                 fx: Fixture::new(),
                 _dir: dir,
@@ -1099,7 +1099,7 @@ mod lfs {
         fn cache_object(&self, content: &str) -> Pointer {
             let src = self._dir.path().join("src");
             fs::write(&src, content).unwrap();
-            self.cache.0.insert_file(&src).unwrap()
+            self.cache.cache().insert_file(&src).unwrap()
         }
 
         /// Commits `files` plus `lfs` (path, content) stored as LFS, with

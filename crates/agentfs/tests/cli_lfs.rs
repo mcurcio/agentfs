@@ -452,3 +452,117 @@ fn status_shows_derived_endpoints_and_why_there_is_none() {
         "{status}"
     );
 }
+
+/// The objects in `remote`'s standalone-file layout.
+fn remote_object(remote: &Path, oid: &str) -> PathBuf {
+    remote.join(format!("lfs/objects/{}/{}/{oid}", &oid[..2], &oid[2..4]))
+}
+
+/// The oid of `path`'s pointer at `rev` in the volume's history.
+fn oid_at(v: &Volume, rev: &str, path: &str) -> String {
+    let text = git_ok(&v.state().join("git"), &["show", &format!("{rev}:{path}")]);
+    pointer(&text).0
+}
+
+fn cached_count(v: &Volume) -> usize {
+    fn walk(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| {
+                        if e.file_type().unwrap().is_dir() {
+                            walk(&e.path())
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    walk(&v.state().join("lfs/objects"))
+}
+
+#[test]
+fn lfs_fetch_brings_back_what_commits_reference() {
+    let v = Volume::new();
+    let a = v.dir.path().join("a.git");
+    let b = v.dir.path().join("b.git");
+    bare(&a);
+    bare(&b);
+    v.config(&[
+        ("remote.a.url", a.to_str().unwrap()),
+        ("remote.b.url", b.to_str().unwrap()),
+    ]);
+    v.write("one.bin", &format!("{LARGE} one"), false);
+    v.ok(&["record", "one.bin"]);
+    let first = git_ok(&v.state().join("git"), &["rev-parse", "agentfs/demo"]);
+    let first = first.trim().to_owned();
+    // `one.bin` is replaced: the head no longer references its object.
+    v.write("one.bin", &format!("{LARGE} one, again"), false);
+    v.write("two.bin", &format!("{LARGE} two"), false);
+    v.ok(&["record", "one.bin", "two.bin"]);
+    v.ok(&["push"]);
+    let old_one = oid_at(&v, &first, "one.bin");
+    let new_one = oid_at(&v, "agentfs/demo", "one.bin");
+    let two = oid_at(&v, "agentfs/demo", "two.bin");
+    // Remote a loses two.bin's object: b provides it.
+    fs::remove_file(remote_object(&a, &two)).unwrap();
+    fs::remove_dir_all(v.state().join("lfs/objects")).unwrap();
+
+    // A dry run downloads nothing.
+    let out = v.ok(&["lfs", "fetch", "--dry-run"]);
+    assert!(out.contains("2 object(s)"), "{out}");
+    assert!(out.contains("would fetch 2 object(s)"), "{out}");
+    assert_eq!(cached_count(&v), 0);
+
+    // The head: its two objects, from a and then b.
+    let out = v.ok(&["lfs", "fetch"]);
+    assert!(out.contains("a: fetched 1 object(s)"), "{out}");
+    assert!(out.contains("b: fetched 1 object(s)"), "{out}");
+    assert!(v.cached(&new_one).is_file() && v.cached(&two).is_file());
+    assert!(!v.cached(&old_one).exists());
+    // Again: nothing to do.
+    let out = v.ok(&["lfs", "fetch"]);
+    assert!(out.contains("2 already cached"), "{out}");
+
+    // A revision: the first commit's tree.
+    let out = v.ok(&["lfs", "fetch", &first]);
+    assert!(out.contains("fetched 1 object(s)"), "{out}");
+    assert!(v.cached(&old_one).is_file());
+
+    // --all, from b only, which lacks nothing.
+    fs::remove_dir_all(v.state().join("lfs/objects")).unwrap();
+    let out = v.ok(&["lfs", "fetch", "--all", "--remote", "b"]);
+    assert!(out.contains("3 object(s)"), "{out}");
+    assert!(!out.contains("a: "), "{out}");
+    assert_eq!(cached_count(&v), 3);
+
+    // Only from a, which lacks two.bin's object: exit 1, naming it.
+    fs::remove_dir_all(v.state().join("lfs/objects")).unwrap();
+    let out = v.run(&["lfs", "fetch", "--remote", "a"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(&two) && err.contains("two.bin"), "{err}");
+    // Unknown remotes and revisions are errors.
+    assert_eq!(
+        v.run(&["lfs", "fetch", "--remote", "nope"]).status.code(),
+        Some(1)
+    );
+    assert_eq!(
+        v.run(&["lfs", "fetch", "no-such-rev"]).status.code(),
+        Some(1)
+    );
+    // A restore after a fetch downloads nothing more: the objects are
+    // cached, and a's are gone too.
+    v.ok(&["lfs", "fetch"]);
+    fs::remove_dir_all(a.join("lfs")).unwrap();
+    fs::remove_dir_all(b.join("lfs")).unwrap();
+    fs::remove_file(v.tree().join("two.bin")).unwrap();
+    v.ok(&["record", "two.bin"]);
+    v.ok(&["restore", "two.bin", "agentfs/demo~1"]);
+    assert_eq!(
+        fs::read_to_string(v.tree().join("two.bin")).unwrap(),
+        format!("{LARGE} two")
+    );
+}

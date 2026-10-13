@@ -43,6 +43,7 @@ mod daemon;
 mod doc_tables;
 mod front;
 mod hold;
+mod lfs_cmd;
 mod otel;
 mod patch_cmd;
 mod push_now;
@@ -249,6 +250,12 @@ enum Command {
     Patch {
         #[command(subcommand)]
         command: patch_cmd::PatchCommand,
+    },
+    /// The local Git LFS object cache (design §7): fetch the objects
+    /// commits reference.
+    Lfs {
+        #[command(subcommand)]
+        command: lfs_cmd::LfsCommand,
     },
 }
 
@@ -535,6 +542,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Patch { command } => {
             return patch_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
         }
+        Command::Lfs { command } => return lfs_cmd::run(command, &state),
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
             // A restarted sidecar whose daemon died (design §17.1).
