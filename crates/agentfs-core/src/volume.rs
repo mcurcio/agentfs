@@ -2425,6 +2425,32 @@ impl Committer {
         let mut git_dirs: HashMap<String, bool> = HashMap::new();
         for record in group {
             let mut record = record.clone();
+            if let Some(missing) = self.missing_copy(&record)? {
+                // A record whose write failed and that reached the journal
+                // all the same (an fsync error, a power cut between the
+                // truncation of a failed batch and the removal of its
+                // copies): its call returned an error, so nothing was
+                // promised. Dropped whole, never committed in part, and
+                // never blocking the records after it (design §3.3).
+                self.events.emit(Event::RecordFailed {
+                    trigger: record.draft.trigger,
+                    paths: record
+                        .draft
+                        .changes
+                        .iter()
+                        .map(|c| c.path().clone())
+                        .collect(),
+                    error: format!(
+                        "record {} is dropped from history: its frozen copy {} is missing \
+                         from pending/",
+                        record.seq,
+                        self.pending.path(missing).display()
+                    ),
+                });
+                record.draft.changes.clear();
+                rechecked.records.push(record);
+                continue;
+            }
             let mut kept = Vec::with_capacity(record.draft.changes.len());
             let mut refused_any = false;
             for change in record.draft.changes {
@@ -2476,6 +2502,20 @@ impl Committer {
             rechecked.records.push(record);
         }
         Ok(rechecked)
+    }
+
+    /// The first frozen copy `record` writes from that is not in `pending/`.
+    fn missing_copy(&self, record: &Record) -> io::Result<Option<PendingId>> {
+        for change in &record.draft.changes {
+            if let Change::Write { pending, .. } = change {
+                match std::fs::symlink_metadata(self.pending.path(*pending)) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(*pending)),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Whether a proper ancestor directory of `path` (never the root) is a

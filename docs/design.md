@@ -436,6 +436,17 @@ returned call is as durable as in single-process mode.
   journaled or the new head with everything it names.
 - **After a crash,** the recorder resumes from the branch head's `Agentfs-Seq`
   and replays later entries.
+- **Entries without their copies.** A record whose journal write failed
+  after the bytes reached the journal (an error after the write, or a
+  power cut before the failed batch's truncation) has its frozen copies
+  removed, and its call returned an error, so nothing was promised. A
+  commit drops such an entry whole when any of its frozen copies is
+  missing from `pending/` and raises `RecordFailed` naming it, rather than
+  failing every later commit on the missing file. Found by the crash
+  harness (§18, `record.after_journal`).
+- **Failed truncation.** When rewriting the journal fails after the new
+  file replaced the old one, the journal keeps appending to the new file,
+  never to the unlinked old one, so later records stay durable.
 
 ### 3.4 Commits
 
