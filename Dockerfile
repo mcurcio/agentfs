@@ -32,7 +32,10 @@ COPY crates/agentfs/Cargo.toml crates/agentfs/
 # protox) are dependencies too.
 COPY crates/agentfs-csi/Cargo.toml crates/agentfs-csi/build.rs crates/agentfs-csi/
 COPY crates/agentfs-csi/proto crates/agentfs-csi/proto
-RUN mkdir -p crates/agentfs-core/src crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src \
+# Every target a manifest declares must exist, so the record_step bench
+# gets a stub too.
+RUN mkdir -p crates/agentfs-core/src crates/agentfs-core/benches crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src \
+ && echo "fn main() {}" > crates/agentfs-core/benches/record_step.rs \
  && touch crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs/src/main.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs-csi/src/main.rs \
