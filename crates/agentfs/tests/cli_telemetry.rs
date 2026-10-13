@@ -650,3 +650,269 @@ fn a_queue_that_cannot_run_sets_the_blocked_gauge() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert_eq!(gauge_last(&collector, "agentfs.patch.blocked"), Some(1));
 }
+
+/// Every value of gauge `name`, in the order the collector got them.
+fn gauge_values(collector: &Collector, name: &str) -> Vec<i64> {
+    use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point};
+    let mut out = Vec::new();
+    for body in collector.bodies("/v1/metrics") {
+        let request = ExportMetricsServiceRequest::decode(&body[..]).unwrap();
+        for rm in request.resource_metrics {
+            for sm in rm.scope_metrics {
+                for m in sm.metrics.into_iter().filter(|m| m.name == name) {
+                    let Some(metric::Data::Gauge(gauge)) = m.data else {
+                        continue;
+                    };
+                    for point in gauge.data_points {
+                        if let Some(number_data_point::Value::AsInt(v)) = point.value {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The largest total of counter `name` over its data points, whatever
+/// their attributes (cumulative: the largest is the total).
+fn counter_any(collector: &Collector, name: &str) -> Option<u64> {
+    use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point};
+    let mut best = None;
+    for body in collector.bodies("/v1/metrics") {
+        let request = ExportMetricsServiceRequest::decode(&body[..]).unwrap();
+        for rm in request.resource_metrics {
+            for sm in rm.scope_metrics {
+                for m in sm.metrics.into_iter().filter(|m| m.name == name) {
+                    let Some(metric::Data::Sum(sum)) = m.data else {
+                        continue;
+                    };
+                    for point in sum.data_points {
+                        if let Some(number_data_point::Value::AsInt(v)) = point.value {
+                            best = best.max(Some(v as u64));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// The largest count of histogram `name`'s data points with `attr`.
+fn histogram_count(collector: &Collector, name: &str, attr: (&str, &str)) -> u64 {
+    use opentelemetry_proto::tonic::metrics::v1::metric;
+    let mut best = 0;
+    for body in collector.bodies("/v1/metrics") {
+        let request = ExportMetricsServiceRequest::decode(&body[..]).unwrap();
+        for rm in request.resource_metrics {
+            for sm in rm.scope_metrics {
+                for m in sm.metrics.into_iter().filter(|m| m.name == name) {
+                    let Some(metric::Data::Histogram(h)) = m.data else {
+                        continue;
+                    };
+                    for point in h.data_points {
+                        if string_attr(&point.attributes, attr.0).as_deref() == Some(attr.1) {
+                            best = best.max(point.count);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "never {what}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Real failures, not synthetic events: a file the caller cannot read
+/// fails its record (`agentfs.record.failures`, by trigger), and a history
+/// whose object directories cannot be written fails the commit
+/// (`agentfs.commit.failures`) while the record stays journaled. Skipped
+/// as root, which permissions do not stop.
+#[test]
+fn real_record_and_commit_failures_are_counted() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: permissions do not stop root");
+        return;
+    }
+    let collector = Collector::start();
+    let endpoint = collector.endpoint();
+    let otel = [("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str())];
+    let v = Volume::new();
+
+    let secret = v.tree().join("secret.txt");
+    fs::write(&secret, "s").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = v.run(&["record", "secret.txt"], &otel);
+    assert!(!out.status.success(), "an unreadable file fails its record");
+    assert_eq!(
+        counter_max(&collector, "agentfs.record.failures", ("trigger", "close")),
+        Some(1),
+        "{}",
+        stderr(&out)
+    );
+
+    // Objects cannot be written: the commit fails, the record stays.
+    let objects = v.dir.path().join("state/git/objects");
+    let mut dirs = vec![objects.clone()];
+    for entry in fs::read_dir(&objects).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
+    for d in &dirs {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    fs::write(v.tree().join("a.txt"), "a").unwrap();
+    let out = v.run(&["record", "a.txt"], &otel);
+    for d in &dirs {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(
+        counter_any(&collector, "agentfs.commit.failures"),
+        Some(1),
+        "{}",
+        stderr(&out)
+    );
+    let out = v.run(&["flush"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let status = v.run(&["status"], &[]);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("backlog:   0 record(s)"),
+        "the journaled record was committed later"
+    );
+}
+
+/// The history service's `agentfs.history_service.fronts` gauge follows
+/// the fronts connected (0, 1, 2, then 1), and a `record
+/// --history-service` front exports its `agentfs.front.round_trip`.
+#[test]
+fn the_fronts_gauge_and_a_fronts_round_trip_are_exported() {
+    use agentfs_core::events::NullSink;
+    use agentfs_core::history_service::protocol::FrontInfo;
+    use agentfs_core::history_service::{Address, ClientConfig, FrontLease, HistoryClient};
+    use agentfs_core::record::Origin;
+    use agentfs_core::telemetry::Telemetry;
+    use agentfs_core::volume::StateDir;
+
+    let collector = Collector::start();
+    let endpoint = collector.endpoint();
+    let otel = [
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str()),
+        ("OTEL_METRIC_EXPORT_INTERVAL", "100"),
+    ];
+    let v = Volume::new();
+    let state = StateDir::new(v.dir.path().join("state"));
+    let log = v.dir.path().join("serve.log");
+    let home = v.dir.path().join("home");
+    let mut service = Command::new(env!("CARGO_BIN_EXE_agentfs"));
+    for (name, _) in std::env::vars_os() {
+        let n = name.to_string_lossy();
+        if n.starts_with("OTEL_") || n.starts_with("AGENTFS_") {
+            service.env_remove(name);
+        }
+    }
+    let mut service = service
+        .arg("--state")
+        .arg(state.root())
+        .arg("--root")
+        .arg(v.tree())
+        .arg("serve-history")
+        .env("AGENTFS_REPLICA", "service-0")
+        .env("HOME", &home)
+        .envs(otel.iter().copied())
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    struct Kill<'a>(&'a mut std::process::Child);
+    impl Drop for Kill<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let service = Kill(&mut service);
+    wait_until("served", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("serving history for volume demo")
+    });
+    let fronts = |want: i64| {
+        let seen = gauge_values(&collector, "agentfs.history_service.fronts");
+        seen.last() == Some(&want)
+    };
+    wait_until("exported 0 fronts", || fronts(0));
+
+    let connect = |pod: &str| {
+        let lease = FrontLease::acquire(&state, &format!("command=test pod={pod}")).unwrap();
+        let client = HistoryClient::connect(
+            ClientConfig {
+                address: Address::Unix(state.history_socket()),
+                timeout: Duration::from_secs(10),
+                connect_wait: Duration::from_secs(10),
+            },
+            "demo",
+            "refs/heads/agentfs/demo",
+            FrontInfo {
+                origin: Origin {
+                    namespace: "agents".into(),
+                    pod: pod.into(),
+                    pod_uid: format!("{pod}-uid"),
+                    node: "node-1".into(),
+                    replica: pod.into(),
+                },
+                slot: lease.slot(),
+                instance: u64::from(std::process::id()) << 16 | u64::from(lease.slot()),
+                pid: std::process::id(),
+                version: "test".into(),
+                views: Vec::new(),
+            },
+            Arc::new(NullSink),
+            Telemetry::noop(),
+        )
+        .unwrap();
+        client.ping().unwrap();
+        (lease, client)
+    };
+    let a = connect("pod-a");
+    wait_until("exported 1 front", || fronts(1));
+    let b = connect("pod-b");
+    wait_until("exported 2 fronts", || fronts(2));
+    drop(b);
+    wait_until("exported 1 front again", || fronts(1));
+    drop(a);
+
+    fs::write(v.tree().join("f.txt"), "f").unwrap();
+    let out = v.run(
+        &[
+            "record",
+            "--history-service",
+            state.history_socket().to_str().unwrap(),
+            "--history-wait",
+            "10s",
+            "f.txt",
+        ],
+        &otel,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        histogram_count(
+            &collector,
+            "agentfs.front.round_trip",
+            ("request", "record")
+        ) >= 1,
+        "the front's round trip was exported"
+    );
+    drop(service);
+}

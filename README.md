@@ -564,7 +564,15 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](ci/e2e-telemetry.sh)): every
   metric, span and alarm log above must reach a real OpenTelemetry Collector,
   and a dead traces endpoint must produce the stderr warning and
-  `agentfs.telemetry.export_failures` over metrics.
+  `agentfs.telemetry.export_failures` over metrics. The failure counters
+  come from real failures: an unreadable file (`agentfs.record.failures`),
+  an unwritable object store (`agentfs.commit.failures`, the record
+  committed later) and a git that fails the repack
+  (`agentfs.repack.failures`). A real `serve-history` with FUSE front
+  mounts shows `agentfs.history_service.fronts` going 0, 1, 2, 1, a
+  front's `agentfs.front.round_trip`, and its
+  `agentfs.front.service_failures` for a hung service (`timeout`) and a
+  stopped one (`connect`).
 - **e2e FUSE mount** ([`ci/fuse-tests.sh`](ci/fuse-tests.sh)), with
   passthrough `auto`, `on` and `off`: real mounts as root running the `#[ignore]`d
   tests in [`crates/agentfs/tests/mount.rs`](crates/agentfs/tests/mount.rs):
