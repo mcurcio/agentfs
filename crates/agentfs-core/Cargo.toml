@@ -51,3 +51,9 @@ https = ["git2/https", "ureq/native-tls"]
 # OpenSSL). Without it an ssh remote is reported as misconfigured (design
 # §11.1).
 ssh = ["git2/ssh"]
+
+# The synchronous step's cost (design §3.2, §18 test 13): a plain binary,
+# no harness or new dependencies; docs/performance.md describes it.
+[[bench]]
+name = "record_step"
+harness = false
