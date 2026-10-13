@@ -452,6 +452,22 @@ fn status_shows_derived_endpoints_and_why_there_is_none() {
         "{status}"
     );
     assert!(!status.contains("proxy:"), "{status}");
+    if cfg!(feature = "ssh") {
+        // An SSH remote's endpoint is the one git-lfs-authenticate names.
+        v.config(&[
+            ("remote.ssh.url", "ssh://git@git.example:2222/acme/r.git"),
+            ("remote.ssh.agentfsSshKey", "/run/secrets/key"),
+            ("remote.ssh.agentfsKnownHosts", "/run/secrets/known_hosts"),
+        ]);
+        let status = v.ok(&["status"]);
+        assert!(
+            status.contains(
+                "lfs: git-lfs-authenticate over ssh://git@git.example:2222/acme/r.git \
+                 (derived from remote.ssh.url; credentials from git-lfs-authenticate)"
+            ),
+            "{status}"
+        );
+    }
     // Proxies: http.proxy for every remote, unless a remote sets its own.
     v.config(&[
         ("http.proxy", "proxy.example:3128"),
@@ -467,7 +483,9 @@ fn status_shows_derived_endpoints_and_why_there_is_none() {
         status.contains("proxy: http://web-proxy.example:8080 (remote.web.proxy)"),
         "{status}"
     );
-    assert_eq!(status.matches("proxy: ").count(), 2, "{status}");
+    // local and web (and ssh, in an ssh build); git turns it off.
+    let proxied = if cfg!(feature = "ssh") { 3 } else { 2 };
+    assert_eq!(status.matches("proxy: ").count(), proxied, "{status}");
 }
 
 /// The objects in `remote`'s standalone-file layout.

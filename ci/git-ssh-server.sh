@@ -19,6 +19,16 @@
 #   with sudo), GIT_SSH_LOG (sshd's log, root-owned: read it with sudo;
 #   the other two log to sshd-2223.log and sshd-2224.log beside it).
 #
+# GIT_SSH_LFS_AUTH=1 also installs a git-shell custom command,
+# ~agentfs-git/git-shell-commands/git-lfs-authenticate (root-owned, 0755),
+# for ci/e2e-lfs-ssh.sh (design §7): it checks its two arguments (a path
+# and upload or download), appends `<time> <operation> <path>` to
+# ~/lfs-auth/log, and prints {"href": <base>/<basename of the path less
+# .git>, "header": {"Authorization": "Basic <token>"}, "expires_in": <n>}
+# from ~/lfs-auth/base, token and expires_in, files owned by agentfs-git
+# that the test writes with sudo tee. `start` then prints
+# GIT_SSH_LFS_AUTH_DIR.
+#
 # Every host key has a certificate signed by one host CA, so a client
 # that asks for certificates gets one (OpenSSH's sshd does not check a
 # certificate's validity or principals: only the client does).
@@ -57,6 +67,28 @@ fi
 # accounts without PAM. "*" means no password, but not locked.
 sudo usermod -p '*' "$user"
 sudo -u "$user" mkdir -p "$home/repos"
+if [ "${GIT_SSH_LFS_AUTH:-}" = 1 ]; then
+  sudo install -d -o root -g root -m 0755 "$home/git-shell-commands"
+  sudo tee "$home/git-shell-commands/git-lfs-authenticate" >/dev/null <<'SCRIPT'
+#!/bin/sh
+# git-lfs-authenticate <path> <upload|download>, for agentfs's CI.
+set -eu
+[ "$#" -eq 2 ] || { echo "usage: git-lfs-authenticate <path> <upload|download>" >&2; exit 2; }
+case "$2" in
+upload | download) ;;
+*) echo "git-lfs-authenticate: unknown operation $2" >&2; exit 2 ;;
+esac
+dir=$HOME/lfs-auth
+echo "$(date +%s.%N) $2 $1" >>"$dir/log"
+printf '{"href": "%s/%s", "header": {"Authorization": "Basic %s"}, "expires_in": %s}\n' \
+  "$(cat "$dir/base")" "$(basename "$1" .git)" "$(cat "$dir/token")" "$(cat "$dir/expires_in")"
+SCRIPT
+  sudo chmod 0755 "$home/git-shell-commands/git-lfs-authenticate"
+  sudo -u "$user" mkdir -p "$home/lfs-auth"
+  for f in base token expires_in log; do
+    sudo -u "$user" touch "$home/lfs-auth/$f"
+  done
+fi
 
 # Host keys of every type, so known_hosts has them all (agentfs asks for the
 # types known_hosts lists first, design §11.1).
@@ -143,3 +175,6 @@ GIT_SSH_KNOWN_HOSTS_CA=$dir/known_hosts.ca
 GIT_SSH_BASE_EXPIRED=ssh://$user@localhost:2223$home/repos
 GIT_SSH_BASE_WRONGNAME=ssh://$user@localhost:2224$home/repos
 EOF
+if [ "${GIT_SSH_LFS_AUTH:-}" = 1 ]; then
+  echo "GIT_SSH_LFS_AUTH_DIR=$home/lfs-auth"
+fi

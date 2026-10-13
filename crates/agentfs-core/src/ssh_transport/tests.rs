@@ -49,10 +49,30 @@ struct Log {
     commands: Vec<String>,
 }
 
+/// How the server answers `git-lfs-authenticate`: exit status, stdout and
+/// stderr. By default as git-shell does without the command.
+#[derive(Clone)]
+struct LfsAnswer {
+    status: u32,
+    stdout: String,
+    stderr: String,
+}
+
+impl Default for LfsAnswer {
+    fn default() -> Self {
+        Self {
+            status: 128,
+            stdout: String::new(),
+            stderr: "fatal: unrecognized command 'git-lfs-authenticate'".into(),
+        }
+    }
+}
+
 struct TestServer {
     port: u16,
     host_key: PublicKey,
     log: Arc<Mutex<Log>>,
+    lfs: Arc<Mutex<LfsAnswer>>,
     _runtime: tokio::runtime::Runtime,
 }
 
@@ -92,11 +112,14 @@ impl TestServer {
         let port = listener.local_addr().unwrap().port();
         let authorized = Arc::new(authorized);
         let server_log = Arc::clone(&log);
+        let lfs = Arc::new(Mutex::new(LfsAnswer::default()));
+        let server_lfs = Arc::clone(&lfs);
         runtime.spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 let handler = Conn {
                     authorized: Arc::clone(&authorized),
                     log: Arc::clone(&server_log),
+                    lfs: Arc::clone(&server_lfs),
                     mode,
                     channels: HashMap::new(),
                 };
@@ -112,8 +135,25 @@ impl TestServer {
             port,
             host_key,
             log,
+            lfs,
             _runtime: runtime,
         }
+    }
+
+    fn answer_lfs(&self, answer: LfsAnswer) {
+        *self.lfs.lock().unwrap() = answer;
+    }
+
+    /// The git-lfs-authenticate commands run so far.
+    fn lfs_commands(&self) -> Vec<String> {
+        self.log
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|c| c.starts_with("git-lfs-authenticate"))
+            .cloned()
+            .collect()
     }
 
     fn url(&self, path: &Path) -> String {
@@ -136,6 +176,7 @@ impl TestServer {
 struct Conn {
     authorized: Arc<Vec<PublicKey>>,
     log: Arc<Mutex<Log>>,
+    lfs: Arc<Mutex<LfsAnswer>>,
     mode: Mode,
     channels: HashMap<ChannelId, russh::Channel<Msg>>,
 }
@@ -188,6 +229,22 @@ impl server::Handler for Conn {
             return Ok(());
         };
         session.channel_success(id)?;
+        if command.starts_with("git-lfs-authenticate ") {
+            let answer = self.lfs.lock().unwrap().clone();
+            tokio::spawn(async move {
+                let (_read, write) = channel.split();
+                if !answer.stdout.is_empty() {
+                    let _ = write.data(answer.stdout.as_bytes()).await;
+                }
+                if !answer.stderr.is_empty() {
+                    let _ = write.extended_data(1, answer.stderr.as_bytes()).await;
+                }
+                let _ = write.exit_status(answer.status).await;
+                let _ = write.eof().await;
+                let _ = write.close().await;
+            });
+            return Ok(());
+        }
         if self.mode == Mode::Stall {
             tokio::spawn(async move {
                 let _keep = channel;
@@ -924,5 +981,211 @@ fn an_agent_offers_each_identity_once() {
             "{err}"
         );
         assert_eq!(server.offered().len(), before);
+    }
+}
+
+mod lfs_authenticate {
+    use super::*;
+    use crate::lfs::fake::FakeLfs;
+    use crate::lfs::{Direction, ObjectCache, Pointer, transfer_for};
+
+    const REF: &str = "refs/heads/agentfs/vol";
+
+    fn settings() -> crate::config::Settings {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config"), "[agentfs]\n\tvolume = v\n").unwrap();
+        crate::config::Settings::load(dir.path()).unwrap()
+    }
+
+    fn answer(href: &str, expires_in: Option<u64>) -> LfsAnswer {
+        let mut json = serde_json::json!({
+            "href": href,
+            "header": {"Authorization": "RemoteAuth tok"},
+        });
+        if let Some(n) = expires_in {
+            json["expires_in"] = n.into();
+        }
+        LfsAnswer {
+            status: 0,
+            stdout: json.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    struct Lfs {
+        f: Fixture,
+        client: PrivateKey,
+        server: TestServer,
+        fake: FakeLfs,
+        cache: ObjectCache,
+    }
+
+    impl Lfs {
+        fn new() -> Self {
+            let f = Fixture::new();
+            let client = ed25519(1);
+            let server =
+                TestServer::start(ed25519(9), vec![client.public_key().clone()], Mode::Git);
+            let fake = FakeLfs::start();
+            fake.with(|st| st.require_auth = Some("RemoteAuth tok".into()));
+            let cache = ObjectCache::open(f.dir.path().join("lfs")).unwrap();
+            Self {
+                f,
+                client,
+                server,
+                fake,
+                cache,
+            }
+        }
+
+        fn remote(&self) -> RemoteSettings {
+            let url = self.server.url(&self.f.served);
+            self.f
+                .remote(&url, &self.client, &self.server.known_hosts_line())
+        }
+
+        fn object(&self, content: &[u8]) -> Pointer {
+            let src = self.f.dir.path().join("src");
+            fs::write(&src, content).unwrap();
+            self.cache.insert_file(&src).unwrap()
+        }
+
+        fn path(&self) -> String {
+            self.f
+                .served
+                .display()
+                .to_string()
+                .trim_start_matches('/')
+                .to_owned()
+        }
+    }
+
+    #[test]
+    fn uploads_and_downloads_use_the_endpoint_it_names() {
+        let t = Lfs::new();
+        t.server.answer_lfs(answer(&t.fake.url(), Some(3600)));
+        let remote = t.remote();
+        let p = t.object(b"through git-lfs-authenticate");
+        let up = transfer_for(&settings(), &remote, Direction::Upload).unwrap();
+        assert!(
+            up.endpoint()
+                .describe()
+                .starts_with("git-lfs-authenticate over ssh://git@127.0.0.1:"),
+            "{}",
+            up.endpoint().describe()
+        );
+        assert_eq!(up.upload(&[p], &t.cache, REF).unwrap().uploaded, 1);
+        let batch = t
+            .fake
+            .seen()
+            .into_iter()
+            .find(|s| s.path.ends_with("/batch"))
+            .unwrap();
+        assert_eq!(batch.header("authorization"), Some("RemoteAuth tok"));
+        // The action on the endpoint's origin carries it too.
+        let put = t
+            .fake
+            .seen()
+            .into_iter()
+            .find(|s| s.method == "PUT")
+            .unwrap();
+        assert_eq!(put.header("authorization"), Some("RemoteAuth tok"));
+        let other = ObjectCache::open(t.f.dir.path().join("other")).unwrap();
+        let down = transfer_for(&settings(), &remote, Direction::Download).unwrap();
+        down.download(&p, &other, REF).unwrap();
+        assert!(other.contains(&p));
+        assert_eq!(
+            t.server.lfs_commands(),
+            [
+                format!("git-lfs-authenticate {} upload", t.path()),
+                format!("git-lfs-authenticate {} download", t.path()),
+            ]
+        );
+    }
+
+    #[test]
+    fn answers_are_reused_until_they_expire() {
+        let t = Lfs::new();
+        let remote = t.remote();
+        let objects: Vec<Pointer> = (0..101)
+            .map(|i| t.object(format!("object {i}").as_bytes()))
+            .collect();
+        // Expired at once: run again for each batch (two here).
+        t.server.answer_lfs(answer(&t.fake.url(), Some(0)));
+        let up = transfer_for(&settings(), &remote, Direction::Upload).unwrap();
+        up.upload(&objects, &t.cache, REF).unwrap();
+        assert_eq!(t.server.lfs_commands().len(), 2);
+        // A long expiry: once, for every later call.
+        t.server.answer_lfs(answer(&t.fake.url(), Some(3600)));
+        let up = transfer_for(&settings(), &remote, Direction::Upload).unwrap();
+        up.upload(&objects, &t.cache, REF).unwrap();
+        up.upload(&objects, &t.cache, REF).unwrap();
+        assert_eq!(t.server.lfs_commands().len(), 3);
+        // No expiry: once per upload (a push attempt).
+        t.server.answer_lfs(answer(&t.fake.url(), None));
+        let up = transfer_for(&settings(), &remote, Direction::Upload).unwrap();
+        up.upload(&objects, &t.cache, REF).unwrap();
+        up.upload(&objects, &t.cache, REF).unwrap();
+        assert_eq!(t.server.lfs_commands().len(), 5);
+    }
+
+    #[test]
+    fn failures_are_classified() {
+        let t = Lfs::new();
+        let p = t.object(b"x");
+        // No git-lfs-authenticate on the server (git-shell's answer).
+        let up = transfer_for(&settings(), &t.remote(), Direction::Upload).unwrap();
+        let err = up.upload(&[p], &t.cache, REF).unwrap_err();
+        assert_eq!(err.kind, PushFailureKind::Refused, "{err}");
+        assert!(err.message.contains("unrecognized command"), "{err}");
+        assert!(err.message.contains("set remote.origin.lfsurl"), "{err}");
+        // Not JSON.
+        t.server.answer_lfs(LfsAnswer {
+            status: 0,
+            stdout: "Welcome!".into(),
+            stderr: String::new(),
+        });
+        let err = up.upload(&[p], &t.cache, REF).unwrap_err();
+        assert_eq!(err.kind, PushFailureKind::Refused, "{err}");
+        // A wrong header: the LFS server's 401.
+        t.server.answer_lfs(LfsAnswer {
+            stdout: answer(&t.fake.url(), Some(3600))
+                .stdout
+                .replace("tok", "bad"),
+            ..answer(&t.fake.url(), Some(3600))
+        });
+        let err = up.upload(&[p], &t.cache, REF).unwrap_err();
+        assert_eq!(err.kind, PushFailureKind::Auth, "{err}");
+        // A key the server refuses: auth, before any command.
+        let before = t.server.lfs_commands().len();
+        let mut remote = t.remote();
+        let other = ed25519(2);
+        let key = t.f.dir.path().join("other-id");
+        fs::write(&key, other.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+        remote.ssh_key = Some(key);
+        let up = transfer_for(&settings(), &remote, Direction::Upload).unwrap();
+        let err = up.upload(&[p], &t.cache, REF).unwrap_err();
+        assert_eq!(err.kind, PushFailureKind::Auth, "{err}");
+        assert_eq!(t.server.lfs_commands().len(), before);
+    }
+
+    #[test]
+    fn an_untrusted_host_never_sees_the_key() {
+        let t = Lfs::new();
+        t.server.answer_lfs(answer(&t.fake.url(), Some(3600)));
+        let p = t.object(b"x");
+        let url = t.server.url(&t.f.served);
+        let wrong = format!(
+            "[127.0.0.1]:{} {}",
+            t.server.port,
+            ed25519(7).public_key().to_openssh().unwrap()
+        );
+        let remote = t.f.remote(&url, &t.client, &wrong);
+        let up = transfer_for(&settings(), &remote, Direction::Upload).unwrap();
+        let err = up.upload(&[p], &t.cache, REF).unwrap_err();
+        assert_eq!(err.kind, PushFailureKind::UntrustedHost, "{err}");
+        assert!(t.server.offered().is_empty());
+        assert!(t.server.lfs_commands().is_empty());
+        assert!(t.fake.seen().is_empty());
     }
 }

@@ -81,6 +81,7 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs/attributes.rs` | The managed `filter=lfs` block in the root `.gitattributes`, in history only |
 | `lfs/cache.rs` | The local LFS object cache, `<state>/lfs/objects` |
 | `lfs/endpoint.rs` | Each remote's LFS endpoint and credentials, in git-lfs's precedence |
+| `lfs/ssh_auth.rs` | `git-lfs-authenticate` for SSH remotes: the command, running it over the SSH transport, and its answer |
 | `lfs/client.rs` | The batch API client (basic transfer) and the standalone-file transfer |
 | `lfs/pool.rs` | The worker pool that moves up to `lfs.concurrenttransfers` objects at once |
 | `lfs/referenced.rs` | Which LFS objects commits reference: one tree, or a range of history |

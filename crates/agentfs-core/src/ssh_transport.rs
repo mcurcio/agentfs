@@ -38,6 +38,10 @@
 //!
 //! The SSH session runs on a current-thread tokio runtime owned by the
 //! connection's stream and driven only while libgit2 reads or writes.
+//!
+//! [`run_command`] runs one other command the same way, bound to the same
+//! remote's host and port with the same checks, and returns its output:
+//! `git-lfs-authenticate` for the LFS client (design §7).
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -329,71 +333,111 @@ struct Stream {
     stderr: Vec<u8>,
 }
 
-impl Stream {
-    fn open(context: &Context, url: &str, command: &str) -> Result<Self, GitError> {
-        let Context { remote, state } = context;
-        let (Some(endpoint), Some(path)) =
-            (remote_url::ssh_endpoint(url), remote_url::ssh_path(url))
-        else {
-            return Err(ssh_error(
-                ErrorCode::GenericError,
-                format!(
-                    "{url} is not an SSH URL with a host and a path (libgit2 sends a local \
-                     path containing ':' to the SSH transport; use a file:// URL for it)"
-                ),
-            ));
-        };
-        let bound = remote.endpoint();
-        let lookup = lookup_name(&bound.host, bound.port);
-        if endpoint != *bound {
-            return Err(ssh_error(
-                ErrorCode::GenericError,
-                format!(
-                    "{url} is not on {lookup}, the host of remote {}'s push URL; nothing is \
-                     offered to it",
-                    remote.name()
-                ),
-            ));
-        }
-        let auth_error = |message: String| {
-            state.fail_auth();
-            ssh_error(ErrorCode::Auth, message)
-        };
-        let credentials = match remote.agent() {
-            Some(socket) => Credentials::Agent(socket.to_path_buf()),
-            None => Credentials::Key(remote.private_key(url).map_err(auth_error)?),
-        };
-        let user = remote_url::url_username(url)
-            .unwrap_or(DEFAULT_SSH_USERNAME)
-            .to_owned();
-        let command = format!("{command} {}", shell_quote(&path));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .map_err(|e| {
-                GitError::new(
-                    ErrorCode::GenericError,
-                    ErrorClass::Os,
-                    format!("starting the SSH runtime: {e}"),
-                )
-            })?;
-        let io_timeout = io_timeout();
-        let connected = runtime.block_on(connect(
-            remote,
-            state,
-            &endpoint,
-            &user,
-            credentials,
-            &command,
-            io_timeout,
+/// A connected session with one command started on it.
+struct Opened {
+    runtime: Runtime,
+    session: Handle<Client>,
+    channel: Channel<client::Msg>,
+    /// `user@host:port`, for messages.
+    peer: String,
+    io_timeout: Duration,
+}
+
+/// Connects to `url` (which must be on `remote`'s push URL host and port),
+/// checks the host, authenticates and starts the command `command` makes
+/// of the URL's path.
+fn open_command(
+    remote: &Arc<SshRemote>,
+    state: &Arc<AuthState>,
+    url: &str,
+    command: impl FnOnce(&str) -> String,
+) -> Result<(Opened, String), GitError> {
+    let (Some(endpoint), Some(path)) = (remote_url::ssh_endpoint(url), remote_url::ssh_path(url))
+    else {
+        return Err(ssh_error(
+            ErrorCode::GenericError,
+            format!(
+                "{url} is not an SSH URL with a host and a path (libgit2 sends a local \
+                 path containing ':' to the SSH transport; use a file:// URL for it)"
+            ),
         ));
-        let (session, channel) = connected?;
-        Ok(Self {
+    };
+    let bound = remote.endpoint();
+    let lookup = lookup_name(&bound.host, bound.port);
+    if endpoint != *bound {
+        return Err(ssh_error(
+            ErrorCode::GenericError,
+            format!(
+                "{url} is not on {lookup}, the host of remote {}'s push URL; nothing is \
+                 offered to it",
+                remote.name()
+            ),
+        ));
+    }
+    let auth_error = |message: String| {
+        state.fail_auth();
+        ssh_error(ErrorCode::Auth, message)
+    };
+    let credentials = match remote.agent() {
+        Some(socket) => Credentials::Agent(socket.to_path_buf()),
+        None => Credentials::Key(remote.private_key(url).map_err(auth_error)?),
+    };
+    let user = remote_url::url_username(url)
+        .unwrap_or(DEFAULT_SSH_USERNAME)
+        .to_owned();
+    let command = command(&path);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|e| {
+            GitError::new(
+                ErrorCode::GenericError,
+                ErrorClass::Os,
+                format!("starting the SSH runtime: {e}"),
+            )
+        })?;
+    let io_timeout = io_timeout();
+    let connected = runtime.block_on(connect(
+        remote,
+        state,
+        &endpoint,
+        &user,
+        credentials,
+        &command,
+        io_timeout,
+    ));
+    let (session, channel) = connected?;
+    Ok((
+        Opened {
             runtime,
             session,
             channel,
             peer: format!("{user}@{lookup}"),
+            io_timeout,
+        },
+        command,
+    ))
+}
+
+impl Stream {
+    fn open(context: &Context, url: &str, command: &str) -> Result<Self, GitError> {
+        let Context { remote, state } = context;
+        let (opened, command) = open_command(remote, state, url, |path| {
+            format!("{command} {}", shell_quote(path))
+        })?;
+        let Opened {
+            runtime,
+            session,
+            channel,
+            peer,
+            io_timeout,
+        } = opened;
+        Ok(Self {
+            runtime,
+            session,
+            channel,
+            peer,
             command,
             io_timeout,
             buffer: Vec::new(),
@@ -451,6 +495,109 @@ impl Stream {
             )),
         }
     }
+}
+
+/// What a command run with [`run_command`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandOutput {
+    /// The exit status, if the server sent one.
+    pub status: Option<u32>,
+    pub stdout: Vec<u8>,
+    /// Up to [`MAX_STDERR`] bytes of stderr.
+    pub stderr: String,
+}
+
+/// Runs `command` (sent as given: the caller quotes it) on `remote`'s
+/// server over `url`, which must be on its push URL's host and port, with
+/// the transport's checks: the host key or certificate before anything is
+/// offered, then the remote's key or agent, as the URL's user, within the
+/// transport's timeouts. More than `max_stdout` bytes of output is an
+/// error. Refusals are recorded in `state`, as for git commands.
+pub(crate) fn run_command(
+    remote: &Arc<SshRemote>,
+    state: &Arc<AuthState>,
+    url: &str,
+    command: &str,
+    max_stdout: usize,
+) -> Result<CommandOutput, GitError> {
+    let (opened, command) = open_command(remote, state, url, |_| command.to_owned())?;
+    let Opened {
+        runtime,
+        session,
+        mut channel,
+        peer,
+        io_timeout,
+    } = opened;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status = None;
+    let mut eof = false;
+    let result = loop {
+        let wait = if eof { EXIT_WAIT } else { io_timeout };
+        let channel = &mut channel;
+        let msg = runtime.block_on(async { tokio::time::timeout(wait, channel.wait()).await });
+        match msg {
+            Err(_) if eof => break Ok(()),
+            Err(_) => {
+                break Err(ssh_error(
+                    ErrorCode::Timeout,
+                    format!("no answer from {peer} for {} s ({command})", wait.as_secs()),
+                ));
+            }
+            Ok(None) | Ok(Some(ChannelMsg::Close)) => break Ok(()),
+            Ok(Some(ChannelMsg::Data { data })) => {
+                if stdout.len() + data.len() > max_stdout {
+                    break Err(ssh_error(
+                        ErrorCode::GenericError,
+                        format!("{command} on {peer} printed more than {max_stdout} bytes"),
+                    ));
+                }
+                stdout.extend_from_slice(&data);
+            }
+            Ok(Some(ChannelMsg::ExtendedData { data, ext: 1 })) => {
+                let room = MAX_STDERR.saturating_sub(stderr.len());
+                stderr.extend_from_slice(&data[..data.len().min(room)]);
+            }
+            Ok(Some(ChannelMsg::ExitStatus { exit_status })) => {
+                status = Some(exit_status);
+                if eof {
+                    break Ok(());
+                }
+            }
+            Ok(Some(ChannelMsg::Eof)) => {
+                eof = true;
+                if status.is_some() {
+                    break Ok(());
+                }
+            }
+            Ok(Some(ChannelMsg::Failure)) => {
+                break Err(ssh_error(
+                    ErrorCode::GenericError,
+                    format!("{peer} refused to run {command}"),
+                ));
+            }
+            Ok(Some(_)) => {}
+        }
+    };
+    disconnect(&runtime, &session, &channel);
+    result.map(|()| CommandOutput {
+        status,
+        stdout,
+        stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
+    })
+}
+
+/// Ends a session politely, waiting at most a second.
+fn disconnect(runtime: &Runtime, session: &Handle<Client>, channel: &Channel<client::Msg>) {
+    let _ = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let _ = channel.eof().await;
+            let _ = session
+                .disconnect(Disconnect::ByApplication, "", "en")
+                .await;
+        })
+        .await
+    });
 }
 
 /// Connects, checks the host key, authenticates and starts `command`.
@@ -766,17 +913,7 @@ impl Write for Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        let channel = &self.channel;
-        let session = &self.session;
-        let _ = self.runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                let _ = channel.eof().await;
-                let _ = session
-                    .disconnect(Disconnect::ByApplication, "", "en")
-                    .await;
-            })
-            .await
-        });
+        disconnect(&self.runtime, &self.session, &self.channel);
     }
 }
 

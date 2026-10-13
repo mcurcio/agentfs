@@ -11,6 +11,7 @@
 //!   end of the root `.gitattributes` in history, as `git lfs track` would;
 //! - [`policy`]: which store a recorded file goes to;
 //! - [`endpoint`]: each remote's LFS endpoint and credentials;
+//! - [`ssh_auth`]: `git-lfs-authenticate`, for SSH remotes' endpoints;
 //! - [`client`]: the batch API client and the standalone-file transfer;
 //! - [`pool`]: the worker pool that moves objects concurrently;
 //! - [`referenced`]: which objects commits reference;
@@ -39,6 +40,7 @@ pub mod policy;
 pub mod pool;
 pub mod prune;
 pub mod referenced;
+pub mod ssh_auth;
 pub mod upload;
 
 use std::fmt;

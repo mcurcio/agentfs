@@ -375,6 +375,47 @@ jobs:
           ci/lfs-server.sh stop "$RUNNER_TEMP/lfs-server"
           ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
 
+  e2e-lfs-ssh:
+    name: "e2e (Git LFS over ssh: git-lfs-authenticate)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: lfs-ssh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server openssh-client nginx fcgiwrap git-lfs libssl-dev pkg-config
+      - name: build lfs-test-server (git-lfs's reference server, pinned)
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/git-lfs/lfs-test-server@d27ad23fddc1949ecd9a4ba6a3d074bc6a567084
+          echo "LFS_TEST_SERVER=$RUNNER_TEMP/bin/lfs-test-server" >>"$GITHUB_ENV"
+      - run: cargo build --locked -p agentfs --features ssh
+      - name: start git server with LFS routes
+        run: GIT_SERVER_LFS=1 ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
+      - name: start LFS servers
+        run: ci/lfs-server.sh start "$RUNNER_TEMP/lfs-server" >>"$GITHUB_ENV"
+      - name: start ssh server with git-lfs-authenticate
+        run: GIT_SSH_LFS_AUTH=1 ci/git-ssh-server.sh start "$RUNNER_TEMP/ssh-server" >>"$GITHUB_ENV"
+      - run: ci/e2e-lfs-ssh.sh
+      - name: server logs
+        if: failure()
+        run: |
+          sudo tail -n 200 "$RUNNER_TEMP/ssh-server/sshd.log"
+          sudo cat /home/agentfs-git/lfs-auth/log || true
+          tail -n 200 "$RUNNER_TEMP"/git-server/logs/*.log
+          tail -n 100 "$RUNNER_TEMP"/lfs-server/*.log
+      - if: always()
+        run: |
+          ci/git-ssh-server.sh stop "$RUNNER_TEMP/ssh-server"
+          ci/lfs-server.sh stop "$RUNNER_TEMP/lfs-server"
+          ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
+
   csi-sanity:
     name: e2e (csi-sanity against agentfs-csi)
     runs-on: ubuntu-24.04

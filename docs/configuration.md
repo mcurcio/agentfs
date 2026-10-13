@@ -533,7 +533,8 @@ wins):
 | `https://github.com/acme/r.git` | `https://github.com/acme/r.git/info/lfs` |
 | `https://git.example/acme/r` | `https://git.example/acme/r.git/info/lfs` |
 | `/srv/r.git`, `file:///srv/r.git` | the files `/srv/r.git/lfs/objects/aa/bb/<oid>` (git-lfs's standalone-file layout) |
-| `ssh://…`, scp-like, `git://…` | none: set `lfsurl` (agentfs has no `git-lfs-authenticate`) |
+| `ssh://…`, scp-like | the endpoint `git-lfs-authenticate` names on the git server (run over agentfs's SSH transport, with the remote's key, known_hosts and user) |
+| `git://…` | none: set `lfsurl` |
 
 An explicit URL is used as written (no `/info/lfs` is added). `https`
 endpoints need the `https` build feature. A tracked `.lfsconfig` is never
@@ -557,6 +558,15 @@ port):
    (GitHub, GitLab and Gitea derived endpoints work this way);
 3. else a password in the endpoint URL;
 4. else none (anonymous).
+
+For an SSH remote's endpoint found with `git-lfs-authenticate`, the
+header the command prints is the credential; `agentfsLfsCredentials` is
+used only when it prints none. The answer is reused until it expires
+(`expires_in`, `expires_at`), else asked for again at each push attempt.
+A server without the command (GitHub, GitLab and Gitea have it; plain
+`git-shell` does not) fails the push as `refused` at stage `lfs`: set
+`lfsurl` for it. git-lfs's pure SSH protocol (`git-lfs-transfer`) is not
+supported.
 
 A separate LFS host never sees the git host's credentials, and an `http`
 endpoint never gets those of an `https` remote. Redirects are not

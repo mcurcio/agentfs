@@ -1079,8 +1079,25 @@ git-lfs's precedence:
 - A local path or `file://` URL, explicit or derived, uses git-lfs's
   standalone-file layout: `<git dir>/lfs/objects/aa/bb/<oid>` of that
   repository, which `git lfs pull` in a clone of it reads.
-- SSH and `git://` remotes derive nothing: agentfs has no
-  `git-lfs-authenticate`, so they need an explicit `lfsurl`.
+- An SSH remote without an explicit endpoint uses the one
+  `git-lfs-authenticate` names (2026-10): agentfs runs
+  `git-lfs-authenticate <path> <upload|download>` on the git server over
+  its own SSH transport (§11.1), bound to the push URL's host and port,
+  with the remote's known_hosts, key or agent and user, and the host
+  checked before any key is offered. Uploads use the push URL's path,
+  downloads `url`'s, which must be on the same host and port (else the
+  remote needs `lfsurl`). The path is sent as git-lfs sends it: the URL's
+  path without a leading `/`, unquoted; one that would need quoting is
+  refused (`local`). The answer's `href` (http, or https with the `https`
+  feature) is the endpoint and its `header` goes to batch requests; it is
+  reused until 5 s before `expires_in` or `expires_at` (RFC 3339), or,
+  without either, for one push attempt or fetch. A refused host is
+  `untrusted_host`, a refused key `auth`, no connection `unreachable`, and
+  a non-zero exit (git-shell's "unrecognized command") or JSON agentfs
+  cannot read `refused`, with a hint to set `lfsurl`; there is no fallback
+  to a guessed https URL. git-lfs's pure SSH protocol (`git-lfs-transfer`)
+  is not built: servers offering only it need `lfsurl`.
+- `git://` remotes derive nothing and need an explicit `lfsurl`.
 - An explicit endpoint that is not `http(s)`, `file://` or a path, or is
   `https` in a build without the `https` feature, makes the remote
   misconfigured (§11.1); a bad global `lfs.url` misconfigures every remote.
@@ -1096,7 +1113,11 @@ port) and never sent anywhere else:
 4. else none.
 
 So a separate LFS host never sees the git host's credentials, and an
-`http` endpoint never gets those of an `https` push URL. The files are
+`http` endpoint never gets those of an `https` push URL. For an endpoint
+`git-lfs-authenticate` names, its `Authorization` header is the
+credential (sent to batch requests, and to action hrefs on its origin
+that carry none); without one, `agentfsLfsCredentials` applies, bound to
+that endpoint's origin; else requests are anonymous. The files are
 re-read when they change, like other credentials, and `mount` refuses
 one under the backing tree or mount point. agentfs's `Authorization`
 goes to batch requests, and to an action's `href` only when it has the
@@ -1152,7 +1173,7 @@ is ordinary content. Every object must be in the local cache. Only when
 every upload succeeds does the git push run; any failure fails the attempt
 with stage `lfs` (§13) and pushes no ref, with the usual alarm and backoff
 (§11.2). A remote whose backlog references no LFS object never resolves or
-contacts an endpoint, so an SSH remote without `lfsurl` keeps pushing
+contacts an endpoint, so a `git://` remote without `lfsurl` keeps pushing
 until LFS content appears. Failures reuse the push failure kinds:
 `unreachable` (connections, timeouts, HTTP 429 and 5xx), `auth` (401, 403,
 a missing or rejected credential), `untrusted_host` (a TLS certificate
@@ -1205,14 +1226,14 @@ copy only of objects their server lacks, so a pruned object costs a
 push nothing; a remote added after a prune that lacks old objects fails
 its push as `local` (stage `lfs`) with an `agentfs lfs fetch --all` hint
 until they are fetched back.
-It limits growth at the source instead, with operator rules, the `fsync`
+Growth is also limited at the source, with operator rules, the `fsync`
 class's coalescing interval and `agentfs.maxSize` per path (§8).
 
-**Not built:** `git-lfs-authenticate` for SSH remotes, concurrent or
-resumable (tus) transfers, a per-remote LFS size limit, pruning cache
-objects every remote has, proxy settings, and an `agentfs lfs fetch`
-command. Members of an `fsync`-class group (§8) follow the same store
-rules as any path.
+**Not built:** byte-level resumable uploads (git-lfs's experimental `tus`
+adapter, which no LFS server agentfs can test against implements),
+git-lfs's pure SSH protocol (`git-lfs-transfer`), proxy authentication,
+and `https://` or SOCKS proxies. Members of an `fsync`-class group (§8)
+follow the same store rules as any path.
 
 ## 8. Files changed in place: the `fsync` class (phase 2)
 
@@ -1586,7 +1607,9 @@ agentfs does not scan content for secrets and does not hold pushes.
   cryptography (no OpenSSL, no libssh2). The remote's settings reach the
   transport through a scope held on the pushing thread around each push
   or fetch; a connection with no scope, or to another host or port than
-  the push URL's, fails closed.
+  the push URL's, fails closed. The same transport runs
+  `git-lfs-authenticate` for the remote's LFS endpoint (§7), with the same
+  host check, key or agent, user and timeouts.
   - An SSH remote authenticates with exactly one of a key file and an
     ssh-agent (2026-10).
   - `remote.<name>.agentfsSshKey` is an absolute path to a private key,
@@ -3434,7 +3457,7 @@ runner.
 | Kind e2e git server | The runner's nginx + `git http-backend`, reached from pods through a selector-less Service and an EndpointSlice on the kind network's gateway, so the credential Secret is exercised over HTTP basic auth and the bare repository stays on the runner for assertions; the daemon is killed from the node (PID 1 ignores SIGKILL from inside its namespace) |
 | LFS store selection | Decided at record time on the frozen size and journaled with the write (older journals read as blob): always blob for empty files, special files, `.lfsconfig` and unnameable paths; then `filter=lfs` (operator, or tree only with `respectTreeRules`), which `agentfs.store=blob` cannot override; then `agentfs.store`; then `size > agentfs.lfsThreshold`, which is unset by default. The blob limit does not apply to LFS content (§7) |
 | LFS `.gitattributes` | A block at the end of the root `.gitattributes`, in history only, rebuilt every commit: one anchored, escaped line per LFS path with `git lfs track`'s attributes; the workload's lines are kept and forged blocks (exact BEGIN through END) replaced; a file holding only the block is agentfs's own. A pointer is never committed without its line: when the block cannot be written, that commit's LFS writes are blobs, then its `.gitattributes` writes are dropped, then the head's file is kept; a commit never fails for it. A directory named `.gitattributes` or `.gitmodules` is refused (`gitattributesBlob`, `gitmodulesBlob`) (§3.4, §7) |
-| LFS endpoints and credentials | git-lfs's precedence (`lfs.pushurl`, `lfs.url`, `remote.<n>.lfspushurl`, `remote.<n>.lfsurl`, then derived `<url>.git/info/lfs`), from operator config only; local and `file://` remotes use the standalone-file layout; SSH needs an explicit `lfsurl`. Credentials: `agentfsLfsCredentials`, else `agentfsCredentials` on the push URL's own origin, else the URL's password; bound to the origin, sent to action hrefs only on that origin and without a server-given `Authorization`; no redirects; the remote's proxy if set (§7, §11.1) |
+| LFS endpoints and credentials | git-lfs's precedence (`lfs.pushurl`, `lfs.url`, `remote.<n>.lfspushurl`, `remote.<n>.lfsurl`, then derived `<url>.git/info/lfs`), from operator config only; local and `file://` remotes use the standalone-file layout; SSH remotes without `lfsurl` use `git-lfs-authenticate` over agentfs's own SSH transport (the push URL's path for uploads, `url`'s on the same host for downloads; its header is the credential, else `agentfsLfsCredentials`; reused until 5 s before it expires, else per attempt; no fallback; `git-lfs-transfer` not built), `git://` needs `lfsurl`. Credentials: `agentfsLfsCredentials`, else `agentfsCredentials` on the push URL's own origin, else the URL's password; bound to the origin, sent to action hrefs only on that origin and without a server-given `Authorization`; no redirects; the remote's proxy if set (§7, §11.1) |
 | Proxies | git's `http.proxy` and `remote.<name>.proxy` (empty: none), from the state area's config only, never the environment; a plain `http://host:port` proxy (1080 by default), no authentication, no `https://` or SOCKS proxies; carries the remote's libgit2 `http(s)` traffic and all its LFS requests (`CONNECT`), never SSH; a bad value misconfigures the remote (every remote for `http.proxy`) (§11.1, 2026-10) |
 | LFS uploads | Before every push attempt, for the objects the commits the remote lacks reference at managed paths; a failure is a `PushFailed` with stage `lfs` and no ref pushed. Batch API, `basic` transfer only, batches of 100 in sequence, `verify` when offered (§7) |
 | LFS transfers | `lfs.concurrenttransfers` (git-lfs's key, default 8, 1 to 64) objects at once within a batch, per remote, on scoped threads; an upload stops starting objects at its first failure and lets those in flight finish; restores prefetch every object they need concurrently, each remote in name order taking what the earlier ones could not provide. Downloads resume by byte (`Range`, from `<state>/lfs/incomplete/<oid>`, 3 tries on `unreachable`); uploads resume by object (the batch API skips what an earlier attempt finished); `tus` byte-level uploads are not built, since no testable server implements them (§7, §15, 2026-10) |

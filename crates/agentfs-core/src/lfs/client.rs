@@ -41,6 +41,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -49,11 +50,28 @@ use serde::Deserialize;
 use super::cache::{ObjectCache, object_path, publish_into};
 use super::endpoint::{Direction, EndpointAuth, EndpointKind, LfsEndpoint, resolve};
 use super::pool;
+#[cfg(feature = "ssh")]
+use super::ssh_auth::authenticate;
 use super::{LfsError, Pointer};
 use crate::config::{RemoteSettings, Settings};
 use crate::credentials::{Credential, CredentialFile};
 use crate::events::PushFailureKind;
-use crate::proxy::ProxySetting;
+
+/// Without the `ssh` feature an SSH remote is misconfigured, so this is
+/// never reached; it fails closed all the same.
+#[cfg(not(feature = "ssh"))]
+fn authenticate(
+    remote: &RemoteSettings,
+    _ssh_url: &str,
+    _path: &str,
+    _direction: Direction,
+) -> Result<super::ssh_auth::Authentication, LfsError> {
+    Err(LfsError::local(format!(
+        "remote {} needs git-lfs-authenticate, and agentfs was built without the `ssh` cargo \
+         feature",
+        remote.name
+    )))
+}
 use crate::remote_url::{self, Transport};
 
 /// The git-lfs media type of batch requests and responses.
@@ -199,12 +217,9 @@ pub fn transfer_for(
     let endpoint = resolve(settings, remote, direction)?;
     let concurrency = settings.lfs.concurrent_transfers;
     match &endpoint.kind {
-        EndpointKind::Http { .. } => Ok(Box::new(HttpTransfer::new(
-            endpoint,
-            &remote.name,
-            concurrency,
-            remote.proxy.as_ref(),
-        )?)),
+        EndpointKind::Http { .. } | EndpointKind::SshAuthenticate { .. } => Ok(Box::new(
+            HttpTransfer::new(endpoint, remote, direction, concurrency)?,
+        )),
         EndpointKind::File { git_dir } => Ok(Box::new(FileTransfer {
             objects: git_dir.join("lfs").join("objects"),
             tmp: git_dir.join("lfs").join("tmp"),
@@ -221,15 +236,45 @@ enum Credentials {
         file: CredentialFile,
     },
     Fixed(Credential),
+    /// The `Authorization` git-lfs-authenticate gave.
+    Header(String),
+}
+
+/// Where the batch API is and how requests to it authenticate.
+struct Base {
+    /// The endpoint URL, without userinfo or a final `/`.
+    url: String,
+    origin: (String, String),
+    credentials: Credentials,
+    /// The other headers git-lfs-authenticate gave, for batch requests.
+    headers: Vec<(String, String)>,
+    /// When a git-lfs-authenticate answer stops being valid.
+    expires_at: Option<std::time::SystemTime>,
+}
+
+/// How long before its expiry an authenticated base is renewed.
+const RENEW_BEFORE: Duration = Duration::from_secs(5);
+
+/// How the base is found.
+enum Resolver {
+    /// An explicit or derived `http(s)` endpoint.
+    Fixed(Arc<Base>),
+    /// git-lfs-authenticate over SSH, renewed when it expires, or at each
+    /// upload, download or presence check when it gives no expiry.
+    Ssh {
+        remote: Box<RemoteSettings>,
+        ssh_url: String,
+        path: String,
+        direction: Direction,
+        lfs_credentials: Option<PathBuf>,
+        current: Mutex<Option<Arc<Base>>>,
+    },
 }
 
 /// The batch API over HTTP(S).
 pub struct HttpTransfer {
     endpoint: LfsEndpoint,
-    /// The endpoint URL, without userinfo or a final `/`.
-    url: String,
-    origin: (String, String),
-    credentials: Credentials,
+    resolver: Resolver,
     agent: ureq::Agent,
     remote: String,
     /// Objects moved at once (`lfs.concurrenttransfers`).
@@ -280,44 +325,59 @@ struct ObjectError {
 }
 
 impl HttpTransfer {
-    /// A client for `endpoint`, an [`EndpointKind::Http`], moving up to
-    /// `concurrency` objects at once, through `proxy` if one is set.
+    /// A client for `endpoint`, an [`EndpointKind::Http`] or
+    /// [`EndpointKind::SshAuthenticate`] of `remote`, moving up to
+    /// `concurrency` objects at once, through the remote's proxy if it has
+    /// one.
     pub fn new(
         endpoint: LfsEndpoint,
-        remote: &str,
+        remote: &RemoteSettings,
+        direction: Direction,
         concurrency: usize,
-        proxy: Option<&ProxySetting>,
     ) -> Result<Self, LfsError> {
-        let EndpointKind::Http { url, auth } = &endpoint.kind else {
-            return Err(LfsError::local("not an http(s) LFS endpoint"));
-        };
-        let url = url.trim_end_matches('/').to_owned();
-        let Some(origin) = remote_url::origin(&url) else {
-            return Err(LfsError::local(format!(
-                "{} is not an http(s) URL",
-                endpoint.display_url
-            )));
-        };
-        if origin.0 == "https" && !cfg!(feature = "https") {
-            return Err(LfsError::local(format!(
-                "the LFS endpoint {} is https, and agentfs was built without the `https` \
-                 cargo feature",
-                endpoint.display_url
-            )));
-        }
-        let credentials = match auth {
-            EndpointAuth::None => Credentials::None,
-            EndpointAuth::File { key, path } => Credentials::File {
-                key,
-                file: CredentialFile::new(path, &url),
+        let resolver = match &endpoint.kind {
+            EndpointKind::Http { url, auth } => {
+                let url = url.trim_end_matches('/').to_owned();
+                let origin = Self::origin_of(&url, &endpoint.display_url)?;
+                let credentials = match auth {
+                    EndpointAuth::None => Credentials::None,
+                    EndpointAuth::File { key, path } => Credentials::File {
+                        key,
+                        file: CredentialFile::new(path, &url),
+                    },
+                    EndpointAuth::Url { username, password } => Credentials::Fixed(Credential {
+                        username: username.clone(),
+                        password: password.clone(),
+                    }),
+                };
+                Resolver::Fixed(Arc::new(Base {
+                    url,
+                    origin,
+                    credentials,
+                    headers: Vec::new(),
+                    expires_at: None,
+                }))
+            }
+            EndpointKind::SshAuthenticate {
+                ssh_url,
+                path,
+                lfs_credentials,
+            } => Resolver::Ssh {
+                remote: Box::new(remote.clone()),
+                ssh_url: ssh_url.clone(),
+                path: path.clone(),
+                direction,
+                lfs_credentials: lfs_credentials.clone(),
+                current: Mutex::new(None),
             },
-            EndpointAuth::Url { username, password } => Credentials::Fixed(Credential {
-                username: username.clone(),
-                password: password.clone(),
-            }),
+            EndpointKind::File { .. } => {
+                return Err(LfsError::local("not an http(s) LFS endpoint"));
+            }
         };
         let concurrency = concurrency.max(1);
-        let proxy = proxy
+        let proxy = remote
+            .proxy
+            .as_ref()
             .map(|p| {
                 ureq::Proxy::new(&p.url)
                     .map_err(|e| LfsError::local(format!("the proxy {p} cannot be used: {e}")))
@@ -325,13 +385,92 @@ impl HttpTransfer {
             .transpose()?;
         Ok(Self {
             agent: agent(concurrency, proxy),
-            url,
-            origin,
-            credentials,
-            remote: remote.to_owned(),
+            resolver,
+            remote: remote.name.clone(),
             endpoint,
             concurrency,
         })
+    }
+
+    /// The origin of an endpoint URL, which must be http, or https with
+    /// the `https` feature.
+    fn origin_of(url: &str, shown: &str) -> Result<(String, String), LfsError> {
+        let Some(origin) = remote_url::origin(url) else {
+            return Err(LfsError::local(format!("{shown} is not an http(s) URL")));
+        };
+        if origin.0 == "https" && !cfg!(feature = "https") {
+            return Err(LfsError::local(format!(
+                "the LFS endpoint {shown} is https, and agentfs was built without the `https` \
+                 cargo feature"
+            )));
+        }
+        Ok(origin)
+    }
+
+    /// Starts an upload, download or presence check: an authenticated
+    /// base without an expiry is valid for one of them only.
+    fn begin(&self) {
+        if let Resolver::Ssh { current, .. } = &self.resolver {
+            let mut current = current.lock().unwrap_or_else(|e| e.into_inner());
+            if current.as_ref().is_some_and(|b| b.expires_at.is_none()) {
+                *current = None;
+            }
+        }
+    }
+
+    /// The base for the next batch request: fixed, or from
+    /// git-lfs-authenticate, run again once the last answer is within
+    /// [`RENEW_BEFORE`] of its expiry.
+    fn base(&self) -> Result<Arc<Base>, LfsError> {
+        let Resolver::Ssh {
+            remote,
+            ssh_url,
+            path,
+            direction,
+            lfs_credentials,
+            current,
+        } = &self.resolver
+        else {
+            let Resolver::Fixed(base) = &self.resolver else {
+                unreachable!("the resolver is fixed or ssh");
+            };
+            return Ok(Arc::clone(base));
+        };
+        let mut current = current.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::SystemTime::now();
+        if let Some(base) = current.as_ref()
+            && base.expires_at.is_none_or(|at| now + RENEW_BEFORE < at)
+        {
+            return Ok(Arc::clone(base));
+        }
+        let auth = authenticate(remote, ssh_url, path, *direction)?;
+        let origin = Self::origin_of(&auth.href, &crate::push::redact_url(&auth.href))?;
+        let mut credentials = Credentials::None;
+        let mut headers = Vec::new();
+        for (name, value) in auth.headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                credentials = Credentials::Header(value);
+            } else {
+                headers.push((name, value));
+            }
+        }
+        if matches!(credentials, Credentials::None)
+            && let Some(path) = lfs_credentials
+        {
+            credentials = Credentials::File {
+                key: "agentfsLfsCredentials",
+                file: CredentialFile::new(path, &auth.href),
+            };
+        }
+        let base = Arc::new(Base {
+            url: remote_url::without_userinfo(&auth.href),
+            origin,
+            credentials,
+            headers,
+            expires_at: auth.expires_at,
+        });
+        *current = Some(Arc::clone(&base));
+        Ok(base)
     }
 
     fn display(&self) -> &str {
@@ -339,12 +478,13 @@ impl HttpTransfer {
     }
 
     /// The `Authorization` header for the endpoint's origin, if any.
-    fn authorization(&self) -> Result<Option<String>, LfsError> {
-        let credential = match &self.credentials {
+    fn authorization(&self, base: &Base) -> Result<Option<String>, LfsError> {
+        let credential = match &base.credentials {
             Credentials::None => return Ok(None),
+            Credentials::Header(value) => return Ok(Some(value.clone())),
             Credentials::Fixed(c) => c.clone(),
             Credentials::File { key, file } => file
-                .credential_for(&self.url, remote_url::url_username(&self.url))
+                .credential_for(&base.url, remote_url::url_username(&base.url))
                 .map_err(|e| {
                     LfsError::new(
                         PushFailureKind::Auth,
@@ -364,7 +504,11 @@ impl HttpTransfer {
     /// The headers for an action: the server's, plus agentfs's
     /// `Authorization` when the href has the endpoint's origin and the
     /// server gave none.
-    fn action_headers(&self, action: &Action) -> Result<Vec<(String, String)>, LfsError> {
+    fn action_headers(
+        &self,
+        base: &Base,
+        action: &Action,
+    ) -> Result<Vec<(String, String)>, LfsError> {
         let mut headers: Vec<(String, String)> = action
             .header
             .iter()
@@ -373,10 +517,10 @@ impl HttpTransfer {
         let has_auth = headers
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
-        let same_origin = remote_url::origin(&action.href).as_ref() == Some(&self.origin);
+        let same_origin = remote_url::origin(&action.href).as_ref() == Some(&base.origin);
         if !has_auth
             && same_origin
-            && let Some(auth) = self.authorization()?
+            && let Some(auth) = self.authorization(base)?
         {
             headers.push(("Authorization".into(), auth));
         }
@@ -403,12 +547,14 @@ impl HttpTransfer {
         }
     }
 
+    /// One batch request, with the base it went to.
     fn batch(
         &self,
         operation: &str,
         objects: &[Pointer],
         ref_name: &str,
-    ) -> Result<BatchResponse, LfsError> {
+    ) -> Result<(BatchResponse, Arc<Base>), LfsError> {
+        let base = self.base()?;
         let body = serde_json::json!({
             "operation": operation,
             "transfers": ["basic"],
@@ -422,10 +568,13 @@ impl HttpTransfer {
         let body = serde_json::to_vec(&body).map_err(|e| LfsError::local(e.to_string()))?;
         let mut request = self
             .agent
-            .post(format!("{}/objects/batch", self.url))
+            .post(format!("{}/objects/batch", base.url))
             .header("Accept", MEDIA_TYPE)
             .header("Content-Type", MEDIA_TYPE);
-        if let Some(auth) = self.authorization()? {
+        for (k, v) in &base.headers {
+            request = request.header(k, v);
+        }
+        if let Some(auth) = self.authorization(&base)? {
             request = request.header("Authorization", auth);
         }
         let response = request
@@ -442,7 +591,7 @@ impl HttpTransfer {
             .read_to_vec()
             .map_err(|e| self.transport_error("batch response", e))?;
         if status != 200 {
-            return Err(self.status_error("batch request", status, &bytes));
+            return Err(self.status_error(&base, "batch request", status, &bytes));
         }
         let parsed: BatchResponse = serde_json::from_slice(&bytes).map_err(|e| {
             LfsError::new(
@@ -465,7 +614,7 @@ impl HttpTransfer {
                 ),
             ));
         }
-        Ok(parsed)
+        Ok((parsed, base))
     }
 
     /// The response's entry for `pointer`, or why there is none.
@@ -508,7 +657,13 @@ impl HttpTransfer {
         Ok(object)
     }
 
-    fn put(&self, pointer: &Pointer, action: &Action, cache: &ObjectCache) -> Result<(), LfsError> {
+    fn put(
+        &self,
+        base: &Base,
+        pointer: &Pointer,
+        action: &Action,
+        cache: &ObjectCache,
+    ) -> Result<(), LfsError> {
         self.check_href(&action.href)?;
         let file = cache.open_object(pointer).map_err(|e| {
             LfsError::local(format!(
@@ -520,7 +675,7 @@ impl HttpTransfer {
             .agent
             .put(&action.href)
             .header("Content-Type", "application/octet-stream");
-        for (k, v) in self.action_headers(action)? {
+        for (k, v) in self.action_headers(base, action)? {
             request = request.header(k, v);
         }
         let response = request
@@ -532,12 +687,17 @@ impl HttpTransfer {
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             let body = read_small(response);
-            return Err(self.status_error(&format!("upload of {}", pointer.oid), status, &body));
+            return Err(self.status_error(
+                base,
+                &format!("upload of {}", pointer.oid),
+                status,
+                &body,
+            ));
         }
         Ok(())
     }
 
-    fn verify(&self, pointer: &Pointer, action: &Action) -> Result<(), LfsError> {
+    fn verify(&self, base: &Base, pointer: &Pointer, action: &Action) -> Result<(), LfsError> {
         self.check_href(&action.href)?;
         let body = serde_json::to_vec(
             &serde_json::json!({"oid": pointer.oid.to_string(), "size": pointer.size}),
@@ -548,7 +708,7 @@ impl HttpTransfer {
             .post(&action.href)
             .header("Accept", MEDIA_TYPE)
             .header("Content-Type", MEDIA_TYPE);
-        for (k, v) in self.action_headers(action)? {
+        for (k, v) in self.action_headers(base, action)? {
             request = request.header(k, v);
         }
         let response = request
@@ -560,7 +720,12 @@ impl HttpTransfer {
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             let body = read_small(response);
-            return Err(self.status_error(&format!("verify of {}", pointer.oid), status, &body));
+            return Err(self.status_error(
+                base,
+                &format!("verify of {}", pointer.oid),
+                status,
+                &body,
+            ));
         }
         Ok(())
     }
@@ -568,11 +733,17 @@ impl HttpTransfer {
     /// Downloads one object, resuming its partial download if there is
     /// one, and retrying a failure to reach the server up to
     /// [`DOWNLOAD_TRIES`] times in all, each from where the last stopped.
-    fn get(&self, pointer: &Pointer, action: &Action, cache: &ObjectCache) -> Result<(), LfsError> {
+    fn get(
+        &self,
+        base: &Base,
+        pointer: &Pointer,
+        action: &Action,
+        cache: &ObjectCache,
+    ) -> Result<(), LfsError> {
         let mut tries = 0;
         loop {
             tries += 1;
-            match self.get_once(pointer, action, cache) {
+            match self.get_once(base, pointer, action, cache) {
                 Err(e) if e.kind == PushFailureKind::Unreachable && tries < DOWNLOAD_TRIES => {
                     std::thread::sleep(RETRY_PAUSES[tries - 1]);
                 }
@@ -589,6 +760,7 @@ impl HttpTransfer {
     /// more for the whole object, without `Range`.
     fn get_once(
         &self,
+        base: &Base,
         pointer: &Pointer,
         action: &Action,
         cache: &ObjectCache,
@@ -602,7 +774,7 @@ impl HttpTransfer {
         loop {
             let offset = if whole { 0 } else { partial.offset() };
             let mut request = self.agent.get(&action.href);
-            for (k, v) in self.action_headers(action)? {
+            for (k, v) in self.action_headers(base, action)? {
                 request = request.header(k, v);
             }
             if offset > 0 {
@@ -629,6 +801,7 @@ impl HttpTransfer {
                 _ => {
                     let body = read_small(response);
                     return Err(self.status_error(
+                        base,
                         &format!("download of {}", pointer.oid),
                         status,
                         &body,
@@ -654,14 +827,14 @@ impl HttpTransfer {
         )
     }
 
-    fn status_error(&self, what: &str, status: u16, body: &[u8]) -> LfsError {
+    fn status_error(&self, base: &Base, what: &str, status: u16, body: &[u8]) -> LfsError {
         let kind = match status {
             401 | 403 => PushFailureKind::Auth,
             429 | 500..=599 => PushFailureKind::Unreachable,
             _ => PushFailureKind::Refused,
         };
         let detail = server_message(body);
-        let hint = match (kind, &self.credentials) {
+        let hint = match (kind, &base.credentials) {
             (PushFailureKind::Auth, Credentials::None) => format!(
                 "; no credentials are configured for it (set remote.{}.agentfsLfsCredentials)",
                 self.remote
@@ -716,8 +889,8 @@ impl HttpTransfer {
         cache: &ObjectCache,
         ref_name: &str,
     ) -> Vec<Result<(), LfsError>> {
-        let response = match self.batch("download", chunk, ref_name) {
-            Ok(response) => response,
+        let (response, base) = match self.batch("download", chunk, ref_name) {
+            Ok(answer) => answer,
             Err(e) => return chunk.iter().map(|_| Err(e.clone())).collect(),
         };
         let mut results: Vec<Option<Result<(), LfsError>>> = vec![None; chunk.len()];
@@ -748,7 +921,7 @@ impl HttpTransfer {
             &todo,
             self.concurrency,
             stops_downloads,
-            |(_, pointer, action)| self.get(pointer, action, cache),
+            |(_, pointer, action)| self.get(&base, pointer, action, cache),
         );
         let first = pool::first_error(&done).cloned();
         for ((index, _, _), result) in todo.iter().zip(done) {
@@ -768,12 +941,13 @@ impl Transfer for HttpTransfer {
         cache: &ObjectCache,
         ref_name: &str,
     ) -> Result<UploadReport, LfsError> {
+        self.begin();
         let mut report = UploadReport {
             objects: objects.len(),
             ..UploadReport::default()
         };
         for chunk in objects.chunks(BATCH_SIZE) {
-            let response = self.batch("upload", chunk, ref_name)?;
+            let (response, base) = self.batch("upload", chunk, ref_name)?;
             let todo = self.uploads_of(&response, chunk)?;
             let missing: Vec<&Pointer> = todo
                 .iter()
@@ -788,9 +962,9 @@ impl Transfer for HttpTransfer {
                 self.concurrency,
                 |_| true,
                 |(pointer, upload, verify)| {
-                    self.put(pointer, upload, cache)?;
+                    self.put(&base, pointer, upload, cache)?;
                     if let Some(verify) = verify {
-                        self.verify(pointer, verify)?;
+                        self.verify(&base, pointer, verify)?;
                     }
                     Ok(pointer.size)
                 },
@@ -812,6 +986,7 @@ impl Transfer for HttpTransfer {
         cache: &ObjectCache,
         ref_name: &str,
     ) -> Vec<Result<(), LfsError>> {
+        self.begin();
         let mut results: Vec<Option<Result<(), LfsError>>> = vec![None; pointers.len()];
         let wanted: Vec<(usize, Pointer)> = pointers
             .iter()
@@ -855,9 +1030,10 @@ impl Transfer for HttpTransfer {
         direction: Direction,
         ref_name: &str,
     ) -> Result<Vec<bool>, LfsError> {
+        self.begin();
         let mut out = Vec::with_capacity(pointers.len());
         for chunk in pointers.chunks(BATCH_SIZE) {
-            let response = self.batch(direction.operation(), chunk, ref_name)?;
+            let (response, _) = self.batch(direction.operation(), chunk, ref_name)?;
             for pointer in chunk {
                 let oid = pointer.oid.to_string();
                 let object = response.objects.iter().find(|o| o.oid == oid);

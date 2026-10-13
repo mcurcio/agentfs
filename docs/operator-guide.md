@@ -670,9 +670,13 @@ whole, consistent groups instead.
 - **`failed (<kind>, stage lfs)`** from `push` or in a `PushFailed`
   alarm: uploading LFS objects failed, so no ref was pushed. `auth`: the
   LFS credentials (`agentfsLfsCredentials`, or `agentfsCredentials` for an
-  endpoint on the git host); `local`: no endpoint (an SSH remote without
-  `lfsurl`), no `https` feature, or an object missing from
-  `<state>/lfs/objects`. See
+  endpoint on the git host, or the header an SSH remote's
+  `git-lfs-authenticate` gave); `local`: no endpoint (a `git://` remote
+  without `lfsurl`), no `https` feature, or an object the server lacks
+  that is missing from `<state>/lfs/objects` (`agentfs lfs fetch --all`
+  brings it back); `refused` from an SSH remote whose server has no
+  `git-lfs-authenticate` (set `lfsurl`); `too_large`: an object over the
+  remote's `agentfsMaxLfsObjectSize`. See
   [stuck-pushes.md](runbooks/stuck-pushes.md#lfs-stage-failures).
 - **A path is not in history.** Check, in order: is it under a `.git`
   directory or a nested repository (`agentfs.nested`)? Excluded by

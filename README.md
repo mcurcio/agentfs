@@ -131,7 +131,9 @@ nested repository detection. Also:
 
   Objects are uploaded before the commits that reference them are pushed,
   to the endpoint derived from the remote (`<url>.git/info/lfs`) or the
-  one configured, with credentials bound to that host, up to
+  one configured (for SSH remotes, the one `git-lfs-authenticate` names),
+  with credentials bound to that host, through the remote's HTTP proxy
+  if one is set, up to
   `lfs.concurrenttransfers` (8) objects at once; interrupted downloads
   resume where they stopped. `agentfs lfs fetch` fills the local cache
   with the objects the head (or any revision, or `--all`) references, and
@@ -218,9 +220,10 @@ who holds the lock.
 
 ### Not built yet
 
-Several mounts of one volume across nodes. LFS has no SSH
-(`git-lfs-authenticate`). Proxies need no authentication (no proxy
-passwords) and are plain `http://` proxies. Restoring a database needs
+Several mounts of one volume across nodes. LFS over SSH needs a server
+with `git-lfs-authenticate` (git-lfs's pure SSH protocol,
+`git-lfs-transfer`, is not supported). Proxies are plain `http://`
+proxies without authentication. Restoring a database needs
 its workload stopped
 ([runbook](docs/runbooks/recovery-and-undo.md#7-restoring-a-database)).
 A file written and closed at once is recorded once: when its last
