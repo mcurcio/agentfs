@@ -26,6 +26,10 @@ use super::attributes::pattern_for;
 use crate::paths::{RepoPath, special_file};
 use crate::rules::{AttrState, Attributes};
 
+/// `agentfs.store`: `blob` or `lfs`, operator attributes only (design §4.2,
+/// §7).
+pub const STORE_ATTR: &str = "agentfs.store";
+
 /// Where a recorded file's content is stored.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,7 +71,7 @@ impl StorePolicy {
         if attrs.get("filter") == Some(&AttrState::Value("lfs".into())) {
             return Store::Lfs;
         }
-        match attrs.get("agentfs.store") {
+        match attrs.get(STORE_ATTR) {
             Some(AttrState::Value(v)) if v == "lfs" => return Store::Lfs,
             Some(AttrState::Value(v)) if v == "blob" => return Store::Blob,
             _ => {}

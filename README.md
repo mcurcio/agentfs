@@ -340,8 +340,9 @@ Runbook: [the patch queue](docs/runbooks/patch-queue.md).
 
 ## Telemetry
 
-`mount`, `flush`, `record`, `push` and `run` export OpenTelemetry metrics, traces and
-logs over OTLP, configured with the standard `OTEL_*` environment variables.
+`mount`, `run`, `record`, `flush`, `push`, `serve-history`, `patch apply`, and
+`restore` and `revert` without a mount export OpenTelemetry metrics, traces
+and logs over OTLP, configured with the standard `OTEL_*` environment variables.
 With no endpoint set, telemetry is off and costs nothing.
 
 ```sh
@@ -349,29 +350,20 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
 agentfs run
 ```
 
-- **Endpoints:** `OTEL_EXPORTER_OTLP_ENDPOINT` enables every signal, at
-  `/v1/traces`, `/v1/metrics` and `/v1/logs` under it. A signal-specific
-  `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` (a full URL) enables
-  only that signal. `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none` turns one off;
-  `OTEL_SDK_DISABLED=true` turns everything off.
-- **Transport:** this build speaks OTLP **http/protobuf over plain http**
-  only, which suits an in-cluster collector. gRPC, `http/json` and `https`
-  endpoints are not built: they are reported with a `warning: telemetry:`
-  line on stderr and that signal stays off. Telemetry problems never stop a
-  command.
+- **Variables:** an endpoint enables export, per signal or for all;
+  `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none` or `OTEL_SDK_DISABLED=true`
+  turn it off. This build speaks OTLP **http/protobuf over plain http**
+  only, which suits an in-cluster collector; anything else is reported
+  with a `warning: telemetry:` line on stderr and that signal stays off.
+  Telemetry problems never stop a command. Every variable agentfs and the
+  OpenTelemetry SDK read, including sampling (`OTEL_TRACES_SAMPLER`: on a
+  busy volume, sample), is in the
+  [configuration reference](docs/configuration.md#environment-variables).
 - **Failed exports** (collector down, an HTTP error) print
   `warning: telemetry: <signal> export failed: ...` on stderr, at once and
   then at most once a minute while they keep failing, and a
   `telemetry: <signal> export recovered` line when they work again. Each
   failure is also counted in `agentfs.telemetry.export_failures`.
-- **Other settings**, read by the OpenTelemetry SDK:
-  `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT` (and their
-  per-signal forms), `OTEL_SERVICE_NAME` (default `agentfs`),
-  `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRIC_EXPORT_INTERVAL` (default 60s),
-  and the batch settings `OTEL_BSP_*` and `OTEL_BLRP_*`.
-- **Sampling:** every record makes an `agentfs.record` span. On a busy
-  volume, sample: `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with
-  `OTEL_TRACES_SAMPLER_ARG=0.01`. Metrics and alarm logs are not sampled.
 - **Resource:** `service.name`, `service.version`, `service.instance.id`
   (the replica), `process.pid`, `agentfs.volume`, and `k8s.*` from the pod
   flags (`AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`,

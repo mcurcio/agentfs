@@ -99,6 +99,86 @@ pub enum ConfigError {
     LfsHttpsUnsupported { key: String },
 }
 
+/// Every git config key agentfs reads, in the order docs/configuration.md
+/// lists them (design §4.3, §7, §9, §11.1). `<name>` stands for a
+/// remote's name and `<condition>` for an `includeIf` condition.
+///
+/// Every read goes through this module's helpers, which note the key in
+/// tests: a unit test checks this list against what [`Settings::load`]
+/// reads, and `tests/docs_reference.rs` checks docs/configuration.md
+/// against this list.
+pub const KEYS: &[&str] = &[
+    "agentfs.volume",
+    "agentfs.branch",
+    "agentfs.respectTreeRules",
+    "agentfs.nested",
+    "agentfs.commitWindow",
+    "agentfs.pushInterval",
+    "agentfs.sweepInterval",
+    "agentfs.repackInterval",
+    "agentfs.patchRemote",
+    "agentfs.patchFetchTimeout",
+    "agentfs.lfsThreshold",
+    "agentfs.identity.committerName",
+    "agentfs.identity.committerEmail",
+    "agentfs.identity.authorName",
+    "agentfs.identity.authorEmail",
+    "lfs.url",
+    "lfs.pushurl",
+    "include.path",
+    "includeIf.<condition>.path",
+    "remote.<name>.url",
+    "remote.<name>.pushurl",
+    "remote.<name>.agentfsMaxBlobSize",
+    "remote.<name>.agentfsCredentials",
+    "remote.<name>.agentfsSshKey",
+    "remote.<name>.agentfsKnownHosts",
+    "remote.<name>.lfsurl",
+    "remote.<name>.lfspushurl",
+    "remote.<name>.agentfsLfsCredentials",
+];
+
+/// Notes that `key` was read, for the test that checks [`KEYS`] against
+/// the reads. A no-op outside tests.
+#[cfg(not(test))]
+fn note(_key: &str) {}
+
+#[cfg(test)]
+fn note(key: &str) {
+    reads::note(key);
+}
+
+/// The keys read on this thread, normalised to [`KEYS`]'s placeholders.
+#[cfg(test)]
+pub(crate) mod reads {
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    thread_local! {
+        static READ: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+    }
+
+    /// `remote.X.k` becomes `remote.<name>.k`; anything else is kept.
+    pub(crate) fn normalise(key: &str) -> String {
+        if let Some(rest) = key.strip_prefix("remote.")
+            && let Some((_, k)) = rest.rsplit_once('.')
+        {
+            return format!("remote.<name>.{k}");
+        }
+        key.to_owned()
+    }
+
+    pub(crate) fn note(key: &str) {
+        READ.with(|r| r.borrow_mut().insert(normalise(key)));
+    }
+
+    /// The keys read on this thread since the last call, which clears
+    /// them.
+    pub(crate) fn take() -> BTreeSet<String> {
+        READ.with(|r| std::mem::take(&mut *r.borrow_mut()))
+    }
+}
+
 /// How nested repositories are handled (design §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nested {
@@ -344,6 +424,7 @@ impl Settings {
 /// Every `include.path`, in order, each absolute and a readable regular
 /// file. Any `includeIf.<condition>.path` is refused.
 fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
+    note("includeIf.<condition>.path");
     {
         let mut entries = config.entries(Some(r"^includeif\..*\.path$"))?;
         if let Some(entry) = entries.next() {
@@ -357,6 +438,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
         }
     }
     let mut paths = Vec::new();
+    note("include.path");
     let mut entries = match config.multivar("include.path", None) {
         Ok(entries) => entries,
         Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(paths),
@@ -401,6 +483,7 @@ fn remotes(
     lfs: &LfsSettings,
 ) -> Result<(Vec<RemoteSettings>, Vec<InvalidRemote>), ConfigError> {
     let mut names = BTreeSet::new();
+    note("remote.<name>.url");
     {
         let mut entries = config.entries(Some(r"^remote\..*\.url$"))?;
         while let Some(entry) = entries.next() {
@@ -589,7 +672,10 @@ pub fn validate_name(key: &str, value: &str) -> Result<(), ConfigError> {
     }
 }
 
-fn string(config: &git2::Config, key: &str) -> Result<Option<String>, git2::Error> {
+/// A string key, `None` when unset. Every string read of agentfs's config
+/// goes through here, so it is checked against [`KEYS`].
+pub(crate) fn string(config: &git2::Config, key: &str) -> Result<Option<String>, git2::Error> {
+    note(key);
     match config.get_string(key) {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
@@ -598,6 +684,7 @@ fn string(config: &git2::Config, key: &str) -> Result<Option<String>, git2::Erro
 }
 
 fn boolean(config: &git2::Config, key: &str) -> Result<Option<bool>, git2::Error> {
+    note(key);
     match config.get_bool(key) {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
@@ -607,6 +694,7 @@ fn boolean(config: &git2::Config, key: &str) -> Result<Option<bool>, git2::Error
 
 /// An integer with git's `k`, `m` and `g` suffixes, as for `lfsThreshold`.
 fn int(config: &git2::Config, key: &str) -> Result<Option<i64>, git2::Error> {
+    note(key);
     match config.get_i64(key) {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
@@ -727,6 +815,72 @@ mod tests {
         std::fs::write(&path, lines).unwrap();
         let config = git2::Config::open(&path).unwrap();
         (dir, config)
+    }
+
+    /// [`KEYS`] is exactly what loading a config that sets every key
+    /// reads: a key read but not registered (or registered but never
+    /// read) fails here, and docs/configuration.md is checked against
+    /// [`KEYS`] by `tests/docs_reference.rs`.
+    #[test]
+    fn every_config_read_is_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragment = dir.path().join("fragment");
+        std::fs::write(&fragment, "[agentfs]\n\tpushInterval = 2m\n").unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            format!(
+                "[include]\n\tpath = {}\n\
+                 [agentfs]\n\tvolume = v\n\tbranch = b\n\trespectTreeRules = true\n\
+                 \tnested = working-tree\n\tcommitWindow = 50ms\n\tpushInterval = 5m\n\
+                 \tsweepInterval = 5s\n\trepackInterval = 2h\n\tpatchRemote = web\n\
+                 \tpatchFetchTimeout = 10s\n\tlfsThreshold = 8m\n\
+                 [agentfs \"identity\"]\n\tcommitterName = c\n\tcommitterEmail = c@e\n\
+                 \tauthorName = a\n\tauthorEmail = a@e\n\
+                 [lfs]\n\turl = http://lfs.example/r\n\tpushurl = http://lfs.example/p\n\
+                 [remote \"web\"]\n\turl = http://git.example/r.git\n\
+                 \tpushurl = http://git.example/p.git\n\tagentfsMaxBlobSize = 100m\n\
+                 \tagentfsCredentials = /run/c\n\tlfsurl = http://lfs.example/web\n\
+                 \tlfspushurl = http://lfs.example/web-push\n\tagentfsLfsCredentials = /run/l\n\
+                 [remote \"ssh\"]\n\turl = ssh://git@git.example/r.git\n\
+                 \tagentfsSshKey = /run/k\n\tagentfsKnownHosts = /run/h\n",
+                fragment.display()
+            ),
+        )
+        .unwrap();
+        reads::take();
+        let settings = Settings::load(dir.path()).unwrap();
+        let read = reads::take();
+        // Both remotes were read whole, whether or not this build supports
+        // ssh: their keys are read before the transport is validated.
+        assert_eq!(
+            settings.remotes.len() + settings.invalid_remotes.len(),
+            2,
+            "{settings:?}"
+        );
+        let registered: BTreeSet<String> = KEYS.iter().map(|k| (*k).to_owned()).collect();
+        let unregistered: Vec<_> = read.difference(&registered).collect();
+        assert!(
+            unregistered.is_empty(),
+            "read but not in config::KEYS (add them, and document them in \
+             docs/configuration.md): {unregistered:?}"
+        );
+        let unread: Vec<_> = registered.difference(&read).collect();
+        assert!(
+            unread.is_empty(),
+            "in config::KEYS but never read by Settings::load: {unread:?}"
+        );
+        assert_eq!(KEYS.len(), registered.len(), "config::KEYS has duplicates");
+    }
+
+    #[test]
+    fn read_keys_are_normalised() {
+        assert_eq!(
+            reads::normalise("remote.origin.agentfsSshKey"),
+            "remote.<name>.agentfsSshKey"
+        );
+        assert_eq!(reads::normalise("remote.a.b.url"), "remote.<name>.url");
+        assert_eq!(reads::normalise("agentfs.volume"), "agentfs.volume");
     }
 
     #[test]

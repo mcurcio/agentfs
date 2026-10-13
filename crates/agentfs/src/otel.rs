@@ -136,10 +136,45 @@ impl Plan {
     }
 }
 
+/// The environment variables agentfs itself reads to decide what to export
+/// ([`plan`]). docs/configuration.md lists each (checked by
+/// `reference_tests`).
+pub const ENV_VARS: &[&str] = &[
+    "OTEL_SDK_DISABLED",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+];
+
+/// Variables the OpenTelemetry SDK and exporter read themselves, not
+/// agentfs. Listed in docs/configuration.md for operators (checked by
+/// `reference_tests`); not exhaustive (the per-signal forms of the headers
+/// and timeout, and the batch settings, are documented as families).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SDK_ENV_VARS: &[&str] = &[
+    "OTEL_SERVICE_NAME",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_TRACES_SAMPLER",
+    "OTEL_TRACES_SAMPLER_ARG",
+];
+
 /// Decides, from the environment as read by `env`, which signals to
 /// export. Empty values count as unset, as the OpenTelemetry spec says.
+/// Only [`ENV_VARS`] are read.
 pub fn plan(env: &dyn Fn(&str) -> Option<String>) -> Plan {
     let get = |name: &str| {
+        debug_assert!(ENV_VARS.contains(&name), "{name} is not in ENV_VARS");
         env(name)
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
@@ -647,6 +682,32 @@ mod tests {
     }
 
     const ENDPOINT: (&str, &str) = ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318");
+
+    /// [`plan`] reads exactly [`ENV_VARS`]: with every endpoint and
+    /// exporter set it asks for each, and it never asks for another.
+    #[test]
+    fn plan_reads_only_env_vars() {
+        let asked = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        let _ = plan(&|name| {
+            asked.borrow_mut().insert(name.to_owned());
+            match name {
+                "OTEL_SDK_DISABLED" => Some("false".to_owned()),
+                n if n.ends_with("_EXPORTER") => Some("otlp".to_owned()),
+                n if n.ends_with("_PROTOCOL") => Some("http/protobuf".to_owned()),
+                n if n.ends_with("_ENDPOINT") => Some("http://collector:4318".to_owned()),
+                _ => None,
+            }
+        });
+        // Without the per-signal forms, the general protocol is read.
+        let _ = plan(&|name| {
+            asked.borrow_mut().insert(name.to_owned());
+            (name == "OTEL_EXPORTER_OTLP_ENDPOINT").then(|| "http://collector:4318".to_owned())
+        });
+        let expected: std::collections::BTreeSet<String> =
+            ENV_VARS.iter().map(|v| (*v).to_owned()).collect();
+        assert_eq!(asked.into_inner(), expected);
+        assert!(SDK_ENV_VARS.iter().all(|v| !ENV_VARS.contains(v)));
+    }
 
     #[test]
     fn plan_reads_otel_env() {

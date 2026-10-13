@@ -194,9 +194,25 @@ impl Attributes {
     }
 }
 
+/// `-agentfs`: never record a path's content (design §4.2).
+pub const RECORD_ATTR: &str = "agentfs";
+
+/// Every operator-only attribute agentfs reads (design §4.2, §7, §8), in
+/// the order docs/configuration.md lists them; `"agentfs"` is the one set
+/// as `-agentfs`. `tests/docs_reference.rs` checks the configuration
+/// reference against this list.
+pub const OPERATOR_ATTRIBUTES: &[&str] = &[
+    RECORD_ATTR,
+    crate::lfs::policy::STORE_ATTR,
+    fsync_class::COMMIT_ATTR,
+    fsync_class::COALESCE_ATTR,
+    fsync_class::GROUP_ATTR,
+    fsync_class::MAX_SIZE_ATTR,
+];
+
 /// True for attribute names only operator rules may set.
 pub fn is_agentfs_attr(name: &str) -> bool {
-    name == "agentfs" || name.starts_with("agentfs.")
+    name == RECORD_ATTR || name.starts_with("agentfs.")
 }
 
 /// The rules engine for one volume. `Send + Sync`; share it behind an `Arc`.
@@ -347,7 +363,7 @@ impl Rules {
     /// set `agentfs.*`.
     pub fn decide(&self, path: &RepoPath, tracked: bool) -> Result<Decision, RulesError> {
         let raw = self.operator_attributes(path);
-        if raw.get("agentfs") == Some(&Some(AttrState::Unset)) {
+        if raw.get(RECORD_ATTR) == Some(&Some(AttrState::Unset)) {
             return Ok(Decision::Skip(SkipReason::NeverRecord));
         }
         if self.is_class_shm(path, &raw) {

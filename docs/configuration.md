@@ -5,6 +5,25 @@ wrong. The design is in [design.md](design.md) (§4.3 settings, §9
 identities, §11 remotes); how to run a mount is in the
 [operator guide](operator-guide.md).
 
+**This page is checked against the code.** Tests fail when a config key,
+operator attribute, flag or environment variable that agentfs reads is
+missing here, or when a row names one it no longer has
+(`crates/agentfs-core/tests/docs_reference.rs`,
+`crates/agentfs/src/reference_tests.rs` and the `reference_tests` module
+of `crates/agentfs-csi/src/main.rs`; the `docs` CI job). They rely on
+these conventions, so keep them when editing:
+
+- each key or attribute is a table row in its section (`[agentfs]`,
+  `[agentfs "identity"]`, `[lfs]`, `[remote "<name>"]`, Includes,
+  Operator attributes) whose first cell is exactly the key in backticks
+  (remote keys without the `remote.<name>.` prefix);
+- each flag is a row of a table under "Flags and environment" whose
+  first cell starts with the flag in backticks (`` `--state DIR` ``), with
+  its variable in backticks in the same row and, in the Commands column,
+  each subcommand that takes it in backticks (`` `patch submit` ``) or
+  `all` for the global flags;
+- every variable is listed in backticks under "Environment variables".
+
 ## Where settings live
 
 Settings are git config keys in the history repository's **own** config
@@ -36,6 +55,13 @@ when one is wrong:
 
 The `git` CLI reads the same includes, so `git --git-dir <state>/git
 config --list --show-origin` shows where each key comes from.
+
+### Includes
+
+| Key | Type | Default | Meaning and validation |
+|---|---|---|---|
+| `include.path` | absolute path, repeatable | none | An operator config fragment whose keys count as the repository's own, at the point of the include. Must exist, be a readable regular file, not set `agentfs.volume` or `agentfs.branch`, and (for `mount`) be outside the backing tree and the mount point. Set by `agentfs init --include` |
+| `includeIf.<condition>.path` | | | Refused: any conditional include fails every command that opens the volume |
 
 Set them with `git config`:
 
@@ -428,35 +454,64 @@ contacts an LFS endpoint. See
 ## Flags and environment
 
 The settings above are per volume, in its config. The commands also take
-flags, most with an environment equivalent:
+flags, most with an environment equivalent (a flag wins over its
+variable). `agentfs <command> --help` prints them too.
+
+**Global flags**, accepted by every command:
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | all |
-| `--root DIR` | `AGENTFS_ROOT` | | `record`, `flush`, `run`; `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
-| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s` | all that take the state-area lock |
-| `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--replica` defaults to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `serve-history` |
+| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: required by `record` and `serve-history`; used by `flush`, `run`, `patch apply`, and `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
+| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it |
+
+**Pod flags**, which name where the volume is mounted (design §9; in
+Kubernetes they come from the downward API). They fill the identity
+templates' variables, the commit trailers and the telemetry resource:
+
+| Flag | Environment | Default | Commands |
+|---|---|---|---|
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `serve-history`, `restore`, `revert`, `patch apply`, `status` (accepted and ignored) |
+
+**Command flags:**
+
+| Flag | Environment | Default | Commands |
+|---|---|---|---|
+| `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init`: the volume's name; `patch submit`: the volume the patch is for |
+| `--branch NAME` | | `agentfs/<volume>` | `init`: the history branch; `patch submit`: the volume's branch |
+| `--include FILE` (repeatable) | | keep the existing includes | `init`: exactly these `include.path` entries |
 | `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount` |
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | `mount` |
-| `--no-allow-other` | | | `mount` |
-| `--unmount-grace DURATION` | | `10s` | `mount` |
-| `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history` |
+| `--no-allow-other` | | | `mount`: only the mounting user can use the mount |
+| `--unmount-grace DURATION` | | `10s` | `mount`: how long shutdown waits for a busy mount |
+| `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount` |
+| `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history`: how long shutdown waits for pushes |
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
 | `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
 | `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR |
 | `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `mount`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
 | `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | `mount`, `record` with `--history-service`: how long to wait for the service at start |
 | `--history-slot N` | `AGENTFS_HISTORY_SLOT` | the lowest free slot | `mount`, `record` with `--history-service`: lease pending slot N (1 to 1023) when it is free, else the lowest free slot; a front restarted after a crash passes its predecessor's slot to drain that slot's repairs |
-| `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount` |
-| `--allow-stale` | | | `probe` |
-| `--remote NAME` (repeatable) | | every remote | `push` |
-| `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init` |
-| `--branch NAME` | | `agentfs/<volume>` | `init` |
-| `--include FILE` (repeatable) | | keep the existing includes | `init`: exactly these `include.path` entries |
+| `--allow-stale` | | | `probe`: exit 0 for a stale agentfs mount too |
+| `--remote NAME` (repeatable) | | every remote | `push`: push only these remotes |
+| `--force` | | | `restore`: write even files open for writing through the mount; `revert`: also revert paths changed again since the commit, and write files open for writing (§15) |
+| `--dry-run` | | | `restore`, `revert`: print the plan and write nothing |
+| `--no-fetch` | | | `patch apply`: apply what is already fetched, without contacting the patch remote |
+| `--json` | | | `patch status`: the status document and the local cache as JSON |
+| `--remote NAME\|URL` | | `origin` | `patch submit`: the remote the volume pushes to |
+| `--repo DIR` | | `.` | `patch submit`: the producer's git repository |
+| `--put PATH=FILE` (repeatable) | | | `patch submit`: write PATH with FILE's content, in a patch built on the remote branch head |
+| `--delete PATH` (repeatable) | | | `patch submit`: remove PATH, in a built patch |
+| `-m`, `--message TEXT` | | empty | `patch submit`: the built patch's commit message |
+| `--author 'NAME <EMAIL>'` | | git's user | `patch submit`: the built patch's author |
+| `--replace N` | | | `patch submit`: replace queued patch N (it must still be what was listed) |
+| `--skip N` | | | `patch submit`: replace queued patch N with an empty patch, so the queue moves on |
+| `--depth N` | | full history | `patch submit`: fetch only this many commits (shallow producers) |
+| `--attempts N` | | `10` | `patch submit`: inbox numbers to try when other submitters race |
 
-Telemetry uses the standard `OTEL_*` variables; see the
-[README](../README.md#telemetry). The [operator guide](operator-guide.md)
-§4 describes the mount flags in full, and §16 the history service and fronts.
+The [operator guide](operator-guide.md) §4 describes the mount flags in
+full, and §16 the history service and fronts; the
+[patch queue runbook](runbooks/patch-queue.md) the patch commands.
 
 ### `agentfs init`
 
@@ -478,6 +533,52 @@ Kubernetes init container does:
   when it is missing.
 - The result is opened once before `init` exits, so a bad setting or
   include fails `init`, not the first mount.
+
+## Environment variables
+
+Every variable agentfs reads. The `AGENTFS_*` variables are the flags'
+equivalents above; a flag given on the command line wins.
+
+| Variable | Flag | Read by |
+|---|---|---|
+| `AGENTFS_STATE` | `--state` | all commands |
+| `AGENTFS_ROOT` | `--root` | all commands |
+| `AGENTFS_WAIT_LOCK` | `--wait-lock` | all commands |
+| `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags |
+| `AGENTFS_VOLUME` | `--volume` | `init`, `patch submit` |
+| `AGENTFS_PASSTHROUGH` | `--passthrough` | `mount` |
+| `AGENTFS_THREADS` | `--threads` | `mount` |
+| `AGENTFS_ON_STALE_MOUNT` | `--on-stale-mount` | `mount` |
+| `AGENTFS_HISTORY_LISTEN` | `--listen` | `serve-history` |
+| `AGENTFS_HISTORY_SERVICE`, `AGENTFS_HISTORY_TIMEOUT`, `AGENTFS_HISTORY_WAIT`, `AGENTFS_HISTORY_SLOT` | `--history-service`, `--history-timeout`, `--history-wait`, `--history-slot` | `mount`, `record` |
+| `AGENTFS_CSI_MODE`, `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | `--mode`, `--endpoint`, `--node-id`, `--pod`, `--namespace` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
+
+**Telemetry** (design §13). Every command with pod flags but `status` (`restore` and `revert` only
+without a mount) exports OpenTelemetry metrics, traces
+and logs over OTLP when an endpoint is set; with none, telemetry is off
+and costs nothing. agentfs itself reads these to decide what to export:
+
+| Variable | Meaning |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables every signal, at `/v1/traces`, `/v1/metrics` and `/v1/logs` under it |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | A full URL: enables only that signal, and wins over the general endpoint |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | Only `http/protobuf` is built; another value turns that signal off with a `warning: telemetry:` line |
+| `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER` | `none` turns that signal off; only `otlp` is built |
+| `OTEL_SDK_DISABLED` | `true` turns everything off |
+
+An `https://` endpoint is not built either (plain http only, which suits
+an in-cluster collector), and is reported the same way. Telemetry
+problems never stop a command.
+
+The OpenTelemetry SDK and exporter read the rest themselves:
+`OTEL_SERVICE_NAME` (default `agentfs`), `OTEL_RESOURCE_ATTRIBUTES`,
+`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT` (and their
+per-signal forms), `OTEL_METRIC_EXPORT_INTERVAL` (default 60s), the
+batch settings `OTEL_BSP_*` and `OTEL_BLRP_*`, and sampling:
+`OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` (every record makes an
+`agentfs.record` span, so on a busy volume use
+`parentbased_traceidratio` with `0.01`). The [README](../README.md#telemetry)
+lists the metrics, spans and resource attributes.
 
 ## The CSI driver (`agentfs-csi`)
 

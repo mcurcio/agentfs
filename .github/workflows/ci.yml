@@ -32,6 +32,31 @@ jobs:
       - name: clippy (all features)
         run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
 
+  # The documentation against the code: every config key, operator
+  # attribute, flag and environment variable agentfs reads is in
+  # docs/configuration.md (and nothing stale is), every module is in
+  # docs/architecture.md, and every relative link and anchor in README.md
+  # and docs/ resolves. The same tests run in the test job; this job names
+  # the failure.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: docs
+      - name: config keys read = config::KEYS
+        run: cargo test --locked -p agentfs-core --lib config::tests::every_config_read_is_registered
+      - name: configuration.md and architecture.md against the code, and links
+        run: cargo test --locked -p agentfs-core --test docs_reference
+      - name: agentfs flags and environment variables
+        run: cargo test --locked -p agentfs --bin agentfs -- reference_tests doc_tables plan_reads_only_env_vars
+      - name: agentfs-csi flags and environment variables
+        run: cargo test --locked -p agentfs-csi --bin agentfs-csi reference_tests
+
   test:
     name: test (${{ matrix.features }})
     runs-on: ubuntu-latest

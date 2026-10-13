@@ -379,11 +379,8 @@ fn existing_identity(git: &Path) -> Result<Option<(String, String)>, VolumeError
     }
     crate::history::init_libgit2();
     let config = git2::Config::open(&path).map_err(HistoryError::from)?;
-    let get = |key: &str| match config.get_string(key) {
-        Ok(v) => Ok(Some(v)),
-        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(VolumeError::History(e.into())),
-    };
+    let get =
+        |key: &str| crate::config::string(&config, key).map_err(|e| VolumeError::History(e.into()));
     let Some(volume) = get("agentfs.volume")? else {
         return Ok(None);
     };

@@ -37,11 +37,15 @@
 
 mod control;
 mod daemon;
+#[cfg(test)]
+mod doc_tables;
 mod front;
 mod hold;
 mod otel;
 mod patch_cmd;
 mod recovery;
+#[cfg(test)]
+mod reference_tests;
 mod serve_history;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
