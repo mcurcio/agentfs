@@ -9,6 +9,7 @@
 #   clone    `git clone` of git.git v2.47.0 with agentfs.nested=working-tree;
 #   npm      30,000 small files written into an excluded node_modules/;
 #   create   100,000 small files, then
+#   mvdir    a rename of their directory (one move, design §3.1), then
 #   rm       `rm -rf` of them;
 #   bigclose closing a 1 GiB file, dirty and after fsync (reflink on XFS,
 #            copy on ext4).
@@ -325,11 +326,11 @@ for i in $(seq "$RUNS"); do
   # record whose commit changes nothing (one the committer drops) does
   # not move it. So write a recorded marker afterwards: its commit carries
   # its own sequence number, which counts every record journaled before
-  # it. The marker makes one or two records (FLUSH, and RELEASE by the
-  # racy-timestamp rule: docs/performance.md, "Known costs"), and the
-  # previous file written (package.json or the last marker) may add a
-  # late RELEASE record of its own: at most 4, against thousands if the
-  # excluded files were journaled.
+  # it. The marker makes one record, or two when RELEASE cannot rule out
+  # a change its racy close may have missed (docs/performance.md, "Known
+  # costs"), and the previous file written (package.json or the last
+  # marker) may add a late RELEASE record of its own: at most 4, against
+  # thousands if the excluded files were journaled.
   assert_eq 0 "$(echo "$LAST" | jq .records)" "npm-$i: the excluded files made no commits"
   echo "$i" | sudo tee "$MNT/npm-marker" >/dev/null
   drained=$(drain "$seq_before" 0)
@@ -349,14 +350,22 @@ unmount_volume
 
 step "create and rm -rf: $MANY files"
 baseline create create "$PLAIN/many" "$MANY"
-baseline rm rm "$PLAIN/many"
+baseline mvdir mvdir "$PLAIN/many" "$PLAIN/moved"
+baseline rm rm "$PLAIN/moved"
 mount_volume many
 measured create create "$MNT/many" "$MANY"
 check_records create "$MANY"
 n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^many/' || true)
 assert_eq "$MANY" "$n" "every created file is in the history"
-measured rm rm "$MNT/many"
-n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^many/' || true)
+# A directory rename is one record whatever is beneath it (design §3.1),
+# its reconciliation none here.
+measured mvdir mvdir "$MNT/many" "$MNT/moved"
+assert_eq 1 "$(echo "$LAST" | jq .records)" "mvdir: the rename of $MANY files is one record"
+n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^moved/' || true)
+assert_eq "$MANY" "$n" "every moved file is in the history at its new path"
+check_history
+measured rm rm "$MNT/moved"
+n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^moved/' || true)
 assert_eq 0 "$n" "every removal is in the history"
 unmount_volume
 

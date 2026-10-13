@@ -17,6 +17,8 @@ plain directory on the same filesystem. Standard library only.
         "files_per_s"}.
     bench-workloads.py rm DIR
         `rm -rf DIR`: {"seconds"}.
+    bench-workloads.py mvdir SRC DST
+        rename(2) of the directory SRC to DST: {"seconds"}.
     bench-workloads.py bigclose PATH [--size 1g] [--fsync] [--copy]
         Writes SIZE bytes (a fresh 1 MiB random block, varied per MiB),
         optionally fsyncs, then times close(2): {"write_s", "fsync_s",
@@ -145,6 +147,12 @@ def cmd_create(args):
 def cmd_rm(args):
     start = time.perf_counter()
     subprocess.run(["rm", "-rf", args.dir], check=True)
+    emit({"seconds": time.perf_counter() - start})
+
+
+def cmd_mvdir(args):
+    start = time.perf_counter()
+    os.rename(args.src, args.dst)
     emit({"seconds": time.perf_counter() - start})
 
 
@@ -283,6 +291,9 @@ def main():
     p.add_argument("n", type=int)
     p = sub.add_parser("rm")
     p.add_argument("dir")
+    p = sub.add_parser("mvdir")
+    p.add_argument("src")
+    p.add_argument("dst")
     p = sub.add_parser("bigclose")
     p.add_argument("path")
     p.add_argument("--size", default="1g")
@@ -299,6 +310,7 @@ def main():
         "npm": cmd_npm,
         "create": cmd_create,
         "rm": cmd_rm,
+        "mvdir": cmd_mvdir,
         "bigclose": cmd_bigclose,
         "compare": cmd_compare,
     }[args.command]

@@ -33,6 +33,7 @@ METRICS = {
     "clone": ("seconds", "s"),
     "npm": ("seconds", "s"),
     "create": ("seconds", "s"),
+    "mvdir": ("seconds", "s"),
     "rm": ("seconds", "s"),
     "bigclose-dirty": ("close_s", "s close(2)"),
     "bigclose-fsync": ("close_s", "s close(2)"),
