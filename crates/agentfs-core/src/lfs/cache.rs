@@ -198,16 +198,15 @@ pub(crate) fn publish_into(objects: &Path, tmp: &Path, oid: &LfsOid) -> io::Resu
     let dest = object_path(objects, oid);
     let bb = dest.parent().expect("an object path has a parent");
     let aa = bb.parent().expect("an object path has a grandparent");
-    let created_aa = create_dir(aa)?;
-    let created_bb = create_dir(bb)?;
+    create_dir(aa)?;
+    create_dir(bb)?;
     fs::rename(tmp, &dest)?;
+    // Every level, not only the ones this call created: a crash after an
+    // earlier call created a directory and before it was synced leaves
+    // an entry no later call would make durable.
     File::open(bb)?.sync_all()?;
-    if created_bb {
-        File::open(aa)?.sync_all()?;
-    }
-    if created_aa {
-        File::open(objects)?.sync_all()?;
-    }
+    File::open(aa)?.sync_all()?;
+    File::open(objects)?.sync_all()?;
     Ok(())
 }
 

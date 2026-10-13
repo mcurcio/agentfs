@@ -166,8 +166,11 @@ impl Journal {
         }
         let before = file.metadata()?.len();
         let written = (self.before_sync)()
+            .and_then(|()| crate::failpoints::hit("journal.before_write"))
             .and_then(|()| file.write_all(&buf))
-            .and_then(|()| file.sync_data());
+            .and_then(|()| crate::failpoints::hit("journal.before_fsync"))
+            .and_then(|()| file.sync_data())
+            .and_then(|()| crate::failpoints::hit("journal.after_fsync"));
         if written.is_err() {
             // Leave no partial frame for the next batch to follow.
             let _ = file.set_len(before);
@@ -252,7 +255,17 @@ impl Journal {
                 Ok(())
             }
             Err(e) => {
-                st.file = Some(old);
+                // A failure after the rename (syncing the directory) left
+                // the new file in place: append to it, never to the old
+                // one, which no longer has a name and would lose every
+                // later record at the next open.
+                match replaced(&self.path, &old) {
+                    Some(new) => {
+                        st.file = Some(new);
+                        st.uncommitted = remaining;
+                    }
+                    None => st.file = Some(old),
+                }
                 Err(e)
             }
         };
@@ -355,14 +368,32 @@ fn rewrite(path: &Path, records: &[Record]) -> io::Result<File> {
         encode(record, &mut buf)?;
     }
     let tmp = path.with_extension("rewrite");
-    {
+    let written = (|| {
         let mut f = File::create(&tmp)?;
         f.write_all(&buf)?;
         f.sync_all()?;
+        crate::failpoints::hit("journal.truncate.after_tmp")
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
     fs::rename(&tmp, path)?;
+    crate::failpoints::hit("journal.truncate.after_rename")?;
     sync_parent(path)?;
     OpenOptions::new().read(true).append(true).open(path)
+}
+
+/// The journal now at `path`, opened for appending, if it is no longer the
+/// file `old` (a rewrite renamed a new one into place).
+fn replaced(path: &Path, old: &File) -> Option<File> {
+    use std::os::unix::fs::MetadataExt;
+    let now = fs::metadata(path).ok()?;
+    let was = old.metadata().ok()?;
+    if (now.dev(), now.ino()) == (was.dev(), was.ino()) {
+        return None;
+    }
+    OpenOptions::new().read(true).append(true).open(path).ok()
 }
 
 fn sync_parent(path: &Path) -> io::Result<()> {
@@ -500,6 +531,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (j, _) = Journal::open(dir.path().join("journal"), 42, no_hook()).unwrap();
         assert_eq!(j.record(draft("a")).unwrap(), 42);
+    }
+
+    /// A truncation that fails after its rename (the directory sync)
+    /// leaves the new file in place, and later records go to it: none is
+    /// lost at the next open.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn records_after_a_failed_truncation_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let (j, _) = Journal::open(&path, 0, no_hook()).unwrap();
+        for p in ["a", "b", "c"] {
+            j.record(draft(p)).unwrap();
+        }
+        {
+            let _guard =
+                crate::failpoints::configure("journal.truncate.after_rename=error").unwrap();
+            assert!(j.truncate_through(1).is_err());
+        }
+        assert_eq!(j.uncommitted().len(), 1);
+        j.record(draft("d")).unwrap();
+        drop(j);
+        let (j, report) = Journal::open(&path, 0, no_hook()).unwrap();
+        assert_eq!(report.records, 2);
+        let seqs: Vec<u64> = j.uncommitted().iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, [2, 3]);
+
+        // Before the rename: the old journal stays, whole.
+        {
+            let _guard = crate::failpoints::configure("journal.truncate.after_tmp=error").unwrap();
+            assert!(j.truncate_through(2).is_err());
+        }
+        assert!(!path.with_extension("rewrite").exists());
+        j.record(draft("e")).unwrap();
+        drop(j);
+        let (j, _) = Journal::open(&path, 0, no_hook()).unwrap();
+        let seqs: Vec<u64> = j.uncommitted().iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, [2, 3, 4]);
     }
 
     #[test]

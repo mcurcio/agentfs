@@ -1019,10 +1019,14 @@ impl Recorder {
                 origin,
             };
             match &self.backend {
-                Backend::Local { journal, .. } => Ok(Recorded {
-                    seq: Some(journal.record(draft)?),
-                    ..Recorded::default()
-                }),
+                Backend::Local { journal, .. } => {
+                    let seq = journal.record(draft)?;
+                    crate::failpoints::hit("record.after_journal")?;
+                    Ok(Recorded {
+                        seq: Some(seq),
+                        ..Recorded::default()
+                    })
+                }
                 // The service decides again and journals (design §14); its
                 // skips come back with the reply.
                 Backend::Front { client } => Ok(client.record(draft, std::mem::take(&mut stamps))?),
@@ -2384,6 +2388,7 @@ impl Committer {
         if let Some(seq) = report.last_seq {
             self.journal.truncate_through(seq)?;
             self.duties.committed_through(seq);
+            crate::failpoints::hit("commit.before_pending_remove")?;
             let done = records
                 .iter()
                 .take_while(|r| r.seq <= seq)

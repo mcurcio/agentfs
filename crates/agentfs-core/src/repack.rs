@@ -148,6 +148,11 @@ pub fn repack(
     }
     let start = Instant::now();
     let mut child = command(git, git_dir).spawn().map_err(RepackError::Spawn)?;
+    if let Err(e) = crate::failpoints::hit("repack.running") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(RepackError::Spawn(e));
+    }
     // Read stderr on the side, so a chatty git never blocks on the pipe.
     let stderr = child.stderr.take().map(|mut pipe| {
         std::thread::spawn(move || {

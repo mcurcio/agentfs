@@ -148,6 +148,7 @@ impl PendingStore {
             }
         };
         fs::rename(&tmp, self.path(id))?;
+        crate::failpoints::hit("pending.after_freeze")?;
         Ok((id, method))
     }
 
@@ -162,6 +163,7 @@ impl PendingStore {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                 _ => {}
             }
+            crate::failpoints::hit("pending.remove.between")?;
         }
         Ok(())
     }

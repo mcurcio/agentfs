@@ -336,6 +336,7 @@ impl History {
             self.keep_head_attributes(&mut index, head_tree.as_ref())?;
         }
         let tree_id = index.write_tree_to(&self.repo)?;
+        crate::failpoints::hit("commit.after_tree")?;
         if head.as_ref().is_some_and(|h| h.tree_id() == tree_id) {
             return Ok(Committed {
                 commit: None,
@@ -366,6 +367,9 @@ impl History {
         let commit = self
             .repo
             .commit(None, &author, &committer, &message, &tree, &parents)?;
+        // Objects before the ref that names them (design §3.3).
+        self.sync_object_dirs()?;
+        crate::failpoints::hit("commit.after_object")?;
 
         let log = format!("agentfs: record through seq {}", last.seq);
         match &head {
@@ -380,7 +384,9 @@ impl History {
                 .repo
                 .reference(&self.settings.branch_ref, commit, false, &log)?,
         };
-        self.sync_dirs()?;
+        crate::failpoints::hit("commit.after_ref")?;
+        self.sync_ref_dirs()?;
+        crate::failpoints::hit("commit.after_sync")?;
         Ok(Committed {
             commit: Some(commit),
             last_seq: last.seq,
@@ -413,6 +419,9 @@ impl History {
                     Store::Lfs => {
                         let pointer = lfs
                             .insert_file(&pending.path(*id))
+                            .and_then(|p| {
+                                crate::failpoints::hit("lfs.after_cache_insert").map(|()| p)
+                            })
                             .map_err(HistoryError::Lfs)?;
                         self.repo.blob(pointer.encode().as_bytes())?
                     }
@@ -540,11 +549,22 @@ impl History {
         Ok(())
     }
 
-    /// libgit2 fsyncs object files and refs once enabled, but not newly
-    /// created directories; fsync the ones a commit can create.
-    fn sync_dirs(&self) -> io::Result<()> {
+    /// Makes a commit's objects durable before its ref moves (design
+    /// §3.3): with fsync enabled, libgit2 fsyncs each loose object and its
+    /// fan-out directory (`objects/xx`), but not `objects/` when it
+    /// creates a fan-out directory there. Without this, a power cut after
+    /// the ref update could leave the branch naming a commit whose
+    /// objects have no durable directory entry.
+    fn sync_object_dirs(&self) -> io::Result<()> {
+        crate::failpoints::hit("commit.sync_objects")?;
+        File::open(self.repo.path().join("objects"))?.sync_all()
+    }
+
+    /// After the ref update: libgit2 fsyncs the ref file and its
+    /// directory, but not the directories above it that the first commit
+    /// of a branch creates.
+    fn sync_ref_dirs(&self) -> io::Result<()> {
         let git_dir = self.repo.path();
-        File::open(git_dir.join("objects"))?.sync_all()?;
         let mut dir = git_dir.join(&self.settings.branch_ref);
         while dir.pop() && dir.starts_with(git_dir) {
             File::open(&dir)?.sync_all()?;
@@ -726,10 +746,11 @@ impl History {
         let commit = self
             .repo
             .commit(None, &author, &committer, &message, &tree, &[&head])?;
+        self.sync_object_dirs()?;
         let log = format!("agentfs: patch marker through seq {seq}");
         self.repo
             .reference_matching(&self.settings.branch_ref, commit, true, head.id(), &log)?;
-        self.sync_dirs()?;
+        self.sync_ref_dirs()?;
         Ok(commit)
     }
 
@@ -1118,6 +1139,59 @@ mod tests {
         Change::Remove {
             path: RepoPath::new(path).unwrap(),
         }
+    }
+
+    /// Objects are made durable before the ref moves, and the ref's
+    /// directories after (design §3.3): the failpoints mark the steps.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn objects_are_synced_before_the_ref_moves() {
+        let mut f = Fixture::new();
+        let change = f.write("a", b"one", false);
+        let r = f.record(Trigger::Close, vec![change]);
+        f.commit(&[r]);
+        let before = f.history.head().unwrap().unwrap().id();
+
+        let guard = crate::failpoints::configure("").unwrap();
+        let change = f.write("a", b"two", false);
+        let r = f.record(Trigger::Close, vec![change]);
+        f.commit(&[r]);
+        assert_eq!(
+            crate::failpoints::trace(),
+            [
+                "pending.after_freeze",
+                "commit.after_tree",
+                "commit.sync_objects",
+                "commit.after_object",
+                "commit.after_ref",
+                "commit.after_sync"
+            ]
+        );
+        drop(guard);
+
+        // A failed object sync leaves the branch where it was.
+        let head = f.history.head().unwrap().unwrap().id();
+        assert_ne!(head, before);
+        let _guard = crate::failpoints::configure("commit.sync_objects=error").unwrap();
+        let change = f.write("a", b"three", false);
+        let r = f.record(Trigger::Close, vec![change]);
+        let err = f
+            .history
+            .commit(
+                &[r],
+                &f.pending,
+                &f.lfs,
+                &f.checks,
+                &f.identities,
+                &f.context,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("failpoint commit.sync_objects"),
+            "{err}"
+        );
+        assert_eq!(f.history.head().unwrap().unwrap().id(), head);
+        assert_eq!(f.read("a").unwrap().0, b"two");
     }
 
     #[test]

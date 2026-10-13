@@ -1817,8 +1817,9 @@ impl Ops {
                 .map(|_| ())
                 .map_err(|_| Errno::EIO);
         }
-        self.record_node(h.node, &h.fd, Trigger::Close, caller)
-            .map(|_| ())
+        self.record_node(h.node, &h.fd, Trigger::Close, caller)?;
+        // Recorded, not yet answered (design §18 test 3).
+        agentfs_core::failpoints::hit("fuse.after_record").map_err(|_| Errno::EIO)
     }
 
     /// Records node `id` from `fd` if it changed. Ok(true) if a record was

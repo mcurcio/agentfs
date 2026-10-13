@@ -83,8 +83,16 @@ pub const STALE_LAYERS: usize = 16;
 
 use crate::daemon::{Daemon, Wake};
 
+/// `--version`: the package version, with `+failpoints` in a test build
+/// with failpoints compiled in (design §18 test 3), so such a binary is
+/// never mistaken for a release.
+#[cfg(not(feature = "failpoints"))]
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(feature = "failpoints")]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+failpoints");
+
 #[derive(Parser)]
-#[command(version, about = "Records every change an agent makes, in git history")]
+#[command(version = VERSION, about = "Records every change an agent makes, in git history")]
 struct Cli {
     /// The volume's state area.
     #[arg(long, global = true, env = "AGENTFS_STATE", default_value = ".")]
@@ -316,6 +324,13 @@ impl Pod {
 const EXIT_LOCKED: u8 = 75;
 
 fn main() -> ExitCode {
+    if cfg!(feature = "failpoints") && std::env::var_os(agentfs_core::failpoints::ENV_VAR).is_some()
+    {
+        eprintln!(
+            "agentfs: warning: failpoints are set ({}): a test build, never for production",
+            agentfs_core::failpoints::ENV_VAR
+        );
+    }
     match real_main() {
         Ok(code) => code,
         Err(e) => match e.downcast_ref::<LockError>() {

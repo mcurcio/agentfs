@@ -19,3 +19,8 @@ thiserror = "2.0.21"
 [dev-dependencies]
 git2 = { version = "0.21.0", default-features = false }
 tempfile = "3.27.0"
+
+[features]
+# Test builds only: agentfs-core's failpoints, and the FUSE layer's own
+# (design §18 test 3). Never in a release or image.
+failpoints = ["agentfs-core/failpoints"]

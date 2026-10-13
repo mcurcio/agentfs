@@ -23,6 +23,7 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()>
         file.write_all(&json)?;
         file.sync_all()?;
     }
+    crate::failpoints::hit("state.json.before_rename")?;
     fs::rename(&tmp, path)?;
     File::open(dir)?.sync_all()
 }

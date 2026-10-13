@@ -413,7 +413,10 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
                 match shared
                     .recorder
                     .sequence(&origin, front.slot, *draft, &stamps)
-                {
+                    .and_then(|recorded| {
+                        crate::failpoints::hit("service.after_record")?;
+                        Ok(recorded)
+                    }) {
                     Ok(recorded) => Reply::Recorded {
                         seq: recorded.seq,
                         skipped: recorded.skipped.into_iter().map(wire_skip).collect(),

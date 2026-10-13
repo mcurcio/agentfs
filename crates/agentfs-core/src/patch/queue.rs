@@ -246,6 +246,7 @@ impl<'a> Queue<'a> {
             }
             match self.apply_one(n, patch) {
                 Step1::Applied(commit) => {
+                    crate::failpoints::hit("patch.after_commit")?;
                     move_refs(repo, &volume, n, patch)?;
                     inbox.remove(&n);
                     last_applied = n;
@@ -302,6 +303,7 @@ impl<'a> Queue<'a> {
         };
         let signature = committer.committer_signature()?;
         let status = write_status_ref(repo, &volume, &doc, &signature)?;
+        crate::failpoints::hit("queue.after_status")?;
         state.version = STATUS_VERSION;
         state.last_applied = last_applied;
         state.last_applied_patch = last.map(|c| c.patch.to_string());
@@ -510,9 +512,11 @@ impl<'a> Queue<'a> {
         let result = restore::apply(&plan, repo, *objects, tree, &NotLive, false);
         match result {
             Ok(applied) => {
+                crate::failpoints::hit("patch.after_tree_write")?;
                 let recorded =
                     restore::record_applied(recorder, tree, &applied, *caller, RecordMode::Atomic);
                 guard.finish();
+                crate::failpoints::hit("patch.after_record")?;
                 let committed = committer.commit_pending();
                 let head_now = history.head()?;
                 let done = head_now.as_ref().is_some_and(|c| {

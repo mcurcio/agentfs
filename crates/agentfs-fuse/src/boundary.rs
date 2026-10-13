@@ -502,6 +502,7 @@ fn write_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
         f.write_all(content)?;
         f.sync_all()?;
     }
+    agentfs_core::failpoints::hit("repairs.before_rename")?;
     fs::rename(&tmp, path)?;
     if let Some(dir) = path.parent() {
         fs::File::open(dir)?.sync_all()?;

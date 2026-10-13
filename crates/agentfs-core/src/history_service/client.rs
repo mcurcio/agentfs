@@ -220,7 +220,15 @@ impl HistoryClient {
             draft: Box::new(draft),
             stamps,
         };
-        match self.call("record", &request)? {
+        let reply = self.call("record", &request)?;
+        if let Err(e) = crate::failpoints::hit("front.after_reply") {
+            return Err(ClientError::Lost {
+                address: self.address.clone(),
+                sent: true,
+                error: e.to_string(),
+            });
+        }
+        match reply {
             Reply::Recorded { seq, skipped } => Ok(Recorded {
                 seq,
                 skipped: skipped

@@ -422,8 +422,18 @@ returned call is as durable as in single-process mode.
 - **Truncation.** The journal and `pending/` are truncated only after the commit
   and branch ref are durable.
 - **libgit2 fsync** is enabled for objects and refs (`GIT_OPT_ENABLE_FSYNC_GITDIR`,
-  set through libgit2-sys). agentfs also fsyncs new object directories itself,
-  because libgit2 does not.
+  set through libgit2-sys): each loose object, its fan-out directory
+  (`objects/xx`) and each ref file are fsynced as they are written.
+  libgit2 does not fsync `objects/` when it creates a fan-out directory,
+  nor the directories above a new ref, so agentfs does.
+- **Commit fsync order.** Blobs, trees and the commit object, then
+  `objects/` (so every new fan-out directory entry is durable), then the
+  branch ref (with its own file and directory), then the directories
+  above the ref, then the journal truncation and the removal of the
+  frozen copies. Objects are durable before any ref names them, and
+  nothing a commit needs is dropped before the ref is durable, so a power
+  cut at any point leaves either the old head with its records still
+  journaled or the new head with everything it names.
 - **After a crash,** the recorder resumes from the branch head's `Agentfs-Seq`
   and replays later entries.
 

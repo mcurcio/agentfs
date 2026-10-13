@@ -472,6 +472,14 @@ impl RemotePusher {
             Ok(report) => *lfs_out = report,
             Err(e) => return self.failed_at(e.kind, e.message, Some(head), PushStage::Lfs),
         }
+        if let Err(e) = crate::failpoints::hit("push.after_lfs_upload") {
+            return self.failed_at(
+                PushFailureKind::Local,
+                e.to_string(),
+                Some(head),
+                PushStage::Lfs,
+            );
+        }
         let attempt = self.attempt(&refspecs, &[]);
         let remote_branch = attempt
             .updates
@@ -908,7 +916,9 @@ impl RemotePusher {
         self.state.consecutive_failures = 0;
         self.state.last_error = None;
         self.state.diverged = None;
-        if let Err(e) = self.state.save(&self.state_path) {
+        if let Err(e) = crate::failpoints::hit("push.after_remote_update")
+            .and_then(|()| self.state.save(&self.state_path))
+        {
             let message = format!(
                 "pushed {head}, but saving {}: {e}",
                 self.state_path.display()
@@ -957,7 +967,11 @@ impl RemotePusher {
                 diverged_ref: None,
                 pending_ref: pending_ref.clone(),
             });
-            match self.state.save(&self.state_path) {
+            match self
+                .state
+                .save(&self.state_path)
+                .and_then(|()| crate::failpoints::hit("push.diverged.after_pending"))
+            {
                 Err(e) => {
                     // Without a durable name, pushing could save the head
                     // twice; try again at the next attempt.
@@ -970,6 +984,9 @@ impl RemotePusher {
                     let attempt = self.attempt(&[format!("{head}:{name}")], &[]);
                     match (&attempt.result, attempt.rejected.first()) {
                         (Ok(()), None) => {
+                            if let Err(e) = crate::failpoints::hit("push.diverged.after_ref") {
+                                message = format!("{message}; {e}");
+                            }
                             self.events.emit(Event::Diverged {
                                 remote: self.remote.name.clone(),
                                 local_head: head,

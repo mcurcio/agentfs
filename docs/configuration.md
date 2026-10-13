@@ -560,6 +560,14 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_HISTORY_SERVICE`, `AGENTFS_HISTORY_TIMEOUT`, `AGENTFS_HISTORY_WAIT`, `AGENTFS_HISTORY_SLOT` | `--history-service`, `--history-timeout`, `--history-wait`, `--history-slot` | `mount`, `record` |
 | `AGENTFS_CSI_MODE`, `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | `--mode`, `--endpoint`, `--node-id`, `--pod`, `--namespace` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
 
+**Test builds only.** `AGENTFS_FAILPOINTS` sets failpoints on the durable
+path (`name=kill|error|panic|sleep(ms)[@n]`, joined with `;`; design §18
+test 3, [architecture.md](architecture.md#crash-model)). Only a binary
+built with `--features agentfs/failpoints` reads it (its `--version` ends
+in `+failpoints`, and it warns at start when the variable is set); release
+builds and the image have no failpoints and ignore it. Never set it in
+production.
+
 **Telemetry** (design §13). Every command with pod flags but `status` (`restore` and `revert` only
 without a mount) exports OpenTelemetry metrics, traces
 and logs over OTLP when an endpoint is set; with none, telemetry is off

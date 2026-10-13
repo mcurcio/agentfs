@@ -43,3 +43,7 @@ tempfile = "3.27.0"
 https = ["agentfs-core/https"]
 # Push to ssh:// and scp-like remotes (libssh2, links OpenSSL).
 ssh = ["agentfs-core/ssh"]
+# Test builds only: failpoints on the durable path (design §18 test 3),
+# set by AGENTFS_FAILPOINTS. `--version` says `+failpoints`. Never in a
+# release or image.
+failpoints = ["agentfs-core/failpoints", "agentfs-fuse/failpoints"]
