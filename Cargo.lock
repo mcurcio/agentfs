@@ -7,6 +7,7 @@ name = "agentfs"
 version = "0.1.0"
 dependencies = [
  "agentfs-core",
+ "agentfs-csi",
  "agentfs-fuse",
  "anyhow",
  "clap",
@@ -23,6 +24,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

@@ -28,6 +28,10 @@ serde_json = "1.0.154"
 thiserror = "2.0.21"
 
 [dev-dependencies]
+# Drives a real `agentfs serve-history` through the CSI supervisor
+# (csi_service.rs).
+agentfs-csi = { version = "0.1.0", path = "../agentfs-csi" }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time"] }
 # Decodes OTLP payloads in the fake collector of the telemetry test.
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs"] }
 prost = "0.14"
