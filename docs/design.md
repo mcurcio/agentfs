@@ -1195,8 +1195,12 @@ use the cache.
 **Restore and revert** (§15) are LFS-aware: a pointer at a managed path is
 checked out as its object's content, from the cache or else downloaded
 from the remotes in name order, and every object a plan writes is fetched
-during the check, before anything is written; a missing one refuses the
-restore (`lfs_object`). The tree's file is compared by size and SHA-256.
+during the check, before anything is written: all of them at once first
+(concurrently, resuming partial downloads), then each checked so a
+missing one names its path and refuses the restore (`lfs_object`). The
+restore holds the cache lock (`<state>/lfs/lock`) shared from the check
+through its writes, so `agentfs lfs prune` cannot remove an object in
+between. The tree's file is compared by size and SHA-256.
 The root `.gitattributes` is compared and written without the managed
 block, and one holding only the block is absent from the tree. A dry run
 (`--dry-run`) downloads and writes nothing: it looks only in the cache and
@@ -1707,8 +1711,11 @@ agentfs does not scan content for secrets and does not hold pushes.
   (`ssh_transport/tests.rs`) run the same cases, plus scp-like URLs, a patch-queue fetch, a missing repository, a
   stalled server and the fail-closed cases, against an in-process russh
   server running the real `git upload-pack` and `git receive-pack`.
-  Git LFS (§7) in `ci/e2e-lfs.sh` against git-lfs's `lfs-test-server`
-  behind the same nginx.
+  Git LFS (§7) in `ci/e2e-lfs.sh` and `ci/e2e-lfs-transfers.sh` against
+  git-lfs's `lfs-test-server` behind the same nginx (with nginx rules that
+  throttle or fail chosen objects, and tinyproxy for proxies), and
+  `git-lfs-authenticate` in `ci/e2e-lfs-ssh.sh` against OpenSSH's
+  git-shell with a custom command.
 
 ### 11.2 Interval push
 
@@ -2855,7 +2862,10 @@ one-time migration of Hermes' existing data and the initial import in
   - alarm events, through a non-blocking sink (§13);
   - Git LFS (§7, `lfs`): store selection, pointers, the managed
     `.gitattributes` block, the object cache, endpoints and credentials,
-    the batch client, uploads before each push, and LFS-aware restores;
+    the batch client with concurrent and resumable transfers, uploads
+    before each push, `git-lfs-authenticate` for SSH remotes, LFS-aware
+    restores, `lfs fetch` and `lfs prune` with the cache lock;
+  - remote proxies (§11.1, `proxy`);
   - the patch queue (§12);
   - telemetry (§13): implemented against the OpenTelemetry API.
 - **`agentfs-fuse`, a library:** the FUSE layer (§2.1, §3.1, §6).
@@ -3178,7 +3188,7 @@ restartable (§14.2). The controller runs no children.
 | TLS and SSH transports | `git2` feature `https` (OpenSSL) behind agentfs's `https` cargo feature; for `ssh`, agentfs's own libgit2 subtransport over `russh` 0.64 (ring and the pure-Rust `rsa` crate; `tokio` current-thread runtime per connection), libgit2 built without libssh2 | `https` is a C library, so feature-gated: default builds stay free of OpenSSL. `ssh` needs no OpenSSL or libssh2 (checked by `ci/check-deps.sh`), and russh gives the transport the host key before authentication, a host key algorithm preference and host certificates, which libssh2 1.11 cannot negotiate. The `rsa` crate has a timing side-channel advisory on private-key operations (RUSTSEC-2023-0071): Ed25519 keys are recommended |
 | SSH host keys | agentfs's own known_hosts parser over `base64` and `sha1_smol` (HMAC-SHA1 for hashed names, written by hand and tested against RFC 2202) | Pure Rust. The SSH transport checks host keys with it before any authentication, and never reads `~/.ssh` (§11.1) |
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
-| LFS | none exists: implemented in agentfs (§7) over `ureq` 3 (default features off: pure Rust, no TLS) and `sha2` 0.11; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, as `git2/https`; its webpki root bundle is compiled in but unused: the platform verifier reads the system store) | ureq's `native-tls-no-default` feature does not compile the native-tls connector in 3.4 (its code is behind the `native-tls` feature), hence `native-tls`. `reqwest` stays in the binary only, for OTLP |
+| LFS | none exists: implemented in agentfs (§7) over `ureq` 3 (default features off: pure Rust, no TLS; proxies through its built-in HTTP `CONNECT` proxy, no extra feature) and `sha2` 0.11; concurrency on `std::thread::scope`, `git-lfs-authenticate` over the `ssh` feature's russh transport, no further crates; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, as `git2/https`; its webpki root bundle is compiled in but unused: the platform verifier reads the system store) | ureq's `native-tls-no-default` feature does not compile the native-tls connector in 3.4 (its code is behind the `native-tls` feature), hence `native-tls`. `reqwest` stays in the binary only, for OTLP |
 | Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `http-json`, `grpc-tonic`, `reqwest-blocking-client`) in the binary, with `tokio` (one worker, started only for gRPC); the `otlp-tls` feature adds `opentelemetry-otlp/tls-ring`, tonic's `tls-ring` and `tls-native-roots`, `rustls` 0.23 (ring), `rustls-native-certs` and reqwest's `rustls-no-provider` | OTLP http/protobuf, http/json and gRPC export. tonic and prost were already in the workspace for the CSI driver, and the OTLP gRPC code comes pre-generated in `opentelemetry-proto`: no protoc. The default build is verified pure Rust (no OpenSSL, ring, aws-lc, cmake or protoc); `otlp-tls` adds ring only (C and assembly, no cmake), never aws-lc or OpenSSL; `ci/check-deps.sh` checks both. With rustls in reqwest, ring is installed as the process's crypto provider |
 | Patch submission | the `git` CLI on the producer's side (`ls-remote`, `fetch`, `commit-tree`, `push --force-with-lease`) | Runs in the producer's repository with its own credentials and config, so agentfs needs none of them; the lease makes a number create-only (§12) |
 | Repack | the `git` CLI (`git repack --geometric=2`, git 2.32 or later) | libgit2 has no repack or gc. Run by the commit loop with system and global config off (§8); the image ships `git` |
@@ -3328,10 +3338,20 @@ leaving nothing mounted on the node. The ignored root tests in
 check the sealed mount point and that stopping `agentfs mount` pushes
 its final commit (§11.2). Test 14's LFS part runs in the `e2e-lfs` job
 (`ci/e2e-lfs.sh`: git-lfs's `lfs-test-server` behind nginx, the real
-git-lfs client, `git clone` plus `git lfs pull`, over http and https)
-and without a server in `crates/agentfs/tests/cli_lfs.rs` (local and
-`file://` remotes; `git lfs pull` where git-lfs is installed, as on CI
-runners). Test 15 runs without a mount in
+git-lfs client, `git clone` plus `git lfs pull`, over http and https;
+`ci/e2e-lfs-transfers.sh`: concurrent downloads seen overlapping in the
+nginx log, uploads resuming by object after a 503 for one object,
+downloads resuming by byte with `Range` after a `kill -9`, the per-remote
+object size limit, `lfs fetch`, `lfs prune` keeping what a remote lacks,
+and proxies through tinyproxy, including https through `CONNECT`) and
+in the `e2e-lfs-ssh` job (`ci/e2e-lfs-ssh.sh`: `git-lfs-authenticate`
+through OpenSSH's git-shell, interoperating with the real git-lfs in
+both directions, expiry per batch, refused headers, a server without the
+command, an untrusted host key with no key offered), and without a
+server in `crates/agentfs/tests/cli_lfs.rs` (local and `file://`
+remotes, `lfs fetch` and `lfs prune`; `git lfs pull` where git-lfs is
+installed, as on CI runners); the `lfs-storage` runbook's blocks run in
+`ci/e2e-runbooks.sh`. Test 15 runs without a mount in
 `agentfs_core::patch` (unit tests, including a crash at each step) and
 `crates/agentfs/tests/cli_patch.rs` (racing submitters over `file://`, a
 blocked and resolved queue), through a real mount in the `fuse` job

@@ -344,6 +344,16 @@ shows the service (`history:   serving fronts at unix:…`), each front's
 slot, pod and pid, the remotes, and the journal. `git` is in the image:
 `git --git-dir /var/lib/agentfs-csi/volumes/<pv>/state/git log`.
 
+**The LFS cache** (design §7) is the volume's
+`<basePath>/<pv>/state/lfs`. `agentfs lfs fetch` and `agentfs lfs prune`
+run in the same container, beside the history service, with `--state`
+as above (the [LFS storage runbook](runbooks/lfs-storage.md)):
+
+```sh
+kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+  agentfs --state /var/lib/agentfs-csi/volumes/<pv>/state lfs prune --dry-run
+```
+
 **Logs.** `kubectl logs` of the node plugin's `agentfs-csi` container
 holds the plugin's own lines and every child's, prefixed with
 `[service <pv>]` or `[front <namespace>/<pod> <key>]`. Restarts are logged

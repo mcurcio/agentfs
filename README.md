@@ -619,7 +619,17 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   `git lfs pull` giving back the exact content, wrong and missing LFS
   credentials failing at stage `lfs` with no ref pushed, the endpoint
   derived from the git remote, `file://` remotes, https and an untrusted
-  certificate, and restores from the cache and from a server.
+  certificate, and restores from the cache and from a server. Then
+  [`ci/e2e-lfs-transfers.sh`](ci/e2e-lfs-transfers.sh), with nginx rules
+  that throttle or fail chosen objects: concurrent transfers, uploads
+  resuming by object and downloads by byte (`Range`, after a `kill -9`),
+  the per-remote object size limit, `agentfs lfs fetch` and `prune`, and
+  proxies through tinyproxy (https through `CONNECT`).
+- **e2e Git LFS over SSH** ([`ci/e2e-lfs-ssh.sh`](ci/e2e-lfs-ssh.sh)):
+  `git-lfs-authenticate` as a git-shell custom command on OpenSSH, with
+  the real git-lfs pulling what agentfs pushed, answers that expire per
+  batch, refused headers, a server without the command, and an untrusted
+  host key with no key offered.
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](ci/e2e-telemetry.sh)): every
   metric, span and alarm log above must reach a real OpenTelemetry Collector,
   and a dead traces endpoint must produce the stderr warning and
