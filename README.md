@@ -670,7 +670,8 @@ synchronous record step without FUSE
 ([`record_step`](crates/agentfs-core/benches/record_step.rs)), then
 workloads through a real mount beside a plain-directory baseline (4 KiB
 closes, a `git clone` with `nested=working-tree`, npm-style small files
-into an excluded `node_modules/`, creating and `rm -rf` of 100,000 files,
+into an excluded `node_modules/`, creating 100,000 files, renaming their
+directory (one record) and `rm -rf` of them,
 closing a 1 GiB file), each checked against the history afterwards.
 Results go to the job summary and a `bench-<fs>` artifact kept 90 days;
 [`ci/bench-budget.json`](ci/bench-budget.json) adds warnings, never

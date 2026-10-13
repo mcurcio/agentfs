@@ -19,38 +19,42 @@ were up to about 1.7 times slower in `fsync`-bound results and up to four
 times faster in commit catch-up (see [Run to run](#run-to-run)). The
 loop device puts every `fsync` through a second filesystem, so
 `fsync`-bound numbers are likely somewhat higher than on a dedicated
-disk.
+disk. The workloads through a mount, and the summary's figures for
+them, are from two later runs, after the double record was removed
+([Workloads through a mount](#workloads-through-a-mount)).
 
 ## Summary
 
-- **A small file's change costs 1.3–1.9 ms in the engine and 1.8–2.4 ms
-  through FUSE** at the median (4 KiB, XFS–ext4). Most of it is the
-  journal's `fsync`; a plain close costs 25–30 µs.
+- **A small file's change costs 1.3–1.9 ms in the engine and 1.8–3.3 ms
+  through FUSE** at the median (4 KiB, XFS–ext4, the most on an Intel
+  ext4 runner). Most of it is the journal's `fsync`; a plain close costs
+  7–36 µs.
 - **On XFS the step does not depend on the file's size.** Freezing a
   16 MiB file takes 0.44 ms, the same as 64 KiB, and closing a clean
   1 GiB file through a mount takes 3 ms. A 1 GiB file with dirty pages
   takes 2.6 s, because the reflink waits for writeback.
-- **On ext4 the freeze is a copy**: 44 ms for 16 MiB, 2.9 s for a clean
-  1 GiB file and 5.4 s for a dirty one. Use XFS (or btrfs) for volumes
+- **On ext4 the freeze is a copy**: 44 ms for 16 MiB, 3.1–4.4 s for a clean
+  1 GiB file and 5.7–8.8 s for a dirty one. Use XFS (or btrfs) for volumes
   that hold large files; ext4 is fine for small ones.
-- **Workloads of many small files run 14–83 times slower** than in a
-  plain directory: about 2.8–3.5 ms per file for a `git clone`, 2.3–3.3
-  ms per created file, 0.8–1.3 ms per removed file.
+- **Workloads of many small files run 13–220 times slower** than in a
+  plain directory (whose times vary threefold between runners): about
+  2.1–3.2 ms per file for a `git clone`, 1.8–2.9 ms per created file,
+  0.8–1.7 ms per removed file.
 - **A file written and closed at once is recorded once.** Until
-  2026-10-13 it was recorded again at RELEASE through the racy-timestamp
-  rule, doubling the records and commit work of the workloads below,
-  which were measured then; RELEASE now compares the file with the copy
-  its close froze instead. See [Known costs](#known-costs).
-- **Excluded paths still pay FUSE**: about 0.63 ms per small file written
-  into an excluded `node_modules/`, against 0.035 ms in a plain
-  directory, and nothing is recorded.
+- **A file written and closed at once is recorded once** (since
+  2026-10-13; before, RELEASE recorded it a second time through the
+  racy-timestamp rule). RELEASE compares the file with the copy its close
+  froze instead. See [Known costs](#known-costs).
+- **A directory rename is one record** however many files it holds: 24
+  ms through a mount for 100,000 files (design §3.1).
+- **Excluded paths still pay FUSE**: about 0.5–0.7 ms per small file
+  written into an excluded `node_modules/`, against 0.01–0.04 ms in a
+  plain directory, and nothing is recorded.
 - **Commits keep up with ordinary work but not with bulk creation**:
-  100,000 new files made about 200,000 records (the double record), which
-  the history caught up with in about 8 minutes on AMD runners (about 420
-  records a second) and about 2 minutes on Intel ones; committing a 1 GiB
-  file takes about 28 s per record (hashing and compressing it), so 56 s
-  for one just written. None of it delays the workload.
-
+  100,000 new files make about 100,000 records, which the history caught
+  up with in about 7.7 minutes on AMD runners and 2.6–3.6 minutes on
+  Intel ones; committing a 1 GiB file takes 23–29 s (hashing and
+  compressing it). None of it delays the workload.
 ## The synchronous step, without FUSE
 
 `cargo bench -p agentfs-core --bench record_step`
@@ -88,42 +92,51 @@ the commit loop running, so FUSE is not included. Microseconds:
 of a fresh volume and, as the baseline, in a plain directory on the same
 filesystem, with the page cache dropped first. After each it waits until
 `agentfs status` shows no backlog ("catch-up") and checks the history
-against the backing tree. Medians of 3 runs, except close4k, create and
-rm (1 run):
+against the backing tree.
 
-| Workload | XFS plain | XFS agentfs | ext4 plain | ext4 agentfs | Catch-up (XFS, ext4) | Records |
+This table is from the two runs after the double record was removed
+(see [Known costs](#known-costs)):
+[38388265326](https://github.com/mcurcio/agentfs/actions/runs/38388265326)
+at `157416d` and
+[38394883510](https://github.com/mcurcio/agentfs/actions/runs/38394883510)
+at `f6223dc`, which added mvdir. Both XFS jobs ran on AMD EPYC 7763 and
+both ext4 jobs on Intel (Xeon Platinum 8370C, then Xeon 6973P-C). Each
+cell is the median of 3 runs in a job, except close4k, create, mvdir
+and rm (1 run). Where the two jobs differ, the cell gives both:
+
+| Workload | XFS plain | XFS agentfs | ext4 plain | ext4 agentfs | Catch-up (XFS; ext4) | Records |
 |---|---|---|---|---|---|---|
-| close4k: write 4 KiB and `close`, 2,000 times over 50 files (p50) | 29 µs | 1.81 ms | 26 µs | 2.42 ms | 0.2 s | 4,000 |
-| clone: `git clone` of git.git v2.47.0 (4,524 files), `agentfs.nested=working-tree` | 0.75 s | 12.7 s | 0.76 s | 16.0 s | 1.1 s, 0.7 s | 9,041–9,048 |
-| npm: 30,000 small files into an excluded `node_modules/` | 1.09 s | 19.0 s | 0.93 s | 18.9 s | 0 s | 0 |
-| create: 100,000 files of 64 bytes | 3.7 s | 230 s | 4.0 s | 330 s | 483 s, 474 s | 199,923–200,008 |
-| rm: `rm -rf` of those 100,000 files | 5.7 s | 78 s | 2.7 s | 132 s | 0.2 s | 100,000 |
-| bigclose, fsynced: `close` of a 1 GiB file after `fsync` | 0 | 3 ms | 0 | 2.86 s | 28 s | 1 |
-| bigclose, dirty: `close` of a 1 GiB file just written | 0.11 s | 2.58 s | 0.30 s | 5.43 s | 56 s | 2 (1–3) |
+| close4k: write 4 KiB and `close`, 2,000 times over 50 files (p50) | 32–36 µs | 1.76–1.77 ms | 7–12 µs | 1.76–3.29 ms | 0.7 s; 0.6–0.8 s | 2,000 |
+| clone: `git clone` of git.git v2.47.0 (4,524 files), `agentfs.nested=working-tree` | 0.76–0.78 s | 11.9–12.1 s | 0.59–0.69 s | 9.4–14.3 s | 0.4–0.7 s; 0.4 s | 4,524–4,525 |
+| npm: 30,000 small files into an excluded `node_modules/` | 1.08–1.10 s | 20.2 s | 0.30–0.45 s | 14.5–18.5 s | 0 s | 0 |
+| create: 100,000 files of 64 bytes | 3.6–3.7 s | 225–229 s | 1.3–1.9 s | 176–292 s | 461–464 s; 157–217 s | 100,004–100,009 |
+| mvdir: `mv` of the directory holding those 100,000 files | 0.5 ms | 24 ms | 0.8 ms | 23 ms | 7.9 s; 3.4 s | 1 |
+| rm: `rm -rf` of those 100,000 files | 5.7 s | 76–77 s | 1.1–1.3 s | 98–173 s | 0.2 s | 100,000 |
+| bigclose, fsynced: `close` of a 1 GiB file after `fsync` | 0 | 3 ms | 0 | 3.06–4.37 s | 29 s; 23–29 s | 1 |
+| bigclose, dirty: `close` of a 1 GiB file just written | 0.10 s | 2.63–2.65 s | 0.30–0.41 s | 5.73–8.75 s | 29 s; 24–29 s | 1 |
 
-*Records* is per run, over all three CI runs (the first run's close4k
-count was not captured): the change boundaries are one per close, file
-or removal, so every workload that writes a file and closes it at once
-showed about twice as many records as boundaries in these runs: the
-double record of [Known costs](#known-costs), since removed.
+*Records* is per run: one per change boundary (a close after a write, a
+file removed, a directory renamed). Before the change, the same
+workloads made about twice as many on the first three runs: 4,000 for
+close4k, 9,041–9,048 for clone, 199,923–200,008 for create and 2 (1–3)
+for the dirty 1 GiB close.
 
 For comparison, copying the 1 GiB file and `fsync`ing the copy in the
-plain directory took 2.6–2.9 s (clean) and 3.8–5.4 s (dirty): ext4's
-freeze is that copy.
+plain directory took 2.6–5.6 s (clean) and 5.1–10.5 s (dirty), the most
+on the Xeon 6973P-C: ext4's freeze is that copy.
 
 What the numbers mean:
 
 - **Closes of small files** cost the step plus FUSE's round trips:
-  about 0.5 ms more through a mount than in the engine alone. Each close
-  makes two records, the second at RELEASE, after `close` has returned:
-  it does not add to the latency measured here, but it takes a second
-  journal `fsync` and freeze on the daemon's side.
+  about 0.5 ms more through a mount than in the engine alone. The
+  RELEASE after the close reads the file and its frozen copy back to
+  compare them, after `close` has returned, and records nothing when
+  they match.
 - **A git clone** writes each working-tree file once and closes it: one
-  boundary per file, recorded twice (FLUSH, then RELEASE), so about 9,046
-  records for 4,524 files. Creating a file records nothing by itself.
-  Its `.git` directory is never recorded (`nested=working-tree`); the
-  60–83 commits per clone came out at the default `commitWindow` of
-  200 ms.
+  boundary, and one record, per file. Creating a file records nothing by
+  itself. Its `.git` directory is never recorded
+  (`nested=working-tree`); the 55–82 commits per clone came out at the
+  default `commitWindow` of 200 ms.
 - **Excluded paths** (`info/exclude`) are decided at once and nothing is
   frozen or journaled (the benchmark checks that the workload adds no
   records), but every operation still goes through the daemon: `create`,
@@ -131,21 +144,27 @@ What the numbers mean:
   (`node_modules/`, build output) out of the mount altogether when that
   cost matters, not just excluded.
 - **Bulk creation** outpaces the commit loop: creating 100,000 files took
-  4–5.5 minutes and made about 200,000 records, half of them the
-  RELEASE duplicates, and committing them took about 8 more minutes on
-  the AMD runners (2 on the Intel ones), during which `agentfs status`
-  showed the backlog shrinking. The journal holds the records durably
+  3–5 minutes and made about 100,000 records, and committing them took
+  about 7.7 more minutes on the AMD runners (2.6–3.6 on the Intel ones),
+  during which `agentfs status` showed the backlog shrinking. Halving
+  the records did not halve that: on AMD it went from 474–510 s to
+  461–464 s. The catch-up is bound by the 1,100–1,450 commits, each
+  writing the trees of a directory that grows to 100,000 entries, more
+  than by the records in them. The journal holds the records durably
   meanwhile, and the workload was never slowed by it.
+- **A directory rename** is one record however many files are beneath
+  it (design §3.1): 23–24 ms through the mount for 100,000 files, where
+  recording each file at its new path made the rename wait for 100,000
+  records. Its commit moves the index entries and writes the trees
+  (3.4–7.9 s here), and the reconciliation that follows it walks the
+  moved tree's metadata, which here records nothing.
 - **Removals** are cheaper than creations (nothing frozen), and each is
   one journaled `fsync`ed record: no RELEASE follows an `unlink`.
 - **A 1 GiB commit** is a loose object written by hashing and
-  zlib-compressing the frozen copy, about 28 s per record. The dirty
-  variant's catch-up takes twice as long because it makes two records:
-  its close follows the last write within the racy window, so RELEASE
-  freezes the file again (a second reflink on XFS, a second 1 GiB copy
-  on ext4) and the commit loop hashes and compresses it twice. The
-  fsynced variant's 2.6 s `fsync` puts its stamp outside the window, so
-  it makes one record.
+  zlib-compressing the frozen copy, 23–29 s. The dirty variant now makes
+  one record too: before the change its RELEASE froze the file again (a
+  second reflink on XFS, a second 1 GiB copy on ext4) and its catch-up
+  took 56 s, twice the fsynced variant's.
 
 ## Known costs
 
@@ -191,7 +210,25 @@ costs:
 
 The benchmark checks that close4k and create make one record per
 boundary (plus 1 % and 10 of slack for the sweep), so a regression to
-the double record fails the job.
+the double record fails the job. It also checks that renaming the
+directory of 100,000 created files is one record and leaves every file
+in the history at its new path.
+
+### Directory renames
+
+A directory rename is journaled as one move (design §3.1), so the
+`rename` waits for one record, not one per file beneath it. What it
+costs instead comes after the call has returned:
+
+- **The reconciliation**: before its next commit pass the commit loop
+  walks the moved tree's metadata (no file contents) to find what the
+  move alone would get wrong, such as files the rules treat differently
+  at the new path or writes that raced the rename, and records those.
+  Records journaled after the move are not committed until it is done,
+  so a rename of a large tree delays the commits behind it, never the
+  workload.
+- **The commit** moves every index entry beneath the source and writes
+  the trees: 3.4–7.9 s for 100,000 files on CI.
 
 ## Performance budget
 
@@ -215,15 +252,25 @@ are budgeted in absolute time, not as ratios.
 | git clone of 4,524 files | 30 s | 12.5–18.9 s |
 | 30,000 small files into an excluded path | 30 s | 17.1–19.0 s |
 | 100,000 creates | 600 s | 230–384 s |
-| Catch-up after 100,000 creates (about 200,000 records) | 12 min | 2.0–8.1 min |
+| Catch-up after 100,000 creates (about 100,000 records) | 12 min | 2.6–7.7 min (2.0–8.1 min with the double record) |
+| Rename of the directory holding them | 0.1 s | 23–24 ms |
+| Catch-up after that rename | 15 s | 3.4–7.9 s |
 | `rm -rf` of 100,000 files | 270 s | 78–177 s |
 | XFS: close of a clean 1 GiB file | 0.5 s | 2–10 ms |
 | XFS: close of a dirty 1 GiB file | 8 s | 2.5–5.4 s |
 | ext4: close of a clean 1 GiB file | 7 s | 2.8–4.3 s |
 | ext4: close of a dirty 1 GiB file | 12 s | 4.9–8.1 s |
 
-The catch-up budget measures the double record above: when the follow-up
-lands it should roughly halve, and the limit should come down with it.
+The catch-up budget was set with the double record. Removing it took
+the catch-up on AMD runners from 453–510 s to 461–464 s, not to half:
+it is bound by the commits' tree writes more than by the records (see
+[Workloads through a mount](#workloads-through-a-mount)), so the limit
+stays. The two rename rows come from the two runs after the change
+(four jobs), not six. On the second of them the ext4 job's engine step
+with 8 threads had a p99 of 22.6 ms and warned, against 4.4–6.6 ms in
+the first six jobs, one of them on the same CPU (Xeon 6973P-C) and
+filesystem. The bench does not exercise the change there (it calls the
+engine, without RELEASE), so it is left as one outlier to watch.
 
 ## Run to run
 
@@ -282,8 +329,9 @@ with `mkfs.xfs -m reflink=1` and once on ext4. Each job:
    directories and `node_modules/` are not in it, every created and
    removed file is, the excluded files journaled nothing (a recorded
    marker written after each npm run must account for every new
-   sequence number), close4k and create made between one and two records
-   per boundary, and every workload's backlog drained within 30 minutes;
+   sequence number), close4k and create made one record per boundary
+   (with a little slack), the rename of the created directory one record,
+   and every workload's backlog drained within 30 minutes;
 4. writes the report ([`ci/bench-report.py`](../ci/bench-report.py)) to
    the job summary, with the budget warnings, and uploads everything as
    the `bench-xfs` or `bench-ext4` artifact, kept 90 days:

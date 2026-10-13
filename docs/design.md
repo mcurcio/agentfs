@@ -308,7 +308,9 @@ Rules that make this precise:
   `reconcile_failed` and stops holding commits back; the move is
   committed as journaled. A move into a git directory (§5) commits as the
   source's removal. Without the backing tree (`agentfs flush` offline)
-  moves are committed as journaled.
+  moves are committed as journaled. Measured (§18 test 13): renaming a
+  directory of 100,000 recorded files takes 23 to 24 ms through a mount and
+  makes one record, committed with its reconciliation in 3.4 to 7.9 s.
   `RENAME_EXCHANGE` of directories, a rename to or from a path the mount
   never records (inside `.git`, an invalid name), and a front whose
   history service predates the `move` feature still record both names'
@@ -360,7 +362,10 @@ the reflink waits for writeback). On ext4 the copy takes 44 ms for 16 MiB
 and 2.9 s for a clean 1 GiB file. A file written and closed at once is
 recorded once: RELEASE compares it with the copy FLUSH froze rather than
 freezing and journaling it again (§3.1), so 100,000 new files make
-about 100,000 records. The performance budget is §19.2 item 1.
+100,004 to 100,009 records on CI where they made about 200,000, a
+clone of 4,524 files 4,524 where it made about 9,046, and a 1 GiB file
+just written is hashed and compressed once. The performance budget is
+§19.2 item 1.
 
 **Through a front (§14).** A front mount splits the step with the history
 service. The front decides the path rules (asking the service with a
@@ -3143,7 +3148,9 @@ runner.
    copy is still the last state journaled at the path (asked of the
    history service by a front, `StillLast`). The benchmark now bounds
    the count at one record per boundary
-   ([performance.md](performance.md#known-costs)).
+   ([performance.md](performance.md#known-costs)); measured on CI,
+   100,000 new files made 100,004 to 100,009 records where they made
+   about 200,000.
 5. **Residuals of multi-front ordering and live restores** (§6, §14.1,
    §15), known and accepted for now (2026-10-13):
    - *Same-tick writes on a coarse clock.* Two fronts' same-size writes

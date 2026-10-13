@@ -1,5 +1,5 @@
 {
-  "comment": "Advisory performance budget (design §19.2 item 1, docs/performance.md): ci/bench-report.py warns when a result exceeds one and never fails the job. Recalibrated on 2026-10-13 from the first three CI runs (six jobs; GitHub ubuntu-24.04, 4 CPUs, loop filesystems), which drew two CPU types, AMD EPYC 7763 and Intel Xeon 6973P-C, with fsync-bound results up to about 1.7 times apart: each limit is about 1.5 times the slowest of the six. Workloads are budgeted in absolute time: the plain-directory baselines varied threefold between runners, so ratios against them are reported but not budgeted. The record counts the workloads produce include the FLUSH+RELEASE double record (docs/performance.md, Known costs).",
+  "comment": "Advisory performance budget (design §19.2 item 1, docs/performance.md): ci/bench-report.py warns when a result exceeds one and never fails the job. Recalibrated on 2026-10-13 from the first three CI runs (six jobs; GitHub ubuntu-24.04, 4 CPUs, loop filesystems), which drew two CPU types, AMD EPYC 7763 and Intel Xeon 6973P-C, with fsync-bound results up to about 1.7 times apart: each limit is about 1.5 times the slowest of the six. Workloads are budgeted in absolute time: the plain-directory baselines varied threefold between runners, so ratios against them are reported but not budgeted. The double record was removed afterwards (design §19.2 item 4): the two runs since made one record per boundary, and the mvdir budgets come from those four jobs.",
   "budgets": [
     {
       "match": {
@@ -100,7 +100,25 @@
       },
       "metric": "drain_s",
       "max": 720,
-      "why": "commit catch-up after 100k files, about 200k records with the double record (measured 119 to 484 s: about 130 s on Intel runners, 450 to 485 s on AMD ones)"
+      "why": "commit catch-up after 100k files, about 100k records (measured 157 to 464 s; 119 to 510 s with the double record): bound by the commits more than the records"
+    },
+    {
+      "match": {
+        "suite": "e2e",
+        "workload": "mvdir"
+      },
+      "metric": "agentfs",
+      "max": 0.1,
+      "why": "§3.1: rename of a directory of 100,000 files, one record, seconds (measured 23 to 24 ms)"
+    },
+    {
+      "match": {
+        "suite": "e2e",
+        "workload": "mvdir"
+      },
+      "metric": "drain_s",
+      "max": 15,
+      "why": "commit of that move and its reconciliation, seconds (measured 3.4 to 7.9 s)"
     },
     {
       "match": {
