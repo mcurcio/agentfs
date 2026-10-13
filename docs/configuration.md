@@ -555,6 +555,16 @@ git --git-dir /data/state/git config lfs.concurrenttransfers 16
 - **Restores** fetch every object they need before writing anything, all
   at once, from each remote in name order; a remote that lacks an object
   leaves it to the next one.
+- **Downloads resume by byte.** An object being downloaded is written to
+  `<state>/lfs/incomplete/<oid>`; when a download is interrupted (a
+  timeout, a killed process, a restart) the next one asks the server for
+  the rest with an HTTP `Range` request, and checks the SHA-256 of the
+  whole object at the end. A server that ignores `Range` sends everything
+  again. Each object is tried 3 times when the server cannot be reached.
+- **Uploads resume by object**: a failed push keeps the objects it
+  finished, and the next attempt sends only the rest. An object is never
+  uploaded halfway and continued later (no LFS server agentfs can test
+  supports git-lfs's experimental `tus` uploads).
 
 ### When uploads fail
 

@@ -1,19 +1,31 @@
 //! The local LFS object cache (design §2.2, §7): `<state>/lfs/objects/aa/bb/<oid>`,
 //! the layout git-lfs uses in `.git/lfs/objects`, plus `<state>/lfs/tmp`
-//! for objects being written.
+//! for objects being written and `<state>/lfs/incomplete/<oid>` for
+//! downloads that can resume.
 //!
 //! Objects are written to `tmp/`, fsynced, renamed into place and their
 //! directories fsynced, so an object that exists is whole and durable.
 //! Commits insert frozen copies from `pending/` (a reflink where the
-//! filesystem allows, as for freezing); restores insert downloads, hashed
-//! while they are written and refused unless they match. Nothing is ever
-//! pruned (design §7).
+//! filesystem allows, as for freezing); downloads are hashed while they
+//! are written and refused unless they match.
+//!
+//! **Resumable downloads** ([`Partial`]) write into `incomplete/<oid>`
+//! (mode 0600) under an exclusive `flock` on that file, so one process
+//! and thread at a time downloads an object; another waits, then finds it
+//! cached. A partial survives failures, commands and restarts: the next
+//! download hashes what is there and asks the server for the rest (HTTP
+//! `Range`). On completion its size and SHA-256 are checked, and it is
+//! fsynced and renamed into `objects/`; a mismatch deletes it. `open`
+//! clears `tmp/` but never `incomplete/`; only `agentfs lfs prune` removes
+//! partials nobody holds.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use rustix::fs::{FlockOperation, flock};
 
 use super::LfsError;
 use super::pointer::{Hashing, LfsOid, Pointer};
@@ -24,18 +36,16 @@ use crate::events::PushFailureKind;
 pub struct ObjectCache {
     objects: PathBuf,
     tmp: PathBuf,
+    incomplete: PathBuf,
 }
 
 impl ObjectCache {
     /// Opens (creating if needed) the cache at `dir` (`<state>/lfs`),
     /// removing whatever a crash left in `tmp/`.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
-        let dir = dir.into();
-        let objects = dir.join("objects");
-        let tmp = dir.join("tmp");
-        fs::create_dir_all(&objects)?;
-        fs::create_dir_all(&tmp)?;
-        for entry in fs::read_dir(&tmp)? {
+        let cache = Self::at(dir)?;
+        let tmp = &cache.tmp;
+        for entry in fs::read_dir(tmp)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 fs::remove_dir_all(entry.path())?;
@@ -43,7 +53,7 @@ impl ObjectCache {
                 fs::remove_file(entry.path())?;
             }
         }
-        Ok(Self { objects, tmp })
+        Ok(cache)
     }
 
     /// The cache at `dir` as another user of the same state area sees it
@@ -53,9 +63,69 @@ impl ObjectCache {
         let dir = dir.into();
         let objects = dir.join("objects");
         let tmp = dir.join("tmp");
+        let incomplete = dir.join("incomplete");
         fs::create_dir_all(&objects)?;
         fs::create_dir_all(&tmp)?;
-        Ok(Self { objects, tmp })
+        fs::create_dir_all(&incomplete)?;
+        Ok(Self {
+            objects,
+            tmp,
+            incomplete,
+        })
+    }
+
+    /// `<state>/lfs/incomplete`, where resumable downloads are written.
+    pub fn incomplete_dir(&self) -> &Path {
+        &self.incomplete
+    }
+
+    /// The resumable download of `pointer`'s object: its partial file,
+    /// locked for this caller (waiting while another holds it), with what
+    /// it holds already hashed. `None` once the object is cached (another
+    /// download finished it meanwhile).
+    pub fn partial(&self, pointer: &Pointer) -> Result<Option<Partial>, LfsError> {
+        let local = |e: io::Error| {
+            LfsError::local(format!(
+                "resuming the download of LFS object {}: {e}",
+                pointer.oid
+            ))
+        };
+        let path = self.incomplete.join(pointer.oid.to_string());
+        loop {
+            if self.contains(pointer) {
+                return Ok(None);
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&path)
+                .map_err(local)?;
+            flock(&file, FlockOperation::LockExclusive).map_err(|e| local(e.into()))?;
+            if self.contains(pointer) {
+                return Ok(None);
+            }
+            // The file locked must still be the one at the path: a holder
+            // that finished renamed it into objects/, or a prune removed
+            // it, while this caller waited.
+            let held = file.metadata().map_err(local)?;
+            match fs::metadata(&path) {
+                Ok(now) if now.ino() == held.ino() && now.dev() == held.dev() => {}
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(local(e)),
+            }
+            let mut partial = Partial {
+                file,
+                path,
+                pointer: *pointer,
+                hashing: Hashing::new(),
+            };
+            partial.rehash().map_err(local)?;
+            return Ok(Some(partial));
+        }
     }
 
     /// Where the object `oid` is (or would be).
@@ -173,6 +243,128 @@ impl ObjectCache {
             let _ = fs::remove_file(tmp);
         }
         result
+    }
+}
+
+/// A resumable download in `incomplete/<oid>`, locked by its holder
+/// ([`ObjectCache::partial`]).
+pub struct Partial {
+    file: File,
+    path: PathBuf,
+    pointer: Pointer,
+    hashing: Hashing,
+}
+
+impl Partial {
+    /// How many bytes it holds: where the download resumes.
+    pub fn offset(&self) -> u64 {
+        self.hashing.size()
+    }
+
+    /// Hashes what the file holds; one longer than the object cannot be
+    /// the object's start, so it is emptied.
+    fn rehash(&mut self) -> io::Result<()> {
+        self.hashing = Hashing::new();
+        let len = self.file.metadata()?.len();
+        if len > self.pointer.size {
+            return self.restart();
+        }
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut buf = vec![0u8; 64 << 10];
+        let mut left = len;
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            let n = self.file.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            self.hashing.update(&buf[..n]);
+            left -= n as u64;
+        }
+        // Whatever could not be read back is dropped.
+        let held = self.hashing.size();
+        self.file.set_len(held)?;
+        self.file.seek(SeekFrom::Start(held))?;
+        Ok(())
+    }
+
+    /// Empties it, for a download that starts again from the first byte.
+    pub fn restart(&mut self) -> io::Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.hashing = Hashing::new();
+        Ok(())
+    }
+
+    /// Appends everything `reader` gives, hashing it. A read error is
+    /// `unreachable` and keeps what arrived, for the next attempt; more
+    /// bytes than the object's size discard the partial (`refused`).
+    pub fn append(&mut self, reader: &mut dyn Read) -> Result<(), LfsError> {
+        let oid = self.pointer.oid;
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(LfsError::new(
+                        PushFailureKind::Unreachable,
+                        format!(
+                            "downloading LFS object {oid}: {e} (after {} of {} bytes; the \
+                             next attempt resumes)",
+                            self.offset(),
+                            self.pointer.size
+                        ),
+                    ));
+                }
+            };
+            if self.offset() + n as u64 > self.pointer.size {
+                self.discard();
+                return Err(mismatch(&self.pointer, "more bytes than its size"));
+            }
+            self.file.write_all(&buf[..n]).map_err(|e| {
+                LfsError::local(format!("writing LFS object {oid} to the cache: {e}"))
+            })?;
+            self.hashing.update(&buf[..n]);
+        }
+    }
+
+    /// Checks the whole object and moves it into the cache. Short: the
+    /// partial is kept (`unreachable`, to resume); the wrong content: it
+    /// is deleted (`refused`).
+    pub fn finish(mut self, cache: &ObjectCache) -> Result<(), LfsError> {
+        let pointer = self.pointer;
+        if self.offset() < pointer.size {
+            return Err(LfsError::new(
+                PushFailureKind::Unreachable,
+                format!(
+                    "the download of LFS object {} ended after {} of {} bytes; the next \
+                     attempt resumes",
+                    pointer.oid,
+                    self.offset(),
+                    pointer.size
+                ),
+            ));
+        }
+        let got = std::mem::replace(&mut self.hashing, Hashing::new()).finish();
+        if got != pointer {
+            self.discard();
+            return Err(mismatch(
+                &pointer,
+                &format!("{} bytes with oid {}", got.size, got.oid),
+            ));
+        }
+        let local = |e: io::Error| LfsError::local(format!("writing to the LFS cache: {e}"));
+        self.file.sync_all().map_err(local)?;
+        // Renamed while still locked: a waiter then finds the object cached.
+        publish_into(&cache.objects, &self.path, &pointer.oid).map_err(local)
+    }
+
+    /// Deletes the partial (while still holding its lock).
+    fn discard(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        self.hashing = Hashing::new();
     }
 }
 

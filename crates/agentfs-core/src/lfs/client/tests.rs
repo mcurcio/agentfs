@@ -575,3 +575,172 @@ fn download_many_keeps_going_past_a_missing_object() {
             .all(|r| r.as_ref().unwrap_err().kind == PushFailureKind::Unreachable)
     );
 }
+
+/// A server holding `content`, and a transfer to it.
+fn serving(content: &[u8]) -> (FakeLfs, Box<dyn Transfer>, Pointer) {
+    let server = FakeLfs::start();
+    let p = Pointer::of_reader(content).unwrap();
+    server.with(|st| st.objects.insert(p.oid.to_string(), content.to_vec()));
+    let mut r = remote("/unused");
+    let t = http(&server, &mut r);
+    (server, t, p)
+}
+
+/// The `Range` header of each download request, in order.
+fn ranges(server: &FakeLfs) -> Vec<Option<String>> {
+    server
+        .seen()
+        .into_iter()
+        .filter(|s| s.method == "GET")
+        .map(|s| s.header("range").map(str::to_owned))
+        .collect()
+}
+
+fn big(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+#[test]
+fn downloads_resume_with_range() {
+    let s = Setup::new();
+    let content = big(200_000);
+    let (server, t, p) = serving(&content);
+    // Cut off after 70000 bytes: the retry asks for the rest.
+    server.with(|st| st.truncate_next = vec![70_000]);
+    t.download(&p, &s.cache, REF).unwrap();
+    assert_eq!(fs::read(s.cache.path(&p.oid)).unwrap(), content);
+    assert_eq!(ranges(&server), [None, Some("bytes=70000-".into())]);
+    assert_eq!(fs::read_dir(s.cache.incomplete_dir()).unwrap().count(), 0);
+
+    // Every try cut off: the partial stays for the next call.
+    let s = Setup::new();
+    let (server, t, p) = serving(&content);
+    server.with(|st| st.truncate_next = vec![50_000, 1000, 0]);
+    let err = t.download(&p, &s.cache, REF).unwrap_err();
+    assert_eq!(err.kind, PushFailureKind::Unreachable, "{err}");
+    assert!(err.message.contains("resumes"), "{err}");
+    let partial = s.cache.incomplete_dir().join(p.oid.to_string());
+    assert_eq!(fs::metadata(&partial).unwrap().len(), 51_000);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(&partial).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        ranges(&server),
+        [
+            None,
+            Some("bytes=50000-".into()),
+            Some("bytes=51000-".into())
+        ]
+    );
+    // Another cache handle (another command) resumes it.
+    let again = ObjectCache::open(s.dir.path().join("lfs")).unwrap();
+    assert!(partial.exists(), "open clears tmp/, never incomplete/");
+    t.download(&p, &again, REF).unwrap();
+    assert_eq!(
+        ranges(&server).last().unwrap().as_deref(),
+        Some("bytes=51000-")
+    );
+    assert_eq!(fs::read(again.path(&p.oid)).unwrap(), content);
+    assert!(!partial.exists());
+}
+
+/// Leaves `n` bytes of `content` as `p`'s partial download.
+fn leave_partial(s: &Setup, p: &Pointer, bytes: &[u8]) {
+    fs::write(s.cache.incomplete_dir().join(p.oid.to_string()), bytes).unwrap();
+}
+
+#[test]
+fn odd_range_answers_start_again_from_zero() {
+    let content = big(100_000);
+    // lfs-test-server's Content-Range (the remaining length as the total)
+    // is accepted: only the start is checked.
+    let s = Setup::new();
+    let (server, t, p) = serving(&content);
+    server.with(|st| st.range_quirk = true);
+    leave_partial(&s, &p, &content[..30_000]);
+    t.download(&p, &s.cache, REF).unwrap();
+    assert_eq!(ranges(&server), [Some("bytes=30000-".into())]);
+    assert_eq!(fs::read(s.cache.path(&p.oid)).unwrap(), content);
+    // A server that ignores Range sends everything again: kept whole.
+    let s = Setup::new();
+    let (server, t, p) = serving(&content);
+    server.with(|st| st.ignore_range = true);
+    leave_partial(&s, &p, &content[..30_000]);
+    t.download(&p, &s.cache, REF).unwrap();
+    assert_eq!(ranges(&server), [Some("bytes=30000-".into())]);
+    assert_eq!(fs::read(s.cache.path(&p.oid)).unwrap(), content);
+    // A 206 that starts elsewhere: the partial is dropped and the whole
+    // object asked for once, without Range.
+    let s = Setup::new();
+    let (server, t, p) = serving(&content);
+    server.with(|st| st.wrong_range_start = true);
+    leave_partial(&s, &p, &content[..30_000]);
+    t.download(&p, &s.cache, REF).unwrap();
+    assert_eq!(ranges(&server), [Some("bytes=30000-".into()), None]);
+    assert_eq!(fs::read(s.cache.path(&p.oid)).unwrap(), content);
+    // A partial longer than the object is emptied first.
+    let s = Setup::new();
+    let (server, t, p) = serving(&content);
+    let mut long = content.clone();
+    long.push(0);
+    leave_partial(&s, &p, &long);
+    t.download(&p, &s.cache, REF).unwrap();
+    assert_eq!(ranges(&server), [None]);
+    assert_eq!(fs::read(s.cache.path(&p.oid)).unwrap(), content);
+}
+
+#[test]
+fn a_corrupt_partial_is_discarded() {
+    let s = Setup::new();
+    let content = big(100_000);
+    let (server, t, p) = serving(&content);
+    let mut wrong = content[..40_000].to_vec();
+    wrong[10] ^= 1;
+    leave_partial(&s, &p, &wrong);
+    let err = t.download(&p, &s.cache, REF).unwrap_err();
+    assert_eq!(err.kind, PushFailureKind::Refused, "{err}");
+    assert!(!s.cache.contains(&p));
+    assert_eq!(fs::read_dir(s.cache.incomplete_dir()).unwrap().count(), 0);
+    // The next try starts from zero.
+    t.download(&p, &s.cache, REF).unwrap();
+    assert_eq!(ranges(&server), [Some("bytes=40000-".into()), None]);
+    assert_eq!(fs::read(s.cache.path(&p.oid)).unwrap(), content);
+}
+
+#[test]
+fn downloads_are_tried_three_times() {
+    let s = Setup::new();
+    let content = big(10_000);
+    let (server, t, p) = serving(&content);
+    server.with(|st| st.truncate_next = vec![0, 0, 0, 0]);
+    let err = t.download(&p, &s.cache, REF).unwrap_err();
+    assert_eq!(err.kind, PushFailureKind::Unreachable, "{err}");
+    assert_eq!(ranges(&server).len(), DOWNLOAD_TRIES);
+    // A refusal is not retried.
+    let s = Setup::new();
+    let (server, t, p) = serving(&content);
+    server.with(|st| st.corrupt_downloads = true);
+    assert_eq!(
+        t.download(&p, &s.cache, REF).unwrap_err().kind,
+        PushFailureKind::Refused
+    );
+    assert_eq!(ranges(&server).len(), 1);
+}
+
+#[test]
+fn concurrent_downloads_of_one_object_take_turns() {
+    let s = Setup::new();
+    let content = big(300_000);
+    let (server, t, p) = serving(&content);
+    server.with(|st| st.delay = Duration::from_millis(50));
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| t.download(&p, &s.cache, REF).unwrap());
+        }
+    });
+    assert_eq!(fs::read(s.cache.path(&p.oid)).unwrap(), content);
+    // One downloaded it; the others found it cached once they had the lock.
+    assert_eq!(ranges(&server).len(), 1);
+}

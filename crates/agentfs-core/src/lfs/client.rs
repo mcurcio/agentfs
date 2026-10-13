@@ -9,7 +9,10 @@
 //!   `lfs.concurrenttransfers` objects move at once ([`super::pool`]).
 //!   An upload stops starting objects at its first failure and lets those
 //!   in flight finish, so the next attempt sends only what is left (the
-//!   batch API skips objects the server has).
+//!   batch API skips objects the server has). Downloads resume by byte
+//!   from the cache's partial file ([`super::cache::Partial`]) with HTTP
+//!   `Range`, and an object is tried [`DOWNLOAD_TRIES`] times when the
+//!   server cannot be reached.
 //! - [`FileTransfer`]: git-lfs's standalone-file layout for local and
 //!   `file://` remotes, `<git dir>/lfs/objects/aa/bb/<oid>`.
 //!
@@ -63,6 +66,16 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MIN_RATE: u64 = 256 << 10;
 /// The largest batch response read.
 const MAX_BATCH_RESPONSE: u64 = 16 << 20;
+/// How many times a download of one object is tried when the server
+/// cannot be reached, each resuming where the last stopped.
+pub const DOWNLOAD_TRIES: usize = 3;
+/// The pauses between those tries.
+#[cfg(not(test))]
+const RETRY_PAUSES: [Duration; DOWNLOAD_TRIES - 1] =
+    [Duration::from_secs(1), Duration::from_secs(2)];
+#[cfg(test)]
+const RETRY_PAUSES: [Duration; DOWNLOAD_TRIES - 1] =
+    [Duration::from_millis(10), Duration::from_millis(20)];
 
 /// What an upload did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -537,25 +550,80 @@ impl HttpTransfer {
         Ok(())
     }
 
+    /// Downloads one object, resuming its partial download if there is
+    /// one, and retrying a failure to reach the server up to
+    /// [`DOWNLOAD_TRIES`] times in all, each from where the last stopped.
     fn get(&self, pointer: &Pointer, action: &Action, cache: &ObjectCache) -> Result<(), LfsError> {
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            match self.get_once(pointer, action, cache) {
+                Err(e) if e.kind == PushFailureKind::Unreachable && tries < DOWNLOAD_TRIES => {
+                    std::thread::sleep(RETRY_PAUSES[tries - 1]);
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// One download attempt (design §7): with `Range: bytes=<n>-` when
+    /// `n` bytes are already in the partial. A `206` must start at `n`
+    /// (only the start is checked: lfs-test-server reports the remaining
+    /// length as the total); a `200` starts again from the first byte; a
+    /// `416` or a `206` starting elsewhere drops the partial and asks once
+    /// more for the whole object, without `Range`.
+    fn get_once(
+        &self,
+        pointer: &Pointer,
+        action: &Action,
+        cache: &ObjectCache,
+    ) -> Result<(), LfsError> {
         self.check_href(&action.href)?;
-        let mut request = self.agent.get(&action.href);
-        for (k, v) in self.action_headers(action)? {
-            request = request.header(k, v);
+        let Some(mut partial) = cache.partial(pointer)? else {
+            return Ok(()); // Another download finished it.
+        };
+        let local = |e: io::Error| LfsError::local(format!("writing to the LFS cache: {e}"));
+        let mut whole = false;
+        loop {
+            let offset = if whole { 0 } else { partial.offset() };
+            let mut request = self.agent.get(&action.href);
+            for (k, v) in self.action_headers(action)? {
+                request = request.header(k, v);
+            }
+            if offset > 0 {
+                request = request.header("Range", format!("bytes={offset}-"));
+            }
+            let response = request
+                .config()
+                .timeout_global(Some(object_timeout(pointer.size - offset)))
+                .build()
+                .call()
+                .map_err(|e| self.transport_error("download", e))?;
+            let status = response.status().as_u16();
+            let resumes = status == 206
+                && offset > 0
+                && content_range_start(response.headers()) == Some(offset);
+            match status {
+                200 => partial.restart().map_err(local)?,
+                206 if resumes => {}
+                206 | 416 if !whole && offset > 0 => {
+                    partial.restart().map_err(local)?;
+                    whole = true;
+                    continue;
+                }
+                _ => {
+                    let body = read_small(response);
+                    return Err(self.status_error(
+                        &format!("download of {}", pointer.oid),
+                        status,
+                        &body,
+                    ));
+                }
+            }
+            let mut reader = response.into_body().into_reader();
+            partial.append(&mut reader)?;
+            return partial.finish(cache);
         }
-        let response = request
-            .config()
-            .timeout_global(Some(object_timeout(pointer.size)))
-            .build()
-            .call()
-            .map_err(|e| self.transport_error("download", e))?;
-        let status = response.status().as_u16();
-        if status != 200 {
-            let body = read_small(response);
-            return Err(self.status_error(&format!("download of {}", pointer.oid), status, &body));
-        }
-        let mut reader = response.into_body().into_reader();
-        cache.insert_verified(pointer, &mut reader)
     }
 
     fn transport_error(&self, what: &str, e: ureq::Error) -> LfsError {
@@ -840,6 +908,14 @@ fn is_certificate_error(text: &str) -> bool {
         || text.contains("unable to get local issuer certificate")
         || text.contains("certificate has expired")
         || text.contains("hostname mismatch")
+}
+
+/// The first byte of a `206` response's `Content-Range: bytes <a>-<b>/<n>`.
+fn content_range_start(headers: &ureq::http::HeaderMap) -> Option<u64> {
+    let value = headers.get("content-range")?.to_str().ok()?.trim();
+    let range = value.strip_prefix("bytes")?.trim_start();
+    let (start, _) = range.split_once('-')?;
+    start.trim().parse().ok()
 }
 
 /// Up to 4 KiB of an error response's body.

@@ -54,6 +54,18 @@ pub(crate) struct State {
     pub max_in_flight: usize,
     /// The status of a `PUT` of these oids (nothing is stored).
     pub put_status: HashMap<String, u16>,
+    /// Cut the next download off after this many bytes of its body (the
+    /// headers announce them all), then close the connection.
+    /// Each entry is used by one download, in order.
+    pub truncate_next: Vec<usize>,
+    /// Serve `Range` requests as lfs-test-server does: `206` with
+    /// `Content-Range: bytes <n>-<last>/<size - n>`. Otherwise as RFC
+    /// 9110 says (the total is the size).
+    pub range_quirk: bool,
+    /// Ignore `Range` and send the whole object with `200`.
+    pub ignore_range: bool,
+    /// Answer `Range` with a `206` that starts one byte later than asked.
+    pub wrong_range_start: bool,
 }
 
 pub(crate) struct FakeLfs {
@@ -108,6 +120,8 @@ struct Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// Send only this many bytes of the body, then close.
+    truncate: Option<usize>,
 }
 
 fn json(status: u16, value: serde_json::Value) -> Response {
@@ -115,6 +129,7 @@ fn json(status: u16, value: serde_json::Value) -> Response {
         status,
         headers: vec![("Content-Type".into(), "application/vnd.git-lfs+json".into())],
         body: serde_json::to_vec(&value).unwrap(),
+        truncate: None,
     }
 }
 
@@ -184,7 +199,11 @@ fn serve(stream: TcpStream, state: &Mutex<State>, port: u16, other_port: u16) {
         response.body.len()
     ));
     let _ = out.write_all(head.as_bytes());
-    let _ = out.write_all(&response.body);
+    let body = match response.truncate {
+        Some(n) => &response.body[..n.min(response.body.len())],
+        None => &response.body[..],
+    };
+    let _ = out.write_all(body);
     let _ = out.flush();
 }
 
@@ -203,6 +222,7 @@ fn route(state: &mut State, seen: &Seen, body: &[u8], port: u16, other_port: u16
                 status: 302,
                 headers: vec![("Location".into(), format!("{base}/elsewhere/objects/batch"))],
                 body: Vec::new(),
+                truncate: None,
             };
         }
         if let Some(status) = state.batch_status {
@@ -281,10 +301,47 @@ fn route(state: &mut State, seen: &Seen, body: &[u8], port: u16, other_port: u16
         if state.corrupt_downloads && !content.is_empty() {
             content[0] ^= 1;
         }
+        let size = content.len();
+        let mut headers = vec![("Content-Type".into(), "application/octet-stream".into())];
+        let mut status = 200;
+        let range = seen
+            .header("range")
+            .and_then(|r| r.strip_prefix("bytes="))
+            .and_then(|r| r.strip_suffix('-'))
+            .and_then(|r| r.parse::<usize>().ok());
+        if let Some(start) = range
+            && !state.ignore_range
+        {
+            if start >= size {
+                return Response {
+                    status: 416,
+                    headers: vec![("Content-Range".into(), format!("bytes */{size}"))],
+                    body: Vec::new(),
+                    truncate: None,
+                };
+            }
+            let start = if state.wrong_range_start {
+                (start + 1).min(size - 1)
+            } else {
+                start
+            };
+            let total = if state.range_quirk {
+                size - start
+            } else {
+                size
+            };
+            headers.push((
+                "Content-Range".into(),
+                format!("bytes {start}-{}/{total}", size - 1),
+            ));
+            content = content[start..].to_vec();
+            status = 206;
+        }
         return Response {
-            status: 200,
-            headers: vec![("Content-Type".into(), "application/octet-stream".into())],
+            status,
+            headers,
             body: content,
+            truncate: (!state.truncate_next.is_empty()).then(|| state.truncate_next.remove(0)),
         };
     }
     json(404, serde_json::json!({"message": "not found"}))

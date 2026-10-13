@@ -7,6 +7,12 @@
 # 12. lfs.concurrenttransfers: downloads overlap with 4, never with 1;
 #     many objects uploaded at once all reach the server, and git-lfs
 #     pulls them back.
+# 13. uploads resume by object: one object's PUT fails, the others reach
+#     the server and the branch does not move; the next push sends only
+#     that object;
+# 14. downloads resume by byte: a download killed halfway leaves a partial
+#     in <state>/lfs/incomplete/, and the next one asks for the rest with
+#     Range (lfs-test-server answers 206).
 #
 # Needs ci/git-http-server.sh started with GIT_SERVER_LFS=1, ci/lfs-server.sh,
 # and git-lfs.
@@ -121,5 +127,63 @@ git -C "$CLONE" config lfs.url "http://lfsbob:lfspw@127.0.0.1:8081/acme/conc"
 git -C "$CLONE" lfs pull
 diff -r "$CLONE/many" "$TREE/many" >/dev/null || fail "git lfs pull gives other content"
 pass "git lfs pull reproduces the 20 objects"
+
+step "13. uploads resume by object"
+lfs_volume resume
+mkdir -p "$TREE/r"
+for i in 1 2 3 4 5; do head -c 5000 /dev/urandom >"$TREE/r/$i.bin"; done
+agentfs record r/1.bin r/2.bin r/3.bin r/4.bin r/5.bin
+FAILING=$(oid_of r/3.bin)
+lfs_faults "$(lfs_location "^/acme/resume/objects/$FAILING\$" 'if ($request_method = PUT) { return 503; }')"
+set +e
+out=$(agentfs push --remote sep 2>&1); code=$?
+set -e
+assert_eq 1 "$code" "the push fails"
+assert_contains "$out" "sep: failed (unreachable, stage lfs)" "a 503 for one object is unreachable at stage lfs"
+assert_eq "" "$(remote_ref "$REPO" refs/heads/agentfs/resume)" "the branch was not pushed"
+on_lfs_host "$FAILING" && fail "the failing object reached the server"
+for i in 1 2 4 5; do
+  on_lfs_host "$(oid_of "r/$i.bin")" || fail "r/$i.bin did not reach the server"
+done
+pass "the other four objects are on the server"
+lfs_faults ""
+before=$(log_lines)
+agentfs push --remote sep
+puts=$(log_since "$before" | awk '$2 == 8081 && $4 == "\"PUT"')
+assert_eq 1 "$(grep -c . <<<"$puts")" "the next push uploads one object"
+assert_contains "$puts" "$FAILING" "the one that failed"
+assert_eq "$(local_head resume)" "$(remote_ref "$REPO" refs/heads/agentfs/resume)" "the branch is pushed"
+
+step "14. downloads resume by byte"
+head -c $((4 << 20)) /dev/urandom >"$TREE/huge.bin"
+cp "$TREE/huge.bin" "$VOL/huge.orig"
+agentfs record huge.bin
+agentfs push --remote sep
+SOURCE=$(local_head resume)
+HUGE=$(oid_of huge.bin)
+rm "$TREE/huge.bin"
+agentfs record huge.bin
+rm -rf "$STATE/lfs/objects"
+lfs_faults "$(lfs_location "^/acme/resume/objects/$HUGE\$" 'limit_rate 256k;')"
+PARTIAL=$STATE/lfs/incomplete/$HUGE
+agentfs_start "$VOL/restore.log" restore huge.bin "$SOURCE"
+wait_for 60 sh -c "[ \"\$(stat -c %s '$PARTIAL' 2>/dev/null || echo 0)\" -gt $((512 << 10)) ]" ||
+  fail "no partial download grew past 512 KiB: $(cat "$VOL/restore.log")"
+kill -9 "$AGENTFS_PID"
+wait "$AGENTFS_PID" 2>/dev/null || true
+held=$(stat -c %s "$PARTIAL")
+[ "$held" -lt $((4 << 20)) ] || fail "the download finished before it was killed"
+pass "a killed download left $held bytes in lfs/incomplete"
+[ -e "$TREE/huge.bin" ] && fail "the killed restore wrote huge.bin"
+lfs_faults ""
+before=$(wc -l <"$GIT_SERVER_LFS_RANGE_LOG")
+agentfs restore huge.bin "$SOURCE"
+cmp "$TREE/huge.bin" "$VOL/huge.orig" && pass "the restore completed with the right content"
+ranged=$(tail -n +"$((before + 1))" "$GIT_SERVER_LFS_RANGE_LOG" | grep "objects/$HUGE" || true)
+held_now=$(grep -o '"bytes=[0-9]*-"' <<<"$ranged" | head -n1 | tr -dc 0-9)
+[ -n "$held_now" ] && [ "$held_now" -ge "$held" ] || fail "no Range request resumed the download: $ranged"
+assert_contains "$ranged" " 206 \"bytes=$held_now-\"" "lfs-test-server answered the Range with 206"
+assert_eq "$HUGE" "$(sha256sum "$STATE/lfs/objects/${HUGE:0:2}/${HUGE:2:2}/$HUGE" | cut -d' ' -f1)" "the cached object's hash"
+assert_eq 0 "$(find "$STATE/lfs/incomplete" -type f | wc -l)" "lfs/incomplete is empty"
 
 step "all LFS transfer checks passed"
