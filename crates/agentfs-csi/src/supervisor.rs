@@ -204,6 +204,15 @@ fn io_error(what: impl std::fmt::Display) -> impl FnOnce(io::Error) -> Error {
     move |e| Error::io(what, e)
 }
 
+/// Whether something is at `path`. Only `NotFound` means absent: a stale
+/// FUSE mount answers `stat` with `ENOTCONN`, and it is very much there.
+pub(crate) fn exists(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    }
+}
+
 impl Supervisor {
     pub fn new(
         cfg: NodeConfig,
@@ -837,7 +846,7 @@ impl Supervisor {
         let target = record.target.clone();
         let key = target_key(&target);
         let source = self.layout().front_source(&handle, &key);
-        if fs::symlink_metadata(&target).is_err() {
+        if !exists(&target) {
             eprintln!(
                 "{} is gone; forgetting the front for {}",
                 target.display(),
@@ -877,7 +886,7 @@ impl Supervisor {
             f.child.spawned.clone()
         });
         // The target first, so the front's final sweep sees no new opens.
-        if fs::symlink_metadata(target).is_ok() {
+        if exists(target) {
             self.detach_all(target).await?;
         }
         if let Some(spawned) = child {
@@ -890,7 +899,7 @@ impl Supervisor {
             self.children().fronts.remove(target);
         }
         let source = self.layout().front_source(handle, &key);
-        if fs::symlink_metadata(&source).is_ok() {
+        if exists(&source) {
             self.detach_all(&source).await?;
             let _ = fs::remove_dir(&source);
         }
@@ -955,7 +964,7 @@ impl Supervisor {
             let key = target_key(&rec.target);
             let path = layout.published_record(&rec.handle, &key);
             let staged = self.children().services.contains_key(&rec.handle);
-            let state = if fs::symlink_metadata(&rec.target).is_ok() {
+            let state = if exists(&rec.target) {
                 self.mount_state(&rec.target).await.ok()
             } else {
                 None
