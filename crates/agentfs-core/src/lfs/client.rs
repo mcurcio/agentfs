@@ -4,8 +4,12 @@
 //! - [`HttpTransfer`]: the git-lfs batch API (`POST <endpoint>/objects/batch`)
 //!   with the `basic` transfer adapter only, over `ureq`: uploads (a `PUT`
 //!   of the cached object, then `verify` when the server asks for it) and
-//!   downloads (a `GET`, hashed as it is written into the cache).
-//!   Sequential, in batches of [`BATCH_SIZE`].
+//!   downloads (a `GET`, hashed as it is written into the cache). Batches
+//!   of [`BATCH_SIZE`] run in sequence; within a batch, up to
+//!   `lfs.concurrenttransfers` objects move at once ([`super::pool`]).
+//!   An upload stops starting objects at its first failure and lets those
+//!   in flight finish, so the next attempt sends only what is left (the
+//!   batch API skips objects the server has).
 //! - [`FileTransfer`]: git-lfs's standalone-file layout for local and
 //!   `file://` remotes, `<git dir>/lfs/objects/aa/bb/<oid>`.
 //!
@@ -39,6 +43,7 @@ use serde::Deserialize;
 
 use super::cache::{ObjectCache, object_path, publish_into};
 use super::endpoint::{Direction, EndpointAuth, EndpointKind, LfsEndpoint, resolve};
+use super::pool;
 use super::{LfsError, Pointer};
 use crate::config::{RemoteSettings, Settings};
 use crate::credentials::{Credential, CredentialFile};
@@ -70,11 +75,16 @@ pub struct UploadReport {
     pub bytes: u64,
 }
 
+/// How many objects of an upload missing from the cache a message names.
+const NAMED_MISSING: usize = 5;
+
 /// One remote's LFS storage.
-pub trait Transfer: Send {
-    /// Makes sure the server has every object in `objects` (all in
-    /// `cache`), uploading those it lacks. `ref_name` is the ref being
-    /// pushed, for servers that authorize by ref.
+pub trait Transfer: Send + Sync {
+    /// Makes sure the server has every object in `objects`, uploading
+    /// those it lacks from `cache`. Only the objects the server asks for
+    /// need to be cached: one it lacks that is not in the cache fails the
+    /// upload as `local` before anything is sent. `ref_name` is the ref
+    /// being pushed, for servers that authorize by ref.
     fn upload(
         &self,
         objects: &[Pointer],
@@ -82,16 +92,86 @@ pub trait Transfer: Send {
         ref_name: &str,
     ) -> Result<UploadReport, LfsError>;
 
+    /// Downloads each object of `pointers` that `cache` lacks into it,
+    /// checking its hash, up to `lfs.concurrenttransfers` at once. One
+    /// result per pointer, in order.
+    fn download_many(
+        &self,
+        pointers: &[Pointer],
+        cache: &ObjectCache,
+        ref_name: &str,
+    ) -> Vec<Result<(), LfsError>>;
+
     /// Downloads `pointer`'s object into `cache`, checking its hash.
     fn download(
         &self,
         pointer: &Pointer,
         cache: &ObjectCache,
         ref_name: &str,
-    ) -> Result<(), LfsError>;
+    ) -> Result<(), LfsError> {
+        self.download_many(std::slice::from_ref(pointer), cache, ref_name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err(LfsError::local("the download gave no result")))
+    }
+
+    /// Whether the endpoint holds each object of `pointers` for
+    /// `direction`: for uploads, the server asks for no upload of it; for
+    /// downloads, it offers one. Nothing is transferred. An object the
+    /// server reports missing (404) is `false`; any other problem fails
+    /// the whole call.
+    fn present(
+        &self,
+        pointers: &[Pointer],
+        direction: Direction,
+        ref_name: &str,
+    ) -> Result<Vec<bool>, LfsError>;
 
     /// Where the objects go.
     fn endpoint(&self) -> &LfsEndpoint;
+}
+
+/// Whether a download failure says the endpoint, not one object, is the
+/// problem: then no further object is started from it.
+fn stops_downloads(e: &LfsError) -> bool {
+    e.kind != PushFailureKind::Refused
+}
+
+/// The error for objects an upload or download never started because an
+/// earlier one failed.
+fn not_started(first: Option<&LfsError>) -> LfsError {
+    match first {
+        Some(e) => LfsError::new(
+            e.kind,
+            format!("not attempted after an earlier failure: {e}"),
+        ),
+        None => LfsError::local("not attempted"),
+    }
+}
+
+/// Fails an upload whose server asks for objects missing from the cache.
+fn missing_from_cache(missing: &[&Pointer], endpoint: &LfsEndpoint) -> LfsError {
+    let named: Vec<String> = missing
+        .iter()
+        .take(NAMED_MISSING)
+        .map(|p| format!("{} ({} bytes)", p.oid, p.size))
+        .collect();
+    let more = missing.len().saturating_sub(NAMED_MISSING);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    let mut error = LfsError::local(format!(
+        "{} lacks {} LFS object(s) missing from the local cache, so they cannot be \
+         uploaded: {}{more}; run `agentfs lfs fetch --all` to bring them back from another \
+         remote",
+        endpoint.display_url,
+        missing.len(),
+        named.join(", ")
+    ));
+    error.missing = missing.iter().map(|p| p.oid).collect();
+    error
 }
 
 /// The transfer for `remote`'s endpoint in `direction`.
@@ -101,8 +181,13 @@ pub fn transfer_for(
     direction: Direction,
 ) -> Result<Box<dyn Transfer>, LfsError> {
     let endpoint = resolve(settings, remote, direction)?;
+    let concurrency = settings.lfs.concurrent_transfers;
     match &endpoint.kind {
-        EndpointKind::Http { .. } => Ok(Box::new(HttpTransfer::new(endpoint, &remote.name)?)),
+        EndpointKind::Http { .. } => Ok(Box::new(HttpTransfer::new(
+            endpoint,
+            &remote.name,
+            concurrency,
+        )?)),
         EndpointKind::File { git_dir } => Ok(Box::new(FileTransfer {
             objects: git_dir.join("lfs").join("objects"),
             tmp: git_dir.join("lfs").join("tmp"),
@@ -130,6 +215,8 @@ pub struct HttpTransfer {
     credentials: Credentials,
     agent: ureq::Agent,
     remote: String,
+    /// Objects moved at once (`lfs.concurrenttransfers`).
+    concurrency: usize,
 }
 
 /// A batch response (git-lfs `docs/api/batch.md`).
@@ -160,7 +247,7 @@ struct Actions {
     download: Option<Action>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Action {
     href: String,
     #[serde(default)]
@@ -176,8 +263,9 @@ struct ObjectError {
 }
 
 impl HttpTransfer {
-    /// A client for `endpoint`, an [`EndpointKind::Http`].
-    pub fn new(endpoint: LfsEndpoint, remote: &str) -> Result<Self, LfsError> {
+    /// A client for `endpoint`, an [`EndpointKind::Http`], moving up to
+    /// `concurrency` objects at once.
+    pub fn new(endpoint: LfsEndpoint, remote: &str, concurrency: usize) -> Result<Self, LfsError> {
         let EndpointKind::Http { url, auth } = &endpoint.kind else {
             return Err(LfsError::local("not an http(s) LFS endpoint"));
         };
@@ -206,13 +294,15 @@ impl HttpTransfer {
                 password: password.clone(),
             }),
         };
+        let concurrency = concurrency.max(1);
         Ok(Self {
-            agent: agent(),
+            agent: agent(concurrency),
             url,
             origin,
             credentials,
             remote: remote.to_owned(),
             endpoint,
+            concurrency,
         })
     }
 
@@ -511,6 +601,83 @@ impl HttpTransfer {
     }
 }
 
+/// One object to upload: its upload action and verify action, if any.
+type Upload<'a> = (&'a Pointer, Action, Option<Action>);
+
+impl HttpTransfer {
+    /// The objects of one batch response the server wants uploaded, with
+    /// their upload and verify actions.
+    fn uploads_of<'a>(
+        &self,
+        response: &BatchResponse,
+        chunk: &'a [Pointer],
+    ) -> Result<Vec<Upload<'a>>, LfsError> {
+        let mut todo = Vec::new();
+        for pointer in chunk {
+            let object = self.object(response, pointer)?;
+            let actions = object.actions.as_ref();
+            // No upload action: the server has it already.
+            let Some(upload) = actions.and_then(|a| a.upload.as_ref()) else {
+                continue;
+            };
+            let verify = actions.and_then(|a| a.verify.clone());
+            todo.push((pointer, upload.clone(), verify));
+        }
+        Ok(todo)
+    }
+
+    /// Downloads one batch's objects (all missing from `cache`).
+    fn download_batch(
+        &self,
+        chunk: &[Pointer],
+        cache: &ObjectCache,
+        ref_name: &str,
+    ) -> Vec<Result<(), LfsError>> {
+        let response = match self.batch("download", chunk, ref_name) {
+            Ok(response) => response,
+            Err(e) => return chunk.iter().map(|_| Err(e.clone())).collect(),
+        };
+        let mut results: Vec<Option<Result<(), LfsError>>> = vec![None; chunk.len()];
+        let mut todo = Vec::new();
+        for (index, pointer) in chunk.iter().enumerate() {
+            let action = self.object(&response, pointer).and_then(|object| {
+                object
+                    .actions
+                    .as_ref()
+                    .and_then(|a| a.download.clone())
+                    .ok_or_else(|| {
+                        LfsError::new(
+                            PushFailureKind::Refused,
+                            format!(
+                                "the LFS server at {} offered no download of object {}",
+                                self.display(),
+                                pointer.oid
+                            ),
+                        )
+                    })
+            });
+            match action {
+                Ok(action) => todo.push((index, pointer, action)),
+                Err(e) => results[index] = Some(Err(e)),
+            }
+        }
+        let done = pool::run(
+            &todo,
+            self.concurrency,
+            stops_downloads,
+            |(_, pointer, action)| self.get(pointer, action, cache),
+        );
+        let first = pool::first_error(&done).cloned();
+        for ((index, _, _), result) in todo.iter().zip(done) {
+            results[*index] = Some(result.unwrap_or_else(|| Err(not_started(first.as_ref()))));
+        }
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(not_started(first.as_ref()))))
+            .collect()
+    }
+}
+
 impl Transfer for HttpTransfer {
     fn upload(
         &self,
@@ -524,43 +691,110 @@ impl Transfer for HttpTransfer {
         };
         for chunk in objects.chunks(BATCH_SIZE) {
             let response = self.batch("upload", chunk, ref_name)?;
-            for pointer in chunk {
-                let object = self.object(&response, pointer)?;
-                let actions = object.actions.as_ref();
-                // No upload action: the server has it already.
-                let Some(upload) = actions.and_then(|a| a.upload.as_ref()) else {
-                    continue;
-                };
-                self.put(pointer, upload, cache)?;
-                if let Some(verify) = actions.and_then(|a| a.verify.as_ref()) {
-                    self.verify(pointer, verify)?;
-                }
+            let todo = self.uploads_of(&response, chunk)?;
+            let missing: Vec<&Pointer> = todo
+                .iter()
+                .map(|(p, _, _)| *p)
+                .filter(|p| !cache.contains(p))
+                .collect();
+            if !missing.is_empty() {
+                return Err(missing_from_cache(&missing, &self.endpoint));
+            }
+            let done = pool::run(
+                &todo,
+                self.concurrency,
+                |_| true,
+                |(pointer, upload, verify)| {
+                    self.put(pointer, upload, cache)?;
+                    if let Some(verify) = verify {
+                        self.verify(pointer, verify)?;
+                    }
+                    Ok(pointer.size)
+                },
+            );
+            for size in done.iter().flatten().flatten() {
                 report.uploaded += 1;
-                report.bytes += pointer.size;
+                report.bytes += size;
+            }
+            if let Some(e) = pool::first_error(&done) {
+                return Err(e.clone());
             }
         }
         Ok(report)
     }
 
-    fn download(
+    fn download_many(
         &self,
-        pointer: &Pointer,
+        pointers: &[Pointer],
         cache: &ObjectCache,
         ref_name: &str,
-    ) -> Result<(), LfsError> {
-        let response = self.batch("download", std::slice::from_ref(pointer), ref_name)?;
-        let object = self.object(&response, pointer)?;
-        let Some(download) = object.actions.as_ref().and_then(|a| a.download.as_ref()) else {
-            return Err(LfsError::new(
-                PushFailureKind::Refused,
-                format!(
-                    "the LFS server at {} offered no download of object {}",
-                    self.display(),
-                    pointer.oid
-                ),
-            ));
-        };
-        self.get(pointer, download, cache)
+    ) -> Vec<Result<(), LfsError>> {
+        let mut results: Vec<Option<Result<(), LfsError>>> = vec![None; pointers.len()];
+        let wanted: Vec<(usize, Pointer)> = pointers
+            .iter()
+            .enumerate()
+            .filter(|(index, p)| {
+                if cache.contains(p) {
+                    results[*index] = Some(Ok(()));
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(|(index, p)| (index, *p))
+            .collect();
+        let mut stopped: Option<LfsError> = None;
+        for chunk in wanted.chunks(BATCH_SIZE) {
+            let pointers: Vec<Pointer> = chunk.iter().map(|(_, p)| *p).collect();
+            let done = match &stopped {
+                Some(e) => pointers.iter().map(|_| Err(not_started(Some(e)))).collect(),
+                None => self.download_batch(&pointers, cache, ref_name),
+            };
+            for ((index, _), result) in chunk.iter().zip(done) {
+                if let Err(e) = &result
+                    && stopped.is_none()
+                    && stops_downloads(e)
+                {
+                    stopped = Some(e.clone());
+                }
+                results[*index] = Some(result);
+            }
+        }
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(not_started(None))))
+            .collect()
+    }
+
+    fn present(
+        &self,
+        pointers: &[Pointer],
+        direction: Direction,
+        ref_name: &str,
+    ) -> Result<Vec<bool>, LfsError> {
+        let mut out = Vec::with_capacity(pointers.len());
+        for chunk in pointers.chunks(BATCH_SIZE) {
+            let response = self.batch(direction.operation(), chunk, ref_name)?;
+            for pointer in chunk {
+                let oid = pointer.oid.to_string();
+                let object = response.objects.iter().find(|o| o.oid == oid);
+                if let Some(BatchObject {
+                    error: Some(ObjectError { code: 404, .. }),
+                    ..
+                }) = object
+                {
+                    out.push(false);
+                    continue;
+                }
+                let object = self.object(&response, pointer)?;
+                let actions = object.actions.as_ref();
+                out.push(match direction {
+                    Direction::Upload => actions.and_then(|a| a.upload.as_ref()).is_none(),
+                    Direction::Download => actions.and_then(|a| a.download.as_ref()).is_some(),
+                });
+            }
+        }
+        Ok(out)
     }
 
     fn endpoint(&self) -> &LfsEndpoint {
@@ -568,13 +802,15 @@ impl Transfer for HttpTransfer {
     }
 }
 
-/// The HTTP client: no redirects, no proxy, the timeouts above, and with
-/// the `https` feature native-tls over the system trust store, as libgit2
-/// uses.
-fn agent() -> ureq::Agent {
+/// The HTTP client: no redirects, no proxy, the timeouts above, an idle
+/// connection kept per concurrent transfer, and with the `https` feature
+/// native-tls over the system trust store, as libgit2 uses.
+fn agent(concurrency: usize) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
+        .max_idle_connections_per_host(concurrency)
+        .max_idle_connections(concurrency.max(3))
         .proxy(None)
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .user_agent(concat!("agentfs/", env!("CARGO_PKG_VERSION")));
@@ -653,10 +889,10 @@ impl FileTransfer {
         )
     }
 
-    /// Copies one cached object into the remote's objects directory.
+    /// Copies one cached object into the remote's objects directory,
+    /// unless it is there already.
     fn put(&self, pointer: &Pointer, cache: &ObjectCache) -> Result<bool, LfsError> {
-        let dest = object_path(&self.objects, &pointer.oid);
-        if fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == pointer.size) {
+        if self.has(pointer) {
             return Ok(false);
         }
         let mut src = cache.open_object(pointer).map_err(|e| {
@@ -697,32 +933,8 @@ impl FileTransfer {
     }
 }
 
-impl Transfer for FileTransfer {
-    fn upload(
-        &self,
-        objects: &[Pointer],
-        cache: &ObjectCache,
-        _ref_name: &str,
-    ) -> Result<UploadReport, LfsError> {
-        let mut report = UploadReport {
-            objects: objects.len(),
-            ..UploadReport::default()
-        };
-        for pointer in objects {
-            if self.put(pointer, cache)? {
-                report.uploaded += 1;
-                report.bytes += pointer.size;
-            }
-        }
-        Ok(report)
-    }
-
-    fn download(
-        &self,
-        pointer: &Pointer,
-        cache: &ObjectCache,
-        _ref_name: &str,
-    ) -> Result<(), LfsError> {
+impl FileTransfer {
+    fn get(&self, pointer: &Pointer, cache: &ObjectCache) -> Result<(), LfsError> {
         let path = object_path(&self.objects, &pointer.oid);
         let mut file: Box<dyn Read> = Box::new(File::open(&path).map_err(|e| {
             LfsError::new(
@@ -734,6 +946,67 @@ impl Transfer for FileTransfer {
             )
         })?);
         cache.insert_verified(pointer, &mut file)
+    }
+
+    /// Whether the remote holds the object with the pointer's size.
+    fn has(&self, pointer: &Pointer) -> bool {
+        fs::metadata(object_path(&self.objects, &pointer.oid))
+            .is_ok_and(|m| m.is_file() && m.len() == pointer.size)
+    }
+}
+
+impl Transfer for FileTransfer {
+    fn upload(
+        &self,
+        objects: &[Pointer],
+        cache: &ObjectCache,
+        _ref_name: &str,
+    ) -> Result<UploadReport, LfsError> {
+        let mut report = UploadReport {
+            objects: objects.len(),
+            ..UploadReport::default()
+        };
+        let missing: Vec<&Pointer> = objects
+            .iter()
+            .filter(|p| !self.has(p) && !cache.contains(p))
+            .collect();
+        if !missing.is_empty() {
+            return Err(missing_from_cache(&missing, &self.endpoint));
+        }
+        for pointer in objects {
+            if self.put(pointer, cache)? {
+                report.uploaded += 1;
+                report.bytes += pointer.size;
+            }
+        }
+        Ok(report)
+    }
+
+    fn download_many(
+        &self,
+        pointers: &[Pointer],
+        cache: &ObjectCache,
+        _ref_name: &str,
+    ) -> Vec<Result<(), LfsError>> {
+        pointers
+            .iter()
+            .map(|p| {
+                if cache.contains(p) {
+                    Ok(())
+                } else {
+                    self.get(p, cache)
+                }
+            })
+            .collect()
+    }
+
+    fn present(
+        &self,
+        pointers: &[Pointer],
+        _direction: Direction,
+        _ref_name: &str,
+    ) -> Result<Vec<bool>, LfsError> {
+        Ok(pointers.iter().map(|p| self.has(p)).collect())
     }
 
     fn endpoint(&self) -> &LfsEndpoint {

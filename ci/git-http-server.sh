@@ -29,7 +29,13 @@
 #     under the git server's own users (htpasswd);
 #   http://127.0.0.1:8081/...  a separate LFS host with its own users
 #     (htpasswd-lfs), proxied to 127.0.0.1:9001;
-# and prints GIT_SERVER_LFS_HTPASSWD and LFS_SEPARATE_BASE.
+# and prints GIT_SERVER_LFS_HTPASSWD and LFS_SEPARATE_BASE. The LFS host
+# also logs every request to logs/lfs-range.log as
+# `$msec $server_port $status "$http_range" $body_bytes_sent "$request" $request_time`
+# (GIT_SERVER_LFS_RANGE_LOG), and includes the file GIT_SERVER_LFS_FAULTS
+# (empty at start) ahead of its own location, so a test can add regex
+# locations that throttle or fail chosen requests (`lfs_faults` in
+# ci/lib.sh).
 #
 # Needs nginx, fcgiwrap, git and openssl. Everything runs as the calling
 # user except --trust-ca.
@@ -87,6 +93,9 @@ lfs_locations=""
 lfs_server=""
 if [ "${GIT_SERVER_LFS:-}" = 1 ]; then
   : >"$dir/htpasswd-lfs"
+  : >"$dir/lfs-faults.conf"
+  log_format="$log_format
+  log_format lfsrange '\$msec \$server_port \$status \"\$http_range\" \$body_bytes_sent \"\$request\" \$request_time';"
   lfs_locations="
     location ~ ^/git/([^/]+)\\.git/info/lfs/(.*)\$ {
       auth_basic \"git\";
@@ -102,6 +111,9 @@ if [ "${GIT_SERVER_LFS:-}" = 1 ]; then
   server {
     listen 127.0.0.1:8081;
     server_name 127.0.0.1;
+    access_log $dir/logs/access.log agentfs;
+    access_log $dir/logs/lfs-range.log lfsrange;
+    include $dir/lfs-faults.conf;
     location / {
       auth_basic \"lfs\";
       auth_basic_user_file $dir/htpasswd-lfs;
@@ -182,5 +194,7 @@ if [ "${GIT_SERVER_LFS:-}" = 1 ]; then
   cat <<EOF
 GIT_SERVER_LFS_HTPASSWD=$dir/htpasswd-lfs
 LFS_SEPARATE_BASE=http://127.0.0.1:8081
+GIT_SERVER_LFS_FAULTS=$dir/lfs-faults.conf
+GIT_SERVER_LFS_RANGE_LOG=$dir/logs/lfs-range.log
 EOF
 fi

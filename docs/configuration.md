@@ -173,6 +173,7 @@ and win over the per-remote keys, as in git-lfs; see [Git LFS](#git-lfs).
 |---|---|---|---|
 | `lfs.url` | `http(s)://` URL, `file://` URL or path | unset | The LFS endpoint for every remote |
 | `lfs.pushurl` | as `lfs.url` | unset | Where LFS uploads go for every remote |
+| `lfs.concurrenttransfers` | integer, 1 to 64 | `8` | How many LFS objects each remote's transfer moves at once (see [Transfers](#transfers)) |
 
 A bad value does not stop the volume: every remote is reported as
 misconfigured instead.
@@ -536,6 +537,24 @@ Two examples:
     lfsurl = https://lfs.example.com/acme/agent-history
     agentfsLfsCredentials = /run/secrets/agentfs/backup-lfs/credentials
 ```
+
+### Transfers
+
+Objects go to and come from the batch API in batches of 100, one batch
+after another; within a batch up to `lfs.concurrenttransfers` objects
+(default 8) move at once, per remote. With several remotes, each pushes
+on its own thread with its own transfers.
+
+```sh
+git --git-dir /data/state/git config lfs.concurrenttransfers 16
+```
+
+- **Uploads** stop starting objects at the first failure; the ones in
+  flight finish. The next attempt sends only what the server still lacks,
+  since the batch API skips objects it has.
+- **Restores** fetch every object they need before writing anything, all
+  at once, from each remote in name order; a remote that lacks an object
+  leaves it to the next one.
 
 ### When uploads fail
 

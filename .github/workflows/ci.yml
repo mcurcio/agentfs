@@ -358,6 +358,9 @@ jobs:
       - run: ci/e2e-lfs.sh
         env:
           E2E_HTTPS: 1
+      - run: ci/e2e-lfs-transfers.sh
+        env:
+          E2E_HTTPS: 1
       - name: server logs
         if: failure()
         run: |

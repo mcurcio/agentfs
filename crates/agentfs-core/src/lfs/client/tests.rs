@@ -92,10 +92,12 @@ fn upload_skips_what_the_server_has_and_verifies_when_asked() {
         }
     );
     assert_eq!(server.object(&a.oid.to_string()).unwrap(), b"first object");
-    assert_eq!(
-        server.with(|st| st.verified.clone()),
-        [a.oid.to_string(), b.oid.to_string()]
-    );
+    // Concurrent: in any order.
+    let mut verified = server.with(|st| st.verified.clone());
+    verified.sort();
+    let mut expected = [a.oid.to_string(), b.oid.to_string()];
+    expected.sort();
+    assert_eq!(verified, expected);
     let batch = &server.seen()[0];
     assert_eq!(batch.path, "/repo/info/lfs/objects/batch");
     assert_eq!(batch.header("content-type"), Some(MEDIA_TYPE));
@@ -104,7 +106,7 @@ fn upload_skips_what_the_server_has_and_verifies_when_asked() {
     let put = server
         .seen()
         .into_iter()
-        .find(|s| s.method == "PUT")
+        .find(|s| s.method == "PUT" && s.path.ends_with(&a.oid.to_string()))
         .unwrap();
     assert_eq!(put.header("content-length"), Some("12"));
     // Again: nothing to send.
@@ -407,5 +409,169 @@ fn object_timeouts_grow_with_size() {
     assert_eq!(
         object_timeout(1 << 30),
         REQUEST_TIMEOUT + Duration::from_secs(4096)
+    );
+}
+
+fn http_with(server: &FakeLfs, r: &mut RemoteSettings, concurrency: usize) -> Box<dyn Transfer> {
+    r.lfs_url = Some(server.url());
+    let mut s = settings();
+    s.lfs.concurrent_transfers = concurrency;
+    transfer_for(&s, r, Direction::Upload).unwrap()
+}
+
+#[test]
+fn uploads_run_concurrently_up_to_the_setting() {
+    let s = Setup::new();
+    let objects: Vec<Pointer> = (0..12)
+        .map(|i| s.object(format!("object number {i}").as_bytes()))
+        .collect();
+    for (n, want) in [(4, 4), (1, 1)] {
+        let server = FakeLfs::start();
+        server.with(|st| st.delay = Duration::from_millis(60));
+        let mut r = remote("/unused");
+        let t = http_with(&server, &mut r, n);
+        let report = t.upload(&objects, &s.cache, REF).unwrap();
+        assert_eq!(report.uploaded, 12);
+        assert_eq!(server.with(|st| st.max_in_flight), want, "concurrency {n}");
+        for p in &objects {
+            assert!(server.object(&p.oid.to_string()).is_some());
+        }
+        // Downloads too, into an empty cache.
+        let other = Setup::new();
+        server.with(|st| st.max_in_flight = 0);
+        let results = t.download_many(&objects, &other.cache, REF);
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(server.with(|st| st.max_in_flight), want, "concurrency {n}");
+        assert!(objects.iter().all(|p| other.cache.contains(p)));
+    }
+}
+
+#[test]
+fn one_failed_object_leaves_the_others_uploaded() {
+    let s = Setup::new();
+    let objects: Vec<Pointer> = (0..6)
+        .map(|i| s.object(format!("object {i}").as_bytes()))
+        .collect();
+    let server = FakeLfs::start();
+    let bad = objects[0].oid.to_string();
+    server.with(|st| {
+        st.put_status.insert(bad.clone(), 503);
+        st.delay = Duration::from_millis(20);
+    });
+    let mut r = remote("/unused");
+    let t = http_with(&server, &mut r, 8);
+    let err = t.upload(&objects, &s.cache, REF).unwrap_err();
+    assert_eq!(err.kind, PushFailureKind::Unreachable, "{err}");
+    assert!(err.message.contains(&bad), "{err}");
+    // All were in flight together: the others are on the server.
+    for p in &objects[1..] {
+        assert!(server.object(&p.oid.to_string()).is_some());
+    }
+    // The next attempt sends only the one that failed.
+    server.with(|st| st.put_status.clear());
+    let report = t.upload(&objects, &s.cache, REF).unwrap();
+    assert_eq!(report.uploaded, 1);
+    assert_eq!(report.objects, 6);
+}
+
+#[test]
+fn only_objects_the_server_lacks_need_a_cached_copy() {
+    let s = Setup::new();
+    let server = FakeLfs::start();
+    let content = b"on the server, not in the cache".to_vec();
+    let on_server = Pointer::of_reader(&content[..]).unwrap();
+    server.with(|st| st.objects.insert(on_server.oid.to_string(), content));
+    let cached = s.object(b"cached here");
+    let mut r = remote("/unused");
+    let t = http(&server, &mut r);
+    let report = t.upload(&[on_server, cached], &s.cache, REF).unwrap();
+    assert_eq!(report.uploaded, 1);
+    // One the server lacks and the cache lacks: local, before any PUT,
+    // with the hint.
+    let lost = Pointer::of_reader(&b"lost from the cache"[..]).unwrap();
+    let other = s.object(b"another one to send");
+    let before = server.seen().len();
+    let err = t.upload(&[lost, other], &s.cache, REF).unwrap_err();
+    assert_eq!(err.kind, PushFailureKind::Local, "{err}");
+    assert!(err.message.contains("agentfs lfs fetch --all"), "{err}");
+    assert!(err.message.contains(&lost.oid.to_string()), "{err}");
+    assert_eq!(err.missing, [lost.oid]);
+    let after: Vec<_> = server.seen()[before..].to_vec();
+    assert!(after.iter().all(|s| s.method != "PUT"), "{after:?}");
+}
+
+#[test]
+fn presence_follows_the_batch_answers() {
+    let s = Setup::new();
+    let server = FakeLfs::start();
+    let content = b"present".to_vec();
+    let here = Pointer::of_reader(&content[..]).unwrap();
+    server.with(|st| st.objects.insert(here.oid.to_string(), content));
+    let absent = s.object(b"absent from the server");
+    let mut r = remote("/unused");
+    let t = http(&server, &mut r);
+    for direction in [Direction::Upload, Direction::Download] {
+        assert_eq!(
+            t.present(&[here, absent], direction, REF).unwrap(),
+            [true, false],
+            "{direction:?}"
+        );
+    }
+    // Nothing was transferred.
+    assert!(server.seen().iter().all(|s| s.path.ends_with("/batch")));
+    // Any other per-object error fails the call.
+    server.with(|st| st.object_error = Some((500, "broken".into())));
+    let err = t.present(&[here], Direction::Download, REF).unwrap_err();
+    assert_eq!(err.kind, PushFailureKind::Unreachable, "{err}");
+    // A file remote: the file with the right size.
+    let remote_dir = s.dir.path().join("remote.git");
+    bare(&remote_dir);
+    let file = transfer_for(
+        &settings(),
+        &remote(remote_dir.to_str().unwrap()),
+        Direction::Upload,
+    )
+    .unwrap();
+    file.upload(&[absent], &s.cache, REF).unwrap();
+    assert_eq!(
+        file.present(&[absent, here], Direction::Download, REF)
+            .unwrap(),
+        [true, false]
+    );
+}
+
+#[test]
+fn download_many_keeps_going_past_a_missing_object() {
+    let s = Setup::new();
+    let server = FakeLfs::start();
+    let mut pointers = Vec::new();
+    for i in 0..4 {
+        let content = format!("served {i}").into_bytes();
+        let p = Pointer::of_reader(&content[..]).unwrap();
+        server.with(|st| st.objects.insert(p.oid.to_string(), content));
+        pointers.push(p);
+    }
+    let missing = Pointer::of_reader(&b"not on the server"[..]).unwrap();
+    pointers.insert(1, missing);
+    let mut r = remote("/unused");
+    let t = http(&server, &mut r);
+    let results = t.download_many(&pointers, &s.cache, REF);
+    assert_eq!(results.len(), 5);
+    assert_eq!(
+        results[1].as_ref().unwrap_err().kind,
+        PushFailureKind::Refused
+    );
+    for (i, p) in pointers.iter().enumerate() {
+        assert_eq!(results[i].is_ok(), i != 1);
+        assert_eq!(s.cache.contains(p), i != 1);
+    }
+    // A server that cannot be reached fails every object.
+    server.with(|st| st.batch_status = Some(503));
+    let other = Setup::new();
+    let results = t.download_many(&pointers, &other.cache, REF);
+    assert!(
+        results
+            .iter()
+            .all(|r| r.as_ref().unwrap_err().kind == PushFailureKind::Unreachable)
     );
 }

@@ -669,30 +669,13 @@ impl RemotePusher {
 
     /// Uploads the LFS objects that the commits the remote lacks reference
     /// (design §7), before any ref is pushed. `None` when they reference
-    /// none: then no LFS endpoint is resolved or contacted. Every object
-    /// must be in the local cache.
+    /// none: then no LFS endpoint is resolved or contacted. Only the
+    /// objects the server lacks must be in the local cache: an object it
+    /// already has needs no local copy (after `agentfs lfs prune`).
     fn upload_lfs(&mut self, head: Oid) -> Result<Option<UploadReport>, LfsError> {
         let objects = objects_to_upload(&self.repo, head, self.state.last_pushed_oid())?;
         if objects.is_empty() {
             return Ok(None);
-        }
-        let missing: Vec<String> = objects
-            .iter()
-            .filter(|(p, _)| !self.lfs.contains(p))
-            .map(|(p, path)| format!("{path} ({})", p.oid))
-            .collect();
-        if !missing.is_empty() {
-            return Err(LfsError::local(format!(
-                "{} LFS object(s) the unpushed commits reference are missing from the local \
-                 cache (<state>/lfs/objects), so they cannot be uploaded: {}",
-                missing.len(),
-                missing
-                    .iter()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
         }
         if self.transfer.is_none() {
             self.transfer = Some(transfer_for(
@@ -706,6 +689,26 @@ impl RemotePusher {
         transfer
             .upload(&pointers, &self.lfs, &self.branch_ref)
             .map(Some)
+            .map_err(|mut e| {
+                if !e.missing.is_empty() {
+                    // Name the paths, which the transfer does not know.
+                    let named: Vec<String> = objects
+                        .iter()
+                        .filter(|(p, _)| e.missing.contains(&p.oid))
+                        .take(5)
+                        .map(|(p, path)| format!("{path} ({})", p.oid))
+                        .collect();
+                    e.message = format!(
+                        "{} LFS object(s) that remote {} lacks are missing from the local \
+                         cache (<state>/lfs/objects), so they cannot be uploaded: {}; run \
+                         `agentfs lfs fetch --all` to bring them back from another remote",
+                        e.missing.len(),
+                        self.remote.name,
+                        named.join(", ")
+                    );
+                }
+                e
+            })
     }
 
     /// This remote's push lock file: held while a push runs, and by a
@@ -3188,6 +3191,32 @@ mod tests {
                     ..
                 }]
             ));
+        }
+
+        /// An object the server already has needs no cached copy (after
+        /// `agentfs lfs prune`): only those it lacks must be in the cache.
+        #[test]
+        fn objects_the_server_has_need_no_cached_copy() {
+            let remote_dir = tempfile::tempdir().unwrap();
+            bare(remote_dir.path());
+            let url = remote_dir.path().display().to_string();
+            let mut v = Vol::with_config("vol", &[("origin", &url)], &[THRESHOLD]);
+            v.commit_file("big.bin", b"large content");
+            let p = pointer_at(&v, "big.bin");
+            let mut pusher = v.pusher("origin", Arc::new(NullSink));
+            assert!(pusher.push_once().is_success());
+            fs::remove_file(v.com.lfs_cache().path(&p.oid)).unwrap();
+            // The remote's push state is lost: the whole branch is walked,
+            // and big.bin's object is asked for again.
+            fs::remove_file(v.state.push_state("origin")).unwrap();
+            let head = v.commit_file("more.bin", b"more large content");
+            let mut pusher = v.pusher("origin", Arc::new(NullSink));
+            let outcome = pusher.push_once();
+            assert!(outcome.is_success(), "{outcome:?}");
+            assert_eq!(
+                remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
+                Some(head)
+            );
         }
 
         /// A branch push that fails before git runs (stage lfs) still

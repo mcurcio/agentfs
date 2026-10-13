@@ -47,6 +47,13 @@ pub(crate) struct State {
     pub redirect: bool,
     /// Serve downloads with one byte changed.
     pub corrupt_downloads: bool,
+    /// How long each object request (`PUT`, `GET`) takes.
+    pub delay: std::time::Duration,
+    /// Object requests being served now, and the most at once.
+    pub in_flight: usize,
+    pub max_in_flight: usize,
+    /// The status of a `PUT` of these oids (nothing is stored).
+    pub put_status: HashMap<String, u16>,
 }
 
 pub(crate) struct FakeLfs {
@@ -149,8 +156,21 @@ fn serve(stream: TcpStream, state: &Mutex<State>, port: u16, other_port: u16) {
     if reader.read_exact(&mut body).is_err() {
         return;
     }
+    let object_request = matches!(seen.method.as_str(), "PUT" | "GET");
+    if object_request {
+        let delay = {
+            let mut state = state.lock().unwrap();
+            state.in_flight += 1;
+            state.max_in_flight = state.max_in_flight.max(state.in_flight);
+            state.delay
+        };
+        std::thread::sleep(delay);
+    }
     let response = {
         let mut state = state.lock().unwrap();
+        if object_request {
+            state.in_flight -= 1;
+        }
         state.seen.push(seen.clone());
         route(&mut state, &seen, &body, port, other_port)
     };
@@ -237,6 +257,9 @@ fn route(state: &mut State, seen: &Seen, body: &[u8], port: u16, other_port: u16
     if seen.method == "PUT"
         && let Some(oid) = seen.path.strip_prefix("/upload/")
     {
+        if let Some(status) = state.put_status.get(oid) {
+            return json(*status, serde_json::json!({"message": "put refused"}));
+        }
         state.objects.insert(oid.to_owned(), body.to_vec());
         return json(200, serde_json::json!({}));
     }

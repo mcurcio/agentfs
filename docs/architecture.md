@@ -81,6 +81,7 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs/cache.rs` | The local LFS object cache, `<state>/lfs/objects` |
 | `lfs/endpoint.rs` | Each remote's LFS endpoint and credentials, in git-lfs's precedence |
 | `lfs/client.rs` | The batch API client (basic transfer) and the standalone-file transfer |
+| `lfs/pool.rs` | The worker pool that moves up to `lfs.concurrenttransfers` objects at once |
 | `lfs/upload.rs` | Which LFS objects a push must upload first |
 | `lfs/fetch.rs` | LFS objects for restores: cache first, then the remotes |
 | `lfs/fake.rs` | An in-process LFS server for tests |

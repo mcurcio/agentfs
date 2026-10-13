@@ -331,6 +331,7 @@ mod tests {
             threshold: None,
             url: Some("http://global/url".into()),
             push_url: Some("http://global/push".into()),
+            ..LfsSettings::default()
         };
         let mut r = remote("https://h/r.git");
         r.lfs_url = Some("http://remote/url".into());

@@ -12,6 +12,7 @@
 //! - [`policy`]: which store a recorded file goes to;
 //! - [`endpoint`]: each remote's LFS endpoint and credentials;
 //! - [`client`]: the batch API client and the standalone-file transfer;
+//! - [`pool`]: the worker pool that moves objects concurrently;
 //! - [`upload`]: the objects a push must upload first;
 //! - [`fetch`]: objects for restores, from the cache or a remote.
 //!
@@ -28,6 +29,7 @@ pub(crate) mod fake;
 pub mod fetch;
 pub mod pointer;
 pub mod policy;
+pub mod pool;
 pub mod upload;
 
 use std::fmt;
@@ -46,6 +48,9 @@ pub use policy::{Store, StorePolicy};
 pub struct LfsError {
     pub kind: PushFailureKind,
     pub message: String,
+    /// The objects an upload needed that are missing from the local cache
+    /// (a `local` failure), so the caller can name their paths.
+    pub missing: Vec<LfsOid>,
 }
 
 impl LfsError {
@@ -53,6 +58,7 @@ impl LfsError {
         Self {
             kind,
             message: message.into(),
+            missing: Vec::new(),
         }
     }
 

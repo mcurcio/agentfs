@@ -1094,11 +1094,17 @@ ignored.
 client (`ureq` 3, pure Rust; TLS through native-tls, OpenSSL and the
 system trust store, under the `https` feature, as libgit2 uses) speaks
 the batch API with the `basic` transfer only: batches of 100 objects,
-sequential, a `PUT` of each object the server lacks, then `verify` when
+in sequence, a `PUT` of each object the server lacks, then `verify` when
 the server asks for it; a `GET` for downloads, hashed while it is written
-and kept only if it matches. Timeouts: 30 s to connect, 5 minutes for a
-batch or verify request, and for an object 5 minutes plus its size at
-256 KiB/s.
+and kept only if it matches. Within a batch, up to
+`lfs.concurrenttransfers` objects (git-lfs's key; default 8, 1 to 64, a
+bad value misconfigures every remote) move at once, each remote with its
+own pool of scoped threads and as many idle connections. An upload starts
+no new object after its first failure, lets those in flight finish, and
+reports that failure; a download keeps going past an object one server
+lacks (404) and stops at a failure of the server itself. Timeouts: 30 s
+to connect, 5 minutes for a batch or verify request, and for an object 5
+minutes plus its size at 256 KiB/s.
 
 **Upload before push.** Before every push attempt, each remote uploads
 the LFS objects the commits it lacks reference (`head ^ last_pushed`, or
@@ -3330,7 +3336,8 @@ runner.
 | LFS store selection | Decided at record time on the frozen size and journaled with the write (older journals read as blob): always blob for empty files, special files, `.lfsconfig` and unnameable paths; then `filter=lfs` (operator, or tree only with `respectTreeRules`), which `agentfs.store=blob` cannot override; then `agentfs.store`; then `size > agentfs.lfsThreshold`, which is unset by default. The blob limit does not apply to LFS content (§7) |
 | LFS `.gitattributes` | A block at the end of the root `.gitattributes`, in history only, rebuilt every commit: one anchored, escaped line per LFS path with `git lfs track`'s attributes; the workload's lines are kept and forged blocks (exact BEGIN through END) replaced; a file holding only the block is agentfs's own. A pointer is never committed without its line: when the block cannot be written, that commit's LFS writes are blobs, then its `.gitattributes` writes are dropped, then the head's file is kept; a commit never fails for it. A directory named `.gitattributes` or `.gitmodules` is refused (`gitattributesBlob`, `gitmodulesBlob`) (§3.4, §7) |
 | LFS endpoints and credentials | git-lfs's precedence (`lfs.pushurl`, `lfs.url`, `remote.<n>.lfspushurl`, `remote.<n>.lfsurl`, then derived `<url>.git/info/lfs`), from operator config only; local and `file://` remotes use the standalone-file layout; SSH needs an explicit `lfsurl`. Credentials: `agentfsLfsCredentials`, else `agentfsCredentials` on the push URL's own origin, else the URL's password; bound to the origin, sent to action hrefs only on that origin and without a server-given `Authorization`; no redirects, no proxies (§7) |
-| LFS uploads | Before every push attempt, for the objects the commits the remote lacks reference at managed paths; a failure is a `PushFailed` with stage `lfs` and no ref pushed. Batch API, `basic` transfer only, sequential batches of 100, `verify` when offered (§7) |
+| LFS uploads | Before every push attempt, for the objects the commits the remote lacks reference at managed paths; a failure is a `PushFailed` with stage `lfs` and no ref pushed. Batch API, `basic` transfer only, batches of 100 in sequence, `verify` when offered (§7) |
+| LFS transfers | `lfs.concurrenttransfers` (git-lfs's key, default 8, 1 to 64) objects at once within a batch, per remote, on scoped threads; an upload stops starting objects at its first failure and lets those in flight finish; restores prefetch every object they need concurrently, each remote in name order taking what the earlier ones could not provide (§7, §15, 2026-10) |
 | LFS cache and retention | `<state>/lfs/objects/aa/bb/<oid>`, written at commit time; nothing is pruned, locally or on servers (§7) |
 | LFS restores | A pointer is checked out from the cache, else downloaded from the remotes in name order, every object before any write; tree content compared by SHA-256; `.gitattributes` without the managed block; a dry run only reports objects missing from the cache, downloading nothing (§7, §15) |
 | LFS client and TLS | agentfs's own client over `ureq` 3, pure Rust by default; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, system trust store, as libgit2). An explicit https endpoint without the feature is a misconfigured remote; a derived one fails at push time as `local` (§7, §17.3) |

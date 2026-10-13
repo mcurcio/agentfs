@@ -17,8 +17,8 @@
 //! preflight's job.
 //!
 //! Git LFS settings (design §7) come from the same file only: the size
-//! threshold `agentfs.lfsThreshold`, git-lfs's `lfs.url` and `lfs.pushurl`,
-//! and per remote `lfsurl`, `lfspushurl` and `agentfsLfsCredentials`. A
+//! threshold `agentfs.lfsThreshold`, git-lfs's `lfs.url`, `lfs.pushurl`
+//! and `lfs.concurrenttransfers`, and per remote `lfsurl`, `lfspushurl` and `agentfsLfsCredentials`. A
 //! tracked `.lfsconfig` is content and is never read.
 
 use std::collections::BTreeSet;
@@ -109,6 +109,14 @@ pub enum ConfigError {
     LfsUrl { key: String, value: String },
     #[error("{key}: https LFS endpoints need agentfs built with the `https` cargo feature")]
     LfsHttpsUnsupported { key: String },
+    #[error(
+        "{key}: {value:?} is not a number of concurrent transfers from 1 to \
+         {MAX_CONCURRENT_TRANSFERS}"
+    )]
+    BadConcurrency { key: String, value: String },
+    /// A global setting that makes every remote misconfigured.
+    #[error("{0}")]
+    Global(String),
 }
 
 /// Every git config key agentfs reads, in the order docs/configuration.md
@@ -137,6 +145,7 @@ pub const KEYS: &[&str] = &[
     "agentfs.identity.authorEmail",
     "lfs.url",
     "lfs.pushurl",
+    "lfs.concurrenttransfers",
     "include.path",
     "includeIf.<condition>.path",
     "remote.<name>.url",
@@ -298,8 +307,13 @@ impl RemoteSettings {
     }
 }
 
+/// The default `lfs.concurrenttransfers`, as in git-lfs.
+pub const DEFAULT_CONCURRENT_TRANSFERS: usize = 8;
+/// The largest `lfs.concurrenttransfers` accepted.
+pub const MAX_CONCURRENT_TRANSFERS: usize = 64;
+
 /// Git LFS settings (design §7), all optional.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LfsSettings {
     /// `agentfs.lfsThreshold`: content larger than this many bytes is
     /// stored as LFS. Unset (the default) means no size rule: only
@@ -309,6 +323,46 @@ pub struct LfsSettings {
     pub url: Option<String>,
     /// `lfs.pushurl`: the LFS endpoint uploads go to, for every remote.
     pub push_url: Option<String>,
+    /// `lfs.concurrenttransfers`: how many objects one remote's transfer
+    /// moves at once (design §7), [`DEFAULT_CONCURRENT_TRANSFERS`] unless
+    /// set; 1 to [`MAX_CONCURRENT_TRANSFERS`].
+    pub concurrent_transfers: usize,
+    /// Why `lfs.concurrenttransfers` cannot be used, if it cannot: then
+    /// every remote is misconfigured, as with a bad `lfs.url`.
+    pub concurrent_transfers_error: Option<String>,
+}
+
+impl Default for LfsSettings {
+    fn default() -> Self {
+        Self {
+            threshold: None,
+            url: None,
+            push_url: None,
+            concurrent_transfers: DEFAULT_CONCURRENT_TRANSFERS,
+            concurrent_transfers_error: None,
+        }
+    }
+}
+
+/// `lfs.concurrenttransfers`: the value, or why it is refused.
+fn concurrent_transfers(config: &git2::Config) -> Result<(usize, Option<String>), ConfigError> {
+    let key = "lfs.concurrenttransfers";
+    let Some(value) = string(config, key)? else {
+        return Ok((DEFAULT_CONCURRENT_TRANSFERS, None));
+    };
+    match value.trim().parse::<usize>() {
+        Ok(n) if (1..=MAX_CONCURRENT_TRANSFERS).contains(&n) => Ok((n, None)),
+        _ => Ok((
+            DEFAULT_CONCURRENT_TRANSFERS,
+            Some(
+                ConfigError::BadConcurrency {
+                    key: key.into(),
+                    value,
+                }
+                .to_string(),
+            ),
+        )),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +443,7 @@ impl Settings {
         let branch =
             string(config, "agentfs.branch")?.unwrap_or_else(|| format!("agentfs/{volume}"));
         let defaults = Templates::default();
+        let (concurrent_transfers, concurrent_transfers_error) = concurrent_transfers(config)?;
         let lfs = LfsSettings {
             threshold: match int(config, "agentfs.lfsThreshold")? {
                 None => None,
@@ -402,6 +457,8 @@ impl Settings {
             },
             url: string(config, "lfs.url")?,
             push_url: string(config, "lfs.pushurl")?,
+            concurrent_transfers,
+            concurrent_transfers_error,
         };
         let (remotes, invalid_remotes) = remotes(config, &lfs)?;
         Ok(Self {
@@ -660,10 +717,13 @@ fn validate_transport(remote: &RemoteSettings) -> Result<(), ConfigError> {
 /// Checks every LFS endpoint that could apply to `remote` (design §7): the
 /// global `lfs.url` and `lfs.pushurl` and the remote's own `lfsurl` and
 /// `lfspushurl`. Each must be an `http(s)://` URL, a `file://` URL or a
-/// path; `https` needs the `https` cargo feature. A bad global key makes
-/// every remote misconfigured, reported per remote, so it never fails the
-/// volume.
+/// path; `https` needs the `https` cargo feature. A bad global key
+/// (including `lfs.concurrenttransfers`) makes every remote misconfigured,
+/// reported per remote, so it never fails the volume.
 fn validate_lfs(remote: &RemoteSettings, lfs: &LfsSettings) -> Result<(), ConfigError> {
+    if let Some(error) = &lfs.concurrent_transfers_error {
+        return Err(ConfigError::Global(error.clone()));
+    }
     let remote_key = |k: &str| format!("remote.{}.{k}", remote.name);
     let keys = [
         ("lfs.url".to_owned(), &lfs.url),
@@ -890,6 +950,7 @@ mod tests {
                  [agentfs \"identity\"]\n\tcommitterName = c\n\tcommitterEmail = c@e\n\
                  \tauthorName = a\n\tauthorEmail = a@e\n\
                  [lfs]\n\turl = http://lfs.example/r\n\tpushurl = http://lfs.example/p\n\
+                 \tconcurrenttransfers = 4\n\
                  [remote \"web\"]\n\turl = http://git.example/r.git\n\
                  \tpushurl = http://git.example/p.git\n\tagentfsMaxBlobSize = 100m\n\
                  \tagentfsCredentials = /run/c\n\tlfsurl = http://lfs.example/web\n\
@@ -1330,6 +1391,7 @@ mod tests {
                 threshold: Some(8 << 20),
                 url: Some("http://lfs.example/r".into()),
                 push_url: Some("/srv/lfs.git".into()),
+                ..LfsSettings::default()
             }
         );
         let r = &s.remotes[0];
@@ -1413,6 +1475,40 @@ mod tests {
                 "{:?}",
                 s.invalid_remotes
             );
+        }
+    }
+
+    #[test]
+    fn lfs_concurrent_transfers() {
+        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n");
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.lfs.concurrent_transfers, DEFAULT_CONCURRENT_TRANSFERS);
+        assert_eq!(DEFAULT_CONCURRENT_TRANSFERS, 8);
+        for (value, n) in [("1", 1), ("64", 64), (" 4 ", 4)] {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n[lfs]\n\tconcurrenttransfers = {value}\n\
+                 [remote \"a\"]\n\turl = /a\n"
+            ));
+            let s = Settings::from_config(&c).unwrap();
+            assert_eq!(s.lfs.concurrent_transfers, n, "{value}");
+            assert_eq!(s.remotes.len(), 1, "{value}");
+        }
+        for bad in ["0", "65", "x", "-1", "\"\""] {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n[lfs]\n\tconcurrenttransfers = {bad}\n\
+                 [remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n"
+            ));
+            // Never the volume: every remote.
+            let s = Settings::from_config(&c).unwrap();
+            assert!(s.remotes.is_empty(), "{bad}");
+            assert_eq!(s.invalid_remotes.len(), 2, "{bad}");
+            for r in &s.invalid_remotes {
+                assert!(
+                    r.error.starts_with("lfs.concurrenttransfers:"),
+                    "{bad}: {}",
+                    r.error
+                );
+            }
         }
     }
 

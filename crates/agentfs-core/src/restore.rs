@@ -874,7 +874,21 @@ pub fn check(
         .filter(|s| s.target.is_none())
         .map(|s| s.path.to_string())
         .collect();
-    // 1. Everything written must be recordable, and its content at hand.
+    // 1. Everything written must be recordable, and its content at hand:
+    //    the LFS objects are fetched together first (concurrently), then
+    //    checked one by one so a missing one names its path.
+    let lfs: Vec<_> = plan
+        .steps
+        .iter()
+        .filter(|step| step.current.as_ref() != step.target.as_ref())
+        .filter_map(|step| match step.target.as_ref()?.stored {
+            Stored::Lfs(pointer) => Some(pointer),
+            _ => None,
+        })
+        .collect();
+    if !lfs.is_empty() {
+        objects.prefetch(&lfs);
+    }
     for step in &plan.steps {
         let Some(target) = &step.target else { continue };
         if step.current.as_ref() == Some(target) {
