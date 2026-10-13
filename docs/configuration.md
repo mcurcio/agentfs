@@ -178,6 +178,16 @@ and win over the per-remote keys, as in git-lfs; see [Git LFS](#git-lfs).
 A bad value does not stop the volume: every remote is reported as
 misconfigured instead.
 
+## `[http]`
+
+git's own proxy key, read from the same config file only. Proxy
+environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+`NO_PROXY`) are never read; see [Proxies](#proxies).
+
+| Key | Type | Default | Meaning and validation |
+|---|---|---|---|
+| `http.proxy` | `http://host[:port]` or `host[:port]` | unset: no proxy | The HTTP proxy of every remote that has no `remote.<name>.proxy`. The port defaults to 1080, as in git. A user or password, `https://` and `socks://` proxies and a path are refused, and a bad value makes every remote misconfigured |
+
 ## `[remote "<name>"]`
 
 One section per push remote; every section with a `url` is a remote. The
@@ -200,6 +210,7 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `lfsurl` | `http(s)://` URL, `file://` URL or path | derived from the remote's URL | The Git LFS endpoint for this remote, as in git-lfs, unless `lfs.url` is set (see [Git LFS](#git-lfs)) |
 | `lfspushurl` | as `lfsurl` | `lfsurl` | Where LFS uploads go, unless `lfs.pushurl` or `lfs.url` is set |
 | `agentfsLfsCredentials` | absolute path | none | The credential file (same format as `agentfsCredentials`) for an LFS endpoint on another host or port than the push URL; never sent to any other host |
+| `proxy` | as `http.proxy`, or empty | `http.proxy` | This remote's HTTP proxy, as in git; an empty value means no proxy for this remote. It carries the remote's `http(s)` git traffic and all its LFS requests, never SSH (see [Proxies](#proxies)) |
 
 The remote's name must be a valid agentfs name (as for `agentfs.volume`;
 git accepts `team/backup`, agentfs does not), because it names the push
@@ -213,6 +224,8 @@ state file and appears in metrics.
 | `agentfsMaxBlobSize` is not a positive size | `remote.<name>.agentfsMaxBlobSize` |
 | `agentfsMaxPushSize` is not a positive size | `remote.<name>.agentfsMaxPushSize` |
 | `agentfsMaxLfsObjectSize` is not a positive size | `remote.<name>.agentfsMaxLfsObjectSize` |
+| `proxy` is not a plain `http://` proxy without a user or password, or `http.proxy` is not | the key; a bad `http.proxy` misconfigures every remote |
+| `lfs.concurrenttransfers` is not 1 to 64 | the key, for every remote |
 | `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`, `agentfsSshAgent`, `agentfsKnownHosts` or `agentfsLfsCredentials` is not an absolute path | the key |
 | the push URL is SSH and `agentfsKnownHosts` is not set | `agentfsKnownHosts` |
 | the push URL is SSH and neither or both of `agentfsSshKey` and `agentfsSshAgent` are set | both keys |
@@ -285,6 +298,33 @@ names a port. A local path with a `:` after a `/` (`/srv/a:b.git`) is
 treated as local, but libgit2 built with `ssh` sends it to its SSH
 transport, so with that feature its push fails (closed: nothing is
 offered and no host is trusted). Avoid `:` in local remote paths.
+
+### Proxies
+
+Remotes reached through an egress proxy name it with git's keys, in the
+volume's config (or an included fragment):
+
+```ini
+[http]
+    proxy = http://proxy.internal:3128      # every remote
+[remote "mirror"]
+    url = https://git.internal/acme/r.git
+    proxy = ""                              # this one connects directly
+```
+
+- `remote.<name>.proxy` wins over `http.proxy`; an empty value turns the
+  proxy off for that remote (agentfs never reads `NO_PROXY`, nor any
+  other proxy environment variable).
+- A proxy is a plain HTTP proxy. It carries the remote's `http://` and
+  `https://` git traffic (libgit2) and every LFS request of the remote,
+  wherever its endpoint is; `https` goes through it with `CONNECT`, so
+  certificates are still verified against the system trust store. SSH
+  remotes' git traffic never uses it.
+- Not supported, and refused as a misconfiguration: a user or password
+  (proxy authentication), `https://` and SOCKS proxies.
+- A proxy that is down or refuses the connection fails pushes as
+  `unreachable`. `agentfs status` prints `proxy: <url> (<key>)` under each
+  remote that has one.
 
 ### HTTPS and HTTP remotes
 
@@ -520,7 +560,8 @@ port):
 
 A separate LFS host never sees the git host's credentials, and an `http`
 endpoint never gets those of an `https` remote. Redirects are not
-followed and `HTTP(S)_PROXY` is ignored. The file is re-read when it
+followed; the remote's proxy, if set, carries LFS requests too, and
+`HTTP(S)_PROXY` is ignored. The file is re-read when it
 changes; `agentfs mount` refuses one under the backing tree or the mount
 point.
 

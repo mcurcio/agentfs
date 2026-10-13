@@ -451,6 +451,23 @@ fn status_shows_derived_endpoints_and_why_there_is_none() {
         status.contains("lfs: none (remote git pushes over git://"),
         "{status}"
     );
+    assert!(!status.contains("proxy:"), "{status}");
+    // Proxies: http.proxy for every remote, unless a remote sets its own.
+    v.config(&[
+        ("http.proxy", "proxy.example:3128"),
+        ("remote.git.proxy", ""),
+        ("remote.web.proxy", "http://web-proxy.example:8080"),
+    ]);
+    let status = v.ok(&["status"]);
+    assert!(
+        status.contains("proxy: http://proxy.example:3128 (http.proxy)"),
+        "{status}"
+    );
+    assert!(
+        status.contains("proxy: http://web-proxy.example:8080 (remote.web.proxy)"),
+        "{status}"
+    );
+    assert_eq!(status.matches("proxy: ").count(), 2, "{status}");
 }
 
 /// The objects in `remote`'s standalone-file layout.

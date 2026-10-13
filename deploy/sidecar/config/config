@@ -16,6 +16,13 @@
 # 	agentfsSshKeyPassphrase = /run/secrets/agentfs/passphrase   # if encrypted
 # 	agentfsKnownHosts = /run/secrets/agentfs/known_hosts
 
+# An egress proxy for every remote (git's key; docs/configuration.md#proxies):
+# a plain http:// proxy without a password. HTTP(S)_PROXY and NO_PROXY in
+# the environment are never read; remote.<name>.proxy = "" turns it off for
+# one remote.
+# [http]
+# 	proxy = http://egress-proxy.infra.svc:3128
+
 # Git LFS (design §7; docs/configuration.md#git-lfs), off by default. Files
 # over the threshold go to the remote's LFS endpoint; this one is derived
 # from the url (<url>/info/lfs) and reuses agentfsCredentials. A separate

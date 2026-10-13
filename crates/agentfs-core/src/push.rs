@@ -959,7 +959,10 @@ impl RemotePusher {
         let listed = (|| {
             let mut remote = self.repo.remote_anonymous(self.remote.push_url())?;
             let callbacks = self.auth.callbacks(&auth);
-            let connection = remote.connect_auth(git2::Direction::Push, Some(callbacks), None)?;
+            let proxy =
+                crate::proxy::git_options(self.remote.proxy.as_ref(), self.remote.push_url());
+            let connection =
+                remote.connect_auth(git2::Direction::Push, Some(callbacks), Some(proxy))?;
             Ok(connection
                 .list()?
                 .iter()
@@ -1058,6 +1061,10 @@ impl RemotePusher {
             });
             let mut options = PushOptions::new();
             options.remote_callbacks(callbacks);
+            options.proxy_options(crate::proxy::git_options(
+                self.remote.proxy.as_ref(),
+                self.remote.push_url(),
+            ));
             remote.push(refspecs, Some(&mut options))
         })();
         Attempt {

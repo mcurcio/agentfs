@@ -190,6 +190,16 @@ path must be absolute and exist, it must not set `agentfs.volume` or
 `agentfs.branch`, and it must be outside the backing tree and the mount
 point.
 
+**Egress proxies** are set in the same fragment with git's keys,
+`http.proxy` (every remote) or `remote.<name>.proxy` (one remote; empty
+for none); the pod's `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` are never
+read ([Proxies](configuration.md#proxies)):
+
+```ini
+[http]
+    proxy = http://egress-proxy.infra.svc:3128
+```
+
 **Rules.** The ConfigMap keys `exclude` and `attributes` are mounted
 read-only over `/data/state/git/info/exclude` and `info/attributes`, in
 the sidecar only (`subPath` mounts). Rules are read at mount time (§4.1).

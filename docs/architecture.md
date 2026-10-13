@@ -53,6 +53,7 @@ missing from these tables or a row names a module that no longer exists;
 | `remote_auth.rs` | Credentials and host-key checks for one remote, shared by push and patch fetch, and the scope that hands an SSH remote to the transport (§11.1) |
 | `ssh_transport.rs` | `ssh` feature: agentfs's libgit2 subtransport for SSH URLs over russh: host key or certificate check before authentication, the key (decrypted) or ssh-agent identities, timeouts (§11.1) |
 | `remote_url.rs` | Pure URL helpers: transport, host, port, userinfo, SSH path, as libgit2 sees them (§11.1) |
+| `proxy.rs` | `http.proxy` and `remote.<name>.proxy`: parsing, and libgit2's proxy options (§11.1) |
 | `credentials.rs` | Credential, SSH key and passphrase files for remotes (§11.1) |
 | `known_hosts.rs` | OpenSSH known_hosts parsing and matching, and `@cert-authority` host certificate checks (§11.1) |
 | `watched.rs` | Files re-read when their stat stamp changes: credentials, keys, known_hosts |
@@ -235,8 +236,11 @@ order:
 2. **LFS objects first** (`lfs/upload.rs`, `lfs/client.rs`): every
    object referenced at a managed path by a commit the remote lacks is
    uploaded through the batch API before any ref, so a ref never reaches
-   the remote ahead of its objects (§7). A failure ends the attempt at
-   stage `lfs` with no ref pushed;
+   the remote ahead of its objects (§7), up to `lfs.concurrenttransfers`
+   at once (`lfs/pool.rs`), with objects over the remote's
+   `agentfsMaxLfsObjectSize` refused first. A failure ends the attempt at
+   stage `lfs` with no ref pushed. The remote's proxy (`proxy.rs`), if
+   set, carries these requests and libgit2's `http(s)` connections below;
 3. **refs**: the branch and the volume's `diverged/*` refs, never forced;
    a non-fast-forward the remote's history explains is a divergence
    (§11.3); the push state records the last pushed commit;

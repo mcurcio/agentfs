@@ -614,6 +614,7 @@ mod tests {
             max_blob_size: max,
             max_push_size: None,
             max_lfs_object_size: None,
+            proxy: None,
             credentials: None,
             ssh_key: None,
             known_hosts: None,
@@ -914,6 +915,7 @@ mod tests {
     fn lfs_object_limit_is_the_smallest_across_remotes_and_only_for_lfs() {
         let lfs = |name: &str, max: Option<u64>| RemoteSettings {
             max_lfs_object_size: max,
+            proxy: None,
             ..remote(name, None)
         };
         let limits = Limits::from_remotes(&[

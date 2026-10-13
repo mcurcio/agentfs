@@ -417,6 +417,9 @@ fn real_main() -> Result<ExitCode> {
                         Ok(endpoint) => println!("           lfs: {}", endpoint.describe()),
                         Err(e) => println!("           lfs: none ({e})"),
                     }
+                    if let Some(proxy) = &r.proxy {
+                        println!("           proxy: {proxy}");
+                    }
                 }
             }
             let patches = agentfs_core::patch::status::PatchState::load(&state.patch_state());

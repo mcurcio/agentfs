@@ -95,4 +95,12 @@ lfs_faults() { # locations
     [ $SECONDS -lt $deadline ] || fail "nginx did not load the LFS fault rules"
     sleep 0.2
   done
+  # The new worker answers, but the old one may still accept connections
+  # with the old rules until it exits: wait for it to (worker_processes 1).
+  local master
+  master=$(cat "$GIT_SERVER_DIR/nginx.pid")
+  until [ "$(pgrep -P "$master" | wc -l)" -le 1 ]; do
+    [ $SECONDS -lt $deadline ] || fail "nginx's old worker did not exit after the reload"
+    sleep 0.1
+  done
 }

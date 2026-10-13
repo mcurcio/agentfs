@@ -43,6 +43,7 @@ fn remote(url: &str) -> RemoteSettings {
         max_blob_size: None,
         max_push_size: None,
         max_lfs_object_size: None,
+        proxy: None,
         credentials: None,
         ssh_key: None,
         known_hosts: None,
@@ -744,4 +745,115 @@ fn concurrent_downloads_of_one_object_take_turns() {
     assert_eq!(fs::read(s.cache.path(&p.oid)).unwrap(), content);
     // One downloaded it; the others found it cached once they had the lock.
     assert_eq!(ranges(&server).len(), 1);
+}
+
+/// An HTTP CONNECT proxy on a loopback port that records the targets it
+/// tunnels to.
+struct ConnectProxy {
+    port: u16,
+    targets: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ConnectProxy {
+    fn start() -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let targets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = targets.clone();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(mut client) = client else { continue };
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(client.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    let mut parts = line.split_whitespace();
+                    let (Some("CONNECT"), Some(target)) = (parts.next(), parts.next()) else {
+                        let _ = client.write_all(b"HTTP/1.1 405 Only CONNECT\r\n\r\n");
+                        return;
+                    };
+                    seen.lock().unwrap().push(target.to_owned());
+                    let Ok(upstream) = std::net::TcpStream::connect(target) else {
+                        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+                        return;
+                    };
+                    client
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .unwrap();
+                    let mut up_read = upstream.try_clone().unwrap();
+                    let mut client_write = client.try_clone().unwrap();
+                    let back = std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut up_read, &mut client_write);
+                        let _ = client_write.shutdown(std::net::Shutdown::Write);
+                    });
+                    // What the reader buffered past the headers is part of
+                    // the tunnel.
+                    let mut upstream_write = upstream;
+                    let _ = upstream_write.write_all(reader.buffer());
+                    let mut rest = reader.into_inner();
+                    let _ = std::io::copy(&mut rest, &mut upstream_write);
+                    let _ = upstream_write.shutdown(std::net::Shutdown::Write);
+                    let _ = back.join();
+                });
+            }
+        });
+        Self { port, targets }
+    }
+
+    fn targets(&self) -> Vec<String> {
+        self.targets.lock().unwrap().clone()
+    }
+}
+
+#[test]
+fn lfs_requests_go_through_the_remotes_proxy() {
+    let s = Setup::new();
+    let p = s.object(b"through the proxy");
+    let server = FakeLfs::start();
+    let proxy = ConnectProxy::start();
+    let mut r = remote("/unused");
+    r.proxy = Some(crate::proxy::ProxySetting {
+        url: format!("http://127.0.0.1:{}", proxy.port),
+        key: "remote.origin.proxy".into(),
+    });
+    let t = http(&server, &mut r);
+    t.upload(&[p], &s.cache, REF).unwrap();
+    let other = Setup::new();
+    t.download(&p, &other.cache, REF).unwrap();
+    assert!(other.cache.contains(&p));
+    let target = format!("127.0.0.1:{}", server.port);
+    let targets = proxy.targets();
+    assert!(
+        !targets.is_empty() && targets.iter().all(|t| *t == target),
+        "{targets:?}"
+    );
+    // No proxy (an empty remote.<name>.proxy): direct.
+    let before = proxy.targets().len();
+    r.proxy = None;
+    let t = http(&server, &mut r);
+    let third = Setup::new();
+    t.download(&p, &third.cache, REF).unwrap();
+    assert_eq!(proxy.targets().len(), before);
+    // A proxy that is not there: unreachable.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    r.proxy = Some(crate::proxy::ProxySetting {
+        url: format!("http://127.0.0.1:{closed}"),
+        key: "http.proxy".into(),
+    });
+    let t = http(&server, &mut r);
+    let err = t
+        .upload(&[s.object(b"another")], &s.cache, REF)
+        .unwrap_err();
+    assert_eq!(err.kind, PushFailureKind::Unreachable, "{err}");
 }

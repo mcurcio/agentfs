@@ -345,7 +345,7 @@ jobs:
         with:
           go-version: stable
           cache: false
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config nginx fcgiwrap git-lfs
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config nginx fcgiwrap git-lfs tinyproxy
       - name: build lfs-test-server (git-lfs's reference server, pinned)
         run: |
           GOBIN="$RUNNER_TEMP/bin" go install github.com/git-lfs/lfs-test-server@d27ad23fddc1949ecd9a4ba6a3d074bc6a567084
@@ -355,6 +355,8 @@ jobs:
         run: GIT_SERVER_LFS=1 ci/git-http-server.sh start "$RUNNER_TEMP/git-server" --trust-ca >>"$GITHUB_ENV"
       - name: start LFS servers
         run: ci/lfs-server.sh start "$RUNNER_TEMP/lfs-server" >>"$GITHUB_ENV"
+      - name: start the HTTP proxy
+        run: ci/proxy-server.sh start "$RUNNER_TEMP/proxy" >>"$GITHUB_ENV"
       - run: ci/e2e-lfs.sh
         env:
           E2E_HTTPS: 1
@@ -366,8 +368,10 @@ jobs:
         run: |
           tail -n 200 "$RUNNER_TEMP"/git-server/logs/*.log
           tail -n 100 "$RUNNER_TEMP"/lfs-server/*.log
+          tail -n 100 "$RUNNER_TEMP"/proxy/tinyproxy.log || true
       - if: always()
         run: |
+          ci/proxy-server.sh stop "$RUNNER_TEMP/proxy"
           ci/lfs-server.sh stop "$RUNNER_TEMP/lfs-server"
           ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
 

@@ -306,6 +306,7 @@ impl Fixture {
             max_blob_size: None,
             max_push_size: None,
             max_lfs_object_size: None,
+            proxy: None,
             credentials: None,
             ssh_key: Some(key_path),
             known_hosts: Some(kh),

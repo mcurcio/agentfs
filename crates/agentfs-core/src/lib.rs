@@ -33,6 +33,7 @@ pub mod patch;
 pub mod paths;
 pub mod pending;
 pub mod probe;
+pub mod proxy;
 pub mod push;
 pub mod push_size;
 pub mod reconcile;

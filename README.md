@@ -219,7 +219,8 @@ who holds the lock.
 ### Not built yet
 
 Several mounts of one volume across nodes. LFS has no SSH
-(`git-lfs-authenticate`) or proxy settings. Restoring a database needs
+(`git-lfs-authenticate`). Proxies need no authentication (no proxy
+passwords) and are plain `http://` proxies. Restoring a database needs
 its workload stopped
 ([runbook](docs/runbooks/recovery-and-undo.md#7-restoring-a-database)).
 A file written and closed at once is recorded once: when its last

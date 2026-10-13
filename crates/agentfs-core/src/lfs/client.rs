@@ -21,7 +21,9 @@
 //! action's `href` only when it has the endpoint's scheme, host and port
 //! and the server gave the action no `Authorization` of its own. The
 //! headers a server gives an action are sent as given. Redirects are never
-//! followed and proxy environment variables are ignored.
+//! followed; the remote's proxy (`remote.<name>.proxy`, else `http.proxy`,
+//! [`crate::proxy`]) carries every request, with `CONNECT`, and proxy
+//! environment variables are ignored.
 //!
 //! **Timeouts:** 30 s to connect; 5 minutes for a batch or verify request;
 //! for an object, 5 minutes plus its size at 256 KiB/s.
@@ -51,6 +53,7 @@ use super::{LfsError, Pointer};
 use crate::config::{RemoteSettings, Settings};
 use crate::credentials::{Credential, CredentialFile};
 use crate::events::PushFailureKind;
+use crate::proxy::ProxySetting;
 use crate::remote_url::{self, Transport};
 
 /// The git-lfs media type of batch requests and responses.
@@ -200,6 +203,7 @@ pub fn transfer_for(
             endpoint,
             &remote.name,
             concurrency,
+            remote.proxy.as_ref(),
         )?)),
         EndpointKind::File { git_dir } => Ok(Box::new(FileTransfer {
             objects: git_dir.join("lfs").join("objects"),
@@ -277,8 +281,13 @@ struct ObjectError {
 
 impl HttpTransfer {
     /// A client for `endpoint`, an [`EndpointKind::Http`], moving up to
-    /// `concurrency` objects at once.
-    pub fn new(endpoint: LfsEndpoint, remote: &str, concurrency: usize) -> Result<Self, LfsError> {
+    /// `concurrency` objects at once, through `proxy` if one is set.
+    pub fn new(
+        endpoint: LfsEndpoint,
+        remote: &str,
+        concurrency: usize,
+        proxy: Option<&ProxySetting>,
+    ) -> Result<Self, LfsError> {
         let EndpointKind::Http { url, auth } = &endpoint.kind else {
             return Err(LfsError::local("not an http(s) LFS endpoint"));
         };
@@ -308,8 +317,14 @@ impl HttpTransfer {
             }),
         };
         let concurrency = concurrency.max(1);
+        let proxy = proxy
+            .map(|p| {
+                ureq::Proxy::new(&p.url)
+                    .map_err(|e| LfsError::local(format!("the proxy {p} cannot be used: {e}")))
+            })
+            .transpose()?;
         Ok(Self {
-            agent: agent(concurrency),
+            agent: agent(concurrency, proxy),
             url,
             origin,
             credentials,
@@ -870,16 +885,17 @@ impl Transfer for HttpTransfer {
     }
 }
 
-/// The HTTP client: no redirects, no proxy, the timeouts above, an idle
-/// connection kept per concurrent transfer, and with the `https` feature
-/// native-tls over the system trust store, as libgit2 uses.
-fn agent(concurrency: usize) -> ureq::Agent {
+/// The HTTP client: no redirects, the remote's proxy if it has one (never
+/// one from the environment), the timeouts above, an idle connection kept
+/// per concurrent transfer, and with the `https` feature native-tls over
+/// the system trust store, as libgit2 uses.
+fn agent(concurrency: usize, proxy: Option<ureq::Proxy>) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
         .max_idle_connections_per_host(concurrency)
         .max_idle_connections(concurrency.max(3))
-        .proxy(None)
+        .proxy(proxy)
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .user_agent(concat!("agentfs/", env!("CARGO_PKG_VERSION")));
     #[cfg(feature = "https")]

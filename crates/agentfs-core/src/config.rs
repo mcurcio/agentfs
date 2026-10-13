@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::identity::Templates;
+use crate::proxy::ProxySetting;
 use crate::remote_url::{self, Transport};
 
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +115,12 @@ pub enum ConfigError {
          {MAX_CONCURRENT_TRANSFERS}"
     )]
     BadConcurrency { key: String, value: String },
+    #[error("{key}: {value:?} is not a proxy agentfs can use: {why}")]
+    BadProxy {
+        key: String,
+        value: String,
+        why: String,
+    },
     /// A global setting that makes every remote misconfigured.
     #[error("{0}")]
     Global(String),
@@ -146,6 +153,7 @@ pub const KEYS: &[&str] = &[
     "lfs.url",
     "lfs.pushurl",
     "lfs.concurrenttransfers",
+    "http.proxy",
     "include.path",
     "includeIf.<condition>.path",
     "remote.<name>.url",
@@ -161,6 +169,7 @@ pub const KEYS: &[&str] = &[
     "remote.<name>.lfsurl",
     "remote.<name>.lfspushurl",
     "remote.<name>.agentfsLfsCredentials",
+    "remote.<name>.proxy",
 ];
 
 /// Notes that `key` was read, for the test that checks [`KEYS`] against
@@ -259,6 +268,10 @@ pub struct RemoteSettings {
     /// credential file for an LFS endpoint on another host than the push
     /// URL's ([`crate::credentials`] format).
     pub lfs_credentials: Option<PathBuf>,
+    /// The proxy this remote's `http(s)` traffic goes through
+    /// ([`crate::proxy`]): `remote.<name>.proxy`, else `http.proxy`; an
+    /// empty `remote.<name>.proxy` means none.
+    pub proxy: Option<ProxySetting>,
 }
 
 /// The agentfs keys of a remote section that name files, which the mount
@@ -389,6 +402,10 @@ pub struct Settings {
     pub identity: Templates,
     /// Git LFS (design §7).
     pub lfs: LfsSettings,
+    /// `http.proxy`, normalised ([`crate::proxy`]): the proxy of every
+    /// remote without its own `remote.<name>.proxy`. A bad value
+    /// misconfigures every remote; `None` then.
+    pub http_proxy: Option<String>,
     /// Push remotes, sorted by name.
     pub remotes: Vec<RemoteSettings>,
     /// Remote sections that could not be used, sorted by name. They are
@@ -464,7 +481,18 @@ impl Settings {
             concurrent_transfers,
             concurrent_transfers_error,
         };
-        let (remotes, invalid_remotes) = remotes(config, &lfs)?;
+        let http_proxy = match string(config, "http.proxy")? {
+            None => Ok(None),
+            Some(value) => crate::proxy::parse(&value).map_err(|why| {
+                ConfigError::BadProxy {
+                    key: "http.proxy".into(),
+                    value: crate::proxy::redact(&value),
+                    why,
+                }
+                .to_string()
+            }),
+        };
+        let (remotes, invalid_remotes) = remotes(config, &lfs, &http_proxy)?;
         Ok(Self {
             branch_ref: format!("refs/heads/{branch}"),
             respect_tree_rules: boolean(config, "agentfs.respectTreeRules")?.unwrap_or(false),
@@ -505,6 +533,7 @@ impl Settings {
             },
             patch_fetch_timeout: patch_fetch_timeout(config)?,
             lfs,
+            http_proxy: http_proxy.ok().flatten(),
             remotes,
             invalid_remotes,
             includes,
@@ -573,6 +602,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
 fn remotes(
     config: &git2::Config,
     lfs: &LfsSettings,
+    http_proxy: &Result<Option<String>, String>,
 ) -> Result<(Vec<RemoteSettings>, Vec<InvalidRemote>), ConfigError> {
     let mut names = BTreeSet::new();
     note("remote.<name>.url");
@@ -592,7 +622,9 @@ fn remotes(
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
     for name in names {
-        match remote(config, &name).and_then(|r| validate_lfs(&r, lfs).map(|()| r)) {
+        let checked =
+            remote(config, &name, http_proxy).and_then(|r| validate_lfs(&r, lfs).map(|()| r));
+        match checked {
             Ok(remote) => valid.push(remote),
             Err(e) => invalid.push(InvalidRemote {
                 files: remote_files(config, &name),
@@ -619,7 +651,11 @@ fn remote_files(config: &git2::Config, name: &str) -> Vec<(&'static str, PathBuf
 }
 
 /// One `[remote "<name>"]` section.
-fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigError> {
+fn remote(
+    config: &git2::Config,
+    name: &str,
+    http_proxy: &Result<Option<String>, String>,
+) -> Result<RemoteSettings, ConfigError> {
     validate_name(&format!("remote.{name}"), name)?;
     let key = |k: &str| format!("remote.{name}.{k}");
     let Some(url) = string(config, &key("url"))? else {
@@ -648,10 +684,41 @@ fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigErr
         lfs_url: string(config, &key("lfsurl"))?,
         lfs_push_url: string(config, &key("lfspushurl"))?,
         lfs_credentials: path("agentfsLfsCredentials")?,
+        proxy: remote_proxy(config, name, http_proxy)?,
         name: name.to_owned(),
     };
     validate_transport(&remote)?;
     Ok(remote)
+}
+
+/// A remote's effective proxy (design §11.1): `remote.<name>.proxy` (empty:
+/// none), else `http.proxy`. A bad `http.proxy` misconfigures every
+/// remote.
+fn remote_proxy(
+    config: &git2::Config,
+    name: &str,
+    http_proxy: &Result<Option<String>, String>,
+) -> Result<Option<ProxySetting>, ConfigError> {
+    let global = match http_proxy {
+        Ok(global) => global,
+        Err(error) => return Err(ConfigError::Global(error.clone())),
+    };
+    let key = format!("remote.{name}.proxy");
+    match string(config, &key)? {
+        Some(value) => match crate::proxy::parse(&value) {
+            Ok(url) => Ok(url.map(|url| ProxySetting { url, key })),
+            Err(why) => Err(ConfigError::BadProxy {
+                key,
+                // Never echo a password the value may carry.
+                value: crate::proxy::redact(&value),
+                why,
+            }),
+        },
+        None => Ok(global.clone().map(|url| ProxySetting {
+            url,
+            key: "http.proxy".into(),
+        })),
+    }
 }
 
 /// Checks the agentfs keys against the push URL's transport (design
@@ -956,11 +1023,13 @@ mod tests {
                  \tauthorName = a\n\tauthorEmail = a@e\n\
                  [lfs]\n\turl = http://lfs.example/r\n\tpushurl = http://lfs.example/p\n\
                  \tconcurrenttransfers = 4\n\
+                 [http]\n\tproxy = http://proxy.example:3128\n\
                  [remote \"web\"]\n\turl = http://git.example/r.git\n\
                  \tpushurl = http://git.example/p.git\n\tagentfsMaxBlobSize = 100m\n\
                  \tagentfsMaxLfsObjectSize = 2g\n\
                  \tagentfsCredentials = /run/c\n\tlfsurl = http://lfs.example/web\n\
                  \tlfspushurl = http://lfs.example/web-push\n\tagentfsLfsCredentials = /run/l\n\
+                 \tproxy = http://other.example:8080\n\
                  [remote \"ssh\"]\n\turl = ssh://git@git.example/r.git\n\
                  \tagentfsSshKey = /run/k\n\tagentfsKnownHosts = /run/h\n",
                 fragment.display()
@@ -1526,6 +1595,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn proxy_settings() {
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n[http]\n\tproxy = proxy.example:3128\n\
+             [remote \"a\"]\n\turl = http://git.example/a.git\n\
+             [remote \"b\"]\n\turl = http://git.example/b.git\n\tproxy = http://other:8080/\n\
+             [remote \"c\"]\n\turl = http://git.example/c.git\n\tproxy = \"\"\n\
+             [remote \"d\"]\n\turl = http://git.example/d.git\n\tproxy = https://p:1\n\
+             [remote \"e\"]\n\turl = http://git.example/e.git\n\tproxy = http://u:pw@p:1\n\
+             [remote \"f\"]\n\turl = http://git.example/f.git\n\tproxy = socks5://p:1\n\
+             [remote \"g\"]\n\turl = http://git.example/g.git\n\tproxy = http://p:1/x\n",
+        );
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.http_proxy.as_deref(), Some("http://proxy.example:3128"));
+        let proxy = |name: &str| {
+            s.remotes
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .proxy
+                .clone()
+        };
+        assert_eq!(
+            proxy("a"),
+            Some(ProxySetting {
+                url: "http://proxy.example:3128".into(),
+                key: "http.proxy".into()
+            })
+        );
+        assert_eq!(
+            proxy("b"),
+            Some(ProxySetting {
+                url: "http://other:8080".into(),
+                key: "remote.b.proxy".into()
+            })
+        );
+        assert_eq!(proxy("c"), None, "an empty value disables the proxy");
+        let bad: Vec<&str> = s.invalid_remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(bad, ["d", "e", "f", "g"]);
+        for r in &s.invalid_remotes {
+            assert!(
+                r.error.starts_with(&format!("remote.{}.proxy:", r.name)),
+                "{}",
+                r.error
+            );
+            assert!(!r.error.contains("pw"), "{}", r.error);
+        }
+        // A bad http.proxy misconfigures every remote, not the volume.
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n[http]\n\tproxy = socks5://p:1\n\
+             [remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n\tproxy = \"\"\n",
+        );
+        let s = Settings::from_config(&c).unwrap();
+        assert!(s.remotes.is_empty());
+        assert_eq!(s.http_proxy, None);
+        for r in &s.invalid_remotes {
+            assert!(r.error.starts_with("http.proxy:"), "{}", r.error);
+        }
+        // No proxy anywhere.
+        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n[remote \"a\"]\n\turl = /a\n");
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(
+            (s.http_proxy.clone(), s.remotes[0].proxy.clone()),
+            (None, None)
+        );
     }
 
     #[test]

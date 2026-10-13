@@ -22,10 +22,15 @@
 # 17. agentfs lfs prune: only objects lfs-test-server and a file:// remote
 #     both hold are deleted; a restore downloads a pruned object again; a
 #     remote added after the prune needs `lfs fetch --all` before its
-#     push; a misconfigured remote refuses the prune.
+#     push; a misconfigured remote refuses the prune;
+# 18. proxies (with ci/proxy-server.sh): remote.<name>.proxy carries the git
+#     push and the LFS uploads and downloads; a dead http.proxy fails at
+#     stage lfs as unreachable, and an empty remote.<name>.proxy bypasses
+#     it; with E2E_HTTPS=1, https git and LFS servers through CONNECT, and
+#     an untrusted certificate still refused through the proxy.
 #
 # Needs ci/git-http-server.sh started with GIT_SERVER_LFS=1, ci/lfs-server.sh,
-# and git-lfs.
+# ci/proxy-server.sh (PROXY_URL, PROXY_LOG) and git-lfs.
 
 . "$(dirname "$0")/lib.sh"
 
@@ -33,6 +38,7 @@
 : "${GIT_SERVER_HTPASSWD:?}" "${GIT_SERVER_LFS_HTPASSWD:?}" "${GIT_HTTP_BASE:?}"
 : "${LFS_SEPARATE_BASE:?}" "${GIT_SERVER_ACCESS_LOG:?}" "${LFS_SERVER_DIR:?start ci/lfs-server.sh first}"
 : "${GIT_SERVER_LFS_FAULTS:?}" "${GIT_SERVER_LFS_RANGE_LOG:?}"
+: "${PROXY_URL:?start ci/proxy-server.sh first}" "${PROXY_LOG:?}"
 command -v git-lfs >/dev/null || fail "git-lfs is not installed"
 LOG=$GIT_SERVER_ACCESS_LOG
 
@@ -314,5 +320,67 @@ set -e
 assert_eq 1 "$code" "a misconfigured remote refuses the prune"
 assert_contains "$out" "remote broken is misconfigured" "naming it"
 git --git-dir "$STATE/git" config --remove-section remote.broken
+
+step "18. proxies"
+lfs_volume prox
+proxy_since() { tail -n +"$(($1 + 1))" "$PROXY_LOG"; }
+proxy_lines() { wc -l <"$PROXY_LOG"; }
+volume_config remote.sep.proxy "$PROXY_URL"
+assert_contains "$(agentfs status)" "proxy: $PROXY_URL (remote.sep.proxy)" "status shows the proxy"
+head -c 5000 /dev/urandom >"$TREE/p.bin"
+agentfs record p.bin
+before=$(proxy_lines)
+agentfs push --remote sep
+assert_eq "$(local_head prox)" "$(remote_ref "$REPO" refs/heads/agentfs/prox)" "pushed through the proxy"
+on_lfs_host "$(oid_of p.bin)" || fail "p.bin is not on the LFS host"
+through=$(proxy_since "$before")
+assert_contains "$through" "localhost:8080" "the git push went through the proxy"
+assert_contains "$through" "127.0.0.1:8081" "the LFS upload went through the proxy"
+rm -rf "$STATE/lfs/objects"
+before=$(proxy_lines)
+agentfs lfs fetch --remote sep
+assert_contains "$(proxy_since "$before")" "127.0.0.1:8081" "lfs fetch went through the proxy"
+# A dead proxy for every remote: the LFS stage cannot reach its server.
+git --git-dir "$STATE/git" config --unset remote.sep.proxy
+volume_config http.proxy http://127.0.0.1:1
+head -c 5000 /dev/urandom >"$TREE/q.bin"
+agentfs record q.bin
+pushed=$(remote_ref "$REPO" refs/heads/agentfs/prox)
+set +e
+out=$(agentfs push --remote sep 2>&1); code=$?
+set -e
+assert_eq 1 "$code" "a dead proxy fails the push"
+assert_contains "$out" "sep: failed (unreachable, stage lfs)" "as unreachable at stage lfs"
+assert_eq "$pushed" "$(remote_ref "$REPO" refs/heads/agentfs/prox)" "the branch did not move"
+volume_config remote.sep.proxy ""
+before=$(proxy_lines)
+agentfs push --remote sep
+assert_eq "$(local_head prox)" "$(remote_ref "$REPO" refs/heads/agentfs/prox)" "an empty remote proxy connects directly"
+assert_eq "" "$(proxy_since "$before")" "nothing went through the proxy"
+git --git-dir "$STATE/git" config --unset http.proxy
+if [ "${E2E_HTTPS:-}" = 1 ]; then
+  TLSP_REPO=$(server_repo tlsp)
+  volume_config remote.tlsp.url "https://localhost:8443/git/tlsp.git"
+  volume_config remote.tlsp.agentfsCredentials "$CREDS/alice"
+  volume_config remote.tlsp.lfsurl "$LFS_HTTPS_BASE/acme/tlsp"
+  volume_config remote.tlsp.proxy "$PROXY_URL"
+  before=$(proxy_lines)
+  out=$(agentfs push --remote tlsp 2>&1)
+  assert_contains "$out" "tlsp: pushed" "https git and LFS through the proxy"
+  assert_eq "$(local_head prox)" "$(remote_ref "$TLSP_REPO" refs/heads/agentfs/prox)" "the https remote has the branch"
+  through=$(proxy_since "$before")
+  assert_contains "$through" "localhost:8443" "the https git push was tunnelled"
+  assert_contains "$through" "localhost:8445" "the https LFS upload was tunnelled"
+  BADP=$VOL/badp.git
+  git init -q --bare "$BADP"
+  volume_config remote.badp.url "$BADP"
+  volume_config remote.badp.lfsurl "https://localhost:8444/x"
+  volume_config remote.badp.proxy "$PROXY_URL"
+  set +e
+  out=$(agentfs push --remote badp 2>&1); code=$?
+  set -e
+  assert_eq 1 "$code" "the untrusted endpoint fails"
+  assert_contains "$out" "badp: failed (untrusted_host, stage lfs)" "still untrusted_host through the proxy"
+fi
 
 step "all LFS transfer checks passed"

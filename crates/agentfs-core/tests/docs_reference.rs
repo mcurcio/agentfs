@@ -44,6 +44,8 @@ fn home(key: &str) -> (&'static str, String) {
         ("`[agentfs]`", key.to_owned())
     } else if key.starts_with("lfs.") {
         ("`[lfs]`", key.to_owned())
+    } else if key.starts_with("http.") {
+        ("`[http]`", key.to_owned())
     } else if key.starts_with("include") {
         ("Includes", key.to_owned())
     } else {

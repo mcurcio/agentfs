@@ -131,6 +131,7 @@ fn fetch_now(
         let mut options = FetchOptions::new();
         options
             .remote_callbacks(callbacks)
+            .proxy_options(crate::proxy::git_options(remote.proxy.as_ref(), url))
             .prune(FetchPrune::Off)
             .update_fetchhead(false)
             .download_tags(AutotagOption::None);
