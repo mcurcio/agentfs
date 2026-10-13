@@ -4,8 +4,8 @@ Status: draft 2, 2026-10-12, updated as phase 1 is built (the FUSE layer,
 `agentfs mount`, `agentfs restore` and `agentfs revert`, the container
 image and the Kubernetes sidecar deployment exist), and from phase 2 Git
 LFS (§7) and the `fsync` class for databases (§8), and from phase 3 the
-patch queue (§12), and the phase 4 building blocks: the history service
-and fronts (§14, single node). Draft 1 was
+patch queue (§12), and from phase 4 the history service and fronts
+(§14.1) and the CSI driver (§14.2, one node per volume). Draft 1 was
 reviewed adversarially. See [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
 for the findings and what changed because of them.
 
@@ -57,7 +57,7 @@ be recorded after the fact; §3.1 lists them.
 | 1 | The recorder as a native sidecar for one pod: recording, commits, interval push to any remote, path rules, operator-only safety settings, push checks, OpenTelemetry, a supported manual recovery path |
 | 2 | Git LFS (§7), and the `fsync` class for databases (§8); both built |
 | 3 | The ordered patch queue for iac (§12); built |
-| 4 | The CSI driver, including volumes mounted by several pods at once (§14) |
+| 4 | The CSI driver, including volumes mounted by several pods at once (§14); built for one node per volume at a time (§14.2); several nodes per volume open (§19.2) |
 
 ### 1.4 Not goals
 
@@ -186,6 +186,11 @@ so a crash never leaves a stale lock.
   single-process command exits 75 as above, and so do `restore` and
   `revert`: fronts serve no control socket, and restores through the
   service are a follow-up.
+- Under the CSI driver (§14.2) the node plugin starts the volume's
+  `serve-history` at NodeStage, so the service holds the lock while the
+  volume is staged on a node. The controller takes the lock only briefly,
+  to create or delete a volume; DeleteVolume of a staged volume fails with
+  `FailedPrecondition`.
 
 ## 3. Recording
 
@@ -1705,8 +1710,10 @@ succeeds again. Each failure also counts in
 only traces or logs shows up in metrics. A failure never stops a command.
 
 **Alarms** are alert rules on these metrics in the consumer's monitoring stack.
-agentfs emits the signals; it does not page anyone itself. The CSI driver may
-also emit Kubernetes Events on the pod.
+agentfs emits the signals; it does not page anyone itself. The CSI driver
+reports failed calls through the kubelet's events on the pod (FailedMount
+with the call's error); it emits no Events of its own, having no API
+access (§14.2).
 
 ## 14. Volumes mounted by several pods (CSI, phase 4)
 
@@ -1738,7 +1745,7 @@ area: `agentfs serve-history --root <backing>` is the service, and
 `agentfs mount --history-service <addr>` (and, for scripts and tests,
 `agentfs record --history-service <addr>`) a front. A plain `agentfs mount`
 stays single-process and is unchanged, journal bytes included. The CSI
-driver that would start these per pod is not built (§17.2).
+driver (§14.2) starts these per volume and per pod.
 
 **Protocol.** A Unix stream socket in the state area,
 `meta/history/history.sock` (directory 0700, socket 0600), reached through
@@ -1908,26 +1915,113 @@ asserts thresholds.
 
 **Still open** for this phase: a cross-node transport (TCP or gRPC with
 authentication, mTLS), since the front's origin is self-declared and only
-trusted because the socket is root or same-uid; passthrough and `flock`
-leases over a shared filesystem; the CSI driver; the RBAC and Pod Security
-inventory.
+trusted because the socket is root or same-uid; and verifying passthrough
+and `flock` leases over a shared filesystem (§14.2).
 
-**CSI requirements carried over from review:**
+### 14.2 CSI driver (built)
 
-- **Persistent identity.** A volume is a PersistentVolume or PVC, not an inline
-  ephemeral volume. Its state and history service outlive any pod, and garbage
-  collection follows the volume's lifecycle.
-- **No network work on mount or unmount.** Mounting a volume never clones, fetches
-  or pushes. The history service does that work in the background (§11.2),
-  except for a first-ever clone. Patch processing (§12) happens in the history
-  service before it accepts the first front, with a time limit.
-- **Operator-owned parameters.** Remote, rules and credentials are set by the
-  StorageClass or PV, not by pod authors.
-- **Recovery** from a front or service crash is specified and tested. This
-  covers:
-  - how a crashed front's mount is replaced or its pod restarted;
-  - how the service resumes from its journal.
-  At single-node level both are specified above and tested (§18 test 16).
+`agentfs-csi` (crate `crates/agentfs-csi`, §17.2) is a CSI v1.13 driver,
+`agentfs.mcurcio.github.io`, in the agentfs image. The operator's guide is
+[csi.md](csi.md). It runs one node per volume at a time; several nodes per
+volume wait for the cross-node transport above.
+
+**Lifecycle mapping.**
+
+| CSI call | Where | agentfs |
+|---|---|---|
+| CreateVolume | controller | `<basePath>/<pv>/{backing,state,csi.json}`; the state area initialised in-process (`init_with`) with the profile's config included and its rules installed |
+| ControllerPublish | controller | records the node in `csi.json`, so a second node is refused; Kubernetes' Multi-Attach check enforces the same (`attachRequired: true`) |
+| NodeStage | node plugin | starts `agentfs serve-history` for the volume, waits a bounded time for it to listen |
+| NodePublish | node plugin | starts a front, `agentfs mount --history-service`, with the pod's identity, mounted at a private source; bind-mounts it onto the kubelet's target |
+| NodeUnpublish, NodeUnstage | node plugin | stop the front, the service (final commit) |
+| DeleteVolume | controller | removes or keeps the directory (`onDelete`) |
+
+The node plugin spawns the `agentfs` binary for every long-running piece
+rather than linking FUSE into the gRPC server: a crashed front or service
+cannot take the server down, and the processes, flags and logs are the
+ones the single-node tests exercise (§14.1).
+
+**Parameters and profiles.** Everything about a volume is the operator's:
+a StorageClass (or static PV) names a `profile`, whose
+`<profile>.config` (a git-config fragment, §4.3), `.exclude` and
+`.attributes` (§4.1, §4.2) live in a ConfigMap in the driver's namespace,
+and whose credentials are files of a Secret there, both mounted into the
+driver's pods. Pod authors choose only the class. Other parameters:
+`volumeName` (a template over the claim's namespace and name), `branch`,
+`onDelete`. Inline ephemeral volumes are refused (`volumeLifecycleModes:
+[Persistent]`), since their parameters would be the pod author's.
+
+**Identity.** `podInfoOnMount` gives NodePublish the pod's name, namespace
+and uid, which the front passes on as its origin (§9): each pod commits
+as itself, and the service journals the origin so replays keep it.
+
+**No network work in a call.** No call clones, fetches or pushes;
+nothing clones at all (a volume starts empty). The service pushes on its
+interval (§11.2), and before it listens fetches the patch inbox (bounded
+by `agentfs.patchFetchTimeout`, §12) and applies queued patches.
+NodeStage only waits for it, at most `--stage-wait` (60 s), and answers
+`UNAVAILABLE` past that while the service keeps starting; the kubelet
+retries.
+
+**Recovery, specified and tested** (§18 test 16):
+
+- *Records.* The node plugin keeps a staged record per volume and a
+  published record per target (pod, slot, front pid) on a hostPath that
+  survives its restarts.
+- *A crashed front* is restarted with backoff (1 s doubling to 30 s,
+  reset after a minute up) with `--history-slot`, so it leases its
+  predecessor's slot (`FrontLease::acquire_preferring`) and drains that
+  slot's repairs as the same pod (§3.5). The stale source is detached
+  (`MNT_DETACH`); the new mount is bound **over** the stale target, which
+  cannot be unmounted under a running container (stacking). The target is
+  made shared after the bind, so the stacked mount propagates to
+  containers that mount with `HostToContainer`; others see it after a
+  container restart.
+- *A crashed service* is restarted with the same backoff; it recovers its
+  journal (§3.3), and fronts reconnect at their next request.
+- *A plugin restart* stops every child (final commits) and leaves the
+  records. The new plugin reconciles: it starts the staged volumes'
+  services, and recovers each recorded target whose mount is still there
+  (live or stale) as for a crashed front; targets the kubelet removed are
+  forgotten. The DaemonSet is `OnDelete`: an upgrade interrupts the node's
+  mounts for seconds, so it is rolled node by node.
+- *Order.* Per-volume locks serialise stage, publish, unpublish, unstage
+  and restarts; unstage is refused (`FailedPrecondition`) while a target
+  is published, and publish before stage likewise.
+
+**One node per volume.** `ReadWriteMany` is refused at CreateVolume. The
+attach step makes Kubernetes refuse a second node while the first holds
+the VolumeAttachment; ControllerPublish refuses it too.
+
+**RBAC inventory.** csi-provisioner: PVs (get, list, watch, create, patch,
+delete), PVCs (get, list, watch, update), StorageClasses, CSINodes and
+Nodes (get, list, watch), Events (list, watch, create, update, patch).
+csi-attacher: PVs (get, list, watch, patch), CSINodes (get, list, watch),
+VolumeAttachments (get, list, watch, patch) and their status (patch).
+Leases in the driver's namespace for leader election. No Secrets, pods or
+snapshots anywhere: credentials are mounted files, never API reads. The
+node plugin's account has no bindings and its token is not mounted; in
+the controller only the two sidecars get a token. The table with the
+reasons is in [csi.md](csi.md#10-security); `ci/e2e-csi.sh` checks it with
+`kubectl auth can-i`.
+
+**Pod Security inventory.** The driver's namespace enforces `privileged`
+(warn and audit `baseline`): the node plugin is privileged and root (FUSE
+mounts, `Bidirectional` propagation into `/var/lib/kubelet`, passthrough's
+`CAP_SYS_ADMIN`, `CAP_CHOWN`/`CAP_FOWNER` for ownership); the controller's
+`agentfs-csi` is root with only `DAC_OVERRIDE` and `FOWNER` and a
+read-only root filesystem; the sidecars run as root without capabilities
+(to reach the root-owned 0660 socket). Workload namespaces can enforce
+`restricted`: a pod only mounts a claim. Hardened node images (Talos) are
+untested.
+
+**Shared filesystems.** basePath must be one filesystem the controller
+and every node see at the same path; with several nodes that is a shared
+filesystem. It must honour `flock` (the state lock, §2.3, and the slot
+leases): NFSv4, or NFSv3 with NLM, never `nolock`. Reflinks do not cross
+it, so freezes copy (§3.2); passthrough is decided per inode and falls
+back where the kernel refuses a backing file (§17.1). None of this is
+tested yet.
 
 ## 15. Recovery and undo
 
@@ -2319,11 +2413,42 @@ one-time migration of Hermes' existing data and the initial import in
   - **Privilege.** `privileged: true` is what Bidirectional propagation
     requires; its cost and mitigations are in
     [deployment.md](deployment.md#9-security-trade-offs-of-the-privileged-sidecar).
-    The CSI driver (phase 4) removes it from workload pods.
+    The CSI driver (§14.2) removes it from workload pods.
 
 ### 17.2 Layer 2: CSI driver (Rust)
 
-Phase 4 (§14).
+Phase 4 (§14.2). The crate `crates/agentfs-csi` is a library and the
+binary `agentfs-csi --mode controller|node|all`. It depends on
+`agentfs-core` (`init_with`, the state lock, `FrontLease::holders`, name
+validation) and `agentfs-fuse` (only the mount-state probe), never on the
+CLI. Modules:
+
+- `csi`: the CSI v1.13.0 protobuf, vendored under `proto/` and compiled by
+  `build.rs` with protox and tonic-prost-build (no `protoc`);
+- `params`: StorageClass and PV parameters, the `volumeName` template,
+  `podInfoOnMount`; `layout`: the paths under basePath and node-state,
+  handle validation, target keys; `records`: `csi.json` and the node's
+  staged and published records, written atomically;
+- `identity`, `controller`, `node`: the tonic services. The controller's
+  calls are serialised and run blocking work off the async threads; `node`
+  validates and delegates to `supervisor`;
+- `supervisor`: per-volume locks, the children (one service per staged
+  volume, one front per target), readiness (the service's address file,
+  the front's mount state), restarts with backoff, recovery by bind
+  stacking, reconcile at start, shutdown;
+- `launcher`: `trait Launcher` and `AgentfsLauncher`, which spawns the
+  `agentfs` binary with tokio, forwards its output prefixed with a label,
+  keeps its last lines for errors and reports its exit; `mounter`: `trait
+  Mounter` and `KernelMounter` (bind, read-only remount, shared
+  propagation, `MNT_DETACH`). Both traits are public so tests inject
+  fakes;
+- `server`: the endpoint, a tonic server on a Unix socket (mode 0660), and
+  graceful shutdown on SIGTERM.
+
+**Process model.** The node plugin is `tini` → `agentfs-csi` → its
+children, the `agentfs` binary (`serve-history`, `mount
+--history-service`), each in its own process so a crash is contained and
+restartable (§14.2). The controller runs no children.
 
 ### 17.3 Libraries (verified 2026-10-12)
 
@@ -2338,7 +2463,11 @@ Phase 4 (§14).
 | Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `reqwest-blocking-client`, no TLS) in the binary | OTLP http/protobuf export. Verified pure Rust: no OpenSSL, ring, aws-lc, cmake or protoc |
 | Patch submission | the `git` CLI on the producer's side (`ls-remote`, `fetch`, `commit-tree`, `push --force-with-lease`) | Runs in the producer's repository with its own credentials and config, so agentfs needs none of them; the lease makes a number create-only (§12) |
 | Repack | the `git` CLI (`git repack --geometric=2`, git 2.32 or later) | libgit2 has no repack or gc. Run by the commit loop with system and global config off (§8); the image ships `git` |
-| Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates` and `git`; built on `rust:1.99-trixie`; both pinned by digest | Not distroless: the daemon runs `git repack` (§8), and operators follow the runbooks with `git` through `kubectl exec`. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after the kind e2e passes |
+| Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates`, `git` and `tini`; built on `rust:1.99-trixie`; both pinned by digest. Ships `agentfs` and `agentfs-csi` | Not distroless: the daemon runs `git repack` (§8), and operators follow the runbooks with `git` through `kubectl exec`. `tini` is the CSI node plugin's PID 1, reaping its children's orphans. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after both kind e2e jobs pass |
+| CSI gRPC | `tonic` 0.14 and `tonic-prost`, `prost` 0.14, `prost-types`, on `tokio` (only in `agentfs-csi`) | Transport and codegen features, no TLS: the socket is local. The front/service protocol stays a plain socket (§14.1) |
+| CSI codegen | `protox` 0.10 and `tonic-prost-build` 0.14 in `build.rs` | A pure-Rust protobuf compiler with the well-known types bundled: no `protoc` on build hosts or in the image |
+| CSI spec | `csi.proto` v1.13.0, vendored in `crates/agentfs-csi/proto` | Pinned by copy; updating it is a deliberate change |
+| CSI sidecars | csi-provisioner v6.4.0, csi-attacher v4.13.0, csi-node-driver-registrar v2.18.0, livenessprobe v2.20.0 from `registry.k8s.io/sig-storage` | Pinned by digest in `deploy/csi/kustomization.yaml` |
 
 ## 18. Acceptance tests
 
@@ -2404,8 +2533,9 @@ Phase 4 (§14).
     `ci/e2e-multipod.sh`: renames and removals across fronts, also of a
     file still open in the other front, a concurrent burst on one path, an
     outage, and a `kill -9` of the service with a journaled, uncommitted
-    record);
-    two nodes wait for the CSI driver.
+    record), and through the CSI driver on one node (two restricted pods
+    on one claim, `ci/e2e-csi.sh`, with the front, service and plugin
+    crash recoveries of §14.2); two nodes wait for a cross-node transport.
 
 **Where they run.** Tests 1, 2, 4, 5, 6, 7 and 11 run through real mounts
 in the `fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with
@@ -2465,8 +2595,28 @@ turn, every commit's committer equal to its `Agentfs-Pod` trailer, `EIO`
 and the alarm while the service is down and the catch-up after it
 restarts, a `kill -9` of the service right after a close returned, the
 push, and the per-close cost through a single-process mount and a front.
-Not automated yet: test 3 (a kill at every step), 13 (performance) and
-16 across two nodes.
+Through the CSI driver (§14.2), test 16 runs: without FUSE in
+`crates/agentfs-csi/tests/grpc.rs` (the Identity and Controller services
+over a real socket), `tests/supervisor.rs` (the supervisor with a fake
+launcher and mounter: restarts in the same slot, bind stacking,
+reconcile, ordering) and `crates/agentfs/tests/csi_service.rs` (the
+supervisor driving a real `serve-history`: two pods' committers, a `kill
+-9` with a journaled commit, the final commit at unstage); in the
+`csi-sanity` job (`ci/csi-sanity.sh`: csi-test v5.6.0 against
+`agentfs-csi --mode all` with real services and FUSE fronts, then nothing
+left behind); and in the `e2e-csi` job of the `image` workflow
+(`ci/e2e-csi.sh`, kind, the image just built): the RBAC inventory through
+`kubectl auth can-i`, two restricted pods (uid 10000 and 10001, one
+fsGroup) on one claim with distinct committers, trailers and uid authors
+on the runner's git server, `kill -9` of one front (the other pod
+unaffected, the front back in its slot and live through
+`HostToContainer`), of the service right after a write (committed and
+pushed), and deletion of the node plugin pod (reconcile; one pod live,
+the other after a container restart), the refusals of inline volumes and
+`ReadWriteMany`, and teardown through DeleteVolume.
+Not automated yet: test 3 (a kill at every step), 13 (performance), 16
+across two nodes, and the CSI driver over a shared filesystem, on
+hardened node images (Talos) and across node reboots.
 
 ## 19. Decisions and open questions
 
@@ -2475,7 +2625,7 @@ Not automated yet: test 3 (a kill at every step), 13 (performance) and
 | Topic | Decision |
 |---|---|
 | Storage model | Real backing tree with FUSE passthrough; the projection is logical only |
-| Several pods on one volume | Supported by the CSI driver, one committer identity per replica (§14, §9); built at single-node level as `serve-history` and front mounts (§14.1) |
+| Several pods on one volume | Supported by the CSI driver, one committer identity per replica (§14, §9); built at single-node level as `serve-history` and front mounts (§14.1), started per volume and per pod by the CSI driver, one node per volume (§14.2) |
 | Rejected pushes | Alarm, retry, keep operating (§11.3) |
 | Remotes | Any git remote, several at once (§11.1) |
 | Push timing | Interval, independent of pod lifecycle (§11.2) |
@@ -2541,20 +2691,32 @@ Not automated yet: test 3 (a kill at every step), 13 (performance) and
 | Patches with fronts | Applied by `serve-history` before it listens, only when no front lease is live; otherwise skipped with a message (§12, §14) |
 | Restores with fronts | Not through fronts: `restore` and `revert` exit 75 while the service runs; through the service is a follow-up (§2.3, §14) |
 | Locks across fronts | POSIX and BSD locks are per FUSE mount, so not shared between pods; a lock-coordinated database (SQLite, the `fsync` class) must be written from one pod (§14) |
+| CSI driver shape | One binary, `agentfs-csi` (`--mode` controller, node or all), in the agentfs image; tonic over a Unix socket, the spec compiled without `protoc`; the node plugin spawns the `agentfs` binary for the service and each front instead of linking FUSE in-process (§14.2, §17.2) |
+| CSI volumes | PersistentVolumes only (no inline ephemeral volumes); `<basePath>/<pv>/{backing,state,csi.json}`; basePath one filesystem seen by the controller and every node; size recorded, not enforced (§14.2) |
+| One node per volume | `ReadWriteOnce`/`ReadWriteOncePod` only, `ReadWriteMany` refused; `attachRequired: true` with ControllerPublish tracking the node, so Kubernetes' Multi-Attach check enforces it (§14.2) |
+| CSI parameters | A StorageClass or PV names a `profile` whose config fragment, rules and credentials live in the driver's namespace (a ConfigMap without hash suffix, a Secret), mounted into its pods; no Secret RBAC; pod authors choose only the class (§14.2) |
+| CSI identity | `podInfoOnMount`: each pod's front commits under the pod's name, namespace and uid (§9, §14.2) |
+| CSI recovery | Crashed fronts and services restarted with backoff (1 s to 30 s); a front in its predecessor's slot (`--history-slot`), its mount bind-stacked over the stale target, made shared so `HostToContainer` containers see it; reconcile from node records after a plugin restart; DaemonSet `OnDelete` (§14.2) |
+| CSI RBAC | csi-provisioner and csi-attacher's minimal ClusterRoles plus leader-election leases; no Secrets, pods or snapshots; the node plugin has no API access and no token (§14.2, [csi.md](csi.md#10-security)) |
+| CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
+| CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |
 
 ### 19.2 Open questions
 
 1. **Performance budget** for the synchronous step, set after the phase 1
    benchmark (§18 test 13).
-2. **Multi-pod (§14):** passthrough over a shared filesystem, RBAC and Pod
-   Security, and a cross-node transport with authentication. The round trip
+2. **Multi-pod (§14):** RBAC and Pod Security are settled by the CSI
+   driver (§14.2). Open: a cross-node transport with authentication (so
+   several nodes can mount one volume), verifying the state lock, slot
+   leases and passthrough over a shared filesystem such as NFS, and
+   upgrading the node plugin without interrupting its mounts. The round trip
    per boundary is measured at single-node level (§14.1): a Unix-socket
    round trip costs tens of microseconds, against about a millisecond
    for the freeze and `fsync` both modes pay: on CI (`ubuntu-latest`,
    ext4) the socket round trip is 15–25 µs and a front close is 48–90 µs
    slower than a single-process close at the median, of about 1 ms. The
-   cost of a network round trip between nodes stays open with the CSI
-   driver.
+   cost of a network round trip between nodes stays open with the
+   cross-node transport.
 3. **Recovery tooling** beyond `restore`, `revert` and the runbooks (§15):
    whether a read-only history view for operators is worth building,
    whether undo through the patch queue (§12) replaces manual restores for

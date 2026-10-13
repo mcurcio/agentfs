@@ -75,6 +75,25 @@ passthrough, and records by interception.
 | 11 | State-area sizing and full-disk behaviour | minor | Recording-failure behaviour defined (§3.5); state size exported (§13) |
 | 12 | No metrics or alarm mechanism | minor | Fixed: OpenTelemetry (§13) |
 
+Phase 4 note (the CSI driver, design §14.2, [csi.md](../csi.md)), on the
+findings left open above:
+
+- **4.** One node per volume, enforced through attach: `attachRequired:
+  true` makes Kubernetes refuse a second node (Multi-Attach) while the
+  first holds the VolumeAttachment, ControllerPublish refuses it too, and
+  `ReadWriteMany` is refused. A volume moves with its pods once they are
+  gone. Several nodes per volume stay open (a cross-node transport).
+- **6.** Recovery is specified and tested in the driver: a crashed front is
+  restarted in its slot and its mount bind-stacked over the stale target,
+  a crashed service restarted with journal recovery, and a restarted node
+  plugin reconciles from its node records; the e2e-csi job kills each.
+  An upgrade still interrupts the node's mounts for seconds (`OnDelete`).
+- **8.** The RBAC inventory is done: the sidecars' minimal roles, no
+  Secrets, pods or snapshots, and no API access for the node plugin.
+- **10.** Pod Security is done: only the driver's namespace is
+  `privileged`; workloads run under `restricted`. Talos and other
+  hardened node images are untested.
+
 ## Objective and scope
 
 | # | Finding | Severity | Draft 2 |

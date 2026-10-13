@@ -348,9 +348,13 @@ mistakes, not a malicious agent. The privilege sits in the sidecar, not
 in the agent's containers: the agent gets an ordinary directory and no
 new privilege. The risk it adds is to the node, if agentfs itself is
 compromised, so treat its image like any privileged node component:
-pinned, scanned, updated. The CSI driver (phase 4, §14) moves the mount
-into a node plugin, so workload pods no longer need a privileged
-container at all.
+pinned, scanned, updated.
+
+**The CSI driver moves the privilege out of workload pods** (design
+§14.2, [csi.md](csi.md#10-security)): its node plugin, in the driver's own
+`agentfs-csi` namespace, is the only privileged container, and workload
+namespaces can enforce `restricted`. Settings and credentials move with
+it, into that namespace.
 
 ## 10. Hermes
 
@@ -454,12 +458,11 @@ alert on `agentfs.patch.blocked`. See
 - `linux/amd64` images only.
 - The pod restart after a crash is manual (§7).
 - A sidecar exit that is not a crash is not held (§7).
-- The privileged sidecar (§9); the CSI driver (phase 4) removes it.
+- The privileged sidecar (§9); the CSI driver ([csi.md](csi.md)) needs no
+  privilege in workload pods.
 - One pod per volume. The sidecar stays single-process (`agentfs mount`
-  without `--history-service`). The history service and fronts exist for
-  one node (`agentfs serve-history`, `mount --history-service`; design
-  §14, [operator guide](operator-guide.md#16-several-mounts-of-one-volume-history-service)),
-  but no manifests run them: several pods on one volume wait for the CSI
-  driver, which will run the service per volume and a front per pod.
+  without `--history-service`). For several pods on one volume use the
+  CSI driver ([csi.md](csi.md)), which runs a history service per volume
+  and a front per pod, one node per volume at a time.
 - The image is not bit-reproducible (Debian packages are not pinned),
   and is not yet signed or shipped with an SBOM.

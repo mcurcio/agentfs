@@ -659,7 +659,12 @@ the single-process mount of the rest of this guide.
 **Requirements.** The service and every front on the same node, with the
 same state area and backing tree (the socket is a Unix socket in the
 state area). The fronts run as root or as the service's user: the
-service refuses any other peer. Cross-node mounts wait for the CSI driver.
+service refuses any other peer. Cross-node mounts are not built yet.
+
+**On Kubernetes**, the CSI driver runs this for you: a service per staged
+volume, a front per pod with that pod's identity, restarts in the same
+slot, and recovery of the mounts. See [csi.md](csi.md) and
+[runbooks/csi-recovery.md](runbooks/csi-recovery.md).
 
 **Start order.** Start the service first; a front waits up to
 `--history-wait` (30 s) for it, then exits 1 with nothing mounted.

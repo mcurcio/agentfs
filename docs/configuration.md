@@ -478,3 +478,48 @@ Kubernetes init container does:
   when it is missing.
 - The result is opened once before `init` exits, so a bad setting or
   include fails `init`, not the first mount.
+
+## The CSI driver (`agentfs-csi`)
+
+On Kubernetes with the CSI driver ([csi.md](csi.md)), a volume's settings,
+remotes and rules come from a **profile** in the driver's
+`agentfs-csi-profiles` ConfigMap: `<profile>.config` is a fragment with
+the keys of this page, included by the volume's state area like
+`init --include` does; `<profile>.exclude` and `<profile>.attributes`
+become its `info/exclude` and `info/attributes`. Credentials files are
+under `/etc/agentfs-csi/credentials/` in the driver's pods.
+
+**StorageClass parameters** (or a static PV's `volumeAttributes`):
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `profile` | required | the profile, a DNS label |
+| `volumeName` | `{pvcNamespace}.{pvcName}`, else the PV name | the agentfs volume name; a template over `{pvcNamespace}`, `{pvcName}`, `{pvName}` |
+| `branch` | `agentfs/<volumeName>` | the history branch |
+| `onDelete` | `retain` | `retain` keeps the volume directory at DeleteVolume, `delete` removes it |
+
+**`agentfs-csi` flags:**
+
+| Flag | Environment | Default | Meaning |
+|---|---|---|---|
+| `--mode controller\|node\|all` | `AGENTFS_CSI_MODE` | required | which CSI services to serve |
+| `--endpoint ADDR` | `CSI_ENDPOINT` | `unix:///csi/csi.sock` | the CSI socket (`unix://`, `unix:` or an absolute path) |
+| `--node-id NAME` | `NODE_NAME` | required for `node` and `all` | this node's name (`spec.nodeName`) |
+| `--base-path DIR` | | `/var/lib/agentfs-csi/volumes` | where volumes live: one filesystem, at the same path on the controller and every node |
+| `--node-state DIR` | | `/var/lib/agentfs-csi/node` | the node's staged and published records and the services' sockets; must survive plugin restarts |
+| `--mount-dir DIR` | | `/run/agentfs-csi/mounts` | where fronts mount before the bind onto the kubelet's target |
+| `--profiles-dir DIR` | | `/etc/agentfs-csi/profiles` | the profiles |
+| `--agentfs-bin PATH` | | `/usr/local/bin/agentfs` | the `agentfs` binary the node plugin runs |
+| `--passthrough auto\|on\|off` | | `auto` | the fronts' FUSE passthrough |
+| `--front-threads N` | | `4` | FUSE threads per front |
+| `--stage-wait DURATION` | | `60s` | how long NodeStage waits for the history service before answering `UNAVAILABLE` |
+| `--publish-wait DURATION` | | `60s` | how long NodePublish waits for the front's mount |
+| `--unpublish-grace DURATION` | | `20s` | how long NodeUnpublish waits for a front to stop before SIGKILL |
+| `--unstage-grace DURATION` | | `30s` | how long NodeUnstage waits for a service to stop before SIGKILL |
+| `--history-wait DURATION` | | `30s` | the fronts' `--history-wait` |
+| `--backoff-max DURATION` | | `30s` | the longest delay between restarts of a crashed service or front |
+| `--pod NAME`, `--namespace NAME` | `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | empty | the plugin pod's name and namespace, passed to the history services (their own identity in telemetry) |
+
+The node plugin passes its `OTEL_*` variables on to every service and
+front; it removes inherited `AGENTFS_*` variables, so the per-volume and
+per-pod flags it sets are the only ones.

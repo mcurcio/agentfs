@@ -22,7 +22,8 @@ It is built in two layers:
 
 ## Status
 
-Phase 1 in progress. See [docs/design.md](docs/design.md) and the
+Phases 1 to 3 built; phase 4 built for one node per volume (the CSI
+driver). See [docs/design.md](docs/design.md) and the
 [review record](docs/reviews/2026-10-12-adversarial.md).
 
 Built so far, in `agentfs-core`: path checks, the journal (group commit,
@@ -109,9 +110,15 @@ nested repository detection. Also:
   state area and return once it is durable. Each pod's changes are
   committed with that pod's committer and trailers. See
   [Several mounts of one volume](#several-mounts-of-one-volume).
-- **Deployment:** a container image (`ghcr.io/mcurcio/agentfs`) and
-  example Kubernetes manifests for the phase 1 sidecar, tested end to end
-  in a kind cluster. See
+- **CSI driver** (phase 4, one node per volume): `agentfs-csi` gives pods
+  agentfs volumes as PersistentVolumeClaims. The node plugin runs a history
+  service per volume and a front per pod, each pod committing as itself;
+  settings, rules and credentials are the operator's (StorageClass
+  profiles); workloads need no privilege; crashed fronts and services are
+  restarted and their mounts recovered. See [docs/csi.md](docs/csi.md).
+- **Deployment:** a container image (`ghcr.io/mcurcio/agentfs`), example
+  Kubernetes manifests for the phase 1 sidecar and for the CSI driver,
+  both tested end to end in a kind cluster. See
   [Deploying on Kubernetes](#deploying-on-kubernetes).
 
 The `agentfs` command has `init`, `status`, `mount`, `probe`, `flush`, `record`,
@@ -138,8 +145,9 @@ with status 75 if another process holds it, naming the holder;
 lock and changes nothing, so it works beside a running daemon, and shows
 who holds the lock.
 
-Not built yet: the CSI driver (phase 4) and several mounts across nodes, asking a running mount to push now, and
-restarting a pod automatically after its sidecar crashes. SSH remotes do
+Not built yet: several mounts of one volume across nodes, asking a running mount to push now, and
+restarting a pod automatically after its sidecar crashes (the CSI driver
+does restart crashed fronts). SSH remotes do
 not support ssh-agent, passphrase-protected keys or `@cert-authority`
 host certificates. LFS has no SSH (`git-lfs-authenticate`), concurrent or
 resumable transfers, proxy settings or pruning. Restoring a database needs
@@ -200,7 +208,9 @@ the service and every front.
 If the service is down, a change through a front fails with `EIO` and
 the `HistoryServiceUnavailable` alarm; once it is back the fronts
 reconnect and their repairs and sweep record the final state
-([runbook](docs/runbooks/history-service-down.md)). Limits: one node only;
+([runbook](docs/runbooks/history-service-down.md)). On Kubernetes the CSI
+driver runs all of this for you, per volume and per pod
+([docs/csi.md](docs/csi.md)). Limits: one node only;
 no `restore` or `revert` while the service runs; locks are not shared
 between mounts, so a database must be written from one of them; patches
 are applied only when the service starts with no fronts; the service
@@ -213,8 +223,9 @@ new name, or not at all. Without
 ## Deploying on Kubernetes
 
 The image `ghcr.io/mcurcio/agentfs` (tags: the commit sha, and `latest`
-for `main`) has `agentfs` built with the `https` and `ssh` features, plus
-`fuse3`, `git` and the CA certificates. [`deploy/sidecar`](deploy/sidecar)
+for `main`) has `agentfs` built with the `https` and `ssh` features and
+the CSI driver `agentfs-csi`, plus `fuse3`, `git`, `tini` and the CA
+certificates. [`deploy/sidecar`](deploy/sidecar)
 is a kustomize base that runs it as a privileged native sidecar next to a
 workload (phase 1, design §17.1):
 
@@ -233,6 +244,21 @@ configuration, operations, the security trade-offs of the privileged
 sidecar and the Hermes example ([`deploy/examples/hermes`](deploy/examples/hermes));
 [runbooks/crashed-sidecar.md](docs/runbooks/crashed-sidecar.md) covers a
 crash.
+
+**Or the CSI driver** (phase 4, design §14.2): [`deploy/csi`](deploy/csi)
+installs `agentfs-csi`, and workloads mount an ordinary claim of an agentfs
+StorageClass, with no privilege and no agentfs configuration of their own
+([`deploy/csi/example`](deploy/csi/example): two replicas on one claim):
+
+```sh
+kubectl apply -k deploy/csi           # after editing deploy/csi/profiles and the credentials
+kubectl apply -k deploy/csi/example
+```
+
+Several pods on one node share a volume, each committing as itself; one
+node per volume at a time. [docs/csi.md](docs/csi.md) covers the
+architecture, parameters, recovery, RBAC and Pod Security;
+[runbooks/csi-recovery.md](docs/runbooks/csi-recovery.md) the incidents.
 
 ## Recovery
 
@@ -498,6 +524,11 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   mount and through a front ([`boundary-latency.py`](ci/boundary-latency.py))
   and the socket round trip, into the job summary. The `fuse` job also
   runs `two_fronts_one_service` from `mount.rs`.
+- **e2e csi-sanity** ([`ci/csi-sanity.sh`](ci/csi-sanity.sh)): the
+  Kubernetes CSI conformance suite csi-test (`csi-sanity` v5.6.0, pinned)
+  against `agentfs-csi --mode all` with real history services and FUSE
+  fronts: every controller and node call, error codes, idempotency and
+  cleanup, then no mount, record or volume directory left behind.
 - **e2e runbooks** ([`ci/e2e-runbooks.sh`](ci/e2e-runbooks.sh)): runs the
   shell blocks of the [divergence](docs/runbooks/divergence.md) and
   [history-rewrite](docs/runbooks/history-rewrite.md) runbooks exactly as
@@ -510,8 +541,9 @@ tests the container image on every push:
 
 - **build:** the [`Dockerfile`](Dockerfile) (with the GitHub Actions layer
   cache), a smoke test of the image (`agentfs --version`, `fusermount3`,
-  `git`), and a render of the kustomizations in `deploy/sidecar` and
-  `ci/k8s`. The image is kept as an artifact for the next jobs.
+  `git`, `agentfs-csi --version`, `tini --version`), and a render of the
+  kustomizations in `deploy/sidecar`, `deploy/csi`, `deploy/csi/example`,
+  `ci/k8s` and `ci/k8s-csi`. The image is kept as an artifact for the next jobs.
 - **e2e kind cluster** ([`ci/e2e-kind.sh`](ci/e2e-kind.sh)): loads that
   image into a kind cluster (kind, kubectl and the node image pinned by
   checksum and digest, [`ci/install-kind.sh`](ci/install-kind.sh)),
@@ -525,7 +557,17 @@ tests the container image on every push:
   `ENOTCONN` for the workload, a holding sidecar and a NotReady pod,
   `kubectl delete pod` completing, and the new pod pushing what was
   written before the kill.
-- **publish** (main only, after the kind test): pushes the tested image to
+- **e2e CSI driver** ([`ci/e2e-csi.sh`](ci/e2e-csi.sh)): the same image in
+  another kind cluster, with [`deploy/csi`](deploy/csi) through its CI
+  overlay [`ci/k8s-csi`](ci/k8s-csi). It validates the manifests, checks
+  the driver's registration and its RBAC inventory with `kubectl auth
+  can-i`, runs two restricted pods (uid 10000 and 10001) on one claim and
+  checks their distinct committers, trailers and authors on the runner's
+  git server, kills one pod's front (the other pod unaffected, the front
+  back in its slot and live), the history service right after a write,
+  and the node plugin pod, each recovered, checks that inline volumes and
+  `ReadWriteMany` are refused, and tears down through DeleteVolume.
+- **publish** (main only, after both kind tests): pushes the tested image to
   `ghcr.io/mcurcio/agentfs` as `<commit sha>` and `latest`.
 
 The e2e scripts run locally too: start the server with
@@ -537,5 +579,6 @@ collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run
 `ci/fuse-tests.sh`, `ci/e2e-recovery.sh` and (with the HTTP server)
 `ci/e2e-patches.sh` on any Linux host with FUSE
 and passwordless sudo. `ci/e2e-runbooks.sh` needs only `git-filter-repo`.
-`ci/e2e-kind.sh` runs on any Linux host with docker, kind, kubectl, nginx
-and fcgiwrap; its header lists the commands.
+`ci/e2e-kind.sh` and `ci/e2e-csi.sh` run on any Linux host with docker,
+kind, kubectl, nginx and fcgiwrap; their headers list the commands.
+`ci/csi-sanity.sh` needs FUSE, passwordless sudo and `csi-sanity`.
