@@ -794,9 +794,11 @@ next start or an `agentfs push`.
 
 **Limits.**
 
-- No `restore` or `revert` while the service runs: they exit 75. Stop the
-  fronts and the service, then restore directly or through a
-  single-process mount.
+- `restore` and `revert` while the service runs need every live front to
+  listen for the service's calls; they exit 75 while one does not (a
+  front from an older release, or one reconnecting). A front that fails
+  to drop its caches after a restore is named in a warning and may show
+  old content until its kernel's cache times out.
 - POSIX and BSD locks are kept by each mount's kernel and are not shared
   between fronts. A database or any lock-coordinated file must be written
   through one front only, and the `fsync` class (§14) is per front.

@@ -7,8 +7,11 @@
 //! own rules, checks and freeze, then a round trip to the service, which
 //! journals and commits. A front mount's failed records wait in its slot's
 //! repair file (`meta/fronts/slot-N.repairs`) for the next front in that
-//! slot. A front serves no control socket: restores need the service
-//! stopped and a single-process mount.
+//! slot. A front serves no control socket: restores and reverts go to
+//! the service, which writes the backing tree itself and calls each front
+//! on its listening connection (design §15): to settle what is dirty, to
+//! say what is open for writing, and to drop its kernel's caches of what
+//! was written.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -19,7 +22,9 @@ use anyhow::{Context as _, Result, bail};
 
 use agentfs_core::history::History;
 use agentfs_core::history_service::protocol::FrontInfo;
-use agentfs_core::history_service::{Address, ClientConfig, FrontLease, HistoryClient};
+use agentfs_core::history_service::{
+    Address, ClientConfig, FrontHooks, FrontLease, HistoryClient, ListenerHandle, NoHooks,
+};
 use agentfs_core::record::Origin;
 use agentfs_core::volume::{self, Recorder, StateDir};
 use agentfs_fuse::{Mount, MountConfig, preflight};
@@ -33,6 +38,16 @@ struct Front {
     lease: FrontLease,
     recorder: Recorder,
     address: Address,
+    client: Arc<HistoryClient>,
+}
+
+impl Front {
+    /// Answers the service's calls with `hooks` until the handle drops.
+    fn listen(&self, hooks: Arc<dyn FrontHooks>) -> Result<ListenerHandle> {
+        self.client
+            .listen(hooks)
+            .context("starting the history service listener")
+    }
 }
 
 fn connect(
@@ -87,17 +102,19 @@ fn connect(
             history.history_wait
         )
     })?;
+    let client = Arc::new(client);
     let recorder = volume::open_front(
         state,
         tree,
         session.events.clone(),
         session.telemetry(),
-        Arc::new(client),
+        client.clone(),
     )?;
     Ok(Front {
         lease,
         recorder,
         address,
+        client,
     })
 }
 
@@ -113,12 +130,16 @@ pub(crate) fn record_front(
 ) -> Result<ExitCode> {
     let session = Session::start(state, pod)?;
     let front = connect(state, root, pod, address, history, &session, "record")?;
+    // Nothing to settle or invalidate, but a live front that does not
+    // listen makes the service refuse restores while it runs.
+    let listener = front.listen(Arc::new(NoHooks))?;
     crate::record_paths(&front.recorder, root, paths)?;
     println!(
         "recorded through the history service at {} (slot {}); it commits them",
         front.address,
         front.lease.slot()
     );
+    listener.stop();
     drop(front);
     session.finish();
     Ok(ExitCode::SUCCESS)
@@ -181,6 +202,8 @@ pub(crate) fn mount_front(
     let mounted = Mount::start(front.recorder.clone(), config)?;
     daemon.watch(mounted.ended(), Wake::Unmounted)?;
     daemon.watch(mounted.failed(), Wake::PassthroughFailed)?;
+    // The service calls the mount on this for restores (design §15).
+    let listener = front.listen(Arc::new(mounted.hooks()))?;
     let startup = mounted.startup_repairs();
     if startup.loaded > 0 {
         eprintln!(
@@ -191,8 +214,7 @@ pub(crate) fn mount_front(
     }
     eprintln!(
         "mounted {} at {} (volume {}, front of history service {}, slot {slot}, passthrough: \
-         {}, threads {}); restore and revert need the service stopped; stop with SIGINT or \
-         SIGTERM",
+         {}, threads {}); stop with SIGINT or SIGTERM",
         backing.display(),
         mountpoint.display(),
         settings.volume,
@@ -211,6 +233,8 @@ pub(crate) fn mount_front(
         crate::describe_wake(wake),
         args.unmount_grace,
     );
+    // No more calls: an invalidation must not race the unmount.
+    listener.stop();
     let report = mounted.shutdown(args.unmount_grace);
     crate::print_unmount(&report, args.unmount_grace);
     drop(front);

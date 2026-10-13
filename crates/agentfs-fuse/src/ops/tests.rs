@@ -1725,3 +1725,28 @@ fn may_open_counts_the_callers_supplementary_groups() {
     };
     assert!(may_open(&st, member, &[], 1, false));
 }
+
+#[test]
+fn cached_at_names_every_entry_on_the_way_and_the_known_node() {
+    let fx = Fx::new();
+    let dir = fx.mkdir("d");
+    fx.put("d/f", "x");
+    let f = fx.id("d/f");
+    assert_eq!(
+        fx.ops.cached_at(b"d/f"),
+        vec![
+            Cached::Entry(ROOT, b"d".to_vec()),
+            Cached::Entry(dir, b"f".to_vec()),
+            Cached::Node(f),
+        ]
+    );
+    // A name the mount never looked up: its entry, and nothing below it.
+    assert_eq!(
+        fx.ops.cached_at(b"d/new/deeper"),
+        vec![
+            Cached::Entry(ROOT, b"d".to_vec()),
+            Cached::Entry(dir, b"new".to_vec()),
+        ]
+    );
+    assert_eq!(fx.ops.cached_at(b""), vec![Cached::Node(ROOT)]);
+}

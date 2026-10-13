@@ -15,7 +15,8 @@ use agentfs_core::history_service::protocol::{
     FrontInfo, PathStamp, Reply, read_frame, read_frame_bytes, write_frame,
 };
 use agentfs_core::history_service::{
-    Address, ClientConfig, ClientError, FrontLease, HistoryClient, HistoryServer,
+    Address, ClientConfig, ClientError, FrontHooks, FrontLease, FrontsError, HistoryClient,
+    HistoryServer, NoHooks,
 };
 use agentfs_core::identity::Context;
 use agentfs_core::lfs::Store;
@@ -1186,4 +1187,195 @@ fn round_trip_cost() {
             .unwrap_or_default()
             .trim()
     );
+}
+
+// ---- listening fronts: the service calls them for live restores (§15) ----
+
+/// Hooks that note every call; `open` paths answer open for writing.
+#[derive(Default)]
+struct Noting {
+    settles: std::sync::Mutex<usize>,
+    open: Vec<RepoPath>,
+    invalidated: std::sync::Mutex<Vec<RepoPath>>,
+}
+
+impl FrontHooks for Noting {
+    fn settle(&self) -> Result<(usize, usize), String> {
+        *self.settles.lock().unwrap() += 1;
+        Ok((0, 2))
+    }
+
+    fn open_for_writing(&self, paths: &[RepoPath]) -> Vec<bool> {
+        paths.iter().map(|p| self.open.contains(p)).collect()
+    }
+
+    fn invalidate(&self, paths: &[RepoPath]) -> Result<(), String> {
+        self.invalidated.lock().unwrap().extend_from_slice(paths);
+        Ok(())
+    }
+}
+
+fn listening_client(env: &Env, lease: &FrontLease, name: &str) -> Arc<HistoryClient> {
+    let sink = Arc::new(MemorySink::new());
+    Arc::new(connect(env, lease, pod(name), "vol", Duration::from_secs(10), sink).unwrap())
+}
+
+fn path(p: &str) -> RepoPath {
+    RepoPath::new(p).unwrap()
+}
+
+#[test]
+fn listening_fronts_answer_the_services_calls() {
+    let env = env();
+    let service = Service::start(&env);
+    let fronts = service.server.as_ref().unwrap().listening_fronts();
+    let lease_a = FrontLease::acquire(&env.state, "pod=pod-a").unwrap();
+    let lease_b = FrontLease::acquire(&env.state, "pod=pod-b").unwrap();
+    let hooks_a = Arc::new(Noting {
+        open: vec![path("a")],
+        ..Noting::default()
+    });
+    let hooks_b = Arc::new(Noting {
+        open: vec![path("c")],
+        ..Noting::default()
+    });
+    let a = listening_client(&env, &lease_a, "pod-a")
+        .listen(hooks_a.clone())
+        .unwrap();
+    let b = listening_client(&env, &lease_b, "pod-b")
+        .listen(hooks_b.clone())
+        .unwrap();
+    assert!(a.wait_listening(Duration::from_secs(5)));
+    assert!(b.wait_listening(Duration::from_secs(5)));
+
+    let mut slots = vec![lease_a.slot(), lease_b.slot()];
+    slots.sort_unstable();
+    assert_eq!(fronts.require_all(Duration::from_secs(5)).unwrap(), slots);
+    // Paths still waiting for a repair, over both fronts.
+    assert_eq!(fronts.settle().unwrap(), 4);
+    assert_eq!(*hooks_a.settles.lock().unwrap(), 1);
+    assert_eq!(*hooks_b.settles.lock().unwrap(), 1);
+    assert_eq!(
+        fronts
+            .open_for_writing(&[path("a"), path("b"), path("c")])
+            .unwrap(),
+        [true, false, true]
+    );
+    // More paths than one call carries: split, and still in order.
+    let many: Vec<RepoPath> = (0..5000).map(|n| path(&format!("d/{n}"))).collect();
+    let mut asked = many.clone();
+    asked.push(path("a"));
+    let open = fronts.open_for_writing(&asked).unwrap();
+    assert_eq!(open.len(), 5001);
+    assert!(open[..5000].iter().all(|o| !o) && open[5000]);
+    fronts.invalidate(&[path("a"), path("x/y")]).unwrap();
+    assert_eq!(
+        *hooks_a.invalidated.lock().unwrap(),
+        [path("a"), path("x/y")]
+    );
+    assert_eq!(
+        *hooks_b.invalidated.lock().unwrap(),
+        [path("a"), path("x/y")]
+    );
+    a.stop();
+    b.stop();
+}
+
+#[test]
+fn a_live_front_that_does_not_listen_holds_live_restores_back() {
+    let env = env();
+    let service = Service::start(&env);
+    let fronts = service.server.as_ref().unwrap().listening_fronts();
+    // No fronts: nothing to wait for.
+    assert_eq!(
+        fronts.require_all(Duration::ZERO).unwrap(),
+        Vec::<u16>::new()
+    );
+    let lease = FrontLease::acquire(&env.state, "pod=old-front").unwrap();
+    let started = Instant::now();
+    match fronts.require_all(Duration::from_millis(300)) {
+        Err(FrontsError::NotListening(slots)) => assert_eq!(slots, [lease.slot()]),
+        other => panic!("{other:?}"),
+    }
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    let message = FrontsError::NotListening(vec![lease.slot()]).to_string();
+    assert!(message.contains("not listening"), "{message}");
+
+    // It starts listening within the grace: accepted.
+    let client = listening_client(&env, &lease, "old-front");
+    let listener = std::thread::spawn({
+        let client = client.clone();
+        move || {
+            std::thread::sleep(Duration::from_millis(200));
+            client.listen(Arc::new(NoHooks)).unwrap()
+        }
+    });
+    assert_eq!(
+        fronts.require_all(Duration::from_secs(5)).unwrap(),
+        [lease.slot()]
+    );
+    let listener = listener.join().unwrap();
+
+    // A front that is gone (its lease released) is no longer required,
+    // and its link is dropped.
+    listener.stop();
+    drop(lease);
+    assert_eq!(
+        fronts.require_all(Duration::ZERO).unwrap(),
+        Vec::<u16>::new()
+    );
+    assert!(fronts.listening().is_empty());
+}
+
+#[test]
+fn a_front_whose_listener_stopped_loses_its_link() {
+    let env = env();
+    let service = Service::start(&env);
+    let fronts = service.server.as_ref().unwrap().listening_fronts();
+    let lease = FrontLease::acquire(&env.state, "pod=pod-a").unwrap();
+    let listener = listening_client(&env, &lease, "pod-a")
+        .listen(Arc::new(NoHooks))
+        .unwrap();
+    assert!(listener.wait_listening(Duration::from_secs(5)));
+    fronts.require_all(Duration::from_secs(5)).unwrap();
+    listener.stop();
+    // The lease is still held: the call fails, and the front is then
+    // required but not listening.
+    match fronts.settle() {
+        Err(FrontsError::Call { slot, pod, .. }) => {
+            assert_eq!((slot, pod.as_str()), (lease.slot(), "pod-a"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fronts.listening().is_empty());
+    assert!(matches!(
+        fronts.require_all(Duration::from_millis(100)),
+        Err(FrontsError::NotListening(_))
+    ));
+}
+
+#[test]
+fn a_listener_comes_back_after_the_service_restarts() {
+    let env = env();
+    let mut service = Service::start(&env);
+    let lease = FrontLease::acquire(&env.state, "pod=pod-a").unwrap();
+    let hooks = Arc::new(Noting::default());
+    let listener = listening_client(&env, &lease, "pod-a")
+        .listen(hooks.clone())
+        .unwrap();
+    assert!(listener.wait_listening(Duration::from_secs(5)));
+    service
+        .server
+        .take()
+        .unwrap()
+        .shutdown(Duration::from_secs(1));
+    service.listen(&env);
+    let fronts = service.server.as_ref().unwrap().listening_fronts();
+    assert_eq!(
+        fronts.require_all(Duration::from_secs(10)).unwrap(),
+        [lease.slot()]
+    );
+    fronts.settle().unwrap();
+    assert_eq!(*hooks.settles.lock().unwrap(), 1);
+    listener.stop();
 }

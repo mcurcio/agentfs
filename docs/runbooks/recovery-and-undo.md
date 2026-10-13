@@ -100,6 +100,15 @@ plain git (§5).
   them. `--root` is not needed.
 - **Nothing runs**: the command takes the state-area lock itself, commits
   anything journaled, writes `--root` directly and records what it wrote.
+- **`agentfs serve-history` runs** (fronts mount the volume, design §14):
+  the command asks the service over the same control socket. Every live
+  front must be listening for the service's calls (otherwise exit status
+  75: a front from an older release, or one reconnecting; retry, or
+  restart it). The service has each front record what is dirty in it,
+  waits until history has caught up, refuses a path any front holds open
+  for writing (unless `--force`), writes the backing tree itself, records
+  it, and has every front drop its kernel's caches of the paths written:
+  every pod sees the restored files at once. `--root` is not needed.
 - **`agentfs run` (or `record`, `flush`, `push`) holds the state area**:
   exit status 75. `run` serves no restores: stop it (or mount instead).
 

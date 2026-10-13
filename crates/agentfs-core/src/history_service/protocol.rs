@@ -50,9 +50,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 64 << 20;
 
 /// What this build's service supports beyond protocol 1 as first released:
-/// `stamps` (freeze stamps on records, design §14.1) and `repair_origin`
-/// (a repair's own origin on a sweep record, design §14.1).
-pub const FEATURES: &[&str] = &["stamps", "repair_origin"];
+/// `stamps` (freeze stamps on records, design §14.1), `repair_origin`
+/// (a repair's own origin on a sweep record, design §14.1) and `listen`
+/// ([`Request::Listen`], design §15).
+pub const FEATURES: &[&str] = &["stamps", "repair_origin", "listen"];
 
 /// The first frame on a connection, from the front.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

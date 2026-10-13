@@ -35,7 +35,7 @@ pub mod sweep;
 
 pub use fuse::{Passthrough, PassthroughStatus};
 pub use mount::{
-    Mount, MountConfig, MountEntry, MountError, MountState, MountView, PreflightError, StackOver,
-    StartupRepairs, UnmountReport, agentfs_layers, detach, detach_stale_layers, mount_state,
-    parse_mountinfo, preflight, preflight_stacked,
+    Mount, MountConfig, MountEntry, MountError, MountHooks, MountState, MountView, PreflightError,
+    StackOver, StartupRepairs, UnmountReport, agentfs_layers, detach, detach_stale_layers,
+    mount_state, parse_mountinfo, preflight, preflight_stacked,
 };

@@ -2,7 +2,7 @@
 
 What to do when an agentfs CSI volume misbehaves: a crashed front or
 history service, a node plugin upgrade, a node reboot, a volume stuck
-staging. The node plugin recovers crashes by itself; this runbook is for
+staging, an undo in a live volume. The node plugin recovers crashes by itself; this runbook is for
 checking that it did and for the cases it cannot handle. Design:
 [§14.2](../design.md#142-csi-driver-built); operator guide:
 [csi.md](../csi.md#8-recovery).
@@ -158,3 +158,27 @@ driver refuses and the provisioner retries
 
 To give the history up instead, remove `<basePath>/<pv>` by hand on the
 node; the next retry then finds no volume and succeeds.
+
+## Undoing a change in a live volume
+
+Restores and reverts run through the volume's history service, with the
+pods still running (design §15,
+[recovery-and-undo.md](recovery-and-undo.md)), from the node plugin pod
+on the node that stages the volume:
+
+```sh
+kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+  agentfs --state /var/lib/agentfs-csi/volumes/$PV/state restore <path> <commit>
+```
+
+- **Exit status 1, open for writing**: a pod holds the file open. Pause
+  the workload, or add `--force` (the pod's later writes are recorded
+  too).
+- **Exit status 75, `not listening for the history service's calls`**: a
+  front named by slot is not reachable. `agentfs status` in the plugin
+  pod lists the fronts by slot; one restarting comes back within
+  seconds, so retry. A front from an older plugin image cannot listen:
+  restart its pod after the upgrade.
+- **A warning that a front could not drop its caches**: the restore is
+  done and recorded, but that pod may show the old content until its
+  kernel's cache times out; restarting the pod clears it.

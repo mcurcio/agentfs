@@ -360,7 +360,7 @@ impl HistoryClient {
     }
 
     /// A new connection, past the handshake.
-    fn open(&self) -> Result<UnixStream, ClientError> {
+    pub(super) fn open(&self) -> Result<UnixStream, ClientError> {
         let unreachable = |error: String| ClientError::Unreachable {
             address: self.address.clone(),
             error,

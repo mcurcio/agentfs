@@ -11,7 +11,9 @@
 # under its new name or not at all, that a concurrent burst on one path
 # from both fronts converges on the tree's last state, that both fronts
 # creating the same new names at once never fail (each creates as the
-# caller), that a change whose close returned (journaled,
+# caller), that a restore and a revert served by the service reach both
+# mounts at once (and refuse a path open for writing in either), that a
+# change whose close returned (journaled,
 # not yet committed: commitWindow is raised for it) survives a
 # kill -9 of the service, and that the service pushes. Then measures the
 # per-close cost, single-process against front (ci/boundary-latency.py).
@@ -373,6 +375,42 @@ assert_contains "$POD" "pod-a" "with pod-a's trailer"
 as_agent "$MNT_A" 'printf mine > from-c.txt'
 wait_history from-c.txt mine
 assert_eq pod-c "$(committer_of from-c.txt)" "pod-c's own writes are its own"
+
+step "restore and revert while the service serves both fronts"
+# The service settles both fronts, refuses a path one holds open for
+# writing, writes the backing tree and has both drop their kernel caches
+# (design §15): each mount shows the restored content at once.
+as_agent "$MNT_A" 'printf r1 > restored.txt'
+wait_history restored.txt r1
+R1=$(sgit log -1 --format=%H refs/heads/agentfs/demo -- restored.txt)
+as_agent "$MNT_B" 'printf r2-longer > restored.txt'
+wait_history restored.txt r2-longer
+# Both mounts have read the file, so both kernels cache it.
+assert_eq r2-longer "$(as_agent "$MNT_A" 'cat restored.txt')" "a sees r2-longer"
+assert_eq r2-longer "$(as_agent "$MNT_B" 'cat restored.txt')" "b sees r2-longer"
+as_agent "$MNT_B" 'exec 3>>restored.txt; sleep 4' &
+HOLDER=$!
+sleep 1
+if sudo "$AGENTFS_BIN" --state "$STATE" restore restored.txt "$R1" >"$W/refused.out" 2>&1; then
+  cat "$W/refused.out"
+  fail "a restore of a path open for writing in b went ahead"
+fi
+cat "$W/refused.out"
+wait "$HOLDER" || true
+assert_eq r2-longer "$(sudo cat "$BACKING/restored.txt")" "the refused restore wrote nothing"
+sudo "$AGENTFS_BIN" --state "$STATE" restore restored.txt "$R1"
+assert_eq r1 "$(as_agent "$MNT_A" 'cat restored.txt')" "a sees the restored r1"
+assert_eq r1 "$(as_agent "$MNT_B" 'cat restored.txt')" "b sees the restored r1"
+wait_history restored.txt r1
+assert_contains "$(sgit log -1 --format=%B refs/heads/agentfs/demo)" "Agentfs-Trigger: restore" \
+  "HEAD is the restore"
+sudo "$AGENTFS_BIN" --state "$STATE" revert HEAD
+assert_eq r2-longer "$(as_agent "$MNT_A" 'cat restored.txt')" "a sees the revert"
+assert_eq r2-longer "$(as_agent "$MNT_B" 'cat restored.txt')" "b sees the revert"
+wait_history restored.txt r2-longer
+as_agent "$MNT_A" 'printf after > after-restore.txt'
+wait_history after-restore.txt after
+assert_eq pod-c "$(committer_of after-restore.txt)" "writes after the restore are recorded"
 
 step "kill -9 the service right after a close returns"
 # A long commit window, so the record is journaled but not committed when

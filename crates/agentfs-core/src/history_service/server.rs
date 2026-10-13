@@ -27,6 +27,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::Address;
+use super::fronts::Fronts;
 use super::lease::{FrontLease, MAX_SLOT};
 use super::protocol::{
     FEATURES, FrontInfo, Reply, Request, WireSkip, WireSkipReason, parse_hello, read_frame,
@@ -70,6 +71,8 @@ struct Shared {
     /// Front instances whose slot was reclaimed when they first connected.
     reclaimed: Mutex<HashSet<u64>>,
     gone: Condvar,
+    /// Fronts listening for the service's calls (design §15).
+    fronts: Fronts,
 }
 
 struct Conn {
@@ -147,6 +150,7 @@ impl HistoryServer {
             conns: Mutex::new(HashMap::new()),
             reclaimed: Mutex::new(HashSet::new()),
             gone: Condvar::new(),
+            fronts: Fronts::new(state, settings.commit_window * 20),
         });
         let gauge: Arc<dyn Fn() -> usize + Send + Sync> = {
             let shared = Arc::downgrade(&shared);
@@ -171,6 +175,12 @@ impl HistoryServer {
 
     pub fn address(&self) -> &Address {
         &self.address
+    }
+
+    /// The fronts listening for the service's calls, for restores served
+    /// live (design §15).
+    pub fn listening_fronts(&self) -> Fronts {
+        self.shared.fronts.clone()
     }
 
     /// The distinct fronts connected now.
@@ -207,6 +217,7 @@ impl HistoryServer {
             let _ = conn.stream.shutdown(Shutdown::Both);
         }
         drop(conns);
+        self.shared.fronts.close_all();
         let _ = local_socket::unlink(&self.dir, &self.name);
         idle
     }
@@ -230,6 +241,7 @@ impl Drop for HistoryServer {
             for conn in self.shared.conns().values() {
                 let _ = conn.stream.shutdown(Shutdown::Both);
             }
+            self.shared.fronts.close_all();
             let _ = local_socket::unlink(&self.dir, &self.name);
         }
     }
@@ -410,9 +422,15 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
                 }
             }
             Request::Ping => Reply::Pong,
-            Request::Listen => Reply::Error {
-                message: "this history service does not call fronts".into(),
-            },
+            Request::Listen => {
+                // The connection is the front's link from now on: the
+                // service calls, the front answers (design §15).
+                if write_frame(&mut stream, &Reply::Listening).is_err() {
+                    return;
+                }
+                shared.fronts.add(front, stream);
+                return;
+            }
         };
         if write_frame(&mut stream, &reply).is_err() {
             return;

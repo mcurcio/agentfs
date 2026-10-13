@@ -9,9 +9,10 @@
 //!   (clamped to [`MIN_TIMEOUT`]..=[`MAX_TIMEOUT`]). The reply carries the
 //!   lines `agentfs push` prints, rendered by the daemon so both modes
 //!   print the same. Misconfigured remotes are reported, never pushed.
-//! - **restore and revert**: served by a mount ([`crate::recovery`]);
-//!   `run` and `serve-history` answer `busy` with the reason, so the exit
-//!   status stays 75 as when they held the lock without a socket.
+//! - **restore and revert**: served by a mount, through itself, and by
+//!   `serve-history`, into the backing tree with its fronts' help
+//!   ([`crate::recovery`]); `run` answers `busy` with the reason, so the
+//!   exit status stays 75 as when it held the lock without a socket.
 //!
 //! [`client`] is the command's side: it asks the daemon first and returns
 //! `None` when none answers (no socket, or a daemon from before `push`
@@ -41,6 +42,8 @@ pub const CONTROL_GRACE: Duration = Duration::from_secs(5);
 pub enum Restores {
     /// A mount writes them through itself.
     Serve(recovery::Daemon),
+    /// The history service writes the backing tree, calling its fronts.
+    ServeFronts(recovery::ServiceDaemon),
     /// Answered `busy` with this message.
     Refuse(&'static str),
 }
@@ -48,9 +51,6 @@ pub enum Restores {
 /// `agentfs run`'s answer to a restore.
 pub const RUN_SERVES_NO_RESTORES: &str = "`agentfs run` holds the state area and serves no \
      restores; stop it (or mount the volume instead), then retry";
-/// `agentfs serve-history`'s answer to a restore.
-pub const HISTORY_SERVICE_SERVES_NO_RESTORES: &str = "the history service holds the state area \
-     and serves no restores yet; stop the fronts and the service, then retry";
 
 /// The control socket's handler for a daemon whose service is `service`.
 /// `misconfigured` lists the remotes the settings refused, with why.
@@ -63,6 +63,7 @@ pub fn handler(
         Op::Push => serve_push(&service, &misconfigured, &request),
         Op::Restore | Op::Revert => match &restores {
             Restores::Serve(daemon) => daemon.serve(request, peer),
+            Restores::ServeFronts(daemon) => daemon.serve(request, peer),
             Restores::Refuse(message) => Reply::Busy((*message).to_owned()),
         },
     })

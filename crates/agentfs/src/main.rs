@@ -188,7 +188,8 @@ enum Command {
     /// Write PATH (a file, symlink or directory, or `.` for the whole
     /// tree) back as it was in COMMIT, removing what COMMIT did not have
     /// there; recorded as one commit (design §15). Goes through a running
-    /// mount when there is one; otherwise writes --root directly.
+    /// mount or history service when there is one; otherwise writes --root
+    /// directly.
     Restore {
         /// Relative to the tree root.
         path: String,
@@ -204,8 +205,8 @@ enum Command {
         pod: Pod,
     },
     /// Undo COMMIT's changes (against its first parent); recorded as one
-    /// commit (design §15). Through a running mount when there is one;
-    /// otherwise writes --root directly.
+    /// commit (design §15). Through a running mount or history service when
+    /// there is one; otherwise writes --root directly.
     Revert {
         /// A commit on the volume's branch (any git revision syntax).
         commit: String,

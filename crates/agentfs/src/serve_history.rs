@@ -7,11 +7,13 @@
 //!
 //! Start order: lock, open (recovery), the patch queue (only when no front
 //! holds a lease: patches write the backing tree, which live fronts serve),
-//! the commit and push loops, the control socket (`agentfs push` asks it
-//! to push now; restores get `busy`, design §2.3), then the socket fronts
-//! use. On SIGINT or SIGTERM it
-//! stops accepting, lets fronts' requests in progress finish (up to
-//! `--shutdown-grace`), then makes the final commit and pushes it, as every
+//! the commit and push loops, the socket fronts use, then the control
+//! socket (`agentfs push` asks it to push now; `restore` and `revert` it
+//! serves live, writing the backing tree with its fronts' help, design
+//! §2.3, §15). On SIGINT or SIGTERM it stops the control socket (waiting
+//! for a restore in progress), stops accepting fronts, lets their
+//! requests in progress finish (up to `--shutdown-grace`), then makes the
+//! final commit and pushes it, as every
 //! long-running mode does: every remote that lacks commits gets one more
 //! attempt, all within `--push-grace` (design §11.2, §14.2). Under the CSI
 //! driver the service stops after the volume's last pod, and nothing else
@@ -30,7 +32,7 @@ use agentfs_core::volume::StateDir;
 
 use crate::daemon::Daemon;
 use crate::{
-    Pod, Session, describe_wake, list, misconfigured, patch_cmd, push_now, start_control,
+    Pod, Session, describe_wake, list, misconfigured, patch_cmd, push_now, recovery, start_control,
     stop_control, stop_service,
 };
 
@@ -67,6 +69,7 @@ pub(crate) fn serve(
     let session = Session::start(state, pod)?;
     let events = session.events.clone();
     let (mut recorder, committer, recovery) = session.open(state, &backing, pod)?;
+    let commit_window = committer.history().settings().commit_window;
     // Orders fronts' records that race for one path (design §14.1).
     recorder.enable_stamps();
     let settings = committer.history().settings().clone();
@@ -101,24 +104,35 @@ pub(crate) fn serve(
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
     let service = Service::start(committer, pushers, events).context("starting the service")?;
-    let server =
-        match HistoryServer::start(&address, recorder, state, &settings, session.telemetry()) {
-            Ok(server) => server,
-            Err(e) => {
-                // Commits what recovery found.
-                let _ = stop_service(service, push_grace);
-                session.finish();
-                return Err(e).with_context(|| format!("listening on {address}"));
-            }
-        };
-    // `agentfs push` asks it to push now; restores are refused (design
-    // §2.3, §14).
+    let server = match HistoryServer::start(
+        &address,
+        recorder.clone(),
+        state,
+        &settings,
+        session.telemetry(),
+    ) {
+        Ok(server) => server,
+        Err(e) => {
+            // Commits what recovery found.
+            let _ = stop_service(service, push_grace);
+            session.finish();
+            return Err(e).with_context(|| format!("listening on {address}"));
+        }
+    };
+    // `agentfs push` asks it to push now; restores and reverts it writes
+    // into the backing tree, calling its fronts (design §2.3, §15).
     let control = start_control(
         state,
         push_now::handler(
             service.handle(),
             misconfigured(&settings),
-            push_now::Restores::Refuse(push_now::HISTORY_SERVICE_SERVES_NO_RESTORES),
+            push_now::Restores::ServeFronts(recovery::ServiceDaemon {
+                state: state.clone(),
+                recorder,
+                fronts: server.listening_fronts(),
+                backing: backing.clone(),
+                commit_window,
+            }),
         ),
     );
     let address_file = state.history_dir().join(ADDRESS_FILE);
@@ -144,11 +158,12 @@ pub(crate) fn serve(
          {push_grace:?} for the final push; signal again to exit now)",
         describe_wake(wake)
     );
+    // The control socket first: a restore in progress still calls fronts.
+    stop_control(&service, control);
     if !server.shutdown(shutdown_grace) {
         eprintln!("fronts' requests were still running at shutdown; they fail with EIO");
     }
     let _ = std::fs::remove_file(&address_file);
-    stop_control(&service, control);
     let code = stop_service(service, push_grace);
     session.finish();
     Ok(code)

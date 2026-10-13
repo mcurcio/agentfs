@@ -18,6 +18,8 @@
 #   - deleting the node plugin pod: the new one reconciles, writer-a
 #     recovers live, writer-b after a container restart;
 #   - an inline (ephemeral) volume and a ReadWriteMany claim are refused;
+#   - a restore and a revert run from the node plugin reach both pods at
+#     once and are pushed;
 #   - deleting the pods unpublishes and unstages (no mounts left, the
 #     socket gone, the final commit made), and deleting the claim removes
 #     the volume directory.
@@ -361,7 +363,30 @@ wait_event inline FailedMount Ephemeral 180
 wait_event rwx ProvisioningFailed multi-node 180
 kubectl delete -k ci/k8s-csi/negative --wait --timeout=120s
 
-step "(j) teardown: unpublish, unstage, delete"
+step "(j) restore and revert live through the history service"
+# The service settles both fronts, writes the volume and has both drop
+# their kernel caches (design §15): both pods see the restore at once.
+lgit() { in_plugin git --git-dir "$STATE/git" "$@"; }
+in_pod writer-a 'umask 002 && printf r1 > /data/restored.txt'
+wait_remote restored.txt r1
+R1=$(lgit log -1 --format=%H "$BRANCH" -- restored.txt)
+in_pod writer-b 'printf r2-longer > /data/restored.txt'
+wait_remote restored.txt r2-longer
+assert_eq r2-longer "$(in_pod writer-a 'cat /data/restored.txt')" "writer-a reads r2-longer"
+in_plugin agentfs --state "$STATE" restore restored.txt "$R1"
+assert_eq r1 "$(in_pod writer-a 'cat /data/restored.txt')" "writer-a sees the restore"
+assert_eq r1 "$(in_pod writer-b 'cat /data/restored.txt')" "writer-b sees the restore"
+wait_remote restored.txt r1
+assert_contains "$(rgit log -1 --format=%B "$BRANCH")" "Agentfs-Trigger: restore" "the restore reached the remote"
+in_plugin agentfs --state "$STATE" revert HEAD
+assert_eq r2-longer "$(in_pod writer-a 'cat /data/restored.txt')" "writer-a sees the revert"
+assert_eq r2-longer "$(in_pod writer-b 'cat /data/restored.txt')" "writer-b sees the revert"
+wait_remote restored.txt r2-longer
+wait_writable writer-b after-restore.txt after 30
+wait_remote after-restore.txt after
+assert_eq writer-b "$(remote_committer after-restore.txt)" "writes after the restore are recorded"
+
+step "(k) teardown: unpublish, unstage, delete"
 in_pod writer-a 'printf final > /data/final.txt'
 ka delete pod writer-a writer-b --wait --timeout=180s
 deadline=$((SECONDS + 180))

@@ -198,8 +198,8 @@ so a crash never leaves a stale lock.
   (`mount --history-service`) take no lock: they write only `pending/`
   (in their own slot) and `meta/fronts/`. While the service runs, every
   single-process command exits 75 as above but `push`, which the service
-  serves; so do `restore` and `revert`: the service answers that it
-  serves no restores (a follow-up), and fronts serve no control socket.
+  and `restore` and `revert`, which the service serves live (§15);
+  fronts serve no control socket.
 - Under the CSI driver (§14.2) the node plugin starts the volume's
   `serve-history` at NodeStage, so the service holds the lock while the
   volume is staged on a node. The controller takes the lock only briefly,
@@ -1912,10 +1912,23 @@ Boundaries during the outage failed with `EIO`; their final states are
 recorded by the fronts' repairs, RELEASE and the sweep, but intermediate
 states are lost.
 
-**What fronts do not do.** They serve no control socket: `restore` and
-`revert` exit 75 while the service runs (the service answers that it
-serves no restores; restores through it are a follow-up), and `agentfs
-push` is served by the service. The patch queue (§12) is applied by `serve-history` before it
+**Listening.** Each front also keeps one connection to the service
+turned around (`Listen`, protocol feature `listen`;
+`history_service::listener`): the service sends calls on it and the front
+answers them, one at a time, on a thread of its own. `Settle` runs the
+front's sweep and returns once its records are journaled (with how many
+paths still wait for a repair), `OpenForWriting` says which of a list of
+paths the front holds open for writing, and `Invalidate` makes the front
+drop its kernel's cached entries, attributes and pages of a list of paths
+(FUSE notifications, sent from the listener thread so never from a
+request handler). The service keeps one link per slot
+(`history_service::fronts`), replacing an older one; the listener
+reconnects with a backoff of 100 ms to 5 s when the service restarts or
+the link breaks. These calls let the service serve `restore` and `revert`
+while fronts are live (§15).
+
+**What fronts do not do.** They serve no control socket: `restore`,
+`revert` and `push` are served by the service. The patch queue (§12) is applied by `serve-history` before it
 listens, and only when no front lease is live, because patches write the
 backing tree that live fronts serve. POSIX and BSD locks stay in each FUSE
 mount's kernel and are not shared between fronts, so a SQLite or other
@@ -2191,8 +2204,8 @@ operator runbooks ([runbooks/](runbooks/)):
 
 **Two modes, one engine** (`agentfs_core::restore`: plan, check, apply):
 
-- **Through a running mount.** `agentfs mount` (like `run` and
-  `serve-history`, which serve only `push`, §2.3) listens on
+- **Through a running mount.** `agentfs mount` (like `run`, which serves
+  only `push`, and `serve-history`, below, §2.3) listens on
   `meta/control/agentfs.sock` (§2.2): directory `0700`, socket `0600`,
   and each connection's `SO_PEERCRED` must be root or the daemon's user.
   Both ends address it as `/proc/self/fd/<dir fd>/agentfs.sock`, so a long
@@ -2211,6 +2224,24 @@ operator runbooks ([runbooks/](runbooks/)):
   through the kernel like any workload's, so kernel caches, the inode
   table and dirty detection stay coherent, and the FUSE layer records
   them. The control socket is shut down before the unmount.
+- **Through the history service.** `agentfs serve-history` (§14) listens
+  on the same control socket and serves restores for the volume's fronts,
+  each of which keeps a listening connection to it (§14.1). Every slot
+  whose lease is held must have a listening front, waiting up to 5 s for
+  one that is reconnecting; otherwise the request is refused as busy
+  (exit 75), since a front the service cannot reach could neither settle
+  nor drop its stale caches. The service has each front settle (record
+  what is dirty in it, journaled before it answers), waits until history
+  has caught up as above, and checks the backing tree, asking the fronts
+  in batches which paths any of them holds open for writing (a path a
+  front failed to answer for counts as open). It then writes the backing
+  tree itself, as direct mode does, records what it wrote as one operation
+  (operator: the socket peer; actor: the service), and has every front
+  drop its kernel's cached entries, attributes and pages of every path
+  written or removed. A front that fails that call keeps serving and is
+  named in a warning: it may show old content until its kernel's cache
+  times out. Records a front's settle or sweep makes during the operation
+  are its own, not the operation's.
 - **Directly.** With nothing listening, no mount (and so no workload
   through one) can be running. The command takes the state-area lock
   (§2.3), commits what is journaled, writes the backing tree (`--root`)
@@ -2922,7 +2953,7 @@ runner.
 | Front failures | Service unreachable, hung (`--history-timeout`) or refusing: `EIO` at the boundary, `RecordFailed`, `HistoryServiceUnavailable` once per outage; repairs in the slot's file; a draft is never resent (§3.5, §14) |
 | Committer of a front's records | The front's origin (namespace, pod, pod uid, node, replica) is journaled in the record, so replays keep it; the service renders the identity templates per origin and refuses a front whose identity does not render; a commit never mixes origins (§9, §14) |
 | Patches with fronts | Applied by `serve-history` before it listens, only when no front lease is live; otherwise skipped with a message (§12, §14) |
-| Restores with fronts | Not through fronts: `restore` and `revert` exit 75 while the service runs; through the service is a follow-up (§2.3, §14) |
+| Restores with fronts | Served live by `serve-history`: every live front must listen (else busy, 75); fronts settle, answer which paths are open for writing, and drop their kernel caches of the paths the service wrote to the backing tree (§14.1, §15) |
 | Locks across fronts | POSIX and BSD locks are per FUSE mount, so not shared between pods; a lock-coordinated database (SQLite, the `fsync` class) must be written from one pod (§14) |
 | CSI driver shape | One binary, `agentfs-csi` (`--mode` controller, node or all), in the agentfs image; tonic over a Unix socket, the spec compiled without `protoc`; the node plugin spawns the `agentfs` binary for the service and each front instead of linking FUSE in-process (§14.2, §17.2) |
 | CSI volumes | PersistentVolumes only (no inline ephemeral volumes); `<basePath>/<pv>/{backing,state,csi.json}`; basePath one filesystem seen by the controller and every node; size recorded, not enforced (§14.2) |

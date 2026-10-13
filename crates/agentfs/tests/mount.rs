@@ -2310,3 +2310,89 @@ fn two_fronts_one_service() {
         "a commit mixes pods: {commits:?}"
     );
 }
+
+/// `restore` and `revert` while the history service serves two fronts
+/// (design §15): the service settles both, writes the backing tree, and
+/// each front's kernel drops what it cached, so both mounts show the
+/// restored content at once.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn restores_through_the_service_reach_every_front() {
+    let v = Vol::new("live-restore");
+    let mnt2 = v.p("mnt2");
+    fs::create_dir_all(&mnt2).unwrap();
+    fs::set_permissions(&mnt2, fs::Permissions::from_mode(0o755)).unwrap();
+    let service = start_history_service(&v);
+    let a = start_front(&v, &v.mnt(), "pod-a");
+    let b = start_front(&v, &mnt2, "pod-b");
+    let read = |mnt: &Path, p: &str| fs::read_to_string(mnt.join(p)).ok();
+
+    write_and_close(&v.mnt().join("f.txt"), "v1").unwrap();
+    write_and_close(&v.mnt().join("g.txt"), "g").unwrap();
+    v.expect(&tree(&[("f.txt", f("v1")), ("g.txt", f("g"))]));
+    write_and_close(&mnt2.join("f.txt"), "v2-longer").unwrap();
+    fs::remove_file(v.mnt().join("g.txt")).unwrap();
+    v.expect(&tree(&[("f.txt", f("v2-longer"))]));
+    // Both kernels cache f.txt's content and attributes, and g.txt's
+    // absence.
+    for mnt in [v.mnt(), mnt2.clone()] {
+        assert_eq!(read(&mnt, "f.txt").as_deref(), Some("v2-longer"));
+        assert_eq!(read(&mnt, "g.txt"), None);
+    }
+
+    // HEAD~2 still had g.txt and f.txt = v1.
+    let out = v.ok(&["restore", ".", "HEAD~2"]);
+    assert!(out.contains("restored 2 path(s)"), "{out}");
+    assert_eq!(fs::read_to_string(v.backing().join("f.txt")).unwrap(), "v1");
+    for mnt in [v.mnt(), mnt2.clone()] {
+        assert_eq!(
+            read(&mnt, "f.txt").as_deref(),
+            Some("v1"),
+            "{}",
+            mnt.display()
+        );
+        assert_eq!(
+            read(&mnt, "g.txt").as_deref(),
+            Some("g"),
+            "{}",
+            mnt.display()
+        );
+    }
+    assert!(
+        v.head().1.contains("Agentfs-Trigger: restore"),
+        "{}",
+        v.head().1
+    );
+    v.expect(&tree(&[("f.txt", f("v1")), ("g.txt", f("g"))]));
+
+    // Undone by a revert: both fronts again.
+    v.ok(&["revert", "HEAD"]);
+    for mnt in [v.mnt(), mnt2.clone()] {
+        assert_eq!(read(&mnt, "f.txt").as_deref(), Some("v2-longer"));
+        assert_eq!(read(&mnt, "g.txt"), None);
+    }
+    v.expect(&tree(&[("f.txt", f("v2-longer"))]));
+
+    // A file open for writing through a front: refused, unless --force.
+    let held = fs::OpenOptions::new()
+        .append(true)
+        .open(mnt2.join("f.txt"))
+        .unwrap();
+    let out = v.agentfs(&["restore", "f.txt", "HEAD~1"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("open for writing"),
+        "{}",
+        text(&out.stderr)
+    );
+    drop(held);
+    // The front's own writes go on being recorded after a restore.
+    v.ok(&["restore", "f.txt", "HEAD~1"]);
+    assert_eq!(read(&mnt2, "f.txt").as_deref(), Some("v1"));
+    write_and_close(&mnt2.join("f.txt"), "after").unwrap();
+    v.expect(&tree(&[("f.txt", f("after"))]));
+
+    a.stop();
+    b.stop();
+    service.stop();
+}

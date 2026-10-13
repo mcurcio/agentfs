@@ -335,13 +335,21 @@ holds the plugin's own lines and every child's, prefixed with
 `[service <pv>]` or `[front <namespace>/<pod> <key>]`. Restarts are logged
 (`front for … exited (…); restarting in 2s in slot 3`).
 
-**Restores** (design §15) need the volume unstaged, because the history
-service holds the state area's lock and fronts serve no control socket:
-scale the workloads using the claim to zero, wait for NodeUnstage (the
-socket disappears), then run `agentfs restore` or `revert` directly in
-the node plugin pod, with `--state <basePath>/<pv>/state --root
-<basePath>/<pv>/backing`, and scale back up. Restores through a running
-service are a follow-up.
+**Restores** (design §15) run live, through the volume's history
+service, from the node plugin pod of the node that stages it:
+
+```sh
+kubectl -n agentfs-csi exec <node plugin pod> -c agentfs-csi -- \
+  agentfs --state /var/lib/agentfs-csi/volumes/<pv>/state restore <path> <commit>
+```
+
+The service has every pod's front record what is dirty in it, refuses a
+path any pod holds open for writing (unless `--force`), writes the
+volume and has every front drop its kernel's caches of what it wrote, so
+each pod sees the restored files at once. Exit status 75 means a front
+is not listening (an older plugin image, or one restarting): retry, or
+restart that pod. With the volume unstaged, `agentfs restore` runs
+directly instead, with `--root <basePath>/<pv>/backing` as well.
 
 **Pushes after the last pod.** The service pushes on its interval while
 the volume is staged. When the last pod goes, NodeUnstage stops it: it
@@ -443,7 +451,8 @@ transport for fronts on several nodes is open (design §19.2).
 - Restarting the node plugin interrupts that node's mounts until it has
   recovered them (seconds); containers without `HostToContainer`
   propagation need a restart to see the recovered mount.
-- Restores need the volume unstaged (§9).
+- A restore runs on the node that stages the volume, from its node plugin
+  pod (§9).
 - No inline ephemeral volumes: a pod author would choose the parameters.
 - The plugin's flags (`--stage-wait`, `--publish-wait`, the graces) are
   per node, not per volume.

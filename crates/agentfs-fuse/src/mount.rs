@@ -62,7 +62,7 @@ use fuser::{MountOption, SessionACL};
 
 use crate::backing::Backing;
 use crate::fuse::{FuseFs, Passthrough, PassthroughStatus};
-use crate::ops::{Ops, OpsConfig};
+use crate::ops::{Cached, Ops, OpsConfig};
 use crate::privileges::Privileges;
 use crate::sweep::{Capturer, Sweeper};
 
@@ -705,6 +705,8 @@ pub struct Mount {
     capturer: Option<Capturer>,
     threads: usize,
     startup: StartupRepairs,
+    /// Sends the kernel cache invalidations of [`MountHooks`].
+    notifier: fuser::Notifier,
 }
 
 impl Mount {
@@ -776,6 +778,7 @@ impl Mount {
                 source,
             });
         }
+        let notifier = session.notifier();
         let ended = Arc::new(Stop::default());
         {
             let ended = ended.clone();
@@ -804,6 +807,7 @@ impl Mount {
             capturer,
             threads,
             startup,
+            notifier,
         })
     }
 
@@ -845,6 +849,15 @@ impl Mount {
         MountView {
             mountpoint: self.mountpoint.clone(),
             ops: self.ops.clone(),
+        }
+    }
+
+    /// What a front's listener answers the history service with (design
+    /// §15): see [`MountHooks`].
+    pub fn hooks(&self) -> MountHooks {
+        MountHooks {
+            ops: self.ops.clone(),
+            notifier: self.notifier.clone(),
         }
     }
 
@@ -914,6 +927,57 @@ impl agentfs_core::restore::Liveness for MountView {
     /// The FUSE layer records every write through the mount.
     fn records_its_writes(&self) -> bool {
         true
+    }
+}
+
+/// A front mount's answers to the history service's calls (design §15),
+/// for a restore the service writes into the backing tree directly:
+///
+/// - settle: the sweep, as at every interval (the repair queue, then every
+///   changed file open for writing), returning once it is journaled;
+/// - open for writing: from the inode table, as for a restore through the
+///   mount;
+/// - invalidate: the kernel drops its cached entries along each path and
+///   the attributes and pages of the node at it ([`Ops::cached_at`]).
+///   Sent from the listener's thread, never a FUSE request's: the kernel
+///   may wait on a request to finish an invalidation.
+pub struct MountHooks {
+    ops: Arc<Ops>,
+    notifier: fuser::Notifier,
+}
+
+impl agentfs_core::history_service::FrontHooks for MountHooks {
+    fn settle(&self) -> Result<(usize, usize), String> {
+        let report = self.ops.sweep(false);
+        Ok((report.recorded + report.repaired, report.still_queued))
+    }
+
+    fn open_for_writing(&self, paths: &[agentfs_core::paths::RepoPath]) -> Vec<bool> {
+        paths
+            .iter()
+            .map(|p| self.ops.open_for_writing(p.as_str().as_bytes()))
+            .collect()
+    }
+
+    fn invalidate(&self, paths: &[agentfs_core::paths::RepoPath]) -> Result<(), String> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut first = None;
+        for path in paths {
+            for cached in self.ops.cached_at(path.as_str().as_bytes()) {
+                // An inode or entry the kernel no longer holds is not an
+                // error (fuser maps ENOENT to Ok).
+                let sent = match &cached {
+                    Cached::Node(id) => self.notifier.inval_inode(fuser::INodeNo(*id), 0, 0),
+                    Cached::Entry(parent, name) => self
+                        .notifier
+                        .inval_entry(fuser::INodeNo(*parent), std::ffi::OsStr::from_bytes(name)),
+                };
+                if let Err(e) = sent {
+                    first.get_or_insert_with(|| format!("invalidating {path}: {e}"));
+                }
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 }
 

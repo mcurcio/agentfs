@@ -7,8 +7,17 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agentfs_core::events::NullSink;
+use agentfs_core::history_service::protocol::FrontInfo;
+use agentfs_core::history_service::{
+    Address, ClientConfig, FrontHooks, FrontLease, HistoryClient, ListenerHandle,
+};
+use agentfs_core::paths::RepoPath;
+use agentfs_core::record::Origin;
+use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::StateDir;
 
 struct Volume {
@@ -381,8 +390,8 @@ fn a_front_prefers_the_slot_it_is_given() {
     service.stop();
 }
 
-/// The history service answers `agentfs push` over the control socket,
-/// and refuses restores with exit 75 (design §2.3).
+/// The history service answers `agentfs push` over the control socket
+/// (design §2.3).
 #[test]
 fn the_history_service_pushes_now() {
     let v = Volume::new();
@@ -413,14 +422,192 @@ fn the_history_service_pushes_now() {
         .unwrap();
     assert_eq!(pushed, local);
 
-    let out = v.run(["restore", "a", "HEAD"]);
-    assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
+    let log = service.stop();
+    assert!(log.contains("final push: origin: nothing new"), "{log}");
+}
+
+/// A front in this process that listens for the service's calls: `open`
+/// paths answer open for writing; invalidations are noted.
+struct TestFront {
+    lease: FrontLease,
+    hooks: Arc<Noting>,
+    listener: ListenerHandle,
+}
+
+#[derive(Default)]
+struct Noting {
+    open: Mutex<Vec<String>>,
+    settles: Mutex<usize>,
+    invalidated: Mutex<Vec<String>>,
+}
+
+impl FrontHooks for Noting {
+    fn settle(&self) -> Result<(usize, usize), String> {
+        *self.settles.lock().unwrap() += 1;
+        Ok((0, 0))
+    }
+
+    fn open_for_writing(&self, paths: &[RepoPath]) -> Vec<bool> {
+        let open = self.open.lock().unwrap();
+        paths
+            .iter()
+            .map(|p| open.contains(&p.to_string()))
+            .collect()
+    }
+
+    fn invalidate(&self, paths: &[RepoPath]) -> Result<(), String> {
+        let mut noted = self.invalidated.lock().unwrap();
+        noted.extend(paths.iter().map(ToString::to_string));
+        Ok(())
+    }
+}
+
+impl Volume {
+    fn listening_front(&self, pod: &str) -> TestFront {
+        let state = self.state();
+        let lease = FrontLease::acquire(&state, &format!("command=test pod={pod}")).unwrap();
+        let client = HistoryClient::connect(
+            ClientConfig {
+                address: Address::Unix(state.history_socket()),
+                timeout: Duration::from_secs(10),
+                connect_wait: Duration::from_secs(10),
+            },
+            "demo",
+            "refs/heads/agentfs/demo",
+            FrontInfo {
+                origin: Origin {
+                    namespace: "agents".into(),
+                    pod: pod.into(),
+                    pod_uid: format!("{pod}-uid"),
+                    node: "node-1".into(),
+                    replica: pod.into(),
+                },
+                slot: lease.slot(),
+                instance: u64::from(std::process::id()) << 16 | u64::from(lease.slot()),
+                pid: std::process::id(),
+                version: "test".into(),
+            },
+            Arc::new(NullSink),
+            Telemetry::noop(),
+        )
+        .unwrap();
+        let hooks = Arc::new(Noting::default());
+        let listener = Arc::new(client).listen(hooks.clone()).unwrap();
+        assert!(listener.wait_listening(Duration::from_secs(10)));
+        TestFront {
+            lease,
+            hooks,
+            listener,
+        }
+    }
+
+    fn head_has(&self, path: &str) -> Option<String> {
+        let repo = git2::Repository::open_bare(self.state().git()).ok()?;
+        let head = repo
+            .find_reference("refs/heads/agentfs/demo")
+            .ok()?
+            .peel_to_commit()
+            .ok()?;
+        let entry = head.tree().ok()?.get_path(Path::new(path)).ok()?;
+        let blob = repo.find_blob(entry.id()).ok()?;
+        Some(String::from_utf8_lossy(blob.content()).into_owned())
+    }
+
+    fn wait_head(&self, path: &str, content: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.head_has(path).as_deref() != Some(content) {
+            assert!(
+                Instant::now() < deadline,
+                "HEAD never had {path} = {content}: {:?}",
+                self.head_has(path)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn head_message(&self) -> String {
+        let repo = git2::Repository::open_bare(self.state().git()).unwrap();
+        let head = repo
+            .find_reference("refs/heads/agentfs/demo")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        head.message().unwrap().to_owned()
+    }
+}
+
+/// `restore` and `revert` while the history service runs (design §15):
+/// served by the service, which writes the backing tree, records it as
+/// the operation and commits, with no front, and with a listening front
+/// it settles, asks about open files and tells to drop its caches.
+#[test]
+fn the_history_service_restores_and_reverts_live() {
+    let v = Volume::new();
+    let service = v.serve();
+    for content in ["one", "two"] {
+        fs::write(v.tree().join("a"), content).unwrap();
+        let out = v.front_record("pod-a", &["a"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        v.wait_head("a", content);
+    }
+
+    // No front runs: written straight into the backing tree.
+    let out = v.run(["restore", "a", "HEAD~1"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     assert!(
-        stderr(&out).contains("serves no restores"),
+        stdout(&out).contains("restored 1 path(s)"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(fs::read_to_string(v.tree().join("a")).unwrap(), "one");
+    assert_eq!(v.head_has("a").as_deref(), Some("one"));
+    assert!(
+        v.head_message().contains("Agentfs-Trigger: restore"),
+        "{}",
+        v.head_message()
+    );
+    let out = v.run(["revert", "HEAD"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(fs::read_to_string(v.tree().join("a")).unwrap(), "two");
+    assert_eq!(v.head_has("a").as_deref(), Some("two"));
+
+    // A listening front holding `a` open for writing: refused, nothing
+    // written; with --force, written, and the front drops its caches.
+    let front = v.listening_front("pod-b");
+    front.hooks.open.lock().unwrap().push("a".into());
+    let out = v.run(["restore", "a", "HEAD~1"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("open for writing"),
         "{}",
         stderr(&out)
     );
+    assert_eq!(fs::read_to_string(v.tree().join("a")).unwrap(), "two");
+    assert!(*front.hooks.settles.lock().unwrap() >= 1);
+    let out = v.run(["restore", "--force", "a", "HEAD~1"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(fs::read_to_string(v.tree().join("a")).unwrap(), "one");
+    assert_eq!(*front.hooks.invalidated.lock().unwrap(), ["a"]);
+    // A dry run checks the same way, and writes nothing.
+    front.hooks.open.lock().unwrap().clear();
+    let out = v.run(["revert", "--dry-run", "HEAD"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("dry run"), "{}", stdout(&out));
+    assert_eq!(fs::read_to_string(v.tree().join("a")).unwrap(), "one");
 
-    let log = service.stop();
-    assert!(log.contains("final push: origin: nothing new"), "{log}");
+    // A live front that stops listening: busy (75) once the grace is over.
+    let TestFront {
+        lease, listener, ..
+    } = front;
+    listener.stop();
+    let started = Instant::now();
+    let out = v.run(["restore", "a", "HEAD~1"]);
+    assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
+    assert!(stderr(&out).contains("not listening"), "{}", stderr(&out));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert_eq!(fs::read_to_string(v.tree().join("a")).unwrap(), "one");
+    drop(lease);
+    let out = v.run(["restore", "a", "HEAD~1"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    service.stop();
 }

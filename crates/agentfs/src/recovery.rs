@@ -14,6 +14,14 @@
 //!   layer records those writes like any workload's, as part of the
 //!   operation, so kernel caches, the inode table and dirty detection stay
 //!   coherent. `--root` is not needed.
+//! - **Service mode**: `agentfs serve-history` listens on the control
+//!   socket too, and serves restores for the fronts that mount the volume
+//!   ([`ServiceDaemon`]). Every live front must be listening (or the
+//!   request is busy, 75); the service has each one settle (record what is
+//!   dirty in it), waits until history has caught up, checks the backing
+//!   tree with the fronts' answers about files open for writing, writes
+//!   the backing tree itself and records what it wrote as one operation,
+//!   then has every front drop its kernel's caches of the paths written.
 //! - **Direct mode** (nothing listening): no mount, and so no workload
 //!   through one, can be running. The command takes the state-area lock,
 //!   commits what is journaled, writes the backing tree (`--root`) itself
@@ -23,8 +31,10 @@
 //! state area is busy (another command holds it) or the daemon is running
 //! another restore.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -32,9 +42,11 @@ use anyhow::{Context as _, Result};
 use agentfs_core::config::Settings;
 use agentfs_core::confined::Dir;
 use agentfs_core::history::{History, seq_from_message};
+use agentfs_core::history_service::{Fronts, FrontsError};
 use agentfs_core::lfs::ObjectCache;
 use agentfs_core::lfs::fetch::{CacheProbe, Fetcher, LfsObjects};
 use agentfs_core::lock::{LockError, StateLock};
+use agentfs_core::paths::RepoPath;
 use agentfs_core::record::Caller;
 use agentfs_core::restore::{
     self, Liveness, NotLive, Pathspec, Plan, RecordMode, Request, RestoreError,
@@ -533,6 +545,218 @@ impl Daemon {
                 done.written, done.removed
             ))),
         }
+    }
+}
+
+/// How long the history service waits for every live front to be
+/// listening before it refuses a restore as busy.
+pub const LISTEN_GRACE: Duration = Duration::from_secs(5);
+
+/// The history service's side of restores and reverts (design §15): it
+/// holds the state area, so it writes the backing tree itself, live, with
+/// every front's help ([`Fronts`]):
+///
+/// 1. every slot whose lease is held must have a listening front (else
+///    `busy`, exit 75: a front that cannot be settled or told to drop its
+///    caches would serve stale content);
+/// 2. each front records what is dirty in it, and history catches up;
+/// 3. the plan is checked against the backing tree, with the fronts
+///    saying which paths are open for writing (refused without `--force`);
+/// 4. the service writes the backing tree and records what it wrote as
+///    the operation, by the operator, then commits;
+/// 5. each front drops its kernel's caches of the paths written.
+pub struct ServiceDaemon {
+    pub state: StateDir,
+    pub recorder: Recorder,
+    pub fronts: Fronts,
+    pub backing: PathBuf,
+    pub commit_window: Duration,
+}
+
+impl ServiceDaemon {
+    /// Serves one request, on the connection's own thread.
+    pub fn serve(&self, request: control::Request, peer: control::Peer) -> Reply {
+        let ask = match Ask::from_wire(request) {
+            Ok(ask) => ask,
+            Err(e) => return refusal_reply(&e),
+        };
+        match self.fronts.require_all(LISTEN_GRACE) {
+            Ok(_) => {}
+            Err(e @ FrontsError::NotListening(_)) => return Reply::Busy(e.to_string()),
+            Err(e) => return Reply::Error(e.to_string()),
+        }
+        match self.serve_ask(&ask, peer) {
+            Ok(done) => Reply::Ok(done),
+            Err(e) if e.is_refusal() => refusal_reply(&e),
+            Err(e) => Reply::Error(e.to_string()),
+        }
+    }
+
+    fn history_wait(&self) -> Duration {
+        (self.commit_window * 20).max(MIN_HISTORY_WAIT)
+    }
+
+    fn serve_ask(&self, ask: &Ask, peer: control::Peer) -> Result<Outcome, RestoreError> {
+        // What the fronts have not recorded yet, then everything recorded,
+        // must be in history before the tree is compared with it.
+        let waiting = self.fronts.settle().map_err(other)?;
+        if waiting > 0 {
+            eprintln!(
+                "{}: {waiting} path(s) still wait for a front's repair; a plan that touches \
+                 them is refused as not recorded",
+                ask.command()
+            );
+        }
+        if let Some(seq) = self.recorder.last_seq()
+            && !self.recorder.wait_committed(seq, self.history_wait())
+        {
+            return Err(RestoreError::HistoryBehind);
+        }
+        let history = History::open(&self.state.git()).map_err(other)?;
+        let repo = history.repo();
+        let tree = Dir::open(&self.backing)?;
+        let plan = restore::plan(repo, &history.settings().branch_ref, &ask.request)?;
+        let live = FrontsLiveness::new(&self.fronts);
+        live.ask(plan.steps.iter().map(|s| &s.path))?;
+        let objects = Objects::new(&self.state, history.settings(), ask.dry_run)?;
+        let plan = restore::check(
+            plan,
+            repo,
+            &self.recorder,
+            objects.get(),
+            &tree,
+            &live,
+            ask.force,
+        )?;
+        let mut done = Outcome {
+            plan: plan_lines(&plan),
+            dry_run: ask.dry_run,
+            lfs_uncached: objects.uncached().0,
+            lfs_uncached_bytes: objects.uncached().1,
+            ..Outcome::default()
+        };
+        if ask.dry_run || plan.steps.is_empty() {
+            return Ok(done);
+        }
+        // Asked again just before writing: a file opened since the check
+        // is refused by the recheck of its step.
+        live.ask(plan.steps.iter().map(|s| &s.path))?;
+        let operator = Caller {
+            uid: peer.uid,
+            gid: peer.gid,
+            pid: peer.pid,
+        };
+        // The service records what it writes, as the operation's actor.
+        let me = Caller {
+            pid: std::process::id(),
+            ..operator
+        };
+        let guard = self
+            .recorder
+            .begin_operation(
+                plan.kind,
+                plan.source.to_string(),
+                plan.summary.clone(),
+                operator,
+                &[me.pid],
+            )
+            .map_err(other)?;
+        let (applied, failure) =
+            match restore::apply(&plan, repo, objects.get(), &tree, &live, ask.force) {
+                Ok(applied) => (applied, None),
+                Err(e) => (e.applied.clone(), Some(e)),
+            };
+        let mut to_record = applied.clone();
+        if let Some(path) = failure
+            .as_ref()
+            .and_then(|e| e.left_changed(&plan, repo, &tree))
+        {
+            to_record.written.push(path);
+        }
+        let recorded = restore::record_applied(
+            &self.recorder,
+            &tree,
+            &to_record,
+            me,
+            RecordMode::Chunked(RECORD_CHUNK),
+        );
+        let last = guard.finish();
+        // The fronts' kernels drop what they cached of the paths written,
+        // committed or not: the tree has changed either way.
+        let changed: Vec<RepoPath> = to_record
+            .written
+            .iter()
+            .chain(&to_record.removed)
+            .cloned()
+            .collect();
+        if let Err(e) = self.fronts.invalidate(&changed) {
+            eprintln!(
+                "{}: a front could not drop its caches of the paths written ({e}); it may \
+                 show their old content until its kernel's cache times out",
+                ask.command()
+            );
+        }
+        done.written = applied.written.len();
+        done.removed = applied.removed.len();
+        if let Some(last) = last
+            && self.recorder.wait_committed(last, self.history_wait())
+        {
+            done.commit = commit_with_seq(&history, last);
+        }
+        match (failure, recorded) {
+            (None, Ok(())) => Ok(done),
+            (Some(e), _) => Err(other(format!(
+                "failed part way: {e}; the {} path(s) written and {} removed before it are \
+                 recorded",
+                done.written, done.removed
+            ))),
+            (None, Err(e)) => Err(other(format!(
+                "the {} path(s) were written, but recording them failed: {e}",
+                done.written + done.removed
+            ))),
+        }
+    }
+}
+
+/// Which paths the fronts hold open for writing, asked of every front in
+/// batches ([`FrontsLiveness::ask`]) and answered from that. A path not
+/// asked about, or asked when a front failed to answer, counts as open:
+/// the safe answer, refused without `--force`.
+struct FrontsLiveness<'a> {
+    fronts: &'a Fronts,
+    open: Mutex<HashMap<RepoPath, bool>>,
+}
+
+impl<'a> FrontsLiveness<'a> {
+    fn new(fronts: &'a Fronts) -> Self {
+        Self {
+            fronts,
+            open: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn ask<'p>(&self, paths: impl Iterator<Item = &'p RepoPath>) -> Result<(), RestoreError> {
+        let paths: Vec<RepoPath> = paths.cloned().collect();
+        let answers = self.fronts.open_for_writing(&paths).map_err(other)?;
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        open.extend(paths.into_iter().zip(answers));
+        Ok(())
+    }
+}
+
+impl Liveness for FrontsLiveness<'_> {
+    fn open_for_writing(&self, path: &RepoPath) -> bool {
+        self.open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(path)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// The service writes the backing tree directly and records itself.
+    fn records_its_writes(&self) -> bool {
+        false
     }
 }
 

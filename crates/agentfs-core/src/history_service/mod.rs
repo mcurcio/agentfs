@@ -7,19 +7,25 @@
 //! into the shared `pending/` in a slot it leases ([`FrontLease`]) and sends
 //! the record to the service ([`protocol`]), which journals it and replies
 //! once it is durable. The front fails the boundary with `EIO` if no
-//! durable reply comes (design §3.5).
+//! durable reply comes (design §3.5). Each front also keeps a listening
+//! connection ([`HistoryClient::listen`]) on which the service calls it,
+//! so the service can serve restores live ([`Fronts`], design §15).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 mod client;
+mod fronts;
 mod lease;
+mod listener;
 pub mod protocol;
 mod server;
 
 pub use client::{ClientConfig, ClientError, HistoryClient};
+pub use fronts::{Fronts, FrontsError, MIN_CALL_TIMEOUT};
 pub use lease::{FrontLease, LeaseError, MAX_SLOT};
+pub use listener::{FrontHooks, ListenerHandle, NoHooks, RECONNECT_MAX, RECONNECT_MIN};
 pub use server::{HELLO_TIMEOUT, HistoryServer, IDLE_TIMEOUT, MAX_CONNECTIONS};
 
 /// Where a history service listens.

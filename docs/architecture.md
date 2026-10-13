@@ -68,6 +68,8 @@ missing from these tables or a row names a module that no longer exists;
 | `history_service/server.rs` | The service's socket: authentication, leases, one thread per connection |
 | `history_service/client.rs` | A front's pooled, never-resending connections to the service (§3.5) |
 | `history_service/lease.rs` | A front's `flock` lease on its pending slot (§2.2, §14) |
+| `history_service/listener.rs` | A front's listening connection: answers the service's settle, open-for-writing and invalidate calls (§14.1, §15) |
+| `history_service/fronts.rs` | The service's links to listening fronts, called to serve live restores (§14.1, §15) |
 | `lfs/mod.rs` | Git LFS (§7): large content as LFS objects with pointer blobs in history |
 | `lfs/pointer.rs` | The canonical LFS pointer format |
 | `lfs/policy.rs` | Which store a recorded file goes to: blob or LFS (§7, §4.2) |
@@ -113,7 +115,7 @@ missing from these tables or a row names a module that no longer exists;
 | `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount (`recover`, which mounts over it, is in `main.rs`) |
 | `control.rs` | The control socket of a running daemon (`mount`, `run`, `serve-history`), through which `push`, `restore` and `revert` act (§2.2, §2.3, §15) |
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
-| `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount or directly (§15) |
+| `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly (§15) |
 | `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters and the environment it reads (§13) |
 | `doc_tables.rs` | Test only: a small markdown reader for the documentation tests |
@@ -199,8 +201,11 @@ frozen copies), runs the patch phase (`patch_cmd.rs`, `patch/fetch.rs`,
 `agentfs restore` and `revert` (`recovery.rs`) plan from history
 (`restore.rs`), then write through the running mount's control socket
 (`control.rs`) so the writes are recorded like any other and grouped into
-one commit (`operations.rs`); without a mount they write the backing tree
-directly through `confined.rs` and record in-process.
+one commit (`operations.rs`); under `serve-history` the service settles the fronts
+(`history_service/fronts.rs`), writes the backing tree itself and has
+each front drop its kernel caches (`history_service/listener.rs`); with
+neither they write the backing tree directly through `confined.rs` and
+record in-process.
 
 ### The push loop
 

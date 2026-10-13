@@ -210,6 +210,15 @@ pub struct SweepReport {
     pub still_queued: usize,
 }
 
+/// A kernel cache entry [`Ops::cached_at`] names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cached {
+    /// A node's attributes and pages.
+    Node(u64),
+    /// A name in a directory node.
+    Entry(u64, Vec<u8>),
+}
+
 /// When [`Ops::capture`] captures a group. Every rule but `Operation` and
 /// `Unmount` leaves a group alone while a running operator operation
 /// changes it ([`Group::deferred`]).
@@ -2184,6 +2193,29 @@ impl Ops {
             }
         }
         report
+    }
+
+    /// What the kernel may have cached of the path `rel` (relative to the
+    /// root), for a change made to the backing tree by someone else (the
+    /// history service's restore, design §15): the entry of each component
+    /// in its parent, up to the first the table does not know (the kernel
+    /// may hold it as a negative entry), and the node at the path, if known
+    /// (its attributes and pages).
+    pub fn cached_at(&self, rel: &[u8]) -> Vec<Cached> {
+        let table = self.table();
+        let mut id = ROOT;
+        // Every entry on the way: a step may have removed a directory (an
+        // emptied one is pruned) or made one.
+        let mut targets = Vec::new();
+        for name in rel.split(|&b| b == b'/').filter(|n| !n.is_empty()) {
+            targets.push(Cached::Entry(id, name.to_vec()));
+            match table.child(id, name) {
+                Some(child) => id = child,
+                None => return targets,
+            }
+        }
+        targets.push(Cached::Node(id));
+        targets
     }
 
     /// Whether the file at `rel` (a path from the mount root) has a handle

@@ -279,7 +279,8 @@ reconnect and their repairs and sweep record the final state
 ([runbook](docs/runbooks/history-service-down.md)). On Kubernetes the CSI
 driver runs all of this for you, per volume and per pod
 ([docs/csi.md](docs/csi.md)). Limits: one node only;
-no `restore` or `revert` while the service runs; locks are not shared
+`restore` and `revert` run through the service and reach every front at
+once; locks are not shared
 between mounts, so a database must be written from one of them; patches
 are applied only when the service starts with no fronts; the service
 serves 1024 connections, about 60 fronts busy at once. A file open in
