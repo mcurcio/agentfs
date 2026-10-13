@@ -12,8 +12,9 @@
 //! names ([`Protocol`]): `http/protobuf` (the default), `http/json`, or
 //! `grpc`. gRPC runs on a one-worker tokio runtime (`agentfs-otlp`) started
 //! only when a signal uses it; the SDK's batch threads drive it through
-//! [`OnRuntime`]. This build speaks plain http only: TLS is not built. A
-//! setting this build cannot serve turns its signal off with a warning on
+//! [`OnRuntime`]. `https://` endpoints need the `otlp-tls` feature (`tls`:
+//! rustls on ring, a CA bundle or the system store, client certificates).
+//! A setting this build cannot serve turns its signal off with a warning on
 //! stderr; telemetry never stops a command.
 //!
 //! Every exporter is wrapped in [`Watched`], so a failed export is visible
@@ -27,6 +28,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
@@ -46,6 +48,9 @@ use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 
 use agentfs_core::identity::Context;
 use agentfs_core::telemetry::{self, OtelAlarmLog, Telemetry, names};
+
+#[cfg(feature = "otlp-tls")]
+mod tls;
 
 /// How long exit waits for telemetry to flush.
 pub const TELEMETRY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -122,10 +127,36 @@ impl fmt::Display for Protocol {
     }
 }
 
-/// Whether one signal is exported, and over which protocol.
+/// How one signal is exported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transport {
+    pub protocol: Protocol,
+    /// Set for an `https://` endpoint.
+    pub tls: Option<Tls>,
+}
+
+/// TLS to the collector (`OTEL_EXPORTER_OTLP_CERTIFICATE` and the client
+/// certificate and key, each per signal or general). The files are read
+/// once, when the exporter is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tls {
+    /// PEM CA certificates to trust instead of the system store.
+    pub ca: Option<PathBuf>,
+    /// PEM client certificate (chain) and its private key, for mutual TLS.
+    pub client: Option<(PathBuf, PathBuf)>,
+    /// The request timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`), which agentfs
+    /// applies to its own HTTPS client.
+    pub timeout: Duration,
+}
+
+/// The export timeout when `OTEL_EXPORTER_OTLP_TIMEOUT` is unset, as the
+/// specification says.
+pub const DEFAULT_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether one signal is exported, and how.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    Enabled(Protocol),
+    Enabled(Transport),
     /// Off; `warning` says why when the configuration asked for something
     /// this build cannot do.
     Disabled {
@@ -201,18 +232,34 @@ pub const ENV_VARS: &[&str] = &[
     "OTEL_TRACES_EXPORTER",
     "OTEL_METRICS_EXPORTER",
     "OTEL_LOGS_EXPORTER",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
 ];
 
 /// Variables the OpenTelemetry SDK and exporter read themselves, not
 /// agentfs. Listed in docs/configuration.md for operators (checked by
-/// `reference_tests`); not exhaustive (the per-signal forms of the headers
-/// and timeout, and the batch settings, are documented as families).
+/// `reference_tests`); not exhaustive (the per-signal forms of the headers,
+/// and the batch settings, are documented as families). The gRPC and plain
+/// HTTP exporters also read the timeout themselves.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const SDK_ENV_VARS: &[&str] = &[
     "OTEL_SERVICE_NAME",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_EXPORTER_OTLP_HEADERS",
-    "OTEL_EXPORTER_OTLP_TIMEOUT",
     "OTEL_METRIC_EXPORT_INTERVAL",
     "OTEL_TRACES_SAMPLER",
     "OTEL_TRACES_SAMPLER_ARG",
@@ -275,15 +322,63 @@ pub fn plan(env: &dyn Fn(&str) -> Option<String>) -> Plan {
                 }
             },
         };
-        if endpoint
+        let https = endpoint
             .get(..8)
-            .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
-        {
+            .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+        if !https {
+            return Decision::Enabled(Transport {
+                protocol,
+                tls: None,
+            });
+        }
+        // The signal's own setting, else the general one: `(var, value)`.
+        let either = |suffix: &str| {
+            let own = format!("OTEL_EXPORTER_OTLP_{upper}_{suffix}");
+            let general = format!("OTEL_EXPORTER_OTLP_{suffix}");
+            get(&own)
+                .map(|v| (own, v))
+                .or_else(|| get(&general).map(|v| (general, v)))
+        };
+        let ca = either("CERTIFICATE").map(|(_, v)| PathBuf::from(v));
+        let client = match (either("CLIENT_CERTIFICATE"), either("CLIENT_KEY")) {
+            (Some((_, cert)), Some((_, key))) => Some((PathBuf::from(cert), PathBuf::from(key))),
+            (None, None) => None,
+            (Some((var, _)), None) | (None, Some((var, _))) => {
+                let missing = if var.ends_with("_KEY") {
+                    "client certificate"
+                } else {
+                    "client key"
+                };
+                return Decision::warn(format!(
+                    "{var} is set without the matching {missing} (set both for mutual TLS)"
+                ));
+            }
+        };
+        let timeout = match either("TIMEOUT") {
+            None => DEFAULT_EXPORT_TIMEOUT,
+            Some((var, value)) => match value.parse::<u64>() {
+                Ok(ms) => Duration::from_millis(ms),
+                Err(_) => {
+                    return Decision::warn(format!(
+                        "{var}={value} is not a timeout in milliseconds"
+                    ));
+                }
+            },
+        };
+        if !cfg!(feature = "otlp-tls") {
             return Decision::warn(format!(
-                "endpoint {endpoint} needs TLS, which is not built (use http://)"
+                "endpoint {endpoint} needs TLS, which this build lacks (build with the \
+                 `otlp-tls` feature, or use http://)"
             ));
         }
-        Decision::Enabled(protocol)
+        Decision::Enabled(Transport {
+            protocol,
+            tls: Some(Tls {
+                ca,
+                client,
+                timeout,
+            }),
+        })
     };
     Plan {
         traces: decide(Signal::Traces),
@@ -665,17 +760,66 @@ impl Drop for Otel {
     }
 }
 
+/// Builds the OTLP exporter `$kind` (`SpanExporter`, `MetricExporter` or
+/// `LogExporter`) for a [`Transport`]: tonic for gRPC, created inside the
+/// runtime, else the HTTP exporter with the protocol set. Over TLS the gRPC
+/// exporter gets its TLS settings and the HTTP exporter agentfs's own
+/// client. Evaluates to `Result<_, String>`.
+macro_rules! exporter {
+    ($kind:ident, $transport:expr, $runtime:expr) => {
+        (|| -> Result<opentelemetry_otlp::$kind, String> {
+            let transport: &Transport = $transport;
+            match transport.protocol {
+                Protocol::Grpc => {
+                    let runtime: &tokio::runtime::Runtime =
+                        $runtime.ok_or("no runtime for gRPC export")?;
+                    let _entered = runtime.enter();
+                    #[allow(unused_mut)]
+                    let mut builder = opentelemetry_otlp::$kind::builder().with_tonic();
+                    #[cfg(feature = "otlp-tls")]
+                    if let Some(settings) = &transport.tls {
+                        use opentelemetry_otlp::WithTonicConfig as _;
+                        builder = builder.with_tls_config(
+                            tls::grpc_config(settings).map_err(|e| e.to_string())?,
+                        );
+                    }
+                    builder.build().map_err(|e| e.to_string())
+                }
+                protocol => {
+                    #[allow(unused_mut)]
+                    let mut builder = opentelemetry_otlp::$kind::builder()
+                        .with_http()
+                        .with_protocol(protocol.otlp());
+                    #[cfg(feature = "otlp-tls")]
+                    if let Some(settings) = &transport.tls {
+                        use opentelemetry_otlp::WithHttpConfig as _;
+                        builder = builder.with_http_client(
+                            tls::http_client(settings).map_err(|e| e.to_string())?,
+                        );
+                    }
+                    builder.build().map_err(|e| e.to_string())
+                }
+            }
+        })()
+    };
+}
+
 /// Sets up export for `volume` from the process environment.
 pub fn init(volume: &str, ctx: &Context) -> Otel {
+    // With TLS built, reqwest has rustls but no crypto provider of its own,
+    // even for plain http: ring is the process's (an error means one is
+    // already installed).
+    #[cfg(feature = "otlp-tls")]
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let plan = plan(&|name| std::env::var(name).ok());
     for warning in plan.warnings() {
         eprintln!("warning: telemetry: {warning}");
     }
-    let protocol = |s: Signal| match plan.get(s) {
-        Decision::Enabled(protocol) => Some(*protocol),
+    let transport = |s: Signal| match plan.get(s) {
+        Decision::Enabled(transport) => Some(transport.clone()),
         Decision::Disabled { .. } => None,
     };
-    if Signal::ALL.iter().all(|s| protocol(*s).is_none()) {
+    if Signal::ALL.iter().all(|s| transport(*s).is_none()) {
         return Otel::noop();
     }
     let warn = |signal: Signal, e: &dyn fmt::Display| {
@@ -685,7 +829,7 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
     let mut runtime = None;
     if Signal::ALL
         .iter()
-        .any(|s| protocol(*s) == Some(Protocol::Grpc))
+        .any(|s| transport(*s).is_some_and(|t| t.protocol == Protocol::Grpc))
     {
         match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -699,36 +843,18 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
     }
     let resource = resource(volume, ctx);
     let health = ExportHealth::new();
-    // The handle a signal's exporter runs on, or `Err` when it needs the
-    // runtime that could not be started.
-    let handle = |signal: Signal| -> Result<Option<tokio::runtime::Handle>, ()> {
-        match (protocol(signal), &runtime) {
-            (Some(Protocol::Grpc), Some(rt)) => Ok(Some(rt.handle().clone())),
-            (Some(Protocol::Grpc), None) => Err(()),
-            _ => Ok(None),
-        }
+    // The runtime a signal's exporter runs on: gRPC's only.
+    let handle = |transport: &Transport| match (transport.protocol, &runtime) {
+        (Protocol::Grpc, Some(rt)) => Some(rt.handle().clone()),
+        _ => None,
     };
-    // tonic's channel is created inside the runtime.
-    let _entered = runtime.as_ref().map(tokio::runtime::Runtime::enter);
 
-    let tracer = protocol(Signal::Traces).and_then(|p| {
-        let Ok(handle) = handle(Signal::Traces) else {
-            return None;
-        };
-        let built = match p {
-            Protocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .build(),
-            _ => opentelemetry_otlp::SpanExporter::builder()
-                .with_http()
-                .with_protocol(p.otlp())
-                .build(),
-        };
-        match built {
+    let tracer = transport(Signal::Traces).and_then(|t| {
+        match exporter!(SpanExporter, &t, runtime.as_ref()) {
             Ok(exporter) => Some(
                 SdkTracerProvider::builder()
                     .with_batch_exporter(Watched::new(
-                        OnRuntime::new(exporter, handle),
+                        OnRuntime::new(exporter, handle(&t)),
                         Signal::Traces,
                         health.clone(),
                     ))
@@ -741,24 +867,12 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
             }
         }
     });
-    let meter = protocol(Signal::Metrics).and_then(|p| {
-        let Ok(handle) = handle(Signal::Metrics) else {
-            return None;
-        };
-        let built = match p {
-            Protocol::Grpc => opentelemetry_otlp::MetricExporter::builder()
-                .with_tonic()
-                .build(),
-            _ => opentelemetry_otlp::MetricExporter::builder()
-                .with_http()
-                .with_protocol(p.otlp())
-                .build(),
-        };
-        match built {
+    let meter = transport(Signal::Metrics).and_then(|t| {
+        match exporter!(MetricExporter, &t, runtime.as_ref()) {
             Ok(exporter) => Some(
                 SdkMeterProvider::builder()
                     .with_periodic_exporter(Watched::new(
-                        OnRuntime::new(exporter, handle),
+                        OnRuntime::new(exporter, handle(&t)),
                         Signal::Metrics,
                         health.clone(),
                     ))
@@ -771,24 +885,12 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
             }
         }
     });
-    let logger = protocol(Signal::Logs).and_then(|p| {
-        let Ok(handle) = handle(Signal::Logs) else {
-            return None;
-        };
-        let built = match p {
-            Protocol::Grpc => opentelemetry_otlp::LogExporter::builder()
-                .with_tonic()
-                .build(),
-            _ => opentelemetry_otlp::LogExporter::builder()
-                .with_http()
-                .with_protocol(p.otlp())
-                .build(),
-        };
-        match built {
+    let logger =
+        transport(Signal::Logs).and_then(|t| match exporter!(LogExporter, &t, runtime.as_ref()) {
             Ok(exporter) => Some(
                 SdkLoggerProvider::builder()
                     .with_batch_exporter(Watched::new(
-                        OnRuntime::new(exporter, handle),
+                        OnRuntime::new(exporter, handle(&t)),
                         Signal::Logs,
                         health.clone(),
                     ))
@@ -799,9 +901,7 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
                 warn(Signal::Logs, &e);
                 None
             }
-        }
-    });
-    drop(_entered);
+        });
     if tracer.is_none() && meter.is_none() && logger.is_none() {
         return Otel::noop();
     }
@@ -896,6 +996,13 @@ mod tests {
     const ENDPOINT: (&str, &str) = ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318");
     const HTTP: Protocol = Protocol::HttpProtobuf;
 
+    fn on(protocol: Protocol) -> Decision {
+        Decision::Enabled(Transport {
+            protocol,
+            tls: None,
+        })
+    }
+
     /// [`plan`] reads exactly [`ENV_VARS`]: with every endpoint and
     /// exporter set it asks for each, and it never asks for another.
     #[test]
@@ -907,14 +1014,18 @@ mod tests {
                 "OTEL_SDK_DISABLED" => Some("false".to_owned()),
                 n if n.ends_with("_EXPORTER") => Some("otlp".to_owned()),
                 n if n.ends_with("_PROTOCOL") => Some("http/protobuf".to_owned()),
-                n if n.ends_with("_ENDPOINT") => Some("http://collector:4318".to_owned()),
+                n if n.ends_with("_ENDPOINT") => Some("https://collector:4318".to_owned()),
+                n if n.ends_with("_CERTIFICATE") || n.ends_with("_KEY") => {
+                    Some("/f.pem".to_owned())
+                }
+                n if n.ends_with("_TIMEOUT") => Some("1000".to_owned()),
                 _ => None,
             }
         });
-        // Without the per-signal forms, the general protocol is read.
+        // Without the per-signal forms, the general ones are read.
         let _ = plan(&|name| {
             asked.borrow_mut().insert(name.to_owned());
-            (name == "OTEL_EXPORTER_OTLP_ENDPOINT").then(|| "http://collector:4318".to_owned())
+            (name == "OTEL_EXPORTER_OTLP_ENDPOINT").then(|| "https://collector:4318".to_owned())
         });
         let expected: std::collections::BTreeSet<String> =
             ENV_VARS.iter().map(|v| (*v).to_owned()).collect();
@@ -934,22 +1045,22 @@ mod tests {
         );
 
         // A generic endpoint enables every signal.
-        assert_eq!(plan_of(&[ENDPOINT]), all(Decision::Enabled(HTTP)));
+        assert_eq!(plan_of(&[ENDPOINT]), all(on(HTTP)));
         assert_eq!(
             plan_of(&[ENDPOINT, ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")]),
-            all(Decision::Enabled(HTTP))
+            all(on(HTTP))
         );
 
         // A signal-specific endpoint enables only that signal.
         let only = plan_of(&[("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://c/v1/metrics")]);
-        assert_eq!(only.metrics, Decision::Enabled(HTTP));
+        assert_eq!(only.metrics, on(HTTP));
         assert_eq!(only.traces, Decision::off());
         assert_eq!(only.logs, Decision::off());
 
         // `none` turns a signal off silently.
         let p = plan_of(&[ENDPOINT, ("OTEL_TRACES_EXPORTER", "none")]);
         assert_eq!(p.traces, Decision::off());
-        assert_eq!(p.metrics, Decision::Enabled(HTTP));
+        assert_eq!(p.metrics, on(HTTP));
         assert!(p.warnings().is_empty());
 
         // Other exporters are not built.
@@ -958,10 +1069,10 @@ mod tests {
             matches!(&p.metrics, Decision::Disabled { warning: Some(w) } if w.contains("prometheus")),
             "{p:?}"
         );
-        assert_eq!(p.logs, Decision::Enabled(HTTP));
+        assert_eq!(p.logs, on(HTTP));
         assert_eq!(
             plan_of(&[ENDPOINT, ("OTEL_LOGS_EXPORTER", "otlp,console")]).logs,
-            Decision::Enabled(HTTP)
+            on(HTTP)
         );
 
         // Each protocol the specification names is built.
@@ -971,7 +1082,7 @@ mod tests {
             ("http/json", Protocol::HttpJson),
         ] {
             let p = plan_of(&[ENDPOINT, ("OTEL_EXPORTER_OTLP_PROTOCOL", value)]);
-            assert_eq!(p, all(Decision::Enabled(protocol)), "{value}");
+            assert_eq!(p, all(on(protocol)), "{value}");
             assert_eq!(protocol.to_string(), value);
         }
         // Anything else is not, with one warning for all signals.
@@ -991,11 +1102,85 @@ mod tests {
             );
         }
 
-        // TLS is not built.
+        // An https endpoint needs the otlp-tls feature, and then carries
+        // its files: the signal's own, else the general ones.
         let p = plan_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "HTTPS://collector:4318")]);
-        assert!(
-            matches!(&p.traces, Decision::Disabled { warning: Some(w) } if w.contains("TLS")),
-            "{p:?}"
+        if cfg!(feature = "otlp-tls") {
+            assert_eq!(
+                p.traces,
+                Decision::Enabled(Transport {
+                    protocol: HTTP,
+                    tls: Some(Tls {
+                        ca: None,
+                        client: None,
+                        timeout: DEFAULT_EXPORT_TIMEOUT,
+                    }),
+                })
+            );
+            let p = plan_of(&[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector:4317"),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+                ("OTEL_EXPORTER_OTLP_CERTIFICATE", "/ca.pem"),
+                ("OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE", "/logs-ca.pem"),
+                ("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "/c.pem"),
+                ("OTEL_EXPORTER_OTLP_CLIENT_KEY", "/c.key"),
+                ("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT", "2500"),
+            ]);
+            let Decision::Enabled(metrics) = &p.metrics else {
+                panic!("{p:?}")
+            };
+            assert_eq!(metrics.protocol, Protocol::Grpc);
+            let tls = metrics.tls.as_ref().unwrap();
+            assert_eq!(tls.ca.as_deref(), Some(std::path::Path::new("/ca.pem")));
+            assert_eq!(
+                tls.client,
+                Some((PathBuf::from("/c.pem"), PathBuf::from("/c.key")))
+            );
+            assert_eq!(tls.timeout, Duration::from_millis(2500));
+            let Decision::Enabled(logs) = &p.logs else {
+                panic!("{p:?}")
+            };
+            let tls = logs.tls.as_ref().unwrap();
+            assert_eq!(
+                tls.ca.as_deref(),
+                Some(std::path::Path::new("/logs-ca.pem"))
+            );
+            assert_eq!(tls.timeout, DEFAULT_EXPORT_TIMEOUT);
+        } else {
+            assert!(
+                matches!(&p.traces, Decision::Disabled { warning: Some(w) } if w.contains("otlp-tls")),
+                "{p:?}"
+            );
+        }
+        // A client certificate needs its key, and the other way round; a
+        // timeout is in milliseconds.
+        for (vars, expect) in [
+            (
+                [("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "/c.pem")],
+                "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE is set without the matching client key",
+            ),
+            (
+                [("OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY", "/c.key")],
+                "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY is set without the matching client \
+                 certificate",
+            ),
+            (
+                [("OTEL_EXPORTER_OTLP_TIMEOUT", "10s")],
+                "OTEL_EXPORTER_OTLP_TIMEOUT=10s is not a timeout in milliseconds",
+            ),
+        ] {
+            let mut all_vars = vec![("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector")];
+            all_vars.extend(vars);
+            let p = plan_of(&all_vars);
+            assert!(
+                matches!(&p.traces, Decision::Disabled { warning: Some(w) } if w.starts_with(expect)),
+                "{p:?}"
+            );
+        }
+        // Over plain http the TLS settings are not used.
+        assert_eq!(
+            plan_of(&[ENDPOINT, ("OTEL_EXPORTER_OTLP_CLIENT_KEY", "/c.key")]),
+            all(on(HTTP))
         );
 
         // OTEL_SDK_DISABLED wins, silently.
@@ -1007,7 +1192,7 @@ mod tests {
         assert_eq!(p, all(Decision::off()));
         assert_eq!(
             plan_of(&[ENDPOINT, ("OTEL_SDK_DISABLED", "false")]),
-            all(Decision::Enabled(HTTP))
+            all(on(HTTP))
         );
 
         // A signal-specific protocol overrides the generic one.
@@ -1016,14 +1201,14 @@ mod tests {
             ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
             ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
         ]);
-        assert_eq!(p.traces, Decision::Enabled(HTTP));
-        assert_eq!(p.metrics, Decision::Enabled(Protocol::Grpc));
+        assert_eq!(p.traces, on(HTTP));
+        assert_eq!(p.metrics, on(Protocol::Grpc));
         let p = plan_of(&[ENDPOINT, ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "http/json")]);
-        assert_eq!(p.logs, Decision::Enabled(Protocol::HttpJson));
-        assert_eq!(p.traces, Decision::Enabled(HTTP));
+        assert_eq!(p.logs, on(Protocol::HttpJson));
+        assert_eq!(p.traces, on(HTTP));
         let p = plan_of(&[ENDPOINT, ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "bogus")]);
         assert!(matches!(p.logs, Decision::Disabled { warning: Some(_) }));
-        assert_eq!(p.traces, Decision::Enabled(HTTP));
+        assert_eq!(p.traces, on(HTTP));
 
         // A signal-specific endpoint is checked, not the generic one.
         let p = plan_of(&[
@@ -1033,8 +1218,13 @@ mod tests {
                 "https://secure/v1/traces",
             ),
         ]);
-        assert!(matches!(p.traces, Decision::Disabled { warning: Some(_) }));
-        assert_eq!(p.metrics, Decision::Enabled(HTTP));
+        match &p.traces {
+            Decision::Enabled(traces) => assert!(traces.tls.is_some()),
+            Decision::Disabled { warning } => {
+                assert!(warning.as_deref().is_some_and(|w| w.contains("otlp-tls")))
+            }
+        }
+        assert_eq!(p.metrics, on(HTTP));
     }
 
     #[test]

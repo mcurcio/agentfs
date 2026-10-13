@@ -19,6 +19,14 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client", "trace", "metrics", "logs"] }
 # The runtime the gRPC exporter runs on (one worker, started only for gRPC).
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "time"] }
+# TLS to the collector (the `otlp-tls` feature): rustls on ring, for the
+# HTTP exporters through reqwest and for gRPC through tonic. Pure Rust plus
+# ring's C and assembly; no OpenSSL, no aws-lc.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+rustls-pki-types = { version = "1.15", features = ["std"], optional = true }
+tonic = { version = "0.14", default-features = false, features = ["tls-ring", "tls-native-roots"], optional = true }
 # The restore thread's id (`thread`), and signals in tests (`process`).
 rustix = { version = "1.1.5", features = ["fs", "process", "thread"] }
 # close(2) and its errno in the FUSE tests (a front failing a boundary with
@@ -47,6 +55,9 @@ tempfile = "3.27.0"
 https = ["agentfs-core/https"]
 # Push to ssh:// and scp-like remotes (libssh2, links OpenSSL).
 ssh = ["agentfs-core/ssh"]
+# OTLP export to https:// collectors, with a CA bundle and client
+# certificates (rustls on ring).
+otlp-tls = ["dep:reqwest", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:tonic", "opentelemetry-otlp/tls-ring"]
 # Test builds only: failpoints on the durable path (design §18 test 3),
 # set by AGENTFS_FAILPOINTS. `--version` says `+failpoints`. Never in a
 # release or image.

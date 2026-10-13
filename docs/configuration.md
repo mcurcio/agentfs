@@ -613,15 +613,26 @@ and costs nothing. agentfs itself reads these to decide what to export:
 | `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | `http/protobuf` (the default), `http/json` or `grpc`; the per-signal form wins. Another value turns that signal off with a `warning: telemetry:` line. With `grpc` the endpoint is the collector's gRPC address (`http://otel-collector:4317`), with no `/v1/...` path |
 | `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER` | `none` turns that signal off; only `otlp` is built |
 | `OTEL_SDK_DISABLED` | `true` turns everything off |
+| `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE`, `OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE`, `OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE` | For an `https://` endpoint: a PEM file of CA certificates, the only ones trusted for the collector. Unset: the system store (`SSL_CERT_FILE`, `SSL_CERT_DIR` move it) |
+| `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE` | For an `https://` endpoint: a PEM client certificate (chain) for mutual TLS. Needs the key; one without the other turns that signal off with a warning |
+| `OTEL_EXPORTER_OTLP_CLIENT_KEY`, `OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY`, `OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY`, `OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY` | The client certificate's PEM private key (PKCS#8, PKCS#1 or SEC1) |
+| `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`, `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`, `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Milliseconds an export may take (default 10000). agentfs applies it to its own HTTPS client; the plain HTTP and gRPC exporters read it themselves. Not a number: that signal is off, with a warning |
 
-An `https://` endpoint is not built either (plain http only, which suits
-an in-cluster collector), and is reported the same way. Telemetry
-problems never stop a command.
+An `https://` endpoint needs a binary built with the `otlp-tls` cargo
+feature (the image is; rustls on ring, no OpenSSL); without it the
+endpoint is reported the same way. Every certificate and key file is read
+once, at start: a file that cannot be read or parsed turns its signal off
+with a `warning: telemetry:` line naming it, and a rotated certificate
+takes a restart. A collector that refuses the handshake or the token
+shows as failed exports (below). For a bearer token, set
+`OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<token>` (sent as a
+header over HTTP and as metadata over gRPC). Telemetry problems never stop
+a command.
 
 The OpenTelemetry SDK and exporter read the rest themselves:
 `OTEL_SERVICE_NAME` (default `agentfs`), `OTEL_RESOURCE_ATTRIBUTES`,
-`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT` (and their
-per-signal forms), `OTEL_METRIC_EXPORT_INTERVAL` (default 60s), the
+`OTEL_EXPORTER_OTLP_HEADERS` (and its per-signal forms; values are
+percent-decoded), `OTEL_METRIC_EXPORT_INTERVAL` (default 60s), the
 batch settings `OTEL_BSP_*` and `OTEL_BLRP_*`, and sampling:
 `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` (every record makes an
 `agentfs.record` span, so on a busy volume use

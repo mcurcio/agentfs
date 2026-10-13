@@ -295,7 +295,7 @@ new name, or not at all. Without
 ## Deploying on Kubernetes
 
 The image `ghcr.io/mcurcio/agentfs` (tags: the commit sha, and `latest`
-for `main`) has `agentfs` built with the `https` and `ssh` features and
+for `main`) has `agentfs` built with the `https`, `ssh` and `otlp-tls` features and
 the CSI driver `agentfs-csi`, plus `fuse3`, `git`, `tini` and the CA
 certificates. [`deploy/sidecar`](deploy/sidecar)
 is a kustomize base that runs it as a privileged native sidecar next to a
@@ -430,10 +430,13 @@ agentfs run
 
 - **Variables:** an endpoint enables export, per signal or for all;
   `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none` or `OTEL_SDK_DISABLED=true`
-  turn it off. `OTEL_EXPORTER_OTLP_PROTOCOL` picks **http/protobuf** (the default),
-  **http/json** or **grpc** (per signal too), over plain http; anything
-  else is reported with a `warning: telemetry:` line on stderr and that
-  signal stays off.
+  turn it off. `OTEL_EXPORTER_OTLP_PROTOCOL` picks **http/protobuf** (the
+  default), **http/json** or **grpc** (per signal too). An `https://`
+  endpoint needs a binary built with `otlp-tls` (the image is): it
+  verifies the collector against `OTEL_EXPORTER_OTLP_CERTIFICATE` or the
+  system store, and sends a client certificate for mutual TLS; a bearer
+  token goes in `OTEL_EXPORTER_OTLP_HEADERS`. Anything else is reported
+  with a `warning: telemetry:` line on stderr and that signal stays off.
   Telemetry problems never stop a command. Every variable agentfs and the
   OpenTelemetry SDK read, including sampling (`OTEL_TRACES_SAMPLER`: on a
   busy volume, sample), is in the
@@ -506,6 +509,9 @@ cargo build -p agentfs --features ssh        # ssh:// and scp-like remotes (libs
 cargo build -p agentfs --features https,ssh  # both
 ```
 
+A third, `otlp-tls`, exports telemetry to `https://` collectors (rustls on
+ring: no OpenSSL; `ci/check-deps.sh` checks what each feature set links).
+
 A binary built without `ssh` reports SSH remotes as misconfigured and
 pushes its other remotes. SSH remotes need `agentfsSshKey` (an unencrypted
 private key) and `agentfsKnownHosts` (an OpenSSH known_hosts file listing
@@ -524,14 +530,16 @@ build: its `--version` ends in `+failpoints`.
 The container image:
 
 ```sh
-docker build -t agentfs:dev .                 # https and ssh features, Debian trixie
+docker build -t agentfs:dev .                 # https, ssh and otlp-tls features, Debian trixie
 ```
 
 ## CI
 
 Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 
-- **lint:** rustfmt, and clippy with default and all features.
+- **lint:** rustfmt, clippy with default and all features, and
+  [`ci/check-deps.sh`](ci/check-deps.sh): what C and crypto each feature
+  set links.
 - **test:** the workspace tests, with default and all features. They
   include `restore` and `revert` without a mount
   ([`cli_restore.rs`](crates/agentfs/tests/cli_restore.rs)), and the
@@ -601,6 +609,12 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   front's `agentfs.front.round_trip`, and its
   `agentfs.front.service_failures` for a hung service (`timeout`) and a
   stopped one (`connect`).
+  Then [`ci/e2e-otlp-transports.sh`](ci/e2e-otlp-transports.sh) exports
+  over http/protobuf, http/json and gRPC, plain, over TLS with a CA bundle
+  and a bearer token, and over mutual TLS (certificates from
+  [`ci/otel-certs.sh`](ci/otel-certs.sh)), and checks that a wrong token,
+  a missing client certificate and an unknown CA get the collector nothing
+  while the command succeeds.
 - **e2e FUSE mount** ([`ci/fuse-tests.sh`](ci/fuse-tests.sh)), with
   passthrough `auto`, `on` and `off`: real mounts as root running the `#[ignore]`d
   tests in [`crates/agentfs/tests/mount.rs`](crates/agentfs/tests/mount.rs):

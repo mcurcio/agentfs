@@ -39,13 +39,13 @@ RUN mkdir -p crates/agentfs-core/src crates/agentfs-core/benches crates/agentfs-
  && touch crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs/src/main.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs-csi/src/main.rs \
- && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh
+ && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh,agentfs/otlp-tls
 
 COPY crates crates
 # COPY keeps the sources' old mtimes, older than the stub artifacts: touch
 # them so cargo rebuilds the workspace crates instead of shipping the stub.
 RUN find crates -name '*.rs' -exec touch {} + \
- && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh \
+ && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh,agentfs/otlp-tls \
  && install -m 0755 target/release/agentfs target/release/agentfs-csi /usr/local/bin/
 
 FROM ${RUNTIME_IMAGE}

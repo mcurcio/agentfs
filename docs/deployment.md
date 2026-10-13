@@ -28,8 +28,9 @@ passed with exactly that image; pull requests and other branches build it
 without publishing. **Pin a commit tag or a digest** in production
 (`images:` in your kustomization); `latest` moves with `main`.
 
-- **Contents:** the `agentfs` binary built with the `https` and `ssh`
-  features (so every remote transport works), on `debian:trixie-slim`
+- **Contents:** the `agentfs` binary built with the `https`, `ssh`
+  and `otlp-tls` features (so every remote transport, and TLS to the
+  collector, works), on `debian:trixie-slim`
   with `fuse3` (`fusermount3`), `libssl3t64`, `ca-certificates` (the TLS
   trust store) and `git`, so the runbooks' `git log` and `git show` work
   through `kubectl exec`. Both base images are pinned by digest.
@@ -223,7 +224,8 @@ feature, which https LFS servers need. LFS objects are cached under
 
 **Telemetry.** Set `OTEL_EXPORTER_OTLP_ENDPOINT` to your collector (OTLP
 http/protobuf by default; `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` with the
-collector's port 4317, or `http/json`; plain http), or `OTEL_SDK_DISABLED=true`. The example
+collector's port 4317, or `http/json`; `https://` with `OTEL_EXPORTER_OTLP_CERTIFICATE` and, for
+mutual TLS, the client certificate and key, mounted from a Secret), or `OTEL_SDK_DISABLED=true`. The example
 samples 1% of traces (`parentbased_traceidratio`, `0.01`); metrics and
 alarm logs are not sampled. See the [README](../README.md#telemetry).
 

@@ -1,6 +1,16 @@
 # OpenTelemetry Collector for ci/e2e-telemetry.sh and
-# ci/e2e-otlp-transports.sh: receives OTLP over HTTP (4318) and gRPC (4317)
-# and writes every signal to /out/otel.jsonl.
+# ci/e2e-otlp-transports.sh. Receives OTLP:
+#
+#   4318 http, 4317 grpc   plain
+#   4319 http, 4320 grpc   TLS, with a bearer token (bearertokenauth)
+#   4321 http, 4322 grpc   mutual TLS: a client certificate from the CA
+#
+# and writes every signal to /out/otel.jsonl. The certificates are from
+# ci/otel-certs.sh, mounted at /certs.
+extensions:
+  bearertokenauth:
+    token: agentfs-ci-token
+
 receivers:
   otlp:
     protocols:
@@ -8,19 +18,50 @@ receivers:
         endpoint: 0.0.0.0:4318
       grpc:
         endpoint: 0.0.0.0:4317
+  otlp/tls:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4319
+        tls:
+          cert_file: /certs/server.pem
+          key_file: /certs/server.key
+        auth:
+          authenticator: bearertokenauth
+      grpc:
+        endpoint: 0.0.0.0:4320
+        tls:
+          cert_file: /certs/server.pem
+          key_file: /certs/server.key
+        auth:
+          authenticator: bearertokenauth
+  otlp/mtls:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4321
+        tls:
+          cert_file: /certs/server.pem
+          key_file: /certs/server.key
+          client_ca_file: /certs/ca.pem
+      grpc:
+        endpoint: 0.0.0.0:4322
+        tls:
+          cert_file: /certs/server.pem
+          key_file: /certs/server.key
+          client_ca_file: /certs/ca.pem
 
 exporters:
   file:
     path: /out/otel.jsonl
 
 service:
+  extensions: [bearertokenauth]
   pipelines:
     traces:
-      receivers: [otlp]
+      receivers: [otlp, otlp/tls, otlp/mtls]
       exporters: [file]
     metrics:
-      receivers: [otlp]
+      receivers: [otlp, otlp/tls, otlp/mtls]
       exporters: [file]
     logs:
-      receivers: [otlp]
+      receivers: [otlp, otlp/tls, otlp/mtls]
       exporters: [file]

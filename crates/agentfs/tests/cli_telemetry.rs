@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,9 +86,8 @@ impl Collector {
 }
 
 /// Serves one HTTP/1.1 request, then closes the connection.
-fn serve(stream: TcpStream, requests: &Requests, failing: Option<&str>) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut stream = stream;
+fn serve<S: Read + Write>(stream: S, requests: &Requests, failing: Option<&str>) {
+    let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
         return;
@@ -124,6 +123,7 @@ fn serve(stream: TcpStream, requests: &Requests, failing: Option<&str>) {
         "200 OK"
     };
     requests.lock().unwrap().push((path, body));
+    let stream = reader.get_mut();
     let _ = stream.write_all(
         format!(
             "HTTP/1.1 {status}\r\ncontent-type: application/x-protobuf\r\n\
@@ -131,6 +131,7 @@ fn serve(stream: TcpStream, requests: &Requests, failing: Option<&str>) {
         )
         .as_bytes(),
     );
+    let _ = stream.flush();
 }
 
 struct Volume {
@@ -339,10 +340,20 @@ fn unsupported_settings_warn_and_carry_on() {
             ],
             "OTEL_EXPORTER_OTLP_PROTOCOL=thrift is not an OTLP protocol",
         ),
-        (
-            vec![("OTEL_EXPORTER_OTLP_ENDPOINT", https.as_str())],
-            "needs TLS, which is not built",
-        ),
+        if cfg!(feature = "otlp-tls") {
+            (
+                vec![
+                    ("OTEL_EXPORTER_OTLP_ENDPOINT", https.as_str()),
+                    ("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "/c.pem"),
+                ],
+                "is set without the matching client key",
+            )
+        } else {
+            (
+                vec![("OTEL_EXPORTER_OTLP_ENDPOINT", https.as_str())],
+                "needs TLS, which this build lacks",
+            )
+        },
     ] {
         let out = v.record(&otel);
         let err = stderr(&out);
@@ -999,6 +1010,12 @@ mod grpc {
     };
     use tonic::{Request, Response, Status};
 
+    #[cfg(feature = "otlp-tls")]
+    pub type TlsConfig = tonic::transport::ServerTlsConfig;
+    /// No TLS without the `otlp-tls` feature.
+    #[cfg(not(feature = "otlp-tls"))]
+    pub enum TlsConfig {}
+
     #[derive(Default)]
     pub struct Received {
         pub traces: Vec<ExportTraceServiceRequest>,
@@ -1060,6 +1077,11 @@ mod grpc {
     /// Starts the collector on its own runtime thread; returns it and its
     /// port.
     pub fn start() -> (Collector, u16) {
+        start_with(None)
+    }
+
+    /// [`start`], behind TLS with `tls` (the `otlp-tls` feature).
+    pub fn start_with(tls: Option<TlsConfig>) -> (Collector, u16) {
         let collector = Collector::default();
         let (tx, rx) = std::sync::mpsc::channel();
         let served = collector.clone();
@@ -1068,7 +1090,16 @@ mod grpc {
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 tx.send(listener.local_addr().unwrap().port()).unwrap();
-                tonic::transport::Server::builder()
+                let builder = tonic::transport::Server::builder();
+                #[cfg(feature = "otlp-tls")]
+                let builder = match tls {
+                    Some(tls) => builder.tls_config(tls).unwrap(),
+                    None => builder,
+                };
+                #[cfg(not(feature = "otlp-tls"))]
+                let _ = &tls;
+                let mut builder = builder;
+                builder
                     .add_service(TraceServiceServer::new(served.clone()))
                     .add_service(MetricsServiceServer::new(served.clone()))
                     .add_service(LogsServiceServer::new(served))
@@ -1167,4 +1198,185 @@ fn a_grpc_collector_that_is_down_never_fails_the_command() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+/// OTLP to `https://` collectors (the `otlp-tls` feature): a CA bundle,
+/// mutual TLS, and refusals that never fail the command.
+#[cfg(feature = "otlp-tls")]
+mod tls {
+    use std::path::Path;
+
+    use rustls_pki_types::pem::PemObject as _;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    use super::*;
+
+    /// Certificates from ci/otel-certs.sh.
+    fn certs() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ci/otel-certs.sh");
+        let status = Command::new("bash")
+            .arg(script)
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        dir
+    }
+
+    fn path(dir: &tempfile::TempDir, name: &str) -> String {
+        dir.path().join(name).to_str().unwrap().to_owned()
+    }
+
+    /// A fake OTLP/HTTP collector behind TLS with the server certificate.
+    fn https_collector(certs: &tempfile::TempDir) -> Collector {
+        let chain: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(certs.path().join("server.pem"))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        let key = PrivateKeyDer::from_pem_file(certs.path().join("server.key")).unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        {
+            let requests = requests.clone();
+            let connections = connections.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    let requests = requests.clone();
+                    let config = config.clone();
+                    thread::spawn(move || {
+                        let Ok(conn) = rustls::ServerConnection::new(config) else {
+                            return;
+                        };
+                        serve(rustls::StreamOwned::new(conn, stream), &requests, None);
+                    });
+                }
+            });
+        }
+        Collector {
+            port,
+            failing: None,
+            requests,
+            connections,
+        }
+    }
+
+    #[test]
+    fn exports_over_https_with_a_ca_bundle() {
+        let certs = certs();
+        let collector = https_collector(&certs);
+        let v = Volume::new();
+        let endpoint = format!("https://localhost:{}", collector.port);
+        let out = v.record(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+            ("OTEL_EXPORTER_OTLP_CERTIFICATE", &path(&certs, "ca.pem")),
+        ]);
+        let err = stderr(&out);
+        assert!(!err.contains("warning: telemetry"), "{err}");
+        let paths = collector.paths();
+        for p in ["/v1/metrics", "/v1/traces", "/v1/logs"] {
+            assert!(paths.contains(p), "{p} missing from {paths:?}");
+        }
+    }
+
+    #[test]
+    fn an_untrusted_collector_gets_nothing() {
+        let certs = certs();
+        let collector = https_collector(&certs);
+        let v = Volume::new();
+        let endpoint = format!("https://localhost:{}", collector.port);
+        // A bundle with another CA: the server's certificate is refused.
+        let out = v.record(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+            (
+                "OTEL_EXPORTER_OTLP_CERTIFICATE",
+                &path(&certs, "other-ca.pem"),
+            ),
+        ]);
+        let err = stderr(&out);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 record(s) into 1 commit(s)"),
+            "{err}"
+        );
+        assert!(err.contains("export failed"), "{err}");
+        assert!(collector.paths().is_empty(), "{:?}", collector.paths());
+    }
+
+    #[test]
+    fn a_bad_certificate_file_turns_its_signal_off_at_start() {
+        let certs = certs();
+        let v = Volume::new();
+        let out = v.record(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://localhost:9"),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+                "/nonexistent/ca.pem",
+            ),
+            ("OTEL_EXPORTER_OTLP_CERTIFICATE", &path(&certs, "ca.pem")),
+            ("OTEL_METRICS_EXPORTER", "none"),
+            ("OTEL_LOGS_EXPORTER", "none"),
+        ]);
+        let err = stderr(&out);
+        assert!(
+            err.contains("warning: telemetry: traces exporter: cannot read /nonexistent/ca.pem: ")
+                && err.contains("traces not exported"),
+            "{err}"
+        );
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn grpc_over_mutual_tls() {
+        let certs = certs();
+        let read = |name: &str| std::fs::read(certs.path().join(name)).unwrap();
+        let tls = tonic::transport::ServerTlsConfig::new()
+            .identity(tonic::transport::Identity::from_pem(
+                read("server.pem"),
+                read("server.key"),
+            ))
+            .client_ca_root(tonic::transport::Certificate::from_pem(read("ca.pem")));
+        let (collector, port) = grpc::start_with(Some(tls));
+        let v = Volume::new();
+        let endpoint = format!("https://localhost:{port}");
+        let ca = path(&certs, "ca.pem");
+        let base = [
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str()),
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+            ("OTEL_EXPORTER_OTLP_CERTIFICATE", ca.as_str()),
+        ];
+
+        // Without a client certificate the collector refuses the handshake.
+        let out = v.record(&base);
+        let err = stderr(&out);
+        assert!(out.status.success(), "{err}");
+        assert!(err.contains("export failed"), "{err}");
+        assert!(collector.0.lock().unwrap().metrics.is_empty());
+
+        let (cert, key) = (path(&certs, "client.pem"), path(&certs, "client.key"));
+        let mut with_client = base.to_vec();
+        with_client.push(("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", &cert));
+        with_client.push(("OTEL_EXPORTER_OTLP_CLIENT_KEY", &key));
+        let out = v.record(&with_client);
+        let err = stderr(&out);
+        assert!(!err.contains("warning: telemetry"), "{err}");
+        let received = collector.0.lock().unwrap();
+        assert!(!received.metrics.is_empty());
+        assert!(!received.traces.is_empty());
+        assert!(!received.logs.is_empty());
+    }
 }
