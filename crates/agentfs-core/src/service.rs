@@ -17,31 +17,28 @@
 //!   [`Event::RepackFailed`] and is tried again an interval later. A stop
 //!   kills a repack in progress, so shutdown never waits for one.
 //!
-//! [`Service::shutdown`] stops every loop, waits for the final commit, and
-//! waits for pushes in progress only up to a grace period: stopping never
-//! waits for a push (design §11.2). libgit2 cannot cancel a push, so a push
-//! still running after the grace period is left on its detached thread
-//! until the process exits.
-//!
-//! [`Service::shutdown_with_final_push`] (the history service, design
-//! §14.2) also gives each remote that lacks commits one more attempt after
-//! the final commit, within the same grace period: under the CSI driver the
-//! service stops after the volume's last pod, and nothing else would push
-//! what that last commit holds.
+//! [`Service::shutdown`] stops every loop, makes the final commit, then
+//! gives each remote that lacks commits one more push attempt, all within
+//! one grace period (design §11.2): stopping never waits longer than that
+//! for a push, and a grace of zero skips the final push. libgit2 cannot
+//! cancel a push, so a push still running after the grace period is left
+//! on its detached thread until the process exits. Every long-running mode
+//! (`mount`, `run`, `serve-history`) stops this way, so the last commit
+//! before a stop reaches the remotes when they answer in time, and
+//! otherwise waits for the next start.
 //!
 //! Signals are a process concern: the binary decides when to call
 //! [`Service::shutdown`].
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::events::{Event, Events};
-use crate::push::{RemotePusher, backoff};
+use crate::push::{PushOutcome, RemotePusher, backoff};
 use crate::repack::{self, RepackOutcome, RepackSchedule};
 use crate::volume::{CommitReport, Committer, VolumeError};
 
@@ -85,11 +82,26 @@ impl Stop {
     }
 }
 
+/// What the final push at shutdown did for one remote (design §11.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalPush {
+    /// One more attempt was made: its outcome.
+    Pushed(PushOutcome),
+    /// The remote already had every commit, or there is no branch yet.
+    NothingNew,
+    /// The grace period was spent before an attempt could start; this many
+    /// commits wait for the next start.
+    Skipped { unpushed: usize },
+}
+
 /// What [`Service::shutdown`] found.
 #[derive(Debug)]
 pub struct ShutdownReport {
     /// The last commit pass, which includes the open group.
     pub final_commit: Result<CommitReport, VolumeError>,
+    /// The final push of each remote whose push thread finished within the
+    /// grace period, in name order.
+    pub final_pushes: Vec<(String, FinalPush)>,
     /// Remotes whose push was still running when the grace period ended.
     pub abandoned_pushes: Vec<String>,
 }
@@ -97,15 +109,15 @@ pub struct ShutdownReport {
 /// The running commit and push loops.
 pub struct Service {
     stop: Arc<Stop>,
-    /// Released once the final commit is done: the push threads wait for
-    /// it before they exit.
+    /// Released once the final commit is done and the deadline is set: the
+    /// push threads wait for it, then make their final attempt.
     committed: Arc<Stop>,
-    /// Whether the push threads make a final attempt once `committed` is
-    /// released.
-    final_push: Arc<AtomicBool>,
+    /// When the final push must have started by; set before `committed`
+    /// is released.
+    deadline: Arc<Mutex<Option<Instant>>>,
     commit: JoinHandle<Result<CommitReport, VolumeError>>,
     pushes: Vec<(String, JoinHandle<()>)>,
-    push_done: mpsc::Receiver<String>,
+    push_done: mpsc::Receiver<(String, FinalPush)>,
     events: Events,
 }
 
@@ -136,7 +148,7 @@ impl Service {
     ) -> io::Result<Self> {
         let stop = Arc::new(Stop::default());
         let committed = Arc::new(Stop::default());
-        let final_push = Arc::new(AtomicBool::new(false));
+        let deadline = Arc::new(Mutex::new(None));
         let commit = {
             let stop = stop.clone();
             let repacker = repack.map(|schedule| Repacker {
@@ -154,7 +166,7 @@ impl Service {
             let name = pusher.name().to_owned();
             let stop_flag = stop.clone();
             let committed_flag = committed.clone();
-            let final_flag = final_push.clone();
+            let deadline = deadline.clone();
             let done = done_tx.clone();
             let spawned = thread::Builder::new()
                 .name(format!("agentfs-push-{name}"))
@@ -167,12 +179,11 @@ impl Service {
                     }
                     // The final commit may hold what this remote lacks.
                     while !committed_flag.wait(Duration::from_secs(3600)) {}
-                    if final_flag.load(Ordering::SeqCst)
-                        && matches!(pusher.unpushed(), Ok(Some(n)) if n > 0)
-                    {
-                        pusher.push_once();
-                    }
-                    let _ = done.send(pusher.name().to_owned());
+                    let deadline = *deadline
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let result = final_push(&mut pusher, deadline);
+                    let _ = done.send((pusher.name().to_owned(), result));
                 });
             match spawned {
                 Ok(handle) => pushes.push((name, handle)),
@@ -187,7 +198,7 @@ impl Service {
         Ok(Self {
             stop,
             committed,
-            final_push,
+            deadline,
             commit,
             pushes,
             push_done,
@@ -200,20 +211,12 @@ impl Service {
         self.pushes.iter().map(|(name, _)| name.as_str())
     }
 
-    /// Stops every loop: makes the final commit, then waits up to
-    /// `push_grace` (from the call) for pushes in progress.
+    /// Stops every loop: makes the final commit, then gives every remote
+    /// that lacks commits one more push attempt (the final commit's among
+    /// them), all within `push_grace` from the call. An attempt is only
+    /// started before the deadline, and one still running at the deadline
+    /// is abandoned; a grace of zero skips the final push.
     pub fn shutdown(self, push_grace: Duration) -> ShutdownReport {
-        self.stop_all(push_grace, false)
-    }
-
-    /// [`Service::shutdown`], then one more push of every remote that lacks
-    /// commits (the final commit's among them), all within `push_grace`. A
-    /// final push still running at the deadline is abandoned as any other.
-    pub fn shutdown_with_final_push(self, push_grace: Duration) -> ShutdownReport {
-        self.stop_all(push_grace, true)
-    }
-
-    fn stop_all(self, push_grace: Duration, final_push: bool) -> ShutdownReport {
         let deadline = Instant::now() + push_grace;
         self.stop.stop();
         let final_commit = self.commit.join().unwrap_or_else(|_| {
@@ -224,14 +227,18 @@ impl Service {
             });
             Err(VolumeError::Io(io::Error::other(error)))
         });
-        self.final_push.store(final_push, Ordering::SeqCst);
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
         self.committed.stop();
 
         let mut pending: Vec<(String, JoinHandle<()>)> = self.pushes;
+        let mut final_pushes = Vec::new();
         while !pending.is_empty() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let done = match self.push_done.recv_timeout(remaining) {
-                Ok(name) => name,
+            let (done, result) = match self.push_done.recv_timeout(remaining) {
+                Ok(done) => done,
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 // Every sender gone: the rest panicked; join reports it.
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -240,6 +247,7 @@ impl Service {
                 let (_, handle) = pending.swap_remove(i);
                 let _ = handle.join();
             }
+            final_pushes.push((done, result));
         }
         // Threads that finished without reporting (a panic) are not
         // abandoned; reap them.
@@ -252,9 +260,29 @@ impl Service {
             }
         }
         abandoned.sort();
+        final_pushes.sort_by(|a, b| a.0.cmp(&b.0));
         ShutdownReport {
             final_commit,
+            final_pushes,
             abandoned_pushes: abandoned,
+        }
+    }
+}
+
+/// The final push of one remote: one attempt if it lacks commits and the
+/// deadline has not passed.
+fn final_push(pusher: &mut RemotePusher, deadline: Option<Instant>) -> FinalPush {
+    let unpushed = match pusher.unpushed() {
+        Ok(None | Some(0)) => return FinalPush::NothingNew,
+        Ok(Some(n)) => Some(n),
+        // Unknown: an attempt finds out.
+        Err(_) => None,
+    };
+    if deadline.is_some_and(|d| Instant::now() < d) {
+        FinalPush::Pushed(pusher.push_once())
+    } else {
+        FinalPush::Skipped {
+            unpushed: unpushed.unwrap_or(0),
         }
     }
 }
@@ -587,41 +615,117 @@ mod tests {
         );
     }
 
-    /// The history service's shutdown pushes its final commit; a plain
-    /// shutdown leaves it for the next start.
+    fn remote_head(remote: &Path) -> Option<git2::Oid> {
+        git2::Repository::open_bare(remote)
+            .unwrap()
+            .refname_to_id("refs/heads/agentfs/vol")
+            .ok()
+    }
+
+    /// A remote, intervals of an hour, and the first push (of nothing)
+    /// done, so only the final push can send what is recorded next.
+    fn idle_service(remote: &Path) -> (tempfile::TempDir, StateDir, Recorder, Service) {
+        let (dir, state) = setup(&[
+            ("agentfs.commitWindow", "1h"),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.origin.url", &remote.display().to_string()),
+        ]);
+        let (rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
+        let service = Service::start(com, pushers, Arc::new(NullSink)).unwrap();
+        // Let the first push (of nothing) happen.
+        thread::sleep(Duration::from_millis(100));
+        (dir, state, rec, service)
+    }
+
+    /// Every shutdown pushes its final commit within the grace period.
     #[test]
     fn a_final_push_sends_the_final_commit() {
-        for final_push in [false, true] {
-            let remote = tempfile::tempdir().unwrap();
-            git2::Repository::init_bare(remote.path()).unwrap();
-            let (dir, state) = setup(&[
-                ("agentfs.commitWindow", "1h"),
-                ("agentfs.pushInterval", "1h"),
-                ("remote.origin.url", &remote.path().display().to_string()),
-            ]);
-            let (rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
-            let service = Service::start(com, pushers, Arc::new(NullSink)).unwrap();
-            // Let the first push (of nothing) happen.
-            thread::sleep(Duration::from_millis(100));
-            record(&rec, dir.path(), "a");
-            let report = if final_push {
-                service.shutdown_with_final_push(Duration::from_secs(10))
-            } else {
-                service.shutdown(Duration::from_secs(10))
-            };
-            report.final_commit.unwrap();
-            assert!(report.abandoned_pushes.is_empty());
-            let local = local_head(&state).expect("the final commit");
-            let pushed = git2::Repository::open_bare(remote.path())
-                .unwrap()
-                .refname_to_id("refs/heads/agentfs/vol")
-                .ok();
-            if final_push {
-                assert_eq!(pushed, Some(local));
-            } else {
-                assert_eq!(pushed, None);
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let (dir, state, rec, service) = idle_service(remote.path());
+        record(&rec, dir.path(), "a");
+        let report = service.shutdown(Duration::from_secs(10));
+        report.final_commit.unwrap();
+        assert!(report.abandoned_pushes.is_empty());
+        let local = local_head(&state).expect("the final commit");
+        assert_eq!(remote_head(remote.path()), Some(local));
+        assert_eq!(report.final_pushes.len(), 1);
+        let (name, result) = &report.final_pushes[0];
+        assert_eq!(name, "origin");
+        assert!(
+            matches!(result, FinalPush::Pushed(PushOutcome::Pushed { to, .. }) if *to == local),
+            "{result:?}"
+        );
+    }
+
+    /// A remote that already has everything gets no final attempt.
+    #[test]
+    fn nothing_new_makes_no_final_push() {
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let (_dir, _state, _rec, service) = idle_service(remote.path());
+        let report = service.shutdown(Duration::from_secs(10));
+        assert_eq!(
+            report.final_pushes,
+            [("origin".to_owned(), FinalPush::NothingNew)]
+        );
+    }
+
+    /// A grace of zero makes the final commit and skips the push.
+    #[test]
+    fn zero_grace_skips_the_final_push() {
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let (dir, state, rec, service) = idle_service(remote.path());
+        record(&rec, dir.path(), "a");
+        let report = service.shutdown(Duration::ZERO);
+        let commit = report.final_commit.unwrap();
+        assert_eq!(commit.commits, 1);
+        assert!(local_head(&state).is_some());
+        assert_eq!(remote_head(remote.path()), None);
+        // The push thread may or may not report before the zero deadline;
+        // either way nothing was pushed.
+        match report.final_pushes.as_slice() {
+            [] => assert_eq!(report.abandoned_pushes, ["origin"]),
+            [(name, FinalPush::Skipped { unpushed })] => {
+                assert_eq!((name.as_str(), *unpushed), ("origin", 1));
             }
+            other => panic!("{other:?}"),
         }
+    }
+
+    /// The final push is abandoned at the deadline when the remote hangs.
+    #[test]
+    fn final_push_respects_the_deadline() {
+        use std::io::Write as _;
+
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let (dir, state, rec, service) = idle_service(remote.path());
+        record(&rec, dir.path(), "a");
+        // Now the remote hangs: libgit2 blocks opening a FIFO config.
+        let fifo = remote.path().join("config");
+        fs::remove_file(&fifo).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let start = Instant::now();
+        let report = service.shutdown(Duration::from_millis(300));
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(250), "{took:?}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        report.final_commit.unwrap();
+        assert!(local_head(&state).is_some());
+        assert_eq!(report.abandoned_pushes, ["origin"]);
+        assert!(report.final_pushes.is_empty());
+        // Release the detached thread.
+        let mut writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        writer.write_all(b"").unwrap();
     }
 
     #[test]

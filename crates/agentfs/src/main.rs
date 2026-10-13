@@ -66,7 +66,7 @@ use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::push::{self, PushOutcome, RemotePusher, RemoteStatus};
 use agentfs_core::record::{Caller, Trigger};
-use agentfs_core::service::Service;
+use agentfs_core::service::{FinalPush, Service};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
 use agentfs_fuse::{
@@ -143,7 +143,8 @@ enum Command {
         listen: Option<String>,
         #[command(flatten)]
         pod: Pod,
-        /// How long shutdown waits for pushes in progress.
+        /// How long shutdown may spend on a last push of the final commit;
+        /// 0s skips it.
         #[arg(long, default_value = "5s", value_parser = parse_grace)]
         push_grace: Duration,
         /// How long shutdown waits for fronts' requests in progress.
@@ -164,7 +165,8 @@ enum Command {
     Run {
         #[command(flatten)]
         pod: Pod,
-        /// How long shutdown waits for pushes in progress.
+        /// How long shutdown may spend on a last push of the final commit;
+        /// 0s skips it.
         #[arg(long, default_value = "5s", value_parser = parse_grace)]
         push_grace: Duration,
     },
@@ -724,7 +726,7 @@ fn run(
 
     let wake = daemon.wait();
     eprintln!(
-        "{}: stopping (waiting up to {push_grace:?} for pushes; signal again to exit now)",
+        "{}: stopping (waiting up to {push_grace:?} for the final push; signal again to exit now)",
         describe_wake(wake)
     );
     let code = stop_service(service, push_grace);
@@ -748,23 +750,15 @@ fn describe_wake(wake: Wake) -> String {
     }
 }
 
-/// Stops the service: the final commit, then pushes in progress for up to
-/// `push_grace`. Exit status 1 if the final commit failed.
+/// Stops the service: the final commit, then one final push of what the
+/// remotes lack, within `push_grace` (design §11.2). Exit status 1 if the
+/// final commit failed.
 fn stop_service(service: Service, push_grace: Duration) -> ExitCode {
     report_stop(service.shutdown(push_grace))
 }
 
-/// [`stop_service`] with one final push of what remotes lack (the history
-/// service, design §14.2).
-fn stop_service_and_push(service: Service, push_grace: Duration) -> ExitCode {
-    report_stop(service.shutdown_with_final_push(push_grace))
-}
-
 fn report_stop(report: agentfs_core::service::ShutdownReport) -> ExitCode {
-    for name in &report.abandoned_pushes {
-        println!("{name}: push still running at shutdown; abandoned");
-    }
-    match report.final_commit {
+    let code = match report.final_commit {
         Ok(commit) => {
             println!(
                 "final commit: {} record(s) into {} commit(s)",
@@ -775,6 +769,23 @@ fn report_stop(report: agentfs_core::service::ShutdownReport) -> ExitCode {
         Err(e) => {
             eprintln!("final commit failed: {e}; the records stay journaled");
             ExitCode::FAILURE
+        }
+    };
+    for (name, result) in &report.final_pushes {
+        println!("final push: {name}: {}", describe_final(result));
+    }
+    for name in &report.abandoned_pushes {
+        println!("final push: {name}: still running at the push grace's end; abandoned");
+    }
+    code
+}
+
+fn describe_final(result: &FinalPush) -> String {
+    match result {
+        FinalPush::Pushed(outcome) => describe(outcome),
+        FinalPush::NothingNew => "nothing new".to_owned(),
+        FinalPush::Skipped { unpushed } => {
+            format!("skipped, push grace spent ({unpushed} commit(s) wait for the next start)")
         }
     }
 }
@@ -800,7 +811,8 @@ struct MountArgs {
     /// Mount without `allow_other`: only the mounting user can use it.
     #[arg(long)]
     no_allow_other: bool,
-    /// How long shutdown waits for pushes in progress.
+    /// How long shutdown may spend on a last push of the final commit; 0s
+    /// skips it.
     #[arg(long, default_value = "5s", value_parser = parse_grace)]
     push_grace: Duration,
     /// How long shutdown waits for a busy mount (files still open) to be
@@ -1002,7 +1014,7 @@ fn mount(
         eprintln!("passthrough: {}", mounted.passthrough());
     }
     eprintln!(
-        "{}: unmounting (waiting up to {:?} for open files, then {:?} for pushes; signal \
+        "{}: unmounting (waiting up to {:?} for open files, then {:?} for the final push; signal \
          again to exit now)",
         describe_wake(wake),
         args.unmount_grace,

@@ -485,7 +485,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--no-allow-other` | | | `mount`: only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | `mount`: how long shutdown waits for a busy mount |
 | `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount` |
-| `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history`: how long shutdown waits for pushes |
+| `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it |
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
 | `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
 | `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR |

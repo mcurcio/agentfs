@@ -239,6 +239,7 @@ end_follow
 graceful=$(cat "$LOGS/graceful.log")
 assert_contains "$graceful" "signal 15: unmounting" "the sidecar got SIGTERM"
 assert_contains "$graceful" "final commit:" "the sidecar made its final commit"
+assert_contains "$graceful" "final push: " "the sidecar pushed its final commit at shutdown"
 OLD=$POD
 wait_ready
 [ "$POD" != "$OLD" ] || fail "the pod was not replaced"

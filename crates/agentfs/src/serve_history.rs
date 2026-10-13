@@ -9,10 +9,11 @@
 //! holds a lease: patches write the backing tree, which live fronts serve),
 //! the commit and push loops, then the socket. On SIGINT or SIGTERM it
 //! stops accepting, lets fronts' requests in progress finish (up to
-//! `--shutdown-grace`), then makes the final commit and, unlike `run`,
-//! pushes it: every remote that lacks commits gets one more attempt, all
-//! within `--push-grace` (design §14.2). Under the CSI driver the service
-//! stops after the volume's last pod, and nothing else would push it.
+//! `--shutdown-grace`), then makes the final commit and pushes it, as every
+//! long-running mode does: every remote that lacks commits gets one more
+//! attempt, all within `--push-grace` (design §11.2, §14.2). Under the CSI
+//! driver the service stops after the volume's last pod, and nothing else
+//! would push it.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -26,7 +27,7 @@ use agentfs_core::service::Service;
 use agentfs_core::volume::StateDir;
 
 use crate::daemon::Daemon;
-use crate::{Pod, Session, describe_wake, list, patch_cmd, stop_service_and_push};
+use crate::{Pod, Session, describe_wake, list, patch_cmd, stop_service};
 
 /// Where the running service's address is written for `agentfs status`.
 const ADDRESS_FILE: &str = "address";
@@ -98,7 +99,7 @@ pub(crate) fn serve(
             Ok(server) => server,
             Err(e) => {
                 // Commits what recovery found.
-                let _ = stop_service_and_push(service, push_grace);
+                let _ = stop_service(service, push_grace);
                 session.finish();
                 return Err(e).with_context(|| format!("listening on {address}"));
             }
@@ -123,14 +124,14 @@ pub(crate) fn serve(
     let wake = daemon.wait();
     eprintln!(
         "{}: stopping (waiting up to {shutdown_grace:?} for fronts' requests, then \
-         {push_grace:?} for pushes; signal again to exit now)",
+         {push_grace:?} for the final push; signal again to exit now)",
         describe_wake(wake)
     );
     if !server.shutdown(shutdown_grace) {
         eprintln!("fronts' requests were still running at shutdown; they fail with EIO");
     }
     let _ = std::fs::remove_file(&address_file);
-    let code = stop_service_and_push(service, push_grace);
+    let code = stop_service(service, push_grace);
     session.finish();
     Ok(code)
 }

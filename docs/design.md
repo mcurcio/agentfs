@@ -1349,15 +1349,22 @@ agentfs does not scan content for secrets and does not hold pushes.
 ### 11.2 Interval push
 
 - Pushes run every `pushInterval`, independent of the workload's lifecycle.
-  Nothing waits for a pod to stop, and stopping a pod never waits for a push.
-  The first push of each remote happens as soon as the service starts.
+  Nothing waits for a pod to stop. The first push of each remote happens as
+  soon as the service starts.
+- **At shutdown**, after the final commit, every long-running mode
+  (`mount`, `run`, `serve-history`) gives each remote that lacks commits
+  one more push attempt, all within `--push-grace` (default 5 s) from the
+  stop: stopping a pod waits at most that long for a push, never retries,
+  and never waits longer. An attempt is only started before the deadline,
+  and a remote that has not answered by then is left; what stays unpushed
+  goes out on the next start. `--push-grace 0s` skips the final push. Each
+  remote's result is printed (`final push: <remote>: ...`). Without it the
+  last commit before a stop would wait for the next start, and under the
+  CSI driver, which stops the history service after the last pod (§14.2),
+  for the next pod.
 - Each remote is pushed from its own thread, so a slow or hung remote cannot
   delay another. libgit2 has no way to cancel a push in progress, so
-  shutdown waits for pushes only up to a grace period, then leaves them.
-  The history service (`serve-history`, §14) also pushes once more after
-  its final commit, within the same grace period: under the CSI driver it
-  stops after the last pod, so nothing else would push that commit
-  (§14.2).
+  shutdown waits for pushes only up to the grace period, then leaves them.
 - **Network timeouts.** libgit2 is set process-wide to give up on a
   connection after 30 s and on a stalled read or write after 5 min. A remote
   that accepts the connection and then stops responding ends as an
@@ -2299,9 +2306,9 @@ one-time migration of Hermes' existing data and the initial import in
     the sidecar's startup and readiness probe;
   - `push` pushes once to every remote (or those named with `--remote`) and
     exits 1 unless all succeeded; `run` runs the service in the foreground
-    until SIGINT or SIGTERM, makes a final commit, waits up to
-    `--push-grace` (default 5s) for pushes in progress, and exits at once on
-    a second signal. `mount`, `flush`, `record`, `push` and `run` export
+    until SIGINT or SIGTERM, makes a final commit, gives each remote that
+    lacks commits one more push within `--push-grace` (default 5s, §11.2),
+    and exits at once on a second signal. `mount`, `flush`, `record`, `push` and `run` export
     telemetry (§13) and take the pod flags (`AGENTFS_POD`, ...), so every
     command's telemetry resource is the same. `record` records paths of a
     backing tree directly, without a mount; a path in the `fsync` class
@@ -2383,8 +2390,8 @@ one-time migration of Hermes' existing data and the initial import in
     plain unmount, then a lazy detach if busy; `fusermount3 -u`, then
     `-u -z`, when not root), wait up to `--unmount-grace` (10 s) for the
     session to end, run a final sweep, capture every `fsync`-class group
-    with changes (§8), make the final commit, wait up to
-    `--push-grace` for pushes, flush telemetry, release the lock. A second
+    with changes (§8), make the final commit, push it once more to each remote that lacks
+    commits within `--push-grace` (§11.2), flush telemetry, release the lock. A second
     signal exits 130.
 
   It works anywhere FUSE does, with no Kubernetes dependency.
@@ -2398,9 +2405,9 @@ one-time migration of Hermes' existing data and the initial import in
   `meta/history/address` for `status`. On SIGINT or SIGTERM it stops
   accepting, waits up to `--shutdown-grace` (10 s) for fronts' requests in
   progress (those still running fail with `EIO`), then makes the final
-  commit and, unlike `run`, pushes it once more to every remote that lacks
-  commits, all within `--push-grace` (§14.2: under the CSI driver nothing
-  else would push the last pod's final commit).
+  commit and, as `mount` and `run` do, pushes it once more to every remote
+  that lacks commits, all within `--push-grace` (§11.2; under the CSI
+  driver nothing else would push the last pod's final commit, §14.2).
 - **`agentfs mount --history-service <addr>`** is a front (§14): no lock
   and no control socket. Order: the preflight, a lease of a pending slot,
   the connection to the service (waiting up to `--history-wait`, 30 s, and
@@ -2669,6 +2676,11 @@ Not automated yet: test 3 (a kill at every step), test 16
 across two nodes, and the CSI driver over a shared filesystem, on
 hardened node images (Talos) and across node reboots.
 
+The `fuse` job also runs README's quick start as written, as root
+(`ci/readme-quickstart.sh`): its remote log after `kill %1; wait` must
+show the edited file, which only the final push at shutdown (§11.2)
+puts there.
+
 Every CI job runs on GitHub's runner image pinned by name,
 `ubuntu-24.04` rather than `ubuntu-latest` (which moves to Ubuntu 26 on 2026-10-19):
 the kernel, FUSE, kind and nginx the tests rely on change only when the pin
@@ -2685,7 +2697,7 @@ runner.
 | Several pods on one volume | Supported by the CSI driver, one committer identity per replica (§14, §9); built at single-node level as `serve-history` and front mounts (§14.1), started per volume and per pod by the CSI driver, one node per volume (§14.2) |
 | Rejected pushes | Alarm, retry, keep operating (§11.3) |
 | Remotes | Any git remote, several at once (§11.1) |
-| Push timing | Interval, independent of pod lifecycle (§11.2) |
+| Push timing | Intervals, independent of pod lifecycle, plus one bounded push at shutdown in `mount`, `run` and `serve-history`: after the final commit, one attempt per remote that lacks commits, within `--push-grace` (5 s; `0s` skips it), never retried and never extending shutdown past the grace. This sits beside the earlier decision that pushes run at intervals and that a pod's stop never waits on a push: the stop waits at most the grace, and what stays unpushed goes out on the next start (§11.2, 2026-10-13) |
 | Recovery | `agentfs restore` and `agentfs revert`, plus operator runbooks; further tooling discovered from use (§15) |
 | Telemetry | OpenTelemetry (§13) |
 | Secret scanning | Not in scope (§10) |
@@ -2758,7 +2770,7 @@ runner.
 | CSI recovery | Crashed fronts and services restarted with backoff (1 s to 30 s); a front in its predecessor's slot (`--history-slot`), its mount bind-stacked over the stale target, made shared so `HostToContainer` containers see it; reconcile from node records after a plugin restart; DaemonSet `OnDelete` (§14.2) |
 | CSI RBAC | csi-provisioner and csi-attacher's minimal ClusterRoles plus leader-election leases; no Secrets, pods or snapshots; the node plugin has no API access and no token (§14.2, [csi.md](csi.md#10-security)) |
 | CSI volume names | The default `volumeName` is `{pvcNamespace}.{pvcName}.{pvName}`: unique per volume, so a claim deleted and created again starts a new branch instead of a root commit on the old one, which every push would find diverged (§11.3, §11.4); a template without `{pvName}` is the operator's choice and documented as unsafe. A static PV's `volumeName` (or `volume`) is literal, and its unknown attributes are refused (§14.2, [csi.md](csi.md#5-parameters)) |
-| CSI final push | `serve-history` (only) pushes once more at shutdown, after its final commit, within `--push-grace`: NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
+| CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2): NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
 | CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |
 

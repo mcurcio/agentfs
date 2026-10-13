@@ -241,10 +241,13 @@ signal exits at once with status 130, which the journal makes safe. For
 5. the commit loop stops after a final commit of everything journaled
    (exit status 1 if it fails: the records stay journaled for the next
    open);
-6. pushes in progress get up to `--push-grace`, then are abandoned.
-   `serve-history` also pushes once more within the grace, since nothing
-   else would push its final commit (§14.2); `mount` and `run` leave
-   that to the next start.
+6. each remote that lacks commits gets one more push of the final
+   commit, all within `--push-grace` from the stop (pushes in progress
+   included); a push still running at the deadline is abandoned on its
+   thread, and `--push-grace 0s` skips the final push. `run` and
+   `serve-history` stop the same way (`Service::shutdown`, §11.2), so the
+   last commit before a stop reaches the remotes when they answer in
+   time, and otherwise goes out on the next start.
 
 ## Crash model
 

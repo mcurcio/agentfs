@@ -289,7 +289,11 @@ fn ssh_remotes_are_validated() {
 }
 
 fn spawn_run(v: &Volume) -> Child {
-    v.command(&["run", "--push-grace", "1s"])
+    spawn_run_with(v, "1s")
+}
+
+fn spawn_run_with(v: &Volume, push_grace: &str) -> Child {
+    v.command(&["run", "--push-grace", push_grace])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -365,43 +369,45 @@ fn run_pushes_until_sigterm() {
     );
 }
 
+/// Journals a record of `name` without committing it, as after a crash:
+/// `record` commits, so write through the library instead.
+fn journal(v: &Volume, name: &str) {
+    fs::write(v.tree().join(name), name).unwrap();
+    let state = agentfs_core::volume::StateDir::new(v.state());
+    let (rec, _, _) = agentfs_core::volume::open(
+        &state,
+        &v.tree(),
+        agentfs_core::identity::Context {
+            volume: "demo".into(),
+            replica: "x".into(),
+            pod_uid: "x".into(),
+            ..Default::default()
+        },
+        std::sync::Arc::new(agentfs_core::events::NullSink),
+        &agentfs_core::telemetry::Telemetry::noop(),
+    )
+    .unwrap();
+    rec.record(
+        agentfs_core::record::Trigger::Close,
+        agentfs_core::record::Caller {
+            uid: 1,
+            gid: 1,
+            pid: 1,
+        },
+        vec![agentfs_core::volume::Input::Write {
+            path: agentfs_core::paths::RepoPath::new(name).unwrap(),
+            backing: v.tree().join(name),
+            executable: false,
+        }],
+    )
+    .unwrap();
+}
+
 #[test]
 fn run_commits_journaled_records_and_stops_on_sigint() {
     let v = Volume::new();
-    // Journal a record without committing it, as after a crash: record
-    // commits, so write through the library instead.
     v.config(&[("agentfs.commitWindow", "1h")]);
-    fs::write(v.tree().join("late.txt"), "late").unwrap();
-    {
-        let state = agentfs_core::volume::StateDir::new(v.state());
-        let (rec, _, _) = agentfs_core::volume::open(
-            &state,
-            &v.tree(),
-            agentfs_core::identity::Context {
-                volume: "demo".into(),
-                replica: "x".into(),
-                pod_uid: "x".into(),
-                ..Default::default()
-            },
-            std::sync::Arc::new(agentfs_core::events::NullSink),
-            &agentfs_core::telemetry::Telemetry::noop(),
-        )
-        .unwrap();
-        rec.record(
-            agentfs_core::record::Trigger::Close,
-            agentfs_core::record::Caller {
-                uid: 1,
-                gid: 1,
-                pid: 1,
-            },
-            vec![agentfs_core::volume::Input::Write {
-                path: agentfs_core::paths::RepoPath::new("late.txt").unwrap(),
-                backing: v.tree().join("late.txt"),
-                executable: false,
-            }],
-        )
-        .unwrap();
-    }
+    journal(&v, "late.txt");
     let mut child = spawn_run(&v);
     // The open group stays open for an hour, so only the shutdown commits
     // it.
@@ -421,4 +427,70 @@ fn run_commits_journaled_records_and_stops_on_sigint() {
         stdout(&out)
     );
     assert!(branch(&v.state().join("git")).is_some());
+}
+
+/// A volume whose remote gets nothing during the run: intervals of an
+/// hour, and a record journaled before the start, so only the final
+/// commit and the final push at shutdown can bring it to the remote.
+fn idle_remote() -> (Volume, PathBuf) {
+    let v = Volume::new();
+    let remote = v.dir.path().join("remote.git");
+    bare(&remote);
+    v.config(&[
+        ("agentfs.commitWindow", "1h"),
+        ("agentfs.pushInterval", "1h"),
+        ("remote.origin.url", &remote.display().to_string()),
+    ]);
+    journal(&v, "late.txt");
+    (v, remote)
+}
+
+/// Stopping `run` pushes the final commit once (design §11.2).
+#[test]
+fn run_pushes_once_at_shutdown() {
+    let (v, remote) = idle_remote();
+    let mut child = spawn_run_with(&v, "30s");
+    wait_until_running(&mut child);
+    // The first push found no branch; nothing is committed yet.
+    assert_eq!(branch(&remote), None);
+    signal(&child, rustix::process::Signal::INT);
+    let status = wait_with_timeout(&mut child, Duration::from_secs(30));
+    let out = child.wait_with_output().unwrap();
+    assert!(status.success(), "{status:?}: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("final commit: 1 record(s) into 1 commit(s)"),
+        "{text}"
+    );
+    let head = v.head();
+    assert!(
+        text.contains(&format!("final push: origin: pushed none..{head}")),
+        "{text}"
+    );
+    assert_eq!(branch(&remote), Some(head));
+}
+
+/// `--push-grace 0s` makes the final commit and skips the final push.
+#[test]
+fn run_push_grace_zero_skips_final_push() {
+    let (v, remote) = idle_remote();
+    let mut child = spawn_run_with(&v, "0s");
+    wait_until_running(&mut child);
+    signal(&child, rustix::process::Signal::TERM);
+    let status = wait_with_timeout(&mut child, Duration::from_secs(30));
+    let out = child.wait_with_output().unwrap();
+    assert!(status.success(), "{status:?}: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("final commit: 1 record(s) into 1 commit(s)"),
+        "{text}"
+    );
+    // Reported as skipped, or abandoned if the thread had not reported by
+    // the (zero) deadline; never pushed.
+    assert!(
+        text.contains("final push: origin: skipped, push grace spent (1 commit(s)")
+            || text.contains("final push: origin: still running"),
+        "{text}"
+    );
+    assert_eq!(branch(&remote), None);
 }

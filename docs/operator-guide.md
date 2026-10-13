@@ -135,7 +135,7 @@ it exits 1 and changes nothing
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | FUSE request threads |
 | `--no-allow-other` | | | Only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | At shutdown, how long to wait for open files on a busy mount after detaching it |
-| `--push-grace DURATION` | | `5s` | At shutdown, how long to wait for pushes in progress |
+| `--push-grace DURATION` | | `5s` | At shutdown, how long to spend on pushes in progress and one last push of the final commit to each remote that lacks commits; `0s` skips the last push (§8) |
 | `--on-stale-mount refuse\|hold` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | When the mount point is an agentfs mount whose daemon died: `refuse` exits 1 with the command that clears it; `hold` (a restarted Kubernetes sidecar, §10) mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then detaches the stale mount and exits 1 |
 
 A missing mount point is created (mode `0755`; its parent must exist), so
@@ -148,7 +148,7 @@ mount; §16):
 |---|---|---|---|
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | Where fronts reach it: `unix:<path>` or an absolute socket path |
 | `--shutdown-grace DURATION` | | `10s` | At shutdown, how long to wait for fronts' requests in progress |
-| `--push-grace DURATION` | | `5s` | At shutdown, how long to wait for pushes in progress and then for one more push of every remote that lacks commits (the final commit among them) |
+| `--push-grace DURATION` | | `5s` | At shutdown, how long to spend on pushes in progress and one last push of the final commit to each remote that lacks commits, as `mount` does; `0s` skips the last push |
 
 `agentfs mount` and `agentfs record` as fronts of a history service
 (§16):
@@ -272,8 +272,11 @@ and up to one interval late: see [Databases](#14-databases-the-fsync-class).
      records. Paths still failing are listed and saved in
      `<state>/meta/repairs`; the next mount records them from the backing
      tree before it serves anything;
-  4. makes the final commit and waits up to `--push-grace` for pushes in
-     progress;
+  4. makes the final commit, then pushes it once more to each remote that
+     lacks commits, all within `--push-grace` (pushes in progress
+     included), printing `final push: <remote>: ...` per remote; a remote
+     still pushing at the deadline is left (`... abandoned`), and with
+     `--push-grace 0s` nothing more is pushed;
   5. flushes telemetry and releases the lock.
   A second signal exits at once.
 - **Unmounted from outside** (`umount`, `fusermount3 -u`): the daemon
@@ -284,8 +287,8 @@ and up to one interval late: see [Databases](#14-databases-the-fsync-class).
 
 In Kubernetes, give the pod a `terminationGracePeriodSeconds` longer than
 `--unmount-grace` plus `--push-grace` plus a few seconds, so the final
-commit always happens. Pushing never delays shutdown beyond
-`--push-grace`; unpushed commits go out at the next start.
+commit and its push always happen. Pushing never delays shutdown beyond
+`--push-grace`; commits still unpushed go out at the next start.
 
 ## 9. The state-area lock
 
@@ -744,9 +747,9 @@ it, or when the slot is taken, a front leases the lowest free slot.
 **Stopping.** Stop the fronts first (each unmounts as `mount` does, but
 leaves the commit to the service), then the service: on SIGINT or SIGTERM
 it stops accepting, waits up to `--shutdown-grace` for fronts' requests,
-makes the final commit and then, unlike `run`, pushes it: every remote that
-lacks commits gets one more attempt, all within `--push-grace` (pushes in
-progress included). The CSI driver stops the service after the volume's
+makes the final commit and then, as `mount` and `run` do, pushes it: every
+remote that lacks commits gets one more attempt, all within `--push-grace`
+(pushes in progress included). The CSI driver stops the service after the volume's
 last pod, and nothing else would push that commit. A push still running
 at the deadline is abandoned, and a failed one leaves the commits for the
 next start or an `agentfs push`.

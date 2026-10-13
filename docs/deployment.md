@@ -140,8 +140,9 @@ of defence. Most clusters need a CSI driver for `ReadWriteOncePod`.
 
 **Termination.** Native sidecars are stopped after the workload
 containers, so the daemon unmounts once nothing uses the mount, runs a
-final sweep, makes the final commit and waits up to `--push-grace` (5 s)
-for pushes. A workload container that mounts the FUSE root itself through
+final sweep, makes the final commit and pushes it once more, within
+`--push-grace` (5 s; the log shows `final commit:` and a `final push:`
+line per remote). A workload container that mounts the FUSE root itself through
 a `subPath` (Hermes, §9 below) pins the mount until the kubelet tears the
 pod's volumes down, so the daemon detaches lazily and waits its
 `--unmount-grace` (10 s) first. `terminationGracePeriodSeconds: 60`

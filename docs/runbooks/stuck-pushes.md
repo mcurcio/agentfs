@@ -99,7 +99,10 @@ needed: they are re-read at the next attempt.
 
 ## At shutdown
 
-Stopping never waits long for a remote: shutdown waits up to
-`--push-grace` (5 s by default) for pushes in progress and then leaves
-them (`origin: push still running at shutdown; abandoned`). Nothing is
-lost; the commits are pushed by the next start.
+Stopping never waits long for a remote: after the final commit, shutdown
+gives each remote that lacks commits one more push, all within
+`--push-grace` (5 s by default), and then leaves them (`final push:
+origin: still running at the push grace's end; abandoned`). A failed
+final push prints its reason (`final push: origin: failed (...)`), and
+`--push-grace 0s` skips it (`final push: origin: skipped, ...`). Nothing
+is lost; the commits are pushed by the next start.

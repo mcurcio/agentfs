@@ -214,6 +214,10 @@ jobs:
         env:
           AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
           AGENTFS_TEST_UNPRIV_USER: runner
+      # README.md's quick start, as written, as root (design §18).
+      - name: README quick start
+        if: matrix.passthrough == 'auto'
+        run: ci/readme-quickstart.sh
       - run: ci/e2e-recovery.sh
         env:
           AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}

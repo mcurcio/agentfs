@@ -46,13 +46,20 @@ agentfs --state /data/state init --volume demo
 git init --bare /data/remote.git
 git --git-dir /data/state/git config remote.origin.url /data/remote.git
 agentfs --state /data/state mount /data/backing /workspace &
+until agentfs probe /workspace >/dev/null; do sleep 0.2; done   # mounted
 
 echo hello > /workspace/notes.txt              # recorded before close returns
+sleep 1                                         # commits follow within commitWindow (200ms)
 agentfs --state /data/state status              # head, committed seq, backlog
 git --git-dir /data/state/git log --stat refs/heads/agentfs/demo
-kill %1                                         # final commit and push, unmount
+kill %1; wait                                   # final commit and push, unmount
 git --git-dir /data/remote.git log --oneline agentfs/demo
 ```
+
+Stopping the mount prints `final commit:` and a `final push: origin: ...`
+line: the last commit is pushed before the mount exits, within
+`--push-grace` (5s), so the remote's log shows it straight away. Remotes
+are otherwise pushed every `agentfs.pushInterval` (60s).
 
 Then [Mounting](#mounting) and the [operator guide](docs/operator-guide.md)
 for a real deployment, or [Deploying on Kubernetes](#deploying-on-kubernetes).
@@ -219,8 +226,8 @@ The backing tree, the state area and the mount point must be separate
 directories, none inside another, and no remote's credentials, SSH key or
 known_hosts file may be under the backing tree or the mount point; `mount` refuses to start otherwise. It runs in the
 foreground until SIGINT, SIGTERM or an unmount, then unmounts (lazily if
-files are still open), records what is still open, makes a final commit
-and exits. Paths whose record failed and could not be repaired by then are
+files are still open), records what is still open, makes a final commit,
+pushes it once more within `--push-grace` and exits. Paths whose record failed and could not be repaired by then are
 saved in `<state>/meta/repairs` and recorded by the next mount before it
 serves anything. A missing mount point is created. Flags: `--passthrough auto|on|off`, `--threads`,
 `--no-allow-other`, `--unmount-grace`, `--push-grace`,
