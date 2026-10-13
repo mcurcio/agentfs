@@ -219,12 +219,12 @@ async fn create_volume_makes_a_state_area_from_the_profile() {
     assert_eq!(vol.volume_id, "pvc-1");
     assert_eq!(vol.capacity_bytes, 1 << 30);
     assert_eq!(vol.volume_context["profile"], "p");
-    assert_eq!(vol.volume_context["volume"], "team.data");
-    assert_eq!(vol.volume_context["branch"], "agentfs/team.data");
+    assert_eq!(vol.volume_context["volume"], "team.data.pvc-1");
+    assert_eq!(vol.volume_context["branch"], "agentfs/team.data.pvc-1");
     assert_eq!(vol.volume_context["onDelete"], "retain");
 
     let history = History::open(&d.layout.state("pvc-1").join("git")).unwrap();
-    assert_eq!(history.settings().volume, "team.data");
+    assert_eq!(history.settings().volume, "team.data.pvc-1");
     assert_eq!(
         history.settings().commit_window,
         Duration::from_millis(100),
@@ -645,5 +645,137 @@ async fn node_calls_are_validated() {
         Code::InvalidArgument
     );
     n.node_unstage_volume(unstage("v", "/s")).await.unwrap();
+    d.stop().await;
+}
+
+/// A volume kept by `onDelete: retain` is mounted again through a static
+/// PV written as docs/csi.md §5 shows it: `volumeName` names the volume
+/// the state area holds, and a misspelt attribute is refused.
+#[tokio::test]
+async fn a_retained_volume_is_adopted_through_the_documented_attributes() {
+    let d = Driver::start().await;
+    let mut c = d.controller();
+    let created = c
+        .create_volume(create_req(
+            "pvc-0b6f",
+            &[
+                ("profile", "p"),
+                ("csi.storage.k8s.io/pvc/name", "claim"),
+                ("csi.storage.k8s.io/pvc/namespace", "ns"),
+                ("csi.storage.k8s.io/pv/name", "pvc-0b6f"),
+            ],
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    let name = created.volume_context["volume"].clone();
+    assert_eq!(
+        name, "ns.claim.pvc-0b6f",
+        "the default name is unique per PV"
+    );
+    c.delete_volume(DeleteVolumeRequest {
+        volume_id: "pvc-0b6f".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert!(d.layout.retained_json("pvc-0b6f").exists());
+
+    let attrs = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    // A typo fails loudly instead of naming the volume after its handle.
+    let mut r = publish_req("pvc-0b6f", "node-1");
+    r.volume_context = attrs(&[("profile", "p"), ("volumename", &name)]);
+    assert_eq!(
+        code(c.controller_publish_volume(r).await),
+        Code::InvalidArgument
+    );
+    // Another name than the state area's is refused.
+    let mut r = publish_req("pvc-0b6f", "node-1");
+    r.volume_context = attrs(&[("profile", "p"), ("volumeName", "other")]);
+    assert_eq!(
+        code(c.controller_publish_volume(r).await),
+        Code::AlreadyExists
+    );
+    // The documented attributes adopt it.
+    let mut r = publish_req("pvc-0b6f", "node-1");
+    r.volume_context = attrs(&[("profile", "p"), ("volumeName", &name)]);
+    c.controller_publish_volume(r).await.unwrap();
+    let rec: agentfs_csi::records::VolumeRecord =
+        agentfs_csi::records::load(&d.layout.csi_json("pvc-0b6f"))
+            .unwrap()
+            .unwrap();
+    assert!(rec.static_volume);
+    assert_eq!(rec.params.volume, name);
+    let history = History::open(&d.layout.state("pvc-0b6f").join("git")).unwrap();
+    assert_eq!(history.settings().volume, name);
+    d.stop().await;
+}
+
+/// `onDelete: delete` refuses while a remote lacks commits of the branch:
+/// removing the directory would lose them.
+#[tokio::test]
+async fn delete_volume_keeps_history_no_remote_holds() {
+    let d = Driver::start().await;
+    let remote = d.dir.path().join("remote.git");
+    git2::Repository::init_bare(&remote).unwrap();
+    fs::write(
+        d.layout.profiles.join("r.config"),
+        format!("[remote \"origin\"]\n\turl = {}\n", remote.display()),
+    )
+    .unwrap();
+    let mut c = d.controller();
+    c.create_volume(create_req(
+        "v",
+        &[
+            ("profile", "r"),
+            ("onDelete", "delete"),
+            ("volumeName", "{pvName}"),
+        ],
+    ))
+    .await
+    .unwrap();
+    let state = agentfs_core::volume::StateDir::new(d.layout.state("v"));
+    let delete = || DeleteVolumeRequest {
+        volume_id: "v".into(),
+        ..Default::default()
+    };
+    // A commit (what a history service's final commit leaves) no remote has.
+    let repo = git2::Repository::open_bare(state.git()).unwrap();
+    let tree = repo.treebuilder(None).unwrap().write().unwrap();
+    let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+    let head = repo
+        .commit(
+            Some("refs/heads/agentfs/v"),
+            &sig,
+            &sig,
+            "final",
+            &repo.find_tree(tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+    let err = c.delete_volume(delete()).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message().contains("origin lacks 1 commit"),
+        "{}",
+        err.message()
+    );
+    assert!(d.layout.volume_dir("v").join("state").exists());
+    assert!(d.layout.csi_json("v").exists());
+    // Once pushed, it goes.
+    let pushed = agentfs_core::push::PushState {
+        last_pushed: Some(head.to_string()),
+        ..Default::default()
+    };
+    pushed.save(&state.push_state("origin")).unwrap();
+    c.delete_volume(delete()).await.unwrap();
+    assert!(!d.layout.volume_dir("v").exists());
     d.stop().await;
 }

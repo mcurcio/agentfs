@@ -127,3 +127,34 @@ It is usually:
   with its last log lines (a profile that
   does not exist, a state area of another volume, a full disk). Fix the
   cause; the kubelet's next attempt starts it again.
+
+## A claim that will not delete
+
+**Symptoms.** A deleted claim's PV stays `Released` (or `Failed`), and
+its events (or the csi-provisioner's log) say `DeleteVolume … Failed
+precondition desc = volume <pv> has history no remote holds (origin
+lacks 3 commit(s)); nothing deleted`.
+
+The StorageClass says `onDelete: delete`, but the history service's
+final push at NodeUnstage did not reach every remote (the remote was
+down, its credentials were wrong, or `--push-grace` ran out), and nothing
+pushes an unstaged volume. Deleting would lose those commits, so the
+driver refuses and the provisioner retries
+([csi.md §9](../csi.md#9-operations)).
+
+1. Find the cause in the node plugin's log (`[service <pv>] … push
+   failed …`) or with `agentfs --state <basePath>/<pv>/state status` in
+   the node plugin pod (each remote's last error and unpushed commits).
+2. Fix it, then push by hand in the node plugin pod, which holds the
+   credentials:
+
+   ```sh
+   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+     agentfs --state /var/lib/agentfs-csi/volumes/<pv>/state push
+   ```
+
+   A diverged remote first needs [divergence.md](divergence.md).
+3. The provisioner's next retry deletes the volume.
+
+To give the history up instead, remove `<basePath>/<pv>` by hand on the
+node; the next retry then finds no volume and succeeds.

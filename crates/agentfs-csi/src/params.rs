@@ -9,12 +9,17 @@
 //! | Parameter | Meaning |
 //! |---|---|
 //! | `profile` | required: `<profile>.config`, `.exclude`, `.attributes` in the profiles directory |
-//! | `volumeName` | the agentfs volume name, a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}`; default `{pvcNamespace}.{pvcName}` (with the provisioner's `--extra-create-metadata`), else the PV name |
+//! | `volumeName` | the agentfs volume name, a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}`; default [`DEFAULT_TEMPLATE`] (with the provisioner's `--extra-create-metadata`), else the PV name. In a static PV's attributes, a literal name |
 //! | `branch` | the history branch (default `agentfs/<volume>`) |
 //! | `onDelete` | `retain` (default: DeleteVolume keeps the directory) or `delete` |
 //!
 //! Keys under `csi.storage.k8s.io/` (the provisioner's metadata) are read
 //! for the template and otherwise ignored; any other key is refused.
+//!
+//! The default name includes the PV name, so it is unique per volume
+//! (design §11.4): a claim deleted and created again gets a new branch
+//! instead of a fresh root commit on the old claim's branch, which every
+//! push would then find diverged (design §11.3).
 
 use std::collections::HashMap;
 
@@ -38,6 +43,13 @@ pub const EPHEMERAL: &str = "csi.storage.k8s.io/ephemeral";
 /// The prefix of keys the CO adds on its own.
 const CO_PREFIX: &str = "csi.storage.k8s.io/";
 
+/// Prefixes of the keys the CO adds to a volume context on its own.
+const CO_CONTEXT_PREFIXES: [&str; 2] = [CO_PREFIX, "storage.kubernetes.io/"];
+
+/// The default `volumeName` template when the provisioner passes the
+/// claim's metadata: unique per PV, readable per claim.
+pub const DEFAULT_TEMPLATE: &str = "{pvcNamespace}.{pvcName}.{pvName}";
+
 /// Longest profile name: a DNS label, so `<profile>.config` is always a
 /// valid ConfigMap key.
 pub const MAX_PROFILE_LEN: usize = 63;
@@ -53,6 +65,12 @@ pub enum ParamError {
     BadProfile(String),
     #[error("unknown StorageClass parameter {0:?} (known: profile, volumeName, branch, onDelete)")]
     UnknownKey(String),
+    #[error(
+        "unknown volume attribute {0:?} (known: profile, volumeName (or volume), branch, onDelete)"
+    )]
+    UnknownAttribute(String),
+    #[error("the volume attributes name two volumes, {a:?} and {b:?} (volume and volumeName)")]
+    ConflictingNames { a: String, b: String },
     #[error(
         "volumeName {template:?}: unknown placeholder {{{name}}} (known: pvcNamespace, pvcName, pvName)"
     )]
@@ -141,7 +159,7 @@ impl VolumeParams {
         let pv_name = parameters.get(PV_NAME).map_or(name, String::as_str);
         let template = template.unwrap_or_else(|| {
             if parameters.contains_key(PVC_NAME) && parameters.contains_key(PVC_NAMESPACE) {
-                "{pvcNamespace}.{pvcName}".to_owned()
+                DEFAULT_TEMPLATE.to_owned()
             } else {
                 "{pvName}".to_owned()
             }
@@ -165,36 +183,53 @@ impl VolumeParams {
     }
 
     /// From a volume context: what CreateVolume returned, or a static PV's
-    /// `volumeAttributes` (`profile` required; the volume name defaults to
-    /// the volume handle). Keys this driver does not know are ignored: the
-    /// CO adds its own (`storage.kubernetes.io/csiProvisionerIdentity`).
+    /// `volumeAttributes`: `profile` (required), `volumeName` (a literal
+    /// name, not a template; `volume`, as CreateVolume returns it, is the
+    /// same; default: the volume handle), `branch` and `onDelete`. Keys
+    /// under the CO's prefixes (`csi.storage.k8s.io/`,
+    /// `storage.kubernetes.io/csiProvisionerIdentity`) are ignored; any
+    /// other key is refused, so a typo in a static PV fails loudly rather
+    /// than naming the volume after its handle.
     pub fn from_context(
         handle: &str,
         context: &HashMap<String, String>,
     ) -> Result<Self, ParamError> {
-        let profile = context
-            .get("profile")
-            .cloned()
-            .ok_or(ParamError::MissingProfile)?;
+        let mut profile = None;
+        let mut names: Vec<&str> = Vec::new();
+        let mut branch = None;
+        let mut on_delete = OnDelete::default();
+        for (key, value) in context {
+            match key.as_str() {
+                "profile" => profile = Some(value.clone()),
+                "volume" | "volumeName" => names.push(value),
+                "branch" => branch = Some(value.clone()).filter(|b| !b.is_empty()),
+                "onDelete" => on_delete = value.parse()?,
+                k if CO_CONTEXT_PREFIXES.iter().any(|p| k.starts_with(p)) => {}
+                other => return Err(ParamError::UnknownAttribute(other.to_owned())),
+            }
+        }
+        let profile = profile.ok_or(ParamError::MissingProfile)?;
         validate_profile(&profile)?;
-        let volume = context
-            .get("volume")
-            .cloned()
-            .unwrap_or_else(|| handle.to_owned());
+        let volume = match names.as_slice() {
+            [] => handle.to_owned(),
+            [one] => (*one).to_owned(),
+            [a, b] if a == b => (*a).to_owned(),
+            [a, b, ..] => {
+                return Err(ParamError::ConflictingNames {
+                    a: (*a).to_owned(),
+                    b: (*b).to_owned(),
+                });
+            }
+        };
         if validate_name("agentfs.volume", &volume).is_err() {
             return Err(ParamError::BadVolumeName {
-                template: "volume".into(),
+                template: "volumeName".into(),
                 value: volume,
             });
         }
-        let branch = context.get("branch").cloned().filter(|b| !b.is_empty());
         if let Some(branch) = &branch {
             validate_branch(branch)?;
         }
-        let on_delete = match context.get("onDelete") {
-            Some(v) => v.parse()?,
-            None => OnDelete::default(),
-        };
         Ok(Self {
             profile,
             volume,
@@ -340,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn the_volume_name_defaults_to_namespace_and_claim() {
+    fn the_volume_name_defaults_to_namespace_claim_and_pv() {
         let p = VolumeParams::from_create(
             "pvc-1234",
             &map(&[
@@ -351,14 +386,14 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert_eq!(p.volume, "agents.data");
+        assert_eq!(p.volume, "agents.data.pvc-1234");
         assert_eq!(p.branch, None);
-        assert_eq!(p.branch_name(), "agentfs/agents.data");
+        assert_eq!(p.branch_name(), "agentfs/agents.data.pvc-1234");
         assert_eq!(p.on_delete, OnDelete::Retain);
         let ctx = p.to_context();
         assert_eq!(ctx["profile"], "example");
-        assert_eq!(ctx["volume"], "agents.data");
-        assert_eq!(ctx["branch"], "agentfs/agents.data");
+        assert_eq!(ctx["volume"], "agents.data.pvc-1234");
+        assert_eq!(ctx["branch"], "agentfs/agents.data.pvc-1234");
         assert_eq!(ctx["onDelete"], "retain");
         // The context round-trips (branch now explicit).
         let back = VolumeParams::from_context("pvc-1234", &ctx).unwrap();
@@ -504,6 +539,47 @@ mod tests {
         assert!(
             VolumeParams::from_context("h", &map(&[("profile", "p"), ("volume", "a/b")])).is_err()
         );
+    }
+
+    #[test]
+    fn a_static_pv_names_its_volume_with_volume_name() {
+        // As docs/csi.md §5 documents it.
+        let p = VolumeParams::from_context(
+            "pvc-0b6f",
+            &map(&[("profile", "p"), ("volumeName", "research.notes")]),
+        )
+        .unwrap();
+        assert_eq!(p.volume, "research.notes");
+        assert_eq!(p.branch_name(), "agentfs/research.notes");
+        // `volume` (CreateVolume's context) is the same key; agreeing is fine.
+        let both = map(&[("profile", "p"), ("volume", "x"), ("volumeName", "x")]);
+        assert_eq!(VolumeParams::from_context("h", &both).unwrap().volume, "x");
+        let clash = map(&[("profile", "p"), ("volume", "x"), ("volumeName", "y")]);
+        assert!(matches!(
+            VolumeParams::from_context("h", &clash).unwrap_err(),
+            ParamError::ConflictingNames { .. }
+        ));
+        // Not a template.
+        assert!(matches!(
+            VolumeParams::from_context("h", &map(&[("profile", "p"), ("volumeName", "{pvName}")]))
+                .unwrap_err(),
+            ParamError::BadVolumeName { .. }
+        ));
+        // A typo is refused, not ignored; the CO's own keys are ignored.
+        assert_eq!(
+            VolumeParams::from_context("h", &map(&[("profile", "p"), ("volumename", "x")]))
+                .unwrap_err(),
+            ParamError::UnknownAttribute("volumename".into())
+        );
+        VolumeParams::from_context(
+            "h",
+            &map(&[
+                ("profile", "p"),
+                ("storage.kubernetes.io/csiProvisionerIdentity", "x"),
+                (POD_NAME, "w"),
+            ]),
+        )
+        .unwrap();
     }
 
     #[test]

@@ -43,8 +43,6 @@ NODE=$KIND_CLUSTER-control-plane
 DNS=agentfs-csi
 APPS=agentfs-csi-e2e-apps
 DRIVER=agentfs.mcurcio.github.io
-VOLUME=$APPS.shared
-BRANCH=agentfs/$VOLUME
 BASE=/var/lib/agentfs-csi/volumes
 NODE_STATE=/var/lib/agentfs-csi/node
 PLUGIN_LABEL=app.kubernetes.io/name=agentfs-csi-node
@@ -258,6 +256,9 @@ ka wait --for=condition=Ready pod/writer-a pod/writer-b --timeout=300s >/dev/nul
 pass "writer-a and writer-b are Ready (admitted under restricted)"
 PV=$(ka get pvc shared -o jsonpath='{.spec.volumeName}')
 [ -n "$PV" ] || fail "the claim is not bound"
+# The default volumeName: {pvcNamespace}.{pvcName}.{pvName}.
+VOLUME=$APPS.shared.$PV
+BRANCH=agentfs/$VOLUME
 STATE=$BASE/$PV/state
 SOCK=$NODE_STATE/run/$PV/history.sock
 UID_A=$(ka get pod writer-a -o jsonpath='{.metadata.uid}')
@@ -376,6 +377,11 @@ while docker exec "$NODE" test -e "$SOCK"; do
 done
 pass "the history service stopped and removed its socket"
 assert_eq final "$(in_plugin git --git-dir "$STATE/git" show "$BRANCH:final.txt")" "the final commit is in the volume's history"
+# The service has exited, so nothing pushes any more: the remote has the
+# final commit now or never (the final push at NodeUnstage, design §14.2).
+assert_eq "$(in_plugin git --git-dir "$STATE/git" rev-parse "$BRANCH")" "$(rgit rev-parse "$BRANCH")" \
+  "the remote has the volume's last commit before the claim is deleted"
+assert_eq final "$(rgit show "$BRANCH:final.txt")" "final.txt reached the remote"
 assert_contains "$(plugin_log)" "unstaged volume $PV" "the volume was unstaged"
 ka delete pvc shared --wait --timeout=180s
 deadline=$((SECONDS + 180))

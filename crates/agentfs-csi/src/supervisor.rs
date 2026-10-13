@@ -24,13 +24,23 @@
 //! - **Unpublish** detaches the target, then stops the front (SIGTERM,
 //!   SIGKILL after `unpublish_grace`). **Unstage** is refused while
 //!   targets are published, then stops the service (SIGTERM, SIGKILL after
-//!   `unstage_grace`; the journal makes that safe).
+//!   `unstage_grace`; the journal makes that safe). The service makes its
+//!   final commit and pushes it once more within `--push-grace`.
 //! - **Reconcile**, at plugin start, registers the node and rebuilds the
 //!   above from the records: services for staged volumes, front recovery
 //!   for targets whose topmost mount is a stale agentfs mount.
+//! - **A restart that cannot spawn** (a failed fork under PID or memory
+//!   pressure, a full disk) is tried again with backoff; the entry and
+//!   the records stay, so the volume and its targets are never dropped
+//!   for it, at a restart or at reconcile.
 //!
-//! Each volume's calls run one at a time (a per-volume async lock); waits
-//! for a restarted child happen outside it.
+//! Each volume's calls run one at a time (a per-volume async lock). Waits
+//! happen outside it: for a restarted child, for a service NodeStage
+//! started and for a front NodePublish started, so a slow start never
+//! delays another pod's recovery. A child NodeStage or NodePublish started
+//! that exits before it is ready is that call's failure, not restarted.
+//! A NodePublish of a published target with other flags (read-only,
+//! single-writer) is `ALREADY_EXISTS`, as the CSI spec requires.
 
 use std::collections::HashMap;
 use std::fs::{self, DirBuilder};
@@ -159,6 +169,11 @@ struct Child {
     spawned: Spawned,
     generation: u64,
     started: Instant,
+    /// Started by NodeStage (a service) or NodePublish (a front) and not
+    /// yet seen ready: if it exits, that call reports it (`FAILED_PRECONDITION`
+    /// with its log) and it is not restarted, unless fronts already use the
+    /// service's volume.
+    starting: bool,
     /// Asked to stop: its exit is not a crash.
     stopping: bool,
     /// The delay before this child was started, if it is a restart.
@@ -307,30 +322,36 @@ impl Supervisor {
 
     /// NodeStage.
     pub async fn stage(self: &Arc<Self>, req: StageRequest) -> Result<(), Error> {
-        let _lock = self.lock_volume(&req.handle).await;
         let handle = req.handle.as_str();
-        if !self.children().services.contains_key(handle) {
-            let layout = self.layout().clone();
-            let h = handle.to_owned();
-            let context = req.volume_context.clone();
-            let params = tokio::task::spawn_blocking(move || prepare(&layout, &h, &context))
-                .await
-                .map_err(|e| Error::Internal(format!("staging task failed: {e}")))??;
-            self.start_service(handle, None)?;
-            eprintln!(
-                "staging volume {handle} (agentfs volume {}): history service started",
-                params.volume
-            );
+        {
+            let _lock = self.lock_volume(handle).await;
+            if !self.children().services.contains_key(handle) {
+                let layout = self.layout().clone();
+                let h = handle.to_owned();
+                let context = req.volume_context.clone();
+                let params = tokio::task::spawn_blocking(move || prepare(&layout, &h, &context))
+                    .await
+                    .map_err(|e| Error::Internal(format!("staging task failed: {e}")))??;
+                self.start_service(handle, None, true)?;
+                eprintln!(
+                    "staging volume {handle} (agentfs volume {}): history service started",
+                    params.volume
+                );
+            }
         }
+        // Without the lock: a front's recovery must not wait behind a slow
+        // journal recovery.
         self.wait_service(handle).await
     }
 
-    /// Starts the volume's service and its monitor. The caller holds the
+    /// Starts the volume's service and its monitor (`starting`: for
+    /// NodeStage, see [`Child::starting`]). The caller holds the
     /// volume's lock.
     fn start_service(
         self: &Arc<Self>,
         handle: &str,
         backoff: Option<Duration>,
+        starting: bool,
     ) -> Result<(), Error> {
         let layout = self.layout();
         let run = layout.run_dir(handle);
@@ -355,6 +376,7 @@ impl Supervisor {
                     spawned,
                     generation,
                     started: Instant::now(),
+                    starting,
                     stopping: false,
                     backoff,
                 },
@@ -369,8 +391,8 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Waits until the service has written its address. The caller holds
-    /// the volume's lock.
+    /// Waits until the service has written its address. Called without the
+    /// volume's lock; takes it only to give up on a service that exited.
     async fn wait_service(&self, handle: &str) -> Result<(), Error> {
         let expected = format!("unix:{}", self.layout().socket(handle).display());
         let address = address_file(self.layout(), handle);
@@ -379,24 +401,28 @@ impl Supervisor {
             let exited = {
                 let children = self.children();
                 let Some(entry) = children.services.get(handle) else {
-                    return Err(Error::Internal(format!(
-                        "volume {handle}'s history service is not supervised"
+                    return Err(Error::Aborted(format!(
+                        "volume {handle} was unstaged meanwhile"
                     )));
                 };
                 entry
                     .child
                     .spawned
                     .exit()
-                    .map(|e| (e, entry.child.spawned.recent()))
+                    .map(|e| (e, entry.child.spawned.recent(), entry.child.generation))
             };
             match exited {
                 None => {
                     let found = fs::read_to_string(&address).unwrap_or_default();
                     if found.trim() == expected {
+                        // It listens: from now on a crash is restarted.
+                        if let Some(e) = self.children().services.get_mut(handle) {
+                            e.child.starting = false;
+                        }
                         return Ok(());
                     }
                 }
-                Some((exit, log)) => {
+                Some((exit, log, generation)) => {
                     if self.has_fronts(handle) {
                         return Err(Error::Unavailable(format!(
                             "volume {handle}'s history service exited ({exit}) and is being \
@@ -404,10 +430,20 @@ impl Supervisor {
                         )));
                     }
                     // Not a restart: give up, and let the kubelet retry
-                    // from the start.
-                    if let Some(entry) = self.children().services.remove(handle) {
-                        drop(entry);
+                    // from the start, unless something else already acted.
+                    let _lock = self.lock_volume(handle).await;
+                    let mut children = self.children();
+                    if !matches!(
+                        children.services.get(handle),
+                        Some(e) if e.child.generation == generation
+                    ) {
+                        return Err(Error::Unavailable(format!(
+                            "volume {handle}'s history service exited ({exit}); its volume \
+                             changed meanwhile"
+                        )));
                     }
+                    children.services.remove(handle);
+                    drop(children);
                     let _ = records::remove(&self.layout().staged_record(handle));
                     return Err(Error::FailedPrecondition(format!(
                         "volume {handle}'s history service exited ({exit}):\n{log}"
@@ -432,6 +468,20 @@ impl Supervisor {
             .any(|f| f.record.handle == handle)
     }
 
+    /// Whether the service entry of `generation` is still the one to
+    /// restart: current, not stopping, and not a NodeStage start that
+    /// NodeStage reports itself.
+    fn service_current(&self, handle: &str, generation: u64) -> bool {
+        let children = self.children();
+        let fronts = children.fronts.values().any(|f| f.record.handle == handle);
+        matches!(
+            children.services.get(handle),
+            Some(e) if e.child.generation == generation
+                && !e.child.stopping
+                && (!e.child.starting || fronts)
+        )
+    }
+
     async fn service_exited(self: Arc<Self>, handle: String, generation: u64, exit: Option<Exit>) {
         let (uptime, prev) = {
             let children = self.children();
@@ -442,7 +492,8 @@ impl Supervisor {
                 _ => return,
             }
         };
-        if self.shutting_down.load(Ordering::Relaxed) {
+        if self.shutting_down.load(Ordering::Relaxed) || !self.service_current(&handle, generation)
+        {
             return;
         }
         let delay = next_backoff(prev, uptime, &self.cfg.backoff);
@@ -450,19 +501,42 @@ impl Supervisor {
             "service for {handle} exited ({}); restarting in {delay:?}",
             describe(exit)
         );
-        tokio::time::sleep(delay).await;
-        let _lock = self.lock_volume(&handle).await;
-        let current = matches!(
-            self.children().services.get(&handle),
-            Some(e) if e.child.generation == generation && !e.child.stopping
-        );
-        if !current || self.shutting_down.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Err(e) = self.start_service(&handle, Some(delay)) {
-            eprintln!("restarting the service for {handle}: {e}");
-            // Try again later: a monitor needs a child to watch.
-            self.children().services.remove(&handle);
+        self.restart_service(handle, Some(generation), delay).await;
+    }
+
+    /// Restarts the volume's service after `delay`, and keeps trying with
+    /// backoff while starting it fails (a failed fork under PID or memory
+    /// pressure, a full disk): the entry of `generation` stays meanwhile,
+    /// so its fronts keep their volume. `None`: no entry (reconcile), while
+    /// the volume is still staged.
+    async fn restart_service(
+        self: &Arc<Self>,
+        handle: String,
+        generation: Option<u64>,
+        mut delay: Duration,
+    ) {
+        loop {
+            tokio::time::sleep(delay).await;
+            let _lock = self.lock_volume(&handle).await;
+            let current = match generation {
+                Some(g) => self.service_current(&handle, g),
+                None => {
+                    !self.children().services.contains_key(&handle)
+                        && self.layout().staged_record(&handle).exists()
+                }
+            };
+            if !current || self.shutting_down.load(Ordering::Relaxed) {
+                return;
+            }
+            match self.start_service(&handle, Some(delay), false) {
+                Ok(()) => return,
+                Err(e) => {
+                    delay = next_backoff(Some(delay), Duration::ZERO, &self.cfg.backoff);
+                    eprintln!(
+                        "restarting the service for {handle}: {e}; trying again in {delay:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -547,79 +621,62 @@ impl Supervisor {
 
     // ----- fronts ---------------------------------------------------------
 
-    /// NodePublish.
+    /// NodePublish. The volume's lock is held to check and start the
+    /// front, released while it mounts (so other pods' recoveries do not
+    /// wait behind it), and taken again to attach the target.
     pub async fn publish(self: &Arc<Self>, req: PublishRequest) -> Result<(), Error> {
-        let _lock = self.lock_volume(&req.handle).await;
         let handle = req.handle.as_str();
         let target = req.target.as_path();
-        if !self.children().services.contains_key(handle) {
-            return Err(Error::FailedPrecondition(format!(
-                "volume {handle} is not staged on this node"
-            )));
-        }
-        {
-            let children = self.children();
-            if let Some(f) = children.fronts.get(target)
-                && f.record.handle != handle
-            {
-                return Err(Error::FailedPrecondition(format!(
-                    "{} is already published for volume {}",
-                    target.display(),
-                    f.record.handle
-                )));
-            }
-            let other = children
-                .fronts
-                .iter()
-                .find(|(t, f)| f.record.handle == handle && t.as_path() != target);
-            if let Some((other, f)) = other
-                && (req.single_writer || f.record.single_writer)
-            {
-                return Err(Error::FailedPrecondition(format!(
-                    "volume {handle} is single-writer (ReadWriteOncePod) and already published \
-                     at {}",
-                    other.display()
-                )));
-            }
-        }
         let key = target_key(target);
         let source = self.layout().front_source(handle, &key);
-        if !self.children().fronts.contains_key(target) {
-            fs::create_dir_all(target)
-                .map_err(io_error(format!("creating {}", target.display())))?;
-            let record = PublishedRecord {
-                handle: handle.to_owned(),
-                target: target.to_path_buf(),
-                readonly: req.readonly,
-                single_writer: req.single_writer,
-                pod: req.pod.clone(),
-                slot: None,
-                front_pid: None,
-            };
-            self.start_front(record, None).await?;
-        }
-        match self
+        let generation = {
+            let _lock = self.lock_volume(handle).await;
+            if !self.children().services.contains_key(handle) {
+                return Err(Error::FailedPrecondition(format!(
+                    "volume {handle} is not staged on this node"
+                )));
+            }
+            self.check_publish(&req)?;
+            if !self.children().fronts.contains_key(target) {
+                fs::create_dir_all(target)
+                    .map_err(io_error(format!("creating {}", target.display())))?;
+                let record = PublishedRecord {
+                    handle: handle.to_owned(),
+                    target: target.to_path_buf(),
+                    readonly: req.readonly,
+                    single_writer: req.single_writer,
+                    pod: req.pod.clone(),
+                    slot: None,
+                    front_pid: None,
+                };
+                self.start_front(record, None, true).await?;
+            }
+            self.children()
+                .fronts
+                .get(target)
+                .map(|f| f.child.generation)
+        };
+        let waited = self
             .wait_front(target, &source, self.cfg.publish_wait)
-            .await
-        {
-            FrontWait::Live => {}
-            FrontWait::Exited(exit, log) => {
-                if let Some(entry) = self.children().fronts.remove(target) {
-                    drop(entry);
-                }
+            .await;
+        let _lock = self.lock_volume(handle).await;
+        let current = || {
+            matches!(
+                self.children().fronts.get(target),
+                Some(f) if Some(f.child.generation) == generation && !f.child.stopping
+            )
+        };
+        match waited {
+            FrontWait::Live if current() => {}
+            FrontWait::Exited(exit, log) if current() => {
+                self.children().fronts.remove(target);
                 let _ = self.detach_all(&source).await;
                 return Err(Error::FailedPrecondition(format!(
                     "the front for {} exited ({exit}):\n{log}",
                     target.display()
                 )));
             }
-            FrontWait::Gone => {
-                return Err(Error::Aborted(format!(
-                    "{} was unpublished meanwhile",
-                    target.display()
-                )));
-            }
-            FrontWait::Timeout => {
+            FrontWait::Timeout if current() => {
                 return Err(Error::Unavailable(format!(
                     "the front for {} is not mounted yet after {:?} (waiting for the history \
                      service?)",
@@ -627,8 +684,58 @@ impl Supervisor {
                     self.cfg.publish_wait
                 )));
             }
+            FrontWait::Live | FrontWait::Exited(..) | FrontWait::Timeout | FrontWait::Gone => {
+                return Err(Error::Aborted(format!(
+                    "{} was unpublished or restarted meanwhile",
+                    target.display()
+                )));
+            }
         }
         self.attach_target(target, &source).await
+    }
+
+    /// NodePublish's checks against what is published: the target for
+    /// another volume or with other flags, a single-writer volume
+    /// elsewhere. The caller holds the volume's lock.
+    fn check_publish(&self, req: &PublishRequest) -> Result<(), Error> {
+        let handle = req.handle.as_str();
+        let target = req.target.as_path();
+        let children = self.children();
+        if let Some(f) = children.fronts.get(target) {
+            if f.record.handle != handle {
+                return Err(Error::FailedPrecondition(format!(
+                    "{} is already published for volume {}",
+                    target.display(),
+                    f.record.handle
+                )));
+            }
+            // The CSI spec: the same target with an incompatible
+            // capability or read-only flag is ALREADY_EXISTS.
+            if f.record.readonly != req.readonly || f.record.single_writer != req.single_writer {
+                return Err(Error::AlreadyExists(format!(
+                    "{} is already published for volume {handle} with readonly={}, \
+                     single_writer={}, not readonly={}, single_writer={}",
+                    target.display(),
+                    f.record.readonly,
+                    f.record.single_writer,
+                    req.readonly,
+                    req.single_writer
+                )));
+            }
+        }
+        let other = children
+            .fronts
+            .iter()
+            .find(|(t, f)| f.record.handle == handle && t.as_path() != target);
+        if let Some((other, f)) = other
+            && (req.single_writer || f.record.single_writer)
+        {
+            return Err(Error::FailedPrecondition(format!(
+                "volume {handle} is single-writer (ReadWriteOncePod) and already published at {}",
+                other.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Detaches a leftover source mount, then starts a front for `record`
@@ -638,6 +745,7 @@ impl Supervisor {
         self: &Arc<Self>,
         record: PublishedRecord,
         backoff: Option<Duration>,
+        starting: bool,
     ) -> Result<(), Error> {
         let handle = record.handle.clone();
         let target = record.target.clone();
@@ -679,6 +787,7 @@ impl Supervisor {
                     spawned,
                     generation,
                     started: Instant::now(),
+                    starting,
                     stopping: false,
                     backoff,
                 },
@@ -771,6 +880,7 @@ impl Supervisor {
                 .get_mut(target)
                 .ok_or_else(|| Error::Aborted(format!("{} is unpublished", target.display())))?;
             f.record.slot = slot;
+            f.child.starting = false;
             f.record.front_pid = Some(pid);
             f.record.clone()
         };
@@ -799,7 +909,11 @@ impl Supervisor {
             let (uptime, prev, record) = {
                 let children = self.children();
                 match children.fronts.get(&target) {
-                    Some(f) if f.child.generation == generation && !f.child.stopping => {
+                    Some(f)
+                        if f.child.generation == generation
+                            && !f.child.stopping
+                            && !f.child.starting =>
+                    {
                         (f.child.started.elapsed(), f.child.backoff, f.record.clone())
                     }
                     _ => return,
@@ -821,7 +935,7 @@ impl Supervisor {
             let lock = self.lock_volume(&handle).await;
             let current = matches!(
                 self.children().fronts.get(&target),
-                Some(f) if f.child.generation == generation && !f.child.stopping
+                Some(f) if f.child.generation == generation && !f.child.stopping && !f.child.starting
             );
             if !current || self.shutting_down.load(Ordering::Relaxed) {
                 return;
@@ -838,7 +952,9 @@ impl Supervisor {
 
     /// Restarts the front of a published target and stacks its mount over
     /// the target, or forgets the target if its directory is gone. Takes
-    /// the volume's lock, and releases it while the front starts.
+    /// the volume's lock, and releases it while the front starts. A front
+    /// that cannot be started (a failed fork, a full disk) is tried again
+    /// with backoff for as long as the target is published.
     async fn recover_front(
         self: &Arc<Self>,
         lock: tokio::sync::OwnedMutexGuard<()>,
@@ -849,22 +965,49 @@ impl Supervisor {
         let target = record.target.clone();
         let key = target_key(&target);
         let source = self.layout().front_source(&handle, &key);
-        if !exists(&target) {
+        let published = self.layout().published_record(&handle, &key);
+        // The entry this recovery replaces: none from reconcile.
+        let expected = self
+            .children()
+            .fronts
+            .get(&target)
+            .map(|f| f.child.generation);
+        let mut lock = lock;
+        let mut backoff = backoff;
+        loop {
+            if !exists(&target) {
+                eprintln!(
+                    "{} is gone; forgetting the front for {}",
+                    target.display(),
+                    who(&record)
+                );
+                self.children().fronts.remove(&target);
+                let _ = self.detach_all(&source).await;
+                let _ = fs::remove_dir(&source);
+                let _ = records::remove(&published);
+                return;
+            }
+            let Err(e) = self.start_front(record.clone(), backoff, false).await else {
+                break;
+            };
+            let delay = next_backoff(backoff, Duration::ZERO, &self.cfg.backoff);
             eprintln!(
-                "{} is gone; forgetting the front for {}",
-                target.display(),
-                who(&record)
+                "restarting the front for {}: {e}; trying again in {delay:?}",
+                target.display()
             );
-            self.children().fronts.remove(&target);
-            let _ = self.detach_all(&source).await;
-            let _ = fs::remove_dir(&source);
-            let _ = records::remove(&self.layout().published_record(&handle, &key));
-            return;
-        }
-        if let Err(e) = self.start_front(record, backoff).await {
-            eprintln!("restarting the front for {}: {e}", target.display());
-            self.children().fronts.remove(&target);
-            return;
+            drop(lock);
+            tokio::time::sleep(delay).await;
+            lock = self.lock_volume(&handle).await;
+            let current = match self.children().fronts.get(&target) {
+                None => expected.is_none(),
+                Some(f) => Some(f.child.generation) == expected && !f.child.stopping,
+            };
+            // Unpublished meanwhile (the record is gone), or recovered by
+            // someone else.
+            if !current || !published.exists() || self.shutting_down.load(Ordering::Relaxed) {
+                return;
+            }
+            backoff = Some(delay);
         }
         drop(lock);
         // No timeout: the front waits for the service itself, and its
@@ -938,17 +1081,28 @@ impl Supervisor {
             bad.into_iter()
                 .map(|(p, e)| format!("{}: {e}", p.display())),
         );
+        let mut staged_handles = std::collections::HashSet::new();
         for rec in staged {
+            staged_handles.insert(rec.handle.clone());
             let _lock = self.lock_volume(&rec.handle).await;
             if self.children().services.contains_key(&rec.handle) {
                 continue;
             }
-            match self.start_service(&rec.handle, None) {
+            match self.start_service(&rec.handle, None, false) {
                 Ok(()) => {
                     report.services += 1;
                     eprintln!("reconcile: started the history service for {}", rec.handle);
                 }
-                Err(e) => eprintln!("reconcile: starting the service for {}: {e}", rec.handle),
+                Err(e) => {
+                    let delay = self.cfg.backoff.initial;
+                    eprintln!(
+                        "reconcile: starting the service for {}: {e}; trying again in {delay:?}",
+                        rec.handle
+                    );
+                    let this = Arc::clone(self);
+                    let handle = rec.handle.clone();
+                    tokio::spawn(async move { this.restart_service(handle, None, delay).await });
+                }
             }
         }
         let mut published = Vec::new();
@@ -966,7 +1120,9 @@ impl Supervisor {
         for rec in published {
             let key = target_key(&rec.target);
             let path = layout.published_record(&rec.handle, &key);
-            let staged = self.children().services.contains_key(&rec.handle);
+            // Staged, whether or not its service has started yet: a front waits
+            // for its service, so a later start recovers it.
+            let staged = staged_handles.contains(&rec.handle);
             let state = if exists(&rec.target) {
                 self.mount_state(&rec.target).await.ok()
             } else {

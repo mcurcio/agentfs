@@ -5,7 +5,9 @@
 //! - DeleteVolume removes the directory (`onDelete: delete`) or keeps it
 //!   for a static PV (`retain`, the default), renaming `csi.json` to
 //!   `csi.retained.json`. It refuses while the volume is attached to a
-//!   node or its state area is locked.
+//!   node or its state area is locked, and `delete` refuses while a
+//!   remote lacks commits of the branch (the history service's final
+//!   push at unstage failed): removing the directory would lose them.
 //! - ControllerPublish only records the node in `csi.json`: with
 //!   `attachRequired: true`, Kubernetes' attach/detach controller then
 //!   refuses to use a ReadWriteOnce volume from a second node
@@ -22,6 +24,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
+use agentfs_core::config::Settings;
+use agentfs_core::push;
 use agentfs_core::volume::StateDir;
 
 use crate::csi::v1::controller_server::Controller;
@@ -183,6 +187,23 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
     match record.params.on_delete {
         OnDelete::Delete => {
             let dir = layout.volume_dir(handle);
+            if state.git().join("config").exists() {
+                let lacking = unpushed(&state)?;
+                if !lacking.is_empty() {
+                    let list: Vec<String> = lacking
+                        .iter()
+                        .map(|(remote, n)| format!("{remote} lacks {n} commit(s)"))
+                        .collect();
+                    return Err(Error::FailedPrecondition(format!(
+                        "volume {handle} has history no remote holds ({}); nothing deleted. Push \
+                         it (`agentfs --state {} push`), or remove {} by hand to discard it \
+                         (docs/csi.md §9)",
+                        list.join(", "),
+                        state.root().display(),
+                        dir.display()
+                    )));
+                }
+            }
             match fs::remove_dir_all(&dir) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => {
                     return Err(Error::io(format!("removing {}", dir.display()), e));
@@ -204,6 +225,29 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
     }
     drop(lock);
     Ok(())
+}
+
+/// Remotes that lack commits of the volume's branch, with how many: what
+/// `onDelete: delete` would destroy. The history service pushes once more
+/// when it stops, but that push can fail, and nothing pushes an unstaged
+/// volume.
+fn unpushed(state: &StateDir) -> Result<Vec<(String, usize)>, Error> {
+    let what = |e: &dyn std::error::Error| {
+        Error::FailedPrecondition(format!(
+            "reading the push state of {}: {}; nothing deleted",
+            state.root().display(),
+            volume::chain(e)
+        ))
+    };
+    let settings = Settings::load(&state.git()).map_err(|e| what(&e))?;
+    let status = push::status(state, &settings).map_err(|e| what(&e))?;
+    Ok(status
+        .into_iter()
+        .filter_map(|r| match r.unpushed {
+            Some(n) if n > 0 => Some((r.name, n)),
+            _ => None,
+        })
+        .collect())
 }
 
 pub(crate) fn publish(layout: &Layout, req: &ControllerPublishVolumeRequest) -> Result<(), Error> {

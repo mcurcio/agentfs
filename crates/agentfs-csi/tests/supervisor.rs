@@ -54,6 +54,10 @@ struct World {
     spawns: Vec<ProcessSpec>,
     service_mode: Option<ServiceMode>,
     ignore_term: bool,
+    /// Spawns of these label prefixes fail, once each (a failed fork).
+    fail_spawns: Vec<&'static str>,
+    /// The next front does not mount.
+    hang_next_front: bool,
     /// Fronts do not mount.
     fronts_hang: bool,
 }
@@ -124,6 +128,11 @@ impl Fake {
 impl Launcher for Fake {
     fn spawn(&self, spec: ProcessSpec) -> io::Result<Spawned> {
         let mut w = self.world();
+        if let Some(i) = w.fail_spawns.iter().position(|p| spec.label.starts_with(p)) {
+            w.fail_spawns.remove(i);
+            w.events.push(format!("spawn failed {}", spec.label));
+            return Err(io::Error::from_raw_os_error(11));
+        }
         w.next_pid += 1;
         let pid = 1000 + w.next_pid;
         w.spawns.push(spec.clone());
@@ -178,7 +187,8 @@ impl Launcher for Fake {
                     break;
                 }
             }
-            if !w.fronts_hang {
+            let hang = w.fronts_hang || std::mem::take(&mut w.hang_next_front);
+            if !hang {
                 let source = PathBuf::from(spec.args.last().unwrap());
                 w.next_mount += 1;
                 let id = w.next_mount;
@@ -676,4 +686,132 @@ async fn reconcile_rebuilds_services_and_fronts_from_the_records() {
     assert!(n.record("v", &rebooted).is_none());
     assert!(n.record("v", &gone).is_none());
     sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_service_restart_that_cannot_spawn_is_tried_again() {
+    let n = Node::new();
+    n.stage("v").await.unwrap();
+    let first = n.sup.service_pid("v").unwrap();
+    n.fake.world().fail_spawns = vec!["service", "service"];
+    n.fake.crash(first);
+    eventually("the restart after two failed spawns", || {
+        n.sup.service_pid("v").is_some_and(|p| p != first)
+    })
+    .await;
+    let failed = n
+        .fake
+        .events()
+        .iter()
+        .filter(|e| e.starts_with("spawn failed service"))
+        .count();
+    assert_eq!(failed, 2);
+    n.stage("v").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_front_restart_that_cannot_spawn_is_tried_again() {
+    let n = Node::new();
+    n.stage("v").await.unwrap();
+    let target = n.target("a");
+    n.publish("v", &target, false).await.unwrap();
+    let pid = n.sup.front_pid(&target).unwrap();
+    n.fake.world().fail_spawns = vec!["front"];
+    n.fake.crash(pid);
+    eventually("the front's recovery after a failed spawn", || {
+        n.fake.stack(&target) == [false, true]
+    })
+    .await;
+    assert!(
+        n.fake
+            .events()
+            .iter()
+            .any(|e| e.starts_with("spawn failed front"))
+    );
+    eventually("the record's update", || {
+        n.record("v", &target).unwrap().front_pid != Some(pid)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reconcile_keeps_targets_whose_service_cannot_start_yet() {
+    let n = Node::new();
+    n.stage("v").await.unwrap();
+    let target = n.target("a");
+    n.publish("v", &target, false).await.unwrap();
+    let pids: Vec<u32> = n.fake.world().procs.keys().copied().collect();
+    n.sup.forget();
+    for pid in pids {
+        n.fake.crash(pid);
+    }
+    n.fake.world().fail_spawns = vec!["service"];
+    let sup = n.restart();
+    let report = sup.reconcile().await.unwrap();
+    assert_eq!(report.services, 0);
+    assert_eq!(report.recovering, 1);
+    assert_eq!(report.dropped, 0);
+    assert!(n.record("v", &target).is_some());
+    eventually("the service's retry", || sup.service_pid("v").is_some()).await;
+    eventually("the recovered front", || {
+        n.fake.stack(&target) == [false, true]
+    })
+    .await;
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pending_publish_does_not_hold_up_another_pods_recovery() {
+    let n = Node::new();
+    n.stage("v").await.unwrap();
+    let a = n.target("a");
+    n.publish("v", &a, false).await.unwrap();
+    let pid = n.sup.front_pid(&a).unwrap();
+    // b's front never mounts: its publish waits publish_wait (500 ms).
+    n.fake.world().hang_next_front = true;
+    let pending = {
+        let sup = n.sup.clone();
+        let b = n.target("b");
+        tokio::spawn(async move {
+            sup.publish(PublishRequest {
+                handle: "v".into(),
+                target: b,
+                readonly: false,
+                single_writer: false,
+                pod: None,
+            })
+            .await
+        })
+    };
+    eventually("b's front", || n.fake.spawns("front").len() == 2).await;
+    n.fake.crash(pid);
+    eventually("a's recovery", || n.fake.stack(&a) == [false, true]).await;
+    assert!(
+        !pending.is_finished(),
+        "a recovered only after b's publish gave up"
+    );
+    let err = pending.await.unwrap().unwrap_err();
+    assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn publishing_a_target_again_with_other_flags_is_already_exists() {
+    let n = Node::new();
+    n.stage("v").await.unwrap();
+    let target = n.target("a");
+    n.publish("v", &target, false).await.unwrap();
+    let again = |readonly: bool, single_writer: bool| PublishRequest {
+        handle: "v".into(),
+        target: target.clone(),
+        readonly,
+        single_writer,
+        pod: None,
+    };
+    let err = n.sup.publish(again(true, false)).await.unwrap_err();
+    assert!(matches!(err, Error::AlreadyExists(_)), "{err:?}");
+    let err = n.sup.publish(again(false, true)).await.unwrap_err();
+    assert!(matches!(err, Error::AlreadyExists(_)), "{err:?}");
+    // The same flags are idempotent.
+    n.sup.publish(again(false, false)).await.unwrap();
+    assert_eq!(n.fake.spawns("front").len(), 1);
 }

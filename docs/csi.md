@@ -157,25 +157,53 @@ each push: rotation needs no restart.
 
 ## 5. Parameters
 
-A StorageClass's `parameters` (or a static PV's `volumeAttributes`):
+A StorageClass's `parameters`:
 
 | Parameter | Meaning | Default |
 |---|---|---|
 | `profile` | required: the profile (`<profile>.config` must exist); a DNS label | |
-| `volumeName` | the agentfs volume name (commit trailers, identity templates), a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}` | `{pvcNamespace}.{pvcName}` (the provisioner runs with `--extra-create-metadata`), else the PV name |
+| `volumeName` | the agentfs volume name (commit trailers, identity templates), a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}` | `{pvcNamespace}.{pvcName}.{pvName}` (the provisioner runs with `--extra-create-metadata`), else the PV name |
 | `branch` | the history branch | `agentfs/<volumeName>` |
-| `onDelete` | what DeleteVolume does: `retain` keeps the directory (renaming `csi.json` to `csi.retained.json`), `delete` removes it | `retain` |
+| `onDelete` | what DeleteVolume does: `retain` keeps the directory (renaming `csi.json` to `csi.retained.json`), `delete` removes it, and refuses while a remote lacks commits of the branch (§9) | `retain` |
 
 Keys under `csi.storage.k8s.io/` are the provisioner's and are otherwise
 ignored; any other key is refused (`InvalidArgument`). The requested size
 is recorded, not enforced.
 
+**Volume names must be unique over time** (design §11.4). Each new
+volume starts its branch with a fresh root commit, so a volume named
+after one that already pushed to the same remote finds the remote branch
+unrelated: every push is non-fast-forward, the service saves its head
+under `refs/agentfs/<volume>/diverged/<timestamp>` and raises
+`PushFailed` until an operator intervenes
+([divergence runbook](runbooks/divergence.md)). That is what a claim
+deleted and created again under the same name would do with
+`{pvcNamespace}.{pvcName}`, whatever `onDelete` says, so the default
+includes `{pvName}`, which the provisioner never reuses. A template
+without `{pvName}` (or a fixed `branch`) is safe only if no claim of that
+name is ever created twice; to carry a claim's history on, mount the
+retained volume through a static PV instead.
+
 **Static PVs.** An existing volume directory (one kept by `onDelete:
 retain`, or prepared by hand) can be mounted through a PV whose
 `csi.volumeHandle` is the directory's name and whose `volumeAttributes`
-hold at least `profile`. The first ControllerPublish or NodeStage adopts
-it: it initialises the state area if needed (an existing state area for
-another volume or branch is refused) and writes `csi.json`.
+hold:
+
+| Attribute | Meaning | Default |
+|---|---|---|
+| `profile` | required, as above | |
+| `volumeName` | the agentfs volume name, literally (not a template); `volume` is the same key (it is what CreateVolume returns) | the volume handle |
+| `branch` | the history branch | `agentfs/<volumeName>` |
+| `onDelete` | as above | `retain` |
+
+Any other key, except the CO's own (`csi.storage.k8s.io/…`,
+`storage.kubernetes.io/…`), is refused (`InvalidArgument`), so a typo
+fails rather than naming the volume after its handle. The first
+ControllerPublish or NodeStage adopts the directory: it initialises the
+state area if needed and writes `csi.json`. An existing state area must
+hold the same volume and branch (else `AlreadyExists`): for a retained
+volume, copy `volume` and `branch` from its `csi.retained.json`
+(`params`).
 
 ```yaml
 apiVersion: v1
@@ -192,7 +220,7 @@ spec:
     volumeHandle: pvc-0b6f...      # the directory under basePath
     volumeAttributes:
       profile: example
-      volumeName: research.notes
+      volumeName: research.notes.pvc-0b6f...   # csi.retained.json's params.volume
 ```
 
 ## 6. Using a volume
@@ -230,22 +258,24 @@ See `deploy/csi/example/deployment.yaml`.
 | Call | Does | Fails with |
 |---|---|---|
 | CreateVolume | Validates the parameters and capabilities; creates `<basePath>/<pv>/{backing,state}`, initialises the state area with the profile's config included and its rules installed, writes `csi.json`. Idempotent for the same name and capacity | `InvalidArgument` (bad parameters, `ReadWriteMany`, block volumes, mount flags), `AlreadyExists` (same name, other capacity or parameters; a state area of another volume) |
-| DeleteVolume | `onDelete: delete` removes the directory, `retain` keeps it as `csi.retained.json`. An unknown volume is a success | `FailedPrecondition` while the volume is attached, or its state area's lock is held (a history service runs) |
+| DeleteVolume | `onDelete: delete` removes the directory, `retain` keeps it as `csi.retained.json`. An unknown volume is a success | `FailedPrecondition` while the volume is attached, or its state area's lock is held (a history service runs), or (`delete`) while a remote lacks commits of the branch (§9) |
 | ControllerPublish | Records the node in `csi.json`; adopts a static PV | `NotFound` (unknown volume or node), `FailedPrecondition` (attached to another node) |
 | ControllerUnpublish | Clears the node. An unknown volume is a success | |
 | NodeStage | Reinstalls the profile's rules, starts the volume's history service, and waits up to `--stage-wait` for it to listen (it recovers the journal and applies queued patches first) | `Unavailable` when the service is still starting (the kubelet retries; the service keeps running), `FailedPrecondition` when it exited (with its last log lines), `NotFound` for an unknown volume |
-| NodePublish | Starts a front for the pod (its slot, identity and passthrough), waits up to `--publish-wait` for its mount, binds it onto the target (read-only for read-only mounts), records it | `FailedPrecondition` (not staged; a `SINGLE_NODE_SINGLE_WRITER` volume published elsewhere), `InvalidArgument` (inline ephemeral volume) |
+| NodePublish | Starts a front for the pod (its slot, identity and passthrough), waits up to `--publish-wait` for its mount, binds it onto the target (read-only for read-only mounts), records it | `FailedPrecondition` (not staged; a `SINGLE_NODE_SINGLE_WRITER` volume published elsewhere), `AlreadyExists` (the target is published with another read-only flag or access mode), `InvalidArgument` (inline ephemeral volume) |
 | NodeUnpublish | Unmounts the target, stops the front (SIGTERM, SIGKILL after `--unpublish-grace`), removes the target directory and the record. Unknown targets are a success | |
-| NodeUnstage | Stops the history service (it makes its final commit and push attempt within its grace), removes the socket and the record | `FailedPrecondition` while a target is still published |
+| NodeUnstage | Stops the history service, which makes its final commit and pushes it once more to every remote that lacks commits (within `--push-grace`, 5 s), removes the socket and the record | `FailedPrecondition` while a target is still published |
 | NodeGetInfo, NodeGetCapabilities, Probe, GetPluginInfo, GetPluginCapabilities, ValidateVolumeCapabilities | as the spec says | |
 
 Snapshots, clones, expansion, volume stats and listing are not offered.
 
-**No network work in a call.** No call clones, fetches or pushes. The
-history service pushes in the background on its interval (design §11.2);
-NodeStage only waits, at most `--stage-wait`, for the service to listen;
-before listening the service fetches the patch inbox (design §12), bounded
-by `agentfs.patchFetchTimeout`, and applies queued patches.
+**Little network work in a call.** No call clones or fetches, and the
+driver itself never pushes. The history service pushes in the background
+on its interval (design §11.2), and once more as it stops, so NodeUnstage
+waits up to `--push-grace` (5 s) for that final push. NodeStage only
+waits, at most `--stage-wait`, for the service to listen; before
+listening the service fetches the patch inbox (design §12), bounded by
+`agentfs.patchFetchTimeout`, and applies queued patches.
 
 ## 8. Recovery
 
@@ -264,6 +294,10 @@ The plugin specifies and tests each of these (§13; design §14.2):
   and alarm (design §3.5) until it is back; the plugin restarts it with
   backoff, it recovers its journal (journaled records are committed under
   their original pod's committer) and the fronts reconnect by themselves.
+- **A restart cannot start** (a failed fork under PID or memory pressure,
+  a full disk): the plugin tries again with the same backoff until it
+  starts, keeping the volume's records, so the volume recovers once the
+  pressure is gone.
 - **The node plugin restarts** (an upgrade, a crash): on SIGTERM it stops
   every front and service, which make their final commits; the mounts on
   the node answer `ENOTCONN` meanwhile. The new plugin reconciles from
@@ -310,10 +344,28 @@ the node plugin pod, with `--state <basePath>/<pv>/state --root
 service are a follow-up.
 
 **Pushes after the last pod.** The service pushes on its interval while
-the volume is staged, and attempts a final push when it stops
-(`--push-grace 5s`). If that push fails, nothing pushes until the volume
-is staged again; push by hand in the node plugin pod with `agentfs
---state … push` while the volume is unstaged.
+the volume is staged. When the last pod goes, NodeUnstage stops it: it
+makes its final commit and pushes once more to every remote that lacks
+commits, within `--push-grace` (5 s). If that push fails (the remote is
+down, the grace runs out), nothing pushes until the volume is staged
+again. The volume's history is still in its state area, and:
+
+- `onDelete: retain` keeps it, as always;
+- `onDelete: delete` refuses DeleteVolume (`FailedPrecondition`, naming
+  each remote and how many commits it lacks; the provisioner retries)
+  rather than delete history no remote holds.
+
+To finish such a deletion, push by hand while the volume is unstaged, in
+the node plugin pod, which holds the credentials:
+
+```sh
+agentfs --state /var/lib/agentfs-csi/volumes/<pv>/state push
+```
+
+and the provisioner's next retry deletes the volume. To discard the
+history instead, remove `<basePath>/<pv>` by hand. A diverged remote
+(design §11.3) never takes the commits; resolve it first
+([runbook](runbooks/divergence.md)).
 
 ## 10. Security
 
@@ -398,15 +450,20 @@ transport for fronts on several nodes is open (design §19.2).
 
 ## 13. How it is tested
 
-- **Unit and integration tests** (`cargo test`): parameters, layout and
-  records; the Identity and Controller services over a real gRPC socket
-  (`crates/agentfs-csi/tests/grpc.rs`); the supervisor with a fake
-  launcher and mounter: staging, publishing, restarts with backoff in the
-  same slot, bind stacking, reconcile after a restart, unpublish and
-  unstage ordering, shutdown (`tests/supervisor.rs`); and the supervisor
-  driving a real `agentfs serve-history` without FUSE: two pods' commits,
-  a `kill -9` recovered with its journaled commit, the final commit at
-  unstage (`crates/agentfs/tests/csi_service.rs`).
+- **Unit and integration tests** (`cargo test`): parameters (static PV
+  attributes included), layout and records; the Identity and Controller
+  services over a real gRPC socket, including the adoption of a retained
+  volume through the documented attributes and DeleteVolume's refusal of
+  unpushed history (`crates/agentfs-csi/tests/grpc.rs`); the supervisor
+  with a fake launcher and mounter: staging, publishing, restarts with
+  backoff in the same slot, restarts whose spawn fails and are tried
+  again, bind stacking, reconcile after a restart (also when a service
+  cannot start yet), a pending publish not holding up another pod's
+  recovery, a republish with other flags, unpublish and unstage
+  ordering, shutdown (`tests/supervisor.rs`); and the supervisor driving
+  a real `agentfs serve-history` without FUSE: two pods' commits, a
+  `kill -9` recovered with its journaled commit, the final commit at
+  unstage and its final push (`crates/agentfs/tests/csi_service.rs`).
 - **csi-sanity** (`ci/csi-sanity.sh`, the `csi-sanity` job): csi-test
   v5.6.0 against `agentfs-csi --mode all` with real history services and
   FUSE fronts, then no mount, record or volume directory left behind.
@@ -415,6 +472,7 @@ transport for fronts on several nodes is open (design §19.2).
   restricted pods on one claim with distinct committers and pushes to a
   git server, `kill -9` of a front, of the service and deletion of the
   node plugin pod, each recovered, the refusals of inline volumes and
-  `ReadWriteMany`, and teardown through DeleteVolume.
+  `ReadWriteMany`, and teardown: the last commit reaches the remote by
+  the final push at NodeUnstage, then DeleteVolume removes the volume.
 - **Not tested**: several nodes, shared filesystems (NFS and others),
   Talos and other hardened node images, node reboots.

@@ -23,11 +23,18 @@
 //! still running after the grace period is left on its detached thread
 //! until the process exits.
 //!
+//! [`Service::shutdown_with_final_push`] (the history service, design
+//! §14.2) also gives each remote that lacks commits one more attempt after
+//! the final commit, within the same grace period: under the CSI driver the
+//! service stops after the volume's last pod, and nothing else would push
+//! what that last commit holds.
+//!
 //! Signals are a process concern: the binary decides when to call
 //! [`Service::shutdown`].
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -90,6 +97,12 @@ pub struct ShutdownReport {
 /// The running commit and push loops.
 pub struct Service {
     stop: Arc<Stop>,
+    /// Released once the final commit is done: the push threads wait for
+    /// it before they exit.
+    committed: Arc<Stop>,
+    /// Whether the push threads make a final attempt once `committed` is
+    /// released.
+    final_push: Arc<AtomicBool>,
     commit: JoinHandle<Result<CommitReport, VolumeError>>,
     pushes: Vec<(String, JoinHandle<()>)>,
     push_done: mpsc::Receiver<String>,
@@ -122,6 +135,8 @@ impl Service {
         repack: Option<RepackSchedule>,
     ) -> io::Result<Self> {
         let stop = Arc::new(Stop::default());
+        let committed = Arc::new(Stop::default());
+        let final_push = Arc::new(AtomicBool::new(false));
         let commit = {
             let stop = stop.clone();
             let repacker = repack.map(|schedule| Repacker {
@@ -138,6 +153,8 @@ impl Service {
         for mut pusher in pushers {
             let name = pusher.name().to_owned();
             let stop_flag = stop.clone();
+            let committed_flag = committed.clone();
+            let final_flag = final_push.clone();
             let done = done_tx.clone();
             let spawned = thread::Builder::new()
                 .name(format!("agentfs-push-{name}"))
@@ -148,6 +165,13 @@ impl Service {
                             break;
                         }
                     }
+                    // The final commit may hold what this remote lacks.
+                    while !committed_flag.wait(Duration::from_secs(3600)) {}
+                    if final_flag.load(Ordering::SeqCst)
+                        && matches!(pusher.unpushed(), Ok(Some(n)) if n > 0)
+                    {
+                        pusher.push_once();
+                    }
                     let _ = done.send(pusher.name().to_owned());
                 });
             match spawned {
@@ -155,12 +179,15 @@ impl Service {
                 Err(e) => {
                     // Wind down what already started before reporting.
                     stop.stop();
+                    committed.stop();
                     return Err(e);
                 }
             }
         }
         Ok(Self {
             stop,
+            committed,
+            final_push,
             commit,
             pushes,
             push_done,
@@ -176,6 +203,17 @@ impl Service {
     /// Stops every loop: makes the final commit, then waits up to
     /// `push_grace` (from the call) for pushes in progress.
     pub fn shutdown(self, push_grace: Duration) -> ShutdownReport {
+        self.stop_all(push_grace, false)
+    }
+
+    /// [`Service::shutdown`], then one more push of every remote that lacks
+    /// commits (the final commit's among them), all within `push_grace`. A
+    /// final push still running at the deadline is abandoned as any other.
+    pub fn shutdown_with_final_push(self, push_grace: Duration) -> ShutdownReport {
+        self.stop_all(push_grace, true)
+    }
+
+    fn stop_all(self, push_grace: Duration, final_push: bool) -> ShutdownReport {
         let deadline = Instant::now() + push_grace;
         self.stop.stop();
         let final_commit = self.commit.join().unwrap_or_else(|_| {
@@ -186,6 +224,8 @@ impl Service {
             });
             Err(VolumeError::Io(io::Error::other(error)))
         });
+        self.final_push.store(final_push, Ordering::SeqCst);
+        self.committed.stop();
 
         let mut pending: Vec<(String, JoinHandle<()>)> = self.pushes;
         while !pending.is_empty() {
@@ -545,6 +585,43 @@ mod tests {
                 .iter()
                 .all(|s| span_attr(s, "agentfs.remote").as_deref() == Some("origin"))
         );
+    }
+
+    /// The history service's shutdown pushes its final commit; a plain
+    /// shutdown leaves it for the next start.
+    #[test]
+    fn a_final_push_sends_the_final_commit() {
+        for final_push in [false, true] {
+            let remote = tempfile::tempdir().unwrap();
+            git2::Repository::init_bare(remote.path()).unwrap();
+            let (dir, state) = setup(&[
+                ("agentfs.commitWindow", "1h"),
+                ("agentfs.pushInterval", "1h"),
+                ("remote.origin.url", &remote.path().display().to_string()),
+            ]);
+            let (rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
+            let service = Service::start(com, pushers, Arc::new(NullSink)).unwrap();
+            // Let the first push (of nothing) happen.
+            thread::sleep(Duration::from_millis(100));
+            record(&rec, dir.path(), "a");
+            let report = if final_push {
+                service.shutdown_with_final_push(Duration::from_secs(10))
+            } else {
+                service.shutdown(Duration::from_secs(10))
+            };
+            report.final_commit.unwrap();
+            assert!(report.abandoned_pushes.is_empty());
+            let local = local_head(&state).expect("the final commit");
+            let pushed = git2::Repository::open_bare(remote.path())
+                .unwrap()
+                .refname_to_id("refs/heads/agentfs/vol")
+                .ok();
+            if final_push {
+                assert_eq!(pushed, Some(local));
+            } else {
+                assert_eq!(pushed, None);
+            }
+        }
     }
 
     #[test]

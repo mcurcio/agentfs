@@ -9,8 +9,10 @@
 //! holds a lease: patches write the backing tree, which live fronts serve),
 //! the commit and push loops, then the socket. On SIGINT or SIGTERM it
 //! stops accepting, lets fronts' requests in progress finish (up to
-//! `--shutdown-grace`), then makes the final commit and waits for pushes
-//! as `run` does.
+//! `--shutdown-grace`), then makes the final commit and, unlike `run`,
+//! pushes it: every remote that lacks commits gets one more attempt, all
+//! within `--push-grace` (design §14.2). Under the CSI driver the service
+//! stops after the volume's last pod, and nothing else would push it.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -24,7 +26,7 @@ use agentfs_core::service::Service;
 use agentfs_core::volume::StateDir;
 
 use crate::daemon::Daemon;
-use crate::{Pod, Session, describe_wake, list, patch_cmd, stop_service};
+use crate::{Pod, Session, describe_wake, list, patch_cmd, stop_service_and_push};
 
 /// Where the running service's address is written for `agentfs status`.
 const ADDRESS_FILE: &str = "address";
@@ -96,7 +98,7 @@ pub(crate) fn serve(
             Ok(server) => server,
             Err(e) => {
                 // Commits what recovery found.
-                let _ = stop_service(service, push_grace);
+                let _ = stop_service_and_push(service, push_grace);
                 session.finish();
                 return Err(e).with_context(|| format!("listening on {address}"));
             }
@@ -128,7 +130,7 @@ pub(crate) fn serve(
         eprintln!("fronts' requests were still running at shutdown; they fail with EIO");
     }
     let _ = std::fs::remove_file(&address_file);
-    let code = stop_service(service, push_grace);
+    let code = stop_service_and_push(service, push_grace);
     session.finish();
     Ok(code)
 }

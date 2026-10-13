@@ -256,7 +256,10 @@ kubectl apply -k deploy/csi/example
 ```
 
 Several pods on one node share a volume, each committing as itself; one
-node per volume at a time. [docs/csi.md](docs/csi.md) covers the
+node per volume at a time. Each claim gets its own branch,
+`agentfs/<namespace>.<claim>.<pv>`; the service pushes the last pod's
+final commit as the volume is unstaged, and `onDelete: delete` never
+deletes history a remote lacks. [docs/csi.md](docs/csi.md) covers the
 architecture, parameters, recovery, RBAC and Pod Security;
 [runbooks/csi-recovery.md](docs/runbooks/csi-recovery.md) the incidents.
 

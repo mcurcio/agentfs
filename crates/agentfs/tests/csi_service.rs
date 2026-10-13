@@ -117,11 +117,18 @@ async fn the_supervisor_runs_and_recovers_a_real_history_service() {
         profiles: dir.path().join("profiles"),
     };
     fs::create_dir_all(&layout.profiles).unwrap();
+    // A remote pushed at each start and then not for an hour: only the
+    // final push at unstage can send the last commit.
+    let remote = dir.path().join("remote.git");
+    git2::Repository::init_bare(&remote).unwrap();
     // A commit window long enough to kill the service between a record
     // and its commit.
     fs::write(
         layout.profiles.join("test.config"),
-        "[agentfs]\n\tcommitWindow = 1500ms\n",
+        format!(
+            "[agentfs]\n\tcommitWindow = 1500ms\n\tpushInterval = 1h\n[remote \"origin\"]\n\turl = {}\n",
+            remote.display()
+        ),
     )
     .unwrap();
     fs::write(layout.profiles.join("test.exclude"), "*.tmp\n").unwrap();
@@ -209,4 +216,14 @@ async fn the_supervisor_runs_and_recovers_a_real_history_service() {
     assert!(!layout.socket("pvc-1").exists());
     assert!(!layout.staged_record("pvc-1").exists());
     assert!(sup.service_pid("pvc-1").is_none());
+    // The final commit was pushed as the service stopped (design §14.2).
+    let local = git2::Repository::open_bare(layout.state("pvc-1").join("git"))
+        .unwrap()
+        .refname_to_id("refs/heads/agentfs/demo")
+        .unwrap();
+    let pushed = git2::Repository::open_bare(&remote)
+        .unwrap()
+        .refname_to_id("refs/heads/agentfs/demo")
+        .ok();
+    assert_eq!(pushed, Some(local), "the final push");
 }

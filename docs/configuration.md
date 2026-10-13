@@ -489,14 +489,14 @@ the keys of this page, included by the volume's state area like
 become its `info/exclude` and `info/attributes`. Credentials files are
 under `/etc/agentfs-csi/credentials/` in the driver's pods.
 
-**StorageClass parameters** (or a static PV's `volumeAttributes`):
+**StorageClass parameters** (or a static PV's `volumeAttributes`, where unknown keys are refused too):
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `profile` | required | the profile, a DNS label |
-| `volumeName` | `{pvcNamespace}.{pvcName}`, else the PV name | the agentfs volume name; a template over `{pvcNamespace}`, `{pvcName}`, `{pvName}` |
+| `volumeName` | `{pvcNamespace}.{pvcName}.{pvName}`, else the PV name | the agentfs volume name; a template over `{pvcNamespace}`, `{pvcName}`, `{pvName}`. Keep `{pvName}` in it: a claim deleted and created again must not reuse the old branch (docs/csi.md §5). In a static PV's attributes, a literal name (`volume` is the same key), default the volume handle |
 | `branch` | `agentfs/<volumeName>` | the history branch |
-| `onDelete` | `retain` | `retain` keeps the volume directory at DeleteVolume, `delete` removes it |
+| `onDelete` | `retain` | `retain` keeps the volume directory at DeleteVolume, `delete` removes it, and refuses while a remote lacks commits of the branch |
 
 **`agentfs-csi` flags:**
 

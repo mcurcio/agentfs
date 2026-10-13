@@ -143,7 +143,7 @@ mount; §16):
 |---|---|---|---|
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | Where fronts reach it: `unix:<path>` or an absolute socket path |
 | `--shutdown-grace DURATION` | | `10s` | At shutdown, how long to wait for fronts' requests in progress |
-| `--push-grace DURATION` | | `5s` | At shutdown, how long to wait for pushes in progress |
+| `--push-grace DURATION` | | `5s` | At shutdown, how long to wait for pushes in progress and then for one more push of every remote that lacks commits (the final commit among them) |
 
 `agentfs mount` and `agentfs record` as fronts of a history service
 (§16):
@@ -739,9 +739,12 @@ it, or when the slot is taken, a front leases the lowest free slot.
 **Stopping.** Stop the fronts first (each unmounts as `mount` does, but
 leaves the commit to the service), then the service: on SIGINT or SIGTERM
 it stops accepting, waits up to `--shutdown-grace` for fronts' requests,
-makes the final commit and waits up to `--push-grace` for pushes. As with
-`run`, it does not push at shutdown; the push loop pushes every
-`agentfs.pushInterval`, and `agentfs push` pushes once afterwards.
+makes the final commit and then, unlike `run`, pushes it: every remote that
+lacks commits gets one more attempt, all within `--push-grace` (pushes in
+progress included). The CSI driver stops the service after the volume's
+last pod, and nothing else would push that commit. A push still running
+at the deadline is abandoned, and a failed one leaves the commits for the
+next start or an `agentfs push`.
 
 **Limits.**
 

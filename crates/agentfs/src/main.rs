@@ -747,7 +747,16 @@ fn describe_wake(wake: Wake) -> String {
 /// Stops the service: the final commit, then pushes in progress for up to
 /// `push_grace`. Exit status 1 if the final commit failed.
 fn stop_service(service: Service, push_grace: Duration) -> ExitCode {
-    let report = service.shutdown(push_grace);
+    report_stop(service.shutdown(push_grace))
+}
+
+/// [`stop_service`] with one final push of what remotes lack (the history
+/// service, design §14.2).
+fn stop_service_and_push(service: Service, push_grace: Duration) -> ExitCode {
+    report_stop(service.shutdown_with_final_push(push_grace))
+}
+
+fn report_stop(report: agentfs_core::service::ShutdownReport) -> ExitCode {
     for name in &report.abandoned_pushes {
         println!("{name}: push still running at shutdown; abandoned");
     }

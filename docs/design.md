@@ -1334,6 +1334,10 @@ agentfs does not scan content for secrets and does not hold pushes.
 - Each remote is pushed from its own thread, so a slow or hung remote cannot
   delay another. libgit2 has no way to cancel a push in progress, so
   shutdown waits for pushes only up to a grace period, then leaves them.
+  The history service (`serve-history`, §14) also pushes once more after
+  its final commit, within the same grace period: under the CSI driver it
+  stops after the last pod, so nothing else would push that commit
+  (§14.2).
 - **Network timeouts.** libgit2 is set process-wide to give up on a
   connection after 30 s and on a stalled read or write after 5 min. A remote
   that accepts the connection and then stops responding ends as an
@@ -1933,8 +1937,8 @@ volume wait for the cross-node transport above.
 | ControllerPublish | controller | records the node in `csi.json`, so a second node is refused; Kubernetes' Multi-Attach check enforces the same (`attachRequired: true`) |
 | NodeStage | node plugin | starts `agentfs serve-history` for the volume, waits a bounded time for it to listen |
 | NodePublish | node plugin | starts a front, `agentfs mount --history-service`, with the pod's identity, mounted at a private source; bind-mounts it onto the kubelet's target |
-| NodeUnpublish, NodeUnstage | node plugin | stop the front, the service (final commit) |
-| DeleteVolume | controller | removes or keeps the directory (`onDelete`) |
+| NodeUnpublish, NodeUnstage | node plugin | stop the front, the service (final commit, and one more push of it within `--push-grace`) |
+| DeleteVolume | controller | removes or keeps the directory (`onDelete`); `delete` refuses while a remote lacks commits of the branch |
 
 The node plugin spawns the `agentfs` binary for every long-running piece
 rather than linking FUSE into the gRPC server: a crashed front or service
@@ -1947,7 +1951,10 @@ a StorageClass (or static PV) names a `profile`, whose
 `.attributes` (§4.1, §4.2) live in a ConfigMap in the driver's namespace,
 and whose credentials are files of a Secret there, both mounted into the
 driver's pods. Pod authors choose only the class. Other parameters:
-`volumeName` (a template over the claim's namespace and name), `branch`,
+`volumeName` (a template over the claim's namespace and name and the PV
+name, by default all three, so a re-created claim never reuses a branch
+whose remote history it does not share, §11.3, §11.4; a literal name in a
+static PV, whose unknown attributes are refused), `branch`,
 `onDelete`. Inline ephemeral volumes are refused (`volumeLifecycleModes:
 [Persistent]`), since their parameters would be the pod author's.
 
@@ -1955,7 +1962,9 @@ driver's pods. Pod authors choose only the class. Other parameters:
 and uid, which the front passes on as its origin (§9): each pod commits
 as itself, and the service journals the origin so replays keep it.
 
-**No network work in a call.** No call clones, fetches or pushes;
+**Little network work in a call.** No call clones or fetches, and only
+NodeUnstage waits on a push (the service's final push, bounded by
+`--push-grace`);
 nothing clones at all (a volume starts empty). The service pushes on its
 interval (§11.2), and before it listens fetches the patch inbox (bounded
 by `agentfs.patchFetchTimeout`, §12) and applies queued patches.
@@ -1987,7 +1996,18 @@ retries.
   mounts for seconds, so it is rolled node by node.
 - *Order.* Per-volume locks serialise stage, publish, unpublish, unstage
   and restarts; unstage is refused (`FailedPrecondition`) while a target
-  is published, and publish before stage likewise.
+  is published, and publish before stage likewise. Waits happen outside
+  the lock (a front mounting, a service starting, a restart's backoff), so
+  one pod's slow start never delays another's recovery; a child that
+  exits before the call that started it sees it ready is that call's
+  failure. A republish of a target with other flags is `ALREADY_EXISTS`.
+- *Failed restarts.* A restart whose spawn fails (fork under pressure, a
+  full disk) is tried again with backoff; entries and records stay, at a
+  restart as at reconcile.
+- *Unpushed history.* NodeUnstage's service pushes its final commit once
+  more within `--push-grace`; if that fails, `onDelete: delete` refuses
+  DeleteVolume while any remote lacks commits of the branch (read from
+  the push state, §11.2), so history no remote holds is never deleted.
 
 **One node per volume.** `ReadWriteMany` is refused at CreateVolume. The
 attach step makes Kubernetes refuse a second node while the first holds
@@ -2356,7 +2376,9 @@ one-time migration of Hermes' existing data and the initial import in
   `meta/history/address` for `status`. On SIGINT or SIGTERM it stops
   accepting, waits up to `--shutdown-grace` (10 s) for fronts' requests in
   progress (those still running fail with `EIO`), then makes the final
-  commit and waits up to `--push-grace` for pushes, as `run` does.
+  commit and, unlike `run`, pushes it once more to every remote that lacks
+  commits, all within `--push-grace` (§14.2: under the CSI driver nothing
+  else would push the last pod's final commit).
 - **`agentfs mount --history-service <addr>`** is a front (§14): no lock
   and no control socket. Order: the preflight, a lease of a pending slot,
   the connection to the service (waiting up to `--history-wait`, 30 s, and
@@ -2698,6 +2720,8 @@ hardened node images (Talos) and across node reboots.
 | CSI identity | `podInfoOnMount`: each pod's front commits under the pod's name, namespace and uid (§9, §14.2) |
 | CSI recovery | Crashed fronts and services restarted with backoff (1 s to 30 s); a front in its predecessor's slot (`--history-slot`), its mount bind-stacked over the stale target, made shared so `HostToContainer` containers see it; reconcile from node records after a plugin restart; DaemonSet `OnDelete` (§14.2) |
 | CSI RBAC | csi-provisioner and csi-attacher's minimal ClusterRoles plus leader-election leases; no Secrets, pods or snapshots; the node plugin has no API access and no token (§14.2, [csi.md](csi.md#10-security)) |
+| CSI volume names | The default `volumeName` is `{pvcNamespace}.{pvcName}.{pvName}`: unique per volume, so a claim deleted and created again starts a new branch instead of a root commit on the old one, which every push would find diverged (§11.3, §11.4); a template without `{pvName}` is the operator's choice and documented as unsafe. A static PV's `volumeName` (or `volume`) is literal, and its unknown attributes are refused (§14.2, [csi.md](csi.md#5-parameters)) |
+| CSI final push | `serve-history` (only) pushes once more at shutdown, after its final commit, within `--push-grace`: NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
 | CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |
 

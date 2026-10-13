@@ -9,9 +9,11 @@ provisioner: agentfs.mcurcio.github.io
 parameters:
   profile: example
   # The agentfs volume name; the history branch is agentfs/<volumeName>.
-  volumeName: "{pvcNamespace}.{pvcName}"
+  # Keep {pvName} in it: a claim deleted and created again must get a new
+  # branch, not a fresh root commit on the old one (docs/csi.md §5).
+  volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
   # DeleteVolume keeps the files and history (reusable through a static
-  # PV); `delete` removes them.
+  # PV); `delete` removes them once every remote has the history.
   onDelete: retain
 reclaimPolicy: Retain
 # Provisioned once a pod is scheduled, on that pod's node.
