@@ -126,8 +126,11 @@ Design §19.2 item 1 is decided: the budget is
 [`ci/bench-budget.json`](../ci/bench-budget.json), checked by every run
 of the benchmark. It is **advisory**: a result over budget is a warning
 in the job and its summary, never a failure, because shared runners are
-noisy. Each limit is about 1.5–2 times the slower filesystem's result
-above:
+noisy. Each limit is about 1.5–2 times the slower result of the
+first two runs. Workloads are budgeted in absolute time, not as ratios:
+see [Run to run](#run-to-run).
+
+
 
 | Budget | Limit | Measured (XFS, ext4) |
 |---|---|---|
@@ -138,15 +141,28 @@ above:
 | XFS: freeze of 16 MiB, p50 | 1 ms | 0.44 ms |
 | XFS: engine step for 16 MiB, p50 | 3 ms | 1.4 ms |
 | 4 KiB close through FUSE, p50 | 4 ms | 1.8 ms, 2.4 ms |
-| git clone, against a plain directory | 32× | 17×, 21× |
-| Small files into an excluded path, against a plain directory | 30× | 17×, 20× |
-| 100,000 creates, against a plain directory | 125× | 63×, 83× |
+| git clone of 4,524 files | 25 s | 12.7 s, 16.0 s |
+| 30,000 small files into an excluded path | 30 s | 19.0 s, 18.9 s |
+| 100,000 creates | 500 s | 230 s, 330 s |
 | Catch-up after 100,000 creates | 12 min | 8.0 min, 7.9 min |
-| `rm -rf` of 100,000 files, against a plain directory | 75× | 14×, 50× |
+| `rm -rf` of 100,000 files | 200 s | 78 s, 132 s |
 | XFS: close of a clean 1 GiB file | 0.5 s | 3 ms |
-| XFS: close of a dirty 1 GiB file | 5 s | 2.6 s |
+| XFS: close of a dirty 1 GiB file | 8 s | 2.6 s (5.3 s in the second run) |
 | ext4: close of a clean 1 GiB file | 6 s | 2.9 s |
 | ext4: close of a dirty 1 GiB file | 10 s | 5.4 s |
+
+## Run to run
+
+The second run, on the next commit
+([38337353781](https://github.com/mcurcio/agentfs/actions/runs/38337353781)),
+got an XFS runner whose plain directory was about three times faster
+(30,000 small files in 0.33 s instead of 1.09 s, 100,000 creates in
+1.2 s instead of 3.7 s), so the ratios against it rose to 52× and 231×,
+while agentfs's own times moved by 25 % at most (the same workloads in
+17.2 s and 275 s). The ext4 results were within about 20 % of the
+first run; on XFS the engine step was 30–45 % slower (1.6 ms instead of
+1.3 ms for a small file, 0.65 ms instead of 0.45 ms for an unlink). Compare absolute times across runs and
+ratios only within one; that is why the budget is in absolute time.
 
 The budget is a regression alarm, not a promise about other hardware.
 On a dedicated disk with a fast `fsync` the small-file numbers are lower;
