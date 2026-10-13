@@ -696,6 +696,21 @@ Results go to the job summary and a `bench-<fs>` artifact kept 90 days;
 [`ci/bench-budget.json`](ci/bench-budget.json) adds warnings, never
 failures. See [docs/performance.md](docs/performance.md).
 
+[`.github/workflows/power-loss.yml`](.github/workflows/power-loss.yml)
+tests power loss and fsync ordering (design §3.3, §18 test 3) on every
+push to main that changes code, and on demand, once on ext4 and once on
+XFS: [`ci/power-loss.sh`](ci/power-loss.sh) runs `agentfs record` and
+`agentfs push` on a filesystem over dm-log-writes, which logs every write,
+flush and FUA, then replays the log with xfstests' `replay-log` (pinned,
+[`ci/install-replay-log.sh`](ci/install-replay-log.sh)) and, at every FUA
+(every flush with the `exhaustive` input), checks the state a power cut
+there leaves on a snapshot ([`ci/power-loss-check.sh`](ci/power-loss-check.sh)):
+the filesystem mounts, `agentfs flush` recovers with no backlog, git fsck
+passes, sequence numbers increase with no empty commit, and every record
+and push whose fsynced promise is on disk is in history and on the
+remote. It needs root, loop devices and the `dm-log-writes` and
+`dm-snapshot` modules.
+
 The e2e scripts run locally too: start the server with
 `ci/git-http-server.sh start <dir>` and source its output, run the
 collector with [`ci/otelcol.yaml`](ci/otelcol.yaml), or run

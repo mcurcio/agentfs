@@ -1,0 +1,74 @@
+name: power-loss
+
+# Power loss and fsync ordering (design §3.3, §18 test 3): ci/power-loss.sh
+# runs `agentfs record` and `agentfs push` on ext4 and XFS over
+# dm-log-writes, then replays the log with xfstests' replay-log (pinned,
+# ci/install-replay-log.sh) and checks the state a power cut would leave
+# at every FUA (every flush, with the `exhaustive` input) with
+# ci/power-loss-check.sh.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      exhaustive:
+        description: Check at every flush, not only at every FUA
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: power-loss-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  power-loss:
+    name: power loss (${{ matrix.fs }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [ext4, xfs]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: power-loss
+      - run: sudo apt-get update && sudo apt-get install -y xfsprogs gcc
+      - name: device-mapper modules
+        run: |
+          uname -a
+          if ! sudo modprobe dm_log_writes; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe dm_log_writes
+          fi
+          sudo modprobe dm_snapshot
+      - name: build replay-log (xfstests, pinned)
+        run: ci/install-replay-log.sh "$RUNNER_TEMP/replay-log" >>"$GITHUB_ENV"
+      - run: cargo build --locked --release -p agentfs
+      - run: |
+          sudo --preserve-env=REPLAY_LOG,AGENTFS_BIN,POWER_LOSS_DIR \
+            ci/power-loss.sh ${{ matrix.fs }} ${{ inputs.exhaustive && 'flush' || 'fua' }}
+        env:
+          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
+          POWER_LOSS_DIR: ${{ runner.temp }}/power-loss
+      - name: clean up devices
+        if: always()
+        run: |
+          sudo umount -l "$RUNNER_TEMP/power-loss/mnt" "$RUNNER_TEMP/power-loss/check" || true
+          sudo dmsetup remove_all || true
+          sudo losetup -D || true
