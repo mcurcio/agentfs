@@ -3,7 +3,7 @@
 # OpenSSH and RSA PEM keys with plain and hashed known_hosts, a wrong key
 # that fails only its own remote, unknown and changed host keys refused
 # before the key is ever offered, a key rotated under a running
-# `agentfs run`, and divergence over SSH.
+# `agentfs run`, divergence over SSH, and a patch-queue inbox fetch.
 #
 # Needs a binary built with --features ssh and a server from
 # ci/git-ssh-server.sh with its GIT_SSH_* variables. Uses sudo to manage
@@ -161,5 +161,17 @@ assert_contains "$out" "diverged" "push reports the divergence"
 assert_eq "$THEIRS" "$(srv_ref "$SSH_REPO" refs/heads/agentfs/demo)" "the other writer's commit was not overwritten"
 saved=$(srv_git --git-dir "$SSH_REPO" for-each-ref --format='%(objectname)' 'refs/agentfs/demo/diverged/')
 assert_eq "$(local_head demo)" "$saved" "local head saved under refs/agentfs/demo/diverged/"
+
+step "the patch queue fetches its inbox over ssh"
+volume_config agentfs.patchRemote ssh
+srv_git --git-dir "$SSH_REPO" update-ref refs/agentfs/demo/inbox/0000000001 "$THEIRS"
+set +e
+out=$(agentfs patch apply 2>&1)
+set -e
+echo "$out"
+case "$out" in
+*"fetching the patch queue from ssh failed"*) fail "the inbox fetch failed" ;;
+esac
+assert_eq "$THEIRS" "$(remote_ref "$STATE/git" refs/agentfs/demo/inbox/0000000001)" "inbox ref fetched over ssh"
 
 step "all ssh scenarios passed"

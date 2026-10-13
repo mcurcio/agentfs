@@ -23,7 +23,7 @@ RUN apt-get update \
 WORKDIR /src
 
 # Dependencies first, against stub crates, so a source change does not
-# rebuild libgit2, OpenSSL bindings, libssh2 and OpenTelemetry.
+# rebuild libgit2, OpenSSL bindings, russh, ring and OpenTelemetry.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/agentfs-core/Cargo.toml crates/agentfs-core/
 COPY crates/agentfs-fuse/Cargo.toml crates/agentfs-fuse/

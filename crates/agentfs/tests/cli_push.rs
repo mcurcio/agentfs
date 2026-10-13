@@ -260,8 +260,9 @@ fn ssh_remotes_are_validated() {
         "{err}"
     );
     if cfg!(feature = "ssh") {
-        // Valid, and nothing listens on port 1.
-        assert!(text.contains("full: failed (unreachable)"), "{text}");
+        // Valid; the key is read before connecting, and there is none.
+        assert!(text.contains("full: failed (auth)"), "{text}");
+        assert!(text.contains("reading credentials"), "{text}");
     } else {
         assert!(
             err.contains(

@@ -43,6 +43,8 @@ pub mod repack;
 pub mod restore;
 pub mod rules;
 pub mod service;
+#[cfg(feature = "ssh")]
+pub(crate) mod ssh_transport;
 pub mod stamps;
 pub mod telemetry;
 pub mod tracked;

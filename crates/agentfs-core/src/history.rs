@@ -121,6 +121,9 @@ pub(crate) fn init_libgit2() {
         // SAFETY: as above.
         let io = unsafe { git2::opts::set_server_timeout_in_milliseconds(SERVER_IO_TIMEOUT_MS) };
         assert!(io.is_ok(), "libgit2 rejected the I/O timeout: {io:?}");
+        // SSH remotes go through agentfs's own transport (design §11.1).
+        #[cfg(feature = "ssh")]
+        crate::ssh_transport::register();
     });
 }
 

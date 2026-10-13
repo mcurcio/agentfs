@@ -2,206 +2,128 @@
 //! ([`crate::push`]) and the patch-queue fetch and push
 //! ([`crate::patch`]).
 //!
-//! The credentials callback gives one credential per connection, for the
-//! remote URL's host only. HTTP(S) remotes get a username and password
-//! (token) from `agentfsCredentials`; SSH remotes get only their private
-//! key from `agentfsSshKey`, and only after their host key has been checked
-//! against `agentfsKnownHosts` in libgit2's certificate callback, which
-//! runs before authentication.
+//! HTTP(S) remotes authenticate through libgit2's credentials callback,
+//! which gives one username and password (token) per connection from
+//! `agentfsCredentials`, for the remote URL's host only.
+//!
+//! SSH remotes never go through libgit2's callbacks: agentfs's own SSH
+//! transport (`ssh_transport`, `ssh` feature) checks the host key against
+//! `agentfsKnownHosts` before any authentication and then offers only the
+//! key from `agentfsSshKey`. It finds the remote's [`SshRemote`] and the
+//! connection's [`AuthState`] through [`RemoteAuth::ssh_scope`], held
+//! around each libgit2 call that may connect.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use git2::{
-    CertificateCheckStatus, Cred, CredentialType, Error as GitError, ErrorClass, ErrorCode,
-    RemoteCallbacks,
-};
+use git2::{Cred, CredentialType, Error as GitError, ErrorClass, ErrorCode, RemoteCallbacks};
 
 use crate::config::RemoteSettings;
-use crate::credentials::{Credential, CredentialFile, DEFAULT_SSH_USERNAME, SshKey, SshKeyFile};
+use crate::credentials::{Credential, CredentialFile, SshKey, SshKeyFile};
 use crate::known_hosts::{self, KnownHostsFile};
 use crate::remote_url::{Endpoint, ssh_endpoint};
 
-/// What the credentials callback hands libgit2 (see
-/// [`RemoteAuth::answer`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CredentialAnswer {
-    /// The user name alone, asked before authenticating over SSH.
-    Username(String),
-    UserPass(Credential),
-    SshKey {
-        username: String,
-        key: SshKey,
-    },
+/// What one connection's authentication saw, read once libgit2 returns.
+/// Shared with the SSH transport, which may run on another thread.
+#[derive(Debug, Default)]
+pub(crate) struct AuthState {
+    /// The credential or key was refused, or none could be read.
+    auth_failed: AtomicBool,
+    /// Why the SSH host key was refused, if it was: libgit2 replaces the
+    /// transport's message with its own.
+    host_key_failure: Mutex<Option<String>>,
 }
 
-impl CredentialAnswer {
-    fn into_cred(self) -> Result<Cred, GitError> {
-        match self {
-            Self::Username(username) => Cred::username(&username),
-            Self::UserPass(c) => Cred::userpass_plaintext(&c.username, &c.password),
-            // Without the `ssh` feature libgit2 refuses this, but config
-            // never lets an ssh remote through then (design §11.1).
-            Self::SshKey { username, key } => {
-                Cred::ssh_key_from_memory(&username, None, &key.text, None)
-            }
-        }
+impl AuthState {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub(crate) fn auth_failed(&self) -> bool {
+        self.auth_failed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn fail_auth(&self) {
+        self.auth_failed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn host_key_failure(&self) -> Option<String> {
+        self.host_key_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    // Only the SSH transport refuses host keys.
+    #[cfg_attr(not(feature = "ssh"), allow(dead_code))]
+    pub(crate) fn refuse_host(&self, why: String) {
+        *self
+            .host_key_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(why);
     }
 }
 
-/// What the callbacks of one connection saw, read once libgit2 returns.
-#[derive(Debug, Default)]
-pub(crate) struct AuthState {
-    /// Credentials handed out on this connection.
-    calls: Cell<u32>,
-    /// The credentials callback refused or ran out of attempts.
-    pub auth_failed: Cell<bool>,
-    /// Why the SSH host key was refused, if it was: libgit2 replaces the
-    /// callback's message with its own.
-    pub host_key_failure: RefCell<Option<String>>,
-}
-
-/// One remote's credentials, SSH key and known hosts, bound to its push
-/// URL's host.
-pub struct RemoteAuth {
+/// One SSH remote's key and known hosts, bound to its push URL's host and
+/// port. Read by the SSH transport (`ssh` feature).
+#[cfg_attr(not(feature = "ssh"), allow(dead_code))]
+pub struct SshRemote {
     name: String,
-    credentials: Option<CredentialFile>,
-    /// The push URL's host and port, for ssh remotes only.
-    ssh: Option<Endpoint>,
-    ssh_key: Option<SshKeyFile>,
+    endpoint: Endpoint,
+    key: Option<SshKeyFile>,
     known_hosts: Option<KnownHostsFile>,
 }
 
-impl RemoteAuth {
-    pub fn new(remote: &RemoteSettings) -> Self {
-        Self {
-            name: remote.name.clone(),
-            credentials: remote
-                .credentials
-                .as_ref()
-                .map(|path| CredentialFile::new(path, remote.push_url())),
-            ssh: ssh_endpoint(remote.push_url()),
-            ssh_key: remote
-                .ssh_key
-                .as_ref()
-                .map(|path| SshKeyFile::new(path, remote.push_url())),
-            known_hosts: remote.known_hosts.as_ref().map(KnownHostsFile::new),
-        }
+#[cfg_attr(not(feature = "ssh"), allow(dead_code))]
+impl SshRemote {
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    /// The push URL's host and port, if it is an ssh remote.
-    pub fn ssh(&self) -> Option<&Endpoint> {
-        self.ssh.as_ref()
+    /// The push URL's host and port.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
     }
 
-    /// The credentials and, for ssh remotes, certificate callbacks of one
-    /// connection, reporting into `state`.
-    pub(crate) fn callbacks<'a>(&'a self, state: &'a AuthState) -> RemoteCallbacks<'a> {
-        let mut callbacks = RemoteCallbacks::new();
-        callbacks.credentials(move |url, username, allowed| {
-            let result = self
-                .answer(url, username, allowed, &state.calls)
-                .and_then(|answer| answer.into_cred().map_err(|e| e.message().to_owned()))
-                .map_err(|message| GitError::new(ErrorCode::Auth, ErrorClass::Callback, message));
-            if result.is_err() {
-                state.auth_failed.set(true);
-            }
-            result
-        });
-        if self.ssh.is_some() {
-            // Runs before any authentication, so the key is never offered
-            // to a host that is not trusted.
-            callbacks.certificate_check(move |cert, hostname| {
-                let Some(hostkey) = cert.as_hostkey() else {
-                    return Ok(CertificateCheckStatus::CertificatePassthrough);
-                };
-                // Never `hostkey_type()`: it panics on types git2 does not
-                // know.
-                match self.check_host_key(hostname, hostkey.hostkey(), hostkey.hash_sha256()) {
-                    Ok(()) => Ok(CertificateCheckStatus::CertificateOk),
-                    Err(message) => {
-                        // libgit2 replaces this error's message with its
-                        // own, so keep the verdict on the side.
-                        *state.host_key_failure.borrow_mut() = Some(message.clone());
-                        Err(GitError::new(
-                            ErrorCode::Certificate,
-                            ErrorClass::Ssh,
-                            message,
-                        ))
-                    }
-                }
-            });
-        }
-        callbacks
+    /// The `agentfsSshKey` file, if set.
+    pub fn key_path(&self) -> Option<&std::path::Path> {
+        self.key.as_ref().map(SshKeyFile::path)
     }
 
-    /// The credentials callback's decision (design §11.1): one credential
-    /// or key per connection, from the remote's own file, for its own host
-    /// only. SSH remotes get only their key, never a password; other
-    /// remotes never get a key. libgit2's request for a user name alone,
-    /// made before authenticating to an SSH URL that names none, is
-    /// answered with [`DEFAULT_SSH_USERNAME`] and is not an attempt.
-    pub(crate) fn answer(
-        &self,
-        url: &str,
-        username: Option<&str>,
-        allowed: CredentialType,
-        calls: &Cell<u32>,
-    ) -> Result<CredentialAnswer, String> {
+    /// The private key for a connection to `url`, from the remote's own
+    /// file, for its own host and port only. The error names the file.
+    pub(crate) fn key(&self, url: &str) -> Result<SshKey, String> {
         let name = &self.name;
-        if self.ssh.is_some() && allowed == CredentialType::USERNAME {
-            return Ok(CredentialAnswer::Username(DEFAULT_SSH_USERNAME.to_owned()));
-        }
-        calls.set(calls.get() + 1);
-        if calls.get() > 1 {
-            return Err(match self.ssh {
-                Some(_) => format!("{url} rejected the SSH key for remote {name}"),
-                None => format!("{url} rejected the credentials for remote {name}"),
-            });
-        }
-        if self.ssh.is_some() {
-            let Some(file) = &self.ssh_key else {
-                return Err(format!(
-                    "{url} asks for a key and remote.{name}.agentfsSshKey is not set"
-                ));
-            };
-            if !allowed.contains(CredentialType::SSH_MEMORY) {
-                return Err(format!(
-                    "{url} does not accept public keys (it offers {allowed:?}); ssh remotes \
-                     authenticate only with agentfsSshKey"
-                ));
-            }
-            let key = file
-                .key_for(url)
-                .map_err(|e| format!("{}: {e}", file.path().display()))?;
-            let username = username
-                .filter(|u| !u.is_empty())
-                .unwrap_or(DEFAULT_SSH_USERNAME)
-                .to_owned();
-            return Ok(CredentialAnswer::SshKey { username, key });
-        }
-        let Some(file) = &self.credentials else {
+        let Some(file) = &self.key else {
             return Err(format!(
-                "{url} asks for credentials and remote.{name}.agentfsCredentials is not set"
+                "{url} needs a key and remote.{name}.agentfsSshKey is not set"
             ));
         };
-        if !allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
-            return Err(format!(
-                "{url} asks for {allowed:?}; only username and password (token) \
-                 credentials are supported"
-            ));
-        }
-        file.credential_for(url, username)
-            .map(CredentialAnswer::UserPass)
-            .map_err(|e| e.to_string())
+        file.key_for(url)
+            .map_err(|e| format!("{}: {e}", file.path().display()))
+    }
+
+    /// The key types `agentfsKnownHosts` lists for the remote's host and
+    /// port, in file order, so that the transport asks for those first, as
+    /// OpenSSH does. Empty if the file cannot be read; the host key check
+    /// then says why.
+    pub(crate) fn known_key_types(&self) -> Vec<String> {
+        let Some(file) = &self.known_hosts else {
+            return Vec::new();
+        };
+        file.load()
+            .map(|hosts| hosts.key_types(&self.endpoint.host, self.endpoint.port))
+            .unwrap_or_default()
     }
 
     /// Whether the SSH server's host key is trusted (design §11.1): the
-    /// host libgit2 connected to must be the push URL's, and its raw key
-    /// must be listed for that host and port in `agentfsKnownHosts`. The
-    /// error says which file, name, key type and SHA256 fingerprint, and
-    /// how to fix it.
+    /// host connected to must be the push URL's, and its raw key must be
+    /// listed for that host and port in `agentfsKnownHosts`. The error says
+    /// which file, name, key type and SHA256 fingerprint, and how to fix
+    /// it.
     pub(crate) fn check_host_key(
         &self,
         hostname: &str,
@@ -209,9 +131,7 @@ impl RemoteAuth {
         sha256: Option<&[u8; 32]>,
     ) -> Result<(), String> {
         let name = &self.name;
-        let Some(endpoint) = &self.ssh else {
-            return Err(format!("remote {name} is not an ssh remote"));
-        };
+        let endpoint = &self.endpoint;
         let lookup = known_hosts::lookup_name(&endpoint.host, endpoint.port);
         let Some(file) = &self.known_hosts else {
             return Err(format!(
@@ -225,8 +145,8 @@ impl RemoteAuth {
             .to_ascii_lowercase();
         if connected != endpoint.host {
             return Err(format!(
-                "libgit2 connected to host {hostname:?}, not {:?} from the push URL; its host \
-                 key is not trusted",
+                "connected to host {hostname:?}, not {:?} from the push URL; its host key is \
+                 not trusted",
                 endpoint.host
             ));
         }
@@ -253,5 +173,148 @@ impl RemoteAuth {
                 endpoint.host
             )
         })
+    }
+}
+
+/// While alive, libgit2 connections made on this thread to an SSH URL use
+/// this remote's key and known hosts and report into its [`AuthState`]
+/// (see [`RemoteAuth::ssh_scope`]).
+#[must_use = "the scope ends when dropped"]
+pub(crate) struct SshScope {
+    #[cfg(feature = "ssh")]
+    _scope: Option<crate::ssh_transport::Scope>,
+}
+
+/// One remote's credentials, SSH key and known hosts, bound to its push
+/// URL's host.
+pub struct RemoteAuth {
+    name: String,
+    credentials: Option<CredentialFile>,
+    /// For ssh remotes only.
+    ssh: Option<Arc<SshRemote>>,
+}
+
+impl RemoteAuth {
+    pub fn new(remote: &RemoteSettings) -> Self {
+        let url = remote.push_url();
+        Self {
+            name: remote.name.clone(),
+            credentials: remote
+                .credentials
+                .as_ref()
+                .map(|path| CredentialFile::new(path, url)),
+            ssh: ssh_endpoint(url).map(|endpoint| {
+                Arc::new(SshRemote {
+                    name: remote.name.clone(),
+                    endpoint,
+                    key: remote
+                        .ssh_key
+                        .as_ref()
+                        .map(|path| SshKeyFile::new(path, url)),
+                    known_hosts: remote.known_hosts.as_ref().map(KnownHostsFile::new),
+                })
+            }),
+        }
+    }
+
+    /// The push URL's host and port, if it is an ssh remote.
+    pub fn ssh(&self) -> Option<&Endpoint> {
+        self.ssh.as_deref().map(SshRemote::endpoint)
+    }
+
+    /// The remote's SSH side, if it is an ssh remote.
+    pub fn ssh_remote(&self) -> Option<&Arc<SshRemote>> {
+        self.ssh.as_ref()
+    }
+
+    /// Hands this remote's SSH side and `state` to the SSH transport for
+    /// libgit2 calls made on this thread until the scope is dropped.
+    /// Without it, or for a remote that is not an ssh remote, the transport
+    /// refuses every connection (design §11.1).
+    pub(crate) fn ssh_scope(&self, state: &Arc<AuthState>) -> SshScope {
+        #[cfg(feature = "ssh")]
+        {
+            SshScope {
+                _scope: self.ssh.as_ref().map(|remote| {
+                    crate::ssh_transport::Scope::enter(Arc::clone(remote), Arc::clone(state))
+                }),
+            }
+        }
+        #[cfg(not(feature = "ssh"))]
+        {
+            let _ = state;
+            SshScope {}
+        }
+    }
+
+    /// The credentials callback of one connection, reporting into `state`.
+    pub(crate) fn callbacks<'a>(&'a self, state: &'a AuthState) -> RemoteCallbacks<'a> {
+        let mut callbacks = RemoteCallbacks::new();
+        let calls = Cell::new(0);
+        callbacks.credentials(move |url, username, allowed| {
+            let result = self
+                .answer(url, username, allowed, &calls)
+                .and_then(|c| {
+                    Cred::userpass_plaintext(&c.username, &c.password)
+                        .map_err(|e| e.message().to_owned())
+                })
+                .map_err(|message| GitError::new(ErrorCode::Auth, ErrorClass::Callback, message));
+            if result.is_err() {
+                state.fail_auth();
+            }
+            result
+        });
+        callbacks
+    }
+
+    /// The credentials callback's decision (design §11.1): one username and
+    /// password (token) per connection, from the remote's own file, for its
+    /// own host only. SSH remotes never get one: their transport is
+    /// agentfs's own.
+    pub(crate) fn answer(
+        &self,
+        url: &str,
+        username: Option<&str>,
+        allowed: CredentialType,
+        calls: &Cell<u32>,
+    ) -> Result<Credential, String> {
+        let name = &self.name;
+        if self.ssh.is_some() {
+            return Err(format!(
+                "{url} asked libgit2 for credentials; ssh remotes authenticate only in \
+                 agentfs's SSH transport, with remote.{name}.agentfsSshKey"
+            ));
+        }
+        calls.set(calls.get() + 1);
+        if calls.get() > 1 {
+            return Err(format!("{url} rejected the credentials for remote {name}"));
+        }
+        let Some(file) = &self.credentials else {
+            return Err(format!(
+                "{url} asks for credentials and remote.{name}.agentfsCredentials is not set"
+            ));
+        };
+        if !allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
+            return Err(format!(
+                "{url} asks for {allowed:?}; only username and password (token) \
+                 credentials are supported"
+            ));
+        }
+        file.credential_for(url, username)
+            .map_err(|e| e.to_string())
+    }
+
+    /// [`SshRemote::check_host_key`] for an ssh remote.
+    #[cfg(test)]
+    pub(crate) fn check_host_key(
+        &self,
+        hostname: &str,
+        raw: Option<&[u8]>,
+        sha256: Option<&[u8; 32]>,
+    ) -> Result<(), String> {
+        match &self.ssh {
+            Some(remote) => remote.check_host_key(hostname, raw, sha256),
+            None => Err(format!("remote {} is not an ssh remote", self.name)),
+        }
     }
 }

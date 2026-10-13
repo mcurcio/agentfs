@@ -269,7 +269,7 @@ The transport is chosen from the push URL, as libgit2 does:
 | a path, `file://…` | local | default |
 | `http://…` | smart HTTP | default |
 | `https://…` | smart HTTP over TLS | `--features https` (OpenSSL) |
-| `ssh://…`, `ssh+git://…`, `git+ssh://…` (any case), scp-like `[user@]host:path` | SSH | `--features ssh` (libssh2, OpenSSL) |
+| `ssh://…`, `ssh+git://…`, `git+ssh://…` (any case), scp-like `[user@]host:path` | SSH | `--features ssh` (agentfs's SSH transport on russh; no OpenSSL) |
 | `git://…`, anything else | not supported for pushing | |
 
 scp-like syntax needs a `:` before any `/`, as in git; `[user@host:port]:path`
@@ -313,7 +313,9 @@ checked (a server that drops it) is `unreachable`. libgit2 uses the system's CA 
 - **User:** the URL's (`git@` above), else `git`.
 - **The key** is an **unencrypted** private key, OpenSSH format
   (`BEGIN OPENSSH PRIVATE KEY`, what `ssh-keygen` writes by default) or
-  PEM (`RSA`, `EC`, PKCS#8 `PRIVATE KEY`). No `.pub` file is needed.
+  PEM (`RSA`, `EC`, PKCS#8 `PRIVATE KEY`; not DSA). No `.pub` file is
+  needed. Ed25519 is recommended: RSA signing uses the pure-Rust `rsa`
+  crate, which has a timing side-channel advisory (RUSTSEC-2023-0071).
   Encrypted keys are refused (agentfs has no passphrase or ssh-agent
   support); remove a passphrase with `ssh-keygen -p -N '' -f <file>`.
   Make one for the volume and add its public half as a deploy key with
@@ -335,10 +337,9 @@ checked (a server that drops it) is `unreachable`. libgit2 uses the system's CA 
   ssh-keygen -lf known_hosts
   ```
 
-  **List every key type the server has**, as `ssh-keyscan` does by
-  default: libssh2 chooses the type (ECDSA, then Ed25519, then RSA)
-  before agentfs sees it, so a file with only the Ed25519 key of a server
-  that also has an ECDSA key is refused with "lists only ssh-ed25519".
+  The key types the file lists for the host are asked for first, in file
+  order, as OpenSSH does, so one of the server's keys is enough. A server
+  that has none of the listed types is refused with "lists only ...".
 - **What is checked:** before any authentication, the server's host key
   is looked up for the push URL's host (`[host]:port` on a port other
   than 22). Plain and hashed names, comma lists, `*` and `?` wildcards,

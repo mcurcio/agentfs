@@ -8,7 +8,7 @@
 //!
 //! `remote.<name>.agentfsSshKey` names an SSH remote's private key: an
 //! unencrypted OpenSSH (`BEGIN OPENSSH PRIVATE KEY`) or PEM (`RSA`, `EC`, or
-//! PKCS#8 `PRIVATE KEY`) file, handed to libssh2 from memory. Encrypted keys
+//! PKCS#8 `PRIVATE KEY`) file, decoded by the SSH transport. Encrypted keys
 //! and public keys are refused with a clear error.
 //!
 //! Both files are re-read whenever their stat stamp changes

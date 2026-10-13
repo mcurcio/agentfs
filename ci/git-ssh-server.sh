@@ -48,8 +48,8 @@ fi
 sudo usermod -p '*' "$user"
 sudo -u "$user" mkdir -p "$home/repos"
 
-# Host keys of every type, so known_hosts must list them all (libssh2 picks
-# the type, design §11.1).
+# Host keys of every type, so known_hosts has them all (agentfs asks for the
+# types known_hosts lists first, design §11.1).
 sudo install -d -m 0755 "$conf" "$conf/authorized_keys"
 for type in ed25519 ecdsa rsa; do
   sudo ssh-keygen -q -t "$type" -N '' -f "$conf/ssh_host_${type}_key"

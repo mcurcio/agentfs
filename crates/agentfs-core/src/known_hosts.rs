@@ -214,6 +214,25 @@ impl KnownHosts {
     }
 }
 
+impl KnownHosts {
+    /// The key types listed for `host` on `port` (plain lines only), in
+    /// file order without repeats: the host key algorithms an SSH client
+    /// should ask for first, as OpenSSH does.
+    pub fn key_types(&self, host: &str, port: Option<u16>) -> Vec<String> {
+        let name = lookup_name(host, port);
+        let mut types: Vec<String> = Vec::new();
+        for entry in &self.entries {
+            if entry.marker == Marker::None
+                && entry.hosts.matches(&name)
+                && !types.contains(&entry.key_type)
+            {
+                types.push(entry.key_type.clone());
+            }
+        }
+        types
+    }
+}
+
 /// The name a host is looked up by: the lowercased host on the default
 /// port, `[host]:port` on any other.
 pub fn lookup_name(host: &str, port: Option<u16>) -> String {
@@ -621,6 +640,27 @@ pub(crate) mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("not supported"), "{err}");
+    }
+
+    #[test]
+    fn key_types_follow_the_file() {
+        let (k1, k2, e1) = (ed25519(1), ed25519(2), ecdsa(1));
+        let kh = KnownHosts::parse(
+            &[
+                line("[h]:2222", &e1),
+                line("other", &k1),
+                line("[h]:2222", &k1),
+                line("[h]:2222", &k2),
+                format!("@revoked {}", line("[h]:2222", &ecdsa(2))),
+            ]
+            .join("\n"),
+        );
+        assert_eq!(
+            kh.key_types("h", Some(2222)),
+            ["ecdsa-sha2-nistp256", "ssh-ed25519"]
+        );
+        assert_eq!(kh.key_types("other", None), ["ssh-ed25519"]);
+        assert!(kh.key_types("h", None).is_empty());
     }
 
     #[test]

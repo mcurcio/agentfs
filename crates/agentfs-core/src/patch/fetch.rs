@@ -117,7 +117,8 @@ fn fetch_now(
     let prefix = inbox_prefix(volume);
     let refspec = format!("+{prefix}*:{prefix}*");
     let auth = RemoteAuth::new(remote);
-    let state = AuthState::default();
+    let state = AuthState::new();
+    let _scope = auth.ssh_scope(&state);
     let mut git_remote = match repo.remote_anonymous(url) {
         Ok(r) => r,
         Err(e) => return FetchOutcome::failed(name, PushFailureKind::Local, e.to_string()),
@@ -137,10 +138,10 @@ fn fetch_now(
     };
     if let Err(e) = result {
         let message = scrub(e.message(), url);
-        if let Some(why) = state.host_key_failure.into_inner() {
+        if let Some(why) = state.host_key_failure() {
             return FetchOutcome::failed(name, PushFailureKind::UntrustedHost, why);
         }
-        let kind = if state.auth_failed.get() {
+        let kind = if state.auth_failed() {
             PushFailureKind::Auth
         } else if e.code() == ErrorCode::User || cancel.load(Ordering::SeqCst) {
             PushFailureKind::Unreachable

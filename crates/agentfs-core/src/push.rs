@@ -68,8 +68,6 @@ use crate::history::init_libgit2;
 use crate::lfs::upload::objects_to_upload;
 use crate::lfs::{Direction, LfsError, ObjectCache, Transfer, UploadReport, transfer_for};
 use crate::push_size::Step;
-#[cfg(test)]
-use crate::remote_auth::CredentialAnswer;
 use crate::remote_auth::{AuthState, RemoteAuth};
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::StateDir;
@@ -891,7 +889,8 @@ impl RemotePusher {
     /// The remote's `refs/agentfs/<volume>/*` refs, as its receive side
     /// advertises them.
     fn list_remote(&self) -> Result<BTreeMap<String, Oid>, (PushFailureKind, String)> {
-        let auth = AuthState::default();
+        let auth = AuthState::new();
+        let _scope = self.auth.ssh_scope(&auth);
         let listed = (|| {
             let mut remote = self.repo.remote_anonymous(self.remote.push_url())?;
             let callbacks = self.auth.callbacks(&auth);
@@ -908,8 +907,8 @@ impl RemotePusher {
             let attempt = Attempt {
                 result: Err(e),
                 negotiated: false,
-                auth_failed: auth.auth_failed.get(),
-                host_key_failure: auth.host_key_failure.borrow().clone(),
+                auth_failed: auth.auth_failed(),
+                host_key_failure: auth.host_key_failure(),
                 updates: Vec::new(),
                 rejected: Vec::new(),
             };
@@ -957,7 +956,8 @@ impl RemotePusher {
     /// given oid on the remote, or the push is stopped before it is sent.
     fn attempt(&self, refspecs: &[String], expect: &[(String, Oid)]) -> Attempt {
         let negotiated = Cell::new(false);
-        let auth = AuthState::default();
+        let auth = AuthState::new();
+        let _scope = self.auth.ssh_scope(&auth);
         let updates = RefCell::new(Vec::new());
         let rejected = RefCell::new(Vec::new());
         let result = (|| {
@@ -999,8 +999,8 @@ impl RemotePusher {
         Attempt {
             result,
             negotiated: negotiated.get(),
-            auth_failed: auth.auth_failed.get(),
-            host_key_failure: auth.host_key_failure.into_inner(),
+            auth_failed: auth.auth_failed(),
+            host_key_failure: auth.host_key_failure(),
             updates: updates.into_inner(),
             rejected: rejected.into_inner(),
         }
@@ -1013,7 +1013,7 @@ impl RemotePusher {
         username: Option<&str>,
         allowed: CredentialType,
         calls: &Cell<u32>,
-    ) -> Result<CredentialAnswer, String> {
+    ) -> Result<crate::credentials::Credential, String> {
         self.auth.answer(url, username, allowed, calls)
     }
 
@@ -1350,10 +1350,11 @@ pub(crate) fn scrub_userinfo(message: &str, url: &str) -> String {
 /// treated as the remote being unreachable, except:
 ///
 /// - a certificate error (a TLS certificate that failed verification, or an
-///   SSH host key refused by libgit2 itself) is an untrusted host;
-/// - libssh2 failing to authenticate with the key it was given (a key it
-///   cannot load, or one the server refuses outright) is an authentication
-///   failure.
+///   SSH host key the SSH transport refused) is an untrusted host;
+/// - an authentication error (from the credentials callback, or the SSH
+///   transport's key being refused or unreadable) is an authentication
+///   failure;
+/// - a timeout is the remote being unreachable.
 pub fn classify(err: &GitError, negotiated: bool) -> PushFailureKind {
     match err.code() {
         ErrorCode::Auth => return PushFailureKind::Auth,
@@ -1361,13 +1362,6 @@ pub fn classify(err: &GitError, negotiated: bool) -> PushFailureKind {
         ErrorCode::Certificate => return PushFailureKind::UntrustedHost,
         ErrorCode::Timeout => return PushFailureKind::Unreachable,
         _ => {}
-    }
-    if err.class() == ErrorClass::Ssh
-        && err
-            .message()
-            .starts_with("failed to authenticate SSH session")
-    {
-        return PushFailureKind::Auth;
     }
     if !negotiated {
         return PushFailureKind::Unreachable;
@@ -1609,17 +1603,10 @@ mod tests {
                 );
             }
         }
-        // libssh2 could not authenticate with the key it was given.
+        assert_eq!(classify(&e(ErrorCode::Auth, ErrorClass::Ssh), false), Auth);
         assert_eq!(
-            classify(
-                &GitError::new(
-                    ErrorCode::GenericError,
-                    ErrorClass::Ssh,
-                    "failed to authenticate SSH session: Unable to extract public key"
-                ),
-                false
-            ),
-            Auth
+            classify(&e(ErrorCode::Timeout, ErrorClass::Ssh), true),
+            Unreachable
         );
         assert_eq!(
             classify(&e(ErrorCode::GenericError, ErrorClass::Ssh), false),
@@ -2782,10 +2769,10 @@ mod tests {
         let url = "https://git.example/o/r.git";
         assert_eq!(
             pusher.answer(url, None, CredentialType::USER_PASS_PLAINTEXT, &calls),
-            Ok(CredentialAnswer::UserPass(Credential {
+            Ok(Credential {
                 username: crate::credentials::DEFAULT_USERNAME.into(),
                 password: "tok".into()
-            }))
+            })
         );
         let again = pusher
             .answer(url, None, CredentialType::USER_PASS_PLAINTEXT, &calls)
@@ -2818,7 +2805,7 @@ mod tests {
     }
 
     /// An unencrypted OpenSSH private key file; only its header and cipher
-    /// name are ever parsed before libssh2.
+    /// name are parsed by these tests (the transport decodes the rest).
     fn openssh_key() -> String {
         let mut body = b"openssh-key-v1\0".to_vec();
         for field in [&b"none"[..], b"none", b""] {
@@ -2856,85 +2843,52 @@ mod tests {
     }
 
     #[test]
-    fn ssh_remotes_get_one_key_per_connection() {
+    fn ssh_remotes_get_only_their_own_key() {
         let (v, _key, _kh) = ssh_vol(&crate::known_hosts::tests::ed25519(1));
         let pusher = v.pusher("origin", Arc::new(NullSink));
-        let calls = Cell::new(0);
-        // The user name asked before authenticating is not an attempt.
-        for _ in 0..2 {
-            assert_eq!(
-                pusher.answer(SSH_URL, None, CredentialType::USERNAME, &calls),
-                Ok(CredentialAnswer::Username("git".into()))
-            );
+        // libgit2's credentials callback never serves an ssh remote: its
+        // transport is agentfs's own.
+        for allowed in [
+            CredentialType::USERNAME,
+            CredentialType::SSH_KEY | CredentialType::SSH_MEMORY,
+            CredentialType::USER_PASS_PLAINTEXT,
+        ] {
+            let err = pusher
+                .answer(SSH_URL, None, allowed, &Cell::new(0))
+                .unwrap_err();
+            assert!(err.contains("agentfs's SSH transport"), "{err}");
         }
-        assert_eq!(calls.get(), 0);
-        let offered = CredentialType::SSH_KEY
-            | CredentialType::SSH_CUSTOM
-            | CredentialType::SSH_MEMORY
-            | CredentialType::USER_PASS_PLAINTEXT;
-        match pusher.answer(SSH_URL, Some("deploy"), offered, &calls) {
-            Ok(CredentialAnswer::SshKey { username, key }) => {
-                assert_eq!(username, "deploy");
-                assert_eq!(key.text, openssh_key());
-            }
-            other => panic!("{other:?}"),
-        }
-        let again = pusher
-            .answer(SSH_URL, Some("deploy"), offered, &calls)
-            .unwrap_err();
-        assert!(again.contains("rejected the SSH key"), "{again}");
-
-        // No user from the URL or libgit2: `git`.
-        let calls = Cell::new(0);
-        assert!(matches!(
-            pusher.answer(SSH_URL, None, offered, &calls),
-            Ok(CredentialAnswer::SshKey { username, .. }) if username == "git"
-        ));
+        let remote = pusher.auth.ssh_remote().unwrap();
+        assert_eq!(remote.key(SSH_URL).unwrap().text, openssh_key());
         // Never for another host or port.
         for url in [
             "ssh://git@evil.example:2222/o/r.git",
             "ssh://git@git.example/o/r.git",
         ] {
-            let calls = Cell::new(0);
-            let err = pusher.answer(url, None, offered, &calls).unwrap_err();
+            let err = remote.key(url).unwrap_err();
             assert!(err.contains("bound to host"), "{err}");
         }
-        // Never a password, even when the server offers only that.
-        let calls = Cell::new(0);
-        let err = pusher
-            .answer(
-                SSH_URL,
-                None,
-                CredentialType::USER_PASS_PLAINTEXT | CredentialType::SSH_INTERACTIVE,
-                &calls,
-            )
-            .unwrap_err();
-        assert!(err.contains("does not accept public keys"), "{err}");
     }
 
     #[test]
     fn ssh_key_problems_are_auth_errors() {
         let (mut v, key, _kh) = ssh_vol(&crate::known_hosts::tests::ed25519(1));
-        let offered = CredentialType::SSH_KEY | CredentialType::SSH_MEMORY;
         fs::write(&key, "ssh-ed25519 AAAA me@host\n").unwrap();
         let pusher = v.pusher("origin", Arc::new(NullSink));
-        let err = pusher
-            .answer(SSH_URL, None, offered, &Cell::new(0))
-            .unwrap_err();
+        let remote = pusher.auth.ssh_remote().unwrap();
+        let err = remote.key(SSH_URL).unwrap_err();
         assert!(err.contains("no private key"), "{err}");
         assert!(err.contains(&key.display().to_string()), "{err}");
         fs::remove_file(&key).unwrap();
         assert!(
-            pusher
-                .answer(SSH_URL, None, offered, &Cell::new(0))
+            remote
+                .key(SSH_URL)
                 .unwrap_err()
                 .contains("reading credentials")
         );
         v.settings.remotes[0].ssh_key = None;
         let pusher = v.pusher("origin", Arc::new(NullSink));
-        let err = pusher
-            .answer(SSH_URL, None, offered, &Cell::new(0))
-            .unwrap_err();
+        let err = pusher.auth.ssh_remote().unwrap().key(SSH_URL).unwrap_err();
         assert!(err.contains("agentfsSshKey is not set"), "{err}");
     }
 

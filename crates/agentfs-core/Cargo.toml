@@ -36,21 +36,27 @@ sha2 = "0.11"
 # TLS unless the `https` feature adds native-tls (OpenSSL, as libgit2 uses).
 ureq = { version = "3.4", default-features = false }
 thiserror = "2.0.21"
+# The SSH transport (`ssh` feature, design §11.1): russh with ring, the
+# runtime that drives one connection.
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa"], optional = true }
+tokio = { version = "1.53", default-features = false, features = ["rt", "net", "time", "io-util"], optional = true }
 
 [dev-dependencies]
 # In-memory exporters for the telemetry tests.
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["testing"] }
 tempfile = "3.27.0"
+# The in-process SSH server of the transport tests (`ssh` feature).
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "process", "io-util", "time", "macros"] }
 
 [features]
 # Push to https:// remotes and https LFS endpoints: libgit2 and ureq with TLS
 # (both link OpenSSL and use the system trust store). Local,
 # file:// and plain http:// remotes need no feature.
 https = ["git2/https", "ureq/native-tls"]
-# Push to ssh:// and scp-like remotes: libgit2 with libssh2 (links
-# OpenSSL). Without it an ssh remote is reported as misconfigured (design
-# §11.1).
-ssh = ["git2/ssh"]
+# Push to ssh:// and scp-like remotes through agentfs's own libgit2
+# subtransport on russh (ring for crypto; no OpenSSL or libssh2). Without
+# it an ssh remote is reported as misconfigured (design §11.1).
+ssh = ["dep:russh", "dep:tokio"]
 # Test builds only: failpoints on the durable path (design §18 test 3,
 # `failpoints`). Never in a release or image.
 failpoints = []

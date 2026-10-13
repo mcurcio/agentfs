@@ -168,7 +168,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ssh
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config openssh-server openssh-client
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server openssh-client
       - run: cargo build --locked -p agentfs --features ssh
       - name: start ssh server
         run: ci/git-ssh-server.sh start "$RUNNER_TEMP/ssh-server" >>"$GITHUB_ENV"

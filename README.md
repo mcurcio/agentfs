@@ -500,12 +500,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 libgit2 is built from source, so a C compiler is needed. Local, `file://`
 and plain `http://` remotes work in the default build. Two features add
-transports; each links OpenSSL (`libssl-dev` and `pkg-config` on Debian
-and Ubuntu):
+transports: `https` links OpenSSL (`libssl-dev` and `pkg-config` on Debian
+and Ubuntu); `ssh` is agentfs's own transport on russh with ring, with no
+OpenSSL or libssh2:
 
 ```sh
 cargo build -p agentfs --features https      # https:// remotes and https LFS servers
-cargo build -p agentfs --features ssh        # ssh:// and scp-like remotes (libssh2)
+cargo build -p agentfs --features ssh        # ssh:// and scp-like remotes (russh)
 cargo build -p agentfs --features https,ssh  # both
 ```
 
@@ -514,8 +515,8 @@ ring: no OpenSSL; `ci/check-deps.sh` checks what each feature set links).
 
 A binary built without `ssh` reports SSH remotes as misconfigured and
 pushes its other remotes. SSH remotes need `agentfsSshKey` (an unencrypted
-private key) and `agentfsKnownHosts` (an OpenSSH known_hosts file listing
-every host key type the server has); see the
+private key) and `agentfsKnownHosts` (an OpenSSH known_hosts file with the
+server's host keys); see the
 [configuration reference](docs/configuration.md#ssh-remotes).
 
 The FUSE layer uses fuser's pure-Rust mount code, so building needs no
@@ -582,11 +583,13 @@ Every push runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 - **e2e ssh remotes** ([`ci/e2e-ssh.sh`](ci/e2e-ssh.sh)): pushes to a real
   OpenSSH server ([`ci/git-ssh-server.sh`](ci/git-ssh-server.sh): its own
   sshd on 127.0.0.1:2222, key-only authentication, a `git-shell` user),
-  with a binary built with `--features ssh`. Covers Ed25519 OpenSSH and RSA
+  with a binary built with `--features ssh` (agentfs's russh transport).
+  Covers Ed25519 OpenSSH and RSA
   PEM keys, plain and hashed known_hosts, a wrong key that fails only its
   own remote, unknown and changed host keys refused before the key is
   offered (checked in the sshd log), a key rotated under a running
-  `agentfs run`, a clean SIGTERM, and divergence over SSH.
+  `agentfs run`, a clean SIGTERM, divergence over SSH, and a patch-queue
+  inbox fetch (`agentfs patch apply`).
 - **e2e Git LFS** ([`ci/e2e-lfs.sh`](ci/e2e-lfs.sh)): git-lfs's reference
   `lfs-test-server` (pinned, [`ci/lfs-server.sh`](ci/lfs-server.sh)) behind
   the same nginx, with a separate LFS host that has its own users, and the

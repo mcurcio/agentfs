@@ -139,6 +139,30 @@ pub fn ssh_endpoint(url: &str) -> Option<Endpoint> {
     (!host.is_empty()).then_some(Endpoint { host, port })
 }
 
+/// The repository path of an SSH URL, as the remote command gets it
+/// (design §11.1): the percent-decoded path of `ssh://host/path`, without
+/// its leading `/` when it starts with `/~` (a home directory, as git
+/// does), or the `path` of scp-like `host:path` as written. `None` for any
+/// other transport or an empty path.
+pub fn ssh_path(url: &str) -> Option<String> {
+    if transport(url) != Transport::Ssh {
+        return None;
+    }
+    let path = match url.split_once("://") {
+        Some((_, rest)) => {
+            let start = rest.find('/')?;
+            let end = rest.find(['?', '#']).unwrap_or(rest.len()).max(start);
+            let path = percent_decode(&rest[start..end]);
+            match path.strip_prefix('/') {
+                Some(home) if home.starts_with('~') => home.to_owned(),
+                _ => path,
+            }
+        }
+        None => url[scp_like(url)?.len() + 1..].to_owned(),
+    };
+    (!path.is_empty() && path != "/").then_some(path)
+}
+
 /// `host`, `host:port`, `[v6]` or `[v6]:port`. `None` for a bad port.
 fn split_host_port(s: &str) -> Option<(&str, Option<u16>)> {
     if let Some(rest) = s.strip_prefix('[') {
@@ -331,6 +355,28 @@ mod tests {
             ("file:///x", None),
         ] {
             assert_eq!(ssh_endpoint(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn ssh_paths() {
+        for (url, expected) in [
+            ("ssh://git@host:2222/srv/r.git", Some("/srv/r.git")),
+            ("ssh://host/~/r.git", Some("~/r.git")),
+            ("ssh://host/~alice/r.git", Some("~alice/r.git")),
+            ("ssh://host/a%20b.git", Some("/a b.git")),
+            ("git+ssh://h/p?x#y", Some("/p")),
+            ("git@github.com:o/r.git", Some("o/r.git")),
+            ("host:/abs/r.git", Some("/abs/r.git")),
+            ("[git@host:2222]:r.git", Some("r.git")),
+            ("[::1]:r.git", Some("r.git")),
+            ("ssh://host", None),
+            ("ssh://host/", None),
+            ("host:", None),
+            ("/srv/a:b.git", None),
+            ("https://h/p", None),
+        ] {
+            assert_eq!(ssh_path(url).as_deref(), expected, "{url}");
         }
     }
 

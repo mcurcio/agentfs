@@ -1485,17 +1485,33 @@ agentfs does not scan content for secrets and does not hold pushes.
     rules: bound to its origin, no redirects followed, no proxies, TLS
     through OpenSSL and the system trust store with the `https` feature.
 - **SSH remotes** (`ssh://`, `ssh+git://`, `git+ssh://`, and scp-like
-  `[user@]host:path`, which needs a `:` before any `/`) need libgit2 built
-  with libssh2: the `ssh` cargo feature (libssh2 and OpenSSL).
+  `[user@]host:path`, which needs a `:` before any `/`) need the `ssh`
+  cargo feature. libgit2 is built without libssh2: agentfs registers its
+  own smart subtransport for these URLs (`ssh_transport.rs`), which runs
+  `git-upload-pack '<path>'` or `git-receive-pack '<path>'` over a
+  [russh](https://crates.io/crates/russh) session, with ring for its
+  cryptography (no OpenSSL, no libssh2). The remote's settings reach the
+  transport through a scope held on the pushing thread around each push
+  or fetch; a connection with no scope, or to another host or port than
+  the push URL's, fails closed.
   - `remote.<name>.agentfsSshKey` is an absolute path to an unencrypted
     private key, OpenSSH (`BEGIN OPENSSH PRIVATE KEY`) or PEM (`RSA`, `EC`,
-    PKCS#8), handed to libssh2 from memory, so no public key file is
-    needed. Encrypted keys and `.pub` files are refused with an `auth`
-    failure that says why. There is no ssh-agent and no passphrase support.
-  - The user is the URL's, else `git`. libgit2's request for a user name
-    before authenticating is answered without counting as the attempt.
-  - The host key is verified by agentfs, in libgit2's certificate callback,
-    which runs before any authentication, against
+    PKCS#8; not DSA), decoded by agentfs, so no public key file is needed.
+    Encrypted keys and `.pub` files are refused with an `auth` failure
+    that says why. There is no ssh-agent and no passphrase support. The key
+    is read and decoded before connecting: a key that cannot be is an
+    `auth` failure with nothing sent. It is offered once per connection;
+    a refusal is an `auth` failure naming its SHA256 fingerprint and the
+    user.
+  - The user is the URL's, else `git`.
+  - Connecting times out after 30 s, and the handshake, authentication
+    and every read or write of the git command after 5 min without
+    progress, as libgit2's own timeouts (§11.2) do for other transports
+    (they do not apply to custom ones). A command that fails (a missing
+    repository, a refused path) is reported with its exit status and its
+    stderr.
+  - The host key is verified by agentfs, in the transport, before any
+    authentication, against
     `remote.<name>.agentfsKnownHosts`: an absolute path to an OpenSSH
     known_hosts file, required for every SSH remote. The host is looked up
     as the push URL's host, or `[host]:port` on a port other than 22, and
@@ -1508,11 +1524,14 @@ agentfs does not scan content for secrets and does not hold pushes.
     the file, the name looked up, the key type, its SHA256 fingerprint and
     the `ssh-keyscan` command that lists the server's keys. Nothing is ever
     accepted on first use or written back.
-  - libssh2 picks the host key type (ECDSA, then Ed25519, then RSA) before
-    agentfs sees it, and git2 offers no way to steer that, so known_hosts
-    must list every type the server has, as `ssh-keyscan` prints them.
-  - libgit2 built with SSH also sends a local path containing a `:` after a
-    `/` (`/srv/a:b.git`) to its SSH transport. agentfs treats such a path as
+  - The host key types known_hosts lists for the host are asked for
+    first, in file order, then every other type russh supports, as
+    OpenSSH does. So a server with several host keys presents one the
+    file lists, and known_hosts needs only one of its keys; a server
+    whose types the file does not list still fails with the "lists only"
+    message.
+  - libgit2 sends a local path containing a `:` after a `/`
+    (`/srv/a:b.git`) to the SSH transport. agentfs treats such a path as
     local, as git does, so with the `ssh` feature its push fails, closed:
     neither a credential nor a key is offered and no host key is trusted.
 - **Tested end to end in CI:** local, `file://`, `http://` and `https://`
@@ -1521,7 +1540,11 @@ agentfs does not scan content for secrets and does not hold pushes.
   key-only authentication): Ed25519 OpenSSH and RSA PEM keys, plain and
   hashed known_hosts, a wrong key, unknown and changed host keys (the key
   is never offered: the sshd log shows no attempt with it), a key rotated
-  under a running `agentfs run`, and a divergence over SSH.
+  under a running `agentfs run`, and a divergence over SSH. The
+  transport's own tests (`ssh_transport/tests.rs`) run the same cases,
+  plus scp-like URLs, a patch-queue fetch, a missing repository, a
+  stalled server and the fail-closed cases, against an in-process russh
+  server running the real `git upload-pack` and `git receive-pack`.
   Git LFS (§7) in `ci/e2e-lfs.sh` against git-lfs's `lfs-test-server`
   behind the same nginx.
 
@@ -1548,7 +1571,8 @@ agentfs does not scan content for secrets and does not hold pushes.
   delay another. libgit2 has no way to cancel a push in progress, so
   shutdown waits for pushes only up to the grace period, then leaves them.
 - **Network timeouts.** libgit2 is set process-wide to give up on a
-  connection after 30 s and on a stalled read or write after 5 min. A remote
+  connection after 30 s and on a stalled read or write after 5 min, and
+  the SSH transport (§11.1) applies the same limits itself. A remote
   that accepts the connection and then stops responding ends as an
   `unreachable` failure with the usual alarm and backoff, rather than
   hanging its thread and silencing its alarms; `agentfs push`, which pushes
@@ -2959,8 +2983,8 @@ restartable (§14.2). The controller runs no children.
 |---|---|---|
 | FUSE | `fuser` 0.18 | Active. Multi-threaded dispatch with cloned fds, passthrough (`BackingId`). Default features are pure Rust: `mount(2)` as root, `fusermount3` otherwise, no libfuse. It sends the attribute inode number as the node id, so `st_ino` is the node id (§6) |
 | Git objects, commits, push, credentials | `git2` (libgit2) | Active. Has **no** filter or merge-driver registration, and its fsync option is only reachable through `libgit2-sys` |
-| TLS and SSH transports | `git2` features `https` (OpenSSL) and `ssh` (libssh2 through `libssh2-sys`, over OpenSSL), behind agentfs's `https` and `ssh` cargo features | C libraries, so feature-gated: default builds stay free of OpenSSL. `ssh` keys are handed to libssh2 from memory (`Cred::ssh_key_from_memory`) |
-| SSH host keys | agentfs's own known_hosts parser over `base64` and `sha1_smol` (HMAC-SHA1 for hashed names, written by hand and tested against RFC 2202) | Pure Rust. libgit2's own check reads `~/.ssh/known_hosts` only, so agentfs checks in the certificate callback instead (§11.1) |
+| TLS and SSH transports | `git2` feature `https` (OpenSSL) behind agentfs's `https` cargo feature; for `ssh`, agentfs's own libgit2 subtransport over `russh` 0.64 (ring and the pure-Rust `rsa` crate; `tokio` current-thread runtime per connection), libgit2 built without libssh2 | `https` is a C library, so feature-gated: default builds stay free of OpenSSL. `ssh` needs no OpenSSL or libssh2 (checked by `ci/check-deps.sh`), and russh gives the transport the host key before authentication, a host key algorithm preference and host certificates, which libssh2 1.11 cannot negotiate. The `rsa` crate has a timing side-channel advisory on private-key operations (RUSTSEC-2023-0071): Ed25519 keys are recommended |
+| SSH host keys | agentfs's own known_hosts parser over `base64` and `sha1_smol` (HMAC-SHA1 for hashed names, written by hand and tested against RFC 2202) | Pure Rust. The SSH transport checks host keys with it before any authentication, and never reads `~/.ssh` (§11.1) |
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust; chosen over libgit2's rules for the reasons in §4.4. gitoxide has no push, so it does not replace `git2` |
 | LFS | none exists: implemented in agentfs (§7) over `ureq` 3 (default features off: pure Rust, no TLS) and `sha2` 0.11; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, as `git2/https`; its webpki root bundle is compiled in but unused: the platform verifier reads the system store) | ureq's `native-tls-no-default` feature does not compile the native-tls connector in 3.4 (its code is behind the `native-tls` feature), hence `native-tls`. `reqwest` stays in the binary only, for OTLP |
 | Telemetry | `opentelemetry` 0.33 (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` (`http-proto`, `http-json`, `grpc-tonic`, `reqwest-blocking-client`) in the binary, with `tokio` (one worker, started only for gRPC); the `otlp-tls` feature adds `opentelemetry-otlp/tls-ring`, tonic's `tls-ring` and `tls-native-roots`, `rustls` 0.23 (ring), `rustls-native-certs` and reqwest's `rustls-no-provider` | OTLP http/protobuf, http/json and gRPC export. tonic and prost were already in the workspace for the CSI driver, and the OTLP gRPC code comes pre-generated in `opentelemetry-proto`: no protoc. The default build is verified pure Rust (no OpenSSL, ring, aws-lc, cmake or protoc); `otlp-tls` adds ring only (C and assembly, no cmake), never aws-lc or OpenSSL; `ci/check-deps.sh` checks both. With rustls in reqwest, ring is installed as the process's crypto provider |
@@ -3231,8 +3255,8 @@ runner.
 | Operation commits | The applying process or thread is registered as an actor; its records get trigger `restore`, the operator as author, and the operation in the journal record; each operation is its own commit with `Agentfs-Restore` or `Agentfs-Revert` (§9, §15) |
 | Control socket | `meta/control/agentfs.sock`, directory 0700, socket 0600, peer root or the daemon's user, addressed through `/proc/self/fd`; served by `mount`, `run` and `serve-history`; JSON lines, protocol v1, operations `push`, `restore` and `revert` (additive fields; one restore or revert at a time, a push beside it) (§2.2, §2.3, §15) |
 | History rewrite | A documented procedure with `git filter-repo --prune-empty never` in a mirror clone, then a force-push with lease per remote by an operator; not a command (§10, §15) |
-| SSH remotes | Built with the `ssh` cargo feature (libssh2). Each SSH remote names an unencrypted private key (`agentfsSshKey`) and a known_hosts file (`agentfsKnownHosts`), both required and both re-read when they change; the key is bound to the push URL's host and port and offered once per connection, as the URL's user, else `git`. No ssh-agent, no passphrases, no global or `~/.ssh` files (§11.1) |
-| Host key verification | Done by agentfs against `agentfsKnownHosts`, in libgit2's certificate callback, before any authentication; plain and hashed names, `[host]:port`, wildcards, negation and `@revoked` honoured, `@cert-authority` not supported; unknown, changed, unlisted-type and revoked keys refused, never learned (§11.1) |
+| SSH remotes | Built with the `ssh` cargo feature: agentfs's own transport on russh (2026-10, replacing libssh2). Each SSH remote names an unencrypted private key (`agentfsSshKey`) and a known_hosts file (`agentfsKnownHosts`), both required and both re-read when they change; the key is bound to the push URL's host and port and offered once per connection, as the URL's user, else `git`. No ssh-agent, no passphrases, no global or `~/.ssh` files (§11.1) |
+| Host key verification | Done by agentfs against `agentfsKnownHosts`, in the SSH transport, before any authentication; plain and hashed names, `[host]:port`, wildcards, negation and `@revoked` honoured, `@cert-authority` not supported; unknown, changed, unlisted-type and revoked keys refused, never learned; the host key types known_hosts lists are asked for first (§11.1) |
 | Untrusted host reason | SSH host key refusals and TLS certificates libgit2 refuses (`GIT_ECERTIFICATE`: a self-signed or unknown CA, a host name the certificate does not cover) fail the push as `untrusted_host`, apart from `unreachable`, so a possible interception alarms differently from a network problem. A TLS handshake that fails before any certificate check (a server that drops it, as for a certificate host mismatch reached over an IP address in CI) stays `unreachable` (§11.3, §13) |
 | Phase 1 pod layout | One `ReadWriteOncePod` PVC mounted once at `/data` (`backing/`, `state/`: reflinks fail across mounts), `Recreate` strategy; the FUSE mount at `/agentfs/workspace`, a subdirectory of a shared `emptyDir` (Bidirectional in the sidecar, HostToContainer in workloads), so a dead daemon does not block the restarted sidecar or the pod's teardown (§17.1) |
 | Crashed daemon in a pod | Automatic: the kubelet restarts the sidecar, which runs `mount --on-stale-mount recover` and bind-stacks a new mount over the stale one; propagation reaches the workload containers and `subPath` binds without restarting them, and a stop detaches the stale layers. A clean exit mid-pod is fenced by the workload's read-only `emptyDir` (`EROFS`) and, for `subPath` consumers, by the sealed mount point (`--seal-mountpoint`: root's, mode 0000, `EACCES` for non-root); they restart onto the new mount through a liveness probe. A stale mount of another volume is refused. `hold` (manual pod restart) remains (§17.1) |
