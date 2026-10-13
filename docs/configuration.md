@@ -585,6 +585,23 @@ each for the objects the ones before it could not provide. It takes no
 state-area lock, so it runs beside a mount, and exits 1 unless every
 object is cached afterwards.
 
+`agentfs lfs prune` frees the cache. It is never run automatically, and
+it deletes nothing on any server: a cached object is deleted only when
+every remote's LFS endpoints (upload, and download if that is another
+endpoint) confirm they hold it. A remote that is misconfigured or has no
+reachable endpoint refuses the prune.
+
+```sh
+agentfs lfs prune --dry-run         # what would go, and which remote lacks what
+agentfs lfs prune --older-than 24h  # keep what was cached in the last day
+```
+
+It runs beside a mount: it waits `--wait-lock` (default: not at all) for
+restores and fetches using the cache and exits 75 while they still do. A
+pruned object is downloaded again when a restore needs it; a remote added
+later needs `agentfs lfs fetch --all` before its first push. See
+[lfs-storage.md](runbooks/lfs-storage.md).
+
 ### When uploads fail
 
 Uploads run before every push attempt of each remote, for the objects the
@@ -607,7 +624,7 @@ variable). `agentfs <command> --help` prints them too.
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | all |
 | `--root DIR` | `AGENTFS_ROOT` | the current directory | all: required by `record` and `serve-history`; used by `flush`, `run`, `patch apply`, and `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
-| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it |
+| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold |
 
 **Pod flags**, which name where the volume is mounted (design §9; in
 Kubernetes they come from the downward API). They fill the identity
@@ -642,7 +659,8 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--remote NAME` (repeatable) | | every remote | `push`: push only these remotes; `lfs fetch`: fetch only from these (in name order) |
 | `--timeout DURATION` | | `120s` | `push` through a running daemon: how long to wait for its pushes (clamped to 1s..10m); a push still running then carries on in the background, and the command exits 1 (also when a push stepped under `agentfsMaxPushSize` still has commits left). Pushing directly ignores it and keeps stepping until up to date or a failure |
 | `--force` | | | `restore`: write even files open for writing through the mount; `revert`: also revert paths changed again since the commit, and write files open for writing (§15) |
-| `--dry-run` | | | `restore`, `revert`: print the plan and write nothing; `lfs fetch`: report the objects (and bytes) missing from the cache, contacting no server |
+| `--dry-run` | | | `restore`, `revert`: print the plan and write nothing; `lfs fetch`: report the objects (and bytes) missing from the cache, contacting no server; `lfs prune`: report what would be deleted, deleting nothing |
+| `--older-than DURATION` | | every object | `lfs prune`: keep objects cached less than DURATION ago |
 | `--all` | | the branch head | `lfs fetch`: every object any commit on the branch references, instead of the head's (or the revisions given) |
 | `--no-fetch` | | | `patch apply`: apply what is already fetched, without contacting the patch remote |
 | `--json` | | | `patch status`: the status document and the local cache as JSON |

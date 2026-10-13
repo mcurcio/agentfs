@@ -252,7 +252,7 @@ enum Command {
         command: patch_cmd::PatchCommand,
     },
     /// The local Git LFS object cache (design §7): fetch the objects
-    /// commits reference.
+    /// commits reference, or prune those every remote holds.
     Lfs {
         #[command(subcommand)]
         command: lfs_cmd::LfsCommand,
@@ -542,7 +542,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Patch { command } => {
             return patch_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
         }
-        Command::Lfs { command } => return lfs_cmd::run(command, &state),
+        Command::Lfs { command } => return lfs_cmd::run(command, &state, cli.wait_lock),
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
             // A restarted sidecar whose daemon died (design §17.1).

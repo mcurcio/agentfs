@@ -81,6 +81,98 @@ impl ObjectCache {
         &self.dir
     }
 
+    /// Every cached object, with its modification time (when it was
+    /// cached): files at `objects/aa/bb/<oid>` whose name is an oid that
+    /// starts with `aabb`. Anything else there is left alone.
+    pub fn list(&self) -> io::Result<Vec<(Pointer, std::time::SystemTime)>> {
+        let mut out = Vec::new();
+        for aa in read_dir_sorted(&self.objects)? {
+            if !aa.is_dir() {
+                continue;
+            }
+            for bb in read_dir_sorted(&aa)? {
+                if !bb.is_dir() {
+                    continue;
+                }
+                for path in read_dir_sorted(&bb)? {
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    let Ok(oid) = name.parse::<LfsOid>() else {
+                        continue;
+                    };
+                    if object_path(&self.objects, &oid) != path {
+                        continue;
+                    }
+                    let meta = match fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.is_file() => meta,
+                        Ok(_) => continue,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e),
+                    };
+                    out.push((
+                        Pointer {
+                            oid,
+                            size: meta.len(),
+                        },
+                        meta.modified()?,
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes the cached object `pointer` (if it is still there with that
+    /// size), removing its `aa/bb` directories once empty and syncing the
+    /// directories above. Whether it was deleted.
+    pub fn remove(&self, pointer: &Pointer) -> io::Result<bool> {
+        let path = self.path(&pointer.oid);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() && meta.len() == pointer.size => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        fs::remove_file(&path)?;
+        let bb = path.parent().expect("an object path has a parent");
+        let aa = bb.parent().expect("an object path has a grandparent");
+        let _ = fs::remove_dir(bb);
+        let _ = fs::remove_dir(aa);
+        for dir in [bb, aa, &self.objects] {
+            if let Ok(dir) = File::open(dir) {
+                dir.sync_all()?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Deletes every partial download in `incomplete/` that no download
+    /// holds (its lock is free); those in use are kept. The number
+    /// deleted and their bytes.
+    pub fn remove_free_partials(&self) -> io::Result<(usize, u64)> {
+        let mut removed = (0, 0);
+        for path in read_dir_sorted(&self.incomplete)? {
+            let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+                continue;
+            };
+            if flock(&file, FlockOperation::NonBlockingLockExclusive).is_err() {
+                continue; // A download holds it.
+            }
+            let len = file.metadata()?.len();
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    removed.0 += 1;
+                    removed.1 += len;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        File::open(&self.incomplete)?.sync_all()?;
+        Ok(removed)
+    }
+
     /// `<state>/lfs/incomplete`, where resumable downloads are written.
     pub fn incomplete_dir(&self) -> &Path {
         &self.incomplete
@@ -407,6 +499,22 @@ pub(crate) fn publish_into(objects: &Path, tmp: &Path, oid: &LfsOid) -> io::Resu
     File::open(aa)?.sync_all()?;
     File::open(objects)?.sync_all()?;
     Ok(())
+}
+
+/// The entries of `dir`, sorted; none if it is missing.
+fn read_dir_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                out.push(entry?.path());
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Creates `dir` if it is missing; whether it was created.

@@ -87,6 +87,7 @@ lfs_faults() { # locations
     printf '%s\n' "${1:-}"
     printf 'location = /__faults { return 200 "%s"; }\n' "$generation"
   } >"$GIT_SERVER_LFS_FAULTS"
+  echo "LFS host fault rules: ${1:-none}" >&2
   nginx -p "$GIT_SERVER_DIR" -c "$GIT_SERVER_DIR/nginx.conf" -s reload
   local deadline=$((SECONDS + 20))
   until [ "$(curl -s http://127.0.0.1:8081/__faults)" = "$generation" ]; do

@@ -116,7 +116,8 @@ through the mount:
              ids carry the writer's slot in their high 16 bits (0 is the
              single process or the history service, 1..1023 a front, §14)
   lfs/       local LFS object cache (§7)
-    objects/aa/bb/<oid>  cached objects, git-lfs's layout; never pruned
+    objects/aa/bb/<oid>  cached objects, git-lfs's layout; pruned only by
+                         `agentfs lfs prune`
     tmp/                 objects being written
     incomplete/<oid>     resumable downloads (0600), each under its own flock
     lock                 flock: shared by restores and fetches, exclusive
@@ -1170,7 +1171,27 @@ checking that a remote has them.
 
 **Retention.** LFS objects cannot be pruned from most LFS servers
 (GitHub's needs the repository deleted), and pruned pointers break
-clones. agentfs prunes nothing, neither on servers nor in the local cache.
+clones. agentfs never deletes anything on a server, and never prunes on
+its own. The local cache is pruned only when an operator runs `agentfs
+lfs prune` ([runbook](runbooks/lfs-storage.md)), and only of objects
+confirmed on every valid remote's upload endpoint and on its download
+endpoint where that is another one: an upload batch that asks for no
+upload of the object and reports no error for it, a download batch that
+offers a download and no error, or for a file remote the file with the
+object's size. A per-object `404` keeps the object; any other failure
+aborts the prune. A misconfigured remote, or one whose endpoint cannot be
+resolved, refuses the whole prune (nothing could be confirmed there),
+and with no remote nothing is pruned. `--older-than` keeps recently
+cached objects; `--dry-run` deletes nothing. Confirmation takes no lock,
+since servers never forget; the deletions run under `<state>/lfs/lock`
+taken exclusive (waiting `--wait-lock`, else exit 75), which restores,
+reverts, patch applies and `lfs fetch` hold shared while they use the
+cache, so no object goes between a restore's check and its write.
+Partial downloads nothing holds are deleted too. Pushes need a cached
+copy only of objects their server lacks, so a pruned object costs a
+push nothing; a remote added after a prune that lacks old objects fails
+its push as `local` (stage `lfs`) with an `agentfs lfs fetch --all` hint
+until they are fetched back.
 It limits growth at the source instead, with operator rules, the `fsync`
 class's coalescing interval and `agentfs.maxSize` per path (§8).
 
@@ -2783,7 +2804,7 @@ one-time migration of Hermes' existing data and the initial import in
 - **`agentfs`, a binary:**
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
     `serve-history` (§14), `restore`, `revert`, `patch` (`submit`,
-    `apply`, `status`) and `lfs` (`fetch`); a test (`crates/agentfs/src/reference_tests.rs`)
+    `apply`, `status`) and `lfs` (`fetch`, `prune`); a test (`crates/agentfs/src/reference_tests.rs`)
     checks this list against the CLI;
   - `init` is safe to re-run (§2.3): exit 0 for the volume it already
     holds, 1 for another volume or branch; `--include` sets the config's
@@ -2830,7 +2851,10 @@ one-time migration of Hermes' existing data and the initial import in
     (or the trees of the revisions given, or every commit with `--all`),
     from the remotes in name order (§7). It takes no state-area lock, so
     it runs beside a daemon, and holds the cache lock shared; exit 1
-    unless every object is cached afterwards.
+    unless every object is cached afterwards; `lfs prune [--dry-run]
+    [--older-than DURATION]` deletes from the cache the objects every
+    remote's endpoints confirm (§7), taking the cache lock exclusive for
+    its deletions and exiting 75 while restores or fetches hold it.
 - **`agentfs mount <backing> <mountpoint>`** runs the FUSE session, the
   commit loop and the push loops in one process.
   - **Preflight.** Before anything is mounted it refuses a state area,
@@ -3372,7 +3396,8 @@ runner.
 | LFS endpoints and credentials | git-lfs's precedence (`lfs.pushurl`, `lfs.url`, `remote.<n>.lfspushurl`, `remote.<n>.lfsurl`, then derived `<url>.git/info/lfs`), from operator config only; local and `file://` remotes use the standalone-file layout; SSH needs an explicit `lfsurl`. Credentials: `agentfsLfsCredentials`, else `agentfsCredentials` on the push URL's own origin, else the URL's password; bound to the origin, sent to action hrefs only on that origin and without a server-given `Authorization`; no redirects, no proxies (§7) |
 | LFS uploads | Before every push attempt, for the objects the commits the remote lacks reference at managed paths; a failure is a `PushFailed` with stage `lfs` and no ref pushed. Batch API, `basic` transfer only, batches of 100 in sequence, `verify` when offered (§7) |
 | LFS transfers | `lfs.concurrenttransfers` (git-lfs's key, default 8, 1 to 64) objects at once within a batch, per remote, on scoped threads; an upload stops starting objects at its first failure and lets those in flight finish; restores prefetch every object they need concurrently, each remote in name order taking what the earlier ones could not provide. Downloads resume by byte (`Range`, from `<state>/lfs/incomplete/<oid>`, 3 tries on `unreachable`); uploads resume by object (the batch API skips what an earlier attempt finished); `tus` byte-level uploads are not built, since no testable server implements them (§7, §15, 2026-10) |
-| LFS cache and retention | `<state>/lfs/objects/aa/bb/<oid>`, written at commit time; nothing is pruned, locally or on servers (§7) |
+| LFS cache and retention | `<state>/lfs/objects/aa/bb/<oid>`, written at commit time; nothing is ever deleted on servers, and the local cache is pruned only by `agentfs lfs prune`, run by an operator (§7) |
+| LFS fetch and prune | `agentfs lfs fetch` downloads the objects the head, given revisions or every commit (`--all`) reference, from the remotes in name order, without the state-area lock; `agentfs lfs prune` deletes cached objects only when every valid remote's upload and download endpoints confirm them, refusing when a remote is misconfigured or has no endpoint; deletions under `<state>/lfs/lock` taken exclusive, which restores and fetches hold shared (§7, 2026-10) |
 | LFS restores | A pointer is checked out from the cache, else downloaded from the remotes in name order, every object before any write; tree content compared by SHA-256; `.gitattributes` without the managed block; a dry run only reports objects missing from the cache, downloading nothing (§7, §15) |
 | LFS client and TLS | agentfs's own client over `ureq` 3, pure Rust by default; the `https` feature adds `ureq`'s `native-tls` (OpenSSL, system trust store, as libgit2). An explicit https endpoint without the feature is a misconfigured remote; a derived one fails at push time as `local` (§7, §17.3) |
 | `fsync` class: opting in | Operator `info/attributes` only; `agentfs.commit`, `agentfs.coalesce` (at least 1s) and `agentfs.maxSize` values are validated at open, and a bad one fails the volume naming the line (§4.2, §8) |

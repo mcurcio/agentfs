@@ -7,14 +7,22 @@
 //!   state-area lock, so it runs beside a daemon, and holds the cache lock
 //!   shared. Exit 0 when every object is in the cache afterwards, 1
 //!   otherwise.
+//! - `prune` deletes from the cache the objects every remote's LFS
+//!   endpoints confirm they hold ([`agentfs_core::lfs::prune`]); only an
+//!   operator runs it, and nothing on a server is ever deleted. It takes
+//!   the cache lock exclusive for the deletions, waiting `--wait-lock` for
+//!   restores and fetches holding it, and exits 75 if they still do.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use clap::Subcommand;
 
+use agentfs_core::config::parse_duration;
 use agentfs_core::history::History;
 use agentfs_core::lfs::fetch::{self, FetchReport};
+use agentfs_core::lfs::prune::{self, PrunePlan};
 use agentfs_core::lfs::{ObjectCache, Pointer, referenced};
 use agentfs_core::paths::RepoPath;
 use agentfs_core::volume::{self, StateDir};
@@ -41,9 +49,29 @@ pub enum LfsCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Delete from the local cache the LFS objects every remote's LFS
+    /// endpoints confirm they hold (never anything on a server). Refuses
+    /// when a remote is misconfigured or has no LFS endpoint. Waits
+    /// --wait-lock for restores and fetches using the cache; exit 75 if
+    /// they still do.
+    Prune {
+        /// Report what would be deleted; delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep objects cached less than DURATION ago (e.g. 24h).
+        #[arg(long, value_name = "DURATION", value_parser = parse_age)]
+        older_than: Option<Duration>,
+    },
 }
 
-pub fn run(command: LfsCommand, state: &StateDir) -> Result<ExitCode> {
+fn parse_age(value: &str) -> Result<Duration, String> {
+    parse_duration(value).ok_or_else(|| format!("{value:?} is not a duration (use e.g. 30m, 24h)"))
+}
+
+/// Exit status when the cache lock is busy (`EX_TEMPFAIL`).
+const EXIT_LOCKED: u8 = 75;
+
+pub fn run(command: LfsCommand, state: &StateDir, wait_lock: Duration) -> Result<ExitCode> {
     match command {
         LfsCommand::Fetch {
             revisions,
@@ -51,6 +79,86 @@ pub fn run(command: LfsCommand, state: &StateDir) -> Result<ExitCode> {
             remotes,
             dry_run,
         } => fetch_cmd(state, &revisions, all, &remotes, dry_run),
+        LfsCommand::Prune {
+            dry_run,
+            older_than,
+        } => prune_cmd(state, dry_run, older_than, wait_lock),
+    }
+}
+
+fn prune_cmd(
+    state: &StateDir,
+    dry_run: bool,
+    older_than: Option<Duration>,
+    wait_lock: Duration,
+) -> Result<ExitCode> {
+    let (history, _) =
+        volume::inspect(state).with_context(|| format!("opening {}", state.root().display()))?;
+    let settings = history.settings().clone();
+    drop(history);
+    let plan = prune::plan(state, &settings, older_than)?;
+    print_plan(&plan, older_than);
+    if dry_run {
+        println!(
+            "dry run: would prune {}",
+            amount(plan.confirmed.len(), plan.confirmed_bytes())
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Some(report) = prune::apply(state, &plan, wait_lock)? else {
+        eprintln!(
+            "error: the LFS cache is in use (a restore, revert, patch apply or fetch holds \
+             {}/lock); nothing was pruned. Retry, or wait longer with --wait-lock",
+            state.lfs().display()
+        );
+        return Ok(ExitCode::from(EXIT_LOCKED));
+    };
+    println!("pruned {}", amount(report.pruned, report.bytes));
+    if report.partials > 0 {
+        println!(
+            "removed {} unfinished download(s), {} byte(s)",
+            report.partials, report.partial_bytes
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_plan(plan: &PrunePlan, older_than: Option<Duration>) {
+    println!(
+        "lfs prune: {} cached",
+        amount(plan.cached, plan.cached_bytes)
+    );
+    if plan.recent > 0 {
+        println!(
+            "  {} object(s) cached less than {:?} ago are kept",
+            plan.recent,
+            older_than.unwrap_or_default()
+        );
+    }
+    if plan.no_remotes {
+        println!("  no remote is configured: nothing can be confirmed, nothing is pruned");
+    }
+    for checked in &plan.checked {
+        println!(
+            "  {} ({}): {} confirmed at {}",
+            checked.remote,
+            checked.direction.operation(),
+            checked.confirmed,
+            checked.endpoint
+        );
+    }
+    let kept_bytes: u64 = plan.kept.iter().map(|(p, _)| p.size).sum();
+    if !plan.kept.is_empty() {
+        let lacking: Vec<String> = plan
+            .lacking()
+            .into_iter()
+            .map(|(remote, n)| format!("{remote} lacks {n}"))
+            .collect();
+        println!(
+            "kept {} that not every remote holds ({})",
+            amount(plan.kept.len(), kept_bytes),
+            lacking.join(", ")
+        );
     }
 }
 

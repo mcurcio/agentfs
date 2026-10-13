@@ -566,3 +566,104 @@ fn lfs_fetch_brings_back_what_commits_reference() {
         format!("{LARGE} two")
     );
 }
+
+#[test]
+fn lfs_prune_keeps_what_a_remote_lacks_and_fetch_brings_objects_back() {
+    let v = Volume::new();
+    let a = v.dir.path().join("a.git");
+    let b = v.dir.path().join("b.git");
+    bare(&a);
+    bare(&b);
+    v.config(&[
+        ("remote.a.url", a.to_str().unwrap()),
+        ("remote.b.url", b.to_str().unwrap()),
+    ]);
+    v.write("one.bin", &format!("{LARGE} one"), false);
+    v.write("two.bin", &format!("{LARGE} two"), false);
+    v.ok(&["record", "one.bin", "two.bin"]);
+    v.ok(&["push"]);
+    let one = oid_at(&v, "agentfs/demo", "one.bin");
+    let two = oid_at(&v, "agentfs/demo", "two.bin");
+    // b loses two.bin's object: only one.bin's is on every remote.
+    fs::remove_file(remote_object(&b, &two)).unwrap();
+
+    let out = v.ok(&["lfs", "prune", "--dry-run"]);
+    assert!(out.contains("would prune 1 object(s)"), "{out}");
+    assert!(out.contains("b lacks 1"), "{out}");
+    assert!(v.cached(&one).is_file(), "a dry run deleted an object");
+    // --older-than keeps what was cached recently.
+    let out = v.ok(&["lfs", "prune", "--older-than", "1h"]);
+    assert!(out.contains("pruned 0 object(s)"), "{out}");
+    assert!(v.cached(&one).is_file());
+    let out = v.ok(&["lfs", "prune"]);
+    assert!(out.contains("pruned 1 object(s)"), "{out}");
+    assert!(!v.cached(&one).exists());
+    assert!(v.cached(&two).is_file());
+
+    // A restore of a pruned object downloads it again.
+    fs::remove_file(v.tree().join("one.bin")).unwrap();
+    v.ok(&["record", "one.bin"]);
+    v.ok(&["restore", "one.bin", "agentfs/demo~1"]);
+    assert!(v.cached(&one).is_file());
+    v.ok(&["lfs", "prune"]);
+    assert!(!v.cached(&one).exists());
+
+    // A new remote after a prune: its first push needs objects the cache
+    // no longer has, and says how to get them back.
+    let c = v.dir.path().join("c.git");
+    bare(&c);
+    v.config(&[("remote.c.url", c.to_str().unwrap())]);
+    let out = v.run(&["push", "--remote", "c"]);
+    assert_eq!(out.status.code(), Some(1));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(all.contains("c: failed (local, stage lfs)"), "{all}");
+    assert!(all.contains("agentfs lfs fetch --all"), "{all}");
+    assert!(all.contains("one.bin"), "{all}");
+    assert_eq!(git_ok_or_none(&c), None);
+    v.ok(&["lfs", "fetch", "--all"]);
+    let out = v.ok(&["push", "--remote", "c"]);
+    assert!(out.contains("c: pushed"), "{out}");
+
+    // A misconfigured remote refuses the prune.
+    v.config(&[
+        ("remote.bad.url", "/nowhere"),
+        ("remote.bad.agentfsMaxBlobSize", "0"),
+    ]);
+    let out = v.run(&["lfs", "prune"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("remote bad is misconfigured"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn lfs_prune_waits_for_the_cache_lock() {
+    let v = Volume::new();
+    let a = v.dir.path().join("a.git");
+    bare(&a);
+    v.config(&[("remote.a.url", a.to_str().unwrap())]);
+    v.write("one.bin", LARGE, false);
+    v.ok(&["record", "one.bin"]);
+    v.ok(&["push"]);
+    let one = oid_at(&v, "agentfs/demo", "one.bin");
+    // A restore (here, the test) holds the cache lock shared.
+    let lock = fs::File::create(v.state().join("lfs/lock")).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockShared).unwrap();
+    let out = v.run(&["--wait-lock", "300ms", "lfs", "prune"]);
+    assert_eq!(out.status.code(), Some(75));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("in use"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(v.cached(&one).is_file());
+    drop(lock);
+    v.ok(&["lfs", "prune"]);
+    assert!(!v.cached(&one).exists());
+}

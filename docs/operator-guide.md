@@ -471,6 +471,9 @@ Runbooks, with the full procedures:
 - [history-rewrite.md](runbooks/history-rewrite.md): removing a recorded
   secret from the state area and every remote;
 - [stuck-pushes.md](runbooks/stuck-pushes.md): pushes that keep failing;
+- [lfs-storage.md](runbooks/lfs-storage.md): the LFS cache's size,
+  pruning it safely (`agentfs lfs prune`) and fetching objects back
+  (`agentfs lfs fetch`);
 - [patch-queue.md](runbooks/patch-queue.md): queued patches, a blocked
   queue, submitting with plain git;
 - [history-service-down.md](runbooks/history-service-down.md): fronts
@@ -528,11 +531,13 @@ a pointer, the content goes to an LFS server. It is off by default.
   `failed (<kind>, stage lfs)` and in `agentfs status` (`last error (…,
   stage lfs)`); see [stuck-pushes.md](runbooks/stuck-pushes.md#lfs-stage-failures).
 - **The cache.** Objects are kept in `<state>/lfs/objects` from commit
-  time on, and **never pruned**, locally or on the server: budget the
-  state area for every version of every LFS file, and watch
-  `agentfs.state.bytes{part="lfs"}`. A push needs every object its
-  commits reference in the cache; a lost object blocks that remote's
-  pushes with a `local` failure.
+  time on, until an operator runs `agentfs lfs prune`, which deletes only
+  objects every remote's LFS servers confirm they hold; nothing is ever
+  deleted on a server. Budget the state area for every version of every
+  LFS file between prunes, and watch `agentfs.state.bytes{part="lfs"}`.
+  A push needs a cached copy only of objects its server lacks; `agentfs
+  lfs fetch` brings objects back. See
+  [lfs-storage.md](runbooks/lfs-storage.md).
 - **Restores** write LFS content from the cache, or download it from the
   remotes (in name order) when the cache lacks it, before writing
   anything. `--dry-run` downloads nothing: it reports how many objects

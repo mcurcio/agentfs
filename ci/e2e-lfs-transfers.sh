@@ -14,7 +14,11 @@
 #     in <state>/lfs/incomplete/, and the next one asks for the rest with
 #     Range (lfs-test-server answers 206).
 # 16. agentfs lfs fetch: the head's objects, a revision's, --all, and a
-#     dry run; a restore after a fetch downloads nothing.
+#     dry run; a restore after a fetch downloads nothing;
+# 17. agentfs lfs prune: only objects lfs-test-server and a file:// remote
+#     both hold are deleted; a restore downloads a pruned object again; a
+#     remote added after the prune needs `lfs fetch --all` before its
+#     push; a misconfigured remote refuses the prune.
 #
 # Needs ci/git-http-server.sh started with GIT_SERVER_LFS=1, ci/lfs-server.sh,
 # and git-lfs.
@@ -136,7 +140,11 @@ mkdir -p "$TREE/r"
 for i in 1 2 3 4 5; do head -c 5000 /dev/urandom >"$TREE/r/$i.bin"; done
 agentfs record r/1.bin r/2.bin r/3.bin r/4.bin r/5.bin
 FAILING=$(oid_of r/3.bin)
+[ ${#FAILING} = 64 ] || fail "r/3.bin is not a pointer: '$FAILING'"
+echo "failing object: $FAILING"
 lfs_faults "$(lfs_location "^/acme/resume/objects/$FAILING\$" 'if ($request_method = PUT) { return 503; }')"
+assert_eq 503 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -u lfsbob:lfspw --data x \
+  "http://127.0.0.1:8081/acme/resume/objects/$FAILING")" "nginx refuses that object's PUT"
 set +e
 out=$(agentfs push --remote sep 2>&1); code=$?
 set -e
@@ -222,5 +230,54 @@ before=$(log_lines)
 agentfs restore a.bin "$FIRST"
 cmp "$TREE/a.bin" "$VOL/a.first" && pass "restored from the fetched cache"
 assert_eq 0 "$(gets_since "$before")" "the restore downloaded nothing"
+
+step "17. agentfs lfs prune"
+FILE_REMOTE=$VOL/file.git
+git init -q --bare "$FILE_REMOTE"
+volume_config remote.file.url "file://$FILE_REMOTE"
+agentfs push --remote file
+B=$(oid_of b.bin)
+A=$(oid_of a.bin)
+cached() { [ -f "$STATE/lfs/objects/${1:0:2}/${1:2:2}/$1" ]; }
+# The file remote loses b.bin's object.
+rm "$FILE_REMOTE/lfs/objects/${B:0:2}/${B:2:2}/$B"
+cached "$A" && cached "$B" || fail "the objects should be cached before the prune"
+out=$(agentfs lfs prune --dry-run)
+echo "$out"
+assert_contains "$out" "file lacks 1" "the dry run names the remote that lacks an object"
+assert_contains "$out" "sep (upload): 3 confirmed" "lfs-test-server confirms all three"
+cached "$A" || fail "the dry run deleted an object"
+out=$(agentfs lfs prune)
+assert_contains "$out" "pruned 2 object(s)" "two objects pruned"
+cached "$A" && fail "a.bin's object is still cached"
+cached "$B" || fail "b.bin's object was pruned though the file remote lacks it"
+pass "only what both remotes hold was pruned"
+rm "$TREE/a.bin"
+agentfs record a.bin
+agentfs restore a.bin agentfs/fetchv~1
+cmp "$TREE/a.bin" "$VOL/a.first" || fail "the restored a.bin differs"
+cached "$A" || fail "the restore did not download the pruned object"
+pass "a restore downloads a pruned object again"
+agentfs lfs prune >/dev/null
+FRESH=$VOL/fresh.git
+git init -q --bare "$FRESH"
+volume_config remote.fresh.url "file://$FRESH"
+set +e
+out=$(agentfs push --remote fresh 2>&1); code=$?
+set -e
+assert_eq 1 "$code" "the fresh remote's push fails"
+assert_contains "$out" "fresh: failed (local, stage lfs)" "at stage lfs, as local"
+assert_contains "$out" "agentfs lfs fetch --all" "with the hint"
+agentfs lfs fetch --all
+agentfs push --remote fresh
+assert_eq "$(local_head fetchv)" "$(remote_ref "$FRESH" refs/heads/agentfs/fetchv)" "after lfs fetch --all it pushes"
+volume_config remote.broken.url "$FRESH"
+volume_config remote.broken.agentfsMaxBlobSize 0
+set +e
+out=$(agentfs lfs prune 2>&1); code=$?
+set -e
+assert_eq 1 "$code" "a misconfigured remote refuses the prune"
+assert_contains "$out" "remote broken is misconfigured" "naming it"
+git --git-dir "$STATE/git" config --remove-section remote.broken
 
 step "all LFS transfer checks passed"

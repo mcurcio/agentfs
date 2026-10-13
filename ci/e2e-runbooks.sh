@@ -10,7 +10,11 @@
 # - history rewrite: the secret's blobs are gone from the state area and
 #   the remote, every commit and the last Agentfs-Seq survive, pushes are
 #   fast-forwards again, recording continues with a higher Agentfs-Seq,
-#   and the secret is not recorded again.
+#   and the secret is not recorded again;
+# - LFS storage (docs/runbooks/lfs-storage.md): a dry run deletes nothing
+#   and names the remote that lacks an object, a prune deletes only what
+#   every remote holds, `lfs fetch` brings it back, and a remote added
+#   after a prune gets its objects through `lfs fetch --all`.
 #
 # Needs git and git-filter-repo (the history-rewrite part). Run from the
 # repository root after `cargo build -p agentfs`:
@@ -159,5 +163,64 @@ out=$(agentfs record "$SECRET_PATH")
 assert_contains "$out" "skipped $SECRET_PATH" "the secret is not recorded again"
 assert_eq "" "$(git --git-dir "$STATE/git" log --all --format=%H -- "$SECRET_PATH")" \
   "history still has no secret"
+
+step "an LFS volume pushing to two file:// remotes"
+LW=$(mktemp -d)
+STATE=$LW/state
+BACKING=$LW/backing
+TREE=$BACKING
+mkdir -p "$BACKING"
+agentfs init --volume lfsbook >/dev/null
+volume_config agentfs.lfsThreshold 1k
+for r in one two; do
+  git init -q --bare "$LW/$r.git"
+  volume_config "remote.$r.url" "file://$LW/$r.git"
+done
+head -c 4000 /dev/urandom >"$BACKING/big.bin"
+head -c 4000 /dev/urandom >"$BACKING/other.bin"
+agentfs record big.bin other.bin >/dev/null
+agentfs push
+lfs_oid() { git --git-dir "$STATE/git" show "agentfs/lfsbook:$1" | sed -n 2p | sed 's/^oid sha256://'; }
+lfs_cached() { [ -f "$STATE/lfs/objects/${1:0:2}/${1:2:2}/$1" ]; }
+BIG=$(lfs_oid big.bin)
+OTHER_OID=$(lfs_oid other.bin)
+# Remote two loses other.bin's object: it must stay cached.
+rm "$LW/two.git/lfs/objects/${OTHER_OID:0:2}/${OTHER_OID:2:2}/$OTHER_OID"
+
+step "lfs-storage runbook: check what the servers hold"
+out=$(run_block lfs-storage.md lfs-dry-run)
+echo "$out"
+assert_contains "$out" "would prune 1 object(s)" "the dry run counts one object"
+assert_contains "$out" "two lacks 1" "it names the remote that lacks one"
+lfs_cached "$BIG" || fail "the dry run deleted an object"
+
+step "lfs-storage runbook: prune"
+out=$(run_block lfs-storage.md lfs-prune)
+echo "$out"
+assert_contains "$out" "pruned 1 object(s)" "one object pruned"
+lfs_cached "$BIG" && fail "big.bin's object is still cached"
+lfs_cached "$OTHER_OID" || fail "other.bin's object was pruned, though remote two lacks it"
+pass "only the object every remote holds was pruned"
+
+step "lfs-storage runbook: get objects back"
+run_block lfs-storage.md lfs-fetch-head
+lfs_cached "$BIG" || fail "lfs fetch did not bring big.bin's object back"
+pass "lfs fetch brought it back"
+
+step "lfs-storage runbook: a new remote after a prune"
+run_block lfs-storage.md lfs-prune >/dev/null
+NEW_REMOTE=three
+git init -q --bare "$LW/three.git"
+volume_config remote.three.url "file://$LW/three.git"
+set +e
+out=$(agentfs push --remote three 2>&1)
+set -e
+assert_contains "$out" "three: failed (local, stage lfs)" "the push needs the pruned object"
+assert_contains "$out" "agentfs lfs fetch --all" "and says how to get it back"
+run_block lfs-storage.md lfs-new-remote
+assert_eq "$(local_head lfsbook)" "$(remote_ref "$LW/three.git" refs/heads/agentfs/lfsbook)" \
+  "the new remote has the branch"
+[ -f "$LW/three.git/lfs/objects/${BIG:0:2}/${BIG:2:2}/$BIG" ] || fail "the new remote lacks big.bin's object"
+pass "and big.bin's object"
 
 step "runbooks passed"
