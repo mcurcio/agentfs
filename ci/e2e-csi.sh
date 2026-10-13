@@ -267,7 +267,8 @@ assert_eq "$NODE_NAME" "$(kubectl get volumeattachments -o jsonpath="{.items[?(@
   "the volume is attached to the node"
 
 step "(e) both pods write; commits from both reach the remote"
-in_pod writer-a 'printf a > /data/a.txt && mkdir -p /data/shared && printf a > /data/shared/from-a.txt'
+# A group-writable directory: fsGroup gives it the group, umask the mode.
+in_pod writer-a 'umask 002 && printf a > /data/a.txt && mkdir -p /data/shared && printf a > /data/shared/from-a.txt'
 in_pod writer-b 'printf b > /data/b.txt && printf b > /data/shared/from-b.txt'
 assert_eq a "$(in_pod writer-b 'cat /data/a.txt')" "writer-b reads writer-a's file"
 assert_eq "10000 10000" "$(in_pod writer-a 'stat -c "%u %g" /data/a.txt')" "writer-a's file is uid 10000, fsGroup 10000"
