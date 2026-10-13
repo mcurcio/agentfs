@@ -24,9 +24,10 @@
 //! | `.gitmodules` update starting with `!` (a command) | | `gitmodulesUpdate` |
 //! | `.gitmodules` size | over [`GITMODULES_MAX_SIZE`] | `gitmodulesLarge` |
 //! | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize`, unless stored as LFS | none (remote policy) |
+//! | LFS object size | over the smallest `remote.<name>.agentfsMaxLfsObjectSize`, when stored as LFS | none (remote policy) |
 //!
-//! There is one history for every remote, so the blob limit that applies is
-//! the smallest across remotes. Checks are pure: they read only the frozen
+//! There is one history for every remote, so the limits that apply are the
+//! smallest across remotes. Checks are pure: they read only the frozen
 //! copy they are given, so one [`Checks`] is shared by the recorder's
 //! threads and the committer.
 //!
@@ -92,25 +93,44 @@ pub struct BlobLimit {
     pub remote: String,
 }
 
+/// The LFS object size limit in force, and the remote it comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LfsLimit {
+    pub bytes: u64,
+    pub remote: String,
+}
+
 /// Limits from the configured remotes (design §11.3).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Limits {
     pub max_blob_size: Option<BlobLimit>,
+    /// `agentfsMaxLfsObjectSize`: content stored as LFS (design §7).
+    pub max_lfs_object_size: Option<LfsLimit>,
+}
+
+/// The smallest of `limit` across `remotes`, with its remote. Ties go to
+/// the first remote by name.
+fn smallest(
+    remotes: &[RemoteSettings],
+    limit: impl Fn(&RemoteSettings) -> Option<u64>,
+) -> Option<(u64, String)> {
+    remotes
+        .iter()
+        .filter_map(|r| limit(r).map(|bytes| (bytes, &r.name)))
+        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
+        .map(|(bytes, remote)| (bytes, remote.clone()))
 }
 
 impl Limits {
     /// The strictest limits across `remotes`. Ties go to the first remote
     /// by name.
     pub fn from_remotes(remotes: &[RemoteSettings]) -> Self {
-        let max_blob_size = remotes
-            .iter()
-            .filter_map(|r| r.max_blob_size.map(|bytes| (bytes, &r.name)))
-            .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
-            .map(|(bytes, remote)| BlobLimit {
-                bytes,
-                remote: remote.clone(),
-            });
-        Self { max_blob_size }
+        Self {
+            max_blob_size: smallest(remotes, |r| r.max_blob_size)
+                .map(|(bytes, remote)| BlobLimit { bytes, remote }),
+            max_lfs_object_size: smallest(remotes, |r| r.max_lfs_object_size)
+                .map(|(bytes, remote)| LfsLimit { bytes, remote }),
+        }
     }
 }
 
@@ -149,6 +169,14 @@ pub enum Refusal {
         bytes: usize,
     },
     BlobTooLarge {
+        bytes: u64,
+        limit: u64,
+        remote: String,
+    },
+    /// Content stored as LFS over the smallest
+    /// `agentfsMaxLfsObjectSize` (design §7): refused, never stored as a
+    /// blob instead.
+    LfsObjectTooLarge {
         bytes: u64,
         limit: u64,
         remote: String,
@@ -201,6 +229,7 @@ impl Refusal {
             Self::GitattributesTooLarge { .. } => "gitattributes_too_large",
             Self::GitattributesLineTooLong { .. } => "gitattributes_line_too_long",
             Self::BlobTooLarge { .. } => "blob_too_large",
+            Self::LfsObjectTooLarge { .. } => "lfs_object_too_large",
             Self::GitmodulesParse { .. } => "gitmodules_parse",
             Self::GitmodulesName { .. } => "gitmodules_name",
             Self::GitmodulesUrl { .. } => "gitmodules_url",
@@ -219,6 +248,7 @@ impl Refusal {
             Self::InvalidPath(_)
             | Self::PathTooLong { .. }
             | Self::BlobTooLarge { .. }
+            | Self::LfsObjectTooLarge { .. }
             | Self::MaxSize { .. }
             | Self::GroupMemberSkipped { .. } => None,
             Self::SymlinkedSpecialFile { file } => Some(match file {
@@ -285,6 +315,15 @@ impl fmt::Display for Refusal {
             } => write!(
                 f,
                 "{bytes} bytes is over the {limit}-byte limit of remote {remote}"
+            ),
+            Self::LfsObjectTooLarge {
+                bytes,
+                limit,
+                remote,
+            } => write!(
+                f,
+                "{bytes} bytes is over the {limit}-byte LFS object limit of remote {remote} \
+                 (agentfsMaxLfsObjectSize)"
             ),
             Self::GitmodulesParse { line } => {
                 write!(f, ".gitmodules cannot be parsed by git (line {line})")
@@ -438,22 +477,38 @@ impl Checks {
             .or_else(|| special_size(path, size))
     }
 
-    /// The size limit on the live backing file, before it is frozen, so a
-    /// file far over the limit is never copied (design §3.2). Advisory: the
-    /// file can change before the freeze, so [`Checks::check_file`] on the
+    /// The size limit of `store` (decided on the size on disk) on the
+    /// live backing file, before it is frozen, so a file far over the
+    /// limit is never copied (design §3.2, §7). Advisory: the file can
+    /// change before the freeze, so [`Checks::check_file_stored`] on the
     /// frozen copy stays the authoritative check. A file that cannot be
     /// stat'ed passes here and fails in the freeze.
-    pub fn check_backing_size(&self, backing: &Path) -> Option<Refusal> {
-        self.limits.max_blob_size.as_ref()?;
+    pub fn check_backing_size(&self, backing: &Path, store: Store) -> Option<Refusal> {
+        let limited = match store {
+            Store::Blob => self.limits.max_blob_size.is_some(),
+            Store::Lfs => self.limits.max_lfs_object_size.is_some(),
+        };
+        if !limited {
+            return None;
+        }
         let bytes = std::fs::metadata(backing).ok()?.len();
-        self.check_blob_size(bytes)
+        self.check_stored_size(bytes, store)
     }
 
     fn check_stored_size(&self, bytes: u64, store: Store) -> Option<Refusal> {
         match store {
             Store::Blob => self.check_blob_size(bytes),
-            Store::Lfs => None,
+            Store::Lfs => self.check_lfs_size(bytes),
         }
+    }
+
+    fn check_lfs_size(&self, bytes: u64) -> Option<Refusal> {
+        let limit = self.limits.max_lfs_object_size.as_ref()?;
+        (bytes > limit.bytes).then(|| Refusal::LfsObjectTooLarge {
+            bytes,
+            limit: limit.bytes,
+            remote: limit.remote.clone(),
+        })
     }
 
     fn check_blob_size(&self, bytes: u64) -> Option<Refusal> {
@@ -558,6 +613,7 @@ mod tests {
             push_url: None,
             max_blob_size: max,
             max_push_size: None,
+            max_lfs_object_size: None,
             credentials: None,
             ssh_key: None,
             known_hosts: None,
@@ -855,6 +911,69 @@ mod tests {
     }
 
     #[test]
+    fn lfs_object_limit_is_the_smallest_across_remotes_and_only_for_lfs() {
+        let lfs = |name: &str, max: Option<u64>| RemoteSettings {
+            max_lfs_object_size: max,
+            ..remote(name, None)
+        };
+        let limits = Limits::from_remotes(&[
+            lfs("a", Some(10)),
+            lfs("b", Some(5)),
+            lfs("c", None),
+            lfs("d", Some(5)),
+        ]);
+        assert_eq!(
+            limits.max_lfs_object_size,
+            Some(LfsLimit {
+                bytes: 5,
+                remote: "b".into()
+            })
+        );
+        assert_eq!(limits.max_blob_size, None);
+        let c = Checks::new(limits);
+        let dir = tempfile::tempdir().unwrap();
+        let five = dir.path().join("five");
+        fs::write(&five, b"12345").unwrap();
+        let six = dir.path().join("six");
+        fs::write(&six, b"123456").unwrap();
+        let refused = Refusal::LfsObjectTooLarge {
+            bytes: 6,
+            limit: 5,
+            remote: "b".into(),
+        };
+        assert_eq!(refused.label(), "lfs_object_too_large");
+        assert_eq!(refused.fsck_id(), None);
+        assert!(
+            refused.to_string().contains("agentfsMaxLfsObjectSize"),
+            "{refused}"
+        );
+        for stage in [Record, Commit] {
+            assert_eq!(
+                c.check_file_stored(&p("f"), &six, stage, Store::Lfs)
+                    .unwrap(),
+                Some(refused.clone())
+            );
+            assert_eq!(
+                c.check_file_stored(&p("f"), &five, stage, Store::Lfs)
+                    .unwrap(),
+                None
+            );
+            // A blob is not limited by it.
+            assert_eq!(
+                c.check_file_stored(&p("f"), &six, stage, Store::Blob)
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(c.check_size(&p("f"), 6, Store::Lfs), Some(refused.clone()));
+        assert_eq!(c.check_size(&p("f"), 6, Store::Blob), None);
+        // Before the freeze, by the store decided on the size on disk.
+        assert_eq!(c.check_backing_size(&six, Store::Lfs), Some(refused));
+        assert_eq!(c.check_backing_size(&six, Store::Blob), None);
+        assert_eq!(c.check_backing_size(&five, Store::Lfs), None);
+    }
+
+    #[test]
     fn missing_content_is_an_io_error() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
@@ -918,6 +1037,7 @@ mod tests {
                 bytes: 4000,
                 remote: "r".into(),
             }),
+            ..Default::default()
         });
         let cases: [(&str, Vec<u8>); 6] = [
             ("a.txt", b"hello".to_vec()),

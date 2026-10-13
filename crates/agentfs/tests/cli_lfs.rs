@@ -667,3 +667,34 @@ fn lfs_prune_waits_for_the_cache_lock() {
     v.ok(&["lfs", "prune"]);
     assert!(!v.cached(&one).exists());
 }
+
+#[test]
+fn lfs_objects_over_the_smallest_lfs_limit_are_refused_when_recorded() {
+    let v = Volume::new();
+    let a = v.dir.path().join("a.git");
+    bare(&a);
+    v.config(&[
+        ("remote.a.url", a.to_str().unwrap()),
+        ("remote.a.agentfsMaxLfsObjectSize", "64"),
+    ]);
+    v.write("small.bin", LARGE, false);
+    v.write("huge.bin", &LARGE.repeat(3), false);
+    let out = v.run(&["record", "small.bin", "huge.bin"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("path refused at record: huge.bin"), "{err}");
+    assert!(err.contains("LFS object limit of remote a"), "{err}");
+    let state_git = v.state().join("git");
+    pointer(&git_ok(&state_git, &["show", "agentfs/demo:small.bin"]));
+    assert!(
+        !git(&state_git, &["show", "agentfs/demo:huge.bin"])
+            .status
+            .success()
+    );
+    // status shows a bad value as a misconfiguration.
+    v.config(&[("remote.a.agentfsMaxLfsObjectSize", "0")]);
+    let status = v.ok(&["status"]);
+    assert!(
+        status.contains("a: misconfigured, not pushed: remote.a.agentfsMaxLfsObjectSize"),
+        "{status}"
+    );
+}

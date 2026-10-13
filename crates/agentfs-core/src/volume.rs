@@ -1124,9 +1124,10 @@ impl Recorder {
         if let Some(refusal) = self.checks.check_path(&path) {
             return Ok(Err((path, refusal)));
         }
-        // The store decides whether the blob limit applies (design §7):
-        // first by the size on disk, so a file far over the limit is never
-        // copied, then by the frozen copy's, which is what is journaled.
+        // The store decides which limit applies, the blob limit or the
+        // LFS object limit (design §7): first by the size on disk, so a
+        // file far over either limit is never copied, then by the frozen
+        // copy's, which is what is journaled.
         let attrs = self.rules.attributes(&path)?;
         let meta = std::fs::metadata(backing).ok();
         let stamp = meta.as_ref().map(FreezeStamp::from_metadata);
@@ -1136,8 +1137,9 @@ impl Recorder {
         if let Some(refusal) = over_max_size(on_disk, max_size) {
             return Ok(Err((path, refusal)));
         }
-        if self.store_policy.decide(&path, on_disk, &attrs) == Store::Blob
-            && let Some(refusal) = self.checks.check_backing_size(backing)
+        if let Some(refusal) = self
+            .checks
+            .check_backing_size(backing, self.store_policy.decide(&path, on_disk, &attrs))
         {
             return Ok(Err((path, refusal)));
         }
@@ -3131,6 +3133,77 @@ mod tests {
         config
             .set_i64(&format!("remote.{remote}.agentfsMaxBlobSize"), limit as i64)
             .unwrap();
+    }
+
+    fn set_lfs_limit(state: &StateDir, remote: &str, limit: u64) {
+        let mut config = git2::Config::open(&state.git().join("config")).unwrap();
+        config
+            .set_str(&format!("remote.{remote}.url"), "/nowhere")
+            .unwrap();
+        config
+            .set_i64(
+                &format!("remote.{remote}.agentfsMaxLfsObjectSize"),
+                limit as i64,
+            )
+            .unwrap();
+    }
+
+    /// Content stored as LFS over the smallest `agentfsMaxLfsObjectSize`
+    /// is refused when recorded, before it is frozen, and at commit time
+    /// for what was journaled before the limit was lowered (design §7).
+    #[test]
+    fn lfs_objects_over_the_lfs_limit_are_refused() {
+        let (dir, state) = setup();
+        set_lfs_threshold(&state, 4);
+        set_lfs_limit(&state, "r", 10);
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        {
+            let memory = Arc::new(MemorySink::new());
+            let (rec, com, _) =
+                open(&state, &tree, context(), memory.clone(), &Telemetry::noop()).unwrap();
+            rec.record(
+                Trigger::Close,
+                CALLER,
+                vec![
+                    write(dir.path(), "big.bin", "0123456789ab"),
+                    write(dir.path(), "ok.bin", "012345678"),
+                ],
+            )
+            .unwrap();
+            assert_eq!(journaled_stores(&rec), [("ok.bin".to_owned(), Store::Lfs)]);
+            // Refused before the freeze: only ok.bin's copy is pending.
+            assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 1);
+            let events = memory.take();
+            assert!(
+                matches!(&events[..], [Event::PathRefused {
+                    path,
+                    reason: Refusal::LfsObjectTooLarge { bytes: 12, limit: 10, remote },
+                    stage: CheckStage::Record,
+                }] if path == "big.bin" && remote == "r"),
+                "{events:?}"
+            );
+            drop(com);
+            // Not committed: the remount brings a lower limit.
+        }
+        set_lfs_limit(&state, "r", 8);
+        let memory = Arc::new(MemorySink::new());
+        let (_, com, _) =
+            open(&state, &tree, context(), memory.clone(), &Telemetry::noop()).unwrap();
+        assert_eq!(com.commit_pending().unwrap().refused, 1);
+        assert!(memory.take().iter().any(|e| matches!(
+            e,
+            Event::PathRefused {
+                reason: Refusal::LfsObjectTooLarge { .. },
+                stage: CheckStage::Commit,
+                ..
+            }
+        )),);
+        let head = com.history().head().unwrap();
+        assert!(
+            head.is_none_or(|h| h.tree().unwrap().get_path(Path::new("ok.bin")).is_err()),
+            "ok.bin was committed over the limit"
+        );
     }
 
     fn set_lfs_threshold(state: &StateDir, threshold: u64) {

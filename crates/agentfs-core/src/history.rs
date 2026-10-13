@@ -1470,6 +1470,7 @@ mod tests {
                 bytes,
                 remote: "r".into(),
             }),
+            ..Default::default()
         })
     }
 

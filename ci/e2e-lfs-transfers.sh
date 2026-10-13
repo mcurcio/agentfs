@@ -13,6 +13,10 @@
 # 14. downloads resume by byte: a download killed halfway leaves a partial
 #     in <state>/lfs/incomplete/, and the next one asks for the rest with
 #     Range (lfs-test-server answers 206).
+# 15. remote.<name>.agentfsMaxLfsObjectSize: a file over the smallest
+#     limit is refused when recorded; an object over a remote's own limit
+#     fails its push as too_large at stage lfs, with no upload; a bad value
+#     is a misconfiguration;
 # 16. agentfs lfs fetch: the head's objects, a revision's, --all, and a
 #     dry run; a restore after a fetch downloads nothing;
 # 17. agentfs lfs prune: only objects lfs-test-server and a file:// remote
@@ -142,7 +146,9 @@ agentfs record r/1.bin r/2.bin r/3.bin r/4.bin r/5.bin
 FAILING=$(oid_of r/3.bin)
 [ ${#FAILING} = 64 ] || fail "r/3.bin is not a pointer: '$FAILING'"
 echo "failing object: $FAILING"
-lfs_faults "$(lfs_location "^/acme/resume/objects/$FAILING\$" 'if ($request_method = PUT) { return 503; }')"
+# Only uploads touch the object during a push: answer every request for
+# it with 503.
+lfs_faults "$(lfs_location "^/acme/resume/objects/$FAILING" 'return 503;')"
 assert_eq 503 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -u lfsbob:lfspw --data x \
   "http://127.0.0.1:8081/acme/resume/objects/$FAILING")" "nginx refuses that object's PUT"
 set +e
@@ -174,7 +180,7 @@ HUGE=$(oid_of huge.bin)
 rm "$TREE/huge.bin"
 agentfs record huge.bin
 rm -rf "$STATE/lfs/objects"
-lfs_faults "$(lfs_location "^/acme/resume/objects/$HUGE\$" 'limit_rate 256k;')"
+lfs_faults "$(lfs_location "^/acme/resume/objects/$HUGE" 'limit_rate 256k;')"
 PARTIAL=$STATE/lfs/incomplete/$HUGE
 agentfs_start "$VOL/restore.log" restore huge.bin "$SOURCE"
 wait_for 60 sh -c "[ \"\$(stat -c %s '$PARTIAL' 2>/dev/null || echo 0)\" -gt $((512 << 10)) ]" ||
@@ -195,6 +201,35 @@ held_now=$(grep -o '"bytes=[0-9]*-"' <<<"$ranged" | head -n1 | tr -dc 0-9)
 assert_contains "$ranged" " 206 \"bytes=$held_now-\"" "lfs-test-server answered the Range with 206"
 assert_eq "$HUGE" "$(sha256sum "$STATE/lfs/objects/${HUGE:0:2}/${HUGE:2:2}/$HUGE" | cut -d' ' -f1)" "the cached object's hash"
 assert_eq 0 "$(find "$STATE/lfs/incomplete" -type f | wc -l)" "lfs/incomplete is empty"
+
+step "15. agentfsMaxLfsObjectSize"
+lfs_volume limits
+volume_config remote.sep.agentfsMaxLfsObjectSize 4k
+head -c 6144 /dev/urandom >"$TREE/six.bin"
+head -c 3072 /dev/urandom >"$TREE/three.bin"
+out=$(agentfs record six.bin three.bin 2>&1)
+assert_contains "$out" "path refused at record: six.bin" "a 6 KiB LFS file is refused"
+assert_contains "$out" "LFS object limit of remote sep" "naming the limit"
+git --git-dir "$STATE/git" cat-file -e agentfs/limits:six.bin 2>/dev/null && fail "six.bin is in history"
+oid_of three.bin >/dev/null && pass "three.bin is in history as LFS"
+agentfs push --remote sep
+# Another remote with a lower limit, set after three.bin was committed.
+LOW=$VOL/low.git
+git init -q --bare "$LOW"
+volume_config remote.low.url "file://$LOW"
+volume_config remote.low.agentfsMaxLfsObjectSize 2k
+set +e
+out=$(agentfs push --remote low 2>&1); code=$?
+set -e
+assert_eq 1 "$code" "the push to the lower limit fails"
+assert_contains "$out" "low: failed (too_large, stage lfs)" "as too_large at stage lfs"
+assert_contains "$out" "three.bin" "naming the path"
+[ -d "$LOW/lfs" ] && fail "something was uploaded to the low remote"
+assert_eq "" "$(remote_ref "$LOW" refs/heads/agentfs/limits)" "nothing pushed to it"
+volume_config remote.low.agentfsMaxLfsObjectSize 0
+assert_contains "$(agentfs status)" "low: misconfigured, not pushed: remote.low.agentfsMaxLfsObjectSize" \
+  "a zero limit is a misconfiguration"
+git --git-dir "$STATE/git" config --remove-section remote.low
 
 step "16. agentfs lfs fetch"
 lfs_volume fetchv

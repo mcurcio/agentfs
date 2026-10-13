@@ -127,7 +127,24 @@ restore or `agentfs lfs fetch`. A server that ignores `Range` sends the
 whole object again. Partials nobody resumes are deleted by the next
 prune.
 
-## 6. Limiting growth
+## 6. Server quotas and per-object limits
+
+LFS hosts cap the size of one object (GitHub: 2 GiB, up to 5 GiB on some
+plans) and often the total storage. Tell agentfs a remote's object cap so
+files over it are refused when they are written, instead of blocking that
+remote's pushes later:
+
+```sh
+git --git-dir "$STATE/git" config remote.origin.agentfsMaxLfsObjectSize 2g
+```
+
+The smallest cap across remotes applies at record time (`PathRefused`,
+reason `lfs_object_too_large`); a push to a remote checks its own cap on
+the objects it would upload and fails as `too_large` at stage `lfs`
+([stuck-pushes.md](stuck-pushes.md#lfs-stage-failures)). Total storage on
+a server only grows: see [Objects on servers](#objects-on-servers).
+
+## 7. Limiting growth
 
 - Store fewer, smaller objects: `agentfs.lfsThreshold`, operator
   `filter=lfs` and `agentfs.store` rules decide what goes to LFS; rules

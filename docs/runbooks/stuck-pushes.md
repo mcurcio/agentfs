@@ -41,8 +41,9 @@ with the next successful push. Design:
 it is left out: a name that is not a valid agentfs name, a relative
 `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`,
 `agentfsSshAgent`, `agentfsKnownHosts` or `agentfsLfsCredentials`, an LFS endpoint (`lfsurl`, `lfspushurl`,
-`lfs.url`, `lfs.pushurl`) that is not `http(s)`, `file://` or a path, an
-`agentfsMaxBlobSize` or `agentfsMaxPushSize` that is not a size; for an SSH push URL, a missing
+`lfs.url`, `lfs.pushurl`) that is not `http(s)`, `file://` or a path, a bad
+`lfs.concurrenttransfers`, an
+`agentfsMaxBlobSize`, `agentfsMaxPushSize` or `agentfsMaxLfsObjectSize` that is not a size; for an SSH push URL, a missing
 `agentfsKnownHosts`, neither or both of `agentfsSshKey` and
 `agentfsSshAgent`, an `agentfsSshKeyPassphrase` without `agentfsSshKey`,
 an `agentfsCredentials`, a
@@ -88,6 +89,7 @@ agentfs --state "$STATE" status
 | `local` | `lfs: none (…)` explains a missing endpoint: an SSH or `git://` remote needs `remote.<name>.lfsurl` (agentfs has no `git-lfs-authenticate`). "built without the `https` cargo feature": use an image built with `--features https`. "missing from the local cache": the remote's server lacks an object the commits reference and `<state>/lfs/objects` no longer has it (it was pruned by `agentfs lfs prune` before this remote got it, the remote is new or lagged behind, or the cache was lost): run `agentfs lfs fetch --all` to download it from the other remotes, then push ([lfs-storage.md](lfs-storage.md#4-a-new-remote-or-one-that-fell-behind-after-a-prune)) |
 | `unreachable` | The LFS server: DNS, connection, a 5xx or 429, or a transfer slower than 256 KiB/s past its 5-minute base timeout. `curl -sI <endpoint>/objects/batch` from the same pod |
 | `untrusted_host` | The LFS server's TLS certificate failed verification against the system trust store (recognised from OpenSSL's message; an unrecognised one shows as `unreachable`) |
+| `too_large` | An object the unpushed commits reference is over this remote's `agentfsMaxLfsObjectSize`; nothing was uploaded. The message names the path and oid. If the server takes it, raise the limit; otherwise the commit can only go out by [rewriting history](history-rewrite.md). New files over the smallest limit are refused when recorded (`PathRefused`, `lfs_object_too_large`) |
 | `refused` | Any other answer: the message has the HTTP status or the per-object error (`422` for an object over the server's size limit, `404` for a wrong endpoint, a redirect, which agentfs never follows: use the final URL as `lfsurl`) |
 
 Remotes whose unpushed commits reference no LFS object never contact an

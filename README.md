@@ -136,7 +136,9 @@ nested repository detection. Also:
   resume where they stopped. `agentfs lfs fetch` fills the local cache
   with the objects the head (or any revision, or `--all`) references, and
   `agentfs lfs prune` frees it of objects every remote confirms it holds
-  ([runbook](docs/runbooks/lfs-storage.md)). See
+  ([runbook](docs/runbooks/lfs-storage.md)), and
+  `remote.<name>.agentfsMaxLfsObjectSize` refuses objects over a host's
+  per-file cap when they are recorded. See
   [Git LFS](docs/configuration.md#git-lfs).
 - **Databases: the `fsync` class** (phase 2): files changed in place, such
   as SQLite databases, are captured whole (the database with its `-wal` or

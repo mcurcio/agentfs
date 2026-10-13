@@ -68,9 +68,10 @@ remote_ref() { # bare-repo ref
 
 # The LFS host of ci/git-http-server.sh (GIT_SERVER_LFS=1, 127.0.0.1:8081)
 # with nginx rules for chosen requests: one regex location for $1 (a path
-# regex) with the directives $2 (`limit_rate 256k;`, or
-# `if ($request_method = PUT) { return 503; }`), authenticated and proxied
-# like the host's own location. Print it into `lfs_faults`.
+# regex) with the directives $2 (`limit_rate 256k;`, or `return 503;`),
+# authenticated and proxied
+# like the host's own location. Print it into `lfs_faults`. A `return`
+# there answers every method.
 lfs_location() { # path-regex directives
   printf 'location ~ %s { %s auth_basic "lfs"; auth_basic_user_file %s; proxy_pass http://127.0.0.1:9001; }\n' \
     "$1" "$2" "$GIT_SERVER_DIR/htpasswd-lfs"

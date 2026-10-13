@@ -514,8 +514,9 @@ returned call is as durable as in single-process mode.
   | `.gitmodules` `update` starting with `!` (a command) | | `gitmodulesUpdate` |
   | `.gitmodules` size | over 512 MiB (git's `core.bigFileThreshold`) | `gitmodulesLarge` |
   | Blob size | over the smallest `remote.<name>.agentfsMaxBlobSize`, unless stored as LFS (§7) | none: remote policy |
+  | LFS object size | over the smallest `remote.<name>.agentfsMaxLfsObjectSize`, when stored as LFS (§7); reason `lfs_object_too_large` | none: remote policy |
 
-  There is one history for every remote, so the blob limit that applies is the
+  There is one history for every remote, so the limits that apply are the
   smallest across remotes. Changing a remote's limits takes a remount. A path
   refused at commit time stays in the in-memory tracked set (§4) until the
   next open.
@@ -979,9 +980,19 @@ and a replay is deterministic:
 5. Otherwise a blob.
 
 The blob size limit (`agentfsMaxBlobSize`, §3.4) does not apply to
-content stored as LFS: history holds only the pointer. Before the freeze
-the store is decided on the size on disk, so an LFS file far over the
-limit is still copied while a blob over it is not.
+content stored as LFS: history holds only the pointer. Content stored as
+LFS has its own limit instead, `remote.<name>.agentfsMaxLfsObjectSize`
+(per object, matching hosts' per-file LFS caps such as GitHub's 2 to
+5 GiB): the smallest across valid remotes applies when a file is
+recorded, because one history goes to every remote, and over it the file
+is refused (`PathRefused`, reason `lfs_object_too_large`), never stored
+as a blob instead, which would contradict `filter=lfs` and the blob
+limit. Before the freeze the store is decided on the size on disk and
+that store's limit applies, so a file far over either limit is never
+copied; the commit-time checks are the backstop for records journaled
+before a limit was lowered. At push time each remote checks its own limit
+on the objects it would upload and fails the attempt as `too_large`
+(stage `lfs`) before any request, with no ref pushed.
 
 **Commit.** Each LFS write is hashed (SHA-256) into the local object
 cache and committed as a canonical pointer blob (git-lfs spec v1:
@@ -1496,7 +1507,7 @@ agentfs does not scan content for secrets and does not hold pushes.
   - its name is not a valid agentfs name (§11.4, e.g. `team/backup`, which
     git accepts);
   - `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`,
-    `agentfsSshAgent` or `agentfsKnownHosts` is not an absolute path, or `agentfsMaxBlobSize` or `agentfsMaxPushSize` is not a
+    `agentfsSshAgent` or `agentfsKnownHosts` is not an absolute path, or `agentfsMaxBlobSize`, `agentfsMaxPushSize` or `agentfsMaxLfsObjectSize` is not a
     positive size;
   - its push URL is SSH and `agentfsKnownHosts` is missing, not exactly
     one of `agentfsSshKey` and `agentfsSshAgent` is set,
@@ -1701,7 +1712,13 @@ agentfs does not scan content for secrets and does not hold pushes.
 
 - **Limits are configured per remote.** `remote.<name>.agentfsMaxBlobSize`:
   commits are checked against it before they are made (§3.4); because one
-  history goes to every remote, the smallest limit applies. git's fsck
+  history goes to every remote, the smallest limit applies. The same goes
+  for `remote.<name>.agentfsMaxLfsObjectSize`, a limit per LFS object
+  (§7), which each remote also checks on the objects it would upload
+  before its push. There is no per-push budget for LFS bytes: objects are
+  uploaded one by one, outside the git pack, and an interrupted upload
+  resumes per object (§7), so a push-size limit would have nothing to
+  step. git's fsck
   rules are always enforced, not per remote: history may later go to a
   stricter remote, and a commit no remote accepts can never be pushed.
 - **A maximum push size** (`remote.<name>.agentfsMaxPushSize`, a positive
@@ -2057,11 +2074,11 @@ and logs above; the CLI also prints alarms to stderr.
 
 | Event | Raised when |
 |---|---|
-| `PathRefused` | A path fails the checks of §3.4 or §5, at record or commit time |
+| `PathRefused` | A path fails the checks of §3.4 or §5, at record or commit time, with the reason's label (for example `blob_too_large`, `lfs_object_too_large`, `max_size`) |
 | `RecordFailed` | The synchronous step fails (§3.5) |
 | `CommitFailed` | Turning records into a commit fails; the records stay journaled and are retried |
 | `ReconcileFailed` | Reconciling a moved directory (§3.1) failed 5 times over at least 30 s, with both paths and the error: the move is committed as journaled, and files beneath the destination that recording the tree would have added, dropped or recorded again differ from the tree until each changes again or is recorded with `agentfs record` |
-| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`, `too_large`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7), the head, the last pushed commit, the consecutive failure count and the next retry; stage `queue` for the patch remote's status, applied and inbox refs (§11.3), which never counts against the branch |
+| `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`, `too_large`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7; `too_large` at stage `lfs` is an object over the remote's `agentfsMaxLfsObjectSize`), the head, the last pushed commit, the consecutive failure count and the next retry; stage `queue` for the patch remote's status, applied and inbox refs (§11.3), which never counts against the branch |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
 | `PushLimited` | A push sent only part of the backlog because it was over the remote's `agentfsMaxPushSize`: the commit pushed, the head, the limit and the first-parent commits left; the next step follows at once (§11.3); a warning |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
@@ -3347,6 +3364,7 @@ runner.
 | Storage model | Real backing tree with FUSE passthrough; the projection is logical only |
 | Several pods on one volume | Supported by the CSI driver, one committer identity per replica (§14, §9); built at single-node level as `serve-history` and front mounts (§14.1), started per volume and per pod by the CSI driver, one node per volume (§14.2) |
 | Rejected pushes | Alarm, retry, keep operating (§11.3) |
+| LFS object size limit | `remote.<name>.agentfsMaxLfsObjectSize`, per object: the smallest across valid remotes refuses LFS content at record time (`PathRefused`, `lfs_object_too_large`, also before the freeze) with a commit-time backstop, never falling back to a blob; each remote's own limit fails its push as `too_large` at stage `lfs` before any upload; no per-push LFS byte budget (§7, §11.3, 2026-10) |
 | Push size limit | `remote.<name>.agentfsMaxPushSize`, measured before connecting with libgit2's pack builder (git pack only, not LFS); a backlog over it pushed in first-parent steps with `PushLimited` and the next step at once, applied and diverged refs held for the full push; a single commit over it fails as `too_large` with backoff, nothing sent; `agentfs push` steps until up to date (§11.3, 2026-10-13) |
 | Remotes | Any git remote, several at once (§11.1) |
 | Push timing | Intervals, independent of pod lifecycle, plus one bounded push at shutdown in `mount`, `run` and `serve-history`: after the final commit, one attempt per remote that lacks commits, within `--push-grace` (5 s; `0s` skips it), never retried and never extending shutdown past the grace. This sits beside the earlier decision that pushes run at intervals and that a pod's stop never waits on a push: the stop waits at most the grace, and what stays unpushed goes out on the next start (§11.2, 2026-10-13) |

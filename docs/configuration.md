@@ -190,6 +190,7 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `url` | URL or path | none: required | Where the remote is |
 | `pushurl` | URL or path | `url` | Where pushes go; wins over `url`, as in git. Everything below is checked against the push URL |
 | `agentfsMaxBlobSize` | positive size | no limit | The largest blob this remote accepts. Checked before each commit; with several remotes the smallest limit applies (§3.4, §11.3) |
+| `agentfsMaxLfsObjectSize` | positive size | no limit | The largest LFS object this remote's LFS server accepts. With several remotes the smallest applies when files are recorded: larger content stored as LFS is refused (`PathRefused`, `lfs_object_too_large`). A push also checks its own remote's limit before uploading (see [Size limit](#size-limit)) |
 | `agentfsMaxPushSize` | positive size | no limit | The largest git pack one push to this remote may send, measured before connecting. A larger backlog is pushed in first-parent steps (`PushLimited`); a single commit over it fails as `too_large`. LFS uploads are not counted (see [Push size](#push-size), §11.3) |
 | `agentfsCredentials` | absolute path | none | HTTP and HTTPS only: a file holding a token or `username=`/`password=` lines (see [HTTPS](#https-and-http-remotes)) |
 | `agentfsSshKey` | absolute path | none | SSH only: the private key (see [SSH](#ssh-remotes)). An SSH remote needs exactly one of this and `agentfsSshAgent` |
@@ -211,6 +212,7 @@ state file and appears in metrics.
 | the name is not a valid agentfs name | `remote.<name>` |
 | `agentfsMaxBlobSize` is not a positive size | `remote.<name>.agentfsMaxBlobSize` |
 | `agentfsMaxPushSize` is not a positive size | `remote.<name>.agentfsMaxPushSize` |
+| `agentfsMaxLfsObjectSize` is not a positive size | `remote.<name>.agentfsMaxLfsObjectSize` |
 | `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`, `agentfsSshAgent`, `agentfsKnownHosts` or `agentfsLfsCredentials` is not an absolute path | the key |
 | the push URL is SSH and `agentfsKnownHosts` is not set | `agentfsKnownHosts` |
 | the push URL is SSH and neither or both of `agentfsSshKey` and `agentfsSshAgent` are set | both keys |
@@ -565,6 +567,28 @@ git --git-dir /data/state/git config lfs.concurrenttransfers 16
   finished, and the next attempt sends only the rest. An object is never
   uploaded halfway and continued later (no LFS server agentfs can test
   supports git-lfs's experimental `tus` uploads).
+
+### Size limit
+
+LFS hosts cap the size of one object (GitHub: 2 GiB, up to 5 GiB on some
+plans). `agentfsMaxLfsObjectSize` tells agentfs a remote's cap:
+
+```sh
+git --git-dir /data/state/git config remote.origin.agentfsMaxLfsObjectSize 2g
+```
+
+- **When a file is recorded**, the smallest cap across remotes applies to
+  content stored as LFS (one history goes to every remote): a larger file
+  is refused, with a `PathRefused` alarm (reason `lfs_object_too_large`),
+  and stays in the backing tree. It is never stored as a git blob instead.
+  The size on disk is checked before the file is copied, and the commit
+  checks again what was recorded before the limit was lowered.
+- **When a remote is pushed**, its own cap is checked on the objects it
+  would upload: one over it fails the attempt as `too_large` at stage
+  `lfs`, before anything is sent ([stuck pushes](runbooks/stuck-pushes.md#lfs-stage-failures)).
+
+Unlike git pushes there is no per-push byte limit for LFS: objects go one
+by one to their own server, and a failed upload resumes per object.
 
 ### The local cache
 

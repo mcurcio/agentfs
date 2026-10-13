@@ -677,6 +677,29 @@ impl RemotePusher {
         if objects.is_empty() {
             return Ok(None);
         }
+        // This remote's own object limit, before anything is sent: a
+        // limit set after the objects were committed (design §7, §11.3).
+        if let Some(limit) = self.remote.max_lfs_object_size {
+            let over: Vec<String> = objects
+                .iter()
+                .filter(|(p, _)| p.size > limit)
+                .map(|(p, path)| format!("{path} ({}, {} bytes)", p.oid, p.size))
+                .collect();
+            if !over.is_empty() {
+                return Err(LfsError::new(
+                    PushFailureKind::TooLarge,
+                    format!(
+                        "{} LFS object(s) the unpushed commits reference are over \
+                         remote.{name}.agentfsMaxLfsObjectSize ({limit} bytes), so nothing \
+                         was uploaded: {}; raise the limit if the server takes them, or \
+                         remove them from history (see the history-rewrite runbook)",
+                        over.len(),
+                        over.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+                        name = self.remote.name
+                    ),
+                ));
+            }
+        }
         if self.transfer.is_none() {
             self.transfer = Some(transfer_for(
                 &self.settings,
@@ -3188,6 +3211,57 @@ mod tests {
                 [Event::PushFailed {
                     stage: PushStage::Lfs,
                     kind: PushFailureKind::Local,
+                    ..
+                }]
+            ));
+        }
+
+        /// An object over the remote's own `agentfsMaxLfsObjectSize`
+        /// fails the attempt as `too_large` before any batch request.
+        #[test]
+        fn objects_over_the_remotes_lfs_limit_fail_before_any_upload() {
+            let remote_dir = tempfile::tempdir().unwrap();
+            bare(remote_dir.path());
+            let url = remote_dir.path().display().to_string();
+            let server = FakeLfs::start();
+            let lfs_url = server.url();
+            let mut v = Vol::with_config(
+                "vol",
+                &[("origin", &url)],
+                &[THRESHOLD, ("remote.origin.lfsurl", &lfs_url)],
+            );
+            v.commit_file("big.bin", b"large content of 33 bytes, really");
+            // The limit is set after the commit: the record-time check
+            // never saw it.
+            v.settings.remotes[0].max_lfs_object_size = Some(16);
+            let (events, sink) = sink();
+            let mut pusher = v.pusher("origin", sink);
+            let outcome = pusher.push_once();
+            let PushOutcome::Failed {
+                kind,
+                stage,
+                message,
+                ..
+            } = &outcome
+            else {
+                panic!("{outcome:?}")
+            };
+            assert_eq!((*kind, *stage), (PushFailureKind::TooLarge, PushStage::Lfs));
+            assert!(message.contains("big.bin"), "{message}");
+            assert!(
+                message.contains("agentfsMaxLfsObjectSize (16 bytes)"),
+                "{message}"
+            );
+            assert!(server.seen().is_empty(), "{:?}", server.seen());
+            assert_eq!(
+                remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
+                None
+            );
+            assert!(matches!(
+                &events.take()[..],
+                [Event::PushFailed {
+                    kind: PushFailureKind::TooLarge,
+                    stage: PushStage::Lfs,
                     ..
                 }]
             ));

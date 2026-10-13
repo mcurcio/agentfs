@@ -1336,6 +1336,7 @@ mod lfs {
                     bytes: 3,
                     remote: "r".into(),
                 }),
+                ..Default::default()
             }),
             ..Policy::default()
         };

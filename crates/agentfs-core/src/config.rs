@@ -152,6 +152,7 @@ pub const KEYS: &[&str] = &[
     "remote.<name>.pushurl",
     "remote.<name>.agentfsMaxBlobSize",
     "remote.<name>.agentfsMaxPushSize",
+    "remote.<name>.agentfsMaxLfsObjectSize",
     "remote.<name>.agentfsCredentials",
     "remote.<name>.agentfsSshKey",
     "remote.<name>.agentfsKnownHosts",
@@ -225,6 +226,9 @@ pub struct RemoteSettings {
     /// to this remote may send, in bytes (design §11.3,
     /// [`crate::push_size`]). LFS uploads are not counted.
     pub max_push_size: Option<u64>,
+    /// `remote.<name>.agentfsMaxLfsObjectSize`: the largest LFS object
+    /// this remote's LFS server accepts, in bytes (design §7, §11.3).
+    pub max_lfs_object_size: Option<u64>,
     /// `remote.<name>.agentfsCredentials`: an absolute path to the
     /// credential file ([`crate::credentials`]). Not for ssh remotes.
     pub credentials: Option<PathBuf>,
@@ -635,6 +639,7 @@ fn remote(config: &git2::Config, name: &str) -> Result<RemoteSettings, ConfigErr
         url,
         max_blob_size,
         max_push_size: positive_size(config, &key("agentfsMaxPushSize"))?,
+        max_lfs_object_size: positive_size(config, &key("agentfsMaxLfsObjectSize"))?,
         credentials: path("agentfsCredentials")?,
         ssh_key: path("agentfsSshKey")?,
         known_hosts: path("agentfsKnownHosts")?,
@@ -953,6 +958,7 @@ mod tests {
                  \tconcurrenttransfers = 4\n\
                  [remote \"web\"]\n\turl = http://git.example/r.git\n\
                  \tpushurl = http://git.example/p.git\n\tagentfsMaxBlobSize = 100m\n\
+                 \tagentfsMaxLfsObjectSize = 2g\n\
                  \tagentfsCredentials = /run/c\n\tlfsurl = http://lfs.example/web\n\
                  \tlfspushurl = http://lfs.example/web-push\n\tagentfsLfsCredentials = /run/l\n\
                  [remote \"ssh\"]\n\turl = ssh://git@git.example/r.git\n\
@@ -1119,7 +1125,7 @@ mod tests {
         let (_d, c) = config_with(
             "[agentfs]\n\tvolume = v\n\
              [remote \"zeta\"]\n\turl = /srv/zeta.git\n\tagentfsMaxBlobSize = 100m\n\
-             \tagentfsMaxPushSize = 2g\n\
+             \tagentfsMaxPushSize = 2g\n\tagentfsMaxLfsObjectSize = 5g\n\
              [remote \"alpha\"]\n\turl = https://example.com/a.git\n\
              \tpushurl = https://push.example.com/a.git\n\
              \tagentfsCredentials = /run/secrets/alpha\n\
@@ -1142,6 +1148,8 @@ mod tests {
         assert_eq!(zeta.max_blob_size, Some(104_857_600));
         assert_eq!(zeta.max_push_size, Some(2 << 30));
         assert_eq!(alpha.max_push_size, None);
+        assert_eq!(zeta.max_lfs_object_size, Some(5 << 30));
+        assert_eq!(alpha.max_lfs_object_size, None);
         assert_eq!(s.remotes[0].url, "file:///srv/ab.git");
 
         let (_d, c) = config_with("[agentfs]\n\tvolume = v\n");
@@ -1178,6 +1186,14 @@ mod tests {
                 assert!(bad.error.contains("agentfsMaxPushSize"), "{bad:?}");
             }
         }
+        for size in ["0", "-1k"] {
+            let bad = invalid(&format!(
+                "[remote \"r\"]\n\turl = /x\n\tagentfsMaxLfsObjectSize = {size}\n"
+            ));
+            assert!(bad.error.contains("agentfsMaxLfsObjectSize"), "{bad:?}");
+        }
+        let bad = invalid("[remote \"r\"]\n\turl = /x\n\tagentfsMaxLfsObjectSize = huge\n");
+        assert_eq!(bad.name, "r");
         let bad = invalid("[remote \"r\"]\n\turl = /x\n\tagentfsMaxBlobSize = lots\n");
         assert_eq!(bad.name, "r");
         let bad = invalid("[remote \"r\"]\n\turl = /x\n\tagentfsCredentials = token\n");
