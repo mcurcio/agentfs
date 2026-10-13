@@ -1,0 +1,18 @@
+{
+  "comment": "Advisory performance budget (docs/performance.md): ci/bench-report.py warns when a result exceeds one, and never fails the job. Calibrated on GitHub's ubuntu-latest runners; see docs/performance.md for the measured numbers and the headroom left for runner noise.",
+  "budgets": [
+    {"match": {"suite": "record_step", "case": "record close 4k"}, "metric": "p50_us", "max": 2000, "why": "§3.2: a small file's change boundary"},
+    {"match": {"suite": "record_step", "case": "record close 4k"}, "metric": "p99_us", "max": 10000, "why": "§3.2 tail"},
+    {"match": {"suite": "record_step", "case": "record close 4k, 8 thread(s)"}, "metric": "p99_us", "max": 30000, "why": "group commit under concurrency"},
+    {"match": {"suite": "record_step", "case": "record unlink"}, "metric": "p50_us", "max": 2000, "why": "a removal is a journal append and fsync"},
+    {"match": {"suite": "record_step", "fs": "xfs", "case": "record close 16m"}, "metric": "p50_us", "max": 5000, "why": "§3.2: with reflink the step does not depend on file size"},
+    {"match": {"suite": "e2e", "workload": "close4k"}, "metric": "agentfs", "max": 3000, "why": "§3.2 through FUSE, p50"},
+    {"match": {"suite": "e2e", "workload": "clone"}, "metric": "ratio", "max": 6, "why": "a git clone into a recorded working tree"},
+    {"match": {"suite": "e2e", "workload": "npm"}, "metric": "ratio", "max": 4, "why": "excluded paths pay FUSE only"},
+    {"match": {"suite": "e2e", "workload": "create"}, "metric": "ratio", "max": 40, "why": "every small file's close is recorded"},
+    {"match": {"suite": "e2e", "workload": "rm"}, "metric": "ratio", "max": 40, "why": "every unlink is recorded"},
+    {"match": {"suite": "e2e", "fs": "xfs", "workload": "bigclose-fsync"}, "metric": "agentfs", "max": 1, "why": "§3.2: a reflink freeze of 1 GiB"},
+    {"match": {"suite": "e2e", "fs": "xfs", "workload": "bigclose-dirty"}, "metric": "agentfs", "max": 10, "why": "the reflink waits for writeback of the dirty pages"},
+    {"match": {"suite": "e2e", "fs": "ext4", "workload": "bigclose-fsync"}, "metric": "agentfs", "max": 20, "why": "§3.2: ext4 copies 1 GiB"}
+  ]
+}

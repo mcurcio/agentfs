@@ -1,0 +1,80 @@
+name: bench
+
+# The performance benchmark (design §18 test 13, docs/performance.md): the
+# synchronous record step, then workloads through real FUSE mounts on a
+# fresh XFS (reflink) and ext4 (copy) loop filesystem. Results go to the
+# job summary and an artifact; ci/bench-budget.json is advisory, so a
+# slow run warns and never fails. Correctness checks in ci/bench.sh do
+# fail the job.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: Smaller workloads, for a smoke run
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench:
+    name: bench (${{ matrix.fs }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [xfs, ext4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: bench
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config fuse3 xfsprogs jq python3
+      - name: show the runner
+        run: |
+          uname -a
+          nproc
+          free -m
+          df -h / /mnt "$RUNNER_TEMP" || true
+      - run: cargo build --locked --release -p agentfs
+      - run: ci/bench.sh ${{ matrix.fs }}
+        env:
+          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
+          BENCH_OUT: ${{ runner.temp }}/bench-${{ matrix.fs }}
+          BENCH_QUICK: ${{ inputs.quick && 1 || 0 }}
+      - name: report
+        if: always()
+        run: |
+          python3 ci/bench-report.py --budget ci/bench-budget.json \
+            "$RUNNER_TEMP/bench-${{ matrix.fs }}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-${{ matrix.fs }}
+          path: ${{ runner.temp }}/bench-${{ matrix.fs }}
+          retention-days: 90
+          if-no-files-found: warn
+      - name: clean up mounts
+        if: always()
+        run: |
+          sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
+          sudo losetup -D || true

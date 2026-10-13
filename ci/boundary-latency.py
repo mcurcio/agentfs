@@ -6,12 +6,15 @@ latency percentiles in microseconds. Through an agentfs mount, close is
 where the synchronous step happens (design §3.2): through a front it
 includes the round trip to the history service.
 
-    boundary-latency.py DIR [N] [LABEL]
+    boundary-latency.py [--json] DIR [N] [LABEL]
 
-Prints one line: `LABEL n=N p50=… p90=… p99=… max=…` (microseconds). The
-numbers are indicative only: CI runners are shared and noisy.
+Prints one line: `LABEL n=N p50=… p90=… p99=… max=…` (microseconds), or
+with --json one JSON object with the fields label, n, p50_us, p90_us,
+p99_us, max_us and mean_us. The numbers are indicative only: CI runners
+are shared and noisy.
 """
 
+import json
 import os
 import sys
 import time
@@ -27,12 +30,14 @@ def percentile(sorted_values, p):
 
 
 def main():
-    if len(sys.argv) < 2:
+    argv = [a for a in sys.argv if a != "--json"]
+    as_json = len(argv) != len(sys.argv)
+    if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
-    directory = sys.argv[1]
-    n = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
-    label = sys.argv[3] if len(sys.argv) > 3 else directory
+    directory = argv[1]
+    n = int(argv[2]) if len(argv) > 2 else 1000
+    label = argv[3] if len(argv) > 3 else directory
     os.makedirs(directory, exist_ok=True)
     payload = os.urandom(4096)
     closes = []
@@ -44,6 +49,21 @@ def main():
         os.close(fd)
         closes.append((time.perf_counter_ns() - start) / 1000.0)
     closes.sort()
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "label": label,
+                    "n": n,
+                    "p50_us": percentile(closes, 50),
+                    "p90_us": percentile(closes, 90),
+                    "p99_us": percentile(closes, 99),
+                    "max_us": closes[-1],
+                    "mean_us": sum(closes) / len(closes),
+                }
+            )
+        )
+        return 0
     print(
         "%s n=%d p50=%.0f p90=%.0f p99=%.0f max=%.0f"
         % (
