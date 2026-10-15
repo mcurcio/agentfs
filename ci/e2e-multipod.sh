@@ -410,6 +410,10 @@ except OSError as e:
     print(errno.errorcode.get(e.errno, e.errno))
 ' "$MNT_A/inherited.txt")
 assert_eq EIO "$OUT" "the close fails with EIO"
+# The repair is queued by RELEASE, which the kernel sends after close(2)
+# has returned.
+wait_for 10 sudo test -s "$STATE/meta/fronts/slot-$A_SLOT.repairs" ||
+  fail "front a never queued the repair"
 REPAIRS=$(sudo cat "$STATE/meta/fronts/slot-$A_SLOT.repairs")
 echo "$REPAIRS"
 assert_contains "$REPAIRS" "@origin " "the repair file names its pod"

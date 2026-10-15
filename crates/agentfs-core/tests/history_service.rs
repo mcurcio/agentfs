@@ -870,13 +870,14 @@ fn a_lost_reply_is_never_resent() {
     )
     .unwrap();
     let recorder = front_on(&env, client, sink);
-    let err = close(&env, &recorder, "a", "1").unwrap_err();
+    let result = close(&env, &recorder, "a", "1");
+    assert_eq!(seen.record.load(Ordering::SeqCst), 1, "resent: {result:?}");
+    let err = result.unwrap_err();
     let VolumeError::HistoryService(e) = &err else {
         panic!("{err:?}")
     };
     assert!(matches!(e, ClientError::Lost { sent: true, .. }), "{e:?}");
     assert_eq!(slot_copies(&env, 1), 1, "the copy stays for the service");
-    assert_eq!(seen.record.load(Ordering::SeqCst), 1, "never resent");
     drop(server);
 }
 
@@ -975,9 +976,10 @@ fn a_service_without_still_last_is_never_asked() {
         Arc::new(NullSink),
     )
     .unwrap();
+    let last = client.still_last(&path("f"), PendingId(1)).unwrap();
+    assert_eq!(seen.still_last.load(Ordering::SeqCst), 0, "asked");
+    assert!(!last);
     assert!(!client.supports("still_last"));
-    assert!(!client.still_last(&path("f"), PendingId(1)).unwrap());
-    assert_eq!(seen.still_last.load(Ordering::SeqCst), 0);
 }
 
 #[test]
