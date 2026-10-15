@@ -254,7 +254,9 @@ freeze and the journal's `fsync`, which both modes pay, dominate. The
 round trip varies with the runner from 49 to 148 µs, more between runs
 than between the designs tried; protocol 1 (JSON frames, before
 2026-10-15) had an 18 to 27 µs round trip and a 1.16 to 1.18 ratio. The
-full table is in design §14.1; nothing asserts thresholds.
+full table is in design §14.1. CI fails when the single-thread ratio's
+median over several runs of the bench exceeds 1.35
+([`ci/round-trip-bench.sh`](../ci/round-trip-bench.sh), design §19.1).
 
 ## Performance budget
 
