@@ -1,0 +1,68 @@
+# Two writers of the RWX claim, one per worker (required anti-affinity),
+# restricted, as the uid 10000 and 10001. Each writes a file every 200 ms
+# while /ledger/run exists, and appends each name whose close succeeded to
+# /ledger/acked (its own emptyDir); a failed close goes to /ledger/failed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writer
+  namespace: agentfs-csi-e2e-apps
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: writer }
+  template:
+    metadata:
+      labels: { app: writer }
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: writer }
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: writer
+          image: ghcr.io/mcurcio/agentfs
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          command:
+            - sh
+            - -c
+            - |
+              trap 'exit 0' TERM
+              i=0
+              while :; do
+                if [ -e /ledger/run ]; then
+                  i=$((i + 1))
+                  name="$POD-$i"
+                  if printf '%s' "$name" > "/data/stream/$name" 2>/dev/null; then
+                    echo "$name" >> /ledger/acked
+                  else
+                    echo "$name $(date -u +%s)" >> /ledger/failed
+                  fi
+                fi
+                sleep 0.2
+              done
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: shared, mountPath: /data, mountPropagation: HostToContainer }
+            - { name: ledger, mountPath: /ledger }
+      volumes:
+        - name: shared
+          persistentVolumeClaim: { claimName: shared-rwx }
+        - name: ledger
+          emptyDir: {}

@@ -32,6 +32,8 @@ jobs:
           kubectl kustomize ci/k8s-csi/driver >/dev/null
           kubectl kustomize ci/k8s-csi/apps >/dev/null
           kubectl kustomize ci/k8s-csi/negative >/dev/null
+          kubectl kustomize ci/k8s-csi/multinode | grep -c -- '--multi-node' | grep -qx 2
+          kubectl kustomize ci/k8s-csi/multinode-apps >/dev/null
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -154,10 +156,68 @@ jobs:
           kind delete cluster --name agentfs-csi || true
           ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
 
-  # Pushes the image e2e-kind and e2e-csi tested (the same tar, not a
-  # rebuild), from main only.
+  # The CSI driver on two nodes (design §14.2, §18 test 16): a kind cluster
+  # with two workers whose basePath is an NFS export on the runner, the
+  # driver with --multi-node, two pods on two nodes on one RWX volume,
+  # failover, node reboots and the plugin upgrade procedure.
+  e2e-csi-multinode:
+    name: e2e (CSI driver on two nodes over NFS)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentfs-image
+          path: ${{ runner.temp }}
+      - name: FUSE, nginx, fcgiwrap
+        run: |
+          sudo modprobe fuse
+          uname -a
+          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+      - name: install kind and kubectl
+        run: |
+          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
+          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+      - name: create the cluster
+        run: |
+          kind create cluster --name agentfs-mn --config ci/kind/multinode.yaml \
+            --image "$KIND_NODE_IMAGE" --wait 180s
+          kind load image-archive "$RUNNER_TEMP/agentfs-image.tar" --name agentfs-mn
+          kubectl get nodes -o wide
+      - name: NFS server on the kind network, mounted in every node
+        run: |
+          . ci/lib.sh
+          . ci/nfs-lib.sh
+          nfs_server "$RUNNER_TEMP/nfs-export"
+          GW=$(ci/e2e-csi-multinode.sh gateway)
+          for n in $(kind get nodes --name agentfs-mn); do
+            ci/kind/nfs-node-mount.sh "$n" "$GW"
+          done
+      - name: start git server
+        run: |
+          GIT_SERVER_EXTRA_LISTEN=$(ci/e2e-csi-multinode.sh gateway) \
+            ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
+      - run: ci/e2e-csi-multinode.sh
+        env:
+          KIND_CLUSTER: agentfs-mn
+      - name: diagnose
+        if: failure()
+        run: ci/e2e-csi-multinode.sh diagnose
+        env:
+          KIND_CLUSTER: agentfs-mn
+      - name: clean up
+        if: always()
+        run: |
+          kind delete cluster --name agentfs-mn || true
+          ci/git-http-server.sh stop "$RUNNER_TEMP/git-server" || true
+          timeout 30 sudo systemctl stop nfs-server || true
+
+  # Pushes the image e2e-kind, e2e-csi and e2e-csi-multinode tested (the
+  # same tar, not a rebuild), from main only.
   publish:
-    needs: [build, e2e-kind, e2e-csi]
+    needs: [build, e2e-kind, e2e-csi, e2e-csi-multinode]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:

@@ -154,6 +154,7 @@ impl StateLock {
     ) -> io::Result<HeartbeatHandle> {
         let file = self.held.file().try_clone()?;
         let line = format!("{}\n", self.held.line());
+        let path = self.held.path().to_path_buf();
         let fence_ref = crate::fence::install(fence);
         fence_ref.renew(Instant::now());
         let every = fence / 5;
@@ -178,7 +179,7 @@ impl StateLock {
                             }
                         }
                         let started = Instant::now();
-                        match renew(&file, &line) {
+                        match renew(&path, &file, &line) {
                             Ok(()) => fence_ref.renew(started),
                             Err(e) => {
                                 fence_ref.revoke();
@@ -198,16 +199,22 @@ impl StateLock {
     }
 }
 
-/// One renewal: the file must still hold this process's holder line (a
-/// node that took the lock over wrote its own: an NFS client whose lease
-/// expired may not say so otherwise), then the line is written again in
-/// place and synced, which an NFS server refuses once the lock is lost.
-fn renew(file: &std::fs::File, line: &str) -> io::Result<()> {
+/// One renewal: the lock file must still hold this process's holder
+/// line, read through a new open (on NFS an open revalidates the file with
+/// the server, where the held descriptor could answer from this client's
+/// cache); a node that took the lock over wrote its own line. Then the
+/// line is written again in place and synced, which an NFS server refuses
+/// once the lock is lost.
+///
+/// Opening and closing a second descriptor is safe here: the lock is a
+/// `flock` (on NFS emulated per open file description, not per process),
+/// which only the held descriptor's close releases.
+fn renew(path: &Path, file: &std::fs::File, line: &str) -> io::Result<()> {
+    use std::io::Read;
     use std::os::unix::fs::FileExt;
     crate::failpoints::hit("lock.heartbeat")?;
-    let mut now = vec![0u8; 512];
-    let n = file.read_at(&mut now, 0)?;
-    now.truncate(n);
+    let mut now = Vec::with_capacity(line.len());
+    std::fs::File::open(path)?.take(512).read_to_end(&mut now)?;
     if now != line.as_bytes() {
         return Err(io::Error::other(format!(
             "the lock file names another holder now: {}",

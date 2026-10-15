@@ -1,0 +1,69 @@
+# Applied by step (h) of ci/e2e-csi-multinode.sh (not in the
+# kustomization): an RWO claim and two pods of it on different workers.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: only-rwo
+  namespace: agentfs-csi-e2e-apps
+spec:
+  storageClassName: agentfs-ci
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# Two pods of the RWO claim, forced onto different workers: the second is
+# refused by the attach step (Multi-Attach).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rwo-first
+  namespace: agentfs-csi-e2e-apps
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  nodeSelector: { agentfs-ci/role: worker-a }
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: agentfs:ci
+      imagePullPolicy: IfNotPresent
+      command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: rwo, mountPath: /data }
+  volumes:
+    - name: rwo
+      persistentVolumeClaim: { claimName: only-rwo }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rwo-second
+  namespace: agentfs-csi-e2e-apps
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  nodeSelector: { agentfs-ci/role: worker-b }
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: agentfs:ci
+      imagePullPolicy: IfNotPresent
+      command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: rwo, mountPath: /data }
+  volumes:
+    - name: rwo
+      persistentVolumeClaim: { claimName: only-rwo }

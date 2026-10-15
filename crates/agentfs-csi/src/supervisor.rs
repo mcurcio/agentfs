@@ -1246,6 +1246,14 @@ async fn futures_join<F: std::future::Future<Output = ()>>(futures: impl Iterato
     }
 }
 
+/// Whether the volume was created for several nodes.
+fn multi_node_record(layout: &Layout, handle: &str) -> bool {
+    volume::load(layout, handle)
+        .ok()
+        .flatten()
+        .is_some_and(|r| r.multi_node)
+}
+
 /// Whether the volume has an active history service now: its endpoint
 /// file names the process holding the state lock (pid and node), so a
 /// crashed service's leftover file never counts (design §14.2).
@@ -1330,6 +1338,13 @@ fn prepare(
             })?;
         }
         Err(Error::FailedPrecondition(_)) if active_service(&state) => {}
+        // Another node is staging it right now (its lock is held, its
+        // service not yet active): the kubelet retries.
+        Err(Error::FailedPrecondition(e)) if multi_node_record(layout, handle) => {
+            return Err(Error::Unavailable(format!(
+                "volume {handle} is being staged on another node: {e}"
+            )));
+        }
         Err(e) => return Err(e),
     }
     volume::install_rules(layout, handle, &params.profile)?;

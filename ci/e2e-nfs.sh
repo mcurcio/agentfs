@@ -162,39 +162,31 @@ serve_bg node-1 "$A/leasevol/state" "$A/leasevol/tree" "$L" --listen-tls "$SERVE
 SVC=$SERVE_PID
 wait_for 30 grep -q '^serving history' "$L" || fail "never served"
 # Two ping-history fronts hold leases at once, one per client: distinct
-# slots.
-sudo env AGENTFS_NODE=node-1 "$AGENTFS_BIN" --state "$A/leasevol/state" ping-history --count 3000 \
-  >"$LOGS/ping-a.out" 2>&1 &
-PA=$!
+# slots. Long runs, so both are seen; then short timed runs.
+holders() { sudo "$AGENTFS_BIN" --state "$A/leasevol/state" status | grep 'command=ping-history' || true; }
+sudo env AGENTFS_NODE=node-1 "$AGENTFS_BIN" --state "$A/leasevol/state" ping-history \
+  --count 100000000 >/dev/null 2>&1 &
 sudo ip netns exec "$NS" env AGENTFS_NODE=node-2 "$AGENTFS_BIN" --state "$B/leasevol/state" \
-  ping-history --count 3000 >"$LOGS/ping-b.out" 2>&1 &
-PB=$!
-wait_for 20 sh -c "sudo $AGENTFS_BIN --state $A/leasevol/state status | grep -c 'command=ping-history' | grep -q 2" ||
-  fail "two leases were never held at once"
-HOLDERS=$(sudo "$AGENTFS_BIN" --state "$A/leasevol/state" status | grep 'command=ping-history')
+  ping-history --count 100000000 >"$LOGS/ping-long-b.out" 2>&1 &
+wait_for 30 sh -c "[ \$(sudo $AGENTFS_BIN --state $A/leasevol/state status | grep -c 'command=ping-history') -ge 2 ]" ||
+  fail "two leases were never held at once: $(holders); B: $(tail -n 3 "$LOGS/ping-long-b.out")"
+HOLDERS=$(holders)
 echo "$HOLDERS"
 assert_contains "$HOLDERS" "node=node-1" "a lease from client A"
 assert_contains "$HOLDERS" "node=node-2" "a lease from client B"
 [ "$(echo "$HOLDERS" | sed -n 's/^fronts:    slot \([0-9]*\):.*/\1/p' | sort -u | wc -l)" = 2 ] ||
   fail "the two fronts share a slot"
 pass "two clients lease distinct slots"
-wait "$PA" || fail "ping from A failed: $(cat "$LOGS/ping-a.out")"
-wait "$PB" || fail "ping from B failed: $(cat "$LOGS/ping-b.out")"
-PING_A=$(cat "$LOGS/ping-a.out")
-PING_B=$(cat "$LOGS/ping-b.out")
+kill_tree "[p]ing-history --count 100000000"
+wait_for 30 sh -c "! sudo $AGENTFS_BIN --state $A/leasevol/state status | grep -q 'command=ping-history'" ||
+  fail "killed fronts' leases were never freed: $(holders)"
+pass "a kill -9 frees the leases, on both clients"
+PING_A=$(sudo env AGENTFS_NODE=node-1 "$AGENTFS_BIN" --state "$A/leasevol/state" ping-history --count 3000)
+PING_B=$(sudo ip netns exec "$NS" env AGENTFS_NODE=node-2 "$AGENTFS_BIN" --state "$B/leasevol/state" \
+  ping-history --count 3000)
 echo "$PING_A"
 echo "$PING_B"
 assert_contains "$PING_B" "ping state from node node-2" "client B reached the service over TLS"
-# kill -9 of a lease holder on B frees its slot (the NFS client releases
-# the process's locks when it dies).
-sudo ip netns exec "$NS" env AGENTFS_NODE=node-2 "$AGENTFS_BIN" --state "$B/leasevol/state" \
-  ping-history --count 100000000 >/dev/null 2>&1 &
-wait_for 20 sh -c "sudo $AGENTFS_BIN --state $A/leasevol/state status | grep -q 'node=node-2 command=ping-history'" ||
-  fail "the long ping never leased"
-kill_tree "[p]ing-history --count 100000000"
-wait_for 30 sh -c "! sudo $AGENTFS_BIN --state $A/leasevol/state status | grep -q 'node=node-2 command=ping-history'" ||
-  fail "a killed front's lease on client B was never freed"
-pass "a kill -9 frees the lease across clients"
 sudo kill -TERM "$SVC"
 wait "$SVC" || fail "the lease volume's service did not stop cleanly"
 

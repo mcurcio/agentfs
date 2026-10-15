@@ -1,0 +1,21 @@
+# The CI overlay for the multi-node e2e (ci/e2e-csi-multinode.sh): the CI
+# driver (ci/k8s-csi/driver) with --multi-node on the controller and the
+# node plugins, whose basePath is the runner's NFS export mounted in each
+# kind node (ci/kind/nfs-node-mount.sh).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../driver
+
+patches:
+  - target: { kind: DaemonSet, name: agentfs-csi-node }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --multi-node
+  - target: { kind: Deployment, name: agentfs-csi-controller }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/3/args/-
+        value: --multi-node

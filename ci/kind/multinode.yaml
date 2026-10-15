@@ -1,0 +1,10 @@
+# Three nodes for the e2e-csi-multinode job (ci/e2e-csi-multinode.sh): the
+# control plane and two workers, each mounting the runner's NFS export at
+# the CSI driver's basePath (ci/kind/nfs-node-mount.sh). The node image is
+# pinned by digest on the command line (ci/install-kind.sh).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
