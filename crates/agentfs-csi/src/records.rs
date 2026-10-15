@@ -1,7 +1,9 @@
 //! The driver's persisted records (design §14.2): the controller's
 //! `csi.json` per volume, and each node's staged and published records,
 //! from which a restarted node plugin reconciles. Written atomically
-//! (mode 0600) with [`agentfs_core::fsutil::write_json_atomic`].
+//! (mode 0600) with [`agentfs_core::fsutil::write_json_atomic`]. A field
+//! this driver does not know fails the load: a record written for a
+//! behaviour it lacks (a multi-node volume) is refused, never half-read.
 
 use std::fs::{self, DirBuilder};
 use std::io;
@@ -15,6 +17,7 @@ use crate::params::{PodInfo, VolumeParams};
 
 /// `<base>/<handle>/csi.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeRecord {
     pub params: VolumeParams,
     /// As requested; recorded, not enforced.
@@ -32,6 +35,7 @@ pub struct VolumeRecord {
 /// `<node-state>/staged/<handle>.json`: the volume's history service runs
 /// on this node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StagedRecord {
     pub handle: String,
     pub params: VolumeParams,
@@ -40,6 +44,7 @@ pub struct StagedRecord {
 /// `<node-state>/published/<handle>/<key>.json`: a front serves this
 /// target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishedRecord {
     pub handle: String,
     pub target: PathBuf,
@@ -153,6 +158,39 @@ mod tests {
         remove(&path).unwrap();
         remove(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_record_with_fields_this_driver_does_not_know_is_refused() {
+        // A csi.json written for a multi-node volume (2026-10, since
+        // dropped): loading it must fail, naming the field.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csi.json");
+        let rec = VolumeRecord {
+            params: params(),
+            capacity_bytes: 1,
+            created: 1,
+            published_node: None,
+            static_volume: false,
+        };
+        let mut json = serde_json::to_value(&rec).unwrap();
+        json["multi_node"] = true.into();
+        json["published_nodes"] = serde_json::json!(["node-1", "node-2"]);
+        fs::write(&path, json.to_string()).unwrap();
+        let err = load::<VolumeRecord>(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            err.to_string().contains("unknown field `multi_node`"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("csi.json"), "{err}");
+        json.as_object_mut().unwrap().remove("multi_node");
+        fs::write(&path, json.to_string()).unwrap();
+        let err = load::<VolumeRecord>(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `published_nodes`"),
+            "{err}"
+        );
     }
 
     #[test]

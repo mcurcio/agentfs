@@ -330,6 +330,47 @@ jobs:
         if: always()
         run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
 
+  e2e-nfs:
+    name: e2e (NFS, one node at a time, passthrough ${{ matrix.passthrough }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        passthrough: [auto, off]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: nfs
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 jq python3
+      - name: enable user_allow_other, show the kernel
+        run: |
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          uname -a
+      - run: cargo build --locked --release -p agentfs -p agentfs-csi
+      - run: ci/e2e-nfs.sh
+        env:
+          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
+          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
+          AGENTFS_CSI_BIN: ${{ github.workspace }}/target/release/agentfs-csi
+      - name: diagnose
+        if: failure()
+        run: |
+          sudo cat /proc/fs/nfsd/clients/*/info 2>/dev/null || true
+          findmnt -t nfs4 || true
+          sudo journalctl -u nfs-server --no-pager -n 50 || true
+          sudo dmesg | tail -n 50 || true
+          tail -n 200 "$RUNNER_TEMP"/agentfs-nfs-logs/*.log 2>/dev/null || true
+      - name: clean up
+        if: always()
+        run: |
+          sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
+          for m in /mnt/nfs-a /mnt/nfs-b /mnt/nfs-v40 /mnt/nfs-flock; do timeout 20 sudo umount -f -l "$m" || true; done
+
   e2e-lfs:
     name: e2e (Git LFS)
     runs-on: ubuntu-24.04

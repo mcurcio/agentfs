@@ -54,7 +54,9 @@ impl fmt::Display for Address {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AddressError {
-    #[error("history service address {0:?} is not supported yet (design §14): use unix:<path>")]
+    #[error(
+        "history service address {0:?} is not supported: a front reaches its history service only over the Unix socket on its own node (unix:<path>, design §14.1)"
+    )]
     Unsupported(String),
     #[error("history service address {0:?} must be an absolute path or unix:<absolute path>")]
     NotAbsolute(String),
@@ -64,7 +66,7 @@ impl FromStr for Address {
     type Err = AddressError;
 
     /// `unix:<path>` or an absolute path. Other schemes (`tcp:`, …) are
-    /// for multi-node transport, which is not built yet.
+    /// refused: a volume is used from one node at a time.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let path = match s.strip_prefix("unix:") {
             Some(path) => path,
@@ -100,7 +102,7 @@ mod tests {
         for bad in ["tcp:host:7000", "grpc://h"] {
             let err = bad.parse::<Address>().unwrap_err();
             assert!(matches!(err, AddressError::Unsupported(_)), "{bad}");
-            assert!(err.to_string().contains("not supported yet (design §14)"));
+            assert!(err.to_string().contains("not supported: a front reaches"));
         }
         for bad in ["relative.sock", "unix:relative", "unix:", "/"] {
             assert!(

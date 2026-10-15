@@ -27,6 +27,7 @@ pub mod known_hosts;
 pub mod lfs;
 pub mod local_socket;
 pub mod lock;
+pub mod mountinfo;
 pub mod nested;
 pub mod operations;
 pub mod patch;
@@ -44,6 +45,7 @@ pub mod repack;
 pub mod restore;
 pub mod rules;
 pub mod service;
+pub mod shared_fs;
 #[cfg(feature = "ssh")]
 pub(crate) mod ssh_transport;
 pub mod stamps;

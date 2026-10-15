@@ -9,6 +9,10 @@
 //! description left behind by a dead holder is never mistaken for a held
 //! lock.
 //!
+//! The state area must be on a filesystem whose locks exclude other nodes
+//! too ([`crate::shared_fs`]): [`StateLock::acquire`] refuses NFS below
+//! 4.1 and NFS with local locks.
+//!
 //! [`StateLock::holder`] probes with a shared lock that it drops at once,
 //! so for a moment it can itself look like a holder. [`StateLock::acquire`]
 //! therefore keeps trying for at least [`MIN_ACQUIRE_WAIT`] even when asked
@@ -38,6 +42,14 @@ pub enum LockError {
     Busy { state: PathBuf, holder: String },
     #[error("locking {}", path.display())]
     Io { path: PathBuf, source: io::Error },
+    /// The state area's filesystem would let another node take the lock
+    /// too.
+    #[error("state area {} cannot be locked safely", state.display())]
+    UnsafeFilesystem {
+        state: PathBuf,
+        #[source]
+        source: crate::shared_fs::CheckError,
+    },
 }
 
 /// Held for as long as this process uses the state area. Dropping it (or
@@ -61,6 +73,14 @@ impl StateLock {
             source,
         };
         fs::create_dir_all(state.meta()).map_err(io_err)?;
+        // Only a lock the server enforces keeps another node out (design
+        // §14.2).
+        crate::shared_fs::require_safe_locks(&state.meta()).map_err(|source| {
+            LockError::UnsafeFilesystem {
+                state: state.root().to_path_buf(),
+                source,
+            }
+        })?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)

@@ -23,9 +23,11 @@ use crate::layout::Layout;
 use crate::params::VolumeParams;
 use crate::records::{self, VolumeRecord};
 
-/// What a refused multi-node access mode says.
-pub const MULTI_NODE: &str = "multi-node access modes are not supported: one node per volume \
-                              until a cross-node transport exists (design §14.2)";
+/// What a refused multi-node access mode says: the decision, with where
+/// it is recorded. `ci/e2e-csi.sh` waits for "multi-node" in it.
+pub const MULTI_NODE: &str = "multi-node access modes are not supported: an agentfs volume is \
+                              used from one node at a time; pods on other nodes read its \
+                              history from the remote it pushes to (design §19.1, 2026-10-15)";
 
 /// The access modes the driver supports: one node at a time.
 pub const SUPPORTED_MODES: [Mode; 4] = [
@@ -196,11 +198,14 @@ pub fn install_rules(layout: &Layout, handle: &str, profile: &str) -> Result<(),
     Ok(())
 }
 
-/// Takes the state-area lock without waiting; a holder is
-/// `FAILED_PRECONDITION` naming it.
+/// Takes the state-area lock without waiting; a holder, or a filesystem
+/// whose locks would not keep another node out, is `FAILED_PRECONDITION`
+/// naming it.
 pub fn lock(state: &StateDir, command: &str) -> Result<StateLock, Error> {
     StateLock::acquire(state, command, Duration::ZERO).map_err(|e| match e {
-        LockError::Busy { .. } => Error::FailedPrecondition(e.to_string()),
+        LockError::Busy { .. } | LockError::UnsafeFilesystem { .. } => {
+            Error::FailedPrecondition(chain(&e))
+        }
         e => Error::Internal(chain(&e)),
     })
 }
@@ -238,8 +243,19 @@ mod tests {
         for mode in SUPPORTED_MODES {
             assert_eq!(check_capability(&cap(mode, mount())).unwrap(), mode);
         }
-        let err = check_capability(&cap(Mode::MultiNodeMultiWriter, mount())).unwrap_err();
-        assert!(err.to_string().contains("multi-node"), "{err}");
+        for mode in [
+            Mode::MultiNodeReaderOnly,
+            Mode::MultiNodeSingleWriter,
+            Mode::MultiNodeMultiWriter,
+        ] {
+            let err = check_capability(&cap(mode, mount())).unwrap_err();
+            assert_eq!(err, Error::InvalidArgument(MULTI_NODE.into()), "{mode:?}");
+            assert_eq!(err.to_string(), MULTI_NODE);
+        }
+        assert!(
+            MULTI_NODE.contains("multi-node"),
+            "ci/e2e-csi.sh waits for it"
+        );
         assert!(check_capability(&cap(Mode::Unknown, mount())).is_err());
         let err = check_capability(&cap(Mode::SingleNodeWriter, None)).unwrap_err();
         assert!(err.to_string().contains("block"), "{err}");

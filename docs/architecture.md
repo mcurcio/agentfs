@@ -61,7 +61,9 @@ missing from these tables or a row names a module that no longer exists;
 | `restore.rs` | Restore and revert: plan from history, check, apply to a tree (§15) |
 | `confined.rs` | `openat2`-confined access to the tree for restores (§6, §15) |
 | `operations.rs` | Restores and reverts in progress: their writes become one operation commit (§15) |
-| `lock.rs` | The state-area lock, an `flock` on `meta/lock` (§2.3) |
+| `lock.rs` | The state-area lock, an `flock` on `meta/lock`, taken only on a filesystem whose locks keep other nodes out (§2.3) |
+| `shared_fs.rs` | Which filesystems a state area may live on: refuses NFS below 4.1, `nolock` and `local_lock` other than `none`, whenever the lock is taken and when agentfs-csi starts (§2.3, §14.2) |
+| `mountinfo.rs` | The one parser of `/proc/self/mountinfo`: device, root, mount point, fstype, source and super options of each mount, and the mount holding a path |
 | `local_socket.rs` | Unix sockets in the state area with peer-credential checks, for the control socket and the history service |
 | `fsutil.rs` | Small helpers for the state files under `<state>/meta` |
 | `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` (§4.3, §11.1) |
@@ -108,12 +110,12 @@ missing from these tables or a row names a module that no longer exists;
 | `dirty.rs` | Whether an inode changed since it was last recorded, so clean closes record nothing |
 | `inodes.rs` | The inode table: FUSE node ids, backing inodes and their paths |
 | `names.rs` | What a path in the mount is, for recording (§5) |
-| `views.rs` | Where workloads see the mount: the mount point, its bind mounts from `/proc/self/mountinfo`, `--workload-mount` (§5) |
+| `views.rs` | Where workloads see the mount: the mount point, its bind mounts (mountinfo read through `agentfs_core::mountinfo`), `--workload-mount` (§5) |
 | `backing.rs` | Confined access to the backing tree (§2.1, §6) |
 | `groups.rs` | fsync-class groups: holding writes while a group is captured, and scheduling captures (§8) |
 | `sweep.rs` | The periodic sweep: files held open, failed records, the fsync-class timer (§3.1, §3.5) |
 | `privileges.rs` | What the daemon may do as the caller or as itself (§6) |
-| `mount.rs` | Layout checks, mounting (also stacked over a stale mount, for `--on-stale-mount recover`), unmounting, detaching stale layers, and reading mount state from `/proc/self/mountinfo` |
+| `mount.rs` | Layout checks, mounting (also stacked over a stale mount, for `--on-stale-mount recover`), unmounting, detaching stale layers, and the mount state at a path (mountinfo read through `agentfs_core::mountinfo`) |
 
 ### `agentfs`
 

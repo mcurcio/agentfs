@@ -6,6 +6,7 @@
 //! - the same for the operator attributes ([`rules::OPERATOR_ATTRIBUTES`]);
 //! - every relative link and `#anchor` in README.md and docs/ resolves;
 //! - every CI job runs on the pinned runner, `ubuntu-24.04` (design §18).
+//! - every script under ci/ is executable.
 //!
 //! The flags and environment variables are checked by the binaries' own
 //! unit tests (`crates/agentfs/src/reference_tests.rs`, and the
@@ -387,4 +388,40 @@ fn workflows_pin_runners() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files_under(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// Workflows and other scripts run the CI scripts directly, so each needs
+/// its execute bit (a sourced library too, so none is missed).
+#[test]
+fn ci_scripts_are_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut files = Vec::new();
+    files_under(&workspace().join("ci"), &mut files);
+    let scripts: Vec<_> = files
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "sh" || e == "py"))
+        .collect();
+    assert!(scripts.len() > 10, "no ci scripts found: {scripts:?}");
+    let offenders: Vec<_> = scripts
+        .iter()
+        .filter(|p| std::fs::metadata(p).unwrap().permissions().mode() & 0o111 == 0)
+        .map(|p| p.display().to_string())
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "not executable (git update-index --chmod=+x):\n{}",
+        offenders.join("\n")
+    );
 }

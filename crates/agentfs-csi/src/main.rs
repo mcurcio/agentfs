@@ -122,6 +122,16 @@ async fn run(cli: Cli) -> Result<(), String> {
             cli.passthrough
         ));
     }
+    // Every volume's state lock lives under the base path: a filesystem
+    // whose locks would not keep another node out is refused before
+    // anything is served (design §14.2).
+    std::fs::create_dir_all(&cli.base_path)
+        .map_err(|e| agentfs_csi::volume::chain(&e))
+        .and_then(|()| {
+            agentfs_core::shared_fs::require_safe_locks(&cli.base_path)
+                .map_err(|e| agentfs_csi::volume::chain(&e))
+        })
+        .map_err(|e| format!("base path {}: {e}", cli.base_path.display()))?;
     let layout = Layout {
         base: cli.base_path.clone(),
         node_state: cli.node_state.clone(),

@@ -29,6 +29,7 @@ use agentfs_csi::mounter::KernelMounter;
 use agentfs_csi::node::NodeService;
 use agentfs_csi::server;
 use agentfs_csi::supervisor::{NodeConfig, Supervisor};
+use agentfs_csi::volume::MULTI_NODE;
 
 struct Driver {
     dir: tempfile::TempDir,
@@ -41,8 +42,19 @@ struct Driver {
 impl Driver {
     async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        Self::start_in(dir, base).await
+    }
+
+    /// A driver whose volumes live under `base` (a shared filesystem in
+    /// ci/e2e-nfs.sh); everything else is in a temporary directory.
+    async fn start_at(base: &Path) -> Self {
+        Self::start_in(tempfile::tempdir().unwrap(), base.to_path_buf()).await
+    }
+
+    async fn start_in(dir: tempfile::TempDir, base: PathBuf) -> Self {
         let layout = Layout {
-            base: dir.path().join("base"),
+            base,
             node_state: dir.path().join("node"),
             mount_dir: dir.path().join("mounts"),
             profiles: dir.path().join("profiles"),
@@ -379,6 +391,92 @@ async fn delete_volume_retains_or_deletes() {
     fs::create_dir_all(d.layout.deleting_dir("gone").join("state")).unwrap();
     c.delete_volume(delete("gone")).await.unwrap();
     assert!(!d.layout.deleting_dir("gone").exists());
+    d.stop().await;
+}
+
+/// DeleteVolume on the shared base path of an NFS export (ci/e2e-nfs.sh
+/// step f, `AGENTFS_CSI_TEST_BASE`): the volume and its aside copy are
+/// gone, and no silly-renamed lock file is left behind.
+#[tokio::test]
+#[ignore = "needs AGENTFS_CSI_TEST_BASE on a shared filesystem (ci/e2e-nfs.sh)"]
+async fn delete_volume_on_a_shared_base_path() {
+    let base = PathBuf::from(
+        std::env::var_os("AGENTFS_CSI_TEST_BASE").expect("AGENTFS_CSI_TEST_BASE is not set"),
+    );
+    fs::create_dir_all(&base).unwrap();
+    let d = Driver::start_at(&base).await;
+    let mut c = d.controller();
+    let pv = format!("pv-shared-{}", std::process::id());
+    c.create_volume(create_req(&pv, &[("profile", "p"), ("onDelete", "delete")]))
+        .await
+        .unwrap();
+    assert!(d.layout.csi_json(&pv).exists());
+    c.delete_volume(DeleteVolumeRequest {
+        volume_id: pv.clone(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert!(!base.join(&pv).exists(), "{pv} is still there");
+    assert!(!base.join(format!(".deleting.{pv}")).exists());
+    let silly: Vec<_> = fs::read_dir(&base)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().starts_with(".nfs"))
+        .collect();
+    assert!(silly.is_empty(), "left in {}: {silly:?}", base.display());
+    d.stop().await;
+}
+
+#[tokio::test]
+async fn multi_node_modes_are_refused_with_the_decision() {
+    let d = Driver::start().await;
+    let mut c = d.controller();
+    let mut n = NodeClient::new(d.channel.clone());
+    c.create_volume(create_req("v", &[("profile", "p")]))
+        .await
+        .unwrap();
+    for mode in [
+        Mode::MultiNodeReaderOnly,
+        Mode::MultiNodeSingleWriter,
+        Mode::MultiNodeMultiWriter,
+    ] {
+        let refused = |r: tonic::Status, call: &str| {
+            assert_eq!(r.code(), Code::InvalidArgument, "{call} {mode:?}");
+            assert_eq!(r.message(), MULTI_NODE, "{call} {mode:?}");
+        };
+        let mut req = create_req("w", &[("profile", "p")]);
+        req.volume_capabilities = vec![mount_cap(mode)];
+        refused(c.create_volume(req).await.unwrap_err(), "CreateVolume");
+        assert!(!d.layout.volume_dir("w").exists());
+
+        let no = c
+            .validate_volume_capabilities(ValidateVolumeCapabilitiesRequest {
+                volume_id: "v".into(),
+                volume_capabilities: vec![mount_cap(mode)],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(no.confirmed.is_none(), "{mode:?}");
+        assert_eq!(no.message, MULTI_NODE, "{mode:?}");
+
+        let mut req = publish_req("v", "node-1");
+        req.volume_capability = Some(mount_cap(mode));
+        refused(
+            c.controller_publish_volume(req).await.unwrap_err(),
+            "ControllerPublish",
+        );
+
+        let mut req = stage_req("v", "/staging");
+        req.volume_capability = Some(mount_cap(mode));
+        refused(n.node_stage_volume(req).await.unwrap_err(), "NodeStage");
+
+        let mut req = node_publish_req("v", "/target");
+        req.volume_capability = Some(mount_cap(mode));
+        refused(n.node_publish_volume(req).await.unwrap_err(), "NodePublish");
+    }
     d.stop().await;
 }
 

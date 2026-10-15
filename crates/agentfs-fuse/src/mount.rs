@@ -20,7 +20,7 @@
 //!
 //! [`mount_state`] tells a live agentfs mount from a stale one (its daemon
 //! gone), from nothing and from another filesystem, using
-//! `/proc/self/mountinfo` ([`parse_mountinfo`]) and a `statfs`; `agentfs
+//! `/proc/self/mountinfo` ([`agentfs_core::mountinfo`]) and a `statfs`; `agentfs
 //! probe` and the hold mode of a restarted sidecar use it, and [`detach`]
 //! clears a stale mount (design §17.1).
 //!
@@ -48,9 +48,7 @@
 //! [`Mount::shutdown`] unmounts (lazily if the mount is busy), waits a grace
 //! period for the session to end, stops the sweep and runs a final one.
 
-use std::ffi::OsStr;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,6 +56,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentfs_core::config::Settings;
+use agentfs_core::mountinfo::{self, MountEntry};
 use agentfs_core::service::Stop;
 use agentfs_core::volume::{Recorder, StateDir};
 use fuser::{MountOption, SessionACL};
@@ -368,73 +367,6 @@ fn check_layout(
     Ok((backing, mountpoint))
 }
 
-/// One line of `/proc/self/mountinfo`: what is mounted where.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MountEntry {
-    pub mountpoint: PathBuf,
-    /// `fuse.agentfs` for an agentfs mount (`fuse` with some mount
-    /// helpers).
-    pub fstype: String,
-    /// `agentfs:<volume>` for an agentfs mount.
-    pub source: String,
-}
-
-impl MountEntry {
-    /// Whether this is an agentfs FUSE mount.
-    pub fn is_agentfs(&self) -> bool {
-        self.fstype.starts_with("fuse") && self.source.starts_with("agentfs:")
-    }
-}
-
-/// Parses `/proc/self/mountinfo` (proc(5)), in order. Lines that do not
-/// parse are skipped. The mount point and source have their octal escapes
-/// (`\040` for a space, ...) decoded.
-pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
-    text.lines()
-        .filter_map(|line| {
-            // `id parent major:minor root mountpoint options [optional...]
-            // - fstype source superoptions`
-            let (before, after) = line.split_once(" - ")?;
-            let mountpoint = before.split(' ').nth(4)?;
-            let mut after = after.split(' ');
-            let fstype = after.next()?;
-            let source = after.next().unwrap_or("");
-            Some(MountEntry {
-                mountpoint: PathBuf::from(OsStr::from_bytes(&unescape(mountpoint))),
-                fstype: String::from_utf8_lossy(&unescape(fstype)).into_owned(),
-                source: String::from_utf8_lossy(&unescape(source)).into_owned(),
-            })
-        })
-        .collect()
-}
-
-/// Decodes the kernel's `\ooo` escapes (space, tab, newline, backslash).
-pub(crate) fn unescape(field: &str) -> Vec<u8> {
-    let bytes = field.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && i + 3 < bytes.len()
-            && bytes[i + 1..=i + 3]
-                .iter()
-                .all(|b| (b'0'..=b'7').contains(b))
-        {
-            let value = bytes[i + 1..=i + 3]
-                .iter()
-                .fold(0u32, |n, b| n * 8 + u32::from(b - b'0'));
-            if let Ok(byte) = u8::try_from(value) {
-                out.push(byte);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    out
-}
-
 /// What is mounted at a path, as `agentfs probe` and the hold mode of a
 /// restarted sidecar see it (design §17.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,8 +386,7 @@ pub enum MountState {
 /// path is resolved without touching its last component when that fails,
 /// since a stale mount answers every `stat` with `ENOTCONN`.
 pub fn mount_state(path: &Path) -> io::Result<MountState> {
-    let info = std::fs::read_to_string("/proc/self/mountinfo")?;
-    mount_state_in(&parse_mountinfo(&info), path)
+    mount_state_in(&mountinfo::read()?, path)
 }
 
 /// `path` resolved as mountinfo names it, through its parent when the path
@@ -536,9 +467,8 @@ pub fn detach_stale_layers(path: &Path, max: usize) -> io::Result<usize> {
 
 /// Counts the agentfs mounts at `path` (stacked layers included).
 pub fn agentfs_layers(path: &Path) -> io::Result<usize> {
-    let info = std::fs::read_to_string("/proc/self/mountinfo")?;
     let resolved = resolve_mountpoint(path)?;
-    Ok(parse_mountinfo(&info)
+    Ok(mountinfo::read()?
         .iter()
         .filter(|e| e.mountpoint == resolved && e.is_agentfs())
         .count())
@@ -1298,48 +1228,6 @@ mod tests {
         }
     }
 
-    const MOUNTINFO: &str = "\
-22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
-35 22 0:31 / /data rw,relatime shared:2 master:7 - xfs /dev/sdb rw,attr2
-40 35 0:44 / /agentfs/workspace rw,nosuid,nodev,relatime shared:9 - fuse.agentfs agentfs:hermes rw,user_id=0,group_id=0,default_permissions,allow_other
-41 22 0:45 / /with\\040space rw - fuse agentfs:v\\134x rw
-42 22 0:46 / /stacked rw - tmpfs tmpfs rw
-43 42 0:47 / /stacked rw - fuse.agentfs agentfs:top rw
-44 22 0:48 / /tab\\011and\\012newline rw - fuse.sshfs host:/x rw
-garbage line
-";
-
-    #[test]
-    fn mountinfo_is_parsed() {
-        let entries = parse_mountinfo(MOUNTINFO);
-        assert_eq!(entries.len(), 7, "{entries:#?}");
-        assert_eq!(
-            entries[2],
-            MountEntry {
-                mountpoint: "/agentfs/workspace".into(),
-                fstype: "fuse.agentfs".into(),
-                source: "agentfs:hermes".into(),
-            }
-        );
-        assert!(entries[2].is_agentfs());
-        // Escapes, and a `fuse` fstype from a mount helper.
-        assert_eq!(entries[3].mountpoint, Path::new("/with space"));
-        assert_eq!(entries[3].source, "agentfs:v\\x");
-        assert!(entries[3].is_agentfs());
-        assert_eq!(entries[6].mountpoint, Path::new("/tab\tand\nnewline"));
-        assert!(!entries[6].is_agentfs());
-        // Optional fields before the separator do not shift anything.
-        assert_eq!(entries[1].fstype, "xfs");
-        assert!(!entries[0].is_agentfs());
-    }
-
-    #[test]
-    fn unescape_leaves_other_backslashes() {
-        assert_eq!(unescape("a\\0"), b"a\\0");
-        assert_eq!(unescape("\\777"), b"\\777");
-        assert_eq!(unescape("\\101\\"), b"A\\");
-    }
-
     #[test]
     fn mount_state_reads_the_topmost_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -1347,9 +1235,12 @@ garbage line
         let mnt = root.join("mnt");
         fs::create_dir(&mnt).unwrap();
         let entry = |fstype: &str, source: &str| MountEntry {
+            device: "0:1".into(),
+            root: "/".into(),
             mountpoint: mnt.clone(),
             fstype: fstype.into(),
             source: source.into(),
+            super_options: "rw".into(),
         };
         assert_eq!(mount_state_in(&[], &mnt).unwrap(), MountState::NotMounted);
         // Only the path itself counts, not a mount above it.
