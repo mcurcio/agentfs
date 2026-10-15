@@ -210,7 +210,9 @@ endpoints:
 EOF
 kubectl apply -k ci/k8s-csi/multinode
 kd rollout status deployment/agentfs-csi-controller --timeout=300s
-kd rollout status daemonset/agentfs-csi-node --timeout=300s
+# The DaemonSet is OnDelete: rollout status does not apply.
+wait_for 300 sh -c "[ \"\$(kubectl -n $DNS get daemonset agentfs-csi-node -o jsonpath='{.status.numberReady}')\" = 3 ]" ||
+  fail "the node plugins never became Ready on all three nodes"
 for n in "$W1" "$W2"; do
   wait_for 120 sh -c "kubectl get csinode $n -o jsonpath='{.spec.drivers[*].name}' | grep -qw $DRIVER" ||
     fail "the driver never registered on $n"

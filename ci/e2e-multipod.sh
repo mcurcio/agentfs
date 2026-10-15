@@ -376,10 +376,16 @@ BURST_B=$!
 wait "$BURST_A" || fail "pod-a's burst failed"
 wait "$BURST_B" || fail "pod-b's burst failed"
 TREE=$(sudo cat "$BACKING/burst.txt")
-# commitWindow is 200ms: give the burst's records time to commit.
-sleep 3
 # Freeze stamps order the racing records (design §14.1): HEAD ends on the
-# tree's last state, with no later boundary to fix it.
+# tree's last state, with no later boundary to fix it. Late RELEASE records
+# and commitWindow (200ms) take a moment; on a shared filesystem, longer.
+if ! wait_for 30 sh -c "[ \"\$(sudo git --git-dir '$STATE/git' show refs/heads/agentfs/demo:burst.txt)\" = '$TREE' ]"; then
+  echo "the last commits of burst.txt (committer, content):"
+  for c in $(sgit log -12 --format=%H refs/heads/agentfs/demo -- burst.txt); do
+    echo "  $(sgit log -1 --format='%cn %s' "$c"): '$(sgit show "$c:burst.txt" 2>/dev/null)'"
+  done
+  echo "tree now: '$(sudo cat "$BACKING/burst.txt")', via b: '$(sudo cat "$BACKING_B/burst.txt")'"
+fi
 assert_eq "$TREE" "$(sgit show refs/heads/agentfs/demo:burst.txt)" \
   "after the burst, HEAD has the tree's burst.txt"
 N_BURST=$(sgit log --format=%cn refs/heads/agentfs/demo -- burst.txt | wc -l)
