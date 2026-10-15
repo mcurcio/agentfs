@@ -7,7 +7,23 @@ set -euo pipefail
 AGENTFS_BIN=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-fail() { printf '\033[31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
+fail() {
+  printf '\033[31mFAIL:\033[0m %s\n' "$*" >&2
+  # An annotation on the run, readable without the job's log.
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    printf '::error title=%s::%s\n' "$(basename "$0")" "$(printf '%s' "$*" | tr '\n' ' ' | cut -c1-900)"
+  fi
+  exit 1
+}
+
+# Annotates the last lines of a log file on the run (GitHub Actions only),
+# so a failure can be read without the job's log.
+annotate_log() { # file [lines]
+  [ -n "${GITHUB_ACTIONS:-}" ] && [ -f "$1" ] || return 0
+  local body
+  body=$(tail -n "${2:-15}" "$1" | sed 's/\x1b\[[0-9;]*m//g' | tr '\n' '|' | cut -c1-3000)
+  printf '::warning title=%s::%s\n' "$(basename "$1")" "$body"
+}
 pass() { printf '\033[32mok\033[0m   %s\n' "$*"; }
 
 assert_eq() { # expected actual message

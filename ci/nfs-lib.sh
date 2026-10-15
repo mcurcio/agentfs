@@ -34,6 +34,7 @@ nfs_server() { # dir
   # Short lease and grace times, so a lost client's locks expire within
   # the test (design §14.2): the server's lease must be at least twice
   # the services' --lock-fence.
+  sudo mkdir -p /etc/nfs.conf.d
   sudo tee /etc/nfs.conf.d/agentfs-ci.conf >/dev/null <<EOF
 [nfsd]
 lease-time=$NFS_LEASE

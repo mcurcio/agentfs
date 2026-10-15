@@ -61,9 +61,11 @@ agentfs_as() { # node args...
 cleanup() {
   status=$?
   if [ $status -ne 0 ]; then
-    for log in "$LOGS"/*.log; do
+    for log in "$LOGS"/*.log "$LOGS"/agentfs-multipod-logs/*.log; do
+      [ -f "$log" ] || continue
       echo "---- $log"
       tail -n 60 "$log" 2>/dev/null || true
+      annotate_log "$log"
     done
   fi
   for pid in "${PIDS[@]}"; do sudo kill -KILL "$pid" 2>/dev/null || true; done
@@ -72,6 +74,9 @@ cleanup() {
   exit $status
 }
 trap cleanup EXIT
+# Every step's output, for annotations if a command fails without `fail`.
+exec > >(tee "$LOGS/e2e-nfs.out.log") 2>&1
+trap 'annotate_log "$LOGS/e2e-nfs.out.log" 25' ERR
 
 step "an NFS server and two clients of its export"
 nfs_server "$EXPORT"
