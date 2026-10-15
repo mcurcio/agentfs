@@ -27,7 +27,7 @@
 #      wait Ready, uncordon; no close fails on the other worker
 #      meanwhile; the handover time is printed;
 #   h. an RWO claim used by two pods on two nodes: the second is refused
-#      (Multi-Attach);
+#      at attach (FailedAttachVolume) and never runs;
 #   i. teardown: unpublish, unstage on both nodes, the final push, then
 #      DeleteVolume.
 #
@@ -414,9 +414,12 @@ RUNNING=$(ka get pod rwo-first rwo-second -o jsonpath='{range .items[?(@.status.
 assert_eq 1 "$(printf '%s\n' "$RUNNING" | grep -c .)" "exactly one RWO pod runs"
 if [ "$RUNNING" = rwo-first ]; then REFUSED=rwo-second; else REFUSED=rwo-first; fi
 # Kubernetes' attach/detach controller refuses the second node before it
-# calls the driver (a Multi-Attach event); if it calls ControllerPublish
-# anyway, the driver refuses it (FAILED_PRECONDITION, "one node per
-# volume"). Either way the second pod must never run.
+# calls the driver: a FailedAttachVolume event, worded "Multi-Attach
+# error ... already used by pod(s)" in older releases and, on the
+# Kubernetes 1.37 of ci/install-kind.sh, "Waiting for detach ... Volume is
+# already used by pod(s)". If it called
+# ControllerPublish anyway, the driver refuses it (FAILED_PRECONDITION,
+# "one node per volume"). Either way the second pod must never run.
 rwo_events() {
   kubectl -n "$APPS" get events --field-selector "involvedObject.name=$REFUSED" \
     -o jsonpath='{range .items[*]}{.reason}: {.message}{"\n"}{end}' 2>/dev/null
@@ -424,7 +427,7 @@ rwo_events() {
 refused_by() {
   local ev
   ev=$(rwo_events)
-  if printf '%s' "$ev" | grep -qi 'multi-attach'; then echo kubernetes
+  if printf '%s' "$ev" | grep -qiE 'FailedAttachVolume: .*(multi-attach|already used by pod)'; then echo kubernetes
   elif printf '%s' "$ev" | grep -qi 'one node per volume'; then echo driver
   else return 1; fi
 }
@@ -435,13 +438,13 @@ if ! wait_for 180 refused_by; then
     kubectl get pv "$(ka get pvc only-rwo -o jsonpath='{.spec.volumeName}')" -o jsonpath='{.spec.accessModes}{"\n"}'
     ka get events -o jsonpath='{range .items[*]}{.involvedObject.name} {.reason}: {.message}{"\n"}{end}' | grep -E 'rwo-|only-rwo'
   } 2>&1 | tail -n 30
-  fail "$REFUSED was not refused (no Multi-Attach event and no driver refusal)"
+  fail "$REFUSED was not refused (no FailedAttachVolume for a volume in use, no driver refusal)"
 fi
 BY=$(refused_by)
 sleep 10
 assert_eq Running-1 "Running-$(ka get pod rwo-first rwo-second -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' | grep -c .)" \
   "still exactly one RWO pod runs"
-echo "- RWO claim on a second node: refused by $BY ($(rwo_events | grep -iE 'multi-attach|one node per volume' | head -n1 | cut -c1-200))" | tee -a "$SUMMARY"
+echo "- RWO claim on a second node: refused by $BY ($(rwo_events | grep -iE 'multi-attach|already used by pod|one node per volume' | head -n1 | cut -c1-200))" | tee -a "$SUMMARY"
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
   printf '::notice title=RWO refusal::%s\n' "$(rwo_events | tr '\n' '|' | cut -c1-900)"
 fi

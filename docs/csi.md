@@ -248,8 +248,11 @@ See `deploy/csi/example/deployment.yaml`.
 
 - **Access modes.** `ReadWriteOnce` (several pods on one node) or
   `ReadWriteOncePod`. Kubernetes enforces one node per volume through the
-  attach step (`attachRequired: true`): a second node's VolumeAttachment
-  is refused with a Multi-Attach error while the first node holds it.
+  attach step (`attachRequired: true`): the attach/detach controller
+  does not attach the volume to a second node while a pod on the first
+  uses it (a `FailedAttachVolume` event, "Multi-Attach error" or, on
+  Kubernetes 1.37, "Waiting for detach ... already used by pod(s)"), and
+  the driver's ControllerPublish refuses a second node too.
   With `--multi-node`, `ReadWriteMany` (and `ReadOnlyMany`) claims are
   attached to every node that runs one of their pods; each node stages
   the volume, and one of their services is active (§3). A volume keeps
