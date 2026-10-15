@@ -56,6 +56,9 @@ https = ["agentfs-core/https"]
 # Push to ssh:// and scp-like remotes (agentfs's russh transport with
 # ring; no OpenSSL).
 ssh = ["agentfs-core/ssh"]
+# Fronts on other nodes reach the history service over TLS (rustls on
+# ring), pinned to the volume's certificate (design §14.1).
+history-tls = ["agentfs-core/history-tls"]
 # OTLP export to https:// collectors, with a CA bundle and client
 # certificates (rustls on ring).
 otlp-tls = ["dep:reqwest", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:tonic", "opentelemetry-otlp/tls-ring"]

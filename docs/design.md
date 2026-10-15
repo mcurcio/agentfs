@@ -135,6 +135,10 @@ through the mount:
     history/history.sock the history service's socket for fronts (§14);
                          directory 0700, socket 0600
     history/address      the address it serves, for `agentfs status`
+    history/endpoint.json where the active service listens, for fronts
+                         given `state` (§14.1)
+    history/tls/identity.pem the volume's TLS certificate and key, 0600
+                         (§14.1)
     fronts/slot-N.lock   a front's lease of pending-id slot N (flock), holding
                          a holder line (`pid=… node=… command=… pod=…`)
     fronts/slot-N.repairs that slot's repair queue (§3.5)
@@ -2261,8 +2265,10 @@ driver (§14.2) starts these per volume and per pod.
 
 **Protocol.** A Unix stream socket in the state area,
 `meta/history/history.sock` (directory 0700, socket 0600), reached through
-`/proc/self/fd/<dir>/history.sock` so long paths fit. Addresses are
-`unix:<path>` or an absolute path; `tcp:` is refused as not supported yet.
+`/proc/self/fd/<dir>/history.sock` so long paths fit; from other nodes,
+TLS over TCP (below). Addresses are `unix:<path>` or an absolute path,
+`tls:<ip>:<port>`, or `state` (below); `tcp:` and anything else are
+refused, and there is never plaintext TCP.
 Messages are frames of a u32 big-endian length and a JSON body (at most
 64 MiB), protocol version 1, reusing the journal's serde types:
 
@@ -2305,6 +2311,42 @@ with nothing mounted. gRPC was rejected for this step: it brings tonic,
 prost and tokio for nothing a socket in the state area needs. The frame
 protocol does not depend on the transport, so a cross-node transport can
 carry it.
+
+**Across nodes: TLS** (feature `history-tls`, `history_service::tls`).
+`serve-history --listen-tls <ip>:<port>` also listens on TCP (port 0: a
+free one) and carries the same frames over TLS 1.3 (rustls on ring; no
+TLS 1.2, no session tickets, no SNI). Both ends authenticate with one
+certificate per volume: a self-signed ECDSA P-256 certificate and key
+the active service makes under the state lock at its first TLS listen,
+in `meta/history/tls/identity.pem` (directory 0700, file 0600, one file
+so a crash never pairs a key with another certificate). Each end
+presents it and accepts exactly it, byte for byte, so a peer proves it
+can read the volume's state area, the same trust the Unix socket's
+root-or-same-uid check gives, and the same as being able to rewrite the
+history. Another volume's certificate, no client certificate, plaintext
+and TLS 1.2 are refused; the handshake runs on the connection's thread
+within the hello timeout. A changed identity file is read again at the
+next connection. TCP connections set `TCP_NODELAY`, keepalives (idle
+10 s, interval 5 s, 3 probes) and `TCP_USER_TIMEOUT` of 30 s, so a
+vanished node fails a request rather than hanging it. Without the
+feature the binary refuses `tls:` addresses and `--listen-tls`, and
+links no TLS (`ci/check-deps.sh`).
+
+**Finding the service: `state`.** The active service writes
+`meta/history/endpoint.json` atomically once it listens (`{v, volume,
+node, unix, tls, instance, pid, since}`) and removes it, if still its
+own, when it stops; a crashed service's file is replaced by the next.
+A front given `--history-service state` reads it at every new
+connection (cached by inode, size and mtime): the Unix socket when the
+service is on its own node (`--node`, `AGENTFS_NODE`, else the host
+name) and the socket exists, else the TLS address. With `state`, a
+request that reaches no service, so certainly sent nothing, is retried
+every 100 ms, re-reading the file, until `--history-timeout` is spent,
+then fails with `EIO` as before: a handover from one service to another
+is latency, not an error, and nothing is ever resent. `agentfs status`
+prints the endpoint (`stale` without a lock holder), and `agentfs
+ping-history [--count N] [--address ADDR]` measures the round trip as a
+front makes it.
 
 **The synchronous step, split** (§3.2): the front decides the path rules,
 runs every record-time check (size on disk, `maxSize`, the blob limit, the
@@ -2914,7 +2956,7 @@ one-time migration of Hermes' existing data and the initial import in
     stays a thin CLI.
 - **`agentfs`, a binary:**
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
-    `serve-history` (§14), `restore`, `revert`, `patch` (`submit`,
+    `serve-history` (§14), `ping-history` (§14.1), `restore`, `revert`, `patch` (`submit`,
     `apply`, `status`) and `lfs` (`fetch`, `prune`); a test (`crates/agentfs/src/reference_tests.rs`)
     checks this list against the CLI;
   - `init` is safe to re-run (§2.3): exit 0 for the volume it already
@@ -3226,7 +3268,8 @@ restartable (§14.2). The controller runs no children.
 | Patch submission | the `git` CLI on the producer's side (`ls-remote`, `fetch`, `commit-tree`, `push --force-with-lease`) | Runs in the producer's repository with its own credentials and config, so agentfs needs none of them; the lease makes a number create-only (§12) |
 | Repack | the `git` CLI (`git repack --geometric=2`, git 2.32 or later) | libgit2 has no repack or gc. Run by the commit loop with system and global config off (§8); the image ships `git` |
 | Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates`, `git` and `tini`; built on `rust:1.99-trixie`; both pinned by digest. Ships `agentfs` and `agentfs-csi` | Not distroless: the daemon runs `git repack` (§8), and operators follow the runbooks with `git` through `kubectl exec`. `tini` (`-s`, a subreaper: the node plugin shares the host's pid namespace) reaps the CSI node plugin's children's orphans. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after both kind e2e jobs pass |
-| CSI gRPC | `tonic` 0.14 and `tonic-prost`, `prost` 0.14, `prost-types`, on `tokio` (only in `agentfs-csi`) | Transport and codegen features, no TLS: the socket is local. The front/service protocol stays a plain socket (§14.1) |
+| CSI gRPC | `tonic` 0.14 and `tonic-prost`, `prost` 0.14, `prost-types`, on `tokio` (only in `agentfs-csi`) | Transport and codegen features, no TLS: the socket is local. The front/service protocol stays a plain socket on one node (§14.1) |
+| Front/service TLS across nodes | `rustls` 0.23 (ring, std; TLS 1.3 only) with its blocking `StreamOwned` on `std::net::TcpStream`, `rustls-pki-types`, and `rcgen` 0.14 (ring, pem) for the volume's self-signed certificate, behind the `history-tls` feature (2026-10-15) | No tokio, no gRPC: the frames and threads of §14.1 stay. Custom verifiers pin the volume's certificate byte for byte and check TLS 1.3 signatures with rustls's own `verify_tls13_signature`. ring and rustls were already in the lockfile through `otlp-tls`; `ci/check-deps.sh` checks the feature brings no aws-lc or OpenSSL. `agentfs-csi` links none of it (it spawns `agentfs`) |
 | CSI codegen | `protox` 0.10 and `tonic-prost-build` 0.14 in `build.rs` | A pure-Rust protobuf compiler with the well-known types bundled: no `protoc` on build hosts or in the image |
 | CSI spec | `csi.proto` v1.13.0, vendored in `crates/agentfs-csi/proto` | Pinned by copy; updating it is a deliberate change |
 | CSI sidecars | csi-provisioner v6.4.0, csi-attacher v4.13.0, csi-node-driver-registrar v2.18.0, livenessprobe v2.20.0 from `registry.k8s.io/sig-storage` | Pinned by digest in `deploy/csi/kustomization.yaml` |
@@ -3555,6 +3598,11 @@ runner.
 | CSI recovery | Crashed fronts and services restarted with backoff (1 s to 30 s); a front in its predecessor's slot (`--history-slot`), its mount bind-stacked over the stale target, made shared so `HostToContainer` containers see it; reconcile from node records after a plugin restart; DaemonSet `OnDelete` (§14.2) |
 | CSI RBAC | csi-provisioner and csi-attacher's minimal ClusterRoles plus leader-election leases; no Secrets, pods or snapshots; the node plugin has no API access and no token (§14.2, [csi.md](csi.md#10-security)) |
 | CSI volume names | The default `volumeName` is `{pvcNamespace}.{pvcName}.{pvName}`: unique per volume, so a claim deleted and created again starts a new branch instead of a root commit on the old one, which every push would find diverged (§11.3, §11.4); a template without `{pvName}` is the operator's choice and documented as unsafe. A static PV's `volumeName` (or `volume`) is literal, and its unknown attributes are refused (§14.2, [csi.md](csi.md#5-parameters)) |
+| Cross-node transport (2026-10-15) | TLS 1.3 over TCP carrying the unchanged frame protocol (v1; new fields and features only), behind the `history-tls` feature, in the image; never plaintext TCP; gRPC stays rejected (§14.1) |
+| Cross-node trust (2026-10-15, default, owner to confirm) | One self-signed certificate per volume, made by the active service under the state lock in `meta/history/tls/identity.pem` (0600); both ends present it and pin it byte for byte. The trust boundary is reading the state area, as for the Unix socket and for rewriting history. No Kubernetes Secret or cluster CA, so the node plugin keeps no API access and no cross-volume secret; a cert-manager or CA option is not built (§14.1) |
+| Finding the service (2026-10-15) | `meta/history/endpoint.json` in the shared state area, written by the active service; fronts given `state` read it at each connection, use the socket on the service's node and TLS elsewhere, and retry a service they cannot reach (nothing sent) within `--history-timeout`. No Kubernetes Service objects, no RBAC change (§14.1, §14.2) |
+| Locks on shared filesystems (2026-10-15) | A process never opens and closes a lock file it holds (NFS emulates `flock` with POSIX locks, which a close drops); holder lines carry the node, and the CSI driver matches a front's slot by pid and node (§2.3) |
+| Stamps across NFS clients (2026-10-15) | A front's hello carries its tree's `st_dev`; the service compares stamps of that device as the tree's. The service's look at the tree opens each directory and uses `statx(AT_STATX_FORCE_SYNC)`. NFS silly-rename names are never recorded (§4, §14.1) |
 | CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2): NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it, and runs with `hostPID: true` so its fronts can read callers' groups, §6); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
 | CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |

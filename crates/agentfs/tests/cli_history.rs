@@ -313,7 +313,7 @@ fn a_front_without_a_service_fails_and_names_it() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        stderr(&out).contains("not supported yet"),
+        stderr(&out).contains("is not supported (design §14.1)"),
         "{}",
         stderr(&out)
     );
@@ -486,6 +486,8 @@ impl Volume {
                 address: Address::Unix(state.history_socket()),
                 timeout: Duration::from_secs(10),
                 connect_wait: Duration::from_secs(10),
+                state: state.clone(),
+                node: String::new(),
             },
             "demo",
             "refs/heads/agentfs/demo",

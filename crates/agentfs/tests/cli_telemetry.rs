@@ -878,6 +878,8 @@ fn the_fronts_gauge_and_a_fronts_round_trip_are_exported() {
                 address: Address::Unix(state.history_socket()),
                 timeout: Duration::from_secs(10),
                 connect_wait: Duration::from_secs(10),
+                state: state.clone(),
+                node: String::new(),
             },
             "demo",
             "refs/heads/agentfs/demo",

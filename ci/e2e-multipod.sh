@@ -21,10 +21,18 @@
 # kill -9 of the service, and that the service pushes. Then measures the
 # per-close cost, single-process against front (ci/boundary-latency.py).
 #
+# With FRONT_B_TRANSPORT=tls (a binary built with the history-tls
+# feature), the service also listens on loopback TLS and front b runs as
+# if on another node (AGENTFS_NODE=node-2, --history-service state): it
+# finds the service through the endpoint file and reaches it over TLS
+# (design §14.1), and every check above holds across the transports; the
+# per-close cost then also measures a TLS front.
+#
 # Needs Linux with /dev/fuse, fuse3, git, python3, setpriv and passwordless
 # sudo; reproducible on any such host:
 #
 #   AGENTFS_TEST_PASSTHROUGH=auto ci/e2e-multipod.sh
+#   AGENTFS_TEST_PASSTHROUGH=auto FRONT_B_TRANSPORT=tls ci/e2e-multipod.sh
 
 . "$(dirname "$0")/lib.sh"
 
@@ -39,6 +47,12 @@ fi
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 P=${AGENTFS_TEST_PASSTHROUGH:-auto}
+T=${FRONT_B_TRANSPORT:-unix}
+case $T in
+  unix) TLS_ARGS=() ;;
+  tls) TLS_ARGS=(--listen-tls 127.0.0.1:0) ;;
+  *) fail "FRONT_B_TRANSPORT is unix or tls, not $T" ;;
+esac
 W=$(mktemp -d)
 chmod 755 "$W"
 STATE=$W/state
@@ -50,10 +64,10 @@ SOCK=$STATE/meta/history/history.sock
 LOGS=${RUNNER_TEMP:-$W}/agentfs-multipod-logs
 mkdir -p "$BACKING" "$MNT_A" "$MNT_B" "$LOGS"
 chmod 755 "$BACKING" "$MNT_A" "$MNT_B"
-SVC_LOG=$LOGS/service-$P.log
-A_LOG=$LOGS/front-a-$P.log
-B_LOG=$LOGS/front-b-$P.log
-SP_LOG=$LOGS/single-process-$P.log
+SVC_LOG=$LOGS/service-$P-$T.log
+A_LOG=$LOGS/front-a-$P-$T.log
+B_LOG=$LOGS/front-b-$P-$T.log
+SP_LOG=$LOGS/single-process-$P-$T.log
 : >"$SVC_LOG"
 : >"$A_LOG"
 : >"$B_LOG"
@@ -93,8 +107,8 @@ start_service() {
   echo "---- serve-history" >>"$SVC_LOG"
   local before
   before=$(grep -c '^serving history' "$SVC_LOG" || true)
-  sudo env AGENTFS_REPLICA=history-0 "$AGENTFS_BIN" --state "$STATE" --root "$BACKING" \
-    serve-history >>"$SVC_LOG" 2>&1 &
+  sudo env AGENTFS_REPLICA=history-0 AGENTFS_NODE=node-1 "$AGENTFS_BIN" --state "$STATE" \
+    --root "$BACKING" serve-history "${TLS_ARGS[@]}" >>"$SVC_LOG" 2>&1 &
   SVC_PID=$!
   wait_for 30 sh -c "[ \$(grep -c '^serving history' '$SVC_LOG') -gt $before ]" ||
     fail "the history service never served"
@@ -117,13 +131,16 @@ kill_service() {
   SVC_PID=
 }
 
+# A front on node-1 reaches the service at its socket; with
+# FRONT_ADDR=state FRONT_NODE=node-2 it is "on another node" and finds the
+# service through the endpoint file, over TLS.
 start_front() { # pod mountpoint log -> sets FRONT_PID
   local before
   before=$(grep -c '^mounted ' "$3" || true)
-  sudo env ${FRONT_SLOT:+AGENTFS_HISTORY_SLOT=$FRONT_SLOT} AGENTFS_WORKLOAD_MOUNTS=/workspace AGENTFS_POD="$1" AGENTFS_POD_UID="$1-uid" AGENTFS_NODE=node-1 \
+  sudo env ${FRONT_SLOT:+AGENTFS_HISTORY_SLOT=$FRONT_SLOT} AGENTFS_WORKLOAD_MOUNTS=/workspace AGENTFS_POD="$1" AGENTFS_POD_UID="$1-uid" AGENTFS_NODE="${FRONT_NODE:-node-1}" \
     AGENTFS_NAMESPACE=agents AGENTFS_REPLICA="$1" \
     "$AGENTFS_BIN" --state "$STATE" mount --passthrough "$P" --unmount-grace 5s \
-    --history-service "$SOCK" --history-timeout 5s --history-wait 30s \
+    --history-service "${FRONT_ADDR:-$SOCK}" --history-timeout 5s --history-wait 30s \
     "$BACKING" "$2" >>"$3" 2>&1 &
   FRONT_PID=$!
   wait_for 30 mountpoint -q "$2" || fail "$1 never mounted"
@@ -177,7 +194,12 @@ step "one service, two fronts over one backing tree"
 start_service
 start_front pod-a "$MNT_A" "$A_LOG"
 A_PID=$FRONT_PID
-start_front pod-b "$MNT_B" "$B_LOG"
+if [ "$T" = tls ]; then
+  FRONT_ADDR=state FRONT_NODE=node-2 start_front pod-b "$MNT_B" "$B_LOG"
+  grep -q "front of history service state" "$B_LOG" || fail "front b is not a front of state"
+else
+  start_front pod-b "$MNT_B" "$B_LOG"
+fi
 B_PID=$FRONT_PID
 sudo chown 10000:10000 "$MNT_A"
 grep '^mounted ' "$A_LOG"
@@ -186,6 +208,14 @@ echo "$STATUS"
 assert_contains "$STATUS" "history:   serving fronts at unix:$SOCK" "status shows the service"
 assert_contains "$STATUS" "command=mount pod=pod-a" "and front a"
 assert_contains "$STATUS" "command=mount pod=pod-b" "and front b"
+assert_contains "$STATUS" "endpoint:  node node-1" "and the endpoint fronts given state find"
+if [ "$T" = tls ]; then
+  assert_contains "$STATUS" "tls:127.0.0.1:" "with its TLS address"
+  assert_contains "$STATUS" "node=node-2 command=mount pod=pod-b" "front b is on node-2"
+  PING=$(sudo env AGENTFS_NODE=node-2 "$AGENTFS_BIN" --state "$STATE" ping-history --count 200)
+  echo "$PING"
+  assert_contains "$PING" "ping state from node node-2" "ping-history over TLS"
+fi
 set +e
 OUT=$(sudo "$AGENTFS_BIN" --state "$STATE" --root "$BACKING" record x 2>&1)
 CODE=$?
@@ -527,13 +557,26 @@ FRONT=$(sudo setpriv --reuid=10000 --regid=10000 --clear-groups -- \
   python3 "$W/boundary-latency.py" "$MNT_A/bench-front" "$N" front)
 stop_front "$A_PID" pod-a
 A_PID=
+TLS_FRONT=
+TLS_PING=
+UNIX_PING=$(sudo env AGENTFS_NODE=node-1 "$AGENTFS_BIN" --state "$STATE" ping-history --count 2000)
+if [ "$T" = tls ]; then
+  TLS_PING=$(sudo env AGENTFS_NODE=node-2 "$AGENTFS_BIN" --state "$STATE" ping-history --count 2000)
+  FRONT_ADDR=state FRONT_NODE=node-2 start_front pod-a "$MNT_A" "$A_LOG"
+  A_PID=$FRONT_PID
+  as_agent "$MNT_A" 'mkdir -p bench-tls'
+  TLS_FRONT=$(sudo setpriv --reuid=10000 --regid=10000 --clear-groups -- \
+    python3 "$W/boundary-latency.py" "$MNT_A/bench-tls" "$N" front-tls-loopback)
+  stop_front "$A_PID" pod-a
+  A_PID=
+fi
 stop_service
 
 row() { # line -> markdown row
   echo "$1" | sed -E 's/^([^ ]+) n=([0-9]+) p50=([0-9]+) p90=([0-9]+) p99=([0-9]+) max=([0-9]+)$/| \1 | \2 | \3 | \4 | \5 | \6 |/'
 }
 TABLE=$(
-  echo "### Per-close latency, passthrough $P (µs, open + write 4 KiB + close)"
+  echo "### Per-close latency, passthrough $P, front b over $T (µs, open + write 4 KiB + close)"
   echo
   echo "Kernel $(uname -r); backing tree on $(findmnt -no FSTYPE -T "$BACKING")."
   echo
@@ -541,6 +584,10 @@ TABLE=$(
   echo "|---|---|---|---|---|---|"
   row "$SINGLE"
   row "$FRONT"
+  if [ -n "$TLS_FRONT" ]; then row "$TLS_FRONT"; fi
+  echo
+  echo "Round trip (\`agentfs ping-history\`, no FUSE): $UNIX_PING"
+  if [ -n "$TLS_PING" ]; then echo; echo "$TLS_PING"; fi
 )
 echo "$TABLE"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then

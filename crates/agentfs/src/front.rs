@@ -96,6 +96,9 @@ fn connect(
             address: address.clone(),
             timeout: history.history_timeout,
             connect_wait: history.history_wait,
+            state: state.clone(),
+            // The pod's --node, else the host name (design §14.2).
+            node: agentfs_core::lockfile::node_name(),
         },
         &settings.volume,
         &settings.branch_ref,
@@ -256,6 +259,71 @@ pub(crate) fn mount_front(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// `agentfs ping-history`: `count` round trips to the service at
+/// `address`, as a front makes them, and their percentiles.
+pub(crate) fn ping(state: &StateDir, pod: &Pod, address: &str, count: usize) -> Result<ExitCode> {
+    let address: Address = address.parse()?;
+    let settings = History::open(&state.git())
+        .with_context(|| format!("opening {}", state.root().display()))?
+        .settings()
+        .clone();
+    let context = pod.context(&settings.volume);
+    let lease = FrontLease::acquire(
+        state,
+        &format!(
+            "command=ping-history pod={} replica={}",
+            context.pod, context.replica
+        ),
+    )?;
+    let front = FrontInfo {
+        origin: Origin::from_context(&context),
+        slot: lease.slot(),
+        instance: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+            ^ (u64::from(std::process::id()) << 32),
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        views: Vec::new(),
+        tree_dev: None,
+    };
+    let client = HistoryClient::connect(
+        ClientConfig {
+            address: address.clone(),
+            timeout: std::time::Duration::from_secs(10),
+            connect_wait: std::time::Duration::from_secs(10),
+            state: state.clone(),
+            node: agentfs_core::lockfile::node_name(),
+        },
+        &settings.volume,
+        &settings.branch_ref,
+        front,
+        std::sync::Arc::new(agentfs_core::events::NullSink),
+        agentfs_core::telemetry::Telemetry::noop(),
+    )
+    .context("connecting to the history service")?;
+    // The first round trip opened the connection; the rest reuse it.
+    let mut samples = Vec::with_capacity(count);
+    for _ in 0..count.max(1) {
+        samples.push(client.ping().context("ping")?);
+    }
+    samples.sort();
+    let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize].as_secs_f64() * 1e6;
+    println!(
+        "ping {address} from node {}: p50 {:.0} µs, p90 {:.0} µs, p99 {:.0} µs, max {:.0} µs \
+         (n={})",
+        agentfs_core::lockfile::node_name(),
+        at(0.5),
+        at(0.9),
+        at(0.99),
+        at(1.0),
+        samples.len()
+    );
+    drop(client);
+    drop(lease);
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `agentfs status`: the live fronts, and repair files no live front

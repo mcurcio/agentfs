@@ -158,6 +158,12 @@ enum Command {
         /// (default: <state>/meta/history/history.sock).
         #[arg(long, env = "AGENTFS_HISTORY_LISTEN", value_name = "ADDR")]
         listen: Option<String>,
+        /// Also serve fronts on other nodes over TLS at IP:PORT (port 0: a
+        /// free one), authenticated both ways with the volume's own
+        /// certificate, made in the state area at first use. Needs the
+        /// history-tls feature (design §14.1).
+        #[arg(long, env = "AGENTFS_HISTORY_LISTEN_TLS", value_name = "IP:PORT")]
+        listen_tls: Option<String>,
         #[command(flatten)]
         pod: Pod,
         /// How long shutdown may spend on a last push of the final commit;
@@ -257,6 +263,20 @@ enum Command {
         #[command(subcommand)]
         command: lfs_cmd::LfsCommand,
     },
+    /// Measure the round trip to the volume's history service as a front
+    /// would make it (leasing a slot for the while), and print its
+    /// percentiles in microseconds: over the Unix socket on the service's
+    /// node, over TLS from another (design §14.1).
+    PingHistory {
+        /// How many pings.
+        #[arg(long, default_value_t = 1000)]
+        count: usize,
+        /// The service's address, as --history-service takes it.
+        #[arg(long, default_value = "state", value_name = "ADDR")]
+        address: String,
+        #[command(flatten)]
+        pod: Pod,
+    },
 }
 
 impl Command {
@@ -269,7 +289,8 @@ impl Command {
             | Self::Push { pod, .. }
             | Self::Run { pod, .. }
             | Self::Restore { pod, .. }
-            | Self::Revert { pod, .. } => Some(pod),
+            | Self::Revert { pod, .. }
+            | Self::PingHistory { pod, .. } => Some(pod),
             Self::Mount(args) => Some(&args.pod),
             Self::Patch { command } => command.pod(),
             Self::Init { .. } | Self::Probe { .. } | Self::Lfs { .. } => None,
@@ -280,9 +301,13 @@ impl Command {
 /// Being a front of a history service (design §14).
 #[derive(Args)]
 struct HistoryArgs {
-    /// Record through the history service at ADDR (`unix:<path>` or an
-    /// absolute socket path) as a front: take no state-area lock, freeze
-    /// into a leased pending slot, and let the service journal and commit.
+    /// Record through the history service at ADDR as a front: take no
+    /// state-area lock, freeze into a leased pending slot, and let the
+    /// service journal and commit. ADDR is `unix:<path>` (or an absolute
+    /// socket path), `tls:<ip>:<port>` (history-tls), or `state`: the
+    /// active service the volume's endpoint file names, its socket on its
+    /// own node and TLS from others, found again at each connection, so a
+    /// handover between services is not an error (design §14.2).
     #[arg(long, env = "AGENTFS_HISTORY_SERVICE", value_name = "ADDR")]
     history_service: Option<String>,
     /// How long a boundary waits for the history service before it fails
@@ -419,11 +444,29 @@ fn real_main() -> Result<ExitCode> {
                 Some(holder) => println!("lock:      held by {holder}"),
                 None => println!("lock:      free"),
             }
-            if holder.is_some_and(|h| h.contains("command=serve-history")) {
+            if holder
+                .as_ref()
+                .is_some_and(|h| h.contains("command=serve-history"))
+            {
                 match serve_history::read_address(&state) {
                     Some(address) => println!("history:   serving fronts at {address}"),
                     None => println!("history:   serving fronts"),
                 }
+            }
+            // The active service, as fronts given `state` find it (design
+            // §14.2); a file without a live lock holder is a crashed one's.
+            match agentfs_core::history_service::Endpoint::read(&state) {
+                Ok(Some(endpoint)) if holder.is_some() => {
+                    println!("endpoint:  {}", endpoint.describe());
+                }
+                Ok(Some(endpoint)) => {
+                    println!(
+                        "endpoint:  stale ({}; no service holds the lock)",
+                        endpoint.describe()
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => println!("endpoint:  unreadable ({e})"),
             }
             front::print_status(&state);
             let settings = history.settings();
@@ -501,6 +544,7 @@ fn real_main() -> Result<ExitCode> {
         }
         Command::ServeHistory {
             listen,
+            listen_tls,
             pod,
             push_grace,
             shutdown_grace,
@@ -518,6 +562,7 @@ fn real_main() -> Result<ExitCode> {
                 &state,
                 root,
                 listen.as_deref(),
+                listen_tls.as_deref(),
                 &pod,
                 push_grace,
                 shutdown_grace,
@@ -573,6 +618,11 @@ fn real_main() -> Result<ExitCode> {
             return patch_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
         }
         Command::Lfs { command } => return lfs_cmd::run(command, &state, cli.wait_lock),
+        Command::PingHistory {
+            count,
+            address,
+            pod,
+        } => return front::ping(&state, &pod, &address, count),
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
             // A restarted sidecar whose daemon died (design §17.1).

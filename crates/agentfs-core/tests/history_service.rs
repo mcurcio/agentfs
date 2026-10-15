@@ -15,8 +15,8 @@ use agentfs_core::history_service::protocol::{
     FrontInfo, PathStamp, Reply, read_frame, read_frame_bytes, write_frame,
 };
 use agentfs_core::history_service::{
-    Address, ClientConfig, ClientError, FrontHooks, FrontLease, FrontsError, HistoryClient,
-    HistoryServer, NoHooks,
+    Address, ClientConfig, ClientError, Endpoint, FrontHooks, FrontLease, FrontsError,
+    HistoryClient, HistoryServer, NoHooks,
 };
 use agentfs_core::identity::Context;
 use agentfs_core::lfs::Store;
@@ -92,11 +92,41 @@ impl Service {
         service
     }
 
+    /// Listens at `addresses` and writes the endpoint file as
+    /// `serve-history` does, naming `node`; returns it.
+    fn listen_on(&mut self, env: &Env, addresses: &[Address], node: &str) -> Endpoint {
+        let settings = self.committer.history().settings().clone();
+        let server = HistoryServer::start(
+            addresses,
+            self.recorder.clone(),
+            &env.state,
+            &settings,
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        let bound = server.bound();
+        let mut endpoint = Endpoint::new(
+            "vol",
+            bound.iter().find_map(|a| match a {
+                Address::Unix(p) => Some(p.clone()),
+                _ => None,
+            }),
+            bound.iter().find_map(|a| match a {
+                Address::Tls(t) => Some(*t),
+                _ => None,
+            }),
+        );
+        endpoint.node = node.to_owned();
+        endpoint.write(&env.state).unwrap();
+        self.server = Some(server);
+        endpoint
+    }
+
     fn listen(&mut self, env: &Env) {
         let settings = self.committer.history().settings().clone();
         self.server = Some(
             HistoryServer::start(
-                &env.address,
+                std::slice::from_ref(&env.address),
                 self.recorder.clone(),
                 &env.state,
                 &settings,
@@ -194,6 +224,31 @@ fn connect_dev(
     events: Events,
     tree_dev: Option<u64>,
 ) -> Result<HistoryClient, ClientError> {
+    connect_to(
+        env,
+        &env.address,
+        "",
+        lease,
+        origin,
+        volume,
+        timeout,
+        events,
+        tree_dev,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_to(
+    env: &Env,
+    address: &Address,
+    node: &str,
+    lease: &FrontLease,
+    origin: Origin,
+    volume: &str,
+    timeout: Duration,
+    events: Events,
+    tree_dev: Option<u64>,
+) -> Result<HistoryClient, ClientError> {
     let branch = agentfs_core::history::History::open(&env.state.git())
         .unwrap()
         .settings()
@@ -201,9 +256,11 @@ fn connect_dev(
         .clone();
     HistoryClient::connect(
         ClientConfig {
-            address: env.address.clone(),
+            address: address.clone(),
             timeout,
             connect_wait: Duration::from_secs(5),
+            state: env.state.clone(),
+            node: node.to_owned(),
         },
         volume,
         &branch,
@@ -224,10 +281,24 @@ fn front_with_timeout(env: &Env, name: &str, timeout: Duration) -> Front {
 /// A front that says the tree's device is `tree_dev`, as a front on
 /// another NFS client of the export would (design §14.1).
 fn front_on(env: &Env, name: &str, timeout: Duration, tree_dev: Option<u64>) -> Front {
+    front_at(env, &env.address, "", name, timeout, tree_dev)
+}
+
+/// A front reaching the service at `address`, on `node`.
+fn front_at(
+    env: &Env,
+    address: &Address,
+    node: &str,
+    name: &str,
+    timeout: Duration,
+    tree_dev: Option<u64>,
+) -> Front {
     let lease = FrontLease::acquire(&env.state, &format!("pod={name}")).unwrap();
     let sink = Arc::new(MemorySink::new());
-    let client = connect_dev(
+    let client = connect_to(
         env,
+        address,
+        node,
         &lease,
         pod(name),
         "vol",
@@ -1482,6 +1553,39 @@ fn round_trip_cost() {
     println!("```");
     let pings: Vec<Duration> = (0..N).map(|_| client.ping().unwrap()).collect();
     println!("{:<34} {}", "ping round trip", percentiles(pings));
+    #[cfg(feature = "history-tls")]
+    let tls_front = {
+        // A second listener over loopback TLS (design §14.1).
+        let (tls, _keep) = tls_listener(&env, &service);
+        let lease = FrontLease::acquire(&env.state, "pod=bench-tls").unwrap();
+        let tls_client = connect_to(
+            &env,
+            &tls,
+            "node-2",
+            &lease,
+            pod("bench-tls"),
+            "vol",
+            Duration::from_secs(10),
+            Arc::new(NullSink),
+            None,
+        )
+        .unwrap();
+        let pings: Vec<Duration> = (0..N).map(|_| tls_client.ping().unwrap()).collect();
+        println!(
+            "{:<34} {}",
+            "TLS ping round trip (loopback)",
+            percentiles(pings)
+        );
+        let f = front_at(
+            &env,
+            &tls,
+            "node-2",
+            "pod-tls",
+            Duration::from_secs(10),
+            None,
+        );
+        (f, _keep, lease)
+    };
     for threads in [1, 8] {
         let local = time_records(
             &env,
@@ -1501,6 +1605,21 @@ fn round_trip_cost() {
             format!("front record, {threads} thr"),
             percentiles(front)
         );
+        #[cfg(feature = "history-tls")]
+        {
+            let tls = time_records(
+                &env,
+                &tls_front.0.recorder,
+                &format!("tls{threads}"),
+                threads,
+                N,
+            );
+            println!(
+                "{:<34} {}",
+                format!("TLS front record, {threads} thr"),
+                percentiles(tls)
+            );
+        }
     }
     println!("```");
     println!();
@@ -1745,4 +1864,291 @@ fn a_fronts_directory_move_is_one_record_reconciled_by_the_service() {
     assert_eq!(service.head_blob("m/e/y").unwrap(), b"y");
     assert_eq!(service.head_blob("m/untracked").unwrap(), b"u");
     assert_eq!(service.head_blob("d/x"), None);
+}
+
+#[test]
+fn a_front_finds_the_service_through_the_endpoint_file() {
+    let env = env();
+    let mut service = Service::start(&env);
+    drop(service.server.take());
+    let endpoint = service.listen_on(&env, std::slice::from_ref(&env.address), "node-1");
+    assert_eq!(Endpoint::read(&env.state).unwrap(), Some(endpoint));
+    let a = front_at(
+        &env,
+        &Address::State,
+        "node-1",
+        "pod-a",
+        Duration::from_secs(10),
+        None,
+    );
+    close(&env, &a.recorder, "f", "1").unwrap().unwrap();
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("f").unwrap(), b"1");
+}
+
+#[test]
+fn a_front_given_state_rides_a_handover_to_a_new_socket_without_eio() {
+    // The active service stops; another (here: on another socket path)
+    // takes over a little later. A front given `state` retries reaching a
+    // service (nothing sent) within its request timeout, so the boundary
+    // in between waits instead of failing (design §14.2).
+    let env = env();
+    let mut service = Service::start(&env);
+    drop(service.server.take());
+    let first = service.listen_on(&env, std::slice::from_ref(&env.address), "node-1");
+    let a = front_at(
+        &env,
+        &Address::State,
+        "node-1",
+        "pod-a",
+        Duration::from_secs(10),
+        None,
+    );
+    close(&env, &a.recorder, "before", "1").unwrap().unwrap();
+
+    // Stops: the endpoint goes first, then the socket.
+    first.remove(&env.state).unwrap();
+    drop(service.server.take());
+    let Service {
+        recorder,
+        committer,
+        ..
+    } = service;
+    let next = Address::Unix(env.state.history_dir().join("next.sock"));
+    let takeover = {
+        let (state, tree, next) = (env.state.clone(), env.tree.clone(), next.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let mut service = Service {
+                recorder,
+                committer,
+                server: None,
+            };
+            let env = Env {
+                _dir: tempfile::tempdir().unwrap(),
+                state,
+                tree,
+                address: next.clone(),
+            };
+            service.listen_on(&env, &[next], "node-1");
+            service
+        })
+    };
+    let start = Instant::now();
+    close(&env, &a.recorder, "during", "2")
+        .expect("no EIO across the handover")
+        .unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(300), "it waited");
+    let service = takeover.join().unwrap();
+    close(&env, &a.recorder, "after", "3").unwrap().unwrap();
+    service.committer.commit_pending().unwrap();
+    for (path, content) in [("before", b"1"), ("during", b"2"), ("after", b"3")] {
+        assert_eq!(service.head_blob(path).unwrap(), content, "{path}");
+    }
+    let unavailable = a
+        .sink
+        .take()
+        .into_iter()
+        .filter(|e| matches!(e, Event::RecordFailed { .. }))
+        .count();
+    assert_eq!(unavailable, 0, "no boundary failed");
+}
+
+#[test]
+fn a_front_given_state_fails_after_its_timeout_with_no_service() {
+    let env = env();
+    let mut service = Service::start(&env);
+    drop(service.server.take());
+    let endpoint = service.listen_on(&env, std::slice::from_ref(&env.address), "node-1");
+    let a = front_at(
+        &env,
+        &Address::State,
+        "node-1",
+        "pod-a",
+        Duration::from_millis(600),
+        None,
+    );
+    endpoint.remove(&env.state).unwrap();
+    drop(service.server.take());
+    let start = Instant::now();
+    let err = close(&env, &a.recorder, "f", "1").unwrap_err();
+    assert!(
+        start.elapsed() >= Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(
+        matches!(&err, VolumeError::HistoryService(e) if !e.maybe_journaled()),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("no history service"), "{err}");
+}
+
+/// A second server of `service`'s recorder on loopback TLS, with the
+/// volume's identity made as `serve-history --listen-tls` makes it; its
+/// address, and the server to keep.
+#[cfg(feature = "history-tls")]
+fn tls_listener(env: &Env, service: &Service) -> (Address, HistoryServer) {
+    agentfs_core::history_service::tls::ensure(&env.state, "vol").unwrap();
+    let settings = service.committer.history().settings().clone();
+    let server = HistoryServer::start(
+        &[Address::Tls("127.0.0.1:0".parse().unwrap())],
+        service.recorder.clone(),
+        &env.state,
+        &settings,
+        &Telemetry::noop(),
+    )
+    .unwrap();
+    let address = server.bound()[0].clone();
+    assert!(
+        matches!(address, Address::Tls(a) if a.port() != 0),
+        "{address}"
+    );
+    (address, server)
+}
+
+#[cfg(feature = "history-tls")]
+#[test]
+fn fronts_record_over_tls_with_their_own_committers() {
+    let env = env();
+    let mut service = Service::start(&env);
+    let (tls, server) = tls_listener(&env, &service);
+    let a = front_at(&env, &tls, "node-2", "pod-a", Duration::from_secs(10), None);
+    let b = front(&env, "pod-b");
+    close(&env, &a.recorder, "a", "1").unwrap().unwrap();
+    close(&env, &b.recorder, "b", "2").unwrap().unwrap();
+    // A pooled TLS connection is reused.
+    close(&env, &a.recorder, "a", "11").unwrap().unwrap();
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("a").unwrap(), b"11");
+    let pods: Vec<Option<String>> = service.commits().into_iter().map(|(_, p)| p).collect();
+    assert!(
+        pods.iter().any(|p| p.as_deref() == Some("pod-a")),
+        "{pods:?}"
+    );
+    assert!(
+        pods.iter().any(|p| p.as_deref() == Some("pod-b")),
+        "{pods:?}"
+    );
+    // A TLS front's restart of the service: it reconnects by itself.
+    drop(server);
+    let (tls2, _server) = {
+        drop(service.server.take());
+        service.listen(&env);
+        tls_listener(&env, &service)
+    };
+    assert_ne!(tls, tls2, "a new ephemeral port");
+}
+
+#[cfg(feature = "history-tls")]
+#[test]
+fn a_tls_front_found_through_state_on_another_node() {
+    let env = env();
+    let mut service = Service::start(&env);
+    drop(service.server.take());
+    agentfs_core::history_service::tls::ensure(&env.state, "vol").unwrap();
+    let endpoint = service.listen_on(
+        &env,
+        &[
+            env.address.clone(),
+            Address::Tls("127.0.0.1:0".parse().unwrap()),
+        ],
+        "node-1",
+    );
+    assert!(endpoint.tls.is_some_and(|t| t.port() != 0));
+    // node-2 has no access to node-1's socket: it takes TLS.
+    let remote = front_at(
+        &env,
+        &Address::State,
+        "node-2",
+        "pod-remote",
+        Duration::from_secs(10),
+        None,
+    );
+    let local = front_at(
+        &env,
+        &Address::State,
+        "node-1",
+        "pod-local",
+        Duration::from_secs(10),
+        None,
+    );
+    close(&env, &remote.recorder, "r", "1").unwrap().unwrap();
+    close(&env, &local.recorder, "l", "2").unwrap().unwrap();
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("r").unwrap(), b"1");
+    assert_eq!(service.head_blob("l").unwrap(), b"2");
+}
+
+#[cfg(feature = "history-tls")]
+#[test]
+fn a_tls_front_listens_for_the_services_calls() {
+    let env = env();
+    let service = Service::start(&env);
+    let (tls, server) = tls_listener(&env, &service);
+    let fronts = server.listening_fronts();
+    let lease = FrontLease::acquire(&env.state, "pod=pod-a").unwrap();
+    let hooks = Arc::new(Noting {
+        open: vec![path("a")],
+        ..Noting::default()
+    });
+    let client = Arc::new(
+        connect_to(
+            &env,
+            &tls,
+            "node-2",
+            &lease,
+            pod("pod-a"),
+            "vol",
+            Duration::from_secs(10),
+            Arc::new(NullSink),
+            None,
+        )
+        .unwrap(),
+    );
+    let listener = client.listen(hooks.clone()).unwrap();
+    assert!(listener.wait_listening(Duration::from_secs(5)));
+    assert_eq!(
+        fronts.require_all(Duration::from_secs(5)).unwrap(),
+        [lease.slot()]
+    );
+    assert_eq!(fronts.settle().unwrap(), 2);
+    assert_eq!(
+        fronts.open_for_writing(&[path("a"), path("b")]).unwrap(),
+        [true, false]
+    );
+    fronts.invalidate(&[path("a")]).unwrap();
+    assert_eq!(*hooks.invalidated.lock().unwrap(), [path("a")]);
+    listener.stop();
+}
+
+#[cfg(feature = "history-tls")]
+#[test]
+fn a_tls_front_without_the_volumes_identity_cannot_connect() {
+    let env = env();
+    let service = Service::start(&env);
+    let (tls, _server) = tls_listener(&env, &service);
+    // A front whose state area holds another identity (another volume's,
+    // or a squatter's).
+    let other = tempfile::tempdir().unwrap();
+    let other_state = StateDir::new(other.path().join("state"));
+    agentfs_core::history_service::tls::ensure(&other_state, "vol").unwrap();
+    let lease = FrontLease::acquire(&env.state, "pod=pod-x").unwrap();
+    let err = HistoryClient::connect(
+        ClientConfig {
+            address: tls,
+            timeout: Duration::from_secs(5),
+            connect_wait: Duration::from_millis(300),
+            state: other_state,
+            node: "node-2".into(),
+        },
+        "vol",
+        "refs/heads/agentfs/vol",
+        front_info(&lease, pod("pod-x")),
+        Arc::new(NullSink),
+        Telemetry::noop(),
+    )
+    .expect_err("refused");
+    assert!(matches!(err, ClientError::Unreachable { .. }), "{err:?}");
+    assert!(err.to_string().contains("TLS"), "{err}");
 }
