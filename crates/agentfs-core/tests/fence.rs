@@ -8,13 +8,17 @@ use std::time::Duration;
 use agentfs_core::lock::StateLock;
 use agentfs_core::volume::{self, StateDir};
 
+/// The fence is process-wide: one test at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn the_heartbeat_renews_the_fence_and_the_journal_stops_without_it() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let state = StateDir::new(dir.path().join("state"));
     volume::init(&state, "vol", None).unwrap();
-    // No fence yet: nothing is refused.
-    agentfs_core::fence::check().unwrap();
     let lock = StateLock::acquire(&state, "serve-history", Duration::ZERO).unwrap();
     let lost = Arc::new(AtomicBool::new(false));
     let flag = lost.clone();
@@ -55,4 +59,39 @@ fn the_heartbeat_renews_the_fence_and_the_journal_stops_without_it() {
     };
     assert!(journal.record(draft).is_err(), "fenced: nothing journaled");
     assert!(journal.uncommitted().is_empty());
+}
+
+#[test]
+fn a_lock_file_naming_another_holder_is_a_lost_lock() {
+    // An NFS client whose lease expired may still write the lock file; the
+    // new holder's line in it tells this one it lost the lock.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateDir::new(dir.path().join("state"));
+    volume::init(&state, "vol", None).unwrap();
+    let lock = StateLock::acquire(&state, "serve-history", Duration::ZERO).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _beat = lock
+        .start_heartbeat(Duration::from_millis(250), move |e| {
+            let _ = tx.send(e.to_string());
+        })
+        .unwrap();
+    fs_write_in_place(
+        &state.lock_file(),
+        "pid=1 node=other command=serve-history since=x\n",
+    );
+    let error = rx.recv_timeout(Duration::from_secs(5)).expect("lost");
+    assert!(error.contains("another holder"), "{error}");
+    assert!(agentfs_core::fence::check().is_err(), "revoked at once");
+}
+
+fn fs_write_in_place(path: &std::path::Path, text: &str) {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_len(0).unwrap();
+    file.write_at(text.as_bytes(), 0).unwrap();
+    // Closing it would drop a POSIX lock this process held: it holds none
+    // through this descriptor under flock.
 }

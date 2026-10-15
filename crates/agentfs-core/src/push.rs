@@ -50,9 +50,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -740,19 +739,11 @@ impl RemotePusher {
         &self.lock_path
     }
 
-    /// Takes this remote's push lock without waiting.
-    fn lock(&self) -> io::Result<Option<File>> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&self.lock_path)?;
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(file)),
-            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+    /// Takes this remote's push lock without waiting. A
+    /// [`crate::lockfile::HeldLock`], so a repack in this same process is
+    /// excluded too where `flock` is emulated with POSIX locks (NFS).
+    fn lock(&self) -> io::Result<Option<crate::lockfile::HeldLock>> {
+        crate::lockfile::HeldLock::try_exclusive(&self.lock_path, 0o600)
     }
 
     /// `<oid>:<ref>` for the branch and every
@@ -2830,7 +2821,7 @@ mod tests {
         v.commit();
         let (events, sink_events) = sink();
         let mut pusher = v.pusher("origin", sink_events);
-        let held = File::create(v.state.push_lock("origin")).unwrap();
+        let held = fs::File::create(v.state.push_lock("origin")).unwrap();
         rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
         assert_eq!(pusher.push_once(), PushOutcome::Busy);
         assert!(!PushOutcome::Busy.is_success());

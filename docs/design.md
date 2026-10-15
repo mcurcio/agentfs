@@ -2713,8 +2713,22 @@ and every node see at the same path; with several nodes that is a shared
 filesystem. It must honour `flock` (the state lock, §2.3, and the slot
 leases): NFSv4, or NFSv3 with NLM, never `nolock`. Reflinks do not cross
 it, so freezes copy (§3.2); passthrough is decided per inode and falls
-back where the kernel refuses a backing file (§17.1). None of this is
-tested yet.
+back where the kernel refuses a backing file (§17.1).
+
+Tested on NFS (`ci/e2e-nfs.sh`, CI job `e2e-nfs`, passthrough `auto` and
+`off`): a kernel NFS server on the runner exports one directory to two
+NFSv4.2 clients (the second in network and UTS namespaces of its own, so
+a separate client id, lease and set of locks), mounted `hard,
+lookupcache=positive`, with the export `rw, sync, no_root_squash` and
+nfsd's lease and grace at 15 s. It checks the state lock and slot leases
+across the clients (POSIX-emulated `flock` included, §2.3), a standby's
+takeover, the multi-pod e2e with a front on each client (front b over
+TLS), mmap and SQLite single-writer through a front, NFS silly renames,
+and a network partition of the active service's client: the heartbeat
+fences it, the other client's standby takes over once the lease
+expires, the fenced service exits 75 after the partition heals, and
+every acknowledged close is in history once. Recommended NFS settings
+are in [csi.md](csi.md).
 
 ## 15. Recovery and undo
 

@@ -153,6 +153,7 @@ impl StateLock {
         lost: impl FnOnce(io::Error) + Send + 'static,
     ) -> io::Result<HeartbeatHandle> {
         let file = self.held.file().try_clone()?;
+        let line = format!("{}\n", self.held.line());
         let fence_ref = crate::fence::install(fence);
         fence_ref.renew(Instant::now());
         let every = fence / 5;
@@ -177,7 +178,7 @@ impl StateLock {
                             }
                         }
                         let started = Instant::now();
-                        match renew(&file) {
+                        match renew(&file, &line) {
                             Ok(()) => fence_ref.renew(started),
                             Err(e) => {
                                 fence_ref.revoke();
@@ -197,14 +198,23 @@ impl StateLock {
     }
 }
 
-/// One renewal: the holder line written again in place, and synced.
-fn renew(file: &std::fs::File) -> io::Result<()> {
+/// One renewal: the file must still hold this process's holder line (a
+/// node that took the lock over wrote its own: an NFS client whose lease
+/// expired may not say so otherwise), then the line is written again in
+/// place and synced, which an NFS server refuses once the lock is lost.
+fn renew(file: &std::fs::File, line: &str) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     crate::failpoints::hit("lock.heartbeat")?;
-    let mut line = vec![0u8; 512];
-    let n = file.read_at(&mut line, 0)?;
-    line.truncate(n);
-    file.write_at(&line, 0)?;
+    let mut now = vec![0u8; 512];
+    let n = file.read_at(&mut now, 0)?;
+    now.truncate(n);
+    if now != line.as_bytes() {
+        return Err(io::Error::other(format!(
+            "the lock file names another holder now: {}",
+            String::from_utf8_lossy(&now).trim()
+        )));
+    }
+    file.write_at(line.as_bytes(), 0)?;
     file.sync_data()
 }
 

@@ -147,6 +147,7 @@ pub struct HeldLock {
     file: Option<File>,
     key: (u64, u64),
     path: PathBuf,
+    line: String,
 }
 
 impl HeldLock {
@@ -184,6 +185,7 @@ impl HeldLock {
             file: Some(file),
             key: k,
             path: path.to_path_buf(),
+            line: String::new(),
         }))
     }
 
@@ -201,7 +203,13 @@ impl HeldLock {
         if let Some(map) = held.as_mut() {
             map.insert(self.key, line.to_owned());
         }
+        line.clone_into(&mut self.line);
         Ok(())
+    }
+
+    /// The holder line this process wrote.
+    pub fn line(&self) -> &str {
+        &self.line
     }
 
     /// The locked file, for writes that do not close it.

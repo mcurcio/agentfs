@@ -174,16 +174,20 @@ impl EndpointCache {
         Self::default()
     }
 
-    /// The endpoint file of `state` now.
+    /// The endpoint file of `state` now. The file is opened every time:
+    /// on NFS an open revalidates the name with the server (close-to-open),
+    /// where a `stat` could answer from another node's stale cache for up
+    /// to a minute; only the parse is cached.
     pub fn get(&self, state: &StateDir) -> io::Result<Option<Endpoint>> {
-        let meta = match fs::metadata(path(state)) {
-            Ok(meta) => meta,
+        let mut file = match fs::File::open(path(state)) {
+            Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 *self.lock() = None;
                 return Ok(None);
             }
             Err(e) => return Err(e),
         };
+        let meta = file.metadata()?;
         let stamp = Stamp {
             ino: meta.ino(),
             size: meta.size(),
@@ -194,9 +198,12 @@ impl EndpointCache {
         {
             return Ok(Some(endpoint.clone()));
         }
-        let endpoint = Endpoint::read(state)?;
-        *self.lock() = endpoint.clone().map(|e| (stamp, e));
-        Ok(endpoint)
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut file, &mut bytes)?;
+        let endpoint: Endpoint = serde_json::from_slice(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        *self.lock() = Some((stamp, endpoint.clone()));
+        Ok(Some(endpoint))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<(Stamp, Endpoint)>> {

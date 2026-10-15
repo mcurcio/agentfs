@@ -21,6 +21,10 @@
 # kill -9 of the service, and that the service pushes. Then measures the
 # per-close cost, single-process against front (ci/boundary-latency.py).
 #
+# With MULTIPOD_DIR_A and MULTIPOD_DIR_B (one directory through two
+# clients of a shared filesystem), front b mounts the second client's view
+# (ci/e2e-nfs.sh runs it so over NFS, design §14.2).
+#
 # With FRONT_B_TRANSPORT=tls (a binary built with the history-tls
 # feature), the service also listens on loopback TLS and front b runs as
 # if on another node (AGENTFS_NODE=node-2, --history-service state): it
@@ -57,13 +61,30 @@ W=$(mktemp -d)
 chmod 755 "$W"
 STATE=$W/state
 BACKING=$W/backing
+# MULTIPOD_DIR_A and MULTIPOD_DIR_B: one directory seen through two
+# clients of one shared filesystem (ci/e2e-nfs.sh: two NFS clients of one
+# export). The service and front a use A's view, front b B's.
+if [ -n "${MULTIPOD_DIR_A:-}" ]; then
+  [ -n "${MULTIPOD_DIR_B:-}" ] || fail "MULTIPOD_DIR_A needs MULTIPOD_DIR_B"
+  sudo mkdir -p "$MULTIPOD_DIR_A/backing"
+  STATE=$MULTIPOD_DIR_A/state
+  BACKING=$MULTIPOD_DIR_A/backing
+  STATE_B=$MULTIPOD_DIR_B/state
+  BACKING_B=$MULTIPOD_DIR_B/backing
+  wait_for 30 test -d "$BACKING_B" || fail "$BACKING_B is not visible through the second client"
+else
+  STATE_B=$STATE
+  BACKING_B=$BACKING
+fi
 MNT_A=$W/mnt-a
 MNT_B=$W/mnt-b
 REMOTE=$W/remote.git
 SOCK=$STATE/meta/history/history.sock
 LOGS=${RUNNER_TEMP:-$W}/agentfs-multipod-logs
-mkdir -p "$BACKING" "$MNT_A" "$MNT_B" "$LOGS"
-chmod 755 "$BACKING" "$MNT_A" "$MNT_B"
+sudo mkdir -p "$BACKING"
+mkdir -p "$MNT_A" "$MNT_B" "$LOGS"
+sudo chmod 755 "$BACKING"
+chmod 755 "$MNT_A" "$MNT_B"
 SVC_LOG=$LOGS/service-$P-$T.log
 A_LOG=$LOGS/front-a-$P-$T.log
 B_LOG=$LOGS/front-b-$P-$T.log
@@ -107,7 +128,7 @@ start_service() {
   echo "---- serve-history" >>"$SVC_LOG"
   local before
   before=$(grep -c '^serving history' "$SVC_LOG" || true)
-  sudo env AGENTFS_REPLICA=history-0 AGENTFS_NODE=node-1 "$AGENTFS_BIN" --state "$STATE" \
+  sudo env AGENTFS_REPLICA=history-0 AGENTFS_NODE=node-1 AGENTFS_LOCK_FENCE="${AGENTFS_LOCK_FENCE:-10s}" "$AGENTFS_BIN" --state "$STATE" \
     --root "$BACKING" serve-history "${TLS_ARGS[@]}" >>"$SVC_LOG" 2>&1 &
   SVC_PID=$!
   wait_for 30 sh -c "[ \$(grep -c '^serving history' '$SVC_LOG') -gt $before ]" ||
@@ -135,13 +156,14 @@ kill_service() {
 # FRONT_ADDR=state FRONT_NODE=node-2 it is "on another node" and finds the
 # service through the endpoint file, over TLS.
 start_front() { # pod mountpoint log -> sets FRONT_PID
-  local before
+  local before state=$STATE backing=$BACKING
+  if [ "$2" = "$MNT_B" ]; then state=$STATE_B backing=$BACKING_B; fi
   before=$(grep -c '^mounted ' "$3" || true)
   sudo env ${FRONT_SLOT:+AGENTFS_HISTORY_SLOT=$FRONT_SLOT} AGENTFS_WORKLOAD_MOUNTS=/workspace AGENTFS_POD="$1" AGENTFS_POD_UID="$1-uid" AGENTFS_NODE="${FRONT_NODE:-node-1}" \
     AGENTFS_NAMESPACE=agents AGENTFS_REPLICA="$1" \
-    "$AGENTFS_BIN" --state "$STATE" mount --passthrough "$P" --unmount-grace 5s \
+    "$AGENTFS_BIN" --state "$state" mount --passthrough "$P" --unmount-grace 5s \
     --history-service "${FRONT_ADDR:-$SOCK}" --history-timeout 5s --history-wait 30s \
-    "$BACKING" "$2" >>"$3" 2>&1 &
+    "$backing" "$2" >>"$3" 2>&1 &
   FRONT_PID=$!
   wait_for 30 mountpoint -q "$2" || fail "$1 never mounted"
   wait_for 30 sh -c "[ \$(grep -c '^mounted ' '$3') -gt $before ]" || fail "$1: no startup line"
