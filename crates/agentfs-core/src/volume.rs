@@ -2174,6 +2174,13 @@ impl Committer {
         self.journal.backlog()
     }
 
+    /// Replaces the journal file with a new inode holding the same
+    /// records ([`Journal::replace_file`]): a history service taking over
+    /// from another node (design §14.2).
+    pub fn replace_journal_file(&self) -> io::Result<()> {
+        self.journal.replace_file()
+    }
+
     /// Commits every durable record, grouping records whose times fall
     /// within the configured commit window into one commit.
     pub fn commit_pending(&self) -> Result<CommitReport, VolumeError> {
@@ -2337,6 +2344,11 @@ impl Committer {
         records: &[Record],
         groups: &[&[Record]],
     ) -> Result<CommitReport, VolumeError> {
+        // Nothing reaches the branch from a service that may have lost its
+        // state lock to another node (design §14.2).
+        if !groups.is_empty() {
+            crate::fence::check()?;
+        }
         let mut report = CommitReport::default();
         let mut result = Ok(());
         for group in groups {

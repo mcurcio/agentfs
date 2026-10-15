@@ -165,7 +165,10 @@ impl Journal {
             encode(record, &mut buf)?;
         }
         let before = file.metadata()?.len();
-        let written = (self.before_sync)()
+        // A service that may have lost its state lock to another node
+        // writes nothing (design §14.2).
+        let written = crate::fence::check()
+            .and_then(|()| (self.before_sync)())
             .and_then(|()| crate::failpoints::hit("journal.before_write"))
             .and_then(|()| file.write_all(&buf))
             .and_then(|()| crate::failpoints::hit("journal.before_fsync"))
@@ -272,6 +275,22 @@ impl Journal {
         st.flushing = false;
         self.flushed.notify_all();
         outcome
+    }
+
+    /// Replaces the journal file by a new one (a new inode) holding the
+    /// same uncommitted records. A history service taking over from
+    /// another node does this first (design §14.2): a fenced predecessor
+    /// that still holds the old file open can only append to a file that
+    /// no longer has a name.
+    pub fn replace_file(&self) -> io::Result<()> {
+        let mut st = self.lock();
+        while st.flushing {
+            st = self.flushed.wait(st).expect("journal lock poisoned");
+        }
+        let remaining = st.uncommitted.clone();
+        let file = rewrite(&self.path, &remaining)?;
+        st.file = Some(file);
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -754,5 +773,26 @@ mod tests {
         j.truncate_through(1).unwrap();
         assert_eq!(j.backlog(), 1);
         assert_eq!(j.backlog(), j.uncommitted().len());
+    }
+
+    #[test]
+    fn a_replaced_file_is_a_new_inode_with_the_same_records() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let (j, _) = Journal::open(&path, 0, no_hook()).unwrap();
+        j.record(draft("a")).unwrap();
+        let before = fs::metadata(&path).unwrap().ino();
+        // A predecessor's descriptor of the old file.
+        let mut stale = OpenOptions::new().append(true).open(&path).unwrap();
+        j.replace_file().unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), before);
+        stale.write_all(b"garbage from a fenced writer").unwrap();
+        j.record(draft("b")).unwrap();
+        drop(j);
+        let (j, report) = Journal::open(&path, 0, no_hook()).unwrap();
+        assert_eq!(report.records, 2);
+        assert_eq!(report.discarded_bytes, 0, "the stale write went nowhere");
+        assert_eq!(j.uncommitted().len(), 2);
     }
 }

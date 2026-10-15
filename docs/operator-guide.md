@@ -478,7 +478,10 @@ Runbooks, with the full procedures:
   queue, submitting with plain git;
 - [history-service-down.md](runbooks/history-service-down.md): fronts
   failing with `EIO` because the history service is down, hung or
-  refusing them (§16).
+  refusing them (§16);
+- [history-service-failover.md](runbooks/history-service-failover.md):
+  standby services on several nodes, takeover, and a service that lost
+  its state lock (`StateLockLost`).
 
 **Patches** (§12) are the other way to change the tree from outside:
 producers queue them on the remote (`agentfs patch submit`), and every

@@ -700,7 +700,8 @@ impl EventSink for TelemetrySink {
             | Event::PatchFetchFailed { .. }
             | Event::HistoryServiceUnavailable { .. }
             | Event::HistoryServiceRestored { .. }
-            | Event::IdentityFallback { .. } => {}
+            | Event::IdentityFallback { .. }
+            | Event::StateLockLost { .. } => {}
         }
         if event.is_alarm()
             && let Some(alarms) = &inner.alarms
@@ -748,6 +749,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::HistoryServiceUnavailable { .. } => "agentfs.history_service_unavailable",
         Event::HistoryServiceRestored { .. } => "agentfs.history_service_restored",
         Event::IdentityFallback { .. } => "agentfs.identity_fallback",
+        Event::StateLockLost { .. } => "agentfs.state_lock_lost",
     }
 }
 
@@ -919,6 +921,9 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
         }
         Event::IdentityFallback { replica, error } => {
             out.push(("agentfs.replica", s(replica)));
+            out.push(("agentfs.error", s(error)));
+        }
+        Event::StateLockLost { error } => {
             out.push(("agentfs.error", s(error)));
         }
     }

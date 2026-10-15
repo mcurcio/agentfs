@@ -92,6 +92,43 @@ impl StateLock {
         Ok(Self { held })
     }
 
+    /// Waits without limit for the lock, as a standby history service
+    /// does (design §14.2): polls every 50 ms for 5 s, then every second,
+    /// and calls `waiting` once with the holder's line when it first finds
+    /// the lock held. Returns `None` as soon as `stop` says so.
+    pub fn wait_for(
+        state: &StateDir,
+        command: &str,
+        mut waiting: impl FnMut(&str),
+        stop: impl Fn() -> bool,
+    ) -> Result<Option<Self>, LockError> {
+        let start = Instant::now();
+        let mut told = false;
+        loop {
+            match Self::acquire(state, command, Duration::ZERO) {
+                Ok(lock) => return Ok(Some(lock)),
+                Err(LockError::Busy { holder, .. }) => {
+                    if !told {
+                        waiting(&holder);
+                        told = true;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+            if stop() {
+                return Ok(None);
+            }
+            std::thread::sleep(if start.elapsed() < FAST_POLL_FOR {
+                POLL
+            } else {
+                SLOW_POLL
+            });
+            if stop() {
+                return Ok(None);
+            }
+        }
+    }
+
     /// The holder's description if a process holds the lock on `state`
     /// (this one included), `None` if it is free (or the state area has
     /// no lock file).
@@ -102,6 +139,91 @@ impl StateLock {
     /// The lock file.
     pub fn path(&self) -> &Path {
         self.held.path()
+    }
+
+    /// Renews the lock every `fence / 5` until the handle is dropped
+    /// (design §14.2, [`crate::fence`]): rewrites the holder line in
+    /// place and syncs it, which an NFS server refuses once this node lost
+    /// the lock. Each success renews the process's fence (installed with
+    /// `fence`); the first failure revokes it and calls `lost` once, from
+    /// the heartbeat's thread.
+    pub fn start_heartbeat(
+        &self,
+        fence: Duration,
+        lost: impl FnOnce(io::Error) + Send + 'static,
+    ) -> io::Result<HeartbeatHandle> {
+        let file = self.held.file().try_clone()?;
+        let fence_ref = crate::fence::install(fence);
+        fence_ref.renew(Instant::now());
+        let every = fence / 5;
+        let stop = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let thread = {
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name("agentfs-lock-heartbeat".into())
+                .spawn(move || {
+                    let mut lost = Some(lost);
+                    loop {
+                        {
+                            let (flag, cv) = &*stop;
+                            let guard = flag
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let (guard, _) = cv
+                                .wait_timeout_while(guard, every, |s| !*s)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if *guard {
+                                return;
+                            }
+                        }
+                        let started = Instant::now();
+                        match renew(&file) {
+                            Ok(()) => fence_ref.renew(started),
+                            Err(e) => {
+                                fence_ref.revoke();
+                                if let Some(lost) = lost.take() {
+                                    lost(e);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                })?
+        };
+        Ok(HeartbeatHandle {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+/// One renewal: the holder line written again in place, and synced.
+fn renew(file: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    crate::failpoints::hit("lock.heartbeat")?;
+    let mut line = vec![0u8; 512];
+    let n = file.read_at(&mut line, 0)?;
+    line.truncate(n);
+    file.write_at(&line, 0)?;
+    file.sync_data()
+}
+
+/// A running lock heartbeat; stops it when dropped.
+pub struct HeartbeatHandle {
+    stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for HeartbeatHandle {
+    fn drop(&mut self) {
+        let (flag, cv) = &*self.stop;
+        *flag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cv.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -218,6 +340,40 @@ mod tests {
         assert_eq!(StateLock::holder(&state).unwrap(), None);
         StateLock::acquire(&state, "run", Duration::ZERO).unwrap();
         crate::lockfile::use_posix_locks_on_this_thread(false);
+    }
+
+    #[test]
+    fn a_standby_waits_until_the_holder_goes_and_can_be_stopped() {
+        let (_dir, state) = state();
+        let lock = StateLock::acquire(&state, "serve-history", Duration::ZERO).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(lock);
+        });
+        let mut seen = Vec::new();
+        let start = Instant::now();
+        let got = StateLock::wait_for(
+            &state,
+            "serve-history",
+            |h| seen.push(h.to_owned()),
+            || false,
+        )
+        .unwrap();
+        assert!(got.is_some());
+        assert!(start.elapsed() >= Duration::from_millis(1400));
+        assert_eq!(seen.len(), 1, "told once: {seen:?}");
+        assert!(seen[0].contains("command=serve-history"), "{seen:?}");
+        releaser.join().unwrap();
+        // Stopped while waiting.
+        let start = Instant::now();
+        let none = StateLock::wait_for(
+            &state,
+            "x",
+            |_| {},
+            || start.elapsed() > Duration::from_millis(5300),
+        )
+        .unwrap();
+        assert!(none.is_none());
     }
 
     #[test]

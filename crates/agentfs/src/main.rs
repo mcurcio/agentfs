@@ -164,6 +164,28 @@ enum Command {
         /// history-tls feature (design §14.1).
         #[arg(long, env = "AGENTFS_HISTORY_LISTEN_TLS", value_name = "IP:PORT")]
         listen_tls: Option<String>,
+        /// Wait without limit for the state lock instead of exiting 75 when
+        /// another service holds it, doing nothing meanwhile, and serve once
+        /// it is free: one per node that stages the volume, so another
+        /// takes over when the active one stops or its node is lost
+        /// (design §14.2). SIGINT or SIGTERM stop the wait.
+        #[arg(long, env = "AGENTFS_HISTORY_STANDBY")]
+        standby: bool,
+        /// Renew the state lock in a heartbeat and stop writing when a
+        /// renewal is older than --lock-fence, exiting 75 when it fails:
+        /// `auto` (on when the state area is on a network filesystem),
+        /// `on` or `off` (design §14.2).
+        #[arg(
+            long,
+            env = "AGENTFS_LOCK_HEARTBEAT",
+            default_value = "auto",
+            value_name = "MODE"
+        )]
+        lock_heartbeat: agentfs_core::fence::LockHeartbeat,
+        /// How old the last lock renewal may be before the service stops
+        /// writing; the NFS server's lease time must be at least twice it.
+        #[arg(long, env = "AGENTFS_LOCK_FENCE", default_value = "10s", value_parser = parse_grace, value_name = "DURATION")]
+        lock_fence: Duration,
         #[command(flatten)]
         pod: Pod,
         /// How long shutdown may spend on a last push of the final commit;
@@ -545,6 +567,9 @@ fn real_main() -> Result<ExitCode> {
         Command::ServeHistory {
             listen,
             listen_tls,
+            standby,
+            lock_heartbeat,
+            lock_fence,
             pod,
             push_grace,
             shutdown_grace,
@@ -556,16 +581,51 @@ fn real_main() -> Result<ExitCode> {
                      mount"
                 );
             };
-            let _lock = StateLock::acquire(&state, "serve-history", cli.wait_lock)?;
+            let lock = if standby {
+                let volume = volume_name(&state).unwrap_or_default();
+                let stopped = std::cell::Cell::new(false);
+                let lock = StateLock::wait_for(
+                    &state,
+                    "serve-history",
+                    |holder| {
+                        eprintln!(
+                            "standby for volume {volume}: the active history service is {holder}; \
+                             waiting to take over"
+                        );
+                    },
+                    || {
+                        let wake = daemon.signalled().is_some();
+                        stopped.set(stopped.get() || wake);
+                        stopped.get()
+                    },
+                )?;
+                match lock {
+                    Some(lock) => {
+                        eprintln!("standby for volume {volume}: took over the state lock");
+                        lock
+                    }
+                    None => {
+                        eprintln!("standby for volume {volume}: stopped while waiting");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                }
+            } else {
+                StateLock::acquire(&state, "serve-history", cli.wait_lock)?
+            };
             return serve_history::serve(
                 daemon,
                 &state,
                 root,
-                listen.as_deref(),
-                listen_tls.as_deref(),
+                &lock,
+                serve_history::Options {
+                    listen: listen.as_deref(),
+                    listen_tls: listen_tls.as_deref(),
+                    heartbeat: lock_heartbeat,
+                    fence: lock_fence,
+                    push_grace,
+                    shutdown_grace,
+                },
                 &pod,
-                push_grace,
-                shutdown_grace,
             );
         }
         Command::Push {

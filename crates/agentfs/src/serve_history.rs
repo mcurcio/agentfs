@@ -30,7 +30,10 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 
+use agentfs_core::events::Event;
+use agentfs_core::fence::LockHeartbeat;
 use agentfs_core::history_service::{Address, Endpoint, FrontLease, HistoryServer};
+use agentfs_core::lock::StateLock;
 use agentfs_core::push;
 use agentfs_core::service::Service;
 use agentfs_core::volume::StateDir;
@@ -52,17 +55,36 @@ pub(crate) fn read_address(state: &StateDir) -> Option<String> {
         .filter(|a| !a.is_empty())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// How `serve-history` serves.
+pub(crate) struct Options<'a> {
+    pub listen: Option<&'a str>,
+    pub listen_tls: Option<&'a str>,
+    pub heartbeat: LockHeartbeat,
+    pub fence: Duration,
+    pub push_grace: Duration,
+    pub shutdown_grace: Duration,
+}
+
+/// Exit status when the state lock is lost (`EX_TEMPFAIL`): the CSI
+/// supervisor restarts the service, as a standby.
+const EXIT_LOCK_LOST: i32 = 75;
+
 pub(crate) fn serve(
     daemon: Daemon,
     state: &StateDir,
     root: &Path,
-    listen: Option<&str>,
-    listen_tls: Option<&str>,
+    lock: &StateLock,
+    options: Options<'_>,
     pod: &Pod,
-    push_grace: Duration,
-    shutdown_grace: Duration,
 ) -> Result<ExitCode> {
+    let Options {
+        listen,
+        listen_tls,
+        heartbeat,
+        fence,
+        push_grace,
+        shutdown_grace,
+    } = options;
     let backing = root
         .canonicalize()
         .with_context(|| format!("the backing tree {}", root.display()))?;
@@ -84,7 +106,38 @@ pub(crate) fn serve(
     };
     let session = Session::start(state, pod)?;
     let events = session.events.clone();
+    // On a shared filesystem the lock is a lease the node can lose: renew
+    // it, and stop writing the moment it may be another node's (design
+    // §14.2). Before the volume is opened, so recovery is fenced too.
+    let _heartbeat = if heartbeat.enabled(state.root()) {
+        let events = events.clone();
+        let beat = lock
+            .start_heartbeat(fence, move |e| {
+                events.emit(Event::StateLockLost {
+                    error: e.to_string(),
+                });
+                eprintln!(
+                    "lost the state lock ({e}): exiting without a final commit; another node's \
+                     standby takes over"
+                );
+                std::process::exit(EXIT_LOCK_LOST);
+            })
+            .context("starting the state lock's heartbeat")?;
+        eprintln!(
+            "state lock heartbeat: renewing every {:?}, fencing writes after {fence:?}",
+            fence / 5
+        );
+        Some(beat)
+    } else {
+        None
+    };
     let (recorder, committer, recovery) = session.open(state, &backing, pod)?;
+    // A previous holder on another node that lost its lock may still have
+    // the journal open: from now on it can only append to a file without
+    // a name (design §14.2).
+    committer
+        .replace_journal_file()
+        .context("replacing the journal file at takeover")?;
     let commit_window = committer.history().settings().commit_window;
     // Orders fronts' records that race for one path (design §14.1).
     recorder.enable_stamps();

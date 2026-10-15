@@ -24,6 +24,9 @@ cargo test --locked -p agentfs-core --features failpoints --test crash_points --
 step "process crash tests"
 cargo test --locked -p agentfs --features failpoints --test crash_daemon
 
+step "a history service that cannot renew its state lock (design §14.2)"
+cargo test --locked -p agentfs --features failpoints --test cli_standby
+
 if [ ! -c /dev/fuse ]; then
   echo "skipping the mount crash tests: /dev/fuse is missing"
   exit 0

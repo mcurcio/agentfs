@@ -222,7 +222,25 @@ so a crash never leaves a stale lock.
   fronts serve no control socket.
 - Under the CSI driver (§14.2) the node plugin starts the volume's
   `serve-history` at NodeStage, so the service holds the lock while the
-  volume is staged on a node. The controller takes the lock only briefly,
+  volume is staged on a node.
+- **Several nodes** (§14.2): every node that stages a volume runs
+  `serve-history --standby`, which waits for the lock without limit and
+  serves once it holds it; the others keep waiting. On a shared
+  filesystem the lock is a lease the node can lose (an NFS client cut off
+  from its server loses its locks after the server's lease time), so the
+  holder runs a **heartbeat** (`--lock-heartbeat`, on by default when the
+  state area is on a network filesystem): every `--lock-fence`/5 (default
+  10 s / 5) it rewrites its holder line in place and syncs it, which the
+  server refuses once the lock is gone. The journal's write and every
+  commit check that the last renewal is no older than `--lock-fence`
+  (`agentfs_core::fence`) and fail otherwise, so a cut-off service stops
+  writing before its lock can be granted elsewhere, provided the server's
+  lease is at least twice the fence. A failed renewal raises
+  `StateLockLost`, and the service exits 75 at once, without a final
+  commit. A service that takes the lock replaces the journal file with a
+  new inode holding the same records before anything else, so a fenced
+  predecessor still holding the old file can only append to a file with
+  no name. The controller takes the lock only briefly,
   to create or delete a volume; DeleteVolume of a staged volume fails with
   `FailedPrecondition`.
 
@@ -2171,6 +2189,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PatchApplied` | A patch was applied as a commit (not an alarm; sinks filter) |
 | `HistoryServiceUnavailable` | A front's request to the history service failed (unreachable, timed out, lost or refused) after it last succeeded: raised once per outage; boundaries fail with `EIO` until it is back (§3.5, §14) |
 | `HistoryServiceRestored` | A front's request succeeded again after `HistoryServiceUnavailable` (not an alarm; sinks filter, the CLI prints it) |
+| `StateLockLost` | A history service's state-lock heartbeat failed (on a shared filesystem another node may hold the lock): it stops writing and exits 75 without a final commit; a standby takes over (§2.3, §14.2) |
 | `IdentityFallback` | The history service could not render a journaled front origin's committer (the identity templates changed across a restart); that pod's records are committed with the service's own committer, keeping the pod trailers (§9); once per pod |
 
 A sink is called from the synchronous step, on the FUSE threads, so it must
@@ -3603,6 +3622,8 @@ runner.
 | Finding the service (2026-10-15) | `meta/history/endpoint.json` in the shared state area, written by the active service; fronts given `state` read it at each connection, use the socket on the service's node and TLS elsewhere, and retry a service they cannot reach (nothing sent) within `--history-timeout`. No Kubernetes Service objects, no RBAC change (§14.1, §14.2) |
 | Locks on shared filesystems (2026-10-15) | A process never opens and closes a lock file it holds (NFS emulates `flock` with POSIX locks, which a close drops); holder lines carry the node, and the CSI driver matches a front's slot by pid and node (§2.3) |
 | Stamps across NFS clients (2026-10-15) | A front's hello carries its tree's `st_dev`; the service compares stamps of that device as the tree's. The service's look at the tree opens each directory and uses `statx(AT_STATX_FORCE_SYNC)`. NFS silly-rename names are never recorded (§4, §14.1) |
+| Standby and failover (2026-10-15) | Every node that stages a volume runs `serve-history --standby`; the lock holder is active, the others poll every second and take over when it is released (a clean stop, or a crash: the kernel or the NFS server's lease frees it). Patches are not fetched or applied at a takeover while front leases are live (§2.3, §12, §14.2) |
+| Fencing a lost lock (2026-10-15, default, owner to confirm) | A heartbeat renews the lock every `--lock-fence`/5 and the journal and commits refuse to write once the last renewal is older than `--lock-fence` (10 s); this relies on the NFS server's lease being at least twice the fence, and accepts one residual: a service stuck inside one NFS call when a partition begins can complete it after a takeover. A per-batch epoch check (one more NFS round trip per group commit) was the alternative. A lost lock exits 75; the journal file is replaced at takeover; ref updates are already compare-and-swap (§2.3, §14.2) |
 | CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2): NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it, and runs with `hostPID: true` so its fronts can read callers' groups, §6); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
 | CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |

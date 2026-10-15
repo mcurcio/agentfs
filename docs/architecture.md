@@ -62,6 +62,7 @@ missing from these tables or a row names a module that no longer exists;
 | `confined.rs` | `openat2`-confined access to the tree for restores (§6, §15) |
 | `operations.rs` | Restores and reverts in progress: their writes become one operation commit (§15) |
 | `lock.rs` | The state-area lock, an `flock` on `meta/lock` (§2.3) |
+| `fence.rs` | The state lock's fence on shared filesystems: the heartbeat's last renewal, checked before every journal write and commit (§2.3, §14.2) |
 | `lockfile.rs` | Lock files that hold under `flock` and NFS's POSIX emulation of it: a per-process registry, probes that never drop the process's own locks, holder lines with pid and node (§2.3, §14.2) |
 | `local_socket.rs` | Unix sockets in the state area with peer-credential checks, for the control socket and the history service |
 | `fsutil.rs` | Small helpers for the state files under `<state>/meta` |
@@ -296,6 +297,7 @@ What a crash at each point leaves, and what the next open does (§3.3,
 | A commit, inside the branch ref update (libgit2 writes `<ref>.lock`, then renames it) | Maybe `refs/heads/agentfs/<volume>.lock` | Ref lock files are removed at open, with a warning (design §3.3); the records are committed again | none (the power-loss workflow, design §18) |
 | After the branch ref moves | The commit's `Agentfs-Seq` names its last record | Records up to that sequence are dropped from the journal and their frozen copies removed | `commit.after_ref`, `commit.after_sync`, `journal.truncate.after_tmp`, `journal.truncate.after_rename`, `commit.before_pending_remove`, `pending.remove.between` |
 | A push | The remote either has the new ref or not; pushes are never forced | The push loop pushes again at start; a push that already landed changes nothing the second time (§11.2) | `push.after_remote_update`, `state.json.before_rename` |
+| A history service's lock renewal on a shared filesystem (§14.2) | The service may no longer hold the state lock | The fence stops its journal writes and commits; it exits 75 without a final commit. The next active service replays the journal and replaces the journal file, so the old one's descriptor appends nowhere | `lock.heartbeat` |
 | A front's process (§14) | Its leased slot's frozen copies; maybe a request in flight | The kernel releases the lease. A request that may have been journaled is never resent; the boundary failed with `EIO`. A restarted front passes its old slot to drain it | `front.after_reply` |
 | The history service | Fronts' requests fail with `EIO` until it is back | The service reopens the volume as above; fronts reconnect | `service.after_record` |
 | A restore | Some paths written, each recorded as an ordinary boundary | The partial apply is recorded and committed; re-running the restore finishes the job (§15) | none |

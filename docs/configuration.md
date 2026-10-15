@@ -728,6 +728,9 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it |
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
 | `--listen-tls IP:PORT` | `AGENTFS_HISTORY_LISTEN_TLS` | none | `serve-history`: also serve fronts on other nodes over TLS 1.3 at IP:PORT (port 0: a free one, named in the endpoint file), both ends pinned to the volume's certificate in `meta/history/tls/identity.pem`, made at first use; needs the `history-tls` feature (design §14.1) |
+| `--standby` | `AGENTFS_HISTORY_STANDBY` | off | `serve-history`: wait without limit for the state lock instead of exiting 75 (polling every 50 ms for 5 s, then every second), doing nothing meanwhile, and serve once it is free; SIGINT or SIGTERM stop the wait (design §14.2) |
+| `--lock-heartbeat MODE` | `AGENTFS_LOCK_HEARTBEAT` | `auto` | `serve-history`: renew the state lock every `--lock-fence`/5 and refuse journal writes and commits once the last renewal is older than `--lock-fence`; a failed renewal raises `StateLockLost` and exits 75. `auto`: on when the state area is on a network filesystem (NFS, SMB, Ceph, 9p, AFS, Lustre, GFS2, OCFS2, FUSE); `on`; `off` (design §14.2) |
+| `--lock-fence DURATION` | `AGENTFS_LOCK_FENCE` | `10s` | `serve-history` with the heartbeat: how old the last lock renewal may be before writes stop; the NFS server's lease time must be at least twice it |
 | `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
 | `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR: `unix:<path>` (or an absolute path), `tls:<ip>:<port>` (`history-tls`), or `state`, the active service its endpoint file names (its socket on its node, TLS from others), found again at each connection; with `state` a boundary that reaches no service (nothing sent) retries within `--history-timeout` (design §14.2) |
 | `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `mount`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
@@ -799,6 +802,7 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_WORKLOAD_MOUNTS` | `--workload-mount` | `mount` |
 | `AGENTFS_HISTORY_LISTEN` | `--listen` | `serve-history` |
 | `AGENTFS_HISTORY_LISTEN_TLS` | `--listen-tls` | `serve-history` |
+| `AGENTFS_HISTORY_STANDBY`, `AGENTFS_LOCK_HEARTBEAT`, `AGENTFS_LOCK_FENCE` | `--standby`, `--lock-heartbeat`, `--lock-fence` | `serve-history` |
 | `AGENTFS_HISTORY_SERVICE`, `AGENTFS_HISTORY_TIMEOUT`, `AGENTFS_HISTORY_WAIT`, `AGENTFS_HISTORY_SLOT` | `--history-service`, `--history-timeout`, `--history-wait`, `--history-slot` | `mount`, `record` |
 | `AGENTFS_CSI_MODE`, `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | `--mode`, `--endpoint`, `--node-id`, `--pod`, `--namespace` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
 
