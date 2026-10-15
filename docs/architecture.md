@@ -62,6 +62,7 @@ missing from these tables or a row names a module that no longer exists;
 | `confined.rs` | `openat2`-confined access to the tree for restores (§6, §15) |
 | `operations.rs` | Restores and reverts in progress: their writes become one operation commit (§15) |
 | `lock.rs` | The state-area lock, an `flock` on `meta/lock` (§2.3) |
+| `lockfile.rs` | Lock files that hold under `flock` and NFS's POSIX emulation of it: a per-process registry, probes that never drop the process's own locks, holder lines with pid and node (§2.3, §14.2) |
 | `local_socket.rs` | Unix sockets in the state area with peer-credential checks, for the control socket and the history service |
 | `fsutil.rs` | Small helpers for the state files under `<state>/meta` |
 | `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` (§4.3, §11.1) |

@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use agentfs_core::history_service::FrontLease;
+use agentfs_core::lockfile;
 use agentfs_core::volume::{self as core_volume, StateDir};
 use agentfs_fuse::MountState;
 use rustix::process::Signal;
@@ -858,7 +859,8 @@ impl Supervisor {
             )
         };
         let state = StateDir::new(self.layout().state(&handle));
-        let slot = tokio::task::spawn_blocking(move || slot_of(&state, pid))
+        let node = self.cfg.node_id.clone();
+        let slot = tokio::task::spawn_blocking(move || slot_of(&state, pid, &node))
             .await
             .ok()
             .flatten()
@@ -1233,14 +1235,20 @@ fn address_file(layout: &Layout, handle: &str) -> PathBuf {
         .join("address")
 }
 
-/// The slot `pid` leases, from the lease holders' lines.
-fn slot_of(state: &StateDir, pid: u32) -> Option<u16> {
-    let prefix = format!("pid={pid} ");
+/// The slot `pid` on `node` leases, from the lease holders' lines. Pids
+/// collide across nodes sharing a volume (design §14.2), so a line naming
+/// another node is never this front's; a line without a node (an older
+/// front) matches on the pid alone.
+pub(crate) fn slot_of(state: &StateDir, pid: u32, node: &str) -> Option<u16> {
     FrontLease::holders(state)
         .ok()?
         .into_iter()
-        .find(|(_, line)| line.starts_with(&prefix))
+        .find(|(_, line)| holder_is(line, pid, node))
         .map(|(slot, _)| slot)
+}
+
+fn holder_is(line: &str, pid: u32, node: &str) -> bool {
+    lockfile::holder_pid(line) == Some(pid) && lockfile::holder_node(line).is_none_or(|n| n == node)
 }
 
 fn describe(exit: Option<Exit>) -> String {
@@ -1327,5 +1335,16 @@ mod tests {
             next_backoff(Some(Duration::from_secs(30)), Duration::from_secs(61), &cfg),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn slots_match_pid_and_node() {
+        let line = "pid=42 node=node-a command=mount pod=x since=y";
+        assert!(holder_is(line, 42, "node-a"));
+        assert!(!holder_is(line, 42, "node-b"), "same pid on another node");
+        assert!(!holder_is(line, 4, "node-a"));
+        assert!(!holder_is("pid=420 node=node-a", 42, "node-a"));
+        // An older front's line, without a node.
+        assert!(holder_is("pid=42 command=mount since=y", 42, "node-b"));
     }
 }

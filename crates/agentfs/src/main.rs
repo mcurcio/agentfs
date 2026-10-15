@@ -259,6 +259,24 @@ enum Command {
     },
 }
 
+impl Command {
+    /// The command's pod flags, if it takes them.
+    fn pod(&self) -> Option<&Pod> {
+        match self {
+            Self::Status(pod) | Self::Flush(pod) => Some(pod),
+            Self::Record { pod, .. }
+            | Self::ServeHistory { pod, .. }
+            | Self::Push { pod, .. }
+            | Self::Run { pod, .. }
+            | Self::Restore { pod, .. }
+            | Self::Revert { pod, .. } => Some(pod),
+            Self::Mount(args) => Some(&args.pod),
+            Self::Patch { command } => command.pod(),
+            Self::Init { .. } | Self::Probe { .. } | Self::Lfs { .. } => None,
+        }
+    }
+}
+
 /// Being a front of a history service (design §14).
 #[derive(Args)]
 struct HistoryArgs {
@@ -356,6 +374,10 @@ fn main() -> ExitCode {
 fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let state = StateDir::new(&cli.state);
+    // Lock and lease holder lines name the node (design §2.3, §14.2).
+    if let Some(pod) = cli.command.pod() {
+        agentfs_core::lockfile::set_node(&pod.node);
+    }
     match cli.command {
         Command::Init {
             volume,

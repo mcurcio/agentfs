@@ -8,19 +8,21 @@
 //! leaves them alone when it prunes `pending/`; an unleased slot's copies
 //! are orphans like any other.
 //!
+//! Leases are [`HeldLock`]s, so a process never leases one slot twice and
+//! a probe never drops a lease, also where `flock` is emulated with POSIX
+//! locks (NFS, [`crate::lockfile`]). Holder lines name the node, since
+//! pids collide across nodes.
+//!
 //! Slot 0 belongs to the holder of the state-area lock (single-process mode
 //! or the history service), so leases run from 1 to [`MAX_SLOT`].
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
+use std::io;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
-use rustix::fs::{FlockOperation, flock};
-
-use crate::push::utc_basic;
+use crate::lockfile::{self, HeldLock};
 use crate::volume::StateDir;
 
 /// The highest slot a front can lease: the number of fronts one volume can
@@ -40,7 +42,7 @@ pub enum LeaseError {
 #[derive(Debug)]
 pub struct FrontLease {
     // Held only for the lock it carries.
-    _file: File,
+    _held: HeldLock,
     slot: u16,
 }
 
@@ -94,32 +96,12 @@ impl FrontLease {
             path: path.clone(),
             source,
         };
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)
-            .map_err(io_err)?;
-        if !try_lock(&file, FlockOperation::NonBlockingLockExclusive).map_err(io_err)? {
+        let Some(mut held) = HeldLock::try_exclusive(&path, 0o600).map_err(io_err)? else {
             return Ok(None);
-        }
-        let since = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let line = format!(
-            "pid={} {description} since={}\n",
-            std::process::id(),
-            utc_basic(since)
-        );
-        (|| {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(line.as_bytes())
-        })()
-        .map_err(io_err)?;
-        Ok(Some(Self { _file: file, slot }))
+        };
+        held.set_holder(&lockfile::holder_line(description))
+            .map_err(io_err)?;
+        Ok(Some(Self { _held: held, slot }))
     }
 
     /// The leased slot.
@@ -143,22 +125,18 @@ impl FrontLease {
             .collect())
     }
 
-    /// The live slots and their holders' descriptions (`pid=… <description>
-    /// since=…`), in slot order, for `agentfs status`.
+    /// The live slots and their holders' descriptions (`pid=… node=…
+    /// <description> since=…`), in slot order, for `agentfs status`.
     pub fn holders(state: &StateDir) -> io::Result<Vec<(u16, String)>> {
-        let mut holders: Vec<(u16, String)> = Self::scan(state)?
-            .into_iter()
-            .map(|(slot, mut file)| {
-                let mut text = String::new();
-                let _ = (&mut file).take(512).read_to_string(&mut text);
-                (slot, text.trim().to_owned())
-            })
-            .collect();
+        let mut holders = Self::scan(state)?;
         holders.sort();
         Ok(holders)
     }
 
-    fn scan(state: &StateDir) -> io::Result<Vec<(u16, File)>> {
+    /// Every slot some process (this one included) holds, with its holder
+    /// line. Never opens a lease this process holds, which would drop it
+    /// where `flock` is emulated with POSIX locks ([`crate::lockfile`]).
+    fn scan(state: &StateDir) -> io::Result<Vec<(u16, String)>> {
         let mut live = Vec::new();
         let entries = match fs::read_dir(state.fronts_dir()) {
             Ok(entries) => entries,
@@ -176,36 +154,13 @@ impl FrontLease {
             else {
                 continue;
             };
-            let file = match File::open(entry.path()) {
-                Ok(file) => file,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
-            };
-            // A shared probe: it fails only against a holder's exclusive
-            // lock, and never blocks a front's own acquire for long.
-            if try_lock(&file, FlockOperation::NonBlockingLockShared)? {
-                flock(&file, FlockOperation::Unlock)?;
-            } else {
-                live.push((slot, file));
+            if let Some(line) = lockfile::probe(&entry.path())? {
+                live.push((slot, line));
             }
         }
         Ok(live)
     }
 }
-
-/// Takes `op` on `file`: `true` if taken, `false` if someone else holds a
-/// conflicting lock.
-fn try_lock(file: &File, op: FlockOperation) -> io::Result<bool> {
-    loop {
-        match flock(file, op) {
-            Ok(()) => return Ok(true),
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(false),
-            Err(e) => return Err(e.into()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +238,27 @@ mod tests {
         assert_eq!(b.slot(), 2);
         assert!(!state.front_lease(0).exists());
         assert!(!state.front_lease(MAX_SLOT + 1).exists());
+    }
+
+    #[test]
+    fn posix_leases_are_distinct_and_survive_probes() {
+        // NFS emulates flock with POSIX locks (crate::lockfile).
+        crate::lockfile::use_posix_locks_on_this_thread(true);
+        let (_dir, state) = state();
+        let a = FrontLease::acquire(&state, "pod=a").unwrap();
+        let b = FrontLease::acquire(&state, "pod=b").unwrap();
+        assert_eq!((a.slot(), b.slot()), (1, 2));
+        for _ in 0..3 {
+            assert_eq!(FrontLease::live(&state).unwrap(), HashSet::from([1, 2]));
+        }
+        let holders = FrontLease::holders(&state).unwrap();
+        assert!(holders[0].1.contains(" node="), "{holders:?}");
+        // The probes did not drop a's lease: slot 1 is still taken.
+        let c = FrontLease::acquire_preferring(&state, "pod=c", Some(1)).unwrap();
+        assert_eq!(c.slot(), 3);
+        drop(a);
+        assert_eq!(FrontLease::live(&state).unwrap(), HashSet::from([2, 3]));
+        crate::lockfile::use_posix_locks_on_this_thread(false);
     }
 
     #[test]

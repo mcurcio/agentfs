@@ -4,33 +4,41 @@
 //! `flush`, `push`) takes [`StateLock`] first: an exclusive `flock` on
 //! `<state>/meta/lock`. The kernel releases it when the holder exits, even
 //! after `kill -9`, so a crash never leaves a stale lock. The file holds a
-//! one-line description of the holder (`pid=… command=… since=…`) for
+//! one-line description of the holder (`pid=… node=… command=… since=…`,
+//! [`crate::lockfile`]) for
 //! error messages and `agentfs status`; it is informational only, and a
 //! description left behind by a dead holder is never mistaken for a held
 //! lock.
+//!
+//! The lock is a [`HeldLock`], so it also holds where `flock` is emulated
+//! with POSIX locks (NFS, design §14.2).
 //!
 //! [`StateLock::holder`] probes with a shared lock that it drops at once,
 //! so for a moment it can itself look like a holder. [`StateLock::acquire`]
 //! therefore keeps trying for at least [`MIN_ACQUIRE_WAIT`] even when asked
 //! not to wait.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use rustix::fs::{FlockOperation, flock};
-
-use crate::push::utc_basic;
+use crate::lockfile::{self, HeldLock};
 use crate::volume::StateDir;
 
 /// How long [`StateLock::acquire`] keeps trying even with no wait, so a
 /// concurrent [`StateLock::holder`] probe cannot make it fail.
 pub const MIN_ACQUIRE_WAIT: Duration = Duration::from_millis(250);
 
-/// Polling interval while waiting for the lock.
+/// Polling interval while waiting for the lock, for the first
+/// [`FAST_POLL_FOR`].
 const POLL: Duration = Duration::from_millis(50);
+
+/// How long [`StateLock::acquire`] polls at [`POLL`] before it backs off to
+/// [`SLOW_POLL`]: a standby waiting without limit (design §14.2) must not
+/// load a shared filesystem.
+const FAST_POLL_FOR: Duration = Duration::from_secs(5);
+const SLOW_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
@@ -44,9 +52,7 @@ pub enum LockError {
 /// the process exiting) releases the lock.
 #[derive(Debug)]
 pub struct StateLock {
-    // Held only for the lock it carries.
-    _file: File,
-    path: PathBuf,
+    held: HeldLock,
 }
 
 impl StateLock {
@@ -61,83 +67,42 @@ impl StateLock {
             source,
         };
         fs::create_dir_all(state.meta()).map_err(io_err)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)
-            .map_err(io_err)?;
-        let deadline = Instant::now() + wait.max(MIN_ACQUIRE_WAIT);
-        loop {
-            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => break,
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(rustix::io::Errno::WOULDBLOCK) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(LockError::Busy {
-                            state: state.root().to_path_buf(),
-                            holder: describe(read_holder(&mut file)),
-                        });
-                    }
-                    std::thread::sleep(POLL.min(deadline - now));
-                }
-                Err(e) => return Err(io_err(e.into())),
+        let start = Instant::now();
+        let deadline = start.checked_add(wait.max(MIN_ACQUIRE_WAIT));
+        let mut held = loop {
+            if let Some(held) = HeldLock::try_exclusive(&path, 0o600).map_err(io_err)? {
+                break held;
             }
-        }
-        let since = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let line = format!(
-            "pid={} command={command} since={}\n",
-            std::process::id(),
-            utc_basic(since)
-        );
-        (|| {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(line.as_bytes())
-        })()
-        .map_err(io_err)?;
-        Ok(Self { _file: file, path })
+            let now = Instant::now();
+            if deadline.is_some_and(|d| now >= d) {
+                return Err(LockError::Busy {
+                    state: state.root().to_path_buf(),
+                    holder: describe(lockfile::probe(&path).ok().flatten().unwrap_or_default()),
+                });
+            }
+            let poll = if now.duration_since(start) < FAST_POLL_FOR {
+                POLL
+            } else {
+                SLOW_POLL
+            };
+            std::thread::sleep(deadline.map_or(poll, |d| poll.min(d - now)));
+        };
+        held.set_holder(&lockfile::holder_line(&format!("command={command}")))
+            .map_err(io_err)?;
+        Ok(Self { held })
     }
 
-    /// The holder's description if another process holds the lock on
-    /// `state`, `None` if it is free (or the state area has no lock file).
+    /// The holder's description if a process holds the lock on `state`
+    /// (this one included), `None` if it is free (or the state area has
+    /// no lock file).
     pub fn holder(state: &StateDir) -> io::Result<Option<String>> {
-        let mut file = match File::open(state.lock_file()) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        loop {
-            match flock(&file, FlockOperation::NonBlockingLockShared) {
-                Ok(()) => {
-                    flock(&file, FlockOperation::Unlock)?;
-                    return Ok(None);
-                }
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(rustix::io::Errno::WOULDBLOCK) => {
-                    return Ok(Some(describe(read_holder(&mut file))));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        Ok(lockfile::probe(&state.lock_file())?.map(describe))
     }
 
     /// The lock file.
     pub fn path(&self) -> &Path {
-        &self.path
+        self.held.path()
     }
-}
-
-fn read_holder(file: &mut File) -> String {
-    let mut text = String::new();
-    let _ = file.seek(SeekFrom::Start(0));
-    let _ = file.take(512).read_to_string(&mut text);
-    text.trim().to_owned()
 }
 
 fn describe(holder: String) -> String {
@@ -224,14 +189,35 @@ mod tests {
         let lock = StateLock::acquire(&state, "x", Duration::ZERO).unwrap();
         drop(lock);
         // Hold a shared lock briefly, as a probe would.
-        let probe = File::open(state.lock_file()).unwrap();
-        flock(&probe, FlockOperation::LockShared).unwrap();
+        let probe = std::fs::File::open(state.lock_file()).unwrap();
+        rustix::fs::flock(&probe, rustix::fs::FlockOperation::LockShared).unwrap();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             drop(probe);
         });
         StateLock::acquire(&state, "mount", Duration::ZERO).unwrap();
         releaser.join().unwrap();
+    }
+
+    #[test]
+    fn posix_locks_behave_as_flock_within_a_process() {
+        // NFS emulates flock with POSIX locks, which a process's own second
+        // open neither conflicts with nor survives the close of.
+        crate::lockfile::use_posix_locks_on_this_thread(true);
+        let (_dir, state) = state();
+        let lock = StateLock::acquire(&state, "serve-history", Duration::ZERO).unwrap();
+        let err = StateLock::acquire(&state, "run", Duration::ZERO).unwrap_err();
+        assert!(matches!(err, LockError::Busy { .. }), "{err:?}");
+        for _ in 0..3 {
+            let holder = StateLock::holder(&state).unwrap().unwrap();
+            assert!(holder.contains("command=serve-history"), "{holder}");
+            assert!(holder.contains(" node="), "{holder}");
+        }
+        assert!(crate::lockfile::held_here(lock.path()));
+        drop(lock);
+        assert_eq!(StateLock::holder(&state).unwrap(), None);
+        StateLock::acquire(&state, "run", Duration::ZERO).unwrap();
+        crate::lockfile::use_posix_locks_on_this_thread(false);
     }
 
     #[test]

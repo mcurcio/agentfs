@@ -136,7 +136,7 @@ through the mount:
                          directory 0700, socket 0600
     history/address      the address it serves, for `agentfs status`
     fronts/slot-N.lock   a front's lease of pending-id slot N (flock), holding
-                         a holder line
+                         a holder line (`pid=… node=… command=… pod=…`)
     fronts/slot-N.repairs that slot's repair queue (§3.5)
 ```
 
@@ -154,9 +154,19 @@ no mount is running) first takes an exclusive
 exits. The kernel releases it when the process dies, even after `kill -9`,
 so a crash never leaves a stale lock.
 
-- The file holds a line describing the holder (`pid=… command=…
+- The file holds a line describing the holder (`pid=… node=… command=…
   since=<UTC>`), used only in messages; a line left by a dead holder is
-  never taken for a held lock.
+  never taken for a held lock. The node is `--node` (`AGENTFS_NODE`),
+  else the host name: pids collide across nodes sharing a volume (§14.2).
+- On NFS, `flock` is emulated with POSIX byte-range locks, which belong
+  to the process: a second open in the same process does not conflict,
+  and closing any descriptor of the file drops the process's lock. So
+  each process keeps a registry of the lock files it holds
+  (`agentfs_core::lockfile`): it never takes one twice, and a probe
+  (`status`, the service's lease checks) reports a file the process
+  holds from the registry, never opening and closing it. The slot leases
+  work the same way. Unit tests run the lock and the leases under both
+  `flock` and POSIX locks.
 - A command that finds the lock held exits with status 75 (`EX_TEMPFAIL`)
   and names the holder, unless `--wait-lock <duration>`
   (`AGENTFS_WAIT_LOCK`) lets it wait.
@@ -194,7 +204,9 @@ so a crash never leaves a stale lock.
   the next command that takes the lock.
 - `status` probes the lock by taking a shared lock and dropping it at once;
   taking the lock therefore retries for at least 250 ms even with no
-  `--wait-lock`, so a probe cannot make it fail.
+  `--wait-lock`, so a probe cannot make it fail. A waiting command polls
+  every 50 ms for 5 s, then every second, so a long wait (a standby
+  history service, §14.2) does not load a shared filesystem.
 - The per-remote push locks (§11.2) stay; they now only matter within one
   process.
 - With several mounts of one volume (§14), `agentfs serve-history` is the

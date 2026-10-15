@@ -182,7 +182,7 @@ impl Launcher for Fake {
                     .open(state.front_lease(slot))?;
                 if flock(&file, FlockOperation::NonBlockingLockExclusive).is_ok() {
                     file.set_len(0)?;
-                    writeln!(file, "pid={pid} command=mount since=x")?;
+                    writeln!(file, "pid={pid} node=node-1 command=mount since=x")?;
                     proc.lease = Some(file);
                     break;
                 }
