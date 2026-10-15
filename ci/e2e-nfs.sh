@@ -152,7 +152,7 @@ check_refused "$V40" "NFS version 4.0"
 if ! nfs_mount "$SERVER_IP" "$FLOCK" vers=4.2,local_lock=flock,hard,nosharecache,timeo=50,retrans=2; then
   echo "SKIP local_lock: the kernel refused local_lock=flock on NFSv4"
   NOT_RUN+=("local_lock=flock: the kernel refused the mount")
-elif ! findmnt -no OPTIONS "$FLOCK" | grep -q 'local_lock=flock'; then
+elif ! findmnt -no OPTIONS "$FLOCK" | grep 'local_lock=flock' >/dev/null; then
   echo "SKIP local_lock: the kernel dropped it: $(findmnt -no OPTIONS "$FLOCK")"
   NOT_RUN+=("local_lock=flock: the kernel dropped the option")
 else
@@ -178,7 +178,9 @@ grep '^mounted' "$F" || true
 fsgit() { sudo git --git-dir "$A/fsvol/state/git" "$@"; }
 in_history() { fsgit cat-file -e "refs/heads/agentfs/fsvol:$1" 2>/dev/null; }
 as10000() { sudo setpriv --reuid=10000 --regid=10000 --clear-groups -- "$@"; }
-backlog_drained() { sudo "$AGENTFS_BIN" --state "$A/fsvol/state" status | grep -Eq '^backlog: +0 record'; }
+# No `grep -q` after a pipe here: under pipefail, its early exit fails
+# the writer with SIGPIPE.
+backlog_drained() { sudo "$AGENTFS_BIN" --state "$A/fsvol/state" status | grep -E '^backlog: +0 record' >/dev/null; }
 as10000 python3 - "$MNT/mapped.bin" <<'PY'
 import mmap, os, sys
 fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
@@ -189,7 +191,7 @@ m.flush()
 m.close()
 os.close(fd)
 PY
-mapped() { [ "$(fsgit show refs/heads/agentfs/fsvol:mapped.bin 2>/dev/null | head -c 5)" = hello ]; }
+mapped() { fsgit show refs/heads/agentfs/fsvol:mapped.bin >"$LOGS/mapped.bin" 2>/dev/null && [ "$(head -c 5 "$LOGS/mapped.bin")" = hello ]; }
 wait_for 30 mapped || fail "the mmap write never reached history"
 pass "an mmap write through a front on NFS is recorded"
 as10000 python3 - "$MNT/app.db" <<'PY'
