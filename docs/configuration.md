@@ -804,7 +804,7 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_HISTORY_LISTEN_TLS` | `--listen-tls` | `serve-history` |
 | `AGENTFS_HISTORY_STANDBY`, `AGENTFS_LOCK_HEARTBEAT`, `AGENTFS_LOCK_FENCE` | `--standby`, `--lock-heartbeat`, `--lock-fence` | `serve-history` |
 | `AGENTFS_HISTORY_SERVICE`, `AGENTFS_HISTORY_TIMEOUT`, `AGENTFS_HISTORY_WAIT`, `AGENTFS_HISTORY_SLOT` | `--history-service`, `--history-timeout`, `--history-wait`, `--history-slot` | `mount`, `record` |
-| `AGENTFS_CSI_MODE`, `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | `--mode`, `--endpoint`, `--node-id`, `--pod`, `--namespace` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
+| `AGENTFS_CSI_MODE`, `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE`, `AGENTFS_CSI_MULTI_NODE`, `AGENTFS_POD_IP` | `--mode`, `--endpoint`, `--node-id`, `--pod`, `--namespace`, `--multi-node`, `--pod-ip` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
 
 **Test builds only.** `AGENTFS_FAILPOINTS` sets failpoints on the durable
 path (`name=kill|error|panic|sleep(ms)[@n]`, joined with `;`; design §18
@@ -893,6 +893,8 @@ under `/etc/agentfs-csi/credentials/` in the driver's pods.
 | `--history-wait DURATION` | | `30s` | the fronts' `--history-wait` |
 | `--backoff-max DURATION` | | `30s` | the longest delay between restarts of a crashed service or front |
 | `--pod NAME`, `--namespace NAME` | `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | empty | the plugin pod's name and namespace, passed to the history services (their own identity in telemetry) |
+| `--multi-node` | `AGENTFS_CSI_MULTI_NODE` | off | accept ReadWriteMany and ReadOnlyMany volumes on several nodes at once (never MULTI_NODE_SINGLE_WRITER); basePath must be one shared filesystem on the controller and every node; set it on both (design §14.2) |
+| `--pod-ip IP` | `AGENTFS_POD_IP` | none; required with `--multi-node` in `node` and `all` | the plugin pod's IP (`status.podIP`), where each volume's history service listens on TLS (`--listen-tls <ip>:0`) for other nodes' fronts |
 
 The node plugin passes its `OTEL_*` variables on to every service and
 front; it removes inherited `AGENTFS_*` variables, so the per-volume and

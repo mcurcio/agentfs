@@ -59,6 +59,12 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - name: AGENTFS_CSI_NAMESPACE
               valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            # Where a multi-node volume's history service listens on TLS
+            # for other nodes' fronts (design §14.2). Used only with
+            # --multi-node: add it to the args here and on the controller,
+            # with basePath on one shared filesystem (docs/csi.md §11).
+            - name: AGENTFS_POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
             # OpenTelemetry (README "Telemetry"), inherited by every
             # service and front: point it at your collector.
             - { name: OTEL_SDK_DISABLED, value: "true" }

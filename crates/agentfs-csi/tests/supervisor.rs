@@ -39,7 +39,11 @@ struct Proc {
     mount: Option<(u64, PathBuf)>,
     /// A front's lease, held like the real one.
     lease: Option<File>,
+    /// A service's endpoint file, removed at a clean exit.
     address: Option<PathBuf>,
+    /// A service's state lock, held like the real one (released at any
+    /// exit, as the kernel does).
+    state_lock: Option<agentfs_core::lockfile::HeldLock>,
 }
 
 #[derive(Default)]
@@ -121,6 +125,7 @@ impl Fake {
         if clean && let Some(address) = proc.address {
             let _ = fs::remove_file(address);
         }
+        drop(proc.state_lock);
         let _ = proc.exit.send(Some(exit));
     }
 }
@@ -145,18 +150,35 @@ impl Launcher for Fake {
             mount: None,
             lease: None,
             address: None,
+            state_lock: None,
         };
         let state = StateDir::new(arg_after(&spec, "--state").unwrap());
         if spec.label.starts_with("service") {
             match w.service_mode.unwrap_or(ServiceMode::Ready) {
                 ServiceMode::Ready => {
-                    let address = state.history_dir().join("address");
-                    fs::create_dir_all(state.history_dir())?;
-                    fs::write(
-                        &address,
-                        format!("{}\n", arg_after(&spec, "--listen").unwrap()),
-                    )?;
-                    proc.address = Some(address);
+                    // As `serve-history` does: the state lock, then the
+                    // endpoint file naming this process (design §14.2).
+                    fs::create_dir_all(state.meta())?;
+                    let mut lock =
+                        agentfs_core::lockfile::HeldLock::try_exclusive(&state.lock_file(), 0o600)?
+                            .expect("the fake service takes a free lock");
+                    lock.set_holder(&format!(
+                        "pid={pid} node=node-1 command=serve-history since=x"
+                    ))?;
+                    proc.state_lock = Some(lock);
+                    let mut endpoint = agentfs_core::history_service::Endpoint::new(
+                        "v",
+                        Some(PathBuf::from(
+                            arg_after(&spec, "--listen")
+                                .unwrap()
+                                .trim_start_matches("unix:"),
+                        )),
+                        None,
+                    );
+                    endpoint.pid = pid;
+                    endpoint.node = "node-1".into();
+                    endpoint.write(&state)?;
+                    proc.address = Some(agentfs_core::history_service::endpoint::path(&state));
                 }
                 ServiceMode::Slow => {}
                 ServiceMode::Fails(code) => {
@@ -828,4 +850,97 @@ async fn publishing_a_target_again_with_other_flags_is_already_exists() {
     // The same flags are idempotent.
     n.sup.publish(again(false, false)).await.unwrap();
     assert_eq!(n.fake.spawns("front").len(), 1);
+}
+
+#[tokio::test]
+async fn services_wait_as_standbys_and_listen_on_tls_with_multi_node() {
+    let n = Node::new();
+    n.stage("v").await.unwrap();
+    let spec = &n.fake.spawns("service")[0];
+    let args: Vec<String> = spec
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.contains(&"--standby".to_owned()), "{args:?}");
+    assert!(!args.contains(&"--listen-tls".to_owned()), "{args:?}");
+    n.sup.shutdown().await;
+
+    // A multi-node plugin: TLS at its pod IP, ephemeral port.
+    let mut cfg = config(&n.layout);
+    cfg.multi_node = true;
+    cfg.pod_ip = Some("10.244.1.7".parse().unwrap());
+    let fake = Fake::default();
+    let sup = Supervisor::new(cfg, Arc::new(fake.clone()), Arc::new(fake.clone()));
+    sup.stage(StageRequest {
+        handle: "w".into(),
+        volume_context: HashMap::new(),
+    })
+    .await
+    .unwrap();
+    let spec = &fake.spawns("service")[0];
+    assert_eq!(arg_after(spec, "--listen-tls").unwrap(), "10.244.1.7:0");
+    // Fronts find the service through the endpoint file.
+    let target = n.root.join("pods/x/mount");
+    sup.publish(PublishRequest {
+        handle: "w".into(),
+        target: target.clone(),
+        readonly: false,
+        single_writer: false,
+        pod: None,
+        workload_mounts: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let front = &fake.spawns("front")[0];
+    assert_eq!(arg_after(front, "--history-service").unwrap(), "state");
+    sup.unpublish("w", &target).await.unwrap();
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn stage_is_ready_when_another_nodes_service_is_active() {
+    // node-2's service holds the lock and wrote the endpoint; this node's
+    // waits as a standby (the fake's never gets the lock), and stage
+    // succeeds: the volume has an active service (design §14.2).
+    let n = Node::new();
+    let state = StateDir::new(n.layout.state("v"));
+    fs::create_dir_all(state.meta()).unwrap();
+    let other = std::thread::spawn({
+        let state = state.clone();
+        move || {
+            // In another thread, as another process would hold it: a
+            // registry entry of this test process is enough for the probe.
+            let mut lock =
+                agentfs_core::lockfile::HeldLock::try_exclusive(&state.lock_file(), 0o600)
+                    .unwrap()
+                    .unwrap();
+            lock.set_holder("pid=4242 node=node-2 command=serve-history since=x")
+                .unwrap();
+            let mut endpoint = agentfs_core::history_service::Endpoint::new(
+                "v",
+                None,
+                Some("10.0.0.2:4100".parse().unwrap()),
+            );
+            endpoint.pid = 4242;
+            endpoint.node = "node-2".into();
+            endpoint.write(&state).unwrap();
+            lock
+        }
+    });
+    let lock = other.join().unwrap();
+    n.fake.world().service_mode = Some(ServiceMode::Slow);
+    n.stage("v").await.unwrap();
+    assert!(n.sup.service_pid("v").is_some(), "a standby runs here too");
+    // A leftover endpoint of a service that no longer holds the lock does
+    // not count.
+    drop(lock);
+    let fresh = Node::new();
+    let state = StateDir::new(fresh.layout.state("v"));
+    let mut endpoint = agentfs_core::history_service::Endpoint::new("v", None, None);
+    endpoint.node = "node-2".into();
+    endpoint.write(&state).unwrap();
+    fresh.fake.world().service_mode = Some(ServiceMode::Slow);
+    let err = fresh.stage("v").await.unwrap_err();
+    assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
 }

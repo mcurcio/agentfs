@@ -23,11 +23,17 @@ use crate::layout::Layout;
 use crate::params::VolumeParams;
 use crate::records::{self, VolumeRecord};
 
-/// What a refused multi-node access mode says.
-pub const MULTI_NODE: &str = "multi-node access modes are not supported: one node per volume \
-                              until a cross-node transport exists (design §14.2)";
+/// What a refused multi-node access mode says without `--multi-node`.
+pub const MULTI_NODE: &str = "multi-node access modes are not supported: this driver runs one \
+                              node per volume unless started with --multi-node on a shared \
+                              basePath (design §14.2)";
 
-/// The access modes the driver supports: one node at a time.
+/// What MULTI_NODE_SINGLE_WRITER says: one writer across nodes is not a
+/// guarantee the driver can give (each node's fronts are independent).
+pub const SINGLE_WRITER_ACROSS_NODES: &str = "MULTI_NODE_SINGLE_WRITER is not supported: use \
+                              ReadWriteMany (MULTI_NODE_MULTI_WRITER) or ReadOnlyMany";
+
+/// The access modes the driver supports on one node.
 pub const SUPPORTED_MODES: [Mode; 4] = [
     Mode::SingleNodeWriter,
     Mode::SingleNodeSingleWriter,
@@ -35,9 +41,22 @@ pub const SUPPORTED_MODES: [Mode; 4] = [
     Mode::SingleNodeReaderOnly,
 ];
 
+/// The multi-node access modes `--multi-node` adds.
+pub const MULTI_NODE_MODES: [Mode; 2] = [Mode::MultiNodeMultiWriter, Mode::MultiNodeReaderOnly];
+
+/// Whether `mode` lets several nodes use the volume at once.
+pub fn is_multi_node(mode: Mode) -> bool {
+    matches!(
+        mode,
+        Mode::MultiNodeMultiWriter | Mode::MultiNodeReaderOnly | Mode::MultiNodeSingleWriter
+    )
+}
+
 /// Checks one volume capability: a mount (any fs_type, no mount flags)
-/// with a single-node access mode. Returns the mode.
-pub fn check_capability(cap: &VolumeCapability) -> Result<Mode, Error> {
+/// with a single-node access mode, or with `multi_node` (the driver's
+/// `--multi-node`) MULTI_NODE_MULTI_WRITER or MULTI_NODE_READER_ONLY.
+/// Returns the mode.
+pub fn check_capability(cap: &VolumeCapability, multi_node: bool) -> Result<Mode, Error> {
     match &cap.access_type {
         None => {
             return Err(Error::InvalidArgument(
@@ -65,6 +84,10 @@ pub fn check_capability(cap: &VolumeCapability) -> Result<Mode, Error> {
         .mode;
     match Mode::try_from(mode) {
         Ok(m) if SUPPORTED_MODES.contains(&m) => Ok(m),
+        Ok(m) if multi_node && MULTI_NODE_MODES.contains(&m) => Ok(m),
+        Ok(Mode::MultiNodeSingleWriter) if multi_node => {
+            Err(Error::InvalidArgument(SINGLE_WRITER_ACROSS_NODES.into()))
+        }
         Ok(
             Mode::MultiNodeReaderOnly | Mode::MultiNodeSingleWriter | Mode::MultiNodeMultiWriter,
         ) => Err(Error::InvalidArgument(MULTI_NODE.into())),
@@ -74,15 +97,18 @@ pub fn check_capability(cap: &VolumeCapability) -> Result<Mode, Error> {
     }
 }
 
-/// Checks a non-empty list of capabilities.
-pub fn check_capabilities(caps: &[VolumeCapability]) -> Result<(), Error> {
+/// Checks a non-empty list of capabilities; whether any is multi-node.
+pub fn check_capabilities(caps: &[VolumeCapability], multi_node: bool) -> Result<bool, Error> {
     if caps.is_empty() {
         return Err(Error::InvalidArgument(
             "volume capabilities are required".into(),
         ));
     }
-    caps.iter()
-        .try_for_each(|c| check_capability(c).map(|_| ()))
+    let mut any = false;
+    for cap in caps {
+        any |= is_multi_node(check_capability(cap, multi_node)?);
+    }
+    Ok(any)
 }
 
 /// The volume's record, if it exists.
@@ -121,6 +147,19 @@ pub fn create(
     params: &VolumeParams,
     capacity_bytes: i64,
     static_volume: bool,
+) -> Result<VolumeRecord, Error> {
+    create_with(layout, handle, params, capacity_bytes, static_volume, false)
+}
+
+/// [`create`], recording whether the volume was created for several nodes
+/// (`multi_node`).
+pub fn create_with(
+    layout: &Layout,
+    handle: &str,
+    params: &VolumeParams,
+    capacity_bytes: i64,
+    static_volume: bool,
+    multi_node: bool,
 ) -> Result<VolumeRecord, Error> {
     let config = profile_config(layout, &params.profile)?;
     let dir = layout.volume_dir(handle);
@@ -164,6 +203,8 @@ pub fn create(
             .map_or(0, |d| d.as_secs()),
         published_node: None,
         static_volume,
+        multi_node,
+        published_nodes: std::collections::BTreeSet::new(),
     };
     store(layout, handle, &record)?;
     // Re-created over a retained volume: it is no longer only retained.
@@ -235,26 +276,57 @@ mod tests {
     #[test]
     fn capabilities() {
         let mount = || Some(MountVolume::default());
-        for mode in SUPPORTED_MODES {
-            assert_eq!(check_capability(&cap(mode, mount())).unwrap(), mode);
+        for multi in [false, true] {
+            for mode in SUPPORTED_MODES {
+                assert_eq!(check_capability(&cap(mode, mount()), multi).unwrap(), mode);
+            }
         }
-        let err = check_capability(&cap(Mode::MultiNodeMultiWriter, mount())).unwrap_err();
-        assert!(err.to_string().contains("multi-node"), "{err}");
-        assert!(check_capability(&cap(Mode::Unknown, mount())).is_err());
-        let err = check_capability(&cap(Mode::SingleNodeWriter, None)).unwrap_err();
+        // Without --multi-node: the error says how to get it.
+        for mode in [
+            Mode::MultiNodeMultiWriter,
+            Mode::MultiNodeReaderOnly,
+            Mode::MultiNodeSingleWriter,
+        ] {
+            let err = check_capability(&cap(mode, mount()), false).unwrap_err();
+            assert!(err.to_string().contains("multi-node"), "{err}");
+            assert!(err.to_string().contains("--multi-node"), "{err}");
+        }
+        // With it: RWX and ROX, never a single writer across nodes.
+        for mode in MULTI_NODE_MODES {
+            assert_eq!(check_capability(&cap(mode, mount()), true).unwrap(), mode);
+            assert!(is_multi_node(mode));
+        }
+        let err = check_capability(&cap(Mode::MultiNodeSingleWriter, mount()), true).unwrap_err();
+        assert!(
+            err.to_string().contains("MULTI_NODE_SINGLE_WRITER"),
+            "{err}"
+        );
+        assert!(check_capability(&cap(Mode::Unknown, mount()), true).is_err());
+        let err = check_capability(&cap(Mode::SingleNodeWriter, None), false).unwrap_err();
         assert!(err.to_string().contains("block"), "{err}");
         let flags = Some(MountVolume {
             mount_flags: vec!["ro".into()],
             ..MountVolume::default()
         });
-        assert!(check_capability(&cap(Mode::SingleNodeWriter, flags)).is_err());
+        assert!(check_capability(&cap(Mode::SingleNodeWriter, flags), false).is_err());
         let ext4 = Some(MountVolume {
             fs_type: "ext4".into(),
             ..MountVolume::default()
         });
-        check_capability(&cap(Mode::SingleNodeWriter, ext4)).unwrap();
-        assert!(check_capabilities(&[]).is_err());
+        check_capability(&cap(Mode::SingleNodeWriter, ext4), false).unwrap();
+        assert!(check_capabilities(&[], true).is_err());
+        assert!(!check_capabilities(&[cap(Mode::SingleNodeWriter, mount())], true).unwrap());
+        assert!(
+            check_capabilities(
+                &[
+                    cap(Mode::SingleNodeWriter, mount()),
+                    cap(Mode::MultiNodeMultiWriter, mount())
+                ],
+                true
+            )
+            .unwrap()
+        );
         let none = VolumeCapability::default();
-        assert!(check_capability(&none).is_err());
+        assert!(check_capability(&none, false).is_err());
     }
 }

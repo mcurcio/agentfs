@@ -28,7 +28,7 @@ There are two ways to run agentfs on Kubernetes:
 |---|---|---|
 | Who runs the recorder | a privileged native sidecar in every workload pod | the driver's node plugin, in its own namespace |
 | Workload pods | privileged (`Bidirectional` propagation); their namespace must allow `privileged` | unprivileged; their namespace can enforce `restricted` |
-| Pods per volume | one (`ReadWriteOncePod`) | several on one node (`ReadWriteOnce`), each committing as itself |
+| Pods per volume | one (`ReadWriteOncePod`) | several on one node (`ReadWriteOnce`), or with `--multi-node` on a shared filesystem several nodes (`ReadWriteMany`), each committing as itself |
 | Settings | a ConfigMap and Secret in the workload's namespace | profiles chosen by StorageClass, in the driver's namespace only |
 | Crash recovery | a pod restart, by hand | automatic: the plugin restarts the crashed front or service |
 
@@ -60,12 +60,16 @@ node a volume is attached to:
 only to the kubelet. It supervises child processes of the `agentfs`
 binary, exactly the ones the single-node tests exercise:
 
-- one `agentfs serve-history` per staged volume (the volume's single writer
-  of history, design §2.3), started at NodeStage;
-- one front, `agentfs mount --history-service`, per pod using the volume,
-  started at NodePublish with that pod's name, namespace and uid. The front
-  mounts FUSE at a private source directory, which is bind-mounted onto the
-  kubelet's target.
+- one `agentfs serve-history --standby` per staged volume, started at
+  NodeStage: the one holding the volume's state lock is its single writer
+  of history (design §2.3); with several nodes, the others wait as
+  standbys and take over when it stops or its node is lost (§3);
+- one front, `agentfs mount --history-service state`, per pod using the
+  volume, started at NodePublish with that pod's name, namespace and uid.
+  It finds the active service through `state/meta/history/endpoint.json`:
+  its Unix socket on the same node, TLS from another (design §14.1). The
+  front mounts FUSE at a private source directory, which is bind-mounted
+  onto the kubelet's target.
 
 A crashed child does not take the plugin down; the plugin restarts it
 (§8). `tini` reaps what the children leave: the plugin shares the host's
@@ -110,9 +114,16 @@ the target path.
   cluster, or when the controller is pinned to the node that runs the
   workloads. With several nodes, mount one shared filesystem at basePath
   on every node (§11).
-- **One node per volume at a time.** `ReadWriteOnce` and
-  `ReadWriteOncePod` only; `ReadWriteMany` is refused. Several pods on one
-  node share a volume.
+- **One node per volume at a time, unless `--multi-node`.** By default
+  `ReadWriteOnce` and `ReadWriteOncePod` only; `ReadWriteMany` is refused.
+  Several pods on one node share a volume. With `--multi-node` on the
+  controller and the node plugin, `ReadWriteMany` and `ReadOnlyMany`
+  volumes are accepted on several nodes at once (never
+  `MULTI_NODE_SINGLE_WRITER`); basePath must then be one shared
+  filesystem (§11), and the node plugin needs `--pod-ip` (the downward
+  API's `status.podIP`): each volume's history service listens there on
+  TLS, on a free port, for other nodes' fronts. Pod-to-pod traffic
+  between plugin pods must be allowed (§10).
 - **A privileged namespace for the driver** (`agentfs-csi`, Pod Security
   `privileged`). Workloads need no privilege.
 - The CSI sidecars from `registry.k8s.io/sig-storage` (pinned by digest in
@@ -239,6 +250,11 @@ See `deploy/csi/example/deployment.yaml`.
   `ReadWriteOncePod`. Kubernetes enforces one node per volume through the
   attach step (`attachRequired: true`): a second node's VolumeAttachment
   is refused with a Multi-Attach error while the first node holds it.
+  With `--multi-node`, `ReadWriteMany` (and `ReadOnlyMany`) claims are
+  attached to every node that runs one of their pods; each node stages
+  the volume, and one of their services is active (§3). A volume keeps
+  the mode it was created with: an RWO volume is never attached to a
+  second node.
 - **fsGroup.** The CSIDriver's `fsGroupPolicy: File` lets the kubelet apply
   the pod's `fsGroup` through the mount. Use `fsGroupChangePolicy:
   OnRootMismatch`, so the walk happens once, not at every pod start (each
@@ -254,11 +270,14 @@ See `deploy/csi/example/deployment.yaml`.
   `HostToContainer` the container sees the new mount at once, without it
   only after the container restarts (§8). It needs no privilege and is
   allowed under `restricted`.
-- **Several pods.** Every pod on the node gets its own front and pending
-  slot; one history service orders their changes. Pods share the files with
-  the backing filesystem's semantics (design §14): two pods writing one
-  file is last-writer-wins, and POSIX locks are not shared between pods,
-  so a SQLite database must be written from one pod.
+- **Several pods.** Every pod gets its own front and pending slot; one
+  history service orders their changes, wherever it runs. Pods share the
+  files with the backing filesystem's semantics (design §14): two pods
+  writing one file is last-writer-wins, and POSIX locks are not shared
+  between pods, so a SQLite database must be written from one pod. Across
+  nodes the shared filesystem's caching applies too: another node's
+  change is seen after the NFS attribute cache and the FUSE entry cache
+  (1 s) expire, and shared writable `mmap` is not coherent across nodes.
 - **Identity.** `podInfoOnMount` gives each front its pod's name,
   namespace and uid. With the default templates (design §9) the committer
   is the pod name (`{replica}`), the committer email
@@ -271,11 +290,11 @@ See `deploy/csi/example/deployment.yaml`.
 
 | Call | Does | Fails with |
 |---|---|---|
-| CreateVolume | Validates the parameters and capabilities; creates `<basePath>/<pv>/{backing,state}`, initialises the state area with the profile's config included and its rules installed, writes `csi.json`. Idempotent for the same name and capacity | `InvalidArgument` (bad parameters, `ReadWriteMany`, block volumes, mount flags), `AlreadyExists` (same name, other capacity or parameters; a state area of another volume) |
+| CreateVolume | Validates the parameters and capabilities; creates `<basePath>/<pv>/{backing,state}`, initialises the state area with the profile's config included and its rules installed, writes `csi.json` (with `multi_node` for a `ReadWriteMany` or `ReadOnlyMany` claim under `--multi-node`). Idempotent for the same name, capacity and node mode | `InvalidArgument` (bad parameters, `ReadWriteMany` without `--multi-node`, `MULTI_NODE_SINGLE_WRITER`, block volumes, mount flags), `AlreadyExists` (same name, other capacity, parameters or node mode; a state area of another volume) |
 | DeleteVolume | `onDelete: delete` removes the directory, `retain` keeps it as `csi.retained.json`. An unknown volume is a success | `FailedPrecondition` while the volume is attached, or its state area's lock is held (a history service runs), or (`delete`) while a remote lacks commits of the branch (§9) |
-| ControllerPublish | Records the node in `csi.json`; adopts a static PV | `NotFound` (unknown volume or node), `FailedPrecondition` (attached to another node) |
+| ControllerPublish | Records the node in `csi.json` (a multi-node volume: adds it to `published_nodes`); adopts a static PV. The node must have registered on basePath (`.nodes/<node>`), which on several nodes proves they share it | `NotFound` (unknown volume or node), `FailedPrecondition` (an RWO volume attached to another node, or attached with a multi-node mode) |
 | ControllerUnpublish | Clears the node. An unknown volume is a success | |
-| NodeStage | Reinstalls the profile's rules, starts the volume's history service, and waits up to `--stage-wait` for it to listen (it recovers the journal and applies queued patches first) | `Unavailable` when the service is still starting (the kubelet retries; the service keeps running), `FailedPrecondition` when it exited (with its last log lines), `NotFound` for an unknown volume |
+| NodeStage | Reinstalls the profile's rules, starts the volume's history service (`--standby`, and with `--multi-node` `--listen-tls <pod IP>:0`), and waits up to `--stage-wait` until the volume has an active service: this node's (it recovers the journal and applies queued patches first) or another node's, while this one waits as its standby | `Unavailable` when no service is active yet (the kubelet retries; the service keeps running), `FailedPrecondition` when it exited (with its last log lines), `NotFound` for an unknown volume |
 | NodePublish | Starts a front for the pod (its slot, identity and passthrough), waits up to `--publish-wait` for its mount, binds it onto the target (read-only for read-only mounts), records it | `FailedPrecondition` (not staged; a `SINGLE_NODE_SINGLE_WRITER` volume published elsewhere), `AlreadyExists` (the target is published with another read-only flag or access mode), `InvalidArgument` (inline ephemeral volume) |
 | NodeUnpublish | Unmounts the target, stops the front (SIGTERM, SIGKILL after `--unpublish-grace`), removes the target directory and the record. Unknown targets are a success | |
 | NodeUnstage | Stops the history service, which makes its final commit and pushes it once more to every remote that lacks commits (within `--push-grace`, 5 s), removes the socket and the record | `FailedPrecondition` while a target is still published |
@@ -324,6 +343,19 @@ The plugin specifies and tests each of these (§13; design §14.2):
   volumes of the pods it restarts; the records left from before the
   reboot are reconciled (services restarted, targets that no longer exist
   forgotten).
+- **Several nodes** (`--multi-node`): the node whose service holds a
+  volume's lock is active; every other node that stages it runs a
+  standby. When the active service stops (its node unstages the volume,
+  its plugin restarts) a standby takes over within about a second plus
+  its journal recovery, and fronts on every node, which find the service
+  through the endpoint file, retry within `--history-timeout` (10 s) and
+  see no error. When the active node is lost, the NFS server frees its
+  lock after the server's lease time (Linux default 90 s; the tests use
+  15 s); fronts on other nodes fail boundaries with `EIO` meanwhile, and
+  their repairs and sweeps record the final states afterwards. A service
+  cut off from the NFS server stops writing within `--lock-fence` (10 s)
+  and exits (`StateLockLost`,
+  [runbook](runbooks/history-service-failover.md)).
 
 What is lost in a crash is the same as for a single process (design
 §3.5): boundaries that failed with `EIO` keep their final state through
@@ -340,8 +372,12 @@ kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
   agentfs --state /var/lib/agentfs-csi/volumes/<pv>/state status
 ```
 
-shows the service (`history:   serving fronts at unix:…`), each front's
-slot, pod and pid, the remotes, and the journal. `git` is in the image:
+shows the service (`history:   serving fronts at unix:…`), the
+endpoint fronts use (`endpoint:  node <node> pid <pid> … at unix:…,
+tls:<ip>:<port>`), the lock holder with its node, each front's slot,
+pod, pid and node, the remotes, and the journal. On a multi-node volume
+run it on any node; `agentfs --state … ping-history` from a node plugin
+pod measures the round trip to the active service from that node. `git` is in the image:
 `git --git-dir /var/lib/agentfs-csi/volumes/<pv>/state/git log`.
 
 **The LFS cache** (design §7) is the volume's
@@ -377,6 +413,32 @@ is not listening (an older plugin image, or one restarting) or could not
 record what is dirty in it: retry, or restart that pod. With the volume
 unstaged, `agentfs restore` runs
 directly instead, with `--root <basePath>/<pv>/backing` as well.
+
+**Upgrading the node plugin.** The DaemonSet is `updateStrategy:
+OnDelete`. A node plugin's restart stops that node's fronts and services
+(its FUSE mounts are the plugin's children; a FUSE session cannot be
+handed to another process), so upgrade node by node, draining first:
+
+```sh
+kubectl -n agentfs-csi set image daemonset/agentfs-csi-node agentfs-csi=<new image>
+for node in <nodes>; do
+  kubectl cordon "$node"
+  # Evict the node's pods that use agentfs volumes (or drain the node).
+  kubectl delete pod -A --field-selector spec.nodeName="$node" -l <your agentfs workloads>
+  kubectl -n agentfs-csi delete pod -l app.kubernetes.io/name=agentfs-csi-node \
+    --field-selector spec.nodeName="$node"
+  kubectl -n agentfs-csi wait pod -l app.kubernetes.io/name=agentfs-csi-node \
+    --field-selector spec.nodeName="$node" --for=condition=Ready --timeout=5m
+  kubectl uncordon "$node"
+done
+```
+
+With the node's pods gone first, nothing is interrupted: on a
+multi-node volume its service hands over to another node's standby when
+the volume is unstaged, and pods on other nodes see at most a handover
+of about a second, inside their `--history-timeout`. The multi-node kind
+e2e runs this procedure and checks that the other node's pod has no
+failed close (§13).
 
 **Pushes after the last pod.** The service pushes on its interval while
 the volume is staged. When the last pod goes, NodeUnstage stops it: it
@@ -421,6 +483,19 @@ or snapshots through the API.
 | `agentfs-csi-controller` | Role `agentfs-csi-leader-election` (namespace `agentfs-csi`) | leases | get, watch, list, delete, update, create | sidecar leader election |
 | `agentfs-csi-node` | none | | | the node plugin talks only to the kubelet; its token is not mounted |
 
+**Network** (`--multi-node` only). Each staged multi-node volume's
+service listens on TCP at the plugin pod's IP (a free port, written to
+the volume's endpoint file), for the plugin pods of other nodes. The
+connection is TLS 1.3, both ends authenticated with the volume's own
+certificate, which only processes that can read the volume's state area
+have (design §14.1): nothing else can record into or read from it. A
+NetworkPolicy in `agentfs-csi` must allow TCP between the node plugin
+pods (any port; for example `podSelector:
+app.kubernetes.io/name=agentfs-csi-node` for both ingress and egress); a
+policy that drops it shows as `HistoryServiceUnavailable` on the fronts
+of nodes without the active service. The plugin pods stay off the host
+network.
+
 The controller pod sets `automountServiceAccountToken: false` and mounts a
 projected token only into the two sidecars that use the API; the
 `agentfs-csi` container never holds one.
@@ -453,25 +528,43 @@ namespace with a ResourceQuota on
 
 ## 11. Shared filesystems
 
-Untested; what agentfs needs from a filesystem at basePath shared between
-nodes:
+What agentfs needs from a filesystem at basePath shared between nodes,
+tested with the Linux kernel NFS server and client (`ci/e2e-nfs.sh`, and
+the multi-node kind e2e, §13):
 
-- **Working `flock`** for the state-area lock and the front slot leases
-  (design §2.3, §14). On NFS that means NFSv4, or NFSv3 with NLM; never the
-  `nolock` mount option, which makes every lock succeed and would let two
-  services write one history.
-- **No reflinks across nodes**: freezes fall back to copies (design §3.2).
+- **NFSv4.2 (4.1 at least), `hard`, `lookupcache=positive`.** A `soft`
+  mount can fail a journal write half-way; `lookupcache=positive` lets a
+  node see a name another node just created.
+- **Working locks**: never `nolock`, which makes every lock succeed and
+  would let two services write one history. NFS emulates `flock` with
+  POSIX locks; agentfs handles their per-process semantics (design §2.3).
+- **The export `no_root_squash`**: the node plugin runs as root and
+  creates files as each pod's uid (design §6).
+- **A lease time at least twice `--lock-fence`** (default 10 s, so 20 s
+  or more; Linux's default is 90 s): a service cut off from the server
+  stops writing before its lock can be granted to another node. The
+  longer the lease, the longer a lost node's volume waits for a standby.
+- **No reflinks across nodes**: freezes copy (design §3.2). Every journal
+  `fsync` is an NFS COMMIT, so each boundary costs a round trip to the
+  server (measured in design §14.1).
 - **Passthrough** is decided per inode: a backing file the kernel refuses
   to register falls back to ordinary FUSE I/O for that inode (design
   §17.1).
+- NFS's silly renames (`.nfsXXXX`, a file removed while open) are never
+  recorded (design §4).
 
-The driver still runs one node per volume; a shared filesystem only lets
-a volume move between nodes (with the pods that use it). A cross-node
-transport for fronts on several nodes is open (design §19.2).
+Other shared filesystems (CephFS, SeaweedFS, JuiceFS) need the same
+lock and cache guarantees, and are untested.
 
 ## 12. Limitations
 
-- One node per volume at a time; no `ReadWriteMany`.
+- One node per volume at a time unless `--multi-node`, which needs a
+  shared filesystem and lets the volume's services listen on TLS at the
+  plugin pod's IP.
+- Upgrading the node plugin interrupts that node's mounts: the FUSE
+  daemons are the plugin's children. Drain the node's agentfs pods first
+  (§9, "Upgrading"); other nodes' pods keep working, and a multi-node
+  volume's service moves to another node's standby.
 - No capacity enforcement, snapshots, clones or expansion.
 - basePath must be one filesystem visible at the same path to the
   controller and every node.

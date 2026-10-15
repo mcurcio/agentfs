@@ -21,12 +21,34 @@ pub struct VolumeRecord {
     pub capacity_bytes: i64,
     /// Unix seconds.
     pub created: u64,
-    /// The node ControllerPublish attached it to, if any.
+    /// The node ControllerPublish attached it to, if any (a volume of one
+    /// node at a time).
     #[serde(default)]
     pub published_node: Option<String>,
     /// Adopted from a static PV rather than created by CreateVolume.
     #[serde(default)]
     pub static_volume: bool,
+    /// Created for several nodes at once (a multi-node access mode, with
+    /// the driver's `--multi-node`, design §14.2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi_node: bool,
+    /// The nodes ControllerPublish attached a multi-node volume to.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub published_nodes: std::collections::BTreeSet<String>,
+}
+
+impl VolumeRecord {
+    /// Every node the volume is attached to.
+    pub fn attached_nodes(&self) -> Vec<String> {
+        let mut nodes: Vec<String> = self.published_nodes.iter().cloned().collect();
+        if let Some(n) = &self.published_node
+            && !nodes.contains(n)
+        {
+            nodes.push(n.clone());
+        }
+        nodes.sort();
+        nodes
+    }
 }
 
 /// `<node-state>/staged/<handle>.json`: the volume's history service runs
@@ -142,6 +164,8 @@ mod tests {
             created: 1,
             published_node: Some("n".into()),
             static_volume: false,
+            multi_node: false,
+            published_nodes: Default::default(),
         };
         store(&path, &rec).unwrap();
         assert_eq!(load::<VolumeRecord>(&path).unwrap(), Some(rec));
@@ -153,6 +177,34 @@ mod tests {
         remove(&path).unwrap();
         remove(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_older_record_loads_and_multi_node_fields_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csi.json");
+        // As written before multi-node volumes existed.
+        fs::write(
+            &path,
+            r#"{"params":{"profile":"p","volume":"v","branch":null,"on_delete":"delete"},
+               "capacity_bytes":0,"created":1,"published_node":"n1"}"#,
+        )
+        .unwrap();
+        let rec = load::<VolumeRecord>(&path).unwrap().unwrap();
+        assert!(!rec.multi_node);
+        assert_eq!(rec.attached_nodes(), ["n1"]);
+        let rec = VolumeRecord {
+            params: params(),
+            capacity_bytes: 0,
+            created: 1,
+            published_node: None,
+            static_volume: false,
+            multi_node: true,
+            published_nodes: ["b".to_owned(), "a".to_owned()].into(),
+        };
+        store(&path, &rec).unwrap();
+        assert_eq!(load::<VolumeRecord>(&path).unwrap().as_ref(), Some(&rec));
+        assert_eq!(rec.attached_nodes(), ["a", "b"]);
     }
 
     #[test]

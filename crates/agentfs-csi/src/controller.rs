@@ -12,6 +12,9 @@
 //!   `attachRequired: true`, Kubernetes' attach/detach controller then
 //!   refuses to use a ReadWriteOnce volume from a second node
 //!   (Multi-Attach), and so does this service (`FAILED_PRECONDITION`).
+//!   With `--multi-node`, a volume created with a multi-node access mode
+//!   (ReadWriteMany, ReadOnlyMany) records a set of nodes instead, each of
+//!   which must have registered on the shared basePath (design §14.2).
 //!   A static PV is adopted (created) here, since attach precedes
 //!   NodeStage.
 //!
@@ -47,24 +50,34 @@ use crate::volume;
 pub struct ControllerService {
     layout: Arc<Layout>,
     serial: Arc<Mutex<()>>,
+    /// `--multi-node`: multi-node access modes are accepted.
+    multi_node: bool,
 }
 
 impl ControllerService {
     pub fn new(layout: Layout) -> Self {
+        Self::with_multi_node(layout, false)
+    }
+
+    /// With `multi_node` (`--multi-node`), ReadWriteMany and ReadOnlyMany
+    /// volumes are accepted (design §14.2).
+    pub fn with_multi_node(layout: Layout, multi_node: bool) -> Self {
         Self {
             layout: Arc::new(layout),
             serial: Arc::new(Mutex::new(())),
+            multi_node,
         }
     }
 
     /// Runs `f` on the blocking pool, one call at a time.
     async fn run<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&Layout) -> Result<T, Error> + Send + 'static,
+        f: impl FnOnce(&Layout, bool) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Status> {
         let _serial = self.serial.lock().await;
         let layout = self.layout.clone();
-        tokio::task::spawn_blocking(move || f(&layout))
+        let multi_node = self.multi_node;
+        tokio::task::spawn_blocking(move || f(&layout, multi_node))
             .await
             .map_err(|e| Status::internal(format!("controller task failed: {e}")))?
             .map_err(Status::from)
@@ -111,11 +124,12 @@ fn capacity(req: &CreateVolumeRequest) -> Result<i64, Error> {
 pub(crate) fn create_volume(
     layout: &Layout,
     req: &CreateVolumeRequest,
+    multi_node: bool,
 ) -> Result<CreateVolumeResponse, Error> {
     required(&req.name, "the volume name")?;
     let handle = req.name.as_str();
     validate_handle(handle).map_err(|e| Error::InvalidArgument(e.to_string()))?;
-    volume::check_capabilities(&req.volume_capabilities)?;
+    let for_nodes = volume::check_capabilities(&req.volume_capabilities, multi_node)?;
     if req.volume_content_source.is_some() {
         return Err(Error::InvalidArgument(
             "volume content sources (snapshots, clones) are not supported".into(),
@@ -138,10 +152,21 @@ pub(crate) fn create_volume(
                     existing.params
                 )));
             }
+            if existing.multi_node != for_nodes {
+                return Err(Error::AlreadyExists(format!(
+                    "volume {handle} exists for {}",
+                    if existing.multi_node {
+                        "several nodes"
+                    } else {
+                        "one node at a time"
+                    }
+                )));
+            }
             existing
         }
         None => {
-            let record = volume::create(layout, handle, &params, capacity_bytes, false)?;
+            let record =
+                volume::create_with(layout, handle, &params, capacity_bytes, false, for_nodes)?;
             eprintln!(
                 "created volume {handle} (agentfs volume {}, branch {}, profile {}, onDelete {})",
                 params.volume,
@@ -173,9 +198,11 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
     let Some(record) = volume::load(layout, handle)? else {
         return Ok(());
     };
-    if let Some(node) = &record.published_node {
+    let attached = record.attached_nodes();
+    if !attached.is_empty() {
         return Err(Error::FailedPrecondition(format!(
-            "volume {handle} is still attached to node {node}"
+            "volume {handle} is still attached to node(s) {}",
+            attached.join(", ")
         )));
     }
     let state = StateDir::new(layout.state(handle));
@@ -250,14 +277,18 @@ fn unpushed(state: &StateDir) -> Result<Vec<(String, usize)>, Error> {
         .collect())
 }
 
-pub(crate) fn publish(layout: &Layout, req: &ControllerPublishVolumeRequest) -> Result<(), Error> {
+pub(crate) fn publish(
+    layout: &Layout,
+    req: &ControllerPublishVolumeRequest,
+    multi_node: bool,
+) -> Result<(), Error> {
     required(&req.volume_id, "the volume id")?;
     required(&req.node_id, "the node id")?;
     let cap = req
         .volume_capability
         .as_ref()
         .ok_or_else(|| Error::InvalidArgument("the volume capability is required".into()))?;
-    volume::check_capability(cap)?;
+    let mode = volume::check_capability(cap, multi_node)?;
     let handle = req.volume_id.as_str();
     let not_found = || Error::NotFound(format!("volume {handle} does not exist"));
     validate_handle(handle).map_err(|_| not_found())?;
@@ -267,7 +298,14 @@ pub(crate) fn publish(layout: &Layout, req: &ControllerPublishVolumeRequest) -> 
         None if req.volume_context.contains_key("profile") => {
             let params = VolumeParams::from_context(handle, &req.volume_context)
                 .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-            let record = volume::create(layout, handle, &params, 0, true)?;
+            let record = volume::create_with(
+                layout,
+                handle,
+                &params,
+                0,
+                true,
+                volume::is_multi_node(mode),
+            )?;
             eprintln!(
                 "adopted static volume {handle} (agentfs volume {})",
                 params.volume
@@ -284,8 +322,26 @@ pub(crate) fn publish(layout: &Layout, req: &ControllerPublishVolumeRequest) -> 
         ))
     };
     validate_node(node).map_err(|_| unknown_node())?;
+    // The node registered on this basePath: on several nodes that proves
+    // they share it (design §14.2).
     if !layout.node_marker(node).exists() {
         return Err(unknown_node());
+    }
+    if volume::is_multi_node(mode) && !record.multi_node {
+        return Err(Error::FailedPrecondition(format!(
+            "volume {handle} was created for one node at a time; it cannot be attached with a \
+             multi-node access mode"
+        )));
+    }
+    if record.multi_node {
+        if record.published_nodes.insert(node.to_owned()) {
+            volume::store(layout, handle, &record)?;
+            eprintln!(
+                "attached volume {handle} to node {node} ({} node(s))",
+                record.published_nodes.len()
+            );
+        }
+        return Ok(());
     }
     match &record.published_node {
         Some(n) if n == node => Ok(()),
@@ -314,13 +370,25 @@ pub(crate) fn unpublish(
     let Some(mut record) = volume::load(layout, handle)? else {
         return Ok(());
     };
+    let mut changed = Vec::new();
     match record.published_node.clone() {
         Some(n) if req.node_id.is_empty() || n == req.node_id => {
             record.published_node = None;
-            volume::store(layout, handle, &record)?;
-            eprintln!("detached volume {handle} from node {n}");
+            changed.push(n);
         }
         _ => {}
+    }
+    if req.node_id.is_empty() {
+        changed.extend(std::mem::take(&mut record.published_nodes));
+    } else if record.published_nodes.remove(&req.node_id) {
+        changed.push(req.node_id.clone());
+    }
+    if !changed.is_empty() {
+        volume::store(layout, handle, &record)?;
+        eprintln!(
+            "detached volume {handle} from node(s) {}",
+            changed.join(", ")
+        );
     }
     Ok(())
 }
@@ -328,6 +396,7 @@ pub(crate) fn unpublish(
 pub(crate) fn validate(
     layout: &Layout,
     req: &ValidateVolumeCapabilitiesRequest,
+    multi_node: bool,
 ) -> Result<ValidateVolumeCapabilitiesResponse, Error> {
     required(&req.volume_id, "the volume id")?;
     if req.volume_capabilities.is_empty() {
@@ -338,10 +407,20 @@ pub(crate) fn validate(
     let handle = req.volume_id.as_str();
     let not_found = || Error::NotFound(format!("volume {handle} does not exist"));
     validate_handle(handle).map_err(|_| not_found())?;
-    if volume::load(layout, handle)?.is_none() {
+    let Some(record) = volume::load(layout, handle)? else {
         return Err(not_found());
-    }
-    Ok(match volume::check_capabilities(&req.volume_capabilities) {
+    };
+    let checked =
+        volume::check_capabilities(&req.volume_capabilities, multi_node).and_then(|for_nodes| {
+            if for_nodes && !record.multi_node {
+                Err(Error::InvalidArgument(format!(
+                    "volume {handle} was created for one node at a time"
+                )))
+            } else {
+                Ok(())
+            }
+        });
+    Ok(match checked {
         Ok(()) => ValidateVolumeCapabilitiesResponse {
             confirmed: Some(Confirmed {
                 volume_context: req.volume_context.clone(),
@@ -365,7 +444,7 @@ impl Controller for ControllerService {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l| create_volume(l, &req))
+        self.run(move |l, m| create_volume(l, &req, m))
             .await
             .map(Response::new)
     }
@@ -375,7 +454,7 @@ impl Controller for ControllerService {
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l| delete_volume(l, &req)).await?;
+        self.run(move |l, _| delete_volume(l, &req)).await?;
         Ok(Response::new(DeleteVolumeResponse {}))
     }
 
@@ -384,7 +463,7 @@ impl Controller for ControllerService {
         request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l| publish(l, &req)).await?;
+        self.run(move |l, m| publish(l, &req, m)).await?;
         Ok(Response::new(ControllerPublishVolumeResponse::default()))
     }
 
@@ -393,7 +472,7 @@ impl Controller for ControllerService {
         request: Request<ControllerUnpublishVolumeRequest>,
     ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l| unpublish(l, &req)).await?;
+        self.run(move |l, _| unpublish(l, &req)).await?;
         Ok(Response::new(ControllerUnpublishVolumeResponse {}))
     }
 
@@ -402,7 +481,7 @@ impl Controller for ControllerService {
         request: Request<ValidateVolumeCapabilitiesRequest>,
     ) -> Result<Response<ValidateVolumeCapabilitiesResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l| validate(l, &req))
+        self.run(move |l, m| validate(l, &req, m))
             .await
             .map(Response::new)
     }

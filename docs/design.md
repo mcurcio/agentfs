@@ -2597,17 +2597,19 @@ and `flock` leases over a shared filesystem (§14.2).
 
 `agentfs-csi` (crate `crates/agentfs-csi`, §17.2) is a CSI v1.13 driver,
 `agentfs.mcurcio.github.io`, in the agentfs image. The operator's guide is
-[csi.md](csi.md). It runs one node per volume at a time; several nodes per
-volume wait for the cross-node transport above.
+[csi.md](csi.md). It runs one node per volume at a time by default; with
+`--multi-node` and a shared basePath (NFS), `ReadWriteMany` volumes are
+mounted on several nodes at once, their fronts reaching the volume's
+active service over TLS (§14.1).
 
 **Lifecycle mapping.**
 
 | CSI call | Where | agentfs |
 |---|---|---|
 | CreateVolume | controller | `<basePath>/<pv>/{backing,state,csi.json}`; the state area initialised in-process (`init_with`) with the profile's config included and its rules installed |
-| ControllerPublish | controller | records the node in `csi.json`, so a second node is refused; Kubernetes' Multi-Attach check enforces the same (`attachRequired: true`) |
-| NodeStage | node plugin | starts `agentfs serve-history` for the volume, waits a bounded time for it to listen |
-| NodePublish | node plugin | starts a front, `agentfs mount --history-service`, with the pod's identity, mounted at a private source; bind-mounts it onto the kubelet's target |
+| ControllerPublish | controller | records the node in `csi.json`, so a second node is refused; Kubernetes' Multi-Attach check enforces the same (`attachRequired: true`). A multi-node volume records a set of nodes, each of which must have registered on basePath |
+| NodeStage | node plugin | starts `agentfs serve-history --standby` for the volume (with `--multi-node`, also `--listen-tls <pod IP>:0`), waits a bounded time until the volume has an active service, this node's or another's |
+| NodePublish | node plugin | starts a front, `agentfs mount --history-service state`, with the pod's identity, mounted at a private source; bind-mounts it onto the kubelet's target |
 | NodeUnpublish, NodeUnstage | node plugin | stop the front, the service (final commit, and one more push of it within `--push-grace`) |
 | DeleteVolume | controller | removes or keeps the directory (`onDelete`); `delete` refuses while a remote lacks commits of the branch |
 
@@ -2680,9 +2682,37 @@ retries.
   DeleteVolume while any remote lacks commits of the branch (read from
   the push state, §11.2), so history no remote holds is never deleted.
 
-**One node per volume.** `ReadWriteMany` is refused at CreateVolume. The
-attach step makes Kubernetes refuse a second node while the first holds
-the VolumeAttachment; ControllerPublish refuses it too.
+**One node per volume, or ReadWriteMany with `--multi-node`.** Without
+the flag `ReadWriteMany` is refused at CreateVolume, the attach step
+makes Kubernetes refuse a second node while the first holds the
+VolumeAttachment, and ControllerPublish refuses it too. With
+`--multi-node` (on the controller and the node plugin), CreateVolume
+accepts `MULTI_NODE_MULTI_WRITER` and `MULTI_NODE_READER_ONLY` (never
+`MULTI_NODE_SINGLE_WRITER`, a guarantee the driver cannot give across
+independent fronts) and marks the volume `multi_node` in `csi.json`;
+ControllerPublish adds each node to its `published_nodes`, refusing a
+node that has not registered on basePath (`.nodes/<node>`, which on
+several nodes proves they share it) and a multi-node attach of a volume
+created for one node; DeleteVolume is refused while any node is
+attached; `attachRequired` stays true. Every node that stages the volume
+runs a service with `--standby`; the lock holder is active (§2.3), its
+endpoint file names it, and NodeStage on a node whose own service waits
+returns once that file names a live lock holder. Each service also
+listens on TLS at the plugin pod's IP (`--pod-ip`, from the downward
+API; no `hostNetwork`). Fronts use `--history-service state`, on one
+node or several (one code path). A front's slot is matched by pid and
+node, since pids collide across nodes.
+
+**Upgrading the node plugin.** A live hand-over of a node's FUSE
+sessions to a new plugin is not built: the fronts are the plugin's
+children, a FUSE session cannot be passed between processes without
+re-running INIT, and the kernel's node ids, lookup counts and
+passthrough backing ids cannot be transferred. The supported procedure
+is per node: cordon, evict that node's agentfs pods, delete its plugin
+pod (the DaemonSet stays `OnDelete`), wait until it is Ready, uncordon
+([csi.md](csi.md#9-operations)). Pods on other nodes keep working; a
+multi-node volume's service hands over to another node's standby. The
+multi-node kind e2e runs it and records the handover time.
 
 **RBAC inventory.** csi-provisioner: PVs (get, list, watch, create, patch,
 delete), PVCs (get, list, watch, update), StorageClasses, CSINodes and
@@ -3638,6 +3668,9 @@ runner.
 | Stamps across NFS clients (2026-10-15) | A front's hello carries its tree's `st_dev`; the service compares stamps of that device as the tree's. The service's look at the tree opens each directory and uses `statx(AT_STATX_FORCE_SYNC)`. NFS silly-rename names are never recorded (§4, §14.1) |
 | Standby and failover (2026-10-15) | Every node that stages a volume runs `serve-history --standby`; the lock holder is active, the others poll every second and take over when it is released (a clean stop, or a crash: the kernel or the NFS server's lease frees it). Patches are not fetched or applied at a takeover while front leases are live (§2.3, §12, §14.2) |
 | Fencing a lost lock (2026-10-15, default, owner to confirm) | A heartbeat renews the lock every `--lock-fence`/5 and the journal and commits refuse to write once the last renewal is older than `--lock-fence` (10 s); this relies on the NFS server's lease being at least twice the fence, and accepts one residual: a service stuck inside one NFS call when a partition begins can complete it after a takeover. A per-batch epoch check (one more NFS round trip per group commit) was the alternative. A lost lock exits 75; the journal file is replaced at takeover; ref updates are already compare-and-swap (§2.3, §14.2) |
+| ReadWriteMany in the CSI driver (2026-10-15) | Opt-in with `--multi-node` on the controller and node plugin; `MULTI_NODE_MULTI_WRITER` and `MULTI_NODE_READER_ONLY` accepted, `MULTI_NODE_SINGLE_WRITER` refused; the node marker on basePath at ControllerPublish proves a shared basePath; `attachRequired` stays true with a set of attached nodes; services listen on TLS at the plugin pod's IP (downward API), never `hostNetwork`; fronts always use `--history-service state` (§14.2) |
+| NFS settings (2026-10-15, default, owner to confirm) | Recommended and tested: NFSv4.2 (4.1 at least), `hard`, `lookupcache=positive`, never `nolock`; exports `no_root_squash`, because the node plugin is root and creates files as pods' uids ([csi.md](csi.md#11-shared-filesystems)) |
+| Node plugin upgrades (2026-10-15, default, owner to confirm) | Drain per node (cordon, evict that node's agentfs pods, delete the plugin pod, wait Ready, uncordon), DaemonSet `OnDelete`; a live FUSE hand-over (a fuser fork that skips INIT and transfers node ids) is rejected as infeasible for now (§14.2) |
 | CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2): NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it, and runs with `hostPID: true` so its fronts can read callers' groups, §6); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
 | CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |

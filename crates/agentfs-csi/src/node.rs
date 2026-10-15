@@ -57,9 +57,10 @@ fn absolute(value: &str, what: &str) -> Result<PathBuf, Error> {
     }
 }
 
-fn capability(cap: Option<&VolumeCapability>) -> Result<Mode, Error> {
+fn capability(cap: Option<&VolumeCapability>, multi_node: bool) -> Result<Mode, Error> {
     check_capability(
         cap.ok_or_else(|| Error::InvalidArgument("the volume capability is required".into()))?,
+        multi_node,
     )
 }
 
@@ -86,7 +87,10 @@ impl Node for NodeService {
         let req = request.into_inner();
         required(&req.volume_id, "the volume id")?;
         absolute(&req.staging_target_path, "the staging target path")?;
-        capability(req.volume_capability.as_ref())?;
+        capability(
+            req.volume_capability.as_ref(),
+            self.supervisor.config().multi_node,
+        )?;
         if is_ephemeral(&req.volume_context) {
             return Err(Error::InvalidArgument(EPHEMERAL_REFUSED.into()).into());
         }
@@ -120,7 +124,10 @@ impl Node for NodeService {
         let req = request.into_inner();
         required(&req.volume_id, "the volume id")?;
         let target = absolute(&req.target_path, "the target path")?;
-        let mode = capability(req.volume_capability.as_ref())?;
+        let mode = capability(
+            req.volume_capability.as_ref(),
+            self.supervisor.config().multi_node,
+        )?;
         if is_ephemeral(&req.volume_context) {
             return Err(Error::InvalidArgument(EPHEMERAL_REFUSED.into()).into());
         }
@@ -130,7 +137,8 @@ impl Node for NodeService {
             .publish(PublishRequest {
                 handle,
                 target,
-                readonly: req.readonly || mode == Mode::SingleNodeReaderOnly,
+                readonly: req.readonly
+                    || matches!(mode, Mode::SingleNodeReaderOnly | Mode::MultiNodeReaderOnly),
                 single_writer: mode == Mode::SingleNodeSingleWriter,
                 pod: PodInfo::from_context(&req.volume_context),
                 workload_mounts: params::workload_mounts(&req.volume_context)

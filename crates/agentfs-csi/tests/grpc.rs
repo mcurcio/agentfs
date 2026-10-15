@@ -40,6 +40,11 @@ struct Driver {
 
 impl Driver {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// A driver started with `--multi-node` (`multi_node`).
+    async fn start_with(multi_node: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout {
             base: dir.path().join("base"),
@@ -61,10 +66,12 @@ impl Driver {
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn({
             let socket = socket.clone();
-            let controller = ControllerService::new(layout.clone());
+            let controller = ControllerService::with_multi_node(layout.clone(), multi_node);
             // The validation tests never get as far as starting a child.
+            let mut cfg = NodeConfig::new("node-1", layout.clone());
+            cfg.multi_node = multi_node;
             let node = NodeService::new(Supervisor::new(
-                NodeConfig::new("node-1", layout.clone()),
+                cfg,
                 Arc::new(AgentfsLauncher {
                     bin: "/bin/false".into(),
                 }),
@@ -459,6 +466,130 @@ async fn controller_publish_tracks_one_node() {
         .controller_unpublish_volume(ControllerUnpublishVolumeRequest::default())
         .await;
     assert_eq!(code(r), Code::InvalidArgument);
+    d.stop().await;
+}
+
+fn rwx(mut r: CreateVolumeRequest) -> CreateVolumeRequest {
+    r.volume_capabilities = vec![mount_cap(Mode::MultiNodeMultiWriter)];
+    r
+}
+
+fn rwx_publish(volume: &str, node: &str) -> ControllerPublishVolumeRequest {
+    ControllerPublishVolumeRequest {
+        volume_capability: Some(mount_cap(Mode::MultiNodeMultiWriter)),
+        ..publish_req(volume, node)
+    }
+}
+
+#[tokio::test]
+async fn a_multi_node_driver_attaches_rwx_volumes_to_several_nodes() {
+    let d = Driver::start_with(true).await;
+    let mut c = d.controller();
+    c.create_volume(rwx(create_req("v", &[("profile", "p")])))
+        .await
+        .unwrap();
+    let rec = || -> agentfs_csi::records::VolumeRecord {
+        agentfs_csi::records::load(&d.layout.csi_json("v"))
+            .unwrap()
+            .unwrap()
+    };
+    assert!(rec().multi_node);
+    // The same request again is idempotent; as one-node, it conflicts.
+    c.create_volume(rwx(create_req("v", &[("profile", "p")])))
+        .await
+        .unwrap();
+    assert_eq!(
+        code(c.create_volume(create_req("v", &[("profile", "p")])).await),
+        Code::AlreadyExists
+    );
+    for node in ["node-1", "node-2", "node-2"] {
+        c.controller_publish_volume(rwx_publish("v", node))
+            .await
+            .unwrap();
+    }
+    assert_eq!(rec().attached_nodes(), ["node-1", "node-2"]);
+    // A node that never registered on the shared basePath is unknown.
+    assert_eq!(
+        code(
+            c.controller_publish_volume(rwx_publish("v", "node-9"))
+                .await
+        ),
+        Code::NotFound
+    );
+    // Deleting while attached anywhere is refused.
+    let del = || DeleteVolumeRequest {
+        volume_id: "v".into(),
+        ..Default::default()
+    };
+    let err = c.delete_volume(del()).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message().contains("node-1, node-2"),
+        "{}",
+        err.message()
+    );
+    let unpublish = |node: &str| ControllerUnpublishVolumeRequest {
+        volume_id: "v".into(),
+        node_id: node.into(),
+        ..Default::default()
+    };
+    c.controller_unpublish_volume(unpublish("node-1"))
+        .await
+        .unwrap();
+    assert_eq!(rec().attached_nodes(), ["node-2"]);
+    assert_eq!(code(c.delete_volume(del()).await), Code::FailedPrecondition);
+    c.controller_unpublish_volume(unpublish("node-2"))
+        .await
+        .unwrap();
+    c.controller_unpublish_volume(unpublish("node-2"))
+        .await
+        .unwrap();
+    c.delete_volume(del()).await.unwrap();
+
+    // An RWO volume stays one node at a time, and refuses a multi-node
+    // attach.
+    c.create_volume(create_req("o", &[("profile", "p")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        code(
+            c.controller_publish_volume(rwx_publish("o", "node-1"))
+                .await
+        ),
+        Code::FailedPrecondition
+    );
+    c.controller_publish_volume(publish_req("o", "node-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        code(
+            c.controller_publish_volume(publish_req("o", "node-2"))
+                .await
+        ),
+        Code::FailedPrecondition
+    );
+    // MULTI_NODE_SINGLE_WRITER is never offered.
+    let mut r = create_req("s", &[("profile", "p")]);
+    r.volume_capabilities = vec![mount_cap(Mode::MultiNodeSingleWriter)];
+    let err = c.create_volume(r).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(
+        err.message().contains("MULTI_NODE_SINGLE_WRITER"),
+        "{}",
+        err.message()
+    );
+    // ValidateVolumeCapabilities: RWX on the RWO volume is not confirmed.
+    let v = c
+        .validate_volume_capabilities(ValidateVolumeCapabilitiesRequest {
+            volume_id: "o".into(),
+            volume_capabilities: vec![mount_cap(Mode::MultiNodeMultiWriter)],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(v.confirmed.is_none());
+    assert!(v.message.contains("one node at a time"), "{}", v.message);
     d.stop().await;
 }
 
