@@ -21,6 +21,7 @@ mod lease;
 mod listener;
 pub mod protocol;
 mod server;
+pub mod wire;
 
 pub use client::{ClientConfig, ClientError, HistoryClient};
 pub use fronts::{Fronts, FrontsError, MIN_CALL_TIMEOUT};

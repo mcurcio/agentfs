@@ -25,11 +25,12 @@ WORKDIR /src
 # Dependencies first, against stub crates, so a source change does not
 # rebuild libgit2, OpenSSL bindings, russh, ring and OpenTelemetry.
 COPY Cargo.toml Cargo.lock ./
-COPY crates/agentfs-core/Cargo.toml crates/agentfs-core/
 COPY crates/agentfs-fuse/Cargo.toml crates/agentfs-fuse/
 COPY crates/agentfs/Cargo.toml crates/agentfs/
-# The CSI crate's build script and the CSI spec it compiles (tonic, prost,
-# protox) are dependencies too.
+# The build scripts and the protos they compile (tonic, prost, protox) are
+# dependencies too: the core's history service and the CSI spec.
+COPY crates/agentfs-core/Cargo.toml crates/agentfs-core/build.rs crates/agentfs-core/
+COPY crates/agentfs-core/proto crates/agentfs-core/proto
 COPY crates/agentfs-csi/Cargo.toml crates/agentfs-csi/build.rs crates/agentfs-csi/
 COPY crates/agentfs-csi/proto crates/agentfs-csi/proto
 # Every target a manifest declares must exist, so the record_step bench

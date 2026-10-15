@@ -39,7 +39,23 @@ thiserror = "2.0.21"
 # The SSH transport (`ssh` feature, design §11.1): russh with ring, the
 # runtime that drives one connection.
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa"], optional = true }
-tokio = { version = "1.53", default-features = false, features = ["rt", "net", "time", "io-util"], optional = true }
+# The history service's gRPC (design §14): tonic over the node-local Unix
+# socket, with its own hyper HTTP/2 client connection. No channel and no
+# TLS: pure Rust, no ring or rustls.
+tonic = { version = "0.14.6", default-features = false, features = ["codegen", "router", "server"] }
+tonic-prost = "0.14.6"
+tonic-health = "0.14.6"
+prost = "0.14"
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+# The history service's runtimes (design §14), and the SSH transport's.
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+
+[build-dependencies]
+# Compiles the history service's .proto without protoc (design §17.3).
+protox = "0.10.0"
+tonic-prost-build = { version = "0.14.6", default-features = false }
 
 [dev-dependencies]
 # In-memory exporters for the telemetry tests.
@@ -59,7 +75,7 @@ https = ["git2/https", "ureq/native-tls"]
 # Push to ssh:// and scp-like remotes through agentfs's own libgit2
 # subtransport on russh (ring for crypto; no OpenSSL or libssh2). Without
 # it an ssh remote is reported as misconfigured (design §11.1).
-ssh = ["dep:russh", "dep:tokio"]
+ssh = ["dep:russh"]
 # Test builds only: failpoints on the durable path (design §18 test 3,
 # `failpoints`). Never in a release or image.
 failpoints = []

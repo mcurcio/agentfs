@@ -1,0 +1,260 @@
+// The contract between fronts and the history service of a volume (design
+// §14): gRPC over the node-local Unix socket
+// <state>/meta/history/history.sock. Field numbers are frozen: add fields
+// and variants, never renumber or reuse one.
+//
+// Liveness is grpc.health.v1.Health on the same server, for the service
+// "agentfs.history.v2.History".
+
+syntax = "proto3";
+
+package agentfs.history.v2;
+
+service History {
+  // The first call on every connection: admits the front and binds its
+  // identity to the connection.
+  rpc Hello(HelloRequest) returns (Welcome);
+  // Whether each path is tracked now. Answered from memory.
+  rpc Tracked(TrackedRequest) returns (TrackedReply);
+  // Journals a record; answers only once it is durable.
+  rpc Record(RecordRequest) returns (RecordReply);
+  // Whether the last change journaled at a path is still the write of the
+  // front's frozen copy. Answered from memory.
+  rpc StillLast(StillLastRequest) returns (StillLastReply);
+  // The reversed channel: the service sends calls, the front answers each.
+  // The response headers mean the service is listening.
+  rpc Listen(stream FrontAnswer) returns (stream FrontCall);
+}
+
+message HelloRequest {
+  uint32 protocol_version = 1;
+  string volume = 2;
+  FrontInfo front = 3;
+}
+
+message FrontInfo {
+  Origin origin = 1;
+  uint32 slot = 2;
+  uint64 instance = 3;
+  uint32 pid = 4;
+  string version = 5;
+  repeated View views = 6;
+}
+
+message Origin {
+  string namespace = 1;
+  string pod = 2;
+  string pod_uid = 3;
+  string node = 4;
+  string replica = 5;
+}
+
+message View {
+  string at = 1;
+  string root = 2;
+}
+
+message Welcome {
+  uint32 protocol_version = 1;
+  string volume = 2;
+  string branch = 3;
+  uint32 service_pid = 4;
+  repeated string features = 5;
+}
+
+message TrackedRequest { repeated string paths = 1; }
+message TrackedReply { repeated bool tracked = 1; }
+
+message StillLastRequest {
+  string path = 1;
+  uint64 copy = 2;
+}
+message StillLastReply { bool last = 1; }
+
+message RecordRequest {
+  Draft draft = 1;
+  repeated PathStamp stamps = 2;
+}
+
+message RecordReply {
+  optional uint64 seq = 1;
+  repeated Skip skipped = 2;
+}
+
+message PathStamp {
+  string path = 1;
+  FreezeStamp stamp = 2;
+}
+
+message FreezeStamp {
+  uint64 dev = 1;
+  uint64 ino = 2;
+  uint64 size = 3;
+  int64 mtime_ns = 4;
+  int64 ctime_ns = 5;
+}
+
+// An absent operation or origin is None.
+message Draft {
+  Trigger trigger = 1;
+  Caller caller = 2;
+  uint64 time_ms = 3;
+  repeated Change changes = 4;
+  Operation operation = 5;
+  bool atomic = 6;
+  Origin origin = 7;
+}
+
+enum Trigger {
+  TRIGGER_UNSPECIFIED = 0;
+  TRIGGER_CLOSE = 1;
+  TRIGGER_RENAME = 2;
+  TRIGGER_UNLINK = 3;
+  TRIGGER_RMDIR = 4;
+  TRIGGER_LINK = 5;
+  TRIGGER_SYMLINK = 6;
+  TRIGGER_SETATTR = 7;
+  TRIGGER_FSYNC = 8;
+  TRIGGER_RELEASE = 9;
+  TRIGGER_SWEEP = 10;
+  TRIGGER_INTERVAL = 11;
+  TRIGGER_RESTORE = 12;
+  TRIGGER_PATCH = 13;
+}
+
+message Caller {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  uint32 pid = 3;
+}
+
+message Change {
+  oneof op {
+    Write write = 1;
+    Symlink symlink = 2;
+    Remove remove = 3;
+    DirMove dir_move = 4;
+  }
+}
+
+message Write {
+  string path = 1;
+  uint64 pending = 2;
+  bool executable = 3;
+  Store store = 4;
+}
+
+enum Store {
+  STORE_UNSPECIFIED = 0;
+  STORE_BLOB = 1;
+  STORE_LFS = 2;
+}
+
+message Symlink {
+  string path = 1;
+  string target = 2;
+}
+message Remove { string path = 1; }
+message DirMove {
+  string from = 1;
+  string to = 2;
+}
+
+message Operation {
+  uint64 id = 1;
+  OperationKind kind = 2;
+  string source = 3;
+  string summary = 4;
+  Caller caller = 5;
+  optional uint64 inbox = 6;
+  PatchAuthor author = 7;
+}
+
+enum OperationKind {
+  OPERATION_KIND_UNSPECIFIED = 0;
+  OPERATION_KIND_RESTORE = 1;
+  OPERATION_KIND_REVERT = 2;
+  OPERATION_KIND_PATCH = 3;
+}
+
+message PatchAuthor {
+  string name = 1;
+  string email = 2;
+  int64 time_s = 3;
+  int32 offset_min = 4;
+}
+
+message Skip {
+  string path = 1;
+  oneof reason {
+    SkipKind kind = 2;
+    Ignored ignored = 3;
+    Nested nested = 4;
+    string group_refused_member = 5;
+    string group_member_skipped = 6;
+  }
+}
+
+enum SkipKind {
+  SKIP_KIND_UNSPECIFIED = 0;
+  SKIP_KIND_NEVER_RECORD = 1;
+  SKIP_KIND_UNTRACKED = 2;
+  SKIP_KIND_SHARED_MEMORY = 3;
+  SKIP_KIND_GONE = 4;
+  SKIP_KIND_SUPERSEDED = 5;
+  SKIP_KIND_NFS_SILLY_RENAME = 6;
+}
+
+// An absent file is info/exclude.
+message Ignored {
+  optional string file = 1;
+  string pattern = 2;
+}
+
+message Nested {
+  string repo = 1;
+  NestedKind kind = 2;
+}
+
+enum NestedKind {
+  NESTED_KIND_UNSPECIFIED = 0;
+  NESTED_KIND_GIT_DIR = 1;
+  NESTED_KIND_GIT_FILE = 2;
+  NESTED_KIND_GIT_SYMLINK = 3;
+  NESTED_KIND_BARE = 4;
+}
+
+// A call from the service to a listening front.
+message FrontCall {
+  uint64 id = 1;
+  oneof call {
+    Settle settle = 2;
+    Paths open_for_writing = 3;
+    Paths invalidate = 4;
+    Ping ping = 5;
+  }
+}
+
+message Settle {}
+message Ping {}
+message Paths { repeated string paths = 1; }
+
+// A front's answer to the FrontCall with the same id.
+message FrontAnswer {
+  uint64 id = 1;
+  oneof answer {
+    Settled settled = 2;
+    OpenPaths open = 3;
+    Invalidated invalidated = 4;
+    Pong pong = 5;
+    string error = 6;
+  }
+}
+
+message Settled {
+  uint64 recorded = 1;
+  uint64 failed = 2;
+}
+message OpenPaths { repeated bool open = 1; }
+message Invalidated {}
+message Pong {}
