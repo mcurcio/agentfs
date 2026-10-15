@@ -11,14 +11,19 @@ operator says the node is down. Design:
 [§14.2](../design.md#142-csi-driver-built), the CSI guide:
 [§11](../csi.md#11-shared-filesystems).
 
-**Never do this for a node that may still be running.** A node cut off
-from the API server but not from the NFS server keeps its history
-service and pods writing. If the volume is started on another node, its
-service takes the state lock once the NFS server's lease for the cut-off
-node expires, and when the network returns there are two writers: the
-journal can be corrupted (the forced-detach residual, csi.md §11). The
-only strong guard is a node-local basePath, which pins each volume to its
-node.
+**Never do this for a node that may still be running.** A node that
+stops answering the API server may still run its history service and
+pods. While it still reaches the NFS server it keeps renewing its lease
+and holds the state lock, so a service on another node cannot start. Once
+it is cut off from the NFS server too, the server expires its lease (90 s
+by default on Linux) and a service on another node can take the lock.
+When the network returns, the cut-off node's processes, which never
+stopped, write again: there are two writers and the journal can be
+corrupted (the forced-detach residual, csi.md §11). Being cut off is
+therefore no proof that a node is down; only a node that is powered off,
+or whose agentfs processes are confirmed dead, is safe to declare lost.
+The only strong guard is a node-local basePath, which pins each volume to
+its node.
 
 This procedure is not run in CI.
 
@@ -33,12 +38,15 @@ This procedure is not run in CI.
 
 ## Steps
 
-1. **Confirm the node is really down**: powered off, or cut off from the
-   NFS server, never only `NotReady`. Check it from outside Kubernetes:
-   the machine's console or power state, or that the NFS server no
-   longer lists its client (on a Linux NFS server,
-   `cat /proc/fs/nfsd/clients/*/info` as root). If you cannot confirm
-   it, power the node off first.
+1. **Confirm the node is really down**: powered off, or fenced so that
+   none of its processes can run again. `NotReady`, or a node that no
+   longer reaches the API server or the NFS server, is not enough, and
+   neither is the NFS server's client list (a Linux NFS server may keep
+   an expired client listed as a courtesy client). Confirm it from
+   outside Kubernetes: the machine's power state on its console, BMC or
+   hypervisor, or a power cycle, or on its console that kubelet and every
+   `agentfs serve-history` and `agentfs mount` process are gone. If you
+   cannot confirm it, power the node off first.
 2. **Mark it out of service** (Kubernetes non-graceful node shutdown):
 
    ```sh
