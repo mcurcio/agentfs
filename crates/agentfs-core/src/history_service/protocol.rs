@@ -60,7 +60,14 @@ pub const MAX_FRAME: usize = 64 << 20;
 /// ([`Request::Listen`], design §15), `still_last`
 /// ([`Request::StillLast`], design §3.1) and `move` (a record may hold a
 /// [`crate::record::Change::Move`], design §3.1).
-pub const FEATURES: &[&str] = &["stamps", "repair_origin", "listen", "still_last", "move"];
+pub const FEATURES: &[&str] = &[
+    "stamps",
+    "repair_origin",
+    "listen",
+    "still_last",
+    "move",
+    "tree_dev",
+];
 
 /// The first frame on a connection, from the front.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +95,12 @@ pub struct FrontInfo {
     /// targets under these map exactly. Absent from older fronts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<View>,
+    /// The device of the backing tree's root as the front sees it: the
+    /// service compares the front's freeze stamps of that device with its
+    /// own as one filesystem ([`crate::stamps::TREE_DEV`], design §14.1).
+    /// Absent from older fronts, whose stamps keep their raw devices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_dev: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +203,8 @@ pub enum WireSkipReason {
     Gone,
     /// A newer state of the path was already journaled (design §14.1).
     Superseded,
+    /// An NFS client's silly-rename name (design §4).
+    NfsSillyRename,
     GroupRefused {
         member: RepoPath,
     },
@@ -251,6 +266,7 @@ impl WireSkipReason {
             SkipReason::SharedMemory => Self::SharedMemory,
             SkipReason::Gone => Self::Gone,
             SkipReason::Superseded => Self::Superseded,
+            SkipReason::NfsSillyRename => Self::NfsSillyRename,
             SkipReason::GroupRefused { member } => Self::GroupRefused {
                 member: member.clone(),
             },
@@ -278,6 +294,7 @@ impl WireSkipReason {
             Self::SharedMemory => SkipReason::SharedMemory,
             Self::Gone => SkipReason::Gone,
             Self::Superseded => SkipReason::Superseded,
+            Self::NfsSillyRename => SkipReason::NfsSillyRename,
             Self::GroupRefused { member } => SkipReason::GroupRefused { member },
             Self::GroupMemberSkipped { reason } => {
                 SkipReason::Refused(Refusal::GroupMemberSkipped { reason })
@@ -542,6 +559,7 @@ mod tests {
                 pid: 7,
                 version: "0.1.0".into(),
                 views: Vec::new(),
+                tree_dev: None,
             },
         }
     }
@@ -688,6 +706,7 @@ mod tests {
             },
             SkipReason::Untracked,
             SkipReason::SharedMemory,
+            SkipReason::NfsSillyRename,
             SkipReason::Gone,
             SkipReason::Superseded,
             SkipReason::GroupRefused { member: path("m") },

@@ -894,6 +894,7 @@ fn the_fronts_gauge_and_a_fronts_round_trip_are_exported() {
                 pid: std::process::id(),
                 version: "test".into(),
                 views: Vec::new(),
+                tree_dev: None,
             },
             Arc::new(NullSink),
             Telemetry::noop(),

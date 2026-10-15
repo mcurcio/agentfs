@@ -647,6 +647,13 @@ recording off or redirect uploads.
 Built-in system- and user-level git attribute and exclude files are never
 consulted. Only the files above count.
 
+One rule is built in: an NFS client's silly-rename name (`.nfs` and 24
+hex digits, what a Linux client renames a file removed while open to, and
+removes at its last close) is never recorded, tracked or not
+(`SkipReason::NfsSillyRename`). It stays visible through the mount, and a
+restore never writes over it (it is never in history). Without the rule a
+backing tree on NFS (§14.2) would record the client's own bookkeeping.
+
 **How the sources combine.** These are deliberate departures from git, so
 that operator rules always apply:
 
@@ -2418,6 +2425,20 @@ The backing file's stamp now is consulted as well:
   if the content is what was just journaled), counted by
   `agentfs.history_service.resyncs`. HEAD then ends on the tree's state
   whichever record arrived last.
+
+Stamps across nodes: on a shared filesystem each NFS client numbers the
+export with a `st_dev` of its own, while inode numbers (NFS file ids)
+and change times (the server's clock) are the same on every client. A
+front therefore says in its hello which device its tree root has
+(`tree_dev`, feature `tree_dev`), and the service compares every stamp
+whose device is its sender's tree device as the tree's
+(`stamps::TREE_DEV`); its own stamps likewise. A front without
+`tree_dev` (an older one) is on the service's node, so its raw devices
+compare as before. The service's look at the backing file now is fresh:
+it opens each directory on the way (NFS revalidates a directory at open)
+and reads the leaf with `statx(AT_STATX_FORCE_SYNC)`, never through a
+symlink, so a cached entry or attribute on its node cannot make another
+node's write look gone or older.
 
 The service's own writes (a live restore, §15; patches; resyncs) note
 their stamps too. Atomic groups (§8) are recorded whole and never

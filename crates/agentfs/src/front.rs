@@ -84,6 +84,12 @@ fn connect(
         version: env!("CARGO_PKG_VERSION").to_owned(),
         // Where its workloads see the tree, as this process knows (design §5).
         views: agentfs_core::nested::views(),
+        // The service compares this front's freeze stamps with its own
+        // through it: each NFS client numbers the export's device itself
+        // (design §14.1).
+        tree_dev: std::fs::metadata(tree)
+            .ok()
+            .map(|m| std::os::unix::fs::MetadataExt::dev(&m)),
     };
     let client = HistoryClient::connect(
         ClientConfig {

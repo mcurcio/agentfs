@@ -408,8 +408,15 @@ fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
             Request::Tracked { paths } => Reply::Tracked {
                 tracked: shared.recorder.tracked_query(&paths),
             },
-            Request::Record { draft, stamps } => {
+            Request::Record { draft, mut stamps } => {
                 let origin = record_origin(shared, &front, &draft);
+                // One filesystem, numbered by each client (NFS): compared
+                // as the tree's (design §14.1). An older front, without
+                // `tree_dev`, is on this node and numbers it as we do.
+                let tree_dev = front.tree_dev.or(shared.recorder.tree_dev());
+                for s in &mut stamps {
+                    s.stamp = s.stamp.normalised(tree_dev);
+                }
                 match shared
                     .recorder
                     .sequence(&origin, front.slot, *draft, &stamps)

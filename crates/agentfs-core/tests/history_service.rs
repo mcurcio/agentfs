@@ -157,6 +157,10 @@ struct Front {
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 fn front_info(lease: &FrontLease, origin: Origin) -> FrontInfo {
+    front_info_dev(lease, origin, None)
+}
+
+fn front_info_dev(lease: &FrontLease, origin: Origin, tree_dev: Option<u64>) -> FrontInfo {
     FrontInfo {
         origin,
         slot: lease.slot(),
@@ -166,6 +170,7 @@ fn front_info(lease: &FrontLease, origin: Origin) -> FrontInfo {
         pid: std::process::id(),
         version: "test".into(),
         views: Vec::new(),
+        tree_dev,
     }
 }
 
@@ -176,6 +181,18 @@ fn connect(
     volume: &str,
     timeout: Duration,
     events: Events,
+) -> Result<HistoryClient, ClientError> {
+    connect_dev(env, lease, origin, volume, timeout, events, None)
+}
+
+fn connect_dev(
+    env: &Env,
+    lease: &FrontLease,
+    origin: Origin,
+    volume: &str,
+    timeout: Duration,
+    events: Events,
+    tree_dev: Option<u64>,
 ) -> Result<HistoryClient, ClientError> {
     let branch = agentfs_core::history::History::open(&env.state.git())
         .unwrap()
@@ -190,7 +207,7 @@ fn connect(
         },
         volume,
         &branch,
-        front_info(lease, origin),
+        front_info_dev(lease, origin, tree_dev),
         events,
         Telemetry::noop(),
     )
@@ -201,9 +218,24 @@ fn front(env: &Env, name: &str) -> Front {
 }
 
 fn front_with_timeout(env: &Env, name: &str, timeout: Duration) -> Front {
+    front_on(env, name, timeout, None)
+}
+
+/// A front that says the tree's device is `tree_dev`, as a front on
+/// another NFS client of the export would (design §14.1).
+fn front_on(env: &Env, name: &str, timeout: Duration, tree_dev: Option<u64>) -> Front {
     let lease = FrontLease::acquire(&env.state, &format!("pod={name}")).unwrap();
     let sink = Arc::new(MemorySink::new());
-    let client = connect(env, &lease, pod(name), "vol", timeout, sink.clone()).unwrap();
+    let client = connect_dev(
+        env,
+        &lease,
+        pod(name),
+        "vol",
+        timeout,
+        sink.clone(),
+        tree_dev,
+    )
+    .unwrap();
     let recorder = volume::open_front(
         &env.state,
         &env.tree,
@@ -878,6 +910,106 @@ fn a_write_frozen_before_a_newer_journaled_one_is_superseded() {
     close(&env, &b.recorder, "other", "ee").unwrap().unwrap();
     service.committer.commit_pending().unwrap();
     assert_eq!(service.head_blob("other").unwrap(), b"ee");
+}
+
+/// The device another NFS client numbers the export with.
+const OTHER_CLIENT_DEV: u64 = 0x2b_0004;
+
+/// `stamp` as a front on another NFS client of the tree takes it.
+fn on_other_client(stamp: FreezeStamp) -> FreezeStamp {
+    FreezeStamp {
+        dev: OTHER_CLIENT_DEV,
+        ..stamp
+    }
+}
+
+#[test]
+fn fronts_on_two_nfs_clients_order_one_path() {
+    // Each NFS client numbers the export with its own st_dev; inode
+    // numbers and change times are the server's (design §14.1). A front on
+    // another client says which device its tree is, and the service
+    // compares its stamps as the tree's.
+    let env = env();
+    let service = Service::start(&env);
+    let a = front_on(
+        &env,
+        "pod-a",
+        Duration::from_secs(10),
+        Some(OTHER_CLIENT_DEV),
+    );
+    let b = front(&env, "pod-b");
+    // Superseded: B (this node) journaled a newer state; A's late write
+    // from the other client is older.
+    close(&env, &b.recorder, "shared", "bb").unwrap().unwrap();
+    let journaled = stamp_of(&env, "shared");
+    let older = FreezeStamp {
+        ctime_ns: journaled.ctime_ns - 1_000_000,
+        size: 1,
+        ..on_other_client(journaled)
+    };
+    let late = send_frozen(&env, &a, "shared", "a", older);
+    assert_eq!(late.skipped[0].reason, SkipReason::Superseded, "{late:?}");
+    // The file as it still is, seen from the other client: journaled.
+    let current = send_frozen(&env, &a, "shared", "bb", on_other_client(journaled));
+    assert!(current.seq.is_some(), "{current:?}");
+
+    // Resync: identical stamps from two slots (one tick, same size), the
+    // other client's first.
+    std::fs::write(env.tree.join("counter"), "BBBB").unwrap();
+    let tick = stamp_of(&env, "counter");
+    assert!(
+        send_frozen(&env, &a, "counter", "AAAA", on_other_client(tick))
+            .seq
+            .is_some()
+    );
+    assert!(send_frozen(&env, &b, "counter", "BBBB", tick).seq.is_some());
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("counter").unwrap(), b"BBBB");
+
+    // Gone: another file renamed over the path since A froze it.
+    std::fs::write(env.tree.join("f"), "old").unwrap();
+    let frozen = on_other_client(stamp_of(&env, "f"));
+    std::fs::write(env.tree.join("f.tmp"), "new").unwrap();
+    std::fs::rename(env.tree.join("f.tmp"), env.tree.join("f")).unwrap();
+    let late = send_frozen(&env, &a, "f", "old", frozen);
+    assert_eq!(late.skipped[0].reason, SkipReason::Gone, "{late:?}");
+}
+
+#[test]
+fn an_older_front_without_a_tree_device_keeps_raw_stamps() {
+    // A front from before `tree_dev` is on the service's node and numbers
+    // the tree's device as the service does.
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let b = front(&env, "pod-b");
+    close(&env, &b.recorder, "shared", "bb").unwrap().unwrap();
+    let journaled = stamp_of(&env, "shared");
+    let older = FreezeStamp {
+        ctime_ns: journaled.ctime_ns - 1_000_000,
+        size: 1,
+        ..journaled
+    };
+    let late = send_frozen(&env, &a, "shared", "a", older);
+    assert_eq!(late.skipped[0].reason, SkipReason::Superseded, "{late:?}");
+    drop(service);
+}
+
+#[test]
+fn nfs_silly_renames_are_never_recorded_through_a_front() {
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let name = ".nfs0000000000a1b2c300000001";
+    let recorded = a
+        .recorder
+        .record(Trigger::Close, CALLER, vec![write(&env, name, "x")])
+        .unwrap();
+    assert_eq!(recorded.seq, None, "{recorded:?}");
+    assert_eq!(recorded.skipped[0].reason, SkipReason::NfsSillyRename);
+    service.committer.commit_pending().unwrap();
+    assert!(service.head_blob(name).is_none());
+    assert!(env.tree.join(name).exists(), "it stays visible");
 }
 
 #[test]

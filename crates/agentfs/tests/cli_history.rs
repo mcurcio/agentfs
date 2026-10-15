@@ -502,6 +502,7 @@ impl Volume {
                 pid: std::process::id(),
                 version: "test".into(),
                 views: Vec::new(),
+                tree_dev: None,
             },
             Arc::new(NullSink),
             Telemetry::noop(),

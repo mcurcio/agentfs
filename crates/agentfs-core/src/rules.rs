@@ -138,6 +138,10 @@ pub enum SkipReason {
     /// Another member of the path's fsync-class group was refused, and a
     /// group is recorded whole or not at all (design §8).
     GroupRefused { member: RepoPath },
+    /// An NFS client's "silly rename" of a file removed while open
+    /// (`.nfs` and 24 hex digits): the client's, removed by it at the last
+    /// close, never the workload's (design §4, §14.2).
+    NfsSillyRename,
 }
 
 impl fmt::Display for SkipReason {
@@ -151,6 +155,9 @@ impl fmt::Display for SkipReason {
             Self::Untracked => f.write_str("nothing tracked at this path"),
             Self::Refused(refusal) => write!(f, "refused: {refusal}"),
             Self::SharedMemory => f.write_str("SQLite shared memory of an fsync-class database"),
+            Self::NfsSillyRename => {
+                f.write_str("an NFS client's rename of a file removed while open (built in)")
+            }
             Self::Gone => f.write_str(
                 "no longer in the backing tree (another front moved, replaced or removed it)",
             ),
@@ -376,6 +383,9 @@ impl Rules {
         }
         if self.is_class_shm(path, &raw) {
             return Ok(Decision::Skip(SkipReason::SharedMemory));
+        }
+        if is_nfs_silly_rename(path.file_name().as_bytes()) {
+            return Ok(Decision::Skip(SkipReason::NfsSillyRename));
         }
         if tracked {
             return Ok(Decision::Record);
@@ -683,6 +693,14 @@ fn collect_attrs(
         .collect()
 }
 
+/// Whether `name` is an NFS client's silly-rename name: `.nfs` and 24
+/// hex digits (Linux's client; the server never shows it to other
+/// clients as anything but a file). Built in, since every NFS-backed tree
+/// has them and they are never the workload's (design §4).
+pub fn is_nfs_silly_rename(name: &[u8]) -> bool {
+    name.len() == 4 + 24 && name.starts_with(b".nfs") && name[4..].iter().all(u8::is_ascii_hexdigit)
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
@@ -763,6 +781,43 @@ mod tests {
             source: RuleSource::TreeIgnore(p(file)),
             pattern: pattern.into(),
         })
+    }
+
+    #[test]
+    fn nfs_silly_renames_are_never_recorded() {
+        assert!(is_nfs_silly_rename(b".nfs0000000000a1b2c3000000ff"));
+        assert!(is_nfs_silly_rename(b".nfs00000000000000000000ABCD"));
+        for name in [
+            &b".nfs"[..],
+            b".nfs0000000000a1b2c3000000f",
+            b".nfs0000000000a1b2c3000000fff",
+            b".nfs0000000000a1b2c3000000fg",
+            b"x.nfs0000000000a1b2c3000000f",
+            b".nfsrc",
+        ] {
+            assert!(
+                !is_nfs_silly_rename(name),
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        let f = Fixture::new();
+        let r = f.rules(true, "", "");
+        for tracked in [false, true] {
+            assert_eq!(
+                r.decide(
+                    &RepoPath::new("d/.nfs0000000000a1b2c3000000ff").unwrap(),
+                    tracked
+                )
+                .unwrap(),
+                Decision::Skip(SkipReason::NfsSillyRename)
+            );
+        }
+        assert_eq!(
+            r.decide(&RepoPath::new("d/.nfsrc").unwrap(), false)
+                .unwrap(),
+            Decision::Record
+        );
     }
 
     #[test]
@@ -1164,6 +1219,10 @@ mod tests {
                 "inside nested repository sub (.git directory)",
             ),
             (SkipReason::Untracked, "nothing tracked at this path"),
+            (
+                SkipReason::NfsSillyRename,
+                "an NFS client's rename of a file removed while open (built in)",
+            ),
             (
                 SkipReason::SharedMemory,
                 "SQLite shared memory of an fsync-class database",
