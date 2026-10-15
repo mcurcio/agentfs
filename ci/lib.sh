@@ -24,6 +24,13 @@ annotate_log() { # file [lines]
   body=$(tail -n "${2:-15}" "$1" | sed 's/\x1b\[[0-9;]*m//g' | tr '\n' '|' | cut -c1-3000)
   printf '::warning title=%s::%s\n' "$(basename "$1")" "$body"
 }
+# Posts a measurement summary as a notice on the run (GitHub Actions
+# only), so the numbers can be read through the API, as the step summary
+# cannot.
+notice_summary() { # title text
+  [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+  printf '::notice title=%s::%s\n' "$1" "$(printf '%s' "$2" | tr '\n' '|' | cut -c1-3000)"
+}
 pass() { printf '\033[32mok\033[0m   %s\n' "$*"; }
 
 assert_eq() { # expected actual message

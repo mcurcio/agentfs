@@ -627,6 +627,7 @@ TABLE=$(
   if [ -n "$TLS_PING" ]; then echo; echo "$TLS_PING"; fi
 )
 echo "$TABLE"
+notice_summary "multipod latency ($P, $T)" "$TABLE"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   echo "$TABLE" >>"$GITHUB_STEP_SUMMARY"
 fi

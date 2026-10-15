@@ -470,4 +470,5 @@ fi
 pass "DeleteVolume removed $BASE/$PV"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$SUMMARY" >>"$GITHUB_STEP_SUMMARY"; fi
+notice_summary "CSI on two nodes" "$(cat "$SUMMARY")"
 step "e2e-csi-multinode passed"
