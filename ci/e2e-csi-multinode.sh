@@ -13,8 +13,8 @@
 #   c. `agentfs status` names the active service's node, and the other
 #      node runs a standby;
 #   d. the round trip: ping-history from the standby's node (TLS over the
-#      pod network) and from the active node (Unix socket), and close
-#      latencies in each pod, into the step summary;
+#      pod network) and from the active node (Unix socket), into the step
+#      summary (close latencies through NFS are measured by e2e-nfs);
 #   e. kill -9 of the active service: the standby on the other node takes
 #      over, writes resume, every acknowledged close is in history;
 #   f. a node reboot (`docker restart` of the active service's worker):
@@ -284,16 +284,6 @@ PING_LOCAL=$(ping_from "$ACTIVE")
 echo "$PING_REMOTE"
 echo "$PING_LOCAL"
 assert_contains "$PING_REMOTE" "from node $STANDBY" "ping-history from the standby's node"
-close_latency() { # pod label
-  ka exec "$1" -- sh -c '
-    mkdir -p /data/bench-'"$2"'
-    i=0; start=$(date +%s%N)
-    while [ $i -lt 200 ]; do printf x > /data/bench-'"$2"'/f$i; i=$((i+1)); done
-    end=$(date +%s%N)
-    echo "'"$2"' n=200 mean_us=$(( (end - start) / 200000 ))"'
-}
-LAT_ACTIVE=$(close_latency "$(writer_on "$ACTIVE")" "on-$ACTIVE")
-LAT_STANDBY=$(close_latency "$(writer_on "$STANDBY")" "on-$STANDBY")
 {
   echo "### CSI on two nodes over NFS (kind)"
   echo
@@ -301,17 +291,21 @@ LAT_STANDBY=$(close_latency "$(writer_on "$STANDBY")" "on-$STANDBY")
   echo
   echo "- ping-history from $ACTIVE (unix): $PING_LOCAL"
   echo "- ping-history from $STANDBY (TLS): $PING_REMOTE"
-  echo "- open + write 1 byte + close through the mount, mean of 200 (shell, includes fork): $LAT_ACTIVE; $LAT_STANDBY"
 } | tee -a "$SUMMARY"
 
 step "(e) kill -9 of the active service"
 writers_run on
 sleep 5
+# The service is the agentfs process whose arguments are
+# `... --state <basePath>/<pv>/state ... serve-history`; never this shell.
 docker exec "$ACTIVE" sh -c '
   for d in /proc/[0-9]*; do
+    [ "${d#/proc/}" = $$ ] && continue
     c=$(tr "\0" " " <"$d/cmdline" 2>/dev/null) || continue
-    case "$c" in *"serve-history"*"'"$PV"'"*) echo "kill -9 ${d#/proc/}"; kill -9 "${d#/proc/}" ;; esac
-  done'
+    case "$c" in
+      */agentfs\ --state\ *"$1"/state\ *serve-history*) echo "kill -9 ${d#/proc/}: $c"; kill -9 "${d#/proc/}" ;;
+    esac
+  done' sh "$PV"
 T0=$SECONDS
 NEW=
 while [ $((SECONDS - T0)) -lt 120 ]; do
