@@ -360,7 +360,7 @@ jobs:
       - name: diagnose
         if: failure()
         run: |
-          sudo cat /proc/fs/nfsd/clients/*/info 2>/dev/null || true
+          sudo sh -c 'cat /proc/fs/nfsd/clients/*/info' 2>/dev/null || true
           findmnt -t nfs4 || true
           sudo journalctl -u nfs-server --no-pager -n 50 || true
           sudo dmesg | tail -n 50 || true

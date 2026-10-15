@@ -115,7 +115,8 @@ wait_for 10 sh -c "[ \"\$(cat '$B/probe' 2>/dev/null)\" = from-a ]" ||
   fail "client B does not see client A's write"
 pass "client B sees client A's write"
 sudo rm "$A/probe"
-CLIENTS=$(sudo cat /proc/fs/nfsd/clients/*/info 2>/dev/null | grep -c '^name:' || true)
+# Only root can list /proc/fs/nfsd/clients: the glob expands under sudo.
+CLIENTS=$(sudo sh -c 'cat /proc/fs/nfsd/clients/*/info' 2>/dev/null | grep -c '^name:' || true)
 [ "$CLIENTS" -ge 2 ] || fail "nfsd counts $CLIENTS client(s), not two"
 pass "nfsd counts $CLIENTS clients"
 
