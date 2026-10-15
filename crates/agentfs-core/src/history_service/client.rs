@@ -1,28 +1,43 @@
 //! A front's connection to the history service (design §14, §3.5).
 //!
-//! The client keeps a pool of synchronous connections, one request in
-//! flight on each, so concurrent boundaries of one front reach the service
-//! together and share its journal's group commit. Each new connection does
-//! its own handshake. A pooled connection the service has closed (it
-//! restarted) is noticed before reuse and dropped, so a restart does not
-//! fail the next boundary.
+//! One HTTP/2 connection per front, multiplexed: concurrent boundaries of
+//! the front reach the service together and share its journal's group
+//! commit, and the listening stream and the health probe ride on it too.
+//! Each connection starts with `Hello`, which the service admits and binds
+//! to the connection. Calls run on the client's [`Bridge`] from the
+//! calling thread.
 //!
-//! Every request has a timeout. Nothing is ever resent: a request that may
-//! have reached the service fails ([`ClientError::maybe_journaled`]), since
-//! resending a record could journal one frozen copy twice. Outages raise
+//! Every call has a deadline (`grpc-timeout`, and the client's own timer).
+//! Nothing is ever resent: a request that may have reached the service
+//! fails ([`ClientError::maybe_journaled`]), since resending a record could
+//! journal one frozen copy twice. The one exception is a request hyper
+//! hands back unsent because its connection had closed (the service
+//! restarted): it is sent once on a new connection, within the same
+//! deadline, so a restart does not fail the next boundary. Outages raise
 //! [`Event::HistoryServiceUnavailable`] once, at the first failure after a
 //! success, and [`Event::HistoryServiceRestored`] at the next success.
 
-use std::os::unix::net::UnixStream;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use super::Address;
-use super::protocol::{
-    FrameError, FrontInfo, Hello, PROTOCOL_VERSION, PathStamp, Reply, Request, read_frame,
-    write_frame,
-};
+use hyper::client::conn::http2::SendRequest;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::body::Body;
+use tonic::codegen::{Service, http};
+use tonic::{Code, Status};
+use tonic_health::pb::HealthCheckRequest;
+use tonic_health::pb::health_check_response::ServingStatus;
+use tonic_health::pb::health_client::HealthClient;
+
+use super::bridge::Bridge;
+use super::wire::pb;
+use super::wire::pb::history_client::HistoryClient as Grpc;
+use super::{Address, FrontInfo, MAX_MESSAGE, PROTOCOL_VERSION, PathStamp, SERVICE_NAME};
 use crate::events::{Event, Events};
 use crate::local_socket;
 use crate::paths::RepoPath;
@@ -42,16 +57,14 @@ pub struct ClientConfig {
     pub connect_wait: Duration,
 }
 
-/// The most idle connections kept for reuse.
-const MAX_IDLE: usize = 64;
-
-/// How long an idle connection is kept for reuse: well under the service's
-/// [`super::IDLE_TIMEOUT`], so a pooled connection is never one the service
-/// is closing, and an idle front holds none of the service's threads.
-const MAX_IDLE_AGE: Duration = Duration::from_secs(20);
-
 /// How often [`HistoryClient::connect`] retries.
 const CONNECT_RETRY: Duration = Duration::from_millis(100);
+
+/// The `:authority` of every request; the socket is what is reached.
+const ORIGIN: &str = "http://agentfs.history";
+
+/// How many answers a listening stream buffers.
+const ANSWERS: usize = 4;
 
 /// Why a request got no answer.
 #[derive(Debug, thiserror::Error)]
@@ -80,8 +93,8 @@ pub enum ClientError {
     /// version, an identity it cannot render).
     #[error("history service {address} refused this front: {reason}")]
     Refused { address: String, reason: String },
-    /// The service serves as many connections as it can. Nothing was sent;
-    /// not an outage.
+    /// The service serves as many fronts as it can. Nothing was sent; not
+    /// an outage.
     #[error("history service {address} is busy: {reason}")]
     Busy { address: String, reason: String },
     /// The service answered that the request failed; nothing was journaled.
@@ -126,19 +139,83 @@ impl ClientError {
     }
 }
 
+/// Whether hyper handed a request to its connection: the one fact that
+/// decides whether a failed request may go again.
+#[derive(Debug, thiserror::Error)]
+enum Dispatch {
+    /// Handed back unsent: the connection had closed.
+    #[error("not sent: {0}")]
+    NotSent(#[source] hyper::Error),
+    #[error("{0}")]
+    Sent(#[source] hyper::Error),
+}
+
+/// The tower service tonic calls through: hyper's HTTP/2 sender, telling
+/// [`Dispatch::NotSent`] from [`Dispatch::Sent`].
+#[derive(Clone)]
+struct Wire {
+    send: SendRequest<Body>,
+}
+
+impl Service<http::Request<Body>> for Wire {
+    type Response = http::Response<hyper::body::Incoming>;
+    type Error = Dispatch;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Dispatch>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Dispatch>> {
+        // A closed connection hands the request back from the call.
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<Body>) -> Self::Future {
+        let sent = self.send.try_send_request(request);
+        Box::pin(async move {
+            sent.await.map_err(|mut e| {
+                if e.take_message().is_some() {
+                    Dispatch::NotSent(e.into_error())
+                } else {
+                    Dispatch::Sent(e.into_error())
+                }
+            })
+        })
+    }
+}
+
+/// The [`Dispatch`] behind a failed call, if a transport error failed it.
+fn dispatch_of(status: &Status) -> Option<&Dispatch> {
+    let mut source = std::error::Error::source(status);
+    while let Some(e) = source {
+        if let Some(dispatch) = e.downcast_ref::<Dispatch>() {
+            return Some(dispatch);
+        }
+        source = e.source();
+    }
+    None
+}
+
+/// One admitted connection.
+#[derive(Clone)]
+struct Conn {
+    id: u64,
+    wire: Wire,
+}
+
 /// A front's handle on the history service. Safe to share across threads.
 pub struct HistoryClient {
     config: ClientConfig,
     address: String,
-    hello: Hello,
+    volume: String,
     branch: String,
-    /// Idle connections and when each went idle.
-    idle: Mutex<Vec<(UnixStream, Instant)>>,
+    front: FrontInfo,
+    /// The connection in use; a new one is opened when it is found closed.
+    conn: tokio::sync::Mutex<Option<Conn>>,
+    next_conn: AtomicU64,
     down: AtomicBool,
     /// `Welcome.features` of the service, as of the last connection made.
     features: Mutex<Vec<String>>,
     events: Events,
     telemetry: Telemetry,
+    bridge: Bridge,
 }
 
 impl HistoryClient {
@@ -154,28 +231,33 @@ impl HistoryClient {
         events: Events,
         telemetry: Telemetry,
     ) -> Result<Self, ClientError> {
+        let address = config.address.to_string();
+        let bridge = Bridge::new("agentfs-grpc", 1).map_err(|e| ClientError::Unreachable {
+            address: address.clone(),
+            error: format!("starting the client's runtime: {e}"),
+        })?;
         let client = Self {
-            address: config.address.to_string(),
+            address,
             config,
-            hello: Hello {
-                v: PROTOCOL_VERSION,
-                volume: volume.to_owned(),
-                front,
-            },
+            volume: volume.to_owned(),
             branch: branch.to_owned(),
-            idle: Mutex::new(Vec::new()),
+            front,
+            conn: tokio::sync::Mutex::new(None),
+            next_conn: AtomicU64::new(1),
             down: AtomicBool::new(false),
             features: Mutex::new(Vec::new()),
             events,
             telemetry,
+            bridge,
         };
         let deadline = Instant::now() + client.config.connect_wait;
         loop {
-            match client.open() {
-                Ok(stream) => {
-                    client.check_in(stream);
-                    return Ok(client);
-                }
+            let opened = client.bridge.block_on(async {
+                let deadline = tokio::time::Instant::now() + client.timeout();
+                client.connection_until(deadline, None).await
+            });
+            match opened {
+                Ok(_) => return Ok(client),
                 Err(
                     e @ (ClientError::Unreachable { .. }
                     | ClientError::Timeout { .. }
@@ -196,18 +278,27 @@ impl HistoryClient {
 
     /// The front this client speaks for.
     pub fn front(&self) -> &FrontInfo {
-        &self.hello.front
+        &self.front
     }
 
     /// Whether each of `paths` is tracked now (design §4).
     pub fn tracked(&self, paths: &[RepoPath]) -> Result<Vec<bool>, ClientError> {
-        let request = Request::Tracked {
-            paths: paths.to_vec(),
+        let request = pb::TrackedRequest {
+            paths: paths.iter().map(|p| p.as_str().to_owned()).collect(),
         };
-        match self.call("tracked", &request)? {
-            Reply::Tracked { tracked } if tracked.len() == paths.len() => Ok(tracked),
-            other => Err(self.unexpected(&other)),
+        let reply = self.call(
+            "tracked",
+            |mut grpc, request| async move { grpc.tracked(request).await },
+            request,
+        )?;
+        if reply.tracked.len() != paths.len() {
+            return Err(self.protocol(format!(
+                "{} answers for {} paths",
+                reply.tracked.len(),
+                paths.len()
+            )));
         }
+        Ok(reply.tracked)
     }
 
     /// Hands `draft` to the service and waits until it is durable there.
@@ -216,11 +307,16 @@ impl HistoryClient {
     /// and stamps the record with this front's origin (or, for a sweep
     /// record, the origin the draft carries, if it can render it).
     pub fn record(&self, draft: Draft, stamps: Vec<PathStamp>) -> Result<Recorded, ClientError> {
-        let request = Request::Record {
-            draft: Box::new(draft),
-            stamps,
+        let request = pb::RecordRequest {
+            draft: Some((&draft).into()),
+            stamps: stamps.iter().map(Into::into).collect(),
         };
-        let reply = self.call("record", &request)?;
+        drop((draft, stamps));
+        let reply = self.call(
+            "record",
+            |mut grpc, request| async move { grpc.record(request).await },
+            request,
+        )?;
         if let Err(e) = crate::failpoints::hit("front.after_reply") {
             return Err(ClientError::Lost {
                 address: self.address.clone(),
@@ -228,20 +324,16 @@ impl HistoryClient {
                 error: e.to_string(),
             });
         }
-        match reply {
-            Reply::Recorded { seq, skipped } => Ok(Recorded {
-                seq,
-                skipped: skipped
-                    .into_iter()
-                    .map(|s| Skipped {
-                        path: s.path,
-                        reason: s.reason.into_reason(),
-                    })
-                    .collect(),
-                written: Vec::new(),
-            }),
-            other => Err(self.unexpected(&other)),
-        }
+        Ok(Recorded {
+            seq: reply.seq,
+            skipped: reply
+                .skipped
+                .into_iter()
+                .map(Skipped::try_from)
+                .collect::<Result<_, _>>()
+                .map_err(|e| self.protocol(e.to_string()))?,
+            written: Vec::new(),
+        })
     }
 
     /// Whether the service supports `feature` (`Welcome.features`), as of
@@ -261,52 +353,110 @@ impl HistoryClient {
         if !self.supports("still_last") {
             return Ok(false);
         }
-        let request = Request::StillLast {
-            path: path.clone(),
-            copy,
+        let request = pb::StillLastRequest {
+            path: path.as_str().to_owned(),
+            copy: copy.0,
         };
-        match self.call("still_last", &request)? {
-            Reply::StillLast { last } => Ok(last),
-            other => Err(self.unexpected(&other)),
-        }
+        let reply = self.call(
+            "still_last",
+            |mut grpc, request| async move { grpc.still_last(request).await },
+            request,
+        )?;
+        Ok(reply.last)
     }
 
-    /// One round trip with nothing to do, for liveness and benchmarks.
+    /// One `grpc.health.v1` Check of [`SERVICE_NAME`]: liveness and the
+    /// round-trip time. A service that is not serving is unreachable.
     pub fn ping(&self) -> Result<Duration, ClientError> {
         let start = Instant::now();
-        match self.call("ping", &Request::Ping)? {
-            Reply::Pong => Ok(start.elapsed()),
-            other => Err(self.unexpected(&other)),
+        let result = self.bridge.block_on(self.unary(
+            |wire, request| async move {
+                HealthClient::with_origin(wire, origin())
+                    .check(request)
+                    .await
+            },
+            HealthCheckRequest {
+                service: SERVICE_NAME.to_owned(),
+            },
+        ));
+        let result = result.and_then(|reply| {
+            if reply.status == ServingStatus::Serving as i32 {
+                Ok(start.elapsed())
+            } else {
+                Err(ClientError::Unreachable {
+                    address: self.address.clone(),
+                    error: format!(
+                        "it is not serving ({})",
+                        ServingStatus::try_from(reply.status)
+                            .map_or("an unknown status", |s| s.as_str_name())
+                    ),
+                })
+            }
+        });
+        self.observe("ping", start, result)
+    }
+
+    /// Opens the listening stream on the current connection (design §15):
+    /// the sender of the front's answers and the service's calls. Returns
+    /// once the service has answered with its headers: it is listening.
+    pub(super) async fn open_listen(&self) -> Result<Listening, ClientError> {
+        let deadline = tokio::time::Instant::now() + self.timeout();
+        let mut stale = None;
+        loop {
+            let conn = self.connection_until(deadline, stale).await?;
+            let (answers, outbound) = tokio::sync::mpsc::channel(ANSWERS);
+            let mut grpc = self.grpc(&conn);
+            // No grpc-timeout: the stream lasts as long as the front.
+            let request = tonic::Request::new(ReceiverStream::new(outbound));
+            match tokio::time::timeout_at(deadline, grpc.listen(request)).await {
+                Err(_) => return Err(self.timed_out(true)),
+                Ok(Ok(calls)) => {
+                    return Ok(Listening {
+                        answers,
+                        calls: calls.into_inner(),
+                    });
+                }
+                Ok(Err(status)) => match self.request_error(&status, stale.is_none()) {
+                    Retry::Fresh => stale = Some(conn.id),
+                    Retry::No(e) => return Err(e),
+                },
+            }
         }
     }
 
-    fn unexpected(&self, reply: &Reply) -> ClientError {
-        match reply {
-            Reply::Error { message } => ClientError::Service {
-                address: self.address.clone(),
-                message: message.clone(),
-            },
-            Reply::Refused { reason } => ClientError::Refused {
-                address: self.address.clone(),
-                reason: reason.clone(),
-            },
-            Reply::Busy { reason } => ClientError::Busy {
-                address: self.address.clone(),
-                reason: reason.clone(),
-            },
-            other => ClientError::Protocol {
-                address: self.address.clone(),
-                message: format!("unexpected reply {other:?}"),
-            },
-        }
+    /// The runtime the listener drives its stream on.
+    pub(super) fn bridge(&self) -> &Bridge {
+        &self.bridge
     }
 
     /// One request and its reply, with outage alarms and telemetry.
-    fn call(&self, name: &'static str, request: &Request) -> Result<Reply, ClientError> {
+    fn call<Req, Rep, F, Fut>(
+        &self,
+        name: &'static str,
+        rpc: F,
+        request: Req,
+    ) -> Result<Rep, ClientError>
+    where
+        Req: Clone,
+        F: Fn(Grpc<Wire>, tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = Result<tonic::Response<Rep>, Status>>,
+    {
         let start = Instant::now();
-        let result = self.exchange(request);
+        let result = self
+            .bridge
+            .block_on(self.unary(|wire, request| rpc(self.grpc_on(wire), request), request));
+        self.observe(name, start, result)
+    }
+
+    /// Notes the outcome of a request: its round trip, an outage beginning
+    /// or ending.
+    fn observe<T>(
+        &self,
+        name: &'static str,
+        start: Instant,
+        result: Result<T, ClientError>,
+    ) -> Result<T, ClientError> {
         match &result {
-            Ok(Reply::Error { .. } | Reply::Refused { .. } | Reply::Busy { .. }) => {}
             Ok(_) => {
                 self.telemetry.front_round_trip(name, start.elapsed());
                 if self.down.swap(false, Ordering::SeqCst) {
@@ -315,6 +465,8 @@ impl HistoryClient {
                     });
                 }
             }
+            // The service answered: it is up, and this request failed.
+            Err(ClientError::Service { .. }) => {}
             Err(e) => {
                 self.telemetry.front_service_failure(e.stage());
                 if e.is_outage() && !self.down.swap(true, Ordering::SeqCst) {
@@ -328,79 +480,59 @@ impl HistoryClient {
         result
     }
 
-    fn exchange(&self, request: &Request) -> Result<Reply, ClientError> {
-        let mut stream = self.check_out()?;
-        if let Err(e) = write_frame(&mut stream, request) {
-            // A frame cut short is never journaled: the service reads it
-            // whole or not at all.
-            return Err(ClientError::Lost {
-                address: self.address.clone(),
-                sent: false,
-                error: e.to_string(),
-            });
-        }
-        match read_frame::<Reply>(&mut stream) {
-            Ok(reply) => {
-                self.check_in(stream);
-                Ok(reply)
-            }
-            Err(e) => Err(self.read_error(e, true)),
-        }
-    }
-
-    fn read_error(&self, e: FrameError, sent: bool) -> ClientError {
-        let address = self.address.clone();
-        if e.is_timeout() {
-            return ClientError::Timeout {
-                address,
-                timeout: self.config.timeout,
-                sent,
-            };
-        }
-        match e {
-            FrameError::Closed | FrameError::Io(_) => ClientError::Lost {
-                address,
-                sent,
-                error: e.to_string(),
-            },
-            FrameError::TooLarge(_) | FrameError::Malformed(_) => ClientError::Protocol {
-                address,
-                message: e.to_string(),
-            },
-        }
-    }
-
-    /// An idle connection the service still holds, or a new one.
-    fn check_out(&self) -> Result<UnixStream, ClientError> {
+    /// A unary call under the deadline, on the current connection; once
+    /// more on a new one if hyper handed it back unsent.
+    async fn unary<Req, Rep, F, Fut>(&self, rpc: F, message: Req) -> Result<Rep, ClientError>
+    where
+        Req: Clone,
+        F: Fn(Wire, tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = Result<tonic::Response<Rep>, Status>>,
+    {
+        let deadline = tokio::time::Instant::now() + self.timeout();
+        let mut stale = None;
         loop {
-            let pooled = self
-                .idle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop();
-            match pooled {
-                Some((_, since)) if since.elapsed() >= MAX_IDLE_AGE => continue,
-                Some((stream, _)) if local_socket::is_closed(&stream) => continue,
-                Some((stream, _)) => return Ok(stream),
-                None => return self.open(),
+            let conn = self.connection_until(deadline, stale).await?;
+            let mut request = tonic::Request::new(message.clone());
+            request.set_timeout(self.timeout());
+            match tokio::time::timeout_at(deadline, rpc(conn.wire.clone(), request)).await {
+                Err(_) => return Err(self.timed_out(true)),
+                Ok(Ok(reply)) => return Ok(reply.into_inner()),
+                Ok(Err(status)) => match self.request_error(&status, stale.is_none()) {
+                    Retry::Fresh => stale = Some(conn.id),
+                    Retry::No(e) => return Err(e),
+                },
             }
         }
     }
 
-    fn check_in(&self, stream: UnixStream) {
-        let mut idle = self
-            .idle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The oldest are first: drop those idle too long.
-        idle.retain(|(_, since)| since.elapsed() < MAX_IDLE_AGE);
-        if idle.len() < MAX_IDLE {
-            idle.push((stream, Instant::now()));
-        }
+    /// The current connection, within `deadline`. Nothing is sent yet.
+    async fn connection_until(
+        &self,
+        deadline: tokio::time::Instant,
+        stale: Option<u64>,
+    ) -> Result<Conn, ClientError> {
+        tokio::time::timeout_at(deadline, self.connection(stale))
+            .await
+            .unwrap_or_else(|_| Err(self.timed_out(false)))
     }
 
-    /// A new connection, past the handshake.
-    pub(super) fn open(&self) -> Result<UnixStream, ClientError> {
+    /// The connection in use, or a new one if there is none or it is
+    /// `stale` (found closed).
+    async fn connection(&self, stale: Option<u64>) -> Result<Conn, ClientError> {
+        let mut current = self.conn.lock().await;
+        if let Some(conn) = current.as_ref()
+            && Some(conn.id) != stale
+        {
+            return Ok(conn.clone());
+        }
+        *current = None;
+        let conn = self.open().await?;
+        *current = Some(conn.clone());
+        Ok(conn)
+    }
+
+    /// A new connection, admitted by the service's `Hello`.
+    async fn open(&self) -> Result<Conn, ClientError> {
         let unreachable = |error: String| ClientError::Unreachable {
             address: self.address.clone(),
             error,
@@ -411,8 +543,7 @@ impl HistoryClient {
             .address
             .unix_parts()
             .ok_or_else(|| unreachable(format!("{} is not a socket path", path.display())))?;
-        let mut stream =
-            local_socket::connect(dir, name).map_err(|e| unreachable(e.to_string()))?;
+        let stream = local_socket::connect(dir, name).map_err(|e| unreachable(e.to_string()))?;
         // Only a service running as root or as this front's own user may
         // acknowledge records: anyone else listening there (a squatter on
         // a shared directory) could answer for records never journaled.
@@ -431,60 +562,167 @@ impl HistoryClient {
             }
             Err(e) => return Err(unreachable(format!("peer credentials: {e}"))),
         }
-        let timeout = Some(self.config.timeout.max(Duration::from_millis(1)));
-        stream
-            .set_read_timeout(timeout)
-            .and_then(|()| stream.set_write_timeout(timeout))
+        let stream = stream
+            .set_nonblocking(true)
+            .and_then(|()| tokio::net::UnixStream::from_std(stream))
             .map_err(|e| unreachable(e.to_string()))?;
-        if let Err(e) = write_frame(&mut stream, &self.hello) {
-            // A service at its connection limit answers `Busy` and closes
-            // without reading the hello: its reply may be waiting.
-            return match read_frame::<Reply>(&mut stream) {
-                Ok(reply @ (Reply::Busy { .. } | Reply::Refused { .. })) => {
-                    Err(self.unexpected(&reply))
-                }
-                _ => Err(unreachable(e.to_string())),
-            };
+        let (send, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(stream))
+            .await
+            .map_err(|e| unreachable(format!("HTTP/2 handshake: {e}")))?;
+        // The connection's task holds the socket, and nothing else.
+        self.bridge.handle().spawn(async move {
+            let _ = connection.await;
+        });
+        let conn = Conn {
+            id: self.next_conn.fetch_add(1, Ordering::Relaxed),
+            wire: Wire { send },
+        };
+        let mut hello = tonic::Request::new(pb::HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            volume: self.volume.clone(),
+            front: Some((&self.front).into()),
+        });
+        hello.set_timeout(self.timeout());
+        let welcome = match self.grpc(&conn).hello(hello).await {
+            Ok(welcome) => welcome.into_inner(),
+            Err(status) => return Err(self.hello_error(&status)),
+        };
+        if welcome.protocol_version != PROTOCOL_VERSION {
+            return Err(ClientError::Refused {
+                address: self.address.clone(),
+                reason: format!(
+                    "it speaks protocol version {}, this front {PROTOCOL_VERSION}; run the same \
+                     agentfs version in fronts and service",
+                    welcome.protocol_version
+                ),
+            });
         }
-        let reply =
-            read_frame::<Reply>(&mut stream).map_err(|e| match self.read_error(e, false) {
-                // The service went away during the handshake: still nothing
-                // sent, so the next try may well work.
-                ClientError::Lost { error, .. } => unreachable(error),
-                other => other,
-            })?;
-        match reply {
-            Reply::Welcome {
-                volume,
-                branch,
-                features,
-                ..
-            } => {
-                if volume != self.hello.volume || branch != self.branch {
-                    return Err(ClientError::Refused {
-                        address: self.address.clone(),
-                        reason: format!(
-                            "it serves volume {volume:?} on {branch}, not {:?} on {}",
-                            self.hello.volume, self.branch
-                        ),
-                    });
-                }
-                *self
-                    .features
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = features;
-                Ok(stream)
-            }
-            other => Err(self.unexpected(&other)),
+        if welcome.volume != self.volume || welcome.branch != self.branch {
+            return Err(ClientError::Refused {
+                address: self.address.clone(),
+                reason: format!(
+                    "it serves volume {:?} on {}, not {:?} on {}",
+                    welcome.volume, welcome.branch, self.volume, self.branch
+                ),
+            });
+        }
+        *self
+            .features
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = welcome.features;
+        Ok(conn)
+    }
+
+    fn grpc(&self, conn: &Conn) -> Grpc<Wire> {
+        self.grpc_on(conn.wire.clone())
+    }
+
+    fn grpc_on(&self, wire: Wire) -> Grpc<Wire> {
+        Grpc::with_origin(wire, origin())
+            .max_decoding_message_size(MAX_MESSAGE)
+            .max_encoding_message_size(MAX_MESSAGE)
+    }
+
+    fn timeout(&self) -> Duration {
+        self.config.timeout.max(Duration::from_millis(1))
+    }
+
+    fn timed_out(&self, sent: bool) -> ClientError {
+        ClientError::Timeout {
+            address: self.address.clone(),
+            timeout: self.config.timeout,
+            sent,
         }
     }
+
+    fn protocol(&self, message: String) -> ClientError {
+        ClientError::Protocol {
+            address: self.address.clone(),
+            message,
+        }
+    }
+
+    /// Why `Hello` failed. Nothing was journaled, whatever happened.
+    fn hello_error(&self, status: &Status) -> ClientError {
+        let address = self.address.clone();
+        let reason = status.message().to_owned();
+        if let Some(dispatch) = dispatch_of(status) {
+            return ClientError::Unreachable {
+                address,
+                error: dispatch.to_string(),
+            };
+        }
+        match status.code() {
+            Code::PermissionDenied | Code::FailedPrecondition | Code::InvalidArgument => {
+                ClientError::Refused { address, reason }
+            }
+            Code::ResourceExhausted => ClientError::Busy { address, reason },
+            Code::DeadlineExceeded | Code::Cancelled => self.timed_out(false),
+            _ => ClientError::Unreachable {
+                address,
+                error: status.to_string(),
+            },
+        }
+    }
+
+    /// What a failed request means, and whether it goes once more on a
+    /// new connection: only on the `first` attempt, and only if hyper
+    /// handed it back unsent.
+    fn request_error(&self, status: &Status, first: bool) -> Retry {
+        let address = self.address.clone();
+        let message = status.message().to_owned();
+        Retry::No(match dispatch_of(status) {
+            Some(Dispatch::NotSent(_)) if first => return Retry::Fresh,
+            Some(Dispatch::NotSent(e)) => ClientError::Unreachable {
+                address,
+                error: e.to_string(),
+            },
+            Some(Dispatch::Sent(e)) => ClientError::Lost {
+                address,
+                sent: true,
+                error: e.to_string(),
+            },
+            None => match status.code() {
+                // The service failed it, or rejected it before journaling.
+                Code::Aborted | Code::InvalidArgument => ClientError::Service { address, message },
+                // "send Hello first".
+                Code::FailedPrecondition => ClientError::Protocol { address, message },
+                Code::DeadlineExceeded | Code::Cancelled => self.timed_out(true),
+                _ => ClientError::Lost {
+                    address,
+                    sent: true,
+                    error: status.to_string(),
+                },
+            },
+        })
+    }
+}
+
+/// An open listening stream (design §15).
+pub(super) struct Listening {
+    /// The front's answers, in the request stream.
+    pub(super) answers: tokio::sync::mpsc::Sender<pb::FrontAnswer>,
+    /// The service's calls, in the response stream.
+    pub(super) calls: tonic::Streaming<pb::FrontCall>,
+}
+
+/// Whether a failed request goes once more.
+enum Retry {
+    /// It was never sent: once more, on a new connection.
+    Fresh,
+    No(ClientError),
+}
+
+fn origin() -> http::Uri {
+    http::Uri::from_static(ORIGIN)
 }
 
 impl std::fmt::Debug for HistoryClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HistoryClient")
             .field("address", &self.address)
-            .field("slot", &self.hello.front.slot)
+            .field("slot", &self.front.slot)
             .finish_non_exhaustive()
     }
 }

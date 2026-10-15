@@ -3,20 +3,18 @@
 //! exactly as a FUSE mount's boundary layer would.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentfs_core::events::{Event, Events, MemorySink, NullSink};
-use agentfs_core::history_service::protocol::{
-    FrontInfo, PathStamp, Reply, read_frame, read_frame_bytes, write_frame,
-};
+use agentfs_core::history_service::wire::pb;
 use agentfs_core::history_service::{
-    Address, ClientConfig, ClientError, FrontHooks, FrontLease, FrontsError, HistoryClient,
-    HistoryServer, NoHooks,
+    Address, ClientConfig, ClientError, FrontHooks, FrontInfo, FrontLease, FrontsError,
+    HistoryClient, HistoryServer, NoHooks, PROTOCOL_VERSION, PathStamp, SERVICE_NAME,
 };
 use agentfs_core::identity::Context;
 use agentfs_core::lfs::Store;
@@ -27,6 +25,12 @@ use agentfs_core::rules::SkipReason;
 use agentfs_core::stamps::FreezeStamp;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Committer, Input, Recorded, Recorder, StateDir, VolumeError};
+use hyper_util::rt::TokioIo;
+use pb::history_client::HistoryClient as RawClient;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tonic::transport::{Channel, Endpoint, Server};
+use tonic::{Request, Response, Status, Streaming};
 
 const CALLER: Caller = Caller {
     uid: 1000,
@@ -506,39 +510,319 @@ fn a_service_outage_fails_boundaries_until_it_is_back() {
     assert!(service.head_blob("during-1").is_none());
 }
 
+// ---- fake services: tonic over the same socket, misbehaving on purpose ----
+
+/// What a fake service saw.
+#[derive(Default)]
+struct Seen {
+    hello: AtomicUsize,
+    record: AtomicUsize,
+    tracked: AtomicUsize,
+    still_last: AtomicUsize,
+    /// Each call's `grpc-timeout`, by call.
+    deadlines: Mutex<Vec<(&'static str, Option<Duration>)>>,
+}
+
+/// What a fake service does with a record.
+#[derive(Clone)]
+enum OnRecord {
+    /// Answers at once, journaled as seq 1.
+    Answer,
+    /// Never answers.
+    Hang,
+    /// Drops the first record's connection without answering; answers
+    /// any later one.
+    DropFirst,
+    /// Answers once every one of the barrier's records has arrived.
+    Together(Arc<tokio::sync::Barrier>),
+}
+
+#[derive(Clone)]
+struct Fake {
+    branch: String,
+    protocol_version: u32,
+    features: Vec<String>,
+    /// Hello answers RESOURCE_EXHAUSTED.
+    busy: bool,
+    on_record: OnRecord,
+    seen: Arc<Seen>,
+}
+
+impl Fake {
+    fn new(env: &Env, on_record: OnRecord) -> Self {
+        Self {
+            branch: branch(env),
+            protocol_version: PROTOCOL_VERSION,
+            features: vec!["still_last".into()],
+            busy: false,
+            on_record,
+            seen: Arc::default(),
+        }
+    }
+
+    fn note<T>(&self, call: &'static str, request: &Request<T>) {
+        let deadline = request
+            .metadata()
+            .get("grpc-timeout")
+            .and_then(|v| v.to_str().ok())
+            .and_then(grpc_timeout);
+        self.seen.deadlines.lock().unwrap().push((call, deadline));
+    }
+}
+
+/// A `grpc-timeout` value: digits and a unit (H M S m u n).
+fn grpc_timeout(value: &str) -> Option<Duration> {
+    let (digits, unit) = value.split_at(value.len().checked_sub(1)?);
+    let n: u64 = digits.parse().ok()?;
+    Some(match unit {
+        "H" => Duration::from_secs(n * 3600),
+        "M" => Duration::from_secs(n * 60),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    })
+}
+
+#[tonic::async_trait]
+impl pb::history_server::History for Fake {
+    async fn hello(
+        &self,
+        request: Request<pb::HelloRequest>,
+    ) -> Result<Response<pb::Welcome>, Status> {
+        self.note("hello", &request);
+        self.seen.hello.fetch_add(1, Ordering::SeqCst);
+        if self.busy {
+            return Err(Status::resource_exhausted(
+                "already serves 1024 front connections",
+            ));
+        }
+        Ok(Response::new(pb::Welcome {
+            protocol_version: self.protocol_version,
+            volume: "vol".into(),
+            branch: self.branch.clone(),
+            service_pid: 1,
+            features: self.features.clone(),
+        }))
+    }
+
+    async fn tracked(
+        &self,
+        request: Request<pb::TrackedRequest>,
+    ) -> Result<Response<pb::TrackedReply>, Status> {
+        self.note("tracked", &request);
+        self.seen.tracked.fetch_add(1, Ordering::SeqCst);
+        let tracked = vec![false; request.into_inner().paths.len()];
+        Ok(Response::new(pb::TrackedReply { tracked }))
+    }
+
+    async fn record(
+        &self,
+        request: Request<pb::RecordRequest>,
+    ) -> Result<Response<pb::RecordReply>, Status> {
+        self.note("record", &request);
+        self.seen.record.fetch_add(1, Ordering::SeqCst);
+        match &self.on_record {
+            OnRecord::Answer => {}
+            OnRecord::Hang => std::future::pending().await,
+            OnRecord::DropFirst => {
+                if self.seen.record.load(Ordering::SeqCst) == 1 {
+                    let fd = *request.extensions().get::<RawFd>().unwrap();
+                    // SAFETY: `fd` is this request's connection, open while
+                    // its request is served; shutdown(2) only ends its
+                    // traffic, both ways.
+                    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+                    std::future::pending::<()>().await;
+                }
+            }
+            OnRecord::Together(barrier) => {
+                barrier.wait().await;
+            }
+        }
+        Ok(Response::new(pb::RecordReply {
+            seq: Some(1),
+            skipped: Vec::new(),
+        }))
+    }
+
+    async fn still_last(
+        &self,
+        request: Request<pb::StillLastRequest>,
+    ) -> Result<Response<pb::StillLastReply>, Status> {
+        self.note("still_last", &request);
+        self.seen.still_last.fetch_add(1, Ordering::SeqCst);
+        Ok(Response::new(pb::StillLastReply { last: true }))
+    }
+
+    type ListenStream = ReceiverStream<Result<pb::FrontCall, Status>>;
+
+    async fn listen(
+        &self,
+        _: Request<Streaming<pb::FrontAnswer>>,
+    ) -> Result<Response<Self::ListenStream>, Status> {
+        Err(Status::unimplemented("a fake"))
+    }
+}
+
+/// A fake service's connection: its descriptor is its connect info, so a
+/// handler can drop it.
+struct FakeConn(tokio::net::UnixStream);
+
+impl tonic::transport::server::Connected for FakeConn {
+    type ConnectInfo = RawFd;
+
+    fn connect_info(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl tokio::io::AsyncRead for FakeConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for FakeConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
+/// A fake service on the volume's socket, on its own runtime; dropped,
+/// it drops every connection at once.
+struct FakeServer {
+    kill: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeServer {
+    fn start(env: &Env, fake: Fake) -> Self {
+        std::fs::create_dir_all(env.state.history_dir()).unwrap();
+        let socket = env.state.history_socket();
+        let _ = std::fs::remove_file(&socket);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (kill, killed) = std::sync::mpsc::channel();
+        let listener = {
+            let _runtime = runtime.enter();
+            tokio::net::UnixListener::bind(&socket).unwrap()
+        };
+        runtime.spawn(
+            Server::builder()
+                .add_service(pb::history_server::HistoryServer::new(fake))
+                .serve_with_incoming(UnixListenerStream::new(listener).map(|io| io.map(FakeConn))),
+        );
+        let thread = std::thread::spawn(move || {
+            let _ = killed.recv();
+            runtime.shutdown_background();
+        });
+        Self {
+            kill,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for FakeServer {
+    fn drop(&mut self) {
+        let _ = self.kill.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn branch(env: &Env) -> String {
+    agentfs_core::history::History::open(&env.state.git())
+        .unwrap()
+        .settings()
+        .branch_ref
+        .clone()
+}
+
+/// A front's recorder on `client`.
+fn front_on(env: &Env, client: HistoryClient, sink: Events) -> Recorder {
+    volume::open_front(
+        &env.state,
+        &env.tree,
+        sink,
+        &Telemetry::noop(),
+        Arc::new(client),
+    )
+    .unwrap()
+}
+
+/// A raw connection to the volume's socket: no Hello unless the test
+/// sends one.
+fn raw_channel(runtime: &tokio::runtime::Runtime, env: &Env) -> Channel {
+    let socket = env.state.history_socket();
+    runtime.block_on(async move {
+        Endpoint::from_static("http://agentfs.history")
+            .connect_with_connector(tower::service_fn(move |_: tonic::codegen::http::Uri| {
+                let socket = socket.clone();
+                async move {
+                    tokio::net::UnixStream::connect(socket)
+                        .await
+                        .map(TokioIo::new)
+                }
+            }))
+            .await
+            .unwrap()
+    })
+}
+
+fn hello_of(front: &FrontInfo, version: u32) -> pb::HelloRequest {
+    pb::HelloRequest {
+        protocol_version: version,
+        volume: "vol".into(),
+        front: Some(front.into()),
+    }
+}
+
+fn empty_draft() -> Draft {
+    Draft {
+        trigger: Trigger::Close,
+        caller: CALLER,
+        time_ms: 1,
+        changes: Vec::new(),
+        operation: None,
+        atomic: false,
+        origin: None,
+    }
+}
+
 #[test]
 fn a_hung_service_times_out() {
     let env = env();
     let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
-    let dir = env.state.history_dir();
-    std::fs::create_dir_all(&dir).unwrap();
-    let listener = UnixListener::bind(env.state.history_socket()).unwrap();
-    let branch = agentfs_core::history::History::open(&env.state.git())
-        .unwrap()
-        .settings()
-        .branch_ref
-        .clone();
-    let fake = {
-        let branch = branch.clone();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_frame_bytes(&mut stream).unwrap();
-            write_frame(
-                &mut stream,
-                &Reply::Welcome {
-                    volume: "vol".into(),
-                    branch,
-                    service_pid: 1,
-                    features: Vec::new(),
-                },
-            )
-            .unwrap();
-            // Reads the request and never answers.
-            let _ = read_frame_bytes(&mut stream);
-            let mut rest = Vec::new();
-            let _ = stream.read_to_end(&mut rest);
-        })
-    };
+    let fake = Fake::new(&env, OnRecord::Hang);
+    let _server = FakeServer::start(&env, fake);
     let sink = Arc::new(MemorySink::new());
     let client = connect(
         &env,
@@ -549,14 +833,7 @@ fn a_hung_service_times_out() {
         sink.clone(),
     )
     .unwrap();
-    let recorder = volume::open_front(
-        &env.state,
-        &env.tree,
-        sink.clone(),
-        &Telemetry::noop(),
-        Arc::new(client),
-    )
-    .unwrap();
+    let recorder = front_on(&env, client, sink);
     let start = Instant::now();
     let err = close(&env, &recorder, "a", "1").unwrap_err();
     assert!(start.elapsed() < Duration::from_secs(5));
@@ -573,46 +850,15 @@ fn a_hung_service_times_out() {
         1,
         "a request that may be journaled keeps its copy"
     );
-    drop(recorder);
-    fake.join().unwrap();
 }
 
 #[test]
-fn a_busy_service_fails_the_boundary_without_an_outage_alarm() {
+fn a_lost_reply_is_never_resent() {
     let env = env();
     let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
-    std::fs::create_dir_all(env.state.history_dir()).unwrap();
-    let listener = UnixListener::bind(env.state.history_socket()).unwrap();
-    let branch = agentfs_core::history::History::open(&env.state.git())
-        .unwrap()
-        .settings()
-        .branch_ref
-        .clone();
-    let fake = std::thread::spawn(move || {
-        // Welcomes the first connection and closes it, as an idle timeout
-        // would; then is at its connection limit.
-        let (mut stream, _) = listener.accept().unwrap();
-        read_frame_bytes(&mut stream).unwrap();
-        write_frame(
-            &mut stream,
-            &Reply::Welcome {
-                volume: "vol".into(),
-                branch,
-                service_pid: 1,
-                features: Vec::new(),
-            },
-        )
-        .unwrap();
-        drop(stream);
-        let (mut stream, _) = listener.accept().unwrap();
-        write_frame(
-            &mut stream,
-            &Reply::Busy {
-                reason: "already serves 1024 connections".into(),
-            },
-        )
-        .unwrap();
-    });
+    let fake = Fake::new(&env, OnRecord::DropFirst);
+    let seen = fake.seen.clone();
+    let server = FakeServer::start(&env, fake);
     let sink = Arc::new(MemorySink::new());
     let client = connect(
         &env,
@@ -623,15 +869,44 @@ fn a_busy_service_fails_the_boundary_without_an_outage_alarm() {
         sink.clone(),
     )
     .unwrap();
-    let recorder = volume::open_front(
-        &env.state,
-        &env.tree,
+    let recorder = front_on(&env, client, sink);
+    let err = close(&env, &recorder, "a", "1").unwrap_err();
+    let VolumeError::HistoryService(e) = &err else {
+        panic!("{err:?}")
+    };
+    assert!(matches!(e, ClientError::Lost { sent: true, .. }), "{e:?}");
+    assert_eq!(slot_copies(&env, 1), 1, "the copy stays for the service");
+    assert_eq!(seen.record.load(Ordering::SeqCst), 1, "never resent");
+    drop(server);
+}
+
+#[test]
+fn a_busy_service_fails_the_boundary_without_an_outage_alarm() {
+    let env = env();
+    let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
+    // Welcomes the first connection, then drops it; the service behind
+    // the socket next is at its connection limit.
+    let first = FakeServer::start(&env, Fake::new(&env, OnRecord::Answer));
+    let sink = Arc::new(MemorySink::new());
+    let client = connect(
+        &env,
+        &lease,
+        pod("pod-a"),
+        "vol",
+        Duration::from_secs(5),
         sink.clone(),
-        &Telemetry::noop(),
-        Arc::new(client),
     )
     .unwrap();
-    // Let the close reach the client's pool.
+    let recorder = front_on(&env, client, sink.clone());
+    drop(first);
+    let _busy = FakeServer::start(
+        &env,
+        Fake {
+            busy: true,
+            ..Fake::new(&env, OnRecord::Answer)
+        },
+    );
+    // Let the close reach the client's connection.
     std::thread::sleep(Duration::from_millis(100));
     let err = close(&env, &recorder, "a", "1").unwrap_err();
     let VolumeError::HistoryService(e) = &err else {
@@ -653,7 +928,117 @@ fn a_busy_service_fails_the_boundary_without_an_outage_alarm() {
             .any(|e| matches!(e, Event::RecordFailed { .. })),
         "{events:?}"
     );
-    fake.join().unwrap();
+}
+
+#[test]
+fn a_service_of_another_protocol_is_refused() {
+    let env = env();
+    let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
+    let _server = FakeServer::start(
+        &env,
+        Fake {
+            protocol_version: 3,
+            ..Fake::new(&env, OnRecord::Answer)
+        },
+    );
+    match connect(
+        &env,
+        &lease,
+        pod("a"),
+        "vol",
+        Duration::from_secs(5),
+        Arc::new(NullSink),
+    ) {
+        Err(ClientError::Refused { reason, .. }) => {
+            assert!(reason.contains("protocol version 3"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_service_without_still_last_is_never_asked() {
+    let env = env();
+    let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
+    let fake = Fake {
+        features: Vec::new(),
+        ..Fake::new(&env, OnRecord::Answer)
+    };
+    let seen = fake.seen.clone();
+    let _server = FakeServer::start(&env, fake);
+    let client = connect(
+        &env,
+        &lease,
+        pod("a"),
+        "vol",
+        Duration::from_secs(5),
+        Arc::new(NullSink),
+    )
+    .unwrap();
+    assert!(!client.supports("still_last"));
+    assert!(!client.still_last(&path("f"), PendingId(1)).unwrap());
+    assert_eq!(seen.still_last.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn calls_carry_the_deadline() {
+    let env = env();
+    let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
+    let fake = Fake::new(&env, OnRecord::Answer);
+    let seen = fake.seen.clone();
+    let _server = FakeServer::start(&env, fake);
+    let timeout = Duration::from_secs(2);
+    let client = connect(&env, &lease, pod("a"), "vol", timeout, Arc::new(NullSink)).unwrap();
+    client.record(empty_draft(), Vec::new()).unwrap();
+    assert_eq!(client.tracked(&[path("x")]).unwrap(), [false]);
+    assert!(client.still_last(&path("f"), PendingId(1)).unwrap());
+    let deadlines = seen.deadlines.lock().unwrap().clone();
+    for call in ["hello", "record", "tracked", "still_last"] {
+        let (_, deadline) = deadlines
+            .iter()
+            .find(|(c, _)| *c == call)
+            .unwrap_or_else(|| panic!("no {call}: {deadlines:?}"));
+        let deadline = deadline.unwrap_or_else(|| panic!("{call} has no grpc-timeout"));
+        assert!(
+            deadline > Duration::ZERO && deadline <= timeout,
+            "{call}: {deadline:?}"
+        );
+    }
+}
+
+#[test]
+fn history_calls_from_many_threads_overlap() {
+    // Every record is held until all 8 have arrived: only calls that run
+    // at once through the one client finish.
+    const THREADS: usize = 8;
+    let env = env();
+    let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(THREADS));
+    let _server = FakeServer::start(&env, Fake::new(&env, OnRecord::Together(barrier)));
+    let client = Arc::new(
+        connect(
+            &env,
+            &lease,
+            pod("a"),
+            "vol",
+            Duration::from_secs(30),
+            Arc::new(NullSink),
+        )
+        .unwrap(),
+    );
+    let (done, finished) = std::sync::mpsc::channel();
+    for _ in 0..THREADS {
+        let (client, done) = (client.clone(), done.clone());
+        std::thread::spawn(move || {
+            let _ = done.send(client.record(empty_draft(), Vec::new()).map(|r| r.seq));
+        });
+    }
+    for n in 0..THREADS {
+        let result = finished
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("only {n} of {THREADS} records finished"));
+        assert_eq!(result.unwrap(), Some(1));
+    }
 }
 
 #[test]
@@ -686,6 +1071,8 @@ fn the_service_refuses_fronts_it_cannot_serve() {
     let reason = refused(connect(&env, &lease, evil, "vol", timeout, null.clone()));
     assert!(reason.contains("identity templates"), "{reason}");
 
+    // Hostile hellos, through the raw generated client.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
     let other = FrontLease::acquire(&env.state, "pod=b").unwrap();
     let slot = other.slot();
     drop(other);
@@ -693,27 +1080,34 @@ fn the_service_refuses_fronts_it_cannot_serve() {
         slot,
         ..front_info(&lease, pod("b"))
     };
-    let mut stream =
-        agentfs_core::local_socket::connect(&env.state.history_dir(), "history.sock").unwrap();
-    let hello = serde_json::json!({"v": 1, "volume": "vol", "front": unleased});
-    write_frame(&mut stream, &hello).unwrap();
-    match read_frame::<Reply>(&mut stream).unwrap() {
-        Reply::Refused { reason } => assert!(reason.contains("not leased"), "{reason}"),
-        other => panic!("{other:?}"),
-    }
+    let mut raw = RawClient::new(raw_channel(&runtime, &env));
+    let status = runtime
+        .block_on(raw.hello(hello_of(&unleased, PROTOCOL_VERSION)))
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert!(status.message().contains("not leased"), "{status:?}");
 
-    let mut stream =
-        agentfs_core::local_socket::connect(&env.state.history_dir(), "history.sock").unwrap();
-    write_frame(&mut stream, &serde_json::json!({"v": 2, "anything": true})).unwrap();
-    match read_frame::<Reply>(&mut stream).unwrap() {
-        Reply::Refused { reason } => {
-            assert!(reason.contains("protocol version 2"), "{reason}");
-        }
-        other => panic!("{other:?}"),
-    }
-    let mut buf = [0u8; 1];
-    assert_eq!(stream.read(&mut buf).unwrap(), 0, "and closes");
-    let _ = stream.write_all(b"x");
+    let status = runtime
+        .block_on(raw.hello(hello_of(&front_info(&lease, pod("a")), 1)))
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert!(
+        status
+            .message()
+            .contains("protocol version 1 is not supported"),
+        "{status:?}"
+    );
+
+    // No call before an admitted Hello on the connection.
+    let mut fresh = RawClient::new(raw_channel(&runtime, &env));
+    let status = runtime
+        .block_on(fresh.record(pb::RecordRequest {
+            draft: Some((&empty_draft()).into()),
+            stamps: Vec::new(),
+        }))
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert!(status.message().contains("send Hello first"), "{status:?}");
 }
 
 #[test]
@@ -1248,6 +1642,104 @@ fn ping_measures_a_round_trip() {
 }
 
 #[test]
+fn health_follows_the_service() {
+    use tonic_health::pb::HealthCheckRequest;
+    use tonic_health::pb::health_check_response::ServingStatus;
+    use tonic_health::pb::health_client::HealthClient;
+
+    let env = env();
+    let mut service = Service::start(&env);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut health = HealthClient::new(raw_channel(&runtime, &env));
+    let request = || HealthCheckRequest {
+        service: SERVICE_NAME.to_owned(),
+    };
+    let checked = runtime
+        .block_on(health.check(request()))
+        .unwrap()
+        .into_inner();
+    assert_eq!(checked.status, ServingStatus::Serving as i32);
+    // Once a connection has seen the service stop it opens no new call:
+    // a watch opened before sees the change.
+    let mut watch = runtime
+        .block_on(health.watch(request()))
+        .unwrap()
+        .into_inner();
+    let first = runtime.block_on(watch.message()).unwrap().unwrap();
+    assert_eq!(first.status, ServingStatus::Serving as i32);
+    let server = service.server.take().unwrap();
+    let stopping = std::thread::spawn(move || server.shutdown(Duration::from_secs(10)));
+    let next = runtime.block_on(watch.message()).unwrap().unwrap();
+    assert_eq!(next.status, ServingStatus::NotServing as i32);
+    drop((watch, health));
+    assert!(stopping.join().unwrap(), "the service stopped in time");
+}
+
+#[test]
+fn a_restarted_service_does_not_fail_the_next_boundary() {
+    let env = env();
+    let mut service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    close(&env, &a.recorder, "before", "1").unwrap().unwrap();
+    assert!(
+        service
+            .server
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+    service.listen(&env);
+    // The connection the front holds is closed: the record goes, once, on
+    // a new one.
+    close(&env, &a.recorder, "after", "2").unwrap().unwrap();
+    assert!(alarms(&a.sink).is_empty());
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob("after").unwrap(), b"2");
+}
+
+#[test]
+fn a_record_over_4_mib_is_journaled() {
+    use prost::Message as _;
+
+    const CHANGES: usize = 50_000;
+    let env = env();
+    let service = Service::start(&env);
+    let a = front(&env, "pod-a");
+    let dir = env.tree.join("links");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = |n: usize| format!("links/{n:0>90}");
+    for n in 0..CHANGES {
+        std::os::unix::fs::symlink("target", env.tree.join(name(n))).unwrap();
+    }
+    let draft = Draft {
+        trigger: Trigger::Symlink,
+        changes: (0..CHANGES)
+            .map(|n| Change::Symlink {
+                path: path(&name(n)),
+                target: "target".into(),
+            })
+            .collect(),
+        ..empty_draft()
+    };
+    let encoded = pb::RecordRequest {
+        draft: Some((&draft).into()),
+        stamps: Vec::new(),
+    }
+    .encoded_len();
+    assert!(encoded > 4 << 20, "only {encoded} bytes");
+    let recorded = a
+        .recorder
+        .history_client()
+        .unwrap()
+        .record(draft, Vec::new())
+        .unwrap();
+    assert!(recorded.seq.is_some(), "{recorded:?}");
+    assert!(recorded.skipped.is_empty());
+    service.committer.commit_pending().unwrap();
+    assert_eq!(service.head_blob(&name(CHANGES - 1)).unwrap(), b"target");
+}
+
+#[test]
 fn the_service_says_whether_a_fronts_copy_is_still_last() {
     // A front's RELEASE skips re-recording a racy close only while the
     // copy it froze is the last state the service journaled at the path
@@ -1561,6 +2053,47 @@ fn a_front_whose_listener_stopped_loses_its_link() {
         fronts.require_all(Duration::from_millis(100)),
         Err(FrontsError::NotListening(_))
     ));
+
+    // A front whose answer is not to the call it was asked loses its link
+    // too, however good the answer.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut raw = RawClient::new(raw_channel(&runtime, &env));
+    runtime
+        .block_on(raw.hello(hello_of(
+            &front_info(&lease, pod("pod-a")),
+            PROTOCOL_VERSION,
+        )))
+        .unwrap();
+    let (answers, outbound) = tokio::sync::mpsc::channel(4);
+    let mut calls = runtime
+        .block_on(raw.listen(ReceiverStream::new(outbound)))
+        .unwrap()
+        .into_inner();
+    runtime.spawn(async move {
+        while let Ok(Some(call)) = calls.message().await {
+            let answer = pb::FrontAnswer {
+                id: call.id + 1,
+                answer: Some(pb::front_answer::Answer::Settled(pb::Settled {
+                    recorded: 0,
+                    failed: 0,
+                })),
+            };
+            if answers.send(answer).await.is_err() {
+                break;
+            }
+        }
+    });
+    assert_eq!(
+        fronts.require_all(Duration::from_secs(5)).unwrap(),
+        [lease.slot()]
+    );
+    match fronts.settle() {
+        Err(FrontsError::Call { message, .. }) => {
+            assert!(message.contains("answered call"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fronts.listening().is_empty());
 }
 
 #[test]

@@ -21,9 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, bail};
 
 use agentfs_core::history::History;
-use agentfs_core::history_service::protocol::FrontInfo;
 use agentfs_core::history_service::{
-    Address, ClientConfig, FrontHooks, FrontLease, HistoryClient, ListenerHandle, NoHooks,
+    Address, ClientConfig, FrontHooks, FrontInfo, FrontLease, HistoryClient, ListenerHandle,
+    NoHooks,
 };
 use agentfs_core::record::Origin;
 use agentfs_core::volume::{self, Recorder, StateDir};

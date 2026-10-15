@@ -21,7 +21,7 @@ gix-parallel = { version = "0.50.0", features = ["parallel"] }
 libgit2-sys = { version = "0.18.8", default-features = false }
 # The API only: the binary picks the SDK and exporters (design §13).
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
-# SO_PEERCRED and recv(MSG_PEEK) on local sockets (design §14, §15):
+# SO_PEERCRED on local sockets (design §14, §15):
 # bindings only, no C build.
 libc = "0.2.190"
 rustix = { version = "1.1.5", features = ["fs", "process"] }
@@ -64,6 +64,10 @@ tempfile = "3.27.0"
 # The in-process ssh-agent of the transport tests (`ssh` feature): its
 # connection stream.
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
+# Fake history services and raw clients over a Unix socket in the history
+# service tests: tonic's channel, test builds only.
+tonic = { version = "0.14.6", features = ["transport"] }
+tower = { version = "0.5.3", features = ["util"] }
 # The in-process SSH server of the transport tests (`ssh` feature).
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "process", "io-util", "time", "macros"] }
 

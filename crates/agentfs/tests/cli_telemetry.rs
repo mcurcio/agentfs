@@ -816,8 +816,9 @@ fn real_record_and_commit_failures_are_counted() {
 #[test]
 fn the_fronts_gauge_and_a_fronts_round_trip_are_exported() {
     use agentfs_core::events::NullSink;
-    use agentfs_core::history_service::protocol::FrontInfo;
-    use agentfs_core::history_service::{Address, ClientConfig, FrontLease, HistoryClient};
+    use agentfs_core::history_service::{
+        Address, ClientConfig, FrontInfo, FrontLease, HistoryClient,
+    };
     use agentfs_core::record::Origin;
     use agentfs_core::telemetry::Telemetry;
     use agentfs_core::volume::StateDir;

@@ -135,34 +135,6 @@ pub fn peer(stream: &UnixStream) -> io::Result<Peer> {
     })
 }
 
-/// Whether the peer has closed `stream` (or it has failed), without
-/// blocking or consuming anything: a pooled connection to a server that
-/// has since restarted is dead and must not carry a request. A connection
-/// with unread data is not idle and also counts as unusable.
-pub fn is_closed(stream: &UnixStream) -> bool {
-    let mut byte = 0u8;
-    // SAFETY: `byte` is a valid, writable buffer of 1 byte; the descriptor
-    // is open for the call.
-    let n = unsafe {
-        libc::recv(
-            stream.as_raw_fd(),
-            (&raw mut byte).cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    if n < 0 {
-        let err = io::Error::last_os_error();
-        !matches!(
-            err.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        )
-    } else {
-        // 0 is the peer's EOF; data nobody asked for is a protocol fault.
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,16 +204,5 @@ mod tests {
         let _l = bind(tmp.path(), "s").unwrap();
         let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755);
-    }
-
-    #[test]
-    fn closed_connections_are_detected() {
-        let (a, b) = UnixStream::pair().unwrap();
-        assert!(!is_closed(&a));
-        drop(b);
-        assert!(is_closed(&a));
-        let (a, mut b) = UnixStream::pair().unwrap();
-        b.write_all(b"x").unwrap();
-        assert!(is_closed(&a), "unread data makes it unusable");
     }
 }

@@ -11,9 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentfs_core::events::NullSink;
-use agentfs_core::history_service::protocol::FrontInfo;
 use agentfs_core::history_service::{
-    Address, ClientConfig, FrontHooks, FrontLease, HistoryClient, ListenerHandle,
+    Address, ClientConfig, FrontHooks, FrontInfo, FrontLease, HistoryClient, ListenerHandle,
 };
 use agentfs_core::paths::RepoPath;
 use agentfs_core::record::Origin;

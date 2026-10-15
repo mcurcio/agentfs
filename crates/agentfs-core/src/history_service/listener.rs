@@ -1,32 +1,30 @@
-//! A front's listening connection: the service calls the front (design
-//! §14.1, §15).
+//! A front's listening stream: the service calls the front (design §14.1,
+//! §15).
 //!
 //! A restore or revert served by the history service writes the backing
 //! tree that live fronts serve. Before it plans, the service needs each
 //! front to record what is dirty in it (`Settle`) and to say which paths
 //! it holds open for writing; after it writes, each front must drop its
 //! kernel's cached entries, attributes and pages of the paths written
-//! (`Invalidate`). [`HistoryClient::listen`] keeps one connection to the
-//! service turned around for that ([`Request::Listen`]): the service sends
-//! [`FrontCall`]s, which [`FrontHooks`] answer, one at a time, on the
-//! listener's own thread.
+//! (`Invalidate`). [`HistoryClient::listen`] keeps one `Listen` stream open
+//! on the front's connection for that: the service sends calls, which
+//! [`FrontHooks`] answer, one at a time, on the listener's own thread
+//! (never on a runtime worker).
 //!
-//! The listener reconnects by itself, with a backoff from
+//! The listener opens the stream again by itself, with a backoff from
 //! [`RECONNECT_MIN`] to [`RECONNECT_MAX`], when the service restarts or the
-//! connection breaks. A service from before listening existed closes the
-//! connection or answers with an error; the listener keeps retrying at the
-//! longest backoff, and that service never calls.
+//! stream breaks.
 
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::HistoryClient;
-use super::protocol::{
-    Answer, Call, FrontAnswer, FrontCall, Reply, Request, read_frame, write_frame,
-};
+use tokio::sync::Notify;
+
+use super::client::Listening;
+use super::wire::pb;
+use super::{Answer, Call, HistoryClient};
 use crate::paths::RepoPath;
 
 /// The first wait before reconnecting.
@@ -91,16 +89,16 @@ pub struct ListenerHandle {
 
 struct Shared {
     stop: AtomicBool,
-    /// The connection in use, to shut down at stop.
-    stream: Mutex<Option<UnixStream>>,
-    /// Whether the service has acknowledged the current connection.
+    /// Wakes the listener from a blocked receive at stop.
+    wake: Notify,
+    /// Whether the service has acknowledged the current stream.
     listening: Mutex<bool>,
     changed: Condvar,
 }
 
 impl ListenerHandle {
     /// Waits up to `timeout` until the service has acknowledged a
-    /// listening connection; whether it has.
+    /// listening stream; whether it has.
     pub fn wait_listening(&self, timeout: Duration) -> bool {
         let listening = self
             .shared
@@ -122,15 +120,9 @@ impl ListenerHandle {
 
     fn halt(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(stream) = self
-            .shared
-            .stream
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-        {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
+        // A stored permit if the listener is not waiting now: it checks
+        // `stop` before its next wait.
+        self.shared.wake.notify_one();
         self.shared.changed.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -145,12 +137,12 @@ impl Drop for ListenerHandle {
 }
 
 impl HistoryClient {
-    /// Keeps a connection open on which the service calls this front,
+    /// Keeps a stream open on which the service calls this front,
     /// answered by `hooks`, until the handle is dropped.
     pub fn listen(self: &Arc<Self>, hooks: Arc<dyn FrontHooks>) -> std::io::Result<ListenerHandle> {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
-            stream: Mutex::new(None),
+            wake: Notify::new(),
             listening: Mutex::new(false),
             changed: Condvar::new(),
         });
@@ -172,12 +164,11 @@ fn run(client: &HistoryClient, hooks: &dyn FrontHooks, shared: &Shared) {
     while !shared.stop.load(Ordering::SeqCst) {
         if let Some(stream) = turn_around(client, shared) {
             backoff = RECONNECT_MIN;
-            serve(stream, hooks, shared);
+            serve(client, stream, hooks, shared);
             set_listening(shared, false);
         } else {
             backoff = (backoff * 2).min(RECONNECT_MAX);
         }
-        *shared.stream.lock().unwrap_or_else(PoisonError::into_inner) = None;
         // Interruptible by stop.
         let listening = shared
             .listening
@@ -197,34 +188,55 @@ fn set_listening(shared: &Shared, value: bool) {
     shared.changed.notify_all();
 }
 
-/// A new connection, turned around: the service sends calls on it now.
-fn turn_around(client: &HistoryClient, shared: &Shared) -> Option<UnixStream> {
-    let mut stream = client.open().ok()?;
-    {
-        let mut slot = shared.stream.lock().unwrap_or_else(PoisonError::into_inner);
-        if shared.stop.load(Ordering::SeqCst) {
-            return None;
+/// A new listening stream: the service sends calls on it now.
+fn turn_around(client: &HistoryClient, shared: &Shared) -> Option<Listening> {
+    if shared.stop.load(Ordering::SeqCst) {
+        return None;
+    }
+    let stream = client.bridge().block_on(async {
+        tokio::select! {
+            opened = client.open_listen() => opened.ok(),
+            () = shared.wake.notified() => None,
         }
-        *slot = stream.try_clone().ok();
+    })?;
+    if shared.stop.load(Ordering::SeqCst) {
+        return None;
     }
-    write_frame(&mut stream, &Request::Listen).ok()?;
-    match read_frame::<Reply>(&mut stream).ok()? {
-        Reply::Listening => {}
-        _ => return None,
-    }
-    // Calls come when the service has a restore to serve: no timeout.
-    stream.set_read_timeout(None).ok()?;
     set_listening(shared, true);
     Some(stream)
 }
 
-fn serve(mut stream: UnixStream, hooks: &dyn FrontHooks, shared: &Shared) {
+/// Answers the service's calls until the stream ends or the listener stops.
+fn serve(client: &HistoryClient, mut stream: Listening, hooks: &dyn FrontHooks, shared: &Shared) {
     while !shared.stop.load(Ordering::SeqCst) {
-        let Ok(FrontCall { id, call }) = read_frame::<FrontCall>(&mut stream) else {
+        // Calls come when the service has a restore to serve: no timeout.
+        let next = client.bridge().block_on(async {
+            tokio::select! {
+                next = stream.calls.message() => next.ok().flatten(),
+                () = shared.wake.notified() => None,
+            }
+        });
+        let Some(pb::FrontCall { id, call }) = next else {
             return;
         };
-        let answer = answer(hooks, &call);
-        if write_frame(&mut stream, &FrontAnswer { id, answer }).is_err() {
+        let answer = match call.map(Call::try_from) {
+            Some(Ok(call)) => answer(hooks, &call),
+            Some(Err(e)) => Answer::Error {
+                message: format!("a call this front cannot read: {e}"),
+            },
+            None => Answer::Error {
+                message: "a call with nothing to do".into(),
+            },
+        };
+        let reply = pb::FrontAnswer {
+            id,
+            answer: Some((&answer).into()),
+        };
+        if client
+            .bridge()
+            .block_on(stream.answers.send(reply))
+            .is_err()
+        {
             return;
         }
     }

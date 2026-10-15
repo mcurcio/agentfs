@@ -1,9 +1,9 @@
 //! The service's side of listening fronts (design §14.1, §15).
 //!
-//! A front that sends [`super::protocol::Request::Listen`] hands its
-//! connection to the service's [`Fronts`], one per slot (a front's new
-//! listening connection replaces its old one). A restore or revert served
-//! by the service then calls every live front through it:
+//! A front that opens a `Listen` stream hands it to the service's
+//! [`Fronts`] as its link, one per slot (a front's new stream replaces its
+//! old one). A restore or revert served by the service then calls every
+//! live front through it:
 //!
 //! 1. [`Fronts::require_all`]: every slot whose lease is held has a
 //!    listening front, waiting up to a grace for one that is reconnecting;
@@ -16,19 +16,22 @@
 //!    caches of the paths written.
 //!
 //! Calls to one front are made one at a time, each with a timeout; a front
-//! whose call fails (it died, or broke the protocol) loses its link, and a
-//! front whose lease is no longer held is never called.
+//! whose call fails (it died, its stream ended, or it broke the protocol)
+//! loses its link, and a front whose lease is no longer held is never
+//! called. Calls are made from the caller's thread (a restore's): the
+//! link's streams are fed by the service's runtime.
 
 use std::collections::{BTreeSet, HashMap};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use tonic::Status;
+
 use super::lease::FrontLease;
-use super::protocol::{Answer, Call, FrontAnswer, FrontCall, FrontInfo, read_frame, write_frame};
-use crate::local_socket;
+use super::wire::pb;
+use super::{Answer, Call, FrontInfo};
 use crate::paths::RepoPath;
 use crate::volume::StateDir;
 
@@ -39,12 +42,51 @@ pub const MIN_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many paths one `OpenForWriting` or `Invalidate` call carries.
 const PATHS_PER_CALL: usize = 4096;
 
+/// A listening front's stream: the calls the service sends it (the
+/// response stream of its `Listen`) and the answers it sends back (fed by
+/// a task reading its request stream).
+pub(crate) struct Link {
+    /// Taken (closed) when the link is dropped, which ends the stream.
+    calls: Mutex<Option<tokio::sync::mpsc::Sender<Result<pb::FrontCall, Status>>>>,
+    answers: Mutex<Receiver<pb::FrontAnswer>>,
+}
+
+impl Link {
+    pub(crate) fn new(
+        calls: tokio::sync::mpsc::Sender<Result<pb::FrontCall, Status>>,
+        answers: Receiver<pb::FrontAnswer>,
+    ) -> Self {
+        Self {
+            calls: Mutex::new(Some(calls)),
+            answers: Mutex::new(answers),
+        }
+    }
+
+    fn sender(&self) -> Option<tokio::sync::mpsc::Sender<Result<pb::FrontCall, Status>>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Alive while the front's stream is open.
+    fn alive(&self) -> bool {
+        self.sender().is_some_and(|s| !s.is_closed())
+    }
+
+    /// Ends the stream (once any call in flight is done with it).
+    fn close(&self) {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+}
+
 /// One listening front.
-struct Link {
+struct Linked {
     front: FrontInfo,
-    stream: Mutex<UnixStream>,
-    /// The same connection, to shut down while a call is in flight.
-    handle: Option<UnixStream>,
+    link: Link,
 }
 
 /// The service's listening fronts. Cheap to clone.
@@ -55,7 +97,7 @@ pub struct Fronts {
 
 struct Inner {
     state: StateDir,
-    links: Mutex<HashMap<u16, Arc<Link>>>,
+    links: Mutex<HashMap<u16, Arc<Linked>>>,
     changed: Condvar,
     next_id: AtomicU64,
     timeout: Duration,
@@ -107,19 +149,13 @@ impl Fronts {
         }
     }
 
-    /// Takes `stream`, a connection `front` turned around, as its link,
-    /// replacing any older link of its slot.
-    pub(crate) fn add(&self, front: FrontInfo, stream: UnixStream) {
-        let _ = stream.set_read_timeout(Some(self.inner.timeout));
-        let _ = stream.set_write_timeout(Some(self.inner.timeout));
-        let link = Arc::new(Link {
-            front,
-            handle: stream.try_clone().ok(),
-            stream: Mutex::new(stream),
-        });
-        let old = self.links().insert(link.front.slot, link.clone());
+    /// Takes `link`, the stream `front` opened, replacing any older link
+    /// of its slot.
+    pub(crate) fn add(&self, front: FrontInfo, link: Link) {
+        let linked = Arc::new(Linked { front, link });
+        let old = self.links().insert(linked.front.slot, linked.clone());
         if let Some(old) = old {
-            shut(&old);
+            old.link.close();
         }
         self.inner.changed.notify_all();
     }
@@ -127,8 +163,8 @@ impl Fronts {
     /// Closes every link (the service is stopping): fronts reconnect to
     /// the next service.
     pub(crate) fn close_all(&self) {
-        for (_, link) in self.links().drain() {
-            shut(&link);
+        for (_, linked) in self.links().drain() {
+            linked.link.close();
         }
     }
 
@@ -146,12 +182,11 @@ impl Fronts {
         let mut links = self.links();
         loop {
             let live = FrontLease::live(&self.inner.state)?;
-            links.retain(|slot, link| {
-                // A front that died, or stopped listening, closed its end.
-                let keep = live.contains(slot)
-                    && !link.handle.as_ref().is_none_or(local_socket::is_closed);
+            links.retain(|slot, linked| {
+                // A front that died, or stopped listening, ended its stream.
+                let keep = live.contains(slot) && linked.link.alive();
                 if !keep {
-                    shut(link);
+                    linked.link.close();
                 }
                 keep
             });
@@ -239,53 +274,78 @@ impl Fronts {
         first.map_or(Ok(()), Err)
     }
 
-    fn snapshot(&self) -> Vec<Arc<Link>> {
-        let mut links: Vec<Arc<Link>> = self.links().values().cloned().collect();
+    fn snapshot(&self) -> Vec<Arc<Linked>> {
+        let mut links: Vec<Arc<Linked>> = self.links().values().cloned().collect();
         links.sort_by_key(|l| l.front.slot);
         links
     }
 
     /// One call and its answer. A failed call drops the link.
-    fn call(&self, link: &Arc<Link>, call: Call) -> Result<Answer, FrontsError> {
+    fn call(&self, linked: &Arc<Linked>, call: Call) -> Result<Answer, FrontsError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let result = {
-            let mut stream = link.stream.lock().unwrap_or_else(PoisonError::into_inner);
-            write_frame(&mut *stream, &FrontCall { id, call })
-                .map_err(|e| e.to_string())
-                .and_then(|()| read_frame::<FrontAnswer>(&mut *stream).map_err(|e| e.to_string()))
+            // One call at a time on a link.
+            let answers = linked
+                .link
+                .answers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let sent = linked.link.sender().is_some_and(|calls| {
+                calls
+                    .blocking_send(Ok(pb::FrontCall {
+                        id,
+                        call: Some((&call).into()),
+                    }))
+                    .is_ok()
+            });
+            if sent {
+                match answers.recv_timeout(self.inner.timeout) {
+                    Ok(answer) => Ok(answer),
+                    Err(RecvTimeoutError::Timeout) => {
+                        Err(format!("no answer within {:?}", self.inner.timeout))
+                    }
+                    Err(RecvTimeoutError::Disconnected) => Err("its stream ended".to_owned()),
+                }
+            } else {
+                Err("its stream is closed".to_owned())
+            }
         };
         let failed = |message: String| {
             let mut links = self.links();
             if links
-                .get(&link.front.slot)
-                .is_some_and(|l| Arc::ptr_eq(l, link))
+                .get(&linked.front.slot)
+                .is_some_and(|l| Arc::ptr_eq(l, linked))
             {
-                links.remove(&link.front.slot);
+                links.remove(&linked.front.slot);
             }
-            shut(link);
+            linked.link.close();
             FrontsError::Call {
-                slot: link.front.slot,
-                pod: link.front.origin.pod.clone(),
+                slot: linked.front.slot,
+                pod: linked.front.origin.pod.clone(),
                 message,
             }
         };
         match result {
-            Ok(FrontAnswer { id: got, answer }) if got == id => match answer {
-                Answer::Error { message } => Err(FrontsError::Call {
-                    slot: link.front.slot,
-                    pod: link.front.origin.pod.clone(),
-                    message,
-                }),
-                answer => Ok(answer),
-            },
-            Ok(FrontAnswer { id: got, .. }) => {
+            Ok(pb::FrontAnswer { id: got, answer }) if got == id => {
+                match answer.map(Answer::try_from) {
+                    Some(Ok(Answer::Error { message })) => Err(FrontsError::Call {
+                        slot: linked.front.slot,
+                        pod: linked.front.origin.pod.clone(),
+                        message,
+                    }),
+                    Some(Ok(answer)) => Ok(answer),
+                    Some(Err(e)) => Err(failed(format!("an answer the service cannot read: {e}"))),
+                    None => Err(failed(format!("answered call {id} with nothing"))),
+                }
+            }
+            Ok(pb::FrontAnswer { id: got, .. }) => {
                 Err(failed(format!("answered call {got}, not call {id}")))
             }
             Err(e) => Err(failed(e)),
         }
     }
 
-    fn links(&self) -> std::sync::MutexGuard<'_, HashMap<u16, Arc<Link>>> {
+    fn links(&self) -> std::sync::MutexGuard<'_, HashMap<u16, Arc<Linked>>> {
         self.inner
             .links
             .lock()
@@ -293,16 +353,10 @@ impl Fronts {
     }
 }
 
-fn shut(link: &Link) {
-    if let Some(handle) = &link.handle {
-        let _ = handle.shutdown(Shutdown::Both);
-    }
-}
-
-fn unexpected(link: &Link, answer: &Answer) -> FrontsError {
+fn unexpected(linked: &Linked, answer: &Answer) -> FrontsError {
     FrontsError::Call {
-        slot: link.front.slot,
-        pod: link.front.origin.pod.clone(),
+        slot: linked.front.slot,
+        pod: linked.front.origin.pod.clone(),
         message: format!("unexpected answer {answer:?}"),
     }
 }

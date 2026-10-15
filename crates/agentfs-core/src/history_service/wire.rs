@@ -11,7 +11,7 @@
 //! Every match over an agentfs or wire enum here lists each variant, with
 //! no wildcard: a new variant does not compile until it has a wire form.
 
-use super::protocol::{Answer, Call, FrontInfo, PathStamp};
+use super::{Answer, Call, FrontInfo, PathStamp};
 use crate::checks::Refusal;
 use crate::lfs::Store;
 use crate::nested::{NestedKind, View};
