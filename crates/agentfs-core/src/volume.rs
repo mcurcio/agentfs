@@ -537,6 +537,7 @@ pub fn open(
         reclaim: Arc::default(),
         stamps: Arc::default(),
         tree_dev: tree_dev(tree),
+        shared_tree: crate::fence::is_network_fs(tree),
         last_writes: Arc::default(),
         duties: duties.clone(),
     };
@@ -597,6 +598,7 @@ pub fn open_front(
         reclaim: Arc::default(),
         stamps: Arc::default(),
         tree_dev: tree_dev(tree),
+        shared_tree: crate::fence::is_network_fs(tree),
         last_writes: Arc::default(),
         duties: Arc::default(),
     })
@@ -720,6 +722,11 @@ pub struct Recorder {
     /// where this process journals, its freeze stamps of that device are
     /// normalised to [`crate::stamps::TREE_DEV`] (design §14.1).
     tree_dev: Option<u64>,
+    /// The tree is on a shared filesystem (design §14.2): a write's freeze
+    /// stamp is taken after flushing the file to the server, as the server
+    /// has it, so stamps of two nodes' writes compare by the server's
+    /// change times.
+    shared_tree: bool,
     /// The frozen copy of the last write journaled at each recently
     /// written path, where this process journals (design §3.1).
     last_writes: Arc<LastWrites>,
@@ -1136,7 +1143,11 @@ impl Recorder {
         // copy's, which is what is journaled.
         let attrs = self.rules.attributes(&path)?;
         let meta = std::fs::metadata(backing).ok();
-        let stamp = meta.as_ref().map(|m| self.own_stamp(m));
+        let stamp = if self.shared_tree {
+            server_stamp(backing).map(|s| self.own_stamp_of(s))
+        } else {
+            meta.as_ref().map(|m| self.own_stamp(m))
+        };
         let on_disk = meta.map_or(0, |m| m.len());
         // `agentfs.maxSize` the same way: on disk, then frozen.
         let max_size = self.rules.max_size(&path);
@@ -1502,6 +1513,14 @@ impl Recorder {
         match self.backend {
             Backend::Local { .. } => self.journaling_stamp(m),
             Backend::Front { .. } => FreezeStamp::from_metadata(m),
+        }
+    }
+
+    /// [`Recorder::own_stamp`] of a stamp taken already.
+    fn own_stamp_of(&self, stamp: FreezeStamp) -> FreezeStamp {
+        match self.backend {
+            Backend::Local { .. } => stamp.normalised(self.tree_dev),
+            Backend::Front { .. } => stamp,
         }
     }
 
@@ -2633,6 +2652,37 @@ enum Judged {
     Skip(SkipReason),
     /// Journal it, then record the path as the tree has it now.
     Resync,
+}
+
+/// The freeze stamp of the file at `path` (a `/proc/self/fd` path of the
+/// open backing file) on a shared filesystem: its dirty pages flushed to
+/// the server first, then its attributes read from the server
+/// (`AT_STATX_FORCE_SYNC`). A client's cached change time precedes the
+/// server's until its writes are flushed, so two nodes' stamps would
+/// otherwise not order their writes (design §14.2). The journal pays the
+/// same round trip at its `fsync`.
+fn server_stamp(path: &Path) -> Option<FreezeStamp> {
+    use rustix::fs::{AtFlags, StatxFlags};
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file.sync_data();
+    }
+    let stx = rustix::fs::statx(
+        rustix::fs::CWD,
+        path,
+        AtFlags::STATX_FORCE_SYNC,
+        StatxFlags::BASIC_STATS,
+    )
+    .ok()?;
+    let ns = |t: rustix::fs::StatxTimestamp| {
+        t.tv_sec.saturating_mul(1_000_000_000) + i64::from(t.tv_nsec)
+    };
+    Some(FreezeStamp {
+        dev: rustix::fs::makedev(stx.stx_dev_major, stx.stx_dev_minor),
+        ino: stx.stx_ino,
+        size: stx.stx_size,
+        mtime_ns: ns(stx.stx_mtime),
+        ctime_ns: ns(stx.stx_ctime),
+    })
 }
 
 /// The device of the tree root at `tree`.

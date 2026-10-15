@@ -50,6 +50,11 @@ LOGS=${E2E_CSI_LOGS:-${RUNNER_TEMP:-/tmp}/agentfs-csi-mn-logs}
 mkdir -p "$LOGS"
 SUMMARY=$LOGS/summary.md
 : >"$SUMMARY"
+OUT_LOG=$LOGS/e2e-csi-multinode.out.log
+if [ -z "${1:-}" ]; then
+  exec > >(tee "$OUT_LOG") 2>&1
+  trap 'status=$?; [ $status -eq 0 ] || annotate_log "$OUT_LOG" 30' EXIT
+fi
 
 kd() { kubectl -n "$DNS" "$@"; }
 ka() { kubectl -n "$APPS" "$@"; }
