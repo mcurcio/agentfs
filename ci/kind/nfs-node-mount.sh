@@ -45,10 +45,18 @@ ExecStart=/usr/local/bin/agentfs-nfs-mount
 
 [Install]
 WantedBy=multi-user.target
-RequiredBy=kubelet.service
 UNIT
+# kubelet waits for it: a drop-in, since kind's kubelet unit is its own.
+docker exec "$node" mkdir -p /etc/systemd/system/kubelet.service.d
+docker exec -i "$node" sh -c "cat >/etc/systemd/system/kubelet.service.d/10-agentfs-nfs.conf" <<'DROPIN'
+[Unit]
+Requires=agentfs-nfs.service
+After=agentfs-nfs.service
+DROPIN
 docker exec "$node" systemctl daemon-reload
-docker exec "$node" systemctl enable agentfs-nfs.service >/dev/null 2>&1
+docker exec "$node" systemctl enable agentfs-nfs.service
+docker exec "$node" systemctl daemon-reload
+docker exec "$node" systemctl is-enabled agentfs-nfs.service
 if ! docker exec "$node" timeout 30 /usr/local/bin/agentfs-nfs-mount; then
   echo "kernel NFS mount failed in $node; installing nfs-common there" >&2
   docker exec "$node" sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-common >/dev/null'

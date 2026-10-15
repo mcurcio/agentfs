@@ -335,7 +335,13 @@ docker restart "$ACTIVE" >/dev/null
 wait_for 300 sh -c "kubectl get node $ACTIVE -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' | grep -q True" ||
   fail "$ACTIVE never became Ready after the restart"
 pass "$ACTIVE is Ready again"
-assert_eq nfs4 "$(docker exec "$ACTIVE" findmnt -no FSTYPE "$BASE")" "basePath is mounted again after the reboot"
+# The unit (ci/kind/nfs-node-mount.sh) mounts it at boot, before the
+# kubelet; kind's node entrypoint may start units late.
+if ! wait_for 60 sh -c "[ \"\$(docker exec $ACTIVE findmnt -no FSTYPE $BASE)\" = nfs4 ]"; then
+  docker exec "$ACTIVE" systemctl status agentfs-nfs.service --no-pager 2>&1 | tail -n 15
+  fail "basePath is not mounted again after the reboot"
+fi
+pass "basePath is mounted again after the reboot"
 wait_for 300 sh -c "kubectl -n $APPS get pod -l app=writer --field-selector spec.nodeName=$ACTIVE,status.phase=Running -o name | grep -q ." ||
   fail "no writer runs on $ACTIVE again"
 sleep 15
