@@ -32,8 +32,12 @@ jobs:
           kubectl kustomize ci/k8s-csi/driver >/dev/null
           kubectl kustomize ci/k8s-csi/apps >/dev/null
           kubectl kustomize ci/k8s-csi/negative >/dev/null
-          kubectl kustomize ci/k8s-csi/multinode | grep -c -- '--multi-node' | grep -qx 2
-          kubectl kustomize ci/k8s-csi/multinode-apps >/dev/null
+          kubectl kustomize ci/k8s-csi/multinode >"$RUNNER_TEMP/multinode.yaml" ||
+            { echo "::error::kubectl kustomize ci/k8s-csi/multinode failed"; exit 1; }
+          n=$(grep -c -- '- --multi-node$' "$RUNNER_TEMP/multinode.yaml" || true)
+          [ "$n" = 2 ] || { echo "::error::ci/k8s-csi/multinode sets --multi-node $n time(s), not 2"; exit 1; }
+          kubectl kustomize ci/k8s-csi/multinode-apps >/dev/null ||
+            { echo "::error::kubectl kustomize ci/k8s-csi/multinode-apps failed"; exit 1; }
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0

@@ -229,6 +229,10 @@ else
 fi
 B_PID=$FRONT_PID
 sudo chown 10000:10000 "$MNT_A"
+# Through another client of a shared filesystem, the owner shows once its
+# attribute cache expires (NFS: up to acdirmax, 60 s).
+wait_for 90 sh -c "[ \$(stat -c %u '$MNT_B') = 10000 ]" ||
+  fail "front b never saw the tree's new owner"
 grep '^mounted ' "$A_LOG"
 STATUS=$(sudo "$AGENTFS_BIN" --state "$STATE" status)
 echo "$STATUS"
