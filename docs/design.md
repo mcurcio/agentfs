@@ -2520,33 +2520,40 @@ daemon's pid namespace (pid 0): the CSI node plugin therefore runs with
 numbers are indicative: the CI runners are shared, and nothing asserts
 thresholds.
 
-- CI, gRPC (protocol 2): the `e2e-multipod` jobs of run 38804442698 for
-  commit 9d8a536 (GitHub `ubuntu-24.04`, x86_64, kernel
-  6.17.0-1022-azure, backing tree and state area on ext4, which has no
-  reflink, so every freeze is a copy), microseconds:
+- CI, gRPC (protocol 2), calls driven by the calling threads: the
+  `e2e-multipod` jobs of run 38819854746 for commit 2526397 (GitHub
+  `ubuntu-24.04`, x86_64, kernel 6.17.0-1022-azure, backing tree and
+  state area on ext4, which has no reflink, so every freeze is a copy),
+  microseconds:
 
   | Measurement | Passthrough | p50 | p90 | p99 |
   |---|---|---|---|---|
-  | close through a single-process mount (`boundary-latency.py`, n=1000) | auto | 809 | 1122 | 7381 |
-  | close through a front | auto | 943 | 1168 | 1958 |
-  | close through a single-process mount | off | 768 | 984 | 13287 |
-  | close through a front | off | 1004 | 1428 | 96622 |
-  | `grpc.health.v1` round trip (bench, no FUSE, n=2000) | auto / off | 49.0 / 72.2 | 52.2 / 86.3 | 61.8 / 99.8 |
-  | single-process record, 1 thread (bench) | auto / off | 656 / 630 | 832 / 771 | 982 / 15497 |
-  | front record, 1 thread (bench) | auto / off | 813 / 846 | 956 / 1015 | 1130 / 18179 |
-  | single-process record, 8 threads (bench) | auto / off | 1523 / 1697 | 2530 / 2808 | 4671 / 100461 |
-  | front record, 8 threads (bench) | auto / off | 1685 / 1876 | 2245 / 2622 | 4682 / 101580 |
+  | close through a single-process mount (`boundary-latency.py`, n=1000) | auto | 996 | 1238 | 2007 |
+  | close through a front | auto | 1234 | 1532 | 3590 |
+  | close through a single-process mount | off | 961 | 1205 | 2304 |
+  | close through a front | off | 1253 | 1493 | 2783 |
+  | `grpc.health.v1` round trip (bench, no FUSE, n=2000) | auto / off | 147.9 / 90.4 | 151.7 / 137.7 | 164.5 / 146.5 |
+  | single-process record, 1 thread (bench) | auto / off | 827 / 858 | 1067 / 1039 | 2167 / 1904 |
+  | front record, 1 thread (bench) | auto / off | 1099 / 1134 | 1340 / 1340 | 3422 / 3038 |
+  | single-process record, 8 threads (bench) | auto / off | 2083 / 2028 | 2816 / 2872 | 5694 / 21208 |
+  | front record, 8 threads (bench) | auto / off | 2516 / 2470 | 3264 / 3436 | 5168 / 21528 |
 
   The bench is `cargo test --release -p agentfs-core --test
   history_service -- --ignored --nocapture round_trip_cost`, each a
-  `record` of a 4 KiB file. A front's single-thread record costs 1.24
-  and 1.34 times the single-process one at the median in the two jobs,
-  and a front adds 134 and 236 µs (17 % and 31 %) to the median close.
-  The round trip itself is 49–72 µs; with protocol 1's JSON frames it
-  was 18–27 µs and the single-thread ratio 1.16–1.18 (runs 38796484778
-  and 38799428170). With 8 threads the front's median
-  is within 11 % of single-process. p99 on shared runners is noise in
-  both directions.
+  `record` of a 4 KiB file. A front's single-thread record costs 1.33
+  and 1.32 times the single-process one at the median in the two jobs
+  (1.30 and 1.23 in reruns of the same commit), and a front adds 238 and
+  292 µs to the median close. The round trip itself varies with the
+  runner from 61 to 148 µs. With one connection per front, driven by a
+  runtime thread (commits 9d8a536 and 33b89b3), the round trip was
+  49–134 µs and the ratio 1.24–1.39 (runs 38804442698 and 38806366270);
+  with protocol 1's JSON frames it was 18–27 µs and the ratio 1.16–1.18
+  (runs 38796484778 and 38799428170). On shared runners these vary more
+  between runs than between designs; a local bench on one machine (an
+  aarch64 VM, interleaved runs) measured the calls driven by the calling
+  threads at about 40 µs less per call (health round trip 45–57 against
+  78–92 µs) and a third less at 8 threads. p99 on shared runners is
+  noise in both directions.
 - Protocol 1, kept for comparison: a local bench (the same test; no
   FUSE; x86_64, 16 CPUs, kernel 6.18.48-talos, overlayfs) measured a
   29 µs `Ping` and a front adding about 6 % to the median single-thread
@@ -3659,11 +3666,11 @@ runner.
    converge; and no consumer needs it (the owner:
    "Write, same node is fine"). Upgrading the node plugin drains the node (§14.2). The round
    trip per boundary over gRPC is measured on one node (§14.1, CI run
-   38804442698, commit 9d8a536, `ubuntu-24.04`, ext4): the
-   `grpc.health.v1` round trip is 49 µs (passthrough `auto` job) and
-   72 µs (`off`) at the median, and a front's close is 943 against 809 µs
-   (`auto`) and 1004 against 768 µs (`off`) for a single-process close at
-   the median.
+   38819854746, commit 2526397, `ubuntu-24.04`, ext4): the
+   `grpc.health.v1` round trip is 148 µs (passthrough `auto` job) and
+   90 µs (`off`) at the median, and a front's close is 1234 against
+   996 µs (`auto`) and 1253 against 961 µs (`off`) for a single-process
+   close at the median.
 3. **Recovery tooling** beyond `restore`, `revert` and the runbooks (§15):
    whether a read-only history view for operators is worth building,
    whether undo through the patch queue (§12) replaces manual restores for

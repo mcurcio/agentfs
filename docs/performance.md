@@ -235,22 +235,24 @@ costs instead comes after the call has returned:
 With several pods on one volume (design §14.1), each pod's mount is a
 front that sends every boundary to the volume's history service over
 gRPC on a Unix socket, and returns once the service has made it durable.
-Measured in the `e2e-multipod` jobs of CI run 38804442698 (commit
-9d8a536, `ubuntu-24.04`, kernel 6.17.0-1022-azure, ext4), medians in
+Measured in the `e2e-multipod` jobs of CI run 38819854746 (commit
+2526397, `ubuntu-24.04`, kernel 6.17.0-1022-azure, ext4), medians in
 microseconds, passthrough `auto` / `off`:
 
 | Measurement | auto | off |
 |---|---|---|
-| `grpc.health.v1` round trip (no FUSE) | 49 | 72 |
-| record of a 4 KiB file, single process, 1 thread (no FUSE) | 656 | 630 |
-| the same through a front | 813 | 846 |
-| close of a 4 KiB file through a single-process mount | 809 | 768 |
-| the same through a front | 943 | 1004 |
+| `grpc.health.v1` round trip (no FUSE) | 148 | 90 |
+| record of a 4 KiB file, single process, 1 thread (no FUSE) | 827 | 858 |
+| the same through a front | 1099 | 1134 |
+| close of a 4 KiB file through a single-process mount | 996 | 961 |
+| the same through a front | 1234 | 1253 |
 
-A front's single-thread record costs 1.24 and 1.34 times the
-single-process one; with 8 threads the two are within 11 % (front
-1685 and 1876 µs against 1523 and 1697 µs). The freeze and the journal's
-`fsync`, which both modes pay, dominate. Protocol 1 (JSON frames, before
+A front's single-thread record costs 1.33 and 1.32 times the
+single-process one (1.23 to 1.30 in reruns); with 8 threads the two are
+within 22 % (front 2516 and 2470 µs against 2083 and 2028 µs). The
+freeze and the journal's `fsync`, which both modes pay, dominate. The
+round trip varies with the runner from 49 to 148 µs, more between runs
+than between the designs tried; protocol 1 (JSON frames, before
 2026-10-15) had an 18 to 27 µs round trip and a 1.16 to 1.18 ratio. The
 full table is in design §14.1; nothing asserts thresholds.
 
