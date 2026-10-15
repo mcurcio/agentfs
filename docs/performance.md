@@ -199,8 +199,9 @@ costs:
   ext4) and the commit loop's second hash and compression.
 - **One descriptor per racy file** between its FLUSH and its RELEASE.
 - **A front's RELEASE asks its history service** whether the copy is
-  still the last state (`StillLast`, no `fsync`): one socket round trip,
-  tens of microseconds (design §14.1).
+  still the last state (`StillLast`, no `fsync`): one gRPC round trip
+  over the node-local socket, about 50 to 70 µs on CI
+  ([below](#a-fronts-round-trip-to-its-history-service)).
 - **Anything in doubt records**: an unreadable file, a second name, a
   path the journaling side no longer remembers (it keeps the last write
   of each path for 60 s), or a history service too old to answer.
@@ -228,6 +229,30 @@ costs instead comes after the call has returned:
   workload.
 - **The commit** moves every index entry beneath the source and writes
   the trees: 3.4–7.9 s for 100,000 files on CI.
+
+### A front's round trip to its history service
+
+With several pods on one volume (design §14.1), each pod's mount is a
+front that sends every boundary to the volume's history service over
+gRPC on a Unix socket, and returns once the service has made it durable.
+Measured in the `e2e-multipod` jobs of CI run 38804442698 (commit
+9d8a536, `ubuntu-24.04`, kernel 6.17.0-1022-azure, ext4), medians in
+microseconds, passthrough `auto` / `off`:
+
+| Measurement | auto | off |
+|---|---|---|
+| `grpc.health.v1` round trip (no FUSE) | 49 | 72 |
+| record of a 4 KiB file, single process, 1 thread (no FUSE) | 656 | 630 |
+| the same through a front | 813 | 846 |
+| close of a 4 KiB file through a single-process mount | 809 | 768 |
+| the same through a front | 943 | 1004 |
+
+A front's single-thread record costs 1.24 and 1.34 times the
+single-process one; with 8 threads the two are within 11 % (front
+1685 and 1876 µs against 1523 and 1697 µs). The freeze and the journal's
+`fsync`, which both modes pay, dominate. Protocol 1 (JSON frames, before
+2026-10-15) had an 18 to 27 µs round trip and a 1.16 to 1.18 ratio. The
+full table is in design §14.1; nothing asserts thresholds.
 
 ## Performance budget
 

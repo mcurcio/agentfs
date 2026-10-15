@@ -556,6 +556,16 @@ alert on `agentfs.patch.blocked`. See
 - One pod per volume. The sidecar stays single-process (`agentfs mount`
   without `--history-service`). For several pods on one volume use the
   CSI driver ([csi.md](csi.md)), which runs a history service per volume
-  and a front per pod, one node per volume at a time.
+  and a front per pod, one node per volume at a time; multi-node access
+  modes are refused (design §19.1, 2026-10-15).
+- A state area on NFS (or a CSI basePath shared between nodes) must be
+  NFS 4.1 or later, without `nolock` and with `local_lock=none`: the
+  state lock is the only guard against a second writer, and agentfs
+  refuses other NFS mounts at start ([csi.md](csi.md#11-shared-filesystems)).
+  Even then, a node cut off but still running keeps writing: if its
+  volume is force-detached, or the node tainted out of service while it
+  runs, another node can take the lock once the NFS lease expires, and
+  two writers can corrupt the journal. Only a node-local volume rules
+  this out; see [runbooks/node-lost.md](runbooks/node-lost.md).
 - The image is not bit-reproducible (Debian packages are not pinned),
   and is not yet signed or shipped with an SBOM.

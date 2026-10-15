@@ -1,9 +1,9 @@
 # agentfs design
 
 Status: draft 2 (2026-10-12), kept current with the code. Phases 1 to 3
-are built; phase 4 is built for one node per volume (the history service
-and fronts, §14.1, and the CSI driver, §14.2); several nodes per volume
-are open (§19.2). §1.3 gives each phase's state, and
+are built; phase 4 is built for several pods on one node (the history
+service and fronts, §14.1, and the CSI driver, §14.2); several nodes per
+volume are not supported (decided 2026-10-15, §19.1). §1.3 gives each phase's state, and
 [performance.md](performance.md) the measured costs and the performance
 budget (§18 test 13, §19.2 item 1). Draft 1 was reviewed adversarially:
 see [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
@@ -58,7 +58,7 @@ be recorded after the fact; §3.1 lists them.
 | 1 | The recorder as a native sidecar for one pod: recording, commits, interval push to any remote, path rules, operator-only safety settings, push checks, OpenTelemetry, a supported manual recovery path | Built: the FUSE layer, `agentfs mount`, recovery (§15), the container image and the Kubernetes sidecar, tested end to end in CI (§18) |
 | 2 | Git LFS (§7), and the `fsync` class for databases (§8) | Built |
 | 3 | The ordered patch queue for iac (§12) | Built |
-| 4 | The CSI driver, including volumes mounted by several pods at once (§14) | Built for one node per volume at a time (§14.1, §14.2); several nodes per volume open (§19.2) |
+| 4 | The CSI driver, including volumes mounted by several pods at once (§14) | Built for several pods on one node, one node per volume at a time (§14.1, §14.2); several nodes per volume not supported (decided 2026-10-15, §19.1) |
 
 ### 1.4 Not goals
 
@@ -135,12 +135,8 @@ through the mount:
     history/history.sock the history service's socket for fronts (§14);
                          directory 0700, socket 0600
     history/address      the address it serves, for `agentfs status`
-    history/endpoint.json where the active service listens, for fronts
-                         given `state` (§14.1)
-    history/tls/identity.pem the volume's TLS certificate and key, 0600
-                         (§14.1)
     fronts/slot-N.lock   a front's lease of pending-id slot N (flock), holding
-                         a holder line (`pid=… node=… command=… pod=…`)
+                         a holder line
     fronts/slot-N.repairs that slot's repair queue (§3.5)
 ```
 
@@ -158,19 +154,9 @@ no mount is running) first takes an exclusive
 exits. The kernel releases it when the process dies, even after `kill -9`,
 so a crash never leaves a stale lock.
 
-- The file holds a line describing the holder (`pid=… node=… command=…
+- The file holds a line describing the holder (`pid=… command=…
   since=<UTC>`), used only in messages; a line left by a dead holder is
-  never taken for a held lock. The node is `--node` (`AGENTFS_NODE`),
-  else the host name: pids collide across nodes sharing a volume (§14.2).
-- On NFS, `flock` is emulated with POSIX byte-range locks, which belong
-  to the process: a second open in the same process does not conflict,
-  and closing any descriptor of the file drops the process's lock. So
-  each process keeps a registry of the lock files it holds
-  (`agentfs_core::lockfile`): it never takes one twice, and a probe
-  (`status`, the service's lease checks) reports a file the process
-  holds from the registry, never opening and closing it. The slot leases
-  work the same way. Unit tests run the lock and the leases under both
-  `flock` and POSIX locks.
+  never taken for a held lock.
 - A command that finds the lock held exits with status 75 (`EX_TEMPFAIL`)
   and names the holder, unless `--wait-lock <duration>`
   (`AGENTFS_WAIT_LOCK`) lets it wait.
@@ -208,9 +194,13 @@ so a crash never leaves a stale lock.
   the next command that takes the lock.
 - `status` probes the lock by taking a shared lock and dropping it at once;
   taking the lock therefore retries for at least 250 ms even with no
-  `--wait-lock`, so a probe cannot make it fail. A waiting command polls
-  every 50 ms for 5 s, then every second, so a long wait (a standby
-  history service, §14.2) does not load a shared filesystem.
+  `--wait-lock`, so a probe cannot make it fail.
+- The lock is taken only on a filesystem whose locks keep other nodes
+  out (`agentfs_core::shared_fs`): a state area on NFS older than 4.1,
+  mounted `nolock`, or with `local_lock` other than `none` (read from
+  `/proc/self/mountinfo`) is refused, because there `flock` excludes only
+  this node's processes and a second history service could run on
+  another (§14.2). Other filesystems are not checked.
 - The per-remote push locks (§11.2) stay; they now only matter within one
   process.
 - With several mounts of one volume (§14), `agentfs serve-history` is the
@@ -222,25 +212,7 @@ so a crash never leaves a stale lock.
   fronts serve no control socket.
 - Under the CSI driver (§14.2) the node plugin starts the volume's
   `serve-history` at NodeStage, so the service holds the lock while the
-  volume is staged on a node.
-- **Several nodes** (§14.2): every node that stages a volume runs
-  `serve-history --standby`, which waits for the lock without limit and
-  serves once it holds it; the others keep waiting. On a shared
-  filesystem the lock is a lease the node can lose (an NFS client cut off
-  from its server loses its locks after the server's lease time), so the
-  holder runs a **heartbeat** (`--lock-heartbeat`, on by default when the
-  state area is on a network filesystem): every `--lock-fence`/5 (default
-  10 s / 5) it rewrites its holder line in place and syncs it, which the
-  server refuses once the lock is gone. The journal's write and every
-  commit check that the last renewal is no older than `--lock-fence`
-  (`agentfs_core::fence`) and fail otherwise, so a cut-off service stops
-  writing before its lock can be granted elsewhere, provided the server's
-  lease is at least twice the fence. A failed renewal raises
-  `StateLockLost`, and the service exits 75 at once, without a final
-  commit. A service that takes the lock replaces the journal file with a
-  new inode holding the same records before anything else, so a fenced
-  predecessor still holding the old file can only append to a file with
-  no name. The controller takes the lock only briefly,
+  volume is staged on a node. The controller takes the lock only briefly,
   to create or delete a volume; DeleteVolume of a staged volume fails with
   `FailedPrecondition`.
 
@@ -2189,7 +2161,6 @@ and logs above; the CLI also prints alarms to stderr.
 | `PatchApplied` | A patch was applied as a commit (not an alarm; sinks filter) |
 | `HistoryServiceUnavailable` | A front's request to the history service failed (unreachable, timed out, lost or refused) after it last succeeded: raised once per outage; boundaries fail with `EIO` until it is back (§3.5, §14) |
 | `HistoryServiceRestored` | A front's request succeeded again after `HistoryServiceUnavailable` (not an alarm; sinks filter, the CLI prints it) |
-| `StateLockLost` | A history service's state-lock heartbeat failed (on a shared filesystem another node may hold the lock): it stops writing and exits 75 without a final commit; a standby takes over (§2.3, §14.2) |
 | `IdentityFallback` | The history service could not render a journaled front origin's committer (the identity templates changed across a restart); that pod's records are committed with the service's own committer, keeping the pod trailers (§9); once per pod |
 
 A sink is called from the synchronous step, on the FUSE threads, so it must
@@ -2252,12 +2223,15 @@ access (§14.2).
 
 ## 14. Volumes mounted by several pods (CSI, phase 4)
 
-A volume can be mounted by several pods at once, on one node or several.
+A volume can be mounted by several pods at once on one node. It is used
+from one node at a time: several nodes writing one volume are not
+supported (§14.2, §19.1, decided 2026-10-15).
 
 **Shape.**
 
-- **Backing tree:** on storage every mounting pod can reach. On one node that can
-  be local; across nodes it needs a shared filesystem such as NFS or SeaweedFS.
+- **Backing tree:** on storage the volume's node can reach: local, or a
+  shared filesystem (NFS 4.1 or later) when the volume is to move between
+  nodes (§14.2).
 - **A front per pod:** a FUSE mount that does the synchronous step of §3.2 for
   that pod's changes.
   - It freezes content into the volume's shared `pending/`.
@@ -2282,90 +2256,72 @@ area: `agentfs serve-history --root <backing>` is the service, and
 stays single-process and is unchanged, journal bytes included. The CSI
 driver (§14.2) starts these per volume and per pod.
 
-**Protocol.** A Unix stream socket in the state area,
+**Protocol.** gRPC (tonic and prost; the contract,
+`crates/agentfs-core/proto/agentfs/history/v2/history.proto`, is compiled
+with protox, so no `protoc`), package `agentfs.history.v2`, protocol
+version 2, over a Unix stream socket in the state area,
 `meta/history/history.sock` (directory 0700, socket 0600), reached through
-`/proc/self/fd/<dir>/history.sock` so long paths fit; from other nodes,
-TLS over TCP (below). Addresses are `unix:<path>` or an absolute path,
-`tls:<ip>:<port>`, or `state` (below); `tcp:` and anything else are
-refused, and there is never plaintext TCP.
-Messages are frames of a u32 big-endian length and a JSON body (at most
-64 MiB), protocol version 1, reusing the journal's serde types:
+`/proc/self/fd/<dir>/history.sock` so long paths fit. Addresses are
+`unix:<path>` or an absolute path; any other scheme (`tcp:` and the like)
+is refused, since a front reaches only the service on its own node.
+Messages are at most 64 MiB each way (the journal's bound on one record,
+not tonic's 4 MiB default). `history_service::wire` is the one place wire
+messages meet agentfs types; every enum and field is converted with
+validation, and an unknown or unspecified value is refused
+(`INVALID_ARGUMENT`). The calls:
 
-- `Hello {v, volume, front: {origin, slot, instance, pid, version, views}}`,
-  the first frame on every connection (`views`, where the front's workloads
-  see the tree, §5, is optional; older services ignore it). The service checks, in this order, the
-  peer's credentials (root or the service's own euid, as for the control
-  socket), the protocol version, the volume name, that the slot is in
-  1..=1023 and leased (below), and that the volume's identity templates
-  (§9) render for the front's origin. It replies `Welcome {volume, branch,
-  service_pid}` or `Refused {reason}` and closes; at its connection limit
-  it replies `Busy {reason}` and closes, before reading the hello. The
-  front checks the other way too: the socket's peer must be root or the
-  front's own euid (`SO_PEERCRED`), so a squatter on a shared listen
-  directory cannot acknowledge records it never journaled.
-- `Tracked {paths}` → `Tracked {tracked}`: which paths are in the tracked
-  set. No `fsync`.
-- `Record {draft}` → `Recorded {seq, skipped}`, or `Error {message}`.
-- `Ping` → `Pong`.
-- `StillLast {path, copy}` → `StillLast {last}`: whether the last change
-  journaled at `path` is still the write of the front's frozen copy
-  `copy`, so a RELEASE may skip re-recording it (§3.1). No `fsync`;
-  feature `still_last`, and a front never asks a service without it.
-- A `Record` may carry one `move` change (a directory rename, §3.1);
+- `Hello {protocol_version, volume, front: {origin, slot, instance, pid,
+  version, views}}`, the first call on every connection (`views`, where
+  the front's workloads see the tree, §5). The service checks the peer's
+  credentials (root or the service's own euid, as for the control socket,
+  else `PERMISSION_DENIED`), the protocol version, the volume name, that
+  the slot is in 1..=1023 and leased (below), and that the volume's
+  identity templates (§9) render for the front's origin (each
+  `FAILED_PRECONDITION`), and that it admits fewer than 1024 connections
+  (`RESOURCE_EXHAUSTED`). It replies `Welcome {protocol_version, volume,
+  branch, service_pid, features}` and binds the front to the connection:
+  every later call on it is that front's, and a call before `Hello` is
+  refused (`FAILED_PRECONDITION`, `send Hello first`). The front checks the
+  other way too: the socket's peer must be root or the front's own euid
+  (`SO_PEERCRED`), so a squatter on a shared listen directory cannot
+  acknowledge records it never journaled, and the `Welcome` must name
+  protocol 2, its volume and its branch. Mixed versions refuse each other
+  here, with a message to run the same agentfs version; a front of
+  protocol 1 (JSON frames) does not speak HTTP/2 and fails to connect.
+- `Tracked {paths}` → `{tracked}`: which paths are in the tracked set. No
+  `fsync`.
+- `Record {draft, stamps}` → `{seq, skipped}`, answered only once the
+  record is durable; a failure to journal it is `ABORTED`.
+- `StillLast {path, copy}` → `{last}`: whether the last change journaled
+  at `path` is still the write of the front's frozen copy `copy`, so a
+  RELEASE may skip re-recording it (§3.1). No `fsync`; feature
+  `still_last`, and a front never asks a service without it.
+- A `Record` may carry one `dir_move` change (a directory rename, §3.1);
   feature `move`. A front whose service lacks it records the tree
   instead, and a move is never part of an fsync-class group.
+- `Listen`, a bidirectional stream on which the service calls the front
+  (below).
+- Liveness is `grpc.health.v1` for the service `agentfs.history.v2.History`
+  on the same socket (`SERVING` while it runs, `NOT_SERVING` once it shuts
+  down).
 
-A front keeps a pool of synchronous connections (one request at a time on
-each, up to 64 idle ones kept for at most 20 s, each checked with a
-non-blocking peek before reuse), and the service runs a thread per
-connection (at most 1024, each closed after 60 s idle), so concurrent
-boundaries from all fronts still share the journal's group commit. A
-front holds about as many connections as it has boundaries in flight
-(its FUSE threads, at most 16 by default, plus its sweep), so about 60
-fronts can be busy at once; past that a boundary fails with `EIO` and
-`RecordFailed` but, being no outage, without `HistoryServiceUnavailable`.
-Every request has a timeout (`--history-timeout`, 10 s); a front
-waits up to `--history-wait` (30 s) for the service at start, then exits 1
-with nothing mounted. gRPC was rejected for this step: it brings tonic,
-prost and tokio for nothing a socket in the state area needs. The frame
-protocol does not depend on the transport, so a cross-node transport can
-carry it.
+`Welcome.features` names what the service supports (`stamps`,
+`repair_origin`, `listen`, `still_last`, `move`), so a feature added later
+needs no new protocol version.
 
-**Across nodes: TLS** (feature `history-tls`, `history_service::tls`).
-`serve-history --listen-tls <ip>:<port>` also listens on TCP (port 0: a
-free one) and carries the same frames over TLS 1.3 (rustls on ring; no
-TLS 1.2, no session tickets, no SNI). Both ends authenticate with one
-certificate per volume: a self-signed ECDSA P-256 certificate and key
-the active service makes under the state lock at its first TLS listen,
-in `meta/history/tls/identity.pem` (directory 0700, file 0600, one file
-so a crash never pairs a key with another certificate). Each end
-presents it and accepts exactly it, byte for byte, so a peer proves it
-can read the volume's state area, the same trust the Unix socket's
-root-or-same-uid check gives, and the same as being able to rewrite the
-history. Another volume's certificate, no client certificate, plaintext
-and TLS 1.2 are refused; the handshake runs on the connection's thread
-within the hello timeout. A changed identity file is read again at the
-next connection. TCP connections set `TCP_NODELAY`, keepalives (idle
-10 s, interval 5 s, 3 probes) and `TCP_USER_TIMEOUT` of 30 s, so a
-vanished node fails a request rather than hanging it. Without the
-feature the binary refuses `tls:` addresses and `--listen-tls`, and
-links no TLS (`ci/check-deps.sh`).
-
-**Finding the service: `state`.** The active service writes
-`meta/history/endpoint.json` atomically once it listens (`{v, volume,
-node, unix, tls, instance, pid, since}`) and removes it, if still its
-own, when it stops; a crashed service's file is replaced by the next.
-A front given `--history-service state` reads it at every new
-connection (cached by inode, size and mtime): the Unix socket when the
-service is on its own node (`--node`, `AGENTFS_NODE`, else the host
-name) and the socket exists, else the TLS address. With `state`, a
-request that reaches no service, so certainly sent nothing, is retried
-every 100 ms, re-reading the file, until `--history-timeout` is spent,
-then fails with `EIO` as before: a handover from one service to another
-is latency, not an error, and nothing is ever resent. `agentfs status`
-prints the endpoint (`stale` without a lock holder), and `agentfs
-ping-history [--count N] [--address ADDR]` measures the round trip as a
-front makes it.
+A front keeps one HTTP/2 connection to the service, opened with `Hello`;
+HTTP/2 multiplexes its concurrent boundaries, its `Tracked` and
+`StillLast` questions, its listening stream and the health probe on it.
+The service serves at most 1024 admitted connections (one per front
+process), and runs every call that touches the volume off the runtime's
+threads (`spawn_blocking`), so concurrent boundaries from all fronts
+still share the journal's group commit. Fronts and service are
+synchronous code that each own a small multi-thread tokio runtime
+(`history_service::bridge`, Tokio's documented pattern for bridging
+synchronous code): FUSE threads block on it per call. Every call carries a
+deadline (`--history-timeout`, 10 s, sent as `grpc-timeout` and also
+enforced by the front); a front waits up to `--history-wait` (30 s) for
+the service at start, then exits 1 with nothing mounted.
 
 **The synchronous step, split** (§3.2): the front decides the path rules,
 runs every record-time check (size on disk, `maxSize`, the blob limit, the
@@ -2398,7 +2354,21 @@ boundary with `EIO`, `RecordFailed` and, once per outage,
 service is back. A draft is never resent (a request that timed out may
 have been journaled; records hold absolute state, so that is harmless,
 while a resend could journal one frozen copy twice); frozen copies are
-removed on the front only when the request was certainly not sent.
+removed on the front only when the request was certainly not sent. The
+one exception proves it: a request that hyper hands back unsent because
+the connection had closed (the service restarted) goes out once on a new
+connection, with its `Hello`, within the same deadline, so a restart does
+not fail the next boundary. How a front reads the service's answers:
+
+| gRPC status | Front's error | Meaning |
+|---|---|---|
+| `PERMISSION_DENIED`, `FAILED_PRECONDITION`, `INVALID_ARGUMENT` at `Hello` | refused | the service will not admit this front |
+| `RESOURCE_EXHAUSTED` at `Hello` | busy | the service is at its connection limit; an `EIO` and `RecordFailed`, but no outage |
+| `ABORTED`, `INVALID_ARGUMENT` on a call | service error | the service failed or rejected the request; nothing was journaled |
+| `FAILED_PRECONDITION` on a call | protocol error | a call before `Hello` |
+| `DEADLINE_EXCEEDED`, `CANCELLED`, the front's own deadline | timeout, maybe journaled | never resent |
+| a transport error after the request left | lost, maybe journaled | never resent |
+| unsent twice, or health `NOT_SERVING` | unreachable | nothing was sent |
 Repairs go to the slot's `meta/fronts/slot-N.repairs`, which the front's
 sweep retries, and which the next front leasing that slot loads at start.
 Each entry keeps the pod that failed to record it (§3.5), so a repair a
@@ -2419,16 +2389,17 @@ Boundaries during the outage failed with `EIO`; their final states are
 recorded by the fronts' repairs, RELEASE and the sweep, but intermediate
 states are lost.
 
-**Listening.** Each front also keeps one connection to the service
-turned around (`Listen`, protocol feature `listen`;
-`history_service::listener`): the service sends calls on it and the front
-answers them, one at a time, on a thread of its own. `Settle` runs the
+**Listening.** Each front also keeps one `Listen` stream open on its
+connection (feature `listen`; `history_service::listener`): the service
+sends calls (`FrontCall`) on it and the front answers them
+(`FrontAnswer`, matched by id), one at a time, on a thread of its own.
+The stream's response headers tell the front it is listening. `Settle` runs the
 front's sweep and returns once its records are journaled (with how many
 paths still wait for a repair), `OpenForWriting` says which of a list of
 paths the front holds open for writing, and `Invalidate` makes the front
 drop its kernel's cached entries, attributes and pages of a list of paths
 (FUSE notifications, sent from the listener thread so never from a
-request handler). The service keeps one link per slot
+request handler); `Ping` checks the link. The service keeps one link per slot
 (`history_service::fronts`), replacing an older one; the listener
 reconnects with a backoff of 100 ms to 5 s when the service restarts or
 the link breaks. These calls let the service serve `restore` and `revert`
@@ -2487,20 +2458,6 @@ The backing file's stamp now is consulted as well:
   `agentfs.history_service.resyncs`. HEAD then ends on the tree's state
   whichever record arrived last.
 
-Stamps across nodes: on a shared filesystem each NFS client numbers the
-export with a `st_dev` of its own, while inode numbers (NFS file ids)
-and change times (the server's clock) are the same on every client. A
-front therefore says in its hello which device its tree root has
-(`tree_dev`, feature `tree_dev`), and the service compares every stamp
-whose device is its sender's tree device as the tree's
-(`stamps::TREE_DEV`); its own stamps likewise. A front without
-`tree_dev` (an older one) is on the service's node, so its raw devices
-compare as before. The service's look at the backing file now is fresh:
-it opens each directory on the way (NFS revalidates a directory at open)
-and reads the leaf with `statx(AT_STATX_FORCE_SYNC)`, never through a
-symlink, so a cached entry or attribute on its node cannot make another
-node's write look gone or older.
-
 The service's own writes (a live restore, §15; patches; resyncs) note
 their stamps too. Atomic groups (§8) are recorded whole and never
 judged.
@@ -2548,68 +2505,58 @@ daemon's pid namespace (pid 0): the CSI node plugin therefore runs with
 `hostPID: true`, and without it the window and the refusals of §6
 ("Callers whose groups are unknown") remain.
 
-**Measured cost per boundary** (open question §19.2 item 2, single node).
-These numbers are indicative: the CI runners are shared, and nothing
-asserts thresholds.
+**Measured cost per boundary** (§19.2 item 2, single node). These
+numbers are indicative: the CI runners are shared, and nothing asserts
+thresholds.
 
-- Local bench (`cargo test --release -p agentfs-core --test history_service
-  -- --ignored --nocapture round_trip_cost`; no FUSE; x86_64, 16 CPUs,
-  kernel 6.18.48-talos, overlayfs), each a `record` of a 4 KiB file,
-  microseconds:
-
-  | Path | p50 | p90 | p99 |
-  |---|---|---|---|
-  | Unix-socket `Ping` round trip | 29 | 33 | 48 |
-  | single-process record, 1 thread | 2976 | 3913 | 6113 |
-  | front record, 1 thread | 3148 | 4457 | 8575 |
-  | single-process record, 8 threads | 6438 | 8284 | 20754 |
-  | front record, 8 threads | 6869 | 9423 | 20858 |
-
-  The round trip itself is tens of microseconds. The record is dominated
-  by the freeze and the journal's `fsync`, which both modes pay, so a
-  front adds about 6 % at the median.
-- CI: the `e2e-multipod` jobs of run 38315269924 for commit 0b35370
-  (GitHub `ubuntu-24.04`, x86_64, kernel 6.17.0-1022-azure, backing tree and state area on ext4, which has
-  no reflink, so every freeze is a copy), microseconds:
+- CI, gRPC (protocol 2): the `e2e-multipod` jobs of run 38804442698 for
+  commit 9d8a536 (GitHub `ubuntu-24.04`, x86_64, kernel
+  6.17.0-1022-azure, backing tree and state area on ext4, which has no
+  reflink, so every freeze is a copy), microseconds:
 
   | Measurement | Passthrough | p50 | p90 | p99 |
   |---|---|---|---|---|
-  | close through a single-process mount (`boundary-latency.py`, n=1000) | auto (on) | 870 | 1321 | 1633 |
-  | close through a front | auto (on) | 918 | 1379 | 3089 |
-  | close through a single-process mount | off | 1039 | 1360 | 4206 |
-  | close through a front | off | 1129 | 1566 | 2850 |
-  | Unix-socket `Ping` round trip (bench, no FUSE, n=2000) | | 15–25 | 20–28 | 27–40 |
-  | single-process record, 1 thread (bench) | | 696–793 | 890–962 | 1675–14501 |
-  | front record, 1 thread (bench) | | 771–925 | 1017–1179 | 3834–14331 |
-  | single-process record, 8 threads (bench) | | 1550–2004 | 2194–2735 | 6617–7220 |
-  | front record, 8 threads (bench) | | 1596–2097 | 2214–2789 | 7109–7120 |
+  | close through a single-process mount (`boundary-latency.py`, n=1000) | auto | 809 | 1122 | 7381 |
+  | close through a front | auto | 943 | 1168 | 1958 |
+  | close through a single-process mount | off | 768 | 984 | 13287 |
+  | close through a front | off | 1004 | 1428 | 96622 |
+  | `grpc.health.v1` round trip (bench, no FUSE, n=2000) | auto / off | 49.0 / 72.2 | 52.2 / 86.3 | 61.8 / 99.8 |
+  | single-process record, 1 thread (bench) | auto / off | 656 / 630 | 832 / 771 | 982 / 15497 |
+  | front record, 1 thread (bench) | auto / off | 813 / 846 | 956 / 1015 | 1130 / 18179 |
+  | single-process record, 8 threads (bench) | auto / off | 1523 / 1697 | 2530 / 2808 | 4671 / 100461 |
+  | front record, 8 threads (bench) | auto / off | 1685 / 1876 | 2245 / 2622 | 4682 / 101580 |
 
-  The closes are through real FUSE mounts; bench ranges span the two
-  jobs. A front adds 48–90 µs (5–9 %) to the median close and 58–206 µs
-  at p90; p99 on shared runners is noise in both directions.
-
-**Still open** for this phase: a cross-node transport (TCP or gRPC with
-authentication, mTLS), since the front's origin is self-declared and only
-trusted because the socket is root or same-uid; and verifying passthrough
-and `flock` leases over a shared filesystem (§14.2).
+  The bench is `cargo test --release -p agentfs-core --test
+  history_service -- --ignored --nocapture round_trip_cost`, each a
+  `record` of a 4 KiB file. A front's single-thread record costs 1.24
+  and 1.34 times the single-process one at the median in the two jobs,
+  and a front adds 134 and 236 µs (17 % and 31 %) to the median close.
+  The round trip itself is 49–72 µs; with protocol 1's JSON frames it
+  was 18–27 µs and the single-thread ratio 1.16–1.18 (runs 38796484778
+  and 38799428170). With 8 threads the front's median
+  is within 11 % of single-process. p99 on shared runners is noise in
+  both directions.
+- Protocol 1, kept for comparison: a local bench (the same test; no
+  FUSE; x86_64, 16 CPUs, kernel 6.18.48-talos, overlayfs) measured a
+  29 µs `Ping` and a front adding about 6 % to the median single-thread
+  record (3148 against 2976 µs).
 
 ### 14.2 CSI driver (built)
 
 `agentfs-csi` (crate `crates/agentfs-csi`, §17.2) is a CSI v1.13 driver,
 `agentfs.mcurcio.github.io`, in the agentfs image. The operator's guide is
-[csi.md](csi.md). It runs one node per volume at a time by default; with
-`--multi-node` and a shared basePath (NFS), `ReadWriteMany` volumes are
-mounted on several nodes at once, their fronts reaching the volume's
-active service over TLS (§14.1).
+[csi.md](csi.md). A volume is used from one node at a time, by any
+number of pods on that node; every multi-node access mode is refused
+(below, §19.1).
 
 **Lifecycle mapping.**
 
 | CSI call | Where | agentfs |
 |---|---|---|
 | CreateVolume | controller | `<basePath>/<pv>/{backing,state,csi.json}`; the state area initialised in-process (`init_with`) with the profile's config included and its rules installed |
-| ControllerPublish | controller | records the node in `csi.json`, so a second node is refused; Kubernetes' Multi-Attach check enforces the same (`attachRequired: true`). A multi-node volume records a set of nodes, each of which must have registered on basePath |
-| NodeStage | node plugin | starts `agentfs serve-history --standby` for the volume (with `--multi-node`, also `--listen-tls <pod IP>:0`), waits a bounded time until the volume has an active service, this node's or another's |
-| NodePublish | node plugin | starts a front, `agentfs mount --history-service state`, with the pod's identity, mounted at a private source; bind-mounts it onto the kubelet's target |
+| ControllerPublish | controller | records the node in `csi.json`, so a second node is refused (`FAILED_PRECONDITION`); Kubernetes' Multi-Attach check enforces the same (`attachRequired: true`) |
+| NodeStage | node plugin | starts `agentfs serve-history` for the volume, waits a bounded time for it to listen |
+| NodePublish | node plugin | starts a front, `agentfs mount --history-service`, with the pod's identity, mounted at a private source; bind-mounts it onto the kubelet's target |
 | NodeUnpublish, NodeUnstage | node plugin | stop the front, the service (final commit, and one more push of it within `--push-grace`) |
 | DeleteVolume | controller | removes or keeps the directory (`onDelete`; `delete` renames it to `.deleting.<handle>` under the state lock and removes it after, so no held lock file is unlinked on NFS); `delete` refuses while a remote lacks commits of the branch |
 
@@ -2682,26 +2629,22 @@ retries.
   DeleteVolume while any remote lacks commits of the branch (read from
   the push state, §11.2), so history no remote holds is never deleted.
 
-**One node per volume, or ReadWriteMany with `--multi-node`.** Without
-the flag `ReadWriteMany` is refused at CreateVolume, the attach step
-makes Kubernetes refuse a second node while the first holds the
-VolumeAttachment, and ControllerPublish refuses it too. With
-`--multi-node` (on the controller and the node plugin), CreateVolume
-accepts `MULTI_NODE_MULTI_WRITER` and `MULTI_NODE_READER_ONLY` (never
-`MULTI_NODE_SINGLE_WRITER`, a guarantee the driver cannot give across
-independent fronts) and marks the volume `multi_node` in `csi.json`;
-ControllerPublish adds each node to its `published_nodes`, refusing a
-node that has not registered on basePath (`.nodes/<node>`, which on
-several nodes proves they share it) and a multi-node attach of a volume
-created for one node; DeleteVolume is refused while any node is
-attached; `attachRequired` stays true. Every node that stages the volume
-runs a service with `--standby`; the lock holder is active (§2.3), its
-endpoint file names it, and NodeStage on a node whose own service waits
-returns once that file names a live lock holder. Each service also
-listens on TLS at the plugin pod's IP (`--pod-ip`, from the downward
-API; no `hostNetwork`). Fronts use `--history-service state`, on one
-node or several (one code path). A front's slot is matched by pid and
-node, since pids collide across nodes.
+**One node per volume.** Several pods on one node share a volume, each
+committing as itself: `ReadWriteOnce` (`SINGLE_NODE_WRITER` or
+`SINGLE_NODE_MULTI_WRITER`) and `ReadWriteOncePod`
+(`SINGLE_NODE_SINGLE_WRITER`); `SINGLE_NODE_READER_ONLY` is a read-only
+mount. Every multi-node access mode (`MULTI_NODE_READER_ONLY`,
+`MULTI_NODE_SINGLE_WRITER`, `MULTI_NODE_MULTI_WRITER`, so
+`ReadWriteMany` and `ReadOnlyMany`) is refused with one message naming
+the decision (§19.1), at CreateVolume, ValidateVolumeCapabilities,
+ControllerPublish, NodeStage and NodePublish, and a `csi.json` with
+fields the driver does not know (one written by a multi-node build) is
+refused rather than read as a single-node volume. The attach step makes
+Kubernetes refuse a second node while the first holds the
+VolumeAttachment; ControllerPublish refuses it too. On a shared basePath
+a volume moves to another node after it is detached from the first,
+never onto two at once. Pods on other nodes read its history from the
+remote it pushes to.
 
 **Upgrading the node plugin.** A live hand-over of a node's FUSE
 sessions to a new plugin is not built: the fronts are the plugin's
@@ -2710,9 +2653,7 @@ re-running INIT, and the kernel's node ids, lookup counts and
 passthrough backing ids cannot be transferred. The supported procedure
 is per node: cordon, evict that node's agentfs pods, delete its plugin
 pod (the DaemonSet stays `OnDelete`), wait until it is Ready, uncordon
-([csi.md](csi.md#9-operations)). Pods on other nodes keep working; a
-multi-node volume's service hands over to another node's standby. The
-multi-node kind e2e runs it and records the handover time.
+([csi.md](csi.md#9-operations)).
 
 **RBAC inventory.** csi-provisioner: PVs (get, list, watch, create, patch,
 delete), PVCs (get, list, watch, update), StorageClasses, CSINodes and
@@ -2739,26 +2680,40 @@ read-only root filesystem; the sidecars run as root without capabilities
 untested.
 
 **Shared filesystems.** basePath must be one filesystem the controller
-and every node see at the same path; with several nodes that is a shared
-filesystem. It must honour `flock` (the state lock, §2.3, and the slot
-leases): NFSv4, or NFSv3 with NLM, never `nolock`. Reflinks do not cross
-it, so freezes copy (§3.2); passthrough is decided per inode and falls
-back where the kernel refuses a backing file (§17.1).
+and every node see at the same path; for volumes to move between nodes
+that is a shared filesystem. The state lock (§2.3) is then the only
+guard against a second history service on another node, so the lock and
+`agentfs-csi`'s start refuse a state area or basePath on NFS older than
+4.1, mounted `nolock`, or with `local_lock` other than `none` (read from
+`/proc/self/mountinfo`): there an `flock` excludes only the node's own
+processes. Other shared filesystems are neither checked nor tested.
+`hard` and `lookupcache=positive` mounts and a `no_root_squash` export
+are recommended ([csi.md](csi.md#11-shared-filesystems)). Reflinks do not
+cross NFS, so freezes copy (§3.2); passthrough is decided per inode and
+falls back where the kernel refuses a backing file (§17.1).
+
+*The forced-detach residual.* On a shared basePath, a node that is cut
+off but still running keeps its history service and pods writing. If
+Kubernetes force-detaches the volume (the attach-detach controller's
+timeout; NOT VERIFIED for Kubernetes 1.37), or an operator taints the
+node out of service while it still runs, a service on another node can
+take the lock once the NFS server's lease for the cut-off client
+expires. When the network returns there are two writers, and the journal
+can be corrupted. This was true before 2026-10-15's multi-node work and
+remains so; the only strong guard is a node-local basePath, which pins
+each volume to its node. A lost node is handled by
+[runbooks/node-lost.md](runbooks/node-lost.md).
 
 Tested on NFS (`ci/e2e-nfs.sh`, CI job `e2e-nfs`, passthrough `auto` and
 `off`): a kernel NFS server on the runner exports one directory to two
 NFSv4.2 clients (the second in network and UTS namespaces of its own, so
-a separate client id, lease and set of locks), mounted `hard,
-lookupcache=positive`, with the export `rw, sync, no_root_squash` and
-nfsd's lease and grace at 15 s. It checks the state lock and slot leases
-across the clients (POSIX-emulated `flock` included, §2.3), a standby's
-takeover, the multi-pod e2e with a front on each client (front b over
-TLS), mmap and SQLite single-writer through a front, NFS silly renames,
-and a network partition of the active service's client: the heartbeat
-fences it, the other client's standby takes over once the lease
-expires, the fenced service exits 75 after the partition heals, and
-every acknowledged close is in history once. Recommended NFS settings
-are in [csi.md](csi.md).
+a separate client id, lease and set of locks). It checks that the state
+lock and its holder line hold across the clients, that NFS 4.0 and
+`local_lock=flock` mounts are refused at start (the `local_lock` half is
+NOT RUN on runners whose kernel reports `local_lock=none` for it), mmap
+and SQLite single-writer through a front on the NFS tree, that NFS silly
+renames never reach history, and DeleteVolume on a base path on the
+export.
 
 ## 15. Recovery and undo
 
@@ -3019,7 +2974,7 @@ one-time migration of Hermes' existing data and the initial import in
     stays a thin CLI.
 - **`agentfs`, a binary:**
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
-    `serve-history` (§14), `ping-history` (§14.1), `restore`, `revert`, `patch` (`submit`,
+    `serve-history` (§14), `restore`, `revert`, `patch` (`submit`,
     `apply`, `status`) and `lfs` (`fetch`, `prune`); a test (`crates/agentfs/src/reference_tests.rs`)
     checks this list against the CLI;
   - `init` is safe to re-run (§2.3): exit 0 for the volume it already
@@ -3331,9 +3286,9 @@ restartable (§14.2). The controller runs no children.
 | Patch submission | the `git` CLI on the producer's side (`ls-remote`, `fetch`, `commit-tree`, `push --force-with-lease`) | Runs in the producer's repository with its own credentials and config, so agentfs needs none of them; the lease makes a number create-only (§12) |
 | Repack | the `git` CLI (`git repack --geometric=2`, git 2.32 or later) | libgit2 has no repack or gc. Run by the commit loop with system and global config off (§8); the image ships `git` |
 | Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates`, `git` and `tini`; built on `rust:1.99-trixie`; both pinned by digest. Ships `agentfs` and `agentfs-csi` | Not distroless: the daemon runs `git repack` (§8), and operators follow the runbooks with `git` through `kubectl exec`. `tini` (`-s`, a subreaper: the node plugin shares the host's pid namespace) reaps the CSI node plugin's children's orphans. Runs as root (§17.1). `linux/amd64` only; published to `ghcr.io/mcurcio/agentfs` as the commit sha and `latest`, only after both kind e2e jobs pass |
-| CSI gRPC | `tonic` 0.14 and `tonic-prost`, `prost` 0.14, `prost-types`, on `tokio` (only in `agentfs-csi`) | Transport and codegen features, no TLS: the socket is local. The front/service protocol stays a plain socket on one node (§14.1) |
-| Front/service TLS across nodes | `rustls` 0.23 (ring, std; TLS 1.3 only) with its blocking `StreamOwned` on `std::net::TcpStream`, `rustls-pki-types`, and `rcgen` 0.14 (ring, pem) for the volume's self-signed certificate, behind the `history-tls` feature (2026-10-15) | No tokio, no gRPC: the frames and threads of §14.1 stay. Custom verifiers pin the volume's certificate byte for byte and check TLS 1.3 signatures with rustls's own `verify_tls13_signature`. ring and rustls were already in the lockfile through `otlp-tls`; `ci/check-deps.sh` checks the feature brings no aws-lc or OpenSSL. `agentfs-csi` links none of it (it spawns `agentfs`) |
-| CSI codegen | `protox` 0.10 and `tonic-prost-build` 0.14 in `build.rs` | A pure-Rust protobuf compiler with the well-known types bundled: no `protoc` on build hosts or in the image |
+| CSI gRPC | `tonic` 0.14 and `tonic-prost`, `prost` 0.14, `prost-types`, on `tokio` (in `agentfs-csi`) | Transport and codegen features, no TLS: the socket is local |
+| Front/service gRPC (2026-10-15) | `tonic` 0.14 (`codegen`, `router`, `server`; never `channel` or TLS), `tonic-prost`, `tonic-health` for `grpc.health.v1`, `prost` 0.14, and `hyper` 1 (`http2` client) with `hyper-util` and `tokio-stream`, on `tokio` (in `agentfs-core`) | The front's client is hyper's HTTP/2 connection over the Unix socket, so a request hyper hands back unsent is known never to have left (§14.1); tonic's `channel` would hide that. No TLS: the socket is node-local. `ci/check-deps.sh` checks the default build still links no ring or rustls |
+| gRPC codegen | `protox` 0.10 and `tonic-prost-build` 0.14 in `build.rs` (both crates) | A pure-Rust protobuf compiler with the well-known types bundled: no `protoc` on build hosts or in the image |
 | CSI spec | `csi.proto` v1.13.0, vendored in `crates/agentfs-csi/proto` | Pinned by copy; updating it is a deliberate change |
 | CSI sidecars | csi-provisioner v6.4.0, csi-attacher v4.13.0, csi-node-driver-registrar v2.18.0, livenessprobe v2.20.0 from `registry.k8s.io/sig-storage` | Pinned by digest in `deploy/csi/kustomization.yaml` |
 
@@ -3414,15 +3369,20 @@ restartable (§14.2). The controller runs no children.
     - the second and third stay queued;
     - the volume mounts;
     - a crash and replay does not apply the first twice.
-16. **Phase 4.** Two pods on two nodes mount one volume. Each pod's changes carry
-    its own committer identity, and history keeps every boundary from both.
-    Built and run at single-node level (two front mounts on one node, §14,
+16. **Phase 4.** Two pods on one node mount one volume. Each pod's changes
+    carry its own committer identity, and history keeps every boundary from
+    both. Run with two front mounts on one node (§14,
     `ci/e2e-multipod.sh`: renames and removals across fronts, also of a
     file still open in the other front, a concurrent burst on one path, an
     outage, and a `kill -9` of the service with a journaled, uncommitted
     record), and through the CSI driver on one node (two restricted pods
     on one claim, `ci/e2e-csi.sh`, with the front, service and plugin
-    crash recoveries of §14.2); two nodes wait for a cross-node transport.
+    crash recoveries of §14.2). A `ReadWriteMany` claim is refused
+    (`ci/e2e-csi.sh`'s negative case, and every multi-node mode at every
+    call in `crates/agentfs-csi/tests/grpc.rs`). The state lock, its
+    holder line and the mount-option check hold across two NFS clients
+    of one export (`ci/e2e-nfs.sh`). Two nodes writing one volume are out
+    of scope by decision (§19.1).
 
 **Where they run.** Tests 1, 2, 4, 5, 6, 7 and 11 run through real mounts
 in the `fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with
@@ -3551,8 +3511,10 @@ run in `crates/agentfs/tests/cli_identity.rs` (every variable, the
 fallbacks, refusals, fronts, a template change across a service
 restart), through a mount and a front in the `fuse` job, and with custom
 templates checked exactly in `e2e-kind` and `e2e-csi`.
-Not automated yet: test 16 across two nodes, and the CSI driver over a shared filesystem, on
-hardened node images (Talos) and across node reboots.
+Not automated yet: the CSI driver on hardened node images (Talos) and
+across node reboots, and a volume moving between two nodes of a cluster
+on a shared basePath (the NFS e2e checks the lock across two clients of
+one export, without Kubernetes).
 
 The `fuse` job also runs README's quick start as written, as root
 (`ci/readme-quickstart.sh`): its remote log after `kill %1; wait` must
@@ -3640,7 +3602,7 @@ runner.
 | Patch idempotency | Decided by the branch's trailers (`Agentfs-Inbox`, `Agentfs-Patch`), never by refs or a cache; refs move after the commit, so a crash anywhere re-applies nothing (§12) |
 | Queue push | Only to the patch remote, after every branch push attempt (failed ones included) and apart from it: the status ref, `applied/<n>` once the branch holds the commit, and `inbox/<n>` of every applied number deleted, leased on the oid listed; its failures never count against the branch (§11.3) |
 | LFS test server | CI uses git-lfs's `lfs-test-server` (pinned by commit, built with `go install`) behind the git server's nginx, which authenticates with separate users per host; rudolfs (no auth or verify) and giftless (JWT setup) were not used (§18) |
-| Front/service protocol | A Unix stream socket in the state area (`meta/history/history.sock`, directory 0700, socket 0600, peer root or the service's euid), u32 big-endian length-prefixed JSON frames, protocol v1 with a `Hello` handshake checking the version, volume, slot lease and identity; a pool of synchronous connections per front, a thread per connection in the service. gRPC rejected (tonic, prost, tokio for nothing a local socket needs); `tcp:` refused until a cross-node transport is designed (§14) |
+| Front/service protocol (2026-10-15) | gRPC (tonic, prost; the `.proto` compiled with protox) over the volume's node-local Unix socket, same path and permissions, peer root or the service's euid checked on both ends; package `agentfs.history.v2`, protocol 2. One HTTP/2 connection per front. Its first call, `Hello`, admits the front (version, volume, slot lease, identity) and binds it to the connection. `Record` answers only once durable and is never resent; a request goes out again on a new connection only when hyper proves it never left. Every call carries a deadline (`--history-timeout`). The service calls fronts on a bidirectional `Listen` stream. `grpc.health.v1` answers liveness. Mixed versions refuse each other at `Hello`. The owner: "i dont want to invent new protocols where they might already exist"; asked whether gRPC comes (a) in this change, (b) in its own later change or (c) not at all, and whether it lands on a PR or main: "1 a, 2 main" (2026-10-15) (§14.1) |
 | Split of the synchronous step | The front decides the rules, runs the record-time checks and freezes (it holds the descriptor); the service re-decides against the authoritative tracked set, checks the copies exist in the sender's slot, journals and replies. A `Tracked` query (no `fsync`) only for writes whose decision depends on tracking, so ignored files are never copied (§3.2, §14) |
 | Pending slots | The high 16 bits of a pending id; slot 0 for the single process and the service, 1..=1023 leased by fronts with an `flock` on `meta/fronts/slot-N.lock`; the service's prune spares live slots (§2.2, §14) |
 | Front failures | Service unreachable, hung (`--history-timeout`) or refusing: `EIO` at the boundary, `RecordFailed`, `HistoryServiceUnavailable` once per outage; repairs in the slot's file; a draft is never resent (§3.5, §14) |
@@ -3651,26 +3613,19 @@ runner.
 | Unorderable front changes (2026-10-13) | Identical stamps from two slots, a removal of a path present again, and a symlink whose target the tree no longer has are journaled, then resynced: the service records the path as the backing tree has it, as its own `sweep` record under the path claim (`agentfs.history_service.resyncs`). Chosen over comparing frozen copies' content, which cannot order two states the file no longer holds (§14.1) |
 | Creating as the caller (2026-10-13) | A daemon with `CAP_SETUID`/`CAP_SETGID`/`CAP_CHOWN`/`CAP_FOWNER` creates as the caller by switching the worker thread's fsuid, fsgid and supplementary groups (read from `/proc/<pid>/status`) for the one creating call; refusals fall back to create-then-chown (`agentfs.fuse.create_as_caller_fallbacks`). The CSI node plugin runs with `hostPID: true` so callers' pids, and so their groups, are visible (§6, §14.1, §14.2) |
 | Repair origins (2026-10-13) | A repair keeps the pod that failed to record it; the service trusts an origin a front names only on `sweep` records whose committer renders, and journals the front's own otherwise (§3.5, §14.1) |
-| Protocol evolution (2026-10-13) | Protocol stays version 1: additions are optional fields and new variants only, and the service lists what it supports in `Welcome.features` (`stamps`, `repair_origin`, `listen`, `still_last`, `move`) (§14.1) |
+| Protocol evolution (2026-10-13) | Additions are optional fields and new variants only, and the service lists what it supports in `Welcome.features` (`stamps`, `repair_origin`, `listen`, `still_last`, `move`); the version changes only with the transport (1 to 2 with gRPC, 2026-10-15) (§14.1) |
 | Locks across fronts | POSIX and BSD locks are per FUSE mount, so not shared between pods; a lock-coordinated database (SQLite, the `fsync` class) must be written from one pod (§14) |
 | CSI driver shape | One binary, `agentfs-csi` (`--mode` controller, node or all), in the agentfs image; tonic over a Unix socket, the spec compiled without `protoc`; the node plugin spawns the `agentfs` binary for the service and each front instead of linking FUSE in-process (§14.2, §17.2) |
 | CSI volumes | PersistentVolumes only (no inline ephemeral volumes); `<basePath>/<pv>/{backing,state,csi.json}`; basePath one filesystem seen by the controller and every node; size recorded, not enforced (§14.2) |
-| One node per volume | `ReadWriteOnce`/`ReadWriteOncePod` only, `ReadWriteMany` refused; `attachRequired: true` with ControllerPublish tracking the node, so Kubernetes' Multi-Attach check enforces it (§14.2) |
+| One node per volume (2026-10-15) | A volume is used from one node at a time. Several pods on that node share it, each committing as itself: `ReadWriteOnce` (`SINGLE_NODE_MULTI_WRITER`) or `ReadWriteOncePod` (`SINGLE_NODE_SINGLE_WRITER`); `SINGLE_NODE_READER_ONLY` is a read-only mount. Every multi-node access mode is refused with one message naming this row, at CreateVolume, ValidateVolumeCapabilities, ControllerPublish, NodeStage and NodePublish, and a `csi.json` the driver does not understand is refused. With a shared basePath (NFS) a volume moves to another node after it is detached, never onto two at once. Pods on other nodes read its history from the remote it pushes to. The owner, asked whether sandboxes write to the directory or only read it, and whether they can run on Hermes's node: "Write, same node is fine". Asked whether volumes still move between nodes on shared NFS (2a) or stay on one node's disk (2b): "2a". On cross-node support he had said: "It is acceptable for the final answer to be that RWX is not supported in some or all cases. I want to do the diligence to know for sure, but if the complexity is not worth the value, then we can drop it" (all 2026-10-15) (§14.2, §19.2 item 2) |
+| Mount options on shared storage (2026-10-15) | The state lock and `agentfs-csi`'s start refuse a state area or basePath on NFS older than 4.1, mounted `nolock`, or with `local_lock` other than `none` (read from `/proc/self/mountinfo`), since the state lock is the only guard against a second history service. Other shared filesystems are neither checked nor tested. This is a design choice, not an owner statement (§2.3, §14.2) |
+| NFS silly renames (2026-10-15) | Silly-rename names (`.nfs` and 24 hex digits) are never recorded (§4) |
+| Node plugin upgrades (2026-10-15, default, owner to confirm) | Drain a node: cordon, evict that node's agentfs pods, delete the plugin pod, wait until it is Ready, uncordon; the DaemonSet is `OnDelete`. A live FUSE hand-over is not built (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI parameters | A StorageClass or PV names a `profile` whose config fragment, rules and credentials live in the driver's namespace (a ConfigMap without hash suffix, a Secret), mounted into its pods; no Secret RBAC; pod authors choose only the class (§14.2) |
 | CSI identity | `podInfoOnMount`: each pod's front commits under the pod's name, namespace and uid (§9, §14.2) |
 | CSI recovery | Crashed fronts and services restarted with backoff (1 s to 30 s); a front in its predecessor's slot (`--history-slot`), its mount bind-stacked over the stale target, made shared so `HostToContainer` containers see it; reconcile from node records after a plugin restart; DaemonSet `OnDelete` (§14.2) |
 | CSI RBAC | csi-provisioner and csi-attacher's minimal ClusterRoles plus leader-election leases; no Secrets, pods or snapshots; the node plugin has no API access and no token (§14.2, [csi.md](csi.md#10-security)) |
 | CSI volume names | The default `volumeName` is `{pvcNamespace}.{pvcName}.{pvName}`: unique per volume, so a claim deleted and created again starts a new branch instead of a root commit on the old one, which every push would find diverged (§11.3, §11.4); a template without `{pvName}` is the operator's choice and documented as unsafe. A static PV's `volumeName` (or `volume`) is literal, and its unknown attributes are refused (§14.2, [csi.md](csi.md#5-parameters)) |
-| Cross-node transport (2026-10-15) | TLS 1.3 over TCP carrying the unchanged frame protocol (v1; new fields and features only), behind the `history-tls` feature, in the image; never plaintext TCP; gRPC stays rejected (§14.1) |
-| Cross-node trust (2026-10-15, default, owner to confirm) | One self-signed certificate per volume, made by the active service under the state lock in `meta/history/tls/identity.pem` (0600); both ends present it and pin it byte for byte. The trust boundary is reading the state area, as for the Unix socket and for rewriting history. No Kubernetes Secret or cluster CA, so the node plugin keeps no API access and no cross-volume secret; a cert-manager or CA option is not built (§14.1) |
-| Finding the service (2026-10-15) | `meta/history/endpoint.json` in the shared state area, written by the active service; fronts given `state` read it at each connection, use the socket on the service's node and TLS elsewhere, and retry a service they cannot reach (nothing sent) within `--history-timeout`. No Kubernetes Service objects, no RBAC change (§14.1, §14.2) |
-| Locks on shared filesystems (2026-10-15) | A process never opens and closes a lock file it holds (NFS emulates `flock` with POSIX locks, which a close drops); holder lines carry the node, and the CSI driver matches a front's slot by pid and node (§2.3) |
-| Stamps across NFS clients (2026-10-15) | A front's hello carries its tree's `st_dev`; the service compares stamps of that device as the tree's. The service's look at the tree opens each directory and uses `statx(AT_STATX_FORCE_SYNC)`. NFS silly-rename names are never recorded (§4, §14.1) |
-| Standby and failover (2026-10-15) | Every node that stages a volume runs `serve-history --standby`; the lock holder is active, the others poll every second and take over when it is released (a clean stop, or a crash: the kernel or the NFS server's lease frees it). Patches are not fetched or applied at a takeover while front leases are live (§2.3, §12, §14.2) |
-| Fencing a lost lock (2026-10-15, default, owner to confirm) | A heartbeat renews the lock every `--lock-fence`/5 and the journal and commits refuse to write once the last renewal is older than `--lock-fence` (10 s); this relies on the NFS server's lease being at least twice the fence, and accepts one residual: a service stuck inside one NFS call when a partition begins can complete it after a takeover. A per-batch epoch check (one more NFS round trip per group commit) was the alternative. A lost lock exits 75; the journal file is replaced at takeover; ref updates are already compare-and-swap (§2.3, §14.2) |
-| ReadWriteMany in the CSI driver (2026-10-15) | Opt-in with `--multi-node` on the controller and node plugin; `MULTI_NODE_MULTI_WRITER` and `MULTI_NODE_READER_ONLY` accepted, `MULTI_NODE_SINGLE_WRITER` refused; the node marker on basePath at ControllerPublish proves a shared basePath; `attachRequired` stays true with a set of attached nodes; services listen on TLS at the plugin pod's IP (downward API), never `hostNetwork`; fronts always use `--history-service state` (§14.2) |
-| NFS settings (2026-10-15, default, owner to confirm) | Recommended and tested: NFSv4.2 (4.1 at least), `hard`, `lookupcache=positive`, never `nolock`; exports `no_root_squash`, because the node plugin is root and creates files as pods' uids ([csi.md](csi.md#11-shared-filesystems)) |
-| Node plugin upgrades (2026-10-15, default, owner to confirm) | Drain per node (cordon, evict that node's agentfs pods, delete the plugin pod, wait Ready, uncordon), DaemonSet `OnDelete`; a live FUSE hand-over (a fuser fork that skips INIT and transfers node ids) is rejected as infeasible for now (§14.2) |
 | CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2): NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it, and runs with `hostPID: true` so its fronts can read callers' groups, §6); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
 | CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |
@@ -3684,17 +3639,20 @@ runner.
    from the first CI measurements, in §19.1 and
    [performance.md](performance.md#performance-budget).
 2. **Multi-pod (§14):** RBAC and Pod Security are settled by the CSI
-   driver (§14.2). Open: a cross-node transport with authentication (so
-   several nodes can mount one volume), verifying the state lock, slot
-   leases and passthrough over a shared filesystem such as NFS, and
-   upgrading the node plugin without interrupting its mounts. The round trip
-   per boundary is measured at single-node level (§14.1): a Unix-socket
-   round trip costs tens of microseconds, against about a millisecond
-   for the freeze and `fsync` both modes pay: on CI (`ubuntu-24.04`,
-   ext4) the socket round trip is 15–25 µs and a front close is 48–90 µs
-   slower than a single-process close at the median, of about 1 ms. The
-   cost of a network round trip between nodes stays open with the
-   cross-node transport.
+   driver (§14.2). *Closed (2026-10-15)*: several nodes writing one
+   volume is not supported (§19.1, "One node per volume"). Attach is not
+   a fence on most storage backends; a lock on shared storage can elect a
+   holder but cannot fence a paused or cut-off one (Kleppmann, "How to do
+   distributed locking"; client-go's `leaderelection` says it gives no
+   fencing); the redesign that would fence in the storage did not
+   converge; and no consumer needs it (the owner:
+   "Write, same node is fine"). Upgrading the node plugin drains the node (§14.2). The round
+   trip per boundary over gRPC is measured on one node (§14.1, CI run
+   38804442698, commit 9d8a536, `ubuntu-24.04`, ext4): the
+   `grpc.health.v1` round trip is 49 µs (passthrough `auto` job) and
+   72 µs (`off`) at the median, and a front's close is 943 against 809 µs
+   (`auto`) and 1004 against 768 µs (`off`) for a single-process close at
+   the median.
 3. **Recovery tooling** beyond `restore`, `revert` and the runbooks (§15):
    whether a read-only history view for operators is worth building,
    whether undo through the patch queue (§12) replaces manual restores for

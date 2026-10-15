@@ -1,5 +1,7 @@
-# One node per volume: ReadWriteOnce (several pods on one node) or
-# ReadWriteOncePod. ReadWriteMany is refused. The size is not enforced.
+# One node at a time (design §19.1, 2026-10-15): ReadWriteOnce (several
+# pods on one node) or ReadWriteOncePod. Every multi-node mode
+# (ReadWriteMany, ReadOnlyMany) is refused; pods on other nodes read the
+# volume's history from the remote it pushes to. The size is not enforced.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

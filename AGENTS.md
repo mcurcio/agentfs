@@ -101,8 +101,8 @@ GitHub Actions runners can, so put such tests in a script under `ci/` and a job 
 
 | Workflow | Runs on | Typical duration | Covers |
 |---|---|---|---|
-| `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, remotes (http/https/ssh), LFS, telemetry, multipod, patches, runbooks, csi-sanity |
-| `image.yml` | every push and PR | ~5–9 min | container image, kind sidecar e2e, CSI on kind; publishes to GHCR on main |
+| `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, remotes (http/https/ssh), LFS, telemetry, multipod, NFS (one export, two clients, one node at a time), patches, runbooks, csi-sanity |
+| `image.yml` | every push and PR | ~5–9 min | container image, kind sidecar e2e, CSI on one kind node (no multi-node job); publishes to GHCR on main |
 | `power-loss.yml` | pushes to main (not docs-only) | ~7 min | dm-log-writes replay on XFS and ext4 |
 | `bench.yml` | pushes to main (not docs-only) | **~23–25 min** | benchmarks on XFS and ext4 against `ci/bench-budget.json` |
 
@@ -115,7 +115,10 @@ Rules:
 Known flakes to watch:
 - the `e2e (operator runbooks)` history-rewrite step;
 - `csi_service.rs::the_supervisor_runs_and_recovers_a_real_history_service` under heavy local load;
-- one FUSE `e2e-recovery` failure, seen once.
+- one FUSE `e2e-recovery` failure, seen once;
+- `crates/agentfs/tests/mount.rs::revert_through_the_mount` (it assumes one commit per shell command);
+- the `e2e (OpenTelemetry collector)` job's `agentfs.repack.failures never counted` within 100 s: a repack is skipped while a push holds the push lock, so with four retrying remotes it can miss the wait;
+- `service::tests::final_push_respects_the_deadline` and `a_push_still_running_is_abandoned_after_the_grace_period` in `test (all)`, on timing under load.
 
 ## Git
 

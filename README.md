@@ -27,7 +27,7 @@ It is built in two layers:
 | 1 | The recorder as a sidecar for one pod: recording, commits, interval push to any remote, path rules, push checks, OpenTelemetry, recovery | Built; tested end to end in CI, including a kind cluster |
 | 2 | Git LFS (§7) and the `fsync` class for databases (§8) | Built |
 | 3 | The ordered patch queue for iac (§12) | Built |
-| 4 | The CSI driver, with volumes several pods mount at once (§14) | Built for one node per volume; several nodes per volume open (§19.2) |
+| 4 | The CSI driver, with volumes several pods mount at once (§14) | Built for several pods on one node; several nodes per volume not supported (decided 2026-10-15) |
 
 Performance is benchmarked in CI on XFS and ext4 against a budget; see
 [docs/performance.md](docs/performance.md). Not built yet: see
@@ -174,11 +174,12 @@ nested repository detection. Also:
 - **Several mounts of one volume** (phase 4 building blocks, single node):
   `agentfs serve-history` is the volume's history service, the only
   writer of its history, and `agentfs mount --history-service` mounts are
-  fronts that hand each change boundary to it over a Unix socket in the
-  state area and return once it is durable. Each pod's changes are
+  fronts that hand each change boundary to it over gRPC on a Unix socket
+  in the state area and return once it is durable. Each pod's changes are
   committed with that pod's committer and trailers. See
   [Several mounts of one volume](#several-mounts-of-one-volume).
-- **CSI driver** (phase 4, one node per volume): `agentfs-csi` gives pods
+- **CSI driver** (phase 4, several pods on one node; several nodes per
+  volume not supported, decided 2026-10-15): `agentfs-csi` gives pods
   agentfs volumes as PersistentVolumeClaims. The node plugin runs a history
   service per volume and a front per pod, each pod committing as itself;
   settings, rules and credentials are the operator's (StorageClass
@@ -220,7 +221,11 @@ who holds the lock.
 
 ### Not built yet
 
-Several mounts of one volume across nodes. LFS over SSH needs a server
+Several nodes writing one volume: not supported, by decision
+([design §19.1](docs/design.md#191-decisions-2026-10-12)); a volume moves
+between nodes one at a time on a shared basePath, which on NFS must be
+4.1 or later, without `nolock` and with `local_lock=none`
+([docs/csi.md](docs/csi.md#11-shared-filesystems)). LFS over SSH needs a server
 with `git-lfs-authenticate` (git-lfs's pure SSH protocol,
 `git-lfs-transfer`, is not supported). Proxies are plain `http://`
 proxies without authentication. Restoring a database needs
@@ -297,7 +302,7 @@ driver runs all of this for you, per volume and per pod
 once; locks are not shared
 between mounts, so a database must be written from one of them; patches
 are applied only when the service starts with no fronts; the service
-serves 1024 connections, about 60 fronts busy at once. A file open in
+admits 1024 fronts at once. A file open in
 one mount that another mount renames or removes is recorded under its
 new name, or not at all. Without
 `--history-service`, `mount` is the single-process mount above. See the

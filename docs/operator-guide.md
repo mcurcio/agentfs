@@ -479,9 +479,15 @@ Runbooks, with the full procedures:
 - [history-service-down.md](runbooks/history-service-down.md): fronts
   failing with `EIO` because the history service is down, hung or
   refusing them (§16);
-- [history-service-failover.md](runbooks/history-service-failover.md):
-  standby services on several nodes, takeover, and a service that lost
-  its state lock (`StateLockLost`).
+- [node-lost.md](runbooks/node-lost.md): a node that is powered off or
+  cut off, its pods stuck Terminating and its volumes still attached;
+  confirming it is down, the out-of-service taint, and checking the state
+  lock before the volume starts elsewhere. On a shared basePath (NFS), a
+  node that is cut off but still running keeps writing: if its volume is
+  force-detached or the node tainted out of service while it runs, a
+  service on another node can take the lock once the NFS lease expires,
+  and two writers can corrupt the journal. Only a node-local basePath
+  rules this out ([csi.md](csi.md#11-shared-filesystems)).
 
 **Patches** (§12) are the other way to change the tree from outside:
 producers queue them on the remote (`agentfs patch submit`), and every
@@ -723,7 +729,9 @@ the single-process mount of the rest of this guide.
 **Requirements.** The service and every front on the same node, with the
 same state area and backing tree (the socket is a Unix socket in the
 state area). The fronts run as root or as the service's user: the
-service refuses any other peer. Cross-node mounts are not built yet.
+service refuses any other peer. They speak gRPC over that socket
+(design §14.1). Mounts on several nodes of one volume are not supported
+(decided 2026-10-15, design §19.1).
 
 **On Kubernetes**, the CSI driver runs this for you: a service per staged
 volume, a front per pod with that pod's identity, restarts in the same
@@ -850,13 +858,13 @@ next start or an `agentfs push`.
   queue is drained only by the next front in that slot, which commits
   each entry as the pod that made the change (files written by older
   versions name no pod: their entries are committed as the new front's).
-- The service serves at most 1024 connections at once (one thread each).
-  A front holds about as many as it has boundaries in flight at once
-  (at most its FUSE threads plus its sweep, 17 by default on a 16-CPU
-  node) and drops them after 20 s idle; the service closes any idle for
-  60 s. So about 60 fronts can all be busy at once; past that, a
-  boundary fails with `EIO` and `RecordFailed` ("history service ... is
-  busy"), without the `HistoryServiceUnavailable` alarm.
+- The service admits at most 1024 fronts at once. Each front keeps one
+  HTTP/2 connection, which carries all its concurrent boundaries, its
+  listening stream and its health checks. A front past the limit is
+  refused as busy: at start it keeps trying for `--history-wait`, and a
+  boundary that must reconnect fails with `EIO` and `RecordFailed`
+  ("history service ... is busy"), without the
+  `HistoryServiceUnavailable` alarm.
 - A front checks that the socket is served by root or by its own user and
   refuses anything else, so a socket in a directory other users can
   write cannot be answered by them. Keep `--listen` in a directory only
