@@ -15,15 +15,21 @@
 //!   its commits can carry its committer;
 //! - fewer than [`MAX_CONNECTIONS`] connections are admitted.
 //!
+//! A connection is bounded before its `Hello` too: one from a peer uid
+//! that may not use the service is closed at accept, at most
+//! [`MAX_UNADMITTED`] wait for their `Hello` at once, and one not admitted
+//! within [`HELLO_TIMEOUT`] is closed.
+//!
 //! Concurrent records meet in the journal, whose group commit makes them
 //! durable together. A record is answered only once
 //! [`Recorder::sequence`] has made it durable. Every `Recorder` call runs
 //! in `spawn_blocking`, never on a runtime worker.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::os::fd::OwnedFd;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -34,7 +40,9 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 use tonic_health::ServingStatus;
-use tonic_health::server::HealthReporter;
+use tonic_health::pb::health_server::{Health, HealthServer};
+use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse};
+use tonic_health::server::{HealthReporter, HealthService};
 
 use super::bridge::Bridge;
 use super::fronts::{Fronts, Link};
@@ -49,8 +57,17 @@ use crate::record::{Draft, Origin, Trigger};
 use crate::telemetry::Telemetry;
 use crate::volume::{Recorder, StateDir};
 
-/// The most front connections admitted at once: one per front process.
-pub const MAX_CONNECTIONS: usize = 1024;
+/// The most front connections admitted at once: two per front process
+/// (its calls and its listening stream), for every front slot.
+pub const MAX_CONNECTIONS: usize = 2048;
+
+/// The most connections waiting for their `Hello` at once; more are
+/// closed at accept.
+pub const MAX_UNADMITTED: usize = 64;
+
+/// How long a new connection has to be admitted by its `Hello` before it
+/// is closed.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many calls to a listening front wait in its stream.
 const LINK_CALLS: usize = 2;
@@ -74,10 +91,16 @@ impl Registry {
         self.conns.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn open(&self) -> u64 {
+    /// A new connection's id, unless [`MAX_UNADMITTED`] connections
+    /// already wait for their `Hello`.
+    fn open(&self) -> Option<u64> {
+        let mut conns = self.conns();
+        if conns.values().filter(|f| f.is_none()).count() >= MAX_UNADMITTED {
+            return None;
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.conns().insert(id, None);
-        id
+        conns.insert(id, None);
+        Some(id)
     }
 
     fn close(&self, id: u64) {
@@ -104,6 +127,10 @@ impl Registry {
         self.conns().get(&id).cloned().flatten()
     }
 
+    fn admitted(&self, id: u64) -> bool {
+        matches!(self.conns().get(&id), Some(Some(_)))
+    }
+
     /// The distinct fronts admitted now.
     fn fronts(&self) -> usize {
         let conns = self.conns();
@@ -118,24 +145,57 @@ struct Conn {
     io: tokio::net::UnixStream,
     info: ConnInfo,
     registry: Arc<Registry>,
+    /// Until the connection is admitted: when it is closed if it is not.
+    hello_by: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl Conn {
-    fn accept(io: tokio::net::UnixStream, registry: &Arc<Registry>) -> Option<Self> {
+    /// `io` as a connection, unless its peer may not use a service
+    /// running as `euid` or too many connections wait for their `Hello`;
+    /// it must be admitted within `hello_timeout`.
+    fn accept(
+        io: tokio::net::UnixStream,
+        registry: &Arc<Registry>,
+        euid: u32,
+        hello_timeout: Duration,
+    ) -> Option<Self> {
         let cred = io.peer_cred().ok()?;
         let peer = Peer {
             uid: cred.uid(),
             gid: cred.gid(),
             pid: cred.pid().and_then(|p| u32::try_from(p).ok()).unwrap_or(0),
         };
+        if !local_socket::allowed(peer.uid, euid) {
+            return None;
+        }
         Some(Self {
             io,
             info: ConnInfo {
-                id: registry.open(),
+                id: registry.open()?,
                 peer,
             },
             registry: registry.clone(),
+            hello_by: Some(Box::pin(tokio::time::sleep(hello_timeout))),
         })
+    }
+
+    /// An error once the `Hello` deadline passes on a connection still
+    /// not admitted; the connection then ends.
+    fn poll_hello(&mut self, cx: &mut Context<'_>) -> std::io::Result<()> {
+        let Some(deadline) = self.hello_by.as_mut() else {
+            return Ok(());
+        };
+        if self.registry.admitted(self.info.id) {
+            self.hello_by = None;
+            return Ok(());
+        }
+        match deadline.as_mut().poll(cx) {
+            Poll::Ready(()) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no Hello admitted this connection in time",
+            )),
+            Poll::Pending => Ok(()),
+        }
     }
 }
 
@@ -159,7 +219,11 @@ impl AsyncRead for Conn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        let conn = self.get_mut();
+        // The connection always waits to read: the deadline is checked,
+        // and wakes it, here.
+        conn.poll_hello(cx)?;
+        Pin::new(&mut conn.io).poll_read(cx, buf)
     }
 }
 
@@ -190,6 +254,45 @@ impl AsyncWrite for Conn {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// The requests being served now, which a shutdown waits for.
+#[derive(Default)]
+struct InFlight {
+    count: AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl InFlight {
+    /// Counts a request until the guard is dropped.
+    fn enter(self: &Arc<Self>) -> Serving {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        Serving(self.clone())
+    }
+
+    /// Returns once no request is being served.
+    async fn drained(&self) {
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One request being served.
+struct Serving(Arc<InFlight>);
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.drained.notify_waiters();
+        }
     }
 }
 
@@ -269,6 +372,7 @@ struct Shared {
     reclaimed: Mutex<HashSet<u64>>,
     /// Fronts listening for the service's calls (design §15).
     fronts: Fronts,
+    in_flight: Arc<InFlight>,
 }
 
 impl Shared {
@@ -362,6 +466,7 @@ impl pb::history_server::History for Svc {
         &self,
         request: Request<pb::HelloRequest>,
     ) -> Result<Response<pb::Welcome>, Status> {
+        let _serving = self.shared.in_flight.enter();
         let conn = Self::conn(&request)?;
         let hello = request.into_inner();
         let shared = self.shared.clone();
@@ -384,6 +489,7 @@ impl pb::history_server::History for Svc {
         &self,
         request: Request<pb::TrackedRequest>,
     ) -> Result<Response<pb::TrackedReply>, Status> {
+        let _serving = self.shared.in_flight.enter();
         self.front(&request)?;
         let paths = repo_paths("tracked.paths", request.into_inner().paths)?;
         let shared = self.shared.clone();
@@ -395,6 +501,7 @@ impl pb::history_server::History for Svc {
         &self,
         request: Request<pb::RecordRequest>,
     ) -> Result<Response<pb::RecordReply>, Status> {
+        let _serving = self.shared.in_flight.enter();
         let front = self.front(&request)?;
         let pb::RecordRequest { draft, stamps } = request.into_inner();
         let draft = Draft::try_from(draft.ok_or(WireError::Missing {
@@ -428,6 +535,7 @@ impl pb::history_server::History for Svc {
         &self,
         request: Request<pb::StillLastRequest>,
     ) -> Result<Response<pb::StillLastReply>, Status> {
+        let _serving = self.shared.in_flight.enter();
         self.front(&request)?;
         let pb::StillLastRequest { path, copy } = request.into_inner();
         let mut paths = repo_paths("still_last.path", vec![path])?;
@@ -462,6 +570,52 @@ impl pb::history_server::History for Svc {
         // the front answers (design §15).
         self.shared.fronts.add(front, Link::new(calls, answered));
         Ok(Response::new(ReceiverStream::new(outbound)))
+    }
+}
+
+/// `grpc.health.v1`, whose checks and watch streams a shutdown waits for
+/// like any request.
+struct CountedHealth {
+    inner: HealthService,
+    in_flight: Arc<InFlight>,
+}
+
+#[tonic::async_trait]
+impl Health for CountedHealth {
+    async fn check(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        let _serving = self.in_flight.enter();
+        self.inner.check(request).await
+    }
+
+    type WatchStream = Counted<tonic_health::server::WatchStream>;
+
+    async fn watch(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let serving = self.in_flight.enter();
+        let stream = self.inner.watch(request).await?.into_inner();
+        Ok(Response::new(Counted {
+            stream,
+            _serving: serving,
+        }))
+    }
+}
+
+/// A response stream counted as being served until it is dropped.
+struct Counted<S> {
+    stream: S,
+    _serving: Serving,
+}
+
+impl<S: tokio_stream::Stream + Unpin> tokio_stream::Stream for Counted<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        Pin::new(&mut self.stream).poll_next(cx)
     }
 }
 
@@ -528,6 +682,7 @@ impl HistoryServer {
             registry: registry.clone(),
             reclaimed: Mutex::new(HashSet::new()),
             fronts: Fronts::new(state, settings.commit_window * 20),
+            in_flight: Arc::default(),
         });
         let gauge: Arc<dyn Fn() -> usize + Send + Sync> = {
             let registry = Arc::downgrade(&registry);
@@ -536,15 +691,20 @@ impl HistoryServer {
         telemetry.observe_fronts(Arc::downgrade(&gauge));
 
         let bridge = Bridge::new("agentfs-history", 2)?;
-        let (health, health_service) = tonic_health::server::health_reporter();
+        let health = HealthReporter::new();
+        let health_service = HealthServer::new(CountedHealth {
+            inner: HealthService::from_health_reporter(health.clone()),
+            in_flight: shared.in_flight.clone(),
+        });
         bridge.block_on(health.set_service_status(SERVICE_NAME, ServingStatus::Serving));
         listener.set_nonblocking(true)?;
         let listener = {
             let _runtime = bridge.handle().enter();
             tokio::net::UnixListener::from_std(listener)?
         };
+        let euid = shared.admission.euid;
         let incoming = UnixListenerStream::new(listener).filter_map(move |accepted| {
-            let conn = Conn::accept(accepted.ok()?, &registry)?;
+            let conn = Conn::accept(accepted.ok()?, &registry, euid, HELLO_TIMEOUT)?;
             Some(Ok::<_, std::io::Error>(conn))
         });
         let history = pb::history_server::HistoryServer::new(Svc {
@@ -594,7 +754,9 @@ impl HistoryServer {
     /// Reports `NOT_SERVING`, stops accepting and asks every connection to
     /// finish (HTTP/2 `GOAWAY`), ends every listening stream, waits up to
     /// `grace` for the requests in flight, then drops what is left and
-    /// removes the socket. Returns whether everything ended in time.
+    /// removes the socket. Returns whether the requests ended in time. It
+    /// does not wait for idle connections to close: a front's calls
+    /// connection is polled only while it makes a call.
     pub fn shutdown(mut self, grace: Duration) -> bool {
         let Some(running) = self.running.take() else {
             return true;
@@ -608,7 +770,16 @@ impl HistoryServer {
         bridge.block_on(health.set_service_status(SERVICE_NAME, ServingStatus::NotServing));
         let _ = stop.send(());
         self.shared.fronts.close_all();
-        let done = bridge.block_on(async { tokio::time::timeout(grace, serve).await.is_ok() });
+        let in_flight = &self.shared.in_flight;
+        let done = bridge.block_on(async {
+            let finished = async {
+                tokio::select! {
+                    _ = serve => {}
+                    () = in_flight.drained() => {}
+                }
+            };
+            tokio::time::timeout(grace, finished).await.is_ok()
+        });
         // Cancels every connection left; waits for `Recorder` calls in
         // flight, which no cancellation can stop halfway.
         drop(bridge);
@@ -730,10 +901,15 @@ mod tests {
             version: String::new(),
             views: Vec::new(),
         };
-        let ids: Vec<u64> = (0..=MAX_CONNECTIONS).map(|_| registry.open()).collect();
-        for (n, id) in ids[..MAX_CONNECTIONS].iter().enumerate() {
-            registry.admit(*id, front(n as u64 % 3)).unwrap();
-        }
+        let ids: Vec<u64> = (0..=MAX_CONNECTIONS)
+            .map(|n| {
+                let id = registry.open().unwrap();
+                if n < MAX_CONNECTIONS {
+                    registry.admit(id, front(n as u64 % 3)).unwrap();
+                }
+                id
+            })
+            .collect();
         assert_eq!(registry.fronts(), 3);
         let last = ids[MAX_CONNECTIONS];
         let err = registry.admit(last, front(9)).unwrap_err();
@@ -748,5 +924,91 @@ mod tests {
             registry.admit(ids[0], front(0)).unwrap_err().code(),
             tonic::Code::Cancelled
         );
+    }
+
+    #[test]
+    fn at_most_max_unadmitted_connections_wait_for_their_hello() {
+        let registry = Registry::default();
+        let waiting: Vec<u64> = (0..MAX_UNADMITTED)
+            .map(|_| registry.open().unwrap())
+            .collect();
+        assert_eq!(registry.open(), None);
+        registry.close(waiting[0]);
+        let id = registry.open().unwrap();
+        let front = FrontInfo::try_from(hello(1, PROTOCOL_VERSION).front.unwrap()).unwrap();
+        registry.admit(id, front).unwrap();
+        assert!(registry.open().is_some());
+    }
+
+    /// A connection's read side, with a limit on how long it may stay open.
+    async fn read_for(conn: &mut Conn, limit: Duration) -> Option<std::io::Result<usize>> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 16];
+        tokio::time::timeout(limit, conn.read(&mut buf)).await.ok()
+    }
+
+    #[test]
+    fn a_connection_not_admitted_by_its_hello_deadline_is_closed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let registry = Arc::new(Registry::default());
+            let euid = rustix::process::geteuid().as_raw();
+            let deadline = Duration::from_millis(100);
+
+            // Never says Hello: closed at its deadline.
+            let (io, _peer) = tokio::net::UnixStream::pair().unwrap();
+            let mut silent = Conn::accept(io, &registry, euid, deadline).unwrap();
+            let started = std::time::Instant::now();
+            let err = read_for(&mut silent, Duration::from_secs(5))
+                .await
+                .expect("the deadline closes the connection")
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+            assert!(started.elapsed() >= deadline);
+
+            // Admitted in time: still open past the deadline, and reads.
+            let (io, mut peer) = tokio::net::UnixStream::pair().unwrap();
+            let mut admitted = Conn::accept(io, &registry, euid, deadline).unwrap();
+            let front = FrontInfo::try_from(hello(1, PROTOCOL_VERSION).front.unwrap()).unwrap();
+            registry.admit(admitted.info.id, front).unwrap();
+            assert!(read_for(&mut admitted, deadline * 3).await.is_none());
+            tokio::io::AsyncWriteExt::write_all(&mut peer, b"x")
+                .await
+                .unwrap();
+            assert_eq!(read_for(&mut admitted, deadline).await.unwrap().unwrap(), 1);
+
+            // A peer that may not use the service is not accepted at all.
+            if euid != 0 {
+                let (io, _peer) = tokio::net::UnixStream::pair().unwrap();
+                assert!(Conn::accept(io, &registry, euid + 1, deadline).is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn shutdown_waits_until_no_request_is_served() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let in_flight = Arc::new(InFlight::default());
+        let drained = |limit| {
+            runtime.block_on(async {
+                tokio::time::timeout(limit, in_flight.drained())
+                    .await
+                    .is_ok()
+            })
+        };
+        assert!(drained(Duration::ZERO), "nothing served yet");
+        let first = in_flight.enter();
+        let second = in_flight.enter();
+        assert!(!drained(Duration::from_millis(50)));
+        drop(first);
+        assert!(!drained(Duration::from_millis(50)));
+        drop(second);
+        assert!(drained(Duration::from_millis(50)));
     }
 }

@@ -1,11 +1,15 @@
 //! Synchronous callers on an async runtime (design §14): Tokio's "bridging
 //! with sync code" pattern (tokio.rs/tokio/topics/bridging).
 //!
-//! A [`super::HistoryClient`] or [`super::HistoryServer`] owns a
-//! multi-thread runtime and runs each request with [`Bridge::block_on`] on
-//! the calling thread: FUSE worker threads, the listener's thread, the
-//! restore and main threads, any number at once. The rules that keep that
-//! sound:
+//! A [`super::HistoryClient`] or [`super::HistoryServer`] owns a runtime
+//! and runs each request with [`Bridge::block_on`] on the calling thread:
+//! FUSE worker threads, the listener's thread, the restore and main
+//! threads, any number at once. A multi-thread runtime ([`Bridge::new`])
+//! drives its connections from its own threads, always; a caller-driven
+//! one ([`Bridge::caller_driven`], a current-thread runtime) has no thread
+//! of its own: whichever thread is in `block_on` drives it, so a request
+//! costs no hop between threads, and nothing is polled while no thread is
+//! in `block_on`. The rules that keep that sound:
 //!
 //! - `block_on` is never called from a runtime worker or inside another
 //!   `block_on` (Tokio panics);
@@ -18,7 +22,7 @@ use std::future::Future;
 
 use tokio::runtime::{Builder, Handle, Runtime};
 
-/// A multi-thread runtime that synchronous code drives.
+/// A runtime that synchronous code drives.
 pub(crate) struct Bridge {
     runtime: Runtime,
 }
@@ -32,6 +36,15 @@ impl Bridge {
             .thread_name(name)
             .enable_all()
             .build()?;
+        Ok(Self { runtime })
+    }
+
+    /// A current-thread runtime with no thread of its own, IO and time
+    /// enabled: the threads in [`Bridge::block_on`] drive it, one at a
+    /// time, and the others wait for their own futures meanwhile. For a
+    /// connection that needs no polling between requests.
+    pub(crate) fn caller_driven() -> std::io::Result<Bridge> {
+        let runtime = Builder::new_current_thread().enable_all().build()?;
         Ok(Self { runtime })
     }
 
@@ -61,10 +74,15 @@ mod tests {
 
     #[test]
     fn block_on_runs_on_many_threads_at_once() {
+        block_on_runs_on_many_threads_at_once_on(Bridge::new("agentfs-test", 1).unwrap());
+        block_on_runs_on_many_threads_at_once_on(Bridge::caller_driven().unwrap());
+    }
+
+    fn block_on_runs_on_many_threads_at_once_on(bridge: Bridge) {
         // Each thread's future waits for all the others: only concurrent
         // block_on calls finish.
         const THREADS: usize = 8;
-        let bridge = Arc::new(Bridge::new("agentfs-test", 1).unwrap());
+        let bridge = Arc::new(bridge);
         let barrier = Arc::new(tokio::sync::Barrier::new(THREADS));
         let (done, finished) = std::sync::mpsc::channel();
         for _ in 0..THREADS {
@@ -89,5 +107,23 @@ mod tests {
             .spawn(async { std::thread::current().name().map(str::to_owned) });
         let name = bridge.block_on(task).unwrap();
         assert_eq!(name.as_deref(), Some("agentfs-test"));
+    }
+
+    #[test]
+    fn a_caller_driven_bridge_runs_its_tasks_on_the_calling_thread() {
+        let bridge = Arc::new(Bridge::caller_driven().unwrap());
+        let caller = {
+            let bridge = bridge.clone();
+            std::thread::Builder::new()
+                .name("agentfs-caller".into())
+                .spawn(move || {
+                    let task = bridge
+                        .handle()
+                        .spawn(async { std::thread::current().name().map(str::to_owned) });
+                    bridge.block_on(task).unwrap()
+                })
+                .unwrap()
+        };
+        assert_eq!(caller.join().unwrap().as_deref(), Some("agentfs-caller"));
     }
 }

@@ -1,11 +1,17 @@
 //! A front's connection to the history service (design §14, §3.5).
 //!
-//! One HTTP/2 connection per front, multiplexed: concurrent boundaries of
-//! the front reach the service together and share its journal's group
-//! commit, and the listening stream and the health probe ride on it too.
-//! Each connection starts with `Hello`, which the service admits and binds
-//! to the connection. Calls run on the client's [`Bridge`] from the
-//! calling thread.
+//! Two HTTP/2 connections per front, each starting with `Hello`, which the
+//! service admits and binds to the connection:
+//!
+//! - the calls connection, multiplexed: concurrent boundaries of the front
+//!   reach the service together and share its journal's group commit, and
+//!   the health probe rides on it too. It is driven by the calling
+//!   threads themselves ([`Bridge::caller_driven`]): a call costs no hop
+//!   to a runtime thread and back, and an idle connection is not polled
+//!   until the next call;
+//! - the listening connection, for the stream on which the service calls
+//!   the front ([`super::listener`]), driven by its own runtime thread,
+//!   since calls arrive on it unasked.
 //!
 //! Every call has a deadline (`grpc-timeout`, and the client's own timer).
 //! Nothing is ever resent: a request that may have reached the service
@@ -200,6 +206,22 @@ struct Conn {
     wire: Wire,
 }
 
+/// A connection to the service and the runtime that drives it.
+struct Lane {
+    bridge: Bridge,
+    /// The connection in use; a new one is opened when it is found closed.
+    conn: tokio::sync::Mutex<Option<Conn>>,
+}
+
+impl Lane {
+    fn new(bridge: Bridge) -> Self {
+        Self {
+            bridge,
+            conn: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
 /// A front's handle on the history service. Safe to share across threads.
 pub struct HistoryClient {
     config: ClientConfig,
@@ -207,15 +229,16 @@ pub struct HistoryClient {
     volume: String,
     branch: String,
     front: FrontInfo,
-    /// The connection in use; a new one is opened when it is found closed.
-    conn: tokio::sync::Mutex<Option<Conn>>,
+    /// Requests and their replies.
+    calls: Lane,
+    /// The listening stream.
+    listen: Lane,
     next_conn: AtomicU64,
     down: AtomicBool,
     /// `Welcome.features` of the service, as of the last connection made.
     features: Mutex<Vec<String>>,
     events: Events,
     telemetry: Telemetry,
-    bridge: Bridge,
 }
 
 impl HistoryClient {
@@ -232,29 +255,31 @@ impl HistoryClient {
         telemetry: Telemetry,
     ) -> Result<Self, ClientError> {
         let address = config.address.to_string();
-        let bridge = Bridge::new("agentfs-grpc", 1).map_err(|e| ClientError::Unreachable {
+        let runtime_failed = |e: std::io::Error| ClientError::Unreachable {
             address: address.clone(),
             error: format!("starting the client's runtime: {e}"),
-        })?;
+        };
+        let calls = Lane::new(Bridge::caller_driven().map_err(runtime_failed)?);
+        let listen = Lane::new(Bridge::new("agentfs-grpc", 1).map_err(runtime_failed)?);
         let client = Self {
             address,
             config,
             volume: volume.to_owned(),
             branch: branch.to_owned(),
             front,
-            conn: tokio::sync::Mutex::new(None),
+            calls,
+            listen,
             next_conn: AtomicU64::new(1),
             down: AtomicBool::new(false),
             features: Mutex::new(Vec::new()),
             events,
             telemetry,
-            bridge,
         };
         let deadline = Instant::now() + client.config.connect_wait;
         loop {
-            let opened = client.bridge.block_on(async {
+            let opened = client.calls.bridge.block_on(async {
                 let deadline = tokio::time::Instant::now() + client.timeout();
-                client.connection_until(deadline, None).await
+                client.connection_until(&client.calls, deadline, None).await
             });
             match opened {
                 Ok(_) => return Ok(client),
@@ -369,7 +394,7 @@ impl HistoryClient {
     /// round-trip time. A service that is not serving is unreachable.
     pub fn ping(&self) -> Result<Duration, ClientError> {
         let start = Instant::now();
-        let result = self.bridge.block_on(self.unary(
+        let result = self.calls.bridge.block_on(self.unary(
             |wire, request| async move {
                 HealthClient::with_origin(wire, origin())
                     .check(request)
@@ -403,7 +428,7 @@ impl HistoryClient {
         let deadline = tokio::time::Instant::now() + self.timeout();
         let mut stale = None;
         loop {
-            let conn = self.connection_until(deadline, stale).await?;
+            let conn = self.connection_until(&self.listen, deadline, stale).await?;
             let (answers, outbound) = tokio::sync::mpsc::channel(ANSWERS);
             let mut grpc = self.grpc(&conn);
             // No grpc-timeout: the stream lasts as long as the front.
@@ -426,7 +451,7 @@ impl HistoryClient {
 
     /// The runtime the listener drives its stream on.
     pub(super) fn bridge(&self) -> &Bridge {
-        &self.bridge
+        &self.listen.bridge
     }
 
     /// One request and its reply, with outage alarms and telemetry.
@@ -443,6 +468,7 @@ impl HistoryClient {
     {
         let start = Instant::now();
         let result = self
+            .calls
             .bridge
             .block_on(self.unary(|wire, request| rpc(self.grpc_on(wire), request), request));
         self.observe(name, start, result)
@@ -489,9 +515,14 @@ impl HistoryClient {
         Fut: Future<Output = Result<tonic::Response<Rep>, Status>>,
     {
         let deadline = tokio::time::Instant::now() + self.timeout();
+        // The calls connection is not polled between calls: let it take in
+        // what arrived meanwhile (a close, a GOAWAY) before a request is
+        // handed to it, so a connection the service closed hands the
+        // request back unsent rather than losing it.
+        tokio::task::yield_now().await;
         let mut stale = None;
         loop {
-            let conn = self.connection_until(deadline, stale).await?;
+            let conn = self.connection_until(&self.calls, deadline, stale).await?;
             let mut request = tonic::Request::new(message.clone());
             request.set_timeout(self.timeout());
             match tokio::time::timeout_at(deadline, rpc(conn.wire.clone(), request)).await {
@@ -505,34 +536,37 @@ impl HistoryClient {
         }
     }
 
-    /// The current connection, within `deadline`. Nothing is sent yet.
+    /// `lane`'s current connection, within `deadline`. Nothing is sent
+    /// yet.
     async fn connection_until(
         &self,
+        lane: &Lane,
         deadline: tokio::time::Instant,
         stale: Option<u64>,
     ) -> Result<Conn, ClientError> {
-        tokio::time::timeout_at(deadline, self.connection(stale))
+        tokio::time::timeout_at(deadline, self.connection(lane, stale))
             .await
             .unwrap_or_else(|_| Err(self.timed_out(false)))
     }
 
-    /// The connection in use, or a new one if there is none or it is
+    /// `lane`'s connection in use, or a new one if there is none or it is
     /// `stale` (found closed).
-    async fn connection(&self, stale: Option<u64>) -> Result<Conn, ClientError> {
-        let mut current = self.conn.lock().await;
+    async fn connection(&self, lane: &Lane, stale: Option<u64>) -> Result<Conn, ClientError> {
+        let mut current = lane.conn.lock().await;
         if let Some(conn) = current.as_ref()
             && Some(conn.id) != stale
         {
             return Ok(conn.clone());
         }
         *current = None;
-        let conn = self.open().await?;
+        let conn = self.open(&lane.bridge).await?;
         *current = Some(conn.clone());
         Ok(conn)
     }
 
-    /// A new connection, admitted by the service's `Hello`.
-    async fn open(&self) -> Result<Conn, ClientError> {
+    /// A new connection driven by `bridge`, admitted by the service's
+    /// `Hello`.
+    async fn open(&self, bridge: &Bridge) -> Result<Conn, ClientError> {
         let unreachable = |error: String| ClientError::Unreachable {
             address: self.address.clone(),
             error,
@@ -571,7 +605,7 @@ impl HistoryClient {
             .await
             .map_err(|e| unreachable(format!("HTTP/2 handshake: {e}")))?;
         // The connection's task holds the socket, and nothing else.
-        self.bridge.handle().spawn(async move {
+        bridge.handle().spawn(async move {
             let _ = connection.await;
         });
         let conn = Conn {

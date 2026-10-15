@@ -858,9 +858,9 @@ next start or an `agentfs push`.
   queue is drained only by the next front in that slot, which commits
   each entry as the pod that made the change (files written by older
   versions name no pod: their entries are committed as the new front's).
-- The service admits at most 1024 fronts at once. Each front keeps one
-  HTTP/2 connection, which carries all its concurrent boundaries, its
-  listening stream and its health checks. A front past the limit is
+- The service admits at most 2048 front connections at once, two per
+  front: one carries all its concurrent boundaries and its health
+  checks, the other its listening stream. A front past the limit is
   refused as busy: at start it keeps trying for `--history-wait`, and a
   boundary that must reconnect fails with `EIO` and `RecordFailed`
   ("history service ... is busy"), without the

@@ -72,9 +72,9 @@ missing from these tables or a row names a module that no longer exists;
 | `telemetry.rs` | OpenTelemetry instruments and spans over the API only; the binary picks exporters (§13) |
 | `history_service/mod.rs` | One history service per volume fed by fronts (§14) |
 | `history_service/wire.rs` | The gRPC contract `agentfs.history.v2` (generated from `proto/`) and its validated conversions to agentfs types (§14) |
-| `history_service/bridge.rs` | Synchronous callers on a multi-thread tokio runtime (Tokio's bridging pattern), for the client and the server |
-| `history_service/server.rs` | The service's socket: tonic, per-connection admission by `Hello` (peer credentials, lease, identity), `grpc.health.v1`; `Recorder` calls off the runtime's workers |
-| `history_service/client.rs` | A front's one multiplexed HTTP/2 connection to the service; deadlines on every call, never resends (§3.5) |
+| `history_service/bridge.rs` | Synchronous callers on a tokio runtime (Tokio's bridging pattern): multi-thread, or current-thread driven by its callers; for the client and the server |
+| `history_service/server.rs` | The service's socket: tonic, per-connection admission by `Hello` (peer credentials, lease, identity) within a deadline, `grpc.health.v1`; `Recorder` calls off the runtime's workers |
+| `history_service/client.rs` | A front's HTTP/2 connections to the service: multiplexed calls driven by the calling threads, and the listening stream's; deadlines on every call, never resends (§3.5) |
 | `history_service/lease.rs` | A front's `flock` lease on its pending slot (§2.2, §14) |
 | `history_service/listener.rs` | A front's listening stream: answers the service's settle, open-for-writing and invalidate calls (§14.1, §15) |
 | `history_service/fronts.rs` | The service's links to listening fronts, called to serve live restores (§14.1, §15) |

@@ -12,9 +12,10 @@
 //! service can serve restores live ([`Fronts`], design §15).
 //!
 //! Fronts and service speak gRPC, `agentfs.history.v2` ([`wire`]), over
-//! the node-local Unix socket: one HTTP/2 connection per front, which
-//! starts with `Hello` and then carries its records, its questions, its
-//! listening stream and the `grpc.health.v1` probe ([`HistoryClient::ping`]).
+//! the node-local Unix socket: two HTTP/2 connections per front, each
+//! starting with `Hello`, one for its records, its questions and the
+//! `grpc.health.v1` probe ([`HistoryClient::ping`]), one for its
+//! listening stream.
 //! Nothing is ever resent: a request that may have reached the service
 //! fails ([`ClientError::maybe_journaled`]).
 

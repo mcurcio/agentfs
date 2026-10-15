@@ -2277,7 +2277,7 @@ validation, and an unknown or unspecified value is refused
   else `PERMISSION_DENIED`), the protocol version, the volume name, that
   the slot is in 1..=1023 and leased (below), and that the volume's
   identity templates (§9) render for the front's origin (each
-  `FAILED_PRECONDITION`), and that it admits fewer than 1024 connections
+  `FAILED_PRECONDITION`), and that it admits fewer than 2048 connections
   (`RESOURCE_EXHAUSTED`). It replies `Welcome {protocol_version, volume,
   branch, service_pid, features}` and binds the front to the connection:
   every later call on it is that front's, and a call before `Hello` is
@@ -2309,19 +2309,30 @@ validation, and an unknown or unspecified value is refused
 `repair_origin`, `listen`, `still_last`, `move`), so a feature added later
 needs no new protocol version.
 
-A front keeps one HTTP/2 connection to the service, opened with `Hello`;
-HTTP/2 multiplexes its concurrent boundaries, its `Tracked` and
-`StillLast` questions, its listening stream and the health probe on it.
-The service serves at most 1024 admitted connections (one per front
-process), and runs every call that touches the volume off the runtime's
-threads (`spawn_blocking`), so concurrent boundaries from all fronts
-still share the journal's group commit. Fronts and service are
-synchronous code that each own a small multi-thread tokio runtime
+A front keeps two HTTP/2 connections to the service, each opened with
+`Hello`. On the calls connection HTTP/2 multiplexes its concurrent
+boundaries, its `Tracked` and `StillLast` questions and the health probe;
+the listening stream has a connection of its own. Fronts and service are
+synchronous code that own small tokio runtimes
 (`history_service::bridge`, Tokio's documented pattern for bridging
-synchronous code): FUSE threads block on it per call. Every call carries a
-deadline (`--history-timeout`, 10 s, sent as `grpc-timeout` and also
-enforced by the front); a front waits up to `--history-wait` (30 s) for
-the service at start, then exits 1 with nothing mounted.
+synchronous code), and FUSE threads block on them per call. The calls
+connection runs on a current-thread runtime with no thread of its own:
+the calling threads drive it, so a call costs no hop to a runtime thread
+and back (in a local bench the two hops were about 40 of an 80 µs health
+round trip), and between calls nothing polls it. The listening connection
+needs a thread that is always polling, since the service's calls arrive
+unasked, so it has a one-thread runtime. The service serves at most 2048
+admitted connections (two per front process), and runs every call that
+touches the volume off the runtime's threads (`spawn_blocking`), so
+concurrent boundaries from all fronts still share the journal's group
+commit. A connection is bounded before its `Hello` too: one from a peer
+uid that may not use the service is closed at accept, at most 64 wait for
+their `Hello` at once, and one not admitted within 10 s is closed. At
+shutdown the service waits for the requests in flight, not for idle
+connections to close. Every call carries a deadline (`--history-timeout`,
+10 s, sent as `grpc-timeout` and also enforced by the front); a front
+waits up to `--history-wait` (30 s) for the service at start, then exits
+1 with nothing mounted.
 
 **The synchronous step, split** (§3.2): the front decides the path rules,
 runs every record-time check (size on disk, `maxSize`, the blob limit, the
@@ -3602,7 +3613,7 @@ runner.
 | Patch idempotency | Decided by the branch's trailers (`Agentfs-Inbox`, `Agentfs-Patch`), never by refs or a cache; refs move after the commit, so a crash anywhere re-applies nothing (§12) |
 | Queue push | Only to the patch remote, after every branch push attempt (failed ones included) and apart from it: the status ref, `applied/<n>` once the branch holds the commit, and `inbox/<n>` of every applied number deleted, leased on the oid listed; its failures never count against the branch (§11.3) |
 | LFS test server | CI uses git-lfs's `lfs-test-server` (pinned by commit, built with `go install`) behind the git server's nginx, which authenticates with separate users per host; rudolfs (no auth or verify) and giftless (JWT setup) were not used (§18) |
-| Front/service protocol (2026-10-15) | gRPC (tonic, prost; the `.proto` compiled with protox) over the volume's node-local Unix socket, same path and permissions, peer root or the service's euid checked on both ends; package `agentfs.history.v2`, protocol 2. One HTTP/2 connection per front. Its first call, `Hello`, admits the front (version, volume, slot lease, identity) and binds it to the connection. `Record` answers only once durable and is never resent; a request goes out again on a new connection only when hyper proves it never left. Every call carries a deadline (`--history-timeout`). The service calls fronts on a bidirectional `Listen` stream. `grpc.health.v1` answers liveness. Mixed versions refuse each other at `Hello`. The owner: "i dont want to invent new protocols where they might already exist"; asked whether gRPC comes (a) in this change, (b) in its own later change or (c) not at all, and whether it lands on a PR or main: "1 a, 2 main" (2026-10-15) (§14.1) |
+| Front/service protocol (2026-10-15) | gRPC (tonic, prost; the `.proto` compiled with protox) over the volume's node-local Unix socket, same path and permissions, peer root or the service's euid checked on both ends; package `agentfs.history.v2`, protocol 2. Two HTTP/2 connections per front, calls and the listening stream (calls driven by the calling threads, measured 2026-10-15: no hop to a runtime thread). Each starts with `Hello`, which admits the front (version, volume, slot lease, identity) and binds it to the connection. `Record` answers only once durable and is never resent; a request goes out again on a new connection only when hyper proves it never left. Every call carries a deadline (`--history-timeout`). The service calls fronts on a bidirectional `Listen` stream. `grpc.health.v1` answers liveness. Mixed versions refuse each other at `Hello`. The owner: "i dont want to invent new protocols where they might already exist"; asked whether gRPC comes (a) in this change, (b) in its own later change or (c) not at all, and whether it lands on a PR or main: "1 a, 2 main" (2026-10-15) (§14.1) |
 | Split of the synchronous step | The front decides the rules, runs the record-time checks and freezes (it holds the descriptor); the service re-decides against the authoritative tracked set, checks the copies exist in the sender's slot, journals and replies. A `Tracked` query (no `fsync`) only for writes whose decision depends on tracking, so ignored files are never copied (§3.2, §14) |
 | Pending slots | The high 16 bits of a pending id; slot 0 for the single process and the service, 1..=1023 leased by fronts with an `flock` on `meta/fronts/slot-N.lock`; the service's prune spares live slots (§2.2, §14) |
 | Front failures | Service unreachable, hung (`--history-timeout`) or refusing: `EIO` at the boundary, `RecordFailed`, `HistoryServiceUnavailable` once per outage; repairs in the slot's file; a draft is never resent (§3.5, §14) |
