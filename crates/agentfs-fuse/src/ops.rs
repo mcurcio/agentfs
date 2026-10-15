@@ -884,7 +884,7 @@ impl Ops {
     /// Whether `path` in the backing tree is the inode `inode`: `None` if
     /// that cannot be told (a failure other than a missing path).
     fn leads_to(&self, path: &[u8], inode: (u64, u64)) -> Option<bool> {
-        match self.backing.open_path(path) {
+        match self.backing.open_path_fresh(path) {
             Ok(fd) => rustix::fs::fstat(&fd).ok().map(|st| dev_ino(&st) == inode),
             Err(e) => {
                 let missing = [Errno::ENOENT, Errno::ENOTDIR, Errno::ELOOP]
@@ -903,14 +903,47 @@ impl Ops {
     /// recorded nowhere: the front that removed it records the removal.
     fn record_paths(&self, id: u64, fd: &impl AsFd, st: &Stat) -> Vec<Vec<u8>> {
         let inode = dev_ino(st);
+        let known: Vec<Vec<u8>> = {
+            let table = self.table();
+            table.get(id).map_or_else(Vec::new, |node| {
+                node.links()
+                    .iter()
+                    .filter_map(|(p, n)| Some(join(&table.path(*p)?, n)))
+                    .collect()
+            })
+        };
         let paths = self.current_names(id, inode, None);
         if !paths.is_empty() || st.st_nlink == 0 {
             return paths;
         }
-        match self.backing.rel_of(fd) {
-            Some(rel) if self.leads_to(&rel, inode) == Some(true) => vec![rel],
-            _ => Vec::new(),
+        if let Some(rel) = self.backing.rel_of(fd)
+            && self.leads_to(&rel, inode) == Some(true)
+        {
+            return vec![rel];
         }
+        // On a shared filesystem the kernel's name for the descriptor is
+        // this client's, stale after another node's rename (design §14.2):
+        // look for the inode near where it was, from the deepest directory
+        // of a known name that still exists, as deep as that name went.
+        known
+            .iter()
+            .find_map(|path| self.find_moved(path, inode))
+            .into_iter()
+            .collect()
+    }
+
+    /// The new path of the inode last known at `path`, found beneath the
+    /// deepest of `path`'s directories that still exists.
+    fn find_moved(&self, path: &[u8], inode: (u64, u64)) -> Option<Vec<u8>> {
+        let parts: Vec<&[u8]> = path.split(|b| *b == b'/').collect();
+        let dirs = parts.len().saturating_sub(1);
+        for keep in (0..=dirs).rev() {
+            let start = parts[..keep].join(&b'/');
+            if self.backing.open_path_fresh(&start).is_ok() {
+                return self.backing.find_inode(&start, inode, dirs - keep);
+            }
+        }
+        None
     }
 
     pub fn forget(&self, id: u64, n: u64) {
