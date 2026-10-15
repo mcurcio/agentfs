@@ -106,9 +106,10 @@ head_of() { sgit rev-parse refs/heads/agentfs/demo; }
 cleanup() {
   status=$?
   if [ $status -ne 0 ]; then
-    for log in "$SVC_LOG" "$A_LOG" "$B_LOG" "$SP_LOG"; do
+    for log in "$SVC_LOG" "$A_LOG" "$B_LOG" "$SP_LOG" "$OUT_LOG"; do
       echo "---- $log"
       tail -n 60 "$log" 2>/dev/null || true
+      annotate_log "$log" 20
     done
   fi
   for pid in $A_PID $B_PID $SP_PID $SVC_PID; do
@@ -123,6 +124,10 @@ cleanup() {
   exit $status
 }
 trap cleanup EXIT
+# This script's own output, for an annotation when a command fails
+# without `fail`.
+OUT_LOG=$LOGS/e2e-multipod-$P-$T.out.log
+exec > >(tee "$OUT_LOG") 2>&1
 
 start_service() {
   echo "---- serve-history" >>"$SVC_LOG"

@@ -200,6 +200,10 @@ impl HeldLock {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(format!("{line}\n").as_bytes())?;
+        // On NFS a write stays in this client's cache until a sync or a
+        // close, and a lock file is never closed: other nodes would read
+        // an empty holder line.
+        file.sync_data()?;
         if let Some(map) = held.as_mut() {
             map.insert(self.key, line.to_owned());
         }
