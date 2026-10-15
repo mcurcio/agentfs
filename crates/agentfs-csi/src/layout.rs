@@ -8,6 +8,7 @@
 //!     state/                      the state area (design §2.2)
 //!     csi.json                    the controller's record of the volume
 //!   .nodes/<node-id>              a node plugin is registered (ControllerPublish checks)
+//!   .deleting.<handle>/           a volume DeleteVolume is removing
 //! <node-state>/                   --node-state: on the node, survives plugin restarts
 //!   run/<handle>/history.sock     the volume's history service (directory 0700)
 //!   staged/<handle>.json          a staged volume: its service runs
@@ -73,6 +74,13 @@ impl Layout {
     /// Where a retained volume's record goes after DeleteVolume.
     pub fn retained_json(&self, handle: &str) -> PathBuf {
         self.volume_dir(handle).join("csi.retained.json")
+    }
+
+    /// Where DeleteVolume (`onDelete: delete`) moves a volume before
+    /// removing its files. Handles start with an alphanumeric, so this
+    /// never names a volume.
+    pub fn deleting_dir(&self, handle: &str) -> PathBuf {
+        self.base.join(format!(".deleting.{handle}"))
     }
 
     pub fn nodes_dir(&self) -> PathBuf {

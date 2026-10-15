@@ -8,6 +8,10 @@
 //!   node or its state area is locked, and `delete` refuses while a
 //!   remote lacks commits of the branch (the history service's final
 //!   push at unstage failed): removing the directory would lose them.
+//!   `delete` renames the directory to `.deleting.<handle>` under the
+//!   state lock and removes it after releasing the lock, so that on NFS
+//!   the held lock file is never unlinked (a silly rename would keep the
+//!   directory from being removed).
 //! - ControllerPublish only records the node in `csi.json`: with
 //!   `attachRequired: true`, Kubernetes' attach/detach controller then
 //!   refuses to use a ReadWriteOnce volume from a second node
@@ -195,6 +199,10 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
         // Not one of ours, so already gone.
         return Ok(());
     }
+    // What an earlier delete of this name could not remove.
+    if let Err(e) = remove_tree(&layout.deleting_dir(handle)) {
+        eprintln!("{e}");
+    }
     let Some(record) = volume::load(layout, handle)? else {
         return Ok(());
     };
@@ -231,13 +239,28 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
                     )));
                 }
             }
-            match fs::remove_dir_all(&dir) {
+            // Under the lock, the volume goes aside in one rename (it no
+            // longer exists for any call); the files go after the lock is
+            // dropped. On NFS, unlinking the lock file this process holds
+            // open would leave a silly-rename `.nfs*` file behind, and the
+            // directory could never be removed.
+            let aside = layout.deleting_dir(handle);
+            remove_tree(&aside)?;
+            match fs::rename(&dir, &aside) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                    return Err(Error::io(format!("removing {}", dir.display()), e));
+                    return Err(Error::io(format!("moving {} aside", dir.display()), e));
                 }
                 _ => {}
             }
-            eprintln!("deleted volume {handle} ({})", dir.display());
+            drop(lock);
+            if let Err(e) = remove_tree(&aside) {
+                // The volume is gone; the next DeleteVolume of this name,
+                // or the operator, removes what is left.
+                eprintln!("deleted volume {handle}, but its files remain: {e}");
+            } else {
+                eprintln!("deleted volume {handle} ({})", dir.display());
+            }
+            return Ok(());
         }
         OnDelete::Retain => {
             let to = layout.retained_json(handle);
@@ -252,6 +275,16 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
     }
     drop(lock);
     Ok(())
+}
+
+/// Removes a directory tree, if it exists.
+fn remove_tree(dir: &std::path::Path) -> Result<(), Error> {
+    match fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            Err(Error::io(format!("removing {}", dir.display()), e))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Remotes that lack commits of the volume's branch, with how many: what

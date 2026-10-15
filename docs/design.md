@@ -2611,7 +2611,7 @@ active service over TLS (§14.1).
 | NodeStage | node plugin | starts `agentfs serve-history --standby` for the volume (with `--multi-node`, also `--listen-tls <pod IP>:0`), waits a bounded time until the volume has an active service, this node's or another's |
 | NodePublish | node plugin | starts a front, `agentfs mount --history-service state`, with the pod's identity, mounted at a private source; bind-mounts it onto the kubelet's target |
 | NodeUnpublish, NodeUnstage | node plugin | stop the front, the service (final commit, and one more push of it within `--push-grace`) |
-| DeleteVolume | controller | removes or keeps the directory (`onDelete`); `delete` refuses while a remote lacks commits of the branch |
+| DeleteVolume | controller | removes or keeps the directory (`onDelete`; `delete` renames it to `.deleting.<handle>` under the state lock and removes it after, so no held lock file is unlinked on NFS); `delete` refuses while a remote lacks commits of the branch |
 
 The node plugin spawns the `agentfs` binary for every long-running piece
 rather than linking FUSE into the gRPC server: a crashed front or service

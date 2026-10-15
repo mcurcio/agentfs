@@ -462,7 +462,11 @@ wait_for 60 sh -c "[ \"\$(git --git-dir '$REMOTE' show '$BRANCH:final.txt' 2>/de
   fail "the final commit never reached the remote"
 pass "the final commit reached the remote"
 ka delete pvc shared-rwx only-rwo --wait --timeout=180s
-wait_for 180 sh -c "! docker exec $W1 test -e $BASE/$PV" || fail "the volume directory was not removed"
+if ! wait_for 180 sh -c "! docker exec $W1 test -e $BASE/$PV && ! docker exec $W1 test -e $BASE/.deleting.$PV"; then
+  docker exec "$W1" sh -c "ls -la $BASE; find $BASE/$PV $BASE/.deleting.$PV -maxdepth 3 2>/dev/null | head -n 40"
+  kd logs deployment/agentfs-csi-controller -c agentfs-csi --tail=40
+  fail "the volume directory was not removed"
+fi
 pass "DeleteVolume removed $BASE/$PV"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$SUMMARY" >>"$GITHUB_STEP_SUMMARY"; fi

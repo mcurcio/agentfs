@@ -381,6 +381,11 @@ async fn delete_volume_retains_or_deletes() {
     drop(lock);
     c.delete_volume(delete("gone")).await.unwrap();
     assert!(!d.layout.volume_dir("gone").exists());
+    assert!(!d.layout.deleting_dir("gone").exists());
+    // Files an earlier delete left aside go at the next delete of the name.
+    fs::create_dir_all(d.layout.deleting_dir("gone").join("state")).unwrap();
+    c.delete_volume(delete("gone")).await.unwrap();
+    assert!(!d.layout.deleting_dir("gone").exists());
     d.stop().await;
 }
 

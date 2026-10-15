@@ -89,6 +89,7 @@ one directory per volume, named after the PV:
                   (csi.retained.json once deleted with onDelete: retain)
 <basePath>/.nodes/<node>   written by each node plugin at start: ControllerPublish
                            refuses nodes without one (NotFound)
+<basePath>/.deleting.<pv-name>/   a volume DeleteVolume (onDelete: delete) is removing
 ```
 
 Under `--node-state` (default `/var/lib/agentfs-csi/node`, a hostPath
@@ -294,7 +295,7 @@ See `deploy/csi/example/deployment.yaml`.
 | Call | Does | Fails with |
 |---|---|---|
 | CreateVolume | Validates the parameters and capabilities; creates `<basePath>/<pv>/{backing,state}`, initialises the state area with the profile's config included and its rules installed, writes `csi.json` (with `multi_node` for a `ReadWriteMany` or `ReadOnlyMany` claim under `--multi-node`). Idempotent for the same name, capacity and node mode | `InvalidArgument` (bad parameters, `ReadWriteMany` without `--multi-node`, `MULTI_NODE_SINGLE_WRITER`, block volumes, mount flags), `AlreadyExists` (same name, other capacity, parameters or node mode; a state area of another volume) |
-| DeleteVolume | `onDelete: delete` removes the directory, `retain` keeps it as `csi.retained.json`. An unknown volume is a success | `FailedPrecondition` while the volume is attached, or its state area's lock is held (a history service runs), or (`delete`) while a remote lacks commits of the branch (§9) |
+| DeleteVolume | `onDelete: delete` moves the directory to `<basePath>/.deleting.<handle>` under the state lock, then removes it (on NFS, unlinking the held lock file would leave a `.nfs*` file and the directory behind; what a failed removal leaves goes at the next delete of the name), `retain` keeps it as `csi.retained.json`. An unknown volume is a success | `FailedPrecondition` while the volume is attached, or its state area's lock is held (a history service runs), or (`delete`) while a remote lacks commits of the branch (§9) |
 | ControllerPublish | Records the node in `csi.json` (a multi-node volume: adds it to `published_nodes`); adopts a static PV. The node must have registered on basePath (`.nodes/<node>`), which on several nodes proves they share it | `NotFound` (unknown volume or node), `FailedPrecondition` (an RWO volume attached to another node, or attached with a multi-node mode) |
 | ControllerUnpublish | Clears the node. An unknown volume is a success | |
 | NodeStage | Reinstalls the profile's rules, starts the volume's history service (`--standby`, and with `--multi-node` `--listen-tls <pod IP>:0`), and waits up to `--stage-wait` until the volume has an active service: this node's (it recovers the journal and applies queued patches first) or another node's, while this one waits as its standby | `Unavailable` when no service is active yet (the kubelet retries; the service keeps running), `FailedPrecondition` when it exited (with its last log lines), `NotFound` for an unknown volume |
