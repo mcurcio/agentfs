@@ -9,36 +9,27 @@
 //!
 //! Every request has a timeout. Nothing is ever resent: a request that may
 //! have reached the service fails ([`ClientError::maybe_journaled`]), since
-//! resending a record could journal one frozen copy twice. With the
-//! address `state` (design §14.2), a request that cannot reach any service
-//! (nothing sent) is retried every [`CONNECT_RETRY`] within its timeout,
-//! re-reading the endpoint file each time, so a handover from one service
-//! to another is latency, not `EIO`.
-//!
-//! The service is reached over a Unix socket, whose peer must be root or
-//! this front's own uid, or over TLS, where both ends prove they hold the
-//! volume's certificate (design §14.1). Outages raise
+//! resending a record could journal one frozen copy twice. Outages raise
 //! [`Event::HistoryServiceUnavailable`] once, at the first failure after a
 //! success, and [`Event::HistoryServiceRestored`] at the next success.
 
+use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::endpoint::EndpointCache;
+use super::Address;
 use super::protocol::{
     FrameError, FrontInfo, Hello, PROTOCOL_VERSION, PathStamp, Reply, Request, read_frame,
     write_frame,
 };
-use super::transport::Stream;
-use super::{Address, TLS_BUILT};
 use crate::events::{Event, Events};
 use crate::local_socket;
 use crate::paths::RepoPath;
 use crate::pending::PendingId;
 use crate::record::Draft;
 use crate::telemetry::Telemetry;
-use crate::volume::{Recorded, Skipped, StateDir};
+use crate::volume::{Recorded, Skipped};
 
 /// How to reach the service.
 #[derive(Debug, Clone)]
@@ -49,12 +40,6 @@ pub struct ClientConfig {
     /// How long [`HistoryClient::connect`] keeps trying to reach a service
     /// that is not up yet (`--history-wait`).
     pub connect_wait: Duration,
-    /// The volume's state area: its endpoint file (for [`Address::State`])
-    /// and its certificate (for TLS).
-    pub state: StateDir,
-    /// This front's node, to tell whether the service is on it (empty:
-    /// [`crate::lockfile::node_name`]).
-    pub node: String,
 }
 
 /// The most idle connections kept for reuse.
@@ -148,11 +133,7 @@ pub struct HistoryClient {
     hello: Hello,
     branch: String,
     /// Idle connections and when each went idle.
-    idle: Mutex<Vec<(Stream, Instant)>>,
-    /// The endpoint file, for [`Address::State`].
-    endpoint: EndpointCache,
-    /// This front's node.
-    node: String,
+    idle: Mutex<Vec<(UnixStream, Instant)>>,
     down: AtomicBool,
     /// `Welcome.features` of the service, as of the last connection made.
     features: Mutex<Vec<String>>,
@@ -173,16 +154,9 @@ impl HistoryClient {
         events: Events,
         telemetry: Telemetry,
     ) -> Result<Self, ClientError> {
-        let node = if config.node.is_empty() {
-            crate::lockfile::node_name()
-        } else {
-            config.node.clone()
-        };
         let client = Self {
             address: config.address.to_string(),
             config,
-            endpoint: EndpointCache::new(),
-            node,
             hello: Hello {
                 v: PROTOCOL_VERSION,
                 volume: volume.to_owned(),
@@ -355,7 +329,7 @@ impl HistoryClient {
     }
 
     fn exchange(&self, request: &Request) -> Result<Reply, ClientError> {
-        let mut stream = self.check_out_retrying()?;
+        let mut stream = self.check_out()?;
         if let Err(e) = write_frame(&mut stream, request) {
             // A frame cut short is never journaled: the service reads it
             // whole or not at all.
@@ -396,26 +370,8 @@ impl HistoryClient {
         }
     }
 
-    /// [`HistoryClient::check_out`], retrying a service that cannot be
-    /// reached (nothing sent) within the request timeout when the address
-    /// is `state`: a handover between services (design §14.2).
-    fn check_out_retrying(&self) -> Result<Stream, ClientError> {
-        let deadline = Instant::now() + self.config.timeout;
-        loop {
-            match self.check_out() {
-                Err(ClientError::Unreachable { .. })
-                    if self.config.address == Address::State
-                        && Instant::now() + CONNECT_RETRY < deadline =>
-                {
-                    std::thread::sleep(CONNECT_RETRY);
-                }
-                other => return other,
-            }
-        }
-    }
-
     /// An idle connection the service still holds, or a new one.
-    fn check_out(&self) -> Result<Stream, ClientError> {
+    fn check_out(&self) -> Result<UnixStream, ClientError> {
         loop {
             let pooled = self
                 .idle
@@ -424,14 +380,14 @@ impl HistoryClient {
                 .pop();
             match pooled {
                 Some((_, since)) if since.elapsed() >= MAX_IDLE_AGE => continue,
-                Some((stream, _)) if stream.is_closed() => continue,
+                Some((stream, _)) if local_socket::is_closed(&stream) => continue,
                 Some((stream, _)) => return Ok(stream),
                 None => return self.open(),
             }
         }
     }
 
-    fn check_in(&self, stream: Stream) {
+    fn check_in(&self, stream: UnixStream) {
         let mut idle = self
             .idle
             .lock()
@@ -443,102 +399,38 @@ impl HistoryClient {
         }
     }
 
-    /// Where to connect now: the configured address, or for `state` what
-    /// the endpoint file says.
-    fn resolve(&self) -> Result<Address, ClientError> {
-        let unreachable = |error: String| ClientError::Unreachable {
-            address: self.address.clone(),
-            error,
-        };
-        match &self.config.address {
-            Address::State => {
-                let endpoint = self
-                    .endpoint
-                    .get(&self.config.state)
-                    .map_err(|e| unreachable(format!("reading the endpoint file: {e}")))?
-                    .ok_or_else(|| {
-                        unreachable(
-                            "no history service has written its endpoint (none is active)".into(),
-                        )
-                    })?;
-                endpoint.choose(&self.node).ok_or_else(|| {
-                    unreachable(format!(
-                        "the active service ({}) is on another node and {}",
-                        endpoint.describe(),
-                        if TLS_BUILT {
-                            "serves no TLS address"
-                        } else {
-                            "this agentfs is built without history-tls"
-                        }
-                    ))
-                })
-            }
-            other => Ok(other.clone()),
-        }
-    }
-
-    /// A connected stream to `address`, before the hello, with its peer
-    /// checked.
-    fn dial(&self, address: &Address) -> Result<Stream, ClientError> {
-        let unreachable = |error: String| ClientError::Unreachable {
-            address: self.address.clone(),
-            error,
-        };
-        match address {
-            Address::Unix(path) => {
-                let (dir, name) = address.unix_parts().ok_or_else(|| {
-                    unreachable(format!("{} is not a socket path", path.display()))
-                })?;
-                let stream = local_socket::connect(dir, name)
-                    .map_err(|e| unreachable(format!("{address}: {e}")))?;
-                // Only a service running as root or as this front's own
-                // user may acknowledge records: anyone else listening there
-                // (a squatter on a shared directory) could answer for
-                // records never journaled.
-                let euid = rustix::process::geteuid().as_raw();
-                match local_socket::peer(&stream) {
-                    Ok(peer) if local_socket::allowed(peer.uid, euid) => {}
-                    Ok(peer) => {
-                        return Err(ClientError::Refused {
-                            address: self.address.clone(),
-                            reason: format!(
-                                "the socket is served by uid {}, not root or this front's uid \
-                                 {euid}; refusing to trust it",
-                                peer.uid
-                            ),
-                        });
-                    }
-                    Err(e) => return Err(unreachable(format!("peer credentials: {e}"))),
-                }
-                Ok(Stream::Unix(stream))
-            }
-            #[cfg(feature = "history-tls")]
-            Address::Tls(addr) => {
-                let tcp = super::transport::connect_tcp(*addr, self.config.timeout)
-                    .map_err(|e| unreachable(format!("{address}: {e}")))?;
-                // The handshake proves the service holds the volume's
-                // certificate; a peer that does not is never trusted.
-                super::tls::TlsStream::connect(tcp, &self.config.state, self.config.timeout)
-                    .map(|s| Stream::Tls(Box::new(s)))
-                    .map_err(|e| unreachable(format!("{address}: TLS: {e}")))
-            }
-            #[cfg(not(feature = "history-tls"))]
-            Address::Tls(_) => Err(ClientError::Refused {
-                address: self.address.clone(),
-                reason: "this agentfs is built without history-tls (design §14.1)".into(),
-            }),
-            Address::State => Err(unreachable("the endpoint names no address".into())),
-        }
-    }
-
     /// A new connection, past the handshake.
-    pub(super) fn open(&self) -> Result<Stream, ClientError> {
+    pub(super) fn open(&self) -> Result<UnixStream, ClientError> {
         let unreachable = |error: String| ClientError::Unreachable {
             address: self.address.clone(),
             error,
         };
-        let target = self.resolve()?;
-        let mut stream = self.dial(&target)?;
+        let Address::Unix(path) = &self.config.address;
+        let (dir, name) = self
+            .config
+            .address
+            .unix_parts()
+            .ok_or_else(|| unreachable(format!("{} is not a socket path", path.display())))?;
+        let mut stream =
+            local_socket::connect(dir, name).map_err(|e| unreachable(e.to_string()))?;
+        // Only a service running as root or as this front's own user may
+        // acknowledge records: anyone else listening there (a squatter on
+        // a shared directory) could answer for records never journaled.
+        let euid = rustix::process::geteuid().as_raw();
+        match local_socket::peer(&stream) {
+            Ok(peer) if local_socket::allowed(peer.uid, euid) => {}
+            Ok(peer) => {
+                return Err(ClientError::Refused {
+                    address: self.address.clone(),
+                    reason: format!(
+                        "the socket is served by uid {}, not root or this front's uid {euid}; \
+                         refusing to trust it",
+                        peer.uid
+                    ),
+                });
+            }
+            Err(e) => return Err(unreachable(format!("peer credentials: {e}"))),
+        }
         let timeout = Some(self.config.timeout.max(Duration::from_millis(1)));
         stream
             .set_read_timeout(timeout)

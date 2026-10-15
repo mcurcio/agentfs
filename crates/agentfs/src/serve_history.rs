@@ -30,10 +30,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 
-use agentfs_core::events::Event;
-use agentfs_core::fence::LockHeartbeat;
-use agentfs_core::history_service::{Address, Endpoint, FrontLease, HistoryServer};
-use agentfs_core::lock::StateLock;
+use agentfs_core::history_service::{Address, FrontLease, HistoryServer};
 use agentfs_core::push;
 use agentfs_core::service::Service;
 use agentfs_core::volume::StateDir;
@@ -55,36 +52,15 @@ pub(crate) fn read_address(state: &StateDir) -> Option<String> {
         .filter(|a| !a.is_empty())
 }
 
-/// How `serve-history` serves.
-pub(crate) struct Options<'a> {
-    pub listen: Option<&'a str>,
-    pub listen_tls: Option<&'a str>,
-    pub heartbeat: LockHeartbeat,
-    pub fence: Duration,
-    pub push_grace: Duration,
-    pub shutdown_grace: Duration,
-}
-
-/// Exit status when the state lock is lost (`EX_TEMPFAIL`): the CSI
-/// supervisor restarts the service, as a standby.
-const EXIT_LOCK_LOST: i32 = 75;
-
 pub(crate) fn serve(
     daemon: Daemon,
     state: &StateDir,
     root: &Path,
-    lock: &StateLock,
-    options: Options<'_>,
+    listen: Option<&str>,
     pod: &Pod,
+    push_grace: Duration,
+    shutdown_grace: Duration,
 ) -> Result<ExitCode> {
-    let Options {
-        listen,
-        listen_tls,
-        heartbeat,
-        fence,
-        push_grace,
-        shutdown_grace,
-    } = options;
     let backing = root
         .canonicalize()
         .with_context(|| format!("the backing tree {}", root.display()))?;
@@ -95,49 +71,9 @@ pub(crate) fn serve(
         Some(listen) => listen.parse::<Address>()?,
         None => Address::Unix(state.history_socket()),
     };
-    if !matches!(address, Address::Unix(_)) {
-        bail!(
-            "--listen takes a Unix socket (unix:<path> or an absolute path); TLS is --listen-tls"
-        );
-    }
-    let tls = match listen_tls {
-        Some(tls) => Some(tls_address(tls)?),
-        None => None,
-    };
     let session = Session::start(state, pod)?;
     let events = session.events.clone();
-    // On a shared filesystem the lock is a lease the node can lose: renew
-    // it, and stop writing the moment it may be another node's (design
-    // §14.2). Before the volume is opened, so recovery is fenced too.
-    let _heartbeat = if heartbeat.enabled(state.root()) {
-        let events = events.clone();
-        let beat = lock
-            .start_heartbeat(fence, move |e| {
-                events.emit(Event::StateLockLost {
-                    error: e.to_string(),
-                });
-                eprintln!(
-                    "lost the state lock ({e}): exiting without a final commit; another node's \
-                     standby takes over"
-                );
-                std::process::exit(EXIT_LOCK_LOST);
-            })
-            .context("starting the state lock's heartbeat")?;
-        eprintln!(
-            "state lock heartbeat: renewing every {:?}, fencing writes after {fence:?}",
-            fence / 5
-        );
-        Some(beat)
-    } else {
-        None
-    };
     let (recorder, committer, recovery) = session.open(state, &backing, pod)?;
-    // A previous holder on another node that lost its lock may still have
-    // the journal open: from now on it can only append to a file without
-    // a name (design §14.2).
-    committer
-        .replace_journal_file()
-        .context("replacing the journal file at takeover")?;
     let commit_window = committer.history().settings().commit_window;
     // Orders fronts' records that race for one path (design §14.1).
     recorder.enable_stamps();
@@ -173,20 +109,8 @@ pub(crate) fn serve(
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
     let service = Service::start(committer, pushers, events).context("starting the service")?;
-    let mut addresses = vec![address.clone()];
-    if let Some(tls) = &tls {
-        // The volume's certificate, made once under the state lock we hold
-        // (design §14.1).
-        #[cfg(feature = "history-tls")]
-        if let Err(e) = agentfs_core::history_service::tls::ensure(state, &settings.volume) {
-            let _ = stop_service(service, push_grace);
-            session.finish();
-            return Err(e).context("creating the volume's TLS identity");
-        }
-        addresses.push(tls.clone());
-    }
     let server = match HistoryServer::start(
-        &addresses,
+        &address,
         recorder.clone(),
         state,
         &settings,
@@ -228,32 +152,10 @@ pub(crate) fn serve(
             address_file.display()
         );
     }
-    // Fronts given `state` find this service here (design §14.2).
-    let bound = server.bound();
-    let endpoint = Endpoint::new(
-        &settings.volume,
-        bound.iter().find_map(|a| match a {
-            Address::Unix(p) => Some(p.clone()),
-            _ => None,
-        }),
-        bound.iter().find_map(|a| match a {
-            Address::Tls(t) => Some(*t),
-            _ => None,
-        }),
-    );
-    if let Err(e) = endpoint.write(state) {
-        eprintln!(
-            "warning: writing the endpoint file: {e}; fronts given `--history-service state` \
-             cannot find this service"
-        );
-    }
-    let shown: Vec<String> = bound.iter().map(Address::to_string).collect();
     eprintln!(
-        "serving history for volume {} at {} on node {} ({} uncommitted record(s) recovered; \
+        "serving history for volume {} at {address} ({} uncommitted record(s) recovered; \
          remotes: {}); stop with SIGINT or SIGTERM",
         settings.volume,
-        shown.join(" and "),
-        endpoint.node,
         recovery.uncommitted,
         list(&names)
     );
@@ -264,11 +166,6 @@ pub(crate) fn serve(
          {push_grace:?} for the final push; signal again to exit now)",
         describe_wake(wake)
     );
-    // No new front finds this service; fronts given `state` wait for the
-    // next one (design §14.2).
-    if let Err(e) = endpoint.remove(state) {
-        eprintln!("warning: removing the endpoint file: {e}");
-    }
     // The control socket first: a restore in progress still calls fronts.
     // It stops before its next path and records what it wrote; that, and
     // its reply, are waited for.
@@ -291,19 +188,4 @@ pub(crate) fn serve(
     let code = stop_service(service, push_grace);
     session.finish();
     Ok(code)
-}
-
-/// `--listen-tls`: `<ip>:<port>` (or `tls:<ip>:<port>`); port 0 picks a
-/// free one, which the endpoint file then names.
-fn tls_address(value: &str) -> Result<Address> {
-    let address = match value.parse::<Address>() {
-        Ok(a @ Address::Tls(_)) => a,
-        _ => format!("tls:{value}").parse::<Address>().map_err(|_| {
-            anyhow::anyhow!("--listen-tls {value:?}: give an IP address and port, as 10.0.0.7:0")
-        })?,
-    };
-    if !agentfs_core::history_service::TLS_BUILT {
-        bail!("--listen-tls: this agentfs is built without the history-tls feature (design §14.1)");
-    }
-    Ok(address)
 }

@@ -66,12 +66,6 @@ impl Daemon {
         Ok(())
     }
 
-    /// Whether a signal arrived, without waiting: a standby waiting for
-    /// the lock stops on it (design §14.2).
-    pub fn signalled(&self) -> Option<Wake> {
-        self.rx.try_recv().ok()
-    }
-
     /// Blocks until the first wake-up, then makes any later signal exit
     /// the process at once.
     pub fn wait(self) -> Wake {

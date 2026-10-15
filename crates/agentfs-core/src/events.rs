@@ -254,10 +254,6 @@ pub enum Event {
     /// service) are committed with the service's own committer, keeping
     /// the pod's trailers (design §9, §14). A warning, once per pod.
     IdentityFallback { replica: String, error: String },
-    /// The history service could not renew its state lock (design
-    /// §14.2): on a shared filesystem another node may hold it now. The
-    /// service stops writing and exits; a standby takes over.
-    StateLockLost { error: String },
 }
 
 impl Event {
@@ -292,7 +288,6 @@ impl Event {
             Self::HistoryServiceUnavailable { .. } => "history_service_unavailable",
             Self::HistoryServiceRestored { .. } => "history_service_restored",
             Self::IdentityFallback { .. } => "identity_fallback",
-            Self::StateLockLost { .. } => "state_lock_lost",
         }
     }
 }
@@ -435,11 +430,6 @@ impl fmt::Display for Event {
                 f,
                 "the committer of front {replica} no longer renders ({error}); its records are \
                  committed with the history service's own committer"
-            ),
-            Self::StateLockLost { error } => write!(
-                f,
-                "lost the state lock ({error}); another node may hold it: this history service \
-                 stops writing and exits, and a standby takes over"
             ),
         }
     }

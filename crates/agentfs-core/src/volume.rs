@@ -536,8 +536,6 @@ pub fn open(
         telemetry: telemetry.clone(),
         reclaim: Arc::default(),
         stamps: Arc::default(),
-        tree_dev: tree_dev(tree),
-        shared_tree: crate::fence::is_network_fs(tree),
         last_writes: Arc::default(),
         duties: duties.clone(),
     };
@@ -597,8 +595,6 @@ pub fn open_front(
         telemetry: telemetry.clone(),
         reclaim: Arc::default(),
         stamps: Arc::default(),
-        tree_dev: tree_dev(tree),
-        shared_tree: crate::fence::is_network_fs(tree),
         last_writes: Arc::default(),
         duties: Arc::default(),
     })
@@ -718,15 +714,6 @@ pub struct Recorder {
     /// The last journaled freeze stamp of each path, in the history
     /// service ([`Recorder::enable_stamps`], design §14.1).
     stamps: Arc<std::sync::OnceLock<StampBook>>,
-    /// The device of the backing tree's root, as this process sees it:
-    /// where this process journals, its freeze stamps of that device are
-    /// normalised to [`crate::stamps::TREE_DEV`] (design §14.1).
-    tree_dev: Option<u64>,
-    /// The tree is on a shared filesystem (design §14.2): a write's freeze
-    /// stamp is taken after flushing the file to the server, as the server
-    /// has it, so stamps of two nodes' writes compare by the server's
-    /// change times.
-    shared_tree: bool,
     /// The frozen copy of the last write journaled at each recently
     /// written path, where this process journals (design §3.1).
     last_writes: Arc<LastWrites>,
@@ -1143,11 +1130,7 @@ impl Recorder {
         // copy's, which is what is journaled.
         let attrs = self.rules.attributes(&path)?;
         let meta = std::fs::metadata(backing).ok();
-        let stamp = if self.shared_tree {
-            server_stamp(backing).map(|s| self.own_stamp_of(s))
-        } else {
-            meta.as_ref().map(|m| self.own_stamp(m))
-        };
+        let stamp = meta.as_ref().map(FreezeStamp::from_metadata);
         let on_disk = meta.map_or(0, |m| m.len());
         // `agentfs.maxSize` the same way: on disk, then frozen.
         let max_size = self.rules.max_size(&path);
@@ -1334,7 +1317,7 @@ impl Recorder {
                     match in_backing(tree, path, false) {
                         None => Decision::Skip(SkipReason::Gone),
                         Some(now) => {
-                            let now = now.map(|stamp| stamp.normalised(self.tree_dev));
+                            let now = now.as_ref().map(FreezeStamp::from_metadata);
                             if let Some(now) = now {
                                 now_of.insert(path.clone(), now);
                             }
@@ -1499,37 +1482,6 @@ impl Recorder {
     /// [`Recorder::sequence`] skips a front's write frozen before it
     /// (design §14.1). The history service turns it on before it serves;
     /// every clone shares it.
-    /// The device of the backing tree's root as this process sees it
-    /// (design §14.1).
-    pub fn tree_dev(&self) -> Option<u64> {
-        self.tree_dev
-    }
-
-    /// The freeze stamp of `m`, a file in the tree, as this recorder
-    /// sends or journals it: a front's keeps its device (the service
-    /// normalises it with the front's `tree_dev`), and where this process
-    /// journals, the tree's device is normalised.
-    fn own_stamp(&self, m: &std::fs::Metadata) -> FreezeStamp {
-        match self.backend {
-            Backend::Local { .. } => self.journaling_stamp(m),
-            Backend::Front { .. } => FreezeStamp::from_metadata(m),
-        }
-    }
-
-    /// [`Recorder::own_stamp`] of a stamp taken already.
-    fn own_stamp_of(&self, stamp: FreezeStamp) -> FreezeStamp {
-        match self.backend {
-            Backend::Local { .. } => stamp.normalised(self.tree_dev),
-            Backend::Front { .. } => stamp,
-        }
-    }
-
-    /// The stamp of `m`, a file in the tree, normalised as where this
-    /// process journals.
-    fn journaling_stamp(&self, m: &std::fs::Metadata) -> FreezeStamp {
-        FreezeStamp::from_metadata(m).normalised(self.tree_dev)
-    }
-
     pub fn enable_stamps(&self) {
         if matches!(self.backend, Backend::Local { .. }) {
             let _ = self.stamps.set(StampBook::new());
@@ -1771,7 +1723,7 @@ impl Recorder {
                 // Changed around the move: unless its journaled state is
                 // the one it has, record it as it is.
                 if meta.is_file()
-                    && self.last_writes.stamp_of(&path) == Some(self.journaling_stamp(&meta))
+                    && self.last_writes.stamp_of(&path) == Some(FreezeStamp::from_metadata(&meta))
                 {
                     continue;
                 }
@@ -2193,13 +2145,6 @@ impl Committer {
         self.journal.backlog()
     }
 
-    /// Replaces the journal file with a new inode holding the same
-    /// records ([`Journal::replace_file`]): a history service taking over
-    /// from another node (design §14.2).
-    pub fn replace_journal_file(&self) -> io::Result<()> {
-        self.journal.replace_file()
-    }
-
     /// Commits every durable record, grouping records whose times fall
     /// within the configured commit window into one commit.
     pub fn commit_pending(&self) -> Result<CommitReport, VolumeError> {
@@ -2363,11 +2308,6 @@ impl Committer {
         records: &[Record],
         groups: &[&[Record]],
     ) -> Result<CommitReport, VolumeError> {
-        // Nothing reaches the branch from a service that may have lost its
-        // state lock to another node (design §14.2).
-        if !groups.is_empty() {
-            crate::fence::check()?;
-        }
         let mut report = CommitReport::default();
         let mut result = Ok(());
         for group in groups {
@@ -2654,120 +2594,41 @@ enum Judged {
     Resync,
 }
 
-/// The freeze stamp of the file at `path` (a `/proc/self/fd` path of the
-/// open backing file) on a shared filesystem: its dirty pages flushed to
-/// the server first, then its attributes read from the server
-/// (`AT_STATX_FORCE_SYNC`). A client's cached change time precedes the
-/// server's until its writes are flushed, so two nodes' stamps would
-/// otherwise not order their writes (design §14.2). The journal pays the
-/// same round trip at its `fsync`.
-fn server_stamp(path: &Path) -> Option<FreezeStamp> {
-    use rustix::fs::{AtFlags, StatxFlags};
-    if let Ok(file) = std::fs::File::open(path) {
-        let _ = file.sync_data();
-    }
-    let stx = rustix::fs::statx(
-        rustix::fs::CWD,
-        path,
-        AtFlags::STATX_FORCE_SYNC,
-        StatxFlags::BASIC_STATS,
-    )
-    .ok()?;
-    let ns = |t: rustix::fs::StatxTimestamp| {
-        t.tv_sec.saturating_mul(1_000_000_000) + i64::from(t.tv_nsec)
-    };
-    Some(FreezeStamp {
-        dev: rustix::fs::makedev(stx.stx_dev_major, stx.stx_dev_minor),
-        ino: stx.stx_ino,
-        size: stx.stx_size,
-        mtime_ns: ns(stx.stx_mtime),
-        ctime_ns: ns(stx.stx_ctime),
-    })
-}
-
-/// The device of the tree root at `tree`.
-fn tree_dev(tree: &Path) -> Option<u64> {
-    std::fs::metadata(tree)
-        .ok()
-        .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
-}
-
 /// Whether `path` is still in the backing tree at `tree` as a front
 /// recorded it (design §14): a regular file (or, with `symlink`, a
 /// symlink) whose every directory is a real directory. Another front
 /// that removed or renamed the path since records that itself, so a late
 /// write must not bring it back. `None`: gone. A failure other than a
-/// missing path counts as present, with no stamp (`Some(None)`); else the
-/// leaf's stamp now, with the device as this process sees it.
-///
-/// Fresh on a shared filesystem (design §14.1): each directory is opened
-/// (NFS revalidates a directory at open, close-to-open), never through a
-/// symlink, and the leaf is read with `AT_STATX_FORCE_SYNC`, so a cached
-/// entry or attribute cannot hide another node's front's change and make
-/// its write look older or gone.
-fn in_backing(tree: &Path, path: &RepoPath, symlink: bool) -> Option<Option<FreezeStamp>> {
-    use rustix::fs::{AtFlags, Mode, OFlags, StatxFlags};
-    let present_unknown = |e: rustix::io::Errno| match e {
-        rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP => None,
-        _ => Some(None),
-    };
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut dir = match rustix::fs::open(tree, flags, Mode::empty()) {
-        Ok(dir) => dir,
-        Err(e) => return present_unknown(e),
-    };
+/// missing path counts as present, with no metadata (`Some(None)`).
+fn in_backing(tree: &Path, path: &RepoPath, symlink: bool) -> Option<Option<std::fs::Metadata>> {
+    let mut at = tree.to_path_buf();
     let parts: Vec<&str> = path.as_str().split('/').collect();
-    let (leaf, dirs) = parts.split_last()?;
-    for part in dirs {
-        dir = match rustix::fs::openat(&dir, *part, flags, Mode::empty()) {
-            Ok(next) => next,
-            Err(e) => return present_unknown(e),
+    let mut last = None;
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(meta) => meta,
+            Err(e) => {
+                return match e.kind() {
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => None,
+                    _ => Some(None),
+                };
+            }
         };
-    }
-    let stx = match rustix::fs::statx(
-        &dir,
-        *leaf,
-        AtFlags::SYMLINK_NOFOLLOW | AtFlags::STATX_FORCE_SYNC,
-        StatxFlags::BASIC_STATS,
-    ) {
-        Ok(stx) => stx,
-        // No statx (old kernels, some sandboxes): a plain lstat.
-        Err(rustix::io::Errno::NOSYS) => {
-            return match std::fs::symlink_metadata(tree.join(path.as_str())) {
-                Ok(m) => {
-                    let ty = m.file_type();
-                    let ok = if symlink {
-                        ty.is_symlink()
-                    } else {
-                        ty.is_file()
-                    };
-                    ok.then(|| Some(FreezeStamp::from_metadata(&m)))
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(_) => Some(None),
-            };
+        let ty = meta.file_type();
+        let ok = if i + 1 < parts.len() {
+            ty.is_dir()
+        } else if symlink {
+            ty.is_symlink()
+        } else {
+            ty.is_file()
+        };
+        if !ok {
+            return None;
         }
-        Err(e) => return present_unknown(e),
-    };
-    let kind = u32::from(stx.stx_mode) & libc::S_IFMT;
-    let ok = if symlink {
-        kind == libc::S_IFLNK
-    } else {
-        kind == libc::S_IFREG
-    };
-    if !ok {
-        return None;
+        last = Some(meta);
     }
-    let ns = |t: rustix::fs::StatxTimestamp| {
-        t.tv_sec.saturating_mul(1_000_000_000) + i64::from(t.tv_nsec)
-    };
-    Some(Some(FreezeStamp {
-        dev: rustix::fs::makedev(stx.stx_dev_major, stx.stx_dev_minor),
-        ino: stx.stx_ino,
-        size: stx.stx_size,
-        mtime_ns: ns(stx.stx_mtime),
-        ctime_ns: ns(stx.stx_ctime),
-    }))
+    Some(last)
 }
 
 /// Splits records into runs where each record is within `window_ms` of the

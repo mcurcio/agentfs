@@ -93,18 +93,6 @@ struct Cli {
     /// The plugin pod's namespace.
     #[arg(long, env = "AGENTFS_CSI_NAMESPACE", default_value = "")]
     namespace: String,
-    /// Accept ReadWriteMany and ReadOnlyMany volumes on several nodes at
-    /// once: basePath must be one shared filesystem (NFS) on the
-    /// controller and every node, and every node's services also listen
-    /// on TLS at --pod-ip for other nodes' fronts (design §14.2). Set it
-    /// on the controller and the node plugin alike.
-    #[arg(long, env = "AGENTFS_CSI_MULTI_NODE")]
-    multi_node: bool,
-    /// The plugin pod's IP (`status.podIP`), where a multi-node volume's
-    /// history service listens on TLS; required with --multi-node in node
-    /// and all modes.
-    #[arg(long, env = "AGENTFS_POD_IP")]
-    pod_ip: Option<std::net::IpAddr>,
 }
 
 #[tokio::main]
@@ -141,7 +129,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         profiles: cli.profiles_dir.clone(),
     };
     let controller = matches!(cli.mode, Mode::Controller | Mode::All)
-        .then(|| ControllerService::with_multi_node(layout.clone(), cli.multi_node));
+        .then(|| ControllerService::new(layout.clone()));
     let supervisor = if matches!(cli.mode, Mode::Node | Mode::All) {
         let node_id = cli
             .node_id
@@ -168,15 +156,6 @@ async fn run(cli: Cli) -> Result<(), String> {
             max: cli.backoff_max,
             ..Backoff::default()
         };
-        cfg.multi_node = cli.multi_node;
-        cfg.pod_ip = cli.pod_ip;
-        if cli.multi_node && cli.pod_ip.is_none() {
-            return Err(
-                "--multi-node needs --pod-ip (or AGENTFS_POD_IP, from status.podIP) in node mode: \
-                 other nodes' fronts reach the history services there"
-                    .into(),
-            );
-        }
         let supervisor = Supervisor::new(
             cfg,
             Arc::new(AgentfsLauncher {
@@ -198,16 +177,11 @@ async fn run(cli: Cli) -> Result<(), String> {
         None
     };
     eprintln!(
-        "agentfs-csi {} serving {:?} on {} (base path {}; {})",
+        "agentfs-csi {} serving {:?} on {} (base path {})",
         env!("CARGO_PKG_VERSION"),
         cli.mode,
         socket.display(),
-        layout.base.display(),
-        if cli.multi_node {
-            "multi-node volumes accepted"
-        } else {
-            "one node per volume"
-        }
+        layout.base.display()
     );
     let result = server::serve(
         &socket,

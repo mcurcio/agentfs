@@ -40,7 +40,9 @@
 //! writes new packs before it deletes old ones, so a killed repack loses
 //! nothing (it may leave a temporary file, which the next one ignores).
 
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -225,10 +227,19 @@ fn loose_objects(git_dir: &Path) -> usize {
         .sum()
 }
 
-/// The push lock at `path`, unless another holder (in this process too)
-/// has it.
-fn try_lock(path: &Path) -> io::Result<Option<crate::lockfile::HeldLock>> {
-    crate::lockfile::HeldLock::try_exclusive(path, 0o600)
+/// The push lock at `path`, unless another holder has it.
+fn try_lock(path: &Path) -> io::Result<Option<File>> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(file)),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]

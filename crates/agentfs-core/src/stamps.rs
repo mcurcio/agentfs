@@ -63,16 +63,6 @@ pub const HORIZON: Duration = Duration::from_secs(300);
 /// How often, at most, [`StampBook::note`] drops old entries.
 const PRUNE_EVERY: Duration = Duration::from_secs(30);
 
-/// The device number every stamp of a file in the backing tree's own
-/// filesystem carries once normalised ([`FreezeStamp::normalised`]).
-///
-/// Each NFS client numbers one export with its own `st_dev`, so a front on
-/// another node stamps a file with a device the service never sees for
-/// it; inode numbers (NFS file ids) and change times (the server's clock)
-/// are the same on every client (design §14.1). Every stamp whose device is
-/// its sender's tree device is therefore compared as this one.
-pub const TREE_DEV: u64 = u64::MAX;
-
 /// A backing file's stat stamp, taken just before its content was frozen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FreezeStamp {
@@ -84,16 +74,6 @@ pub struct FreezeStamp {
 }
 
 impl FreezeStamp {
-    /// This stamp with [`TREE_DEV`] for its device if that is `tree_dev`,
-    /// the device of the tree root as its taker sees it.
-    #[must_use]
-    pub fn normalised(mut self, tree_dev: Option<u64>) -> Self {
-        if tree_dev == Some(self.dev) {
-            self.dev = TREE_DEV;
-        }
-        self
-    }
-
     pub fn from_metadata(m: &Metadata) -> Self {
         Self {
             dev: m.dev(),
@@ -405,24 +385,6 @@ impl LastInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stamps_of_two_clients_of_one_export_compare_once_normalised() {
-        // Two NFS clients see one file with their own st_dev each.
-        let mut a = stamp(7, 100, 3);
-        a.dev = 41;
-        let mut b = stamp(7, 100, 3);
-        b.dev = 52;
-        assert_ne!(a, b);
-        assert_eq!(a.normalised(Some(41)), b.normalised(Some(52)));
-        assert_eq!(a.normalised(Some(41)).dev, TREE_DEV);
-        // Another filesystem (a mount inside the tree) keeps its device.
-        assert_eq!(a.normalised(Some(52)), a);
-        assert_eq!(a.normalised(None), a);
-        // Idempotent.
-        let n = a.normalised(Some(41));
-        assert_eq!(n.normalised(Some(41)), n);
-    }
 
     fn stamp(ino: u64, ctime_ns: i64, size: u64) -> FreezeStamp {
         FreezeStamp {

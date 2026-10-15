@@ -709,7 +709,7 @@ templates' variables, the commit trailers and the telemetry resource:
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `serve-history`, `ping-history`, `restore`, `revert`, `patch apply`, `status` (accepted and ignored); `--node` also names the node in lock and lease holder lines and the endpoint file (design §2.3, §14.2) |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `serve-history`, `restore`, `revert`, `patch apply`, `status` (accepted and ignored) |
 
 **Command flags:**
 
@@ -727,16 +727,10 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--workload-mount PATH[=DIR]` (repeatable) | `AGENTFS_WORKLOAD_MOUNTS` (comma-separated) | the mount point, and its bind mounts | `mount`: where a workload sees the mount when not at the mount point (a container's `mountPath`; `=DIR` when it sees the tree's directory `DIR`, a `subPath`), so absolute `gitdir:` targets that `git worktree add` writes map exactly to nested repositories (design §5); a front sends them to its history service |
 | `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it |
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
-| `--listen-tls IP:PORT` | `AGENTFS_HISTORY_LISTEN_TLS` | none | `serve-history`: also serve fronts on other nodes over TLS 1.3 at IP:PORT (port 0: a free one, named in the endpoint file), both ends pinned to the volume's certificate in `meta/history/tls/identity.pem`, made at first use; needs the `history-tls` feature (design §14.1) |
-| `--standby` | `AGENTFS_HISTORY_STANDBY` | off | `serve-history`: wait without limit for the state lock instead of exiting 75 (polling every 50 ms for 5 s, then every second), doing nothing meanwhile, and serve once it is free; SIGINT or SIGTERM stop the wait (design §14.2) |
-| `--lock-heartbeat MODE` | `AGENTFS_LOCK_HEARTBEAT` | `auto` | `serve-history`: renew the state lock every `--lock-fence`/5 and refuse journal writes and commits once the last renewal is older than `--lock-fence`; a failed renewal raises `StateLockLost` and exits 75. `auto`: on when the state area is on a network filesystem (NFS, SMB, Ceph, 9p, AFS, Lustre, GFS2, OCFS2, FUSE); `on`; `off` (design §14.2) |
-| `--lock-fence DURATION` | `AGENTFS_LOCK_FENCE` | `10s` | `serve-history` with the heartbeat: how old the last lock renewal may be before writes stop; the NFS server's lease time must be at least twice it |
 | `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
-| `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR: `unix:<path>` (or an absolute path), `tls:<ip>:<port>` (`history-tls`), or `state`, the active service its endpoint file names (its socket on its node, TLS from others), found again at each connection; with `state` a boundary that reaches no service (nothing sent) retries within `--history-timeout` (design §14.2) |
+| `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR |
 | `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `mount`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
 | `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | `mount`, `record` with `--history-service`: how long to wait for the service at start |
-| `--count N` | | `1000` | `ping-history`: how many round trips to time |
-| `--address ADDR` | | `state` | `ping-history`: the service's address, as `--history-service` takes it |
 | `--history-slot N` | `AGENTFS_HISTORY_SLOT` | the lowest free slot | `mount`, `record` with `--history-service`: lease pending slot N (1 to 1023) when it is free, else the lowest free slot; a front restarted after a crash passes its predecessor's slot to drain that slot's repairs |
 | `--allow-stale` | | | `probe`: exit 0 for a stale agentfs mount too |
 | `--remote NAME` (repeatable) | | every remote | `push`: push only these remotes; `lfs fetch`: fetch only from these (in name order) |
@@ -801,10 +795,8 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_SEAL_MOUNTPOINT` | `--seal-mountpoint` | `mount` |
 | `AGENTFS_WORKLOAD_MOUNTS` | `--workload-mount` | `mount` |
 | `AGENTFS_HISTORY_LISTEN` | `--listen` | `serve-history` |
-| `AGENTFS_HISTORY_LISTEN_TLS` | `--listen-tls` | `serve-history` |
-| `AGENTFS_HISTORY_STANDBY`, `AGENTFS_LOCK_HEARTBEAT`, `AGENTFS_LOCK_FENCE` | `--standby`, `--lock-heartbeat`, `--lock-fence` | `serve-history` |
 | `AGENTFS_HISTORY_SERVICE`, `AGENTFS_HISTORY_TIMEOUT`, `AGENTFS_HISTORY_WAIT`, `AGENTFS_HISTORY_SLOT` | `--history-service`, `--history-timeout`, `--history-wait`, `--history-slot` | `mount`, `record` |
-| `AGENTFS_CSI_MODE`, `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE`, `AGENTFS_CSI_MULTI_NODE`, `AGENTFS_POD_IP` | `--mode`, `--endpoint`, `--node-id`, `--pod`, `--namespace`, `--multi-node`, `--pod-ip` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
+| `AGENTFS_CSI_MODE`, `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | `--mode`, `--endpoint`, `--node-id`, `--pod`, `--namespace` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
 
 **Test builds only.** `AGENTFS_FAILPOINTS` sets failpoints on the durable
 path (`name=kill|error|panic|sleep(ms)[@n]`, joined with `;`; design §18
@@ -893,8 +885,6 @@ under `/etc/agentfs-csi/credentials/` in the driver's pods.
 | `--history-wait DURATION` | | `30s` | the fronts' `--history-wait` |
 | `--backoff-max DURATION` | | `30s` | the longest delay between restarts of a crashed service or front |
 | `--pod NAME`, `--namespace NAME` | `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | empty | the plugin pod's name and namespace, passed to the history services (their own identity in telemetry) |
-| `--multi-node` | `AGENTFS_CSI_MULTI_NODE` | off | accept ReadWriteMany and ReadOnlyMany volumes on several nodes at once (never MULTI_NODE_SINGLE_WRITER); basePath must be one shared filesystem on the controller and every node; set it on both (design §14.2) |
-| `--pod-ip IP` | `AGENTFS_POD_IP` | none; required with `--multi-node` in `node` and `all` | the plugin pod's IP (`status.podIP`), where each volume's history service listens on TLS (`--listen-tls <ip>:0`) for other nodes' fronts |
 
 The node plugin passes its `OTEL_*` variables on to every service and
 front; it removes inherited `AGENTFS_*` variables, so the per-volume and

@@ -17,6 +17,7 @@
 //! connection or answers with an error; the listener keeps retrying at the
 //! longest backoff, and that service never calls.
 
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -26,7 +27,6 @@ use super::HistoryClient;
 use super::protocol::{
     Answer, Call, FrontAnswer, FrontCall, Reply, Request, read_frame, write_frame,
 };
-use super::transport::{Handle, Stream};
 use crate::paths::RepoPath;
 
 /// The first wait before reconnecting.
@@ -92,7 +92,7 @@ pub struct ListenerHandle {
 struct Shared {
     stop: AtomicBool,
     /// The connection in use, to shut down at stop.
-    stream: Mutex<Option<Handle>>,
+    stream: Mutex<Option<UnixStream>>,
     /// Whether the service has acknowledged the current connection.
     listening: Mutex<bool>,
     changed: Condvar,
@@ -198,14 +198,14 @@ fn set_listening(shared: &Shared, value: bool) {
 }
 
 /// A new connection, turned around: the service sends calls on it now.
-fn turn_around(client: &HistoryClient, shared: &Shared) -> Option<Stream> {
+fn turn_around(client: &HistoryClient, shared: &Shared) -> Option<UnixStream> {
     let mut stream = client.open().ok()?;
     {
         let mut slot = shared.stream.lock().unwrap_or_else(PoisonError::into_inner);
         if shared.stop.load(Ordering::SeqCst) {
             return None;
         }
-        *slot = stream.handle().ok();
+        *slot = stream.try_clone().ok();
     }
     write_frame(&mut stream, &Request::Listen).ok()?;
     match read_frame::<Reply>(&mut stream).ok()? {
@@ -218,7 +218,7 @@ fn turn_around(client: &HistoryClient, shared: &Shared) -> Option<Stream> {
     Some(stream)
 }
 
-fn serve(mut stream: Stream, hooks: &dyn FrontHooks, shared: &Shared) {
+fn serve(mut stream: UnixStream, hooks: &dyn FrontHooks, shared: &Shared) {
     while !shared.stop.load(Ordering::SeqCst) {
         let Ok(FrontCall { id, call }) = read_frame::<FrontCall>(&mut stream) else {
             return;

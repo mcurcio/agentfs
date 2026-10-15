@@ -57,16 +57,6 @@ pub enum PatchCommand {
     },
 }
 
-impl PatchCommand {
-    /// The command's pod flags, if it takes them.
-    pub(crate) fn pod(&self) -> Option<&Pod> {
-        match self {
-            Self::Apply { pod, .. } => Some(pod),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Args)]
 pub struct SubmitArgs {
     /// The commit to queue (any revision); omit to build one from

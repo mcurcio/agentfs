@@ -21,13 +21,14 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::lease::FrontLease;
 use super::protocol::{Answer, Call, FrontAnswer, FrontCall, FrontInfo, read_frame, write_frame};
-use super::transport::{Handle, Stream};
+use crate::local_socket;
 use crate::paths::RepoPath;
 use crate::volume::StateDir;
 
@@ -41,9 +42,9 @@ const PATHS_PER_CALL: usize = 4096;
 /// One listening front.
 struct Link {
     front: FrontInfo,
-    stream: Mutex<Stream>,
+    stream: Mutex<UnixStream>,
     /// The same connection, to shut down while a call is in flight.
-    handle: Option<Handle>,
+    handle: Option<UnixStream>,
 }
 
 /// The service's listening fronts. Cheap to clone.
@@ -108,12 +109,12 @@ impl Fronts {
 
     /// Takes `stream`, a connection `front` turned around, as its link,
     /// replacing any older link of its slot.
-    pub(crate) fn add(&self, front: FrontInfo, stream: Stream) {
+    pub(crate) fn add(&self, front: FrontInfo, stream: UnixStream) {
         let _ = stream.set_read_timeout(Some(self.inner.timeout));
         let _ = stream.set_write_timeout(Some(self.inner.timeout));
         let link = Arc::new(Link {
             front,
-            handle: stream.handle().ok(),
+            handle: stream.try_clone().ok(),
             stream: Mutex::new(stream),
         });
         let old = self.links().insert(link.front.slot, link.clone());
@@ -147,8 +148,8 @@ impl Fronts {
             let live = FrontLease::live(&self.inner.state)?;
             links.retain(|slot, link| {
                 // A front that died, or stopped listening, closed its end.
-                let keep =
-                    live.contains(slot) && !link.handle.as_ref().is_none_or(Handle::is_closed);
+                let keep = live.contains(slot)
+                    && !link.handle.as_ref().is_none_or(local_socket::is_closed);
                 if !keep {
                     shut(link);
                 }

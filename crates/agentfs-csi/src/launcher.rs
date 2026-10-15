@@ -212,20 +212,9 @@ fn secs(d: Duration) -> OsString {
     os(format!("{}ms", d.as_millis()))
 }
 
-/// The plugin pod's IP (`--pod-ip`, from the downward API): where a
-/// multi-node volume's service listens for other nodes' fronts.
-pub type PodIp = Option<std::net::IpAddr>;
-
-/// `agentfs --state S --root B serve-history --listen unix:<socket>
-/// --standby ...`, and with `tls` (the plugin's `--multi-node` and
-/// `--pod-ip`) `--listen-tls <ip>:0` (design §14.2).
-pub fn service_spec(
-    layout: &Layout,
-    handle: &str,
-    plugin: &PluginIdentity,
-    tls: PodIp,
-) -> ProcessSpec {
-    let mut args = vec![
+/// `agentfs --state S --root B serve-history --listen unix:<socket> ...`
+pub fn service_spec(layout: &Layout, handle: &str, plugin: &PluginIdentity) -> ProcessSpec {
+    let args = vec![
         os("--state"),
         layout.state(handle).into_os_string(),
         os("--root"),
@@ -243,16 +232,7 @@ pub fn service_spec(
         os("10s"),
         os("--push-grace"),
         os("5s"),
-        // Another node's service may hold the lock: wait to take over
-        // (one code path for one node or several).
-        os("--standby"),
     ];
-    if let Some(ip) = tls {
-        args.extend([
-            os("--listen-tls"),
-            os(std::net::SocketAddr::new(ip, 0).to_string()),
-        ]);
-    }
     ProcessSpec {
         label: format!("service {handle}"),
         args,
@@ -266,10 +246,8 @@ pub fn anonymous_replica(key: &str) -> String {
     format!("publish-{key}")
 }
 
-/// `agentfs --state S mount --history-service state ... B <source>`, with
-/// a `--workload-mount` for each of `workload_mounts` (design §5). The
-/// front finds the volume's active service through its endpoint file: the
-/// socket on this node, TLS on another (design §14.2).
+/// `agentfs --state S mount --history-service unix:<socket> ... B <source>`,
+/// with a `--workload-mount` for each of `workload_mounts` (design §5).
 #[allow(clippy::too_many_arguments)]
 pub fn front_spec(
     layout: &Layout,
@@ -286,7 +264,7 @@ pub fn front_spec(
         layout.state(handle).into_os_string(),
         os("mount"),
         os("--history-service"),
-        os("state"),
+        os(format!("unix:{}", layout.socket(handle).display())),
     ];
     if let Some(slot) = slot {
         args.extend([os("--history-slot"), os(slot.to_string())]);
@@ -363,21 +341,13 @@ mod tests {
             pod: "agentfs-csi-node-x".into(),
             node: "n1".into(),
         };
-        let spec = service_spec(&layout(), "v", &plugin, None);
+        let spec = service_spec(&layout(), "v", &plugin);
         assert_eq!(spec.label, "service v");
         assert_eq!(
             strings(&spec).join(" "),
             "--state /b/v/state --root /b/v/backing serve-history --listen \
              unix:/n/run/v/history.sock --namespace agentfs-csi --pod agentfs-csi-node-x \
-             --node n1 --shutdown-grace 10s --push-grace 5s --standby"
-        );
-        let spec = service_spec(&layout(), "v", &plugin, Some("10.1.2.3".parse().unwrap()));
-        assert!(
-            strings(&spec)
-                .join(" ")
-                .ends_with("--standby --listen-tls 10.1.2.3:0"),
-            "{:?}",
-            strings(&spec)
+             --node n1 --shutdown-grace 10s --push-grace 5s"
         );
     }
 
@@ -407,7 +377,7 @@ mod tests {
         assert_eq!(spec.label, "front ns/web-0 k");
         assert_eq!(
             strings(&spec).join(" "),
-            "--state /b/v/state mount --history-service state \
+            "--state /b/v/state mount --history-service unix:/n/run/v/history.sock \
              --history-slot 3 --history-wait 30000ms --threads 4 --passthrough auto \
              --namespace ns --pod web-0 --pod-uid u-1 --node n1 --replica web-0 /b/v/backing \
              /m/v/k"

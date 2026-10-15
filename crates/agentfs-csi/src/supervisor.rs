@@ -3,13 +3,11 @@
 //! front per published target, and their recovery.
 //!
 //! - **Stage** initialises the state area under its lock (static PVs are
-//!   created here too; skipped when another node's service already holds
-//!   it), installs the profile's rules, records the volume in
-//!   `<node-state>/staged/`, starts the service (`--standby`) on a
-//!   node-local socket, with `--multi-node` also on TLS at the pod IP,
-//!   and waits until the volume has an active service, this node's or
-//!   another's (at most `stage_wait`; then `UNAVAILABLE`, and the kubelet
-//!   retries while the service recovers its journal or fetches patches).
+//!   created here too), installs the profile's rules, records the volume
+//!   in `<node-state>/staged/`, starts the service on a node-local socket
+//!   and waits for it to write its address (at most `stage_wait`; then
+//!   `UNAVAILABLE`, and the kubelet retries while the service recovers its
+//!   journal or fetches patches).
 //! - **Publish** starts a front that FUSE-mounts the backing tree at its
 //!   own source directory, waits until that mount is live, bind-mounts it
 //!   onto the kubelet's target and records the target in
@@ -53,8 +51,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use agentfs_core::history_service::{Endpoint, FrontLease};
-use agentfs_core::lockfile;
+use agentfs_core::history_service::FrontLease;
 use agentfs_core::volume::{self as core_volume, StateDir};
 use agentfs_fuse::MountState;
 use rustix::process::Signal;
@@ -111,12 +108,6 @@ pub struct NodeConfig {
     pub backoff: Backoff,
     /// How often readiness is checked.
     pub poll: Duration,
-    /// `--multi-node`: multi-node access modes are accepted, and each
-    /// service also listens on TLS at `pod_ip` for other nodes' fronts
-    /// (design §14.2).
-    pub multi_node: bool,
-    /// The plugin pod's IP (`--pod-ip`), where services listen on TLS.
-    pub pod_ip: Option<std::net::IpAddr>,
 }
 
 impl NodeConfig {
@@ -137,8 +128,6 @@ impl NodeConfig {
             unstage_grace: Duration::from_secs(30),
             backoff: Backoff::default(),
             poll: Duration::from_millis(100),
-            multi_node: false,
-            pod_ip: None,
         }
     }
 }
@@ -374,12 +363,9 @@ impl Supervisor {
             .mode(0o700)
             .create(&run)
             .map_err(io_error(format!("creating {}", run.display())))?;
-        let tls = if self.cfg.multi_node {
-            self.cfg.pod_ip
-        } else {
-            None
-        };
-        let spec = launcher::service_spec(layout, handle, &self.cfg.plugin, tls);
+        let address = address_file(layout, handle);
+        records::remove(&address).map_err(io_error(format!("removing {}", address.display())))?;
+        let spec = launcher::service_spec(layout, handle, &self.cfg.plugin);
         let spawned = self
             .launcher
             .spawn(spec)
@@ -408,12 +394,11 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Waits until the volume has an active service: this node's, or with
-    /// several nodes another node's, while this node's waits as a standby
-    /// (design §14.2). Called without the volume's lock; takes it only to
-    /// give up on a service that exited.
+    /// Waits until the service has written its address. Called without the
+    /// volume's lock; takes it only to give up on a service that exited.
     async fn wait_service(&self, handle: &str) -> Result<(), Error> {
-        let state = StateDir::new(self.layout().state(handle));
+        let expected = format!("unix:{}", self.layout().socket(handle).display());
+        let address = address_file(self.layout(), handle);
         let deadline = Instant::now() + self.cfg.stage_wait;
         loop {
             let exited = {
@@ -431,11 +416,8 @@ impl Supervisor {
             };
             match exited {
                 None => {
-                    let probe = state.clone();
-                    let active = tokio::task::spawn_blocking(move || active_service(&probe))
-                        .await
-                        .unwrap_or(false);
-                    if active {
+                    let found = fs::read_to_string(&address).unwrap_or_default();
+                    if found.trim() == expected {
                         // It listens: from now on a crash is restarted.
                         if let Some(e) = self.children().services.get_mut(handle) {
                             e.child.starting = false;
@@ -876,8 +858,7 @@ impl Supervisor {
             )
         };
         let state = StateDir::new(self.layout().state(&handle));
-        let node = self.cfg.node_id.clone();
-        let slot = tokio::task::spawn_blocking(move || slot_of(&state, pid, &node))
+        let slot = tokio::task::spawn_blocking(move || slot_of(&state, pid))
             .await
             .ok()
             .flatten()
@@ -1246,41 +1227,20 @@ async fn futures_join<F: std::future::Future<Output = ()>>(futures: impl Iterato
     }
 }
 
-/// Whether the volume was created for several nodes.
-fn multi_node_record(layout: &Layout, handle: &str) -> bool {
-    volume::load(layout, handle)
-        .ok()
-        .flatten()
-        .is_some_and(|r| r.multi_node)
+fn address_file(layout: &Layout, handle: &str) -> PathBuf {
+    StateDir::new(layout.state(handle))
+        .history_dir()
+        .join("address")
 }
 
-/// Whether the volume has an active history service now: its endpoint
-/// file names the process holding the state lock (pid and node), so a
-/// crashed service's leftover file never counts (design §14.2).
-pub(crate) fn active_service(state: &StateDir) -> bool {
-    let Ok(Some(endpoint)) = Endpoint::read(state) else {
-        return false;
-    };
-    let Ok(Some(holder)) = agentfs_core::lock::StateLock::holder(state) else {
-        return false;
-    };
-    holder_is(&holder, endpoint.pid, &endpoint.node) && holder.contains("command=serve-history")
-}
-
-/// The slot `pid` on `node` leases, from the lease holders' lines. Pids
-/// collide across nodes sharing a volume (design §14.2), so a line naming
-/// another node is never this front's; a line without a node (an older
-/// front) matches on the pid alone.
-pub(crate) fn slot_of(state: &StateDir, pid: u32, node: &str) -> Option<u16> {
+/// The slot `pid` leases, from the lease holders' lines.
+fn slot_of(state: &StateDir, pid: u32) -> Option<u16> {
+    let prefix = format!("pid={pid} ");
     FrontLease::holders(state)
         .ok()?
         .into_iter()
-        .find(|(_, line)| holder_is(line, pid, node))
+        .find(|(_, line)| line.starts_with(&prefix))
         .map(|(slot, _)| slot)
-}
-
-fn holder_is(line: &str, pid: u32, node: &str) -> bool {
-    lockfile::holder_pid(line) == Some(pid) && lockfile::holder_node(line).is_none_or(|n| n == node)
 }
 
 fn describe(exit: Option<Exit>) -> String {
@@ -1318,34 +1278,21 @@ fn prepare(
     let params = record.params;
     let config = volume::profile_config(layout, &params.profile)?;
     let state = StateDir::new(layout.state(handle));
-    // Another node's history service may already serve the volume (a
-    // multi-node volume, design §14.2): it holds the lock, and the state
-    // area is initialised.
-    match volume::lock(&state, "agentfs-csi stage") {
-        Ok(_lock) => {
-            core_volume::init_with(
-                &state,
-                &params.volume,
-                params.branch.as_deref(),
-                Some(&[config]),
-            )
-            .map_err(|e| {
-                Error::FailedPrecondition(format!(
-                    "checking {}: {}",
-                    state.root().display(),
-                    volume::chain(&e)
-                ))
-            })?;
-        }
-        Err(Error::FailedPrecondition(_)) if active_service(&state) => {}
-        // Another node is staging it right now (its lock is held, its
-        // service not yet active): the kubelet retries.
-        Err(Error::FailedPrecondition(e)) if multi_node_record(layout, handle) => {
-            return Err(Error::Unavailable(format!(
-                "volume {handle} is being staged on another node: {e}"
-            )));
-        }
-        Err(e) => return Err(e),
+    {
+        let _lock = volume::lock(&state, "agentfs-csi stage")?;
+        core_volume::init_with(
+            &state,
+            &params.volume,
+            params.branch.as_deref(),
+            Some(&[config]),
+        )
+        .map_err(|e| {
+            Error::FailedPrecondition(format!(
+                "checking {}: {}",
+                state.root().display(),
+                volume::chain(&e)
+            ))
+        })?;
     }
     volume::install_rules(layout, handle, &params.profile)?;
     let staged = layout.staged_record(handle);
@@ -1380,16 +1327,5 @@ mod tests {
             next_backoff(Some(Duration::from_secs(30)), Duration::from_secs(61), &cfg),
             Duration::from_secs(1)
         );
-    }
-
-    #[test]
-    fn slots_match_pid_and_node() {
-        let line = "pid=42 node=node-a command=mount pod=x since=y";
-        assert!(holder_is(line, 42, "node-a"));
-        assert!(!holder_is(line, 42, "node-b"), "same pid on another node");
-        assert!(!holder_is(line, 4, "node-a"));
-        assert!(!holder_is("pid=420 node=node-a", 42, "node-a"));
-        // An older front's line, without a node.
-        assert!(holder_is("pid=42 command=mount since=y", 42, "node-b"));
     }
 }

@@ -1,16 +1,12 @@
 //! The history service's socket (design §14).
 //!
-//! One thread accepts on each address (a Unix socket on this node, and
-//! with `history-tls` a TLS address other nodes reach), and one thread
-//! serves each connection, one request at a time ([`MAX_CONNECTIONS`] at
-//! most). Concurrent records from many connections meet in the journal,
-//! whose group commit makes them durable together. A connection is served
-//! only after:
+//! One thread accepts, and one thread serves each connection, one request
+//! at a time ([`MAX_CONNECTIONS`] at most). Concurrent records from many
+//! connections meet in the journal, whose group commit makes them durable
+//! together. A connection is served only after:
 //!
-//! - on the Unix socket, its peer's `SO_PEERCRED` uid is root or the
-//!   service's own ([`local_socket::allowed`]); over TLS, the handshake
-//!   (within [`HELLO_TIMEOUT`]) proved the peer holds the volume's
-//!   certificate (design §14.1);
+//! - its peer's `SO_PEERCRED` uid is root or the service's own
+//!   ([`local_socket::allowed`]);
 //! - its [`Hello`] arrives within [`HELLO_TIMEOUT`], speaks
 //!   [`PROTOCOL_VERSION`] and names this volume;
 //! - the front holds the lease on the slot it names ([`FrontLease`]), so
@@ -24,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Shutdown;
 use std::os::fd::OwnedFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -37,7 +33,6 @@ use super::protocol::{
     FEATURES, FrontInfo, Reply, Request, WireSkip, WireSkipReason, parse_hello, read_frame,
     read_frame_bytes, write_frame,
 };
-use super::transport::{Accepted, Handle, Listener, PeerInfo, Stream};
 use crate::config::Settings;
 use crate::identity::{IdentityRenderer, Templates};
 use crate::local_socket;
@@ -82,7 +77,7 @@ struct Shared {
 
 struct Conn {
     /// A handle to shut the connection's read side at shutdown.
-    stream: Handle,
+    stream: UnixStream,
     /// The front's instance, once its hello is accepted.
     instance: Option<u64>,
 }
@@ -101,73 +96,48 @@ impl Shared {
     }
 }
 
-/// One address the service listens on.
-struct Bound {
-    address: Address,
-    /// A Unix socket's directory and name, removed at shutdown.
-    unix: Option<(OwnedFd, String)>,
-    /// A TCP listener's clone, to wake its accept loop.
-    tcp: Option<std::net::TcpListener>,
-    accept: Option<JoinHandle<()>>,
-}
-
-impl Bound {
-    fn stop_accepting(&mut self) {
-        if let Some(accept) = self.accept.take() {
-            // Wakes the accept loop, which then sees `stop`.
-            if let Some((dir, name)) = &self.unix {
-                let _ = UnixStream::connect(local_socket::socket_address(dir, name));
-            }
-            if let Some(tcp) = &self.tcp {
-                super::transport::wake_tcp(tcp);
-            }
-            let _ = accept.join();
-        }
-    }
-
-    fn remove(&self) {
-        if let Some((dir, name)) = &self.unix {
-            let _ = local_socket::unlink(dir, name);
-        }
-    }
-}
-
-/// A running history service.
+/// A running history service socket.
 pub struct HistoryServer {
-    bound: Vec<Bound>,
+    address: Address,
+    dir: OwnedFd,
+    name: String,
     shared: Arc<Shared>,
+    accept: Option<JoinHandle<()>>,
     /// Kept alive for the `agentfs.history_service.fronts` gauge.
     _gauge: Arc<dyn Fn() -> usize + Send + Sync>,
 }
 
 impl HistoryServer {
-    /// Listens at each of `addresses` and serves fronts of the volume
-    /// `recorder` records for: its local recorder, as
-    /// [`crate::volume::open`] returns it, with `settings` and `state` its
-    /// own. A Unix socket in the default directory makes it `0700`; another
-    /// directory is left as it is; the socket is `0600`. A TLS address
-    /// (`history-tls`) with port 0 gets a free port ([`HistoryServer::bound`]
-    /// says which), and authenticates with the volume's certificate, which
-    /// the caller has made sure of ([`super::tls::VolumeIdentity::ensure`]).
-    /// Fails if another service is listening at one of them.
+    /// Listens at `address` and serves fronts of the volume `recorder`
+    /// records for: its local recorder, as [`crate::volume::open`] returns
+    /// it, with `settings` and `state` its own. The default address's
+    /// directory is made `0700`; another directory is left as it is. The
+    /// socket is `0600`. Fails if another service is listening there.
     pub fn start(
-        addresses: &[Address],
+        address: &Address,
         recorder: Recorder,
         state: &StateDir,
         settings: &Settings,
         telemetry: &Telemetry,
     ) -> std::io::Result<Self> {
-        let invalid = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
+        let Some((dir, name)) = address.unix_parts() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{address} is not a socket path"),
+            ));
+        };
         if recorder.is_front() {
-            return Err(invalid("a front cannot serve history".into()));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a front cannot serve history",
+            ));
         }
-        if addresses.is_empty() {
-            return Err(invalid("no address to listen on".into()));
-        }
-        let mut listeners = Vec::new();
-        for address in addresses {
-            listeners.push(bind(address, state)?);
-        }
+        let (dir_fd, listener) = if dir == state.history_dir() {
+            local_socket::bind_private(dir, name)?
+        } else {
+            std::fs::create_dir_all(dir)?;
+            local_socket::bind(dir, name)?
+        };
         let shared = Arc::new(Shared {
             recorder,
             state: state.clone(),
@@ -187,44 +157,24 @@ impl HistoryServer {
             Arc::new(move || shared.upgrade().map_or(0, |s| s.fronts()))
         };
         telemetry.observe_fronts(Arc::downgrade(&gauge));
-        let mut bound = Vec::new();
-        for (mut b, listener) in listeners {
-            let worker = shared.clone();
-            let spawned = std::thread::Builder::new()
+        let accept = {
+            let shared = shared.clone();
+            std::thread::Builder::new()
                 .name("agentfs-history".into())
-                .spawn(move || accept_loop(&listener, &worker));
-            match spawned {
-                Ok(accept) => {
-                    b.accept = Some(accept);
-                    bound.push(b);
-                }
-                Err(e) => {
-                    let mut server = Self {
-                        bound,
-                        shared: shared.clone(),
-                        _gauge: gauge,
-                    };
-                    server.stop_accepting();
-                    b.remove();
-                    return Err(e);
-                }
-            }
-        }
+                .spawn(move || accept_loop(&listener, &shared))?
+        };
         Ok(Self {
-            bound,
+            address: address.clone(),
+            dir: dir_fd,
+            name: name.to_owned(),
             shared,
+            accept: Some(accept),
             _gauge: gauge,
         })
     }
 
-    /// The first address it listens on.
     pub fn address(&self) -> &Address {
-        &self.bound[0].address
-    }
-
-    /// Every address it listens on, a TLS address with its actual port.
-    pub fn bound(&self) -> Vec<Address> {
-        self.bound.iter().map(|b| b.address.clone()).collect()
+        &self.address
     }
 
     /// The fronts listening for the service's calls, for restores served
@@ -268,16 +218,16 @@ impl HistoryServer {
         }
         drop(conns);
         self.shared.fronts.close_all();
-        for b in &self.bound {
-            b.remove();
-        }
+        let _ = local_socket::unlink(&self.dir, &self.name);
         idle
     }
 
     fn stop_accepting(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        for b in &mut self.bound {
-            b.stop_accepting();
+        if let Some(accept) = self.accept.take() {
+            // Wakes the accept loop, which then sees `stop`.
+            let _ = UnixStream::connect(local_socket::socket_address(&self.dir, &self.name));
+            let _ = accept.join();
         }
     }
 }
@@ -286,99 +236,35 @@ impl Drop for HistoryServer {
     /// A server dropped without [`HistoryServer::shutdown`] (a test, a
     /// panic) stops at once: like a crash, except the socket is removed.
     fn drop(&mut self) {
-        if self.bound.iter().any(|b| b.accept.is_some()) {
+        if self.accept.is_some() {
             self.stop_accepting();
             for conn in self.shared.conns().values() {
                 let _ = conn.stream.shutdown(Shutdown::Both);
             }
             self.shared.fronts.close_all();
-            for b in &self.bound {
-                b.remove();
-            }
+            let _ = local_socket::unlink(&self.dir, &self.name);
         }
     }
 }
 
-/// Binds one address.
-fn bind(address: &Address, state: &StateDir) -> std::io::Result<(Bound, Listener)> {
-    match address {
-        Address::Unix(_) => {
-            let Some((dir, name)) = address.unix_parts() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{address} is not a socket path"),
-                ));
-            };
-            let (dir_fd, listener) = if dir == state.history_dir() {
-                local_socket::bind_private(dir, name)?
-            } else {
-                std::fs::create_dir_all(dir)?;
-                local_socket::bind(dir, name)?
-            };
-            Ok((
-                Bound {
-                    address: address.clone(),
-                    unix: Some((dir_fd, name.to_owned())),
-                    tcp: None,
-                    accept: None,
-                },
-                Listener::Unix(listener),
-            ))
-        }
-        #[cfg(feature = "history-tls")]
-        Address::Tls(addr) => {
-            let identity = super::tls::IdentitySource::load(state)?;
-            let listener = std::net::TcpListener::bind(addr)?;
-            let actual = listener.local_addr()?;
-            Ok((
-                Bound {
-                    address: Address::Tls(actual),
-                    unix: None,
-                    tcp: Some(listener.try_clone()?),
-                    accept: None,
-                },
-                Listener::Tls { listener, identity },
-            ))
-        }
-        #[cfg(not(feature = "history-tls"))]
-        Address::Tls(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!("{address}: this agentfs is built without history-tls (design §14.1)"),
-        )),
-        Address::State => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "a service listens on a socket or TLS address, not `state`",
-        )),
-    }
-}
-
-fn accept_loop(listener: &Listener, shared: &Arc<Shared>) {
-    loop {
-        let accepted = listener.accept();
+fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
+    for stream in listener.incoming() {
         if shared.stop.load(Ordering::SeqCst) {
             break;
         }
-        let Ok(mut accepted) = accepted else {
-            // EMFILE and the like: do not spin.
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
-        };
+        let Ok(mut stream) = stream else { continue };
         let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
         {
             let mut conns = shared.conns();
             if conns.len() >= MAX_CONNECTIONS {
                 drop(conns);
-                // A TLS connection is dropped before its handshake: the
-                // front sees it unreachable, nothing sent, and retries.
-                if let Some(stream) = accepted.as_unix() {
-                    busy(
-                        stream,
-                        format!("the history service already serves {MAX_CONNECTIONS} connections"),
-                    );
-                }
+                busy(
+                    &mut stream,
+                    format!("the history service already serves {MAX_CONNECTIONS} connections"),
+                );
                 continue;
             }
-            let Ok(handle) = accepted.handle() else {
+            let Ok(handle) = stream.try_clone() else {
                 continue;
             };
             conns.insert(
@@ -393,7 +279,7 @@ fn accept_loop(listener: &Listener, shared: &Arc<Shared>) {
         let spawned = std::thread::Builder::new()
             .name("agentfs-front".into())
             .spawn(move || {
-                serve(&worker, accepted, id);
+                serve(&worker, stream, id);
                 worker.conns().remove(&id);
                 worker.gone.notify_all();
             });
@@ -410,7 +296,7 @@ fn busy(stream: &mut UnixStream, reason: String) {
     let _ = write_frame(stream, &Reply::Busy { reason });
 }
 
-fn refuse(stream: &mut Stream, reason: String) {
+fn refuse(stream: &mut UnixStream, reason: String) {
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let _ = write_frame(stream, &Reply::Refused { reason });
 }
@@ -466,15 +352,10 @@ fn reclaim(shared: &Shared, front: &FrontInfo) {
     }
 }
 
-fn serve(shared: &Shared, accepted: Accepted, id: u64) {
-    // A TLS handshake proves the peer holds the volume's certificate; one
-    // that fails or stalls past the hello timeout is closed.
-    let Ok(mut stream) = accepted.establish(HELLO_TIMEOUT) else {
-        return;
-    };
-    match stream.peer() {
-        Ok(PeerInfo::Local(peer)) if local_socket::allowed(peer.uid, shared.euid) => {}
-        Ok(PeerInfo::Local(peer)) => {
+fn serve(shared: &Shared, mut stream: UnixStream, id: u64) {
+    match local_socket::peer(&stream) {
+        Ok(peer) if local_socket::allowed(peer.uid, shared.euid) => {}
+        Ok(peer) => {
             return refuse(
                 &mut stream,
                 format!(
@@ -483,7 +364,6 @@ fn serve(shared: &Shared, accepted: Accepted, id: u64) {
                 ),
             );
         }
-        Ok(PeerInfo::Remote(_)) => {}
         Err(e) => return refuse(&mut stream, format!("peer credentials: {e}")),
     }
     let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT));
@@ -528,15 +408,8 @@ fn serve(shared: &Shared, accepted: Accepted, id: u64) {
             Request::Tracked { paths } => Reply::Tracked {
                 tracked: shared.recorder.tracked_query(&paths),
             },
-            Request::Record { draft, mut stamps } => {
+            Request::Record { draft, stamps } => {
                 let origin = record_origin(shared, &front, &draft);
-                // One filesystem, numbered by each client (NFS): compared
-                // as the tree's (design §14.1). An older front, without
-                // `tree_dev`, is on this node and numbers it as we do.
-                let tree_dev = front.tree_dev.or(shared.recorder.tree_dev());
-                for s in &mut stamps {
-                    s.stamp = s.stamp.normalised(tree_dev);
-                }
                 match shared
                     .recorder
                     .sequence(&origin, front.slot, *draft, &stamps)

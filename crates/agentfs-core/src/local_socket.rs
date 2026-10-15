@@ -139,7 +139,7 @@ pub fn peer(stream: &UnixStream) -> io::Result<Peer> {
 /// blocking or consuming anything: a pooled connection to a server that
 /// has since restarted is dead and must not carry a request. A connection
 /// with unread data is not idle and also counts as unusable.
-pub fn is_closed(stream: &impl AsRawFd) -> bool {
+pub fn is_closed(stream: &UnixStream) -> bool {
     let mut byte = 0u8;
     // SAFETY: `byte` is a valid, writable buffer of 1 byte; the descriptor
     // is open for the call.

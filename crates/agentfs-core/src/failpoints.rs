@@ -69,8 +69,6 @@ pub const POINTS: &[&str] = &[
     "patch.after_commit",
     "queue.after_status",
     "repack.running",
-    // The history service's state lock across nodes (design §14.2).
-    "lock.heartbeat",
 ];
 
 /// Passes failpoint `name`: `Ok(())` unless a test build was told to act
