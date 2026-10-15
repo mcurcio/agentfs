@@ -7,9 +7,9 @@
 # 12. lfs.concurrenttransfers: downloads overlap with 4, never with 1;
 #     many objects uploaded at once all reach the server, and git-lfs
 #     pulls them back.
-# 13. uploads resume by object: one object's PUT fails, the others reach
-#     the server and the branch does not move; the next push sends only
-#     that object;
+# 13. uploads resume by object: one object's PUT fails and the branch
+#     does not move; objects in flight finish, none starts after the
+#     failure; the next push sends exactly the objects still missing;
 # 14. downloads resume by byte: a download killed halfway leaves a partial
 #     in <state>/lfs/incomplete/, and the next one asks for the rest with
 #     Range (lfs-test-server answers 206).
@@ -165,16 +165,30 @@ assert_eq 1 "$code" "the push fails"
 assert_contains "$out" "sep: failed (unreachable, stage lfs)" "a 503 for one object is unreachable at stage lfs"
 assert_eq "" "$(remote_ref "$REPO" refs/heads/agentfs/resume)" "the branch was not pushed"
 on_lfs_host "$FAILING" && fail "the failing object reached the server"
+# An upload stops starting objects at its first failure and lets those in
+# flight finish (design §7): which of the other four started before the
+# 503 depends on thread timing, so count them, then check the next push
+# sends exactly the objects still missing.
+ON_SERVER=()
+MISSING=("$FAILING")
 for i in 1 2 4 5; do
-  on_lfs_host "$(oid_of "r/$i.bin")" || fail "r/$i.bin did not reach the server"
+  oid=$(oid_of "r/$i.bin")
+  if on_lfs_host "$oid"; then ON_SERVER+=("$oid"); else MISSING+=("$oid"); fi
 done
-pass "the other four objects are on the server"
+echo "after the failed push: ${#ON_SERVER[@]} of the other four objects are on the server"
 lfs_faults ""
 before=$(log_lines)
 agentfs push --remote sep
 puts=$(log_since "$before" | awk '$2 == 8081 && $4 == "\"PUT"')
-assert_eq 1 "$(grep -c . <<<"$puts")" "the next push uploads one object"
-assert_contains "$puts" "$FAILING" "the one that failed"
+assert_eq "${#MISSING[@]}" "$(grep -c . <<<"$puts")" "the next push uploads only the ${#MISSING[@]} missing object(s)"
+assert_contains "$puts" "$FAILING" "including the one that failed"
+for oid in "${ON_SERVER[@]}"; do
+  grep -q "$oid" <<<"$puts" && fail "object $oid was uploaded again"
+done
+pass "no object already on the server was sent again"
+for i in 1 2 3 4 5; do
+  on_lfs_host "$(oid_of "r/$i.bin")" || fail "r/$i.bin is not on the server"
+done
 assert_eq "$(local_head resume)" "$(remote_ref "$REPO" refs/heads/agentfs/resume)" "the branch is pushed"
 
 step "14. downloads resume by byte"
