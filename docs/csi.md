@@ -139,6 +139,9 @@ kubectl apply -k deploy/csi
 kubectl apply -k deploy/csi/example
 ```
 
+With Helm instead: `charts/agentfs-csi`, published at
+`oci://ghcr.io/mcurcio/charts/agentfs-csi` ([helm.md](helm.md)).
+
 `deploy/csi` installs only the driver; `deploy/csi/example` is a
 workload. Pin the agentfs image to a commit tag or digest in production
 (the kustomization's `images`).
