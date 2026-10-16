@@ -572,7 +572,8 @@ declare a node lost while it may still run.
   unpushed history, and every multi-node access mode refused with the
   decision at every call that takes a capability
   (`crates/agentfs-csi/tests/grpc.rs`); a `csi.json` with unknown fields
-  refused (`records.rs`); the supervisor
+  refused, and one written by the multi-node build refused for use but
+  detached and deleted (`records.rs`, `volume.rs`, `controller.rs`); the supervisor
   with a fake launcher and mounter: staging, publishing, restarts with
   backoff in the same slot, restarts whose spawn fails and are tried
   again, bind stacking, reconcile after a restart (also when a service
@@ -595,12 +596,17 @@ declare a node lost while it may still run.
 - **NFS** (`ci/e2e-nfs.sh`, the `e2e-nfs` job, passthrough `auto` and
   `off`): a kernel NFS server on the runner and two NFSv4.2 clients of
   one export, the second in network and UTS namespaces of its own. The
-  state lock and its holder line across the clients; NFS 4.0 and
-  `local_lock=flock` mounts refused by `serve-history` and by
-  `agentfs-csi` at start (the `local_lock` half is NOT RUN where the
-  runner's kernel reports `local_lock=none`); mmap and SQLite through a
-  front on the NFS tree; silly renames never reaching history; and
-  DeleteVolume on a base path on the export.
-- **Not tested**: a volume moving between two nodes of a cluster, other
+  state lock and its holder line across the clients; an NFS 4.0 mount
+  refused by `serve-history` and by `agentfs-csi` at start; mmap and
+  SQLite through a front on the NFS tree; silly renames never reaching
+  history; DeleteVolume on a base path on the export; and a volume
+  moving between two node plugins, one per client, over gRPC without
+  Kubernetes: NodeStage on the second is refused while the first has
+  it staged, then the volume moves and both nodes' commits reach its
+  history. The `local_lock` and `nolock` refusals cannot fire on Linux,
+  which drops both options on every NFSv4 mount
+  (`nfs_fs_context_validate`) while NFSv3 is refused by version first;
+  only unit tests cover them.
+- **Not tested**: a volume moving between two nodes of a Kubernetes cluster, other
   shared filesystems, Talos and other hardened node images, node
   reboots, and the lost-node runbook.
