@@ -2,9 +2,13 @@
 //! `csi.json` per volume, and each node's staged and published records,
 //! from which a restarted node plugin reconciles. Written atomically
 //! (mode 0600) with [`agentfs_core::fsutil::write_json_atomic`]. A field
-//! this driver does not know fails the load: a record written for a
-//! behaviour it lacks (a multi-node volume) is refused, never half-read.
+//! this driver does not know fails the load, so a record written for a
+//! behaviour it lacks is refused, never half-read. One exception: the two
+//! fields of a `csi.json` written by the multi-node build (2026-10, since
+//! dropped), which [`load_volume`] returns apart as [`MultiNodeFields`] so
+//! that such a volume can still be detached and deleted.
 
+use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -30,6 +34,70 @@ pub struct VolumeRecord {
     /// Adopted from a static PV rather than created by CreateVolume.
     #[serde(default)]
     pub static_volume: bool,
+}
+
+/// What the multi-node build (2026-10, since dropped) added to a
+/// `csi.json`. The only home of these field names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiNodeFields {
+    #[serde(default)]
+    pub multi_node: bool,
+    /// The nodes ControllerPublish attached the volume to.
+    #[serde(default)]
+    pub published_nodes: BTreeSet<String>,
+}
+
+impl MultiNodeFields {
+    const KEYS: [&str; 2] = ["multi_node", "published_nodes"];
+}
+
+/// Reads a `csi.json`, with the multi-node build's fields apart when it
+/// has any; `None` if there is none. Any other unknown field fails.
+pub fn load_volume(path: &Path) -> io::Result<Option<(VolumeRecord, Option<MultiNodeFields>)>> {
+    let Some(mut map) = load::<serde_json::Map<String, serde_json::Value>>(path)? else {
+        return Ok(None);
+    };
+    let mut legacy = serde_json::Map::new();
+    for key in MultiNodeFields::KEYS {
+        if let Some(value) = map.remove(key) {
+            legacy.insert(key.to_owned(), value);
+        }
+    }
+    let invalid = |e: serde_json::Error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {e}", path.display()),
+        )
+    };
+    let record = serde_json::from_value(map.into()).map_err(invalid)?;
+    let legacy = if legacy.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_value(legacy.into()).map_err(invalid)?)
+    };
+    Ok(Some((record, legacy)))
+}
+
+/// Writes a `csi.json`, keeping the multi-node build's fields while any
+/// node is still in them.
+pub fn store_volume(
+    path: &Path,
+    record: &VolumeRecord,
+    legacy: Option<&MultiNodeFields>,
+) -> io::Result<()> {
+    match legacy {
+        Some(fields) if !fields.published_nodes.is_empty() => {
+            let mut value = serde_json::to_value(record).map_err(io::Error::other)?;
+            if let (Some(map), serde_json::Value::Object(extra)) = (
+                value.as_object_mut(),
+                serde_json::to_value(fields).map_err(io::Error::other)?,
+            ) {
+                map.extend(extra);
+            }
+            store(path, &value)
+        }
+        _ => store(path, record),
+    }
 }
 
 /// `<node-state>/staged/<handle>.json`: the volume's history service runs
@@ -162,8 +230,9 @@ mod tests {
 
     #[test]
     fn a_record_with_fields_this_driver_does_not_know_is_refused() {
-        // A csi.json written for a multi-node volume (2026-10, since
-        // dropped): loading it must fail, naming the field.
+        // A csi.json written by the multi-node build (2026-10, since
+        // dropped): its two fields come apart, and round-trip while a node
+        // is in them. Any other unknown field fails, naming it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("csi.json");
         let rec = VolumeRecord {
@@ -173,24 +242,34 @@ mod tests {
             published_node: None,
             static_volume: false,
         };
-        let mut json = serde_json::to_value(&rec).unwrap();
-        json["multi_node"] = true.into();
-        json["published_nodes"] = serde_json::json!(["node-1", "node-2"]);
-        fs::write(&path, json.to_string()).unwrap();
+        let fields = MultiNodeFields {
+            multi_node: true,
+            published_nodes: ["node-1".to_owned(), "node-2".to_owned()].into(),
+        };
+        store_volume(&path, &rec, Some(&fields)).unwrap();
         let err = load::<VolumeRecord>(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(
             err.to_string().contains("unknown field `multi_node`"),
             "{err}"
         );
-        assert!(err.to_string().contains("csi.json"), "{err}");
-        json.as_object_mut().unwrap().remove("multi_node");
+        assert_eq!(
+            load_volume(&path).unwrap(),
+            Some((rec.clone(), Some(fields.clone())))
+        );
+        let none_left = MultiNodeFields::default();
+        store_volume(&path, &rec, Some(&none_left)).unwrap();
+        assert_eq!(load_volume(&path).unwrap(), Some((rec.clone(), None)));
+        let mut json = serde_json::to_value(&rec).unwrap();
+        json["published_nodes"] = serde_json::json!(["node-1"]);
+        json["replicas"] = 2.into();
         fs::write(&path, json.to_string()).unwrap();
-        let err = load::<VolumeRecord>(&path).unwrap_err();
+        let err = load_volume(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(
-            err.to_string().contains("unknown field `published_nodes`"),
+            err.to_string().contains("unknown field `replicas`"),
             "{err}"
         );
+        assert!(err.to_string().contains("csi.json"), "{err}");
     }
 
     #[test]

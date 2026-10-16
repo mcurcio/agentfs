@@ -178,12 +178,21 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
     if let Err(e) = remove_tree(&layout.deleting_dir(handle)) {
         eprintln!("{e}");
     }
-    let Some(record) = volume::load(layout, handle)? else {
+    // A record of the multi-node build too: it can still be deleted.
+    let Some((record, legacy)) = volume::load_any(layout, handle)? else {
         return Ok(());
     };
-    if let Some(node) = &record.published_node {
+    let mut attached: Vec<&str> = legacy
+        .iter()
+        .flat_map(|f| f.published_nodes.iter().map(String::as_str))
+        .chain(record.published_node.as_deref())
+        .collect();
+    attached.sort_unstable();
+    attached.dedup();
+    if !attached.is_empty() {
         return Err(Error::FailedPrecondition(format!(
-            "volume {handle} is still attached to node {node}"
+            "volume {handle} is still attached to node {}",
+            attached.join(", ")
         )));
     }
     let state = StateDir::new(layout.state(handle));
@@ -343,17 +352,36 @@ pub(crate) fn unpublish(
     if validate_handle(handle).is_err() {
         return Ok(());
     }
-    // A volume that is gone is not attached anywhere.
-    let Some(mut record) = volume::load(layout, handle)? else {
+    // A volume that is gone is not attached anywhere. A record of the
+    // multi-node build is detached node by node, and written in this
+    // build's format once no node is left.
+    let Some((mut record, mut legacy)) = volume::load_any(layout, handle)? else {
         return Ok(());
     };
-    match record.published_node.clone() {
-        Some(n) if req.node_id.is_empty() || n == req.node_id => {
-            record.published_node = None;
-            volume::store(layout, handle, &record)?;
-            eprintln!("detached volume {handle} from node {n}");
-        }
-        _ => {}
+    // No node id: every node.
+    let detaches = |n: &String| req.node_id.is_empty() || *n == req.node_id;
+    let mut detached: Vec<String> = record
+        .published_node
+        .take_if(|n| detaches(n))
+        .into_iter()
+        .collect();
+    if let Some(fields) = &mut legacy {
+        detached.extend(
+            fields
+                .published_nodes
+                .iter()
+                .filter(|n| detaches(n))
+                .cloned(),
+        );
+        fields.published_nodes.retain(|n| !detaches(n));
+    }
+    if !detached.is_empty() || legacy.is_some() {
+        volume::store_any(layout, handle, &record, legacy.as_ref())?;
+    }
+    detached.sort_unstable();
+    detached.dedup();
+    for n in detached {
+        eprintln!("detached volume {handle} from node {n}");
     }
     Ok(())
 }
@@ -454,5 +482,114 @@ impl Controller for ControllerService {
             .map(capability)
             .collect(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::csi::v1::VolumeCapability;
+    use crate::csi::v1::volume_capability::access_mode::Mode;
+    use crate::csi::v1::volume_capability::{AccessMode, AccessType, MountVolume};
+    use crate::records::{MultiNodeFields, VolumeRecord};
+
+    /// A volume whose `csi.json` the multi-node build wrote, attached to
+    /// `nodes`.
+    fn multi_node_volume(nodes: &[&str]) -> (tempfile::TempDir, Layout) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            base: dir.path().join("base"),
+            node_state: dir.path().join("node"),
+            mount_dir: dir.path().join("mnt"),
+            profiles: dir.path().join("profiles"),
+        };
+        let record = VolumeRecord {
+            params: VolumeParams {
+                profile: "p".into(),
+                volume: "v".into(),
+                branch: None,
+                on_delete: OnDelete::Delete,
+                workload_mounts: Vec::new(),
+            },
+            capacity_bytes: 0,
+            created: 1,
+            published_node: None,
+            static_volume: false,
+        };
+        let fields = MultiNodeFields {
+            multi_node: true,
+            published_nodes: nodes.iter().map(|n| (*n).to_owned()).collect(),
+        };
+        volume::store_any(&layout, "v", &record, Some(&fields)).unwrap();
+        (dir, layout)
+    }
+
+    fn delete(layout: &Layout) -> Result<(), Error> {
+        delete_volume(
+            layout,
+            &DeleteVolumeRequest {
+                volume_id: "v".into(),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn detach(layout: &Layout, node: &str) -> Result<(), Error> {
+        unpublish(
+            layout,
+            &ControllerUnpublishVolumeRequest {
+                volume_id: "v".into(),
+                node_id: node.into(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_multi_node_volume_can_be_detached_and_deleted() {
+        let (_dir, layout) = multi_node_volume(&["n1", "n2"]);
+        let err = delete(&layout).unwrap_err();
+        assert_eq!(
+            err,
+            Error::FailedPrecondition("volume v is still attached to node n1, n2".into())
+        );
+        detach(&layout, "n1").unwrap();
+        let text = fs::read_to_string(layout.csi_json("v")).unwrap();
+        assert!(
+            text.contains("\"n2\"") && !text.contains("\"n1\""),
+            "{text}"
+        );
+        assert!(delete(&layout).is_err(), "n2 is still attached");
+        detach(&layout, "n2").unwrap();
+        // No node left: written in this build's format.
+        let text = fs::read_to_string(layout.csi_json("v")).unwrap();
+        assert!(!text.contains("multi_node"), "{text}");
+        assert!(volume::load(&layout, "v").unwrap().is_some());
+        delete(&layout).unwrap();
+        assert!(!layout.volume_dir("v").exists());
+    }
+
+    #[test]
+    fn a_multi_node_volume_is_not_published() {
+        let (_dir, layout) = multi_node_volume(&["n1"]);
+        let err = publish(
+            &layout,
+            &ControllerPublishVolumeRequest {
+                volume_id: "v".into(),
+                node_id: "n1".into(),
+                volume_capability: Some(VolumeCapability {
+                    access_mode: Some(AccessMode {
+                        mode: Mode::SingleNodeWriter as i32,
+                    }),
+                    access_type: Some(AccessType::Mount(MountVolume::default())),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let Error::FailedPrecondition(message) = err else {
+            panic!("{err:?}");
+        };
+        assert!(message.contains(volume::MULTI_NODE), "{message}");
     }
 }
