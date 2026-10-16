@@ -26,6 +26,10 @@
 # $BENCH_OUT (default ./bench-out): env.json, record.md, record.jsonl,
 # results.jsonl, and the mount logs; ci/bench-report.py turns them into
 # markdown. BENCH_QUICK=1 shrinks every workload for a smoke run.
+# BENCH_SHARD picks the steps: `many` runs create, mvdir and rm; `rest`
+# runs everything else (record_step, close4k, clone, npm, bigclose); `all`
+# (the default) runs both. The bench workflow runs the two shards as
+# separate jobs and reports their outputs together, per filesystem.
 
 . "$(dirname "$0")/lib.sh"
 
@@ -37,6 +41,15 @@ FS=${1:-}
 GIT_URL=${BENCH_GIT_URL:-https://github.com/git/git.git}
 GIT_TAG=${BENCH_GIT_TAG:-v2.47.0}
 
+SHARD=${BENCH_SHARD:-all}
+case "$SHARD" in
+  all | many | rest) ;;
+  *) fail "BENCH_SHARD must be all, many or rest, not $SHARD" ;;
+esac
+# Whether this run includes the shard's steps.
+in_shard() { [ "$SHARD" = all ] || [ "$SHARD" = "$1" ]; }
+
+# clone and npm run once; bigclose runs RUNS times.
 if [ "${BENCH_QUICK:-0}" = 1 ]; then
   NPM_FILES=2000 MANY=5000 BIG=64m RUNS=1 CLOSES=200
 else
@@ -140,23 +153,25 @@ jq -n \
   --arg commit "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)" \
   --arg git "$(git --version)" \
   --arg backing "$(findmnt -no SOURCE -T "${LOOP_IMG:-$FSDIR}" || true)" \
-  --argjson quick "${BENCH_QUICK:-0}" \
-  '{fs: $fs, fstype: $fstype, kernel: $kernel, cpu: $cpu, cpus: $cpus,
+  --argjson quick "${BENCH_QUICK:-0}" --arg shard "$SHARD" \
+  '{fs: $fs, shard: $shard, fstype: $fstype, kernel: $kernel, cpu: $cpu, cpus: $cpus,
     mem_mib: $mem_mib, commit: $commit, git: $git, image_on: $backing,
     quick: ($quick == 1)}' | tee "$OUT/env.json"
 
-step "the synchronous record step, no FUSE (record_step bench)"
-mkdir -p "$FSDIR/record"
-(
-  cd "$ROOT"
-  AGENTFS_BENCH_DIR=$FSDIR/record \
-    AGENTFS_BENCH_JSON=$OUT/record.jsonl \
-    AGENTFS_BENCH_EXPECT_FREEZE=$EXPECT_FREEZE \
-    AGENTFS_BENCH_N=${BENCH_N:-500} \
-    cargo bench --locked -p agentfs-core --bench record_step
-) | tee "$OUT/record.md"
-rm -rf "$FSDIR/record"
-pass "record_step froze by ${EXPECT_FREEZE:-whatever the filesystem offers}"
+if in_shard rest; then
+  step "the synchronous record step, no FUSE (record_step bench)"
+  mkdir -p "$FSDIR/record"
+  (
+    cd "$ROOT"
+    AGENTFS_BENCH_DIR=$FSDIR/record \
+      AGENTFS_BENCH_JSON=$OUT/record.jsonl \
+      AGENTFS_BENCH_EXPECT_FREEZE=$EXPECT_FREEZE \
+      AGENTFS_BENCH_N=${BENCH_N:-500} \
+      cargo bench --locked -p agentfs-core --bench record_step
+  ) | tee "$OUT/record.md"
+  rm -rf "$FSDIR/record"
+  pass "record_step froze by ${EXPECT_FREEZE:-whatever the filesystem offers}"
+fi
 
 # --- one volume per workload ---------------------------------------------
 
@@ -272,55 +287,47 @@ check_history() { # [--exclude NAME]...
 PLAIN=$FSDIR/plain
 sudo mkdir -p "$PLAIN"
 
-step "close4k: 4 KiB write and close"
-drop_caches
-sudo python3 "$HERE/boundary-latency.py" --json "$PLAIN/lat" "$CLOSES" baseline |
-  result close4k baseline
-mount_volume close4k
-drop_caches
-before=$(committed_seq)
-json=$(sudo python3 "$HERE/boundary-latency.py" --json "$MNT/lat" "$CLOSES" agentfs)
-drained=$(drain "$before" 0)
-LAST=$(echo "$json" | result close4k agentfs "$drained")
-echo "$LAST"
-check_records close4k "$CLOSES"
-check_history
-unmount_volume
+if in_shard rest; then
+  step "close4k: 4 KiB write and close"
+  drop_caches
+  sudo python3 "$HERE/boundary-latency.py" --json "$PLAIN/lat" "$CLOSES" baseline |
+    result close4k baseline
+  mount_volume close4k
+  drop_caches
+  before=$(committed_seq)
+  json=$(sudo python3 "$HERE/boundary-latency.py" --json "$MNT/lat" "$CLOSES" agentfs)
+  drained=$(drain "$before" 0)
+  LAST=$(echo "$json" | result close4k agentfs "$drained")
+  echo "$LAST"
+  check_records close4k "$CLOSES"
+  check_history
+  unmount_volume
 
-step "clone: git clone of git.git $GIT_TAG, agentfs.nested=working-tree"
-SRC=$W/git.git
-sudo git clone -q --bare --depth 1 --branch "$GIT_TAG" "$GIT_URL" "$SRC"
-for i in $(seq "$RUNS"); do
-  baseline clone clone "$SRC" "$PLAIN/clone-$i"
-  sudo rm -rf "$PLAIN/clone-$i"
-done
-mount_volume clone agentfs.nested working-tree
-for i in $(seq "$RUNS"); do
-  measured clone clone "$SRC" "$MNT/clone-$i"
-done
-check_history
-for i in $(seq "$RUNS"); do
-  sgit cat-file -e "refs/heads/agentfs/clone:clone-$i/Makefile" ||
-    fail "clone-$i's working tree is not in the history"
-  if sgit ls-tree -r --name-only "refs/heads/agentfs/clone" -- "clone-$i/.git" | grep -q .; then
-    fail "clone-$i's git directory is in the history"
+  step "clone: git clone of git.git $GIT_TAG, agentfs.nested=working-tree"
+  SRC=$W/git.git
+  sudo git clone -q --bare --depth 1 --branch "$GIT_TAG" "$GIT_URL" "$SRC"
+  baseline clone clone "$SRC" "$PLAIN/clone"
+  sudo rm -rf "$PLAIN/clone"
+  mount_volume clone agentfs.nested working-tree
+  measured clone clone "$SRC" "$MNT/clone"
+  check_history
+  sgit cat-file -e "refs/heads/agentfs/clone:clone/Makefile" ||
+    fail "the clone's working tree is not in the history"
+  if sgit ls-tree -r --name-only "refs/heads/agentfs/clone" -- "clone/.git" | grep -q .; then
+    fail "the clone's git directory is in the history"
   fi
-done
-pass "the working trees are recorded, their git directories are not"
-unmount_volume
+  pass "the working tree is recorded, its git directory is not"
+  unmount_volume
 
-step "npm: $NPM_FILES files into an excluded node_modules/"
-for i in $(seq "$RUNS"); do
-  baseline npm npm "$PLAIN/npm-$i/node_modules" --files "$NPM_FILES"
-  sudo rm -rf "$PLAIN/npm-$i"
-done
-EXCLUDE=node_modules/ mount_volume npm
-echo '{"name": "app"}' | sudo tee "$MNT/package.json" >/dev/null
-# package.json is recorded; commit it first, so each run's count is its own.
-drained=$(drain -1 0)
-for i in $(seq "$RUNS"); do
+  step "npm: $NPM_FILES files into an excluded node_modules/"
+  baseline npm npm "$PLAIN/npm/node_modules" --files "$NPM_FILES"
+  sudo rm -rf "$PLAIN/npm"
+  EXCLUDE=node_modules/ mount_volume npm
+  echo '{"name": "app"}' | sudo tee "$MNT/package.json" >/dev/null
+  # package.json is recorded; commit it first, so the run's count is its own.
+  drained=$(drain -1 0)
   seq_before=$(committed_seq)
-  measured npm npm "$MNT/npm-$i/node_modules" --files "$NPM_FILES"
+  measured npm npm "$MNT/npm/node_modules" --files "$NPM_FILES"
   # Excluded paths are decided at record time: nothing frozen or
   # journaled. The committed sequence alone cannot show that, since a
   # record whose commit changes nothing (one the committer drops) does
@@ -328,62 +335,65 @@ for i in $(seq "$RUNS"); do
   # its own sequence number, which counts every record journaled before
   # it. The marker makes one record, or two when RELEASE cannot rule out
   # a change its racy close may have missed (docs/performance.md, "Known
-  # costs"), and the previous file written (package.json or the last
-  # marker) may add a late RELEASE record of its own: at most 4, against
-  # thousands if the excluded files were journaled.
-  assert_eq 0 "$(echo "$LAST" | jq .records)" "npm-$i: the excluded files made no commits"
-  echo "$i" | sudo tee "$MNT/npm-marker" >/dev/null
+  # costs"), and package.json may add a late RELEASE record of its own: at
+  # most 4, against thousands if the excluded files were journaled.
+  assert_eq 0 "$(echo "$LAST" | jq .records)" "npm: the excluded files made no commits"
+  echo 1 | sudo tee "$MNT/npm-marker" >/dev/null
   drained=$(drain "$seq_before" 0)
   made=$(echo "$drained" | jq .records)
   [ "$made" -ge 1 ] && [ "$made" -le 4 ] ||
-    fail "npm-$i: $made records journaled with the marker, expected 1 to 4: the excluded files were journaled"
-  pass "npm-$i: the excluded files were not journaled ($made records with the marker)"
-  n=$(sudo find "$BACKING/npm-$i/node_modules" -type f | wc -l)
-  assert_eq "$NPM_FILES" "$n" "npm-$i: every file reached the backing tree"
-done
-if sgit ls-tree -r --name-only refs/heads/agentfs/npm | grep -q node_modules; then
-  fail "node_modules/ is in the history"
-fi
-pass "nothing under node_modules/ was recorded"
-check_history --exclude node_modules
-unmount_volume
-
-step "create and rm -rf: $MANY files"
-baseline create create "$PLAIN/many" "$MANY"
-baseline mvdir mvdir "$PLAIN/many" "$PLAIN/moved"
-baseline rm rm "$PLAIN/moved"
-mount_volume many
-measured create create "$MNT/many" "$MANY"
-check_records create "$MANY"
-n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^many/' || true)
-assert_eq "$MANY" "$n" "every created file is in the history"
-# A directory rename is one record whatever is beneath it (design §3.1),
-# its reconciliation none here.
-measured mvdir mvdir "$MNT/many" "$MNT/moved"
-assert_eq 1 "$(echo "$LAST" | jq .records)" "mvdir: the rename of $MANY files is one record"
-n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^moved/' || true)
-assert_eq "$MANY" "$n" "every moved file is in the history at its new path"
-check_history
-measured rm rm "$MNT/moved"
-n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^moved/' || true)
-assert_eq 0 "$n" "every removal is in the history"
-unmount_volume
-
-step "bigclose: close a $BIG file, dirty and fsynced (freeze by ${EXPECT_FREEZE:-either})"
-for i in $(seq "$RUNS"); do
-  workload bigclose "$PLAIN/big.bin" --size "$BIG" --copy | result bigclose-dirty baseline
-  workload bigclose "$PLAIN/big.bin" --size "$BIG" --fsync --copy | result bigclose-fsync baseline
-done
-sudo rm -f "$PLAIN/big.bin"
-for variant in dirty fsync; do
-  flag=
-  [ $variant = fsync ] && flag=--fsync
-  mount_volume "big-$variant"
-  for i in $(seq "$RUNS"); do
-    measured "bigclose-$variant" bigclose "$MNT/big.bin" --size "$BIG" $flag
-  done
-  check_history
+    fail "npm: $made records journaled with the marker, expected 1 to 4: the excluded files were journaled"
+  pass "npm: the excluded files were not journaled ($made records with the marker)"
+  n=$(sudo find "$BACKING/npm/node_modules" -type f | wc -l)
+  assert_eq "$NPM_FILES" "$n" "npm: every file reached the backing tree"
+  if sgit ls-tree -r --name-only refs/heads/agentfs/npm | grep -q node_modules; then
+    fail "node_modules/ is in the history"
+  fi
+  pass "nothing under node_modules/ was recorded"
+  check_history --exclude node_modules
   unmount_volume
-done
+fi
+
+if in_shard many; then
+  step "create and rm -rf: $MANY files"
+  baseline create create "$PLAIN/many" "$MANY"
+  baseline mvdir mvdir "$PLAIN/many" "$PLAIN/moved"
+  baseline rm rm "$PLAIN/moved"
+  mount_volume many
+  measured create create "$MNT/many" "$MANY"
+  check_records create "$MANY"
+  n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^many/' || true)
+  assert_eq "$MANY" "$n" "every created file is in the history"
+  # A directory rename is one record whatever is beneath it (design §3.1),
+  # its reconciliation none here.
+  measured mvdir mvdir "$MNT/many" "$MNT/moved"
+  assert_eq 1 "$(echo "$LAST" | jq .records)" "mvdir: the rename of $MANY files is one record"
+  n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^moved/' || true)
+  assert_eq "$MANY" "$n" "every moved file is in the history at its new path"
+  check_history
+  measured rm rm "$MNT/moved"
+  n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^moved/' || true)
+  assert_eq 0 "$n" "every removal is in the history"
+  unmount_volume
+fi
+
+if in_shard rest; then
+  step "bigclose: close a $BIG file, dirty and fsynced (freeze by ${EXPECT_FREEZE:-either})"
+  for _ in $(seq "$RUNS"); do
+    workload bigclose "$PLAIN/big.bin" --size "$BIG" --copy | result bigclose-dirty baseline
+    workload bigclose "$PLAIN/big.bin" --size "$BIG" --fsync --copy | result bigclose-fsync baseline
+  done
+  sudo rm -f "$PLAIN/big.bin"
+  for variant in dirty fsync; do
+    flag=
+    [ $variant = fsync ] && flag=--fsync
+    mount_volume "big-$variant"
+    for _ in $(seq "$RUNS"); do
+      measured "bigclose-$variant" bigclose "$MNT/big.bin" --size "$BIG" $flag
+    done
+    check_history
+    unmount_volume
+  done
+fi
 
 step "done: $(wc -l <"$OUT/results.jsonl") results in $OUT"

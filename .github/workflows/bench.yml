@@ -2,10 +2,17 @@ name: bench
 
 # The performance benchmark (design §18 test 13, docs/performance.md): the
 # synchronous record step, then workloads through real FUSE mounts on a
-# fresh XFS (reflink) and ext4 (copy) loop filesystem. Results go to the
-# job summary and an artifact; ci/bench-budget.json is advisory, so a
-# slow run warns and never fails. Correctness checks in ci/bench.sh do
-# fail the job.
+# fresh XFS (reflink) and ext4 (copy) loop filesystem. Each filesystem
+# runs as two shards in parallel (ci/bench.sh BENCH_SHARD): `many` is
+# create, mvdir and rm of 100,000 files, the longest part; `rest` is
+# everything else. The report job reads all four outputs and writes one
+# report per filesystem to its summary. ci/bench-budget.json is
+# advisory, so a slow run warns and never fails. Correctness checks in
+# ci/bench.sh do fail the job.
+#
+# This workflow runs after a change lands on main and does not hold it
+# (AGENTS.md, design §19.1): a budget warning or a failure here is a
+# follow-up.
 
 on:
   push:
@@ -33,13 +40,14 @@ env:
 
 jobs:
   bench:
-    name: bench (${{ matrix.fs }})
+    name: bench (${{ matrix.fs }}, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         fs: [xfs, ext4]
+        shard: [many, rest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
@@ -47,7 +55,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: bench
+          # Per shard: only `rest` builds the record_step bench and its
+          # dev-dependencies.
+          key: bench-${{ matrix.shard }}
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config fuse3 xfsprogs jq python3
       - name: show the runner
         run: |
@@ -56,21 +66,22 @@ jobs:
           free -m
           df -h / /mnt "$RUNNER_TEMP" || true
       - run: cargo build --locked --release -p agentfs
+      # Built here, so ci/bench.sh's `cargo bench` finds it fresh and the
+      # measuring step does not compile.
+      - name: build the record_step bench
+        if: matrix.shard == 'rest'
+        run: cargo bench --locked --no-run -p agentfs-core --bench record_step
       - run: ci/bench.sh ${{ matrix.fs }}
         env:
           AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
-          BENCH_OUT: ${{ runner.temp }}/bench-${{ matrix.fs }}
+          BENCH_OUT: ${{ runner.temp }}/bench-${{ matrix.fs }}-${{ matrix.shard }}
           BENCH_QUICK: ${{ inputs.quick && 1 || 0 }}
-      - name: report
-        if: always()
-        run: |
-          python3 ci/bench-report.py --budget ci/bench-budget.json \
-            "$RUNNER_TEMP/bench-${{ matrix.fs }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          BENCH_SHARD: ${{ matrix.shard }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: bench-${{ matrix.fs }}
-          path: ${{ runner.temp }}/bench-${{ matrix.fs }}
+          name: bench-${{ matrix.fs }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/bench-${{ matrix.fs }}-${{ matrix.shard }}
           retention-days: 90
           if-no-files-found: warn
       - name: clean up mounts
@@ -78,3 +89,30 @@ jobs:
         run: |
           sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
           sudo losetup -D || true
+
+  report:
+    needs: bench
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bench-*
+          path: ${{ runner.temp }}/bench
+      # One report per filesystem from both of its shards; a shard that
+      # left no output shows as "no result" lines under the budgets.
+      - name: report
+        run: |
+          dirs=()
+          for fs in xfs ext4; do
+            for shard in many rest; do
+              d=$RUNNER_TEMP/bench/bench-$fs-$shard
+              if [ -d "$d" ]; then dirs+=("$d"); else echo "::warning::no output from $fs $shard"; fi
+            done
+          done
+          [ ${#dirs[@]} -gt 0 ] || { echo "::error::no bench output at all"; exit 1; }
+          python3 ci/bench-report.py --budget ci/bench-budget.json "${dirs[@]}" |
+            tee -a "$GITHUB_STEP_SUMMARY"
+          exit "${PIPESTATUS[0]}"

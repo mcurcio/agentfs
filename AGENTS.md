@@ -103,13 +103,14 @@ GitHub Actions runners can, so put such tests in a script under `ci/` and a job 
 |---|---|---|---|
 | `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, remotes (http/https/ssh), LFS, telemetry, multipod, NFS (one export, two clients, one node at a time), patches, runbooks, csi-sanity |
 | `image.yml` | every push and PR | ~5–9 min | container image, kind sidecar e2e, CSI on one kind node (no multi-node job); publishes to GHCR on main |
-| `power-loss.yml` | pushes to main (not docs-only) | ~7 min | dm-log-writes replay on XFS and ext4 |
-| `bench.yml` | pushes to main (not docs-only) | **~23–25 min** | benchmarks on XFS and ext4 against `ci/bench-budget.json` |
+| `power-loss.yml` | pushes to main (not docs-only), after landing | ~7 min | dm-log-writes replay on XFS and ext4 |
+| `bench.yml` | pushes to main (not docs-only), after landing | ~10–16 min | benchmarks on XFS and ext4, each in two parallel shards, against `ci/bench-budget.json` |
 
 Rules:
 - Pin third-party actions by full commit SHA (`gh api repos/OWNER/REPO/commits/TAG --jq .sha`).
 - Pin runners to `ubuntu-24.04`, never the floating `-latest` label. A test (`workflows_pin_runners`) enforces this.
-- A change is done only when **every** workflow run for your final pushed SHA is green. Wait for all of them, bench included: `gh run list -R mcurcio/agentfs --commit <sha>`, then `gh run watch <id> -R mcurcio/agentfs --exit-status`. Don't report success while a run is still in progress.
+- A change is done when the **ci** and **image** runs for your final pushed SHA are green. Wait for both: `gh run list -R mcurcio/agentfs --commit <sha>`, then `gh run watch <id> -R mcurcio/agentfs --exit-status`. Don't report success while either is still in progress.
+- **bench** and **power-loss** run after the change lands on main and are checked afterwards (design §19.1, 2026-10-15). A bench budget warning or a power-loss failure is a follow-up to fix, not a reason to hold the change; report it.
 - Read failures with `gh run view <id> --log-failed`. Fix flaky jobs; a rerun alone is not a fix.
 
 Known flakes to watch:

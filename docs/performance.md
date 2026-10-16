@@ -266,7 +266,10 @@ of the benchmark. It is **advisory**: a result over budget is a warning
 in the job and its summary, never a failure, because shared runners are
 noisy. Each limit is about 1.5 times the slowest of the first three runs
 (six jobs, on two CPU types; see [Run to run](#run-to-run)). Workloads
-are budgeted in absolute time, not as ratios.
+are budgeted in absolute time, not as ratios. Since 2026-10-15 clone and
+npm run once per job instead of three times (design §19.1), so their
+budgets apply to one sample rather than a median of three: the limits
+are unchanged, and a single slow run can now warn.
 
 | Budget | Limit | Measured (slowest to fastest of six jobs) |
 |---|---|---|
@@ -343,30 +346,39 @@ on network storage they are higher, by the cost of an `fsync` per change.
 
 [`.github/workflows/bench.yml`](../.github/workflows/bench.yml) runs on
 every push to main that changes more than documentation, and on demand
-(with `quick` for a smoke run of smaller workloads), once on XFS created
-with `mkfs.xfs -m reflink=1` and once on ext4. Each job:
+(with `quick` for a smoke run of smaller workloads), on XFS created
+with `mkfs.xfs -m reflink=1` and on ext4. It runs after a change lands
+and does not hold it: a budget warning or a failed check is a follow-up
+(design §19.1, 2026-10-15). Each filesystem runs as two parallel jobs,
+the shards of `ci/bench.sh` (`BENCH_SHARD`): `many` (create, mvdir and
+rm of 100,000 files, the longest part) and `rest` (everything else).
+Each job:
 
 1. creates and mounts the loop filesystem, and writes `env.json` (kernel,
-   CPU, memory, commit);
-2. runs the `record_step` bench on it with
+   CPU, memory, commit, shard);
+2. in the `rest` shard, runs the `record_step` bench, built in the job's
+   build step, on it with
    `AGENTFS_BENCH_EXPECT_FREEZE=reflink` (XFS) or `copy` (ext4), which
    fails the job if the freeze used the other method;
-3. runs the workloads above ([`ci/bench-workloads.py`](../ci/bench-workloads.py),
+3. runs its share of the workloads above ([`ci/bench-workloads.py`](../ci/bench-workloads.py),
    [`ci/boundary-latency.py`](../ci/boundary-latency.py)) and their
-   checks: the history equals the backing tree, the clones' git
-   directories and `node_modules/` are not in it, every created and
+   checks: the history equals the backing tree, the clone's git
+   directory and `node_modules/` are not in it, every created and
    removed file is, the excluded files journaled nothing (a recorded
-   marker written after each npm run must account for every new
+   marker written after the npm run must account for every new
    sequence number), close4k and create made one record per boundary
    (with a little slack), the rename of the created directory one record,
    and every workload's backlog drained within 30 minutes;
-4. writes the report ([`ci/bench-report.py`](../ci/bench-report.py)) to
-   the job summary, with the budget warnings, and uploads everything as
-   the `bench-xfs` or `bench-ext4` artifact, kept 90 days:
-   `record.jsonl`, `results.jsonl`, `record.md`, `env.json` and the mount
-   logs.
+4. uploads everything as the `bench-<fs>-<shard>` artifact (such as
+   `bench-xfs-many`), kept 90 days: `record.jsonl`, `results.jsonl`,
+   `record.md`, `env.json` and the mount logs.
 
-A failed check fails the job; a slow result only warns.
+A `report` job then reads the four artifacts and writes the report
+([`ci/bench-report.py`](../ci/bench-report.py)) to its summary: one
+section per filesystem from both of its shards, the budget warnings, and
+a "no result" line for each budget a reported filesystem has no result
+for, so a workload missing from one shard shows. A failed check fails
+its job; a slow result only warns.
 
 ### Running it yourself
 
@@ -394,7 +406,9 @@ python3 ci/bench-report.py --budget ci/bench-budget.json bench-out
 ```
 
 `BENCH_QUICK=1` shrinks every workload; `BENCH_OUT` sets the output
-directory (default `./bench-out`).
+directory (default `./bench-out`); `BENCH_SHARD` (`many`, `rest` or the
+default `all`) picks the steps. The report merges every directory given
+for one filesystem.
 
 ### Columns of the report
 

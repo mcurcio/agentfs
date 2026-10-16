@@ -780,7 +780,10 @@ closes, a `git clone` with `nested=working-tree`, npm-style small files
 into an excluded `node_modules/`, creating 100,000 files, renaming their
 directory (one record) and `rm -rf` of them,
 closing a 1 GiB file), each checked against the history afterwards.
-Results go to the job summary and a `bench-<fs>` artifact kept 90 days;
+Each filesystem runs as two parallel shards (the 100,000-file workloads,
+and the rest), reported together in one summary; their outputs are
+`bench-<fs>-<shard>` artifacts kept 90 days. The workflow runs after a
+change lands and does not hold it;
 [`ci/bench-budget.json`](ci/bench-budget.json) adds warnings, never
 failures. See [docs/performance.md](docs/performance.md).
 

@@ -3,8 +3,11 @@
 
     bench-report.py [--budget ci/bench-budget.json] OUT_DIR...
 
-Reads env.json, record.jsonl and results.jsonl from each OUT_DIR (one per
-filesystem) and prints markdown: the synchronous record step without FUSE,
+Reads env.json, record.jsonl and results.jsonl from each OUT_DIR and
+prints markdown, one section per filesystem: the OUT_DIRs of one
+filesystem (named by env.json, else by the directory), such as the
+`many` and `rest` shards of the bench workflow, are reported together.
+Each section gives the synchronous record step without FUSE,
 then each workload through the mount beside its plain-directory baseline,
 as medians over the runs. With --budget, each budget the results exceed
 is printed as a GitHub `::warning::` line on stderr and listed in the
@@ -110,24 +113,27 @@ def matches(row, match):
     return all(row.get(k) == v for k, v in match.items())
 
 
-def check(budgets, rows):
-    """[(budget, row, value)] for every budget a row exceeds, and the
-    budgets that matched no row."""
+def check(budgets, rows, fss):
+    """[(budget, row, value)] for every budget a row exceeds, and
+    [(budget, fs)] for every filesystem in fss that has no row a budget
+    matches (a budget naming its fs is checked on that fs only, when it is
+    reported), so a workload missing from one filesystem is listed."""
     over = []
     unmatched = []
     for budget in budgets:
-        hit = False
+        match = budget.get("match", {})
+        hit = set()
         for row in rows:
-            if not matches(row, budget.get("match", {})):
+            if not matches(row, match):
                 continue
             value = row.get(budget["metric"])
             if value is None:
                 continue
-            hit = True
+            hit.add(row["fs"])
             if value > budget["max"]:
                 over.append((budget, row, value))
-        if not hit:
-            unmatched.append(budget)
+        wanted = [match["fs"]] if "fs" in match else fss
+        unmatched.extend((budget, fs) for fs in wanted if fs in fss and fs not in hit)
     return over, unmatched
 
 
@@ -137,9 +143,10 @@ def describe(row):
     return "%s %s" % (row["fs"], row["case"])
 
 
-def report(dirs, budgets):
-    out = []
-    all_rows = []
+def read_dirs(dirs):
+    """{fs: {"envs": [...], "record": [...], "results": [...]}}, in the
+    order the filesystems first appear."""
+    by_fs = {}
     for d in dirs:
         env_path = os.path.join(d, "env.json")
         env = {}
@@ -147,26 +154,42 @@ def report(dirs, budgets):
             with open(env_path) as f:
                 env = json.load(f)
         fs = env.get("fs") or os.path.basename(os.path.normpath(d))
-        record = read_jsonl(os.path.join(d, "record.jsonl"))
-        results = read_jsonl(os.path.join(d, "results.jsonl"))
+        group = by_fs.setdefault(fs, {"envs": [], "record": [], "results": []})
+        group["envs"].append(env)
+        group["record"].extend(read_jsonl(os.path.join(d, "record.jsonl")))
+        group["results"].extend(read_jsonl(os.path.join(d, "results.jsonl")))
+    return by_fs
+
+
+def describe_env(env):
+    shard = env.get("shard")
+    return "%s%s on kernel %s, %s CPU(s) (%s), %s MiB; agentfs %s, %s.%s" % (
+        "Shard %s: " % shard if shard and shard != "all" else "",
+        env.get("fstype", "?"),
+        env.get("kernel", "?"),
+        env.get("cpus", "?"),
+        env.get("cpu", "?"),
+        env.get("mem_mib", "?"),
+        (env.get("commit") or "?")[:12],
+        env.get("git", "git ?"),
+        " Quick mode: smaller workloads." if env.get("quick") else "",
+    )
+
+
+def report(dirs, budgets):
+    out = []
+    all_rows = []
+    by_fs = read_dirs(dirs)
+    for fs, group in by_fs.items():
+        record = group["record"]
+        results = group["results"]
         for r in record:
             r["fs"] = fs
         out.append("## Benchmark: %s" % fs)
         out.append("")
-        out.append(
-            "%s on kernel %s, %s CPU(s) (%s), %s MiB; agentfs %s, %s.%s"
-            % (
-                env.get("fstype", "?"),
-                env.get("kernel", "?"),
-                env.get("cpus", "?"),
-                env.get("cpu", "?"),
-                env.get("mem_mib", "?"),
-                (env.get("commit") or "?")[:12],
-                env.get("git", "git ?"),
-                " Quick mode: smaller workloads." if env.get("quick") else "",
-            )
-        )
-        out.append("")
+        for env in group["envs"]:
+            out.append(describe_env(env))
+            out.append("")
         out.append("### The synchronous record step, without FUSE (µs)")
         out.append("")
         if record:
@@ -226,7 +249,7 @@ def report(dirs, budgets):
         all_rows.extend({**r, "suite": "record_step"} for r in record)
         all_rows.extend(rows)
 
-    over, unmatched = check(budgets, all_rows)
+    over, unmatched = check(budgets, all_rows, list(by_fs))
     if budgets:
         out.append("## Budgets (advisory, ci/bench-budget.json)")
         out.append("")
@@ -242,12 +265,11 @@ def report(dirs, budgets):
                 out.append("- **over**: " + message)
                 print("::warning title=bench budget::" + message, file=sys.stderr)
         else:
-            out.append("All %d budgets met." % (len(budgets) - len(unmatched)))
-        for budget in unmatched:
-            fss = {r["fs"] for r in all_rows}
-            if "fs" in budget.get("match", {}) and budget["match"]["fs"] not in fss:
-                continue
-            out.append("- no result for %s %s" % (json.dumps(budget["match"]), budget["metric"]))
+            out.append("All budgets with a result met.")
+        for budget, fs in unmatched:
+            out.append(
+                "- no result on %s for %s %s" % (fs, json.dumps(budget["match"]), budget["metric"])
+            )
         out.append("")
     return "\n".join(out)
 
