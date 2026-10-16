@@ -141,6 +141,7 @@ volume only the agentfs container mounts:
 examples/docker/docker-run.sh up
 examples/docker/docker-run.sh workload --name app --user 10000:10000 --cap-drop ALL \
   debian:trixie-slim sh -c 'echo hello > /agentfs/workspace/hello.txt; sleep infinity'
+sleep 1                     # the commit follows within commitWindow (200ms)
 docker exec agentfs-example git --git-dir /data/state/git log --format='%h %an %s' agentfs/example
 examples/docker/docker-run.sh down
 ```

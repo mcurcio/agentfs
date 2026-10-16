@@ -84,6 +84,7 @@ script, so CI runs exactly what this page describes:
 examples/docker/docker-run.sh up
 examples/docker/docker-run.sh workload --name app --user 10000:10000 --cap-drop ALL \
   debian:trixie-slim sh -c 'echo hello > /agentfs/workspace/hello.txt; sleep infinity'
+sleep 1                     # the commit follows within commitWindow (200ms)
 docker exec agentfs-example git --git-dir /data/state/git log --format='%h %an %s' agentfs/example
 examples/docker/docker-run.sh down
 ```
@@ -132,6 +133,7 @@ cd examples/docker
 mkdir -p mnt                # Docker does not create a long-syntax bind's source
 docker compose up -d
 docker compose exec workload sh -c 'echo hello > hello.txt'
+sleep 1                     # the commit follows within commitWindow (200ms)
 docker compose exec agentfs git --git-dir /data/state/git log --format='%h %an %s' agentfs/example
 docker compose down
 ```
