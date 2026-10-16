@@ -24,6 +24,8 @@ Kubernetes: `>=1.30.0-0`
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| alerts.enabled | bool | `false` | Install the example alert rules of deploy/alerts as a Prometheus Operator PrometheusRule (docs/deployment.md "Alerts"). Needs its CRD. |
+| alerts.labels | object | `{}` | More labels on the PrometheusRule, for your Prometheus's ruleSelector (kube-prometheus-stack selects `release: <its release>`). |
 | basePath.path | string | `"/var/lib/agentfs-csi/volumes"` | Where volumes live (`--base-path`): one filesystem, at this path on the controller and every node (docs/csi.md §3). |
 | basePath.volume | object | `{}` | The volume mounted at `path` in the controller and the node plugin, as a pod volume source: one shared filesystem on several nodes, which on NFS must be 4.1 or later (docs/csi.md §11). Empty means a hostPath of `path`, right for a single node. |
 | controller.affinity | object | `{}` | The controller's affinity. |

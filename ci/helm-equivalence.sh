@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Checks that the charts render what deploy/ holds (docs/helm.md §5):
 # charts/agentfs-csi against deploy/csi and the StorageClasses of deploy/csi/example, and the sidecar library through
-# deploy/examples/helm-sidecar against deploy/sidecar. Object by object,
+# deploy/examples/helm-sidecar against deploy/sidecar, and the CSI chart's
+# alerts option against deploy/alerts/prometheusrule.yaml. Object by object,
 # field by field (ci/helm-equivalence.py says what is ignored).
 #
 # Needs helm, kubectl (for kustomize) and python3 with PyYAML.
@@ -40,4 +41,11 @@ sidecar=0
 python3 ci/helm-equivalence.py "$out/sidecar-kustomize.yaml" "$out/sidecar-helm.yaml" \
   --unhash agentfs-config || sidecar=$?
 
-[ "$csi" = 0 ] && [ "$sidecar" = 0 ]
+echo "== charts/agentfs-csi alerts.enabled = deploy/alerts/prometheusrule.yaml"
+helm template agentfs-csi charts/agentfs-csi --namespace agentfs-csi \
+  --set alerts.enabled=true --show-only templates/alerts.yaml >"$out/alerts-helm.yaml"
+alerts=0
+python3 ci/helm-equivalence.py deploy/alerts/prometheusrule.yaml "$out/alerts-helm.yaml" \
+  --object-namespace agentfs-csi || alerts=$?
+
+[ "$csi" = 0 ] && [ "$sidecar" = 0 ] && [ "$alerts" = 0 ]

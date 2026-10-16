@@ -8,10 +8,13 @@ Only what Helm adds by design is ignored:
     into a namespace that already exists, docs/helm.md);
   - Helm's standard labels (helm.sh/chart, app.kubernetes.io/instance,
     managed-by, version, part-of) and `checksum/*` annotations;
-  - kustomize's content-hash suffix on the names given with --unhash.
+  - kustomize's content-hash suffix on the names given with --unhash;
+  - with --object-namespace, the namespace of an expected object that has
+    none (a plain manifest, applied with `kubectl -n`).
 Everything else, every field and value, must be equal.
 
 Usage: helm-equivalence.py EXPECTED ACTUAL [--namespace NS] [--unhash NAME]...
+                           [--object-namespace NS]
 Exit status 0 when equal, 1 with a unified diff otherwise.
 """
 
@@ -77,6 +80,7 @@ def main():
     p.add_argument("actual")
     p.add_argument("--namespace", default="")
     p.add_argument("--unhash", action="append", default=[])
+    p.add_argument("--object-namespace", default="")
     a = p.parse_args()
 
     expected = [
@@ -88,6 +92,9 @@ def main():
     for name in a.unhash:
         text = re.sub(re.escape(name) + r"-[a-z0-9]{10}\b", name, text)
     expected = [normalize(d) for d in json.loads(text)]
+    if a.object_namespace:
+        for d in expected:
+            d["metadata"].setdefault("namespace", a.object_namespace)
     actual = [normalize(d) for d in load(a.actual)]
 
     e, h = canonical(expected), canonical(actual)

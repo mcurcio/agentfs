@@ -90,6 +90,14 @@ driver parameters need no chart change. `reclaimPolicy` defaults to
 `Delete` for a fork class (`fork: "true"`, which the admission policy
 requires) and `Retain` otherwise.
 
+`alerts.enabled=true` installs the example alert rules of
+[`deploy/alerts`](../deploy/alerts) as a Prometheus Operator
+`PrometheusRule` in the release namespace, with `alerts.labels` for your
+Prometheus's `ruleSelector` (deployment.md "Alerts"). It is off by
+default and needs the PrometheusRule CRD. The chart reads
+`deploy/alerts/agentfs.rules.yml` through a symlink
+(`charts/agentfs-csi/files/`), so the rules have one home.
+
 `basePath.volume` replaces the hostPath at basePath with any pod volume
 source, for a filesystem shared by several nodes (csi.md §3, §11).
 
@@ -156,7 +164,9 @@ charts render the same objects:
 - `charts/agentfs-csi` with [`ci/helm/deploy-csi-values.yaml`](../ci/helm/deploy-csi-values.yaml)
   and the `deploy/csi/profiles` files equals `kubectl kustomize deploy/csi`
   plus the two StorageClasses of `deploy/csi/example`;
-- `deploy/examples/helm-sidecar` equals `kubectl kustomize deploy/sidecar`.
+- `deploy/examples/helm-sidecar` equals `kubectl kustomize deploy/sidecar`;
+- `charts/agentfs-csi` with `alerts.enabled=true` renders
+  `deploy/alerts/prometheusrule.yaml` (in the release namespace).
 
 The comparison ([`ci/helm-equivalence.py`](../ci/helm-equivalence.py))
 is object by object and field by field. It ignores only what Helm adds by
@@ -192,7 +202,9 @@ on every push and pull request:
   server-side validation (`kubectl apply --dry-run=server`).
 
 Not tested: the forks e2e (`ci/e2e-csi-forks.sh`) against the chart,
-`helm upgrade` between chart versions, the sidecar chart on a cluster
+`helm upgrade` between chart versions, the `PrometheusRule` against a
+cluster with its CRD (kind has none; only its equivalence and the alerts
+workflow's checks of the rules), the sidecar chart on a cluster
 (only its equivalence with `deploy/sidecar`, which image.yml's e2e-kind
 runs), and installing from the published OCI artifacts.
 
