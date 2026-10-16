@@ -1,0 +1,38 @@
+# Adds a remote to compose.yaml: a local git server (git-server/) that the
+# volume pushes to, with the credentials in secrets/origin (docs/docker.md).
+#
+#   docker compose -f examples/docker/compose.yaml -f examples/docker/compose.remote.yaml up -d
+#   docker compose -f examples/docker/compose.yaml -f examples/docker/compose.remote.yaml \
+#     exec -u www-data git-server git --git-dir /srv/git/history.git log agentfs/example
+#
+# For a real remote, keep config/remote's [remote] section with your URL,
+# drop the git-server service, and put your token in the secret.
+
+services:
+  agentfs-init:
+    volumes:
+      - ./config/remote:/etc/agentfs/config:ro
+
+  agentfs:
+    volumes:
+      - ./config/remote:/etc/agentfs/config:ro
+    secrets: [origin]
+    depends_on:
+      git-server:
+        condition: service_started
+
+  # A throwaway smart-HTTP git server with basic auth, for trying the
+  # example. Not hardened: use your own git host in real use.
+  git-server:
+    build: ./git-server
+    secrets: [origin]
+    volumes:
+      - remote:/srv/git
+
+secrets:
+  # Mounted at /run/secrets/origin: `username=` and `password=` lines.
+  origin:
+    file: ./secrets/origin
+
+volumes:
+  remote:

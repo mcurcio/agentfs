@@ -1,0 +1,117 @@
+# agentfs as a Docker volume with Docker Compose (docs/docker.md): an
+# init step, the agentfs container, and a workload that uses the mount.
+#
+#   docker compose -f examples/docker/compose.yaml up -d
+#   docker compose -f examples/docker/compose.yaml exec workload sh
+#   docker compose -f examples/docker/compose.yaml down
+#
+# This file alone is a volume with no remote: the history stays in the
+# Docker volume `data`. Add compose.remote.yaml for a git server it pushes
+# to (`-f compose.yaml -f compose.remote.yaml`).
+#
+#   ./mnt                 on the host: the directory the mount appears in
+#   ./mnt/workspace       the FUSE mount; the workload's /agentfs/workspace
+#   data (volume)         /data in the agentfs containers only: backing/
+#                         (the files) and state/ (the history)
+#
+# ./mnt must be on a shared mount (it is on systemd hosts, where / is
+# shared); Docker Desktop cannot propagate mounts to the host.
+
+name: agentfs-example
+
+x-agentfs: &agentfs
+  image: ${AGENTFS_IMAGE:-ghcr.io/mcurcio/agentfs:latest}
+  environment: &agentfs-env
+    AGENTFS_STATE: /data/state
+    AGENTFS_ROOT: /data/backing
+  volumes:
+    - data:/data
+    - ./config/local:/etc/agentfs/config:ro
+
+services:
+  # Creates the state area and /data/backing on the first run, checks them
+  # on every later one (another volume's state area stops here), names the
+  # config fragment as the history's include.path, and gives the tree's
+  # root to the workload's user so it can write at the top of the volume.
+  agentfs-init:
+    <<: *agentfs
+    environment:
+      <<: *agentfs-env
+      AGENTFS_VOLUME: ${VOLUME:-example}
+      WORKLOAD_USER: ${WORKLOAD_USER:-10000:10000}
+    entrypoint: [sh, -c]
+    command: ['agentfs init --include /etc/agentfs/config && chown "$$WORKLOAD_USER" /data/backing']
+    restart: "no"
+
+  # The recorder. FUSE needs /dev/fuse and CAP_SYS_ADMIN, and Docker's
+  # AppArmor profile denies mount(2), so it runs unconfined
+  # (`privileged: true` covers all three, and more).
+  agentfs:
+    <<: *agentfs
+    hostname: agentfs
+    command: [mount, /data/backing, /agentfs/workspace]
+    environment:
+      <<: *agentfs-env
+      # Restarted after a crash: mount over the stale mount the dead daemon
+      # left; the new mount reaches the workload through propagation, with
+      # no restart of the workload (design §17.1).
+      AGENTFS_ON_STALE_MOUNT: recover
+      # The bare mount point becomes root's with mode 0000 (design §17.1).
+      AGENTFS_SEAL_MOUNTPOINT: "true"
+      # Point this at your collector instead (README "Telemetry").
+      OTEL_SDK_DISABLED: "true"
+    devices: [/dev/fuse]
+    cap_add: [SYS_ADMIN]
+    security_opt: [apparmor:unconfined]
+    volumes:
+      - data:/data
+      - ./config/local:/etc/agentfs/config:ro
+      # The mount propagates to the host (and from there to the workload).
+      - type: bind
+        source: ./mnt
+        target: /agentfs
+        bind:
+          propagation: rshared
+    restart: unless-stopped
+    # Longer than --unmount-grace (10s) + --push-grace (5s) + the final
+    # commit, so `docker compose down` always makes the final commit.
+    stop_grace_period: 60s
+    # The workload starts once the mount is live; 5 minutes for journal
+    # recovery at start.
+    healthcheck:
+      test: [CMD, agentfs, probe, /agentfs/workspace]
+      interval: 10s
+      timeout: 5s
+      start_period: 300s
+      start_interval: 1s
+    depends_on:
+      agentfs-init:
+        condition: service_completed_successfully
+
+  # Your workload: any image and any user. It never sees /data.
+  workload:
+    image: ${WORKLOAD_IMAGE:-debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f}
+    command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+    user: ${WORKLOAD_USER:-10000:10000}
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    working_dir: /agentfs/workspace
+    volumes:
+      # Read-only and rslave: the FUSE mount inside (and the one that
+      # replaces it after a crash) propagates in and stays writable
+      # (recursive: writable), while the bare directory under it is
+      # read-only, so nothing is written where nothing records it while no
+      # daemon is mounted.
+      - type: bind
+        source: ./mnt
+        target: /agentfs
+        read_only: true
+        bind:
+          propagation: rslave
+          recursive: writable
+    depends_on:
+      agentfs:
+        condition: service_healthy
+
+volumes:
+  data:

@@ -1,0 +1,7 @@
+# Settings for a volume with no remote (docs/docker.md): its history stays
+# in the Docker volume. Every key is in docs/configuration.md; a fragment
+# must not set agentfs.volume or agentfs.branch (`agentfs init` sets them).
+# A volume with no [remote] section records and commits, and never pushes;
+# a declared local-only mode is coming with milestone F8.
+[agentfs]
+	commitWindow = 200ms

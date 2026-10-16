@@ -1,0 +1,21 @@
+# CI overlay of examples/docker/compose.yaml for ci/e2e-docker.sh: a second
+# workload container, root with Docker's default capabilities, on the same
+# mount as the example's non-root workload. Relative paths resolve against
+# examples/docker (the first compose file's directory).
+services:
+  writer-root:
+    image: ${WORKLOAD_IMAGE:-debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f}
+    command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+    user: "0:0"
+    working_dir: /agentfs/workspace
+    volumes:
+      - type: bind
+        source: ./mnt
+        target: /agentfs
+        read_only: true
+        bind:
+          propagation: rslave
+          recursive: writable
+    depends_on:
+      agentfs:
+        condition: service_healthy
