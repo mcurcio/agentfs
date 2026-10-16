@@ -10,7 +10,7 @@ page says *where*. Section references (§) are to design.md.
 |---|---|---|
 | `agentfs-core` | library | The engine: path rules, the journal, frozen copies, commits, pushes, restores, the patch queue, the history service, LFS, telemetry. No FUSE and no CLI |
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary (§2.1, §3.1, §6) |
-| `agentfs` | binary | The `agentfs` command (§17.1): `init`, `mount`, `run`, `record`, `flush`, `push`, `status`, `probe`, `serve-history`, `restore`, `revert`, `patch`; OpenTelemetry export |
+| `agentfs` | binary | The `agentfs` command (§17.1): `init`, `mount`, `run`, `record`, `flush`, `push`, `status`, `probe`, `serve-history`, `restore`, `revert`, `patch`, `fork`; OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver (§14.2): `agentfs-csi --mode controller\|node\|all`, which supervises `agentfs serve-history` and `agentfs mount` children |
 
 The dependencies run one way: `agentfs-csi` → (`agentfs` as a child
@@ -46,7 +46,7 @@ missing from these tables or a row names a module that no longer exists;
 | `gitmodules.rs` | A port of git fsck's `.gitmodules` rules (§3.4) |
 | `fsync_class.rs` | The `fsync` class for databases: membership and groups (§8) |
 | `history.rs` | The bare history repository: records to commits with `Agentfs-*` trailers (§3.3, §3.4, §9) |
-| `fork/mod.rs` | Forked volumes: a volume started from another's latest commit that publishes one change for a receiver to gate (§19.1, "Forked volumes"); interfaces only until unit 1 lands |
+| `fork/mod.rs` | Forked volumes: a volume started from another's latest commit that publishes one change for a receiver to gate (§11.5, §19.1 "Forked volumes") |
 | `fork/identity.rs` | A fork's identity, fixed at create (source, base, push target), and its ref names |
 | `fork/create.rs` | Creating a fork from a source's state area, without the source's lock or any credentials |
 | `fork/finish.rs` | The finisher: the change and finish commits, publishing to the fork remote, and the fork status DeleteVolume reads |
@@ -135,6 +135,7 @@ missing from these tables or a row names a module that no longer exists;
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
 | `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly (§15) |
 | `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
+| `fork_cmd.rs` | `agentfs fork create` and `agentfs fork finish` (§11.5) |
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it (§7) |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads (§13) |
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters (§13) |

@@ -52,6 +52,7 @@ fn remote(url: &str) -> RemoteSettings {
         lfs_credentials: None,
         ssh_agent: None,
         ssh_key_passphrase: None,
+        fork_remote: false,
     }
 }
 

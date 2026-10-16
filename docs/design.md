@@ -44,8 +44,8 @@ exists to:
 the mount. agentfs does not try to resist a workload that is actively trying to
 defeat it.
 
-Forks are the exception (decided 2026-10-15, §19.1 "Fork content"; not
-built yet): what a sandbox writes into a fork is treated as potentially
+Forks are the exception (decided 2026-10-15, §19.1 "Fork content"; §11.5):
+what a sandbox writes into a fork is treated as potentially
 hostile in everything agentfs itself does with it, while agentfs limits
 nothing that users' own CI may do with what a fork publishes.
 
@@ -133,6 +133,8 @@ through the mount:
     push/<remote>.lock   flock held while pushing that remote
     repairs              paths a mount could not record, for the next one (§3.5)
     patch.json           the patch queue's last run, a cache (§12)
+    fork.json            a fork's published mark, written by the finisher
+                         only after the fork remote confirmed it (§11.5)
     control/agentfs.sock the running daemon's control socket (§2.3, §15);
                          directory 0700, socket 0600
     stack/mnt            where a mount recovering over a stale one mounts FUSE
@@ -485,9 +487,10 @@ returned call is as durable as in single-process mode.
   database (§8). A failure raises `RepackFailed` (§13).
 - **A commit whose tree would not change is not made**: its records are
   consumed without one, so a capture of an unchanged database costs a
-  copy, not a commit. The exception is a patch that changes nothing:
-  it gets a marker commit with the head's tree, so the branch records that
-  it was applied (§12).
+  copy, not a commit. The exceptions are marker commits with the head's
+  tree: a patch that changes nothing, or a duplicate of a patch already
+  applied, so the branch records that it was consumed (§12); and a fork's
+  finish commit, the last commit of its history (§11.5).
 - **Atomic records** (an `fsync`-class group, §8) are committed whole: if
   the commit-time checks refuse any change in one, the whole record is
   dropped, with a `PathRefused` alarm for the refused path.
@@ -1516,6 +1519,16 @@ Agentfs-Pid: 4711
   `Agentfs-Inbox: <n>`, which is how the queue knows a patch is applied:
   only that paragraph counts, so a path or a patch message cannot forge
   it.
+- **A fork's finish commit** (§11.5) is a marker commit whose last
+  paragraph carries `Agentfs-Seq`, `Agentfs-Trigger: finish`,
+  `Agentfs-Fork: <fork>`, `Agentfs-Source: <source>`, `Agentfs-Base:
+  <commit>`, `Agentfs-Change: <commit>` (absent when nothing changed),
+  `Agentfs-Fork-Remote: <remote>` and `Agentfs-Unrecorded: <n>`. Only that
+  paragraph counts, each field checked against its grammar (names as
+  volume names, full commit ids, a decimal count), each at most once. The
+  change commit carries `Agentfs-Fork`, `Agentfs-Source` and
+  `Agentfs-Base` in a final trailer paragraph, which the patch queue drops
+  when it applies the change (§12).
 
 ## 10. Secrets (not in scope)
 
@@ -1899,6 +1912,9 @@ set by the operator) and owns a branch and a ref namespace in that repository:
 | `refs/agentfs/<volume>/applied/<n>` | The patch commit applied as `<n>`; pushed before `inbox/<n>` is deleted on the remote |
 | `refs/agentfs/<volume>/status` | The queue's status for iac (§12): a parentless commit with `status.json`, force-pushed |
 | `refs/agentfs/<volume>/diverged/<timestamp>` | Divergence (§11.3) |
+| `refs/heads/agentfs/<fork>` | A fork's history (§11.5), on its fork remote; fixed at create |
+| `refs/agentfs/<fork>/change` | A fork's change, one commit on base; pushed create-only, never moved |
+| `refs/agentfs/<fork>/finish` | A fork's finish commit; pushed create-only, never moved |
 
 **Pushing.** A recorder pushes only its own volume's refs, with explicit
 refspecs, so pushes from different volumes never contend: the branch and
@@ -1925,6 +1941,74 @@ with the same name would see each other as divergence.
 without `..` and not ending in `.` or `.lock`. They become ref components and
 state file names; a `/` in a volume name would let one volume's
 `refs/agentfs/<volume>/` namespace contain another's.
+
+### 11.5 Forks
+
+A **fork** is a volume started from another volume's latest local commit:
+its **source**, at its **base** (§19.1 "Forked volumes"). It records,
+pushes and recovers like any volume. When it **finishes** (its claim is
+deleted under CSI, or `agentfs fork finish`), it publishes one **change**,
+a commit whose parent is base and whose tree is the fork's final tree,
+and whatever receives the change does all the gating: agentfs never
+reviews, accepts or merges.
+
+**Identity.** `agentfs.fork.source` and `agentfs.fork.base` sit in the
+fork's own state-area config beside `agentfs.volume`, written once at
+create; no include may set them (or `agentfs.fork.pushTarget`), and a
+fork's config may not set `agentfs.branch`. `config::Settings` is the one
+decider of a fork's refs and remotes. Every other setting comes from the
+source's settings files, which the fork includes and reads at every open.
+
+**The fork remote.** Where forks push: the one valid remote section with
+`remote.<name>.agentfsForkRemote = true`, else the source's patch remote
+(§12; §19.1 "Fork remote", gate answer b). A flagged section is never one
+of the source's own push remotes, never sets its limits (§3.4) and never
+becomes its patch remote, so a source never pushes there. Two flagged
+sections, or one that is invalid, leave no fork remote: forks are refused
+rather than fall back. A fork pushes only to its fork remote, at
+`refs/heads/agentfs/<fork>` (the push target, fixed at create; hidden refs
+arrive with forked volumes unit 4), and has no patch queue.
+
+**Create** (`fork::create`) reads the source's settings and branch head
+without its lock and with no credentials, and refuses a source with no
+history, one that is a fork (forks of forks are deferred) and one with no
+fork remote. It then writes the fork's state area: its identity, the
+source's settings files as includes, the source's `info/exclude` and
+`info/attributes`, every object reachable from base packed into the
+fork's own object store (no alternates, so a fork outlives its source),
+the fork's branch at base, and base's tree written into the backing tree
+through the restore engine's confined writer (no symlink followed, nothing
+recorded), with LFS objects copied from the source's cache. Each step is
+idempotent per name: a retry resumes, and a second create of the same
+fork returns the base it was created with. A CLI source must keep its
+settings in included files (`SourceSettingsNotIncluded` otherwise), since
+the fork reads only those; a CSI source's are its profile's.
+
+**Finish** (`fork::finish::Finisher`, only under the fork's state lock)
+commits what is journaled, records the paths in `meta/repairs` from the
+tree (each one that fails is counted and alarmed as `RecordFailed`), then
+writes the change (none when the final tree is base's) with
+`refs/agentfs/<fork>/change`, the finish commit (§9) as the branch head,
+and `refs/agentfs/<fork>/finish`. The finish commit is the single home of
+base, change and fork remote. A second finish returns the same record; a
+crash between any two writes converges. With no fork remote, finish
+writes nothing and the fork stays active.
+
+**Publish** retries with §11.2 backoff: the history push to the fork
+remote (a branch a forge moved is §11.3 divergence: the head is saved
+under `diverged/` and alarmed, and it never blocks publishing), then the
+change and finish refs, **create-only**: never `+`, a ref the remote holds
+at another id is another writer's and is never moved, and a listing after
+the push confirms both refs at exactly their ids. Only then is the
+published mark written to `meta/fork.json`. **Status** (`fork::finish::status`,
+no lock, no credentials) is `active` before the finish commit, `finished`
+after it, and `published` when the mark names that finish commit; a mark
+that cannot be read, or settings that cannot be loaded, are errors, never
+a state, so DeleteVolume waits.
+
+Not built yet: refused and abandoned forks, finished forks read-only,
+`fork status` and `fork list` (unit 2); library delivery (unit 3); hidden
+refs and the operations runbooks (unit 4).
 
 ## 12. Patch queue for iac (phase 3, built)
 
@@ -1993,8 +2077,17 @@ volume stopped. `agentfs run` does not. In order:
   oid>` and `Agentfs-Inbox: <n>`; its message is the patch's, without a
   final trailer paragraph.
 - **A patch that changes nothing** (its content is already there) gets a
-  marker commit with the head's tree and the same trailers: the one
-  exception to §3.4's no empty commits.
+  marker commit with the head's tree and the same trailers (§3.4's
+  exceptions).
+- **A duplicate** (§19.1 "Patch duplicates"): when anything is queued, the
+  run scans the whole first-parent history once; before applying inbox
+  `n`, if an earlier number applied the same patch commit, `n` is consumed
+  with a marker commit with the head's tree carrying `Agentfs-Inbox: <n>`
+  and the subject `duplicate of patch <m>: <summary>`, its refs move, and
+  `PatchDuplicate` is raised; nothing is merged or written, so a change the
+  workload reverted since stays reverted. `status.json` lists these under
+  `duplicate_now`. The branch's trailers still decide, so every crash
+  point converges.
 - **Refused at record or commit time** (a commit-time check drops the
   atomic record), the patch's writes are put back and the queue blocks.
   **A write that fails part way** is recorded as it stands, as an
@@ -2057,7 +2150,7 @@ on the oid listed).
 `status.json`, rewritten at every run and force-pushed: a snapshot, not
 history. Schema version 1 (fields in the runbook): the volume, branch and
 head, `updated`, `last_applied` (inbox, patch, commit), `applied_now`,
-`queue` (inbox, patch; the blocked one first), `blocked` (inbox, patch,
+`duplicate_now` (inbox, patch, applied_as; absent when empty), `queue` (inbox, patch; the blocked one first), `blocked` (inbox, patch,
 reason, message, paths), `ignored` and `fetch` (remote, ok, error).
 `agentfs status` prints a `patches:` line from `meta/patch.json`, and
 `agentfs patch status [--json]` the whole status.
@@ -2164,6 +2257,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PatchFetchFailed` | Fetching the inbox from the patch remote failed or timed out; the queue runs with what was already fetched (§12) |
 | `PatchIgnored` | An inbox entry the queue never applies: `stale` (at or below the last applied number, with another commit; deleted on the remote by the queue push) or `malformed` (§12); a warning |
 | `PatchApplied` | A patch was applied as a commit (not an alarm; sinks filter) |
+| `PatchDuplicate` | A queued patch commit was already applied under an earlier inbox number, so it was consumed with a marker commit and not applied again (§12; not an alarm) |
 | `HistoryServiceUnavailable` | A front's request to the history service failed (unreachable, timed out, lost or refused) after it last succeeded: raised once per outage; boundaries fail with `EIO` until it is back (§3.5, §14) |
 | `HistoryServiceRestored` | A front's request succeeded again after `HistoryServiceUnavailable` (not an alarm; sinks filter, the CLI prints it) |
 | `IdentityFallback` | The history service could not render a journaled front origin's committer (the identity templates changed across a restart); that pod's records are committed with the service's own committer, keeping the pod trailers (§9); once per pod |
@@ -3012,7 +3106,8 @@ one-time migration of Hermes' existing data and the initial import in
 - **`agentfs`, a binary:**
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
     `serve-history` (§14), `restore`, `revert`, `patch` (`submit`,
-    `apply`, `status`) and `lfs` (`fetch`, `prune`); a test (`crates/agentfs/src/reference_tests.rs`)
+    `apply`, `status`), `lfs` (`fetch`, `prune`) and `fork` (`create`,
+    `finish`, §11.5); a test (`crates/agentfs/src/reference_tests.rs`)
     checks this list against the CLI;
   - `init` is safe to re-run (§2.3): exit 0 for the volume it already
     holds, 1 for another volume or branch; `--include` sets the config's
@@ -3675,11 +3770,15 @@ runner.
 | Fork finish (2026-10-15) | A fork finishes when its claim is deleted (DeleteVolume of a volume from a fork class, whose reclaim policy must be Delete), and outside Kubernetes when `agentfs fork finish` runs. A restart of agentfs, the node plugin or the kubelet never finishes a fork; with a pod-scoped claim, a drain or rollout does. Asked when a sandbox is finished (a: its claim is deleted; b: its last pod stops; c: an explicit finish), the owner: "1a". Not built yet |
 | Fork delivery (2026-10-15) | The CSI driver only publishes; a receiver lands a published change in its source with `agentfs patch submit`. The library and the CLI also deliver a change, by four built-in methods: inbox, branch, command and webhook. The owner: "2 a for CSI and b for the library". Not built yet |
 | Fork content (2026-10-15) | Everything agentfs itself does with a fork's content treats it as potentially hostile: names, paths, sizes, symlinks and gitlinks are checked, and nothing is run. agentfs adds no CI filtering: forks publish where users' own CI can act on them (§1.1). The owner: "3 potentially hostile, but don't limit CI capabilities that users could create". Not built yet |
-| Fork remote (2026-10-16) | Forks publish to the source's own remote by default, with no setup (the remote its patch queue uses, §12: a design choice). An explicit fork-remote setting may name another remote, which is then never one of the source's push remotes, never sets its limits and never becomes its patch remote (a design choice, design rule 1). The stated cost: wherever that repository's CI may write, a sandbox's CI file can write the source's inbox, so the gate is only as strong as that repository's CI write permissions. The owner, answering the design gate's question on where forks publish: "b". Not built yet |
+| Fork remote (2026-10-16) | Forks publish to the source's own remote by default, with no setup (the remote its patch queue uses, §12: a design choice). An explicit fork-remote setting may name another remote, which is then never one of the source's push remotes, never sets its limits and never becomes its patch remote (a design choice, design rule 1). The stated cost: wherever that repository's CI may write, a sandbox's CI file can write the source's inbox, so the gate is only as strong as that repository's CI write permissions. The owner, answering the design gate's question on where forks publish: "b". Built (§11.5) |
 | Fork hostile residual (2026-10-16) | Accepted and stated, with no hardening work now: a sandbox's file calls are served by the privileged node plugin, which holds every profile's credentials, so a bug in that front would expose node root and every profile's credentials; and volume size is not enforced on the shared base path (§14.2), so a sandbox can fill it for every volume there. The owner, answering the design gate's question on the hostile residual: "a" |
 | Fork design rules (2026-10-16) | (1) A fork's push target is fixed at create: `agentfs/<fork>` on the fork remote, never the source's branch; every other setting is read from the source's settings files at each open, and settings that cannot be read stop the fork opening. (2) A fork finishes once, writing one finish record, and the finisher retries publishing until the fork remote holds the change; the fork is not deleted until it is published, or until an operator abandons it on record. (3) agentfs publishes and the receiver gates: a receiver lands the exact change commit it reviewed, and the source applies a given change at most once. Approved with the design gate's answers, with no notes (2026-10-16). Not built yet |
 | Fork scope (2026-10-16) | Four units, tracer first, docs with each: (1) the tracer: fork identity and fork remote; create, finish and publish; CSI cloning of a claim, a fork StorageClass with `fork: "true"` and reclaim policy Delete, and its admission check; DeleteVolume waiting until the fork is published; the source applying a given change at most once; (2) refused and abandoned forks, settings that fail closed, finished forks read-only, `fork status` and `fork list`; (3) library delivery: the delivery contract, its four methods, `fork deliver`; (4) hidden refs, the history-rewrite runbook covering forks, telemetry, the runbook for refused publishes. The owner, answering the design gate's question on scope: "a" (build units 1 to 4 as outlined) |
 | Content sources (2026-10-16) | Reverses §14.2's "nothing clones": CreateVolume clones a claim's `dataSource` claim when the StorageClass is a fork class (`fork: "true"`), copying the source's history up to its latest commit and writing that commit's tree locally, with no credentials. Any other content source, and every snapshot, stays refused. Follows from "Forked volumes" and "Fork scope". Not built yet (forked volumes unit 1) |
+| Fork remote flag (2026-10-16) | The explicit fork-remote setting of "Fork remote" is `remote.<name>.agentfsForkRemote = true` on one remote section of the source's settings: that section is only for forks, never one of the source's push remotes, never its patch remote and never a source of its record-time limits; with none, forks push to the source's patch remote. Two flagged sections, or an invalid one, leave no fork remote, and forks are refused rather than fall back. A design choice (forked volumes unit 1), not the owner's words |
+| Patch duplicates (2026-10-16) | The source applies a given change at most once ("Fork design rules" 3) by a rule for every producer, keyed by the patch commit's id: a queued patch commit that an earlier inbox number already applied is consumed with a marker commit and `PatchDuplicate`, never merged again (§12). Cost: a producer can no longer resubmit the identical commit to apply it again (it must make a new commit), and a replaced or replayed copy of a change has another id and is not caught. A design choice (forked volumes unit 1), not the owner's words |
+| Fork onDelete (2026-10-16) | A fork class's `onDelete` defaults to `delete`: publishing is a fork's gate before deletion, so the unpushed-branch check of ordinary volumes does not apply to it. A design choice (forked volumes unit 1), not the owner's words |
+| Published (2026-10-16) | A fork is published when the finisher has seen its fork remote hold `refs/agentfs/<fork>/change` and `refs/agentfs/<fork>/finish` at exactly their ids after pushing them create-only; the fork's branch is pushed first, and a branch a forge moved is §11.3 divergence (saved and alarmed), which never blocks publishing. A design choice (forked volumes unit 1), not the owner's words |
 
 ### 19.2 Open questions
 

@@ -372,6 +372,7 @@ impl Fixture {
             lfs_credentials: None,
             ssh_agent: None,
             ssh_key_passphrase: None,
+            fork_remote: false,
         }
     }
 

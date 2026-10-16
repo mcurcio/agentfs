@@ -32,6 +32,7 @@ use crate::claims::PathClaims;
 use crate::config::{ConfigError, validate_name};
 use crate::confined;
 use crate::events::{CheckStage, Event, Events};
+use crate::fork::identity::{self as fork_identity, ForkIdentity};
 use crate::fsync_class::{self, FsyncClass, GroupMembers};
 use crate::history::{Committed, History, HistoryError};
 use crate::history_service::{ClientError, FrontLease, HistoryClient, PathStamp};
@@ -108,6 +109,11 @@ impl StateDir {
     /// The patch queue's cached state (design §12): `meta/patch.json`.
     pub fn patch_state(&self) -> PathBuf {
         self.meta().join("patch.json")
+    }
+
+    /// `meta/fork.json`: the finisher's marks (design §2.2, §11.5).
+    pub fn fork_mark(&self) -> PathBuf {
+        self.meta().join("fork.json")
     }
 
     /// The lock that keeps two processes from pushing `remote` at once.
@@ -252,6 +258,8 @@ pub enum VolumeError {
          branch cannot be changed by init)"
     )]
     OtherBranch { found: String, wanted: String },
+    #[error("this state area is fork {found:?}, not {wanted:?}; nothing was changed")]
+    OtherFork { found: String, wanted: String },
 }
 
 /// What [`Recorder::record_move`] did.
@@ -361,9 +369,43 @@ pub fn init_with(
     branch: Option<&str>,
     includes: Option<&[PathBuf]>,
 ) -> Result<Init, VolumeError> {
+    init_inner(state, volume, branch, includes, None)
+}
+
+/// Creates the state area of the fork `identity` (design §11.5), or
+/// accepts the one an earlier try created, as [`init_with`] does: the
+/// identity goes in the state area's own config (`agentfs.volume`,
+/// `agentfs.fork.source`, `agentfs.fork.base`, never `agentfs.branch`),
+/// and `includes` become its `include.path` entries. An existing state area
+/// of the same fork and source is [`Init::AlreadyInitialised`] with its
+/// base untouched; one of another volume or fork is refused.
+pub fn init_fork(
+    state: &StateDir,
+    identity: &ForkIdentity,
+    includes: &[PathBuf],
+) -> Result<Init, VolumeError> {
+    init_inner(state, &identity.fork, None, Some(includes), Some(identity))
+}
+
+/// [`init_with`] and [`init_fork`].
+fn init_inner(
+    state: &StateDir,
+    volume: &str,
+    branch: Option<&str>,
+    includes: Option<&[PathBuf]>,
+    fork: Option<&ForkIdentity>,
+) -> Result<Init, VolumeError> {
     validate_name("agentfs.volume", volume).map_err(config_error)?;
+    if let Some(fork) = fork {
+        validate_name(fork_identity::SOURCE_KEY, &fork.source).map_err(config_error)?;
+    }
     let git = state.git();
     let existing = existing_identity(&git)?;
+    if let (Some((found, _)), Some(fork)) = (&existing, fork)
+        && found == volume
+    {
+        check_fork(&git, fork)?;
+    }
     let outcome = match existing {
         Some((found, _)) if found != volume => {
             return Err(VolumeError::OtherVolume {
@@ -391,6 +433,9 @@ pub fn init_with(
         }
         None => {
             History::init(&git, volume, branch)?;
+            if let Some(fork) = fork {
+                write_fork_identity(&git, fork)?;
+            }
             Init::Created
         }
     };
@@ -424,6 +469,47 @@ fn existing_identity(git: &Path) -> Result<Option<(String, String)>, VolumeError
     };
     let branch = get("agentfs.branch")?.unwrap_or_else(|| format!("agentfs/{volume}"));
     Ok(Some((volume, branch)))
+}
+
+/// An existing state area named like the fork `wanted`: it must be that
+/// fork of that source. One whose identity was never written (a crash
+/// between creating the repository and writing it), with no history yet,
+/// gets it now.
+fn check_fork(git: &Path, wanted: &ForkIdentity) -> Result<(), VolumeError> {
+    let config = git2::Config::open(&git.join("config")).map_err(HistoryError::from)?;
+    let get = |key: &str| {
+        crate::config::string(&config, key).map_err(|e| VolumeError::History(e.into()))
+    };
+    match get(fork_identity::SOURCE_KEY)? {
+        Some(source) if source == wanted.source => Ok(()),
+        Some(source) => Err(VolumeError::OtherFork {
+            found: format!("{} of {source}", wanted.fork),
+            wanted: format!("{} of {}", wanted.fork, wanted.source),
+        }),
+        None => {
+            let repo = git2::Repository::open_bare(git).map_err(HistoryError::from)?;
+            let has_history = repo.find_reference(&wanted.history_ref()).is_ok();
+            if has_history || get(fork_identity::BASE_KEY)?.is_some() {
+                return Err(VolumeError::OtherFork {
+                    found: format!("{} (not a fork)", wanted.fork),
+                    wanted: format!("{} of {}", wanted.fork, wanted.source),
+                });
+            }
+            write_fork_identity(git, wanted)
+        }
+    }
+}
+
+/// The fork identity keys, in the state area's own config.
+fn write_fork_identity(git: &Path, fork: &ForkIdentity) -> Result<(), VolumeError> {
+    let mut config = git2::Config::open(&git.join("config")).map_err(HistoryError::from)?;
+    config
+        .set_str(fork_identity::SOURCE_KEY, &fork.source)
+        .map_err(HistoryError::from)?;
+    config
+        .set_str(fork_identity::BASE_KEY, &fork.base.to_string())
+        .map_err(HistoryError::from)?;
+    Ok(())
 }
 
 fn config_error(e: ConfigError) -> VolumeError {

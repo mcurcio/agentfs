@@ -13,11 +13,14 @@
 //! - [`finish`]: the finisher, the one owner of `finished` and
 //!   `published`, and [`finish::status`], what DeleteVolume asks.
 //!
-//! Interfaces only for now: every operation returns its `NotBuilt` error
-//! until forked volumes unit 1 lands.
+//! Design §11.5 has the whole model; refused and abandoned forks arrive
+//! with forked volumes unit 2.
 
 pub mod create;
 pub mod finish;
 pub mod identity;
+
+#[cfg(test)]
+mod tests;
 
 pub use identity::{ForkIdentity, PushTarget, change_ref, finish_ref};

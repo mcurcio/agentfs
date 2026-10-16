@@ -695,6 +695,7 @@ impl EventSink for TelemetrySink {
             | Event::RemoteMisconfigured { .. }
             | Event::PushSucceeded { .. }
             | Event::PatchApplied { .. }
+            | Event::PatchDuplicate { .. }
             | Event::PatchBlocked { .. }
             | Event::PatchIgnored { .. }
             | Event::PatchFetchFailed { .. }
@@ -742,6 +743,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::RemoteMisconfigured { .. } => "agentfs.remote_misconfigured",
         Event::PushSucceeded { .. } => "agentfs.push_succeeded",
         Event::PatchApplied { .. } => "agentfs.patch_applied",
+        Event::PatchDuplicate { .. } => "agentfs.patch_duplicate",
         Event::PatchBlocked { .. } => "agentfs.patch_blocked",
         Event::PatchIgnored { .. } => "agentfs.patch_ignored",
         Event::PatchFetchFailed { .. } => "agentfs.patch_fetch_failed",
@@ -871,6 +873,18 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             out.push(("agentfs.patch.oid", oid(patch)));
             out.push(("agentfs.patch.commit", oid(commit)));
         }
+        Event::PatchDuplicate {
+            inbox,
+            patch,
+            applied_as,
+        } => {
+            out.push(("agentfs.patch.inbox", AnyValue::Int(*inbox as i64)));
+            out.push(("agentfs.patch.oid", oid(patch)));
+            out.push((
+                "agentfs.patch.applied_as",
+                AnyValue::Int(*applied_as as i64),
+            ));
+        }
         Event::PatchBlocked {
             inbox,
             patch,
@@ -931,6 +945,7 @@ impl<L: Logger + Send + Sync> AlarmLog for OtelAlarmLog<L> {
             Event::PathRefused { .. } => (Severity::Warn, "WARN"),
             Event::PushSucceeded { .. }
             | Event::PatchApplied { .. }
+            | Event::PatchDuplicate { .. }
             | Event::HistoryServiceRestored { .. } => (Severity::Info, "INFO"),
             Event::PatchFetchFailed { .. }
             | Event::PatchIgnored { .. }

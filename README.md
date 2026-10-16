@@ -430,7 +430,37 @@ agentfs --state /data/state --root /data/backing patch apply   # with the volume
   `applied/<n>`, deletes `inbox/<n>` and updates the status ref
   (`refs/agentfs/<volume>/status`, holding `status.json`).
 
+- The same patch commit queued twice applies once: the later number gets
+  a marker commit (`duplicate of patch <m>`), so a change is never
+  applied again.
+
 Runbook: [the patch queue](docs/runbooks/patch-queue.md).
+
+## Forked volumes
+
+A fork is a volume started from another volume's latest commit: a
+sandbox edits it like any directory, and when it ends the fork publishes
+one change, a commit on the base it started from, for whatever receives
+it to review and land. agentfs never accepts or merges
+([design §11.5](docs/design.md#115-forks)).
+
+```sh
+# A fork of the volume at ./state, in ./fork with its tree in ./fork-tree:
+agentfs --state ./fork --root ./fork-tree fork create --source-state ./state
+# ... the sandbox works in ./fork-tree; record or mount it as usual ...
+agentfs --state ./fork --root ./fork-tree fork finish    # finish once, publish
+# A receiver lands the exact change it reviewed in the source:
+agentfs patch submit --volume src <change commit>
+```
+
+- Forks push `refs/heads/agentfs/<fork>`, and on finish
+  `refs/agentfs/<fork>/change` and `/finish`, to the fork remote: the one
+  remote section with `agentfsForkRemote = true`, else the source's patch
+  remote. A source never pushes to a flagged remote.
+- Under CSI, a claim with a `dataSource` claim on a fork StorageClass
+  (`fork: "true"`, reclaim policy `Delete`) is a fork; deleting it
+  finishes the fork, and the driver deletes the volume only once it is
+  published ([docs/csi.md](docs/csi.md)).
 
 ## Telemetry
 

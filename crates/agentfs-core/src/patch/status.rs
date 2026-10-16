@@ -112,6 +112,16 @@ pub struct QueueEntry {
     pub patch: String,
 }
 
+/// A patch consumed as a duplicate in this run (design §12): the same
+/// patch commit as an earlier inbox number, so not applied again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateEntry {
+    pub inbox: u64,
+    pub patch: String,
+    /// The inbox number that applied it first.
+    pub applied_as: u64,
+}
+
 /// How the fetch before the run went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchStatus {
@@ -134,6 +144,10 @@ pub struct StatusDoc {
     pub last_applied: Option<AppliedEntry>,
     /// Applied in this run, in order.
     pub applied_now: Vec<u64>,
+    /// Consumed as duplicates in this run, in order (an optional field:
+    /// the schema stays version 1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_now: Vec<DuplicateEntry>,
     /// Still queued, in order, the blocked patch first.
     pub queue: Vec<QueueEntry>,
     pub blocked: Option<Blocked>,
@@ -214,6 +228,7 @@ mod tests {
                 commit: "3".repeat(40),
             }),
             applied_now: vec![1],
+            duplicate_now: vec![],
             queue: vec![
                 QueueEntry {
                     inbox: 2,

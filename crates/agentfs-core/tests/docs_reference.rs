@@ -41,6 +41,8 @@ fn home(key: &str) -> (&'static str, String) {
         ("`[remote \"<name>\"]`", k.to_owned())
     } else if key.starts_with("agentfs.identity.") {
         ("`[agentfs \"identity\"]`", key.to_owned())
+    } else if key.starts_with("agentfs.fork.") {
+        ("`[agentfs \"fork\"]`", key.to_owned())
     } else if key.starts_with("agentfs.") {
         ("`[agentfs]`", key.to_owned())
     } else if key.starts_with("lfs.") {

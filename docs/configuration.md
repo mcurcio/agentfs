@@ -137,6 +137,22 @@ with the service's own committer, keeping the pod's trailers, and the
 | `agentfs.identity.authorName` | `uid-{uid}` |
 | `agentfs.identity.authorEmail` | `uid-{uid}@{volume}.agentfs.invalid` |
 
+### `[agentfs "fork"]`
+
+A fork's identity (design §11.5), fixed when the fork is created
+(`agentfs fork create`, or CSI CreateVolume with a fork class) and written
+in the fork's own state-area config, beside `agentfs.volume`. Never set
+them by hand, and never in an include: a fragment that sets either key,
+or `agentfs.fork.pushTarget`, fails with `IncludeSetsIdentity`. Both are
+set, or neither; a fork's config must not set `agentfs.branch`. A fork's
+branch is `agentfs/<fork>`, its only push remote is its fork remote (see
+`agentfsForkRemote`), and it has no patch queue.
+
+| Key | Type | Default | Meaning and validation |
+|---|---|---|---|
+| `agentfs.fork.source` | name | unset: not a fork | The source volume's name, as `agentfs.volume` |
+| `agentfs.fork.base` | full commit id | unset: not a fork | The source branch's head when the fork was created: 40 lowercase hex digits |
+
 ## Operator attributes
 
 `<state>/git/info/attributes` uses git's attribute syntax. `agentfs.store`,
@@ -211,6 +227,7 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `lfspushurl` | as `lfsurl` | `lfsurl` | Where LFS uploads go, unless `lfs.pushurl` or `lfs.url` is set |
 | `agentfsLfsCredentials` | absolute path | none | The credential file (same format as `agentfsCredentials`) for an LFS endpoint on another host or port than the push URL; never sent to any other host |
 | `proxy` | as `http.proxy`, or empty | `http.proxy` | This remote's HTTP proxy, as in git; an empty value means no proxy for this remote. It carries the remote's `https` git traffic and all its LFS requests, never SSH or plain `http://` git traffic (see [Proxies](#proxies)) |
+| `agentfsForkRemote` | boolean | `false` | This section is only for forks of the volume (design §11.5): never one of the volume's own push remotes, never its patch remote, and its limits never apply to the volume's records. With one such section, forks push there; with none, forks push to the volume's patch remote; two or more such sections are all invalid and forks are refused (`NoForkRemote`) |
 
 The remote's name must be a valid agentfs name (as for `agentfs.volume`;
 git accepts `team/backup`, agentfs does not), because it names the push
@@ -709,7 +726,7 @@ templates' variables, the commit trailers and the telemetry resource:
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `serve-history`, `restore`, `revert`, `patch apply`, `status` (accepted and ignored) |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `serve-history`, `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
 
 **Command flags:**
 
@@ -751,6 +768,9 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--skip N` | | | `patch submit`: replace queued patch N with an empty patch, so the queue moves on |
 | `--depth N` | | full history | `patch submit`: fetch only this many commits (shallow producers) |
 | `--attempts N` | | `10` | `patch submit`: inbox numbers to try when other submitters race |
+| `--source-state DIR` | | none: required | `fork create`: the source volume's state area, read without its lock; its settings must be in included files, which the fork includes too |
+| `--name NAME` | | the source's name | `fork create`: the fork's name before its random suffix (`<name>-<8 hex digits>`) |
+| `--timeout DURATION` | | until published | `fork finish`: stop publishing after this long and exit 1 |
 
 The [operator guide](operator-guide.md) §4 describes the mount flags in
 full, and §16 the history service and fronts; the

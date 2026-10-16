@@ -262,6 +262,30 @@ impl PushOutcome {
     }
 }
 
+/// One ref of [`RemotePusher::push_create_only`]: created on the remote
+/// at `oid` if absent, never moved (design §11.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateOnlyRef {
+    pub name: String,
+    pub oid: Oid,
+}
+
+/// What [`RemotePusher::push_create_only`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateOnlyOutcome {
+    /// Every ref is on the remote at exactly its oid (listed after the
+    /// push).
+    Held,
+    /// Not yet: retried like any failed push (design §11.3).
+    Failed {
+        kind: PushFailureKind,
+        message: String,
+    },
+    /// A ref is on the remote at another oid: someone else wrote it, and
+    /// it is never overwritten.
+    AnotherWriter { name: String, found: Oid },
+}
+
 /// What libgit2 reported for one push call.
 struct Attempt {
     result: Result<(), GitError>,
@@ -732,6 +756,79 @@ impl RemotePusher {
                 }
                 e
             })
+    }
+
+    /// One push of `refs`, each created only where the remote lacks it
+    /// (never `+`), under this remote's push lock, with the same
+    /// authentication and proxy as the branch push and the LFS objects
+    /// their commits reference uploaded first; then a listing that checks
+    /// each is at exactly its oid (design §11.5). A ref the remote holds at
+    /// another oid, before or after the push, is
+    /// [`CreateOnlyOutcome::AnotherWriter`] and is left alone. Never
+    /// touches the branch or the queue refs, nor this remote's push state.
+    pub fn push_create_only(&mut self, refs: &[CreateOnlyRef]) -> CreateOnlyOutcome {
+        let url = self.remote.push_url().to_owned();
+        let failed = |kind, message: String| CreateOnlyOutcome::Failed {
+            kind,
+            message: scrub_userinfo(&message, &url),
+        };
+        let _lock = match self.lock() {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                return failed(
+                    PushFailureKind::Local,
+                    "another process is pushing this remote".into(),
+                );
+            }
+            Err(e) => {
+                let message = format!("locking {}: {e}", self.lock_path.display());
+                return failed(PushFailureKind::Local, message);
+            }
+        };
+        let wanted = |name: &str| refs.iter().any(|r| r.name == name);
+        let listed = match self.list_remote_refs(wanted) {
+            Ok(listed) => listed,
+            Err((kind, message)) => return failed(kind, message),
+        };
+        if let Some(other) = another_writer(refs, &listed) {
+            return other;
+        }
+        let missing: Vec<&CreateOnlyRef> = refs
+            .iter()
+            .filter(|r| listed.get(&r.name) != Some(&r.oid))
+            .collect();
+        if missing.is_empty() {
+            return CreateOnlyOutcome::Held;
+        }
+        for r in &missing {
+            if let Err(e) = self.upload_lfs(r.oid) {
+                return failed(e.kind, e.message);
+            }
+        }
+        let refspecs: Vec<String> = missing
+            .iter()
+            .map(|r| format!("{}:{}", r.oid, r.name))
+            .collect();
+        let attempt = self.attempt(&refspecs, &[]);
+        let pushed = self.attempt_error(&attempt);
+        let listed = match self.list_remote_refs(wanted) {
+            Ok(listed) => listed,
+            Err((kind, message)) => {
+                let (kind, message) = pushed.unwrap_or((kind, message));
+                return failed(kind, message);
+            }
+        };
+        if let Some(other) = another_writer(refs, &listed) {
+            return other;
+        }
+        if refs.iter().all(|r| listed.get(&r.name) == Some(&r.oid)) {
+            return CreateOnlyOutcome::Held;
+        }
+        let (kind, message) = pushed.unwrap_or((
+            PushFailureKind::Refused,
+            "the remote accepted the push but does not list every ref".into(),
+        ));
+        failed(kind, message)
     }
 
     /// This remote's push lock file: held while a push runs, and by a
@@ -1267,6 +1364,20 @@ impl RemotePusher {
             stage,
         }
     }
+}
+
+/// The first of `refs` that `listed` holds at another oid.
+fn another_writer(
+    refs: &[CreateOnlyRef],
+    listed: &BTreeMap<String, Oid>,
+) -> Option<CreateOnlyOutcome> {
+    refs.iter().find_map(|r| match listed.get(&r.name) {
+        Some(found) if *found != r.oid => Some(CreateOnlyOutcome::AnotherWriter {
+            name: r.name.clone(),
+            found: *found,
+        }),
+        _ => None,
+    })
 }
 
 /// A pusher for every configured remote (see [`RemotePusher::open`]).
@@ -2333,6 +2444,65 @@ mod tests {
         assert_eq!(steps, [(Some(pushed), chain[1], 2)]);
         assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(chain[3]));
         assert!(diverged_refs(remote, "vol").is_empty());
+    }
+
+    /// Design §11.5: create-only refs are created where absent, confirmed
+    /// by a listing, and never moved.
+    #[test]
+    fn create_only_refs_are_created_and_never_moved() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        bare(remote_dir.path());
+        let url = remote_dir.path().display().to_string();
+        let mut v = Vol::new("vol", &[("origin", &url)]);
+        let first = v.commit();
+        let second = v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        let refs = [CreateOnlyRef {
+            name: "refs/agentfs/vol/finish".into(),
+            oid: second,
+        }];
+        assert_eq!(pusher.push_create_only(&refs), CreateOnlyOutcome::Held);
+        assert_eq!(
+            remote_ref(remote_dir.path(), "refs/agentfs/vol/finish"),
+            Some(second)
+        );
+        // Again: already held, nothing sent.
+        assert_eq!(pusher.push_create_only(&refs), CreateOnlyOutcome::Held);
+        // A ref the remote holds elsewhere, even an ancestor a plain push
+        // would fast-forward, is another writer's and stays.
+        let other = [CreateOnlyRef {
+            name: "refs/agentfs/vol/change".into(),
+            oid: second,
+        }];
+        assert!(pusher.push_once().is_success());
+        let remote = Repository::open_bare(remote_dir.path()).unwrap();
+        remote
+            .reference("refs/agentfs/vol/change", first, true, "test")
+            .unwrap();
+        assert_eq!(
+            pusher.push_create_only(&other),
+            CreateOnlyOutcome::AnotherWriter {
+                name: "refs/agentfs/vol/change".into(),
+                found: first,
+            }
+        );
+        assert_eq!(
+            remote_ref(remote_dir.path(), "refs/agentfs/vol/change"),
+            Some(first)
+        );
+        // An unreachable remote fails and is retried.
+        let missing = tempfile::tempdir().unwrap().path().join("nope");
+        let mut gone = Vol::new("vol", &[("gone", &missing.display().to_string())]);
+        let head = gone.commit();
+        let mut pusher = gone.pusher("gone", Arc::new(NullSink));
+        let outcome = pusher.push_create_only(&[CreateOnlyRef {
+            name: "refs/agentfs/vol/finish".into(),
+            oid: head,
+        }]);
+        assert!(
+            matches!(outcome, CreateOnlyOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
     }
 
     #[test]

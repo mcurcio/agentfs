@@ -1021,6 +1021,7 @@ mod tests {
             lfs_credentials: None,
             ssh_agent: None,
             ssh_key_passphrase: None,
+            fork_remote: false,
         }
     }
 
@@ -1041,6 +1042,7 @@ mod tests {
             credentials: None,
             ssh_key: Some(key),
             known_hosts: Some(known_hosts),
+            fork_remote: false,
         }
     }
 
@@ -1304,6 +1306,7 @@ mod tests {
                 ("agentfsCredentials", l.p("token")),
                 ("agentfsSshKey", l.p("backing/keys/id")),
             ],
+            fork_remote: false,
         }];
         let err = l.check_with("state", "backing", "mnt", &s).unwrap_err();
         assert!(

@@ -25,6 +25,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::fork::identity::{self as fork_identity, ForkIdentity, PushTarget};
 use crate::identity::Templates;
 use crate::proxy::ProxySetting;
 use crate::remote_url::{self, Transport};
@@ -103,6 +104,12 @@ pub enum ConfigError {
         path.display()
     )]
     IncludeSetsIdentity { path: PathBuf, key: &'static str },
+    #[error("{key}: {value:?} is not a full commit id")]
+    BadForkBase { key: String, value: String },
+    #[error("agentfs.fork.source and agentfs.fork.base must be set together")]
+    PartialForkIdentity,
+    #[error("agentfs.branch is set in a fork's config; a fork's push target is fixed at create")]
+    ForkBranch,
     #[error(
         "{key}: {value:?} is not an LFS endpoint agentfs can use (an http:// or https:// \
          URL, a file:// URL or a path; design §7)"
@@ -150,6 +157,8 @@ pub const KEYS: &[&str] = &[
     "agentfs.identity.committerEmail",
     "agentfs.identity.authorName",
     "agentfs.identity.authorEmail",
+    "agentfs.fork.source",
+    "agentfs.fork.base",
     "lfs.url",
     "lfs.pushurl",
     "lfs.concurrenttransfers",
@@ -170,6 +179,7 @@ pub const KEYS: &[&str] = &[
     "remote.<name>.lfspushurl",
     "remote.<name>.agentfsLfsCredentials",
     "remote.<name>.proxy",
+    "remote.<name>.agentfsForkRemote",
 ];
 
 /// Notes that `key` was read, for the test that checks [`KEYS`] against
@@ -272,6 +282,10 @@ pub struct RemoteSettings {
     /// ([`crate::proxy`]): `remote.<name>.proxy`, else `http.proxy`; an
     /// empty `remote.<name>.proxy` means none.
     pub proxy: Option<ProxySetting>,
+    /// `remote.<name>.agentfsForkRemote` (bool, default false): this
+    /// section is only for forks of the volume (design §11.5). It is never
+    /// one of the volume's own push remotes.
+    pub fork_remote: bool,
 }
 
 /// The agentfs keys of a remote section that name files, which the mount
@@ -294,6 +308,9 @@ pub struct InvalidRemote {
     /// [`REMOTE_FILE_KEYS`]), read separately so the mount preflight checks
     /// them even though the section is not used.
     pub files: Vec<(&'static str, PathBuf)>,
+    /// The section sets `agentfsForkRemote` (or a value that cannot be
+    /// read as false): it is only for forks, never the volume's own.
+    pub fork_remote: bool,
 }
 
 impl RemoteSettings {
@@ -421,6 +438,16 @@ pub struct Settings {
     /// Every `include.path`, in order: absolute, readable config fragments
     /// whose keys count as the repository's own (design §4.3).
     pub includes: Vec<PathBuf>,
+    /// This volume's fork identity; `None` when it is not a fork (design
+    /// §11.5).
+    pub fork: Option<ForkIdentity>,
+    /// Where forks of this volume push, and for a fork its one push
+    /// remote: the one valid section with `agentfsForkRemote = true`, else
+    /// the remote the patch remote resolves to (design §19.1, gate answer
+    /// Q1 b), else `None`. `None` too when a flagged section is invalid or
+    /// more than one is flagged: a fork never falls back past the
+    /// operator's choice.
+    pub fork_remote: Option<RemoteSettings>,
 }
 
 /// `agentfs.patchRemote` (design §12).
@@ -437,15 +464,124 @@ pub enum PatchRemote {
 }
 
 impl Settings {
-    /// The remote the patch queue uses, if any (design §12).
+    /// The remote the patch queue uses, if any (design §12). A section
+    /// with `agentfsForkRemote` is never one: it is not in `remotes`, and
+    /// an invalid one does not count against the automatic choice.
     pub fn patch_remote(&self) -> Option<&RemoteSettings> {
-        match &self.patch_remote {
-            PatchRemote::Disabled => None,
-            PatchRemote::Auto => match self.remotes.as_slice() {
-                [only] if self.invalid_remotes.is_empty() => Some(only),
-                _ => None,
-            },
-            PatchRemote::Named(name) => self.remotes.iter().find(|r| r.name == *name),
+        resolve_patch_remote(&self.patch_remote, &self.remotes, &self.invalid_remotes)
+    }
+
+    /// Whether this volume is a fork (design §11.5).
+    pub fn is_fork(&self) -> bool {
+        self.fork.is_some()
+    }
+}
+
+/// `setting` against the valid `remotes` and the `invalid` sections;
+/// sections with `agentfsForkRemote` are never candidates.
+fn resolve_patch_remote<'r>(
+    setting: &PatchRemote,
+    remotes: &'r [RemoteSettings],
+    invalid: &[InvalidRemote],
+) -> Option<&'r RemoteSettings> {
+    let mut own = remotes.iter().filter(|r| !r.fork_remote);
+    match setting {
+        PatchRemote::Disabled => None,
+        PatchRemote::Auto => match (own.next(), own.next()) {
+            (Some(only), None) if invalid.iter().all(|r| r.fork_remote) => Some(only),
+            _ => None,
+        },
+        PatchRemote::Named(name) => own.find(|r| r.name == *name),
+    }
+}
+
+/// The error of each flagged section when more than one is flagged.
+const MANY_FORK_REMOTES: &str = "more than one remote sets agentfsForkRemote";
+
+/// The fork identity in `config` (design §11.5): both keys or neither.
+fn fork_identity_of(
+    config: &git2::Config,
+    volume: &str,
+) -> Result<Option<ForkIdentity>, ConfigError> {
+    let source = string(config, fork_identity::SOURCE_KEY)?;
+    let base = string(config, fork_identity::BASE_KEY)?;
+    let (source, base) = match (source, base) {
+        (None, None) => return Ok(None),
+        (Some(source), Some(base)) => (source, base),
+        _ => return Err(ConfigError::PartialForkIdentity),
+    };
+    validate_name(fork_identity::SOURCE_KEY, &source)?;
+    let bad_base = || ConfigError::BadForkBase {
+        key: fork_identity::BASE_KEY.into(),
+        value: base.clone(),
+    };
+    if !is_full_oid(&base) {
+        return Err(bad_base());
+    }
+    let base_oid = git2::Oid::from_str(&base).map_err(|_| bad_base())?;
+    Ok(Some(ForkIdentity {
+        fork: volume.to_owned(),
+        source,
+        base: base_oid,
+        // Hidden refs are read from forked volumes unit 4.
+        push_target: PushTarget::Branch,
+    }))
+}
+
+/// 40 lowercase hex digits: a full commit id as agentfs writes one.
+pub fn is_full_oid(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The volume's own remotes and the fork remote, from every valid and
+/// invalid section (design §11.5): see [`Settings::fork_remote`].
+struct SplitRemotes {
+    remotes: Vec<RemoteSettings>,
+    invalid: Vec<InvalidRemote>,
+    fork_remote: Option<RemoteSettings>,
+}
+
+fn split_remotes(
+    valid: Vec<RemoteSettings>,
+    mut invalid: Vec<InvalidRemote>,
+    patch_remote: &PatchRemote,
+    fork: bool,
+) -> SplitRemotes {
+    let (mut flagged, own): (Vec<_>, Vec<_>) = valid.into_iter().partition(|r| r.fork_remote);
+    if flagged.len() > 1 {
+        for r in flagged.drain(..) {
+            invalid.push(InvalidRemote {
+                files: r
+                    .files()
+                    .into_iter()
+                    .map(|(k, p)| (k, p.to_path_buf()))
+                    .collect(),
+                name: r.name,
+                error: MANY_FORK_REMOTES.into(),
+                fork_remote: true,
+            });
+        }
+        invalid.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    let any_flagged_invalid = invalid.iter().any(|r| r.fork_remote);
+    let fork_remote = match flagged.pop() {
+        Some(one) if !any_flagged_invalid => Some(one),
+        Some(_) => None,
+        None if any_flagged_invalid => None,
+        None => resolve_patch_remote(patch_remote, &own, &invalid).cloned(),
+    };
+    if fork {
+        SplitRemotes {
+            remotes: fork_remote.iter().cloned().collect(),
+            // An unflagged section is not a fork's remote: nothing to raise.
+            invalid: invalid.into_iter().filter(|r| r.fork_remote).collect(),
+            fork_remote,
+        }
+    } else {
+        SplitRemotes {
+            remotes: own,
+            invalid,
+            fork_remote,
         }
     }
 }
@@ -461,8 +597,18 @@ impl Settings {
         let includes = includes(config)?;
         let volume = string(config, "agentfs.volume")?.ok_or(ConfigError::MissingVolume)?;
         validate_name("agentfs.volume", &volume)?;
-        let branch =
-            string(config, "agentfs.branch")?.unwrap_or_else(|| format!("agentfs/{volume}"));
+        let own_branch = string(config, "agentfs.branch")?;
+        let fork = fork_identity_of(config, &volume)?;
+        if fork.is_some() && own_branch.is_some() {
+            return Err(ConfigError::ForkBranch);
+        }
+        let branch_ref = match &fork {
+            Some(identity) => identity.history_ref(),
+            None => format!(
+                "refs/heads/{}",
+                own_branch.unwrap_or_else(|| format!("agentfs/{volume}"))
+            ),
+        };
         let defaults = Templates::default();
         let (concurrent_transfers, concurrent_transfers_error) = concurrent_transfers(config)?;
         let lfs = LfsSettings {
@@ -492,9 +638,18 @@ impl Settings {
                 .to_string()
             }),
         };
-        let (remotes, invalid_remotes) = remotes(config, &lfs, &http_proxy)?;
+        let (valid, invalid) = remotes(config, &lfs, &http_proxy)?;
+        let patch_remote = match string(config, "agentfs.patchRemote")?.as_deref() {
+            None | Some("") => PatchRemote::Auto,
+            Some("none") => PatchRemote::Disabled,
+            Some(name) => {
+                validate_name("agentfs.patchRemote", name)?;
+                PatchRemote::Named(name.to_owned())
+            }
+        };
+        let split = split_remotes(valid, invalid, &patch_remote, fork.is_some());
         Ok(Self {
-            branch_ref: format!("refs/heads/{branch}"),
+            branch_ref,
             respect_tree_rules: boolean(config, "agentfs.respectTreeRules")?.unwrap_or(false),
             nested: match string(config, "agentfs.nested")?.as_deref() {
                 None | Some("exclude") => Nested::Exclude,
@@ -523,19 +678,19 @@ impl Settings {
                 author_email: string(config, "agentfs.identity.authorEmail")?
                     .unwrap_or(defaults.author_email),
             },
-            patch_remote: match string(config, "agentfs.patchRemote")?.as_deref() {
-                None | Some("") => PatchRemote::Auto,
-                Some("none") => PatchRemote::Disabled,
-                Some(name) => {
-                    validate_name("agentfs.patchRemote", name)?;
-                    PatchRemote::Named(name.to_owned())
-                }
+            // A fork has no patch queue (design §11.5).
+            patch_remote: if fork.is_some() {
+                PatchRemote::Disabled
+            } else {
+                patch_remote
             },
             patch_fetch_timeout: patch_fetch_timeout(config)?,
             lfs,
             http_proxy: http_proxy.ok().flatten(),
-            remotes,
-            invalid_remotes,
+            remotes: split.remotes,
+            invalid_remotes: split.invalid,
+            fork_remote: split.fork_remote,
+            fork,
             includes,
             volume,
         })
@@ -585,9 +740,16 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
         // The volume's identity belongs to its state area (`agentfs
         // init`): a shared fragment naming one would silently turn every
         // volume using it into the same volume.
+        // A fork's identity likewise (design §11.5).
         let fragment = git2::Config::open(&path)?;
-        for key in ["agentfs.volume", "agentfs.branch"] {
-            if string(&fragment, key)?.is_some() {
+        for key in [
+            "agentfs.volume",
+            "agentfs.branch",
+            fork_identity::SOURCE_KEY,
+            fork_identity::BASE_KEY,
+            fork_identity::PUSH_TARGET_KEY,
+        ] {
+            if is_set(&fragment, key)? {
                 return Err(ConfigError::IncludeSetsIdentity { path, key });
             }
         }
@@ -628,6 +790,11 @@ fn remotes(
             Ok(remote) => valid.push(remote),
             Err(e) => invalid.push(InvalidRemote {
                 files: remote_files(config, &name),
+                // Fails closed: a flag that cannot be read is not "false".
+                fork_remote: !matches!(
+                    boolean(config, &format!("remote.{name}.agentfsForkRemote")),
+                    Ok(None | Some(false))
+                ),
                 name,
                 error: e.to_string(),
             }),
@@ -685,6 +852,7 @@ fn remote(
         lfs_push_url: string(config, &key("lfspushurl"))?,
         lfs_credentials: path("agentfsLfsCredentials")?,
         proxy: remote_proxy(config, name, http_proxy)?,
+        fork_remote: boolean(config, &key("agentfsForkRemote"))?.unwrap_or(false),
         name: name.to_owned(),
     };
     validate_transport(&remote)?;
@@ -851,6 +1019,16 @@ pub(crate) fn string(config: &git2::Config, key: &str) -> Result<Option<String>,
     match config.get_string(key) {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `key` is set in `config`, read without noting it: a check that
+/// a fragment leaves a key alone, not a read of the setting.
+fn is_set(config: &git2::Config, key: &str) -> Result<bool, git2::Error> {
+    match config.get_entry(key) {
+        Ok(_) => Ok(true),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -1800,6 +1978,170 @@ mod tests {
             assert!(
                 matches!(&s, Err(ConfigError::IncludeSetsIdentity { key: k, .. })
                     if *k == format!("agentfs.{key}")),
+                "{s:?}"
+            );
+        }
+    }
+
+    const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn fork_config(extra: &str) -> String {
+        format!(
+            "[agentfs]\n\tvolume = f-1\n[agentfs \"fork\"]\n\tsource = src\n\tbase = {BASE}\n\
+             {extra}"
+        )
+    }
+
+    /// A1: a section only for forks changes nothing about the source.
+    #[test]
+    fn a_fork_remote_section_is_never_the_sources() {
+        let own = "[agentfs]\n\tvolume = v\n[remote \"origin\"]\n\turl = /o\n\
+                   \tagentfsMaxBlobSize = 1m\n";
+        let forks = "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n\
+                     \tagentfsMaxBlobSize = 1k\n";
+        let (_d, c) = config_with(own);
+        let without = Settings::from_config(&c).unwrap();
+        let (_d, c) = config_with(&format!("{own}{forks}"));
+        let with = Settings::from_config(&c).unwrap();
+        assert_eq!(with.remotes, without.remotes);
+        assert_eq!(
+            crate::checks::Limits::from_remotes(&with.remotes),
+            crate::checks::Limits::from_remotes(&without.remotes)
+        );
+        assert_eq!(with.patch_remote(), without.patch_remote());
+        assert_eq!(with.patch_remote().map(|r| r.name.as_str()), Some("origin"));
+        assert!(with.invalid_remotes.is_empty());
+        assert_eq!(with.fork_remote.as_ref().map(|r| r.name.as_str()), Some("forks"));
+        assert!(!with.is_fork());
+        // Naming the fork remote as the patch remote resolves to none.
+        let (_d, c) = config_with(&format!(
+            "[agentfs]\n\tvolume = v\n\tpatchRemote = forks\n[remote \"origin\"]\n\turl = /o\n\
+             {forks}"
+        ));
+        assert_eq!(Settings::from_config(&c).unwrap().patch_remote(), None);
+        // An invalid flagged section does not count against the automatic
+        // choice, and leaves no fork remote.
+        let (_d, c) = config_with(&format!(
+            "{own}[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n\
+             \tagentfsMaxBlobSize = 0\n"
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.patch_remote().map(|r| r.name.as_str()), Some("origin"));
+        assert_eq!(s.invalid_remotes.len(), 1);
+        assert!(s.invalid_remotes[0].fork_remote);
+        assert_eq!(s.fork_remote, None);
+    }
+
+    /// Two flagged sections: both invalid, no fork remote.
+    #[test]
+    fn two_fork_remotes_are_both_invalid() {
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n[remote \"origin\"]\n\turl = /o\n\
+             [remote \"a\"]\n\turl = /a\n\tagentfsForkRemote = true\n\
+             [remote \"b\"]\n\turl = /b\n\tagentfsForkRemote = true\n",
+        );
+        let s = Settings::from_config(&c).unwrap();
+        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["origin"]);
+        let bad: Vec<(&str, &str)> = s
+            .invalid_remotes
+            .iter()
+            .map(|r| (r.name.as_str(), r.error.as_str()))
+            .collect();
+        assert_eq!(bad, [("a", MANY_FORK_REMOTES), ("b", MANY_FORK_REMOTES)]);
+        assert_eq!(s.fork_remote, None);
+        assert_eq!(s.patch_remote().map(|r| r.name.as_str()), Some("origin"));
+    }
+
+    /// A2: a fork pushes only to its fork remote, at its own branch, and
+    /// has no patch queue.
+    #[test]
+    fn a_fork_has_one_remote_and_no_patch_queue() {
+        let (_d, c) = config_with(&fork_config(
+            "[agentfs]\n\tpatchRemote = origin\n[remote \"origin\"]\n\turl = /o\n\
+             [remote \"other\"]\n\turl = /x\n\
+             [remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n",
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert!(s.is_fork());
+        let fork = s.fork.as_ref().unwrap();
+        assert_eq!(fork.source, "src");
+        assert_eq!(fork.base.to_string(), BASE);
+        assert_eq!(s.branch_ref, "refs/heads/agentfs/f-1");
+        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["forks"]);
+        assert_eq!(s.patch_remote, PatchRemote::Disabled);
+        assert_eq!(s.patch_remote(), None);
+        // No flagged section: the source's patch remote (gate answer Q1 b).
+        let (_d, c) = config_with(&fork_config("[remote \"origin\"]\n\turl = /o\n"));
+        let s = Settings::from_config(&c).unwrap();
+        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["origin"]);
+        assert_eq!(s.fork_remote.map(|r| r.name), Some("origin".to_owned()));
+        assert_eq!(s.patch_remote(), None);
+        // Two remotes and no patch remote: no fork remote, nothing pushed.
+        let (_d, c) = config_with(&fork_config(
+            "[remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n",
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert!(s.remotes.is_empty());
+        assert_eq!(s.fork_remote, None);
+        // An unflagged invalid section is not the fork's: nothing raised.
+        let (_d, c) = config_with(&fork_config(
+            "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n\
+             [remote \"bad\"]\n\turl = /b\n\tagentfsMaxBlobSize = 0\n",
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert!(s.invalid_remotes.is_empty(), "{:?}", s.invalid_remotes);
+        assert_eq!(s.remotes.len(), 1);
+        // Two flagged sections: both invalid, nothing pushed.
+        let (_d, c) = config_with(&fork_config(
+            "[remote \"a\"]\n\turl = /a\n\tagentfsForkRemote = true\n\
+             [remote \"b\"]\n\turl = /b\n\tagentfsForkRemote = true\n",
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert!(s.remotes.is_empty());
+        assert_eq!(s.invalid_remotes.len(), 2);
+        assert_eq!(s.fork_remote, None);
+    }
+
+    /// A3: a fork's identity is its own config's, whole and well formed.
+    #[test]
+    fn fork_identity_errors() {
+        let (_d, c) = config_with(&fork_config("[agentfs]\n\tbranch = x\n"));
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::ForkBranch)
+        ));
+        for base in ["abc", "0123456789ABCDEF0123456789ABCDEF01234567", "HEAD"] {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = f\n[agentfs \"fork\"]\n\tsource = s\n\tbase = {base}\n"
+            ));
+            assert!(
+                matches!(Settings::from_config(&c), Err(ConfigError::BadForkBase { .. })),
+                "{base}"
+            );
+        }
+        let (_d, c) = config_with("[agentfs]\n\tvolume = f\n[agentfs \"fork\"]\n\tsource = s\n");
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::PartialForkIdentity)
+        ));
+        let (_d, c) = config_with(&format!(
+            "[agentfs]\n\tvolume = f\n[agentfs \"fork\"]\n\tsource = a/b\n\tbase = {BASE}\n"
+        ));
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::BadName { .. })
+        ));
+        for key in ["source", "base", "pushTarget"] {
+            let (_d, s) = with_include(
+                "[agentfs]\n\tvolume = v\n[include]\n\tpath = FRAGMENT\n",
+                &format!("[agentfs \"fork\"]\n\t{key} = x\n"),
+            );
+            assert!(
+                matches!(&s, Err(ConfigError::IncludeSetsIdentity { key: k, .. })
+                    if *k == format!("agentfs.fork.{key}")),
                 "{s:?}"
             );
         }

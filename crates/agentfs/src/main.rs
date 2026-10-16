@@ -32,6 +32,9 @@
 //! (design §2.3) and exit 75 while another process holds it; fronts take
 //! no lock; `status` is read-only and takes no lock.
 //!
+//! `fork create` makes a fork of a volume and `fork finish` finishes and
+//! publishes it ([`fork_cmd`], design §11.5).
+//!
 //! `mount`, `flush`, `record`, `push` and `run` export telemetry over OTLP
 //! when the standard `OTEL_*` variables configure an endpoint (see
 //! [`otel`], design §13); alarms are also printed to stderr. `init` and
@@ -41,6 +44,7 @@ mod control;
 mod daemon;
 #[cfg(test)]
 mod doc_tables;
+mod fork_cmd;
 mod front;
 mod hold;
 mod lfs_cmd;
@@ -256,6 +260,12 @@ enum Command {
     Lfs {
         #[command(subcommand)]
         command: lfs_cmd::LfsCommand,
+    },
+    /// Forked volumes (design §11.5, §19.1): create a fork; finish and
+    /// publish it.
+    Fork {
+        #[command(subcommand)]
+        command: fork_cmd::ForkCommand,
     },
 }
 
@@ -551,6 +561,9 @@ fn real_main() -> Result<ExitCode> {
             return patch_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
         }
         Command::Lfs { command } => return lfs_cmd::run(command, &state, cli.wait_lock),
+        Command::Fork { command } => {
+            return fork_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
+        }
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
             // A restarted sidecar whose daemon died (design §17.1).

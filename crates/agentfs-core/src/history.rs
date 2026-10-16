@@ -20,6 +20,7 @@ use git2::{Index, IndexEntry, IndexTime, Oid, Repository, Signature, Time};
 use crate::checks::{Checks, Refusal, path_refusal};
 use crate::config::{ConfigError, Settings};
 use crate::events::CheckStage;
+use crate::fork::finish::FinishRecord;
 use crate::identity::{Context, IdentityError, IdentityRenderer};
 use crate::lfs::{ObjectCache, Store, attributes};
 use crate::paths::{RepoPath, SpecialFile};
@@ -567,8 +568,13 @@ impl History {
     /// directory, but not the directories above it that the first commit
     /// of a branch creates.
     fn sync_ref_dirs(&self) -> io::Result<()> {
+        self.sync_dirs_of(&self.settings.branch_ref)
+    }
+
+    /// The directories above the ref `refname`, synced.
+    fn sync_dirs_of(&self, refname: &str) -> io::Result<()> {
         let git_dir = self.repo.path();
-        let mut dir = git_dir.join(&self.settings.branch_ref);
+        let mut dir = git_dir.join(refname);
         while dir.pop() && dir.starts_with(git_dir) {
             File::open(&dir)?.sync_all()?;
         }
@@ -764,9 +770,12 @@ impl History {
         identities: &IdentityRenderer,
         context: &Context,
     ) -> Result<Oid, HistoryError> {
-        let head = self.head()?.ok_or_else(|| {
-            git2::Error::from_str("the branch does not exist: nothing to apply a patch to")
-        })?;
+        if self.head()?.is_none() {
+            return Err(git2::Error::from_str(
+                "the branch does not exist: nothing to apply a patch to",
+            )
+            .into());
+        }
         let seq = self.head_seq()?.unwrap_or_default();
         let author = match patch_author(op.author.as_ref()) {
             Some(author) => author,
@@ -789,15 +798,75 @@ impl History {
         }
         push_context_trailers(&mut message, context);
         message.push_str(&format!("Agentfs-Uid: {}\n", op.caller.uid));
+        let log = format!("agentfs: patch marker through seq {seq}");
+        self.marker(&message, &author, &committer, &log)
+    }
+
+    /// An empty commit on the branch with the head's tree and `message`
+    /// (§3.4's exceptions: the patch marker and a fork's finish commit),
+    /// objects and refs synced. Fails if the branch does not exist.
+    pub fn commit_marker(
+        &self,
+        message: &str,
+        signature: &Signature<'_>,
+    ) -> Result<Oid, HistoryError> {
+        self.marker(message, signature, signature, "agentfs: marker commit")
+    }
+
+    fn marker(
+        &self,
+        message: &str,
+        author: &Signature<'_>,
+        committer: &Signature<'_>,
+        log: &str,
+    ) -> Result<Oid, HistoryError> {
+        let head = self.head()?.ok_or_else(|| {
+            git2::Error::from_str("the branch does not exist: there is nothing to mark")
+        })?;
         let tree = head.tree()?;
         let commit = self
             .repo
-            .commit(None, &author, &committer, &message, &tree, &[&head])?;
+            .commit(None, author, committer, message, &tree, &[&head])?;
         self.sync_object_dirs()?;
-        let log = format!("agentfs: patch marker through seq {seq}");
         self.repo
-            .reference_matching(&self.settings.branch_ref, commit, true, head.id(), &log)?;
+            .reference_matching(&self.settings.branch_ref, commit, true, head.id(), log)?;
         self.sync_ref_dirs()?;
+        Ok(commit)
+    }
+
+    /// A commit of `tree` on `parent`, outside the branch, and `refname`
+    /// created at it (design §11.5, a fork's change). Create-only: when
+    /// `refname` already names a commit of `tree` on `parent`, that commit
+    /// is returned and nothing is written; when it names anything else,
+    /// this fails. Objects and the ref are synced.
+    pub fn commit_detached(
+        &self,
+        refname: &str,
+        tree: Oid,
+        parent: Oid,
+        message: &str,
+        signature: &Signature<'_>,
+    ) -> Result<Oid, HistoryError> {
+        if let Ok(existing) = self.repo.find_reference(refname) {
+            let commit = existing.peel_to_commit()?;
+            if commit.tree_id() == tree && commit.parent_ids().eq([parent]) {
+                return Ok(commit.id());
+            }
+            return Err(git2::Error::from_str(&format!(
+                "{refname} already names {}, which is not a commit of {tree} on {parent}",
+                commit.id()
+            ))
+            .into());
+        }
+        let tree = self.repo.find_tree(tree)?;
+        let parent = self.repo.find_commit(parent)?;
+        let commit = self
+            .repo
+            .commit(None, signature, signature, message, &tree, &[&parent])?;
+        self.sync_object_dirs()?;
+        self.repo
+            .reference(refname, commit, false, "agentfs: detached commit")?;
+        self.sync_dirs_of(refname)?;
         Ok(commit)
     }
 
@@ -860,6 +929,73 @@ pub fn inbox_from_message(message: &str) -> Option<(u64, Oid)> {
         (true, Some(n), Some(patch)) if n > 0 => Some((n, patch)),
         _ => None,
     }
+}
+
+/// The finish record of the fork's finish commit `finish` (design §11.5):
+/// read only from the message's last paragraph, which agentfs writes
+/// itself, and only with `Agentfs-Trigger: finish` there. Every field is
+/// checked against its grammar (names as volume names, full commit ids, a
+/// decimal count) and each may appear once; anything else is `None`, so a
+/// path or a line the workload wrote cannot forge one.
+pub fn finish_from_message(message: &str, finish: Oid) -> Option<FinishRecord> {
+    use crate::fork::finish as f;
+    let trimmed = message.trim_end_matches('\n');
+    let last = trimmed.rsplit("\n\n").next()?;
+    let trigger_line = format!("Agentfs-Trigger: {}", f::FINISH_TRIGGER);
+    let mut trigger = false;
+    let mut fields: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for line in last.lines() {
+        if line == trigger_line {
+            trigger = true;
+            continue;
+        }
+        let Some((key, value)) = line.split_once(": ") else {
+            continue;
+        };
+        let known = [
+            f::FORK_TRAILER,
+            f::SOURCE_TRAILER,
+            f::BASE_TRAILER,
+            f::CHANGE_TRAILER,
+            f::FORK_REMOTE_TRAILER,
+            f::UNRECORDED_TRAILER,
+        ];
+        if known.contains(&key) && fields.insert(key, value).is_some() {
+            return None;
+        }
+    }
+    if !trigger {
+        return None;
+    }
+    let name = |key: &str| {
+        let value = *fields.get(key)?;
+        crate::config::validate_name(key, value).ok()?;
+        Some(value.to_owned())
+    };
+    let oid = |value: &str| {
+        if crate::config::is_full_oid(value) {
+            Oid::from_str(value).ok()
+        } else {
+            None
+        }
+    };
+    let change = match fields.get(f::CHANGE_TRAILER) {
+        None => None,
+        Some(value) => Some(oid(*value)?),
+    };
+    let unrecorded = *fields.get(f::UNRECORDED_TRAILER)?;
+    if unrecorded.is_empty() || !unrecorded.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(FinishRecord {
+        fork: name(f::FORK_TRAILER)?,
+        source: name(f::SOURCE_TRAILER)?,
+        base: oid(*fields.get(f::BASE_TRAILER)?)?,
+        finish,
+        change,
+        remote: name(f::FORK_REMOTE_TRAILER)?,
+        unrecorded: unrecorded.parse().ok()?,
+    })
 }
 
 /// The git signature of a patch author, if it makes one (a name or email

@@ -125,8 +125,9 @@ impl fmt::Display for PushStage {
     }
 }
 
-/// One signal. Every variant except [`Event::PushSucceeded`] and
-/// [`Event::PatchApplied`] is an alarm condition (design §13).
+/// One signal. Every variant except [`Event::PushSucceeded`],
+/// [`Event::PatchApplied`], [`Event::PatchDuplicate`] and
+/// [`Event::HistoryServiceRestored`] is an alarm condition (design §13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A path was not recorded, or dropped from a commit, because git's
@@ -213,6 +214,15 @@ pub enum Event {
         /// The branch commit that applies it.
         commit: Oid,
     },
+    /// A queued patch commit was already applied under an earlier inbox
+    /// number, so it was consumed with a marker commit and not applied
+    /// again (design §12). Not an alarm.
+    PatchDuplicate {
+        inbox: u64,
+        patch: Oid,
+        /// The inbox number that applied the same patch commit first.
+        applied_as: u64,
+    },
     /// The patch queue stopped at a patch it could not apply; it and the
     /// later ones stay queued (design §12).
     PatchBlocked {
@@ -264,6 +274,7 @@ impl Event {
             self,
             Self::PushSucceeded { .. }
                 | Self::PatchApplied { .. }
+                | Self::PatchDuplicate { .. }
                 | Self::HistoryServiceRestored { .. }
         )
     }
@@ -282,6 +293,7 @@ impl Event {
             Self::RemoteMisconfigured { .. } => "remote_misconfigured",
             Self::PushSucceeded { .. } => "push_succeeded",
             Self::PatchApplied { .. } => "patch_applied",
+            Self::PatchDuplicate { .. } => "patch_duplicate",
             Self::PatchBlocked { .. } => "patch_blocked",
             Self::PatchIgnored { .. } => "patch_ignored",
             Self::PatchFetchFailed { .. } => "patch_fetch_failed",
@@ -388,6 +400,15 @@ impl fmt::Display for Event {
                 patch,
                 commit,
             } => write!(f, "patch {inbox} ({patch}) applied as {commit}"),
+            Self::PatchDuplicate {
+                inbox,
+                patch,
+                applied_as,
+            } => write!(
+                f,
+                "patch {inbox} ({patch}) was already applied as patch {applied_as}; it is not \
+                 applied again"
+            ),
             Self::PatchBlocked {
                 inbox,
                 patch,

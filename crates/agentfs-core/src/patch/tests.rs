@@ -873,3 +873,77 @@ fn ignored_entries_raise_a_warning() {
     );
     assert!(warned[0].is_alarm());
 }
+
+/// A10: the same patch commit queued twice applies once; the second is a
+/// marker commit carrying its inbox number, with nothing merged.
+#[test]
+fn a_patch_commit_queued_twice_applies_once() {
+    let f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
+    f.queue(1, p);
+    f.queue(2, p);
+    f.events();
+    let report = f.process();
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(report.duplicates, [(2, 1)]);
+    assert_eq!(report.blocked, None);
+    assert_eq!(report.last_applied, 2);
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.inbox_commits(2), 1);
+    let head = f.repo().find_commit(f.head()).unwrap();
+    let message = head.message().unwrap();
+    assert!(message.starts_with("duplicate of patch 1: edit a"), "{message}");
+    assert_eq!(inbox_from_message(message), Some((2, p)));
+    // A marker: the tree of the commit that applied 1.
+    assert_eq!(head.tree_id(), head.parent(0).unwrap().tree_id());
+    assert_eq!(f.reference(&applied_ref("vol", 2)), Some(p));
+    assert_eq!(f.reference(&inbox_ref("vol", 2)), None);
+    let events = f.events();
+    let duplicate = events
+        .iter()
+        .find(|e| matches!(e, Event::PatchDuplicate { .. }))
+        .unwrap();
+    assert!(!duplicate.is_alarm());
+    assert!(matches!(
+        duplicate,
+        Event::PatchDuplicate {
+            inbox: 2,
+            applied_as: 1,
+            ..
+        }
+    ));
+    let status = read_status(f.repo(), report.status).unwrap();
+    assert_eq!(status.applied_now, [1]);
+    assert_eq!(status.duplicate_now.len(), 1);
+    assert_eq!(status.duplicate_now[0].inbox, 2);
+    assert_eq!(status.duplicate_now[0].patch, p.to_string());
+    assert_eq!(status.duplicate_now[0].applied_as, 1);
+    // A rerun converges: nothing new.
+    let head = f.head();
+    let again = f.process();
+    assert!(again.applied.is_empty() && again.duplicates.is_empty());
+    assert_eq!(f.head(), head);
+}
+
+/// A10: a duplicate in a later run, after the workload reverted the
+/// patched file, leaves the file reverted.
+#[test]
+fn a_duplicate_never_reapplies_a_reverted_change() {
+    let mut f = Fixture::new(&[("a.txt", "a0\n")]);
+    let p = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
+    f.queue(1, p);
+    f.process();
+    assert_eq!(f.read("a.txt").as_deref(), Some("a1\n"));
+    f.change(&[("a.txt", "a0\n")], &[]);
+    f.queue(2, p);
+    // Across a reopen, so the scan cache plays no part.
+    f.reopen();
+    let report = f.process();
+    assert_eq!(report.duplicates, [(2, 1)]);
+    assert!(report.applied.is_empty());
+    assert_eq!(f.read("a.txt").as_deref(), Some("a0\n"));
+    assert_eq!(f.at_head("a.txt").as_deref(), Some("a0\n"));
+}

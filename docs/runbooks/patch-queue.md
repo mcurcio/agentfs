@@ -129,6 +129,16 @@ patches: through 3 applied, none queued
 After the next push to the patch remote, `refs/agentfs/<volume>/applied/<n>`
 holds each applied patch and its `inbox/<n>` is gone.
 
+**The same patch commit twice** (two receivers submitting one fork's
+change at once, or a producer pushing a commit again) applies once (design
+§12): the later number gets a marker commit with the head's tree, whose
+subject is `duplicate of patch <m>: ...`, its refs move like an applied
+patch's, and the `PatchDuplicate` event (not an alarm) and `status.json`'s
+`duplicate_now` say so. Nothing is merged, so a change the workload has
+reverted since stays reverted. To apply the same content again on
+purpose, submit a new commit (`git commit --amend --no-edit` on the patch
+gives it a new id).
+
 ## 3. Check the queue
 
 ```sh
@@ -152,6 +162,7 @@ git show FETCH_HEAD:status.json
 | `updated` | When the run ended (RFC 3339, UTC) |
 | `last_applied` | `{inbox, patch, commit}` of the highest applied patch, or `null` |
 | `applied_now` | The numbers this run applied |
+| `duplicate_now` | `[{inbox, patch, applied_as}]`: numbers this run consumed as duplicates of a patch commit an earlier number (`applied_as`) applied; absent when there are none |
 | `queue` | `[{inbox, patch}]` still queued, the blocked one first |
 | `blocked` | `{inbox, patch, reason, message, paths}`, or `null` |
 | `ignored` | `[{ref, inbox, patch, why}]`: inbox refs that are `malformed` (not ten digits) or `stale` (at or below the last applied number, with another commit) |

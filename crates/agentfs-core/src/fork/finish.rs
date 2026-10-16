@@ -13,19 +13,27 @@
 //! the published mark. [`status`] reads, without a lock or credentials,
 //! what DeleteVolume asks: whether the fork is published.
 
+use std::io;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use git2::Oid;
+use git2::{Oid, Repository};
+use serde::{Deserialize, Serialize};
 
-use crate::events::{Events, PushFailureKind};
-use crate::history::HistoryError;
+use crate::config::Settings;
+use crate::events::{Event, Events, PushFailureKind};
+use crate::history::{HistoryError, finish_from_message};
 use crate::identity::Context;
 use crate::lock::StateLock;
+use crate::paths::RepoPath;
+use crate::push::{
+    CreateOnlyOutcome, CreateOnlyRef, PUSH_BACKOFF_CAP, PushOutcome, RemotePusher, backoff,
+};
+use crate::record::{Caller, Trigger};
 use crate::telemetry::Telemetry;
-use crate::volume::{StateDir, VolumeError};
+use crate::volume::{self, Committer, Input, Recorder, StateDir, VolumeError};
 
-use super::identity::ForkIdentity;
+use super::identity::{ForkIdentity, change_ref, finish_ref};
 
 /// `Agentfs-Trigger` of a finish commit.
 pub const FINISH_TRIGGER: &str = "finish";
@@ -139,10 +147,31 @@ pub enum PublishOutcome {
     },
 }
 
+/// The version of `meta/fork.json`.
+pub const MARK_VERSION: u32 = 1;
+
+/// `meta/fork.json` (design §2.2): the finisher's marks, written only
+/// after the remote confirmed what they say.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkMark {
+    pub version: u32,
+    pub published: Option<PublishedMark>,
+}
+
+/// The fork remote held the change and finish refs at exactly these ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedMark {
+    pub finish: String,
+    pub change: Option<String>,
+    pub remote: String,
+    /// When the remote confirmed it (milliseconds since the Unix epoch).
+    pub at_ms: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StatusError {
-    #[error("not built yet: forked volumes unit 1 (design §19.1)")]
-    NotBuilt,
     #[error("the fork's published mark cannot be read: {0}")]
     Mark(std::io::Error),
     #[error(transparent)]
@@ -151,8 +180,6 @@ pub enum StatusError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FinishError {
-    #[error("not built yet: forked volumes unit 1 (design §19.1)")]
-    NotBuilt,
     #[error("this volume is not a fork")]
     NotAFork,
     #[error("fork {fork} has no valid fork remote in its settings; it stays active")]
@@ -169,7 +196,13 @@ pub enum FinishError {
 
 /// A fork opened for finishing and publishing.
 pub struct Finisher {
-    _unbuilt: (),
+    state: StateDir,
+    tree: std::path::PathBuf,
+    identity: ForkIdentity,
+    recorder: Recorder,
+    committer: Committer,
+    events: Events,
+    telemetry: Telemetry,
 }
 
 impl Finisher {
@@ -183,23 +216,329 @@ impl Finisher {
         telemetry: &Telemetry,
         lock: &StateLock,
     ) -> Result<Self, FinishError> {
-        let _ = (state, tree, context, events, telemetry, lock);
-        Err(FinishError::NotBuilt)
+        if lock.path() != state.lock_file() {
+            return Err(FinishError::Io(io::Error::other(format!(
+                "the lock held is {}, not this state area's {}",
+                lock.path().display(),
+                state.lock_file().display()
+            ))));
+        }
+        let settings = Settings::load(&state.git()).map_err(HistoryError::from)?;
+        let identity = settings.fork.ok_or(FinishError::NotAFork)?;
+        let (recorder, committer, _) =
+            volume::open(state, tree, context, events.clone(), telemetry)?;
+        Ok(Self {
+            state: state.clone(),
+            tree: tree.to_path_buf(),
+            identity,
+            recorder,
+            committer,
+            events,
+            telemetry: telemetry.clone(),
+        })
     }
 
     /// Finishes the fork once (see the module docs). A fork already
     /// finished returns its record unchanged.
     pub fn finish(&mut self) -> Result<FinishRecord, FinishError> {
-        Err(FinishError::NotBuilt)
+        let fork = self.identity.fork.clone();
+        if let Some(record) = self.finished()? {
+            // A crash between the finish commit and its ref.
+            self.set_ref(&finish_ref(&fork), record.finish)?;
+            return Ok(record);
+        }
+        let history = self.committer.history();
+        let Some(remote) = history.settings().fork_remote.as_ref().map(|r| r.name.clone()) else {
+            return Err(FinishError::NoForkRemote { fork });
+        };
+        let unrecorded = self.record_repairs();
+        self.committer.commit_now()?;
+        let history = self.committer.history();
+        let repo = history.repo();
+        let head = history
+            .head()?
+            .ok_or_else(|| git2::Error::from_str("the fork has no history"))
+            .map_err(HistoryError::from)?;
+        let head_tree = head.tree_id();
+        let base = self.identity.base;
+        let base_tree = repo
+            .find_commit(base)
+            .map(|c| c.tree_id())
+            .map_err(HistoryError::from)?;
+        let signature = self
+            .committer
+            .committer_signature()
+            .map_err(HistoryError::from)?;
+        let source = &self.identity.source;
+        let change = if head_tree == base_tree {
+            None
+        } else {
+            let name = change_ref(&fork);
+            // A change a crash left before the finish commit, of another
+            // tree: never published (publishing needs the finish), so it is
+            // made again.
+            if let Ok(existing) = repo.find_reference(&name)
+                && let Ok(commit) = existing.peel_to_commit()
+                && (commit.tree_id() != head_tree || !commit.parent_ids().eq([base]))
+            {
+                repo.find_reference(&name)
+                    .and_then(|mut r| r.delete())
+                    .map_err(HistoryError::from)?;
+            }
+            let message = format!(
+                "change of fork {fork}\n\n{FORK_TRAILER}: {fork}\n{SOURCE_TRAILER}: {source}\n\
+                 {BASE_TRAILER}: {base}\n"
+            );
+            Some(history.commit_detached(&name, head_tree, base, &message, &signature)?)
+        };
+        let seq = history.head_seq()?.unwrap_or_default();
+        let mut message = format!(
+            "finish fork {fork}\n\n{}: {seq}\nAgentfs-Trigger: {FINISH_TRIGGER}\n\
+             {FORK_TRAILER}: {fork}\n{SOURCE_TRAILER}: {source}\n{BASE_TRAILER}: {base}\n",
+            crate::history::SEQ_TRAILER
+        );
+        if let Some(change) = change {
+            message.push_str(&format!("{CHANGE_TRAILER}: {change}\n"));
+        }
+        message.push_str(&format!(
+            "{FORK_REMOTE_TRAILER}: {remote}\n{UNRECORDED_TRAILER}: {unrecorded}\n"
+        ));
+        let finish = history.commit_marker(&message, &signature)?;
+        self.set_ref(&finish_ref(&fork), finish)?;
+        Ok(FinishRecord {
+            fork,
+            source: source.clone(),
+            base,
+            finish,
+            change,
+            remote,
+            unrecorded,
+        })
+    }
+
+    /// The finish record of the branch head, if it is a finish commit.
+    fn finished(&self) -> Result<Option<FinishRecord>, FinishError> {
+        let Some(head) = self.committer.history().head()? else {
+            return Ok(None);
+        };
+        Ok(finish_from_message(head.message_raw().unwrap_or_default(), head.id()))
+    }
+
+    /// The local ref `name` at `oid`.
+    fn set_ref(&self, name: &str, oid: Oid) -> Result<(), FinishError> {
+        let repo = self.committer.history().repo();
+        if repo.refname_to_id(name).ok() != Some(oid) {
+            repo.reference(name, oid, true, "agentfs: fork finished")
+                .map_err(HistoryError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Records each path the FUSE layer could not record (`meta/repairs`,
+    /// design §3.5) as the tree holds it. Returns how many could not be
+    /// recorded, each alarmed.
+    fn record_repairs(&self) -> u64 {
+        let Ok(bytes) = std::fs::read(self.state.repairs()) else {
+            return 0;
+        };
+        let mut unrecorded = 0;
+        for (raw, caller) in parse_repairs(&bytes) {
+            let path = match String::from_utf8(raw)
+                .map_err(|e| e.to_string())
+                .and_then(|p| RepoPath::new(p).map_err(|e| e.to_string()))
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    unrecorded += 1;
+                    self.events.emit(Event::RecordFailed {
+                        trigger: Trigger::Sweep,
+                        paths: Vec::new(),
+                        error: format!("a repair of {}: {error}", self.tree.display()),
+                    });
+                    continue;
+                }
+            };
+            let input = Input::Tree { path: path.clone() };
+            if let Err(e) = self.recorder.record(Trigger::Sweep, caller, vec![input]) {
+                unrecorded += 1;
+                self.events.emit(Event::RecordFailed {
+                    trigger: Trigger::Sweep,
+                    paths: vec![path],
+                    error: e.to_string(),
+                });
+            }
+        }
+        unrecorded
     }
 
     /// Publishes the finished fork: attempts with §11.2 backoff until it
     /// is published or refused, or, with a `deadline`, until then. Safe to
-    /// run again; a fork already published returns at once.
+    /// run again; a fork already published returns at once. Finishes the
+    /// fork first if it is not finished yet.
     pub fn publish(&mut self, deadline: Option<Instant>) -> Result<PublishOutcome, FinishError> {
-        let _ = deadline;
-        Err(FinishError::NotBuilt)
+        let record = self.finish()?;
+        if read_mark(&self.state)
+            .ok()
+            .flatten()
+            .and_then(|m| m.published)
+            .is_some_and(|p| p.finish == record.finish.to_string())
+        {
+            return Ok(PublishOutcome::Published);
+        }
+        let settings = self.committer.history().settings().clone();
+        let mut pusher = None;
+        let mut failures = 0u32;
+        loop {
+            match self.publish_once(&settings, &record, &mut pusher) {
+                Ok(()) => {
+                    let mark = ForkMark {
+                        version: MARK_VERSION,
+                        published: Some(PublishedMark {
+                            finish: record.finish.to_string(),
+                            change: record.change.map(|c| c.to_string()),
+                            remote: record.remote.clone(),
+                            at_ms: now_ms(),
+                        }),
+                    };
+                    crate::fsutil::write_json_atomic(&self.state.fork_mark(), &mark)?;
+                    return Ok(PublishOutcome::Published);
+                }
+                Err((kind, message)) => {
+                    failures = failures.saturating_add(1);
+                    let now = Instant::now();
+                    let delay = backoff(settings.push_interval, failures, PUSH_BACKOFF_CAP);
+                    let delay = match deadline {
+                        Some(deadline) if now >= deadline => {
+                            return Ok(PublishOutcome::Pending { kind, message });
+                        }
+                        Some(deadline) => delay.min(deadline - now),
+                        None => delay,
+                    };
+                    std::thread::sleep(delay.max(Duration::from_millis(10)));
+                }
+            }
+        }
     }
+
+    /// One attempt: the history, then the change and finish refs,
+    /// create-only. `Ok` once the remote holds both refs at exactly their
+    /// ids.
+    fn publish_once(
+        &self,
+        settings: &Settings,
+        record: &FinishRecord,
+        pusher: &mut Option<RemotePusher>,
+    ) -> Result<(), (PushFailureKind, String)> {
+        let local = |message: String| (PushFailureKind::Local, message);
+        if pusher.is_none() {
+            let Some(remote) = settings.remotes.iter().find(|r| r.name == record.remote) else {
+                return Err(local(format!(
+                    "the fork's settings no longer define remote {:?}, which its finish names",
+                    record.remote
+                )));
+            };
+            let opened = RemotePusher::open(
+                &self.state,
+                settings,
+                remote,
+                self.events.clone(),
+                &self.telemetry,
+            )
+            .map_err(|e| local(e.to_string()))?;
+            *pusher = Some(opened);
+        }
+        let pusher = pusher.as_mut().expect("opened just above");
+        // The history: held once pushed, or saved as diverged when a forge
+        // moved the fork's branch (§11.3, alarmed; it never blocks).
+        loop {
+            match pusher.push_once() {
+                outcome if outcome.is_limited() => continue,
+                PushOutcome::Pushed { .. } | PushOutcome::UpToDate { .. } => break,
+                PushOutcome::Diverged {
+                    diverged_ref: Some(_),
+                    ..
+                } => break,
+                PushOutcome::Diverged { .. } => {
+                    return Err((
+                        PushFailureKind::NonFastForward,
+                        "the fork's branch diverged on the remote and the head is not saved yet"
+                            .into(),
+                    ));
+                }
+                PushOutcome::Failed { kind, message, .. } => return Err((kind, message)),
+                PushOutcome::Busy => {
+                    return Err(local("another process is pushing the fork remote".into()));
+                }
+                PushOutcome::NothingToPush => {
+                    return Err(local("the fork has no history to push".into()));
+                }
+            }
+        }
+        let mut refs = Vec::new();
+        if let Some(change) = record.change {
+            refs.push(CreateOnlyRef {
+                name: change_ref(&record.fork),
+                oid: change,
+            });
+        }
+        refs.push(CreateOnlyRef {
+            name: finish_ref(&record.fork),
+            oid: record.finish,
+        });
+        match pusher.push_create_only(&refs) {
+            CreateOnlyOutcome::Held => Ok(()),
+            CreateOnlyOutcome::Failed { kind, message } => Err((kind, message)),
+            // Refused for good from forked volumes unit 2.
+            CreateOnlyOutcome::AnotherWriter { name, found } => Err((
+                PushFailureKind::Refused,
+                format!("{name} on the remote holds {found}, another writer's; it is never moved"),
+            )),
+        }
+    }
+}
+
+/// The repair queue's entries: `<uid> <gid> <pid> <hex path>` lines, the
+/// FUSE layer's format (`agentfs-fuse` boundary), `@origin` lines skipped.
+fn parse_repairs(bytes: &[u8]) -> Vec<(Vec<u8>, Caller)> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        out.extend(parse_repair(line));
+    }
+    out
+}
+
+fn parse_repair(line: &str) -> Option<(Vec<u8>, Caller)> {
+    let mut f = line.split(' ');
+    let uid = f.next()?.parse().ok()?;
+    let gid = f.next()?.parse().ok()?;
+    let pid = f.next()?.parse().ok()?;
+    let hex = f.next()?;
+    if f.next().is_some() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let path = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some((path, Caller { uid, gid, pid }))
+}
+
+/// `meta/fork.json`, `None` when there is none.
+fn read_mark(state: &StateDir) -> Result<Option<ForkMark>, StatusError> {
+    match std::fs::read(state.fork_mark()) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| StatusError::Mark(io::Error::other(e))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(StatusError::Mark(e)),
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// The fork status of the state area at `state`, read without a lock or
@@ -207,6 +546,37 @@ impl Finisher {
 /// read is an error, never a state, so a caller deciding whether to
 /// delete waits.
 pub fn status(state: &StateDir) -> Result<Option<ForkStatus>, StatusError> {
-    let _ = state;
-    Err(StatusError::NotBuilt)
+    crate::history::init_libgit2();
+    let settings = Settings::load(&state.git()).map_err(HistoryError::from)?;
+    let Some(identity) = settings.fork.clone() else {
+        return Ok(None);
+    };
+    let repo = Repository::open_bare(state.git()).map_err(HistoryError::from)?;
+    let record = match repo.find_reference(&settings.branch_ref) {
+        Ok(r) => {
+            let head = r.peel_to_commit().map_err(HistoryError::from)?;
+            finish_from_message(head.message_raw().unwrap_or_default(), head.id())
+        }
+        Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+        Err(e) => return Err(HistoryError::from(e).into()),
+    };
+    let Some(record) = record else {
+        return Ok(Some(ForkStatus {
+            identity,
+            state: ForkState::Active,
+            record: None,
+        }));
+    };
+    let published = read_mark(state)?
+        .and_then(|m| m.published)
+        .is_some_and(|p| p.finish == record.finish.to_string());
+    Ok(Some(ForkStatus {
+        identity,
+        state: if published {
+            ForkState::Published
+        } else {
+            ForkState::Finished
+        },
+        record: Some(record),
+    }))
 }

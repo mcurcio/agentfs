@@ -49,8 +49,8 @@ use opentelemetry::KeyValue;
 
 use super::fetch::FetchOutcome;
 use super::status::{
-    AppliedEntry, FetchStatus, InFlight, PatchState, QueueEntry, STATUS_VERSION, StatusDoc,
-    write_status_ref,
+    AppliedEntry, DuplicateEntry, FetchStatus, InFlight, PatchState, QueueEntry, STATUS_VERSION,
+    StatusDoc, write_status_ref,
 };
 use super::{
     BlockReason, Blocked, Ignored, MAX_PATCH_PATHS, PatchError, applied_ref, inbox_from_message,
@@ -91,6 +91,9 @@ pub struct QueueReport {
     pub applied: Vec<(u64, Oid)>,
     /// Entries the branch already applied, whose refs this run moved.
     pub already: Vec<u64>,
+    /// (inbox number, the inbox number that applied the same patch commit
+    /// first), this run: consumed with a marker commit, not applied again.
+    pub duplicates: Vec<(u64, u64)>,
     pub blocked: Option<Blocked>,
     /// Patches still queued, the blocked one included.
     pub queue_depth: usize,
@@ -225,10 +228,21 @@ impl<'a> Queue<'a> {
             self.recover_in_flight(&f, last_applied, &inbox)?;
         }
 
-        // The rest, in order.
+        // The rest, in order. A patch commit already applied under an
+        // earlier number is consumed, not applied again (design §12): the
+        // whole history is scanned once to know them all.
         let mut applied = Vec::new();
+        let mut duplicates = Vec::new();
         let mut blocked = None;
         let queued: Vec<(u64, Oid)> = inbox.iter().map(|(n, o)| (*n, *o)).collect();
+        if !queued.is_empty() && !full_scan {
+            found = history.find_inbox_commits(None)?;
+        }
+        let mut first_applied: std::collections::HashMap<Oid, u64> =
+            std::collections::HashMap::new();
+        for (n, c) in &found {
+            first_applied.entry(c.patch).or_insert(*n);
+        }
         for (i, (n, patch)) in queued.iter().copied().enumerate() {
             let waiting = queued.len() - i;
             let next = last_applied + 1;
@@ -244,8 +258,30 @@ impl<'a> Queue<'a> {
                 blocked = Some(b);
                 break;
             }
+            if let Some(&m) = first_applied.get(&patch)
+                && m < n
+            {
+                let commit = self.consume_duplicate(n, patch, m)?;
+                move_refs(repo, &volume, n, patch)?;
+                inbox.remove(&n);
+                last_applied = n;
+                last = Some(InboxCommit { commit, patch });
+                duplicates.push((n, m));
+                state.last_applied = n;
+                state.last_applied_patch = Some(patch.to_string());
+                state.last_applied_commit = Some(commit.to_string());
+                state.scanned_head = Some(commit.to_string());
+                let _ = state.save(&state_path);
+                self.cx.recorder.events().emit(Event::PatchDuplicate {
+                    inbox: n,
+                    patch,
+                    applied_as: m,
+                });
+                continue;
+            }
             match self.apply_one(n, patch) {
                 Step1::Applied(commit) => {
+                    first_applied.entry(patch).or_insert(n);
                     crate::failpoints::hit("patch.after_commit")?;
                     move_refs(repo, &volume, n, patch)?;
                     inbox.remove(&n);
@@ -286,6 +322,18 @@ impl<'a> Queue<'a> {
                 commit: c.commit.to_string(),
             }),
             applied_now: applied.iter().map(|(n, _)| *n).collect(),
+            duplicate_now: duplicates
+                .iter()
+                .map(|(n, m)| DuplicateEntry {
+                    inbox: *n,
+                    patch: queued
+                        .iter()
+                        .find(|(q, _)| q == n)
+                        .map(|(_, o)| o.to_string())
+                        .unwrap_or_default(),
+                    applied_as: *m,
+                })
+                .collect(),
             queue: inbox
                 .iter()
                 .map(|(n, o)| QueueEntry {
@@ -317,12 +365,35 @@ impl<'a> Queue<'a> {
         Ok(QueueReport {
             applied,
             already,
+            duplicates,
             blocked,
             queue_depth: inbox.len(),
             ignored,
             last_applied,
             status,
         })
+    }
+
+    /// Consumes patch `n`, the same patch commit that `m` applied first
+    /// (design §12): a marker commit with the head's tree carrying
+    /// `Agentfs-Inbox: <n>`, so the branch's trailers record it as done and
+    /// every crash point converges. Nothing is merged or written.
+    fn consume_duplicate(&self, n: u64, patch_oid: Oid, m: u64) -> Result<Oid, PatchError> {
+        let repo = self.cx.committer.history().repo();
+        let summary = match repo.find_commit(patch_oid) {
+            Ok(patch) => summary_of(&patch, n),
+            Err(_) => format!("patch {n}"),
+        };
+        let op = Operation {
+            id: 0,
+            kind: OperationKind::Patch,
+            source: patch_oid.to_string(),
+            summary: format!("duplicate of patch {m}: {summary}"),
+            caller: self.cx.caller,
+            inbox: Some(n),
+            author: repo.find_commit(patch_oid).ok().map(|p| author_of(&p)),
+        };
+        Ok(self.cx.committer.commit_patch_marker(&op)?)
     }
 
     fn blocked_event(&self, b: &Blocked, queued: usize) {
@@ -891,6 +962,7 @@ pub fn record_failure(state: &StateDir, committer: Option<&Committer>, message: 
             updated: crate::push::utc_basic(now_ms() / 1000),
             last_applied: previous.as_ref().and_then(|p| p.last_applied.clone()),
             applied_now: Vec::new(),
+            duplicate_now: Vec::new(),
             queue: previous.map(|p| p.queue).unwrap_or_default(),
             blocked: Some(blocked),
             ignored: Vec::new(),
