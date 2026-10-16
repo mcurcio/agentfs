@@ -104,7 +104,7 @@ GitHub Actions runners can, so put such tests in a script under `ci/` and a job 
 | `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, remotes (http/https/ssh), LFS, telemetry, multipod, NFS (one export, two clients, one node at a time), patches, runbooks, csi-sanity |
 | `image.yml` | every push and PR | ~5–9 min | container image, kind sidecar e2e, CSI on one kind node (no multi-node job); publishes to GHCR on main |
 | `power-loss.yml` | pushes to main (not docs-only), after landing | ~7 min | dm-log-writes replay on XFS and ext4 |
-| `bench.yml` | pushes to main (not docs-only), after landing | ~10–16 min | benchmarks on XFS and ext4, each in two parallel shards, against `ci/bench-budget.json` |
+| `bench.yml` | pushes to main (not docs-only), after landing | ~15–18 min | benchmarks on XFS and ext4, each in two parallel shards, against `ci/bench-budget.json` |
 
 Rules:
 - Pin third-party actions by full commit SHA (`gh api repos/OWNER/REPO/commits/TAG --jq .sha`).
