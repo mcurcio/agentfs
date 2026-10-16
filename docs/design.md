@@ -1970,8 +1970,20 @@ store) is set, a flagged section must name its own `lfsurl` or
 `lfspushurl`, which it reads before the global keys; without one it is
 invalid, so a fork's LFS objects never reach the source's store. The
 default fork remote, the source's own, is unaffected. A fork pushes only to its fork remote, at
-`refs/heads/agentfs/<fork>` (the push target, fixed at create; hidden refs
-arrive with forked volumes unit 4), and has no patch queue.
+its push target, and has no patch queue.
+
+**The push target** is where a fork's history is kept and pushed, fixed
+at create in its identity (`agentfs.fork.pushTarget`, §19.1 "Hidden
+forks"): `branch` (the default, unset) is `refs/heads/agentfs/<fork>`,
+where users' CI and pull requests can act on it; `hidden` is
+`refs/agentfs/<fork>/history`, never under `refs/heads/` on any remote,
+as forges keep a pull request's head under `refs/pull/`. Create gives a
+new fork the source's `agentfs.forkRefs` (default `branch`); changing it
+moves no fork that exists, since a fork reads its target only from its
+own identity. Every consumer of the fork's history ref (pushes, restore,
+status, the finisher, `fork list` and `fork deliver`) takes either name.
+Whether a forge runs CI or webhooks on a push to `refs/agentfs/*` is the
+forge's own behaviour, not verified here (§19.2).
 
 **Create** (`fork::create`) reads the source's settings and branch head
 without its lock and with no credentials, and refuses a source with no
@@ -2107,7 +2119,11 @@ repository's own CI and hooks act on it; the branch method only creates
 refs under its prefix and the inbox method only queues, but what runs on a
 new branch is the repository's affair (§19.1 "Fork content").
 
-Not built yet: hidden refs and the operations runbooks (unit 4).
+**Operations.** A refused publish has its runbook,
+[fork-refused.md](runbooks/fork-refused.md), one section per reason;
+`fork finish` and `fork status` link the section. A history rewrite of a
+source covers its forks ([§15](#15-recovery-and-undo)). The finisher's
+spans, metric and events are in §13.
 
 ## 12. Patch queue for iac (phase 3, built)
 
@@ -2306,6 +2322,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.reconcile.records` | counter | Records made reconciling moved directories (§3.1) |
 | `agentfs.reconcile.failures` | counter | Moved directories given up on after 5 failed reconciliations over at least 30 s (`reconcile_failed`, §3.1) |
 | `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree, found by trying their suffixes (§5); set `--workload-mount` (CSI: `workloadMounts`) |
+| `agentfs.fork.publish.duration` | histogram, per remote | Seconds from a fork's finish commit to its fork remote holding the change and finish refs (§11.5): one point per fork, when the published mark is written |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
 `reason` (a refusal label or a push failure kind), `stage` (`record` or
@@ -2333,11 +2350,21 @@ trace. Record and commit spans are not linked; they correlate through the
 sequence numbers. `agentfs.patch` covers one patch at mount (inbox number,
 patch oid, outcome, the commit or the block reason, §12); a push to the
 patch remote carries the queue push's result as `agentfs.push.queue`.
+`agentfs.fork.finish` covers writing a fork's change and finish commit,
+once (`agentfs.fork`, `agentfs.fork.change` when there is one,
+`agentfs.fork.unrecorded`), and `agentfs.fork.publish` one publish call
+(`agentfs.fork`, `agentfs.remote`, `agentfs.fork.publish.outcome`:
+`published`, `pending` or `refused`, and `agentfs.fork.refused.reason`),
+with its `agentfs.push` spans inside it (§11.5). `agentfs fork finish`
+exports like `push`, so the CSI node plugin's finisher children export
+too.
 
-**Logs.** A structured log record for every alarm condition: the event name
+**Logs.** A structured log record for every alarm condition, and at INFO
+for a fork's lifecycle (`ForkFinished`, `ForkPublished`, `ForkAbandoned`:
+`Event::is_logged`): the event name
 (`agentfs.path_refused`, `agentfs.push_failed`, ...), WARN for a refused
 path, a failed patch fetch, an ignored patch, an identity fallback and a
-limited push, and ERROR otherwise, the event's message as the body and its fields
+limited push, and ERROR for every other alarm, the event's message as the body and its fields
 (path, reason, remote, kind, heads, ...) as attributes; a push failure
 carries its stage as `agentfs.push.stage`.
 
@@ -2363,6 +2390,10 @@ and logs above; the CLI also prints alarms to stderr.
 | `PatchIgnored` | An inbox entry the queue never applies: `stale` (at or below the last applied number, with another commit; deleted on the remote by the queue push) or `malformed` (§12); a warning |
 | `PatchApplied` | A patch was applied as a commit (not an alarm; sinks filter) |
 | `PatchDuplicate` | A queued patch commit was already applied under an earlier inbox number, so it was consumed with a marker commit and not applied again (§12; not an alarm) |
+| `ForkFinished` | A fork wrote its finish commit, with the fork and its change (none when nothing changed); once (§11.5; not an alarm, logged at INFO) |
+| `ForkPublished` | A fork's fork remote holds its change and finish refs at exactly their ids: the fork and the remote; once, when the published mark is written (§11.5; not an alarm, logged at INFO) |
+| `ForkRefused` | A fork's fork remote refuses its publish for good: the fork, the remote, the reason (`another_writer`, `too_large`, `rejected`, `remote_gone`) and the remote's message; once, when the refusal is recorded; nothing retries it until `agentfs fork finish --retry` ([fork-refused.md](runbooks/fork-refused.md), §11.5) |
+| `ForkAbandoned` | An operator abandoned a fork on record, with the reason (§11.5; not an alarm, logged at INFO) |
 | `HistoryServiceUnavailable` | A front's request to the history service failed (unreachable, timed out, lost or refused) after it last succeeded: raised once per outage; boundaries fail with `EIO` until it is back (§3.5, §14) |
 | `HistoryServiceRestored` | A front's request succeeded again after `HistoryServiceUnavailable` (not an alarm; sinks filter, the CLI prints it) |
 | `IdentityFallback` | The history service could not render a journaled front origin's committer (the identity templates changed across a restart); that pod's records are committed with the service's own committer, keeping the pod trailers (§9); once per pod |
@@ -2990,6 +3021,7 @@ operator runbooks ([runbooks/](runbooks/)):
 | [stuck-pushes.md](runbooks/stuck-pushes.md) | Pushes that keep failing |
 | [crashed-sidecar.md](runbooks/crashed-sidecar.md) | A sidecar whose daemon died: automatic recovery by stacking, when to step in, the pod restart (§17.1) |
 | [patch-queue.md](runbooks/patch-queue.md) | Submitting patches (with agentfs or plain git), a blocked queue, replacing or skipping a patch (§12) |
+| [fork-refused.md](runbooks/fork-refused.md) | A fork whose publish is refused for good: each reason, how it shows, retry or abandon (§11.5) |
 
 **The supported path:**
 
@@ -3168,7 +3200,22 @@ history, such as a recorded secret (§10). It is a documented procedure,
 - on each remote, a force-push of the volume's branch with a lease, the
   one case where agentfs's no-force-push rule is set aside, by an
   operator, plus deleting the volume's other refs there and the host's
-  own purge.
+  own purge;
+- **forks** (§11.5, §19.1 "Forks in history rewrites"): the affected refs
+  are found by reachability, never from a list: in mirror clones of the
+  source's remotes and of every fork remote its settings name, every ref
+  under `refs/heads/agentfs/` and `refs/agentfs/` that contains the first
+  commit that recorded the content (`git for-each-ref --contains`). Only
+  forks whose base contains that commit are abandoned, before anything
+  is rewritten (`git merge-base --is-ancestor <bad> <base>`); forks based
+  earlier keep their ids under filter-repo and publish and land as
+  before. The affected refs are deleted with a lease on each remote. A
+  change based after the bad commit and not yet landed can no longer land
+  (`parent_not_in_history`, §12). agentfs cannot enumerate, and the
+  runbook lists for the operator: delivery targets (the branch method's
+  repositories, webhook and command receivers), receivers' clones and
+  mirrors, users' CI caches, and fork state areas kept with `onDelete:
+  retain`.
 
 **Not built yet** (§19.2): a read-only history view for operators, and undo
 through the patch queue (§12).
@@ -3700,7 +3747,23 @@ restartable (§14.2). The controller runs no children.
     with `Idempotency-Key` and the bearer token, its status decides, and
     no redirect or proxy from the environment is followed; and no CSI
     source uses delivery. The payload's schema, its serde round trip and
-    the factory's validation are unit tests in `fork/deliver.rs`.
+    the factory's validation are unit tests in `fork/deliver.rs`. Hidden
+    forks (`cli_fork.rs`): with `agentfs.forkRefs = hidden`, a new fork
+    is published at `refs/agentfs/<fork>/history` and nothing of it under
+    `refs/heads/`, `fork status`, `list` and `deliver` work on it, and a
+    fork created before the setting changed keeps its branch; both keys'
+    values and the include rule are unit tests in `config.rs`. Telemetry
+    (`cli_telemetry.rs`): a finish and publish export both fork spans with
+    their attributes, `ForkFinished` and `ForkPublished` at INFO and one
+    `agentfs.fork.publish.duration` point; a refused publish exports
+    `ForkRefused` as an alarm and no point. Every refused reason has its
+    section in the refused runbook, which `fork finish` links (a unit test
+    in `fork_cmd.rs`). The history-rewrite runbook with forks runs as its
+    own step of the `e2e-runbooks` job (`ci/e2e-runbooks.sh forks`): on a
+    source with a fork based before the secret and one after, both
+    pushed, the secret's blobs are gone from the source remote and the
+    fork remote, only the later fork is abandoned and its refs deleted,
+    and the earlier one still publishes.
 
 **Where they run.** Tests 1, 2, 4, 5, 6, 7 and 11 run through real mounts
 in the `fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with
@@ -3951,14 +4014,14 @@ runner.
 | Crash testing (2026-10-13) | Failpoints in the durable path (`agentfs_core::failpoints`), compiled only with the `failpoints` cargo feature (release builds have none; such a build says `+failpoints` in `--version` and warns when `AGENTFS_FAILPOINTS` is set), configured by `AGENTFS_FAILPOINTS` (`name=kill\|error\|panic\|sleep(ms)[@n]`); three harness tiers with one oracle, run in the `crash` job; power loss by `dm-log-writes` and `replay-log` in the `power-loss` workflow (§18 test 3) |
 | Crash findings (2026-10-13) | Found by the harnesses and fixed: objects and `objects/` are synced before the ref names them; the journal keeps appending to the file a failed truncation renamed in; a record whose frozen copies are gone is dropped with `RecordFailed` instead of failing every later commit; a repair queue left in its temporary file is loaded; ref lock files a crash left are removed at open (§3.3, §3.5) |
 | Bench off the landing path (2026-10-15) | A change is done when the `ci` and `image` workflows are green on its final commit; `bench` and `power-loss` run after it lands on main and are checked afterwards, and a bench budget warning or a power-loss failure is a follow-up, not a reason to hold the change (AGENTS.md). The bench runs each filesystem as two parallel jobs, `many` (create, mvdir and rm of 100,000 files) and `rest` (record_step, close4k, clone, npm, bigclose), and one report job merges them per filesystem; clone and npm run once instead of three times, bigclose keeps three. The owner, on the bench's 17 to 24 minute jobs: "23 minutes is too long for a CI job. Let's bring that time down"; offered options including sharding the bench (1) and agents not waiting on it (3), he chose "1 and 3" (both 2026-10-15) ([performance.md](performance.md#the-benchmark)) |
-| Forked volumes (2026-10-15) | A fork is a volume started from another volume's latest local commit (its source, at its base). It records, pushes and recovers like any volume; when it finishes it publishes one change, a commit whose parent is base, and whatever receives the change does all the gating: agentfs never reviews, accepts or merges. The owner's ask: "I want to gate the acceptance of changes upstream, but still want sandbox agents to interact with the normal filesystem. So with agentfs, I can grant them a worktree forked from the latest head, they edit whatever files they choose, and then when the sandbox ends those edits become an upstream merge patch — either through a PR or some automated flow, configurable/programmable by an implementer." Its scope: "Design it, but leave Hermes out of it. We're building an open source project; my application of it to my cluster stack will come later. Focus on capabilities. Configuration with sensible defaults". Where a change lands, the source volume or another repository as a PR: "A or b. I'm not sure" (both are supported); part of a volume: "Partial would be via a subpath mount rather than a partial clone"; one squashed patch or the full history: "Configurable". On the frame "agentfs forks and publishes; whatever receives the change does the gating": "Go" (all 2026-10-15, in a Claude Code session). Units 1 to 3 are built (§11.5); unit 4 is not yet ("Fork scope") |
+| Forked volumes (2026-10-15) | A fork is a volume started from another volume's latest local commit (its source, at its base). It records, pushes and recovers like any volume; when it finishes it publishes one change, a commit whose parent is base, and whatever receives the change does all the gating: agentfs never reviews, accepts or merges. The owner's ask: "I want to gate the acceptance of changes upstream, but still want sandbox agents to interact with the normal filesystem. So with agentfs, I can grant them a worktree forked from the latest head, they edit whatever files they choose, and then when the sandbox ends those edits become an upstream merge patch — either through a PR or some automated flow, configurable/programmable by an implementer." Its scope: "Design it, but leave Hermes out of it. We're building an open source project; my application of it to my cluster stack will come later. Focus on capabilities. Configuration with sensible defaults". Where a change lands, the source volume or another repository as a PR: "A or b. I'm not sure" (both are supported); part of a volume: "Partial would be via a subpath mount rather than a partial clone"; one squashed patch or the full history: "Configurable". On the frame "agentfs forks and publishes; whatever receives the change does the gating": "Go" (all 2026-10-15, in a Claude Code session). Built (§11.5), in the four units of "Fork scope" |
 | Fork finish (2026-10-15) | A fork finishes when its claim is deleted (DeleteVolume of a volume from a fork class, whose reclaim policy must be Delete), and outside Kubernetes when `agentfs fork finish` runs. A restart of agentfs, the node plugin or the kubelet never finishes a fork; with a pod-scoped claim, a drain or rollout does. Asked when a sandbox is finished (a: its claim is deleted; b: its last pod stops; c: an explicit finish), the owner: "1a". Built (§11.5, §14.2) |
 | Fork delivery (2026-10-15) | The CSI driver only publishes; a receiver lands a published change in its source with `agentfs patch submit`. The library and the CLI also deliver a change, by four built-in methods: inbox, branch, command and webhook. The owner: "2 a for CSI and b for the library". Built: the CSI side (§14.2), and the library's methods with `agentfs fork deliver` (§11.5 "Delivery", forked volumes unit 3) |
 | Fork content (2026-10-15) | Everything agentfs itself does with a fork's content treats it as potentially hostile: names, paths, sizes, symlinks and gitlinks are checked, and nothing is run. agentfs adds no CI filtering: forks publish where users' own CI can act on them (§1.1). The owner: "3 potentially hostile, but don't limit CI capabilities that users could create". Built for create (base's tree through the confined writer), publish (create-only refs), a finished fork (read-only: no record, and a read-only CSI publish) and `fork list` (every published change checked against its finish commit, §11.5) |
 | Fork remote (2026-10-16) | Forks publish to the source's own remote by default, with no setup (the remote its patch queue uses, §12: a design choice). An explicit fork-remote setting may name another remote, which is then never one of the source's push remotes, never sets its limits and never becomes its patch remote (a design choice, design rule 1). The stated cost: wherever that repository's CI may write, a sandbox's CI file can write the source's inbox, so the gate is only as strong as that repository's CI write permissions. The owner, answering the design gate's question on where forks publish: "b". Built (§11.5) |
 | Fork hostile residual (2026-10-16) | Accepted and stated, with no hardening work now: a sandbox's file calls are served by the privileged node plugin, which holds every profile's credentials, so a bug in that front would expose node root and every profile's credentials; and volume size is not enforced on the shared base path (§14.2), so a sandbox can fill it for every volume there. The owner, answering the design gate's question on the hostile residual: "a" |
-| Fork design rules (2026-10-16) | (1) A fork's push target is fixed at create: `agentfs/<fork>` on the fork remote, never the source's branch; every other setting is read from the source's settings files at each open, and settings that cannot be read stop the fork opening. (2) A fork finishes once, writing one finish record, and the finisher retries publishing until the fork remote holds the change; the fork is not deleted until it is published, or until an operator abandons it on record. (3) agentfs publishes and the receiver gates: a receiver lands the exact change commit it reviewed, and the source applies a given change at most once. Approved with the design gate's answers, with no notes (2026-10-16). Built (§11.5), except abandoning, which is forked volumes unit 2 |
-| Fork scope (2026-10-16) | Four units, tracer first, docs with each: (1) the tracer: fork identity and fork remote; create, finish and publish; CSI cloning of a claim, a fork StorageClass with `fork: "true"` and reclaim policy Delete, and its admission check; DeleteVolume waiting until the fork is published; the source applying a given change at most once; (2) refused and abandoned forks, settings that fail closed, finished forks read-only, `fork status` and `fork list`; (3) library delivery: the delivery contract, its four methods, `fork deliver`; (4) hidden refs, the history-rewrite runbook covering forks, telemetry, the runbook for refused publishes. The owner, answering the design gate's question on scope: "a" (build units 1 to 4 as outlined) |
+| Fork design rules (2026-10-16) | (1) A fork's push target is fixed at create: `agentfs/<fork>` on the fork remote, never the source's branch; every other setting is read from the source's settings files at each open, and settings that cannot be read stop the fork opening. (2) A fork finishes once, writing one finish record, and the finisher retries publishing until the fork remote holds the change; the fork is not deleted until it is published, or until an operator abandons it on record. (3) agentfs publishes and the receiver gates: a receiver lands the exact change commit it reviewed, and the source applies a given change at most once. Approved with the design gate's answers, with no notes (2026-10-16). Built (§11.5) |
+| Fork scope (2026-10-16) | Four units, tracer first, docs with each: (1) the tracer: fork identity and fork remote; create, finish and publish; CSI cloning of a claim, a fork StorageClass with `fork: "true"` and reclaim policy Delete, and its admission check; DeleteVolume waiting until the fork is published; the source applying a given change at most once; (2) refused and abandoned forks, settings that fail closed, finished forks read-only, `fork status` and `fork list`; (3) library delivery: the delivery contract, its four methods, `fork deliver`; (4) hidden refs, the history-rewrite runbook covering forks, telemetry, the runbook for refused publishes. The owner, answering the design gate's question on scope: "a" (build units 1 to 4 as outlined). All four are built (§11.5) |
 | Content sources (2026-10-16) | Reverses §14.2's "nothing clones": CreateVolume clones a claim's `dataSource` claim when the StorageClass is a fork class (`fork: "true"`), copying the source's history up to its latest commit and writing that commit's tree locally, with no credentials. Any other content source, and every snapshot, stays refused. Follows from "Forked volumes" and "Fork scope". Built (§14.2) |
 | Fork remote flag (2026-10-16) | The explicit fork-remote setting of "Fork remote" is `remote.<name>.agentfsForkRemote = true` on one remote section of the source's settings: that section is only for forks, never one of the source's push remotes, never its patch remote and never a source of its record-time limits; with none, forks push to the source's patch remote. Two flagged sections, or an invalid one, leave no fork remote, and forks are refused rather than fall back. A design choice (forked volumes unit 1), not the owner's words |
 | Patch duplicates (2026-10-16) | The source applies a given change at most once ("Fork design rules" 3) by a rule for every producer, keyed by the patch commit's id: a queued patch commit that an earlier inbox number already applied is consumed with a marker commit and `PatchDuplicate`, never merged again (§12). Cost: a producer can no longer resubmit the identical commit to apply it again (it must make a new commit), and a replaced or replayed copy of a change has another id and is not caught. A design choice (forked volumes unit 1), not the owner's words |
@@ -3971,6 +4034,9 @@ runner.
 | Submit's early refusal (2026-10-16) | `agentfs patch submit` of a given commit that takes a new number is refused (`AlreadySubmitted`) when the remote already queues or has applied that commit; `--replace N` and `--skip N` are not checked, since they name their number deliberately and refuse applied ones already. The queue's duplicate rule ("Patch duplicates") stays the guarantee, since two submits at once both pass the check. A design choice (forked volumes unit 2), not the owner's words |
 | Delivery payload v1 (2026-10-16) | The command and webhook methods send one JSON document, schema 1: `schema`, `fork`, `source`, `base`, `change`, `finish` and `fetch` (`remote` as the runner named it, and the `change`, `finish` and `history` refs). `change` is the key receivers dedupe on, and the webhook's `Idempotency-Key`. A new field or meaning is a new schema number, never a silent change. Both methods are at least once; the inbox method is at most once by the §12 duplicate rule. A design choice (forked volumes unit 3), not the owner's words |
 | Branch delivery idempotency (2026-10-16) | The branch method decides "already delivered" by content: its squash commit is deterministic (the change commit's author and committer, the message `change of fork <fork>` with `Agentfs-Change: <change>`), so the target ref at exactly the commit it would create is already delivered, and a ref at any other commit is refused and never moved; a trailer is never trusted, since anyone who may write the target can forge one. It pushes create-only (`--force-with-lease=<ref>:`). Cost: with `--onto`, a branch that moved since the first delivery makes a repeat refused rather than already delivered, and a receiver that rewrote the branch (a rebase in its pull request) gets the same refusal. A design choice (forked volumes unit 3), not the owner's words |
+| Hidden forks (2026-10-16) | A fork's push target is `branch` (`refs/heads/agentfs/<fork>`, the default) or `hidden` (`refs/agentfs/<fork>/history`, never under `refs/heads/`); new forks get the source's `agentfs.forkRefs`, and the fork keeps it in its identity (`agentfs.fork.pushTarget`, written only for `hidden`), so changing the setting moves no fork that exists. Any other value of either key is refused (`BadChoice`), and an include may not set `pushTarget`. It is unit 4 of "Fork scope". Cost: whether a forge runs CI or webhooks on pushes to `refs/agentfs/*` is not verified (§19.2), and an operator who switches to `hidden` to contain exposure must abandon or finish the forks that already push branches. A design choice (forked volumes unit 4), not the owner's words |
+| Fork telemetry (2026-10-16) | The finisher reports through §13's existing signals: spans `agentfs.fork.finish` (once, when the finish commit is written) and `agentfs.fork.publish` (one publish call, its outcome and refusal reason, with the pushes inside it), the histogram `agentfs.fork.publish.duration` (seconds from the finish commit to published, one point per fork, written with the published mark), and the events `ForkFinished` and `ForkPublished`, which are not alarms. A fork's lifecycle events (finished, published, abandoned) become INFO log records beside the alarms (`Event::is_logged`), so a fork's life is in the same log as its refusal. Cost: a duration measured from the finish commit's time trusts the node's clock, and a fork retried after a refusal counts the time it waited for the operator. A design choice (forked volumes unit 4), not the owner's words |
+| Forks in history rewrites (2026-10-16) | The history-rewrite runbook covers forks by reachability, not a list: the affected refs are those containing the first commit that recorded the content, in mirror clones of the source's remotes and fork remotes; only forks whose base contains it are abandoned, before the rewrite, and their refs deleted with a lease; forks based earlier keep their ids and publish as before. What agentfs cannot enumerate (delivery targets, receivers' clones, CI caches, retained fork directories) is listed for the operator. Cost: a change based after the bad commit and not yet landed becomes unlandable (`parent_not_in_history`). A design choice (forked volumes unit 4), not the owner's words |
 
 ### 19.2 Open questions
 
@@ -4058,6 +4124,12 @@ runner.
    (`ci/e2e-csi-forks.sh`, step 1, image workflow run 38871457716). Open:
    whether a later provisioner or Kubernetes release adds the check the
    documentation describes; the kind job would show it.
+9. **Forge CI on hidden refs** (§19.1 "Hidden forks"). Whether a forge
+   (GitHub, Gitea, GitLab) runs workflows or sends push webhooks for a
+   push to `refs/agentfs/<fork>/history`, outside `refs/heads/`, is not
+   verified; a bare repository runs only its own hooks. Open: check each
+   forge an operator relies on before choosing `hidden` to keep a
+   sandbox's output away from its CI.
 
 ## 20. Prior art
 

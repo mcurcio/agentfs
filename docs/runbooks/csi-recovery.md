@@ -210,27 +210,9 @@ says why.
    remote confirms; a refusal or an abandon it recorded is lost with it).
 4. **Refused** (`state: refused`; the alarm `ForkRefused`, once; the
    publisher starts no further finisher): the fork remote refuses for
-   good. `publish:` names the reason:
-   - `another_writer`: `refs/agentfs/<fork>/finish` or `/change` on the
-     fork remote holds another commit. agentfs never moves it. Find who
-     wrote it; if it is not this fork's, remove it on the remote
-     (`git push <remote> :refs/agentfs/<fork>/finish`).
-   - `rejected`: the remote refused the change and finish refs (a
-     pre-receive hook or branch protection on `refs/agentfs/*`). Allow
-     agentfs's identity to create them.
-   - `too_large`: one commit over the fork remote's `agentfsMaxPushSize`,
-     or an LFS object over `agentfsMaxLfsObjectSize` (design §11.3).
-     Raise the limit in the profile.
-   - `remote_gone`: the profile no longer has the fork remote the finish
-     named (or it is now invalid, `RemoteMisconfigured`). Restore it.
-
-   Then publish again, clearing the refusal:
-
-   ```sh
-   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
-     agentfs --wait-lock 6m --state /var/lib/agentfs-csi/volumes/$PV/state \
-       --root /var/lib/agentfs-csi/volumes/$PV/backing fork finish --retry --timeout 2m
-   ```
+   good, and `publish:` names the reason. Each reason, its fix, and
+   publishing again with `fork finish --retry`, are in
+   [fork-refused.md](fork-refused.md).
 5. **Give the fork up** (unreachable for good, or its change not
    wanted): abandon it on record, and the next DeleteVolume applies
    `onDelete`, discarding the change (it stays in the fork's branch on the

@@ -28,11 +28,11 @@ use serde::Serialize;
 
 use agentfs_core::config::Settings;
 use agentfs_core::events::Event;
-use agentfs_core::fork::PushTarget;
 use agentfs_core::fork::create::{self, CreateRequest};
 use agentfs_core::fork::deliver::{self, DEFAULT_PREFIX, Delivered, DeliveryMethod, Shape};
 use agentfs_core::fork::finish::{
-    self, AbandonedMark, FinishRecord, Finisher, ForkState, ForkStatus, PublishOutcome, RefusedMark,
+    self, AbandonedMark, FinishRecord, Finisher, ForkState, ForkStatus, PublishOutcome,
+    RefusedMark, RefusedReason,
 };
 use agentfs_core::fork::listing;
 use agentfs_core::lock::StateLock;
@@ -42,8 +42,32 @@ use agentfs_core::volume::StateDir;
 
 use crate::{Pod, Session};
 
-/// Where an operator reads what to do about a refused publish.
-const REFUSED_RUNBOOK: &str = "docs/runbooks/csi-recovery.md";
+/// Where an operator reads what to do about a refused publish: one section
+/// per [`RefusedReason`], headed by its name.
+const REFUSED_RUNBOOK: &str = "docs/runbooks/fork-refused.md";
+
+/// What to fix for a publish refused for `reason`, and the runbook
+/// section that says how.
+fn refused_hint(reason: RefusedReason) -> String {
+    let fix = match reason {
+        RefusedReason::AnotherWriter => {
+            "a change or finish ref on the fork remote holds another commit, which agentfs \
+             never moves: find who wrote it"
+        }
+        RefusedReason::TooLarge => {
+            "a commit or an LFS object is over the fork remote's agentfsMaxPushSize or \
+             agentfsMaxLfsObjectSize"
+        }
+        RefusedReason::Rejected => {
+            "the fork remote refuses refs/agentfs/<fork>/change and /finish (a hook or a \
+             protection rule)"
+        }
+        RefusedReason::RemoteGone => {
+            "the fork's settings no longer have the fork remote its finish names"
+        }
+    };
+    format!("{fix}; see {REFUSED_RUNBOOK}#{}", reason.as_str())
+}
 
 #[derive(Subcommand)]
 pub enum ForkCommand {
@@ -268,10 +292,11 @@ pub fn run(
                 }
                 PublishOutcome::Refused { reason, message } => {
                     eprintln!(
-                        "publishing is refused ({}): {message}; nothing retries it: fix the \
-                         cause and run `agentfs fork finish --retry`, or `agentfs fork \
-                         abandon` (see {REFUSED_RUNBOOK})",
-                        reason.as_str()
+                        "publishing is refused ({}): {message}; {}; nothing retries it: fix \
+                         the cause and run `agentfs fork finish --retry`, or `agentfs fork \
+                         abandon --reason TEXT`",
+                        reason.as_str(),
+                        refused_hint(reason)
                     );
                     ExitCode::FAILURE
                 }
@@ -484,11 +509,12 @@ fn print_status(doc: &ForkStatusDoc) {
         format!("published at {at} ms")
     } else if let Some(r) = &doc.refused {
         format!(
-            "refused ({}) at {} ms by {}: {} (see {REFUSED_RUNBOOK})",
+            "refused ({}) at {} ms by {}: {} (see {REFUSED_RUNBOOK}#{})",
             r.reason.as_str(),
             r.at_ms,
             r.remote,
-            r.message
+            r.message,
+            r.reason.as_str()
         )
     } else if doc.finish.is_some() {
         "not published yet".to_owned()
@@ -502,6 +528,7 @@ fn print_status(doc: &ForkStatusDoc) {
 fn create_cmd(args: &CreateArgs, state: &StateDir, root: &Path) -> Result<String> {
     let source = StateDir::new(&args.source_state);
     let includes = create::settings_files(&source)?;
+    let push_target = create::push_target(&source)?;
     // A fork already in this state area keeps its name: create is
     // idempotent per name.
     let existing = Settings::load(&state.git())
@@ -524,7 +551,7 @@ fn create_cmd(args: &CreateArgs, state: &StateDir, root: &Path) -> Result<String
         tree: root,
         name: &name,
         includes: &includes,
-        push_target: PushTarget::Branch,
+        push_target,
     })?;
     Ok(format!(
         "fork {} of {} at {}",
@@ -546,4 +573,26 @@ fn describe(record: &FinishRecord) -> String {
         record.remote,
         record.unrecorded
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D5: every reason's hint links its own section of the refused
+    /// runbook, and that section exists.
+    #[test]
+    fn each_refused_reason_links_its_runbook_section() {
+        let runbook = include_str!("../../../docs/runbooks/fork-refused.md");
+        for reason in RefusedReason::ALL {
+            let hint = refused_hint(reason);
+            let link = format!("{REFUSED_RUNBOOK}#{}", reason.as_str());
+            assert!(hint.contains(&link), "{reason:?}: {hint}");
+            let heading = format!("\n## `{}`\n", reason.as_str());
+            assert!(
+                runbook.contains(&heading),
+                "{REFUSED_RUNBOOK} has no section {heading:?}"
+            );
+        }
+    }
 }

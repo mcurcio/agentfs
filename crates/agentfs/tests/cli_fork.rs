@@ -47,6 +47,23 @@ impl Setup {
         (messages.len() - duplicates, duplicates)
     }
 
+    /// `fork create` of the source into `state` and `tree`; returns the
+    /// fork's name.
+    fn create_fork_in(&self, state: &str, tree: &str) -> String {
+        let source = self.path("state").display().to_string();
+        let out = self.ok(state, tree, &["fork", "create", "--source-state", &source]);
+        out.strip_prefix("fork ")
+            .and_then(|l| l.split(' ').next())
+            .unwrap_or_else(|| panic!("{out}"))
+            .to_owned()
+    }
+
+    /// Key `key` of the state area `state`'s own config.
+    fn own_config(&self, state: &str, key: &str) -> Option<String> {
+        let path = self.path(state).join("git/config");
+        git2::Config::open(&path).unwrap().get_string(key).ok()
+    }
+
     fn submit_command(&self, producer: &Path, commit: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
         cmd.args(["patch", "submit", commit, "--volume", "src", "--repo"])
@@ -288,7 +305,10 @@ fn a_refused_publish_waits_for_retry() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
     let err = stderr_of(&out);
     assert!(err.contains("refused (another_writer)"), "{err}");
-    assert!(err.contains("csi-recovery"), "{err}");
+    assert!(
+        err.contains("docs/runbooks/fork-refused.md#another_writer"),
+        "{err}"
+    );
     let doc = status_json(&s);
     assert_eq!(doc["version"], 1);
     assert_eq!(doc["state"], "refused");
@@ -622,5 +642,131 @@ fn fork_list_checks_every_published_change() {
     assert!(
         !s.path("no-state-here").exists(),
         "fork list made a state area"
+    );
+}
+
+/// D1: with `agentfs.forkRefs = hidden` in the source's profile, a new
+/// fork's history is kept and published at `refs/agentfs/<fork>/history`,
+/// never under `refs/heads/`, and finish, status, list and deliver work
+/// unchanged; a fork created before the profile changed keeps its branch.
+#[test]
+fn a_hidden_fork_publishes_off_every_branch() {
+    let s = Setup::new(true);
+    s.record("state", "tree", "a.txt", "a\n");
+    s.ok("state", "tree", &["push"]);
+    let early = s.create_fork_in("fork", "fork-tree");
+    let profile = fs::read_to_string(s.path("profile")).unwrap();
+    fs::write(
+        s.path("profile"),
+        format!("{profile}[agentfs]\n\tforkRefs = hidden\n"),
+    )
+    .unwrap();
+    let hidden = s.create_fork_in("fork2", "fork2-tree");
+    assert_ne!(early, hidden);
+    assert_eq!(
+        s.own_config("fork2", "agentfs.fork.pushTarget").as_deref(),
+        Some("hidden")
+    );
+    assert_eq!(s.own_config("fork", "agentfs.fork.pushTarget"), None);
+    let fork2 = Repository::open_bare(s.path("fork2/git")).unwrap();
+    let history = format!("refs/agentfs/{hidden}/history");
+    assert_eq!(fork2.refname_to_id(&history).ok(), Some(s.source_head()));
+    assert!(
+        fork2
+            .refname_to_id(&format!("refs/heads/agentfs/{hidden}"))
+            .is_err()
+    );
+
+    s.record("fork", "fork-tree", "b.txt", "early\n");
+    s.record("fork2", "fork2-tree", "b.txt", "hidden\n");
+    for (state, tree) in [("fork", "fork-tree"), ("fork2", "fork2-tree")] {
+        let out = s.ok(state, tree, &["fork", "finish"]);
+        assert!(out.contains("published to forks"), "{out}");
+    }
+    let finish = |fork: &str| {
+        s.remote_ref("forks.git", &format!("refs/agentfs/{fork}/finish"))
+            .unwrap()
+    };
+    // Fixed at create: the early fork still publishes its branch.
+    assert_eq!(
+        s.remote_ref("forks.git", &format!("refs/heads/agentfs/{early}")),
+        Some(finish(&early))
+    );
+    assert_eq!(s.remote_ref("forks.git", &history), Some(finish(&hidden)));
+    let branches: Vec<String> = s
+        .refs("forks.git")
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("refs/heads/") && name.contains(&hidden))
+        .collect();
+    assert!(branches.is_empty(), "{branches:?}");
+    assert!(
+        s.refs("origin.git")
+            .iter()
+            .all(|(n, _)| !n.contains(&hidden))
+    );
+    let out = s.ok("fork2", "fork2-tree", &["fork", "status", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(doc["state"], "published");
+    assert_eq!(
+        doc["finish"].as_str().map(str::to_owned),
+        Some(finish(&hidden).to_string())
+    );
+
+    if !have_git() {
+        return;
+    }
+    let receiver = s.path("receiver");
+    let out = s.git(
+        s.dir.path(),
+        &["init", "--quiet", receiver.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let forks = s.url("forks.git");
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
+        cmd.current_dir(s.dir.path())
+            .args(args)
+            .arg("--repo")
+            .arg(&receiver);
+        s.hermetic(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}{}",
+            text(&out.stdout),
+            stderr_of(&out)
+        );
+        text(&out.stdout)
+    };
+    let listed: serde_json::Value =
+        serde_json::from_str(&run(&["fork", "list", "--json", "--remote", &forks])).unwrap();
+    let refs: Vec<(String, String)> = listed["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["fork"].as_str().unwrap().to_owned(),
+                c["history_ref"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let mut want = vec![
+        (early.clone(), format!("refs/heads/agentfs/{early}")),
+        (hidden.clone(), history.clone()),
+    ];
+    want.sort();
+    let mut refs = refs;
+    refs.sort();
+    assert_eq!(refs, want, "{listed}");
+    let out = run(&[
+        "fork", "deliver", &hidden, "--from", &forks, "--to", "branch", "--shape", "history",
+        "--prefix", "hist/",
+    ]);
+    assert!(out.contains("delivered change"), "{out}");
+    assert_eq!(
+        s.remote_ref("forks.git", &format!("refs/heads/hist/{hidden}")),
+        Some(finish(&hidden))
     );
 }

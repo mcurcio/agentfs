@@ -32,7 +32,7 @@ use crate::claims::PathClaims;
 use crate::config::{ConfigError, validate_name};
 use crate::confined;
 use crate::events::{CheckStage, Event, Events};
-use crate::fork::identity::{self as fork_identity, ForkIdentity};
+use crate::fork::identity::{self as fork_identity, ForkIdentity, PushTarget};
 use crate::fsync_class::{self, FsyncClass, GroupMembers};
 use crate::history::{Committed, History, HistoryError};
 use crate::history_service::{ClientError, FrontLease, HistoryClient, PathStamp};
@@ -501,9 +501,18 @@ fn check_fork(git: &Path, wanted: &ForkIdentity) -> Result<(), VolumeError> {
     }
 }
 
-/// The fork identity keys, in the state area's own config.
+/// The fork identity keys, in the state area's own config. The push
+/// target goes first: a crash after it leaves no source (so the next try
+/// writes every key again), never a fork that reads as `branch` because
+/// its `hidden` was lost.
 fn write_fork_identity(git: &Path, fork: &ForkIdentity) -> Result<(), VolumeError> {
     let mut config = git2::Config::open(&git.join("config")).map_err(HistoryError::from)?;
+    // Unset is `branch`: only the other target is written.
+    if fork.push_target == PushTarget::Hidden {
+        config
+            .set_str(fork_identity::PUSH_TARGET_KEY, "hidden")
+            .map_err(HistoryError::from)?;
+    }
     config
         .set_str(fork_identity::SOURCE_KEY, &fork.source)
         .map_err(HistoryError::from)?;

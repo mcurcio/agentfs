@@ -22,6 +22,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use git2::{Oid, Repository};
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Settings;
@@ -34,7 +35,7 @@ use crate::push::{
     CreateOnlyOutcome, CreateOnlyRef, PUSH_BACKOFF_CAP, PushOutcome, RemotePusher, backoff,
 };
 use crate::record::{Caller, Trigger};
-use crate::telemetry::Telemetry;
+use crate::telemetry::{Telemetry, spans};
 use crate::volume::{self, Committer, Input, Recorder, StateDir, VolumeError};
 
 use super::identity::{ForkIdentity, change_ref, finish_ref};
@@ -134,6 +135,14 @@ pub enum RefusedReason {
 }
 
 impl RefusedReason {
+    /// Every reason, for what must cover each (the runbook, its hints).
+    pub const ALL: [Self; 4] = [
+        Self::AnotherWriter,
+        Self::TooLarge,
+        Self::Rejected,
+        Self::RemoteGone,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AnotherWriter => "another_writer",
@@ -371,6 +380,33 @@ impl Finisher {
             self.set_ref(&finish_ref(&fork), record.finish)?;
             return Ok(record);
         }
+        let span = self.telemetry.span(spans::FORK_FINISH, || {
+            vec![KeyValue::new("agentfs.fork", fork.clone())]
+        });
+        let finished = self.finish_once(&fork);
+        match &finished {
+            Ok(record) => {
+                if let Some(change) = record.change {
+                    span.set(KeyValue::new("agentfs.fork.change", change.to_string()));
+                }
+                span.set(KeyValue::new(
+                    "agentfs.fork.unrecorded",
+                    i64::try_from(record.unrecorded).unwrap_or(i64::MAX),
+                ));
+                self.events.emit(Event::ForkFinished {
+                    fork: record.fork.clone(),
+                    change: record.change,
+                });
+            }
+            Err(e) => span.error(e),
+        }
+        span.end();
+        finished
+    }
+
+    /// Writes the change and the finish commit of a fork not finished yet.
+    fn finish_once(&mut self, fork: &str) -> Result<FinishRecord, FinishError> {
+        let fork = fork.to_owned();
         let history = self.committer.history();
         let Some(remote) = history
             .settings()
@@ -519,6 +555,40 @@ impl Finisher {
     /// read again: an abandoned fork stops with [`FinishError::Abandoned`].
     pub fn publish(&mut self, deadline: Option<Instant>) -> Result<PublishOutcome, FinishError> {
         let record = self.finish()?;
+        let span = self.telemetry.span(spans::FORK_PUBLISH, || {
+            vec![
+                KeyValue::new("agentfs.fork", record.fork.clone()),
+                KeyValue::new("agentfs.remote", record.remote.clone()),
+            ]
+        });
+        let outcome = self.publish_record(&record, deadline);
+        match &outcome {
+            Ok(outcome) => {
+                let label = match outcome {
+                    PublishOutcome::Published => "published",
+                    PublishOutcome::Pending { .. } => "pending",
+                    PublishOutcome::Refused { reason, .. } => {
+                        span.set(KeyValue::new(
+                            "agentfs.fork.refused.reason",
+                            reason.as_str(),
+                        ));
+                        "refused"
+                    }
+                };
+                span.set(KeyValue::new("agentfs.fork.publish.outcome", label));
+            }
+            Err(e) => span.error(e),
+        }
+        span.end();
+        outcome
+    }
+
+    /// [`Finisher::publish`] of the finished fork `record`.
+    fn publish_record(
+        &mut self,
+        record: &FinishRecord,
+        deadline: Option<Instant>,
+    ) -> Result<PublishOutcome, FinishError> {
         let finish = record.finish.to_string();
         let mut pusher = None;
         let mut failures = 0u32;
@@ -538,7 +608,7 @@ impl Finisher {
                     message: refused.message.clone(),
                 });
             }
-            let failed = match self.publish_once(&record, &mut pusher) {
+            let failed = match self.publish_once(record, &mut pusher) {
                 Ok(()) => {
                     let published = PublishedMark {
                         finish: finish.clone(),
@@ -550,6 +620,7 @@ impl Finisher {
                         mark.published = Some(published);
                         mark.refused = None;
                     })?;
+                    self.published(record);
                     return Ok(PublishOutcome::Published);
                 }
                 Err(failed) => failed,
@@ -590,6 +661,22 @@ impl Finisher {
             };
             std::thread::sleep(delay.max(Duration::from_millis(10)));
         }
+    }
+
+    /// What the published mark, just written, is told by: the
+    /// `agentfs.fork.publish.duration` point, from the finish commit's time,
+    /// and [`Event::ForkPublished`].
+    fn published(&self, record: &FinishRecord) {
+        let repo = self.committer.history().repo();
+        if let Ok(finish) = repo.find_commit(record.finish) {
+            let at = UNIX_EPOCH + Duration::from_secs(finish.time().seconds().max(0) as u64);
+            let elapsed = SystemTime::now().duration_since(at).unwrap_or_default();
+            self.telemetry.fork_published(&record.remote, elapsed);
+        }
+        self.events.emit(Event::ForkPublished {
+            fork: record.fork.clone(),
+            remote: record.remote.clone(),
+        });
     }
 
     /// One attempt: the history, then the change and finish refs,

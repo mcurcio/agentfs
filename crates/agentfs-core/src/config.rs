@@ -106,7 +106,10 @@ pub enum ConfigError {
     IncludeSetsIdentity { path: PathBuf, key: &'static str },
     #[error("{key}: {value:?} is not a full commit id")]
     BadForkBase { key: String, value: String },
-    #[error("agentfs.fork.source and agentfs.fork.base must be set together")]
+    #[error(
+        "agentfs.fork.source and agentfs.fork.base must be set together, and \
+         agentfs.fork.pushTarget only with them"
+    )]
     PartialForkIdentity,
     #[error("agentfs.branch is set in a fork's config; a fork's push target is fixed at create")]
     ForkBranch,
@@ -158,12 +161,14 @@ pub const KEYS: &[&str] = &[
     "agentfs.patchRemote",
     "agentfs.patchFetchTimeout",
     "agentfs.lfsThreshold",
+    "agentfs.forkRefs",
     "agentfs.identity.committerName",
     "agentfs.identity.committerEmail",
     "agentfs.identity.authorName",
     "agentfs.identity.authorEmail",
     "agentfs.fork.source",
     "agentfs.fork.base",
+    "agentfs.fork.pushTarget",
     "lfs.url",
     "lfs.pushurl",
     "lfs.concurrenttransfers",
@@ -453,6 +458,10 @@ pub struct Settings {
     /// more than one is flagged: a fork never falls back past the
     /// operator's choice.
     pub fork_remote: Option<RemoteSettings>,
+    /// `agentfs.forkRefs`: the push target new forks of this volume get
+    /// (design §11.5), fixed in each fork's identity at create, so a
+    /// change here never moves a fork that exists.
+    pub fork_refs: PushTarget,
 }
 
 /// `agentfs.patchRemote` (design §12).
@@ -510,9 +519,10 @@ fn fork_identity_of(
 ) -> Result<Option<ForkIdentity>, ConfigError> {
     let source = string(config, fork_identity::SOURCE_KEY)?;
     let base = string(config, fork_identity::BASE_KEY)?;
-    let (source, base) = match (source, base) {
-        (None, None) => return Ok(None),
-        (Some(source), Some(base)) => (source, base),
+    let push_target = push_target(config, fork_identity::PUSH_TARGET_KEY)?;
+    let (source, base, push_target) = match (source, base, push_target) {
+        (None, None, None) => return Ok(None),
+        (Some(source), Some(base), push_target) => (source, base, push_target.unwrap_or_default()),
         _ => return Err(ConfigError::PartialForkIdentity),
     };
     validate_name(fork_identity::SOURCE_KEY, &source)?;
@@ -528,9 +538,23 @@ fn fork_identity_of(
         fork: volume.to_owned(),
         source,
         base: base_oid,
-        // Hidden refs are read from forked volumes unit 4.
-        push_target: PushTarget::Branch,
+        push_target,
     }))
+}
+
+/// A push target key (`agentfs.forkRefs`, `agentfs.fork.pushTarget`):
+/// `branch` or `hidden`; unset is `None`.
+fn push_target(config: &git2::Config, key: &str) -> Result<Option<PushTarget>, ConfigError> {
+    match string(config, key)?.as_deref() {
+        None => Ok(None),
+        Some("branch") => Ok(Some(PushTarget::Branch)),
+        Some("hidden") => Ok(Some(PushTarget::Hidden)),
+        Some(other) => Err(ConfigError::BadChoice {
+            key: key.into(),
+            value: other.into(),
+            allowed: "branch, hidden",
+        }),
+    }
 }
 
 /// 40 lowercase hex digits: a full commit id as agentfs writes one.
@@ -656,6 +680,7 @@ impl Settings {
             }
         };
         let split = split_remotes(valid, invalid, &patch_remote, fork.is_some());
+        let fork_refs = push_target(config, "agentfs.forkRefs")?.unwrap_or_default();
         Ok(Self {
             branch_ref,
             respect_tree_rules: boolean(config, "agentfs.respectTreeRules")?.unwrap_or(false),
@@ -698,6 +723,7 @@ impl Settings {
             remotes: split.remotes,
             invalid_remotes: split.invalid,
             fork_remote: split.fork_remote,
+            fork_refs,
             fork,
             includes,
             volume,
@@ -2220,5 +2246,69 @@ mod tests {
                 "{s:?}"
             );
         }
+    }
+
+    /// D1, D2: a fork's push target is its own config's, `branch` when
+    /// unset; `hidden` keeps its history off `refs/heads/`. A source's
+    /// `agentfs.forkRefs` is the target new forks get. Any other value of
+    /// either key is `BadChoice`, and `pushTarget` alone is a partial
+    /// identity.
+    #[test]
+    fn push_targets() {
+        let (_d, c) = config_with(&fork_config(
+            "[agentfs \"fork\"]\n\tpushTarget = hidden\n[remote \"origin\"]\n\turl = /o\n",
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(
+            s.fork.as_ref().map(|f| f.push_target),
+            Some(PushTarget::Hidden)
+        );
+        assert_eq!(s.branch_ref, "refs/agentfs/f-1/history");
+        let (_d, c) = config_with(&fork_config("[agentfs \"fork\"]\n\tpushTarget = branch\n"));
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.branch_ref, "refs/heads/agentfs/f-1");
+
+        let (_d, c) = config_with("[agentfs]\n\tvolume = v\n");
+        assert_eq!(
+            Settings::from_config(&c).unwrap().fork_refs,
+            PushTarget::Branch
+        );
+        for (value, want) in [
+            ("branch", PushTarget::Branch),
+            ("hidden", PushTarget::Hidden),
+        ] {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n\tforkRefs = {value}\n"));
+            assert_eq!(Settings::from_config(&c).unwrap().fork_refs, want);
+        }
+
+        for value in ["Hidden", "heads", "", "refs/agentfs"] {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n\tforkRefs = \"{value}\"\n"
+            ));
+            assert!(
+                matches!(
+                    Settings::from_config(&c),
+                    Err(ConfigError::BadChoice { ref key, allowed, .. })
+                        if key == "agentfs.forkRefs" && allowed == "branch, hidden"
+                ),
+                "forkRefs = {value:?}"
+            );
+            let (_d, c) = config_with(&fork_config(&format!(
+                "[agentfs \"fork\"]\n\tpushTarget = \"{value}\"\n"
+            )));
+            assert!(
+                matches!(
+                    Settings::from_config(&c),
+                    Err(ConfigError::BadChoice { ref key, .. }) if key == "agentfs.fork.pushTarget"
+                ),
+                "pushTarget = {value:?}"
+            );
+        }
+        let (_d, c) =
+            config_with("[agentfs]\n\tvolume = f\n[agentfs \"fork\"]\n\tpushTarget = hidden\n");
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::PartialForkIdentity)
+        ));
     }
 }

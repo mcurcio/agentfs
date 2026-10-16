@@ -12,7 +12,6 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentfs_core::fork::PushTarget;
 use agentfs_core::fork::create::{self as fork_create, CreateError, CreateRequest};
 use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::volume::{self, StateDir};
@@ -236,13 +235,15 @@ pub fn create_fork(
     }
     let state = StateDir::new(layout.state(handle));
     let lock = lock(&state, "agentfs-csi create")?;
+    let source_state = StateDir::new(layout.state(source_handle));
+    let push_target = fork_create::push_target(&source_state).map_err(create_error)?;
     let identity = fork_create::create(&CreateRequest {
-        source: &StateDir::new(layout.state(source_handle)),
+        source: &source_state,
         fork: &state,
         tree: &layout.backing(handle),
         name: &params.volume,
         includes: &[config],
-        push_target: PushTarget::Branch,
+        push_target,
     })
     .map_err(create_error)?;
     drop(lock);

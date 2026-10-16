@@ -127,6 +127,7 @@ impl fmt::Display for PushStage {
 
 /// One signal. Every variant except [`Event::PushSucceeded`],
 /// [`Event::PatchApplied`], [`Event::PatchDuplicate`],
+/// [`Event::ForkFinished`], [`Event::ForkPublished`],
 /// [`Event::ForkAbandoned`] and [`Event::HistoryServiceRestored`] is an
 /// alarm condition (design §13).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +253,18 @@ pub enum Event {
         kind: PushFailureKind,
         message: String,
     },
+    /// A fork wrote its finish commit (design §11.5): it takes no changes
+    /// from now on, and publishing starts. Raised once, when the finish
+    /// commit is written. Not an alarm.
+    ForkFinished {
+        fork: String,
+        /// The change; `None` when the fork's final tree is base's.
+        change: Option<Oid>,
+    },
+    /// A fork's fork remote holds its change and finish refs at exactly
+    /// their ids (design §11.5). Raised once, when the published mark is
+    /// written. Not an alarm.
+    ForkPublished { fork: String, remote: String },
     /// A fork's fork remote refuses its publish for good (design §11.5,
     /// `fork::finish::refused_reason`): the fork is refused, and nothing
     /// retries it until an operator runs `agentfs fork finish --retry` or
@@ -284,16 +297,31 @@ pub enum Event {
 
 impl Event {
     /// True for alarm conditions: everything except a successful push, an
-    /// applied patch and a restored history service.
+    /// applied or duplicate patch, a fork finished, published or abandoned,
+    /// and a restored history service.
     pub fn is_alarm(&self) -> bool {
         !matches!(
             self,
             Self::PushSucceeded { .. }
                 | Self::PatchApplied { .. }
                 | Self::PatchDuplicate { .. }
+                | Self::ForkFinished { .. }
+                | Self::ForkPublished { .. }
                 | Self::ForkAbandoned { .. }
                 | Self::HistoryServiceRestored { .. }
         )
+    }
+
+    /// True for what the telemetry layer turns into a log record (design
+    /// §13): every alarm, and a fork's lifecycle (finished, published,
+    /// abandoned), at INFO, so a fork's life is on record where its
+    /// refusal is.
+    pub fn is_logged(&self) -> bool {
+        self.is_alarm()
+            || matches!(
+                self,
+                Self::ForkFinished { .. } | Self::ForkPublished { .. } | Self::ForkAbandoned { .. }
+            )
     }
 
     /// A stable name for logs and metrics.
@@ -314,6 +342,8 @@ impl Event {
             Self::PatchBlocked { .. } => "patch_blocked",
             Self::PatchIgnored { .. } => "patch_ignored",
             Self::PatchFetchFailed { .. } => "patch_fetch_failed",
+            Self::ForkFinished { .. } => "fork_finished",
+            Self::ForkPublished { .. } => "fork_published",
             Self::ForkRefused { .. } => "fork_refused",
             Self::ForkAbandoned { .. } => "fork_abandoned",
             Self::HistoryServiceUnavailable { .. } => "history_service_unavailable",
@@ -458,6 +488,14 @@ impl fmt::Display for Event {
                 f,
                 "fetching the patch queue from {remote} failed ({kind}): {message}"
             ),
+            Self::ForkFinished { fork, change } => write!(
+                f,
+                "fork {fork} finished with change {}",
+                oid_or(*change, "none")
+            ),
+            Self::ForkPublished { fork, remote } => {
+                write!(f, "fork {fork} is published to {remote}")
+            }
             Self::ForkRefused {
                 fork,
                 remote,
@@ -467,7 +505,7 @@ impl fmt::Display for Event {
                 f,
                 "fork {fork}: {remote} refuses its publish for good ({reason}): {message}; it is \
                  not retried until an operator runs `agentfs fork finish --retry` or abandons \
-                 it (see the csi-recovery runbook)"
+                 it (see docs/runbooks/fork-refused.md)"
             ),
             Self::ForkAbandoned { fork, reason } => {
                 write!(f, "fork {fork} was abandoned: {reason}")

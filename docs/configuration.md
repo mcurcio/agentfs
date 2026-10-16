@@ -104,6 +104,7 @@ suffix (`512k`, `100m`).
 | `agentfs.patchRemote` | remote name, or `none` | the only remote, when exactly one is configured; else none | Where the patch queue (§12) is fetched from at mount, and the only remote that gets the queue push (status ref, `applied/<n>`, deleted `inbox/<n>`). A name that is not a valid remote means none. With none, patches already in the local inbox still apply |
 | `agentfs.patchFetchTimeout` | duration, or `0`/`off` | `30s` | How long a mount (or `agentfs patch apply`) waits for the inbox fetch; on timeout or failure it raises `PatchFetchFailed` and applies what is already fetched. `0` or `off` skips the fetch |
 | `agentfs.lfsThreshold` | positive size | unset: no size rule | Content larger than this (strictly `>`) is stored as Git LFS instead of a git blob (§7). Unset, only `agentfs.store=lfs` and `filter=lfs` in `info/attributes` select LFS. Setting it needs an LFS server for every remote (see [Git LFS](#git-lfs)) |
+| `agentfs.forkRefs` | `branch` or `hidden` | `branch` | The push target new forks of this volume get (design §11.5), written into each fork's identity as `agentfs.fork.pushTarget`: `branch` pushes a fork's history to `refs/heads/agentfs/<fork>` on its fork remote, where CI and pull requests can act on it; `hidden` keeps it at `refs/agentfs/<fork>/history`, never under `refs/heads/`. Read only when a fork is created: changing it moves no fork that exists, so forks already pushing branches keep doing so until they finish or are abandoned. Any other value fails the volume (`BadChoice`). Under CSI, set it in the source's profile config |
 
 Operator path rules are not config keys: they are `<state>/git/info/exclude`
 (git ignore syntax: paths never recorded when new) and
@@ -142,16 +143,18 @@ with the service's own committer, keeping the pod's trailers, and the
 A fork's identity (design §11.5), fixed when the fork is created
 (`agentfs fork create`, or CSI CreateVolume with a fork class) and written
 in the fork's own state-area config, beside `agentfs.volume`. Never set
-them by hand, and never in an include: a fragment that sets either key,
-or `agentfs.fork.pushTarget`, fails with `IncludeSetsIdentity`. Both are
-set, or neither; a fork's config must not set `agentfs.branch`. A fork's
-branch is `agentfs/<fork>`, its only push remote is its fork remote (see
+them by hand, and never in an include: a fragment that sets any of them
+fails with `IncludeSetsIdentity`. `source` and `base` are set together,
+or neither, and `pushTarget` only with them (`PartialForkIdentity`); a
+fork's config must not set `agentfs.branch`. A fork's history ref is its
+push target, its only push remote is its fork remote (see
 `agentfsForkRemote`), and it has no patch queue.
 
 | Key | Type | Default | Meaning and validation |
 |---|---|---|---|
 | `agentfs.fork.source` | name | unset: not a fork | The source volume's name, as `agentfs.volume` |
 | `agentfs.fork.base` | full commit id | unset: not a fork | The source branch's head when the fork was created: 40 lowercase hex digits |
+| `agentfs.fork.pushTarget` | `branch` or `hidden` | `branch` | Where the fork's history is kept and pushed, from the source's `agentfs.forkRefs` at create (written only for `hidden`): `branch` is `refs/heads/agentfs/<fork>`, `hidden` is `refs/agentfs/<fork>/history`. Any other value fails the fork (`BadChoice`) |
 
 ## Operator attributes
 

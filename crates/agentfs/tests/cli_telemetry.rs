@@ -18,6 +18,8 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{KeyValue, any_value};
 use prost::Message;
 
+mod fork_setup;
+
 /// `(path, body)` of each request received.
 type Requests = Mutex<Vec<(String, Vec<u8>)>>;
 
@@ -1380,4 +1382,218 @@ mod tls {
         assert!(!received.traces.is_empty());
         assert!(!received.logs.is_empty());
     }
+}
+
+/// Runs `agentfs --state <state> --root <tree> args` in fork setup `s`,
+/// exporting every signal to `collector`.
+fn fork_run(
+    s: &fork_setup::Setup,
+    state: &str,
+    tree: &str,
+    args: &[&str],
+    collector: &Collector,
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
+    cmd.arg("--state")
+        .arg(s.path(state))
+        .arg("--root")
+        .arg(s.path(tree))
+        .args(args);
+    s.hermetic(&mut cmd);
+    cmd.env("OTEL_EXPORTER_OTLP_ENDPOINT", collector.endpoint());
+    cmd.output().unwrap()
+}
+
+/// Every exported span called `name`.
+fn spans_named(
+    collector: &Collector,
+    name: &str,
+) -> Vec<opentelemetry_proto::tonic::trace::v1::Span> {
+    let mut out = Vec::new();
+    for body in collector.bodies("/v1/traces") {
+        let request = ExportTraceServiceRequest::decode(&body[..]).unwrap();
+        for rs in request.resource_spans {
+            for ss in rs.scope_spans {
+                out.extend(ss.spans.into_iter().filter(|s| s.name == name));
+            }
+        }
+    }
+    out
+}
+
+/// Every exported log record.
+fn log_records(collector: &Collector) -> Vec<opentelemetry_proto::tonic::logs::v1::LogRecord> {
+    let mut out = Vec::new();
+    for body in collector.bodies("/v1/logs") {
+        let request = ExportLogsServiceRequest::decode(&body[..]).unwrap();
+        for rl in request.resource_logs {
+            for sl in rl.scope_logs {
+                out.extend(sl.log_records);
+            }
+        }
+    }
+    out
+}
+
+fn int_attr(attrs: &[KeyValue], key: &str) -> Option<i64> {
+    attrs
+        .iter()
+        .find(|kv| kv.key == key)
+        .and_then(|kv| kv.value.as_ref())
+        .and_then(|v| match &v.value {
+            Some(any_value::Value::IntValue(i)) => Some(*i),
+            _ => None,
+        })
+}
+
+/// D3: a fork's finish and publish export the `agentfs.fork.finish` and
+/// `agentfs.fork.publish` spans with their attributes, `ForkFinished` and
+/// `ForkPublished` as INFO log records (not alarms), and one
+/// `agentfs.fork.publish.duration` point; a refused publish exports
+/// `ForkRefused` as an alarm and records no duration.
+#[test]
+fn a_fork_finish_and_publish_export_spans_events_and_duration() {
+    let collector = Collector::start();
+    let s = fork_setup::Setup::new(true);
+    s.record("state", "tree", "a.txt", "a\n");
+    s.ok("state", "tree", &["push"]);
+    let fork = s.create_fork();
+    s.record("fork", "fork-tree", "b.txt", "b\n");
+    let out = fork_run(&s, "fork", "fork-tree", &["fork", "finish"], &collector);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("warning: telemetry"),
+        "{}",
+        stderr(&out)
+    );
+    let change = s
+        .remote_ref("forks.git", &format!("refs/agentfs/{fork}/change"))
+        .unwrap()
+        .to_string();
+
+    let finishes = spans_named(&collector, "agentfs.fork.finish");
+    assert_eq!(finishes.len(), 1, "one finish span: {finishes:?}");
+    let attrs = &finishes[0].attributes;
+    assert_eq!(
+        string_attr(attrs, "agentfs.fork").as_deref(),
+        Some(fork.as_str())
+    );
+    assert_eq!(
+        string_attr(attrs, "agentfs.fork.change").as_deref(),
+        Some(change.as_str())
+    );
+    assert_eq!(int_attr(attrs, "agentfs.fork.unrecorded"), Some(0));
+    let publishes = spans_named(&collector, "agentfs.fork.publish");
+    assert_eq!(publishes.len(), 1, "{publishes:?}");
+    let attrs = &publishes[0].attributes;
+    assert_eq!(
+        string_attr(attrs, "agentfs.fork").as_deref(),
+        Some(fork.as_str())
+    );
+    assert_eq!(
+        string_attr(attrs, "agentfs.remote").as_deref(),
+        Some("forks")
+    );
+    assert_eq!(
+        string_attr(attrs, "agentfs.fork.publish.outcome").as_deref(),
+        Some("published")
+    );
+    assert_eq!(string_attr(attrs, "agentfs.fork.refused.reason"), None);
+    // The pushes run inside the publish span.
+    let pushes = spans_named(&collector, "agentfs.push");
+    assert!(
+        pushes
+            .iter()
+            .any(|p| p.parent_span_id == publishes[0].span_id),
+        "{pushes:?}"
+    );
+
+    let logs = log_records(&collector);
+    for (name, key, value) in [
+        (
+            "agentfs.fork_finished",
+            "agentfs.fork.change",
+            change.as_str(),
+        ),
+        ("agentfs.fork_published", "agentfs.remote", "forks"),
+    ] {
+        let record = logs
+            .iter()
+            .find(|r| r.event_name == name)
+            .unwrap_or_else(|| panic!("no {name} log: {logs:?}"));
+        assert_eq!(record.severity_text, "INFO", "{name} is not an alarm");
+        assert_eq!(
+            string_attr(&record.attributes, "agentfs.fork").as_deref(),
+            Some(fork.as_str())
+        );
+        assert_eq!(string_attr(&record.attributes, key).as_deref(), Some(value));
+    }
+    assert!(!stderr(&out).contains("alarm:"), "{}", stderr(&out));
+    assert_eq!(
+        histogram_count(
+            &collector,
+            "agentfs.fork.publish.duration",
+            ("remote", "forks")
+        ),
+        1
+    );
+
+    // Refused: another writer's finish ref.
+    let collector = Collector::start();
+    let s = fork_setup::Setup::new(true);
+    s.record("state", "tree", "a.txt", "a\n");
+    s.ok("state", "tree", &["push"]);
+    let fork = s.create_fork();
+    s.record("fork", "fork-tree", "b.txt", "b\n");
+    git2::Repository::open_bare(s.path("forks.git"))
+        .unwrap()
+        .reference(
+            &format!("refs/agentfs/{fork}/finish"),
+            s.source_head(),
+            true,
+            "another writer",
+        )
+        .unwrap();
+    let out = fork_run(
+        &s,
+        "fork",
+        "fork-tree",
+        &["fork", "finish", "--timeout", "30s"],
+        &collector,
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let publishes = spans_named(&collector, "agentfs.fork.publish");
+    assert_eq!(publishes.len(), 1, "{publishes:?}");
+    assert_eq!(
+        string_attr(&publishes[0].attributes, "agentfs.fork.publish.outcome").as_deref(),
+        Some("refused")
+    );
+    assert_eq!(
+        string_attr(&publishes[0].attributes, "agentfs.fork.refused.reason").as_deref(),
+        Some("another_writer")
+    );
+    let logs = log_records(&collector);
+    let refused = logs
+        .iter()
+        .find(|r| r.event_name == "agentfs.fork_refused")
+        .unwrap_or_else(|| panic!("no fork_refused log: {logs:?}"));
+    assert_eq!(refused.severity_text, "ERROR");
+    assert_eq!(
+        string_attr(&refused.attributes, "agentfs.fork.reason").as_deref(),
+        Some("another_writer")
+    );
+    assert!(
+        !logs
+            .iter()
+            .any(|r| r.event_name == "agentfs.fork_published"),
+        "{logs:?}"
+    );
+    assert_eq!(
+        histogram_count(
+            &collector,
+            "agentfs.fork.publish.duration",
+            ("remote", "forks")
+        ),
+        0
+    );
 }

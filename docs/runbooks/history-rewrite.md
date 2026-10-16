@@ -11,7 +11,12 @@ case where the volume's branch is force-pushed, by an operator.
 `ci/e2e-runbooks.sh` runs every block below, as written, in CI (against
 a `file://` remote), and checks that the secret's blobs are gone from the
 state area and the remote, that pushes are fast-forwards again and that
-`Agentfs-Seq` keeps increasing.
+`Agentfs-Seq` keeps increasing. `ci/e2e-runbooks.sh forks` runs the
+whole procedure again with [Forks](#forks), on a volume with two forks.
+
+If the volume has forks (design [§11.5](../design.md#115-forks)), read
+[Forks](#forks) before you start: two of its steps come between steps 2
+and 3, and one after step 9.
 
 Throughout:
 
@@ -191,3 +196,122 @@ Then delete what still holds the secret locally:
 ```sh
 rm -rf "$WORK" "$BACKUP"
 ```
+
+## Forks
+
+A fork copies the source's history up to its base and pushes it to its
+fork remote, so a secret recorded before a fork's base is in that fork's
+history too: in its state area, on its fork remote, and in its change's
+parent. Forks whose base predates the bad commit are unaffected: the
+commits they share with the source keep their ids under filter-repo, so
+they finish, publish and land as before.
+
+Find what is affected by reachability, never from a list kept beside the
+forks: a ref is affected if it contains the first commit that recorded
+the secret. Then abandon every fork whose base contains it, before
+anything is rewritten, so no finisher pushes the old history again.
+
+Also set:
+
+```sh
+FORK_STATES="/data/forks/*/state"    # the forks' state areas (CSI: /var/lib/agentfs-csi/volumes/*/state)
+```
+
+Under CSI, run the next two blocks in each node plugin pod
+(`kubectl -n agentfs-csi exec -it "$NODE_POD" -c agentfs-csi -- sh`),
+with the state area paths of that node. Stop the forks' pods first, as
+the workload in step 1: a running fork holds its state lock, and
+`fork abandon` then exits 75.
+
+### F1. Find the bad commit and every affected ref (after step 2)
+
+The first commit on the volume's branch that recorded the path, and on
+each remote the source's settings name (its own remotes and every fork
+remote: `agentfsForkRemote` sections), every ref of another volume under
+`refs/heads/agentfs/` or `refs/agentfs/` that contains it. A remote that
+does not have the commit has no ref that contains it. The volume's own
+refs are rewritten in step 9 and left out here.
+
+<!-- ci: rewrite-fork-find -->
+```sh
+BAD=$(git --git-dir "$STATE/git" rev-list --reverse "$BRANCH" -- "$SECRET_PATH" | sed -n 1p)
+test -n "$BAD"
+FORK_WORK=$(mktemp -d)
+: > "$FORK_WORK/affected"
+for REMOTE in $(git --git-dir "$STATE/git" config --name-only --get-regexp '^remote\..*\.url$' | sed 's/^remote\.//; s/\.url$//'); do
+  URL=$(git --git-dir "$STATE/git" config "remote.$REMOTE.url")
+  git clone -q --mirror "$URL" "$FORK_WORK/$REMOTE.git"
+  git --git-dir "$FORK_WORK/$REMOTE.git" cat-file -e "$BAD^{commit}" 2>/dev/null || continue
+  git --git-dir "$FORK_WORK/$REMOTE.git" for-each-ref --contains "$BAD" --format='%(objectname) %(refname)' refs/heads/agentfs/ refs/agentfs/ |
+    while read -r OID REF; do
+      case "$REF" in "refs/heads/agentfs/$VOL" | "refs/agentfs/$VOL/"*) continue ;; esac
+      echo "$URL $OID $REF" >> "$FORK_WORK/affected"
+    done
+done
+cat "$FORK_WORK/affected"
+```
+
+### F2. Abandon the forks whose base contains it (after F1)
+
+For each fork of the volume, abandon it on record only when
+`git merge-base --is-ancestor "$BAD" <base>` holds. Nothing agentfs runs
+pushes an abandoned fork again, and under CSI the next DeleteVolume
+applies its `onDelete`. A published fork cannot be abandoned (it says
+so): its refs are in `$FORK_WORK/affected` and go in F3, and its change,
+not landed yet, can no longer land: its parent is not in the rewritten
+history (`parent_not_in_history`, design §12).
+
+<!-- ci: rewrite-fork-abandon -->
+```sh
+for FORK_STATE in $FORK_STATES; do
+  [ "$(git --git-dir "$FORK_STATE/git" config agentfs.fork.source)" = "$VOL" ] || continue
+  FORK_BASE=$(git --git-dir "$FORK_STATE/git" config agentfs.fork.base)
+  if git --git-dir "$STATE/git" merge-base --is-ancestor "$BAD" "$FORK_BASE"; then
+    agentfs --state "$FORK_STATE" fork abandon --reason "history rewrite of $VOL: base $FORK_BASE contains $BAD" ||
+      echo "$FORK_STATE: not abandoned; its refs are deleted in F3"
+  fi
+done
+```
+
+An abandoned fork's state area still holds the secret: delete it (CLI:
+its state area and backing tree; CSI: delete its claim, and remove
+`<basePath>/<pv>` by hand if its class keeps volumes with
+`onDelete: retain`). Never mount it again: an abandoned fork that is
+mounted pushes its branch on its interval like any volume.
+
+### F3. Delete the affected refs on each remote (after step 9)
+
+With the lease each was found at, so a ref that moved since F1 is left
+for you to look at:
+
+<!-- ci: rewrite-fork-refs -->
+```sh
+while read -r URL OID REF; do
+  git --git-dir "$STATE/git" push -q --force-with-lease="$REF:$OID" "$URL" ":$REF"
+done < "$FORK_WORK/affected"
+```
+
+Then purge each host as in step 9 (a bare repository: `reflog expire` and
+`gc` on it; a forge: its own purge), fork remotes included, and continue
+with step 10. Forks that were not abandoned publish as before.
+
+### What agentfs cannot find
+
+The steps above reach the source's state area and remotes, the forks'
+state areas you list and their fork remotes. They cannot reach, and you
+must check yourself:
+
+- delivery targets: the repositories the branch method pushed to (pull
+  request heads), and what webhook and command receivers did with a
+  change;
+- receivers' clones and mirrors of a fork remote, and any repository a
+  change was landed in from them;
+- users' CI caches and artifacts built from a fork's branch;
+- fork state areas kept on disk: forks under CSI whose class has
+  `onDelete: retain`, and CLI forks you did not list in `FORK_STATES`;
+- clones, forks and caches on a forge, as in step 9.
+
+The rewritten source's history keeps the ids of everything before the bad
+commit, so forks based earlier stay landable; everything from the bad
+commit on has new ids, so any change based there that was not landed
+before the rewrite cannot be landed after it.

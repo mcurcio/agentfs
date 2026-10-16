@@ -630,7 +630,9 @@ is the source's claim, on a **fork class**: a StorageClass with
 ([example](../deploy/csi/example/fork-storageclass.yaml)). The fork has the
 source's profile; it pushes `refs/heads/agentfs/<fork>` to its fork remote
 (the one remote with `agentfsForkRemote = true` in the profile, else the
-source's patch remote), never the source's branch.
+source's patch remote), never the source's branch, or with
+`agentfs.forkRefs = hidden` in the profile `refs/agentfs/<fork>/history`,
+off every branch ([configuration](configuration.md#agentfs)).
 
 - **Create.** CreateVolume clones the source locally: its settings and
   branch head read without its lock (the source may be in use), its
@@ -670,7 +672,8 @@ source's patch remote), never the source's branch.
   `agentfsMaxPushSize`, or a fork remote no longer in the profile) makes
   the fork `refused`: the alarm `ForkRefused` is raised
   once, the publisher starts no further finisher, and DeleteVolume keeps
-  answering `UNAVAILABLE`.
+  answering `UNAVAILABLE`. Each reason and its fix:
+  [the refused-publish runbook](runbooks/fork-refused.md).
 - **Stuck.** A fork whose remote stays unreachable, or refuses, keeps its
   PV `Released`; see [the CSI recovery runbook](runbooks/csi-recovery.md).
   To look, and to act, run agentfs in the node plugin pod that holds the

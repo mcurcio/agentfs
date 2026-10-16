@@ -226,8 +226,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y git-filter-repo
       - run: git filter-repo --version && git --version
-      - run: cargo build --locked -p agentfs
+      - id: build
+        run: cargo build --locked -p agentfs
       - run: ci/e2e-runbooks.sh
+      # Its own step, run even when the one above fails, so a flake of
+      # the history-rewrite step there stays attributable (AGENTS.md).
+      - name: history rewrite with forks
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: ci/e2e-runbooks.sh forks
 
   fuse:
     name: e2e (FUSE mount, passthrough ${{ matrix.passthrough }})

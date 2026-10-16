@@ -16,10 +16,18 @@
 #   every remote holds, `lfs fetch` brings it back, and a remote added
 #   after a prune gets its objects through `lfs fetch --all`.
 #
-# Needs git and git-filter-repo (the history-rewrite part). Run from the
+# `ci/e2e-runbooks.sh forks` runs only the history rewrite again, with its
+# 'Forks' steps, on a source with two forks, one based before the secret
+# was recorded and one after: the secret's blobs are gone from the source
+# remote and the fork remote, only the later fork is abandoned and its
+# refs deleted, and the earlier one still publishes. CI runs it as a step
+# of its own, so a flake of either is attributable.
+#
+# Needs git and git-filter-repo (the history-rewrite parts). Run from the
 # repository root after `cargo build -p agentfs`:
 #
 #   ci/e2e-runbooks.sh
+#   ci/e2e-runbooks.sh forks
 
 . "$(dirname "$0")/lib.sh"
 
@@ -47,6 +55,123 @@ run_block() { # runbook name
 seq_of() { # commit
   git --git-dir "$STATE/git" log -1 --format=%B "$1" | sed -n 's/^Agentfs-Seq: //p'
 }
+
+# `agentfs` against the fork in $W/forks/$1.
+fork_agentfs() { # name args...
+  local dir=$W/forks/$1
+  shift
+  AGENTFS_POD=ci-0 "$AGENTFS_BIN" --state "$dir/state" --root "$dir/tree" "$@"
+}
+
+# Creates a fork of the source in $W/forks/$1; prints the fork's name.
+fork_create() { # name
+  mkdir -p "$W/forks/$1/tree"
+  fork_agentfs "$1" fork create --source-state "$STATE" | sed -n 's/^fork \([^ ]*\) of .*/\1/p'
+}
+
+# Fails if a secret blob of $WORK/secret-blobs is in bare repository $1.
+no_secret_in() { # repo
+  if git --git-dir "$1" cat-file --batch-all-objects --batch-check='%(objectname)' |
+    grep -F -x -f "$WORK/secret-blobs"; then
+    fail "secret objects remain in $1"
+  fi
+  pass "no secret object in $1"
+}
+
+if [ "${1:-}" = forks ]; then
+  git filter-repo --version >/dev/null 2>&1 || fail "git-filter-repo is needed for the history-rewrite runbook"
+  W=$(mktemp -d)
+  STATE=$W/state
+  BACKING=$W/backing
+  TREE=$BACKING
+  VOL=forkbook
+  BRANCH=refs/heads/agentfs/$VOL
+  SECRET_PATH=config/.env
+  BACKUP=$W/state.before-rewrite
+  FORK_STATES="$W/forks/*/state"
+  git init -q --bare "$W/origin.git"
+  git init -q --bare "$W/forks.git"
+  printf '[remote "origin"]\n\turl = file://%s\n[remote "forks"]\n\turl = file://%s\n\tagentfsForkRemote = true\n' \
+    "$W/origin.git" "$W/forks.git" >"$W/profile"
+  mkdir -p "$BACKING"
+
+  step "a source whose settings are a profile, with a fork remote"
+  agentfs init --volume "$VOL" --include "$W/profile" >/dev/null
+  echo one >"$BACKING/a.txt"
+  agentfs record a.txt >/dev/null
+  agentfs push
+
+  step "a fork based before the secret, pushed to the fork remote"
+  EARLY=$(fork_create early)
+  [ -n "$EARLY" ] || fail "fork create printed no name"
+  echo early >"$W/forks/early/tree/e.txt"
+  fork_agentfs early record e.txt >/dev/null
+  fork_agentfs early push
+
+  step "the source records a secret; a fork based after it pushes it too"
+  mkdir -p "$BACKING/config"
+  echo "TOKEN=hunter2" >"$BACKING/$SECRET_PATH"
+  agentfs record "$SECRET_PATH" >/dev/null
+  echo three >"$BACKING/c.txt"
+  agentfs record c.txt >/dev/null
+  agentfs push
+  LATE=$(fork_create late)
+  [ -n "$LATE" ] || fail "fork create printed no name"
+  echo late >"$W/forks/late/tree/l.txt"
+  fork_agentfs late record l.txt >/dev/null
+  fork_agentfs late push
+  [ -n "$(git --git-dir "$W/forks.git" log --all --format=%H -- "$SECRET_PATH")" ] ||
+    fail "the secret should be on the fork remote before the rewrite"
+  EARLY_BASE=$(git --git-dir "$W/forks/early/state/git" config agentfs.fork.base)
+  LATE_BASE=$(git --git-dir "$W/forks/late/state/git" config agentfs.fork.base)
+
+  for name in rewrite-flush rewrite-exclude rewrite-fork-find rewrite-fork-abandon \
+    rewrite-backup rewrite-filter rewrite-fetch rewrite-gc rewrite-verify \
+    rewrite-push-state rewrite-remote rewrite-fork-refs; do
+    step "history-rewrite runbook: $name"
+    run_block history-rewrite.md "$name"
+  done
+  for SERVER_REPO in "$W/origin.git" "$W/forks.git"; do
+    step "history-rewrite runbook: rewrite-purge-bare ($SERVER_REPO)"
+    run_block history-rewrite.md rewrite-purge-bare
+  done
+  step "history-rewrite runbook: rewrite-restart"
+  run_block history-rewrite.md rewrite-restart
+
+  step "the secret is gone from both remotes; only the later fork is abandoned"
+  no_secret_in "$W/origin.git"
+  no_secret_in "$W/forks.git"
+  assert_eq "" "$(git --git-dir "$W/forks.git" for-each-ref --format='%(refname)' \
+    "refs/heads/agentfs/$LATE" "refs/agentfs/$LATE/")" "the later fork's refs are deleted"
+  late_state=$(fork_agentfs late fork status --json | sed -n 's/^  "state": "\(.*\)",$/\1/p')
+  assert_eq abandoned "$late_state" "the fork based after the secret is abandoned"
+  early_state=$(fork_agentfs early fork status --json | sed -n 's/^  "state": "\(.*\)",$/\1/p')
+  assert_eq active "$early_state" "the fork based before it is not"
+  git --git-dir "$STATE/git" merge-base --is-ancestor "$EARLY_BASE" "$BRANCH" ||
+    fail "the earlier fork's base is not in the rewritten history"
+  pass "the earlier fork's base keeps its id"
+  if git --git-dir "$STATE/git" merge-base --is-ancestor "$LATE_BASE" "$BRANCH" 2>/dev/null; then
+    fail "the later fork's base is still in the rewritten history"
+  fi
+  pass "the later fork's base is not"
+
+  step "the earlier fork still publishes"
+  out=$(fork_agentfs early fork finish --timeout 60s)
+  echo "$out"
+  assert_contains "$out" "published to forks" "the earlier fork publishes"
+  [ -n "$(remote_ref "$W/forks.git" "refs/agentfs/$EARLY/change")" ] || fail "no change ref on the fork remote"
+  pass "its change is on the fork remote"
+  set +e
+  out=$(fork_agentfs late fork finish --timeout 5s 2>&1)
+  code=$?
+  set -e
+  assert_eq 1 "$code" "the abandoned fork does not publish"
+  assert_contains "$out" "abandoned" "and says why"
+  no_secret_in "$W/forks.git"
+
+  step "fork runbooks passed"
+  exit 0
+fi
 
 W=$(mktemp -d)
 STATE=$W/state

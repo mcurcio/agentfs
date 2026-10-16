@@ -9,14 +9,16 @@
 //! Signals come from three places:
 //!
 //! - **Alarm events.** [`Telemetry::sink`] wraps the process's
-//!   [`EventSink`]: each event updates its counter and, for alarms, becomes
-//!   a structured log record, then goes on to the next sink. The caller
+//!   [`EventSink`]: each event updates its counter and, for alarms and a
+//!   fork's lifecycle ([`Event::is_logged`]), becomes a structured log
+//!   record, then goes on to the next sink. The caller
 //!   wraps once per process; the engine never wraps, so nothing is counted
 //!   twice.
 //! - **Direct instrumentation.** The recorder, committer and pushers call
 //!   the handle for `agentfs.record.duration`, `agentfs.commit.count` and
-//!   the `agentfs.record`, `agentfs.commit`, `agentfs.push` and `agentfs.patch`
-//!   spans. Each
+//!   the `agentfs.record`, `agentfs.commit`, `agentfs.push`, `agentfs.patch`,
+//!   `agentfs.fork.finish` and `agentfs.fork.publish` spans, and the
+//!   finisher for `agentfs.fork.publish.duration`. Each
 //!   span is current while its operation runs, so alarm logs raised inside
 //!   it carry its trace context.
 //! - **Observable gauges**, read from state when metrics are collected:
@@ -74,6 +76,7 @@ pub mod names {
     pub const RECONCILE_RECORDS: &str = "agentfs.reconcile.records";
     pub const RECONCILE_FAILURES: &str = "agentfs.reconcile.failures";
     pub const NESTED_GITDIR_HEURISTIC: &str = "agentfs.nested.gitdir_heuristic";
+    pub const FORK_PUBLISH_DURATION: &str = "agentfs.fork.publish.duration";
     /// Recorded by the binary, which owns the exporters (design §13).
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -84,6 +87,8 @@ pub mod spans {
     pub const COMMIT: &str = "agentfs.commit";
     pub const PUSH: &str = "agentfs.push";
     pub const PATCH: &str = "agentfs.patch";
+    pub const FORK_FINISH: &str = "agentfs.fork.finish";
+    pub const FORK_PUBLISH: &str = "agentfs.fork.publish";
 }
 
 /// Bucket boundaries of `agentfs.record.duration`, in seconds: the
@@ -92,6 +97,12 @@ pub mod spans {
 const RECORD_DURATION_BOUNDARIES: [f64; 16] = [
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
     5.0, 10.0,
+];
+
+/// Bucket boundaries of `agentfs.fork.publish.duration`, in seconds: from
+/// a publish at once to one waiting a day for its fork remote.
+const FORK_PUBLISH_BOUNDARIES: [f64; 12] = [
+    0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0, 21600.0, 86400.0,
 ];
 
 /// The longest the push gauges reuse one backlog walk (see
@@ -137,6 +148,7 @@ struct Inner {
     resyncs: Counter<u64>,
     create_as_caller_fallbacks: Counter<u64>,
     racy_rechecks: Counter<u64>,
+    fork_publish_duration: Histogram<f64>,
 }
 
 impl fmt::Debug for Telemetry {
@@ -261,6 +273,16 @@ impl Telemetry {
                  was racy, by outcome: skipped (its bytes were the frozen copy still last \
                  journaled at its path) or recorded (design §3.1)",
             ),
+            fork_publish_duration: meter
+                .f64_histogram(names::FORK_PUBLISH_DURATION)
+                .with_unit("s")
+                .with_description(
+                    "Seconds from a fork's finish commit to its fork remote holding the change \
+                     and finish refs, by remote; recorded once, when the published mark is \
+                     written (design §11.5)",
+                )
+                .with_boundaries(FORK_PUBLISH_BOUNDARIES.to_vec())
+                .build(),
             meter: meter.clone(),
             tracer,
             alarms,
@@ -285,8 +307,9 @@ impl Telemetry {
         self.inner.is_some()
     }
 
-    /// Wraps `next`: each event updates its counter and, if it is an alarm,
-    /// becomes a log record; then it goes on to `next`. Never blocks.
+    /// Wraps `next`: each event updates its counter and, if it is logged
+    /// ([`Event::is_logged`]: alarms and a fork's lifecycle), becomes a log
+    /// record; then it goes on to `next`. Never blocks.
     ///
     /// Wrap once per process and give the result to every engine
     /// constructor: a bare sink loses the alarm metrics, and wrapping twice
@@ -520,6 +543,16 @@ impl Telemetry {
             .build();
     }
 
+    /// Records one fork published to `remote`, `elapsed` after its finish
+    /// commit (design §11.5).
+    pub(crate) fn fork_published(&self, remote: &str, elapsed: Duration) {
+        if let Some(inner) = &self.inner {
+            inner
+                .fork_publish_duration
+                .record(elapsed.as_secs_f64(), &[remote_attr(remote)]);
+        }
+    }
+
     /// Counts one commit made.
     pub(crate) fn commit_made(&self) {
         if let Some(inner) = &self.inner {
@@ -699,13 +732,15 @@ impl EventSink for TelemetrySink {
             | Event::PatchBlocked { .. }
             | Event::PatchIgnored { .. }
             | Event::PatchFetchFailed { .. }
+            | Event::ForkFinished { .. }
+            | Event::ForkPublished { .. }
             | Event::ForkRefused { .. }
             | Event::ForkAbandoned { .. }
             | Event::HistoryServiceUnavailable { .. }
             | Event::HistoryServiceRestored { .. }
             | Event::IdentityFallback { .. } => {}
         }
-        if event.is_alarm()
+        if event.is_logged()
             && let Some(alarms) = &inner.alarms
         {
             alarms.log(&event);
@@ -749,6 +784,8 @@ fn event_name(event: &Event) -> &'static str {
         Event::PatchBlocked { .. } => "agentfs.patch_blocked",
         Event::PatchIgnored { .. } => "agentfs.patch_ignored",
         Event::PatchFetchFailed { .. } => "agentfs.patch_fetch_failed",
+        Event::ForkFinished { .. } => "agentfs.fork_finished",
+        Event::ForkPublished { .. } => "agentfs.fork_published",
         Event::ForkRefused { .. } => "agentfs.fork_refused",
         Event::ForkAbandoned { .. } => "agentfs.fork_abandoned",
         Event::HistoryServiceUnavailable { .. } => "agentfs.history_service_unavailable",
@@ -928,6 +965,16 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             out.push(("agentfs.kind", AnyValue::from(kind.as_str())));
             out.push(("agentfs.message", s(message)));
         }
+        Event::ForkFinished { fork, change } => {
+            out.push(("agentfs.fork", s(fork)));
+            if let Some(change) = change {
+                out.push(("agentfs.fork.change", oid(change)));
+            }
+        }
+        Event::ForkPublished { fork, remote } => {
+            out.push(("agentfs.fork", s(fork)));
+            out.push(("agentfs.remote", s(remote)));
+        }
         Event::ForkRefused {
             fork,
             remote,
@@ -965,6 +1012,8 @@ impl<L: Logger + Send + Sync> AlarmLog for OtelAlarmLog<L> {
             Event::PushSucceeded { .. }
             | Event::PatchApplied { .. }
             | Event::PatchDuplicate { .. }
+            | Event::ForkFinished { .. }
+            | Event::ForkPublished { .. }
             | Event::ForkAbandoned { .. }
             | Event::HistoryServiceRestored { .. } => (Severity::Info, "INFO"),
             Event::PatchFetchFailed { .. }

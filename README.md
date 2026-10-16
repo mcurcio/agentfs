@@ -459,7 +459,10 @@ agentfs patch submit --volume src <change commit>
 - Forks push `refs/heads/agentfs/<fork>`, and on finish
   `refs/agentfs/<fork>/change` and `/finish`, to the fork remote: the one
   remote section with `agentfsForkRemote = true`, else the source's patch
-  remote. A source never pushes to a flagged remote.
+  remote. A source never pushes to a flagged remote. With
+  `agentfs.forkRefs = hidden` in the source's settings, new forks keep
+  their history at `refs/agentfs/<fork>/history` instead, off every
+  branch ([docs/configuration.md](docs/configuration.md#agentfs)).
 - Under CSI, a claim with a `dataSource` claim on a fork StorageClass
   (`fork: "true"`, reclaim policy `Delete`) is a fork; deleting it
   finishes the fork, and the driver deletes the volume only once it is
@@ -467,7 +470,10 @@ agentfs patch submit --volume src <change commit>
 - A finished fork is read-only. A fork remote that refuses for good
   leaves the fork `refused` until `fork finish --retry`; `fork abandon
   --reason TEXT` discards a fork on record, and nothing agentfs runs
-  pushes it again.
+  pushes it again. What each refusal means and how to clear it:
+  [runbooks/fork-refused.md](docs/runbooks/fork-refused.md). Removing a
+  recorded secret from a source and its forks:
+  [runbooks/history-rewrite.md](docs/runbooks/history-rewrite.md#forks).
 
 ### Delivering a change
 
@@ -498,9 +504,9 @@ it.
 
 ## Telemetry
 
-`mount`, `run`, `record`, `flush`, `push`, `serve-history`, `patch apply`, and
-`restore` and `revert` without a mount export OpenTelemetry metrics, traces
-and logs over OTLP, configured with the standard `OTEL_*` environment variables.
+`mount`, `run`, `record`, `flush`, `push`, `serve-history`, `patch apply`,
+`fork finish`, and `restore` and `revert` without a mount export
+OpenTelemetry metrics, traces and logs over OTLP, configured with the standard `OTEL_*` environment variables.
 With no endpoint set, telemetry is off and costs nothing.
 
 ```sh

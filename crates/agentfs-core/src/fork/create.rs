@@ -44,7 +44,10 @@ pub struct CreateRequest<'a> {
     /// The fork's `include.path` entries: the files the source's settings
     /// come from (under CSI, its profile's config), read at every open.
     pub includes: &'a [PathBuf],
-    /// Where the fork's history goes.
+    /// Where the fork's history goes: the source's
+    /// [`Settings::fork_refs`] (`agentfs.forkRefs`), which the CLI and the
+    /// CSI controller pass. Written into the fork's identity, so it is
+    /// fixed at create; a fork that already exists keeps its own.
     pub push_target: PushTarget,
 }
 
@@ -135,6 +138,27 @@ pub fn create(request: &CreateRequest<'_>) -> Result<ForkIdentity, CreateError> 
     Ok(identity)
 }
 
+/// The push target new forks of the source at `source` get: its
+/// [`Settings::fork_refs`] (`agentfs.forkRefs`), read without its lock.
+/// What the CLI and the CSI controller pass as
+/// [`CreateRequest::push_target`].
+pub fn push_target(source: &StateDir) -> Result<PushTarget, CreateError> {
+    Ok(source_settings(source)?.fork_refs)
+}
+
+/// The source's settings, without its lock: [`CreateError::SourceNotFound`]
+/// when `source` is not a volume's state area.
+fn source_settings(source: &StateDir) -> Result<Settings, CreateError> {
+    let git = source.git();
+    if !git.join("config").is_file() {
+        return Err(CreateError::SourceNotFound {
+            path: source.root().to_path_buf(),
+        });
+    }
+    crate::history::init_libgit2();
+    Settings::load(&git).map_err(CreateError::SourceSettings)
+}
+
 /// The source as a fork reads it: settings and branch head, without its
 /// lock.
 struct Source {
@@ -145,13 +169,7 @@ struct Source {
 
 fn read_source(state: &StateDir) -> Result<Source, CreateError> {
     let git = state.git();
-    if !git.join("config").is_file() {
-        return Err(CreateError::SourceNotFound {
-            path: state.root().to_path_buf(),
-        });
-    }
-    crate::history::init_libgit2();
-    let settings = Settings::load(&git).map_err(CreateError::SourceSettings)?;
+    let settings = source_settings(state)?;
     let volume = settings.volume.clone();
     if settings.is_fork() {
         return Err(CreateError::SourceIsFork { volume });
