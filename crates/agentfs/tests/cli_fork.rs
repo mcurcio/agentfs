@@ -275,7 +275,7 @@ fn finish_publishes_to_the_patch_remote_and_the_change_applies_once() {
         first.starts_with(&format!("finished fork {fork} of src")),
         "{first}"
     );
-    fs::rename(&parked, s.path("origin.git")).unwrap();
+    fs::rename(parked, s.path("origin.git")).unwrap();
     let out = s.ok("fork", "fork-tree", &["fork", "finish"]);
     assert_eq!(out.lines().next().unwrap(), first);
     assert!(out.contains("published to origin"), "{out}");
@@ -331,7 +331,11 @@ fn finish_publishes_to_the_patch_remote_and_the_change_applies_once() {
     s.ok("state", "tree", &["patch", "apply"]);
     let (applied, more) = s.patch_commits(&oid);
     assert_eq!(applied, 1, "still one commit applies it");
-    assert_eq!(more, duplicates + 1, "the resubmission is a duplicate marker");
+    assert_eq!(
+        more,
+        duplicates + 1,
+        "the resubmission is a duplicate marker"
+    );
     assert_eq!(
         fs::read_to_string(s.path("tree/b.txt")).unwrap(),
         "reverted\n"

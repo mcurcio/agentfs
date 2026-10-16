@@ -210,8 +210,8 @@ fn copy_rules(source: &StateDir, fork: &StateDir) -> Result<(), CreateError> {
     for name in ["exclude", "attributes"] {
         let from = source.git().join("info").join(name);
         let to = fork.git().join("info").join(name);
-        match std::fs::read(&from) {
-            Ok(content) => std::fs::write(&to, content)?,
+        match std::fs::read(from) {
+            Ok(content) => std::fs::write(to, content)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(CreateError::SourceUnreadable(HistoryError::Io(e))),
         }
@@ -237,7 +237,7 @@ fn write_tree(
     identity: &ForkIdentity,
 ) -> Result<(), CreateError> {
     std::fs::create_dir_all(request.tree)?;
-    let plan = match restore::plan(
+    let mut plan = match restore::plan(
         fork,
         &identity.history_ref(),
         &Request::Restore {
@@ -252,7 +252,6 @@ fn write_tree(
     };
     // From nothing: the tree is new, and holds at most what an earlier
     // try wrote.
-    let mut plan = plan;
     for step in &mut plan.steps {
         step.current = None;
     }
@@ -338,8 +337,7 @@ impl LfsObjects for SourceObjects {
 pub fn unique_name(prefix: &str) -> Result<String, CreateError> {
     let mut bytes = [0u8; 4];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let name = format!("{prefix}-{suffix}");
+    let name = format!("{prefix}-{:08x}", u32::from_be_bytes(bytes));
     validate_name("agentfs.volume", &name).map_err(|e| CreateError::BadName {
         name: name.clone(),
         why: e.to_string(),

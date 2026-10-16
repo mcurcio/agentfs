@@ -86,8 +86,8 @@ impl Vol {
             fs::create_dir_all(full.parent().unwrap()).unwrap();
             let _ = fs::remove_file(&full);
             match content.strip_prefix("->") {
-                Some(target) => std::os::unix::fs::symlink(target, &full).unwrap(),
-                None => fs::write(&full, content).unwrap(),
+                Some(target) => std::os::unix::fs::symlink(target, full).unwrap(),
+                None => fs::write(full, content).unwrap(),
             }
         }
         self.record(files.iter().map(|(p, _)| *p).collect());
@@ -142,7 +142,7 @@ impl Vol {
         }
         let mut dirs = vec![self.state.root().to_path_buf()];
         while let Some(dir) = dirs.pop() {
-            for entry in fs::read_dir(&dir).unwrap() {
+            for entry in fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 // libgit2 writes nothing a fork reads; `objects` is
                 // compared through the refs.
@@ -153,7 +153,7 @@ impl Vol {
                 if meta.is_dir() {
                     dirs.push(path);
                 } else if meta.is_file() && !path.ends_with("lock") {
-                    out.insert(path.display().to_string(), fs::read(&path).unwrap());
+                    out.insert(path.display().to_string(), fs::read(path).unwrap());
                 }
             }
         }
@@ -216,7 +216,7 @@ impl ForkVol<'_> {
     fn write(&self, path: &str, content: &str) {
         let full = self.0.tree.join(path);
         fs::create_dir_all(full.parent().unwrap()).unwrap();
-        fs::write(&full, content).unwrap();
+        fs::write(full, content).unwrap();
         let (recorder, committer, _) = volume::open(
             &self.0.state,
             &self.0.tree,
@@ -299,7 +299,7 @@ fn create_reads_the_source_live_and_leaves_it_untouched() {
         fs::read_to_string(fork.tree.join("d/out/f.txt")).unwrap(),
         "beneath\n"
     );
-    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "wrote outside");
+    assert_eq!(fs::read_dir(outside).unwrap().count(), 0, "wrote outside");
 
     // A second create after the source moved returns the original base.
     source.change(&[("a.txt", "moved\n")]);
@@ -340,9 +340,9 @@ fn create_refuses_and_changes_nothing() {
     assert!(!second.state.root().exists());
 
     // No fork remote: two remotes and no patch remote.
-    let mut two = fs::read_to_string(&source.fragment).unwrap();
+    let mut two = fs::read_to_string(source.fragment.as_path()).unwrap();
     two.push_str("[remote \"other\"]\n\turl = /nowhere\n");
-    fs::write(&source.fragment, two).unwrap();
+    fs::write(source.fragment.as_path(), two).unwrap();
     let third = Fork::new();
     assert!(matches!(
         third.create(&source, "src-2"),
@@ -453,7 +453,7 @@ fn finish_and_publish_a_fork() {
 
     // Published only once the remote holds both refs.
     assert_eq!(finisher.publish(None).unwrap(), PublishOutcome::Published);
-    let remote = Repository::open_bare(&source.remote).unwrap();
+    let remote = Repository::open_bare(source.remote.as_path()).unwrap();
     assert_eq!(
         remote.refname_to_id("refs/heads/agentfs/src-1").unwrap(),
         head
@@ -478,7 +478,7 @@ fn finish_and_publish_a_fork() {
         ForkState::Finished
     );
     // An unreadable mark is an error, never a state.
-    fs::write(&mark, "{not json").unwrap();
+    fs::write(mark, "{not json").unwrap();
     assert!(matches!(
         finish::status(&fork.state),
         Err(StatusError::Mark(_))
@@ -525,9 +525,9 @@ fn finish_with_no_fork_remote_writes_nothing() {
     let fork = Fork::new();
     fork.create(&source, "src-1").unwrap();
     // The profile now has two remotes and no patch remote.
-    let mut two = fs::read_to_string(&source.fragment).unwrap();
+    let mut two = fs::read_to_string(source.fragment.as_path()).unwrap();
     two.push_str("[remote \"other\"]\n\turl = /nowhere\n");
-    fs::write(&source.fragment, two).unwrap();
+    fs::write(source.fragment.as_path(), two).unwrap();
     let repo = Repository::open_bare(fork.state.git()).unwrap();
     let head = repo.refname_to_id("refs/heads/agentfs/src-1").unwrap();
     let lock = fork.lock();
@@ -558,7 +558,7 @@ fn publish_waits_for_the_remote_and_never_moves_its_refs() {
     fork.as_vol().write("b.txt", "b\n");
     // Unreachable.
     let parked = source.dir.path().join("parked.git");
-    fs::rename(&source.remote, &parked).unwrap();
+    fs::rename(source.remote.as_path(), &parked).unwrap();
     let lock = fork.lock();
     let mut finisher = fork.finisher(&lock).unwrap();
     let outcome = finisher
@@ -570,8 +570,8 @@ fn publish_waits_for_the_remote_and_never_moves_its_refs() {
     );
     assert!(!fork.state.fork_mark().exists());
     // Back, with the finish ref set by another writer.
-    fs::rename(&parked, &source.remote).unwrap();
-    let remote = Repository::open_bare(&source.remote).unwrap();
+    fs::rename(parked, source.remote.as_path()).unwrap();
+    let remote = Repository::open_bare(source.remote.as_path()).unwrap();
     let source_head = source.head().unwrap();
     let local = source.repo();
     // The remote needs the commit it names: push the source's branch.
@@ -606,7 +606,7 @@ fn a_moved_fork_branch_is_divergence_not_a_block() {
     let fork = Fork::new();
     fork.create(&source, "src-1").unwrap();
     // Someone else's commit on the fork's branch on the remote.
-    let remote = Repository::open_bare(&source.remote).unwrap();
+    let remote = Repository::open_bare(source.remote.as_path()).unwrap();
     let sig = git2::Signature::now("forge", "forge@example.com").unwrap();
     let tree = remote.treebuilder(None).unwrap().write().unwrap();
     let tree = remote.find_tree(tree).unwrap();

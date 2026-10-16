@@ -1064,11 +1064,10 @@ async fn forks_are_cloned_and_deleted_once_published() {
         ("csi.storage.k8s.io/pv/name", "fork-1"),
     ];
     // What a fork class refuses.
-    let mut cases = Vec::new();
-    cases.push((
+    let mut cases = vec![(
         "a fork class without a dataSource",
         create_req("fork-1", &fork_params),
-    ));
+    )];
     let mut r = create_req("fork-1", &[("profile", "r")]);
     r.volume_content_source = clone_of("src");
     cases.push(("a dataSource on an ordinary class", r));
