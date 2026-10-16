@@ -1,0 +1,6 @@
+{{- $agentfs := include "example.agentfs" . | fromYaml }}
+{{- include "agentfs-sidecar.configMap" $agentfs }}
+---
+{{- include "agentfs-sidecar.secret" $agentfs | nindent 0 }}
+---
+{{- include "agentfs-sidecar.claim" $agentfs | nindent 0 }}

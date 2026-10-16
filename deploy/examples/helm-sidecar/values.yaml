@@ -1,0 +1,16 @@
+# The sidecar helpers' values (charts/agentfs-sidecar/README.md), under
+# the dependency's alias. The settings and rules are files of this chart
+# (files/, here deploy/sidecar/config), read in templates/_helpers.tpl.
+agentfs:
+  image:
+    # Pin a commit tag (<40-char sha>) or a digest in production.
+    tag: latest
+  volume: example
+  labels:
+    app.kubernetes.io/name: agentfs-example
+  credentials:
+    # Create the real Secret out of band instead (deploy/sidecar/secret.yaml).
+    stringData:
+      origin: |
+        username=agentfs
+        password=REPLACE_ME

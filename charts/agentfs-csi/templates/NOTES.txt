@@ -1,0 +1,33 @@
+The agentfs CSI driver ({{ include "agentfs-csi.driverName" . }}) is installed in {{ .Release.Namespace }}.
+
+Check it:
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/agentfs-csi-controller
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name=agentfs-csi-node
+{{- $ns := lookup "v1" "Namespace" "" .Release.Namespace }}
+{{- with $ns }}
+{{- $enforce := dig "metadata" "labels" "pod-security.kubernetes.io/enforce" "" . }}
+{{- if and $enforce (ne $enforce "privileged") }}
+
+WARNING: namespace {{ $.Release.Namespace }} enforces the "{{ $enforce }}" Pod Security
+standard; the node plugin needs "privileged" (docs/helm.md §2):
+  kubectl label --overwrite namespace {{ $.Release.Namespace }} pod-security.kubernetes.io/enforce=privileged
+{{- end }}
+{{- end }}
+{{- if not .Values.profiles }}
+
+No profiles are set: a StorageClass names one with `profile: <name>`. Add
+one with --set-file profiles.<name>.config=<file> (docs/csi.md §4).
+{{- end }}
+{{- if .Values.credentials.existingSecret }}
+
+Remote credentials come from Secret {{ .Values.credentials.existingSecret }}; the node plugin
+does not start until it exists.
+{{- end }}
+{{- if .Values.storageClasses }}
+
+StorageClasses: {{ range $i, $c := .Values.storageClasses }}{{ if $i }}, {{ end }}{{ $c.name }}{{ end }}
+{{- else }}
+
+No StorageClasses are set (storageClasses): create one that names a profile,
+then claims on it (docs/csi.md §6).
+{{- end }}
