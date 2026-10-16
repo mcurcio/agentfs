@@ -167,8 +167,10 @@ history service per volume, fed by each pod's front. Either way history is a
 straight line, and every commit is made by agentfs.
 
 **Enforced by a state-area lock.** Every command that writes the state area
-(`mount`, `run`, `record`, `flush`, `push`, and `restore` and `revert` when
-no mount is running) first takes an exclusive
+(`mount`, `run`, `serve-history`, `record`, `flush`, `patch apply`,
+`fork create`, `fork finish`, `fork abandon`, `init` of an existing state
+area, and `push`, `restore` and `revert` in direct mode, when no daemon
+answers on the control socket) first takes an exclusive
 `flock` on `meta/lock`, before it opens the volume, and holds it until it
 exits. The kernel releases it when the process dies, even after `kill -9`,
 so a crash never leaves a stale lock.
@@ -3989,7 +3991,7 @@ runner.
 | Identity | Configurable templates with defaults (§9) |
 | Backing filesystem | Both supported. XFS (reflink) makes the synchronous step size-independent; ext4 falls back to a copy. Recommendation, from the benchmark (§3.2, §18 test 13): XFS (or btrfs) for volumes holding large files, where ext4 costs about 2.9 s per clean GiB at close; either for small files, where the journal `fsync` dominates on both |
 | Performance budget | Advisory, checked by every benchmark run (`ci/bench-budget.json`, [performance.md](performance.md#performance-budget)): about 1.5 times the slowest of the first three CI runs (six jobs on two CPU types), for example 3.5 ms for a small file's step at the median; a result over budget warns and never fails CI (2026-10-13) |
-| One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `serve-history`, `record`, `flush`, and `push`, `restore` and `revert` in direct mode (when no daemon answers on the control socket); exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
+| One process per state area | An exclusive `flock` on `meta/lock`, taken by `mount`, `run`, `serve-history`, `record`, `flush`, `patch apply`, `fork create`, `fork finish`, `fork abandon`, `init` of an existing state area, and `push`, `restore` and `revert` in direct mode (when no daemon answers on the control socket); exit 75 when held, `--wait-lock` to wait; `status` is read-only (§2.3) |
 | FUSE layer placement | A separate library crate, `agentfs-fuse`, whose kernel-independent `Ops` carries all behaviour; the fuser adapter only maps replies (§17.1) |
 | Dirty detection | Armed inodes compared by stat stamp, with git's racy-timestamp rule; created and `O_TRUNC`-opened files always recorded at their next close. A boundary that would record a file again only because its last record was racy compares it with that record's frozen copy, kept open, and skips the record if the bytes are equal and the copy is still the last state journaled at the path (2026-10-13; §3.1, §19.2 item 4) |
 | Directory renames | One `move` change in the synchronous step, then reconciled on the commit thread before the move is committed: excluded paths dropped, newly recorded paths added, and files changed within 60 s of the move whose stamp is not the last journaled recorded again; paths refused at the destination (path rules, `agentfs.maxSize`) left out with `path_refused`; every reconciling read confined with `openat2`, never through a symlink or into a FIFO; failures retried with backoff for at least 30 s; the move and its reconciliation share a commit (2026-10-13; §3.1) |
