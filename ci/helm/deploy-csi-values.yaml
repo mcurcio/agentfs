@@ -1,0 +1,19 @@
+# The values under which charts/agentfs-csi renders exactly deploy/csi
+# plus the StorageClasses of deploy/csi/example (ci/helm-equivalence.sh).
+# The profiles come from deploy/csi/profiles/ with --set-file.
+credentials:
+  stringData:
+    example-origin: |
+      username=agentfs
+      password=REPLACE_ME
+storageClasses:
+  - name: agentfs
+    parameters:
+      profile: example
+      volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
+      onDelete: retain
+  - name: agentfs-fork
+    parameters:
+      fork: "true"
+      volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
+      onDelete: delete
