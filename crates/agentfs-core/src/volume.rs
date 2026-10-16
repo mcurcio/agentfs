@@ -477,9 +477,8 @@ fn existing_identity(git: &Path) -> Result<Option<(String, String)>, VolumeError
 /// gets it now.
 fn check_fork(git: &Path, wanted: &ForkIdentity) -> Result<(), VolumeError> {
     let config = git2::Config::open(&git.join("config")).map_err(HistoryError::from)?;
-    let get = |key: &str| {
-        crate::config::string(&config, key).map_err(|e| VolumeError::History(e.into()))
-    };
+    let get =
+        |key: &str| crate::config::string(&config, key).map_err(|e| VolumeError::History(e.into()));
     match get(fork_identity::SOURCE_KEY)? {
         Some(source) if source == wanted.source => Ok(()),
         Some(source) => Err(VolumeError::OtherFork {

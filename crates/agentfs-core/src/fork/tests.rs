@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use git2::{Oid, Repository};
 
 use super::create::{self, CreateError, CreateRequest};
-use super::finish::{self, FinishError, ForkState, Finisher, PublishOutcome, StatusError};
+use super::finish::{self, FinishError, Finisher, ForkState, PublishOutcome, StatusError};
 use super::identity::{ForkIdentity, PushTarget, change_ref, finish_ref};
 use crate::confined::Dir;
 use crate::events::NullSink;
@@ -134,7 +134,10 @@ impl Vol {
             let r = r.unwrap();
             out.insert(
                 format!("ref {}", r.name().unwrap()),
-                r.target().map(|o| o.to_string()).unwrap_or_default().into_bytes(),
+                r.target()
+                    .map(|o| o.to_string())
+                    .unwrap_or_default()
+                    .into_bytes(),
             );
         }
         let mut dirs = vec![self.state.root().to_path_buf()];
@@ -282,7 +285,10 @@ fn create_reads_the_source_live_and_leaves_it_untouched() {
     assert!(!fork.state.git().join("objects/info/alternates").exists());
     // The tree is base's, byte for byte.
     assert_eq!(fs::read_to_string(fork.tree.join("a.txt")).unwrap(), "a\n");
-    let mode = fs::metadata(fork.tree.join("bin/run")).unwrap().permissions().mode();
+    let mode = fs::metadata(fork.tree.join("bin/run"))
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o111, 0o111, "{mode:o}");
     assert_eq!(read_link(&fork.tree.join("link")), "a.txt");
     assert_eq!(
@@ -429,11 +435,17 @@ fn finish_and_publish_a_fork() {
     let change = repo.find_commit(record.change.unwrap()).unwrap();
     assert_eq!(change.parent_ids().collect::<Vec<_>>(), [identity.base]);
     assert_eq!(change.tree_id(), finish_commit.tree_id());
-    assert_eq!(repo.refname_to_id(&change_ref("src-1")).unwrap(), change.id());
+    assert_eq!(
+        repo.refname_to_id(&change_ref("src-1")).unwrap(),
+        change.id()
+    );
     assert_eq!(repo.refname_to_id(&finish_ref("src-1")).unwrap(), head);
     // Once: a second finish is the same record, with no new commit.
     assert_eq!(finisher.finish().unwrap(), record);
-    assert_eq!(repo.refname_to_id("refs/heads/agentfs/src-1").unwrap(), head);
+    assert_eq!(
+        repo.refname_to_id("refs/heads/agentfs/src-1").unwrap(),
+        head
+    );
     assert_eq!(
         finish::status(&fork.state).unwrap().unwrap().state,
         ForkState::Finished
@@ -524,7 +536,10 @@ fn finish_with_no_fork_remote_writes_nothing() {
         matches!(result, Err(FinishError::NoForkRemote { .. })),
         "{result:?}"
     );
-    assert_eq!(repo.refname_to_id("refs/heads/agentfs/src-1").unwrap(), head);
+    assert_eq!(
+        repo.refname_to_id("refs/heads/agentfs/src-1").unwrap(),
+        head
+    );
     assert!(repo.find_reference(&finish_ref("src-1")).is_err());
     assert_eq!(
         finish::status(&fork.state).unwrap().unwrap().state,
@@ -560,7 +575,9 @@ fn publish_waits_for_the_remote_and_never_moves_its_refs() {
     let source_head = source.head().unwrap();
     let local = source.repo();
     // The remote needs the commit it names: push the source's branch.
-    let mut push = local.remote_anonymous(&source.remote.display().to_string()).unwrap();
+    let mut push = local
+        .remote_anonymous(&source.remote.display().to_string())
+        .unwrap();
     push.push(&[format!("{source_head}:refs/heads/agentfs/src")], None)
         .unwrap();
     remote

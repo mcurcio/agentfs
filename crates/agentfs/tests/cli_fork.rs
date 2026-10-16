@@ -43,10 +43,7 @@ impl Setup {
         fs::create_dir_all(s.path("home")).unwrap();
         Repository::init_bare(s.path("origin.git")).unwrap();
         Repository::init_bare(s.path("forks.git")).unwrap();
-        let mut profile = format!(
-            "[remote \"origin\"]\n\turl = {}\n",
-            s.url("origin.git")
-        );
+        let mut profile = format!("[remote \"origin\"]\n\turl = {}\n", s.url("origin.git"));
         if fork_remote {
             profile.push_str(&format!(
                 "[remote \"forks\"]\n\turl = {}\n\tagentfsForkRemote = true\n",
@@ -55,7 +52,11 @@ impl Setup {
         }
         fs::write(s.path("profile"), profile).unwrap();
         let profile = s.path("profile").display().to_string();
-        s.ok("state", "tree", &["init", "--volume", "src", "--include", &profile]);
+        s.ok(
+            "state",
+            "tree",
+            &["init", "--volume", "src", "--include", &profile],
+        );
         s
     }
 
@@ -198,7 +199,10 @@ fn a_source_never_pushes_to_its_fork_remote() {
     let fork = s.create_fork();
     assert!(fork.starts_with("src-"), "{fork}");
     // The fork's tree is base's.
-    assert_eq!(fs::read_to_string(s.path("fork-tree/a.txt")).unwrap(), "a\n");
+    assert_eq!(
+        fs::read_to_string(s.path("fork-tree/a.txt")).unwrap(),
+        "a\n"
+    );
     s.record("fork", "fork-tree", "b.txt", "b\n");
     let out = s.ok("fork", "fork-tree", &["fork", "finish"]);
     assert!(out.contains("published to forks"), "{out}");
@@ -242,7 +246,10 @@ fn finish_publishes_to_the_patch_remote_and_the_change_applies_once() {
     let out = s.agentfs("fork", "fork-tree", &["fork", "finish", "--timeout", "1s"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     let first = text(&out.stdout).lines().next().unwrap().to_owned();
-    assert!(first.starts_with(&format!("finished fork {fork} of src")), "{first}");
+    assert!(
+        first.starts_with(&format!("finished fork {fork} of src")),
+        "{first}"
+    );
     fs::rename(&parked, s.path("origin.git")).unwrap();
     let out = s.ok("fork", "fork-tree", &["fork", "finish"]);
     assert_eq!(out.lines().next().unwrap(), first);
@@ -329,5 +336,9 @@ fn a_source_with_settings_in_its_own_config_is_refused() {
         &["fork", "create", "--source-state", &source],
     );
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
-    assert!(text(&out.stderr).contains("remote.own.url"), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("remote.own.url"),
+        "{}",
+        text(&out.stderr)
+    );
 }

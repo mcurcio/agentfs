@@ -895,7 +895,10 @@ fn a_patch_commit_queued_twice_applies_once() {
     assert_eq!(f.inbox_commits(2), 1);
     let head = f.repo().find_commit(f.head()).unwrap();
     let message = head.message().unwrap();
-    assert!(message.starts_with("duplicate of patch 1: edit a"), "{message}");
+    assert!(
+        message.starts_with("duplicate of patch 1: edit a"),
+        "{message}"
+    );
     assert_eq!(inbox_from_message(message), Some((2, p)));
     // A marker: the tree of the commit that applied 1.
     assert_eq!(head.tree_id(), head.parent(0).unwrap().tree_id());

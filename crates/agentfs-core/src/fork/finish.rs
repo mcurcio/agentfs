@@ -248,7 +248,12 @@ impl Finisher {
             return Ok(record);
         }
         let history = self.committer.history();
-        let Some(remote) = history.settings().fork_remote.as_ref().map(|r| r.name.clone()) else {
+        let Some(remote) = history
+            .settings()
+            .fork_remote
+            .as_ref()
+            .map(|r| r.name.clone())
+        else {
             return Err(FinishError::NoForkRemote { fork });
         };
         let unrecorded = self.record_repairs();
@@ -321,7 +326,10 @@ impl Finisher {
         let Some(head) = self.committer.history().head()? else {
             return Ok(None);
         };
-        Ok(finish_from_message(head.message_raw().unwrap_or_default(), head.id()))
+        Ok(finish_from_message(
+            head.message_raw().unwrap_or_default(),
+            head.id(),
+        ))
     }
 
     /// The local ref `name` at `oid`.

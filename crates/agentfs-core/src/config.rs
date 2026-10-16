@@ -530,7 +530,10 @@ fn fork_identity_of(
 
 /// 40 lowercase hex digits: a full commit id as agentfs writes one.
 pub fn is_full_oid(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The volume's own remotes and the fork remote, from every valid and
@@ -2011,7 +2014,10 @@ mod tests {
         assert_eq!(with.patch_remote(), without.patch_remote());
         assert_eq!(with.patch_remote().map(|r| r.name.as_str()), Some("origin"));
         assert!(with.invalid_remotes.is_empty());
-        assert_eq!(with.fork_remote.as_ref().map(|r| r.name.as_str()), Some("forks"));
+        assert_eq!(
+            with.fork_remote.as_ref().map(|r| r.name.as_str()),
+            Some("forks")
+        );
         assert!(!with.is_fork());
         // Naming the fork remote as the patch remote resolves to none.
         let (_d, c) = config_with(&format!(
@@ -2077,7 +2083,10 @@ mod tests {
         let s = Settings::from_config(&c).unwrap();
         let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["origin"]);
-        assert_eq!(s.fork_remote.map(|r| r.name), Some("origin".to_owned()));
+        assert_eq!(
+            s.fork_remote.as_ref().map(|r| r.name.as_str()),
+            Some("origin")
+        );
         assert_eq!(s.patch_remote(), None);
         // Two remotes and no patch remote: no fork remote, nothing pushed.
         let (_d, c) = config_with(&fork_config(
@@ -2118,7 +2127,10 @@ mod tests {
                 "[agentfs]\n\tvolume = f\n[agentfs \"fork\"]\n\tsource = s\n\tbase = {base}\n"
             ));
             assert!(
-                matches!(Settings::from_config(&c), Err(ConfigError::BadForkBase { .. })),
+                matches!(
+                    Settings::from_config(&c),
+                    Err(ConfigError::BadForkBase { .. })
+                ),
                 "{base}"
             );
         }

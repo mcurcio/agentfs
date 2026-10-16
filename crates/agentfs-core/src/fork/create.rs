@@ -28,6 +28,26 @@ use crate::volume::{self, StateDir, VolumeError};
 
 use super::identity::{ForkIdentity, PushTarget};
 
+/// What to create.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateRequest<'a> {
+    /// The source's state area, only read: no lock, no commit, never
+    /// paused.
+    pub source: &'a StateDir,
+    /// The fork's state area: new, or this fork's from an earlier try.
+    pub fork: &'a StateDir,
+    /// The fork's backing tree: empty, or this fork's from an earlier try.
+    pub tree: &'a Path,
+    /// The fork's volume name, unique at create: [`unique_name`] from the
+    /// CLI, the class's `volumeName` (which names `{pvName}`) under CSI.
+    pub name: &'a str,
+    /// The fork's `include.path` entries: the files the source's settings
+    /// come from (under CSI, its profile's config), read at every open.
+    pub includes: &'a [PathBuf],
+    /// Where the fork's history goes.
+    pub push_target: PushTarget,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CreateError {
     #[error("{} is not a volume's state area", path.display())]
@@ -175,9 +195,11 @@ fn copy_objects(source: &Repository, fork: &Repository, base: Oid) -> Result<(),
     packed.map_err(unreadable)?;
     writer.commit().map_err(HistoryError::from)?;
     if !odb.exists(base) {
-        return Err(CreateError::SourceUnreadable(HistoryError::Io(io::Error::other(
-            format!("commit {base} is not in the fork after copying the source's objects"),
-        ))));
+        return Err(CreateError::SourceUnreadable(HistoryError::Io(
+            io::Error::other(format!(
+                "commit {base} is not in the fork after copying the source's objects"
+            )),
+        )));
     }
     Ok(())
 }
