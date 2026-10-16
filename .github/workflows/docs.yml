@@ -1,0 +1,34 @@
+name: docs
+
+# The documentation's build checks, on every push and pull request. The
+# assets job checks that each logo PNG under docs/assets/ is a fresh
+# render of the SVG beside it (ci/render-assets.sh).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  assets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: install resvg
+        run: |
+          ci/install-resvg.sh "$RUNNER_TEMP/resvg"
+          echo "$RUNNER_TEMP/resvg/bin" >>"$GITHUB_PATH"
+      - name: PNGs match their SVGs
+        run: ci/render-assets.sh --check
