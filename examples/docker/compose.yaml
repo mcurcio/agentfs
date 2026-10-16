@@ -1,6 +1,7 @@
 # agentfs as a Docker volume with Docker Compose (docs/docker.md): an
 # init step, the agentfs container, and a workload that uses the mount.
 #
+#   mkdir -p examples/docker/mnt    # Docker does not create it
 #   docker compose -f examples/docker/compose.yaml up -d
 #   docker compose -f examples/docker/compose.yaml exec workload sh
 #   docker compose -f examples/docker/compose.yaml down

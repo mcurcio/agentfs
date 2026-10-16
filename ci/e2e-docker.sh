@@ -110,6 +110,7 @@ run)
     --security-opt no-new-privileges "$WORKLOAD_IMAGE" "${idle[@]}" >/dev/null
   ;;
 *)
+  mkdir -p "$EX/mnt"
   dc up -d --build
   ;;
 esac
@@ -118,6 +119,9 @@ assert_contains "$(agentfs_logs)" "volume $VOLUME" "the mount is volume $VOLUME"
 
 step "root and uid 10000 write with normal permissions (design §18 test 4)"
 in_root "printf root > $WS/root.txt && chmod 600 $WS/root.txt"
+# Records within agentfs.commitWindow of each other share one commit (and
+# its author, §3.4): keep the writers' commits apart.
+sleep 1
 in_user "printf user > $WS/user.txt"
 assert_eq 10000 "$(in_root "stat -c %u $WS/user.txt")" "uid 10000's file is its own"
 assert_eq "0 600" "$(in_root "stat -c '%u %a' $WS/root.txt")" "root's file is root's, mode 600"
