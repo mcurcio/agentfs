@@ -3394,7 +3394,8 @@ mod tests {
                 None
             );
             server.with(|st| st.batch_status = None);
-            assert!(pusher.push_once().is_success());
+            let outcome = pusher.push_once();
+            assert!(outcome.is_success(), "{outcome:?}");
             assert_eq!(
                 remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
                 Some(head)
