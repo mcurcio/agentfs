@@ -1,0 +1,17 @@
+apiVersion: v2
+name: agentfs-csi
+description: >-
+  The agentfs CSI driver: volumes whose every change is recorded in git
+  history the workload cannot see (design §14.2).
+type: application
+# The repository's version. CI publishes main as <version>-main.<run> and
+# a tag vX.Y.Z as X.Y.Z, with appVersion set to the commit (docs/helm.md).
+version: 0.1.0
+# The default agentfs image tag. Published charts carry the commit's id,
+# the immutable image tag image.yml publishes for it.
+appVersion: latest
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/mcurcio/agentfs
+sources:
+  - https://github.com/mcurcio/agentfs
+keywords: [csi, fuse, git, audit]

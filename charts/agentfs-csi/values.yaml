@@ -1,0 +1,154 @@
+# The agentfs CSI driver (design §14.2, docs/csi.md, docs/helm.md).
+# Install into a namespace labelled for privileged pods (docs/helm.md).
+
+image:
+  # -- The agentfs image: `agentfs-csi` and the `agentfs` it starts.
+  repository: ghcr.io/mcurcio/agentfs
+  # -- Its tag; empty means the chart's appVersion (a published chart's
+  # commit id).
+  tag: ""
+  # -- A digest (`sha256:...`); when set, it pins the image.
+  digest: ""
+  # -- The pull policy; empty leaves the Kubernetes default.
+  pullPolicy: ""
+
+# -- Pull secrets for every image, as `[{name: ...}]`.
+imagePullSecrets: []
+
+# The Kubernetes CSI sidecars, pinned by digest (the tag is informational).
+sidecars:
+  provisioner:
+    image:
+      # -- csi-provisioner's image.
+      repository: registry.k8s.io/sig-storage/csi-provisioner
+      # -- csi-provisioner's tag.
+      tag: v6.4.0
+      # -- csi-provisioner's digest.
+      digest: sha256:6ebe60fd8ed67a7f8a90d34402e9e706b274e53612d6fa5fbb8285728db622e2
+    # -- More csi-provisioner flags, e.g. `--retry-interval-max=20s`.
+    extraArgs: []
+    # -- csi-provisioner's resources.
+    resources: {}
+  attacher:
+    image:
+      # -- csi-attacher's image.
+      repository: registry.k8s.io/sig-storage/csi-attacher
+      # -- csi-attacher's tag.
+      tag: v4.13.0
+      # -- csi-attacher's digest.
+      digest: sha256:d1a26170efed45491074ca4545c81844eee2b9043fb885ac01fb4aed6f8b72d2
+    # -- More csi-attacher flags.
+    extraArgs: []
+    # -- csi-attacher's resources.
+    resources: {}
+  nodeDriverRegistrar:
+    image:
+      # -- node-driver-registrar's image.
+      repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
+      # -- node-driver-registrar's tag.
+      tag: v2.18.0
+      # -- node-driver-registrar's digest.
+      digest: sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
+    # -- node-driver-registrar's resources.
+    resources: {}
+  livenessProbe:
+    image:
+      # -- livenessprobe's image.
+      repository: registry.k8s.io/sig-storage/livenessprobe
+      # -- livenessprobe's tag.
+      tag: v2.20.0
+      # -- livenessprobe's digest.
+      digest: sha256:19f2cf2f40e1987c7943945deca5f65cd4e4bf5cc0657fc78a5df131861578e8
+    # -- livenessprobe's resources.
+    resources: {}
+
+# -- The kubelet's directory on the nodes. Some distributions move it
+# (k0s: `/var/lib/k0s/kubelet`).
+kubeletDir: /var/lib/kubelet
+
+basePath:
+  # -- Where volumes live (`--base-path`): one filesystem, at this path on
+  # the controller and every node (docs/csi.md §3).
+  path: /var/lib/agentfs-csi/volumes
+  # -- The volume mounted at `path` in the controller and the node plugin,
+  # as a pod volume source: one shared filesystem on several nodes, which
+  # on NFS must be 4.1 or later (docs/csi.md §11). Empty means a hostPath
+  # of `path`, right for a single node.
+  volume: {}
+
+controller:
+  # -- Controller replicas. The sidecars elect a leader: a second replica
+  # is a hot standby.
+  replicas: 1
+  # -- The controller's priority class.
+  priorityClassName: system-cluster-critical
+  # -- More `agentfs-csi --mode controller` flags (docs/configuration.md).
+  extraArgs: []
+  # -- The agentfs-csi container's resources.
+  resources: {}
+  # -- Annotations on the controller's pods.
+  podAnnotations: {}
+  # -- The controller's node selector.
+  nodeSelector: {}
+  # -- The controller's tolerations.
+  tolerations: []
+  # -- The controller's affinity.
+  affinity: {}
+
+node:
+  # -- The node plugin's priority class.
+  priorityClassName: system-node-critical
+  # -- Longer than `--unpublish-grace` plus `--unstage-grace`, so a
+  # stopped plugin lets its children make their final commits.
+  terminationGracePeriodSeconds: 60
+  # -- Where the node keeps its staged and published records
+  # (`--node-state`); must survive plugin restarts.
+  stateDir: /var/lib/agentfs-csi/node
+  # -- More `agentfs-csi --mode node` flags (docs/configuration.md).
+  extraArgs: []
+  # -- Environment of the node plugin, inherited by every history service
+  # and front: the `OTEL_*` variables (README "Telemetry"). Point
+  # `OTEL_EXPORTER_OTLP_ENDPOINT` at your collector to turn telemetry on.
+  env:
+    - name: OTEL_SDK_DISABLED
+      value: "true"
+  # -- The agentfs-csi container's resources. Every history service and
+  # front on the node runs in this container, inside these limits.
+  resources: {}
+  # -- Annotations on the node plugin's pods.
+  podAnnotations: {}
+  # -- The node plugin's node selector.
+  nodeSelector: {}
+  # -- The node plugin runs on every node by default.
+  tolerations:
+    - operator: Exists
+  # -- The node plugin's affinity.
+  affinity: {}
+
+# -- Profiles: every setting of a volume, by name (docs/csi.md
+# "Profiles and credentials"). Each is `{config, exclude, attributes}`:
+# the git-config fragment and the optional rule files. A StorageClass
+# picks one with the parameter `profile: <name>`. Load files with
+# `--set-file profiles.<name>.config=<path>`.
+profiles: {}
+
+credentials:
+  # -- Use this existing Secret for remote credentials instead of the
+  # chart's; create it out of band (`kubectl create secret generic`).
+  existingSecret: ""
+  # -- Keys of the chart's own Secret, mounted at
+  # `/etc/agentfs-csi/credentials/<key>`. Prefer `existingSecret`: values
+  # end up in the release record.
+  stringData: {}
+
+forkAdmission:
+  # -- Install the ValidatingAdmissionPolicy that refuses a fork class
+  # whose reclaim policy is not Delete (docs/csi.md §14).
+  enabled: true
+
+# -- StorageClasses of the driver: `[{name, parameters, reclaimPolicy,
+# volumeBindingMode, annotations}]`. `parameters` go to the driver as
+# written (docs/configuration.md "The CSI driver"). `reclaimPolicy`
+# defaults to Delete for a fork class (`fork: "true"`) and Retain
+# otherwise; `volumeBindingMode` to WaitForFirstConsumer.
+storageClasses: []

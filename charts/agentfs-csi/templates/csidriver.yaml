@@ -1,0 +1,21 @@
+# How Kubernetes calls the driver (design §14.2, docs/csi.md).
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ include "agentfs-csi.driverName" . }}
+  labels:
+    {{- include "agentfs-csi.labels" . | nindent 4 }}
+spec:
+  # ControllerPublish only tracks the node, so that the attach/detach
+  # controller enforces one node per volume.
+  attachRequired: true
+  # NodePublish gets the pod's identity: each pod's front commits as itself.
+  podInfoOnMount: true
+  # PersistentVolumes only: inline volumes would let a pod author choose
+  # the parameters, which are the operator's.
+  volumeLifecycleModes: [Persistent]
+  # The kubelet applies a pod's fsGroup through the mount.
+  fsGroupPolicy: File
+  requiresRepublish: false
+  storageCapacity: false
+  seLinuxMount: false

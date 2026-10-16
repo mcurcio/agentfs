@@ -1,0 +1,9 @@
+# chart-testing's values for `ct install` in the helm workflow's e2e job
+# (ci/helm-csi-install.sh): the image the job built, and credentials from
+# a Secret the script creates. The `ci` profile comes from
+# ci/k8s-csi/driver/profiles with --set-file, the same files e2e-csi uses.
+image:
+  repository: agentfs
+  tag: ci
+credentials:
+  existingSecret: agentfs-csi-ci-credentials

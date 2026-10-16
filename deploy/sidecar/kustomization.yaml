@@ -17,6 +17,9 @@ resources:
 # at mount time (design §4.1).
 configMapGenerator:
   - name: agentfs-config
+    options:
+      labels:
+        app.kubernetes.io/name: agentfs-example
     files:
       - config/config
       - config/exclude

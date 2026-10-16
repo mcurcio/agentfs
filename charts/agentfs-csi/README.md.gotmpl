@@ -1,0 +1,21 @@
+# {{ template "chart.name" . }}
+
+{{ template "chart.description" . }}
+
+Generated from `values.yaml` by [helm-docs](https://github.com/norwoodj/helm-docs)
+(`helm-docs --chart-search-root charts`); CI fails when it is stale. How to
+install and run it is in [docs/helm.md](../../docs/helm.md); the driver
+itself in [docs/csi.md](../../docs/csi.md).
+
+```sh
+kubectl create namespace agentfs-csi
+kubectl label namespace agentfs-csi pod-security.kubernetes.io/enforce=privileged
+helm install agentfs-csi oci://ghcr.io/mcurcio/charts/agentfs-csi \
+  --namespace agentfs-csi --version <version> \
+  --set credentials.existingSecret=agentfs-csi-credentials \
+  --set-file profiles.example.config=example.config
+```
+
+{{ template "chart.requirementsSection" . }}
+
+{{ template "chart.valuesSection" . }}

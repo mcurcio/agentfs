@@ -1,0 +1,88 @@
+# Defaults of the agentfs sidecar helpers (docs/helm.md §4). A workload
+# chart depends on this library under an alias (`alias: agentfs`) and
+# sets these under that key; each helper takes
+# that values map, e.g. `include "agentfs-sidecar.initContainers"
+# .Values.agentfs`.
+
+image:
+  # -- The agentfs image.
+  repository: ghcr.io/mcurcio/agentfs
+  # -- Its tag: required unless `digest` is set. Pin a commit tag
+  # (`<40-char sha>`); `latest` follows main.
+  tag: ""
+  # -- A digest (`sha256:...`); when set, it pins the image.
+  digest: ""
+  # -- The pull policy; empty leaves the Kubernetes default.
+  pullPolicy: ""
+
+# -- The agentfs volume name (required); the history branch is
+# `agentfs/<volume>` (design §4.3).
+volume: ""
+
+# -- Labels of the ConfigMap, Secret and claim the helpers render.
+labels: {}
+
+config:
+  # -- The ConfigMap the helpers render and mount.
+  name: agentfs-config
+  # -- Operator settings and remotes, included from the state area's
+  # config (git-config syntax; every key is in docs/configuration.md).
+  # Must not set agentfs.volume or agentfs.branch.
+  settings: ""
+  # -- Mounted over `<state>/git/info/exclude`: paths never recorded when
+  # new (design §4.1).
+  exclude: ""
+  # -- Mounted over `<state>/git/info/attributes`: agentfs attributes
+  # (design §4.2).
+  attributes: ""
+
+credentials:
+  # -- The Secret mounted at `/run/secrets/agentfs` in the sidecar. Create
+  # it out of band, or set `stringData` for the helpers to render it.
+  secretName: agentfs-credentials
+  # -- Keys of a Secret for `agentfs-sidecar.secret` to render. Prefer an
+  # out-of-band Secret: values end up in the release record.
+  stringData: {}
+
+claim:
+  # -- The claim holding the backing tree and the state area, mounted at
+  # `/data` in the agentfs containers only.
+  name: agentfs-data
+  # -- Its access modes. ReadWriteOncePod makes this pod the single writer
+  # (design §2.3).
+  accessModes: [ReadWriteOncePod]
+  # -- Its size.
+  size: 10Gi
+  # -- Its StorageClass; empty means the cluster default. XFS or btrfs
+  # make recording cost the same whatever a file's size (reflinks).
+  storageClassName: ""
+
+# -- What the sidecar does on a stale mount after a crash: `recover`
+# mounts over it, `hold` waits for a pod restart (design §17.1).
+onStaleMount: recover
+
+# -- Seal the bare mount point (root's, mode 0000) so a non-root workload
+# cannot write where nothing records it (design §17.1).
+sealMountpoint: true
+
+# -- More environment of the sidecar: OpenTelemetry (README "Telemetry").
+env:
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability.svc:4318
+  - name: OTEL_SERVICE_NAME
+    value: agentfs
+  - name: OTEL_RESOURCE_ATTRIBUTES
+    value: k8s.container.name=agentfs
+  - name: OTEL_TRACES_SAMPLER
+    value: parentbased_traceidratio
+  - name: OTEL_TRACES_SAMPLER_ARG
+    value: "0.01"
+
+# -- The sidecar's resources. An OOM kill is a crash: size the limit for
+# the volume.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 512Mi
