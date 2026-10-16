@@ -1538,14 +1538,15 @@ fn a_fork_finish_and_publish_export_spans_events_and_duration() {
         1
     );
 
-    // Refused: another writer's finish ref.
+    // Refused: another writer's finish ref, on the fork remote that is the
+    // source's own (which holds the commit the ref names).
     let collector = Collector::start();
-    let s = fork_setup::Setup::new(true);
+    let s = fork_setup::Setup::new(false);
     s.record("state", "tree", "a.txt", "a\n");
     s.ok("state", "tree", &["push"]);
     let fork = s.create_fork();
     s.record("fork", "fork-tree", "b.txt", "b\n");
-    git2::Repository::open_bare(s.path("forks.git"))
+    git2::Repository::open_bare(s.path("origin.git"))
         .unwrap()
         .reference(
             &format!("refs/agentfs/{fork}/finish"),
@@ -1592,7 +1593,7 @@ fn a_fork_finish_and_publish_export_spans_events_and_duration() {
         histogram_count(
             &collector,
             "agentfs.fork.publish.duration",
-            ("remote", "forks")
+            ("remote", "origin")
         ),
         0
     );
