@@ -3,7 +3,9 @@
 Every setting agentfs reads, what it accepts, and what happens when it is
 wrong. The design is in [design.md](design.md) (§4.3 settings, §9
 identities, §11 remotes); how to run a mount is in the
-[operator guide](operator-guide.md).
+[operator guide](operator-guide.md). The Helm charts' values are in their
+READMEs, generated from `values.yaml` and checked in CI
+([helm.md](helm.md#3-values)).
 
 **This page is checked against the code.** Tests fail when a config key,
 operator attribute, flag or environment variable that agentfs reads is

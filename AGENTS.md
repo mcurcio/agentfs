@@ -103,6 +103,7 @@ GitHub Actions runners can, so put such tests in a script under `ci/` and a job 
 |---|---|---|---|
 | `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, remotes (http/https/ssh), LFS, telemetry, multipod, NFS (one export, two clients, one node at a time), patches, runbooks, csi-sanity |
 | `image.yml` | every push and PR | ~5–9 min | container image, kind sidecar e2e, CSI on one kind node (no multi-node job); publishes to GHCR on main |
+| `helm.yml` | every push and PR | ~10–15 min (estimate, not yet measured) | Helm charts: helm lint, ct lint, READMEs current with helm-docs, charts equal to `deploy/`; `ct install` of the CSI chart on kind and `ci/e2e-csi.sh` against it; publishes charts to `oci://ghcr.io/mcurcio/charts` on main and `v*` tags (docs/helm.md) |
 | `power-loss.yml` | pushes to main (not docs-only), after landing | ~7 min | dm-log-writes replay on XFS and ext4 |
 | `bench.yml` | pushes to main (not docs-only), after landing | ~15–18 min | benchmarks on XFS and ext4, each in two parallel shards, against `ci/bench-budget.json` |
 

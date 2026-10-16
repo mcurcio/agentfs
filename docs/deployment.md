@@ -84,6 +84,9 @@ The workload sees the volume at `/agentfs/workspace`. Every change it
 makes there is recorded before the call returns, committed to the branch
 `agentfs/<volume>` and pushed every `pushInterval`.
 
+With Helm, the `agentfs-sidecar` library chart renders the same pod
+pieces into your workload's own chart ([helm.md](helm.md#4-the-sidecar-helpers)).
+
 ## 3. The pod, piece by piece
 
 ```

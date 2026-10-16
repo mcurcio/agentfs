@@ -355,6 +355,8 @@ deletes history a remote lacks. [docs/csi.md](docs/csi.md) covers the
 architecture, parameters, recovery, RBAC and Pod Security;
 [runbooks/csi-recovery.md](docs/runbooks/csi-recovery.md) the incidents.
 
+**Or with Helm:** [docs/helm.md](docs/helm.md) (the CSI driver chart and the sidecar library, at `oci://ghcr.io/mcurcio/charts`).
+
 ## Recovery
 
 Bring files back as they were in a commit, or undo a commit; either way
