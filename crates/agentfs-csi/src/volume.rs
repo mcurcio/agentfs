@@ -12,6 +12,8 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentfs_core::fork::PushTarget;
+use agentfs_core::fork::create::{self as fork_create, CreateError, CreateRequest};
 use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::volume::{self, StateDir};
 
@@ -20,7 +22,7 @@ use crate::csi::v1::volume_capability::AccessType;
 use crate::csi::v1::volume_capability::access_mode::Mode;
 use crate::error::Error;
 use crate::layout::Layout;
-use crate::params::VolumeParams;
+use crate::params::{ForkClass, VolumeParams};
 use crate::records::{self, MultiNodeFields, VolumeRecord};
 
 /// What a refused multi-node access mode says: the decision, with where
@@ -194,12 +196,92 @@ pub fn create(
             .map_or(0, |d| d.as_secs()),
         published_node: None,
         static_volume,
+        finish_requested: false,
     };
     store(layout, handle, &record)?;
     // Re-created over a retained volume: it is no longer only retained.
     records::remove(&layout.retained_json(handle))
         .map_err(|e| Error::io("removing the retained record", e))?;
     Ok(record)
+}
+
+/// Creates a fork of `source_handle` (CreateVolume with a fork class,
+/// design §11.5): directories as [`create`], then
+/// [`agentfs_core::fork::create::create`] with the source profile's config
+/// as the fork's include, the source's profile rules, and `csi.json`
+/// last. The source is read without its lock, so it may be in use.
+pub fn create_fork(
+    layout: &Layout,
+    handle: &str,
+    class: &ForkClass,
+    source_handle: &str,
+    capacity_bytes: i64,
+) -> Result<VolumeRecord, Error> {
+    let Some(source) = load(layout, source_handle)? else {
+        return Err(Error::NotFound(format!(
+            "the source volume {source_handle} does not exist"
+        )));
+    };
+    let params = class.params(&source.params);
+    let config = profile_config(layout, &params.profile)?;
+    let dir = layout.volume_dir(handle);
+    fs::create_dir_all(&layout.base)
+        .map_err(|e| Error::io(format!("creating {}", layout.base.display()), e))?;
+    for (path, mode) in [(&dir, 0o700), (&layout.backing(handle), 0o755)] {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(mode)
+            .create(path)
+            .map_err(|e| Error::io(format!("creating {}", path.display()), e))?;
+    }
+    let state = StateDir::new(layout.state(handle));
+    let lock = lock(&state, "agentfs-csi create")?;
+    let identity = fork_create::create(&CreateRequest {
+        source: &StateDir::new(layout.state(source_handle)),
+        fork: &state,
+        tree: &layout.backing(handle),
+        name: &params.volume,
+        includes: &[config],
+        push_target: PushTarget::Branch,
+    })
+    .map_err(create_error)?;
+    drop(lock);
+    install_rules(layout, handle, &params.profile)?;
+    let record = VolumeRecord {
+        params,
+        capacity_bytes,
+        created: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        published_node: None,
+        static_volume: false,
+        finish_requested: false,
+    };
+    store(layout, handle, &record)?;
+    records::remove(&layout.retained_json(handle))
+        .map_err(|e| Error::io("removing the retained record", e))?;
+    eprintln!(
+        "created fork {handle} of {source_handle} (agentfs volume {} of {} at {})",
+        identity.fork, identity.source, identity.base
+    );
+    Ok(record)
+}
+
+/// A fork's [`CreateError`] as the CSI code the CO acts on.
+pub fn create_error(e: CreateError) -> Error {
+    let message = chain(&e);
+    match e {
+        CreateError::SourceNotFound { .. } => Error::NotFound(message),
+        CreateError::SourceHasNoHistory { .. }
+        | CreateError::SourceIsFork { .. }
+        | CreateError::NoForkRemote { .. }
+        | CreateError::SourceSettingsNotIncluded { .. }
+        | CreateError::LfsObjectMissing { .. } => Error::FailedPrecondition(message),
+        CreateError::BadName { .. } => Error::InvalidArgument(message),
+        CreateError::Exists { .. } => Error::AlreadyExists(message),
+        CreateError::SourceUnreadable(_) => Error::Unavailable(message),
+        _ => Error::Internal(message),
+    }
 }
 
 /// Copies the profile's `.exclude` and `.attributes` (empty when absent)
@@ -339,6 +421,7 @@ mod tests {
             created: 1,
             published_node: None,
             static_volume: false,
+            finish_requested: false,
         };
         let mut json = serde_json::to_value(&record).unwrap();
         json["multi_node"] = true.into();

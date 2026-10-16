@@ -155,6 +155,7 @@ missing from these tables or a row names a module that no longer exists;
 | `node.rs` | The Node service: validates calls and hands them to the supervisor |
 | `supervisor.rs` | One `serve-history` per staged volume and one front per pod, restarted when they crash |
 | `launcher.rs` | Starting the `agentfs` children |
+| `publisher.rs` | The node plugin's fork publisher: finishes and publishes the forks whose deletion asked for it, one `agentfs fork finish` each (§11.5) |
 | `mounter.rs` | The node plugin's mount operations: bind mounts onto the kubelet's targets |
 | `params.rs` | StorageClass and PersistentVolume parameters |
 | `volume.rs` | Volumes on disk: creating one, adopting a static PV |

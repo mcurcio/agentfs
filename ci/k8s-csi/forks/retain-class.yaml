@@ -1,0 +1,11 @@
+# A fork class with reclaim policy Retain: the admission policy
+# (deploy/csi/fork-admission.yaml) must deny it (ci/e2e-csi-forks.sh).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: agentfs-ci-fork-retain
+provisioner: agentfs.mcurcio.github.io
+parameters:
+  fork: "true"
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer

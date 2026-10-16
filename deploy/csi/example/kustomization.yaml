@@ -1,6 +1,6 @@
 # A workload on the agentfs CSI driver (docs/csi.md "Using a volume"):
 # a StorageClass, a claim and two replicas sharing it, each committing
-# under its own identity. Install the driver first (deploy/csi).
+# under its own identity, and a fork class for sandboxes (docs/csi.md §14). Install the driver first (deploy/csi).
 #
 #   kubectl apply -k deploy/csi/example
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -9,5 +9,6 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - storageclass.yaml
+  - fork-storageclass.yaml
   - pvc.yaml
   - deployment.yaml

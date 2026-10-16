@@ -1,0 +1,25 @@
+# The source's class, and the fork class (as deploy/csi/example's
+# agentfs-fork).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: agentfs-ci-source
+provisioner: agentfs.mcurcio.github.io
+parameters:
+  profile: cifork
+  onDelete: delete
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: agentfs-ci-fork
+provisioner: agentfs.mcurcio.github.io
+parameters:
+  fork: "true"
+  volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false

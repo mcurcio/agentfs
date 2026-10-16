@@ -164,6 +164,46 @@ driver refuses and the provisioner retries
 To give the history up instead, remove `<basePath>/<pv>` by hand on the
 node; the next retry then finds no volume and succeeds.
 
+## A fork that will not delete
+
+**Symptoms.** A deleted fork claim's PV stays `Released`, and the
+csi-provisioner's log says `DeleteVolume … Unavailable desc = fork <pv> is
+active` (or `finished`) `: DeleteVolume completes once it is published or
+abandoned`.
+
+This is the design working (design §11.5, [csi.md §14](../csi.md#14-forks)):
+a fork is deleted only once its fork remote holds its change and finish
+refs. The node plugin's publisher runs `agentfs fork finish` for it at
+start and every `--fork-scan-interval`; the finisher retries with
+backoff until the remote takes the push.
+
+1. Find the finisher's output in the node plugin's log: `[fork <pv>] …`,
+   with each push failure and why (unreachable, auth, refused).
+2. Fix the remote (it is the profile's fork remote: the section with
+   `agentfsForkRemote = true`, else the patch remote). The finisher's
+   next attempt, and then the provisioner's next DeleteVolume, complete
+   by themselves. To publish at once, in the node plugin pod:
+
+   ```sh
+   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+     agentfs --state /var/lib/agentfs-csi/volumes/$PV/state \
+       --root /var/lib/agentfs-csi/volumes/$PV/backing fork finish --timeout 60s
+   ```
+
+   Exit 0 is published, 1 not yet (it says why), 75 means the publisher's
+   own finisher holds the fork: wait for it.
+3. `FAILED_PRECONDITION … reading the fork status …; nothing deleted`:
+   the fork's settings or `meta/fork.json` cannot be read. The volume is
+   kept until they can; fix the profile, or remove a corrupt
+   `meta/fork.json` (the next publish writes it again once the remote
+   confirms).
+
+A fork whose remote refuses it for good (another writer's finish ref, a
+change too large) waits for an operator; recording that refusal, and
+abandoning a fork on record, arrive with forked volumes unit 2. Until
+then, the only way to give a fork up is to remove `<basePath>/<pv>` by
+hand, which discards its change.
+
 ## Undoing a change in a live volume
 
 Restores and reverts run through the volume's history service, with the

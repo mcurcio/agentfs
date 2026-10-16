@@ -34,6 +34,11 @@ pub struct VolumeRecord {
     /// Adopted from a static PV rather than created by CreateVolume.
     #[serde(default)]
     pub static_volume: bool,
+    /// DeleteVolume of a fork asked for it to be finished (design §11.5);
+    /// never cleared. The node plugin's publisher finishes and publishes
+    /// it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub finish_requested: bool,
 }
 
 /// What the multi-node build (2026-10, since dropped) added to a
@@ -215,6 +220,7 @@ mod tests {
             created: 1,
             published_node: Some("n".into()),
             static_volume: false,
+            finish_requested: false,
         };
         store(&path, &rec).unwrap();
         assert_eq!(load::<VolumeRecord>(&path).unwrap(), Some(rec));
@@ -241,6 +247,7 @@ mod tests {
             created: 1,
             published_node: None,
             static_volume: false,
+            finish_requested: false,
         };
         let fields = MultiNodeFields {
             multi_node: true,

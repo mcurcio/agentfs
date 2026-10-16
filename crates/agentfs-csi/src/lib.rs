@@ -12,8 +12,12 @@
 //!   `agentfs mount --history-service` front per pod, bind-mounted onto
 //!   the kubelet's target, and recovers them when they crash.
 //!
-//! No CSI call clones, fetches or pushes: the history service does all
-//! network work in the background (design §14).
+//! - the publisher ([`publisher`]) finishes and publishes the forks
+//!   whose deletion asked for it (design §11.5).
+//!
+//! No CSI call fetches or pushes: the history service and the fork
+//! finisher do all network work in the background (design §14). The one
+//! clone, CreateVolume of a fork class, copies a local volume's history.
 
 /// The CSI driver name (CSIDriver object, StorageClass provisioner).
 pub const DRIVER_NAME: &str = "agentfs.mcurcio.github.io";
@@ -30,6 +34,7 @@ pub mod identity;
 pub mod launcher;
 pub mod mounter;
 pub mod node;
+pub mod publisher;
 pub mod server;
 pub mod supervisor;
 pub mod volume;

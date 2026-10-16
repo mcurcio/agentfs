@@ -18,6 +18,7 @@ use agentfs_csi::launcher::{AgentfsLauncher, FrontOptions, PluginIdentity};
 use agentfs_csi::layout::{Layout, validate_node};
 use agentfs_csi::mounter::KernelMounter;
 use agentfs_csi::node::NodeService;
+use agentfs_csi::publisher::Publisher;
 use agentfs_csi::server;
 use agentfs_csi::supervisor::{Backoff, NodeConfig, Supervisor};
 
@@ -93,6 +94,10 @@ struct Cli {
     /// The plugin pod's namespace.
     #[arg(long, env = "AGENTFS_CSI_NAMESPACE", default_value = "")]
     namespace: String,
+    /// How often the node plugin looks for forks whose deletion asked for
+    /// them to be finished and published (design §11.5).
+    #[arg(long, env = "AGENTFS_CSI_FORK_SCAN_INTERVAL", default_value = "30s", value_parser = duration)]
+    fork_scan_interval: Duration,
 }
 
 #[tokio::main]
@@ -140,6 +145,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     };
     let controller = matches!(cli.mode, Mode::Controller | Mode::All)
         .then(|| ControllerService::new(layout.clone()));
+    let (stop_tx, stop_publisher) = tokio::sync::watch::channel(false);
     let supervisor = if matches!(cli.mode, Mode::Node | Mode::All) {
         let node_id = cli
             .node_id
@@ -153,6 +159,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             pod: cli.pod.clone(),
             node: node_id,
         };
+        let plugin = cfg.plugin.clone();
         cfg.front = FrontOptions {
             passthrough: cli.passthrough.clone(),
             threads: cli.front_threads,
@@ -166,13 +173,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             max: cli.backoff_max,
             ..Backoff::default()
         };
-        let supervisor = Supervisor::new(
-            cfg,
-            Arc::new(AgentfsLauncher {
-                bin: cli.agentfs_bin.clone(),
-            }),
-            Arc::new(KernelMounter),
-        );
+        let launcher = Arc::new(AgentfsLauncher {
+            bin: cli.agentfs_bin.clone(),
+        });
+        let supervisor = Supervisor::new(cfg, launcher.clone(), Arc::new(KernelMounter));
         let report = supervisor.reconcile().await.map_err(|e| e.to_string())?;
         for bad in &report.unreadable {
             eprintln!("warning: an unreadable node record was skipped: {bad}");
@@ -182,6 +186,14 @@ async fn run(cli: Cli) -> Result<(), String> {
              dropped",
             report.services, report.recovering, report.dropped
         );
+        // Forks asked to finish, at once and then on an interval.
+        let publisher = Arc::new(Publisher::new(
+            Arc::new(layout.clone()),
+            launcher,
+            plugin,
+            cli.fork_scan_interval,
+        ));
+        tokio::spawn(publisher.run(stop_publisher.clone()));
         Some(supervisor)
     } else {
         None
@@ -201,6 +213,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         shutdown_signal(),
     )
     .await;
+    let _ = stop_tx.send(true);
     if let Some(supervisor) = supervisor {
         eprintln!("stopping the fronts and history services");
         supervisor.shutdown().await;

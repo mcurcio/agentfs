@@ -69,11 +69,15 @@ wait_for 30 sudo test -S "$SOCK" || fail "no socket at $SOCK: $(cat "$LOG")"
 pass "driver listening on $SOCK (pid $DRIVER_PID)"
 
 step "csi-sanity"
-# No test is skipped. --csi.testvolumeexpandsize is unset (no expansion);
-# the capability-gated tests (snapshots, clones, expansion, stats, list)
-# skip themselves because the driver does not advertise them.
+# --csi.testvolumeexpandsize is unset (no expansion); the capability-gated
+# tests (snapshots, expansion, stats, list) skip themselves because the
+# driver does not advertise them. The clone tests ("source volume") are
+# skipped: the driver clones only into a fork class (fork: "true", design
+# §11.5), which the test parameters are not; crates/agentfs-csi/tests/grpc.rs
+# and ci/e2e-csi-forks.sh cover cloning.
 sudo "$CSI_SANITY" \
   --csi.endpoint "unix://$SOCK" \
+  --ginkgo.skip "source volume" \
   --csi.mountdir "$W/target" \
   --csi.stagingdir "$W/staging" \
   --csi.testvolumeparameters "$HERE/csi-sanity/params.yaml" \

@@ -198,7 +198,16 @@ async fn identity() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(caps.capabilities.len(), 3);
+    assert_eq!(caps.capabilities.len(), 4);
+    let clone = controller_service_capability::Type::Rpc(controller_service_capability::Rpc {
+        r#type: controller_service_capability::rpc::Type::CloneVolume as i32,
+    });
+    assert!(
+        caps.capabilities
+            .iter()
+            .any(|c| c.r#type.as_ref() == Some(&clone)),
+        "CLONE_VOLUME is advertised"
+    );
     // Everything else is UNIMPLEMENTED.
     let r = d
         .controller()
@@ -998,4 +1007,182 @@ async fn delete_volume_keeps_history_no_remote_holds() {
     c.delete_volume(delete()).await.unwrap();
     assert!(!d.layout.volume_dir("v").exists());
     d.stop().await;
+}
+
+/// A content source naming the volume `id`.
+fn clone_of(id: &str) -> Option<VolumeContentSource> {
+    Some(VolumeContentSource {
+        r#type: Some(volume_content_source::Type::Volume(
+            volume_content_source::VolumeSource {
+                volume_id: id.into(),
+            },
+        )),
+    })
+}
+
+/// A12, A13: CreateVolume of a fork class clones a source volume, and
+/// DeleteVolume waits until the fork is published.
+#[tokio::test]
+async fn forks_are_cloned_and_deleted_once_published() {
+    let d = Driver::start().await;
+    let remote = d.dir.path().join("remote.git");
+    git2::Repository::init_bare(&remote).unwrap();
+    fs::write(
+        d.layout.profiles.join("r.config"),
+        format!("[remote \"origin\"]\n\turl = {}\n", remote.display()),
+    )
+    .unwrap();
+    let mut c = d.controller();
+    c.create_volume(create_req(
+        "src",
+        &[("profile", "r"), ("volumeName", "{pvName}")],
+    ))
+    .await
+    .unwrap();
+    // The source's history: one file, as a history service commits it.
+    let source = git2::Repository::open_bare(d.layout.state("src").join("git")).unwrap();
+    let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+    let blob = source.blob(b"from the source\n").unwrap();
+    let mut tree = source.treebuilder(None).unwrap();
+    tree.insert("a.txt", blob, 0o100644).unwrap();
+    let tree = source.find_tree(tree.write().unwrap()).unwrap();
+    let base = source
+        .commit(
+            Some("refs/heads/agentfs/src"),
+            &sig,
+            &sig,
+            "write: a.txt\n\nAgentfs-Seq: 1\nAgentfs-Trigger: close\n",
+            &tree,
+            &[],
+        )
+        .unwrap();
+
+    let fork_params = [
+        ("fork", "true"),
+        ("csi.storage.k8s.io/pvc/name", "sandbox"),
+        ("csi.storage.k8s.io/pvc/namespace", "agents"),
+        ("csi.storage.k8s.io/pv/name", "fork-1"),
+    ];
+    // What a fork class refuses.
+    let mut cases = Vec::new();
+    cases.push(("a fork class without a dataSource", create_req("fork-1", &fork_params)));
+    let mut r = create_req("fork-1", &[("profile", "r")]);
+    r.volume_content_source = clone_of("src");
+    cases.push(("a dataSource on an ordinary class", r));
+    let mut r = create_req("fork-1", &fork_params);
+    r.volume_content_source = Some(VolumeContentSource {
+        r#type: Some(volume_content_source::Type::Snapshot(
+            volume_content_source::SnapshotSource {
+                snapshot_id: "s".into(),
+            },
+        )),
+    });
+    cases.push(("a snapshot", r));
+    for (key, value) in [("profile", "r"), ("branch", "b"), ("volumeName", "{pvcName}")] {
+        let mut params = fork_params.to_vec();
+        params.push((key, value));
+        let mut r = create_req("fork-1", &params);
+        r.volume_content_source = clone_of("src");
+        cases.push((key, r));
+    }
+    for (what, req) in cases {
+        let err = c.create_volume(req).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{what}: {}", err.message());
+    }
+
+    let mut req = create_req("fork-1", &fork_params);
+    req.volume_content_source = clone_of("src");
+    let vol = c
+        .create_volume(req.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    assert_eq!(vol.content_source, clone_of("src"));
+    assert_eq!(vol.volume_context["profile"], "r");
+    assert_eq!(vol.volume_context["volume"], "agents.sandbox.fork-1");
+    assert_eq!(vol.volume_context["onDelete"], "delete");
+    let state = agentfs_core::volume::StateDir::new(d.layout.state("fork-1"));
+    let settings = agentfs_core::config::Settings::load(&state.git()).unwrap();
+    let identity = settings.fork.clone().unwrap();
+    assert_eq!(identity.source, "src");
+    assert_eq!(identity.base, base);
+    assert_eq!(
+        fs::read_to_string(d.layout.backing("fork-1").join("a.txt")).unwrap(),
+        "from the source\n"
+    );
+    // Idempotent.
+    c.create_volume(req).await.unwrap();
+
+    // Unpublished: UNAVAILABLE, the request stored, nothing deleted.
+    let delete = || DeleteVolumeRequest {
+        volume_id: "fork-1".into(),
+        ..Default::default()
+    };
+    let err = c.delete_volume(delete()).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    assert!(err.message().contains("is active"), "{}", err.message());
+    let record = agentfs_csi::volume::load(&d.layout, "fork-1")
+        .unwrap()
+        .unwrap();
+    assert!(record.finish_requested);
+    assert!(d.layout.volume_dir("fork-1").exists());
+
+    // Finished, with a mark that cannot be read: FAILED_PRECONDITION.
+    let lock =
+        agentfs_core::lock::StateLock::acquire(&state, "test", Duration::ZERO).unwrap();
+    let mut finisher = agentfs_core::fork::finish::Finisher::open(
+        &state,
+        &d.layout.backing("fork-1"),
+        fork_context(),
+        Arc::new(agentfs_core::events::NullSink),
+        &agentfs_core::telemetry::Telemetry::noop(),
+        &lock,
+    )
+    .unwrap();
+    finisher.finish().unwrap();
+    fs::write(state.fork_mark(), "{").unwrap();
+    drop(finisher);
+    drop(lock);
+    let err = c.delete_volume(delete()).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
+    assert!(err.message().contains("nothing deleted"), "{}", err.message());
+    fs::remove_file(state.fork_mark()).unwrap();
+    let err = c.delete_volume(delete()).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    assert!(err.message().contains("is finished"), "{}", err.message());
+
+    // Published: onDelete applies (delete, the fork class's default).
+    let lock =
+        agentfs_core::lock::StateLock::acquire(&state, "test", Duration::ZERO).unwrap();
+    let mut finisher = agentfs_core::fork::finish::Finisher::open(
+        &state,
+        &d.layout.backing("fork-1"),
+        fork_context(),
+        Arc::new(agentfs_core::events::NullSink),
+        &agentfs_core::telemetry::Telemetry::noop(),
+        &lock,
+    )
+    .unwrap();
+    let outcome = finisher
+        .publish(Some(Instant::now() + Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(outcome, agentfs_core::fork::finish::PublishOutcome::Published);
+    drop(finisher);
+    drop(lock);
+    c.delete_volume(delete()).await.unwrap();
+    assert!(!d.layout.volume_dir("fork-1").exists());
+    // The source is untouched, and ordinary volumes delete as before.
+    assert!(d.layout.volume_dir("src").exists());
+    d.stop().await;
+}
+
+fn fork_context() -> agentfs_core::identity::Context {
+    agentfs_core::identity::Context {
+        volume: "agents.sandbox.fork-1".into(),
+        replica: "test-0".into(),
+        pod_uid: "u".into(),
+        ..Default::default()
+    }
 }

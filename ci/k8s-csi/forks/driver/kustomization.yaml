@@ -1,0 +1,26 @@
+# The CI overlay for the e2e-csi-forks job (ci/e2e-csi-forks.sh): the
+# e2e-csi driver overlay, a `cifork` profile with a separate fork remote,
+# and a provisioner that retries DeleteVolume within 20 seconds.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../driver
+
+configMapGenerator:
+  - name: agentfs-csi-profiles
+    namespace: agentfs-csi
+    behavior: merge
+    options:
+      disableNameSuffixHash: true
+    files:
+      - profiles/cifork.config
+
+patches:
+  - target:
+      kind: Deployment
+      name: agentfs-csi-controller
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --retry-interval-max=20s

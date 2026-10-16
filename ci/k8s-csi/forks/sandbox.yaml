@@ -1,0 +1,42 @@
+# A sandbox pod with a pod-scoped (generic ephemeral) claim on the fork
+# class whose dataSource is the source claim, in use by the writer
+# (ci/e2e-csi-forks.sh). Deleting the pod deletes the claim, which finishes
+# the fork.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sandbox
+  namespace: agentfs-csi-e2e-forks
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    runAsGroup: 10000
+    fsGroup: 10000
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: sandbox
+      image: agentfs:ci
+      imagePullPolicy: Never
+      command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: data, mountPath: /data }
+  volumes:
+    - name: data
+      ephemeral:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: agentfs-ci-fork
+            dataSource:
+              kind: PersistentVolumeClaim
+              name: source
+            accessModes: [ReadWriteOnce]
+            resources:
+              requests:
+                storage: 1Gi

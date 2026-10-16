@@ -14,6 +14,8 @@ resources:
   - credentials.yaml
   - controller.yaml
   - node.yaml
+  # Fork classes must have reclaim policy Delete (docs/csi.md §14).
+  - fork-admission.yaml
 
 # One profile per `<name>.config` (with optional `.exclude` and
 # `.attributes`); a StorageClass picks one with `profile: <name>`. No hash

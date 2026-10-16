@@ -1,6 +1,8 @@
 //! Starting the `agentfs` children the node plugin supervises (design
-//! §14.2, §17.2): one `agentfs serve-history` per staged volume and one
-//! `agentfs mount --history-service` front per published target.
+//! §14.2, §17.2): one `agentfs serve-history` per staged volume, one
+//! `agentfs mount --history-service` front per published target, and one
+//! `agentfs fork finish` per fork whose deletion asked for it to be
+//! finished ([`crate::publisher`], design §11.5).
 //!
 //! The children are the same commands the single-node deployments run, so
 //! a crashed front or service never takes the gRPC server down. Their
@@ -13,7 +15,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -236,6 +238,35 @@ pub fn service_spec(layout: &Layout, handle: &str, plugin: &PluginIdentity) -> P
     ProcessSpec {
         label: format!("service {handle}"),
         args,
+        env: Vec::new(),
+    }
+}
+
+/// argv of the finisher child, with the plugin's identity flags: `--state
+/// S --root B fork finish --namespace NS --pod POD --node NODE`, with no
+/// `--timeout` (it publishes until it is published).
+pub fn fork_finish_args(state: &Path, root: &Path, identity: &PluginIdentity) -> Vec<OsString> {
+    vec![
+        os("--state"),
+        state.as_os_str().to_owned(),
+        os("--root"),
+        root.as_os_str().to_owned(),
+        os("fork"),
+        os("finish"),
+        os("--namespace"),
+        os(identity.namespace.as_str()),
+        os("--pod"),
+        os(identity.pod.as_str()),
+        os("--node"),
+        os(identity.node.as_str()),
+    ]
+}
+
+/// The finisher child of the fork `handle`.
+pub fn fork_finish_spec(layout: &Layout, handle: &str, identity: &PluginIdentity) -> ProcessSpec {
+    ProcessSpec {
+        label: format!("fork {handle}"),
+        args: fork_finish_args(&layout.state(handle), &layout.backing(handle), identity),
         env: Vec::new(),
     }
 }

@@ -1,7 +1,13 @@
 //! The CSI Controller service (design §14.2).
 //!
 //! - CreateVolume makes `<base>/<pv-name>/{backing,state,csi.json}` and
-//!   initialises the state area in-process. Nothing is cloned or fetched.
+//!   initialises the state area in-process. With a fork class
+//!   (`fork: "true"`) and a `dataSource` claim, it makes a fork of that
+//!   volume (design §11.5) from its local history, without its lock or
+//!   any credentials; nothing is fetched, and nothing else is cloned.
+//! - DeleteVolume of a fork asks for it to be finished (`finish_requested`
+//!   in `csi.json`) and answers `UNAVAILABLE` until the node plugin's
+//!   publisher has published it; then it applies `onDelete`.
 //! - DeleteVolume removes the directory (`onDelete: delete`) or keeps it
 //!   for a static PV (`retain`, the default), renaming `csi.json` to
 //!   `csi.retained.json`. It refuses while the volume is attached to a
@@ -34,6 +40,7 @@ use agentfs_core::volume::StateDir;
 
 use crate::csi::v1::controller_server::Controller;
 use crate::csi::v1::controller_service_capability::{self, rpc};
+use crate::csi::v1::volume_content_source;
 use crate::csi::v1::validate_volume_capabilities_response::Confirmed;
 use crate::csi::v1::{
     ControllerGetCapabilitiesRequest, ControllerGetCapabilitiesResponse,
@@ -44,7 +51,7 @@ use crate::csi::v1::{
 };
 use crate::error::Error;
 use crate::layout::{Layout, validate_handle, validate_node};
-use crate::params::{OnDelete, VolumeParams};
+use crate::params::{ForkClass, OnDelete, VolumeParams};
 use crate::volume;
 
 #[derive(Clone)]
@@ -120,14 +127,57 @@ pub(crate) fn create_volume(
     let handle = req.name.as_str();
     validate_handle(handle).map_err(|e| Error::InvalidArgument(e.to_string()))?;
     volume::check_capabilities(&req.volume_capabilities)?;
-    if req.volume_content_source.is_some() {
-        return Err(Error::InvalidArgument(
-            "volume content sources (snapshots, clones) are not supported".into(),
-        ));
-    }
-    let params = VolumeParams::from_create(handle, &req.parameters)
-        .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+    let invalid = |e: crate::params::ParamError| Error::InvalidArgument(e.to_string());
+    let class = ForkClass::from_create(handle, &req.parameters).map_err(invalid)?;
+    let source = match req.volume_content_source.as_ref().map(|s| &s.r#type) {
+        None => None,
+        Some(Some(volume_content_source::Type::Volume(v))) => Some(v.volume_id.clone()),
+        Some(Some(volume_content_source::Type::Snapshot(_))) => {
+            return Err(Error::InvalidArgument(
+                "snapshots are not supported".into(),
+            ));
+        }
+        Some(None) => {
+            return Err(Error::InvalidArgument(
+                "the volume content source names no volume".into(),
+            ));
+        }
+    };
     let capacity_bytes = capacity(req)?;
+    let (params, fork) = match (class, source) {
+        (Some(class), Some(source)) => (None, Some((class, source))),
+        (Some(_), None) => {
+            return Err(Error::InvalidArgument(
+                "a fork class needs a dataSource claim".into(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(Error::InvalidArgument(
+                "cloning needs a fork class (fork: \"true\")".into(),
+            ));
+        }
+        (None, None) => (
+            Some(VolumeParams::from_create(handle, &req.parameters).map_err(invalid)?),
+            None,
+        ),
+    };
+    if let Some((class, source)) = fork {
+        validate_handle(&source).map_err(|e| Error::NotFound(e.to_string()))?;
+        let record = match volume::load(layout, handle)? {
+            Some(existing) => existing,
+            None => volume::create_fork(layout, handle, &class, &source, capacity_bytes)?,
+        };
+        return Ok(CreateVolumeResponse {
+            volume: Some(Volume {
+                capacity_bytes: record.capacity_bytes,
+                volume_id: handle.to_owned(),
+                volume_context: record.params.to_context(),
+                content_source: req.volume_content_source.clone(),
+                accessible_topology: Vec::new(),
+            }),
+        });
+    }
+    let params = params.expect("an ordinary volume has its parameters");
     let record = match volume::load(layout, handle)? {
         Some(existing) => {
             if existing.capacity_bytes != capacity_bytes {
@@ -201,10 +251,41 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
     } else {
         None
     };
+    // A fork is deleted only once it is published (design §11.5): its
+    // deletion is the request to finish it, which the node plugin carries
+    // out.
+    let mut is_fork = false;
+    if state.git().join("config").exists() {
+        match fork_status(&state) {
+            Err(why) => {
+                return Err(Error::FailedPrecondition(format!(
+                    "{why}; nothing deleted"
+                )));
+            }
+            Ok(Some(status)) => {
+                is_fork = true;
+                if !record.finish_requested {
+                    let mut requested = record.clone();
+                    requested.finish_requested = true;
+                    volume::store_any(layout, handle, &requested, legacy.as_ref())?;
+                    eprintln!("fork {handle}: finishing requested by DeleteVolume");
+                }
+                if !status.state.may_delete() {
+                    return Err(Error::Unavailable(format!(
+                        "fork {handle} is {}: DeleteVolume completes once it is published or \
+                         abandoned (the node plugin publishes it)",
+                        status.state.as_str()
+                    )));
+                }
+            }
+            Ok(None) => {}
+        }
+    }
     match record.params.on_delete {
         OnDelete::Delete => {
             let dir = layout.volume_dir(handle);
-            if state.git().join("config").exists() {
+            // Publishing is a fork's gate: its remote holds its history.
+            if !is_fork && state.git().join("config").exists() {
                 let lacking = unpushed(&state)?;
                 if !lacking.is_empty() {
                     let list: Vec<String> = lacking
@@ -257,6 +338,17 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
     }
     drop(lock);
     Ok(())
+}
+
+/// The fork status of the state area, or why it cannot be read.
+fn fork_status(state: &StateDir) -> Result<Option<agentfs_core::fork::finish::ForkStatus>, String> {
+    agentfs_core::fork::finish::status(state).map_err(|e| {
+        format!(
+            "reading the fork status of {}: {}",
+            state.root().display(),
+            volume::chain(&e)
+        )
+    })
 }
 
 /// Removes a directory tree, if it exists.
@@ -477,6 +569,7 @@ impl Controller for ControllerService {
                 rpc::Type::CreateDeleteVolume,
                 rpc::Type::PublishUnpublishVolume,
                 rpc::Type::SingleNodeMultiWriter,
+                rpc::Type::CloneVolume,
             ]
             .into_iter()
             .map(capability)
@@ -515,6 +608,7 @@ mod tests {
             created: 1,
             published_node: None,
             static_volume: false,
+            finish_requested: false,
         };
         let fields = MultiNodeFields {
             multi_node: true,

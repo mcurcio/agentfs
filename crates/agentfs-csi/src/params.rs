@@ -12,6 +12,7 @@
 //! | `volumeName` | the agentfs volume name, a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}`; default [`DEFAULT_TEMPLATE`] (with the provisioner's `--extra-create-metadata`), else the PV name. In a static PV's attributes, a literal name |
 //! | `branch` | the history branch (default `agentfs/<volume>`) |
 //! | `onDelete` | `retain` (default: DeleteVolume keeps the directory) or `delete` |
+//! | `fork` | `"true"`: a fork class ([`ForkClass`], design §11.5); `"false"` or absent: an ordinary one |
 //!
 //! Keys under `csi.storage.k8s.io/` (the provisioner's metadata) are read
 //! for the template and otherwise ignored; any other key is refused.
@@ -65,7 +66,7 @@ pub enum ParamError {
     BadProfile(String),
     #[error(
         "unknown StorageClass parameter {0:?} (known: profile, volumeName, branch, onDelete, \
-         workloadMounts)"
+         workloadMounts, fork)"
     )]
     UnknownKey(String),
     #[error(
@@ -93,6 +94,18 @@ pub enum ParamError {
     BadOnDelete(String),
     #[error("workloadMounts: {0}")]
     BadWorkloadMount(String),
+    #[error(
+        "a fork class (fork: \"true\") must not set {0}: a fork's profile is its source's and \
+         its branch is fixed"
+    )]
+    ForkClassSets(&'static str),
+    #[error("fork {0:?} must be \"true\" or \"false\"")]
+    BadFork(String),
+    #[error(
+        "volumeName {template:?} of a fork class must contain {{pvName}}, so each fork is unique \
+         on the remote"
+    )]
+    ForkNameNotUnique { template: String },
 }
 
 /// What DeleteVolume does with the volume's directory.
@@ -163,27 +176,17 @@ impl VolumeParams {
                 "branch" => branch = Some(value.clone()),
                 "onDelete" => on_delete = value.parse()?,
                 "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
+                // An ordinary class may say so; a fork class is a ForkClass.
+                "fork" if value == "false" => {}
+                "fork" => return Err(ParamError::BadFork(value.clone())),
                 k if k.starts_with(CO_PREFIX) => {}
                 other => return Err(ParamError::UnknownKey(other.to_owned())),
             }
         }
         let profile = profile.ok_or(ParamError::MissingProfile)?;
         validate_profile(&profile)?;
-        let pv_name = parameters.get(PV_NAME).map_or(name, String::as_str);
-        let template = template.unwrap_or_else(|| {
-            if parameters.contains_key(PVC_NAME) && parameters.contains_key(PVC_NAMESPACE) {
-                DEFAULT_TEMPLATE.to_owned()
-            } else {
-                "{pvName}".to_owned()
-            }
-        });
-        let volume = render(&template, parameters, pv_name)?;
-        if validate_name("agentfs.volume", &volume).is_err() {
-            return Err(ParamError::BadVolumeName {
-                template,
-                value: volume,
-            });
-        }
+        let template = template.unwrap_or_else(|| default_template(parameters));
+        let volume = volume_name(name, &template, parameters)?;
         if let Some(branch) = &branch {
             validate_branch(branch)?;
         }
@@ -276,6 +279,96 @@ impl VolumeParams {
             context.insert(WORKLOAD_MOUNTS.to_owned(), self.workload_mounts.join(","));
         }
         context
+    }
+}
+
+/// The default `volumeName` template: [`DEFAULT_TEMPLATE`] when the
+/// provisioner passes the claim's metadata, else `{pvName}`.
+fn default_template(parameters: &HashMap<String, String>) -> String {
+    if parameters.contains_key(PVC_NAME) && parameters.contains_key(PVC_NAMESPACE) {
+        DEFAULT_TEMPLATE.to_owned()
+    } else {
+        "{pvName}".to_owned()
+    }
+}
+
+/// `template` rendered for the PV `name`, as a valid volume name.
+fn volume_name(
+    name: &str,
+    template: &str,
+    parameters: &HashMap<String, String>,
+) -> Result<String, ParamError> {
+    let pv_name = parameters.get(PV_NAME).map_or(name, String::as_str);
+    let volume = render(template, parameters, pv_name)?;
+    if validate_name("agentfs.volume", &volume).is_err() {
+        return Err(ParamError::BadVolumeName {
+            template: template.to_owned(),
+            value: volume,
+        });
+    }
+    Ok(volume)
+}
+
+/// A fork class's settings (design §11.5): a StorageClass with `fork:
+/// "true"`, whose claims clone a `dataSource` claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkClass {
+    /// The fork's volume name, unique on the remote (it names
+    /// `{pvName}`).
+    pub volume: String,
+    pub on_delete: OnDelete,
+    pub workload_mounts: Vec<String>,
+}
+
+impl ForkClass {
+    /// `Ok(None)` unless `parameters` has `fork: "true"`. A fork class must
+    /// not set `profile` or `branch`, and its `volumeName` template must
+    /// contain `{pvName}`; `onDelete` defaults to `delete` (publishing
+    /// already gates deletion, design §19.1 "Fork onDelete").
+    pub fn from_create(
+        name: &str,
+        parameters: &HashMap<String, String>,
+    ) -> Result<Option<Self>, ParamError> {
+        match parameters.get("fork").map(String::as_str) {
+            None | Some("false") => return Ok(None),
+            Some("true") => {}
+            Some(other) => return Err(ParamError::BadFork(other.to_owned())),
+        }
+        let mut template = None;
+        let mut on_delete = OnDelete::Delete;
+        let mut workload_mounts = Vec::new();
+        for (key, value) in parameters {
+            match key.as_str() {
+                "fork" => {}
+                "profile" => return Err(ParamError::ForkClassSets("profile")),
+                "branch" => return Err(ParamError::ForkClassSets("branch")),
+                "volumeName" => template = Some(value.clone()),
+                "onDelete" => on_delete = value.parse()?,
+                "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
+                k if k.starts_with(CO_PREFIX) => {}
+                other => return Err(ParamError::UnknownKey(other.to_owned())),
+            }
+        }
+        let template = template.unwrap_or_else(|| default_template(parameters));
+        if !template.contains("{pvName}") {
+            return Err(ParamError::ForkNameNotUnique { template });
+        }
+        Ok(Some(Self {
+            volume: volume_name(name, &template, parameters)?,
+            on_delete,
+            workload_mounts,
+        }))
+    }
+
+    /// The fork's parameters: the source's profile, no branch.
+    pub fn params(&self, source: &VolumeParams) -> VolumeParams {
+        VolumeParams {
+            profile: source.profile.clone(),
+            volume: self.volume.clone(),
+            branch: None,
+            on_delete: self.on_delete,
+            workload_mounts: self.workload_mounts.clone(),
+        }
     }
 }
 
@@ -414,6 +507,59 @@ pub fn is_ephemeral(context: &HashMap<String, String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A12: what a fork class may and may not set.
+    #[test]
+    fn fork_classes() {
+        let meta = [
+            (PVC_NAME, "sandbox"),
+            (PVC_NAMESPACE, "agents"),
+            (PV_NAME, "pvc-9"),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut pairs = meta.to_vec();
+            pairs.extend_from_slice(extra);
+            map(&pairs)
+        };
+        assert_eq!(ForkClass::from_create("pvc-9", &with(&[])).unwrap(), None);
+        assert_eq!(
+            ForkClass::from_create("pvc-9", &with(&[("fork", "false")])).unwrap(),
+            None
+        );
+        let class = ForkClass::from_create("pvc-9", &with(&[("fork", "true")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(class.volume, "agents.sandbox.pvc-9");
+        assert_eq!(class.on_delete, OnDelete::Delete);
+        let source = VolumeParams::from_create("pvc-1", &map(&[("profile", "example")])).unwrap();
+        let params = class.params(&source);
+        assert_eq!(params.profile, "example");
+        assert_eq!(params.branch, None);
+        assert_eq!(params.branch_name(), "agentfs/agents.sandbox.pvc-9");
+        for (key, what) in [("profile", "profile"), ("branch", "branch")] {
+            assert_eq!(
+                ForkClass::from_create("pvc-9", &with(&[("fork", "true"), (key, "x")])),
+                Err(ParamError::ForkClassSets(what))
+            );
+        }
+        assert!(matches!(
+            ForkClass::from_create(
+                "pvc-9",
+                &with(&[("fork", "true"), ("volumeName", "{pvcName}")])
+            ),
+            Err(ParamError::ForkNameNotUnique { .. })
+        ));
+        assert_eq!(
+            ForkClass::from_create("pvc-9", &with(&[("fork", "yes")])),
+            Err(ParamError::BadFork("yes".into()))
+        );
+        // An ordinary class accepts fork: "false" and refuses anything else.
+        VolumeParams::from_create("pvc-1", &map(&[("profile", "p"), ("fork", "false")])).unwrap();
+        assert_eq!(
+            VolumeParams::from_create("pvc-1", &map(&[("profile", "p"), ("fork", "true")])),
+            Err(ParamError::BadFork("true".into()))
+        );
+    }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

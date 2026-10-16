@@ -1,0 +1,45 @@
+# The source volume, kept in use by a pod that writes to it every few
+# seconds while it is forked.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: source
+  namespace: agentfs-csi-e2e-forks
+spec:
+  storageClassName: agentfs-ci-source
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+  namespace: agentfs-csi-e2e-forks
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    runAsGroup: 10000
+    fsGroup: 10000
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: writer
+      image: agentfs:ci
+      imagePullPolicy: Never
+      command:
+        - sh
+        - -c
+        - "trap 'exit 0' TERM; n=0; while :; do n=$((n+1)); printf '%s' $n > /data/tick.txt; sleep 5; done"
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: data, mountPath: /data }
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: source }

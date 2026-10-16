@@ -19,6 +19,7 @@ page is the operator's guide and reference.
 - [11. Shared filesystems](#11-shared-filesystems)
 - [12. Limitations](#12-limitations)
 - [13. How it is tested](#13-how-it-is-tested)
+- [14. Forks](#14-forks)
 
 ## 1. What it is
 
@@ -285,8 +286,8 @@ See `deploy/csi/example/deployment.yaml`.
 
 | Call | Does | Fails with |
 |---|---|---|
-| CreateVolume | Validates the parameters and capabilities; creates `<basePath>/<pv>/{backing,state}`, initialises the state area with the profile's config included and its rules installed, writes `csi.json`. Idempotent for the same name and capacity | `InvalidArgument` (bad parameters, any multi-node access mode, block volumes, mount flags), `AlreadyExists` (same name, other capacity or parameters; a state area of another volume) |
-| DeleteVolume | `onDelete: delete` moves the directory to `<basePath>/.deleting.<handle>` under the state lock, then removes it (on NFS, unlinking the held lock file would leave a `.nfs*` file and the directory behind; what a failed removal leaves goes at the next delete of the name), `retain` keeps it as `csi.retained.json`. An unknown volume is a success | `FailedPrecondition` while the volume is attached (to any node, in either format of `csi.json`), or its state area's lock is held (a history service runs), or (`delete`) while a remote lacks commits of the branch (§9) |
+| CreateVolume | Validates the parameters and capabilities; creates `<basePath>/<pv>/{backing,state}`, initialises the state area with the profile's config included and its rules installed, writes `csi.json`. Idempotent for the same name and capacity. With a fork class and a `dataSource` claim, creates a fork of that volume (§14) and returns the content source | `InvalidArgument` (bad parameters, any multi-node access mode, block volumes, mount flags; a content source on an ordinary class, a fork class without one, a snapshot), `AlreadyExists` (same name, other capacity or parameters; a state area of another volume), and for a fork `NotFound` (no such source), `FailedPrecondition` (a source with no history, a fork, no fork remote, a missing LFS object), `Unavailable` (the source could not be read; retried) |
+| DeleteVolume | A fork that is not published yet is asked to finish (`finish_requested` in `csi.json`) and the call answers `Unavailable` until the node plugin has published it (§14); a published fork's `onDelete` applies without the unpushed-history check. Otherwise, `onDelete: delete` moves the directory to `<basePath>/.deleting.<handle>` under the state lock, then removes it (on NFS, unlinking the held lock file would leave a `.nfs*` file and the directory behind; what a failed removal leaves goes at the next delete of the name), `retain` keeps it as `csi.retained.json`. An unknown volume is a success | `FailedPrecondition` while the volume is attached (to any node, in either format of `csi.json`), or its state area's lock is held (a history service runs), or (`delete`) while a remote lacks commits of the branch (§9) |
 | ControllerPublish | Records the node in `csi.json`; adopts a static PV. A `csi.json` with fields this driver does not know is refused, never read as a single-node volume. One written by the multi-node build (2026-10, since dropped) is refused by every call that would use the volume (ControllerPublish, NodeStage, CreateVolume, ValidateVolumeCapabilities), but ControllerUnpublish and DeleteVolume still work on it | `NotFound` (unknown volume or node), `FailedPrecondition` (attached to another node; a multi-node build's `csi.json`, with the decision), `InvalidArgument` (a multi-node access mode) |
 | ControllerUnpublish | Clears the node. An unknown volume is a success. On a multi-node build's `csi.json` it removes the node from its node list too; once no node is left, the record is rewritten in this driver's format and the volume is usable from one node again | |
 | NodeStage | Reinstalls the profile's rules, starts the volume's history service, and waits up to `--stage-wait` for it to listen (it recovers the journal and applies queued patches first) | `Unavailable` when the service is still starting (the kubelet retries; the service keeps running), `FailedPrecondition` when it exited (with its last log lines), `NotFound` for an unknown volume, `InvalidArgument` (a multi-node access mode) |
@@ -296,10 +297,12 @@ See `deploy/csi/example/deployment.yaml`.
 | ValidateVolumeCapabilities | Confirms single-node mount capabilities; a multi-node mode is not confirmed, with the same message | `NotFound` for an unknown volume |
 | NodeGetInfo, NodeGetCapabilities, Probe, GetPluginInfo, GetPluginCapabilities | as the spec says | |
 
-Snapshots, clones, expansion, volume stats and listing are not offered.
+Snapshots, expansion, volume stats and listing are not offered; clones
+only into a fork class (§14).
 
-**Little network work in a call.** No call clones or fetches, and the
-driver itself never pushes. The history service pushes in the background
+**Little network work in a call.** No call fetches, and no call pushes.
+The one clone, CreateVolume of a fork class, copies a local volume's
+history and writes its tree, with no network and no credentials. The history service pushes in the background
 on its interval (design §11.2), and once more as it stops, so NodeUnstage
 waits up to `--push-grace` (5 s) for that final push. NodeStage only
 waits, at most `--stage-wait`, for the service to listen; before
@@ -547,7 +550,8 @@ declare a node lost while it may still run.
   remote.
 - On a shared basePath, a cut-off node that is force-detached can leave
   two writers (§11).
-- No capacity enforcement, snapshots, clones or expansion.
+- No capacity enforcement, snapshots or expansion; clones only into a
+  fork class (§14).
 - basePath must be one filesystem visible at the same path to the
   controller and every node.
 - Restarting the node plugin interrupts that node's mounts until it has
@@ -586,6 +590,12 @@ declare a node lost while it may still run.
 - **csi-sanity** (`ci/csi-sanity.sh`, the `csi-sanity` job): csi-test
   v5.6.0 against `agentfs-csi --mode all` with real history services and
   FUSE fronts, then no mount, record or volume directory left behind.
+  Its clone tests are skipped: the driver clones only into a fork class.
+- **Forks on kind** (`ci/e2e-csi-forks.sh`, the `e2e-csi-forks` job in
+  the image workflow): a sandbox's ephemeral claim cloning a source claim
+  in use, its pushes to the fork remote only, the admission policy, a
+  DeleteVolume that waits across a node-plugin restart until the fork is
+  published, and the change submitted twice and applied once (§14).
 - **kind** (`ci/e2e-csi.sh`, the `e2e-csi` job in the image workflow, with
   the image just built): the RBAC inventory with `kubectl auth can-i`, two
   restricted pods on one claim with distinct committers and pushes to a
@@ -610,3 +620,44 @@ declare a node lost while it may still run.
 - **Not tested**: a volume moving between two nodes of a Kubernetes cluster, other
   shared filesystems, Talos and other hardened node images, node
   reboots, and the lost-node runbook.
+
+## 14. Forks
+
+A **fork** is a volume started from another volume's latest commit
+(design §11.5). A sandbox pod gets one through a claim whose `dataSource`
+is the source's claim, on a **fork class**: a StorageClass with
+`fork: "true"` and reclaim policy `Delete`
+([example](../deploy/csi/example/fork-storageclass.yaml)). The fork has the
+source's profile; it pushes `refs/heads/agentfs/<fork>` to its fork remote
+(the one remote with `agentfsForkRemote = true` in the profile, else the
+source's patch remote), never the source's branch.
+
+- **Create.** CreateVolume clones the source locally: its settings and
+  branch head read without its lock (the source may be in use), its
+  history up to that head copied, and the head's tree written into the
+  fork's backing tree, with no credentials. Kubernetes' documentation
+  says a clone's source claim must not be in use; the kind test
+  (`ci/e2e-csi-forks.sh`) records what the external-provisioner does
+  (design §19.2).
+- **Admission.** `deploy/csi/fork-admission.yaml` is a
+  ValidatingAdmissionPolicy that refuses a StorageClass of this driver
+  with `fork: "true"` and any reclaim policy but `Delete`: with `Retain`,
+  deleting a claim would never call DeleteVolume, and the fork would
+  never finish.
+- **Finish.** Deleting the claim (a pod-scoped ephemeral claim goes with
+  its pod) calls DeleteVolume, which records `finish_requested` in
+  `csi.json` and answers `UNAVAILABLE` until the fork is published, so the
+  PV stays `Released` meanwhile. The node plugin's publisher scans the
+  base path at start and every `--fork-scan-interval` (30 s); for each
+  fork asked to finish that no node stages, it runs `agentfs fork finish`,
+  which commits what is journaled, writes the change and finish commits,
+  and pushes the history, then the change and finish refs create-only,
+  retrying with backoff until the fork remote holds them. The next
+  DeleteVolume deletes the volume (`onDelete: delete` by default).
+  Restarts of the node plugin carry on: the request is in `csi.json`.
+- **Receiving.** Whatever reads the fork remote gates the change: a PR on
+  the fork's branch, or `agentfs patch submit <change>` into the source's
+  inbox, which applies a given change commit at most once.
+- **Stuck.** A fork whose remote stays unreachable keeps its PV
+  `Released`; see [the CSI recovery runbook](runbooks/csi-recovery.md).
+  Refusing or abandoning a fork arrives with forked volumes unit 2.

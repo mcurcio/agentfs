@@ -816,7 +816,7 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_WORKLOAD_MOUNTS` | `--workload-mount` | `mount` |
 | `AGENTFS_HISTORY_LISTEN` | `--listen` | `serve-history` |
 | `AGENTFS_HISTORY_SERVICE`, `AGENTFS_HISTORY_TIMEOUT`, `AGENTFS_HISTORY_WAIT`, `AGENTFS_HISTORY_SLOT` | `--history-service`, `--history-timeout`, `--history-wait`, `--history-slot` | `mount`, `record` |
-| `AGENTFS_CSI_MODE`, `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | `--mode`, `--endpoint`, `--node-id`, `--pod`, `--namespace` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
+| `AGENTFS_CSI_MODE`, `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE`, `AGENTFS_CSI_FORK_SCAN_INTERVAL` | `--mode`, `--endpoint`, `--node-id`, `--pod`, `--namespace`, `--fork-scan-interval` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
 
 **Test builds only.** `AGENTFS_FAILPOINTS` sets failpoints on the durable
 path (`name=kill|error|panic|sleep(ms)[@n]`, joined with `;`; design §18
@@ -883,6 +883,7 @@ under `/etc/agentfs-csi/credentials/` in the driver's pods.
 | `branch` | `agentfs/<volumeName>` | the history branch |
 | `onDelete` | `retain` | `retain` keeps the volume directory at DeleteVolume, `delete` removes it, and refuses while a remote lacks commits of the branch |
 | `workloadMounts` | none | where pods mount the volume: comma-separated `PATH` or `PATH=DIR`, passed to every front as `--workload-mount` so worktree `gitdir:` paths map exactly (design §5, docs/csi.md §5) |
+| `fork` | `"false"` | `"true"` makes a fork class (design §11.5): a claim on it with a `dataSource` claim is a fork of that claim's volume, with the source's profile. A fork class must not set `profile` or `branch`, its `volumeName` must contain `{pvName}`, its `onDelete` defaults to `delete`, and its reclaim policy must be `Delete` (the shipped admission policy refuses anything else). Not a static PV attribute |
 
 **`agentfs-csi` flags:**
 
@@ -905,6 +906,7 @@ under `/etc/agentfs-csi/credentials/` in the driver's pods.
 | `--history-wait DURATION` | | `30s` | the fronts' `--history-wait` |
 | `--backoff-max DURATION` | | `30s` | the longest delay between restarts of a crashed service or front |
 | `--pod NAME`, `--namespace NAME` | `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | empty | the plugin pod's name and namespace, passed to the history services (their own identity in telemetry) |
+| `--fork-scan-interval DURATION` | `AGENTFS_CSI_FORK_SCAN_INTERVAL` | `30s` | node and all modes: how often the node plugin looks for forks whose deletion asked for them to be finished, and starts `agentfs fork finish` for each (design §11.5; it scans once at start too) |
 
 The node plugin passes its `OTEL_*` variables on to every service and
 front; it removes inherited `AGENTFS_*` variables, so the per-volume and
