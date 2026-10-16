@@ -44,6 +44,11 @@ exists to:
 the mount. agentfs does not try to resist a workload that is actively trying to
 defeat it.
 
+Forks are the exception (decided 2026-10-15, §19.1 "Fork content"; not
+built yet): what a sandbox writes into a fork is treated as potentially
+hostile in everything agentfs itself does with it, while agentfs limits
+nothing that users' own CI may do with what a fork publishes.
+
 ### 1.2 What "every change" means
 
 A change is recorded at each **change boundary** (§3.1), before the call that
@@ -2603,10 +2608,14 @@ static PV, whose unknown attributes are refused), `branch`,
 and uid, which the front passes on as its origin (§9): each pod commits
 as itself, and the service journals the origin so replays keep it.
 
-**Little network work in a call.** No call clones or fetches, and only
+**Little network work in a call.** No call fetches over the network, and only
 NodeUnstage waits on a push (the service's final push, bounded by
-`--push-grace`);
-nothing clones at all (a volume starts empty). The service pushes on its
+`--push-grace`).
+A volume starts empty, except a fork (decided 2026-10-16, §19.1
+"Content sources"; not built yet): CreateVolume from a fork class
+clones its `dataSource` claim locally, copying the source's history up to
+its latest commit and writing that commit's tree, with no credentials and
+no network. The service pushes on its
 interval (§11.2), and before it listens fetches the patch inbox (bounded
 by `agentfs.patchFetchTimeout`, §12) and applies queued patches.
 NodeStage only waits for it, at most `--stage-wait` (60 s), and answers
@@ -3662,6 +3671,15 @@ runner.
 | Crash testing (2026-10-13) | Failpoints in the durable path (`agentfs_core::failpoints`), compiled only with the `failpoints` cargo feature (release builds have none; such a build says `+failpoints` in `--version` and warns when `AGENTFS_FAILPOINTS` is set), configured by `AGENTFS_FAILPOINTS` (`name=kill\|error\|panic\|sleep(ms)[@n]`); three harness tiers with one oracle, run in the `crash` job; power loss by `dm-log-writes` and `replay-log` in the `power-loss` workflow (§18 test 3) |
 | Crash findings (2026-10-13) | Found by the harnesses and fixed: objects and `objects/` are synced before the ref names them; the journal keeps appending to the file a failed truncation renamed in; a record whose frozen copies are gone is dropped with `RecordFailed` instead of failing every later commit; a repair queue left in its temporary file is loaded; ref lock files a crash left are removed at open (§3.3, §3.5) |
 | Bench off the landing path (2026-10-15) | A change is done when the `ci` and `image` workflows are green on its final commit; `bench` and `power-loss` run after it lands on main and are checked afterwards, and a bench budget warning or a power-loss failure is a follow-up, not a reason to hold the change (AGENTS.md). The bench runs each filesystem as two parallel jobs, `many` (create, mvdir and rm of 100,000 files) and `rest` (record_step, close4k, clone, npm, bigclose), and one report job merges them per filesystem; clone and npm run once instead of three times, bigclose keeps three. The owner, on the bench's 17 to 24 minute jobs: "23 minutes is too long for a CI job. Let's bring that time down"; offered options including sharding the bench (1) and agents not waiting on it (3), he chose "1 and 3" (both 2026-10-15) ([performance.md](performance.md#the-benchmark)) |
+| Forked volumes (2026-10-15) | A fork is a volume started from another volume's latest local commit (its source, at its base). It records, pushes and recovers like any volume; when it finishes it publishes one change, a commit whose parent is base, and whatever receives the change does all the gating: agentfs never reviews, accepts or merges. The owner's ask: "I want to gate the acceptance of changes upstream, but still want sandbox agents to interact with the normal filesystem. So with agentfs, I can grant them a worktree forked from the latest head, they edit whatever files they choose, and then when the sandbox ends those edits become an upstream merge patch — either through a PR or some automated flow, configurable/programmable by an implementer." Its scope: "Design it, but leave Hermes out of it. We're building an open source project; my application of it to my cluster stack will come later. Focus on capabilities. Configuration with sensible defaults". Where a change lands, the source volume or another repository as a PR: "A or b. I'm not sure" (both are supported); part of a volume: "Partial would be via a subpath mount rather than a partial clone"; one squashed patch or the full history: "Configurable". On the frame "agentfs forks and publishes; whatever receives the change does the gating": "Go" (all 2026-10-15, in a Claude Code session). Not built yet: forked volumes units 1 to 4 ("Fork scope") |
+| Fork finish (2026-10-15) | A fork finishes when its claim is deleted (DeleteVolume of a volume from a fork class, whose reclaim policy must be Delete), and outside Kubernetes when `agentfs fork finish` runs. A restart of agentfs, the node plugin or the kubelet never finishes a fork; with a pod-scoped claim, a drain or rollout does. Asked when a sandbox is finished (a: its claim is deleted; b: its last pod stops; c: an explicit finish), the owner: "1a". Not built yet |
+| Fork delivery (2026-10-15) | The CSI driver only publishes; a receiver lands a published change in its source with `agentfs patch submit`. The library and the CLI also deliver a change, by four built-in methods: inbox, branch, command and webhook. The owner: "2 a for CSI and b for the library". Not built yet |
+| Fork content (2026-10-15) | Everything agentfs itself does with a fork's content treats it as potentially hostile: names, paths, sizes, symlinks and gitlinks are checked, and nothing is run. agentfs adds no CI filtering: forks publish where users' own CI can act on them (§1.1). The owner: "3 potentially hostile, but don't limit CI capabilities that users could create". Not built yet |
+| Fork remote (2026-10-16) | Forks publish to the source's own remote by default, with no setup (the remote its patch queue uses, §12: a design choice). An explicit fork-remote setting may name another remote, which is then never one of the source's push remotes, never sets its limits and never becomes its patch remote (a design choice, design rule 1). The stated cost: wherever that repository's CI may write, a sandbox's CI file can write the source's inbox, so the gate is only as strong as that repository's CI write permissions. The owner, answering the design gate's question on where forks publish: "b". Not built yet |
+| Fork hostile residual (2026-10-16) | Accepted and stated, with no hardening work now: a sandbox's file calls are served by the privileged node plugin, which holds every profile's credentials, so a bug in that front would expose node root and every profile's credentials; and volume size is not enforced on the shared base path (§14.2), so a sandbox can fill it for every volume there. The owner, answering the design gate's question on the hostile residual: "a" |
+| Fork design rules (2026-10-16) | (1) A fork's push target is fixed at create: `agentfs/<fork>` on the fork remote, never the source's branch; every other setting is read from the source's settings files at each open, and settings that cannot be read stop the fork opening. (2) A fork finishes once, writing one finish record, and the finisher retries publishing until the fork remote holds the change; the fork is not deleted until it is published, or until an operator abandons it on record. (3) agentfs publishes and the receiver gates: a receiver lands the exact change commit it reviewed, and the source applies a given change at most once. Approved with the design gate's answers, with no notes (2026-10-16). Not built yet |
+| Fork scope (2026-10-16) | Four units, tracer first, docs with each: (1) the tracer: fork identity and fork remote; create, finish and publish; CSI cloning of a claim, a fork StorageClass with `fork: "true"` and reclaim policy Delete, and its admission check; DeleteVolume waiting until the fork is published; the source applying a given change at most once; (2) refused and abandoned forks, settings that fail closed, finished forks read-only, `fork status` and `fork list`; (3) library delivery: the delivery contract, its four methods, `fork deliver`; (4) hidden refs, the history-rewrite runbook covering forks, telemetry, the runbook for refused publishes. The owner, answering the design gate's question on scope: "a" (build units 1 to 4 as outlined) |
+| Content sources (2026-10-16) | Reverses §14.2's "nothing clones": CreateVolume clones a claim's `dataSource` claim when the StorageClass is a fork class (`fork: "true"`), copying the source's history up to its latest commit and writing that commit's tree locally, with no credentials. Any other content source, and every snapshot, stays refused. Follows from "Forked volumes" and "Fork scope". Not built yet (forked volumes unit 1) |
 
 ### 19.2 Open questions
 
@@ -3738,6 +3756,11 @@ runner.
    daemon. Open: watching the files and rebuilding the exporter, or
    resolving them per connection, as the git credentials are re-read
    when they change (§11.1).
+8. **Cloning a claim in use** (§19.1 "Content sources"). Kubernetes'
+   documentation says a clone's source claim "must be bound and available
+   (not in use)" (checked 2026-10-15). Whether the external-provisioner
+   enforces that is NOT VERIFIED; forking a source while its pod runs
+   depends on it, so the forked-volumes tracer checks it first.
 
 ## 20. Prior art
 

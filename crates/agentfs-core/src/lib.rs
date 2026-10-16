@@ -16,6 +16,7 @@ pub mod confined;
 pub mod credentials;
 pub mod events;
 pub mod failpoints;
+pub mod fork;
 pub mod fsutil;
 pub mod fsync_class;
 pub mod gitmodules;

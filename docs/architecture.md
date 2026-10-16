@@ -46,6 +46,10 @@ missing from these tables or a row names a module that no longer exists;
 | `gitmodules.rs` | A port of git fsck's `.gitmodules` rules (§3.4) |
 | `fsync_class.rs` | The `fsync` class for databases: membership and groups (§8) |
 | `history.rs` | The bare history repository: records to commits with `Agentfs-*` trailers (§3.3, §3.4, §9) |
+| `fork/mod.rs` | Forked volumes: a volume started from another's latest commit that publishes one change for a receiver to gate (§19.1, "Forked volumes"); interfaces only until unit 1 lands |
+| `fork/identity.rs` | A fork's identity, fixed at create (source, base, push target), and its ref names |
+| `fork/create.rs` | Creating a fork from a source's state area, without the source's lock or any credentials |
+| `fork/finish.rs` | The finisher: the change and finish commits, publishing to the fork remote, and the fork status DeleteVolume reads |
 | `identity.rs` | Committer and author identities from templates (§9) |
 | `service.rs` | The background loops: commit loop, one push loop per remote, repack (§3.4, §11.2) |
 | `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
