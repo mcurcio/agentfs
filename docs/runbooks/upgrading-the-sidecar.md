@@ -90,43 +90,62 @@ an error naming `agentfs flush` (design
 - **The newer pod stopped normally:** its final commit emptied the
   journal. Set the older image and apply.
 - **It did not** (a crash, a kill), or the older pod refuses to start:
-  empty the journal with the newer image first. Scale the Deployment to
-  0, run `agentfs flush` with the newer image against the claim, then set
-  the older image and scale back to 1:
+  empty the journal with the newer image first, as below, then set the
+  older image and apply.
 
-  ```yaml
-  apiVersion: v1
-  kind: Pod
-  metadata:
-    name: agentfs-flush
-  spec:
-    restartPolicy: Never
-    containers:
-      - name: flush
-        image: ghcr.io/mcurcio/agentfs:<newer sha>
-        args: [flush]
-        env:
-          - { name: AGENTFS_STATE, value: /data/state }
-          - { name: AGENTFS_ROOT, value: /data/backing }
-        securityContext:
-          runAsUser: 0
-          runAsGroup: 0
-        volumeMounts:
-          - { name: data, mountPath: /data }
-          - { name: config, mountPath: /data/state/git/info/exclude, subPath: exclude, readOnly: true }
-          - { name: config, mountPath: /data/state/git/info/attributes, subPath: attributes, readOnly: true }
-          - { name: config, mountPath: /etc/agentfs, readOnly: true }
-    volumes:
-      - name: data
-        persistentVolumeClaim:
-          claimName: agentfs-data
-      - name: config
-        configMap:
-          name: agentfs-config
-  ```
+Name the newer image, then scale the Deployment to 0 and run
+`agentfs flush` with it against the claim. The flush Pod mounts the
+Deployment's ConfigMap, read from the Deployment because kustomize adds
+a hash of the content to its name (`agentfs-config-<hash>`):
 
-  `kubectl logs agentfs-flush` prints `<n> record(s) into <m> commit(s)`;
-  delete the pod before scaling back.
+```sh
+NEWER=ghcr.io/mcurcio/agentfs:<newer sha>
+```
+
+<!-- ci: rollback-flush -->
+```sh
+kubectl scale deployment/agentfs-example --replicas=0
+kubectl wait --for=delete "$POD" --timeout=120s
+CONFIG=$(kubectl get deployment agentfs-example \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}')
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agentfs-flush
+spec:
+  restartPolicy: Never
+  containers:
+    - name: flush
+      image: $NEWER
+      args: [flush]
+      env:
+        - { name: AGENTFS_STATE, value: /data/state }
+        - { name: AGENTFS_ROOT, value: /data/backing }
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      volumeMounts:
+        - { name: data, mountPath: /data }
+        - { name: config, mountPath: /data/state/git/info/exclude, subPath: exclude, readOnly: true }
+        - { name: config, mountPath: /data/state/git/info/attributes, subPath: attributes, readOnly: true }
+        - { name: config, mountPath: /etc/agentfs, readOnly: true }
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: agentfs-data
+    - name: config
+      configMap:
+        name: $CONFIG
+EOF
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/agentfs-flush --timeout=300s
+kubectl logs agentfs-flush
+kubectl delete pod agentfs-flush
+```
+
+The log says `<n> record(s) into <m> commit(s)`. Then set the older
+image and scale back to 1
+(`kubectl scale deployment/agentfs-example --replicas=1`).
 
 Commits the newer version made stay in history: a rollback changes the
 binary, never the history.
@@ -136,5 +155,8 @@ binary, never the history.
 The kind job of the `image` workflow checks the stop this relies on: the
 final commit and push when the pod is deleted, and recovery after the
 daemon is killed ([deployment.md](../deployment.md#8-how-it-is-tested)).
-A rollout from one released image to another, and the rollback with
-`agentfs flush`, are not run in CI.
+The same job runs the flush block above as written (`ci: rollback-flush`),
+with the image under test as `NEWER`: the Pod starts with the
+Deployment's ConfigMap, the flush succeeds, and the volume mounts again
+after the scale back. A rollout from one released image to another, and
+an older image reading the flushed state area, are not run in CI.

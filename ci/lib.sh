@@ -33,6 +33,26 @@ notice_summary() { # title text
 }
 pass() { printf '\033[32mok\033[0m   %s\n' "$*"; }
 
+# Operator runbooks run as written: the fenced block after
+# `<!-- ci: <name> -->` in docs/runbooks/<runbook>.
+RUNBOOKS=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docs/runbooks
+runbook_block() { # runbook name
+  awk -v m="<!-- ci: $2 -->" '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    !found && line == m { found = 1; next }
+    found && line ~ /^```/ { if (inside) exit; inside = 1; next }
+    inside { print }' "$RUNBOOKS/$1"
+}
+
+# Runs that block in this shell, as an operator would paste it.
+run_block() { # runbook name
+  local code
+  code=$(runbook_block "$1" "$2")
+  [ -n "$code" ] || fail "no block '$2' in $1"
+  printf '\033[2m# %s: %s\n%s\033[0m\n' "$1" "$2" "$code"
+  eval "$code"
+}
+
 assert_eq() { # expected actual message
   [ "$1" = "$2" ] || fail "$3: expected '$1', got '$2'"
   pass "$3"

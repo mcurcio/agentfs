@@ -30,7 +30,10 @@
 #     mount point (or, if the sidecar was back first, writes through the
 #     new mount and is recorded), its liveness probe restarts it onto the
 #     new mount, and both write through the restarted sidecar's mount;
-#   - deleting the recovered pod leaves nothing mounted on the node.
+#   - deleting the recovered pod leaves nothing mounted on the node;
+#   - the rollback's flush Pod of docs/runbooks/upgrading-the-sidecar.md
+#     (`ci: rollback-flush`), run as written: it finds the Deployment's
+#     hashed ConfigMap, flushes, and the volume mounts again after it.
 #
 # Needs docker, kind and kubectl (ci/install-kind.sh), a kind cluster
 # $KIND_CLUSTER (default agentfs-e2e) with the image agentfs:ci loaded, and
@@ -74,7 +77,7 @@ diagnose() {
   k describe pods
   k get events --sort-by=.lastTimestamp | tail -n 60
   for pod in $(k get pods -o name); do
-    for c in agentfs-init agentfs writer-root writer-10000; do
+    for c in agentfs-init agentfs writer-root writer-10000 flush; do
       echo "---- $pod $c"
       k logs "$pod" -c "$c" --tail=100
       echo "---- $pod $c (previous)"
@@ -454,5 +457,28 @@ if docker exec "$NODE" grep "/pods/$LAST_UID/" /proc/self/mountinfo; then
 fi
 pass "nothing of the deleted pod is left mounted on the node"
 echo "first pod $FIRST_POD, recovered in place: $POD"
+
+step "the rollback's flush Pod runs as written (docs/runbooks/upgrading-the-sidecar.md)"
+wait_ready
+CONFIG=$(k get deployment agentfs-example -o jsonpath='{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}')
+case "$CONFIG" in
+agentfs-config-?*) pass "the ConfigMap's name carries kustomize's hash ($CONFIG)" ;;
+*) fail "the ConfigMap is named '$CONFIG', not agentfs-config-<hash>" ;;
+esac
+# The runbook's kubectl, in this namespace, with the image under test. A
+# plain subshell, so set -e stops at the block's first failure (diagnose
+# prints the saved log and describes the flush Pod).
+(
+  kubectl() { command kubectl -n "$NS" "$@"; }
+  POD=pod/$POD
+  NEWER=agentfs:ci
+  run_block upgrading-the-sidecar.md rollback-flush
+) >"$LOGS/rollback-flush.log" 2>&1
+cat "$LOGS/rollback-flush.log"
+assert_contains "$(cat "$LOGS/rollback-flush.log")" "record(s) into" "agentfs flush ran in the flush Pod"
+k scale deployment/agentfs-example --replicas=1
+wait_ready
+in_root "printf after-flush > $WS/after-flush.txt"
+wait_remote after-flush.txt after-flush
 
 step "e2e-kind passed"

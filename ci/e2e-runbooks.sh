@@ -32,25 +32,6 @@
 . "$(dirname "$0")/lib.sh"
 
 [ -x "$AGENTFS_BIN" ] || fail "build first: cargo build -p agentfs"
-RUNBOOKS=$(cd "$(dirname "$0")/.." && pwd)/docs/runbooks
-
-# The fenced block after `<!-- ci: $2 -->` in runbook $1.
-block() {
-  awk -v m="<!-- ci: $2 -->" '
-    { line = $0; sub(/^[ \t]+/, "", line) }
-    !found && line == m { found = 1; next }
-    found && line ~ /^```/ { if (inside) exit; inside = 1; next }
-    inside { print }' "$RUNBOOKS/$1"
-}
-
-# Runs that block in this shell, as an operator would paste it.
-run_block() { # runbook name
-  local code
-  code=$(block "$1" "$2")
-  [ -n "$code" ] || fail "no block '$2' in $1"
-  printf '\033[2m# %s: %s\n%s\033[0m\n' "$1" "$2" "$code"
-  eval "$code"
-}
 
 seq_of() { # commit
   git --git-dir "$STATE/git" log -1 --format=%B "$1" | sed -n 's/^Agentfs-Seq: //p'
