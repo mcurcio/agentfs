@@ -146,6 +146,14 @@ forkAdmission:
   # whose reclaim policy is not Delete (docs/csi.md §14).
   enabled: true
 
+alerts:
+  # -- Install the example alert rules of deploy/alerts as a Prometheus
+  # Operator PrometheusRule (docs/deployment.md "Alerts"). Needs its CRD.
+  enabled: false
+  # -- More labels on the PrometheusRule, for your Prometheus's
+  # ruleSelector (kube-prometheus-stack selects `release: <its release>`).
+  labels: {}
+
 # -- StorageClasses of the driver: `[{name, parameters, reclaimPolicy,
 # volumeBindingMode, annotations}]`. `parameters` go to the driver as
 # written (docs/configuration.md "The CSI driver"). `reclaimPolicy`

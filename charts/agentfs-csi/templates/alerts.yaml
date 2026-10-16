@@ -1,0 +1,23 @@
+{{- if .Values.alerts.enabled }}
+{{- /*
+The example alert rules of deploy/alerts/agentfs.rules.yml (files/ links
+to it) as a Prometheus Operator PrometheusRule, like
+deploy/alerts/prometheusrule.yaml (docs/deployment.md "Alerts"). Needs
+the PrometheusRule CRD.
+*/}}
+{{- $rules := .Files.Get "files/agentfs.rules.yml" | fromYaml }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: agentfs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: agentfs
+    {{- include "agentfs-csi.labels" . | nindent 4 }}
+    {{- with .Values.alerts.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    {{- toYaml $rules.groups | nindent 4 }}
+{{- end }}
