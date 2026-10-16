@@ -1,0 +1,62 @@
+name: alerts
+
+# The example alert rules (deploy/alerts, docs/deployment.md "Alerts"):
+# promtool's checks and unit tests, the PrometheusRule generated from the
+# rules file, and the rules against the real binary's metrics in a real
+# Prometheus (ci/e2e-alerts.sh). Runs when the rules, their scripts or
+# the code that names and exports the metrics change.
+
+on:
+  push:
+    paths: &paths
+      - deploy/alerts/**
+      - ci/alerts-prometheusrule.sh
+      - ci/e2e-alerts.sh
+      - ci/install-prometheus.sh
+      - ci/lib.sh
+      - .github/workflows/alerts.yml
+      - crates/agentfs-core/src/telemetry.rs
+      - crates/agentfs/src/otel.rs
+      - Cargo.lock
+  pull_request:
+    paths: *paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alerts-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rules:
+    name: promtool
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: ci/install-prometheus.sh "$RUNNER_TEMP/prom" && echo "$RUNNER_TEMP/prom/bin" >>"$GITHUB_PATH"
+      - run: promtool check rules deploy/alerts/agentfs.rules.yml
+      - run: promtool test rules deploy/alerts/agentfs.rules.test.yml
+      - name: the PrometheusRule is generated from the rules file
+        run: |
+          ci/alerts-prometheusrule.sh | diff -u deploy/alerts/prometheusrule.yaml - ||
+            { echo "::error::regenerate it: ci/alerts-prometheusrule.sh >deploy/alerts/prometheusrule.yaml"; exit 1; }
+
+  e2e:
+    name: e2e (rules against agentfs metrics)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: ci/install-prometheus.sh "$RUNNER_TEMP/prom"
+      - run: cargo build --locked -p agentfs
+      - run: ci/e2e-alerts.sh
+        env:
+          PROMETHEUS: ${{ runner.temp }}/prom/bin/prometheus

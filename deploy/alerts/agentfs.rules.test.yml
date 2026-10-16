@@ -1,0 +1,180 @@
+# Unit tests of agentfs.rules.yml, run by .github/workflows/alerts.yml:
+#
+#   promtool test rules deploy/alerts/agentfs.rules.test.yml
+#
+# Series are as Prometheus stores agentfs's OTLP metrics; `_` is no sample,
+# so `_x5 1x30` is a counter that first appears at its first count. Three
+# alerts are checked with their annotations (the templates); the rest
+# through the ALERTS series, labels only.
+rule_files:
+  - agentfs.rules.yml
+evaluation_interval: 1m
+
+tests:
+  # A record failure is caught at the counter's first sample, then resolves
+  # once no failure has been counted for a window.
+  - interval: 1m
+    input_series:
+      - series: 'agentfs_record_failures_total{job="agentfs",instance="pod-0",trigger="close"}'
+        values: '_x5 1x30'
+      - series: 'agentfs_record_failures_total{job="agentfs",instance="pod-1",trigger="close"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AgentfsRecordFailed
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: AgentfsRecordFailed
+        exp_alerts:
+          - exp_labels: {severity: critical, job: agentfs, instance: pod-0, trigger: close}
+            exp_annotations:
+              summary: "agentfs could not record a change (pod-0)"
+              description: "The synchronous step failed (trigger close): the workload's call got EIO or its own error, and the change is not in history until it is recorded again. Usually the state area is full or unwritable. Read the RecordFailed alarm in the agentfs log."
+              runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/runbooks/recording-failures.md
+      - eval_time: 30m
+        alertname: AgentfsRecordFailed
+        exp_alerts: []
+
+  # A later failure in a long-running process: increase() sees it. And a
+  # restarted daemon starts its counter again: the reset is a failure.
+  - interval: 1m
+    input_series:
+      - series: 'agentfs_record_failures_total{job="agentfs",instance="pod-0",trigger="sweep"}'
+        values: '2x20 3x20'
+      - series: 'agentfs_record_failures_total{job="agentfs",instance="pod-1",trigger="close"}'
+        values: '4x20 1x20'
+    promql_expr_test:
+      - expr: ALERTS{alertname="AgentfsRecordFailed"}
+        eval_time: 15m
+        exp_samples: []
+      - expr: ALERTS{alertname="AgentfsRecordFailed"}
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AgentfsRecordFailed",alertstate="firing",severity="critical",job="agentfs",instance="pod-0",trigger="sweep"}'
+            value: 1
+          - labels: 'ALERTS{alertname="AgentfsRecordFailed",alertstate="firing",severity="critical",job="agentfs",instance="pod-1",trigger="close"}'
+            value: 1
+
+  # Commits that keep failing with records waiting fire after 10 minutes;
+  # a single failure whose records then commit does not.
+  - interval: 1m
+    input_series:
+      - series: 'agentfs_commit_failures_total{job="agentfs",instance="pod-0"}'
+        values: '_x2 1+1x40'
+      - series: 'agentfs_journal_backlog{job="agentfs",instance="pod-0"}'
+        values: '0x2 7x40'
+      - series: 'agentfs_commit_failures_total{job="agentfs",instance="pod-1"}'
+        values: '_x2 1x40'
+      - series: 'agentfs_journal_backlog{job="agentfs",instance="pod-1"}'
+        values: '0x2 3 0x40'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: AgentfsCommitsFailing
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: AgentfsCommitsFailing
+        exp_alerts:
+          - exp_labels: {severity: critical, job: agentfs, instance: pod-0}
+            exp_annotations:
+              summary: "agentfs commits keep failing with records waiting (pod-0)"
+              description: "Commit passes have failed for 10 minutes while the journal holds records. The records are safe in the journal and are retried, but history does not advance and the state area grows."
+              runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/runbooks/recording-failures.md#3-commits-failing-commitfailed
+
+  # The other counters, first seen at 61m.
+  - interval: 1m
+    input_series:
+      - series: 'agentfs_repack_failures_total{job="agentfs",instance="pod-0"}'
+        values: '_x60 1x200'
+      - series: 'agentfs_reconcile_failures_total{job="agentfs",instance="pod-0"}'
+        values: '_x60 1x200'
+      - series: 'agentfs_front_service_failures_total{job="agentfs",instance="pod-0",stage="connect"}'
+        values: '_x60 1x200'
+      - series: 'agentfs_telemetry_export_failures_total{job="agentfs",instance="pod-0",signal="logs"}'
+        values: '_x60 1x200'
+      # An observable counter, reported from 0: no alert until it counts.
+      - series: 'agentfs_nested_gitdir_heuristic_total{job="agentfs",instance="pod-0"}'
+        values: '0x60 1x200'
+    promql_expr_test:
+      - expr: ALERTS
+        eval_time: 30m
+        exp_samples: []
+      - expr: ALERTS
+        eval_time: 61m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AgentfsRepackFailed",alertstate="firing",severity="warning",job="agentfs",instance="pod-0"}'
+            value: 1
+          - labels: 'ALERTS{alertname="AgentfsReconcileFailed",alertstate="firing",severity="warning",job="agentfs",instance="pod-0"}'
+            value: 1
+          - labels: 'ALERTS{alertname="AgentfsHistoryServiceUnreachable",alertstate="firing",severity="critical",job="agentfs",instance="pod-0",stage="connect"}'
+            value: 1
+          - labels: 'ALERTS{alertname="AgentfsTelemetryExportFailing",alertstate="firing",severity="warning",job="agentfs",instance="pod-0",signal="logs"}'
+            value: 1
+          - labels: 'ALERTS{alertname="AgentfsWorktreeHeuristic",alertstate="firing",severity="info",job="agentfs",instance="pod-0"}'
+            value: 1
+      # Each resolves one window after its last count.
+      - expr: ALERTS
+        eval_time: 140m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AgentfsRepackFailed",alertstate="firing",severity="warning",job="agentfs",instance="pod-0"}'
+            value: 1
+      - expr: ALERTS
+        eval_time: 250m
+        exp_samples: []
+
+  # The push backlog: an hour old warns, six hours is critical; the age is 0
+  # when nothing is unpushed.
+  - interval: 1m
+    input_series:
+      - series: 'agentfs_push_oldest_unpushed_age_seconds{job="agentfs",instance="pod-0",remote="origin"}'
+        values: '0+60x400'
+      - series: 'agentfs_push_oldest_unpushed_age_seconds{job="agentfs",instance="pod-0",remote="backup"}'
+        values: '0x400'
+    alert_rule_test:
+      - eval_time: 62m
+        alertname: AgentfsPushBacklogOld
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: AgentfsPushBacklogOld
+        exp_alerts:
+          - exp_labels: {severity: warning, job: agentfs, instance: pod-0, remote: origin}
+            exp_annotations:
+              summary: "agentfs history has not reached remote origin for over an hour (pod-0)"
+              description: "The oldest commit remote origin lacks is 1h 10m 0s old. Read the PushFailed alarms in the agentfs log, or agentfs status in the sidecar."
+              runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/runbooks/stuck-pushes.md
+    promql_expr_test:
+      - expr: ALERTS{alertname="AgentfsPushBacklogStale"}
+        eval_time: 300m
+        exp_samples: []
+      - expr: ALERTS{alertname="AgentfsPushBacklogStale"}
+        eval_time: 370m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AgentfsPushBacklogStale",alertstate="firing",severity="critical",job="agentfs",instance="pod-0",remote="origin"}'
+            value: 1
+
+  # Gauges that are 1 while the condition holds.
+  - interval: 1m
+    input_series:
+      - series: 'agentfs_push_diverged{job="agentfs",instance="pod-0",remote="origin"}'
+        values: '0x5 1x5 0x5'
+      - series: 'agentfs_remote_misconfigured{job="agentfs",instance="pod-0",remote="broken"}'
+        values: '1x15'
+      - series: 'agentfs_patch_blocked{job="agentfs",instance="pod-0"}'
+        values: '0x5 1x10'
+    promql_expr_test:
+      - expr: ALERTS
+        eval_time: 3m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AgentfsRemoteMisconfigured",alertstate="firing",severity="warning",job="agentfs",instance="pod-0",remote="broken"}'
+            value: 1
+      - expr: ALERTS
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AgentfsRemoteMisconfigured",alertstate="firing",severity="warning",job="agentfs",instance="pod-0",remote="broken"}'
+            value: 1
+          - labels: 'ALERTS{alertname="AgentfsPushDiverged",alertstate="firing",severity="critical",job="agentfs",instance="pod-0",remote="origin"}'
+            value: 1
+          - labels: 'ALERTS{alertname="AgentfsPatchQueueBlocked",alertstate="firing",severity="warning",job="agentfs",instance="pod-0"}'
+            value: 1
+      - expr: ALERTS{alertname="AgentfsPushDiverged"}
+        eval_time: 14m
+        exp_samples: []

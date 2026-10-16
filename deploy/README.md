@@ -5,6 +5,7 @@
 | [`sidecar/`](sidecar) | A kustomize base: a Deployment with agentfs as a privileged native sidecar (phase 1, design §17.1), a `ReadWriteOncePod` PVC, the operator ConfigMap (settings, `info/exclude`, `info/attributes`) and the credentials Secret |
 | [`csi/`](csi) | The CSI driver (phase 4, design §14.2): its namespace, CSIDriver, RBAC, controller Deployment, node DaemonSet, the profiles ConfigMap (`profiles/`) and the credentials Secret; sidecars pinned by digest. Installs only the driver |
 | [`csi/example/`](csi/example) | A workload on the driver: a restricted namespace, a StorageClass using the `example` profile, a `ReadWriteOnce` claim and a two-replica Deployment |
+| [`alerts/`](alerts) | Example alert rules for agentfs's metrics: a Prometheus rules file, the same as a `PrometheusRule`, and their promtool tests ([docs/deployment.md](../docs/deployment.md#alerts)) |
 | [`examples/hermes/`](examples/hermes) | Operator rules for Hermes, the first consumer (design §16) |
 
 The sidecar is explained in [docs/deployment.md](../docs/deployment.md):
