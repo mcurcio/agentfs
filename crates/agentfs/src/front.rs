@@ -203,6 +203,12 @@ pub(crate) fn mount_front(
         sweep_interval: settings.sweep_interval,
         repair_store: Some(state.front_repairs(slot)),
         stack_over: None,
+        // A finished fork is read-only (design §11.5): the kernel refuses
+        // its writes, whatever the binds of this mount say.
+        read_only: matches!(
+            agentfs_core::volume::refuse_finished(state),
+            Err(agentfs_core::volume::VolumeError::ForkFinished { .. })
+        ),
     };
     let mounted = Mount::start(front.recorder.clone(), config)?;
     crate::add_mounted_views(&mountpoint);

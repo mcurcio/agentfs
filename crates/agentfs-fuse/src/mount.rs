@@ -87,6 +87,10 @@ pub struct MountConfig {
     /// Mount over the stale agentfs mount at `mountpoint` instead of on it
     /// (`--on-stale-mount recover`, design §17.1); `None` mounts normally.
     pub stack_over: Option<StackOver>,
+    /// Mount read-only (`ro`): the kernel refuses every change with
+    /// `EROFS`, through any bind of the mount (a finished fork, design
+    /// §11.5).
+    pub read_only: bool,
 }
 
 /// How a mount is stacked over a stale one: FUSE is mounted at `source`, a
@@ -599,7 +603,11 @@ pub fn fuser_config(config: &MountConfig) -> fuser::Config {
         MountOption::DefaultPermissions,
         MountOption::NoDev,
         MountOption::NoSuid,
-        MountOption::RW,
+        if config.read_only {
+            MountOption::RO
+        } else {
+            MountOption::RW
+        },
     ];
     c.acl = if config.allow_other {
         SessionACL::All
@@ -1394,8 +1402,15 @@ mod tests {
             sweep_interval: Duration::from_secs(30),
             repair_store: None,
             stack_over: None,
+            read_only: false,
         };
         let c = fuser_config(&config);
+        assert!(c.mount_options.contains(&MountOption::RW));
+        config.read_only = true;
+        let ro = fuser_config(&config);
+        assert!(ro.mount_options.contains(&MountOption::RO));
+        assert!(!ro.mount_options.contains(&MountOption::RW));
+        config.read_only = false;
         assert!(
             c.mount_options
                 .contains(&MountOption::FSName("agentfs:vol".into()))

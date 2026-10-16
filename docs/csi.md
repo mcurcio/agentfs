@@ -662,8 +662,9 @@ source's patch remote), never the source's branch.
   inbox, which applies a given change commit at most once.
 - **Read-only once finished.** A finished fork takes no changes. Staged
   again (a static PV of its directory, while DeleteVolume waits), its
-  history service starts and every NodePublish is bind-mounted read-only,
-  whatever the pod asked: writes fail with `EROFS`.
+  history service starts, its fronts FUSE-mount it read-only and every
+  NodePublish is bind-mounted read-only, whatever the pod asked: writes
+  fail with `EROFS`.
 - **Refused.** A fork remote that refuses for good (another writer's
   finish or change ref, a hook refusing `refs/agentfs/*`, a commit over
   `agentfsMaxPushSize`, or a fork remote no longer in the profile) makes

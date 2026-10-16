@@ -1229,6 +1229,8 @@ fn mount(
         stack_over: stacked.then(|| StackOver {
             source: state.stack_source(),
         }),
+        // A finished fork never gets here (`refuse_finished`).
+        read_only: false,
     };
     let mounted = match Mount::start(recorder, config) {
         Ok(mounted) => mounted,

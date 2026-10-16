@@ -13,7 +13,8 @@
 //!   onto the kubelet's target and records the target in
 //!   `<node-state>/published/`. A finished fork is published read-only
 //!   (`MS_RDONLY`) whatever the request asks (design §11.5); its service
-//!   still starts, and refuses every record.
+//!   still starts and refuses every record, and its front mounts it
+//!   read-only, so the kernel refuses writes through any bind.
 //! - **A front that exits unasked** (a crash, `kill -9`, an external
 //!   unmount) is restarted after a backoff in the same pending slot, with
 //!   the same pod flags; its stale source is detached and the new mount is
