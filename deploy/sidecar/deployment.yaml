@@ -83,7 +83,7 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
             - name: AGENTFS_NODE
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
-            # OpenTelemetry (README "Telemetry"): point this at your
+            # OpenTelemetry (docs/telemetry.md): point this at your
             # collector, or set OTEL_SDK_DISABLED=true.
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability.svc:4318" }
             - { name: OTEL_SERVICE_NAME, value: agentfs }

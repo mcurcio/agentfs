@@ -5,8 +5,9 @@
 //!   key agentfs reads;
 //! - the same for the operator attributes ([`rules::OPERATOR_ATTRIBUTES`]);
 //! - every relative link and `#anchor` in README.md and docs/ resolves;
-//! - every CI job runs on the pinned runner, `ubuntu-24.04` (design §18).
-//! - every script under ci/ is executable.
+//! - every CI job runs on the pinned runner, `ubuntu-24.04` (design §18);
+//! - every script under ci/ is executable;
+//! - every page under docs/ is in the book's docs/SUMMARY.md.
 //!
 //! The flags and environment variables are checked by the binaries' own
 //! unit tests (`crates/agentfs/src/reference_tests.rs`, and the
@@ -425,5 +426,25 @@ fn ci_scripts_are_executable() {
         offenders.is_empty(),
         "not executable (git update-index --chmod=+x):\n{}",
         offenders.join("\n")
+    );
+}
+
+/// The book (book.toml) renders only the pages docs/SUMMARY.md lists, so a
+/// page left out of it is unreachable there and every link to it breaks.
+#[test]
+fn every_page_is_in_the_book() {
+    let docs = workspace().join("docs");
+    let summary = std::fs::read_to_string(docs.join("SUMMARY.md")).unwrap();
+    let listed: BTreeSet<String> = links(&summary).into_iter().collect();
+    let missing: Vec<_> = markdown_files()
+        .iter()
+        .filter_map(|p| p.strip_prefix(&docs).ok())
+        .map(|p| p.display().to_string())
+        .filter(|p| p != "SUMMARY.md" && !listed.contains(p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "pages missing from docs/SUMMARY.md:\n  {}",
+        missing.join("\n  ")
     );
 }

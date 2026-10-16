@@ -59,7 +59,7 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - name: AGENTFS_CSI_NAMESPACE
               valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
-            # OpenTelemetry (README "Telemetry"), inherited by every
+            # OpenTelemetry (docs/telemetry.md), inherited by every
             # service and front: point it at your collector.
             - { name: OTEL_SDK_DISABLED, value: "true" }
           ports:

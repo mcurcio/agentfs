@@ -30,10 +30,12 @@ without publishing. **Pin a commit tag or a digest** in production
 
 - **Contents:** the `agentfs` binary built with the `https`, `ssh`
   and `otlp-tls` features (so every remote transport, and TLS to the
-  collector, works), on `debian:trixie-slim`
+  collector, works), and the CSI driver `agentfs-csi`
+  ([csi.md](csi.md)), on `debian:trixie-slim`
   with `fuse3` (`fusermount3`), `libssl3t64`, `ca-certificates` (the TLS
-  trust store) and `git`, so the runbooks' `git log` and `git show` work
-  through `kubectl exec`. Both base images are pinned by digest.
+  trust store), `git`, so the runbooks' `git log` and `git show` work
+  through `kubectl exec`, and `tini`, PID 1 of the CSI node plugin. Both
+  base images are pinned by digest.
 - **Platform:** `linux/amd64` only for now.
 - **Entrypoint:** `agentfs`; the default command is `--help`.
 - **User:** root, on purpose (`USER 0`). The sidecar must be root and
@@ -242,7 +244,7 @@ http/protobuf by default; `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` with the
 collector's port 4317, or `http/json`; `https://` with `OTEL_EXPORTER_OTLP_CERTIFICATE` and, for
 mutual TLS, the client certificate and key, mounted from a Secret), or `OTEL_SDK_DISABLED=true`. The example
 samples 1% of traces (`parentbased_traceidratio`, `0.01`); metrics and
-alarm logs are not sampled. See the [README](../README.md#telemetry).
+alarm logs are not sampled. See [telemetry.md](telemetry.md).
 
 ## 5. Users and permissions
 

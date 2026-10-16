@@ -183,8 +183,8 @@ API in Kubernetes: `--namespace` (`AGENTFS_NAMESPACE`), `--pod`
 (`AGENTFS_NODE`), `--replica` (`AGENTFS_REPLICA`). They fill the commit
 trailers and the committer identity (§9) and the telemetry resource.
 
-Telemetry is configured with the standard `OTEL_*` variables; see the
-[README](../README.md#telemetry).
+Telemetry is configured with the standard `OTEL_*` variables; see
+[telemetry.md](telemetry.md).
 
 ## 5. Settings that affect the mount
 
@@ -300,12 +300,14 @@ commit and its push always happen. Pushing never delays shutdown beyond
 
 ## 9. The state-area lock
 
-One process uses a state area at a time (§2.3). `mount`, `run`,
-`serve-history`, `record`, `flush`, and `push`, `restore` and `revert`
-when no daemon answers on the control socket, take an
-exclusive lock on `<state>/meta/lock` before
-opening the volume; a second one exits with status 75 and names the
-holder:
+One process uses a state area at a time (§2.3). Every command that
+writes it takes an exclusive lock on `<state>/meta/lock` before opening
+the volume: `mount`, `run`, `serve-history`, `record`, `flush`,
+`patch apply`, `fork create`, `fork finish` and `fork abandon`; `init`
+when the state area already exists; and `push`, `restore` and `revert`
+when no daemon answers on the control socket. A front (`mount` or
+`record` with `--history-service`) takes none (§16). A second one exits
+with status 75 and names the holder:
 
 ```
 error: state area /data/state is in use (pid=4711 command=mount since=20261012T110302Z)
@@ -495,7 +497,7 @@ mount applies them, in order, after journal recovery and before it
 serves. `agentfs status` shows a `patches:` line, `agentfs patch status`
 the whole queue, and `agentfs patch apply` applies it with the volume
 stopped. A patch that cannot be applied blocks the queue (`PatchBlocked`)
-without stopping the mount.
+without stopping the mount. See [patches.md](patches.md).
 
 ## 13. Large files (LFS)
 
@@ -661,10 +663,17 @@ whole, consistent groups instead.
   paths: history differs from the backing tree there until each is changed
   again, or recorded by hand with `agentfs --root <backing> record <path>`. Many programs ignore errors from `close`, so
   watch the alarms. Runbook: [recording-failures.md](runbooks/recording-failures.md).
-- **Alarms** are printed to stderr and exported as telemetry logs (see the
-  README): `PathRefused`, `RecordFailed`, `CommitFailed`, `ReconcileFailed`, `PushFailed`,
-  `Diverged`, `RemoteMisconfigured`, `PatchBlocked`, `PatchFetchFailed`,
-  `PatchIgnored` (a warning: a stale inbox entry that is never applied).
+- **Alarms** are printed to stderr and exported as telemetry logs
+  ([telemetry.md](telemetry.md)): `PathRefused`, `RecordFailed`,
+  `CommitFailed`, `RepackFailed`, `ReconcileFailed`, `PushFailed`,
+  `Diverged`, `PushLimited`, `RemoteMisconfigured`, `PatchBlocked`,
+  `PatchFetchFailed`, `PatchIgnored` (a stale or malformed inbox entry
+  that is never applied), `ForkRefused`, `HistoryServiceUnavailable` and
+  `IdentityFallback` (a pod's records committed with the service's own
+  committer). `PathRefused`, `PatchFetchFailed`, `PatchIgnored`,
+  `IdentityFallback` and `PushLimited` are logged as warnings, the rest as
+  errors. When each is raised and what it carries: the events table in
+  [design §13](design.md#13-observability-opentelemetry).
 - **`patches: blocked at N (<reason>)`** at mount: patch N could not be
   applied; the mount serves without it and the patches after it. The
   reason and its fix are in

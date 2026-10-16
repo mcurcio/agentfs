@@ -46,7 +46,7 @@ Kubernetes: `>=1.30.0-0`
 | imagePullSecrets | list | `[]` | Pull secrets for every image, as `[{name: ...}]`. |
 | kubeletDir | string | `"/var/lib/kubelet"` | The kubelet's directory on the nodes. Some distributions move it (k0s: `/var/lib/k0s/kubelet`). |
 | node.affinity | object | `{}` | The node plugin's affinity. |
-| node.env | list | `[{"name":"OTEL_SDK_DISABLED","value":"true"}]` | Environment of the node plugin, inherited by every history service and front: the `OTEL_*` variables (README "Telemetry"). Point `OTEL_EXPORTER_OTLP_ENDPOINT` at your collector to turn telemetry on. |
+| node.env | list | `[{"name":"OTEL_SDK_DISABLED","value":"true"}]` | Environment of the node plugin, inherited by every history service and front: the `OTEL_*` variables (docs/telemetry.md). Point `OTEL_EXPORTER_OTLP_ENDPOINT` at your collector to turn telemetry on. |
 | node.extraArgs | list | `[]` |  |
 | node.nodeSelector | object | `{}` | The node plugin's node selector. |
 | node.podAnnotations | object | `{}` | Annotations on the node plugin's pods. |

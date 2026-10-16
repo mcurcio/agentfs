@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end test of telemetry (design §13) against a real OpenTelemetry
-# Collector: every metric, span and alarm log the README lists must arrive.
+# Collector: every metric, span and alarm log this script names must arrive.
 # The failure counters come from real failures (an unreadable file, an
 # unwritable object store, an unwritable pack directory for the repack), and the history
 # service's fronts gauge, a front's round trip and its service failures
@@ -69,7 +69,7 @@ for name in agentfs.record agentfs.commit agentfs.push; do
   wait_for 20 grep -q "\"name\":\"$name\"" "$OTEL_OUT" || fail "span $name never arrived"
   pass "span $name"
 done
-# Alarms only: a successful push is not logged (README, Telemetry).
+# Alarms only: a successful push is not logged (design §13, "Logs").
 for name in agentfs.path_refused agentfs.push_failed agentfs.diverged \
   agentfs.remote_misconfigured; do
   wait_for 20 grep -q "$name" "$OTEL_OUT" || fail "log $name never arrived"

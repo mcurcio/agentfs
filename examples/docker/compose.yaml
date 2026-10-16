@@ -59,7 +59,7 @@ services:
       AGENTFS_ON_STALE_MOUNT: recover
       # The bare mount point becomes root's with mode 0000 (design §17.1).
       AGENTFS_SEAL_MOUNTPOINT: "true"
-      # Point this at your collector instead (README "Telemetry").
+      # Point this at your collector instead (docs/telemetry.md).
       OTEL_SDK_DISABLED: "true"
     devices: [/dev/fuse]
     cap_add: [SYS_ADMIN]

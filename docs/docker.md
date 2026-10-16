@@ -115,7 +115,7 @@ The agentfs container's flags, besides the privileges of §2:
 | `--stop-timeout 60` | Longer than `--unmount-grace` (10 s) plus `--push-grace` (5 s) plus the final commit, so `docker stop` never cuts the final commit short |
 | `-e AGENTFS_ON_STALE_MOUNT=recover` | A restarted daemon mounts over the stale mount the dead one left |
 | `-e AGENTFS_SEAL_MOUNTPOINT=true` | The bare mount point is root's with mode 0000 |
-| `-e OTEL_SDK_DISABLED=true` | No collector in the example; set `OTEL_EXPORTER_OTLP_ENDPOINT` instead (README "Telemetry") |
+| `-e OTEL_SDK_DISABLED=true` | No collector in the example; set `OTEL_EXPORTER_OTLP_ENDPOINT` instead ([telemetry.md](telemetry.md)) |
 | `--health-cmd 'agentfs probe /agentfs/workspace'` | Healthy once the mount is live; 5 minutes' start period for journal recovery |
 
 ## 4. Docker Compose
@@ -196,8 +196,8 @@ containers, which need no restart ([deployment.md
 §7](deployment.md#7-a-crashed-daemon)). A daemon stopped cleanly while a
 workload runs leaves the workload on the bare, read-only directory:
 restart the workload after agentfs. If the host itself is left with a
-dead mount (the Docker daemon stopped, say), `umount -l
-<dir>/workspace` as root clears it; the next `up` mounts again.
+dead mount (the Docker daemon stopped, say), `umount -l <dir>/workspace`
+as root clears it; the next `up` mounts again.
 
 ## 6. Volumes with no remote
 

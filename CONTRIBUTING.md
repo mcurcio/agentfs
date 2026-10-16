@@ -26,8 +26,8 @@ not in an issue.
 
 You need stable Rust and a C compiler (libgit2 is built from source); the
 `https` feature also needs OpenSSL headers (`libssl-dev` and `pkg-config`
-on Debian and Ubuntu). The [README](README.md) covers the features and
-the container image.
+on Debian and Ubuntu). [docs/development.md](docs/development.md) covers
+the cargo features, the container image and what each CI job runs.
 
 Every commit passes these, as CI's `lint` and `test` jobs run them:
 

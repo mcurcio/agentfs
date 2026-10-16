@@ -112,8 +112,8 @@ struct Cli {
     #[arg(long, global = true, env = "AGENTFS_ROOT")]
     root: Option<PathBuf>,
     /// How long to wait for another agentfs process to release the state
-    /// area (`mount`, `run`, `record`, `flush` and `push` take it; design
-    /// §2.3). By default a busy state area exits 75 at once.
+    /// area (every command that writes it takes it; design §2.3). By
+    /// default a busy state area exits 75 at once.
     #[arg(long, global = true, env = "AGENTFS_WAIT_LOCK", default_value = "0s", value_parser = parse_grace, value_name = "DURATION")]
     wait_lock: Duration,
     #[command(subcommand)]

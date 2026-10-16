@@ -395,7 +395,7 @@ checked (a server that drops it) is `unreachable`. libgit2 uses the system's CA 
   other legacy PEM encryption is refused with a hint to rewrite the key
   (`ssh-keygen -p -f <file>` writes OpenSSH format). The key is decrypted
   before connecting: without a passphrase file, or with a wrong
-  passphrase ("cannot decrypt <key> with <file>"), the push fails as
+  passphrase (`cannot decrypt <key> with <file>`), the push fails as
   `auth` and nothing is offered. Both files are re-read when they change;
   after `ssh-keygen -p`, update the passphrase file too.
 
@@ -895,8 +895,8 @@ percent-decoded), `OTEL_METRIC_EXPORT_INTERVAL` (default 60s), the
 batch settings `OTEL_BSP_*` and `OTEL_BLRP_*`, and sampling:
 `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` (every record makes an
 `agentfs.record` span, so on a busy volume use
-`parentbased_traceidratio` with `0.01`). The [README](../README.md#telemetry)
-lists the metrics, spans and resource attributes.
+`parentbased_traceidratio` with `0.01`). [telemetry.md](telemetry.md) has
+the resource attributes, and design §13 the metrics and spans.
 
 ## The CSI driver (`agentfs-csi`)
 

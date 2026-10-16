@@ -1,0 +1,26 @@
+# The documentation as a book (mdBook): the pages under docs/, in the
+# order of docs/SUMMARY.md. Built by .github/workflows/docs.yml on every
+# push and pull request, and deployed to GitHub Pages from main
+# (https://mcurcio.github.io/agentfs/). Locally: `mdbook build` or
+# `mdbook serve`; the output goes to target/book.
+
+[book]
+title = "agentfs"
+description = "A filesystem that records every change to a directory in git history its users cannot see."
+authors = ["the agentfs authors"]
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+# A page missing from SUMMARY.md is an error, not a silently created stub.
+create-missing = false
+
+[output.html]
+site-url = "/agentfs/"
+git-repository-url = "https://github.com/mcurcio/agentfs"
+edit-url-template = "https://github.com/mcurcio/agentfs/edit/main/{path}"
+
+# Links from docs/ to files elsewhere in the repository go to GitHub.
+[preprocessor.repo-links]
+command = "python3 ci/book-links.py"

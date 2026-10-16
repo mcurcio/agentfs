@@ -107,7 +107,7 @@ node:
   # -- More `agentfs-csi --mode node` flags (docs/configuration.md).
   extraArgs: []
   # -- Environment of the node plugin, inherited by every history service
-  # and front: the `OTEL_*` variables (README "Telemetry"). Point
+  # and front: the `OTEL_*` variables (docs/telemetry.md). Point
   # `OTEL_EXPORTER_OTLP_ENDPOINT` at your collector to turn telemetry on.
   env:
     - name: OTEL_SDK_DISABLED

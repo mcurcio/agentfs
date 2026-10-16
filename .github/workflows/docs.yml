@@ -1,8 +1,13 @@
 name: docs
 
-# The documentation's build checks, on every push and pull request. The
-# assets job checks that each logo PNG under docs/assets/ is a fresh
-# render of the SVG beside it (ci/render-assets.sh).
+# The documentation (docs/development.md "CI"), on every push and pull
+# request: the logo PNGs under docs/assets/ checked as fresh renders of
+# the SVGs beside them (ci/render-assets.sh); the mdBook of docs/
+# (book.toml, docs/SUMMARY.md) built, and deployed to GitHub Pages from
+# main (https://mcurcio.github.io/agentfs/); and the README's Docker
+# quick start run as written. Links and the configuration and
+# architecture references are checked against the code by the docs job
+# of ci.yml; the README's from-source quick start runs in its fuse job.
 
 on:
   push:
@@ -12,13 +17,21 @@ on:
 permissions:
   contents: read
 
+# A newer push cancels an older run, except on main, where a Pages
+# deployment in progress is left to finish.
 concurrency:
   group: docs-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 defaults:
   run:
     shell: bash
+
+env:
+  MDBOOK_VERSION: v0.5.4
+  # sha256 of mdbook-$MDBOOK_VERSION-x86_64-unknown-linux-gnu.tar.gz, from
+  # the release's asset digests.
+  MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
 
 jobs:
   assets:
@@ -32,3 +45,71 @@ jobs:
           echo "$RUNNER_TEMP/resvg/bin" >>"$GITHUB_PATH"
       - name: PNGs match their SVGs
         run: ci/render-assets.sh --check
+
+  book:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: install mdbook (pinned)
+        run: |
+          tarball=mdbook-$MDBOOK_VERSION-x86_64-unknown-linux-gnu.tar.gz
+          curl -fsSLo "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rust-lang/mdBook/releases/download/$MDBOOK_VERSION/$tarball"
+          echo "$MDBOOK_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/mdbook"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/mdbook"
+          echo "$RUNNER_TEMP/mdbook" >>"$GITHUB_PATH"
+      # A warning is text lost from a page (an unclosed HTML tag swallows
+      # what follows it), so it fails the build.
+      - name: mdbook build
+        run: |
+          mdbook --version
+          status=0
+          mdbook build 2>"$RUNNER_TEMP/mdbook.log" || status=$?
+          cat "$RUNNER_TEMP/mdbook.log"
+          [ "$status" = 0 ] || exit "$status"
+          if grep -q WARN "$RUNNER_TEMP/mdbook.log"; then
+            echo "::error::mdbook warned; fix the pages it names"
+            exit 1
+          fi
+          test -f target/book/index.html
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/book
+
+  # Pages from main only: the site is the book of main's newest commit.
+  deploy:
+    needs: [assets, book]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  # The README's "### Docker" block as written, against the published
+  # image a reader would pull (docker.yml tests the examples against the
+  # image built from the commit).
+  readme-docker:
+    name: README Docker quick start
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: FUSE and Docker
+        run: |
+          sudo modprobe fuse
+          ls -l /dev/fuse
+          docker version
+      - run: ci/readme-quickstart.sh docker

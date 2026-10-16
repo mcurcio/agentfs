@@ -3,7 +3,9 @@
 Status: draft 2 (2026-10-12), kept current with the code. Phases 1 to 3
 are built; phase 4 is built for several pods on one node (the history
 service and fronts, §14.1, and the CSI driver, §14.2); several nodes per
-volume are not supported (decided 2026-10-15, §19.1). §1.3 gives each phase's state, and
+volume are not supported (decided 2026-10-15, §19.1). Forked volumes
+(§11.5), the Docker examples, the Helm charts and the example alert
+rules are built too. §1.3 gives each phase's and extra's state, and
 [performance.md](performance.md) the measured costs and the performance
 budget (§18 test 13, §19.2 item 1). Draft 1 was reviewed adversarially:
 see [reviews/2026-10-12-adversarial.md](reviews/2026-10-12-adversarial.md)
@@ -64,6 +66,16 @@ be recorded after the fact; §3.1 lists them.
 | 2 | Git LFS (§7), and the `fsync` class for databases (§8) | Built |
 | 3 | The ordered patch queue for iac (§12) | Built |
 | 4 | The CSI driver, including volumes mounted by several pods at once (§14) | Built for several pods on one node, one node per volume at a time (§14.1, §14.2); several nodes per volume not supported (decided 2026-10-15, §19.1) |
+
+Built beside the phases, and planned:
+
+| Extra | State |
+|---|---|
+| Forked volumes: create, finish, publish, deliver, through the CLI and the CSI driver (§11.5) | Built, tested end to end on kind |
+| Docker examples, `docker run` and Compose ([docker.md](docker.md)) | Built, tested in the `docker` workflow |
+| Helm charts: the CSI driver and the sidecar library ([helm.md](helm.md)) | Built, tested in the `helm` workflow, published to `oci://ghcr.io/mcurcio/charts` |
+| Example Prometheus alert rules with runbooks (§13, `deploy/alerts`) | Built, tested in the `alerts` workflow |
+| Local-only volumes on node-local disk with a git backend | In design; nothing built |
 
 ### 1.4 Not goals
 
@@ -1666,7 +1678,7 @@ agentfs does not scan content for secrets and does not hold pushes.
     holding the passphrase (one trailing newline dropped; 64 KiB at most;
     bound to the push URL's host and port like the key; re-read when it
     changes). It is decrypted before connecting: no passphrase file, or a
-    wrong passphrase ("cannot decrypt <key> with <file>"), is an `auth`
+    wrong passphrase (`cannot decrypt <key> with <file>`), is an `auth`
     failure and the key is never offered. A passphrase file set for an
     unencrypted key is not read. Other legacy PEM encryption is refused
     with a hint to rewrite the key in OpenSSH format. The decrypted key is
@@ -3030,7 +3042,7 @@ their version first.
 
 Recovery may be manual, but it must be supported and documented. Phase 1
 delivers two commands, `agentfs restore` and `agentfs revert`, and
-operator runbooks ([runbooks/](runbooks/)):
+operator runbooks ([runbooks](README.md#runbooks)):
 
 | Runbook | For |
 |---|---|
@@ -3074,9 +3086,8 @@ operator runbooks ([runbooks/](runbooks/)):
    - `<commit>` is any git revision; `HEAD` means the volume's branch. It
      must be on the branch (the head or an ancestor); other commits,
      including diverged refs, are restored with plain git.
-   - With the workload stopped, plain git also works: `git show
-     <commit>:<path> > <file>` into the backing tree, then `agentfs record
-     <path>`.
+   - With the workload stopped, plain git also works: `git show <commit>:<path> > <file>`
+     into the backing tree, then `agentfs record <path>`.
 4. **Resume the workload.**
 
 **Two modes, one engine** (`agentfs_core::restore`: plan, check, apply):
@@ -3348,9 +3359,11 @@ one-time migration of Hermes' existing data and the initial import in
     as one commit (§15): through a running mount over its control socket,
     or directly into `--root` when nothing runs. Exit status 0 done, 1
     refused (a reason and a hint) or failed, 75 busy;
-  - `mount`, `run`, `record`, `flush` and `push` take the state-area lock
-    (§2.3) and exit 75 while another process holds it; `restore` and
-    `revert` take it only in direct mode;
+  - `mount`, `run`, `serve-history`, `record`, `flush`, `patch apply`,
+    `fork create`, `fork finish`, `fork abandon`, and `init` of an
+    existing state area take the state-area lock (§2.3) and exit 75 while
+    another process holds it; `push`, `restore` and `revert` take it only
+    in direct mode, with no daemon answering; fronts take none;
   - `patch submit` runs on the producer's side, in its git repository,
     through its `git` (§12); `patch apply` fetches and applies the queue
     with the volume stopped (it takes the lock; exit 1 when blocked);
@@ -3699,11 +3712,23 @@ restartable (§14.2). The controller runs no children.
     - Committer identities follow the configured templates.
 11. **Recovery.** Following §15, a file and a whole commit are restored, and the
     restore is recorded.
-12. **Telemetry.** Every metric in §13 is exported and moves as expected in the
-    tests above.
+12. **Telemetry.** The metrics in §13 are exported and move as expected
+    in the tests above. Checked against a real collector
+    (`ci/e2e-telemetry.sh`): the record, commit, repack, push, precheck,
+    remote, patch, state, journal and export-failure metrics, the
+    history service's fronts gauge and a front's round trip and service
+    failures, the record, commit and push spans, and the alarm logs;
+    without one (`cli_telemetry.rs`): the patch and fork spans and
+    `agentfs.fork.publish.duration`. Not checked as exported:
+    `agentfs.history_service.superseded` and `.resyncs`,
+    `agentfs.fuse.create_as_caller_fallbacks` and `.racy_rechecks`,
+    `agentfs.reconcile.records` and `.failures`, and
+    `agentfs.nested.gitdir_heuristic`; the behaviour each counts is
+    tested, its export is not.
 13. **Performance.** Recorded latency and throughput for:
     - a mid-size `git clone` with `nested = working-tree`;
-    - `npm install` into an excluded path;
+    - 30,000 small files written into an excluded `node_modules/` (the
+      shape of an `npm install`; npm itself is not run);
     - `rm -rf` of 100k files;
     - closing a 1 GB file, on XFS (reflink) and ext4 (copy).
     Automated: `.github/workflows/bench.yml` runs `ci/bench.sh` on fresh
@@ -3928,10 +3953,15 @@ across node reboots, and a volume moving between two nodes of a cluster
 on a shared basePath (the NFS e2e moves one between two node plugins on
 two clients of one export, driven over gRPC without Kubernetes).
 
-The `fuse` job also runs README's quick start as written, as root
-(`ci/readme-quickstart.sh`): its remote log after `kill %1; wait` must
-show the edited file, which only the final push at shutdown (§11.2)
-puts there.
+The `fuse` job also runs the README's from-source quick start as
+written, as root (`ci/readme-quickstart.sh`): its remote log after
+`kill %1; wait` must show the edited file, which only the final push at
+shutdown (§11.2) puts there. The `docs` workflow runs the README's
+Docker quick start as written against the published image
+(`ci/readme-quickstart.sh docker`): the history it leaves must hold the
+workload's file with uid 10000 as its author. The README's Kubernetes
+quick starts are not run as written; the manifests and charts they use
+are tested by the `image` and `helm` workflows.
 
 Every CI job runs on GitHub's runner image pinned by name,
 `ubuntu-24.04` rather than `ubuntu-latest` (which moves to Ubuntu 26 on 2026-10-19):

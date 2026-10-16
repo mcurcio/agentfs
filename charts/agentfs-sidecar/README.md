@@ -42,7 +42,7 @@ Each takes this library's values, e.g.
 | config.settings | string | `""` | Operator settings and remotes, included from the state area's config (git-config syntax; every key is in docs/configuration.md). Must not set agentfs.volume or agentfs.branch. |
 | credentials.secretName | string | `"agentfs-credentials"` | The Secret mounted at `/run/secrets/agentfs` in the sidecar. Create it out of band, or set `stringData` for the helpers to render it. |
 | credentials.stringData | object | `{}` | Keys of a Secret for `agentfs-sidecar.secret` to render. Prefer an out-of-band Secret: values end up in the release record. |
-| env | list | `[{"name":"OTEL_EXPORTER_OTLP_ENDPOINT","value":"http://otel-collector.observability.svc:4318"},{"name":"OTEL_SERVICE_NAME","value":"agentfs"},{"name":"OTEL_RESOURCE_ATTRIBUTES","value":"k8s.container.name=agentfs"},{"name":"OTEL_TRACES_SAMPLER","value":"parentbased_traceidratio"},{"name":"OTEL_TRACES_SAMPLER_ARG","value":"0.01"}]` | More environment of the sidecar: OpenTelemetry (README "Telemetry"). |
+| env | list | `[{"name":"OTEL_EXPORTER_OTLP_ENDPOINT","value":"http://otel-collector.observability.svc:4318"},{"name":"OTEL_SERVICE_NAME","value":"agentfs"},{"name":"OTEL_RESOURCE_ATTRIBUTES","value":"k8s.container.name=agentfs"},{"name":"OTEL_TRACES_SAMPLER","value":"parentbased_traceidratio"},{"name":"OTEL_TRACES_SAMPLER_ARG","value":"0.01"}]` | More environment of the sidecar: OpenTelemetry (docs/telemetry.md). |
 | image.digest | string | `""` | A digest (`sha256:...`); when set, it pins the image. |
 | image.pullPolicy | string | `""` | The pull policy; empty leaves the Kubernetes default. |
 | image.repository | string | `"ghcr.io/mcurcio/agentfs"` | The agentfs image. |

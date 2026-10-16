@@ -65,7 +65,7 @@ onStaleMount: recover
 # cannot write where nothing records it (design §17.1).
 sealMountpoint: true
 
-# -- More environment of the sidecar: OpenTelemetry (README "Telemetry").
+# -- More environment of the sidecar: OpenTelemetry (docs/telemetry.md).
 env:
   - name: OTEL_EXPORTER_OTLP_ENDPOINT
     value: http://otel-collector.observability.svc:4318
