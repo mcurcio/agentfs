@@ -98,7 +98,8 @@ agentfs_start "$RUN_LOG" run
 RUN=$AGENTFS_PID
 
 step "every metric the rules name is in Prometheus"
-NAMES=$(grep -o 'agentfs_[a-z_]*' "$RULES" | sort -u)
+# agentfs_volume is a label (the promoted agentfs.volume), checked below.
+NAMES=$(grep -o 'agentfs_[a-z_]*' "$RULES" | grep -v -x agentfs_volume | sort -u)
 [ -n "$NAMES" ] || fail "no metric names found in $RULES"
 for name in $NAMES; do
   case " $NOT_CAUSED " in
