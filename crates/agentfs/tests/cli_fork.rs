@@ -172,6 +172,31 @@ impl Setup {
         cmd.output().unwrap()
     }
 
+    /// On the source's first-parent history, the commits applying patch
+    /// commit `oid`: (applied, duplicate markers).
+    fn patch_commits(&self, oid: &str) -> (usize, usize) {
+        let repo = Repository::open_bare(self.path("state/git")).unwrap();
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(self.source_head()).unwrap();
+        walk.simplify_first_parent().unwrap();
+        let line = format!("Agentfs-Patch: {oid}\n");
+        let messages: Vec<String> = walk
+            .map(|o| {
+                repo.find_commit(o.unwrap())
+                    .unwrap()
+                    .message()
+                    .unwrap()
+                    .to_owned()
+            })
+            .filter(|m| m.contains(&line))
+            .collect();
+        let duplicates = messages
+            .iter()
+            .filter(|m| m.starts_with("duplicate of patch "))
+            .count();
+        (messages.len() - duplicates, duplicates)
+    }
+
     fn submit_command(&self, producer: &Path, commit: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
         cmd.args(["patch", "submit", commit, "--volume", "src", "--repo"])
@@ -289,36 +314,27 @@ fn finish_publishes_to_the_patch_remote_and_the_change_applies_once() {
         let out = h.join().unwrap();
         assert!(out.status.success(), "{}", text(&out.stderr));
     }
-    let out = s.ok("state", "tree", &["patch", "apply"]);
-    let _ = out;
+    // Two submitters of one commit at once may share an inbox number: the
+    // second push finds the ref already at that commit.
+    s.ok("state", "tree", &["patch", "apply"]);
     assert_eq!(
         fs::read_to_string(s.path("tree/b.txt")).unwrap(),
         "from the fork\n"
     );
-    // One commit applies it; the other is a duplicate marker.
-    let repo = Repository::open_bare(s.path("state/git")).unwrap();
-    let mut walk = repo.revwalk().unwrap();
-    walk.push(s.source_head()).unwrap();
-    walk.simplify_first_parent().unwrap();
-    let patch_line = format!("Agentfs-Patch: {oid}\n");
-    let messages: Vec<String> = walk
-        .map(|o| {
-            repo.find_commit(o.unwrap())
-                .unwrap()
-                .message()
-                .unwrap()
-                .to_owned()
-        })
-        .filter(|m| m.contains(&patch_line))
-        .collect();
-    assert_eq!(messages.len(), 2, "{messages:?}");
+    let (applied, duplicates) = s.patch_commits(&oid);
+    assert_eq!(applied, 1, "one commit applies the change");
+    // The workload reverts the file; the same change submitted again is a
+    // duplicate, and the file stays reverted.
+    s.record("state", "tree", "b.txt", "reverted\n");
+    let out = s.submit_command(&producer, &oid).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    s.ok("state", "tree", &["patch", "apply"]);
+    let (applied, more) = s.patch_commits(&oid);
+    assert_eq!(applied, 1, "still one commit applies it");
+    assert_eq!(more, duplicates + 1, "the resubmission is a duplicate marker");
     assert_eq!(
-        messages
-            .iter()
-            .filter(|m| m.starts_with("duplicate of patch "))
-            .count(),
-        1,
-        "{messages:?}"
+        fs::read_to_string(s.path("tree/b.txt")).unwrap(),
+        "reverted\n"
     );
 }
 

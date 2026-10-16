@@ -102,20 +102,24 @@ in_pod() { ka exec "$1" -- sh -c "$2"; }
 # Checks for until_ok.
 has_plugin_pod() { [ -n "$(plugin_pod)" ]; }
 csinode_lists_driver() {
-  kubectl get csinode "$1" -o jsonpath='{.spec.drivers[*].name}' | grep -qw "$DRIVER"
+  local drivers
+  drivers=$(kubectl get csinode "$1" -o jsonpath='{.spec.drivers[*].name}')
+  grep -qw "$DRIVER" <<<"$drivers"
 }
 remote_file_is() { [ "$(git --git-dir "$1" show "$2:$3" 2>/dev/null)" = "$4" ]; } # remote ref path content
 pv_phase_is() { [ "$(kubectl get pv "$1" -o jsonpath='{.status.phase}' 2>/dev/null)" = "$2" ]; }
 pv_gone() { ! kubectl get pv "$1" >/dev/null 2>&1; }
 node_path_gone() { ! docker exec "$NODE" test -e "$1"; }
 delete_unavailable() { # pv
-  { provisioner_log; kubectl get events --field-selector "involvedObject.name=$1" \
-    -o jsonpath='{range .items[*]}{.message}{"\n"}{end}'; } 2>/dev/null |
-    grep -q "Unavailable.*fork $1 is"
+  local said # captured first: grep -q closing a pipe would fail it (pipefail)
+  said=$(provisioner_log 2>/dev/null)
+  grep -q "Unavailable.*fork $1 is" <<<"$said"
 }
 ref_exists() { git --git-dir "$1" rev-parse -q --verify "$2" >/dev/null 2>&1; }
 inbox_commits_are() { # n
-  [ "$(sgit log --first-parent --format=%B "$SOURCE_BRANCH" | grep -c "^Agentfs-Patch: $CHANGE\$")" = "$1" ]
+  local log
+  log=$(sgit log --first-parent --format=%B "$SOURCE_BRANCH")
+  [ "$(grep -c "^Agentfs-Patch: $CHANGE\$" <<<"$log")" = "$1" ]
 }
 
 # Waits up to <seconds> for <command...> to succeed.
@@ -231,6 +235,9 @@ plugin_ready
 sleep 10
 assert_eq Released "$(kubectl get pv "$FORK_PV" -o jsonpath='{.status.phase}')" \
   "across the node plugin's restart, the PV stays Released"
+said=$(provisioner_log)
+assert_contains "$(grep 'Volume deletion failed' <<<"$said" | tail -n 1)" \
+  "code = Unavailable" "DeleteVolume still answers UNAVAILABLE"
 fgit rev-parse -q --verify "refs/agentfs/$FORK/finish" >/dev/null 2>&1 &&
   fail "the finish ref reached a blocked remote"
 chmod "$mode" "$FORKS_REMOTE"
@@ -265,15 +272,22 @@ submit >"$W/submit-2.log" 2>&1 &
 p2=$!
 wait "$p1" || fail "the first submit failed: $(cat "$W/submit-1.log")"
 wait "$p2" || fail "the second submit failed: $(cat "$W/submit-2.log")"
-pass "both submits queued the change"
+pass "both submits succeeded"
+# Two pushes of one commit at once can land on one inbox number (the
+# second finds the ref already there); a third, later, always gets its own.
+submit >"$W/submit-3.log" 2>&1 || fail "the third submit failed: $(cat "$W/submit-3.log")"
+QUEUED=$(sgit for-each-ref --format='%(objectname)' "refs/agentfs/$SOURCE_VOLUME/inbox/" | grep -c "^$CHANGE\$")
+[ "$QUEUED" -ge 2 ] || fail "the change is queued $QUEUED time(s), expected at least 2"
+pass "the change is queued $QUEUED times"
 ka delete pod writer --wait --timeout=120s
 kubectl apply -k ci/k8s-csi/forks/apps
 ka wait --for=condition=Ready pod/writer --timeout=300s >/dev/null || fail "the writer never came back"
-until_ok 240 "the source's branch has both inbox commits of the change" inbox_commits_are 2
+until_ok 240 "the source's branch has a commit for each inbox number of the change" \
+  inbox_commits_are "$QUEUED"
 messages=$(sgit log --first-parent --format='%s' --grep="^Agentfs-Patch: $CHANGE\$" "$SOURCE_BRANCH")
 echo "$messages"
-assert_eq 1 "$(grep -c '^duplicate of patch ' <<<"$messages")" "one is a duplicate marker"
-assert_eq 1 "$(grep -vc '^duplicate of patch ' <<<"$messages")" "one applies the change"
+assert_eq 1 "$(grep -vc '^duplicate of patch ' <<<"$messages")" "one commit applies the change"
+assert_eq $((QUEUED - 1)) "$(grep -c '^duplicate of patch ' <<<"$messages")" "the rest are duplicate markers"
 assert_eq "from the sandbox" "$(sgit show "$SOURCE_BRANCH:sandbox.txt")" "the source has the sandbox's file"
 assert_eq "from the sandbox" "$(in_pod writer 'cat /data/sandbox.txt')" "the source's pod sees it"
 

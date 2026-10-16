@@ -1065,7 +1065,10 @@ async fn forks_are_cloned_and_deleted_once_published() {
     ];
     // What a fork class refuses.
     let mut cases = Vec::new();
-    cases.push(("a fork class without a dataSource", create_req("fork-1", &fork_params)));
+    cases.push((
+        "a fork class without a dataSource",
+        create_req("fork-1", &fork_params),
+    ));
     let mut r = create_req("fork-1", &[("profile", "r")]);
     r.volume_content_source = clone_of("src");
     cases.push(("a dataSource on an ordinary class", r));
@@ -1078,7 +1081,11 @@ async fn forks_are_cloned_and_deleted_once_published() {
         )),
     });
     cases.push(("a snapshot", r));
-    for (key, value) in [("profile", "r"), ("branch", "b"), ("volumeName", "{pvcName}")] {
+    for (key, value) in [
+        ("profile", "r"),
+        ("branch", "b"),
+        ("volumeName", "{pvcName}"),
+    ] {
         let mut params = fork_params.to_vec();
         params.push((key, value));
         let mut r = create_req("fork-1", &params);
@@ -1087,7 +1094,12 @@ async fn forks_are_cloned_and_deleted_once_published() {
     }
     for (what, req) in cases {
         let err = c.create_volume(req).await.unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument, "{what}: {}", err.message());
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "{what}: {}",
+            err.message()
+        );
     }
 
     let mut req = create_req("fork-1", &fork_params);
@@ -1130,8 +1142,7 @@ async fn forks_are_cloned_and_deleted_once_published() {
     assert!(d.layout.volume_dir("fork-1").exists());
 
     // Finished, with a mark that cannot be read: FAILED_PRECONDITION.
-    let lock =
-        agentfs_core::lock::StateLock::acquire(&state, "test", Duration::ZERO).unwrap();
+    let lock = agentfs_core::lock::StateLock::acquire(&state, "test", Duration::ZERO).unwrap();
     let mut finisher = agentfs_core::fork::finish::Finisher::open(
         &state,
         &d.layout.backing("fork-1"),
@@ -1147,15 +1158,18 @@ async fn forks_are_cloned_and_deleted_once_published() {
     drop(lock);
     let err = c.delete_volume(delete()).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
-    assert!(err.message().contains("nothing deleted"), "{}", err.message());
+    assert!(
+        err.message().contains("nothing deleted"),
+        "{}",
+        err.message()
+    );
     fs::remove_file(state.fork_mark()).unwrap();
     let err = c.delete_volume(delete()).await.unwrap_err();
     assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
     assert!(err.message().contains("is finished"), "{}", err.message());
 
     // Published: onDelete applies (delete, the fork class's default).
-    let lock =
-        agentfs_core::lock::StateLock::acquire(&state, "test", Duration::ZERO).unwrap();
+    let lock = agentfs_core::lock::StateLock::acquire(&state, "test", Duration::ZERO).unwrap();
     let mut finisher = agentfs_core::fork::finish::Finisher::open(
         &state,
         &d.layout.backing("fork-1"),
@@ -1168,7 +1182,10 @@ async fn forks_are_cloned_and_deleted_once_published() {
     let outcome = finisher
         .publish(Some(Instant::now() + Duration::from_secs(10)))
         .unwrap();
-    assert_eq!(outcome, agentfs_core::fork::finish::PublishOutcome::Published);
+    assert_eq!(
+        outcome,
+        agentfs_core::fork::finish::PublishOutcome::Published
+    );
     drop(finisher);
     drop(lock);
     c.delete_volume(delete()).await.unwrap();

@@ -148,9 +148,7 @@ fn to_finish(layout: &Layout) -> (Vec<String>, Vec<(PathBuf, String)>) {
             continue;
         }
         match finish::status(&StateDir::new(layout.state(&handle))) {
-            Ok(Some(status))
-                if matches!(status.state, ForkState::Active | ForkState::Finished) =>
-            {
+            Ok(Some(status)) if matches!(status.state, ForkState::Active | ForkState::Finished) => {
                 wanted.push(handle);
             }
             Ok(_) => {}

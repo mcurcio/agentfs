@@ -636,9 +636,10 @@ source's patch remote), never the source's branch.
   branch head read without its lock (the source may be in use), its
   history up to that head copied, and the head's tree written into the
   fork's backing tree, with no credentials. Kubernetes' documentation
-  says a clone's source claim must not be in use; the kind test
-  (`ci/e2e-csi-forks.sh`) records what the external-provisioner does
-  (design §19.2).
+  says a clone's source claim must not be in use, but the
+  external-provisioner does not check it, and the kind test
+  (`ci/e2e-csi-forks.sh`) clones a claim a running pod writes to (design
+  §19.2, question 8).
 - **Admission.** `deploy/csi/fork-admission.yaml` is a
   ValidatingAdmissionPolicy that refuses a StorageClass of this driver
   with `fork: "true"` and any reclaim policy but `Delete`: with `Retain`,

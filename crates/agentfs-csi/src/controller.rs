@@ -40,8 +40,8 @@ use agentfs_core::volume::StateDir;
 
 use crate::csi::v1::controller_server::Controller;
 use crate::csi::v1::controller_service_capability::{self, rpc};
-use crate::csi::v1::volume_content_source;
 use crate::csi::v1::validate_volume_capabilities_response::Confirmed;
+use crate::csi::v1::volume_content_source;
 use crate::csi::v1::{
     ControllerGetCapabilitiesRequest, ControllerGetCapabilitiesResponse,
     ControllerPublishVolumeRequest, ControllerPublishVolumeResponse, ControllerServiceCapability,
@@ -133,9 +133,7 @@ pub(crate) fn create_volume(
         None => None,
         Some(Some(volume_content_source::Type::Volume(v))) => Some(v.volume_id.clone()),
         Some(Some(volume_content_source::Type::Snapshot(_))) => {
-            return Err(Error::InvalidArgument(
-                "snapshots are not supported".into(),
-            ));
+            return Err(Error::InvalidArgument("snapshots are not supported".into()));
         }
         Some(None) => {
             return Err(Error::InvalidArgument(
@@ -246,41 +244,17 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
         )));
     }
     let state = StateDir::new(layout.state(handle));
+    // A fork is deleted only once it is published (design §11.5): its
+    // deletion is the request to finish it, which the node plugin carries
+    // out while this answers UNAVAILABLE. Checked before the lock, which
+    // the finisher holds while it publishes, and again under it.
+    fork_gate(layout, handle, &state, &record, legacy.as_ref())?;
     let lock = if state.root().exists() {
         Some(volume::lock(&state, "agentfs-csi delete")?)
     } else {
         None
     };
-    // A fork is deleted only once it is published (design §11.5): its
-    // deletion is the request to finish it, which the node plugin carries
-    // out.
-    let mut is_fork = false;
-    if state.git().join("config").exists() {
-        match fork_status(&state) {
-            Err(why) => {
-                return Err(Error::FailedPrecondition(format!(
-                    "{why}; nothing deleted"
-                )));
-            }
-            Ok(Some(status)) => {
-                is_fork = true;
-                if !record.finish_requested {
-                    let mut requested = record.clone();
-                    requested.finish_requested = true;
-                    volume::store_any(layout, handle, &requested, legacy.as_ref())?;
-                    eprintln!("fork {handle}: finishing requested by DeleteVolume");
-                }
-                if !status.state.may_delete() {
-                    return Err(Error::Unavailable(format!(
-                        "fork {handle} is {}: DeleteVolume completes once it is published or \
-                         abandoned (the node plugin publishes it)",
-                        status.state.as_str()
-                    )));
-                }
-            }
-            Ok(None) => {}
-        }
-    }
+    let is_fork = fork_gate(layout, handle, &state, &record, legacy.as_ref())?;
     match record.params.on_delete {
         OnDelete::Delete => {
             let dir = layout.volume_dir(handle);
@@ -338,6 +312,42 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
     }
     drop(lock);
     Ok(())
+}
+
+/// For a fork: records that its deletion asks for it to be finished,
+/// and is `UNAVAILABLE` until it may be deleted (published or abandoned);
+/// a status that cannot be read is `FAILED_PRECONDITION`. Whether the
+/// volume is a fork.
+fn fork_gate(
+    layout: &Layout,
+    handle: &str,
+    state: &StateDir,
+    record: &crate::records::VolumeRecord,
+    legacy: Option<&crate::records::MultiNodeFields>,
+) -> Result<bool, Error> {
+    if !state.git().join("config").exists() {
+        return Ok(false);
+    }
+    let status = match fork_status(state) {
+        Err(why) => return Err(Error::FailedPrecondition(format!("{why}; nothing deleted"))),
+        Ok(None) => return Ok(false),
+        Ok(Some(status)) => status,
+    };
+    let stored = volume::load_any(layout, handle)?.map(|(r, _)| r);
+    if !stored.as_ref().unwrap_or(record).finish_requested {
+        let mut requested = record.clone();
+        requested.finish_requested = true;
+        volume::store_any(layout, handle, &requested, legacy)?;
+        eprintln!("fork {handle}: finishing requested by DeleteVolume");
+    }
+    if !status.state.may_delete() {
+        return Err(Error::Unavailable(format!(
+            "fork {handle} is {}: DeleteVolume completes once it is published or abandoned \
+             (the node plugin publishes it)",
+            status.state.as_str()
+        )));
+    }
+    Ok(true)
 }
 
 /// The fork status of the state area, or why it cannot be read.

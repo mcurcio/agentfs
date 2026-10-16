@@ -3894,9 +3894,15 @@ runner.
    when they change (§11.1).
 8. **Cloning a claim in use** (§19.1 "Content sources"). Kubernetes'
    documentation says a clone's source claim "must be bound and available
-   (not in use)" (checked 2026-10-15). Whether the external-provisioner
-   enforces that is NOT VERIFIED; forking a source while its pod runs
-   depends on it, so the forked-volumes tracer checks it first.
+   (not in use)" (checked 2026-10-15). Answered 2026-10-16: the
+   external-provisioner (v6.4.0, the version deploy/csi pins) checks only
+   that the source claim is bound, not being deleted, of the same driver
+   and no larger than the new claim (its `getPVCSource`; no in-use check,
+   and no same-class rule), and on kind (Kubernetes 1.37) a sandbox's
+   ephemeral claim on a fork class cloned a claim a running pod writes to
+   (`ci/e2e-csi-forks.sh`, step 1, image workflow run 38871457716). Open:
+   whether a later provisioner or Kubernetes release adds the check the
+   documentation describes; the kind job would show it.
 
 ## 20. Prior art
 
