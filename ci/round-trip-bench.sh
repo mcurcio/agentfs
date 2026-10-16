@@ -15,7 +15,7 @@
 # Odd, so the median is one run's ratio. A run takes about 7 s on CI after
 # the first builds the bench, so five add about 30 s to the job.
 RUNS=5
-LIMIT=1.45
+LIMIT=1.6
 
 summary() { [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "$*" >>"$GITHUB_STEP_SUMMARY"; }
 

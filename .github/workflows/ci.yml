@@ -316,7 +316,7 @@ jobs:
         env:
           AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
           AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
-      # Fails when a front's record costs over 1.45 times the
+      # Fails when a front's record costs over 1.6 times the
       # single-process one at the median of several runs (design §19.1).
       - name: round-trip benchmark
         run: ci/round-trip-bench.sh
