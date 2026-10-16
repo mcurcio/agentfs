@@ -13,6 +13,7 @@
 //! restarted plugin picks it up at its first scan.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -78,15 +79,19 @@ impl Publisher {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         running.retain(|_, child| child.exit().is_none());
         for handle in wanted {
-            if running.contains_key(&handle) {
-                report.running.push(handle);
-                continue;
-            }
+            let slot = match running.entry(handle) {
+                Entry::Occupied(running) => {
+                    report.running.push(running.key().clone());
+                    continue;
+                }
+                Entry::Vacant(slot) => slot,
+            };
+            let handle = slot.key().clone();
             let spec = launcher::fork_finish_spec(&self.layout, &handle, &self.identity);
             match self.launcher.spawn(spec) {
                 Ok(child) => {
                     eprintln!("fork {handle}: finishing and publishing it");
-                    running.insert(handle.clone(), child);
+                    slot.insert(child);
                     report.started.push(handle);
                 }
                 Err(e) => report.unreadable.push((

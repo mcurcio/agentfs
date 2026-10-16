@@ -373,7 +373,7 @@ fn settings_files_need_the_settings_included() {
     let source = Vol::new("src");
     assert_eq!(
         create::settings_files(&source.state).unwrap(),
-        [source.fragment.clone()]
+        std::slice::from_ref(&source.fragment)
     );
     let mut config = git2::Config::open(&source.state.git().join("config")).unwrap();
     config.set_str("remote.own.url", "/own").unwrap();

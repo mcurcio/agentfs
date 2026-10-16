@@ -981,7 +981,7 @@ pub fn finish_from_message(message: &str, finish: Oid) -> Option<FinishRecord> {
     };
     let change = match fields.get(f::CHANGE_TRAILER) {
         None => None,
-        Some(value) => Some(oid(*value)?),
+        Some(value) => Some(oid(value)?),
     };
     let unrecorded = *fields.get(f::UNRECORDED_TRAILER)?;
     if unrecorded.is_empty() || !unrecorded.bytes().all(|b| b.is_ascii_digit()) {
@@ -990,7 +990,7 @@ pub fn finish_from_message(message: &str, finish: Oid) -> Option<FinishRecord> {
     Some(FinishRecord {
         fork: name(f::FORK_TRAILER)?,
         source: name(f::SOURCE_TRAILER)?,
-        base: oid(*fields.get(f::BASE_TRAILER)?)?,
+        base: oid(fields.get(f::BASE_TRAILER)?)?,
         finish,
         change,
         remote: name(f::FORK_REMOTE_TRAILER)?,
