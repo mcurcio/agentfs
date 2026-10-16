@@ -3573,6 +3573,16 @@ one-time migration of Hermes' existing data and the initial import in
     requires; its cost and mitigations are in
     [deployment.md](deployment.md#9-security-trade-offs-of-the-privileged-sidecar).
     The CSI driver (§14.2) removes it from workload pods.
+- **Docker** ([docker.md](docker.md), examples in `examples/docker`): the
+  same pattern without Kubernetes. One agentfs container per volume
+  mounts FUSE inside a host directory bound with `rshared` propagation;
+  workload containers bind that directory read-only, `rslave`, with
+  writable submounts, so the mount (and a mount stacked over it after a
+  crash) reaches them and the bare directory is the fence. The backing
+  tree and the state area share one Docker volume that only the agentfs
+  containers mount. Docker's restart policy plays the kubelet's part in
+  crash recovery (`--on-stale-mount recover`). There is no Docker volume
+  plugin (§19.1 "Docker").
 
 ### 17.2 Layer 2: CSI driver (Rust)
 
@@ -4056,6 +4066,7 @@ runner.
 | Fork telemetry (2026-10-16) | The finisher reports through §13's existing signals: spans `agentfs.fork.finish` (once, when the finish commit is written) and `agentfs.fork.publish` (one publish call, its outcome and refusal reason, with the pushes inside it), the histogram `agentfs.fork.publish.duration` (seconds from the finish commit to published, one point per fork, written with the published mark), and the events `ForkFinished` and `ForkPublished`, which are not alarms. A fork's lifecycle events (finished, published, abandoned) become INFO log records beside the alarms (`Event::is_logged`), so a fork's life is in the same log as its refusal. Cost: a duration measured from the finish commit's time trusts the node's clock, and a fork retried after a refusal counts the time it waited for the operator. A design choice (forked volumes unit 4), not the owner's words |
 | Forks in history rewrites (2026-10-16) | The history-rewrite runbook covers forks by reachability, not a list: the affected refs are those containing the first commit that recorded the content, in mirror clones of the source's remotes and fork remotes; only forks whose base contains it are abandoned, before the rewrite, and their refs deleted with a lease; forks based earlier keep their ids and publish as before. What agentfs cannot enumerate (delivery targets, receivers' clones, CI caches, retained fork directories) is listed for the operator. Cost: a change based after the bad commit and not yet landed becomes unlandable (`parent_not_in_history`). A design choice (forked volumes unit 4), not the owner's words |
 | Alert rules (2026-10-16) | Milestone F11 ships example alert rules and runbooks, without the Hermes end-to-end test it first planned. Asked whether to (a) drop that test and keep the alert rules and runbooks or (b) keep it, given "Design it, but leave Hermes out of it. We're building an open source project" (2026-10-15), the owner answered "3 a" (2026-10-16, in a Claude Code session). The rules are one Prometheus rules file, `deploy/alerts/agentfs.rules.yml`, with the `PrometheusRule` generated from it and checked in CI, so they have one home; they use the names of Prometheus's default OTLP translation, and each counter rule matches a counter's first sample (§13). The Helm option to install them waits for the chart (F9). Cost: another translation strategy, or a collector that renames metrics, needs the rules edited; the `PrometheusRule` is not applied to a Prometheus Operator in CI. The file layout, names and thresholds are design choices, not the owner's words |
+| Docker (2026-10-16) | Docker support is examples of the container pattern (§17.1 "Docker"): `docker run` and Compose, one agentfs container per volume with `/dev/fuse`, `CAP_SYS_ADMIN` and AppArmor unconfined rather than `--privileged`, a host directory on a shared mount, and workloads bound to it read-only and `rslave` with writable submounts; each example runs in the `docker` workflow. A Docker managed volume plugin was evaluated and not built: it needs its own long-running service for Docker's volume plugin API, the per-volume daemon supervision the CSI node plugin already has (duplicated, or factored out of `agentfs-csi` first), and a `docker plugin push` release path, and one plugin process would hold every volume's mount ([docker.md](docker.md#7-why-there-is-no-docker-volume-plugin)). Cost: no `docker volume create -d agentfs`, and no Docker Desktop, which cannot propagate mounts to the host. Volumes with no remote use what agentfs allows today (no `[remote]` section); a declared local-only mode is F8's. The ask, from the milestone brief: "examples of how to use agentfs as a docker volume", with "a Docker volume plugin ... implement it if it is a reasonable size, otherwise document why not". The size judgement is a design choice, not the owner's words |
 
 ### 19.2 Open questions
 

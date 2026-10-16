@@ -68,6 +68,7 @@ When you learn something durable, write it to its home in the same commit. Never
 | `crates/agentfs-csi` | CSI driver |
 | `ci/` | End-to-end scripts run by GitHub Actions; `ci/lib.sh` has the shared helpers |
 | `deploy/` | Kubernetes manifests for the sidecar and CSI, plus examples (Hermes) |
+| `examples/docker` | Docker examples: `docker run` and compose (docs/docker.md) |
 | `docs/` | Design, operator guide, configuration, deployment, CSI, performance, runbooks |
 
 ## Style
@@ -104,6 +105,7 @@ GitHub Actions runners can, so put such tests in a script under `ci/` and a job 
 | `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, remotes (http/https/ssh), LFS, telemetry, multipod, NFS (one export, two clients, one node at a time), patches, runbooks, csi-sanity |
 | `image.yml` | every push and PR | ~5–9 min | container image, kind sidecar e2e, CSI on one kind node (no multi-node job); publishes to GHCR on main |
 | `alerts.yml` | pushes and PRs touching `deploy/alerts`, its `ci/` scripts or the telemetry code | ~4 min | promtool checks and unit tests of the example alert rules, the generated `PrometheusRule`, the rules against the binary's metrics in a real Prometheus |
+| `docker.yml` | pushes and PRs touching the image or `examples/docker` | ~5–8 min | the Docker examples (`docker run`, compose, compose with a git server remote) via `ci/e2e-docker.sh`, one job each |
 | `power-loss.yml` | pushes to main (not docs-only), after landing | ~7 min | dm-log-writes replay on XFS and ext4 |
 | `bench.yml` | pushes to main (not docs-only), after landing | ~15–18 min | benchmarks on XFS and ext4, each in two parallel shards, against `ci/bench-budget.json` |
 

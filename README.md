@@ -77,6 +77,7 @@ for a real deployment, or [Deploying on Kubernetes](#deploying-on-kubernetes).
 | [performance.md](docs/performance.md) | Measured costs, the benchmark and the performance budget |
 | [deployment.md](docs/deployment.md) | The container image and the Kubernetes sidecar |
 | [csi.md](docs/csi.md) | The CSI driver |
+| [docker.md](docs/docker.md) | Docker: the agentfs container and workload containers, with `docker run` and Compose |
 | [runbooks/](docs/runbooks/) | Recovery and undo, divergence, stuck pushes, history rewrite, patch queue, crashed sidecar, history service down, CSI recovery, a failed directory-move reconciliation, worktree paths found by the heuristic |
 
 ## Features
