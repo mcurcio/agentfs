@@ -223,11 +223,11 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `agentfsSshKeyPassphrase` | absolute path | none | SSH only, with `agentfsSshKey`: a file holding the key's passphrase (one trailing newline dropped). Needed for an encrypted key; not read for an unencrypted one |
 | `agentfsSshAgent` | absolute path | none | SSH only: the Unix socket of an ssh-agent whose identities are offered instead of a key file. `SSH_AUTH_SOCK` is never read |
 | `agentfsKnownHosts` | absolute path | none | SSH only, and required there: the known_hosts file the server's host key is checked against |
-| `lfsurl` | `http(s)://` URL, `file://` URL or path | derived from the remote's URL | The Git LFS endpoint for this remote, as in git-lfs, unless `lfs.url` is set (see [Git LFS](#git-lfs)) |
-| `lfspushurl` | as `lfsurl` | `lfsurl` | Where LFS uploads go, unless `lfs.pushurl` or `lfs.url` is set |
+| `lfsurl` | `http(s)://` URL, `file://` URL or path | derived from the remote's URL | The Git LFS endpoint for this remote, as in git-lfs, unless `lfs.url` is set (see [Git LFS](#git-lfs)); on an `agentfsForkRemote` section, before `lfs.url` |
+| `lfspushurl` | as `lfsurl` | `lfsurl` | Where LFS uploads go, unless `lfs.pushurl` or `lfs.url` is set; on an `agentfsForkRemote` section, before them |
 | `agentfsLfsCredentials` | absolute path | none | The credential file (same format as `agentfsCredentials`) for an LFS endpoint on another host or port than the push URL; never sent to any other host |
 | `proxy` | as `http.proxy`, or empty | `http.proxy` | This remote's HTTP proxy, as in git; an empty value means no proxy for this remote. It carries the remote's `https` git traffic and all its LFS requests, never SSH or plain `http://` git traffic (see [Proxies](#proxies)) |
-| `agentfsForkRemote` | boolean | `false` | This section is only for forks of the volume (design §11.5): never one of the volume's own push remotes, never its patch remote, and its limits never apply to the volume's records. With one such section, forks push there; with none, forks push to the volume's patch remote; two or more such sections are all invalid and forks are refused (`NoForkRemote`) |
+| `agentfsForkRemote` | boolean | `false` | This section is only for forks of the volume (design §11.5): never one of the volume's own push remotes, never its patch remote, and its limits never apply to the volume's records. With one such section, forks push there; with none, forks push to the volume's patch remote; two or more such sections are all invalid and forks are refused (`NoForkRemote`). While `lfs.url` or `lfs.pushurl` is set (the source's LFS store), such a section must set its own `lfsurl` or `lfspushurl`, which it then uses before the global keys; without one it is invalid (`RemoteMisconfigured`: a fork remote must name its own LFS endpoint), so a fork's LFS objects never reach the source's store |
 
 The remote's name must be a valid agentfs name (as for `agentfs.volume`;
 git accepts `team/backup`, agentfs does not), because it names the push
@@ -547,6 +547,11 @@ wins):
 | `remote.<name>.lfsurl` | `remote.<name>.lfsurl` |
 | derived from the remote's `pushurl`, else `url` | derived from the remote's `url` |
 
+A section with `agentfsForkRemote` (design §11.5) reads its own
+`lfspushurl` and `lfsurl` before `lfs.pushurl` and `lfs.url`, and while a
+global key is set it must have one, or it is invalid: the global keys name
+the source's store, which a fork's objects must not reach.
+
 | Remote URL | Derived endpoint |
 |---|---|
 | `https://github.com/acme/r.git` | `https://github.com/acme/r.git/info/lfs` |
@@ -770,7 +775,13 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--attempts N` | | `10` | `patch submit`: inbox numbers to try when other submitters race |
 | `--source-state DIR` | | none: required | `fork create`: the source volume's state area, read without its lock; its settings must be in included files, which the fork includes too |
 | `--name NAME` | | the source's name | `fork create`: the fork's name before its random suffix (`<name>-<8 hex digits>`) |
-| `--timeout DURATION` | | until published | `fork finish`: stop publishing after this long and exit 1 |
+| `--timeout DURATION` | | until published | `fork finish`: stop publishing after this long and exit 1 (the CSI node plugin's finisher runs with `300000ms`, so the fork's lock is free between its scans) |
+| `--retry` | | | `fork finish`: clear a refused publish (the `refused` mark in `meta/fork.json`) and try again; without it a refused fork exits 1 at once, pushing nothing |
+| `--json` | | | `fork status`: the status document, version 1 (`version`, `fork`, `source`, `base`, `state`, `change`, `finish`, `remote`, `published_at_ms`, `refused`, `abandoned`); `fork list`: the listing (`changes`, `skipped`) |
+| `--reason TEXT` | | none: required, not empty | `fork abandon`: why the fork is discarded, kept in `meta/fork.json` with the time, the operator's uid and the state it was in |
+| `--remote NAME\|URL` | | `origin` | `fork list`: the fork remote, as the receiver's repository names it |
+| `--source VOLUME` | | every source | `fork list`: only the changes of forks of this source volume |
+| `--repo DIR` | | `.` | `fork list`: the receiver's git repository, whose `git` and credentials are used; no state area is read |
 
 The [operator guide](operator-guide.md) §4 describes the mount flags in
 full, and §16 the history service and fronts; the

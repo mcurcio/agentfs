@@ -699,6 +699,8 @@ impl EventSink for TelemetrySink {
             | Event::PatchBlocked { .. }
             | Event::PatchIgnored { .. }
             | Event::PatchFetchFailed { .. }
+            | Event::ForkRefused { .. }
+            | Event::ForkAbandoned { .. }
             | Event::HistoryServiceUnavailable { .. }
             | Event::HistoryServiceRestored { .. }
             | Event::IdentityFallback { .. } => {}
@@ -747,6 +749,8 @@ fn event_name(event: &Event) -> &'static str {
         Event::PatchBlocked { .. } => "agentfs.patch_blocked",
         Event::PatchIgnored { .. } => "agentfs.patch_ignored",
         Event::PatchFetchFailed { .. } => "agentfs.patch_fetch_failed",
+        Event::ForkRefused { .. } => "agentfs.fork_refused",
+        Event::ForkAbandoned { .. } => "agentfs.fork_abandoned",
         Event::HistoryServiceUnavailable { .. } => "agentfs.history_service_unavailable",
         Event::HistoryServiceRestored { .. } => "agentfs.history_service_restored",
         Event::IdentityFallback { .. } => "agentfs.identity_fallback",
@@ -924,6 +928,21 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             out.push(("agentfs.kind", AnyValue::from(kind.as_str())));
             out.push(("agentfs.message", s(message)));
         }
+        Event::ForkRefused {
+            fork,
+            remote,
+            reason,
+            message,
+        } => {
+            out.push(("agentfs.fork", s(fork)));
+            out.push(("agentfs.remote", s(remote)));
+            out.push(("agentfs.fork.reason", AnyValue::from(*reason)));
+            out.push(("agentfs.message", s(message)));
+        }
+        Event::ForkAbandoned { fork, reason } => {
+            out.push(("agentfs.fork", s(fork)));
+            out.push(("agentfs.fork.reason", s(reason)));
+        }
         Event::HistoryServiceUnavailable { address, error } => {
             out.push(("agentfs.history_service", s(address)));
             out.push(("agentfs.error", s(error)));
@@ -946,6 +965,7 @@ impl<L: Logger + Send + Sync> AlarmLog for OtelAlarmLog<L> {
             Event::PushSucceeded { .. }
             | Event::PatchApplied { .. }
             | Event::PatchDuplicate { .. }
+            | Event::ForkAbandoned { .. }
             | Event::HistoryServiceRestored { .. } => (Severity::Info, "INFO"),
             Event::PatchFetchFailed { .. }
             | Event::PatchIgnored { .. }

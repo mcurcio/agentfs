@@ -449,7 +449,10 @@ it to review and land. agentfs never accepts or merges
 agentfs --state ./fork --root ./fork-tree fork create --source-state ./state
 # ... the sandbox works in ./fork-tree; record or mount it as usual ...
 agentfs --state ./fork --root ./fork-tree fork finish    # finish once, publish
-# A receiver lands the exact change it reviewed in the source:
+agentfs --state ./fork fork status                         # state and publish result
+# A receiver lists the published changes, each checked, from its own clone:
+agentfs fork list --remote origin --source src
+# and lands the exact change it reviewed in the source:
 agentfs patch submit --volume src <change commit>
 ```
 
@@ -461,6 +464,10 @@ agentfs patch submit --volume src <change commit>
   (`fork: "true"`, reclaim policy `Delete`) is a fork; deleting it
   finishes the fork, and the driver deletes the volume only once it is
   published ([docs/csi.md](docs/csi.md)).
+- A finished fork is read-only. A fork remote that refuses for good
+  leaves the fork `refused` until `fork finish --retry`; `fork abandon
+  --reason TEXT` discards a fork on record, and nothing agentfs runs
+  pushes it again.
 
 ## Telemetry
 

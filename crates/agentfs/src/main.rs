@@ -32,8 +32,12 @@
 //! (design §2.3) and exit 75 while another process holds it; fronts take
 //! no lock; `status` is read-only and takes no lock.
 //!
-//! `fork create` makes a fork of a volume and `fork finish` finishes and
-//! publishes it ([`fork_cmd`], design §11.5).
+//! `fork create` makes a fork of a volume, `fork finish` finishes and
+//! publishes it, `fork status` reads its state, `fork abandon` discards it
+//! on record and `fork list` lists the published changes on a fork remote
+//! ([`fork_cmd`], design §11.5). A finished fork is read-only: `mount`
+//! (but not a front), `run`, `record`, `restore`, `revert` and `patch
+//! apply` refuse it.
 //!
 //! `mount`, `flush`, `record`, `push` and `run` export telemetry over OTLP
 //! when the standard `OTEL_*` variables configure an endpoint (see
@@ -298,7 +302,7 @@ fn parse_grace(value: &str) -> Result<Duration, String> {
 
 /// Where the volume is mounted. In Kubernetes these come from the downward
 /// API.
-#[derive(Args)]
+#[derive(Args, Default)]
 struct Pod {
     #[arg(long, env = "AGENTFS_NAMESPACE", default_value = "")]
     namespace: String,
@@ -473,6 +477,7 @@ fn real_main() -> Result<ExitCode> {
             let Some(root) = cli.root.as_deref() else {
                 bail!("record needs --root (or AGENTFS_ROOT): the backing tree the paths are in");
             };
+            refuse_finished(&state)?;
             if let Some(address) = &history.history_service {
                 return front::record_front(&state, root, &pod, address, &history, &paths);
             }
@@ -527,6 +532,7 @@ fn real_main() -> Result<ExitCode> {
             return Ok(code);
         }
         Command::Run { pod, push_grace } => {
+            refuse_finished(&state)?;
             let daemon = Daemon::start()?;
             let _lock = StateLock::acquire(&state, "run", cli.wait_lock)?;
             return run(daemon, &state, cli.root.as_deref(), &pod, push_grace);
@@ -538,6 +544,7 @@ fn real_main() -> Result<ExitCode> {
             dry_run,
             pod,
         } => {
+            refuse_finished(&state)?;
             let ask = match recovery::Ask::restore(&path, commit, force, dry_run) {
                 Ok(ask) => ask,
                 Err(e) => return Ok(recovery::refused("restore", &e)),
@@ -550,6 +557,7 @@ fn real_main() -> Result<ExitCode> {
             dry_run,
             pod,
         } => {
+            refuse_finished(&state)?;
             let ask = recovery::Ask::revert(commit, force, dry_run);
             return recovery::run(&state, cli.root.as_deref(), cli.wait_lock, &pod, ask);
         }
@@ -600,12 +608,27 @@ fn real_main() -> Result<ExitCode> {
                 // A front takes no lock: the history service holds it.
                 return front::mount_front(daemon, &state, cli.root.as_deref(), &args, address);
             }
+            // A front of a finished fork mounts (the CSI node plugin binds
+            // it read-only, design §11.5); its history service refuses
+            // every record.
+            refuse_finished(&state)?;
             // The dead daemon's lock went with it.
             let _lock = StateLock::acquire(&state, "mount", cli.wait_lock)?;
             return mount(daemon, &state, cli.root.as_deref(), &args, stacked);
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// A finished fork is read-only (design §11.5): `mount`, `run`, `record`,
+/// `restore`, `revert` and `patch apply` refuse it before they change
+/// anything. Any other problem opening the state area is the command's own
+/// to report.
+fn refuse_finished(state: &StateDir) -> Result<()> {
+    match volume::refuse_finished(state) {
+        Err(e @ volume::VolumeError::ForkFinished { .. }) => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// `agentfs init`: creates the state area or checks an existing one

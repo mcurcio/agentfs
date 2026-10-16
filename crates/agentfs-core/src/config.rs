@@ -111,6 +111,11 @@ pub enum ConfigError {
     #[error("agentfs.branch is set in a fork's config; a fork's push target is fixed at create")]
     ForkBranch,
     #[error(
+        "remote.{remote}: a fork remote must name its own LFS endpoint (lfsurl or lfspushurl): \
+         lfs.url and lfs.pushurl would send a fork's LFS objects to the source's store"
+    )]
+    ForkRemoteGlobalLfs { remote: String },
+    #[error(
         "{key}: {value:?} is not an LFS endpoint agentfs can use (an http:// or https:// \
          URL, a file:// URL or a path; design §7)"
     )]
@@ -787,8 +792,9 @@ fn remotes(
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
     for name in names {
-        let checked =
-            remote(config, &name, http_proxy).and_then(|r| validate_lfs(&r, lfs).map(|()| r));
+        let checked = remote(config, &name, http_proxy)
+            .and_then(|r| validate_lfs(&r, lfs).map(|()| r))
+            .and_then(|r| validate_fork_lfs(&r, lfs).map(|()| r));
         match checked {
             Ok(remote) => valid.push(remote),
             Err(e) => invalid.push(InvalidRemote {
@@ -988,6 +994,23 @@ fn validate_lfs(remote: &RemoteSettings, lfs: &LfsSettings) -> Result<(), Config
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// A flagged fork remote (design §11.5) needs its own LFS endpoint while
+/// `lfs.url` or `lfs.pushurl` is set: those name the source's store, and a
+/// fork's LFS objects must not reach it. The section is invalid otherwise
+/// (fails closed: forks are refused, the source pushes as before). The
+/// default fork remote, the source's own, is unaffected: its store is the
+/// source's anyway.
+fn validate_fork_lfs(remote: &RemoteSettings, lfs: &LfsSettings) -> Result<(), ConfigError> {
+    let global = lfs.url.is_some() || lfs.push_url.is_some();
+    let own = remote.lfs_url.is_some() || remote.lfs_push_url.is_some();
+    if remote.fork_remote && global && !own {
+        return Err(ConfigError::ForkRemoteGlobalLfs {
+            remote: remote.name.clone(),
+        });
     }
     Ok(())
 }
@@ -2036,6 +2059,46 @@ mod tests {
         assert_eq!(s.invalid_remotes.len(), 1);
         assert!(s.invalid_remotes[0].fork_remote);
         assert_eq!(s.fork_remote, None);
+    }
+
+    /// B5: a flagged section with only the global LFS endpoints is
+    /// invalid (no fork remote); its own lfsurl or lfspushurl makes it
+    /// valid; the default fork remote, the source's own, is unaffected.
+    #[test]
+    fn a_fork_remote_needs_its_own_lfs_endpoint() {
+        let own = "[agentfs]\n\tvolume = v\n[lfs]\n\turl = http://lfs.example/source\n\
+                   [remote \"origin\"]\n\turl = /o\n";
+        let forks = "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n";
+        let (_d, c) = config_with(&format!("{own}{forks}"));
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.fork_remote, None);
+        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["origin"]);
+        assert_eq!(s.invalid_remotes.len(), 1);
+        assert!(s.invalid_remotes[0].fork_remote);
+        assert!(
+            s.invalid_remotes[0]
+                .error
+                .contains("must name its own LFS endpoint"),
+            "{}",
+            s.invalid_remotes[0].error
+        );
+        for key in ["lfsurl", "lfspushurl"] {
+            let (_d, c) = config_with(&format!("{own}{forks}\t{key} = http://lfs.example/forks\n"));
+            let s = Settings::from_config(&c).unwrap();
+            assert_eq!(
+                s.fork_remote.as_ref().map(|r| r.name.as_str()),
+                Some("forks"),
+                "{key}"
+            );
+        }
+        let (_d, c) = config_with(own);
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(
+            s.fork_remote.as_ref().map(|r| r.name.as_str()),
+            Some("origin")
+        );
+        assert!(s.invalid_remotes.is_empty());
     }
 
     /// Two flagged sections: both invalid, no fork remote.

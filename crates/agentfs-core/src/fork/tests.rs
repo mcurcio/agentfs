@@ -10,15 +10,20 @@ use std::time::{Duration, Instant};
 
 use git2::{Oid, Repository};
 
+use std::sync::Mutex;
+
 use super::create::{self, CreateError, CreateRequest};
-use super::finish::{self, FinishError, Finisher, ForkState, PublishOutcome, StatusError};
+use super::finish::{
+    self, AbandonError, FinishError, Finisher, ForkState, Met, PublishOutcome, RefusedReason,
+    StatusError, refused_reason,
+};
 use super::identity::{ForkIdentity, PushTarget, change_ref, finish_ref};
 use crate::confined::Dir;
-use crate::events::NullSink;
+use crate::events::{Event, Events, NullSink, PushFailureKind};
 use crate::identity::Context;
 use crate::lock::StateLock;
 use crate::paths::RepoPath;
-use crate::record::Caller;
+use crate::record::{Caller, OperationKind, Trigger};
 use crate::restore::{self, Applied, RecordMode};
 use crate::telemetry::Telemetry;
 use crate::volume::{self, StateDir};
@@ -190,11 +195,15 @@ impl Fork {
     }
 
     fn finisher(&self, lock: &StateLock) -> Result<Finisher, FinishError> {
+        self.finisher_with(lock, Arc::new(NullSink))
+    }
+
+    fn finisher_with(&self, lock: &StateLock, events: Events) -> Result<Finisher, FinishError> {
         Finisher::open(
             &self.state,
             &self.tree,
             context("fork"),
-            Arc::new(NullSink),
+            events,
             &Telemetry::noop(),
             lock,
         )
@@ -547,16 +556,15 @@ fn finish_with_no_fork_remote_writes_nothing() {
     );
 }
 
-/// A8: an unreachable remote, or a finish ref someone else set, never
-/// yields Published or a mark.
+/// A8, B2: an unreachable remote never yields Published or a mark: it is
+/// pending, and retried.
 #[test]
-fn publish_waits_for_the_remote_and_never_moves_its_refs() {
+fn publish_waits_for_an_unreachable_remote() {
     let source = Vol::new("src");
     source.change(&[("a.txt", "a\n")]);
     let fork = Fork::new();
     fork.create(&source, "src-1").unwrap();
     fork.as_vol().write("b.txt", "b\n");
-    // Unreachable.
     let parked = source.dir.path().join("parked.git");
     fs::rename(source.remote.as_path(), &parked).unwrap();
     let lock = fork.lock();
@@ -569,32 +577,485 @@ fn publish_waits_for_the_remote_and_never_moves_its_refs() {
         "{outcome:?}"
     );
     assert!(!fork.state.fork_mark().exists());
-    // Back, with the finish ref set by another writer.
+    assert_eq!(
+        finish::status(&fork.state).unwrap().unwrap().state,
+        ForkState::Finished
+    );
     fs::rename(parked, source.remote.as_path()).unwrap();
-    let remote = Repository::open_bare(source.remote.as_path()).unwrap();
-    let source_head = source.head().unwrap();
-    let local = source.repo();
-    // The remote needs the commit it names: push the source's branch.
-    let mut push = local
+    assert_eq!(finisher.publish(None).unwrap(), PublishOutcome::Published);
+}
+
+/// The source's branch on its remote, so the remote holds its head.
+fn push_source_branch(source: &Vol) {
+    let repo = source.repo();
+    let head = source.head().unwrap();
+    let mut push = repo
         .remote_anonymous(&source.remote.display().to_string())
         .unwrap();
-    push.push(&[format!("{source_head}:refs/heads/agentfs/src")], None)
+    push.push(&[format!("{head}:refs/heads/agentfs/src")], None)
         .unwrap();
+}
+
+/// Every event raised, for counting.
+fn recording() -> (Events, Arc<Mutex<Vec<Event>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let events: Events = Arc::new(move |event: Event| sink.lock().unwrap().push(event));
+    (events, seen)
+}
+
+fn refusals(seen: &Mutex<Vec<Event>>) -> Vec<Event> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::ForkRefused { .. }))
+        .cloned()
+        .collect()
+}
+
+/// B1: a finish ref another writer holds is refused for good: the refused
+/// mark, one ForkRefused, the ref never moved, nothing retried; `--retry`
+/// once the ref is gone publishes.
+#[test]
+fn another_writers_finish_ref_is_refused_until_retried() {
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+    fork.as_vol().write("b.txt", "b\n");
+    let remote = Repository::open_bare(source.remote.as_path()).unwrap();
+    let source_head = source.head().unwrap();
+    // The remote needs the commit it names: push the source's branch.
+    push_source_branch(&source);
     remote
         .reference(&finish_ref("src-1"), source_head, true, "test")
         .unwrap();
-    let outcome = finisher
-        .publish(Some(Instant::now() + Duration::from_millis(300)))
-        .unwrap();
+    let (events, seen) = recording();
+    let lock = fork.lock();
+    let mut finisher = fork.finisher_with(&lock, events).unwrap();
+    let outcome = finisher.publish(None).unwrap();
     assert!(
-        matches!(outcome, PublishOutcome::Pending { .. }),
+        matches!(
+            outcome,
+            PublishOutcome::Refused {
+                reason: RefusedReason::AnotherWriter,
+                ..
+            }
+        ),
         "{outcome:?}"
     );
     assert_eq!(
         remote.refname_to_id(&finish_ref("src-1")).unwrap(),
         source_head
     );
-    assert!(!fork.state.fork_mark().exists());
+    let status = finish::status(&fork.state).unwrap().unwrap();
+    assert_eq!(status.state, ForkState::Refused);
+    let mark = status.mark.unwrap();
+    let refused = mark.refused.unwrap();
+    assert_eq!(refused.reason, RefusedReason::AnotherWriter);
+    assert_eq!(refused.remote, "origin");
+    assert_eq!(refused.finish, status.record.unwrap().finish.to_string());
+    assert!(mark.published.is_none());
+    assert_eq!(refusals(&seen).len(), 1);
+    // Publishing again returns the refusal, with no push and no alarm.
+    let again = finisher.publish(None).unwrap();
+    assert!(matches!(again, PublishOutcome::Refused { .. }), "{again:?}");
+    assert_eq!(refusals(&seen).len(), 1, "ForkRefused is raised once");
+    // The operator removes the ref and retries.
+    remote
+        .find_reference(&finish_ref("src-1"))
+        .unwrap()
+        .delete()
+        .unwrap();
+    finisher.retry_refused().unwrap();
+    assert_eq!(finisher.publish(None).unwrap(), PublishOutcome::Published);
+    let status = finish::status(&fork.state).unwrap().unwrap();
+    assert_eq!(status.state, ForkState::Published);
+    assert!(status.mark.unwrap().refused.is_none());
+}
+
+/// B2: the single decider of "permanent".
+#[test]
+fn refused_reasons_are_decided_in_one_place() {
+    use PushFailureKind::*;
+    assert_eq!(
+        refused_reason(Met::AnotherWriter),
+        Some(RefusedReason::AnotherWriter)
+    );
+    assert_eq!(
+        refused_reason(Met::RemoteGone),
+        Some(RefusedReason::RemoteGone)
+    );
+    assert_eq!(
+        refused_reason(Met::CreateOnly(Refused)),
+        Some(RefusedReason::Rejected)
+    );
+    for met in [Met::Branch(TooLarge), Met::CreateOnly(TooLarge)] {
+        assert_eq!(
+            refused_reason(met),
+            Some(RefusedReason::TooLarge),
+            "{met:?}"
+        );
+    }
+    for kind in [Unreachable, Auth, UntrustedHost, NonFastForward, Local] {
+        assert_eq!(refused_reason(Met::Branch(kind)), None, "{kind:?}");
+        assert_eq!(refused_reason(Met::CreateOnly(kind)), None, "{kind:?}");
+    }
+    // A branch push the remote refuses (a hook on the branch, a lock) is
+    // retried, as for any volume (§11.3).
+    assert_eq!(refused_reason(Met::Branch(Refused)), None);
+    for (reason, text) in [
+        (RefusedReason::AnotherWriter, "another_writer"),
+        (RefusedReason::TooLarge, "too_large"),
+        (RefusedReason::Rejected, "rejected"),
+        (RefusedReason::RemoteGone, "remote_gone"),
+    ] {
+        assert_eq!(reason.as_str(), text);
+        assert_eq!(
+            serde_json::to_string(&reason).unwrap(),
+            format!("\"{text}\"")
+        );
+    }
+}
+
+/// Pseudo-random hex text, which compresses to about half its size.
+fn noise(bytes: usize) -> String {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..bytes / 16)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            format!("{x:016x}")
+        })
+        .collect()
+}
+
+/// B2: one commit over the fork remote's agentfsMaxPushSize is refused
+/// as too large.
+#[test]
+fn a_commit_over_the_push_size_is_refused_as_too_large() {
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let mut profile = fs::read_to_string(source.fragment.as_path()).unwrap();
+    profile.push_str("\tagentfsMaxPushSize = 8192\n");
+    fs::write(source.fragment.as_path(), profile).unwrap();
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+    fork.as_vol().write("big.txt", &noise(256 * 1024));
+    let lock = fork.lock();
+    let mut finisher = fork.finisher(&lock).unwrap();
+    let outcome = finisher.publish(None).unwrap();
+    assert!(
+        matches!(
+            outcome,
+            PublishOutcome::Refused {
+                reason: RefusedReason::TooLarge,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        finish::status(&fork.state).unwrap().unwrap().state,
+        ForkState::Refused
+    );
+    let remote = Repository::open_bare(source.remote.as_path()).unwrap();
+    assert!(remote.find_reference(&finish_ref("src-1")).is_err());
+}
+
+/// B3: the fork remote removed from the profile after finish is refused
+/// as gone at the next publish, not retried until a deadline.
+#[test]
+fn a_fork_remote_removed_after_finish_is_refused_as_gone() {
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+    fork.as_vol().write("b.txt", "b\n");
+    let lock = fork.lock();
+    let mut finisher = fork.finisher(&lock).unwrap();
+    finisher.finish().unwrap();
+    fs::write(source.fragment.as_path(), "").unwrap();
+    let started = Instant::now();
+    let outcome = finisher
+        .publish(Some(Instant::now() + Duration::from_secs(30)))
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            PublishOutcome::Refused {
+                reason: RefusedReason::RemoteGone,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "it was retried"
+    );
+    assert_eq!(
+        finish::status(&fork.state).unwrap().unwrap().state,
+        ForkState::Refused
+    );
+}
+
+/// The remote's refs, for "unchanged".
+fn remote_refs(path: &Path) -> BTreeMap<String, Oid> {
+    let repo = Repository::open_bare(path).unwrap();
+    repo.references()
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.name().unwrap().to_owned(), r.target().unwrap())
+        })
+        .collect()
+}
+
+const OPERATOR: Caller = Caller {
+    uid: 0,
+    gid: 0,
+    pid: 2,
+};
+
+/// B4: abandon records the discard in any state but published; after it
+/// nothing the finisher runs pushes, even between two attempts.
+#[test]
+fn an_abandoned_fork_is_never_pushed_again() {
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    // Active.
+    let active = Fork::new();
+    active.create(&source, "src-1").unwrap();
+    let lock = active.lock();
+    assert!(matches!(
+        finish::abandon(&active.state, &lock, "  ", OPERATOR),
+        Err(AbandonError::EmptyReason)
+    ));
+    let status = finish::abandon(&active.state, &lock, "not needed", OPERATOR).unwrap();
+    assert_eq!(status.state, ForkState::Abandoned);
+    let mark = status.mark.unwrap().abandoned.unwrap();
+    assert_eq!(mark.reason, "not needed");
+    assert_eq!(mark.state, "active");
+    assert_eq!(mark.uid, 0);
+    assert!(status.state.may_delete());
+    assert!(matches!(
+        active.finisher(&lock),
+        Err(FinishError::Abandoned { .. })
+    ));
+    // Again: unchanged.
+    let again = finish::abandon(&active.state, &lock, "twice", OPERATOR).unwrap();
+    assert_eq!(again.mark.unwrap().abandoned.unwrap().reason, "not needed");
+    drop(lock);
+
+    // Finished and pending: abandoned between two attempts.
+    let fork = Fork::new();
+    fork.create(&source, "src-2").unwrap();
+    fork.as_vol().write("b.txt", "b\n");
+    let parked = source.dir.path().join("parked.git");
+    fs::rename(source.remote.as_path(), &parked).unwrap();
+    let lock = fork.lock();
+    let mut finisher = fork.finisher(&lock).unwrap();
+    let outcome = finisher
+        .publish(Some(Instant::now() + Duration::from_millis(200)))
+        .unwrap();
+    assert!(
+        matches!(outcome, PublishOutcome::Pending { .. }),
+        "{outcome:?}"
+    );
+    let status = finish::abandon(&fork.state, &lock, "stuck", OPERATOR).unwrap();
+    assert_eq!(status.mark.unwrap().abandoned.unwrap().state, "finished");
+    fs::rename(parked, source.remote.as_path()).unwrap();
+    let before = remote_refs(source.remote.as_path());
+    assert!(matches!(
+        finisher.publish(None),
+        Err(FinishError::Abandoned { .. })
+    ));
+    assert!(matches!(
+        finisher.finish(),
+        Err(FinishError::Abandoned { .. })
+    ));
+    assert_eq!(
+        remote_refs(source.remote.as_path()),
+        before,
+        "a push reached the remote"
+    );
+    drop(finisher);
+    drop(lock);
+
+    // Refused, then abandoned.
+    let refused = Fork::new();
+    refused.create(&source, "src-3").unwrap();
+    refused.as_vol().write("c.txt", "c\n");
+    let remote = Repository::open_bare(source.remote.as_path()).unwrap();
+    let source_head = source.head().unwrap();
+    push_source_branch(&source);
+    remote
+        .reference(&finish_ref("src-3"), source_head, true, "test")
+        .unwrap();
+    let lock = refused.lock();
+    let outcome = refused.finisher(&lock).unwrap().publish(None).unwrap();
+    assert!(
+        matches!(outcome, PublishOutcome::Refused { .. }),
+        "{outcome:?}"
+    );
+    let status = finish::abandon(&refused.state, &lock, "another writer", OPERATOR).unwrap();
+    assert_eq!(status.state, ForkState::Abandoned);
+    assert_eq!(status.mark.unwrap().abandoned.unwrap().state, "refused");
+    drop(lock);
+
+    // Published: nothing to discard.
+    let done = Fork::new();
+    done.create(&source, "src-4").unwrap();
+    let lock = done.lock();
+    assert_eq!(
+        done.finisher(&lock).unwrap().publish(None).unwrap(),
+        PublishOutcome::Published
+    );
+    assert!(matches!(
+        finish::abandon(&done.state, &lock, "late", OPERATOR),
+        Err(AbandonError::Published { .. })
+    ));
+    // A volume that is not a fork.
+    let held = StateLock::acquire(&source.state, "test", Duration::ZERO).unwrap();
+    assert!(matches!(
+        finish::abandon(&source.state, &held, "x", OPERATOR),
+        Err(AbandonError::NotAFork)
+    ));
+}
+
+/// B5: a fork whose included profile file is missing fails to open; a
+/// flagged fork remote with a global lfs.url and no endpoint of its own
+/// is misconfigured, and finish has no fork remote.
+#[test]
+fn settings_that_cannot_be_trusted_fail_closed() {
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let forks = source.dir.path().join("forks.git");
+    Repository::init_bare(&forks).unwrap();
+    let base_profile = fs::read_to_string(source.fragment.as_path()).unwrap();
+    let flagged = format!(
+        "{base_profile}[remote \"forks\"]\n\turl = {}\n\tagentfsForkRemote = true\n",
+        forks.display()
+    );
+    fs::write(source.fragment.as_path(), &flagged).unwrap();
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+
+    // A global LFS endpoint, and none of the fork remote's own.
+    fs::write(
+        source.fragment.as_path(),
+        format!("{flagged}[lfs]\n\turl = http://lfs.example/source\n"),
+    )
+    .unwrap();
+    let (events, seen) = recording();
+    let lock = fork.lock();
+    let mut finisher = fork.finisher_with(&lock, events).unwrap();
+    let misconfigured: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            Event::RemoteMisconfigured { remote, error } => Some(format!("{remote}: {error}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(misconfigured.len(), 1, "{misconfigured:?}");
+    assert!(
+        misconfigured[0].starts_with("forks: ")
+            && misconfigured[0].contains("must name its own LFS endpoint"),
+        "{misconfigured:?}"
+    );
+    assert!(matches!(
+        finisher.finish(),
+        Err(FinishError::NoForkRemote { .. })
+    ));
+    drop(finisher);
+    // The source is unaffected: its own remote is valid.
+    let settings = crate::config::Settings::load(&source.state.git()).unwrap();
+    assert_eq!(settings.remotes.len(), 1);
+    assert_eq!(settings.remotes[0].name, "origin");
+
+    // The profile file gone: nothing opens, nothing reads a status.
+    fs::remove_file(source.fragment.as_path()).unwrap();
+    let opened = fork.finisher(&lock);
+    let error = format!("{}", opened.err().unwrap());
+    assert!(error.contains("cannot be read"), "{error}");
+    let status = finish::status(&fork.state);
+    assert!(status.is_err(), "{status:?}");
+    let opened = volume::open(
+        &fork.state,
+        &fork.tree,
+        context("fork"),
+        Arc::new(NullSink),
+        &Telemetry::noop(),
+    );
+    assert!(opened.is_err());
+}
+
+/// B6: a Recorder opened on a finished fork refuses every record.
+#[test]
+fn a_finished_fork_records_nothing() {
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+    fork.as_vol().write("b.txt", "b\n");
+    volume::refuse_finished(&fork.state).unwrap();
+    let lock = fork.lock();
+    fork.finisher(&lock).unwrap().finish().unwrap();
+    assert!(matches!(
+        volume::refuse_finished(&fork.state),
+        Err(volume::VolumeError::ForkFinished { fork }) if fork == "src-1"
+    ));
+    fs::write(fork.tree.join("c.txt"), "c\n").unwrap();
+    let (recorder, _committer, _) = volume::open(
+        &fork.state,
+        &fork.tree,
+        context("fork"),
+        Arc::new(NullSink),
+        &Telemetry::noop(),
+    )
+    .unwrap();
+    let finished = |e: &volume::VolumeError| matches!(e, volume::VolumeError::ForkFinished { .. });
+    let path = RepoPath::new("c.txt").unwrap();
+    let input = || vec![volume::Input::Tree { path: path.clone() }];
+    assert!(finished(
+        &recorder
+            .record(Trigger::Close, CALLER, input())
+            .unwrap_err()
+    ));
+    assert!(finished(
+        &recorder
+            .record_group(Trigger::Close, CALLER, input())
+            .unwrap_err()
+    ));
+    assert!(finished(
+        &recorder
+            .record_as(Trigger::Sweep, CALLER, input(), None)
+            .unwrap_err()
+    ));
+    assert!(finished(
+        &recorder
+            .record_move(
+                Trigger::Rename,
+                CALLER,
+                RepoPath::new("b.txt").unwrap(),
+                RepoPath::new("d.txt").unwrap()
+            )
+            .unwrap_err()
+    ));
+    let op = recorder.begin_operation(
+        OperationKind::Restore,
+        "HEAD".into(),
+        "restore".into(),
+        CALLER,
+        &[CALLER.pid],
+    );
+    assert!(finished(&op.err().unwrap()));
+    // An ordinary volume is not refused.
+    volume::refuse_finished(&source.state).unwrap();
 }
 
 /// A8: a forge that moved the fork's branch does not block publishing once

@@ -7,10 +7,14 @@
 //! each fork asked to finish, not staged on this node, whose status is
 //! active or finished and that has no finisher running here, it starts
 //! `agentfs fork finish`, which takes the fork's state lock, finishes it
-//! once and publishes it with backoff until its fork remote holds it. A
-//! finisher that exits 75 found the fork busy (another node or process
-//! holds it); the next scan tries again. The request is on disk, so a
-//! restarted plugin picks it up at its first scan.
+//! once and publishes it with backoff until its fork remote holds it, or
+//! until its `--timeout` ([`launcher::FINISH_TIMEOUT`]), so the lock is
+//! free between scans for an operator's `fork abandon`. A finisher that
+//! exits 75 found the fork busy (another node or process holds it); the
+//! next scan tries again. A refused fork (its remote refuses for good) and
+//! an abandoned one are skipped: they wait for the operator (`fork finish
+//! --retry`, `fork abandon`). The request is on disk, so a restarted
+//! plugin picks it up at its first scan.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -126,7 +130,8 @@ impl Publisher {
 }
 
 /// The forks to finish: asked to by DeleteVolume, not staged on this node
-/// (its history service holds the fork), and active or finished.
+/// (its history service holds the fork), and active or finished; never
+/// refused or abandoned.
 fn to_finish(layout: &Layout) -> (Vec<String>, Vec<(PathBuf, String)>) {
     let mut wanted = Vec::new();
     let mut unreadable = Vec::new();
@@ -172,7 +177,9 @@ mod tests {
     use git2::{Oid, Repository};
     use rustix::process::Signal;
 
-    use agentfs_core::fork::finish::{ForkMark, PublishedMark};
+    use agentfs_core::fork::finish::{
+        AbandonedMark, ForkMark, PublishedMark, RefusedMark, RefusedReason,
+    };
     use agentfs_core::fork::{ForkIdentity, PushTarget};
 
     use super::*;
@@ -274,13 +281,13 @@ mod tests {
         agentfs_core::fsutil::write_json_atomic(
             &state.fork_mark(),
             &ForkMark {
-                version: 1,
                 published: Some(PublishedMark {
                     finish: finish.to_string(),
                     change: None,
                     remote: "origin".into(),
                     at_ms: 1,
                 }),
+                ..ForkMark::empty()
             },
         )
         .unwrap();
@@ -288,6 +295,38 @@ mod tests {
             finish::status(&state).unwrap().unwrap().state,
             ForkState::Published
         );
+    }
+
+    /// Marks the published fork `handle` refused instead, or abandoned.
+    fn refuse_or_abandon(layout: &Layout, handle: &str, abandon: bool) {
+        publish(layout, handle);
+        let state = StateDir::new(layout.state(handle));
+        let mut mark: ForkMark =
+            serde_json::from_slice(&fs::read(state.fork_mark()).unwrap()).unwrap();
+        let finish = mark.published.take().unwrap().finish;
+        if abandon {
+            mark.abandoned = Some(AbandonedMark {
+                reason: "not wanted".into(),
+                at_ms: 2,
+                uid: 0,
+                state: "finished".into(),
+            });
+        } else {
+            mark.refused = Some(RefusedMark {
+                finish,
+                remote: "origin".into(),
+                reason: RefusedReason::AnotherWriter,
+                message: "another writer".into(),
+                at_ms: 2,
+            });
+        }
+        agentfs_core::fsutil::write_json_atomic(&state.fork_mark(), &mark).unwrap();
+        let wanted = if abandon {
+            ForkState::Abandoned
+        } else {
+            ForkState::Refused
+        };
+        assert_eq!(finish::status(&state).unwrap().unwrap().state, wanted);
     }
 
     fn args(spec: &ProcessSpec) -> Vec<String> {
@@ -308,6 +347,11 @@ mod tests {
         volume(&layout, "plain", false, true);
         volume(&layout, "done", true, true);
         publish(&layout, "done");
+        // B1, B4: refused and abandoned forks wait for the operator.
+        volume(&layout, "refused", true, true);
+        refuse_or_abandon(&layout, "refused", false);
+        volume(&layout, "dropped", true, true);
+        refuse_or_abandon(&layout, "dropped", true);
         volume(&layout, "staged", true, true);
         fs::create_dir_all(layout.staged_dir()).unwrap();
         fs::write(layout.staged_record("staged"), "{}").unwrap();
@@ -341,6 +385,8 @@ mod tests {
                 root.as_str(),
                 "fork",
                 "finish",
+                "--timeout",
+                "300000ms",
                 "--namespace",
                 "ns",
                 "--pod",
@@ -363,5 +409,16 @@ mod tests {
         // A restarted plugin: the request is on disk.
         let restarted = Publisher::new(layout, fake.clone(), identity, Duration::from_secs(30));
         assert_eq!(restarted.scan().await.started, ["fork-a"]);
+        let labels: Vec<String> = fake
+            .started
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.label.clone())
+            .collect();
+        assert!(
+            labels.iter().all(|l| l == "fork fork-a"),
+            "a finisher started for a refused or abandoned fork: {labels:?}"
+        );
     }
 }

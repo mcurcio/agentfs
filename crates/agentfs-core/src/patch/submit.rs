@@ -11,6 +11,12 @@
 //!    a given commit with exactly one parent, or one built here on `H`
 //!    from `--put`/`--delete` (with a temporary index), or, for `--skip`,
 //!    an empty commit on `H`.
+//!    A given commit taking a new number that is already queued
+//!    (`inbox/*`) or applied (`applied/*`, or `last_applied` in the status
+//!    ref) is refused early
+//!    ([`SubmitError::AlreadySubmitted`]), pushing nothing: a change lands
+//!    at most once. Two submits at once can both pass this check; the
+//!    queue's duplicate rule (§12) is the guarantee.
 //! 4. Its number is one past the highest inbox or applied number on the
 //!    remote, or, for `--replace N`/`--skip N`, `N`: a queued patch, or a
 //!    gap (a number below the highest one that the remote has neither as
@@ -72,6 +78,15 @@ pub enum SubmitError {
          so); a replacement would never be applied: submit a new patch instead"
     )]
     AlreadyApplied(u64),
+    #[error(
+        "commit {commit} is already queued as inbox {inbox:?} or applied as {applied:?}; a \
+         change lands at most once"
+    )]
+    AlreadySubmitted {
+        commit: String,
+        inbox: Option<u64>,
+        applied: Option<u64>,
+    },
     #[error("lost the race for an inbox number {attempts} times; try again")]
     Raced { attempts: u32 },
     #[error("the remote refused {ref_name}: {message}")]
@@ -282,6 +297,11 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
             head.clone(),
         ),
     };
+    // A given commit taking a new number; `--replace N` names its number
+    // deliberately and is checked against applied numbers below.
+    if let (Source::Commit(_), None) = (&req.source, req.replace) {
+        refuse_submitted(git, req, &listing, &oid)?;
+    }
     let replace = match (&req.source, req.replace) {
         (Source::Skip(n), None) => Some(*n),
         (Source::Skip(n), Some(r)) if r != *n => {
@@ -382,6 +402,41 @@ fn ls_remote(
         .collect())
 }
 
+/// [`SubmitError::AlreadySubmitted`] when `oid` is a queued or applied
+/// patch commit on the remote: an `inbox/*` or `applied/*` ref at it, or
+/// the status ref's `last_applied` patch. An early refusal only: two
+/// submits at once both pass it, and the queue's duplicate rule (§12) is
+/// what makes a change land at most once.
+fn refuse_submitted(
+    git: &impl GitRunner,
+    req: &SubmitRequest,
+    listing: &BTreeMap<String, String>,
+    oid: &str,
+) -> Result<(), SubmitError> {
+    let at = |prefix: String| {
+        listing
+            .iter()
+            .filter(|(_, o)| o.as_str() == oid)
+            .find_map(|(name, _)| seq_of_ref(&prefix, name))
+    };
+    let inbox = at(inbox_prefix(&req.volume));
+    let applied = at(applied_prefix(&req.volume)).or_else(|| {
+        let last = remote_status(git, req, listing)?;
+        let last = last.get("last_applied")?;
+        (last.get("patch")?.as_str()? == oid)
+            .then(|| last.get("inbox")?.as_u64())
+            .flatten()
+    });
+    if inbox.is_some() || applied.is_some() {
+        return Err(SubmitError::AlreadySubmitted {
+            commit: oid.to_owned(),
+            inbox,
+            applied,
+        });
+    }
+    Ok(())
+}
+
 /// The highest number the volume has applied, as the remote's status ref
 /// says (`last_applied.inbox` in its `status.json`). The status reaches
 /// the remote even while the branch and the applied refs cannot, so it
@@ -392,6 +447,19 @@ fn remote_last_applied(
     req: &SubmitRequest,
     listing: &BTreeMap<String, String>,
 ) -> Option<u64> {
+    remote_status(git, req, listing)?
+        .get("last_applied")?
+        .get("inbox")?
+        .as_u64()
+}
+
+/// The remote's `status.json`, from its status ref. `None` when there is
+/// no status or it cannot be read: best effort.
+fn remote_status(
+    git: &impl GitRunner,
+    req: &SubmitRequest,
+    listing: &BTreeMap<String, String>,
+) -> Option<serde_json::Value> {
     let name = status_ref(&req.volume);
     let oid = listing.get(&name)?;
     let base = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"];
@@ -408,8 +476,7 @@ fn remote_last_applied(
     if !out.success {
         return None;
     }
-    let doc: serde_json::Value = serde_json::from_str(&out.stdout).ok()?;
-    doc.get("last_applied")?.get("inbox")?.as_u64()
+    serde_json::from_str(&out.stdout).ok()
 }
 
 /// `git push` of `oid` to `ref_name`, leased on the remote holding
@@ -926,6 +993,69 @@ mod tests {
         ));
         assert!(git.calls.borrow().iter().all(|c| c[0] != "push"
             || c[3] != format!("--force-with-lease=refs/agentfs/v/inbox/0000000004:{OTHER}")));
+    }
+
+    /// B7: a commit already queued or applied is refused early, and
+    /// nothing is pushed.
+    #[test]
+    fn a_queued_or_applied_commit_is_refused_early() {
+        let pushes = |git: &FakeGit| git.calls.borrow().iter().filter(|c| c[0] == "push").count();
+        let git = FakeGit::new(&[
+            ("refs/heads/agentfs/v", HEAD),
+            ("refs/agentfs/v/inbox/0000000003", PATCH),
+        ]);
+        match submit(&git, &request(Source::Commit("HEAD".into()))).unwrap_err() {
+            SubmitError::AlreadySubmitted {
+                commit,
+                inbox,
+                applied,
+            } => {
+                assert_eq!(commit, PATCH);
+                assert_eq!(inbox, Some(3));
+                assert_eq!(applied, None);
+            }
+            other => panic!("{other}"),
+        }
+        assert_eq!(pushes(&git), 0);
+        let git = FakeGit::new(&[
+            ("refs/heads/agentfs/v", HEAD),
+            ("refs/agentfs/v/applied/0000000002", PATCH),
+        ]);
+        assert!(matches!(
+            submit(&git, &request(Source::Commit("HEAD".into()))).unwrap_err(),
+            SubmitError::AlreadySubmitted {
+                inbox: None,
+                applied: Some(2),
+                ..
+            }
+        ));
+        assert_eq!(pushes(&git), 0);
+        // Applied, its applied ref held back: the status says so.
+        let git = FakeGit::new(&[
+            ("refs/heads/agentfs/v", HEAD),
+            ("refs/agentfs/v/status", OTHER),
+        ]);
+        *git.status.borrow_mut() = Some(format!(
+            r#"{{"last_applied": {{"inbox": 5, "patch": "{PATCH}"}}}}"#
+        ));
+        assert!(matches!(
+            submit(&git, &request(Source::Commit("HEAD".into()))).unwrap_err(),
+            SubmitError::AlreadySubmitted {
+                applied: Some(5),
+                ..
+            }
+        ));
+        assert_eq!(pushes(&git), 0);
+        // Another patch applied last: submitted.
+        *git.status.borrow_mut() = Some(format!(
+            r#"{{"last_applied": {{"inbox": 5, "patch": "{OTHER}"}}}}"#
+        ));
+        assert_eq!(
+            submit(&git, &request(Source::Commit("HEAD".into())))
+                .unwrap()
+                .inbox,
+            1
+        );
     }
 
     #[test]

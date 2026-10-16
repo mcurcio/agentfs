@@ -10,15 +10,18 @@
 //! - [`identity`]: what a fork is, fixed at create, and its ref names;
 //! - [`create`]: a fork from a source's state area, read without the
 //!   source's lock and with no credentials;
-//! - [`finish`]: the finisher, the one owner of `finished` and
-//!   `published`, and [`finish::status`], what DeleteVolume asks.
+//! - [`finish`]: the finisher, the one owner of `finished`, `published`
+//!   and `refused`; [`finish::abandon`], the operator's discard; and
+//!   [`finish::status`], what DeleteVolume asks;
+//! - [`listing`]: the published changes on a fork remote, checked, read
+//!   in a receiver's repository with its own git.
 //!
-//! Design §11.5 has the whole model; refused and abandoned forks arrive
-//! with forked volumes unit 2.
+//! Design §11.5 has the whole model.
 
 pub mod create;
 pub mod finish;
 pub mod identity;
+pub mod listing;
 
 #[cfg(test)]
 mod tests;

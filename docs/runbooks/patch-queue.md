@@ -135,9 +135,12 @@ change at once, or a producer pushing a commit again) applies once (design
 subject is `duplicate of patch <m>: ...`, its refs move like an applied
 patch's, and the `PatchDuplicate` event (not an alarm) and `status.json`'s
 `duplicate_now` say so. Nothing is merged, so a change the workload has
-reverted since stays reverted. To apply the same content again on
-purpose, submit a new commit (`git commit --amend --no-edit` on the patch
-gives it a new id).
+reverted since stays reverted. `agentfs patch submit` of a commit the
+remote already queues or has applied is refused before it pushes
+(`already queued as inbox … or applied as …; a change lands at most
+once`); only submits at the same moment both get through. To apply the
+same content again on purpose, submit a new commit (`git commit --amend
+--no-edit` on the patch gives it a new id).
 
 ## 3. Check the queue
 

@@ -168,14 +168,24 @@ node; the next retry then finds no volume and succeeds.
 
 **Symptoms.** A deleted fork claim's PV stays `Released`, and the
 csi-provisioner's log says `DeleteVolume … Unavailable desc = fork <pv> is
-active` (or `finished`) `: DeleteVolume completes once it is published or
-abandoned`.
+active` (or `finished`, or `refused`) `: DeleteVolume completes once it is
+published or abandoned`.
 
 This is the design working (design §11.5, [csi.md §14](../csi.md#14-forks)):
 a fork is deleted only once its fork remote holds its change and finish
 refs. The node plugin's publisher runs `agentfs fork finish` for it at
 start and every `--fork-scan-interval`; the finisher retries with
-backoff until the remote takes the push.
+backoff until the remote takes the push, or refuses it for good. First
+look at the fork, in the node plugin pod (no lock, no network):
+
+```sh
+kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+  agentfs --state /var/lib/agentfs-csi/volumes/$PV/state fork status
+```
+
+`state:` is `active` or `finished` (pending: steps 1 and 2), `refused`
+(step 4), or `published` (the next DeleteVolume completes). `publish:`
+says why.
 
 1. Find the finisher's output in the node plugin's log: `[fork <pv>] …`,
    with each push failure and why (unreachable, auth, refused).
@@ -190,19 +200,51 @@ backoff until the remote takes the push.
        --root /var/lib/agentfs-csi/volumes/$PV/backing fork finish --timeout 60s
    ```
 
-   Exit 0 is published, 1 not yet (it says why), 75 means the publisher's
-   own finisher holds the fork: wait for it.
+   Exit 0 is published, 1 not yet or refused (it says why), 75 means the
+   publisher's own finisher holds the fork: add `--wait-lock 6m` (it
+   frees the lock at its 5-minute timeout).
 3. `FAILED_PRECONDITION … reading the fork status …; nothing deleted`:
    the fork's settings or `meta/fork.json` cannot be read. The volume is
-   kept until they can; fix the profile, or remove a corrupt
-   `meta/fork.json` (the next publish writes it again once the remote
-   confirms).
+   kept until they can; fix the profile, or move a corrupt
+   `meta/fork.json` aside (the next publish writes it again once the
+   remote confirms; a refusal or an abandon it recorded is lost with it).
+4. **Refused** (`state: refused`; the alarm `ForkRefused`, once; the
+   publisher starts no further finisher): the fork remote refuses for
+   good. `publish:` names the reason:
+   - `another_writer`: `refs/agentfs/<fork>/finish` or `/change` on the
+     fork remote holds another commit. agentfs never moves it. Find who
+     wrote it; if it is not this fork's, remove it on the remote
+     (`git push <remote> :refs/agentfs/<fork>/finish`).
+   - `rejected`: the remote refused the change and finish refs (a
+     pre-receive hook or branch protection on `refs/agentfs/*`). Allow
+     agentfs's identity to create them.
+   - `too_large`: one commit over the fork remote's `agentfsMaxPushSize`,
+     or an LFS object over `agentfsMaxLfsObjectSize` (design §11.3).
+     Raise the limit in the profile.
+   - `remote_gone`: the profile no longer has the fork remote the finish
+     named (or it is now invalid, `RemoteMisconfigured`). Restore it.
 
-A fork whose remote refuses it for good (another writer's finish ref, a
-change too large) waits for an operator; recording that refusal, and
-abandoning a fork on record, arrive with forked volumes unit 2. Until
-then, the only way to give a fork up is to remove `<basePath>/<pv>` by
-hand, which discards its change.
+   Then publish again, clearing the refusal:
+
+   ```sh
+   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+     agentfs --wait-lock 6m --state /var/lib/agentfs-csi/volumes/$PV/state \
+       --root /var/lib/agentfs-csi/volumes/$PV/backing fork finish --retry --timeout 2m
+   ```
+5. **Give the fork up** (unreachable for good, or its change not
+   wanted): abandon it on record, and the next DeleteVolume applies
+   `onDelete`, discarding the change (it stays in the fork's branch on the
+   fork remote, if it got there):
+
+   ```sh
+   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+     agentfs --wait-lock 6m --state /var/lib/agentfs-csi/volumes/$PV/state \
+       fork abandon --reason "<why>"
+   ```
+
+   It is refused for a published fork, and exits 75 while another
+   process holds the fork. After it nothing agentfs runs pushes the fork;
+   a push already running finishes or times out.
 
 ## Undoing a change in a live volume
 

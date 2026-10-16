@@ -11,7 +11,9 @@
 //! - **Publish** starts a front that FUSE-mounts the backing tree at its
 //!   own source directory, waits until that mount is live, bind-mounts it
 //!   onto the kubelet's target and records the target in
-//!   `<node-state>/published/`.
+//!   `<node-state>/published/`. A finished fork is published read-only
+//!   (`MS_RDONLY`) whatever the request asks (design §11.5); its service
+//!   still starts, and refuses every record.
 //! - **A front that exits unasked** (a crash, `kill -9`, an external
 //!   unmount) is restarted after a backoff in the same pending slot, with
 //!   the same pod flags; its stale source is detached and the new mount is
@@ -628,6 +630,14 @@ impl Supervisor {
     /// front, released while it mounts (so other pods' recoveries do not
     /// wait behind it), and taken again to attach the target.
     pub async fn publish(self: &Arc<Self>, req: PublishRequest) -> Result<(), Error> {
+        let mut req = req;
+        if !req.readonly && self.fork_finished(&req.handle) {
+            eprintln!(
+                "volume {}: a finished fork, published read-only",
+                req.handle
+            );
+            req.readonly = true;
+        }
         let handle = req.handle.as_str();
         let target = req.target.as_path();
         let key = target_key(target);
@@ -696,6 +706,17 @@ impl Supervisor {
             }
         }
         self.attach_target(target, &source).await
+    }
+
+    /// Whether the volume is a finished fork, which is read-only (design
+    /// §11.5). Anything else wrong with its state area is the front's to
+    /// report.
+    fn fork_finished(&self, handle: &str) -> bool {
+        let state = StateDir::new(self.layout().state(handle));
+        matches!(
+            core_volume::refuse_finished(&state),
+            Err(core_volume::VolumeError::ForkFinished { .. })
+        )
     }
 
     /// NodePublish's checks against what is published: the target for

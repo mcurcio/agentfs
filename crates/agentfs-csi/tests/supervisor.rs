@@ -829,3 +829,65 @@ async fn publishing_a_target_again_with_other_flags_is_already_exists() {
     n.sup.publish(again(false, false)).await.unwrap();
     assert_eq!(n.fake.spawns("front").len(), 1);
 }
+
+/// B6: a finished fork is published read-only whatever the request asks,
+/// and its service still starts.
+#[tokio::test]
+async fn a_finished_fork_is_published_read_only() {
+    let n = Node::new();
+    agentfs_csi::volume::create(&n.layout, "f", &params("f"), 0, false).unwrap();
+    let state = StateDir::new(n.layout.state("f"));
+    fs::remove_dir_all(state.root()).unwrap();
+    let base = "1".repeat(40);
+    let identity = agentfs_core::fork::ForkIdentity {
+        fork: "f".into(),
+        source: "src".into(),
+        base: git2::Oid::from_str(&base).unwrap(),
+        push_target: agentfs_core::fork::PushTarget::Branch,
+    };
+    let config = agentfs_csi::volume::profile_config(&n.layout, "p").unwrap();
+    agentfs_core::volume::init_fork(&state, &identity, &[config]).unwrap();
+    let target = n.target("a");
+    // Active: as asked.
+    n.stage("f").await.unwrap();
+    n.publish("f", &target, false).await.unwrap();
+    let binds = |n: &Node| -> Vec<String> {
+        n.fake
+            .events()
+            .into_iter()
+            .filter(|e| e.starts_with("bind "))
+            .collect()
+    };
+    assert!(
+        binds(&n).last().unwrap().ends_with("ro=false"),
+        "{:?}",
+        binds(&n)
+    );
+    n.sup.unpublish("f", &target).await.unwrap();
+    // Finished: its head is the finish commit.
+    let repo = git2::Repository::open_bare(state.git()).unwrap();
+    let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+    let tree = repo.treebuilder(None).unwrap().write().unwrap();
+    let tree = repo.find_tree(tree).unwrap();
+    let message = format!(
+        "finish fork f\n\nAgentfs-Seq: 0\nAgentfs-Trigger: finish\nAgentfs-Fork: f\n\
+         Agentfs-Source: src\nAgentfs-Base: {base}\nAgentfs-Fork-Remote: origin\n\
+         Agentfs-Unrecorded: 0\n"
+    );
+    repo.commit(
+        Some("refs/heads/agentfs/f"),
+        &sig,
+        &sig,
+        &message,
+        &tree,
+        &[],
+    )
+    .unwrap();
+    n.publish("f", &target, false).await.unwrap();
+    assert!(
+        binds(&n).last().unwrap().ends_with("ro=true"),
+        "{:?}",
+        binds(&n)
+    );
+    assert!(n.record("f", &target).unwrap().readonly);
+}

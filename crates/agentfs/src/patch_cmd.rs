@@ -112,6 +112,7 @@ pub fn run(
             let Some(root) = root else {
                 bail!("patch apply needs --root (or AGENTFS_ROOT): the backing tree");
             };
+            crate::refuse_finished(state)?;
             let _lock = StateLock::acquire(state, "patch apply", wait_lock)?;
             let session = Session::start(state, &pod)?;
             let (recorder, committer, _) = session.open(state, root, &pod)?;

@@ -1189,6 +1189,36 @@ async fn forks_are_cloned_and_deleted_once_published() {
     drop(lock);
     c.delete_volume(delete()).await.unwrap();
     assert!(!d.layout.volume_dir("fork-1").exists());
+
+    // B4: an abandoned fork, never published, is deleted as onDelete says.
+    let mut params = fork_params.to_vec();
+    params.retain(|(k, _)| *k != "csi.storage.k8s.io/pv/name");
+    params.push(("csi.storage.k8s.io/pv/name", "fork-2"));
+    let mut req = create_req("fork-2", &params);
+    req.volume_content_source = clone_of("src");
+    c.create_volume(req).await.unwrap();
+    let delete2 = || DeleteVolumeRequest {
+        volume_id: "fork-2".into(),
+        ..Default::default()
+    };
+    let err = c.delete_volume(delete2()).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    let state = agentfs_core::volume::StateDir::new(d.layout.state("fork-2"));
+    let lock = agentfs_core::lock::StateLock::acquire(&state, "test", Duration::ZERO).unwrap();
+    let operator = agentfs_core::record::Caller {
+        uid: 0,
+        gid: 0,
+        pid: 1,
+    };
+    let status =
+        agentfs_core::fork::finish::abandon(&state, &lock, "not wanted", operator).unwrap();
+    assert_eq!(
+        status.state,
+        agentfs_core::fork::finish::ForkState::Abandoned
+    );
+    drop(lock);
+    c.delete_volume(delete2()).await.unwrap();
+    assert!(!d.layout.volume_dir("fork-2").exists());
     // The source is untouched, and ordinary volumes delete as before.
     assert!(d.layout.volume_dir("src").exists());
     d.stop().await;

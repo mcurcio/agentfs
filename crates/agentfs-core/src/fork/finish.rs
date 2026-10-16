@@ -10,8 +10,12 @@
 //! [`Finisher::publish`] pushes the history, the change and the finish
 //! commit to the fork remote, with §11.2 backoff, until the remote holds
 //! the change and finish refs at exactly their ids, and only then writes
-//! the published mark. [`status`] reads, without a lock or credentials,
-//! what DeleteVolume asks: whether the fork is published.
+//! the published mark. A remote that refuses for good (see
+//! [`refused_reason`], the single decider) is recorded as refused and not
+//! retried until the operator clears it ([`Finisher::retry_refused`]).
+//! [`abandon`] records the operator's discard, after which nothing agentfs
+//! runs pushes the fork. [`status`] reads, without a lock or credentials,
+//! what DeleteVolume asks: whether the fork is published or abandoned.
 
 use std::io;
 use std::path::Path;
@@ -79,10 +83,10 @@ pub enum ForkState {
     /// The fork remote holds the change and finish refs at exactly their
     /// ids, as the finisher saw after pushing.
     Published,
-    /// The fork remote refuses for good; waits for the operator (forked
-    /// volumes unit 2).
+    /// The fork remote refuses for good; waits for the operator
+    /// (`agentfs fork finish --retry`, or [`abandon`]).
     Refused,
-    /// The operator's recorded discard (forked volumes unit 2).
+    /// The operator's recorded discard ([`abandon`]).
     Abandoned,
 }
 
@@ -111,11 +115,13 @@ pub struct ForkStatus {
     pub state: ForkState,
     /// The finish record, once the fork is finished.
     pub record: Option<FinishRecord>,
+    /// `meta/fork.json`, when there is one.
+    pub mark: Option<ForkMark>,
 }
 
-/// Why a publish cannot succeed without the operator (forked volumes
-/// unit 2 produces these).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a publish cannot succeed without the operator ([`refused_reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RefusedReason {
     /// A create-only ref on the fork remote holds another object.
     AnotherWriter,
@@ -125,6 +131,48 @@ pub enum RefusedReason {
     Rejected,
     /// The fork's settings no longer define the remote the finish named.
     RemoteGone,
+}
+
+impl RefusedReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AnotherWriter => "another_writer",
+            Self::TooLarge => "too_large",
+            Self::Rejected => "rejected",
+            Self::RemoteGone => "remote_gone",
+        }
+    }
+}
+
+/// What a publish attempt met, for [`refused_reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Met {
+    /// The history push (the fork's branch) failed so.
+    Branch(PushFailureKind),
+    /// The create-only push of the change and finish refs failed so.
+    CreateOnly(PushFailureKind),
+    /// A create-only ref on the remote holds another object.
+    AnotherWriter,
+    /// The finish names a remote that is not the fork's fork remote now.
+    RemoteGone,
+}
+
+/// The single decider of "permanent" (design §11.5): what makes a publish
+/// refused, alarmed once and never retried by the node plugin's
+/// publisher. Everything else (unreachable, auth, a moved branch, a busy
+/// remote) is pending and retried with backoff (§11.3).
+pub fn refused_reason(met: Met) -> Option<RefusedReason> {
+    match met {
+        Met::AnotherWriter => Some(RefusedReason::AnotherWriter),
+        Met::RemoteGone => Some(RefusedReason::RemoteGone),
+        // One commit over agentfsMaxPushSize, or one LFS object over
+        // agentfsMaxLfsObjectSize (§11.3): no retry can send it.
+        Met::Branch(PushFailureKind::TooLarge) | Met::CreateOnly(PushFailureKind::TooLarge) => {
+            Some(RefusedReason::TooLarge)
+        }
+        Met::CreateOnly(PushFailureKind::Refused) => Some(RefusedReason::Rejected),
+        Met::Branch(_) | Met::CreateOnly(_) => None,
+    }
 }
 
 /// How a publish went.
@@ -151,12 +199,53 @@ pub enum PublishOutcome {
 pub const MARK_VERSION: u32 = 1;
 
 /// `meta/fork.json` (design §2.2): the finisher's marks, written only
-/// after the remote confirmed what they say.
+/// after the remote confirmed what they say, and the operator's discard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForkMark {
     pub version: u32,
     pub published: Option<PublishedMark>,
+    #[serde(default)]
+    pub refused: Option<RefusedMark>,
+    #[serde(default)]
+    pub abandoned: Option<AbandonedMark>,
+}
+
+impl ForkMark {
+    /// A mark with nothing recorded yet.
+    pub fn empty() -> Self {
+        Self {
+            version: MARK_VERSION,
+            published: None,
+            refused: None,
+            abandoned: None,
+        }
+    }
+}
+
+/// The fork remote refused the finish `finish` for good ([`refused_reason`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefusedMark {
+    pub finish: String,
+    pub remote: String,
+    pub reason: RefusedReason,
+    pub message: String,
+    /// When it was refused (milliseconds since the Unix epoch).
+    pub at_ms: u64,
+}
+
+/// The operator's recorded discard ([`abandon`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbandonedMark {
+    pub reason: String,
+    /// When (milliseconds since the Unix epoch).
+    pub at_ms: u64,
+    /// The operator's uid.
+    pub uid: u32,
+    /// [`ForkState::as_str`] when it was abandoned.
+    pub state: String,
 }
 
 /// The fork remote held the change and finish refs at exactly these ids.
@@ -179,6 +268,20 @@ pub enum StatusError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum AbandonError {
+    #[error("this volume is not a fork")]
+    NotAFork,
+    #[error("fork {fork} is published; there is nothing to discard")]
+    Published { fork: String },
+    #[error("a reason is required")]
+    EmptyReason,
+    #[error(transparent)]
+    Status(#[from] StatusError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum FinishError {
     #[error("this volume is not a fork")]
     NotAFork,
@@ -191,7 +294,26 @@ pub enum FinishError {
     #[error(transparent)]
     History(#[from] HistoryError),
     #[error(transparent)]
+    Status(#[from] StatusError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// A failed publish attempt: what it met, and how the push failed.
+struct Failed {
+    met: Met,
+    kind: PushFailureKind,
+    message: String,
+}
+
+impl Failed {
+    fn branch(kind: PushFailureKind, message: String) -> Self {
+        Self {
+            met: Met::Branch(kind),
+            kind,
+            message,
+        }
+    }
 }
 
 /// A fork opened for finishing and publishing.
@@ -225,6 +347,7 @@ impl Finisher {
         }
         let settings = Settings::load(&state.git()).map_err(HistoryError::from)?;
         let identity = settings.fork.ok_or(FinishError::NotAFork)?;
+        refuse_abandoned(state, &identity.fork)?;
         let (recorder, committer, _) =
             volume::open(state, tree, context, events.clone(), telemetry)?;
         Ok(Self {
@@ -242,6 +365,7 @@ impl Finisher {
     /// finished returns its record unchanged.
     pub fn finish(&mut self) -> Result<FinishRecord, FinishError> {
         let fork = self.identity.fork.clone();
+        refuse_abandoned(&self.state, &fork)?;
         if let Some(record) = self.finished()? {
             // A crash between the finish commit and its ref.
             self.set_ref(&finish_ref(&fork), record.finish)?;
@@ -379,75 +503,129 @@ impl Finisher {
         unrecorded
     }
 
+    /// Clears a refused mark so publish tries again (`fork finish
+    /// --retry`).
+    pub fn retry_refused(&mut self) -> Result<(), FinishError> {
+        refuse_abandoned(&self.state, &self.identity.fork)?;
+        update_mark(&self.state, |mark| mark.refused = None)?;
+        Ok(())
+    }
+
     /// Publishes the finished fork: attempts with §11.2 backoff until it
     /// is published or refused, or, with a `deadline`, until then. Safe to
-    /// run again; a fork already published returns at once. Finishes the
-    /// fork first if it is not finished yet.
+    /// run again; a fork already published returns at once, and one
+    /// refused returns its refusal without pushing. Finishes the fork
+    /// first if it is not finished yet. Before every attempt the mark is
+    /// read again: an abandoned fork stops with [`FinishError::Abandoned`].
     pub fn publish(&mut self, deadline: Option<Instant>) -> Result<PublishOutcome, FinishError> {
         let record = self.finish()?;
-        if read_mark(&self.state)
-            .ok()
-            .flatten()
-            .and_then(|m| m.published)
-            .is_some_and(|p| p.finish == record.finish.to_string())
-        {
-            return Ok(PublishOutcome::Published);
-        }
-        let settings = self.committer.history().settings().clone();
+        let finish = record.finish.to_string();
         let mut pusher = None;
         let mut failures = 0u32;
         loop {
-            match self.publish_once(&settings, &record, &mut pusher) {
+            let mark = read_mark(&self.state)?.unwrap_or_else(ForkMark::empty);
+            if mark.abandoned.is_some() {
+                return Err(FinishError::Abandoned {
+                    fork: record.fork.clone(),
+                });
+            }
+            if mark.published.as_ref().is_some_and(|p| p.finish == finish) {
+                return Ok(PublishOutcome::Published);
+            }
+            if let Some(refused) = mark.refused.as_ref().filter(|r| r.finish == finish) {
+                return Ok(PublishOutcome::Refused {
+                    reason: refused.reason,
+                    message: refused.message.clone(),
+                });
+            }
+            let failed = match self.publish_once(&record, &mut pusher) {
                 Ok(()) => {
-                    let mark = ForkMark {
-                        version: MARK_VERSION,
-                        published: Some(PublishedMark {
-                            finish: record.finish.to_string(),
-                            change: record.change.map(|c| c.to_string()),
-                            remote: record.remote.clone(),
-                            at_ms: now_ms(),
-                        }),
+                    let published = PublishedMark {
+                        finish: finish.clone(),
+                        change: record.change.map(|c| c.to_string()),
+                        remote: record.remote.clone(),
+                        at_ms: now_ms(),
                     };
-                    crate::fsutil::write_json_atomic(&self.state.fork_mark(), &mark)?;
+                    update_mark(&self.state, |mark| {
+                        mark.published = Some(published);
+                        mark.refused = None;
+                    })?;
                     return Ok(PublishOutcome::Published);
                 }
-                Err((kind, message)) => {
-                    failures = failures.saturating_add(1);
-                    let now = Instant::now();
-                    let delay = backoff(settings.push_interval, failures, PUSH_BACKOFF_CAP);
-                    let delay = match deadline {
-                        Some(deadline) if now >= deadline => {
-                            return Ok(PublishOutcome::Pending { kind, message });
-                        }
-                        Some(deadline) => delay.min(deadline - now),
-                        None => delay,
-                    };
-                    std::thread::sleep(delay.max(Duration::from_millis(10)));
-                }
+                Err(failed) => failed,
+            };
+            if let Some(reason) = refused_reason(failed.met) {
+                let refused = RefusedMark {
+                    finish: finish.clone(),
+                    remote: record.remote.clone(),
+                    reason,
+                    message: failed.message.clone(),
+                    at_ms: now_ms(),
+                };
+                update_mark(&self.state, |mark| mark.refused = Some(refused))?;
+                self.events.emit(Event::ForkRefused {
+                    fork: record.fork.clone(),
+                    remote: record.remote.clone(),
+                    reason: reason.as_str(),
+                    message: failed.message.clone(),
+                });
+                return Ok(PublishOutcome::Refused {
+                    reason,
+                    message: failed.message,
+                });
             }
+            failures = failures.saturating_add(1);
+            let now = Instant::now();
+            let interval = self.committer.history().settings().push_interval;
+            let delay = backoff(interval, failures, PUSH_BACKOFF_CAP);
+            let delay = match deadline {
+                Some(deadline) if now >= deadline => {
+                    return Ok(PublishOutcome::Pending {
+                        kind: failed.kind,
+                        message: failed.message,
+                    });
+                }
+                Some(deadline) => delay.min(deadline - now),
+                None => delay,
+            };
+            std::thread::sleep(delay.max(Duration::from_millis(10)));
         }
     }
 
     /// One attempt: the history, then the change and finish refs,
     /// create-only. `Ok` once the remote holds both refs at exactly their
-    /// ids.
+    /// ids. The settings are read again first, so a fork remote removed
+    /// meanwhile is seen at once.
     fn publish_once(
         &self,
-        settings: &Settings,
         record: &FinishRecord,
         pusher: &mut Option<RemotePusher>,
-    ) -> Result<(), (PushFailureKind, String)> {
-        let local = |message: String| (PushFailureKind::Local, message);
-        if pusher.is_none() {
-            let Some(remote) = settings.remotes.iter().find(|r| r.name == record.remote) else {
-                return Err(local(format!(
-                    "the fork's settings no longer define remote {:?}, which its finish names",
+    ) -> Result<(), Failed> {
+        let local = |message: String| Failed::branch(PushFailureKind::Local, message);
+        let settings = Settings::load(&self.state.git()).map_err(|e| {
+            local(format!(
+                "the fork's settings cannot be read, so nothing is pushed: {e}"
+            ))
+        })?;
+        let Some(remote) = settings
+            .fork_remote
+            .as_ref()
+            .filter(|r| r.name == record.remote)
+        else {
+            return Err(Failed {
+                met: Met::RemoteGone,
+                kind: PushFailureKind::Local,
+                message: format!(
+                    "the fork's settings no longer define a valid fork remote {:?}, which its \
+                     finish names",
                     record.remote
-                )));
-            };
+                ),
+            });
+        };
+        if pusher.is_none() {
             let opened = RemotePusher::open(
                 &self.state,
-                settings,
+                &settings,
                 remote,
                 self.events.clone(),
                 &self.telemetry,
@@ -467,13 +645,15 @@ impl Finisher {
                     ..
                 } => break,
                 PushOutcome::Diverged { .. } => {
-                    return Err((
+                    return Err(Failed::branch(
                         PushFailureKind::NonFastForward,
                         "the fork's branch diverged on the remote and the head is not saved yet"
                             .into(),
                     ));
                 }
-                PushOutcome::Failed { kind, message, .. } => return Err((kind, message)),
+                PushOutcome::Failed { kind, message, .. } => {
+                    return Err(Failed::branch(kind, message));
+                }
                 PushOutcome::Busy => {
                     return Err(local("another process is pushing the fork remote".into()));
                 }
@@ -495,12 +675,18 @@ impl Finisher {
         });
         match pusher.push_create_only(&refs) {
             CreateOnlyOutcome::Held => Ok(()),
-            CreateOnlyOutcome::Failed { kind, message } => Err((kind, message)),
-            // Refused for good from forked volumes unit 2.
-            CreateOnlyOutcome::AnotherWriter { name, found } => Err((
-                PushFailureKind::Refused,
-                format!("{name} on the remote holds {found}, another writer's; it is never moved"),
-            )),
+            CreateOnlyOutcome::Failed { kind, message } => Err(Failed {
+                met: Met::CreateOnly(kind),
+                kind,
+                message,
+            }),
+            CreateOnlyOutcome::AnotherWriter { name, found } => Err(Failed {
+                met: Met::AnotherWriter,
+                kind: PushFailureKind::Refused,
+                message: format!(
+                    "{name} on the remote holds {found}, another writer's; it is never moved"
+                ),
+            }),
         }
     }
 }
@@ -543,6 +729,72 @@ fn read_mark(state: &StateDir) -> Result<Option<ForkMark>, StatusError> {
     }
 }
 
+/// Reads `meta/fork.json`, changes it with `change` and writes it back
+/// atomically. A mark that cannot be read is an error, never replaced.
+fn update_mark(state: &StateDir, change: impl FnOnce(&mut ForkMark)) -> Result<(), StatusError> {
+    let mut mark = read_mark(state)?.unwrap_or_else(ForkMark::empty);
+    change(&mut mark);
+    mark.version = MARK_VERSION;
+    crate::fsutil::write_json_atomic(&state.fork_mark(), &mark).map_err(StatusError::Mark)
+}
+
+/// [`FinishError::Abandoned`] once the operator has abandoned `fork`.
+fn refuse_abandoned(state: &StateDir, fork: &str) -> Result<(), FinishError> {
+    match read_mark(state)? {
+        Some(mark) if mark.abandoned.is_some() => Err(FinishError::Abandoned {
+            fork: fork.to_owned(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The operator's recorded discard, in any state but published; with the
+/// state lock held. After it returns, nothing agentfs runs pushes the
+/// fork: [`Finisher::open`], [`Finisher::finish`] and every publish
+/// attempt re-read the mark first and stop with [`FinishError::Abandoned`].
+/// A push already running finishes or times out (libgit2 cannot cancel
+/// one, §11.2): abandon does not wait for it, and a fork remote may then
+/// still receive it. Abandoning an abandoned fork returns its status
+/// unchanged.
+pub fn abandon(
+    state: &StateDir,
+    lock: &StateLock,
+    reason: &str,
+    caller: Caller,
+) -> Result<ForkStatus, AbandonError> {
+    if lock.path() != state.lock_file() {
+        return Err(AbandonError::Io(io::Error::other(format!(
+            "the lock held is {}, not this state area's {}",
+            lock.path().display(),
+            state.lock_file().display()
+        ))));
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(AbandonError::EmptyReason);
+    }
+    let Some(current) = status(state)? else {
+        return Err(AbandonError::NotAFork);
+    };
+    match current.state {
+        ForkState::Published => {
+            return Err(AbandonError::Published {
+                fork: current.identity.fork,
+            });
+        }
+        ForkState::Abandoned => return Ok(current),
+        ForkState::Active | ForkState::Finished | ForkState::Refused => {}
+    }
+    let abandoned = AbandonedMark {
+        reason: reason.to_owned(),
+        at_ms: now_ms(),
+        uid: caller.uid,
+        state: current.state.as_str().to_owned(),
+    };
+    update_mark(state, |mark| mark.abandoned = Some(abandoned))?;
+    status(state)?.ok_or(AbandonError::NotAFork)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -552,7 +804,8 @@ fn now_ms() -> u64 {
 /// The fork status of the state area at `state`, read without a lock or
 /// credentials: `Ok(None)` for a volume that is not a fork. What cannot be
 /// read is an error, never a state, so a caller deciding whether to
-/// delete waits.
+/// delete waits. Abandoned wins, then published, then refused (each
+/// naming the branch head's finish commit), then finished or active.
 pub fn status(state: &StateDir) -> Result<Option<ForkStatus>, StatusError> {
     crate::history::init_libgit2();
     let settings = Settings::load(&state.git()).map_err(HistoryError::from)?;
@@ -568,23 +821,28 @@ pub fn status(state: &StateDir) -> Result<Option<ForkStatus>, StatusError> {
         Err(e) if e.code() == git2::ErrorCode::NotFound => None,
         Err(e) => return Err(HistoryError::from(e).into()),
     };
-    let Some(record) = record else {
-        return Ok(Some(ForkStatus {
-            identity,
-            state: ForkState::Active,
-            record: None,
-        }));
+    let mark = read_mark(state)?;
+    let finish = record.as_ref().map(|r| r.finish.to_string());
+    let names_finish = |f: &str| finish.as_deref() == Some(f);
+    let fork_state = match &mark {
+        Some(m) if m.abandoned.is_some() => ForkState::Abandoned,
+        Some(m)
+            if m.published
+                .as_ref()
+                .is_some_and(|p| names_finish(&p.finish)) =>
+        {
+            ForkState::Published
+        }
+        Some(m) if m.refused.as_ref().is_some_and(|r| names_finish(&r.finish)) => {
+            ForkState::Refused
+        }
+        _ if record.is_some() => ForkState::Finished,
+        _ => ForkState::Active,
     };
-    let published = read_mark(state)?
-        .and_then(|m| m.published)
-        .is_some_and(|p| p.finish == record.finish.to_string());
     Ok(Some(ForkStatus {
         identity,
-        state: if published {
-            ForkState::Published
-        } else {
-            ForkState::Finished
-        },
-        record: Some(record),
+        state: fork_state,
+        record,
+        mark,
     }))
 }

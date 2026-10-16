@@ -242,9 +242,15 @@ pub fn service_spec(layout: &Layout, handle: &str, plugin: &PluginIdentity) -> P
     }
 }
 
+/// How long one finisher child publishes before it exits 1 and frees the
+/// fork's state lock; the publisher's next scan starts another. Between
+/// them an operator's `fork abandon --wait-lock` gets the lock (design
+/// §11.5).
+pub const FINISH_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// argv of the finisher child, with the plugin's identity flags: `--state
-/// S --root B fork finish --namespace NS --pod POD --node NODE`, with no
-/// `--timeout` (it publishes until it is published).
+/// S --root B fork finish --timeout 300000ms --namespace NS --pod POD --node
+/// NODE` ([`FINISH_TIMEOUT`]).
 pub fn fork_finish_args(state: &Path, root: &Path, identity: &PluginIdentity) -> Vec<OsString> {
     vec![
         os("--state"),
@@ -253,6 +259,8 @@ pub fn fork_finish_args(state: &Path, root: &Path, identity: &PluginIdentity) ->
         root.as_os_str().to_owned(),
         os("fork"),
         os("finish"),
+        os("--timeout"),
+        secs(FINISH_TIMEOUT),
         os("--namespace"),
         os(identity.namespace.as_str()),
         os("--pod"),

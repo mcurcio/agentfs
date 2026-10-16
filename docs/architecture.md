@@ -49,7 +49,8 @@ missing from these tables or a row names a module that no longer exists;
 | `fork/mod.rs` | Forked volumes: a volume started from another's latest commit that publishes one change for a receiver to gate (§11.5, §19.1 "Forked volumes") |
 | `fork/identity.rs` | A fork's identity, fixed at create (source, base, push target), and its ref names |
 | `fork/create.rs` | Creating a fork from a source's state area, without the source's lock or any credentials |
-| `fork/finish.rs` | The finisher: the change and finish commits, publishing to the fork remote, and the fork status DeleteVolume reads |
+| `fork/finish.rs` | The finisher: the change and finish commits, publishing to the fork remote, the single decider of a refused publish, the operator's abandon, and the fork status DeleteVolume reads |
+| `fork/listing.rs` | The published changes on a fork remote, each checked (fork name, finish trailers, change id, parent, tree), read in a receiver's repository with its own git (§11.5) |
 | `identity.rs` | Committer and author identities from templates (§9) |
 | `service.rs` | The background loops: commit loop, one push loop per remote, repack (§3.4, §11.2) |
 | `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
@@ -135,7 +136,7 @@ missing from these tables or a row names a module that no longer exists;
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
 | `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly (§15) |
 | `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
-| `fork_cmd.rs` | `agentfs fork create` and `agentfs fork finish` (§11.5) |
+| `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon` and `list` (§11.5) |
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it (§7) |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads (§13) |
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters (§13) |
@@ -153,9 +154,9 @@ missing from these tables or a row names a module that no longer exists;
 | `identity.rs` | The CSI Identity service |
 | `controller.rs` | The Controller service: CreateVolume, DeleteVolume, ControllerPublish |
 | `node.rs` | The Node service: validates calls and hands them to the supervisor |
-| `supervisor.rs` | One `serve-history` per staged volume and one front per pod, restarted when they crash |
+| `supervisor.rs` | One `serve-history` per staged volume and one front per pod, restarted when they crash; a finished fork published read-only |
 | `launcher.rs` | Starting the `agentfs` children |
-| `publisher.rs` | The node plugin's fork publisher: finishes and publishes the forks whose deletion asked for it, one `agentfs fork finish` each (§11.5) |
+| `publisher.rs` | The node plugin's fork publisher: finishes and publishes the forks whose deletion asked for it, one `agentfs fork finish` each, skipping refused and abandoned forks (§11.5) |
 | `mounter.rs` | The node plugin's mount operations: bind mounts onto the kubelet's targets |
 | `params.rs` | StorageClass and PersistentVolume parameters |
 | `volume.rs` | Volumes on disk: creating one, adopting a static PV |

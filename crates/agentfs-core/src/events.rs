@@ -126,8 +126,9 @@ impl fmt::Display for PushStage {
 }
 
 /// One signal. Every variant except [`Event::PushSucceeded`],
-/// [`Event::PatchApplied`], [`Event::PatchDuplicate`] and
-/// [`Event::HistoryServiceRestored`] is an alarm condition (design §13).
+/// [`Event::PatchApplied`], [`Event::PatchDuplicate`],
+/// [`Event::ForkAbandoned`] and [`Event::HistoryServiceRestored`] is an
+/// alarm condition (design §13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A path was not recorded, or dropped from a commit, because git's
@@ -251,6 +252,21 @@ pub enum Event {
         kind: PushFailureKind,
         message: String,
     },
+    /// A fork's fork remote refuses its publish for good (design §11.5,
+    /// `fork::finish::refused_reason`): the fork is refused, and nothing
+    /// retries it until an operator runs `agentfs fork finish --retry` or
+    /// abandons it. Raised once, when the refusal is recorded.
+    ForkRefused {
+        fork: String,
+        remote: String,
+        /// `fork::finish::RefusedReason::as_str`.
+        reason: &'static str,
+        message: String,
+    },
+    /// An operator abandoned a fork on record (design §11.5): nothing
+    /// agentfs runs pushes it again, and DeleteVolume may proceed. Not an
+    /// alarm.
+    ForkAbandoned { fork: String, reason: String },
     /// A front could not reach its volume's history service, or the
     /// service did not answer in time or refused it (design §14, §3.5):
     /// the boundary failed with `EIO`. Raised once per outage, at its
@@ -275,6 +291,7 @@ impl Event {
             Self::PushSucceeded { .. }
                 | Self::PatchApplied { .. }
                 | Self::PatchDuplicate { .. }
+                | Self::ForkAbandoned { .. }
                 | Self::HistoryServiceRestored { .. }
         )
     }
@@ -297,6 +314,8 @@ impl Event {
             Self::PatchBlocked { .. } => "patch_blocked",
             Self::PatchIgnored { .. } => "patch_ignored",
             Self::PatchFetchFailed { .. } => "patch_fetch_failed",
+            Self::ForkRefused { .. } => "fork_refused",
+            Self::ForkAbandoned { .. } => "fork_abandoned",
             Self::HistoryServiceUnavailable { .. } => "history_service_unavailable",
             Self::HistoryServiceRestored { .. } => "history_service_restored",
             Self::IdentityFallback { .. } => "identity_fallback",
@@ -439,6 +458,20 @@ impl fmt::Display for Event {
                 f,
                 "fetching the patch queue from {remote} failed ({kind}): {message}"
             ),
+            Self::ForkRefused {
+                fork,
+                remote,
+                reason,
+                message,
+            } => write!(
+                f,
+                "fork {fork}: {remote} refuses its publish for good ({reason}): {message}; it is \
+                 not retried until an operator runs `agentfs fork finish --retry` or abandons \
+                 it (see the csi-recovery runbook)"
+            ),
+            Self::ForkAbandoned { fork, reason } => {
+                write!(f, "fork {fork} was abandoned: {reason}")
+            }
             Self::HistoryServiceUnavailable { address, error } => write!(
                 f,
                 "history service {address} is unavailable: {error}; changes fail with EIO \

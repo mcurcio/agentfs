@@ -260,6 +260,8 @@ pub enum VolumeError {
     OtherBranch { found: String, wanted: String },
     #[error("this state area is fork {found:?}, not {wanted:?}; nothing was changed")]
     OtherFork { found: String, wanted: String },
+    #[error("fork {fork} is finished: it is read-only (design §19.1)")]
+    ForkFinished { fork: String },
 }
 
 /// What [`Recorder::record_move`] did.
@@ -515,6 +517,33 @@ fn config_error(e: ConfigError) -> VolumeError {
     VolumeError::History(HistoryError::Config(e))
 }
 
+/// The fork `history` belongs to, if it is a fork whose branch head is
+/// its finish commit (design §11.5): a finished fork is read-only.
+fn finished_fork(history: &History) -> Result<Option<String>, VolumeError> {
+    let Some(identity) = &history.settings().fork else {
+        return Ok(None);
+    };
+    let Some(head) = history.head()? else {
+        return Ok(None);
+    };
+    let finished =
+        crate::history::finish_from_message(head.message_raw().unwrap_or_default(), head.id())
+            .is_some();
+    Ok(finished.then(|| identity.fork.clone()))
+}
+
+/// [`VolumeError::ForkFinished`] for a finished fork (design §11.5), read
+/// without a lock: what `mount`, `run`, `record`, `restore`, `revert` and
+/// `patch apply` check before they change anything, and the CSI node
+/// plugin before it publishes a fork.
+pub fn refuse_finished(state: &StateDir) -> Result<(), VolumeError> {
+    let history = History::open(&state.git())?;
+    match finished_fork(&history)? {
+        Some(fork) => Err(VolumeError::ForkFinished { fork }),
+        None => Ok(()),
+    }
+}
+
 /// Opens an existing state area for the backing tree at `tree`.
 ///
 /// Alarms go to `events`, which the caller has already wrapped with
@@ -532,6 +561,7 @@ pub fn open(
     let history = History::open(&state.git())?;
     // The caller holds the state-area lock: a ref lock is a crash's.
     let removed_ref_locks = history.remove_stale_ref_locks()?;
+    let finished = finished_fork(&history)?;
     // A bad remote section only stops that remote's pushes (design §11.1).
     for bad in &history.settings().invalid_remotes {
         events.emit(Event::RemoteMisconfigured {
@@ -608,6 +638,7 @@ pub fn open(
             journal: journal.clone(),
             tracked: Arc::new(tracked),
         },
+        finished,
         operations: operations.clone(),
         pending: pending.clone(),
         rules: rules.clone(),
@@ -660,6 +691,7 @@ pub fn open_front(
     client: Arc<HistoryClient>,
 ) -> Result<Recorder, VolumeError> {
     let history = History::open(&state.git())?;
+    let finished = finished_fork(&history)?;
     let settings = history.settings();
     let slot = client.front().slot;
     let pending = Arc::new(PendingStore::open_slot(state.pending(), slot, |s| {
@@ -667,6 +699,7 @@ pub fn open_front(
     })?);
     Ok(Recorder {
         backend: Backend::Front { client },
+        finished,
         operations: Arc::new(Operations::default()),
         pending,
         rules: Arc::new(Rules::load(&state.git(), tree, settings.into())?),
@@ -783,6 +816,9 @@ impl OperationSpec {
 #[derive(Clone)]
 pub struct Recorder {
     backend: Backend,
+    /// The fork's name when it was finished at open (design §11.5): every
+    /// record then fails with [`VolumeError::ForkFinished`].
+    finished: Option<String>,
     operations: Arc<Operations>,
     pending: Arc<PendingStore>,
     rules: Arc<Rules>,
@@ -819,6 +855,14 @@ enum Backend {
 }
 
 impl Recorder {
+    /// [`VolumeError::ForkFinished`] when this recorder's fork is finished.
+    fn refuse_if_finished(&self) -> Result<(), VolumeError> {
+        match &self.finished {
+            Some(fork) => Err(VolumeError::ForkFinished { fork: fork.clone() }),
+            None => Ok(()),
+        }
+    }
+
     /// Durably records one change boundary, once it is safe to let the
     /// triggering call return.
     ///
@@ -894,6 +938,7 @@ impl Recorder {
         atomic: bool,
         origin: Option<Origin>,
     ) -> Result<Recorded, VolumeError> {
+        self.refuse_if_finished()?;
         let start = Instant::now();
         // A record by an operation's actor is part of that operation (design
         // §15): trigger `restore`, made by the operator who asked for it.
@@ -1293,6 +1338,7 @@ impl Recorder {
         draft: Draft,
         stamps: &[PathStamp],
     ) -> Result<Recorded, VolumeError> {
+        self.refuse_if_finished()?;
         let caller = draft.caller;
         let mut resync = Vec::new();
         let recorded = self.sequence_inner(origin, slot, draft, stamps, &mut resync)?;
@@ -1670,6 +1716,7 @@ impl Recorder {
         from: RepoPath,
         to: RepoPath,
     ) -> Result<MoveOutcome, VolumeError> {
+        self.refuse_if_finished()?;
         let start = Instant::now();
         let paths = vec![from.clone(), to.clone()];
         let result = self.record_move_inner(trigger, caller, from, to);
@@ -1948,6 +1995,7 @@ impl Recorder {
         spec: OperationSpec,
         actors: &[u32],
     ) -> Result<OperationGuard, VolumeError> {
+        self.refuse_if_finished()?;
         let op = Operation {
             id: self.operations.next_id(now_ms()),
             kind: spec.kind,

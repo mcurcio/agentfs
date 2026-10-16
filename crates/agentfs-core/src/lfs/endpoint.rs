@@ -12,6 +12,11 @@
 //! | `remote.<name>.lfsurl` | `remote.<name>.lfsurl` |
 //! | derived from `pushurl`, else `url` | derived from `url` |
 //!
+//! A flagged fork remote (`agentfsForkRemote`, design §11.5) reads its own
+//! `lfspushurl` and `lfsurl` before the global keys: it must name one while
+//! `lfs.url` or `lfs.pushurl` is set (the section is invalid otherwise), so
+//! a fork's LFS objects never reach the source's store.
+//!
 //! An explicit `http(s)` URL is the endpoint as written. A remote URL
 //! derives one as git-lfs does: `<url>/info/lfs` when it ends in `.git`,
 //! else `<url>.git/info/lfs`. A local path or `file://` URL (explicit or
@@ -134,9 +139,11 @@ pub fn resolve(
 ) -> Result<LfsEndpoint, LfsError> {
     let name = &remote.name;
     let upload = direction == Direction::Upload;
-    let explicit = [
+    let global = [
         (upload, "lfs.pushurl".to_owned(), &settings.lfs.push_url),
         (true, "lfs.url".to_owned(), &settings.lfs.url),
+    ];
+    let own = [
         (
             upload,
             format!("remote.{name}.lfspushurl"),
@@ -144,6 +151,11 @@ pub fn resolve(
         ),
         (true, format!("remote.{name}.lfsurl"), &remote.lfs_url),
     ];
+    let explicit = if remote.fork_remote {
+        [own, global].concat()
+    } else {
+        [global, own].concat()
+    };
     for (applies, key, value) in explicit {
         if let (true, Some(url)) = (applies, value) {
             return endpoint(remote, key, url.trim_end_matches('/').to_owned());
@@ -425,6 +437,29 @@ mod tests {
         // An explicit URL is used as written (no /info/lfs), less a final /.
         r.lfs_url = Some("http://lfs.example/acme/sep/".into());
         assert_eq!(pick(&none, &r, Upload), "http://lfs.example/acme/sep");
+    }
+
+    /// A flagged fork remote's own endpoints come before the global ones,
+    /// which name the source's store (design §11.5).
+    #[test]
+    fn a_fork_remote_prefers_its_own_endpoints() {
+        let all = LfsSettings {
+            threshold: None,
+            url: Some("http://source/url".into()),
+            push_url: Some("http://source/push".into()),
+            ..LfsSettings::default()
+        };
+        let mut r = remote("https://h/forks.git");
+        r.fork_remote = true;
+        r.lfs_push_url = Some("http://forks/push".into());
+        let pick = |r: &RemoteSettings, d| {
+            http_url(&resolve(&settings(all.clone()), r, d).unwrap()).to_owned()
+        };
+        assert_eq!(pick(&r, Direction::Upload), "http://forks/push");
+        r.lfs_push_url = None;
+        r.lfs_url = Some("http://forks/url".into());
+        assert_eq!(pick(&r, Direction::Upload), "http://forks/url");
+        assert_eq!(pick(&r, Direction::Download), "http://forks/url");
     }
 
     #[test]

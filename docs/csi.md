@@ -650,7 +650,8 @@ source's patch remote), never the source's branch.
   `csi.json` and answers `UNAVAILABLE` until the fork is published, so the
   PV stays `Released` meanwhile. The node plugin's publisher scans the
   base path at start and every `--fork-scan-interval` (30 s); for each
-  fork asked to finish that no node stages, it runs `agentfs fork finish`,
+  fork asked to finish that no node stages and that is neither refused
+  nor abandoned, it runs `agentfs fork finish --timeout 300s`,
   which commits what is journaled, writes the change and finish commits,
   and pushes the history, then the change and finish refs create-only,
   retrying with backoff until the fork remote holds them. The next
@@ -659,6 +660,34 @@ source's patch remote), never the source's branch.
 - **Receiving.** Whatever reads the fork remote gates the change: a PR on
   the fork's branch, or `agentfs patch submit <change>` into the source's
   inbox, which applies a given change commit at most once.
-- **Stuck.** A fork whose remote stays unreachable keeps its PV
-  `Released`; see [the CSI recovery runbook](runbooks/csi-recovery.md).
-  Refusing or abandoning a fork arrives with forked volumes unit 2.
+- **Read-only once finished.** A finished fork takes no changes. Staged
+  again (a static PV of its directory, while DeleteVolume waits), its
+  history service starts and every NodePublish is bind-mounted read-only,
+  whatever the pod asked: writes fail with `EROFS`.
+- **Refused.** A fork remote that refuses for good (another writer's
+  finish or change ref, a hook refusing `refs/agentfs/*`, a commit over
+  `agentfsMaxPushSize`, or a fork remote no longer in the profile) makes
+  the fork `refused`: the alarm `ForkRefused` is raised
+  once, the publisher starts no further finisher, and DeleteVolume keeps
+  answering `UNAVAILABLE`.
+- **Stuck.** A fork whose remote stays unreachable, or refuses, keeps its
+  PV `Released`; see [the CSI recovery runbook](runbooks/csi-recovery.md).
+  To look, and to act, run agentfs in the node plugin pod that holds the
+  volume (`<base>` is the plugin's `--base-path`):
+
+  ```sh
+  kubectl -n agentfs-csi exec <node-plugin-pod> -c agentfs-csi -- \
+    agentfs --state <base>/<pv>/state fork status
+  # Fixed the cause of a refusal (removed the other writer's ref, the hook):
+  kubectl -n agentfs-csi exec <node-plugin-pod> -c agentfs-csi -- \
+    agentfs --wait-lock 6m --state <base>/<pv>/state --root <base>/<pv>/backing \
+    fork finish --retry --timeout 2m
+  # Or discard it on record, so DeleteVolume applies onDelete:
+  kubectl -n agentfs-csi exec <node-plugin-pod> -c agentfs-csi -- \
+    agentfs --wait-lock 6m --state <base>/<pv>/state fork abandon --reason "<why>"
+  ```
+
+  `--wait-lock` waits for the publisher's finisher, which frees the
+  fork's lock at its 5-minute timeout. Abandon is refused for a
+  published fork; nothing agentfs runs pushes an abandoned one again,
+  though a push already running finishes.
