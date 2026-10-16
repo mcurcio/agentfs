@@ -539,6 +539,8 @@ agentfs run
 - **Shutdown** flushes telemetry, waiting up to 5s, so a collector that is
   down can add up to 5s to a short command.
 
+Example Prometheus alert rules on these metrics, each with its runbook, are in [deploy/alerts](deploy/alerts) ([deployment.md](docs/deployment.md#alerts)).
+
 Metrics (design §13):
 
 | Metric | Type | Attributes |

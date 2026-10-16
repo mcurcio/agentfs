@@ -660,7 +660,7 @@ whole, consistent groups instead.
   If that file could not be written either, the shutdown message lists the
   paths: history differs from the backing tree there until each is changed
   again, or recorded by hand with `agentfs --root <backing> record <path>`. Many programs ignore errors from `close`, so
-  watch the alarms.
+  watch the alarms. Runbook: [recording-failures.md](runbooks/recording-failures.md).
 - **Alarms** are printed to stderr and exported as telemetry logs (see the
   README): `PathRefused`, `RecordFailed`, `CommitFailed`, `ReconcileFailed`, `PushFailed`,
   `Diverged`, `RemoteMisconfigured`, `PatchBlocked`, `PatchFetchFailed`,
