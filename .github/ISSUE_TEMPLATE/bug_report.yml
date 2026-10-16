@@ -1,0 +1,56 @@
+name: Bug report
+description: Something agentfs does differs from its documentation or design.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A security problem goes through the
+        Security tab instead, as SECURITY.md says, never in an issue.
+        Remove secrets, tokens and private paths from anything you paste.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of commands or manifests that shows it.
+      render: sh
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`agentfs --version`, or the image tag or digest."
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How agentfs runs
+      options:
+        - agentfs CLI (mount, run, record, ...)
+        - Kubernetes sidecar
+        - CSI driver
+        - Docker or Compose
+        - Helm chart
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and kernel (`uname -a`), filesystem under the backing directory and the state area, Kubernetes version, remotes (kind, not URLs).
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and status
+      description: Relevant stderr, alarms and `agentfs status` output.
+      render: text

@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose a change to what agentfs does.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        docs/design.md records the decisions taken so far (§19.1) and the
+        open questions (§19.2). If your idea touches one, say which.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What agentfs could do instead, and what it would cost (recording guarantees, invisibility, operations).
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use now, or other tools that do this.
