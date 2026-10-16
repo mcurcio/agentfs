@@ -1,0 +1,31 @@
+# {{ template "chart.name" . }}
+
+{{ template "chart.description" . }}
+
+Generated from `values.yaml` by [helm-docs](https://github.com/norwoodj/helm-docs)
+(`helm-docs --chart-search-root charts`); CI fails when it is stale. How to
+use it is in [docs/helm.md](../../docs/helm.md) §4, with a worked example in
+[deploy/examples/helm-sidecar](../../deploy/examples/helm-sidecar); the
+sidecar itself in [docs/deployment.md](../../docs/deployment.md).
+
+```yaml
+# Chart.yaml of your workload
+dependencies:
+  - name: agentfs-sidecar
+    version: <version>
+    repository: oci://ghcr.io/mcurcio/charts
+    alias: agentfs
+```
+
+| Helper | Renders |
+|---|---|
+| `agentfs-sidecar.initContainers` | the init container and the recorder (a native sidecar), for `initContainers` |
+| `agentfs-sidecar.workspaceMount` | the workload container's mount of `/agentfs` (read-only; the workspace is `/agentfs/workspace`) |
+| `agentfs-sidecar.volumes` | the pod's volumes: the claim, the shared emptyDir, the ConfigMap and the Secret |
+| `agentfs-sidecar.podAnnotations` | a checksum of the settings, so changing them rolls the pod |
+| `agentfs-sidecar.configMap`, `.secret`, `.claim` | the ConfigMap, the credentials Secret and the claim |
+
+Each takes this library's values, e.g.
+`{{ "{{" }} include "agentfs-sidecar.initContainers" .Values.agentfs | nindent 8 {{ "}}" }}`.
+
+{{ template "chart.valuesSection" . }}

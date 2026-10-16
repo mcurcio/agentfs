@@ -1,0 +1,48 @@
+{{- $agentfs := include "example.agentfs" . | fromYaml }}
+# A workload with agentfs as a phase 1 native sidecar (design §17.1,
+# docs/deployment.md), through the helpers of charts/agentfs-sidecar.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentfs-example
+  labels:
+    app.kubernetes.io/name: agentfs-example
+spec:
+  replicas: 1
+  # One pod at a time: the old pod releases the claim first.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentfs-example
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentfs-example
+      annotations:
+        {{- include "agentfs-sidecar.podAnnotations" $agentfs | nindent 8 }}
+    spec:
+      # Longer than --unmount-grace + --push-grace + the final commit.
+      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      initContainers:
+        {{- include "agentfs-sidecar.initContainers" $agentfs | nindent 8 }}
+      containers:
+        # Your workload. Any user works; files it creates are its own.
+        - name: workload
+          image: debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+          command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
+          securityContext:
+            runAsUser: 10000
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            # Use /agentfs/workspace.
+            {{- include "agentfs-sidecar.workspaceMount" $agentfs | nindent 12 }}
+      volumes:
+        {{- include "agentfs-sidecar.volumes" $agentfs | nindent 8 }}

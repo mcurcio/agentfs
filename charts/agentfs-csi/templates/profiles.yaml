@@ -1,0 +1,23 @@
+# The profiles, one `<profile>.config` (with optional `.exclude` and
+# `.attributes`) each; a StorageClass picks one with `profile: <name>`
+# (docs/csi.md §4). The pods see edits through the
+# mounted ConfigMap without being restarted.
+{{- $data := dict }}
+{{- range $name, $profile := .Values.profiles }}
+{{- range $kind := list "config" "exclude" "attributes" }}
+{{- with index $profile $kind }}
+{{- $_ := set $data (printf "%s.%s" $name $kind) . }}
+{{- end }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentfs-csi-profiles
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentfs-csi.labels" . | nindent 4 }}
+{{- with $data }}
+data:
+  {{- toYaml . | nindent 2 }}
+{{- end }}

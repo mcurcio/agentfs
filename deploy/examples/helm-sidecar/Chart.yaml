@@ -1,0 +1,13 @@
+apiVersion: v2
+name: agentfs-sidecar-example
+description: >-
+  A workload chart using charts/agentfs-sidecar: deploy/sidecar as Helm
+  renders it (ci/helm-equivalence.sh checks they are the same).
+type: application
+version: 0.1.0
+dependencies:
+  - name: agentfs-sidecar
+    version: 0.1.0
+    # Published: oci://ghcr.io/mcurcio/charts (docs/helm.md).
+    repository: file://../../../charts/agentfs-sidecar
+    alias: agentfs

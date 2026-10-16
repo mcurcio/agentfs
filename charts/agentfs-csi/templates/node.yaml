@@ -1,0 +1,156 @@
+# The node plugin: `agentfs-csi --mode node` under tini on every node, with
+# node-driver-registrar and livenessprobe (design §14.2, docs/csi.md
+# "Architecture").
+{{- $kubelet := .Values.kubeletDir }}
+{{- $pluginDir := printf "%s/plugins/%s" $kubelet (include "agentfs-csi.driverName" .) }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: agentfs-csi-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: agentfs-csi-node
+    {{- include "agentfs-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentfs-csi-node
+  # Restarting the plugin stops the fronts it runs: roll it by hand, one
+  # drained node at a time (docs/runbooks/csi-recovery.md).
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentfs-csi-node
+      {{- with .Values.node.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: agentfs-csi-node
+      automountServiceAccountToken: false
+      {{- with .Values.node.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.node.terminationGracePeriodSeconds }}
+      # The workloads' processes must be visible to the fronts (design §6,
+      # docs/csi.md "Pod Security").
+      hostPID: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: agentfs-csi
+          {{- include "agentfs-csi.agentfsImage" . | nindent 10 }}
+          # tini reaps what the children leave behind; with hostPID it is not
+          # PID 1, so it registers as a subreaper (-s).
+          command: [tini, -s, --, agentfs-csi]
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+            - --base-path={{ .Values.basePath.path }}
+            - --node-state={{ .Values.node.stateDir }}
+            - --mount-dir=/run/agentfs-csi/mounts
+            - --profiles-dir=/etc/agentfs-csi/profiles
+            {{- with .Values.node.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: AGENTFS_CSI_POD
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: AGENTFS_CSI_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            {{- with .Values.node.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - { name: healthz, containerPort: 9808 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: healthz }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          # FUSE mounts and Bidirectional propagation into the kubelet's
+          # directory need privileged (design §14.2 "Pod Security").
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          {{- with .Values.node.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+            - { name: kubelet-dir, mountPath: {{ $kubelet }}, mountPropagation: Bidirectional }
+            - { name: base, mountPath: {{ .Values.basePath.path }}, mountPropagation: HostToContainer }
+            - { name: node-state, mountPath: {{ .Values.node.stateDir }} }
+            - { name: mounts, mountPath: /run/agentfs-csi }
+            - { name: profiles, mountPath: /etc/agentfs-csi/profiles, readOnly: true }
+            - { name: credentials, mountPath: /etc/agentfs-csi/credentials, readOnly: true }
+            - { name: dev-fuse, mountPath: /dev/fuse }
+        - name: node-driver-registrar
+          {{- include "agentfs-csi.sidecarImage" .Values.sidecars.nodeDriverRegistrar | nindent 10 }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ $pluginDir }}/csi.sock
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+          {{- with .Values.sidecars.nodeDriverRegistrar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+            - { name: registration-dir, mountPath: /registration }
+        - name: liveness-probe
+          {{- include "agentfs-csi.sidecarImage" .Values.sidecars.livenessProbe | nindent 10 }}
+          args: [--csi-address=/csi/csi.sock, --http-endpoint=:9808]
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+          {{- with .Values.sidecars.livenessProbe.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+      volumes:
+        - name: plugin-dir
+          hostPath: { path: {{ $pluginDir }}, type: DirectoryOrCreate }
+        - name: registration-dir
+          hostPath: { path: {{ $kubelet }}/plugins_registry, type: Directory }
+        - name: kubelet-dir
+          hostPath: { path: {{ $kubelet }}, type: Directory }
+        {{- include "agentfs-csi.baseVolume" . | nindent 8 }}
+        - name: node-state
+          hostPath: { path: {{ .Values.node.stateDir }}, type: DirectoryOrCreate }
+        - name: mounts
+          emptyDir: {}
+        - name: dev-fuse
+          hostPath: { path: /dev/fuse, type: CharDevice }
+        - name: profiles
+          configMap: { name: agentfs-csi-profiles }
+        - name: credentials
+          secret: { secretName: {{ include "agentfs-csi.credentialsSecret" . }}, defaultMode: 0400 }
