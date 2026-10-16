@@ -11,10 +11,10 @@
 # b. with serve-history serving on A, a second serve-history on B's view
 #    exits 75 naming command=serve-history (the holder line reached the
 #    other client);
-# c. on the export mounted again with vers=4.0, and with
-#    local_lock=flock, serve-history exits 1 naming the reason, and so
-#    does agentfs-csi with its base path there, before serving (a kernel
-#    that will not show local_lock on NFSv4 makes that half SKIP: NOT RUN);
+# c. on the export mounted again with vers=4.0, serve-history exits 1
+#    naming the reason, and so does agentfs-csi with its base path there,
+#    before serving; the same with local_lock=flock is NOT RUN, since
+#    Linux drops local_lock on every NFSv4 mount (see step c);
 # d. a front on A over the NFS tree: an mmap write is recorded; 50 SQLite
 #    commits are recorded and pass integrity_check;
 # e. a file held open through the front and removed through it leaves a
@@ -22,7 +22,14 @@
 #    the front; no .nfs name ever reaches history, and the directory's
 #    other file is at its new path;
 # f. DeleteVolume on a base path on the export (agentfs-csi's ignored
-#    grpc test delete_volume_on_a_shared_base_path) leaves nothing behind.
+#    grpc test delete_volume_on_a_shared_base_path) leaves nothing behind;
+# g. a volume moves between nodes (agentfs-csi's ignored grpc test
+#    a_volume_moves_between_nodes_on_a_shared_base_path): agentfs-csi
+#    node plugins for node-1 on A's view of one base path and node-2 on
+#    B's, and a controller. NodeStage on node-2 fails FAILED_PRECONDITION
+#    while node-1 has the volume staged; after node-1 unstages and the
+#    attachment moves, node-2 serves node-1's file, whose commit names
+#    node-1, and records its own write as node-2.
 #
 # GitHub ubuntu-24.04 runners only: it installs nfs-kernel-server and
 # changes the host. Reproducible on a disposable Linux VM with /dev/fuse,
@@ -149,14 +156,18 @@ check_refused() { # mnt reason
 nfs_mount "$SERVER_IP" "$V40" vers=4.0,hard,nosharecache,timeo=50,retrans=2
 assert_contains "$(findmnt -no OPTIONS "$V40")" "vers=4.0" "the second mount is NFS 4.0"
 check_refused "$V40" "NFS version 4.0"
-if ! nfs_mount "$SERVER_IP" "$FLOCK" vers=4.2,local_lock=flock,hard,nosharecache,timeo=50,retrans=2; then
-  echo "SKIP local_lock: the kernel refused local_lock=flock on NFSv4"
-  NOT_RUN+=("local_lock=flock: the kernel refused the mount")
-elif ! findmnt -no OPTIONS "$FLOCK" | grep 'local_lock=flock' >/dev/null; then
-  echo "SKIP local_lock: the kernel dropped it: $(findmnt -no OPTIONS "$FLOCK")"
-  NOT_RUN+=("local_lock=flock: the kernel dropped the option")
-else
+# The local_lock refusal cannot fire on Linux. nfs_fs_context_validate()
+# in fs/nfs/fs_context.c (v6.17, the runner's kernel series) clears
+# NFS_MOUNT_LOCAL_FLOCK, NFS_MOUNT_LOCAL_FCNTL and NFS_MOUNT_NONLM
+# whenever the version is 4, so every NFSv4 mount (4.0 to 4.2) shows
+# local_lock=none and no nolock, and its locks go to the server. Only NFSv2/3 keep local_lock, and agentfs
+# refuses those for their version first. The mount stays, as a canary:
+# should a kernel ever keep the option, the refusal is checked.
+nfs_mount "$SERVER_IP" "$FLOCK" vers=4.2,local_lock=flock,hard,nosharecache,timeo=50,retrans=2
+if findmnt -no OPTIONS "$FLOCK" | grep 'local_lock=flock' >/dev/null; then
   check_refused "$FLOCK" "local_lock=flock"
+else
+  NOT_RUN+=("local_lock=flock: Linux drops local_lock on NFSv4 mounts (fs/nfs/fs_context.c, nfs_fs_context_validate) and agentfs refuses NFSv3 by version first, so this refusal cannot fire on Linux")
 fi
 
 step "d. a front on client A over the NFS tree: mmap and SQLite"
@@ -252,6 +263,38 @@ sudo chown "$(id -u):$(id -g)" "$A/csi"
 (cd "$HERE/.." && AGENTFS_CSI_TEST_BASE=$A/csi cargo test --locked --release -p agentfs-csi \
   --test grpc -- --ignored --exact delete_volume_on_a_shared_base_path)
 pass "DeleteVolume on NFS leaves neither the volume nor a .nfs name"
+
+step "g. a volume moves between nodes on the shared base path"
+CSI=$(mktemp -d)
+chmod 755 "$CSI"
+mkdir "$CSI/profiles"
+printf '[agentfs]\n\tcommitWindow = 100ms\n' >"$CSI/profiles/p.config"
+CSI_PIDS=()
+csi_bg() { # name mode base [command prefix...]
+  local name=$1 mode=$2 base=$3
+  shift 3
+  sudo "$@" "$AGENTFS_CSI_BIN" --mode "$mode" --node-id "$name" --base-path "$base" \
+    --node-state "$CSI/$name/state" --mount-dir "$CSI/$name/mounts" \
+    --profiles-dir "$CSI/profiles" --agentfs-bin "$AGENTFS_BIN" --passthrough "$P" \
+    --endpoint "unix://$CSI/$name.sock" >>"$LOGS/csi-$name.log" 2>&1 &
+  PIDS+=("$!")
+  CSI_PIDS+=("$!")
+  wait_for 30 test -S "$CSI/$name.sock" || fail "agentfs-csi $name never served"
+}
+csi_bg controller controller "$A/move"
+csi_bg node-1 node "$A/move"
+# B's network namespace, but the host's mount namespace (not `ip netns
+# exec`, which makes a mount namespace of its own): the test reads
+# node-2's mounts.
+csi_bg node-2 node "$B/move" nsenter --net="/run/netns/$NS"
+# The test runs as root (`sudo -E`): the volume is root's, 0700.
+(cd "$HERE/.." && AGENTFS_CSI_TEST_CONTROLLER=$CSI/controller.sock \
+  AGENTFS_CSI_TEST_NODE1=$CSI/node-1.sock AGENTFS_CSI_TEST_NODE2=$CSI/node-2.sock \
+  AGENTFS_CSI_TEST_BASE=$B/move cargo --config "target.'cfg(all())'.runner = 'sudo -E'" \
+  test --locked --release -p agentfs-csi --test grpc -- --ignored --exact a_volume_moves_between_nodes_on_a_shared_base_path)
+pass "the volume moved from node-1 to node-2, refused on node-2 while staged on node-1"
+for pid in "${CSI_PIDS[@]}"; do sudo kill -TERM "$pid"; done
+for pid in "${CSI_PIDS[@]}"; do wait "$pid" || fail "an agentfs-csi plugin did not stop cleanly"; done
 
 for what in "${NOT_RUN[@]}"; do
   echo "NOT RUN: $what"

@@ -2729,12 +2729,19 @@ Tested on NFS (`ci/e2e-nfs.sh`, CI job `e2e-nfs`, passthrough `auto` and
 `off`): a kernel NFS server on the runner exports one directory to two
 NFSv4.2 clients (the second in network and UTS namespaces of its own, so
 a separate client id, lease and set of locks). It checks that the state
-lock and its holder line hold across the clients, that NFS 4.0 and
-`local_lock=flock` mounts are refused at start (the `local_lock` half is
-NOT RUN on runners whose kernel reports `local_lock=none` for it), mmap
-and SQLite single-writer through a front on the NFS tree, that NFS silly
-renames never reach history, and DeleteVolume on a base path on the
-export.
+lock and its holder line hold across the clients, that an NFS 4.0 mount
+is refused at start, mmap and SQLite single-writer through a front on the
+NFS tree, that NFS silly renames never reach history, DeleteVolume on a
+base path on the export, and a volume moving between two `agentfs-csi`
+node plugins, one on each client's view of the base path: NodeStage on
+the second is refused (`FAILED_PRECONDITION`, the state lock) while the
+first has the volume staged, and after the first unstages and the
+attachment moves, the second serves the first's file, whose commit names
+the first node, and records its own writes. The `local_lock` refusal is
+NOT RUN and cannot run on Linux: the kernel clears `local_lock` and
+`nolock` on every NFSv4 mount (`nfs_fs_context_validate` in
+`fs/nfs/fs_context.c`), and NFSv2/3, which keep them, are refused for
+their version first.
 
 ## 15. Recovery and undo
 
@@ -3402,8 +3409,9 @@ restartable (§14.2). The controller runs no children.
     (`ci/e2e-csi.sh`'s negative case, and every multi-node mode at every
     call in `crates/agentfs-csi/tests/grpc.rs`). The state lock, its
     holder line and the mount-option check hold across two NFS clients
-    of one export (`ci/e2e-nfs.sh`). Two nodes writing one volume are out
-    of scope by decision (§19.1).
+    of one export, and a volume moves between two node plugins on it,
+    refused on the second while staged on the first (`ci/e2e-nfs.sh`).
+    Two nodes writing one volume are out of scope by decision (§19.1).
 
 **Where they run.** Tests 1, 2, 4, 5, 6, 7 and 11 run through real mounts
 in the `fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with
@@ -3534,8 +3542,8 @@ restart), through a mount and a front in the `fuse` job, and with custom
 templates checked exactly in `e2e-kind` and `e2e-csi`.
 Not automated yet: the CSI driver on hardened node images (Talos) and
 across node reboots, and a volume moving between two nodes of a cluster
-on a shared basePath (the NFS e2e checks the lock across two clients of
-one export, without Kubernetes).
+on a shared basePath (the NFS e2e moves one between two node plugins on
+two clients of one export, driven over gRPC without Kubernetes).
 
 The `fuse` job also runs README's quick start as written, as root
 (`ci/readme-quickstart.sh`): its remote log after `kill %1; wait` must

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
@@ -426,6 +426,123 @@ async fn delete_volume_on_a_shared_base_path() {
         .collect();
     assert!(silly.is_empty(), "left in {}: {silly:?}", base.display());
     d.stop().await;
+}
+
+/// The message of the newest commit on `branch` that added `path`.
+fn added_by(git: &Path, branch: &str, path: &str) -> Option<String> {
+    let repo = git2::Repository::open_bare(git).ok()?;
+    let mut walk = repo.revwalk().ok()?;
+    walk.push_ref(&format!("refs/heads/{branch}")).ok()?;
+    let has = |c: &git2::Commit| c.tree().is_ok_and(|t| t.get_path(Path::new(path)).is_ok());
+    for id in walk {
+        let commit = repo.find_commit(id.ok()?).ok()?;
+        if has(&commit) && !commit.parents().any(|p| has(&p)) {
+            return Some(commit.message().unwrap_or_default().to_owned());
+        }
+    }
+    None
+}
+
+/// A volume moves between nodes on a shared base path (ci/e2e-nfs.sh step
+/// g; design §14.2, §19.1 "One node per volume"): real `agentfs-csi`
+/// plugins, node-1 on one NFS client's view of the base path and node-2 on
+/// another's, and a controller. While node-1 has the volume staged, the
+/// state lock refuses NodeStage on node-2 across the clients. Once node-1
+/// unstages and the attachment moves, node-2 serves node-1's file, whose
+/// commit names node-1, and records its own writes as node-2.
+#[tokio::test]
+#[ignore = "needs ci/e2e-nfs.sh's plugins (AGENTFS_CSI_TEST_CONTROLLER, _NODE1, _NODE2, _BASE), as root"]
+async fn a_volume_moves_between_nodes_on_a_shared_base_path() {
+    let env = |name: &str| {
+        PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is not set")))
+    };
+    let mut c = ControllerClient::new(connect(&env("AGENTFS_CSI_TEST_CONTROLLER")).await);
+    let mut n1 = NodeClient::new(connect(&env("AGENTFS_CSI_TEST_NODE1")).await);
+    let mut n2 = NodeClient::new(connect(&env("AGENTFS_CSI_TEST_NODE2")).await);
+    // Node-2's view: its history service writes the newest commits.
+    let git = |pv: &str| env("AGENTFS_CSI_TEST_BASE").join(pv).join("state/git");
+    let dir = tempfile::tempdir().unwrap();
+    let (t1, t2) = (dir.path().join("node-1"), dir.path().join("node-2"));
+    let pv = format!("pv-move-{}", std::process::id());
+    let volume = c
+        .create_volume(create_req(&pv, &[("profile", "p")]))
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    let branch = &volume.volume_context["branch"];
+    let unpublish = |target: &Path| NodeUnpublishVolumeRequest {
+        volume_id: pv.clone(),
+        target_path: target.to_str().unwrap().into(),
+    };
+    let unstage = || NodeUnstageVolumeRequest {
+        volume_id: pv.clone(),
+        staging_target_path: "/staging".into(),
+    };
+    let detach = |node: &str| ControllerUnpublishVolumeRequest {
+        volume_id: pv.clone(),
+        node_id: node.into(),
+        ..Default::default()
+    };
+
+    c.controller_publish_volume(publish_req(&pv, "node-1"))
+        .await
+        .unwrap();
+    n1.node_stage_volume(stage_req(&pv, "/staging"))
+        .await
+        .unwrap();
+    n1.node_publish_volume(node_publish_req(&pv, t1.to_str().unwrap()))
+        .await
+        .unwrap();
+    fs::write(t1.join("moved.txt"), "from node-1").unwrap();
+    let err = n2
+        .node_stage_volume(stage_req(&pv, "/staging"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert!(
+        err.message().contains("command=serve-history"),
+        "{}",
+        err.message()
+    );
+
+    n1.node_unpublish_volume(unpublish(&t1)).await.unwrap();
+    n1.node_unstage_volume(unstage()).await.unwrap();
+    c.controller_unpublish_volume(detach("node-1"))
+        .await
+        .unwrap();
+    c.controller_publish_volume(publish_req(&pv, "node-2"))
+        .await
+        .unwrap();
+    n2.node_stage_volume(stage_req(&pv, "/staging"))
+        .await
+        .unwrap();
+    n2.node_publish_volume(node_publish_req(&pv, t2.to_str().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(t2.join("moved.txt")).unwrap(),
+        "from node-1"
+    );
+    let first = added_by(&git(&pv), branch, "moved.txt").expect("moved.txt is not in history");
+    assert!(first.contains("Agentfs-Node: node-1\n"), "{first}");
+    fs::write(t2.join("after.txt"), "from node-2").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let second = loop {
+        if let Some(message) = added_by(&git(&pv), branch, "after.txt") {
+            break message;
+        }
+        assert!(Instant::now() < deadline, "after.txt never reached history");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(second.contains("Agentfs-Node: node-2\n"), "{second}");
+
+    n2.node_unpublish_volume(unpublish(&t2)).await.unwrap();
+    n2.node_unstage_volume(unstage()).await.unwrap();
+    c.controller_unpublish_volume(detach("node-2"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
