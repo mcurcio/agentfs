@@ -360,6 +360,9 @@ mod imp {
                 let _guard = configure("commit.after_tree=error").unwrap();
                 assert!(hit("commit.after_tree").is_err());
             }
+            // Hold the test lock so no parallel test configures a spec
+            // between the drop and these checks.
+            let _lock = TESTS.lock().unwrap_or_else(PoisonError::into_inner);
             assert!(hit("commit.after_tree").is_ok());
             assert_eq!(hits("commit.after_tree"), 0);
         }
