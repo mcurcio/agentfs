@@ -14,11 +14,15 @@
 //!   and `refused`; [`finish::abandon`], the operator's discard; and
 //!   [`finish::status`], what DeleteVolume asks;
 //! - [`listing`]: the published changes on a fork remote, checked, read
-//!   in a receiver's repository with its own git.
+//!   in a receiver's repository with its own git;
+//! - [`deliver`]: the library's delivery of a published change (inbox,
+//!   branch, command, webhook), for a receiver to program; never run by
+//!   the CSI driver.
 //!
 //! Design §11.5 has the whole model.
 
 pub mod create;
+pub mod deliver;
 pub mod finish;
 pub mod identity;
 pub mod listing;

@@ -14,19 +14,23 @@
 //! - `fork abandon` records the operator's discard, with the state lock.
 //! - `fork list` runs in a receiver's git repository, with its own git and
 //!   credentials, never a state area ([`agentfs_core::fork::listing`]).
+//! - `fork deliver` runs there too: it reads the fork's published change,
+//!   checked as `fork list` checks it, and delivers it by one method
+//!   ([`agentfs_core::fork::deliver`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use agentfs_core::config::Settings;
 use agentfs_core::events::Event;
 use agentfs_core::fork::PushTarget;
 use agentfs_core::fork::create::{self, CreateRequest};
+use agentfs_core::fork::deliver::{self, DEFAULT_PREFIX, Delivered, DeliveryMethod, Shape};
 use agentfs_core::fork::finish::{
     self, AbandonedMark, FinishRecord, Finisher, ForkState, ForkStatus, PublishOutcome, RefusedMark,
 };
@@ -66,6 +70,10 @@ pub enum ForkCommand {
     /// Published changes on a fork remote, checked (run in the receiver's
     /// git repository).
     List(ListArgs),
+    /// Deliver a published fork's change to a receiver, from the
+    /// receiver's git repository; exit 0 delivered or already, 1 refused,
+    /// 75 unavailable (retry).
+    Deliver(DeliverArgs),
 }
 
 #[derive(Args)]
@@ -105,6 +113,62 @@ pub struct ListArgs {
     repo: PathBuf,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+pub struct DeliverArgs {
+    /// The fork to deliver.
+    pub fork: String,
+    /// The fork remote (name or URL) the change is read from.
+    #[arg(long, default_value = "origin")]
+    pub from: String,
+    /// The delivery method.
+    #[arg(long, value_enum)]
+    pub to: DeliverTo,
+    /// inbox: the volume to land it in.
+    #[arg(long)]
+    pub volume: Option<String>,
+    /// inbox and branch: where to push (default: --from).
+    #[arg(long)]
+    pub remote: Option<String>,
+    /// branch: the branch is <prefix><fork>.
+    #[arg(long, default_value = DEFAULT_PREFIX)]
+    pub prefix: String,
+    /// branch: one squashed commit, or the fork's history.
+    #[arg(long, value_enum, default_value = "squash")]
+    pub shape: ShapeArg,
+    /// branch, squash: merge the change onto this branch's head.
+    #[arg(long, value_name = "BRANCH")]
+    pub onto: Option<String>,
+    /// command: the program and its arguments, after `--`.
+    #[arg(last = true)]
+    pub command: Vec<String>,
+    /// webhook: the http(s) URL to POST the payload to.
+    #[arg(long)]
+    pub url: Option<String>,
+    /// webhook: a file whose contents are the bearer token.
+    #[arg(long, value_name = "FILE")]
+    pub credential_file: Option<PathBuf>,
+    /// command and webhook: how long the receiver may take.
+    #[arg(long, default_value = "60s", value_parser = crate::parse_grace)]
+    pub timeout: Duration,
+    /// The receiver's git repository, whose git and credentials are used.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DeliverTo {
+    Inbox,
+    Branch,
+    Command,
+    Webhook,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ShapeArg {
+    Squash,
+    History,
 }
 
 /// `fork status --json`, version 1.
@@ -279,6 +343,125 @@ pub fn run(
             }
             Ok(ExitCode::SUCCESS)
         }
+        ForkCommand::Deliver(args) => deliver_cmd(args),
+    }
+}
+
+/// Exit status of a delivery to retry: the receiver or a remote is
+/// unavailable (`EX_TEMPFAIL`, as a busy state area).
+const EXIT_RETRY: u8 = 75;
+
+/// `fork deliver`: read the change, checked; build the method; deliver.
+fn deliver_cmd(args: DeliverArgs) -> Result<ExitCode> {
+    let method = deliver_method(&args)?;
+    let git = GitCli::new(&args.repo);
+    let change = match listing::read(&git, &args.from, &args.fork) {
+        Ok(Some(change)) => change,
+        Ok(None) => {
+            eprintln!(
+                "error: fork {} is not published on {} (or its change fails a check: see                  `agentfs fork list`)",
+                args.fork, args.from
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+        Err(listing::ListError::Unreachable(detail)) => {
+            eprintln!("error: {detail}");
+            return Ok(ExitCode::from(EXIT_RETRY));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let result = deliver::delivery(&method, &git, &args.from).and_then(|d| d.deliver(&change));
+    match result {
+        Ok(done) => {
+            println!("{}", describe_delivered(&done, &change.change));
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            let retry = e.is_retryable();
+            eprintln!(
+                "error: delivering change {} of fork {}: {e}{}",
+                change.change,
+                change.fork,
+                if retry { " (try again)" } else { "" }
+            );
+            Ok(if retry {
+                ExitCode::from(EXIT_RETRY)
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+    }
+}
+
+/// The method `fork deliver`'s flags name. A flag that belongs to another
+/// method is refused rather than ignored.
+fn deliver_method(args: &DeliverArgs) -> Result<DeliveryMethod> {
+    use DeliverTo::{Branch, Command, Inbox, Webhook};
+    let stray = [
+        ("--volume", args.volume.is_some(), &[Inbox][..]),
+        ("--remote", args.remote.is_some(), &[Inbox, Branch][..]),
+        ("--onto", args.onto.is_some(), &[Branch][..]),
+        (
+            "a command after --",
+            !args.command.is_empty(),
+            &[Command][..],
+        ),
+        ("--url", args.url.is_some(), &[Webhook][..]),
+        (
+            "--credential-file",
+            args.credential_file.is_some(),
+            &[Webhook][..],
+        ),
+    ];
+    for (flag, given, methods) in stray {
+        if given && !methods.contains(&args.to) {
+            let to = args.to.to_possible_value().map(|v| v.get_name().to_owned());
+            bail!("{flag} does not apply to --to {}", to.unwrap_or_default());
+        }
+    }
+    let remote = || args.remote.clone().unwrap_or_else(|| args.from.clone());
+    Ok(match args.to {
+        Inbox => DeliveryMethod::Inbox {
+            remote: remote(),
+            volume: args
+                .volume
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--to inbox needs --volume"))?,
+            branch: None,
+        },
+        Branch => DeliveryMethod::Branch {
+            remote: remote(),
+            prefix: args.prefix.clone(),
+            shape: match args.shape {
+                ShapeArg::Squash => Shape::Squash,
+                ShapeArg::History => Shape::History,
+            },
+            onto: args.onto.clone(),
+        },
+        Command => DeliveryMethod::Command {
+            argv: args.command.clone(),
+            timeout: args.timeout,
+        },
+        Webhook => DeliveryMethod::Webhook {
+            url: args
+                .url
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--to webhook needs --url"))?,
+            credential_file: args.credential_file.clone(),
+            timeout: args.timeout,
+        },
+    })
+}
+
+/// One line for a delivery.
+fn describe_delivered(done: &Delivered, change: &str) -> String {
+    match done {
+        Delivered::Submitted { inbox } => format!("delivered change {change} as inbox {inbox}"),
+        Delivered::Pushed { ref_name, commit } => {
+            format!("delivered change {change} as {ref_name} at {commit}")
+        }
+        Delivered::Accepted => format!("delivered change {change}: accepted"),
+        Delivered::AlreadyDelivered => format!("change {change} was already delivered"),
     }
 }
 

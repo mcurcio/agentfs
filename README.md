@@ -469,6 +469,33 @@ agentfs patch submit --volume src <change commit>
   --reason TEXT` discards a fork on record, and nothing agentfs runs
   pushes it again.
 
+### Delivering a change
+
+`agentfs fork deliver` hands one published change, checked as `fork
+list` checks it, to a receiver by one method, from the receiver's own
+clone and credentials ([design §11.5](docs/design.md#115-forks),
+"Delivery"). The CSI driver never delivers: a receiver runs this.
+
+```sh
+# Queue it in a volume's inbox (at most once; applied at its next mount):
+agentfs fork deliver src-1a2b3c4d --to inbox --volume src
+# Open a pull request's head, agentfs-review/<fork>, one squashed commit
+# on base, or merged onto a branch's head:
+agentfs fork deliver src-1a2b3c4d --to branch --onto main
+# Run a program (no shell) with the JSON payload on stdin:
+agentfs fork deliver src-1a2b3c4d --to command -- ./review.sh
+# POST the payload, with Idempotency-Key: <change>:
+agentfs fork deliver src-1a2b3c4d --to webhook --url https://ci.example.com/hook \
+  --credential-file /run/secrets/hook-token
+```
+
+It exits 0 when delivered or already delivered, 1 when refused, and 75
+when the receiver is unavailable: run it again. The payload (schema 1)
+names the fork, source, base, change and finish commits and where to
+fetch them; receivers dedupe on `change`. Delivering pushes a sandbox's
+unreviewed output into the target repository, where its own CI acts on
+it.
+
 ## Telemetry
 
 `mount`, `run`, `record`, `flush`, `push`, `serve-history`, `patch apply`, and

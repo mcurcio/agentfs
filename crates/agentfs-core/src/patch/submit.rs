@@ -258,22 +258,7 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
         .cloned()
         .ok_or_else(|| SubmitError::NoBranch(branch_ref.clone()))?;
     // The head and enough history to check the patch's parent.
-    let mut fetch = vec!["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"];
-    let depth;
-    if let Some(d) = req.depth {
-        depth = format!("--depth={d}");
-        fetch.push(&depth);
-    }
-    fetch.push(&req.remote);
-    fetch.push(&head);
-    let fetched = git.run(&fetch, &[])?;
-    if !fetched.success {
-        // Older servers refuse fetching by object id; fetch the ref.
-        fetch.pop();
-        fetch.retain(|a| *a != "--no-write-fetch-head");
-        fetch.push(&branch_ref);
-        check(git, &fetch, &[])?;
-    }
+    fetch_commit(git, &req.remote, &head, &branch_ref, req.depth)?;
     let (oid, parent) = match &req.source {
         Source::Commit(rev) => existing_commit(git, req, rev, &head)?,
         Source::Build {
@@ -384,6 +369,34 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
     }
 }
 
+/// Fetches commit `oid`, listed at `ref_name` on `remote`, with its
+/// history (`--depth` when given), writing no ref. Older servers refuse
+/// fetching by object id, so it falls back to fetching the ref (which
+/// writes only `FETCH_HEAD`).
+pub fn fetch_commit(
+    git: &impl GitRunner,
+    remote: &str,
+    oid: &str,
+    ref_name: &str,
+    depth: Option<u32>,
+) -> Result<(), SubmitError> {
+    let mut fetch = vec!["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"];
+    let depth = depth.map(|d| format!("--depth={d}"));
+    if let Some(d) = &depth {
+        fetch.push(d);
+    }
+    fetch.push(remote);
+    fetch.push(oid);
+    let fetched = git.run(&fetch, &[])?;
+    if !fetched.success {
+        fetch.pop();
+        fetch.retain(|a| *a != "--no-write-fetch-head");
+        fetch.push(ref_name);
+        check(git, &fetch, &[])?;
+    }
+    Ok(())
+}
+
 fn ls_remote(
     git: &impl GitRunner,
     req: &SubmitRequest,
@@ -488,16 +501,24 @@ fn push(
     ref_name: &str,
     expected: &str,
 ) -> Result<PushLine, SubmitError> {
+    push_leased(git, &req.remote, oid, ref_name, expected)
+}
+
+/// `git push --force-with-lease=<ref_name>:<expected> <oid>:<ref_name>` to
+/// `remote`: the ref moves only if the remote holds `expected` there, and
+/// with `expected` empty it is created only if it does not exist. Never a
+/// plain force. Also used by the fork delivery's branch method
+/// ([`crate::fork::deliver`]).
+pub fn push_leased(
+    git: &impl GitRunner,
+    remote: &str,
+    oid: &str,
+    ref_name: &str,
+    expected: &str,
+) -> Result<PushLine, SubmitError> {
     let lease = format!("--force-with-lease={ref_name}:{expected}");
     let spec = format!("{oid}:{ref_name}");
-    let args = [
-        "push",
-        "--porcelain",
-        "--no-verify",
-        &lease,
-        &req.remote,
-        &spec,
-    ];
+    let args = ["push", "--porcelain", "--no-verify", &lease, remote, &spec];
     let out = git.run(&args, &[])?;
     match parse_porcelain(&out.stdout, ref_name) {
         Some(line) => Ok(line),
@@ -644,7 +665,8 @@ pub fn parse_author(author: &str) -> Result<(String, String), SubmitError> {
     Ok((name.to_owned(), email.to_owned()))
 }
 
-fn check(
+/// `git <args>`, an error unless it succeeded.
+pub(crate) fn check(
     git: &impl GitRunner,
     args: &[&str],
     env: &[(&str, &str)],

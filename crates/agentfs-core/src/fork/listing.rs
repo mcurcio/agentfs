@@ -286,14 +286,21 @@ fn check(
 
 /// A commit as `git cat-file commit` shows it.
 #[derive(Debug, PartialEq, Eq)]
-struct RawCommit {
-    tree: String,
-    parents: Vec<String>,
-    message: String,
+pub(super) struct RawCommit {
+    pub tree: String,
+    pub parents: Vec<String>,
+    /// The `author` and `committer` headers' values: `Name <email> <time>
+    /// <offset>`.
+    pub author: Option<String>,
+    pub committer: Option<String>,
+    pub message: String,
 }
 
 /// `oid`'s commit, `None` when git cannot show it as one.
-fn read_commit(git: &impl GitRunner, oid: &str) -> Result<Option<(RawCommit, Oid)>, ListError> {
+pub(super) fn read_commit(
+    git: &impl GitRunner,
+    oid: &str,
+) -> Result<Option<(RawCommit, Oid)>, ListError> {
     let Ok(parsed) = Oid::from_str(oid) else {
         return Ok(None);
     };
@@ -310,16 +317,24 @@ fn parse_commit(raw: &str) -> Option<RawCommit> {
     let (headers, message) = raw.split_once("\n\n").unwrap_or((raw, ""));
     let mut tree = None;
     let mut parents = Vec::new();
+    let mut author = None;
+    let mut committer = None;
     for line in headers.lines() {
         if let Some(t) = line.strip_prefix("tree ") {
             tree.get_or_insert_with(|| t.to_owned());
         } else if let Some(p) = line.strip_prefix("parent ") {
             parents.push(p.to_owned());
+        } else if let Some(a) = line.strip_prefix("author ") {
+            author.get_or_insert_with(|| a.to_owned());
+        } else if let Some(c) = line.strip_prefix("committer ") {
+            committer.get_or_insert_with(|| c.to_owned());
         }
     }
     Some(RawCommit {
         tree: tree?,
         parents,
+        author,
+        committer,
         message: message.to_owned(),
     })
 }
@@ -336,6 +351,8 @@ mod tests {
         let c = parse_commit(raw).unwrap();
         assert_eq!(c.tree, "aaaa");
         assert_eq!(c.parents, ["bbbb", "cccc"]);
+        assert_eq!(c.author.as_deref(), Some("A <a@b> 1 +0000"));
+        assert_eq!(c.committer.as_deref(), Some("A <a@b> 1 +0000"));
         assert_eq!(c.message, "subject\n\nbody\n");
         assert_eq!(parse_commit("parent bbbb\n\nno tree\n"), None);
     }

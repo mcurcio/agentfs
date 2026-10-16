@@ -2070,8 +2070,44 @@ and its tree is the finish commit's; anything else is skipped with why.
 A listing is only as trustworthy as the remote's writers: whoever may
 write `refs/agentfs/*` there can publish a change that passes.
 
-Not built yet: library delivery (unit 3); hidden refs and the operations
-runbooks (unit 4).
+**Delivery (library and CLI).** `fork::deliver` and `agentfs fork
+deliver <fork> --to <method>` hand a published change to a receiver
+(§19.1 "Fork delivery"). They run in the receiver's repository with its
+own git and credentials, on the change `fork::listing::read` checked and
+fetched (a fork with none, or one failing a check, is "not published",
+exit 1). One contract, `Delivery::deliver(change)`, has four
+single-responsibility methods, and one factory, `fork::deliver::delivery`,
+is the only place a method is built and validated (a volume name, a
+non-empty argv, an absolute credential file, an `http(s)` URL, a prefix
+that makes valid branch names, no `onto` with the history shape):
+
+| Method | Delivers | Idempotency |
+|---|---|---|
+| `inbox` | `patch submit` of the change commit into the inbox of the volume the runner names (`--volume`, never the change's `Agentfs-Source`), on `--remote` | At most once: the remote already queuing or having applied the commit is `AlreadyDelivered` (`AlreadySubmitted`, §12), and the source's duplicate rule is the guarantee |
+| `branch` | A pull request's head, `refs/heads/<prefix><fork>` (default prefix `agentfs-review/`), created only if absent (`--force-with-lease=<ref>:`, never a force). `squash`: one commit, the change's tree on base, or with `--onto B` the three-way merge (against base) of B's head and the change on B's head, a conflict refused with its paths. `history`: the fork's history as published, its finish commit | Content-based: the squash commit is deterministic (the change commit's author and committer, the message `change of fork <fork>` with `Agentfs-Change: <change>`), so the ref already at exactly the commit this delivery creates is `AlreadyDelivered`; a ref at any other commit, even one carrying the trailer, is refused and never moved |
+| `command` | `argv` run without a shell, the payload as JSON on stdin, an environment of `PATH` alone, in its own process group, killed with it after `--timeout` (default 60s) | At least once: exit 0 accepted, 75 unavailable, anything else or a signal refused, a timeout unavailable |
+| `webhook` | One POST of the payload as `application/json` with `Idempotency-Key: <change>` and, with `--credential-file`, `Authorization: Bearer <its contents>`; no redirect followed, never a proxy from the environment, `--timeout` | At least once: 2xx accepted, 409 already delivered, 429, 5xx, a timeout or a connection failure unavailable, any other status refused |
+
+The **payload**, schema 1 (`DeliveryPayload`): `schema`, `fork`,
+`source`, `base`, `change` (receivers dedupe on it), `finish`, and
+`fetch` (`remote`, as the runner named it, and the `change`, `finish` and
+`history` refs). A receiver that dedupes on `change` makes the
+at-least-once methods at most once. `fork deliver` exits 0 delivered or
+already delivered, 1 refused, and 75 unavailable (a receiver, or a remote
+unreachable, or an inbox number lost to racing submitters, all
+`DeliveryError::is_retryable`): run it again.
+
+**The CSI driver never delivers** (gate answer "2 a for CSI and b for
+the library"): it publishes, and delivery runs only where an implementer
+runs it, with that runner's credentials and settings; the target is never
+read from the change. A test greps the CSI sources for any use. **The
+exposure:** a delivery pushes a sandbox's unreviewed output into a target
+repository (a branch on `--remote`, or a volume's inbox), where that
+repository's own CI and hooks act on it; the branch method only creates
+refs under its prefix and the inbox method only queues, but what runs on a
+new branch is the repository's affair (§19.1 "Fork content").
+
+Not built yet: hidden refs and the operations runbooks (unit 4).
 
 ## 12. Patch queue for iac (phase 3, built)
 
@@ -3201,7 +3237,7 @@ one-time migration of Hermes' existing data and the initial import in
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
     `serve-history` (§14), `restore`, `revert`, `patch` (`submit`,
     `apply`, `status`), `lfs` (`fetch`, `prune`) and `fork` (`create`,
-    `finish`, `status`, `abandon`, `list`, §11.5); a test
+    `finish`, `status`, `abandon`, `list`, `deliver`, §11.5); a test
     (`crates/agentfs/src/reference_tests.rs`) checks this list against the
     CLI;
   - `fork finish [--retry] [--timeout D]` finishes once and publishes
@@ -3211,7 +3247,10 @@ one-time migration of Hermes' existing data and the initial import in
     discards the fork on record, under the state lock (75 busy); `fork
     list [--remote R] [--source V] [--repo DIR] [--json]` lists the
     checked published changes on a fork remote from a receiver's
-    repository, never a state area (§11.5);
+    repository, never a state area (§11.5); `fork deliver <fork> --to
+    inbox|branch|command|webhook [--from R]` delivers one checked change
+    from there by one method (exit 0 delivered or already, 1 refused or
+    not published, 75 unavailable; §11.5 "Delivery");
   - `init` is safe to re-run (§2.3): exit 0 for the volume it already
     holds, 1 for another volume or branch; `--include` sets the config's
     `include.path` entries (§4.3), and `--root` creates the backing tree;
@@ -3649,7 +3688,19 @@ restartable (§14.2). The controller runs no children.
     read-only commands and submit's early refusal end to end in
     `cli_fork.rs`; the publisher skipping refused and abandoned forks in
     `publisher.rs`; the read-only publish in `tests/supervisor.rs`;
-    DeleteVolume after abandon in `tests/grpc.rs`.
+    DeleteVolume after abandon in `tests/grpc.rs`. `fork deliver`
+    (`cli_fork_deliver.rs`): the inbox method queues exactly the checked
+    change commit in the named volume's inbox, once; the branch method's
+    squash commit has the change's tree on base, a repeat is already
+    delivered, a forged ref carrying the trailer is refused and never
+    moved, and `--onto` merges a clean change and refuses a conflicting
+    one with its paths; the history shape pushes the finish commit; a
+    command gets the v1 payload on stdin with its arguments unexpanded and
+    `PATH` alone, and is killed at its timeout; a webhook gets the payload
+    with `Idempotency-Key` and the bearer token, its status decides, and
+    no redirect or proxy from the environment is followed; and no CSI
+    source uses delivery. The payload's schema, its serde round trip and
+    the factory's validation are unit tests in `fork/deliver.rs`.
 
 **Where they run.** Tests 1, 2, 4, 5, 6, 7 and 11 run through real mounts
 in the `fuse` CI job (`crates/agentfs/tests/mount.rs`, as root, with
@@ -3900,9 +3951,9 @@ runner.
 | Crash testing (2026-10-13) | Failpoints in the durable path (`agentfs_core::failpoints`), compiled only with the `failpoints` cargo feature (release builds have none; such a build says `+failpoints` in `--version` and warns when `AGENTFS_FAILPOINTS` is set), configured by `AGENTFS_FAILPOINTS` (`name=kill\|error\|panic\|sleep(ms)[@n]`); three harness tiers with one oracle, run in the `crash` job; power loss by `dm-log-writes` and `replay-log` in the `power-loss` workflow (§18 test 3) |
 | Crash findings (2026-10-13) | Found by the harnesses and fixed: objects and `objects/` are synced before the ref names them; the journal keeps appending to the file a failed truncation renamed in; a record whose frozen copies are gone is dropped with `RecordFailed` instead of failing every later commit; a repair queue left in its temporary file is loaded; ref lock files a crash left are removed at open (§3.3, §3.5) |
 | Bench off the landing path (2026-10-15) | A change is done when the `ci` and `image` workflows are green on its final commit; `bench` and `power-loss` run after it lands on main and are checked afterwards, and a bench budget warning or a power-loss failure is a follow-up, not a reason to hold the change (AGENTS.md). The bench runs each filesystem as two parallel jobs, `many` (create, mvdir and rm of 100,000 files) and `rest` (record_step, close4k, clone, npm, bigclose), and one report job merges them per filesystem; clone and npm run once instead of three times, bigclose keeps three. The owner, on the bench's 17 to 24 minute jobs: "23 minutes is too long for a CI job. Let's bring that time down"; offered options including sharding the bench (1) and agents not waiting on it (3), he chose "1 and 3" (both 2026-10-15) ([performance.md](performance.md#the-benchmark)) |
-| Forked volumes (2026-10-15) | A fork is a volume started from another volume's latest local commit (its source, at its base). It records, pushes and recovers like any volume; when it finishes it publishes one change, a commit whose parent is base, and whatever receives the change does all the gating: agentfs never reviews, accepts or merges. The owner's ask: "I want to gate the acceptance of changes upstream, but still want sandbox agents to interact with the normal filesystem. So with agentfs, I can grant them a worktree forked from the latest head, they edit whatever files they choose, and then when the sandbox ends those edits become an upstream merge patch — either through a PR or some automated flow, configurable/programmable by an implementer." Its scope: "Design it, but leave Hermes out of it. We're building an open source project; my application of it to my cluster stack will come later. Focus on capabilities. Configuration with sensible defaults". Where a change lands, the source volume or another repository as a PR: "A or b. I'm not sure" (both are supported); part of a volume: "Partial would be via a subpath mount rather than a partial clone"; one squashed patch or the full history: "Configurable". On the frame "agentfs forks and publishes; whatever receives the change does the gating": "Go" (all 2026-10-15, in a Claude Code session). Unit 1 is built (§11.5); units 2 to 4 are not yet ("Fork scope") |
+| Forked volumes (2026-10-15) | A fork is a volume started from another volume's latest local commit (its source, at its base). It records, pushes and recovers like any volume; when it finishes it publishes one change, a commit whose parent is base, and whatever receives the change does all the gating: agentfs never reviews, accepts or merges. The owner's ask: "I want to gate the acceptance of changes upstream, but still want sandbox agents to interact with the normal filesystem. So with agentfs, I can grant them a worktree forked from the latest head, they edit whatever files they choose, and then when the sandbox ends those edits become an upstream merge patch — either through a PR or some automated flow, configurable/programmable by an implementer." Its scope: "Design it, but leave Hermes out of it. We're building an open source project; my application of it to my cluster stack will come later. Focus on capabilities. Configuration with sensible defaults". Where a change lands, the source volume or another repository as a PR: "A or b. I'm not sure" (both are supported); part of a volume: "Partial would be via a subpath mount rather than a partial clone"; one squashed patch or the full history: "Configurable". On the frame "agentfs forks and publishes; whatever receives the change does the gating": "Go" (all 2026-10-15, in a Claude Code session). Units 1 to 3 are built (§11.5); unit 4 is not yet ("Fork scope") |
 | Fork finish (2026-10-15) | A fork finishes when its claim is deleted (DeleteVolume of a volume from a fork class, whose reclaim policy must be Delete), and outside Kubernetes when `agentfs fork finish` runs. A restart of agentfs, the node plugin or the kubelet never finishes a fork; with a pod-scoped claim, a drain or rollout does. Asked when a sandbox is finished (a: its claim is deleted; b: its last pod stops; c: an explicit finish), the owner: "1a". Built (§11.5, §14.2) |
-| Fork delivery (2026-10-15) | The CSI driver only publishes; a receiver lands a published change in its source with `agentfs patch submit`. The library and the CLI also deliver a change, by four built-in methods: inbox, branch, command and webhook. The owner: "2 a for CSI and b for the library". The CSI side is built (§14.2); the library's methods are not yet (forked volumes unit 3) |
+| Fork delivery (2026-10-15) | The CSI driver only publishes; a receiver lands a published change in its source with `agentfs patch submit`. The library and the CLI also deliver a change, by four built-in methods: inbox, branch, command and webhook. The owner: "2 a for CSI and b for the library". Built: the CSI side (§14.2), and the library's methods with `agentfs fork deliver` (§11.5 "Delivery", forked volumes unit 3) |
 | Fork content (2026-10-15) | Everything agentfs itself does with a fork's content treats it as potentially hostile: names, paths, sizes, symlinks and gitlinks are checked, and nothing is run. agentfs adds no CI filtering: forks publish where users' own CI can act on them (§1.1). The owner: "3 potentially hostile, but don't limit CI capabilities that users could create". Built for create (base's tree through the confined writer), publish (create-only refs), a finished fork (read-only: no record, and a read-only CSI publish) and `fork list` (every published change checked against its finish commit, §11.5) |
 | Fork remote (2026-10-16) | Forks publish to the source's own remote by default, with no setup (the remote its patch queue uses, §12: a design choice). An explicit fork-remote setting may name another remote, which is then never one of the source's push remotes, never sets its limits and never becomes its patch remote (a design choice, design rule 1). The stated cost: wherever that repository's CI may write, a sandbox's CI file can write the source's inbox, so the gate is only as strong as that repository's CI write permissions. The owner, answering the design gate's question on where forks publish: "b". Built (§11.5) |
 | Fork hostile residual (2026-10-16) | Accepted and stated, with no hardening work now: a sandbox's file calls are served by the privileged node plugin, which holds every profile's credentials, so a bug in that front would expose node root and every profile's credentials; and volume size is not enforced on the shared base path (§14.2), so a sandbox can fill it for every volume there. The owner, answering the design gate's question on the hostile residual: "a" |
@@ -3918,6 +3969,8 @@ runner.
 | Finished forks read-only (2026-10-16) | A fork whose branch head is its finish commit takes no record (`ForkFinished`, in the recorder itself); the CLI's changing commands refuse it before they start, while a CSI front of it FUSE-mounts it read-only (`ro`) and is bind-mounted read-only. The kind e2e found the read-only bind alone insufficient: the container still wrote, its runtime binding the target read-write. A design choice (forked volumes unit 2, "Fork content"), not the owner's words |
 | Fork remote LFS (2026-10-16) | A flagged fork remote must name its own `lfsurl` or `lfspushurl` while `lfs.url` or `lfs.pushurl` is set, and reads them before the global keys, so a fork's LFS objects never reach the source's store; without one the section is invalid and forks are refused. A design choice (forked volumes unit 2), not the owner's words |
 | Submit's early refusal (2026-10-16) | `agentfs patch submit` of a given commit that takes a new number is refused (`AlreadySubmitted`) when the remote already queues or has applied that commit; `--replace N` and `--skip N` are not checked, since they name their number deliberately and refuse applied ones already. The queue's duplicate rule ("Patch duplicates") stays the guarantee, since two submits at once both pass the check. A design choice (forked volumes unit 2), not the owner's words |
+| Delivery payload v1 (2026-10-16) | The command and webhook methods send one JSON document, schema 1: `schema`, `fork`, `source`, `base`, `change`, `finish` and `fetch` (`remote` as the runner named it, and the `change`, `finish` and `history` refs). `change` is the key receivers dedupe on, and the webhook's `Idempotency-Key`. A new field or meaning is a new schema number, never a silent change. Both methods are at least once; the inbox method is at most once by the §12 duplicate rule. A design choice (forked volumes unit 3), not the owner's words |
+| Branch delivery idempotency (2026-10-16) | The branch method decides "already delivered" by content: its squash commit is deterministic (the change commit's author and committer, the message `change of fork <fork>` with `Agentfs-Change: <change>`), so the target ref at exactly the commit it would create is already delivered, and a ref at any other commit is refused and never moved; a trailer is never trusted, since anyone who may write the target can forge one. It pushes create-only (`--force-with-lease=<ref>:`). Cost: with `--onto`, a branch that moved since the first delivery makes a repeat refused rather than already delivered, and a receiver that rewrote the branch (a rebase in its pull request) gets the same refusal. A design choice (forked volumes unit 3), not the owner's words |
 
 ### 19.2 Open questions
 

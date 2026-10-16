@@ -51,6 +51,7 @@ missing from these tables or a row names a module that no longer exists;
 | `fork/create.rs` | Creating a fork from a source's state area, without the source's lock or any credentials |
 | `fork/finish.rs` | The finisher: the change and finish commits, publishing to the fork remote, the single decider of a refused publish, the operator's abandon, and the fork status DeleteVolume reads |
 | `fork/listing.rs` | The published changes on a fork remote, each checked (fork name, finish trailers, change id, parent, tree), read in a receiver's repository with its own git (§11.5) |
+| `fork/deliver.rs` | Library delivery of a published change (§11.5 "Delivery"): the `Delivery` contract, its four methods (inbox, branch, command, webhook), the payload (schema 1) and the one factory that validates a method; never used by the CSI driver |
 | `identity.rs` | Committer and author identities from templates (§9) |
 | `service.rs` | The background loops: commit loop, one push loop per remote, repack (§3.4, §11.2) |
 | `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
@@ -136,7 +137,7 @@ missing from these tables or a row names a module that no longer exists;
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
 | `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly (§15) |
 | `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
-| `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon` and `list` (§11.5) |
+| `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon`, `list` and `deliver` (§11.5) |
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it (§7) |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads (§13) |
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters (§13) |

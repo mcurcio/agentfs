@@ -782,6 +782,24 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--remote NAME\|URL` | | `origin` | `fork list`: the fork remote, as the receiver's repository names it |
 | `--source VOLUME` | | every source | `fork list`: only the changes of forks of this source volume |
 | `--repo DIR` | | `.` | `fork list`: the receiver's git repository, whose `git` and credentials are used; no state area is read |
+| `--from NAME\|URL` | | `origin` | `fork deliver`: the fork remote the published change is read from (checked as `fork list` checks it), as the receiver's repository names it; the payload's `fetch.remote` carries it as given |
+| `--to inbox\|branch\|command\|webhook` | | none: required | `fork deliver`: the delivery method (design §11.5 "Delivery"); a flag of another method is refused |
+| `--volume VOLUME` | | none: required by `inbox` | `fork deliver`: inbox, the volume whose inbox the change is queued in (the runner's choice, never the change's `Agentfs-Source`) |
+| `--remote NAME\|URL` | | `--from` | `fork deliver`: inbox and branch, where to push (the volume's patch remote, or the repository the pull request is opened in) |
+| `--prefix PREFIX` | | `agentfs-review/` | `fork deliver`: branch, the branch is `<prefix><fork>`, created only if absent |
+| `--shape squash\|history` | | `squash` | `fork deliver`: branch, one commit with the change's tree on base (author and committer of the change, message `change of fork <fork>` with `Agentfs-Change`), or the fork's history up to its finish commit |
+| `--onto BRANCH` | | base | `fork deliver`: branch, squash only, the squash commit sits on BRANCH's head after a three-way merge against base; a conflict is refused with its paths (git 2.40 or later) |
+| `--url URL` | | none: required by `webhook` | `fork deliver`: webhook, the `http://` or `https://` URL (`https` with the `https` feature) the payload is POSTed to; redirects are never followed, and no proxy from the environment is used |
+| `--credential-file FILE` | | none | `fork deliver`: webhook, an absolute path whose contents (trimmed) are sent as `Authorization: Bearer`, read at each delivery |
+| `--timeout DURATION` | | `60s` | `fork deliver`: command and webhook, how long the receiver may take; a program still running is killed with its process group and counts unavailable (exit 75) |
+| `--repo DIR` | | `.` | `fork deliver`: the receiver's git repository, whose `git` and credentials are used; no state area is read |
+
+`fork deliver ... --to command -- PROGRAM [ARGS...]` runs PROGRAM
+without a shell, with the payload (design §11.5, schema 1) as JSON on
+stdin and an environment of `PATH` alone; its stdout goes to `fork
+deliver`'s stderr. Exit 0 accepts, 75 means try again, anything else
+refuses. `fork deliver` exits 0 delivered or already delivered, 1 refused
+(or not published), 75 unavailable: run it again.
 
 The [operator guide](operator-guide.md) §4 describes the mount flags in
 full, and §16 the history service and fronts; the

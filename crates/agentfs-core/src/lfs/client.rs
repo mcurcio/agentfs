@@ -1064,8 +1064,9 @@ impl Transfer for HttpTransfer {
 /// The HTTP client: no redirects, the remote's proxy if it has one (never
 /// one from the environment), the timeouts above, an idle connection kept
 /// per concurrent transfer, and with the `https` feature native-tls over
-/// the system trust store, as libgit2 uses.
-fn agent(concurrency: usize, proxy: Option<ureq::Proxy>) -> ureq::Agent {
+/// the system trust store, as libgit2 uses. Also the fork delivery's
+/// webhook client ([`crate::fork::deliver`]).
+pub(crate) fn agent(concurrency: usize, proxy: Option<ureq::Proxy>) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
@@ -1111,7 +1112,7 @@ fn content_range_start(headers: &ureq::http::HeaderMap) -> Option<u64> {
 }
 
 /// Up to 4 KiB of an error response's body.
-fn read_small(response: ureq::http::Response<ureq::Body>) -> Vec<u8> {
+pub(crate) fn read_small(response: ureq::http::Response<ureq::Body>) -> Vec<u8> {
     response
         .into_body()
         .with_config()
