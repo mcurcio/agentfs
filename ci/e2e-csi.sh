@@ -38,6 +38,10 @@
 #   eval "$(GIT_SERVER_EXTRA_LISTEN=$(ci/e2e-csi.sh gateway) ci/git-http-server.sh start /tmp/gs | sed 's/^/export /')"
 #   ci/e2e-csi.sh            # ci/e2e-csi.sh diagnose after a failure
 #
+# CSI_INSTALL=chart tests a driver installed beforehand from
+# charts/agentfs-csi (ci/helm-csi-install.sh, the helm workflow's e2e
+# job) instead of deploying ci/k8s-csi/driver; every check is the same.
+#
 # The FUSE module must be loaded on the host (modprobe fuse).
 
 . "$(dirname "$0")/lib.sh"
@@ -218,7 +222,11 @@ ports:
 endpoints:
   - addresses: ["$GW"]
 EOF
-kubectl apply -k ci/k8s-csi/driver
+case "${CSI_INSTALL:-kustomize}" in
+kustomize) kubectl apply -k ci/k8s-csi/driver ;;
+chart) helm status agentfs-csi -n "$DNS" >/dev/null || fail "no agentfs-csi release (ci/helm-csi-install.sh)" ;;
+*) fail "CSI_INSTALL is kustomize or chart, not $CSI_INSTALL" ;;
+esac
 kd rollout status deployment/agentfs-csi-controller --timeout=300s
 deadline=$((SECONDS + 300))
 until [ -n "$(plugin_pod)" ]; do

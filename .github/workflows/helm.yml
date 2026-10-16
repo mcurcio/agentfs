@@ -1,0 +1,174 @@
+name: helm
+
+# The Helm charts (charts/, docs/helm.md): linted and checked against
+# deploy/ on every push and pull request, the CSI chart installed with
+# chart-testing on kind and put through ci/e2e-csi.sh, and both charts
+# published to oci://ghcr.io/mcurcio/charts from main and v* tags once
+# that passes.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: helm-${{ github.ref }}
+  cancel-in-progress: true
+
+# bash -eo pipefail: a failure inside a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  HELM_VERSION: v3.22.1
+  CT_VERSION: 3.15.0
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - uses: helm/chart-testing-action@720270857a28afd41e2426521a7801db09e9b510 # v2.9.0
+        with:
+          version: ${{ env.CT_VERSION }}
+          uv_version: 0.13.1
+      - name: install kubectl and helm-docs
+        run: |
+          ci/install-kind.sh "$RUNNER_TEMP/kind" >/dev/null
+          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+          ci/install-helm-docs.sh "$RUNNER_TEMP/helm-docs"
+          echo "$RUNNER_TEMP/helm-docs/bin" >>"$GITHUB_PATH"
+          python3 -c 'import yaml' || sudo apt-get install -y python3-yaml
+      - name: helm lint
+        run: |
+          helm version
+          helm lint --strict charts/agentfs-csi charts/agentfs-sidecar
+          helm lint --strict charts/agentfs-csi -f ci/helm/deploy-csi-values.yaml
+          helm dependency update deploy/examples/helm-sidecar
+          helm lint --strict deploy/examples/helm-sidecar
+      - name: ct lint
+        run: ct lint --config ci/ct.yaml --all
+      - name: chart READMEs are current (helm-docs)
+        run: |
+          helm-docs --chart-search-root charts
+          git diff --exit-code -- charts || {
+            echo "::error::run helm-docs --chart-search-root charts and commit the READMEs"
+            exit 1
+          }
+      - name: the charts render deploy/
+        run: ci/helm-equivalence.sh
+
+  e2e:
+    name: e2e (CSI chart on kind)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - uses: helm/chart-testing-action@720270857a28afd41e2426521a7801db09e9b510 # v2.9.0
+        with:
+          version: ${{ env.CT_VERSION }}
+          uv_version: 0.13.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The image as image.yml builds it, from its cache (read only here).
+      - name: build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: agentfs:ci
+          cache-from: type=gha,scope=agentfs-image
+          provenance: false
+      - name: FUSE, nginx and fcgiwrap
+        run: |
+          sudo modprobe fuse
+          ls -l /dev/fuse
+          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+      - name: install kind and kubectl
+        run: |
+          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
+          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+      - name: create the cluster
+        run: |
+          kind create cluster --name agentfs-csi --config ci/kind/cluster.yaml \
+            --image "$KIND_NODE_IMAGE" --wait 120s
+          kind load docker-image agentfs:ci --name agentfs-csi
+          kubectl get nodes -o wide
+      - name: start git server
+        run: |
+          GIT_SERVER_EXTRA_LISTEN=$(ci/e2e-csi.sh gateway) \
+            ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
+      - name: ct install
+        run: ci/helm-csi-install.sh
+      - name: e2e-csi against the chart
+        run: CSI_INSTALL=chart ci/e2e-csi.sh
+      - name: the sidecar example passes server-side validation
+        run: |
+          helm dependency update deploy/examples/helm-sidecar
+          helm template agentfs-example deploy/examples/helm-sidecar |
+            kubectl apply --dry-run=server -n default -f -
+      - name: diagnose
+        if: failure()
+        run: ci/e2e-csi.sh diagnose
+      - name: clean up
+        if: always()
+        run: |
+          kind delete cluster --name agentfs-csi || true
+          ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
+
+  # From main: <version>-main.<run number>; from a tag vX.Y.Z: X.Y.Z. The
+  # CSI chart's appVersion is the commit, the image tag image.yml publishes.
+  publish:
+    needs: [lint, e2e]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: package and push
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          RUN: ${{ github.run_number }}
+        run: |
+          base=$(sed -n 's/^version: //p' charts/agentfs-csi/Chart.yaml)
+          case "$REF" in
+          refs/tags/v*) version=${REF#refs/tags/v} ;;
+          *) version=$base-main.$RUN ;;
+          esac
+          echo "$TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
+          mkdir dist
+          helm package charts/agentfs-csi --version "$version" --app-version "$SHA" -d dist
+          helm package charts/agentfs-sidecar --version "$version" -d dist
+          {
+            echo "### Published"
+            echo
+          } >>"$GITHUB_STEP_SUMMARY"
+          for chart in dist/*.tgz; do
+            out=$(helm push "$chart" oci://ghcr.io/mcurcio/charts 2>&1)
+            echo "$out"
+            digest=$(sed -n 's/^Digest: //p' <<<"$out")
+            echo "- \`$(basename "$chart" .tgz)\`, digest \`$digest\`" >>"$GITHUB_STEP_SUMMARY"
+          done

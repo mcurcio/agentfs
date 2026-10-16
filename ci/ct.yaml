@@ -1,0 +1,8 @@
+# chart-testing (ct) for the helm workflow (docs/helm.md §6).
+chart-dirs:
+  - charts
+target-branch: main
+# Versions are set at publish time (docs/helm.md §7), not bumped by hand.
+check-version-increment: false
+validate-maintainers: false
+helm-extra-args: --timeout 600s
