@@ -96,7 +96,10 @@ requires) and `Retain` otherwise.
 Prometheus's `ruleSelector` (deployment.md "Alerts"). It is off by
 default and needs the PrometheusRule CRD. The chart reads
 `deploy/alerts/agentfs.rules.yml` through a symlink
-(`charts/agentfs-csi/files/`), so the rules have one home.
+(`charts/agentfs-csi/files/`), so the rules have one home. Promote the
+`agentfs.volume` resource attribute in Prometheus: under the CSI driver
+the volumes on a node share one `instance` (deployment.md "Names and
+labels").
 
 `basePath.volume` replaces the hostPath at basePath with any pod volume
 source, for a filesystem shared by several nodes (csi.md §3, §11).

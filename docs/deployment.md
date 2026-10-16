@@ -340,10 +340,18 @@ underscores, counters end in `_total`, a seconds or bytes unit becomes a
 suffix (`agentfs_push_oldest_unpushed_age_seconds`), and `service.name`
 and `service.instance.id` (the pod name, or `AGENTFS_REPLICA`) become
 `job` and `instance`. Other resource attributes are not labels unless
-promoted: promote `agentfs.volume` (Prometheus:
-`otlp.promote_resource_attributes`) to tell volumes apart. Another
-translation, such as `NoTranslation`, needs the names in the rules
-changed.
+promoted (Prometheus: `otlp.promote_resource_attributes`). Promote
+`agentfs.volume`, which becomes `agentfs_volume`, wherever one
+`instance` runs several volumes. **Under the CSI driver it is
+required:** every history service on a node reports the node plugin's
+pod as `instance`, so without it the volumes' series merge, and their
+interleaved counters look like resets. `AgentfsCommitsFailing` joins a
+volume's failures to its backlog on `job`, `instance` and
+`agentfs_volume`. A sidecar runs one volume, so there it only names the
+volume. An `agentfs` command run by `kubectl exec` in the sidecar
+exports under the daemon's `instance` and volume too, so for its run a
+metric both export is one series. Another translation, such as
+`NoTranslation`, needs the names in the rules changed.
 
 **Counters** appear at their first count, so `increase()` alone, which
 needs two samples, would miss a process's first failure. Each counter
@@ -453,7 +461,10 @@ final commit and push when the pod is deleted, the in-place recovery of
 without a restart, and `agentfs push` in the sidecar pushes at once), and
 the sealed mount point (checked from the node), and the clean-exit fence
 (`EROFS` in the gap; the subPath writer, restarted inside the gap, refused
-with `EACCES`, then restarted onto the new mount by its liveness probe). `kubectl apply --dry-run=server`
+with `EACCES`, then restarted onto the new mount by its liveness probe),
+and the rollback's flush Pod of
+[upgrading-the-sidecar.md](runbooks/upgrading-the-sidecar.md#rolling-back)
+run as written against the claim. `kubectl apply --dry-run=server`
 validates `deploy/sidecar` itself. It runs locally on any Linux host with
 docker, kind, kubectl, nginx and fcgiwrap (see the script's header).
 

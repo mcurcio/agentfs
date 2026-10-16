@@ -12,6 +12,11 @@
 # agentfs_record_failures_total and agentfs.push.oldest_unpushed_age is
 # agentfs_push_oldest_unpushed_age_seconds.
 #
+# Volumes. `agentfs.volume` becomes the label agentfs_volume only when
+# promoted. Under the CSI driver every volume on a node shares one
+# `instance` (the node plugin's pod), so there it must be promoted, or
+# the volumes' series merge; joins match on it too.
+#
 # Counters. An agentfs counter first appears at its first count, so
 # increase() alone, which needs two samples, would miss the first failure
 # of a process. Each counter rule therefore also matches a series that is
@@ -41,7 +46,7 @@ groups:
             increase(agentfs_commit_failures_total[5m]) > 0
               or (agentfs_commit_failures_total > 0 unless agentfs_commit_failures_total offset 5m)
           )
-          and on (job, instance) agentfs_journal_backlog > 0
+          and on (job, instance, agentfs_volume) agentfs_journal_backlog > 0
         for: 10m
         labels:
           severity: critical

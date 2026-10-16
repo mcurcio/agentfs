@@ -80,6 +80,33 @@ tests:
               description: "Commit passes have failed for 10 minutes while the journal holds records. The records are safe in the journal and are retried, but history does not advance and the state area grows."
               runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/runbooks/recording-failures.md#3-commits-failing-commitfailed
 
+  # Under the CSI driver every volume's history service on a node reports
+  # the node plugin's pod as `instance`, so only the promoted
+  # `agentfs_volume` tells them apart, and the join must match on it.
+  # Volume c's commits keep failing with records waiting: it fires. Volume
+  # a's commits keep failing with nothing waiting, and volume b has records
+  # waiting with no failure: neither fires, though they share an instance.
+  - interval: 1m
+    input_series:
+      - series: 'agentfs_commit_failures_total{job="agentfs",instance="node-plugin-0",agentfs_volume="a"}'
+        values: '_x2 1+1x40'
+      - series: 'agentfs_journal_backlog{job="agentfs",instance="node-plugin-0",agentfs_volume="a"}'
+        values: '0x42'
+      - series: 'agentfs_commit_failures_total{job="agentfs",instance="node-plugin-0",agentfs_volume="b"}'
+        values: '0x42'
+      - series: 'agentfs_journal_backlog{job="agentfs",instance="node-plugin-0",agentfs_volume="b"}'
+        values: '0x2 7x40'
+      - series: 'agentfs_commit_failures_total{job="agentfs",instance="node-plugin-0",agentfs_volume="c"}'
+        values: '_x2 1+1x40'
+      - series: 'agentfs_journal_backlog{job="agentfs",instance="node-plugin-0",agentfs_volume="c"}'
+        values: '0x2 5x40'
+    promql_expr_test:
+      - expr: ALERTS{alertname="AgentfsCommitsFailing"}
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AgentfsCommitsFailing",alertstate="firing",severity="critical",job="agentfs",instance="node-plugin-0",agentfs_volume="c"}'
+            value: 1
+
   # The other counters, first seen at 61m.
   - interval: 1m
     input_series:

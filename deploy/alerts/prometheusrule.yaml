@@ -32,7 +32,7 @@ spec:
               increase(agentfs_commit_failures_total[5m]) > 0
                 or (agentfs_commit_failures_total > 0 unless agentfs_commit_failures_total offset 5m)
             )
-            and on (job, instance) agentfs_journal_backlog > 0
+            and on (job, instance, agentfs_volume) agentfs_journal_backlog > 0
           for: 10m
           labels:
             severity: critical
