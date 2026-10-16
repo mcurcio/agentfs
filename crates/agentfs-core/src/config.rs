@@ -618,6 +618,29 @@ fn split_remotes(
     }
 }
 
+/// Whether `<git_dir>/config` names a fork identity (any of
+/// `agentfs.fork.source`, `.base`, `.pushTarget`), read without the rest
+/// of the settings: whether a volume is a fork does not depend on
+/// settings that may fail to load (an include removed or holding a bad
+/// value). No include may set these keys
+/// ([`ConfigError::IncludeSetsIdentity`]); libgit2 still reads includes
+/// here, skipping a missing one, so one that sets them makes the volume
+/// look like a fork whose settings then fail to load, and one that does
+/// not parse is an error.
+pub fn declares_fork(git_dir: &Path) -> Result<bool, git2::Error> {
+    let config = git2::Config::open(&git_dir.join("config"))?;
+    for key in [
+        fork_identity::SOURCE_KEY,
+        fork_identity::BASE_KEY,
+        fork_identity::PUSH_TARGET_KEY,
+    ] {
+        if is_set(&config, key)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl Settings {
     /// Reads settings from `<git_dir>/config` only.
     pub fn load(git_dir: &Path) -> Result<Self, ConfigError> {

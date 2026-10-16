@@ -2001,8 +2001,12 @@ settings in included files (`SourceSettingsNotIncluded` otherwise), since
 the fork reads only those; a CSI source's are its profile's.
 
 **Finish** (`fork::finish::Finisher`, only under the fork's state lock)
-commits what is journaled, records the paths in `meta/repairs` from the
-tree (each one that fails is counted and alarmed as `RecordFailed`), then
+commits what is journaled, records from the tree the paths every repair
+queue left (`meta/repairs`, and each front slot's
+`meta/fronts/slot-<n>.repairs` with a crashed rewrite's temporary file,
+which under CSI no next front would drain; each entry as the pod that
+queued it, and each one that fails, or a queue that cannot be read,
+counted and alarmed as `RecordFailed`), then
 writes the change (none when the final tree is base's) with
 `refs/agentfs/<fork>/change`, the finish commit (§9) as the branch head,
 and `refs/agentfs/<fork>/finish`. The finish commit is the single home of
@@ -2051,7 +2055,10 @@ lock, no credentials, no network): `abandoned` wins, then `published` and
 then `refused` when their marks name the branch head's finish commit, then
 `finished` after the finish commit and `active` before it. A mark that
 cannot be read, or settings that cannot be loaded, are errors, never a
-state, so DeleteVolume waits.
+state, so DeleteVolume waits. Whether a volume is a fork is read first
+from its own `git/config` (the identity keys, which no include may set),
+so an ordinary volume whose settings fail to load has no fork status and
+its DeleteVolume never reads them.
 
 **Settings that fail closed.** A fork whose included settings file cannot
 be read does not open: `mount`, `fork finish`, `fork status` and
@@ -3722,12 +3729,14 @@ restartable (§14.2). The controller runs no children.
     claim in use; its pushes reach only the fork remote; a Retain fork
     class is denied at admission; with the fork remote blocked, deleting
     the sandbox leaves the PV Released and DeleteVolume UNAVAILABLE across
-    a node-plugin restart; once reachable, a pre-receive hook refusing
-    `refs/agentfs/*` makes the publish refused and no further finisher
-    starts; the finished fork's directory mounted read-write through a
-    static PV is read-only (`EROFS`); `fork finish --retry` in the node
-    plugin publishes it and the PV goes; the change submitted twice
-    applies once, and a later submit is refused early
+    a node-plugin restart; once reachable, the publisher alone publishes
+    the change and finish refs and the PV goes; for a second fork, a
+    pre-receive hook refusing `refs/agentfs/*` makes the publish refused
+    and no further finisher starts; that finished fork's directory
+    mounted read-write through a static PV is read-only (`EROFS`); `fork
+    finish --retry` in the node plugin publishes it and its PV goes; the
+    first change submitted twice applies once, and a later submit is
+    refused early
     (`ci/e2e-csi-forks.sh`). Refused, abandoned and remote-gone publishes,
     the single refusal decider, settings that fail closed and the
     read-only recorder are tested in `fork/tests.rs`; `fork status`,

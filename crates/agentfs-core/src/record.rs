@@ -3,6 +3,9 @@
 //! Records hold absolute state ("this path now has this content"), never
 //! deltas, so applying a record twice gives the same tree (design §3.3).
 
+use std::io;
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 use crate::identity::Context;
@@ -275,6 +278,91 @@ impl Record {
     pub fn pending_ids(&self) -> impl Iterator<Item = PendingId> + '_ {
         self.draft.changes.iter().filter_map(Change::pending)
     }
+}
+
+/// A saved repair queue's entry (design §3.5): a path the FUSE layer
+/// could not record, the caller that changed it, and the pod it is
+/// committed as (`None`: the loading process's own).
+pub type QueuedRepair = (Vec<u8>, Caller, Option<Origin>);
+
+/// What a repair queue saved at a store holds ([`read_repairs`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SavedRepairs {
+    pub entries: Vec<QueuedRepair>,
+    /// A crash left the temporary file of a rewrite ([`repairs_tmp`]):
+    /// its complete lines are among `entries`.
+    pub had_tmp: bool,
+}
+
+/// Where a repair queue saved at `store` is written before it is renamed
+/// over it.
+pub fn repairs_tmp(store: &Path) -> PathBuf {
+    store.with_extension("tmp")
+}
+
+/// The repair queue saved at `store` (`meta/repairs` or a front slot's
+/// file), with the complete lines of a temporary file a crash left
+/// between writing a rewrite and renaming it over the store. A missing
+/// file is an empty queue. A repair is idempotent, so an entry read twice
+/// costs a sweep record at most.
+pub fn read_repairs(store: &Path) -> io::Result<SavedRepairs> {
+    let mut saved = SavedRepairs::default();
+    match std::fs::read(store) {
+        Ok(bytes) => saved.entries = parse_repairs(&bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    match std::fs::read(repairs_tmp(store)) {
+        Ok(mut bytes) => {
+            let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            bytes.truncate(complete);
+            saved.entries.extend(parse_repairs(&bytes));
+            saved.had_tmp = true;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    Ok(saved)
+}
+
+/// The entries of a saved repair queue, the FUSE layer's format: lines
+/// `<uid> <gid> <pid> <path in hex>`, each after an `@origin <JSON>` line
+/// naming the pod its entries are committed as (`@origin -`: none). Each
+/// entry keeps the origin it was saved under; malformed lines are skipped
+/// (a malformed `@origin` line counts as `@origin -`).
+pub fn parse_repairs(bytes: &[u8]) -> Vec<QueuedRepair> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut origin: Option<Origin> = None;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("@origin ") {
+            origin = match rest {
+                "-" => None,
+                json => serde_json::from_str(json).ok(),
+            };
+            continue;
+        }
+        if let Some((path, caller)) = parse_repair_entry(line) {
+            out.push((path, caller, origin.clone()));
+        }
+    }
+    out
+}
+
+fn parse_repair_entry(line: &str) -> Option<(Vec<u8>, Caller)> {
+    let mut f = line.split(' ');
+    let uid = f.next()?.parse().ok()?;
+    let gid = f.next()?.parse().ok()?;
+    let pid = f.next()?.parse().ok()?;
+    let hex = f.next()?;
+    if f.next().is_some() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let path = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some((path, Caller { uid, gid, pid }))
 }
 
 #[cfg(test)]

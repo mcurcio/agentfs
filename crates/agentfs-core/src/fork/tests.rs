@@ -23,7 +23,7 @@ use crate::events::{Event, Events, NullSink, PushFailureKind};
 use crate::identity::Context;
 use crate::lock::StateLock;
 use crate::paths::RepoPath;
-use crate::record::{Caller, OperationKind, Trigger};
+use crate::record::{Caller, OperationKind, Origin, Trigger};
 use crate::restore::{self, Applied, RecordMode};
 use crate::telemetry::Telemetry;
 use crate::volume::{self, StateDir};
@@ -494,6 +494,110 @@ fn finish_and_publish_a_fork() {
     ));
     // A non-fork has no fork status.
     assert_eq!(finish::status(&source.state).unwrap(), None);
+}
+
+/// A repair queue's line for `path` (the FUSE layer's format).
+fn repair_line(path: &str) -> String {
+    let hex: String = path.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("{} {} {} {hex}\n", CALLER.uid, CALLER.gid, CALLER.pid)
+}
+
+/// Finish records what every repair queue left (design §11.5): the
+/// single-process `meta/repairs`, a front slot's queue (CSI: no next front
+/// comes for a deleted fork), and a slot's temporary file a crash left,
+/// each entry as the pod that queued it; what it cannot record is counted.
+#[test]
+fn finish_records_the_paths_every_repair_queue_left() {
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+    for (path, content) in [("x.txt", "x\n"), ("y.txt", "y\n"), ("z.txt", "z\n")] {
+        fs::write(fork.tree.join(path), content).unwrap();
+    }
+    fs::create_dir_all(fork.state.meta()).unwrap();
+    fs::write(fork.state.repairs(), repair_line("y.txt")).unwrap();
+    fs::create_dir_all(fork.state.fronts_dir()).unwrap();
+    let origin = serde_json::to_string(&Origin {
+        namespace: "ns".into(),
+        pod: "pod-a".into(),
+        pod_uid: "pod-a-uid".into(),
+        node: "n".into(),
+        replica: "pod-a".into(),
+    })
+    .unwrap();
+    fs::write(
+        fork.state.front_repairs(0),
+        format!("@origin {origin}\n{}", repair_line("x.txt")),
+    )
+    .unwrap();
+    // Slot 3: only the temporary file of a rewrite, with a torn last line
+    // and a path that can never be recorded.
+    fs::write(
+        fork.state.fronts_dir().join("slot-3.tmp"),
+        format!(
+            "{}{}1 2 3 7a2e",
+            repair_line("z.txt"),
+            repair_line("a/../b")
+        ),
+    )
+    .unwrap();
+
+    let lock = fork.lock();
+    let record = fork.finisher(&lock).unwrap().finish().unwrap();
+    assert_eq!(record.unrecorded, 1, "a/../b is counted");
+    let repo = Repository::open_bare(fork.state.git()).unwrap();
+    let change = repo.find_commit(record.change.unwrap()).unwrap();
+    let tree = change.tree().unwrap();
+    for (path, content) in [("x.txt", "x\n"), ("y.txt", "y\n"), ("z.txt", "z\n")] {
+        let blob = tree
+            .get_path(Path::new(path))
+            .unwrap()
+            .to_object(&repo)
+            .unwrap();
+        assert_eq!(
+            blob.as_blob().unwrap().content(),
+            content.as_bytes(),
+            "{path}"
+        );
+    }
+    let message = repo
+        .find_commit(record.finish)
+        .unwrap()
+        .message()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("Agentfs-Unrecorded: 1\n"), "{message}");
+    // x.txt, from slot 0, is committed as the pod that queued it.
+    let mut walk = repo.revwalk().unwrap();
+    walk.push(record.finish).unwrap();
+    let by_pod_a = walk
+        .map(|id| repo.find_commit(id.unwrap()).unwrap())
+        .filter(|c| {
+            c.message()
+                .unwrap_or_default()
+                .contains("Agentfs-Pod: pod-a\n")
+        })
+        .count();
+    assert_eq!(by_pod_a, 1, "one commit records slot 0's repair as pod-a");
+}
+
+/// A volume that is not a fork has no fork status even when its settings
+/// cannot be loaded (its profile include removed): DeleteVolume of it
+/// never waits on them.
+#[test]
+fn a_volume_that_is_not_a_fork_has_no_status_whatever_its_settings() {
+    let source = Vol::new("src");
+    fs::remove_file(&source.fragment).unwrap();
+    assert!(crate::config::Settings::load(&source.state.git()).is_err());
+    assert_eq!(finish::status(&source.state).unwrap(), None);
+    // A fork whose settings fail to load fails closed.
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+    fs::remove_file(&source.fragment).unwrap();
+    assert!(finish::status(&fork.state).is_err());
 }
 
 #[test]

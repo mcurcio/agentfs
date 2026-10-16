@@ -39,7 +39,7 @@ use std::sync::Mutex;
 use agentfs_core::fsync_class::GroupMembers;
 use agentfs_core::nested;
 use agentfs_core::paths::PathError;
-use agentfs_core::record::{Caller, Origin, Trigger};
+use agentfs_core::record::{Caller, Origin, SavedRepairs, Trigger, read_repairs, repairs_tmp};
 use agentfs_core::volume::{Input, MoveOutcome, Recorded, Recorder, VolumeError};
 
 use crate::names::{Class, classify};
@@ -153,30 +153,15 @@ impl Boundary {
     /// loading what a previous mount left there (design §3.5). Returns how
     /// many paths were loaded.
     pub fn persist_repairs(&self, store: PathBuf) -> io::Result<usize> {
-        let mut loaded = match fs::read(&store) {
-            Ok(bytes) => parse_repairs(&bytes),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e),
-        };
         // A crash between writing the new queue and renaming it over the
         // store leaves the new queue in the temporary file: its complete
-        // lines are loaded too. A repair is idempotent, so an entry loaded
-        // twice, or one already repaired, costs a sweep record at most.
-        let tmp = store.with_extension("tmp");
-        let had_tmp = match fs::read(&tmp) {
-            Ok(mut bytes) => {
-                let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-                bytes.truncate(complete);
-                loaded.extend(parse_repairs(&bytes));
-                true
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e),
-        };
+        // lines are loaded too (`read_repairs`).
+        let SavedRepairs { entries, had_tmp } = read_repairs(&store)?;
+        let tmp = repairs_tmp(&store);
         let mut repairs = self.lock();
         repairs.store = Some(store);
-        let n = loaded.len();
-        for (path, caller, origin) in loaded {
+        let n = entries.len();
+        for (path, caller, origin) in entries {
             let generation = repairs.next;
             repairs.next += 1;
             // This pod's own entries (a restart in the same pod) are its own.
@@ -522,7 +507,7 @@ impl Repairs {
 }
 
 fn write_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = repairs_tmp(path);
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(content)?;
@@ -564,50 +549,13 @@ fn format_repairs(queue: &BTreeMap<Vec<u8>, Entry>, own: Option<&Origin>) -> Vec
     out.into_bytes()
 }
 
-/// The entries of a saved queue, each with the origin it was saved
-/// under; malformed lines are skipped (a malformed `@origin` line counts
-/// as `@origin -`).
-fn parse_repairs(bytes: &[u8]) -> Vec<(Vec<u8>, Caller, Option<Origin>)> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut origin: Option<Origin> = None;
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("@origin ") {
-            origin = match rest {
-                "-" => None,
-                json => serde_json::from_str(json).ok(),
-            };
-            continue;
-        }
-        if let Some((path, caller)) = parse_entry(line) {
-            out.push((path, caller, origin.clone()));
-        }
-    }
-    out
-}
-
-fn parse_entry(line: &str) -> Option<(Vec<u8>, Caller)> {
-    let mut f = line.split(' ');
-    let uid = f.next()?.parse().ok()?;
-    let gid = f.next()?.parse().ok()?;
-    let pid = f.next()?.parse().ok()?;
-    let hex = f.next()?;
-    if f.next().is_some() || hex.len() % 2 != 0 {
-        return None;
-    }
-    let path = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-        .collect::<Option<Vec<u8>>>()?;
-    Some((path, Caller { uid, gid, pid }))
-}
-
 /// The trigger a recorded change gets when the sweep repairs it.
 pub const REPAIR_TRIGGER: Trigger = Trigger::Sweep;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentfs_core::record::parse_repairs;
 
     fn entry(caller: Caller, generation: u64, origin: Option<Origin>) -> Entry {
         Entry {

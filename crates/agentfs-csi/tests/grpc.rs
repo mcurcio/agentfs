@@ -403,6 +403,50 @@ async fn delete_volume_retains_or_deletes() {
     d.stop().await;
 }
 
+/// DeleteVolume of an ordinary `onDelete: retain` volume never reads its
+/// settings: one whose profile was removed from the ConfigMap, or holds a
+/// bad value, is still deleted (whether it is a fork is read from the
+/// state area's own config, design §11.5).
+#[tokio::test]
+async fn an_ordinary_volume_with_unreadable_settings_is_still_deleted() {
+    let d = Driver::start().await;
+    let mut c = d.controller();
+    for profile in ["removed", "broken"] {
+        fs::write(
+            d.layout.profiles.join(format!("{profile}.config")),
+            "[agentfs]\n\tcommitWindow = 100ms\n",
+        )
+        .unwrap();
+        c.create_volume(create_req(profile, &[("profile", profile)]))
+            .await
+            .unwrap();
+        let state = agentfs_core::volume::StateDir::new(d.layout.state(profile));
+        assert!(state.git().join("config").exists());
+    }
+    fs::remove_file(d.layout.profiles.join("removed.config")).unwrap();
+    fs::write(
+        d.layout.profiles.join("broken.config"),
+        "[agentfs]\n\tcommitWindow = soon\n",
+    )
+    .unwrap();
+    for profile in ["removed", "broken"] {
+        let state = agentfs_core::volume::StateDir::new(d.layout.state(profile));
+        assert!(
+            agentfs_core::config::Settings::load(&state.git()).is_err(),
+            "{profile}: its settings must fail to load for this test to mean anything"
+        );
+        c.delete_volume(DeleteVolumeRequest {
+            volume_id: profile.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{profile}: {e}"));
+        assert!(!d.layout.csi_json(profile).exists());
+        assert!(d.layout.retained_json(profile).exists());
+    }
+    d.stop().await;
+}
+
 /// DeleteVolume on the shared base path of an NFS export (ci/e2e-nfs.sh
 /// step f, `AGENTFS_CSI_TEST_BASE`): the volume and its aside copy are
 /// gone, and no silly-renamed lock file is left behind.

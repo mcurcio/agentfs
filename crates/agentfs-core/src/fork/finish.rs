@@ -34,7 +34,7 @@ use crate::paths::RepoPath;
 use crate::push::{
     CreateOnlyOutcome, CreateOnlyRef, PUSH_BACKOFF_CAP, PushOutcome, RemotePusher, backoff,
 };
-use crate::record::{Caller, Trigger};
+use crate::record::{Caller, Trigger, read_repairs};
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::{self, Committer, Input, Recorder, StateDir, VolumeError};
 
@@ -502,41 +502,96 @@ impl Finisher {
         Ok(())
     }
 
-    /// Records each path the FUSE layer could not record (`meta/repairs`,
-    /// design §3.5) as the tree holds it. Returns how many could not be
-    /// recorded, each alarmed.
+    /// Records each path the FUSE layer could not record (design §3.5) as
+    /// the tree holds it: `meta/repairs`, and every front slot's queue
+    /// (`meta/fronts/slot-<n>.repairs`), which would otherwise wait for a
+    /// next front in that slot that a finished fork never gets. Each entry
+    /// is committed as the pod that queued it. Every slot is read, a live
+    /// lease or not: a repair is idempotent, and a front still running
+    /// could no longer record into a finished fork. Returns how many could
+    /// not be recorded, each alarmed; a queue that cannot be read counts as
+    /// one.
     fn record_repairs(&self) -> u64 {
-        let Ok(bytes) = std::fs::read(self.state.repairs()) else {
-            return 0;
-        };
         let mut unrecorded = 0;
-        for (raw, caller) in parse_repairs(&bytes) {
-            let path = match String::from_utf8(raw)
-                .map_err(|e| e.to_string())
-                .and_then(|p| RepoPath::new(p).map_err(|e| e.to_string()))
-            {
-                Ok(path) => path,
+        let alarm = |paths: Vec<RepoPath>, error: String| {
+            self.events.emit(Event::RecordFailed {
+                trigger: Trigger::Sweep,
+                paths,
+                error,
+            });
+        };
+        for store in self.repair_stores() {
+            let saved = match store.and_then(|store| {
+                read_repairs(&store).map_err(|e| format!("reading {}: {e}", store.display()))
+            }) {
+                Ok(saved) => saved,
                 Err(error) => {
                     unrecorded += 1;
-                    self.events.emit(Event::RecordFailed {
-                        trigger: Trigger::Sweep,
-                        paths: Vec::new(),
-                        error: format!("a repair of {}: {error}", self.tree.display()),
-                    });
+                    alarm(Vec::new(), format!("a repair queue of the fork: {error}"));
                     continue;
                 }
             };
-            let input = Input::Tree { path: path.clone() };
-            if let Err(e) = self.recorder.record(Trigger::Sweep, caller, vec![input]) {
-                unrecorded += 1;
-                self.events.emit(Event::RecordFailed {
-                    trigger: Trigger::Sweep,
-                    paths: vec![path],
-                    error: e.to_string(),
-                });
+            for (raw, caller, origin) in saved.entries {
+                let path = match String::from_utf8(raw)
+                    .map_err(|e| e.to_string())
+                    .and_then(|p| RepoPath::new(p).map_err(|e| e.to_string()))
+                {
+                    Ok(path) => path,
+                    Err(error) => {
+                        unrecorded += 1;
+                        alarm(
+                            Vec::new(),
+                            format!("a repair of {}: {error}", self.tree.display()),
+                        );
+                        continue;
+                    }
+                };
+                let input = Input::Tree { path: path.clone() };
+                if let Err(e) = self
+                    .recorder
+                    .record_as(Trigger::Sweep, caller, vec![input], origin)
+                {
+                    unrecorded += 1;
+                    alarm(vec![path], e.to_string());
+                }
             }
         }
         unrecorded
+    }
+
+    /// The repair queues of the fork's state area: `meta/repairs`, then
+    /// each front slot with a queue or the temporary file of one, in slot
+    /// order. A fronts directory that cannot be listed is an error entry.
+    fn repair_stores(&self) -> Vec<Result<std::path::PathBuf, String>> {
+        let mut stores = vec![Ok(self.state.repairs())];
+        let dir = self.state.fronts_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return stores,
+            Err(e) => {
+                stores.push(Err(format!("listing {}: {e}", dir.display())));
+                return stores;
+            }
+        };
+        let mut slots: Vec<u16> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let rest = name.to_str()?.strip_prefix("slot-")?;
+                let slot = rest
+                    .strip_suffix(".repairs")
+                    .or_else(|| rest.strip_suffix(".tmp"))?;
+                slot.parse::<u16>().ok()
+            })
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        stores.extend(
+            slots
+                .into_iter()
+                .map(|slot| Ok(self.state.front_repairs(slot))),
+        );
+        stores
     }
 
     /// Clears a refused mark so publish tries again (`fork finish
@@ -778,33 +833,6 @@ impl Finisher {
     }
 }
 
-/// The repair queue's entries: `<uid> <gid> <pid> <hex path>` lines, the
-/// FUSE layer's format (`agentfs-fuse` boundary), `@origin` lines skipped.
-fn parse_repairs(bytes: &[u8]) -> Vec<(Vec<u8>, Caller)> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut out = Vec::new();
-    for line in text.lines() {
-        out.extend(parse_repair(line));
-    }
-    out
-}
-
-fn parse_repair(line: &str) -> Option<(Vec<u8>, Caller)> {
-    let mut f = line.split(' ');
-    let uid = f.next()?.parse().ok()?;
-    let gid = f.next()?.parse().ok()?;
-    let pid = f.next()?.parse().ok()?;
-    let hex = f.next()?;
-    if f.next().is_some() || hex.len() % 2 != 0 {
-        return None;
-    }
-    let path = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-        .collect::<Option<Vec<u8>>>()?;
-    Some((path, Caller { uid, gid, pid }))
-}
-
 /// `meta/fork.json`, `None` when there is none.
 fn read_mark(state: &StateDir) -> Result<Option<ForkMark>, StatusError> {
     match std::fs::read(state.fork_mark()) {
@@ -893,8 +921,14 @@ fn now_ms() -> u64 {
 /// read is an error, never a state, so a caller deciding whether to
 /// delete waits. Abandoned wins, then published, then refused (each
 /// naming the branch head's finish commit), then finished or active.
+/// Whether the volume is a fork is decided from its own config first
+/// ([`crate::config::declares_fork`]), so a volume that is not one is
+/// `Ok(None)` even when its settings cannot be loaded.
 pub fn status(state: &StateDir) -> Result<Option<ForkStatus>, StatusError> {
     crate::history::init_libgit2();
+    if !crate::config::declares_fork(&state.git()).map_err(HistoryError::from)? {
+        return Ok(None);
+    }
     let settings = Settings::load(&state.git()).map_err(HistoryError::from)?;
     let Some(identity) = settings.fork.clone() else {
         return Ok(None);

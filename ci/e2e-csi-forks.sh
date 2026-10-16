@@ -15,17 +15,20 @@
 #      Retain, and admits the shipped agentfs-fork class;
 #   4. with the fork remote blocked, deleting the sandbox pod leaves the PV
 #      Released and DeleteVolume UNAVAILABLE, across a restart of the node
-#      plugin pod; once reachable, the remote's pre-receive hook refusing
-#      refs/agentfs/* makes the publish refused (`rejected`), and the node
-#      plugin starts no further finisher for it;
-#   5. the finished fork's retained directory, mounted read-write through a
-#      static PV, is published read-only: a write fails with EROFS;
-#   6. with the hook gone, `agentfs fork finish --retry` run in the node
-#      plugin publishes the change and finish refs and the PV goes;
-#   7. the change submitted twice at once (`agentfs patch submit`), then a
-#      restart of the source's pod, gives one commit applying it and a
-#      duplicate marker for each other copy queued; a later submit of it is
-#      refused early.
+#      plugin pod; once the remote is reachable again, the node plugin's
+#      publisher publishes the change and finish refs and the PV goes, with
+#      no operator action;
+#   5. a second sandbox's fork, whose remote's pre-receive hook refuses
+#      refs/agentfs/*, is refused (`rejected`) once its pod is deleted, and
+#      the node plugin starts no further finisher for it;
+#   6. that finished fork's retained directory, mounted read-write through
+#      a static PV, is published read-only: a write fails with EROFS;
+#   7. with the hook gone, `agentfs fork finish --retry` run in the node
+#      plugin publishes it and its PV goes;
+#   8. the first fork's change submitted twice at once (`agentfs patch
+#      submit`), then a restart of the source's pod, gives one commit
+#      applying it and a duplicate marker for each other copy queued; a
+#      later submit of it is refused early.
 #
 # Needs what ci/e2e-csi.sh needs (kind, kubectl, the image agentfs:ci
 # loaded into the cluster $KIND_CLUSTER, default agentfs-forks, and the git
@@ -122,10 +125,10 @@ delete_unavailable() { # pv
   grep -q "Unavailable.*fork $1 is" <<<"$said"
 }
 ref_exists() { git --git-dir "$1" rev-parse -q --verify "$2" >/dev/null 2>&1; }
-fork_mark_has() { # text
+fork_mark_has() { # pv text
   local mark # captured first: grep -q closing a pipe would fail it (pipefail)
-  mark=$(docker exec "$NODE" cat "$BASE/$FORK_PV/state/meta/fork.json" 2>/dev/null)
-  grep -q "$1" <<<"$mark"
+  mark=$(docker exec "$NODE" cat "$BASE/$1/state/meta/fork.json" 2>/dev/null)
+  grep -q "$2" <<<"$mark"
 }
 finishers_started() { # pv
   local said
@@ -236,17 +239,6 @@ kubectl apply --dry-run=server -f deploy/csi/example/fork-storageclass.yaml >/de
 pass "the shipped agentfs-fork class is admitted"
 
 step "(4) DeleteVolume waits until the fork is published"
-# Once the remote is reachable again, its hook refuses refs/agentfs/*:
-# the publish is refused for good (design §11.5, `rejected`).
-cat >"$FORKS_REMOTE/hooks/pre-receive" <<'HOOK'
-#!/bin/sh
-while read -r _old _new ref; do
-  case "$ref" in
-  refs/agentfs/*) echo "refs/agentfs/* is refused by policy" >&2; exit 1 ;;
-  esac
-done
-HOOK
-chmod +x "$FORKS_REMOTE/hooks/pre-receive"
 mode=$(stat -c %a "$FORKS_REMOTE")
 chmod 000 "$FORKS_REMOTE"
 ka delete pod sandbox --wait --timeout=180s
@@ -265,23 +257,62 @@ assert_eq Released "$(kubectl get pv "$FORK_PV" -o jsonpath='{.status.phase}')" 
 said=$(provisioner_log)
 assert_contains "$(grep 'Volume deletion failed' <<<"$said" | tail -n 1)" \
   "code = Unavailable" "DeleteVolume still answers UNAVAILABLE"
-fgit rev-parse -q --verify "refs/agentfs/$FORK/finish" >/dev/null 2>&1 &&
-  fail "the finish ref reached a blocked remote"
+ref_exists "$FORKS_REMOTE" "refs/agentfs/$FORK/finish" && fail "the finish ref reached a blocked remote"
+pass "a blocked fork remote has no finish ref"
+# Reachable again: the publisher alone (no operator action) publishes it.
 chmod "$mode" "$FORKS_REMOTE"
-until_ok 300 "the publish is refused as rejected, on record" fork_mark_has '"reason": "rejected"'
-started=$(finishers_started "$FORK_PV")
+until_ok 600 "the publisher puts the finish ref on the fork remote" \
+  ref_exists "$FORKS_REMOTE" "refs/agentfs/$FORK/finish"
+CHANGE=$(fgit rev-parse "refs/agentfs/$FORK/change") || fail "no change ref"
+sgit merge-base --is-ancestor "$(fgit rev-parse "$CHANGE^")" "$SOURCE_BRANCH" ||
+  fail "the change's parent is not on the source's branch"
+pass "the change's parent is base, a commit of the source's branch"
+assert_eq "from the sandbox" "$(fgit show "$CHANGE:sandbox.txt")" "the change holds the sandbox's file"
+assert_eq "$(fgit rev-parse "refs/agentfs/$FORK/finish")" "$(fgit rev-parse "$FORK_BRANCH")" \
+  "the finish commit is the fork branch's head"
+until_ok 600 "the fork's PV is gone once published" pv_gone "$FORK_PV"
+until_ok 60 "the fork's volume directory is removed" node_path_gone "$BASE/$FORK_PV"
+ka get pod writer -o jsonpath='{.status.phase}' | grep -q Running || fail "the source's pod stopped"
+pass "the source stayed in use throughout"
+
+step "(5) a fork whose remote refuses its refs is refused"
+# The hook refuses refs/agentfs/* (the change and finish refs), not the
+# fork's branch: the publish is refused for good (design §11.5,
+# `rejected`).
+cat >"$FORKS_REMOTE/hooks/pre-receive" <<'HOOK'
+#!/bin/sh
+while read -r _old _new ref; do
+  case "$ref" in
+  refs/agentfs/*) echo "refs/agentfs/* is refused by policy" >&2; exit 1 ;;
+  esac
+done
+HOOK
+chmod +x "$FORKS_REMOTE/hooks/pre-receive"
+sed -e 's/^  name: sandbox$/  name: sandbox2/' "$HERE/k8s-csi/forks/sandbox.yaml" >"$W/sandbox2.yaml"
+kubectl apply -f "$W/sandbox2.yaml"
+ka wait --for=condition=Ready pod/sandbox2 --timeout=240s >/dev/null ||
+  fail "the second sandbox never became Ready"
+FORK2_PV=$(ka get pvc sandbox2-data -o jsonpath='{.spec.volumeName}')
+FORK2=$APPS.sandbox2-data.$FORK2_PV
+echo "second fork $FORK2_PV ($FORK2)"
+in_pod sandbox2 'printf "from the second sandbox" > /data/sandbox2.txt'
+until_ok 120 "the fork remote has the second fork's branch with sandbox2.txt" \
+  remote_file_is "$FORKS_REMOTE" "refs/heads/agentfs/$FORK2" sandbox2.txt "from the second sandbox"
+ka delete pod sandbox2 --wait --timeout=180s
+until_ok 300 "the publish is refused as rejected, on record" fork_mark_has "$FORK2_PV" '"reason": "rejected"'
+started=$(finishers_started "$FORK2_PV")
 sleep 45 # more than the node plugin's 30 s fork scan
-assert_eq "$started" "$(finishers_started "$FORK_PV")" \
+assert_eq "$started" "$(finishers_started "$FORK2_PV")" \
   "the node plugin starts no further finisher for a refused fork"
-assert_eq Released "$(kubectl get pv "$FORK_PV" -o jsonpath='{.status.phase}')" \
+assert_eq Released "$(kubectl get pv "$FORK2_PV" -o jsonpath='{.status.phase}')" \
   "the refused fork's PV stays Released"
 said=$(provisioner_log)
 assert_contains "$(grep 'Volume deletion failed' <<<"$said" | tail -n 1)" "is refused" \
   "DeleteVolume answers UNAVAILABLE for a refused fork"
-ref_exists "$FORKS_REMOTE" "refs/agentfs/$FORK/finish" && fail "the hook let the finish ref in"
+ref_exists "$FORKS_REMOTE" "refs/agentfs/$FORK2/finish" && fail "the hook let the finish ref in"
 pass "the fork remote has no finish ref"
 
-step "(5) a finished fork is published read-only"
+step "(6) a finished fork is published read-only"
 kubectl apply -f - <<EOF
 apiVersion: v1
 kind: PersistentVolume
@@ -295,8 +326,8 @@ spec:
   claimRef: { namespace: $APPS, name: finished-fork }
   csi:
     driver: $DRIVER
-    volumeHandle: $FORK_PV
-    volumeAttributes: { profile: cifork, volumeName: "$FORK" }
+    volumeHandle: $FORK2_PV
+    volumeAttributes: { profile: cifork, volumeName: "$FORK2" }
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -320,7 +351,7 @@ EOF
 kubectl apply -f "$W/finished.yaml"
 ka wait --for=condition=Ready pod/finished --timeout=240s >/dev/null ||
   fail "the finished fork's pod never became Ready"
-assert_eq "from the sandbox" "$(in_pod finished 'cat /data/sandbox.txt')" "the finished fork reads"
+assert_eq "from the second sandbox" "$(in_pod finished 'cat /data/sandbox2.txt')" "the finished fork reads"
 if out=$(in_pod finished 'printf x > /data/late.txt' 2>&1); then
   fail "a write reached a finished fork"
 fi
@@ -330,25 +361,19 @@ ka delete pod finished --wait --timeout=120s
 ka delete pvc finished-fork --wait --timeout=120s
 kubectl delete pv finished-fork --wait --timeout=120s
 
-step "(6) fork finish --retry publishes the refused fork"
+step "(7) fork finish --retry publishes the refused fork"
 rm "$FORKS_REMOTE/hooks/pre-receive"
 kd exec "$(plugin_pod)" -c agentfs-csi -- /usr/local/bin/agentfs --wait-lock 180s \
-  --state "$BASE/$FORK_PV/state" --root "$BASE/$FORK_PV/backing" \
+  --state "$BASE/$FORK2_PV/state" --root "$BASE/$FORK2_PV/backing" \
   fork finish --retry --timeout 120s || fail "fork finish --retry did not publish"
-until_ok 60 "the fork remote has the finish ref" ref_exists "$FORKS_REMOTE" "refs/agentfs/$FORK/finish"
-CHANGE=$(fgit rev-parse "refs/agentfs/$FORK/change") || fail "no change ref"
-sgit merge-base --is-ancestor "$(fgit rev-parse "$CHANGE^")" "$SOURCE_BRANCH" ||
-  fail "the change's parent is not on the source's branch"
-pass "the change's parent is base, a commit of the source's branch"
-assert_eq "from the sandbox" "$(fgit show "$CHANGE:sandbox.txt")" "the change holds the sandbox's file"
-assert_eq "$(fgit rev-parse "refs/agentfs/$FORK/finish")" "$(fgit rev-parse "$FORK_BRANCH")" \
-  "the finish commit is the fork branch's head"
-until_ok 600 "the fork's PV is gone once published" pv_gone "$FORK_PV"
-until_ok 60 "the fork's volume directory is removed" node_path_gone "$BASE/$FORK_PV"
-ka get pod writer -o jsonpath='{.status.phase}' | grep -q Running || fail "the source's pod stopped"
-pass "the source stayed in use throughout"
+until_ok 60 "the fork remote has the second fork's finish ref" \
+  ref_exists "$FORKS_REMOTE" "refs/agentfs/$FORK2/finish"
+assert_eq "from the second sandbox" "$(fgit show "refs/agentfs/$FORK2/change:sandbox2.txt")" \
+  "the second fork's change holds its file"
+until_ok 600 "the refused fork's PV is gone once published" pv_gone "$FORK2_PV"
+until_ok 60 "the refused fork's volume directory is removed" node_path_gone "$BASE/$FORK2_PV"
 
-step "(7) the change, submitted twice at once, applies once"
+step "(8) the first fork's change, submitted twice at once, applies once"
 git clone -q "$SOURCE_REMOTE" "$W/producer"
 git -C "$W/producer" fetch -q "$FORKS_REMOTE" "refs/agentfs/$FORK/change"
 submit() {
