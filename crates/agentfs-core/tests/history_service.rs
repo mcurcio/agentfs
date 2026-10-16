@@ -535,6 +535,8 @@ enum OnRecord {
     DropFirst,
     /// Answers once every one of the barrier's records has arrived.
     Together(Arc<tokio::sync::Barrier>),
+    /// Fails it with this code.
+    Fail(tonic::Code),
 }
 
 #[derive(Clone)]
@@ -544,6 +546,8 @@ struct Fake {
     features: Vec<String>,
     /// Hello answers RESOURCE_EXHAUSTED.
     busy: bool,
+    /// What its health service reports for [`SERVICE_NAME`].
+    serving: bool,
     on_record: OnRecord,
     seen: Arc<Seen>,
 }
@@ -555,6 +559,7 @@ impl Fake {
             protocol_version: PROTOCOL_VERSION,
             features: vec!["still_last".into()],
             busy: false,
+            serving: true,
             on_record,
             seen: Arc::default(),
         }
@@ -639,6 +644,7 @@ impl pb::history_server::History for Fake {
             OnRecord::Together(barrier) => {
                 barrier.wait().await;
             }
+            OnRecord::Fail(code) => return Err(Status::new(*code, "a fake failure")),
         }
         Ok(Response::new(pb::RecordReply {
             seq: Some(1),
@@ -733,8 +739,18 @@ impl FakeServer {
             let _runtime = runtime.enter();
             tokio::net::UnixListener::bind(&socket).unwrap()
         };
+        let (reporter, health) = tonic_health::server::health_reporter();
+        runtime.block_on(reporter.set_service_status(
+            SERVICE_NAME,
+            if fake.serving {
+                tonic_health::ServingStatus::Serving
+            } else {
+                tonic_health::ServingStatus::NotServing
+            },
+        ));
         runtime.spawn(
             Server::builder()
+                .add_service(health)
                 .add_service(pb::history_server::HistoryServer::new(fake))
                 .serve_with_incoming(UnixListenerStream::new(listener).map(|io| io.map(FakeConn))),
         );
@@ -929,6 +945,73 @@ fn a_busy_service_fails_the_boundary_without_an_outage_alarm() {
             .any(|e| matches!(e, Event::RecordFailed { .. })),
         "{events:?}"
     );
+}
+
+/// The error a close fails with when the service answers its record
+/// with `code`, and how many frozen copies the front kept.
+fn record_failure(code: tonic::Code) -> (ClientError, usize) {
+    let env = env();
+    let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
+    let _server = FakeServer::start(&env, Fake::new(&env, OnRecord::Fail(code)));
+    let sink = Arc::new(MemorySink::new());
+    let client = connect(
+        &env,
+        &lease,
+        pod("pod-a"),
+        "vol",
+        Duration::from_secs(5),
+        sink.clone(),
+    )
+    .unwrap();
+    let recorder = front_on(&env, client, sink);
+    match close(&env, &recorder, "a", "1").unwrap_err() {
+        VolumeError::HistoryService(e) => (e, slot_copies(&env, 1)),
+        err => panic!("{err:?}"),
+    }
+}
+
+#[test]
+fn a_record_the_service_rejects_drops_its_copy() {
+    let (e, copies) = record_failure(tonic::Code::InvalidArgument);
+    assert!(matches!(e, ClientError::Service { .. }), "{e:?}");
+    assert!(!e.maybe_journaled());
+    assert_eq!(copies, 0, "nothing was journaled");
+}
+
+#[test]
+fn a_record_refused_for_a_missing_hello_keeps_its_copy() {
+    let (e, copies) = record_failure(tonic::Code::FailedPrecondition);
+    assert!(matches!(e, ClientError::Protocol { .. }), "{e:?}");
+    assert!(e.maybe_journaled());
+    assert_eq!(copies, 1, "a request that may be journaled keeps its copy");
+}
+
+#[test]
+fn ping_of_a_service_that_is_not_serving_is_unreachable() {
+    let env = env();
+    let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
+    let _server = FakeServer::start(
+        &env,
+        Fake {
+            serving: false,
+            ..Fake::new(&env, OnRecord::Answer)
+        },
+    );
+    let client = connect(
+        &env,
+        &lease,
+        pod("a"),
+        "vol",
+        Duration::from_secs(5),
+        Arc::new(NullSink),
+    )
+    .unwrap();
+    match client.ping() {
+        Err(ClientError::Unreachable { error, .. }) => {
+            assert!(error.contains("NOT_SERVING"), "{error}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
