@@ -7,6 +7,10 @@
 | [`csi/example/`](csi/example) | A workload on the driver: a restricted namespace, a StorageClass using the `example` profile, a `ReadWriteOnce` claim and a two-replica Deployment |
 | [`alerts/`](alerts) | Example alert rules for agentfs's metrics: a Prometheus rules file, the same as a `PrometheusRule`, and their promtool tests ([docs/deployment.md](../docs/deployment.md#alerts)) |
 | [`examples/hermes/`](examples/hermes) | Operator rules for Hermes, the first consumer (design §16) |
+| [`examples/helm-sidecar/`](examples/helm-sidecar) | A workload chart using the `agentfs-sidecar` Helm library: `sidecar/` as Helm renders it, its settings and rules linked from `sidecar/config` |
+
+The Helm charts in [`../charts`](../charts) render the same objects as
+`sidecar/` and `csi/`; CI checks they do ([docs/helm.md](../docs/helm.md)).
 
 The sidecar is explained in [docs/deployment.md](../docs/deployment.md):
 the image, the pod layout and why, configuration, users and permissions,
