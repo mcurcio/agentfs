@@ -28,7 +28,7 @@ spec:
   variables:
     - name: node
       expression: >-
-        'authentication.kubernetes.io/node-name' in request.userInfo.extra
+        has(request.userInfo.extra) && 'authentication.kubernetes.io/node-name' in request.userInfo.extra
         ? request.userInfo.extra['authentication.kubernetes.io/node-name'][0] : ''
     # The PV as it is and as it would be: none for a claim.
     - name: pvs

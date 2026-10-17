@@ -108,6 +108,11 @@ remote_ref() { # ref
   awk '{print $1}' <<<"$said"
 }
 remote_ref_is() { [ "$(remote_ref "$1")" = "$2" ]; } # ref oid
+moved_from() { # pv volume commit: the worktree's head is another commit
+  local head
+  head=$(local_head "$1" "$2") || return 1
+  [ "$head" != "$3" ]
+}
 pushed() { # pv volume: the remote's branch is at the worktree's head
   local head
   head=$(local_head "$1" "$2") || return 1
@@ -259,6 +264,9 @@ until_ok 180 "a new server pod is Ready" sh -c \
 port_forward
 assert_eq "$ONE" "$(remote_ref "refs/heads/agentfs/$V")" "the repository survived the pod (its claim)"
 in_pod 'printf two > /data/two.txt'
+# Committed first: until then the worktree's head is still $ONE, which
+# the server already holds.
+until_ok 60 "the next write is committed" moved_from "$PV" "$V" "$ONE"
 until_ok 120 "the next write reaches the new server pod" pushed "$PV" "$V"
 TWO=$(remote_ref "refs/heads/agentfs/$V")
 [ "$TWO" != "$ONE" ] || fail "agentfs/$V did not move"
