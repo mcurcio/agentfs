@@ -500,7 +500,8 @@ pub enum Remotes {
     NoneValid,
     /// `agentfs.remotes = none` and no push section: status, telemetry
     /// and alarms say local-only. A remote added later (and `none`
-    /// removed) gets all history.
+    /// removed) gets all history: the branch, and the refs of the forks
+    /// received meanwhile (`fork::receive::received_refs`).
     LocalOnly,
     /// Neither, or `none` beside a push section (`beside` names it):
     /// pushes nothing and raises `RemotesUndeclared`; `agentfs init` and

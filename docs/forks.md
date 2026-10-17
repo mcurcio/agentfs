@@ -32,7 +32,8 @@ agentfs patch submit --volume src <change commit>
   exits 75 while another command holds it). Nothing applies them:
   whatever reads the source's history decides (`git --git-dir <source
   state>/git log agentfs/<fork>`;
-  [configuration](configuration.md#declaring-remotes)).
+  [configuration](configuration.md#declaring-remotes)). Once the source
+  declares a remote, its pushes carry those refs there too, create-only.
 - Under CSI, a claim with a `dataSource` claim on a fork StorageClass
   (`fork: "true"`, reclaim policy `Delete`) is a fork; deleting it
   finishes the fork, and the driver deletes the volume only once it is

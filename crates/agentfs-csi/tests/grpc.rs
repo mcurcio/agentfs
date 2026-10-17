@@ -802,6 +802,49 @@ async fn delete_volume_asks_the_remotes() {
     d.stop().await;
 }
 
+/// F8 S3: a source that received a fork while local-only, then gained a
+/// remote, holds that fork's only copy: DeleteVolume waits, naming the
+/// ref, until the remote holds it as well as the head (the push carries
+/// it), and only then deletes.
+#[tokio::test]
+async fn delete_volume_waits_for_received_forks() {
+    let d = Driver::start().await;
+    d.remote_profile("r", "");
+    let mut c = d.controller();
+    c.create_volume(create_req(
+        "s",
+        &[
+            ("profile", "r"),
+            ("onDelete", "delete"),
+            ("volumeName", "{pvName}"),
+        ],
+    ))
+    .await
+    .unwrap();
+    let git = d.layout.state("s").join("git");
+    commit(&git, "refs/heads/agentfs/s", &[("a.txt", "a")]);
+    push(&d.layout, "s");
+    // What receive_fork_change writes for fork s-1.
+    let finish = commit(&git, "refs/heads/agentfs/s-1", &[("b.txt", "b")]);
+    let repo = git2::Repository::open_bare(&git).unwrap();
+    for name in ["refs/agentfs/s-1/change", "refs/agentfs/s-1/finish"] {
+        repo.reference(name, finish, false, "test").unwrap();
+    }
+    let err = c.delete_volume(delete_req("s")).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    assert!(
+        err.message()
+            .contains("does not hold refs/agentfs/s-1/change, a fork received"),
+        "{}",
+        err.message()
+    );
+    assert!(d.layout.volume_dir("s").exists());
+    push(&d.layout, "s");
+    c.delete_volume(delete_req("s")).await.unwrap();
+    assert!(!d.layout.volume_dir("s").exists());
+    d.stop().await;
+}
+
 /// DeleteVolume cannot ask the remotes of a worktree whose settings fail
 /// to load (its profile removed from the ConfigMap, or holding a bad
 /// value): FAILED_PRECONDITION, and nothing deleted or released.

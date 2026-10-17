@@ -15,7 +15,9 @@
 //!   ([`agentfs_core::release::decide`], F8 rule 3) over facts gathered
 //!   here: the worktree's declared remotes, what each pushed remote
 //!   advertises for the branch in a listing made for this call
-//!   ([`agentfs_core::push::RemotePusher::branch_claim`]), the journal's
+//!   ([`agentfs_core::push::RemotePusher::branch_claim`]) and for the refs
+//!   of forks received into its history
+//!   ([`agentfs_core::push::RemotePusher::received_lacking`]), the journal's
 //!   backlog ([`agentfs_core::volume::inspect`], read under the state
 //!   lock), the class's `onDelete`, and a fork's status. `Delete` removes
 //!   the directory; `Keep` releases the volume and keeps the worktree,
@@ -367,11 +369,12 @@ pub(crate) fn delete_volume(
 
 /// DeleteVolume's answer to [`Release::Wait`]: `UNAVAILABLE`, naming why,
 /// after waking the release scan, which commits and pushes (or finishes)
-/// the worktree meanwhile. A remote that lacks the head contradicts the
+/// the worktree meanwhile. A remote that lacks the head (or a received
+/// fork's ref) contradicts the
 /// scan's memory of a push that held it (the remote lost the branch since,
 /// or was added after): the scan forgets it and pushes again.
 fn wait(handle: &str, release: &ReleaseScan, waiting: &Waiting) -> Error {
-    if let Waiting::Lacking { .. } = waiting {
+    if let Waiting::Lacking { .. } | Waiting::ReceivedLacking { .. } = waiting {
         release.forget(handle);
     }
     release.wake();
@@ -424,9 +427,17 @@ fn decide(
                 &Telemetry::noop(),
             )
             .map_err(|e| unreadable(&e))?;
+            let (branch, received_lacking) = match pusher.branch_claim(head) {
+                Ok(claim) => match pusher.received_lacking() {
+                    Ok(lacking) => (Ok(claim), lacking),
+                    Err(why) => (Err(why), None),
+                },
+                Err(why) => (Err(why), None),
+            };
             seen.push(Seen {
                 remote: remote.name.clone(),
-                branch: pusher.branch_claim(head),
+                branch,
+                received_lacking,
             });
         }
     }

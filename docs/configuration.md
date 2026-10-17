@@ -131,7 +131,10 @@ S3), in one of four modes, which `agentfs status` prints as its
 A section with `agentfsForkRemote = true` is not a push section. A push
 section beside `none` is never pushed and is reported misconfigured
 (`agentfs.remotes = none is set beside this push section`). A remote
-added later, with `none` removed, gets all the history.
+added later, with `none` removed, gets all the history: the branch, and
+after it the refs of every fork the volume received while local-only,
+create-only (a remote holding one at another commit fails the push and
+keeps its value). DeleteVolume waits until every remote holds them too.
 
 A fork of a local-only source with no `agentfsForkRemote` section
 publishes into the source's own history (R4): `refs/heads/agentfs/<fork>`

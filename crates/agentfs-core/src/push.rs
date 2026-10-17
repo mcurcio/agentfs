@@ -6,7 +6,8 @@
 //! colours another.
 //!
 //! A push sends only the volume's own refs (design §11.4): the history
-//! branch and `refs/agentfs/<volume>/*`, as explicit `<oid>:<ref>` refspecs
+//! branch and `refs/agentfs/<volume>/*` (and the forks it received, below),
+//! as explicit `<oid>:<ref>` refspecs
 //! on an anonymous remote, never forced. Remote configuration such as
 //! `remote.<name>.push` is therefore never consulted, and the system,
 //! global and XDG git config are not read at all
@@ -24,6 +25,11 @@
 //!   [`RemotePusher::push_with_lease`] or a new name.
 //! - **The patch queue** writes only while the remote's branch is this
 //!   worktree's, leased on it ([`QueuePush::branch_not_ours`]).
+//! - **Forks received into this history** (a local-only source's forks,
+//!   `fork::receive::received_refs`) follow a branch push that worked,
+//!   create-only ([`RemotePusher::push_create_only`]'s rule): a remote
+//!   added later gets them too, and a ref the remote holds at another oid
+//!   fails the push, never overwritten.
 //! - **Over the push size limit** (`agentfsMaxPushSize`, [`crate::push_size`]):
 //!   measured from the branch the remote advertises (the push state can lag
 //!   it), a backlog that does not fit is pushed in first-parent steps,
@@ -593,6 +599,11 @@ impl RemotePusher {
         self.step_pending = false;
         let outcome = self.branch_push(head_out, lfs_out);
         let limited = outcome.is_limited();
+        let outcome = if outcome.is_success() && !limited {
+            self.received_push(outcome, *head_out)
+        } else {
+            outcome
+        };
         self.step_pending = limited;
         // The queue push follows every branch attempt, failed or not
         // (design §12): the status ref reaches the remote even while the
@@ -602,6 +613,79 @@ impl RemotePusher {
             self.queue = self.queue_push(outcome.is_success() && !limited);
         }
         outcome
+    }
+
+    /// The refs of the forks received into this history
+    /// ([`crate::fork::receive::received_refs`]), pushed create-only after
+    /// a branch push that worked (`outcome`), with the push lock held: a
+    /// local-only source's forks reach a remote added later (F8 S3). A
+    /// ref the remote holds at another oid is never overwritten and fails
+    /// the push, alarmed and retried like any failure, as does a push
+    /// that did not take. `outcome` stands when there is none, or all are
+    /// held.
+    fn received_push(&mut self, outcome: PushOutcome, head: Option<Oid>) -> PushOutcome {
+        let refs = match self.received() {
+            Ok(refs) if refs.is_empty() => return outcome,
+            Ok(refs) => refs,
+            Err(e) => {
+                let message = format!("reading the received forks' refs: {}", e.message());
+                return self.failed(PushFailureKind::Local, message, head);
+            }
+        };
+        match self.create_only_locked(&refs) {
+            CreateOnlyOutcome::Held => outcome,
+            CreateOnlyOutcome::AnotherWriter { name, found } => {
+                let message = format!(
+                    "{name}, a fork received into this history, is at {found} on the remote, \
+                     not at its own commit: another writer's, never overwritten"
+                );
+                self.failed(PushFailureKind::Refused, message, head)
+            }
+            CreateOnlyOutcome::Failed { kind, message } => self.failed(
+                kind,
+                format!("pushing the received forks' refs: {message}"),
+                head,
+            ),
+        }
+    }
+
+    /// [`crate::fork::receive::received_refs`] of this repository.
+    fn received(&self) -> Result<Vec<CreateOnlyRef>, GitError> {
+        Ok(
+            crate::fork::receive::received_refs(&self.repo, &self.volume)?
+                .into_iter()
+                .map(|(name, oid)| CreateOnlyRef { name, oid })
+                .collect(),
+        )
+    }
+
+    /// The first ref of a fork received into this history
+    /// ([`crate::fork::receive::received_refs`]) that this remote does not
+    /// list at its commit, in one listing connection; `None` when the
+    /// remote holds them all, or there are none (no connection then). For
+    /// the release decider, beside [`RemotePusher::branch_claim`]: never
+    /// pushes, never takes the push lock.
+    pub fn received_lacking(&self) -> Result<Option<String>, Unreachable> {
+        let local = |message: String| Unreachable {
+            kind: PushFailureKind::Local,
+            message,
+        };
+        let refs = self
+            .received()
+            .map_err(|e| local(format!("reading the received forks' refs: {}", e.message())))?;
+        if refs.is_empty() {
+            return Ok(None);
+        }
+        let listed = self
+            .list_remote_refs(|name| refs.iter().any(|r| r.name == name))
+            .map_err(|(kind, message)| Unreachable {
+                kind,
+                message: scrub_userinfo(&message, self.remote.push_url()),
+            })?;
+        Ok(refs
+            .into_iter()
+            .find(|r| listed.get(&r.name) != Some(&r.oid))
+            .map(|r| r.name))
     }
 
     /// The branch push of [`RemotePusher::push_once_inner`], with the push
@@ -953,6 +1037,17 @@ impl RemotePusher {
                 let message = format!("locking {}: {e}", self.lock_path.display());
                 return failed(PushFailureKind::Local, message);
             }
+        };
+        self.create_only_locked(refs)
+    }
+
+    /// [`RemotePusher::push_create_only`] with this remote's push lock
+    /// held.
+    fn create_only_locked(&mut self, refs: &[CreateOnlyRef]) -> CreateOnlyOutcome {
+        let url = self.remote.push_url().to_owned();
+        let failed = |kind, message: String| CreateOnlyOutcome::Failed {
+            kind,
+            message: scrub_userinfo(&message, &url),
         };
         let wanted = |name: &str| refs.iter().any(|r| r.name == name);
         let listed = match self.list_remote_refs(wanted) {

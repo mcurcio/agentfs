@@ -2,12 +2,14 @@
 //! whether DeleteVolume removes a worktree, keeps it, or waits.
 //!
 //! [`decide`] is pure. Its inputs are the worktree's declared remotes,
-//! what each pushed remote advertises for the branch in a listing made
+//! what each pushed remote advertises for the branch (and for the refs of
+//! forks received into this history) in a listing made
 //! for this call (rule 3: it asks the remote, never the push record), how
 //! many journaled records history lacks, the class's `onDelete`, and, for
 //! a fork, its status. It answers:
 //!
-//! - [`Release::Delete`]: every declared remote holds the head, or the
+//! - [`Release::Delete`]: every declared remote holds the head (and the
+//!   refs of every fork received into this history), or the
 //!   worktree has no history, its journal holds nothing history lacks,
 //!   and `onDelete` is `delete`;
 //! - [`Release::Keep`]: the volume is released but the worktree stays on
@@ -84,6 +86,9 @@ impl fmt::Display for OnDelete {
 pub struct Seen {
     pub remote: String,
     pub branch: Result<Claim, Unreachable>,
+    /// The first ref of a fork received into this history that the remote
+    /// does not hold ([`crate::push::RemotePusher::received_lacking`]).
+    pub received_lacking: Option<String>,
 }
 
 /// How the worktree declares its remotes, with what each pushed one
@@ -165,6 +170,10 @@ pub enum Waiting {
     /// The remote does not hold the head ([`Claim::Create`] or
     /// [`Claim::FastForward`]).
     Lacking { remote: String },
+    /// The remote holds the head but not `refname`, a ref of a fork
+    /// received into this history (a local-only source's fork, before a
+    /// remote was added): the release scan pushes it with the branch.
+    ReceivedLacking { remote: String, refname: String },
     /// The remote could not be listed.
     Unreachable { remote: String, message: String },
     /// The remote's branch is another writer's ([`Claim::Diverged`]): the
@@ -207,7 +216,13 @@ pub fn decide(worktree: &Worktree<'_>) -> Release {
             for remote in seen {
                 let name = || remote.remote.clone();
                 let waiting = match &remote.branch {
-                    Ok(claim) if claim.holds_head() => continue,
+                    Ok(claim) if claim.holds_head() => match &remote.received_lacking {
+                        None => continue,
+                        Some(refname) => Waiting::ReceivedLacking {
+                            remote: name(),
+                            refname: refname.clone(),
+                        },
+                    },
                     Ok(Claim::Diverged) => Waiting::Diverged { remote: name() },
                     Ok(_) => Waiting::Lacking { remote: name() },
                     Err(why) => Waiting::Unreachable {
@@ -235,6 +250,11 @@ impl fmt::Display for Waiting {
                 f,
                 "remote {remote} does not hold the branch's head yet (the node plugin's release \
                  scan pushes it)"
+            ),
+            Self::ReceivedLacking { remote, refname } => write!(
+                f,
+                "remote {remote} does not hold {refname}, a fork received into this history \
+                 (the node plugin's release scan pushes it)"
             ),
             Self::Unreachable { remote, message } => write!(
                 f,
@@ -279,6 +299,7 @@ mod tests {
         Seen {
             remote: remote.into(),
             branch,
+            received_lacking: None,
         }
     }
 
@@ -376,6 +397,32 @@ mod tests {
                 message: "connection refused".into()
             })
         );
+    }
+
+    /// A source that received forks while local-only, then gained a
+    /// remote: the remote holding the head is not enough while it lacks a
+    /// received fork's ref, which only this worktree holds.
+    #[test]
+    fn a_received_fork_the_remote_lacks_holds_the_worktree() {
+        let refname = "refs/heads/agentfs/src-1".to_owned();
+        let remotes = [Seen {
+            received_lacking: Some(refname.clone()),
+            ..seen("origin", Ok(Claim::UpToDate))
+        }];
+        for on_delete in [OnDelete::Delete, OnDelete::Retain] {
+            let Release::Wait(waiting) = decide(&worktree(on_delete, Declared::Pushed(&remotes)))
+            else {
+                panic!("must wait");
+            };
+            assert_eq!(
+                waiting,
+                Waiting::ReceivedLacking {
+                    remote: "origin".into(),
+                    refname: refname.clone()
+                }
+            );
+            assert!(waiting.to_string().contains(&refname), "{waiting}");
+        }
     }
 
     #[test]

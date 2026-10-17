@@ -10,7 +10,8 @@
 //! fast-forwarded from a value on the fork's history), then the change
 //! and finish refs, create-only. It never touches the source's own
 //! branch, its patch queue or its tree: whatever reads the source's
-//! history does the gating (principle 9). The fork and the source are on
+//! history does the gating (principle 9). Once the source declares a
+//! remote, its pushes carry those refs ([`received_refs`]). The fork and the source are on
 //! one node (forks are placed on their source's node). The CLI and the
 //! node plugin run it through the source's control socket when its
 //! service is up (design §2.3), else directly under the source's state
@@ -34,7 +35,7 @@ use crate::lock::{LockError, StateLock};
 use crate::push::{Claim, claim};
 use crate::volume::StateDir;
 
-use super::identity::{ForkIdentity, change_ref, finish_ref};
+use super::identity::{ForkIdentity, PushTarget, change_ref, finish_ref};
 
 /// `agentfs.fork.sourceState`: the source's state area, in a fork of a
 /// local-only source (its own config only, like the fork identity).
@@ -156,6 +157,47 @@ pub fn receive_fork_change(
         super::create::sync_parents(&source_git, name)?;
     }
     Ok(record.change.unwrap_or(record.finish))
+}
+
+/// The refs [`receive_fork_change`] wrote into `repo`, the history of the
+/// volume `volume`: for each fork received (a `refs/agentfs/<fork>/finish`
+/// of another volume), its branch or hidden history ref, its change and
+/// its finish, sorted by name. They are this history too: the source's
+/// branch push carries them to every remote, create-only, and DeleteVolume
+/// waits until each remote holds them (`push::RemotePusher`), so a remote
+/// added after the source was local-only gets them and deleting the source
+/// never loses them.
+pub fn received_refs(repo: &Repository, volume: &str) -> Result<Vec<(String, Oid)>, git2::Error> {
+    let mut forks = Vec::new();
+    for reference in repo.references_glob("refs/agentfs/*/finish")? {
+        let reference = reference?;
+        let fork = reference
+            .name()
+            .ok()
+            .and_then(|n| n.strip_prefix("refs/agentfs/"))
+            .and_then(|n| n.strip_suffix("/finish"));
+        if let Some(fork) = fork
+            && fork != volume
+            && !fork.contains('/')
+        {
+            forks.push(fork.to_owned());
+        }
+    }
+    let mut out = Vec::new();
+    for fork in &forks {
+        for name in [
+            PushTarget::Branch.history_ref(fork),
+            PushTarget::Hidden.history_ref(fork),
+            change_ref(fork),
+            finish_ref(fork),
+        ] {
+            if let Some(oid) = existing(repo, &name)? {
+                out.push((name, oid));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// The ref `name` in `repo`, `None` when there is none.

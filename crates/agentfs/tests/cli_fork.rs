@@ -849,3 +849,66 @@ fn a_local_only_sources_fork_finishes_into_its_history() {
     );
     assert_eq!(s.source_head(), base);
 }
+
+/// F8 S3: forks a local-only source received are its history too. Once a
+/// remote is declared (`none` removed), `agentfs push` carries each
+/// fork's branch, change and finish refs there, create-only; a remote
+/// holding one at another commit fails the push and keeps its value.
+#[test]
+fn a_remote_added_to_a_local_only_source_gets_its_forks() {
+    let s = Setup::local_only();
+    s.record("state", "tree", "a.txt", "a\n");
+    let fork = s.create_fork();
+    s.record("fork", "fork-tree", "b.txt", "from the fork\n");
+    s.ok("fork", "fork-tree", &["fork", "finish"]);
+    let fork_branch = format!("refs/heads/agentfs/{fork}");
+    let received: Vec<(String, Oid)> = s
+        .refs("state/git")
+        .into_iter()
+        .filter(|(name, _)| {
+            *name == fork_branch || name.starts_with(&format!("refs/agentfs/{fork}/"))
+        })
+        .collect();
+    assert_eq!(received.len(), 3, "{received:?}");
+
+    // A second remote, where another writer holds the fork's branch.
+    let two = Repository::init_bare(s.path("two.git")).unwrap();
+    let sig = git2::Signature::now("x", "x@example.invalid").unwrap();
+    let tree = two
+        .find_tree(two.treebuilder(None).unwrap().write().unwrap())
+        .unwrap();
+    let stray = two
+        .commit(None, &sig, &sig, "another writer", &tree, &[])
+        .unwrap();
+    two.reference(&fork_branch, stray, false, "test").unwrap();
+    fs::write(
+        s.path("profile"),
+        format!(
+            "[remote \"origin\"]\n\turl = {}\n[remote \"two\"]\n\turl = {}\n",
+            s.url("origin.git"),
+            s.url("two.git")
+        ),
+    )
+    .unwrap();
+    let out = s.agentfs("state", "tree", &["push"]);
+    let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(!out.status.success(), "{all}");
+    assert!(all.contains("another writer"), "{all}");
+    assert_eq!(
+        s.remote_ref("two.git", &fork_branch),
+        Some(stray),
+        "never overwritten"
+    );
+
+    let origin = s.refs("origin.git");
+    for (name, oid) in &received {
+        assert!(
+            origin.contains(&(name.clone(), *oid)),
+            "{name} not on origin: {origin:?}"
+        );
+    }
+    assert_eq!(
+        s.remote_ref("origin.git", "refs/heads/agentfs/src"),
+        Some(s.source_head())
+    );
+}

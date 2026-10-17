@@ -2012,7 +2012,9 @@ set by the operator) and owns a branch and a ref namespace in that repository:
 **Pushing.** A recorder pushes only its own volume's refs, with explicit
 refspecs, so pushes from different volumes never contend: the branch and
 `diverged/*`, and to the patch remote the status and `applied/*`, then
-deletions of `inbox/*` (§11.3). It never pushes an inbox ref.
+deletions of `inbox/*` (§11.3). It never pushes an inbox ref. The one
+exception is a source that received forks while local-only (§11.5):
+those forks' refs are its history, and it pushes them create-only.
 
 **Fetching.** At mount it fetches only its own volume's `inbox/*` from the
 patch remote (§12), and deletes local inbox refs the remote no longer has.
@@ -2084,8 +2086,16 @@ else under that lock; while another command holds it, `fork finish`
 exits 75. A branch name another writer holds there is `AnotherWriter`,
 and a source state area that is gone is `RemoteGone` (both refused, the
 fork can be abandoned). The fork itself is local-only and pushes
-nothing. Cost: the source must stay on the node at its path until the
-fork is published, and receiving is not visible to any remote.
+nothing. The received refs are the source's history too: once the source
+declares a remote (`none` removed), every push that writes its branch
+carries them after it, create-only (`fork::receive::received_refs`; one
+more listing per push while there are any), and a remote holding one at
+another commit fails that push, never overwritten. The release decider
+waits (`ReceivedLacking`) while a remote holds the head but lacks one of
+them (§14.2), so deleting the source never loses a fork's only copy.
+Cost: the source must stay on the node at its path until the fork is
+published, and receiving is not visible to any remote until the source
+has one.
 
 **The push target** is where a fork's history is kept and pushed, fixed
 at create in its identity (`agentfs.fork.pushTarget`, §19.1 "Hidden
@@ -3056,7 +3066,8 @@ then the fork's state, then the remotes:
   committed, or a profile declared local-only, or one that declares
   nothing (nothing elsewhere can hold it), whatever `onDelete` says;
 - **Wait**: `UNAVAILABLE`, naming the first remote that does not hold the
-  head and why (lacking, unreachable, diverged), every remote section
+  head and why (lacking, unreachable, diverged), or that holds it but
+  lacks a ref of a fork received into the history (§11.5), every remote section
   invalid, a journal holding records history lacks, or a fork not yet
   published or abandoned.
 
@@ -4373,7 +4384,7 @@ runner.
 | Every write by the branch rule (2026-10-17) | The patch queue push writes the status, `applied/*` and inbox deletions only while the branch the remote advertises, in a listing made for that push, is on this worktree's history (`push::claim`), and carries the branch as a no-op update leased on that value, so the negotiation stops it if the branch moved since. A branch that is not this worktree's (none yet, or another writer's) writes nothing and is no queue failure. Cost: the status no longer reaches a remote whose branch is missing or diverged, so iac reads an older status there until the branch is resolved; one more ref in each queue push. A design choice (F8 S2, design rule 2), not the owner's words |
 | The operator's lease push (2026-10-17) | Operators replace a worktree's own branch only with `agentfs push --force-with-lease <oid>`: one remote, direct (never through a daemon), under that remote's push lock, refused when the lease and the head share no commit, a lease the state area lacks fetched into a removed scratch repository (never into the state area); divergence case A and history-rewrite step 9 use it. Runbooks never `git push` a branch: a docs test holds every runbook `git push` to destinations literally under `refs/agentfs/`, with no force and no lease but the create-only `--force-with-lease=<ref>:` of patch submission (§12, kept from "Patch submission" above). The history rewrite's fork step deletes other worktrees' refs on each server (`git update-ref -d <ref> <oid>`) or with a forge's tools, no longer by `git push`. Cost: on a forge, that deletion has no lease; `--force-with-lease` does not step through `agentfsMaxPushSize`. A design choice (F8 S2), not the owner's words; it serves R2, the owner's "Go" to one branch per worktree, for good (2026-10-16) |
 | Zero remotes declared (2026-10-16) | A volume declares its remotes: pushed, none valid, local-only (`agentfs.remotes = none`, `agentfs init --local-only`) or undeclared, which alarms (`RemotesUndeclared`) and which `agentfs init` and CSI CreateVolume refuse; status, the `agentfs.remotes.mode` gauge and the alarms say which (§11.1). A fork of a local-only source publishes `agentfs/<fork>` into the source's own history and is never applied (§11.5). The owner, on the F8 reframe's question 2, "publish a no-remote source's fork as `agentfs/<fork>` in the source's own history, never applied automatically": "yes"; and the frame he accepted: "zero remotes is a declared mode; a no-remote source's fork publishes `agentfs/<fork>` in the source's own history, never applied automatically" (2026-10-16, R4, `.handoff/f8-f12-notes.md`). Built (F8 S3) |
-| Declaring remotes, the details (2026-10-17) | Design choices (F8 S3), not the owner's words: `none` beside a push section is undeclared, and that section is never pushed and is reported misconfigured, so the mount preflight still checks its files; `agentfs init` refuses an undeclared result on an existing state area too (the state area stays, as with a bad include), so an init container of a volume that never declared fails until its profile declares; a local-only `agentfs push` prints `local-only: nothing to push` and exits 0, an undeclared one alarms and exits 1; CreateVolume removes the worktree it made for an undeclared profile; a start class on a local-only profile is `StartError::LocalOnly`. A fork of a local-only source finds it by `agentfs.fork.sourceState`, written at create (the source must stay at that path until the fork is published); its finish names the fork remote `(source history)`, which no remote section can be called; it receives through the source's control socket (`receive_fork`) when a daemon holds the source's lock, else under the lock, and `fork finish` exits 75 while another command holds it; the fork's LFS objects are copied into the source's cache; a ref another writer holds there is `AnotherWriter` and a source that is gone `RemoteGone`, both refused (§11.5) |
+| Declaring remotes, the details (2026-10-17) | Design choices (F8 S3), not the owner's words: `none` beside a push section is undeclared, and that section is never pushed and is reported misconfigured, so the mount preflight still checks its files; `agentfs init` refuses an undeclared result on an existing state area too (the state area stays, as with a bad include), so an init container of a volume that never declared fails until its profile declares; a local-only `agentfs push` prints `local-only: nothing to push` and exits 0, an undeclared one alarms and exits 1; CreateVolume removes the worktree it made for an undeclared profile; a start class on a local-only profile is `StartError::LocalOnly`. A fork of a local-only source finds it by `agentfs.fork.sourceState`, written at create (the source must stay at that path until the fork is published); its finish names the fork remote `(source history)`, which no remote section can be called; it receives through the source's control socket (`receive_fork`) when a daemon holds the source's lock, else under the lock, and `fork finish` exits 75 while another command holds it; the fork's LFS objects are copied into the source's cache; a ref another writer holds there is `AnotherWriter` and a source that is gone `RemoteGone`, both refused (§11.5). Amended 2026-10-17 (F8 fixes): a source that gains a remote pushes the refs it received, create-only, after each branch push that worked (`fork::receive::received_refs` finds them by their `finish` ref; one held on the remote at another commit fails the push), and the release decider waits (`ReceivedLacking`) while a remote lacks one, so "a remote added later gets all the history" holds and DeleteVolume never removes a fork's only copy. Refusing to receive once the source has a remote was rejected: forks made while it was local-only could not publish, and what it already received would stay unpushed |
 
 ### 19.2 Open questions
 
