@@ -261,6 +261,10 @@ jobs:
       contents: read
       packages: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: ci/publish-image.sh
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: git-server-image
@@ -274,19 +278,7 @@ jobs:
       - name: push
         env:
           SHA: ${{ github.sha }}
-        run: |
-          for tag in "$SHA" latest; do
-            docker tag agentfs-git-server:ci "ghcr.io/mcurcio/agentfs-git-server:$tag"
-            docker push "ghcr.io/mcurcio/agentfs-git-server:$tag"
-          done
-          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "ghcr.io/mcurcio/agentfs-git-server:$SHA")
-          {
-            echo "### Published"
-            echo
-            echo "- \`ghcr.io/mcurcio/agentfs-git-server:$SHA\`"
-            echo "- \`ghcr.io/mcurcio/agentfs-git-server:latest\`"
-            echo "- digest: \`$digest\`"
-          } >>"$GITHUB_STEP_SUMMARY"
+        run: ci/publish-image.sh agentfs-git-server:ci ghcr.io/mcurcio/agentfs-git-server "$SHA"
 
   # Pushes the image e2e-kind, e2e-csi and e2e-csi-forks tested (the same
   # tar, not a rebuild), from main only.
@@ -298,6 +290,10 @@ jobs:
       contents: read
       packages: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: ci/publish-image.sh
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agentfs-image
@@ -311,15 +307,4 @@ jobs:
       - name: push
         env:
           SHA: ${{ github.sha }}
-        run: |
-          for tag in "$SHA" latest; do
-            docker push "ghcr.io/mcurcio/agentfs:$tag"
-          done
-          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "ghcr.io/mcurcio/agentfs:$SHA")
-          {
-            echo "### Published"
-            echo
-            echo "- \`ghcr.io/mcurcio/agentfs:$SHA\`"
-            echo "- \`ghcr.io/mcurcio/agentfs:latest\`"
-            echo "- digest: \`$digest\`"
-          } >>"$GITHUB_STEP_SUMMARY"
+        run: ci/publish-image.sh agentfs:ci ghcr.io/mcurcio/agentfs "$SHA"

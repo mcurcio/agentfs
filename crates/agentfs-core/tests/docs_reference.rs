@@ -433,6 +433,64 @@ fn ci_scripts_are_executable() {
     );
 }
 
+/// `ci/publish-image.sh` against a stand-in `docker` whose first `fails`
+/// pushes answer "unknown blob", as GHCR did in image run 39047451574:
+/// its exit status and the `docker` calls it made.
+fn publish_image(fails: usize) -> (bool, Vec<String>) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let docker = dir.path().join("docker");
+    std::fs::write(
+        &docker,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> \"$LOG\"\ncase \"$1\" in\n  push)\n    n=$(grep -c '^push' \"$LOG\")\n    [ \"$n\" -gt {fails} ] || {{ echo 'unknown blob' >&2; exit 1; }} ;;\n  inspect) echo 'ghcr.io/x@sha256:0' ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = dir.path().join("log");
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let status = std::process::Command::new(workspace().join("ci/publish-image.sh"))
+        .args(["img:ci", "ghcr.io/x", "abc"])
+        .env("PATH", path)
+        .env("LOG", &log)
+        .env("PUBLISH_RETRY_DELAY", "0")
+        .env("GITHUB_STEP_SUMMARY", dir.path().join("summary"))
+        .status()
+        .unwrap();
+    let calls = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (status.success(), calls)
+}
+
+/// image.yml's publish jobs retry a push GHCR fails, up to three attempts.
+#[test]
+fn publishing_an_image_retries_a_failed_push() {
+    let (ok, calls) = publish_image(1);
+    assert!(ok, "{calls:?}");
+    assert_eq!(
+        calls,
+        [
+            "tag img:ci ghcr.io/x:abc",
+            "push ghcr.io/x:abc",
+            "push ghcr.io/x:abc",
+            "tag img:ci ghcr.io/x:latest",
+            "push ghcr.io/x:latest",
+            "inspect --format {{index .RepoDigests 0}} ghcr.io/x:abc",
+        ]
+    );
+    let (ok, calls) = publish_image(3);
+    assert!(!ok, "{calls:?}");
+    assert_eq!(calls.iter().filter(|c| c.starts_with("push")).count(), 3);
+}
+
 /// The shell words of `line`: split on blanks outside quotes, with the
 /// quotes removed (`$VAR` is left as written, so a destination is checked
 /// as the reader sees it).
@@ -478,15 +536,19 @@ fn shell_words(line: &str) -> Vec<String> {
 /// runbooks' push rule, if it does (F8 S2): a runbook writes only refs
 /// literally under `refs/agentfs/`, and never forces. A volume's own
 /// branch is replaced only by `agentfs push --force-with-lease` (§15).
-/// The one lease allowed is the create-only one, `--force-with-lease=<ref>:`
-/// with an empty expected value, on a destination of the same push
-/// literally under `refs/agentfs/` (patch submission, §12 and §19.1): it
-/// can create a ref, never replace one.
+/// Two leases are allowed, each on a destination of the same push
+/// literally under `refs/agentfs/`: the create-only one,
+/// `--force-with-lease=<ref>:` with an empty expected value (patch
+/// submission, §12 and §19.1), which can create a ref, never replace one;
+/// and `--force-with-lease=<ref>:<oid>` on a ref the push deletes
+/// (`--delete`, or a `:<ref>` refspec), which deletes it only while it
+/// holds the oid listed (history rewrite, step 9).
 fn push_rule_breach(args: &[String]) -> Option<String> {
     const TAKES_VALUE: &[&str] = &["--repo", "--receive-pack", "--exec", "-o", "--push-option"];
     const WHOLESALE: &[&str] = &["--all", "--branches", "--mirror", "--tags", "--prune"];
     let mut leases = Vec::new();
     let mut positional = Vec::new();
+    let mut delete_all = false;
     let mut words = args.iter();
     while let Some(word) = words.next() {
         let word = word.as_str();
@@ -513,6 +575,10 @@ fn push_rule_breach(args: &[String]) -> Option<String> {
         {
             return Some(format!("forces ({word})"));
         }
+        if word == "--delete" || word == "-d" {
+            delete_all = true;
+            continue;
+        }
         if word.starts_with('-') {
             continue;
         }
@@ -524,6 +590,7 @@ fn push_rule_breach(args: &[String]) -> Option<String> {
         return Some("names no refspec, so git picks what to push".into());
     }
     let mut destinations = Vec::new();
+    let mut deleted = Vec::new();
     for spec in refspecs {
         if spec.starts_with('+') {
             return Some(format!("forces ({spec})"));
@@ -535,10 +602,14 @@ fn push_rule_breach(args: &[String]) -> Option<String> {
             ));
         }
         destinations.push(destination);
+        if delete_all || spec.starts_with(':') {
+            deleted.push(destination);
+        }
     }
     for lease in leases {
         match lease.split_once(':') {
             Some((name, "")) if destinations.contains(&name) => {}
+            Some((name, _)) if deleted.contains(&name) => {}
             _ => {
                 return Some(format!(
                     "uses --force-with-lease{}{lease}: only `agentfs push \
@@ -554,7 +625,8 @@ fn push_rule_breach(args: &[String]) -> Option<String> {
 /// F8 S2: no runbook writes a branch, or forces anything. In every fenced
 /// block of docs/runbooks/*.md, a `git push` must write only refs
 /// literally under `refs/agentfs/`, with no `--force`, `-f`, `+` refspec
-/// or lease (but a create-only one, [`push_rule_breach`]): a volume's own
+/// or lease (but a create-only one, or one on a ref the push deletes,
+/// [`push_rule_breach`]): a volume's own
 /// branch is replaced only through `agentfs push --force-with-lease`, which
 /// checks it shares history with the head.
 #[test]
@@ -637,6 +709,8 @@ fn the_push_rule_reads_git_push_as_git_does() {
         r#"git --git-dir "$S" push -q "$URL" --delete "refs/agentfs/$VOL/diverged/$ref""#,
         r#"git push "$URL" --force-with-lease="refs/agentfs/$VOL/inbox/$N:" "$OID:refs/agentfs/$VOL/inbox/$N""#,
         "git push \"$URL\" ':refs/agentfs/v/finish' # a comment --force",
+        r#"git push -q "$URL" --force-with-lease="refs/agentfs/$VOL/$REF:$OID" --delete "refs/agentfs/$VOL/$REF""#,
+        r#"git push "$URL" --force-with-lease="refs/agentfs/v/x:$OID" ":refs/agentfs/v/x""#,
     ] {
         assert_eq!(breach(ok), None, "{ok}");
     }
@@ -648,6 +722,8 @@ fn the_push_rule_reads_git_push_as_git_does() {
         r#"git push "$URL" "+x:refs/agentfs/v/status""#,
         r#"git push "$URL" "refs/heads/agentfs/v""#,
         r#"git push "$URL" --force-with-lease="refs/agentfs/v/x:abc" "y:refs/agentfs/v/x""#,
+        r#"git push "$URL" --force-with-lease="refs/agentfs/v/y:abc" --delete "refs/agentfs/v/x""#,
+        r#"git push "$URL" --delete "$REF""#,
         r#"git push --mirror "$URL""#,
         r#"git push "$URL""#,
     ] {
