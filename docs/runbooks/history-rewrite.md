@@ -153,7 +153,7 @@ the rewritten one (`shares no commit`: the secret was in the first
 commit, so the rewrite changed the root; continue under a new name
 instead, as in [divergence.md](divergence.md) case B). The old tip, gone
 from the state area since step 6, is fetched into a scratch repository
-for that check, never into the state area. `git ls-remote` and the
+for that check, never into the state area. `git ls-remote`, the fetch and the
 deletions need git credentials for the remote, as in
 [divergence.md](divergence.md).
 
@@ -163,14 +163,33 @@ NAME=origin
 URL=$(git --git-dir "$STATE/git" config "remote.$NAME.url")
 OLD_TIP=$(git ls-remote "$URL" "$BRANCH" | cut -f1)
 agentfs --state "$STATE" push --remote "$NAME" --force-with-lease "$OLD_TIP"
-for name in $(git ls-remote "$URL" "refs/agentfs/$VOL/*" | cut -f2 | sed "s|^refs/agentfs/$VOL/||"); do
-  git --git-dir "$STATE/git" push -q "$URL" --delete "refs/agentfs/$VOL/$name"
-done
+BAD=$(git --git-dir "$BACKUP/git" rev-list --reverse "$BRANCH" -- "$SECRET_PATH" | sed -n 1p)
+test -n "$BAD"
+git init -q --bare "$WORK/$NAME.git"
+git --git-dir "$WORK/$NAME.git" fetch -q "$URL" "refs/agentfs/$VOL/*:refs/agentfs/$VOL/*"
+if git --git-dir "$WORK/$NAME.git" cat-file -e "$BAD^{commit}" 2>/dev/null; then
+  git --git-dir "$WORK/$NAME.git" for-each-ref --contains "$BAD" --format='%(objectname) %(refname:lstrip=3)' "refs/agentfs/$VOL/" |
+    while read -r OID REF; do
+      [ "refs/agentfs/$VOL/$REF" != "$BRANCH" ] || continue
+      git --git-dir "$STATE/git" push -q "$URL" --force-with-lease="refs/agentfs/$VOL/$REF:$OID" --delete "refs/agentfs/$VOL/$REF" ||
+        echo "refs/agentfs/$VOL/$REF moved since it was listed: left"
+    done
+fi
 ```
 
-The loop deletes the volume's other refs on that remote (`diverged/`,
-`overwritten/`): they hold the old history too. To keep one, rewrite it
-like the branch instead (fetch it into the mirror before step 4).
+The loop deletes the volume's other refs on that remote that hold the old
+history, found by reachability: each ref under `refs/agentfs/$VOL/` that
+contains `$BAD`, the first commit that recorded the secret (`diverged/`
+heads, and producers' patches and `applied/` commits based on it, which
+cannot land on the rewritten history anyway: producers submit them
+again). Every other ref stays: an `inbox/<n>` based before the secret,
+the queue's `status`, an `overwritten/` tip of another writer's history
+from before it, and, for a fork with a hidden push target, its branch
+itself (`refs/agentfs/$VOL/history`, just replaced). Each deletion is
+leased on the oid listed, so a ref written or moved since (a patch
+submitted meanwhile) is left, and a moved one is named. To keep a ref
+that holds the secret, rewrite it like the branch instead (fetch it into
+the mirror before step 4).
 
 Replacing the branch does not remove the old objects from the server. What does
 depends on the host:

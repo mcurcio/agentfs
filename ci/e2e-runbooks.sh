@@ -11,7 +11,9 @@
 #   are gone;
 # - history rewrite: the secret's blobs are gone from the state area and
 #   the remote (the lease push of step 9 fetches the old tip aside, never
-#   into the state area), every commit and the last Agentfs-Seq survive,
+#   into the state area), the volume's remote refs holding the secret are
+#   deleted and the others (a patch based before it, the overwritten tip)
+#   stay, every commit and the last Agentfs-Seq survive,
 #   pushes are fast-forwards again, recording continues with a higher
 #   Agentfs-Seq, and the secret is not recorded again;
 # - LFS storage (docs/runbooks/lfs-storage.md): a dry run deletes nothing
@@ -258,6 +260,18 @@ COMMITS_BEFORE=$(git --git-dir "$STATE/git" rev-list --count "$BRANCH")
 SEQ_BEFORE=$(seq_of "$BRANCH")
 [ -n "$(git --git-dir "$REMOTE" log --format=%H "$BRANCH" -- "$SECRET_PATH")" ] ||
   fail "the secret should be on the remote before the rewrite"
+# The volume's other refs on the remote: a saved head holding the secret,
+# and two producers' patches, one based before the secret and one after.
+OLD_HEAD=$(local_head "$VOL")
+FIRST=$(git --git-dir "$STATE/git" rev-list --max-parents=0 "$BRANCH")
+patch_on() { # parent
+  git --git-dir "$REMOTE" -c user.name=producer -c user.email=p@example.com \
+    commit-tree -p "$1" -m "a producer's patch" "$1^{tree}"
+}
+EARLY_PATCH=$(patch_on "$FIRST")
+git --git-dir "$REMOTE" update-ref "refs/agentfs/$VOL/diverged/before-rewrite" "$OLD_HEAD"
+git --git-dir "$REMOTE" update-ref "refs/agentfs/$VOL/inbox/0000000001" "$EARLY_PATCH"
+git --git-dir "$REMOTE" update-ref "refs/agentfs/$VOL/inbox/0000000002" "$(patch_on "$OLD_HEAD")"
 BACKUP=$W/state.before-rewrite
 SERVER_REPO=$REMOTE
 
@@ -282,8 +296,15 @@ for repo in "$STATE/git" "$REMOTE"; do
   pass "no secret object in $repo"
 done
 assert_eq "$(local_head "$VOL")" "$(remote_ref "$REMOTE" "$BRANCH")" "the remote has the rewritten branch"
-assert_eq "" "$(git --git-dir "$REMOTE" for-each-ref "refs/agentfs/$VOL/")" \
-  "the volume's other refs on the remote are gone"
+assert_eq "" "$(remote_ref "$REMOTE" "refs/agentfs/$VOL/diverged/before-rewrite")" \
+  "a ref holding the secret is deleted"
+assert_eq "" "$(remote_ref "$REMOTE" "refs/agentfs/$VOL/inbox/0000000002")" \
+  "a patch based on the secret is deleted"
+assert_eq "$EARLY_PATCH" "$(remote_ref "$REMOTE" "refs/agentfs/$VOL/inbox/0000000001")" \
+  "a producer's patch from before the secret stays"
+assert_eq "$FOREIGN" \
+  "$(git --git-dir "$REMOTE" for-each-ref --format='%(objectname)' "refs/agentfs/$VOL/overwritten/")" \
+  "the overwritten tip from before the secret stays"
 
 step "recording and pushing carry on"
 echo four >"$BACKING/d.txt"
