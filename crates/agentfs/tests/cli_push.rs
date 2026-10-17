@@ -649,3 +649,157 @@ fn push_now_steps_through_a_push_size_limit() {
     let status = wait_with_timeout(&mut child, Duration::from_secs(30));
     assert!(status.success(), "{status:?}");
 }
+
+/// Another writer's commit on top of the remote branch, written in the
+/// remote: the volume's state area never has it.
+fn foreign_commit(remote: &Path) -> git2::Oid {
+    let repo = git2::Repository::open_bare(remote).unwrap();
+    let parent = repo
+        .find_commit(repo.refname_to_id("refs/heads/agentfs/demo").unwrap())
+        .unwrap();
+    let sig = git2::Signature::now("intruder", "i@example.invalid").unwrap();
+    let tree = parent.tree().unwrap();
+    repo.commit(
+        Some("refs/heads/agentfs/demo"),
+        &sig,
+        &sig,
+        "a foreign commit",
+        &tree,
+        &[&parent],
+    )
+    .unwrap()
+}
+
+/// F8 S2, acceptance 3: `agentfs push --force-with-lease` (the divergence
+/// and history-rewrite runbooks) replaces the volume's own branch only
+/// with the right lease, fetches a lease it lacks, clears the divergence,
+/// and never replaces an unrelated history.
+#[test]
+fn force_with_lease_replaces_only_the_leased_branch() {
+    let v = Volume::new();
+    let remote = v.dir.path().join("remote.git");
+    bare(&remote);
+    v.config(&[("remote.origin.url", &remote.display().to_string())]);
+    v.record("a.txt", "a");
+    assert!(v.run(&["push"]).status.success());
+    let theirs = foreign_commit(&remote);
+    v.record("b.txt", "b");
+    let out = v.run(&["push"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).contains("diverged"), "{}", stdout(&out));
+    let head = v.head();
+
+    // Not a full commit id.
+    let out = v.run(&["push", "--force-with-lease", "HEAD"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("not a full commit id"),
+        "{}",
+        stderr(&out)
+    );
+
+    // A wrong lease: nothing written, exit 1, the remote's value printed.
+    let out = v.run(&["push", "--force-with-lease", &head.to_string()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains(&format!("origin: lease broken: the remote holds {theirs}")),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(branch(&remote), Some(theirs));
+
+    // The right lease, which the state area lacks: fetched aside, then the
+    // branch is the head again and the divergence is cleared.
+    let out = v.run(&["push", "--force-with-lease", &theirs.to_string()]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(
+        stdout(&out).trim(),
+        format!("origin: replaced {theirs} with {head} (leased on {theirs})")
+    );
+    assert_eq!(branch(&remote), Some(head));
+    let local = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    assert!(
+        local.find_commit(theirs).is_err(),
+        "the lease was not taken in"
+    );
+    let status = stdout(&v.run(&["status"]));
+    assert!(!status.contains("diverged"), "{status}");
+    let out = v.run(&["push", "--force-with-lease", &theirs.to_string()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), format!("origin: up to date at {head}"));
+
+    // An unrelated history: refused, exit 1.
+    let other = v.dir.path().join("other.git");
+    let repo = git2::Repository::init_bare(&other).unwrap();
+    let sig = git2::Signature::now("o", "o@example.invalid").unwrap();
+    let tree = repo.treebuilder(None).unwrap().write().unwrap();
+    let tree = repo.find_tree(tree).unwrap();
+    let unrelated = repo.commit(None, &sig, &sig, "x", &tree, &[]).unwrap();
+    repo.remote_anonymous(&remote.display().to_string())
+        .unwrap()
+        .push(&[format!("+{unrelated}:refs/heads/agentfs/demo")], None)
+        .unwrap();
+    let out = v.run(&["push", "--force-with-lease", &unrelated.to_string()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("shares no commit"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(branch(&remote), Some(unrelated));
+}
+
+/// The lease push needs exactly one remote, and never goes through a
+/// running daemon.
+#[test]
+fn force_with_lease_needs_one_remote_and_bypasses_the_daemon() {
+    let v = Volume::new();
+    let one = v.dir.path().join("one.git");
+    let two = v.dir.path().join("two.git");
+    bare(&one);
+    bare(&two);
+    v.config(&[
+        ("remote.one.url", &one.display().to_string()),
+        ("remote.two.url", &two.display().to_string()),
+    ]);
+    v.record("a.txt", "a");
+    let head = v.head().to_string();
+    let out = v.run(&["push", "--force-with-lease", &head]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("needs --remote NAME"),
+        "{}",
+        stderr(&out)
+    );
+    let out = v.run(&[
+        "push",
+        "--force-with-lease",
+        &head,
+        "--remote",
+        "one",
+        "--remote",
+        "two",
+    ]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("one --remote"), "{}", stderr(&out));
+
+    // With `run` holding the state lock, the lease push still runs, alone.
+    assert!(v.run(&["push", "--remote", "one"]).status.success());
+    let mut child = spawn_run_with(&v, "0s");
+    wait_until_running(&mut child);
+    // `run`'s own first push may hold the remote's push lock: exit 75.
+    let mut out = v.run(&["push", "--remote", "one", "--force-with-lease", &head]);
+    for _ in 0..50 {
+        if out.status.code() != Some(75) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        out = v.run(&["push", "--remote", "one", "--force-with-lease", &head]);
+    }
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert_eq!(text.trim(), format!("one: up to date at {head}"));
+    signal(&child, rustix::process::Signal::TERM);
+    let status = wait_with_timeout(&mut child, Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+}

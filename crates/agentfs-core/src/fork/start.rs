@@ -196,8 +196,9 @@ fn reaches(repo: &Repository, tip: Oid, commit: Oid) -> bool {
 /// authentication and proxy (its push URL, as every agentfs connection to
 /// it), writing no ref and no `FETCH_HEAD`: the objects only. The tip the
 /// remote advertised, `None` when it has no such ref. A failure is the
-/// remote's ([`PushFailureKind`] and a message scrubbed of userinfo).
-fn fetch_branch(
+/// remote's ([`PushFailureKind`] and a message scrubbed of userinfo). Also
+/// the lease check of [`crate::push::RemotePusher::push_with_lease`].
+pub(crate) fn fetch_branch(
     repo: &Repository,
     remote: &RemoteSettings,
     refname: &str,

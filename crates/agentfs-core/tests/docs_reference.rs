@@ -7,7 +7,9 @@
 //! - every relative link and `#anchor` in README.md and docs/ resolves;
 //! - every CI job runs on the pinned runner, `ubuntu-24.04` (design §18);
 //! - every script under ci/ is executable;
-//! - every page under docs/ is in the book's docs/SUMMARY.md.
+//! - every page under docs/ is in the book's docs/SUMMARY.md;
+//! - every `git push` in a runbook writes only refs literally under
+//!   `refs/agentfs/` and never forces (F8 S2).
 //!
 //! The flags and environment variables are checked by the binaries' own
 //! unit tests (`crates/agentfs/src/reference_tests.rs`, and the
@@ -429,6 +431,228 @@ fn ci_scripts_are_executable() {
         "not executable (git update-index --chmod=+x):\n{}",
         offenders.join("\n")
     );
+}
+
+/// The shell words of `line`: split on blanks outside quotes, with the
+/// quotes removed (`$VAR` is left as written, so a destination is checked
+/// as the reader sees it).
+fn shell_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut in_word = false;
+    for c in line.chars() {
+        match (quote, c) {
+            (None, '#') if !in_word => break,
+            (None, ' ' | '\t') => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (Some(q), c) if c == q => quote = None,
+            (None, ';' | '|' | '&' | '(' | ')') => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+                words.push(c.to_string());
+            }
+            (_, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Why the `git push` whose arguments (after `push`) are `args` breaks the
+/// runbooks' push rule, if it does (F8 S2): a runbook writes only refs
+/// literally under `refs/agentfs/`, and never forces. A volume's own
+/// branch is replaced only by `agentfs push --force-with-lease` (§15).
+/// The one lease allowed is the create-only one, `--force-with-lease=<ref>:`
+/// with an empty expected value, on a destination of the same push
+/// literally under `refs/agentfs/` (patch submission, §12 and §19.1): it
+/// can create a ref, never replace one.
+fn push_rule_breach(args: &[String]) -> Option<String> {
+    const TAKES_VALUE: &[&str] = &["--repo", "--receive-pack", "--exec", "-o", "--push-option"];
+    const WHOLESALE: &[&str] = &["--all", "--branches", "--mirror", "--tags", "--prune"];
+    let mut leases = Vec::new();
+    let mut positional = Vec::new();
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        let word = word.as_str();
+        if matches!(word, ";" | "|" | "&" | "(" | ")") {
+            break;
+        }
+        if word == "--force" || word == "-f" {
+            return Some(format!("forces ({word})"));
+        }
+        if let Some(lease) = word.strip_prefix("--force-with-lease") {
+            leases.push(lease.strip_prefix('=').unwrap_or("").to_owned());
+            continue;
+        }
+        if WHOLESALE.contains(&word) {
+            return Some(format!("pushes refs wholesale ({word})"));
+        }
+        if TAKES_VALUE.contains(&word) {
+            words.next();
+            continue;
+        }
+        if let Some(short) = word.strip_prefix('-')
+            && !short.starts_with('-')
+            && short.contains('f')
+        {
+            return Some(format!("forces ({word})"));
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        positional.push(word.to_owned());
+    }
+    // The first is the repository; the rest are refspecs.
+    let refspecs = positional.get(1..).unwrap_or_default();
+    if refspecs.is_empty() {
+        return Some("names no refspec, so git picks what to push".into());
+    }
+    let mut destinations = Vec::new();
+    for spec in refspecs {
+        if spec.starts_with('+') {
+            return Some(format!("forces ({spec})"));
+        }
+        let destination = spec.rsplit_once(':').map_or(spec.as_str(), |(_, d)| d);
+        if !destination.starts_with("refs/agentfs/") {
+            return Some(format!(
+                "writes {destination}, not literally under refs/agentfs/"
+            ));
+        }
+        destinations.push(destination);
+    }
+    for lease in leases {
+        match lease.split_once(':') {
+            Some((name, "")) if destinations.contains(&name) => {}
+            _ => {
+                return Some(format!(
+                    "uses --force-with-lease{}{lease}: only `agentfs push \
+                     --force-with-lease` replaces a branch",
+                    if lease.is_empty() { "" } else { "=" }
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// F8 S2: no runbook writes a branch, or forces anything. In every fenced
+/// block of docs/runbooks/*.md, a `git push` must write only refs
+/// literally under `refs/agentfs/`, with no `--force`, `-f`, `+` refspec
+/// or lease (but a create-only one, [`push_rule_breach`]): a volume's own
+/// branch is replaced only through `agentfs push --force-with-lease`, which
+/// checks it shares history with the head.
+#[test]
+fn runbooks_push_only_the_namespace() {
+    let dir = workspace().join("docs/runbooks");
+    let mut pages: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .collect();
+    pages.sort();
+    assert!(pages.len() > 5, "no runbooks found in {}", dir.display());
+    let mut pushes = 0;
+    let mut problems = Vec::new();
+    for page in &pages {
+        let text = std::fs::read_to_string(page).unwrap();
+        let name = page.file_name().unwrap().to_string_lossy().into_owned();
+        let mut fence = false;
+        let mut pending = String::new();
+        let mut start = 0;
+        for (n, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                fence = !fence;
+                pending.clear();
+                continue;
+            }
+            if !fence {
+                continue;
+            }
+            if pending.is_empty() {
+                start = n + 1;
+            }
+            // A backslash continues the command on the next line.
+            if let Some(head) = line.strip_suffix('\\') {
+                pending.push_str(head);
+                pending.push(' ');
+                continue;
+            }
+            pending.push_str(line);
+            let words = shell_words(&std::mem::take(&mut pending));
+            for (i, word) in words.iter().enumerate() {
+                if word != "git" {
+                    continue;
+                }
+                // git's own options before the subcommand.
+                let mut j = i + 1;
+                while let Some(option) = words.get(j).filter(|w| w.starts_with('-')) {
+                    j += if matches!(option.as_str(), "-C" | "-c" | "--git-dir" | "--work-tree") {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                if words.get(j).map(String::as_str) != Some("push") {
+                    continue;
+                }
+                pushes += 1;
+                if let Some(why) = push_rule_breach(&words[j + 1..]) {
+                    problems.push(format!("docs/runbooks/{name}:{start}: `git push` {why}"));
+                }
+            }
+        }
+    }
+    assert!(
+        pushes > 3,
+        "found only {pushes} git push commands in the runbooks"
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn the_push_rule_reads_git_push_as_git_does() {
+    let breach = |line: &str| {
+        let words = shell_words(line);
+        push_rule_breach(&words[words.iter().position(|w| w == "push").unwrap() + 1..])
+    };
+    for ok in [
+        r#"git push -q "$URL" "refs/theirs/branch:refs/agentfs/$VOL/overwritten/$TS""#,
+        r#"git --git-dir "$S" push -q "$URL" --delete "refs/agentfs/$VOL/diverged/$ref""#,
+        r#"git push "$URL" --force-with-lease="refs/agentfs/$VOL/inbox/$N:" "$OID:refs/agentfs/$VOL/inbox/$N""#,
+        "git push \"$URL\" ':refs/agentfs/v/finish' # a comment --force",
+    ] {
+        assert_eq!(breach(ok), None, "{ok}");
+    }
+    for bad in [
+        r#"git push -q --force-with-lease="$BRANCH:$TIP" "$URL" "$BRANCH:$BRANCH""#,
+        r#"git push "$URL" "$OID:$REF""#,
+        r#"git push --force "$URL" "x:refs/agentfs/v/status""#,
+        r#"git push -qf "$URL" "x:refs/agentfs/v/status""#,
+        r#"git push "$URL" "+x:refs/agentfs/v/status""#,
+        r#"git push "$URL" "refs/heads/agentfs/v""#,
+        r#"git push "$URL" --force-with-lease="refs/agentfs/v/x:abc" "y:refs/agentfs/v/x""#,
+        r#"git push --mirror "$URL""#,
+        r#"git push "$URL""#,
+    ] {
+        assert!(breach(bad).is_some(), "{bad}");
+    }
 }
 
 /// The book (book.toml) renders only the pages docs/SUMMARY.md lists, so a

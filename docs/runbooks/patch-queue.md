@@ -92,17 +92,17 @@ URL=https://git.example.com/acme/agent-history.git
 git ls-remote "$URL" "refs/heads/$BRANCH" "refs/agentfs/$VOL/inbox/*" "refs/agentfs/$VOL/applied/*"
 N=$(git ls-remote "$URL" "refs/agentfs/$VOL/inbox/*" "refs/agentfs/$VOL/applied/*" |
   sed 's#.*/##' | sort | tail -n1)
-REF=$(printf 'refs/agentfs/%s/inbox/%010d' "$VOL" $((10#${N:-0} + 1)))
+NUM=$(printf '%010d' $((10#${N:-0} + 1)))
 # 2. A commit whose parent is on the branch (here: the current HEAD).
 OID=$(git rev-parse HEAD)
 # 3. Create the ref only if nobody has it (an empty lease means "must not exist").
-git push "$URL" --force-with-lease="$REF:" "$OID:$REF"
+git push "$URL" --force-with-lease="refs/agentfs/$VOL/inbox/$NUM:" "$OID:refs/agentfs/$VOL/inbox/$NUM"
 ```
 
 If the push is rejected (`stale info`), another producer took that number:
 list again and try the next one. Never push to a number that exists
 unless you mean to replace that patch (lease on its current oid:
-`--force-with-lease=$REF:<oid listed>`), and never reuse a number below
+`--force-with-lease=refs/agentfs/$VOL/inbox/$NUM:<oid listed>`), and never reuse a number below
 the highest applied one: it is ignored as `stale` (the warning
 `PatchIgnored`), never applied, and deleted by the next queue push.
 

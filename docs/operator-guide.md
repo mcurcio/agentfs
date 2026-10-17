@@ -347,6 +347,26 @@ remotes). With no daemon running, `push` takes the lock and pushes
 directly, as before. In Kubernetes: `kubectl exec -c agentfs <pod> --
 agentfs push`.
 
+**Replacing the volume's branch.** agentfs never force-pushes, and an
+operator never `git push`es a volume's branch either: the one way to put
+it back at the local head after someone else moved it (a divergence,
+[divergence.md](runbooks/divergence.md) case A) or to send a rewritten
+history ([history-rewrite.md](runbooks/history-rewrite.md) step 9) is
+`agentfs push --remote NAME --force-with-lease OID`, leased on the commit
+the remote shows (`git ls-remote <url> refs/heads/agentfs/<volume>`):
+
+```
+$ agentfs --state /data/state push --remote origin --force-with-lease 9f8e7d6...
+origin: replaced 9f8e7d6... with 5d6e7f8... (leased on 9f8e7d6...)
+```
+
+It replaces only this volume's branch, on that one remote, and only if
+the remote still holds OID (`lease broken` otherwise, exit 1) and OID
+shares a commit with the head (`shares no commit`, exit 1: another
+history is never replaced). It always pushes directly, also while a
+daemon runs, under that remote's push lock (exit 75 while a push to it
+runs). The divergence clears with it.
+
 ## 10. Crashes and stale mounts
 
 Every change was journaled before its call returned, so a crash loses

@@ -1889,9 +1889,18 @@ agentfs does not scan content for secrets and does not hold pushes.
 - **Non-fast-forward on the branch means someone else wrote it.**
   - The recorder pushes its head to
     `refs/agentfs/<volume>/diverged/<UTC timestamp, no colons>`
-    (`YYYYMMDDTHHMMSSZ`) once per divergence, raising `Diverged`, then keeps
-    raising `PushFailed` (`non_fast_forward`) at every attempt, with the same
-    backoff as other failures.
+    (`YYYYMMDDTHHMMSSZ`), created once per divergence, raising `Diverged`,
+    then keeps raising `PushFailed` (`non_fast_forward`) at every attempt,
+    with the same backoff as other failures.
+  - **The save follows the head** (F8 D3, 2026-10-17). At each attempt
+    whose head moved past the one saved (`saved_head` in the push state),
+    the head is pushed to the same ref again, judged by `push::claim` in
+    that push's negotiation from the value the remote holds there: a
+    fast-forward moves it (leased on that value), a ref the remote lacks
+    is re-created, and one another writer moved is kept, never
+    overwritten, with the `PushFailed` message saying so. A diverged
+    worktree's later commits thus reach the remote under its own name.
+    `Diverged` is still raised once per divergence.
   - The name is chosen and saved in the remote's push state as pending
     before that push, and confirmed after it. A crash in between reuses the
     pending name at the next attempt (the same head, or a fast-forward of
@@ -1899,10 +1908,12 @@ agentfs does not scan content for secrets and does not hold pushes.
     raised again after such a crash.
   - It never force-pushes.
   - An operator resolves it (§15,
-    [divergence.md](runbooks/divergence.md)). The divergence clears when a
+    [divergence.md](runbooks/divergence.md)): case A replaces the branch
+    with `agentfs push --force-with-lease`. The divergence clears when a
     branch push next succeeds.
   - The branch push carries only the branch and the `diverged/*` and
-    `accepted/*` refs, both create-only (they never move). A
+    `accepted/*` refs, created where the remote lacks them and otherwise
+    left (the divergence save moves only through its own push, above). A
     non-fast-forward on one is reported like any other and saves
     nothing.
 - **The start-branch alarm** (F8 R9, 2026-10-16). A volume started from
@@ -1933,7 +1944,18 @@ agentfs does not scan content for secrets and does not hold pushes.
 - **The patch queue has its own push** (§12), to the patch remote only,
   after every branch push attempt, failed ones included (an LFS upload
   failure, a refused or unreachable branch), under the same lock, so the
-  status reaches the remote even while the branch cannot:
+  status reaches the remote even while the branch cannot be pushed. It
+  writes only by the branch rule (F8 rule 2, 2026-10-17): one listing of
+  the branch and the volume's refs, and `push::claim` on the branch
+  listed, judged against the local head. A branch that is not this
+  worktree's (none yet, or another writer's) writes nothing: no status,
+  applied ref or inbox deletion. That is reported (`agentfs push`:
+  `queue: nothing written: ...`), not counted as a queue failure (the
+  branch push alarms already), and retried at the next attempt.
+  Otherwise each of its two pushes also carries the branch as a no-op
+  update (`<listed>:<branch>`) leased on the value listed, so libgit2's
+  negotiation stops the push if the branch moved since the listing, and
+  a smart server's compare-and-swap does inside the connection:
   1. the status ref, forced (the only ref agentfs ever force-pushes: it is
      a snapshot), and, only when the branch push succeeded, every
      `applied/<n>` the remote lacks, never forced;
@@ -2411,7 +2433,8 @@ current while its operation runs, so alarm logs raised inside it carry its
 trace. Record and commit spans are not linked; they correlate through the
 sequence numbers. `agentfs.patch` covers one patch at mount (inbox number,
 patch oid, outcome, the commit or the block reason, §12); a push to the
-patch remote carries the queue push's result as `agentfs.push.queue`.
+patch remote carries the queue push's result as `agentfs.push.queue`
+(`pushed`, `failed`, or `branch_not_ours`: nothing written, §11.3).
 `agentfs.fork.finish` covers writing a fork's change and finish commit,
 once (`agentfs.fork`, `agentfs.fork.change` when there is one,
 `agentfs.fork.unrecorded`), and `agentfs.fork.publish` one publish call
@@ -3379,10 +3402,12 @@ history, such as a recorded secret (§10). It is a documented procedure,
   filter-repo never edits the state area's config or remotes; the
   rewritten branch is fetched back, the reflog expired and old objects
   collected, and the push state (`meta/push/*.json`) deleted;
-- on each remote, a force-push of the volume's branch with a lease, the
-  one case where agentfs's no-force-push rule is set aside, by an
+- on each remote, `agentfs push --force-with-lease <old tip>` (below),
+  the one case where agentfs's no-force-push rule is set aside, by an
   operator, plus deleting the volume's other refs there and the host's
-  own purge;
+  own purge; a rewrite that changed the root (the content was in the
+  first commit) shares no commit with the old tip, is refused, and
+  continues under a new name;
 - **forks** (§11.5, §19.1 "Forks in history rewrites"): the affected refs
   are found by reachability, never from a list: in mirror clones of the
   source's remotes and of every fork remote its settings name, every ref
@@ -3391,13 +3416,50 @@ history, such as a recorded secret (§10). It is a documented procedure,
   forks whose base contains that commit are abandoned, before anything
   is rewritten (`git merge-base --is-ancestor <bad> <base>`); forks based
   earlier keep their ids under filter-repo and publish and land as
-  before. The affected refs are deleted with a lease on each remote. A
+  before. The affected refs, other worktrees' refs, are deleted where
+  each repository is kept, leased on the oid found: `git update-ref -d
+  <ref> <oid>` on a bare repository the operator runs, a forge's own
+  tools otherwise (no runbook `git push`es another worktree's branch,
+  below). A
   change based after the bad commit and not yet landed can no longer land
   (`parent_not_in_history`, §12). agentfs cannot enumerate, and the
   runbook lists for the operator: delivery targets (the branch method's
   repositories, webhook and command receivers), receivers' clones and
   mirrors, users' CI caches, and fork state areas kept with `onDelete:
   retain`.
+
+**The operator's lease push** (F8 S2, 2026-10-17): `agentfs push --remote
+<name> --force-with-lease <oid>` replaces this worktree's own branch, and
+nothing else, on one remote (`--remote`, or the volume's only one) with
+the local head. It runs directly, never through a daemon (the control
+protocol has no way to replace a branch), under that remote's push lock
+and not the state lock, so it works while the volume is mounted. It lists
+the remote's branch: at the head is up to date; not at `<oid>` is a
+broken lease, and nothing is written. A lease not in the state area is
+fetched, with the remote's branch, into a scratch repository beside the
+push lock that borrows the state area's objects
+(`objects/info/alternates`) and is removed afterwards, so the state area
+never takes in the remote's objects (a rewrite's old history above). A
+lease that shares no commit with the head is refused: another history is
+never replaced, it continues under a new name. Then the LFS objects are
+uploaded and the branch is pushed forced, with `<oid>` as the expected old
+value in libgit2's negotiation and, on smart HTTP and SSH, the server's
+compare-and-swap (the local and `file://` transports have none, §11.3).
+Success is recorded like any push and clears the divergence; the
+`diverged/*` refs stay. Exit status 0 for pushed and up to date, 1 for a
+broken lease, an unrelated history or a failure (each printed with the
+remote's value), 75 while another push to that remote runs. A failure
+leaves the push state as it was: the operator reads it from the command.
+
+**Runbooks never `git push` a branch.** A test
+(`runbooks_push_only_the_namespace` in `docs_reference.rs`) reads every
+fenced block of `docs/runbooks/*.md` and fails, naming the file and line,
+on a `git push` whose destination is not literally under `refs/agentfs/`,
+or that forces (`--force`, `-f`, a `+` refspec, `--mirror` and the like),
+or that has a lease: the one lease allowed is the create-only
+`--force-with-lease=<ref>:` (an empty expected value) on a destination of
+the same push under `refs/agentfs/` (patch submission, §12), which can
+create a ref and never replace one.
 
 **Not built yet** (§19.2): a read-only history view for operators, and undo
 through the patch queue (§12).
@@ -4167,7 +4229,7 @@ runner.
 | Restore safety | Every check before any write; content not in history is never overwritten, even with `--force`; `--force` overrides only what loses nothing (later recorded changes to a reverted path, files open for writing through the mount); each path is re-checked just before it changes; a partial apply is recorded, a tree already holding the target is recorded (direct) or refused (mount), and a re-run finishes the job (§15) |
 | Operation commits | The applying process or thread is registered as an actor; its records get trigger `restore`, the operator as author, and the operation in the journal record; each operation is its own commit with `Agentfs-Restore` or `Agentfs-Revert` (§9, §15) |
 | Control socket | `meta/control/agentfs.sock`, directory 0700, socket 0600, peer root or the daemon's user, addressed through `/proc/self/fd`; served by `mount`, `run` and `serve-history`; JSON lines, protocol v1, operations `push`, `restore` and `revert` (additive fields; one restore or revert at a time, a push beside it) (§2.2, §2.3, §15) |
-| History rewrite | A documented procedure with `git filter-repo --prune-empty never` in a mirror clone, then a force-push with lease per remote by an operator; not a command (§10, §15) |
+| History rewrite | A documented procedure with `git filter-repo --prune-empty never` in a mirror clone, then a force-push with lease per remote by an operator; not a command (§10, §15). Since 2026-10-17 that push is `agentfs push --force-with-lease` ("The operator's lease push" below) |
 | SSH remotes | Built with the `ssh` cargo feature: agentfs's own transport on russh (2026-10, replacing libssh2). Each SSH remote names a known_hosts file (`agentfsKnownHosts`) and exactly one of a private key (`agentfsSshKey`, with `agentfsSshKeyPassphrase`, a passphrase file, if it is encrypted) and an ssh-agent socket (`agentfsSshAgent`); every file is re-read when it changes. The key is bound to the push URL's host and port, decrypted before connecting and offered once per connection; an agent's identities are offered once each, in its order (sshd's `MaxAuthTries` applies); as the URL's user, else `git`. `SSH_AUTH_SOCK`, global and `~/.ssh` files are never read (2026-10, §11.1) |
 | Host key verification | Done by agentfs against `agentfsKnownHosts`, in the SSH transport, before any authentication; plain and hashed names, `[host]:port`, wildcards, negation and `@revoked` honoured; unknown, changed, unlisted-type and revoked keys refused, never learned; the host key types known_hosts lists are asked for first. Host certificates (2026-10): with a matching `@cert-authority` line, certificates are asked for first and trusted only if host type, CA listed and not revoked, signature, validity, principal (the URL's host) and no critical options all check out, as for OpenSSH (§11.1) |
 | Untrusted host reason | SSH host key refusals and TLS certificates libgit2 refuses (`GIT_ECERTIFICATE`: a self-signed or unknown CA, a host name the certificate does not cover) fail the push as `untrusted_host`, apart from `unreachable`, so a possible interception alarms differently from a network problem. A TLS handshake that fails before any certificate check (a server that drops it, as for a certificate host mismatch reached over an IP address in CI) stays `unreachable` (§11.3, §13) |
@@ -4265,7 +4327,10 @@ runner.
 | The chart's git server (2026-10-16) | `charts/agentfs-csi` has an optional `server:` section, off by default: one pod of a StatefulSet running the minimal git server image `ghcr.io/mcurcio/agentfs-git-server` (`examples/docker/git-server`: nginx, basic auth, `git http-backend`; non-root, read-only root filesystem), its repositories on a claim of any StorageClass, behind the Service `agentfs-git-server`. Its credentials are wired once: one Secret holds the server's `htpasswd` and the profiles' `token`, which the node plugin mounts as credentials key `agentfs-server`; the chart makes it with a random password kept across upgrades, or takes `server.credentials.existingSecret`. No fencing, per-volume keys, launch commits or hooks; it is left out of `deploy/`. Its repository has `core.fsync committed` (amended 2026-10-17, F8 fixes: git's default leaves loose objects unsynced while it syncs the ref, and the release decider deletes a worktree once the server lists its head). The owner, asked for a reference server, Forgejo or lighter: "Something lighter. This is a minimal fit remote. Pull Requests and the like can be achieved by configuring agentfs to include GitHub (or similar) as a remote. The point of this core server is for kubernetes-native replication"; on where it lives: "Ideally it's optional config in the one helm chart"; and on fencing, choosing the smallest F8 with no fencing server: "A and jj" (all 2026-10-16, R5). The StatefulSet, the Secret's shape and leaving it out of `deploy/` are design choices (F8 S4), not the owner's words ([helm.md](helm.md#the-git-server)) |
 | Release decider (2026-10-17) | One pure decider, `release::decide`, answers DeleteVolume: delete (every declared remote holds the head, or no history, and `onDelete: delete`), keep (`onDelete: retain` once every remote holds it, or a profile with no remote declared) or wait (`UNAVAILABLE`: a remote lacks the head, cannot be listed or diverged; every remote section invalid; a fork not published). Its facts are gathered by DeleteVolume, one listing per remote (`RemotePusher::branch_claim`), never the push record. Every class of the driver has `reclaimPolicy: Delete`, enforced by the chart's admission policy `agentfs-class` (widened from fork classes), so DeleteVolume always runs; DeleteVolume never pushes; the node plugin's release scan (the fork publisher, generalised) pushes every unstaged worktree until held, raising `PushFailed` at each failure; CreateVolume does not refuse `onDelete: delete` on a profile without remotes (the decider keeps such a worktree). Amended 2026-10-17 (F8 fixes): a journal holding records history lacks (a history service killed at NodeUnstage) is a wait fact, and the release scan commits it with `agentfs flush` before it pushes; the scan holds a push at its head and the profile's remotes, so a remote added later is pushed to, and forgets it when DeleteVolume finds a remote lacking the head. A design choice (F8 S1, "D1"), not the owner's words |
 | Accepting a start-branch tip (2026-10-17) | The start-branch alarm is cleared by `agentfs start accept --tip <oid>` on the new volume: it fetches the start branch, checks `<oid>` is on it and creates `refs/agentfs/<volume>/accepted/<oid>` (never moved, pushed create-only with the branch); the alarm then stops for every commit the tip reaches and comes back if the old branch moves again. "Deleting the old branch clears it" was dropped. A design choice (F8 S1, "D2"), not the owner's words |
-| Start points are branches (2026-10-17) | A `startFrom` names a branch, never a `refs/...` ref: a `diverged/*` ref is refused at parse (`BadStartPoint::NotABranch`, CreateVolume `INVALID_ARGUMENT`), since it never moves and nothing could alarm on it. The release decider answers wait for a diverged remote, so a diverged worktree is never removed and its release-scan pushes keep alarming. A design choice (F8 S1, "D3"), not the owner's words |
+| Start points are branches (2026-10-17) | A `startFrom` names a branch, never a `refs/...` ref: a `diverged/*` ref is refused at parse (`BadStartPoint::NotABranch`, CreateVolume `INVALID_ARGUMENT`), since nothing could alarm on it. The release decider answers wait for a diverged remote, so a diverged worktree is never removed and its release-scan pushes keep alarming. A design choice (F8 S1, "D3"), not the owner's words |
+| Divergence save follows the head (2026-10-17) | A diverged worktree's `diverged/<T>` save is created once per divergence and then pushed again whenever the head moved past the one it holds, judged by `push::claim` in that push's negotiation: fast-forwarded (leased on the remote's value), re-created if the remote lacks it, kept and named in the alarm if another writer moved it. Before, it was pushed once and the worktree's later commits never reached the remote. Cost: one more push per attempt while diverged and the head moves. A design choice (F8 S2, "D3"), not the owner's words |
+| Every write by the branch rule (2026-10-17) | The patch queue push writes the status, `applied/*` and inbox deletions only while the branch the remote advertises, in a listing made for that push, is on this worktree's history (`push::claim`), and carries the branch as a no-op update leased on that value, so the negotiation stops it if the branch moved since. A branch that is not this worktree's (none yet, or another writer's) writes nothing and is no queue failure. Cost: the status no longer reaches a remote whose branch is missing or diverged, so iac reads an older status there until the branch is resolved; one more ref in each queue push. A design choice (F8 S2, design rule 2), not the owner's words |
+| The operator's lease push (2026-10-17) | Operators replace a worktree's own branch only with `agentfs push --force-with-lease <oid>`: one remote, direct (never through a daemon), under that remote's push lock, refused when the lease and the head share no commit, a lease the state area lacks fetched into a removed scratch repository (never into the state area); divergence case A and history-rewrite step 9 use it. Runbooks never `git push` a branch: a docs test holds every runbook `git push` to destinations literally under `refs/agentfs/`, with no force and no lease but the create-only `--force-with-lease=<ref>:` of patch submission (§12, kept from "Patch submission" above). The history rewrite's fork step deletes other worktrees' refs on each server (`git update-ref -d <ref> <oid>`) or with a forge's tools, no longer by `git push`. Cost: on a forge, that deletion has no lease; `--force-with-lease` does not step through `agentfsMaxPushSize`. A design choice (F8 S2), not the owner's words; it serves R2, the owner's "Go" to one branch per worktree, for good (2026-10-16) |
 
 ### 19.2 Open questions
 

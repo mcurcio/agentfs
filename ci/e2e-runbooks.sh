@@ -4,13 +4,16 @@
 # docs/runbooks/history-rewrite.md is extracted and run in order against a
 # real volume and a file:// remote, and the results are checked:
 #
-# - divergence: the foreign tip is kept under overwritten/, the branch is
-#   the local head again, pushes succeed and `status` no longer says
-#   diverged, the diverged refs are gone;
+# - divergence: the diverged save follows the head; the foreign tip is
+#   kept under overwritten/, `agentfs push --force-with-lease` makes the
+#   branch the local head again without taking the foreign commit in,
+#   pushes succeed and `status` no longer says diverged, the diverged refs
+#   are gone;
 # - history rewrite: the secret's blobs are gone from the state area and
-#   the remote, every commit and the last Agentfs-Seq survive, pushes are
-#   fast-forwards again, recording continues with a higher Agentfs-Seq,
-#   and the secret is not recorded again;
+#   the remote (the lease push of step 9 fetches the old tip aside, never
+#   into the state area), every commit and the last Agentfs-Seq survive,
+#   pushes are fast-forwards again, recording continues with a higher
+#   Agentfs-Seq, and the secret is not recorded again;
 # - LFS storage (docs/runbooks/lfs-storage.md): a dry run deletes nothing
 #   and names the remote that lacks an object, a prune deletes only what
 #   every remote holds, `lfs fetch` brings it back, and a remote added
@@ -20,7 +23,8 @@
 # 'Forks' steps, on a source with two forks, one based before the secret
 # was recorded and one after: the secret's blobs are gone from the source
 # remote and the fork remote, only the later fork is abandoned and its
-# refs deleted, and the earlier one still publishes. CI runs it as a step
+# refs deleted (on each server, leased on the oid found), and the earlier
+# one still publishes. CI runs it as a step
 # of its own, so a flake of either is attributable.
 #
 # Needs git and git-filter-repo (the history-rewrite parts). Run from the
@@ -108,9 +112,14 @@ if [ "${1:-}" = forks ]; then
 
   for name in rewrite-flush rewrite-exclude rewrite-fork-find rewrite-fork-abandon \
     rewrite-backup rewrite-filter rewrite-fetch rewrite-gc rewrite-verify \
-    rewrite-push-state rewrite-remote rewrite-fork-refs; do
+    rewrite-push-state rewrite-remote; do
     step "history-rewrite runbook: $name"
     run_block history-rewrite.md "$name"
+  done
+  for SERVER_REPO in "$W/origin.git" "$W/forks.git"; do
+    SERVER_URL=file://$SERVER_REPO
+    step "history-rewrite runbook: rewrite-fork-refs ($SERVER_REPO)"
+    run_block history-rewrite.md rewrite-fork-refs
   done
   for SERVER_REPO in "$W/origin.git" "$W/forks.git"; do
     step "history-rewrite runbook: rewrite-purge-bare ($SERVER_REPO)"
@@ -188,18 +197,38 @@ out=$(agentfs push 2>&1)
 set -e
 assert_contains "$out" "diverged" "the push reports the divergence"
 assert_contains "$(agentfs status)" "diverged: head saved as" "status shows it"
+
+step "the divergence save follows the head"
+echo three >"$BACKING/b2.txt"
+agentfs record b2.txt >/dev/null
+set +e
+agentfs push >/dev/null 2>&1
+set -e
 LOCAL=$(local_head "$VOL")
+assert_eq "$LOCAL" \
+  "$(git --git-dir "$REMOTE" for-each-ref --format='%(objectname)' "refs/agentfs/$VOL/diverged/")" \
+  "the one diverged ref is the new head"
 
 step "divergence runbook: inspect"
 run_block divergence.md divergence-inspect
 assert_eq "$FOREIGN" "$REMOTE_TIP" "the foreign tip is found"
 
 step "divergence runbook: case A"
-run_block divergence.md divergence-case-a
+NAME=origin
+out=$(run_block divergence.md divergence-case-a)
+echo "$out"
+assert_contains "$out" "origin: replaced $FOREIGN with $LOCAL" "agentfs push replaces the branch, leased"
 assert_eq "$LOCAL" "$(remote_ref "$REMOTE" "$BRANCH")" "the branch is the local head again"
 assert_eq "$FOREIGN" \
   "$(git --git-dir "$REMOTE" for-each-ref --format='%(objectname)' "refs/agentfs/$VOL/overwritten/")" \
   "the foreign tip is kept under overwritten/"
+git --git-dir "$STATE/git" cat-file -e "$FOREIGN^{commit}" 2>/dev/null &&
+  fail "the lease push took the foreign commit into the state area"
+pass "the foreign commit stays out of the state area"
+set +e
+out=$(agentfs push --remote origin --force-with-lease "$FOREIGN" 2>&1)
+set -e
+assert_contains "$out" "origin: up to date at $LOCAL" "a second lease push is up to date"
 
 step "divergence runbook: verify"
 run_block divergence.md divergence-verify

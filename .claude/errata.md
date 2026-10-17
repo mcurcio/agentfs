@@ -111,3 +111,40 @@ None of these stopped the slice; each was resolved as below and is reported with
    installed, no value to turn it off) is a design choice beyond the doc correction the
    finding allowed; it needs Kubernetes 1.30's node-name claim in pod-bound tokens, which
    the chart's `kubeVersion: >=1.30` already implies.
+
+## 2026-10-17, F8 S2 implementer (f8-s2)
+
+None of these stopped the slice; each was resolved as below and is reported with it.
+
+1. Brief: `.handoff/f8-slices.md` is still not in the main checkout; read from the architect's
+   worktree, as S1 did.
+2. Acceptance 4 (`runbooks_push_only_the_namespace` refuses every `--force-with-lease`)
+   contradicts two §19.1 decisions it does not mention: "Patch submission" (a create-only
+   `--force-with-lease=<ref>:`, in `docs/runbooks/patch-queue.md`, a file no F8 slice owns)
+   and "Forks in history rewrites" (the fork refs deleted with a lease, by `git push`, in
+   history-rewrite F3, including other worktrees' branches, never under `refs/agentfs/`).
+   Resolved: the test allows only the create-only lease (empty expected value) on a
+   destination of the same push literally under `refs/agentfs/`; `patch-queue.md`'s block
+   names its destination literally (no other change); F3 deletes on each server with
+   `git update-ref -d <ref> <oid>` (a lease) or a forge's tools (no lease), and
+   `ci/e2e-runbooks.sh forks` runs it per server. §15 and a §19.1 row say so.
+3. Acceptance 1 says "against the HTTP test server": the repository has no in-process HTTP
+   git server (only `ci/git-http-server.sh`, CI). The moved-branch test uses a `file://`
+   remote and a test-only hook between the queue push's listing and its push; the
+   negotiation check it proves is transport-independent. A smart server's own
+   compare-and-swap on the no-op branch update is not tested here.
+4. Behaviour change the slice implies but does not state: §11.3 said the status reaches the
+   remote "even while the branch cannot". With rule 2 it does not while the remote has no
+   branch or another writer's: two existing tests (`applied_refs_wait_for_the_branch_push`,
+   `lfs::a_failed_lfs_stage_still_pushes_the_queue_status`) now first push the branch.
+5. "A lease not in the repository is fetched first": fetched into a scratch repository
+   beside the push lock (alternates on the state area's objects, removed afterwards), not
+   into the state area, which would take a rewrite's removed history (and its secret) back
+   in at step 9. The e2e checks the state area stays clean.
+6. `fork/start.rs` (S1's) `fetch_branch` made `pub(crate)` for that fetch: visibility only.
+7. Not in the frozen page: `LeaseOutcome::NothingToPush` exits 1; a failed lease push leaves
+   the push state alone and raises no `PushFailed` (an operator command reports directly).
+8. Divergence case B for a CLI or sidecar volume: there is no CLI start-from (deferred), so
+   the runbook gives a manual new-volume procedure; not exercised in CI.
+9. S1's §19.1 row "Start points are branches" gave "it never moves" as a reason; with D3's
+   save following the head that is no longer true, and the clause is removed.

@@ -17,6 +17,11 @@
 //! [`client`] is the command's side: it asks the daemon first and returns
 //! `None` when none answers (no socket, or a daemon from before `push`
 //! existed), and the command then pushes directly, taking the lock.
+//!
+//! `agentfs push --force-with-lease` never comes here: the operator's
+//! lease push (§15) is always direct, under the remote's push lock alone,
+//! so it runs the same with or without a daemon and the control protocol
+//! carries no way to replace a branch.
 
 use std::process::ExitCode;
 use std::sync::Arc;

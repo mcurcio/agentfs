@@ -17,9 +17,13 @@
 //! - **Success** records the pushed head and clears failures and any
 //!   divergence.
 //! - **Non-fast-forward on the branch** means someone else wrote it. The
-//!   local head is pushed once per divergence to
-//!   `refs/agentfs/<volume>/diverged/<UTC timestamp>`, and every attempt
-//!   raises [`Event::PushFailed`] until an operator resolves it.
+//!   local head is saved once per divergence under
+//!   `refs/agentfs/<volume>/diverged/<UTC timestamp>`, which then follows
+//!   the head by [`claim`] (F8 D3), and every attempt raises
+//!   [`Event::PushFailed`] until an operator resolves it, with
+//!   [`RemotePusher::push_with_lease`] or a new name.
+//! - **The patch queue** writes only while the remote's branch is this
+//!   worktree's, leased on it ([`QueuePush::branch_not_ours`]).
 //! - **Over the push size limit** (`agentfsMaxPushSize`, [`crate::push_size`]):
 //!   measured from the branch the remote advertises (the push state can lag
 //!   it), a backlog that does not fit is pushed in first-parent steps,
@@ -151,6 +155,9 @@ pub struct Divergence {
     /// saving the head again under a new name.
     #[serde(default)]
     pub pending_ref: Option<String>,
+    /// The head the save under `diverged_ref` last reached.
+    #[serde(default)]
+    pub saved_head: Option<String>,
 }
 
 /// One remote's push bookkeeping, persisted across restarts.
@@ -255,11 +262,21 @@ pub struct QueuePush {
     pub held_back: bool,
     /// Why it failed, if it did.
     pub error: Option<(PushFailureKind, String)>,
+    /// The branch the remote advertised in the queue push's connection when it was not this
+    /// worktree's (Claim::Create or Claim::Diverged): nothing was written. None otherwise.
+    pub branch_not_ours: Option<Claim>,
 }
 
 impl QueuePush {
     /// One line for `agentfs push`.
     pub fn summary(&self) -> String {
+        if let Some(claim) = self.branch_not_ours {
+            let why = match claim {
+                Claim::Create => "the remote has no branch of this volume yet",
+                _ => "the remote's branch is not on this volume's history",
+            };
+            return format!("nothing written: {why} (F8 rule 2)");
+        }
         match &self.error {
             Some((kind, message)) => format!("failed ({kind}): {message}"),
             None => {
@@ -335,6 +352,28 @@ pub enum CreateOnlyOutcome {
     AnotherWriter { name: String, found: Oid },
 }
 
+/// Whether a lease and the head share a commit
+/// ([`RemotePusher::push_with_lease`]).
+enum LeaseCheck {
+    Related,
+    Unrelated,
+    /// The remote's branch moved off the lease while it was fetched.
+    Moved(Option<Oid>),
+}
+
+/// What one push of a divergence save did ([`RemotePusher::save_head`]).
+enum Saved {
+    /// The remote holds the head under the save's name.
+    Held,
+    /// The remote holds a commit under that name that is not on this
+    /// history: nothing was sent.
+    AnotherWriter,
+    /// The remote refused the update.
+    Refused(String),
+    /// The push failed (unreachable, authentication, ...).
+    Failed(String),
+}
+
 /// What libgit2 reported for one push call.
 struct Attempt {
     result: Result<(), GitError>,
@@ -349,10 +388,11 @@ struct Attempt {
     updates: Vec<(String, Oid)>,
     /// `(remote ref, the remote's rejection message)`.
     rejected: Vec<(String, String)>,
-    /// The claim the push negotiation computed from the branch update's
-    /// old value (F8 rule 2), for a branch push; `None` for other pushes.
+    /// The claim the push negotiation computed from the guarded ref's old
+    /// value (F8 rule 2): the branch for a branch push, the `diverged/*`
+    /// ref for a divergence save; `None` for other pushes.
     /// [`Claim::Diverged`] stopped the push before anything was sent.
-    branch_claim: Option<Claim>,
+    claim: Option<Claim>,
 }
 
 /// Pushes one remote. Owns its own repository handle, so each remote can
@@ -383,6 +423,10 @@ pub struct RemotePusher {
     /// The last attempt pushed only part of the backlog (design §11.3):
     /// the next follows at once.
     step_pending: bool,
+    /// Runs between the queue push's listing and its pushes: a test moves
+    /// the branch there.
+    #[cfg(test)]
+    after_queue_listing: Option<Box<dyn Fn() + Send>>,
 }
 
 impl RemotePusher {
@@ -420,6 +464,8 @@ impl RemotePusher {
                 .is_some_and(|p| p.name == remote.name),
             queue: None,
             step_pending: false,
+            #[cfg(test)]
+            after_queue_listing: None,
         })
     }
 
@@ -479,6 +525,8 @@ impl RemotePusher {
         if let Some(queue) = &self.queue {
             let label = if queue.error.is_some() {
                 "failed"
+            } else if queue.branch_not_ours.is_some() {
+                "branch_not_ours"
             } else {
                 "pushed"
             };
@@ -750,7 +798,7 @@ impl RemotePusher {
 
         // Rule 2: the negotiation stopped the push before anything was
         // sent, because the remote's branch is not on this history.
-        if attempt.branch_claim == Some(Claim::Diverged) {
+        if attempt.claim == Some(Claim::Diverged) {
             let message = format!(
                 "{}: the remote holds {}, which is not on this volume's history (another \
                  worktree wrote it); nothing was sent",
@@ -982,8 +1030,128 @@ impl RemotePusher {
     /// `diverged/*` refs stay. Success clears the divergence in the push
     /// state and is recorded like any push.
     pub fn push_with_lease(&mut self, lease: Oid) -> LeaseOutcome {
-        let _ = lease;
-        todo!("F8 S2")
+        let url = self.remote.push_url().to_owned();
+        let failed = |kind, message: String| LeaseOutcome::Failed {
+            kind,
+            message: scrub_userinfo(&message, &url),
+        };
+        let _lock = match self.lock() {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return LeaseOutcome::Busy,
+            Err(e) => {
+                let message = format!("locking {}: {e}", self.lock_path.display());
+                return failed(PushFailureKind::Local, message);
+            }
+        };
+        self.state = PushState::load(&self.state_path);
+        let head = match self.repo.refname_to_id(&self.branch_ref) {
+            Ok(head) => head,
+            Err(e) if e.code() == ErrorCode::NotFound => return LeaseOutcome::NothingToPush,
+            Err(e) => return failed(PushFailureKind::Local, e.message().to_owned()),
+        };
+        let branch = self.branch_ref.clone();
+        let found = match self.list_remote_refs(|name| name == branch) {
+            Ok(listed) => listed.get(&branch).copied(),
+            Err((kind, message)) => return failed(kind, message),
+        };
+        if found == Some(head) {
+            return self.leased(head, found, true);
+        }
+        if found != Some(lease) {
+            return LeaseOutcome::LeaseBroken { found };
+        }
+        match self.lease_check(lease, head) {
+            Ok(LeaseCheck::Related) => {}
+            Ok(LeaseCheck::Unrelated) => return LeaseOutcome::Unrelated { lease, head },
+            Ok(LeaseCheck::Moved(found)) => return LeaseOutcome::LeaseBroken { found },
+            Err((kind, message)) => return failed(kind, message),
+        }
+        // LFS objects first: a ref is never pushed before the objects its
+        // commits reference (design §7).
+        if let Err(e) = self.upload_lfs(head) {
+            return failed(e.kind, e.message);
+        }
+        // Forced, so libgit2 sends it although the remote's branch is not
+        // an ancestor; the lease is checked in the negotiation, from the
+        // old value the remote reports in this connection, and by the
+        // smart protocol's compare-and-swap on it.
+        let attempt = self.attempt(&[format!("+{head}:{branch}")], &[(branch.clone(), lease)]);
+        let now = attempt
+            .updates
+            .iter()
+            .find(|(name, _)| *name == branch)
+            .map(|(_, oid)| *oid);
+        if let Some(now) = now
+            && now != lease
+        {
+            return LeaseOutcome::LeaseBroken {
+                found: Some(now).filter(|o| !o.is_zero()),
+            };
+        }
+        match self.attempt_error(&attempt) {
+            None => self.leased(head, Some(lease), false),
+            Some((kind, message)) => failed(kind, message),
+        }
+    }
+
+    /// A lease push that left the remote's branch at `head`: recorded like
+    /// any successful push, which clears the divergence.
+    fn leased(&mut self, head: Oid, previous: Option<Oid>, up_to_date: bool) -> LeaseOutcome {
+        match self.succeeded(head, previous, up_to_date) {
+            PushOutcome::UpToDate { head } => LeaseOutcome::UpToDate { head },
+            PushOutcome::Pushed { from, to, .. } => LeaseOutcome::Pushed {
+                from: from.unwrap_or(head),
+                to,
+            },
+            PushOutcome::Failed { kind, message, .. } => LeaseOutcome::Failed { kind, message },
+            other => LeaseOutcome::Failed {
+                kind: PushFailureKind::Local,
+                message: format!("unexpected outcome {}", other.label()),
+            },
+        }
+    }
+
+    /// Whether `lease` and `head` share a commit. A lease not in this
+    /// repository is fetched first, with the branch the remote advertises
+    /// (it is the lease, or the lease is broken), into a scratch repository
+    /// beside the push lock that borrows this repository's objects
+    /// (`objects/info/alternates`) and is removed afterwards: the state
+    /// area never takes in the remote's objects, such as the old history a
+    /// rewrite removed (history-rewrite runbook, step 9).
+    fn lease_check(&self, lease: Oid, head: Oid) -> Result<LeaseCheck, (PushFailureKind, String)> {
+        let local = |e: GitError| (PushFailureKind::Local, e.message().to_owned());
+        let related = |repo: &Repository| match repo.merge_base(head, lease) {
+            Ok(_) => Ok(LeaseCheck::Related),
+            Err(e) if e.code() == ErrorCode::NotFound => Ok(LeaseCheck::Unrelated),
+            Err(e) => Err(local(e)),
+        };
+        if self.repo.odb().is_ok_and(|odb| odb.exists(lease)) {
+            return related(&self.repo);
+        }
+        let scratch = self.lock_path.with_extension("lease.git");
+        let _ = fs::remove_dir_all(&scratch);
+        let checked = (|| {
+            Repository::init_bare(&scratch).map_err(local)?;
+            let objects = fs::canonicalize(self.repo.path().join("objects"))
+                .map_err(|e| (PushFailureKind::Local, e.to_string()))?;
+            fs::write(
+                scratch.join("objects/info/alternates"),
+                format!("{}\n", objects.display()),
+            )
+            .map_err(|e| (PushFailureKind::Local, e.to_string()))?;
+            let repo = Repository::open_bare(&scratch).map_err(local)?;
+            // What the fetch negotiates from: the remote sends only what
+            // this history lacks.
+            repo.reference("refs/heads/head", head, true, "agentfs lease check")
+                .map_err(local)?;
+            let tip = crate::fork::start::fetch_branch(&repo, &self.remote, &self.branch_ref)?;
+            if tip != Some(lease) {
+                return Ok(LeaseCheck::Moved(tip));
+            }
+            related(&repo)
+        })();
+        let _ = fs::remove_dir_all(&scratch);
+        checked
     }
 
     /// This remote's push lock file: held while a push runs, and by a
@@ -1032,7 +1200,18 @@ impl RemotePusher {
     }
 
     /// The patch queue push (design §11.3, §12), after the branch push,
-    /// for the patch remote only. Two pushes:
+    /// for the patch remote only.
+    ///
+    /// It writes only by the branch rule (F8 rule 2): one listing of the
+    /// branch and the volume's refs, and [`claim`] on the branch listed,
+    /// judged against the local head. A branch that is not this worktree's
+    /// ([`Claim::Create`]: none yet; [`Claim::Diverged`]: another writer's)
+    /// writes nothing and is reported as [`QueuePush::branch_not_ours`],
+    /// not as a failure: the branch push already alarms. Otherwise each of
+    /// the two pushes below also carries the branch as a no-op update
+    /// (`<listed>:<branch>`) leased on the value listed, so libgit2's
+    /// negotiation stops it if the branch moved since the listing. Two
+    /// pushes:
     ///
     /// 1. the status ref, forced (it is a snapshot), and, only when the
     ///    branch push succeeded, every local `applied/<n>` ref the remote
@@ -1063,7 +1242,8 @@ impl RemotePusher {
         match self.queue_push_inner(status, &status_ref, branch_ok, &mut report) {
             Ok(()) => {
                 self.state.queue_error = None;
-                if branch_ok {
+                // Not synced while the branch is not ours: retried next time.
+                if branch_ok && report.branch_not_ours.is_none() {
                     self.state.queue_synced_ms = Some(now_ms());
                     self.state.queue_synced_status = Some(status.to_string());
                 }
@@ -1122,7 +1302,28 @@ impl RemotePusher {
                 applied.insert(n, oid);
             }
         }
-        let remote = self.list_remote()?;
+        // One listing: the branch, and the volume's refs.
+        let prefix = format!("refs/agentfs/{}/", self.volume);
+        let remote =
+            self.list_remote_refs(|name| name == self.branch_ref || name.starts_with(&prefix))?;
+        #[cfg(test)]
+        if let Some(hook) = &self.after_queue_listing {
+            hook();
+        }
+        let listed = remote.get(&self.branch_ref).copied();
+        // No local branch: nothing the remote holds is on this history.
+        let judged = match self.repo.refname_to_id(&self.branch_ref) {
+            Ok(head) => claim(listed, head, |oid| self.on_history(head, oid)),
+            Err(_) if listed.is_none() => Claim::Create,
+            Err(_) => Claim::Diverged,
+        };
+        let Some(listed) = listed.filter(|_| judged.is_ours()) else {
+            report.branch_not_ours = Some(judged);
+            return Ok(());
+        };
+        // The branch, unchanged, leased on the value listed.
+        let lease_spec = format!("{listed}:{}", self.branch_ref);
+        let lease = (self.branch_ref.clone(), listed);
 
         // Push 1.
         let mut specs = Vec::new();
@@ -1142,12 +1343,15 @@ impl RemotePusher {
                 report.held_back = true;
             }
         }
-        if !specs.is_empty()
-            && let Some(error) = self.attempt_error(&self.attempt(&specs, &[]))
-        {
-            report.status = false;
-            report.applied = 0;
-            return Err(error);
+        if !specs.is_empty() {
+            specs.push(lease_spec.clone());
+            if let Some(error) =
+                self.attempt_error(&self.attempt(&specs, std::slice::from_ref(&lease)))
+            {
+                report.status = false;
+                report.applied = 0;
+                return Err(error);
+            }
         }
         if !branch_ok {
             return Ok(());
@@ -1156,7 +1360,7 @@ impl RemotePusher {
         // Push 2: every remote inbox entry whose number is applied, the
         // applied patch or a stale one (replaced after it was applied),
         // leased on the oid listed.
-        let deletes: Vec<(String, Oid)> = applied
+        let mut deletes: Vec<(String, Oid)> = applied
             .keys()
             .map(|n| crate::patch::inbox_ref(&self.volume, *n))
             .filter_map(|name| remote.get(&name).map(|oid| (name, *oid)))
@@ -1164,19 +1368,15 @@ impl RemotePusher {
         if deletes.is_empty() {
             return Ok(());
         }
-        let specs: Vec<String> = deletes.iter().map(|(name, _)| format!(":{name}")).collect();
+        let deleted = deletes.len();
+        let mut specs: Vec<String> = deletes.iter().map(|(name, _)| format!(":{name}")).collect();
+        specs.push(lease_spec);
+        deletes.push(lease);
         if let Some(error) = self.attempt_error(&self.attempt(&specs, &deletes)) {
             return Err(error);
         }
-        report.deleted = deletes.len();
+        report.deleted = deleted;
         Ok(())
-    }
-
-    /// The remote's `refs/agentfs/<volume>/*` refs, as its receive side
-    /// advertises them.
-    fn list_remote(&self) -> Result<BTreeMap<String, Oid>, (PushFailureKind, String)> {
-        let prefix = format!("refs/agentfs/{}/", self.volume);
-        self.list_remote_refs(|name| name.starts_with(&prefix))
     }
 
     /// Where a measured push starts (design §11.3): the branch the remote
@@ -1236,7 +1436,7 @@ impl RemotePusher {
                 host_key_failure: auth.host_key_failure(),
                 updates: Vec::new(),
                 rejected: Vec::new(),
-                branch_claim: None,
+                claim: None,
             };
             self.attempt_error(&attempt)
                 .unwrap_or((PushFailureKind::Unreachable, "listing the remote".into()))
@@ -1289,21 +1489,26 @@ impl RemotePusher {
     /// branch in this very connection, [`claim`] decides (F8 rule 2), and
     /// [`Claim::Diverged`] stops the push before anything is sent.
     fn attempt_branch(&self, refspecs: &[String], head: Oid) -> Attempt {
-        self.attempt_guarded(refspecs, &[], Some(head))
+        self.attempt_guarded(refspecs, &[], Some((&self.branch_ref, head)))
     }
 
+    /// One libgit2 push of `refspecs`, checked in its negotiation: a ref in
+    /// `expect` must hold the given oid on the remote, and the update of
+    /// `guard`'s ref, which pushes its oid, must be [`claim`]ed from the
+    /// old value the remote reports in this connection (F8 rule 2):
+    /// [`Claim::Diverged`] stops the push before anything is sent.
     fn attempt_guarded(
         &self,
         refspecs: &[String],
         expect: &[(String, Oid)],
-        branch_head: Option<Oid>,
+        guard: Option<(&str, Oid)>,
     ) -> Attempt {
         let negotiated = Cell::new(false);
         let auth = AuthState::new();
         let _scope = self.auth.ssh_scope(&auth);
         let updates = RefCell::new(Vec::new());
         let rejected = RefCell::new(Vec::new());
-        let branch_claim = Cell::new(None);
+        let judged_claim = Cell::new(None);
         let result = (|| {
             let mut remote = self.repo.remote_anonymous(self.remote.push_url())?;
             let mut callbacks = self.auth.callbacks(&auth);
@@ -1325,12 +1530,12 @@ impl RemotePusher {
                             update.src()
                         )));
                     }
-                    if let Some(head) = branch_head
-                        && name == self.branch_ref
+                    if let Some((guarded, head)) = guard
+                        && name == guarded
                     {
                         let old = Some(update.src()).filter(|o| !o.is_zero());
                         let judged = claim(old, head, |oid| self.on_history(head, oid));
-                        branch_claim.set(Some(judged));
+                        judged_claim.set(Some(judged));
                         if judged == Claim::Diverged {
                             return Err(GitError::from_str(&format!(
                                 "{name} on the remote is not on this volume's history; nothing \
@@ -1364,7 +1569,7 @@ impl RemotePusher {
             host_key_failure: auth.host_key_failure(),
             updates: updates.into_inner(),
             rejected: rejected.into_inner(),
-            branch_claim: branch_claim.get(),
+            claim: judged_claim.get(),
         }
     }
 
@@ -1430,22 +1635,47 @@ impl RemotePusher {
         }
     }
 
-    /// Someone else wrote the branch: save the local head once per
-    /// divergence, then fail like any other attempt.
+    /// Someone else wrote the branch: save the local head under
+    /// `refs/agentfs/<volume>/diverged/<UTC timestamp>`, then fail like any
+    /// other attempt.
+    ///
+    /// The save is created once per divergence, raising
+    /// [`Event::Diverged`], and then follows the head (F8 D3): at each
+    /// attempt whose head moved past the one saved, the save is pushed
+    /// again, judged by [`claim`] in the push's negotiation on the value
+    /// the remote holds there. A fast-forward moves it, leased on that
+    /// value; a save the remote lacks is re-created; one another writer
+    /// moved is kept and named in the alarm, never overwritten.
     ///
     /// The ref name is chosen and saved in the state file as
-    /// `pending_ref` before it is pushed, so a crash between the push and
-    /// the state update retries the same name (the same or a descendant
-    /// head: a no-op or a fast-forward) instead of saving the head again
-    /// under a new timestamp.
+    /// `pending_ref` before it is first pushed, so a crash between the push
+    /// and the state update retries the same name (the same or a
+    /// descendant head: a no-op or a fast-forward) instead of saving the
+    /// head again under a new timestamp.
     fn diverged(&mut self, head: Oid, remote_head: Option<Oid>, message: String) -> PushOutcome {
         let now = now_ms();
         let previous = self.state.diverged.take();
         let since_ms = previous.as_ref().map_or(now, |d| d.since_ms);
         let mut diverged_ref = previous.as_ref().and_then(|d| d.diverged_ref.clone());
         let mut pending_ref = previous.as_ref().and_then(|d| d.pending_ref.clone());
+        let mut saved_head = previous.as_ref().and_then(|d| d.saved_head.clone());
         let mut message = message;
-        if diverged_ref.is_none() {
+        if let Some(name) = diverged_ref.clone() {
+            if saved_head.as_deref() != Some(head.to_string().as_str()) {
+                match self.save_head(&name, head) {
+                    Saved::Held => saved_head = Some(head.to_string()),
+                    Saved::AnotherWriter => {
+                        message = format!(
+                            "{message}; {name} on the remote is not on this volume's history \
+                             (another writer moved it): kept, not moved to the head"
+                        );
+                    }
+                    Saved::Refused(why) | Saved::Failed(why) => {
+                        message = format!("{message}; moving {name} to the head: {why}");
+                    }
+                }
+            }
+        } else {
             let name = pending_ref
                 .clone()
                 .unwrap_or_else(|| self::diverged_ref(&self.volume, now / 1000));
@@ -1456,6 +1686,7 @@ impl RemotePusher {
                 remote_head: remote_head.map(|o| o.to_string()),
                 diverged_ref: None,
                 pending_ref: pending_ref.clone(),
+                saved_head: None,
             });
             match self
                 .state
@@ -1470,34 +1701,40 @@ impl RemotePusher {
                         self.state_path.display()
                     );
                 }
-                Ok(()) => {
-                    let attempt = self.attempt(&[format!("{head}:{name}")], &[]);
-                    match (&attempt.result, attempt.rejected.first()) {
-                        (Ok(()), None) => {
-                            if let Err(e) = crate::failpoints::hit("push.diverged.after_ref") {
-                                message = format!("{message}; {e}");
-                            }
-                            self.events.emit(Event::Diverged {
-                                remote: self.remote.name.clone(),
-                                local_head: head,
-                                remote_head,
-                                diverged_ref: name.clone(),
-                            });
-                            diverged_ref = Some(name);
-                            pending_ref = None;
+                Ok(()) => match self.save_head(&name, head) {
+                    Saved::Held => {
+                        if let Err(e) = crate::failpoints::hit("push.diverged.after_ref") {
+                            message = format!("{message}; {e}");
                         }
-                        (Ok(()), Some((_, msg))) => {
-                            // The remote refused this name; pick a fresh
-                            // one next time.
-                            message = format!("{message}; saving the head as {name}: {msg}");
-                            pending_ref = None;
-                        }
-                        (Err(e), _) => {
-                            message =
-                                format!("{message}; saving the head as {name}: {}", e.message());
-                        }
+                        self.events.emit(Event::Diverged {
+                            remote: self.remote.name.clone(),
+                            local_head: head,
+                            remote_head,
+                            diverged_ref: name.clone(),
+                        });
+                        diverged_ref = Some(name);
+                        pending_ref = None;
+                        saved_head = Some(head.to_string());
                     }
-                }
+                    Saved::AnotherWriter => {
+                        // Someone else holds this name; pick a fresh one
+                        // next time.
+                        message = format!(
+                            "{message}; saving the head as {name}: the remote holds another \
+                             commit there"
+                        );
+                        pending_ref = None;
+                    }
+                    Saved::Refused(why) => {
+                        // The remote refused this name; pick a fresh one
+                        // next time.
+                        message = format!("{message}; saving the head as {name}: {why}");
+                        pending_ref = None;
+                    }
+                    Saved::Failed(why) => {
+                        message = format!("{message}; saving the head as {name}: {why}");
+                    }
+                },
             }
         }
         self.state.diverged = Some(Divergence {
@@ -1506,12 +1743,29 @@ impl RemotePusher {
             remote_head: remote_head.map(|o| o.to_string()),
             diverged_ref: diverged_ref.clone(),
             pending_ref,
+            saved_head,
         });
         self.failed(PushFailureKind::NonFastForward, message, Some(head));
         PushOutcome::Diverged {
             local_head: head,
             remote_head,
             diverged_ref,
+        }
+    }
+
+    /// Pushes `head` to the divergence save `name`, judged by [`claim`] on
+    /// the remote's value of `name` in the push's own negotiation: created
+    /// where the remote lacks it, fast-forwarded where it holds a commit on
+    /// this history, and never moved otherwise.
+    fn save_head(&self, name: &str, head: Oid) -> Saved {
+        let attempt = self.attempt_guarded(&[format!("{head}:{name}")], &[], Some((name, head)));
+        if attempt.claim == Some(Claim::Diverged) {
+            return Saved::AnotherWriter;
+        }
+        match (&attempt.result, attempt.rejected.first()) {
+            (Ok(()), None) => Saved::Held,
+            (Ok(()), Some((_, msg))) => Saved::Refused(msg.clone()),
+            (Err(e), _) => Saved::Failed(e.message().to_owned()),
         }
     }
 
@@ -2253,6 +2507,7 @@ mod tests {
                 deleted: 2,
                 held_back: false,
                 error: None,
+                branch_not_ours: None,
             })
         );
         assert_eq!(
@@ -2362,18 +2617,23 @@ mod tests {
         assert!(pusher.queue().unwrap().error.is_some());
     }
 
-    /// Applied refs wait for the branch; the status goes anyway.
+    /// Applied refs wait for the branch; the status goes anyway, while the
+    /// remote's branch is this worktree's (here: a push over the size
+    /// limit fails before anything is sent).
     #[test]
     fn applied_refs_wait_for_the_branch_push() {
         let remote_dir = tempfile::tempdir().unwrap();
         let remote = remote_dir.path();
         bare(remote);
-        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        let mut v = Vol::with_config(
+            "vol",
+            &[("origin", &remote.display().to_string())],
+            &[("remote.origin.agentfsMaxPushSize", "1m")],
+        );
         let c1 = v.commit();
         let mut pusher = v.pusher("origin", Arc::new(NullSink));
         assert!(pusher.push_once().is_success());
-        write_remote(remote, "refs/heads/agentfs/vol");
-        let c2 = v.commit();
+        let c2 = v.commit_file("big", &random(2 << 20, 5));
         let repo = v.com.history().repo();
         repo.reference("refs/agentfs/vol/applied/0000000001", c1, false, "t")
             .unwrap();
@@ -2381,12 +2641,21 @@ mod tests {
             .unwrap();
         let outcome = pusher.push_once();
         assert!(
-            matches!(outcome, PushOutcome::Diverged { .. }),
+            matches!(
+                outcome,
+                PushOutcome::Failed {
+                    kind: PushFailureKind::TooLarge,
+                    ..
+                }
+            ),
             "{outcome:?}"
         );
         let queue = pusher.queue().unwrap();
         assert!(
-            queue.status && queue.held_back && queue.error.is_none(),
+            queue.status
+                && queue.held_back
+                && queue.error.is_none()
+                && queue.branch_not_ours.is_none(),
             "{queue:?}"
         );
         assert_eq!(queue.applied, 0);
@@ -2395,7 +2664,144 @@ mod tests {
             remote_ref(remote, "refs/agentfs/vol/applied/0000000001"),
             None
         );
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(c1));
         assert_eq!(pusher.state().queue_synced_status, None);
+    }
+
+    /// F8 rule 2, acceptance 1: a queue push to a remote whose branch is
+    /// another repository's writes no status, applied or inbox-deletion
+    /// ref, and is not a failure (the branch push alarms).
+    #[test]
+    fn the_queue_push_writes_nothing_while_the_branch_is_not_ours() {
+        for created_by_other in [true, false] {
+            let remote_dir = tempfile::tempdir().unwrap();
+            let remote = remote_dir.path();
+            bare(remote);
+            let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+            let c1 = v.commit();
+            let theirs = if created_by_other {
+                // Another repository created the branch first: unrelated.
+                let other = Repository::open_bare(remote).unwrap();
+                let sig = git2::Signature::now("other", "o@example.invalid").unwrap();
+                let tree = other.treebuilder(None).unwrap().write().unwrap();
+                let tree = other.find_tree(tree).unwrap();
+                other
+                    .commit(Some("refs/heads/agentfs/vol"), &sig, &sig, "x", &tree, &[])
+                    .unwrap()
+            } else {
+                // Ours first, then another writer moved it.
+                assert!(
+                    v.pusher("origin", Arc::new(NullSink))
+                        .push_once()
+                        .is_success()
+                );
+                write_remote(remote, "refs/heads/agentfs/vol")
+            };
+            Repository::open_bare(remote)
+                .unwrap()
+                .reference("refs/agentfs/vol/inbox/0000000001", theirs, false, "t")
+                .unwrap();
+            let repo = v.com.history().repo();
+            repo.reference("refs/agentfs/vol/applied/0000000001", c1, false, "t")
+                .unwrap();
+            repo.reference("refs/agentfs/vol/status", c1, false, "t")
+                .unwrap();
+            let before = remote_refs(remote);
+            let (events, sink_events) = sink();
+            let mut pusher = v.pusher("origin", sink_events);
+            let outcome = pusher.push_once();
+            assert!(
+                matches!(outcome, PushOutcome::Diverged { .. }),
+                "{outcome:?}"
+            );
+            let queue = pusher.queue().unwrap().clone();
+            assert_eq!(queue.branch_not_ours, Some(Claim::Diverged), "{queue:?}");
+            assert_eq!((queue.status, queue.applied, queue.deleted), (false, 0, 0));
+            assert_eq!(queue.error, None);
+            // Only the divergence save was added.
+            let after: Vec<String> = remote_refs(remote)
+                .into_iter()
+                .filter(|r| !r.starts_with("refs/agentfs/vol/diverged/"))
+                .collect();
+            assert_eq!(after, before);
+            assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(theirs));
+            assert!(
+                !events.take().iter().any(|e| matches!(
+                    e,
+                    Event::PushFailed {
+                        stage: PushStage::Queue,
+                        ..
+                    }
+                )),
+                "a branch not ours is no queue failure"
+            );
+            assert_eq!(pusher.state().queue_error, None);
+            assert_eq!(
+                pusher.state().queue_synced_status,
+                None,
+                "retried next time"
+            );
+        }
+    }
+
+    /// No branch on the remote yet (the branch push failed before it was
+    /// created): the queue push waits for it ([`Claim::Create`]).
+    #[test]
+    fn the_queue_push_waits_for_the_branch_to_exist() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::with_config(
+            "vol",
+            &[("origin", &remote.display().to_string())],
+            &[("remote.origin.agentfsMaxPushSize", "1m")],
+        );
+        let big = v.commit_file("big", &random(2 << 20, 6));
+        v.com
+            .history()
+            .repo()
+            .reference("refs/agentfs/vol/status", big, false, "t")
+            .unwrap();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(!pusher.push_once().is_success());
+        let queue = pusher.queue().unwrap();
+        assert_eq!(queue.branch_not_ours, Some(Claim::Create), "{queue:?}");
+        assert!(queue.summary().starts_with("nothing written"), "{queue:?}");
+        assert!(remote_refs(remote).is_empty());
+    }
+
+    /// F8 rule 2, acceptance 1: the branch moved between the queue push's
+    /// listing and its push. The no-op branch update it carries is leased
+    /// on the listed value, so libgit2's negotiation stops the push.
+    #[test]
+    fn a_branch_moved_after_the_listing_stops_the_queue_push() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path().to_owned();
+        bare(&remote);
+        let url = format!("file://{}", remote.display());
+        let mut v = Vol::new("vol", &[("origin", &url)]);
+        let c1 = v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        v.com
+            .history()
+            .repo()
+            .reference("refs/agentfs/vol/status", c1, false, "t")
+            .unwrap();
+        let moved = remote.clone();
+        pusher.after_queue_listing = Some(Box::new(move || {
+            write_remote(&moved, "refs/heads/agentfs/vol");
+        }));
+        assert!(pusher.push_once().is_success(), "the branch was up to date");
+        let queue = pusher.queue().unwrap();
+        let Some((_, message)) = &queue.error else {
+            panic!("the queue push went through: {queue:?}");
+        };
+        assert!(message.contains("changed on the remote"), "{message}");
+        assert!(!queue.status);
+        assert_eq!(remote_ref(&remote, "refs/agentfs/vol/status"), None);
+        // The other writer's commit stays.
+        assert_ne!(remote_ref(&remote, "refs/heads/agentfs/vol"), Some(c1));
     }
 
     /// Incompressible bytes: a xorshift stream.
@@ -2919,6 +3325,7 @@ mod tests {
             remote_head: None,
             diverged_ref: None,
             pending_ref: Some(name.clone()),
+            saved_head: None,
         });
         state.save(&state_path).unwrap();
         v.com
@@ -2947,6 +3354,213 @@ mod tests {
         assert_eq!(saved.diverged_ref, Some(name));
         assert_eq!(saved.pending_ref, None);
         assert_eq!(saved.since_ms, 1000);
+    }
+
+    /// F8 D3, acceptance 2: the divergence save follows the head, so a
+    /// diverged worktree's later commits reach the remote under its own
+    /// name; a save another writer moved is kept, never overwritten.
+    #[test]
+    fn the_divergence_save_follows_the_head() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        v.commit();
+        let (events, sink_events) = sink();
+        let mut pusher = v.pusher("origin", sink_events);
+        assert!(pusher.push_once().is_success());
+        let theirs = write_remote(remote, "refs/heads/agentfs/vol");
+        let first = v.commit();
+        let PushOutcome::Diverged {
+            diverged_ref: Some(name),
+            ..
+        } = pusher.push_once()
+        else {
+            panic!("not diverged");
+        };
+        assert_eq!(diverged_refs(remote, "vol"), [(name.clone(), first)]);
+        events.take();
+
+        // Two more commits: the save fast-forwards to the new head, with no
+        // second Diverged and no second save.
+        v.commit();
+        let head = v.commit();
+        let outcome = pusher.push_once();
+        assert!(
+            matches!(&outcome, PushOutcome::Diverged { diverged_ref: Some(r), local_head, .. }
+                if *r == name && *local_head == head),
+            "{outcome:?}"
+        );
+        assert_eq!(diverged_refs(remote, "vol"), [(name.clone(), head)]);
+        let got = events.take();
+        assert!(
+            matches!(
+                &got[..],
+                [Event::PushFailed {
+                    kind: PushFailureKind::NonFastForward,
+                    ..
+                }]
+            ),
+            "{got:?}"
+        );
+        let saved = PushState::load(&v.state.push_state("origin"))
+            .diverged
+            .unwrap();
+        assert_eq!(saved.saved_head, Some(head.to_string()));
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(theirs));
+
+        // The save deleted on the remote is re-created at the next head.
+        Repository::open_bare(remote)
+            .unwrap()
+            .find_reference(&name)
+            .unwrap()
+            .delete()
+            .unwrap();
+        let head = v.commit();
+        pusher.push_once();
+        assert_eq!(diverged_refs(remote, "vol"), [(name.clone(), head)]);
+
+        // Another writer moves the save: kept, and the alarm says so.
+        let moved = write_remote(remote, &name);
+        v.commit();
+        let outcome = pusher.push_once();
+        assert!(
+            matches!(&outcome, PushOutcome::Diverged { diverged_ref: Some(r), .. } if *r == name),
+            "{outcome:?}"
+        );
+        assert_eq!(diverged_refs(remote, "vol"), [(name.clone(), moved)]);
+        let got = events.take();
+        assert!(
+            got.iter()
+                .any(|e| matches!(e, Event::PushFailed { message, .. }
+                if message.contains("another writer moved it"))),
+            "{got:?}"
+        );
+        let saved = pusher.state().diverged.clone().unwrap();
+        assert_eq!(
+            saved.saved_head,
+            Some(head.to_string()),
+            "the last head it reached"
+        );
+    }
+
+    /// Writes a commit unrelated to anything else into `remote` at `name`.
+    fn write_unrelated(remote: &Path, name: &str) -> Oid {
+        let repo = Repository::open_bare(remote).unwrap();
+        let sig = git2::Signature::now("other", "o@example.invalid").unwrap();
+        let blob = repo.blob(b"unrelated").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("u", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+        let oid = repo
+            .commit(None, &sig, &sig, "unrelated", &tree, &[])
+            .unwrap();
+        repo.reference(name, oid, true, "t").unwrap();
+        oid
+    }
+
+    /// F8 S2, acceptance 3: `push_with_lease` replaces the volume's own
+    /// branch only when the remote holds the lease and the lease shares a
+    /// commit with the head, and clears the divergence.
+    #[test]
+    fn a_lease_push_replaces_only_the_leased_branch() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        // Another writer's commit: not in this repository.
+        let theirs = write_remote(remote, "refs/heads/agentfs/vol");
+        let head = v.commit();
+        assert!(matches!(pusher.push_once(), PushOutcome::Diverged { .. }));
+        assert!(
+            v.com.history().repo().find_commit(theirs).is_err(),
+            "the other writer's commit is unknown here"
+        );
+        let before = remote_refs(remote);
+
+        // A wrong lease: nothing written, nothing fetched.
+        assert_eq!(
+            pusher.push_with_lease(head),
+            LeaseOutcome::LeaseBroken {
+                found: Some(theirs)
+            }
+        );
+        assert_eq!(remote_refs(remote), before);
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(theirs));
+        assert!(pusher.state().diverged.is_some());
+
+        // The right lease, not in the repository: fetched into a scratch
+        // repository first (the state area never takes it in), then the
+        // branch is replaced and the divergence cleared.
+        assert_eq!(
+            pusher.push_with_lease(theirs),
+            LeaseOutcome::Pushed {
+                from: theirs,
+                to: head
+            }
+        );
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(head));
+        assert!(v.com.history().repo().find_commit(theirs).is_err());
+        assert!(!pusher.lock_path().with_extension("lease.git").exists());
+        let state = PushState::load(&v.state.push_state("origin"));
+        assert_eq!(state.diverged, None);
+        assert_eq!(state.last_pushed, Some(head.to_string()));
+        assert_eq!(state.consecutive_failures, 0);
+        // Only the branch moved: the diverged save stays.
+        assert_eq!(diverged_refs(remote, "vol").len(), 1);
+        assert_eq!(
+            pusher.push_with_lease(theirs),
+            LeaseOutcome::UpToDate { head }
+        );
+        assert!(pusher.push_once().is_success());
+
+        // An unrelated history on the remote is never replaced.
+        let unrelated = write_unrelated(remote, "refs/heads/agentfs/vol");
+        v.commit();
+        assert_eq!(
+            pusher.push_with_lease(unrelated),
+            LeaseOutcome::Unrelated {
+                lease: unrelated,
+                head: v.head()
+            }
+        );
+        assert_eq!(
+            remote_ref(remote, "refs/heads/agentfs/vol"),
+            Some(unrelated)
+        );
+
+        // No branch on the remote: the lease is broken.
+        Repository::open_bare(remote)
+            .unwrap()
+            .find_reference("refs/heads/agentfs/vol")
+            .unwrap()
+            .delete()
+            .unwrap();
+        assert_eq!(
+            pusher.push_with_lease(unrelated),
+            LeaseOutcome::LeaseBroken { found: None }
+        );
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), None);
+    }
+
+    #[test]
+    fn a_lease_push_waits_for_no_lock_and_needs_a_branch() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        bare(remote_dir.path());
+        let mut v = Vol::new(
+            "vol",
+            &[("origin", &remote_dir.path().display().to_string())],
+        );
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        let lease = Oid::from_bytes(&[7; 20]).unwrap();
+        assert_eq!(pusher.push_with_lease(lease), LeaseOutcome::NothingToPush);
+        v.commit();
+        let held = v.pusher("origin", Arc::new(NullSink));
+        let _lock = held.lock().unwrap().unwrap();
+        assert_eq!(pusher.push_with_lease(lease), LeaseOutcome::Busy);
     }
 
     /// F8 rule 2: the branch push decides in libgit2's negotiation, from
@@ -3856,13 +4470,20 @@ mod tests {
         }
 
         /// A branch push that fails before git runs (stage lfs) still
-        /// pushes the queue's status, and holds the applied refs back.
+        /// pushes the queue's status while the remote's branch is this
+        /// worktree's (F8 rule 2), and holds the applied refs back.
         #[test]
         fn a_failed_lfs_stage_still_pushes_the_queue_status() {
             let remote_dir = tempfile::tempdir().unwrap();
             bare(remote_dir.path());
             let url = remote_dir.path().display().to_string();
             let mut v = Vol::with_config("vol", &[("origin", &url)], &[THRESHOLD]);
+            v.commit_file("small.txt", b"small");
+            assert!(
+                v.pusher("origin", Arc::new(NullSink))
+                    .push_once()
+                    .is_success()
+            );
             let head = v.commit_file("big.bin", b"large content");
             let p = pointer_at(&v, "big.bin");
             fs::remove_file(v.com.lfs_cache().path(&p.oid)).unwrap();

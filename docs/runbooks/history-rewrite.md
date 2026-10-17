@@ -5,8 +5,11 @@ agentfs never scans content and never rewrites history on its own
 is in the state area's history and on every remote it reached. Removing
 it is this operator procedure ([§15](../design.md#15-recovery-and-undo)):
 rewrite the volume's branch with `git filter-repo`, outside the state
-area, bring it back, and force-push it to each remote. It is the one
-case where the volume's branch is force-pushed, by an operator.
+area, bring it back, and replace it on each remote with `agentfs push
+--force-with-lease`. It is the one case where the volume's branch is
+replaced, by an operator, and only through that command: no runbook
+`git push`es a branch (a test, `runbooks_push_only_the_namespace`,
+holds them to refs under `refs/agentfs/`).
 
 `ci/e2e-runbooks.sh` runs every block below, as written, in CI (against
 a `file://` remote), and checks that the secret's blobs are gone from the
@@ -142,17 +145,26 @@ rm -f "$STATE"/meta/push/*.json
 ## 9. Rewrite every remote
 
 For each remote the secret reached (`git --git-dir "$STATE/git" config
---get-regexp 'remote\..*\.(push)?url'` lists them), with git credentials
-for it, as in [divergence.md](divergence.md). The lease makes the push
-fail if the branch moved since you looked.
+--get-regexp 'remote\..*\.(push)?url'` lists them; `NAME` is the remote's
+name), replace the branch with `agentfs push --force-with-lease`, leased
+on the tip the remote shows: it fails if the branch moved since you
+looked (`lease broken`), and refuses a branch that shares no commit with
+the rewritten one (`shares no commit`: the secret was in the first
+commit, so the rewrite changed the root; continue under a new name
+instead, as in [divergence.md](divergence.md) case B). The old tip, gone
+from the state area since step 6, is fetched into a scratch repository
+for that check, never into the state area. `git ls-remote` and the
+deletions need git credentials for the remote, as in
+[divergence.md](divergence.md).
 
 <!-- ci: rewrite-remote -->
 ```sh
-URL=$(git --git-dir "$STATE/git" config remote.origin.url)
+NAME=origin
+URL=$(git --git-dir "$STATE/git" config "remote.$NAME.url")
 OLD_TIP=$(git ls-remote "$URL" "$BRANCH" | cut -f1)
-git --git-dir "$STATE/git" push -q --force-with-lease="$BRANCH:$OLD_TIP" "$URL" "$BRANCH:$BRANCH"
-for ref in $(git ls-remote "$URL" "refs/agentfs/$VOL/*" | cut -f2); do
-  git --git-dir "$STATE/git" push -q "$URL" --delete "$ref"
+agentfs --state "$STATE" push --remote "$NAME" --force-with-lease "$OLD_TIP"
+for name in $(git ls-remote "$URL" "refs/agentfs/$VOL/*" | cut -f2 | sed "s|^refs/agentfs/$VOL/||"); do
+  git --git-dir "$STATE/git" push -q "$URL" --delete "refs/agentfs/$VOL/$name"
 done
 ```
 
@@ -160,7 +172,7 @@ The loop deletes the volume's other refs on that remote (`diverged/`,
 `overwritten/`): they hold the old history too. To keep one, rewrite it
 like the branch instead (fetch it into the mirror before step 4).
 
-A force-push does not remove the old objects from the server. What does
+Replacing the branch does not remove the old objects from the server. What does
 depends on the host:
 
 - **A bare repository you run** (ssh, a file server): expire its reflog
@@ -281,15 +293,29 @@ mounted pushes its branch on its interval like any volume.
 
 ### F3. Delete the affected refs on each remote (after step 9)
 
-With the lease each was found at, so a ref that moved since F1 is left
-for you to look at:
+These are other worktrees' refs (the abandoned forks' branches and their
+`refs/agentfs/<fork>/` refs), which no runbook `git push`es: each worktree
+writes only its own branch. Delete them where each repository is kept,
+each only while it still holds the oid F1 found, so a ref that moved
+since is left for you to look at:
 
-<!-- ci: rewrite-fork-refs -->
-```sh
-while read -r URL OID REF; do
-  git --git-dir "$STATE/git" push -q --force-with-lease="$REF:$OID" "$URL" ":$REF"
-done < "$FORK_WORK/affected"
-```
+- **A bare repository you run**: on the server, with `$SERVER_REPO` its
+  path and `$SERVER_URL` the URL F1 listed it under (copy
+  `$FORK_WORK/affected` there). `update-ref -d <ref> <oid>` deletes only
+  a ref at that oid:
+
+  <!-- ci: rewrite-fork-refs -->
+  ```sh
+  while read -r URL OID REF; do
+    [ "$URL" = "$SERVER_URL" ] || continue
+    git --git-dir "$SERVER_REPO" update-ref -d "$REF" "$OID" || echo "$REF moved since F1: left"
+  done < "$FORK_WORK/affected"
+  ```
+
+- **A forge**: delete each ref with the forge's own tools (GitHub: `gh
+  api -X DELETE repos/<owner>/<repo>/git/refs/<the ref without refs/>`),
+  after checking it still points at its oid: a forge's API takes no
+  lease.
 
 Then purge each host as in step 9 (a bare repository: `reflog expire` and
 `gc` on it; a forge: its own purge), fork remotes included, and continue

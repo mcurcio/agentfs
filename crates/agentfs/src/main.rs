@@ -81,7 +81,7 @@ use agentfs_core::identity::Context;
 use agentfs_core::lfs;
 use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::paths::{PathError, RepoPath};
-use agentfs_core::push::{self, PushOutcome, RemotePusher, RemoteStatus};
+use agentfs_core::push::{self, LeaseOutcome, PushOutcome, RemotePusher, RemoteStatus};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::service::{FinalPush, Service};
 use agentfs_core::telemetry::Telemetry;
@@ -184,7 +184,8 @@ enum Command {
     /// Push the volume's refs to its remotes once. With a daemon running
     /// (`mount`, `run`, `serve-history`), asks it to commit and push now
     /// over its control socket; otherwise pushes directly. Exits 1 unless
-    /// every selected remote succeeded.
+    /// every selected remote succeeded. `--force-with-lease` always pushes
+    /// directly, one remote only.
     Push {
         /// Push only this remote; repeatable (default: every remote).
         #[arg(long = "remote", value_name = "NAME")]
@@ -194,6 +195,9 @@ enum Command {
         /// directly ignores it.
         #[arg(long, default_value = "120s", value_parser = parse_grace, value_name = "DURATION")]
         timeout: Duration,
+        /// Replace this volume's own branch on one remote, leased on OID (runbooks only).
+        #[arg(long, value_name = "OID")]
+        force_with_lease: Option<String>,
         #[command(flatten)]
         pod: Pod,
     },
@@ -541,8 +545,17 @@ fn real_main() -> Result<ExitCode> {
         Command::Push {
             remotes,
             timeout,
+            force_with_lease,
             pod,
         } => {
+            // A lease push is always direct, under the remote's push lock
+            // only: never through a daemon, never the state lock (§15).
+            if let Some(lease) = force_with_lease {
+                let session = Session::start(&state, &pod)?;
+                let code = push_with_lease(&state, &remotes, &lease, &session)?;
+                session.finish();
+                return Ok(code);
+            }
             // A running daemon pushes for us (design §2.3).
             if let Some(code) = push_now::client(&state, &remotes, timeout) {
                 return Ok(code);
@@ -758,6 +771,95 @@ fn push_once(state: &StateDir, only: &[String], session: &Session) -> Result<Exi
             println!("{}: queue: {}", remote.name, queue.summary());
         }
     }
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// `agentfs push --force-with-lease OID` (§15; the divergence and
+/// history-rewrite runbooks): replaces this volume's own branch on exactly
+/// one remote with the local head, if the remote holds `lease` and it
+/// shares a commit with the head. Direct, under the remote's push lock.
+/// Exit 0 for pushed and up to date, 1 otherwise, 75 when the remote is
+/// being pushed.
+fn push_with_lease(
+    state: &StateDir,
+    only: &[String],
+    lease: &str,
+    session: &Session,
+) -> Result<ExitCode> {
+    let lease = agentfs_core::fork::identity::full_commit(lease)
+        .with_context(|| format!("--force-with-lease: {lease:?} is not a full commit id"))?;
+    let history = History::open(&state.git())
+        .with_context(|| format!("opening {}", state.root().display()))?;
+    let settings = history.settings();
+    session.telemetry().observe_volume(state, settings);
+    if let Some(bad) = settings
+        .invalid_remotes
+        .iter()
+        .find(|bad| only.contains(&bad.name))
+    {
+        bail!("remote {:?} is misconfigured: {}", bad.name, bad.error);
+    }
+    let remote = match only {
+        [name] => settings
+            .remotes
+            .iter()
+            .find(|r| r.name == *name)
+            .with_context(|| format!("no remote named {name:?} is configured"))?,
+        [] => match settings.remotes.as_slice() {
+            [remote] => remote,
+            [] => bail!("--force-with-lease: no remote is configured"),
+            _ => bail!("--force-with-lease needs --remote NAME: this volume has several remotes"),
+        },
+        _ => bail!("--force-with-lease replaces the branch on one remote: give one --remote"),
+    };
+    let mut pusher = RemotePusher::open(
+        state,
+        settings,
+        remote,
+        session.events.clone(),
+        session.telemetry(),
+    )?;
+    let name = &remote.name;
+    let ok = match pusher.push_with_lease(lease) {
+        LeaseOutcome::Pushed { from, to } => {
+            println!("{name}: replaced {from} with {to} (leased on {lease})");
+            true
+        }
+        LeaseOutcome::UpToDate { head } => {
+            println!("{name}: up to date at {head}");
+            true
+        }
+        LeaseOutcome::NothingToPush => {
+            println!("{name}: nothing to push: the branch has no commit yet");
+            false
+        }
+        LeaseOutcome::LeaseBroken { found: now } => {
+            println!(
+                "{name}: lease broken: the remote holds {}, not {lease}; nothing was written",
+                now.map_or_else(|| "no such branch".to_owned(), |o| o.to_string())
+            );
+            false
+        }
+        LeaseOutcome::Unrelated { lease, head } => {
+            println!(
+                "{name}: refused: the remote holds {lease}, which shares no commit with the head \
+                 {head}; it is another history and is never replaced (continue under a new name)"
+            );
+            false
+        }
+        LeaseOutcome::Failed { kind, message } => {
+            println!("{name}: failed ({kind}): {message}");
+            false
+        }
+        LeaseOutcome::Busy => {
+            eprintln!("error: another process is pushing remote {name}; retry");
+            return Ok(ExitCode::from(EXIT_LOCKED));
+        }
+    };
     Ok(if ok {
         ExitCode::SUCCESS
     } else {
