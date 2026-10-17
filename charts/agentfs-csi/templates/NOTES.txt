@@ -1,8 +1,8 @@
 The agentfs CSI driver ({{ include "agentfs-csi.driverName" . }}) is installed in {{ .Release.Namespace }}.
 
-Check it:
-  kubectl -n {{ .Release.Namespace }} rollout status deployment/agentfs-csi-controller
-  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name=agentfs-csi-node
+Check it (one node plugin per node, each provisioning its own node's worktrees):
+  kubectl -n {{ .Release.Namespace }} wait --for=condition=Ready pod -l app.kubernetes.io/name=agentfs-csi-node
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name=agentfs-csi-node -o wide
 {{- $ns := lookup "v1" "Namespace" "" .Release.Namespace }}
 {{- with $ns }}
 {{- $enforce := dig "metadata" "labels" "pod-security.kubernetes.io/enforce" "" . }}

@@ -481,15 +481,12 @@ Runbooks, with the full procedures:
 - [history-service-down.md](runbooks/history-service-down.md): fronts
   failing with `EIO` because the history service is down, hung or
   refusing them (§16);
-- [node-lost.md](runbooks/node-lost.md): a node that is powered off or
-  cut off, its pods stuck Terminating and its volumes still attached;
-  confirming it is down, the out-of-service taint, and checking the state
-  lock before the volume starts elsewhere. On a shared basePath (NFS), a
-  node that is cut off but still running keeps writing: if its volume is
-  force-detached or the node tainted out of service while it runs, a
-  service on another node can take the lock once the NFS lease expires,
-  and two writers can corrupt the journal. Only a node-local basePath
-  rules this out ([csi.md](csi.md#11-shared-filesystems)).
+- [moving.md](runbooks/moving.md): a CSI volume continued on another
+  node (a node lost or retired) as a new volume started from its branch;
+  each worktree stays on its node's disk
+  ([csi.md](csi.md#11-where-worktrees-live));
+- [start-branch-moved.md](runbooks/start-branch-moved.md): the old branch
+  received commits after a move (`StartBranchMoved`).
 
 **Patches** (§12) are the other way to change the tree from outside:
 producers queue them on the remote (`agentfs patch submit`), and every

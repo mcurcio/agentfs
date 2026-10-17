@@ -1,14 +1,15 @@
 //! Where the driver keeps things (design §14.2).
 //!
 //! ```text
-//! <base>/                         --base-path: one filesystem, the same path on
-//!                                 the controller and every node
-//!   <handle>/                     a volume (the PV name), 0700
+//! <base>/                         --base-path: a directory on this node's own
+//!                                 disk, never a network filesystem (F8 R1)
+//!   <handle>/                     a worktree (the PV name), 0700
 //!     backing/                    the files the pods see
 //!     state/                      the state area (design §2.2)
-//!     csi.json                    the controller's record of the volume
-//!   .nodes/<node-id>              a node plugin is registered (ControllerPublish checks)
-//!   .deleting.<handle>/           a volume DeleteVolume is removing
+//!     csi.json                    the record of the volume (CreateVolume, or
+//!                                 a static PV adopted over the worktree)
+//!     csi.retained.json           the record once DeleteVolume kept the worktree
+//!   .deleting.<handle>/           a worktree DeleteVolume is removing
 //! <node-state>/                   --node-state: on the node, survives plugin restarts
 //!   run/<handle>/history.sock     the volume's history service (directory 0700)
 //!   staged/<handle>.json          a staged volume: its service runs
@@ -81,15 +82,6 @@ impl Layout {
     /// never names a volume.
     pub fn deleting_dir(&self, handle: &str) -> PathBuf {
         self.base.join(format!(".deleting.{handle}"))
-    }
-
-    pub fn nodes_dir(&self) -> PathBuf {
-        self.base.join(".nodes")
-    }
-
-    /// Present while a node plugin with this id has started.
-    pub fn node_marker(&self, node: &str) -> PathBuf {
-        self.nodes_dir().join(node)
     }
 
     /// The directory of the volume's history service socket (0700).
@@ -193,7 +185,7 @@ mod tests {
         assert_eq!(l.state("v"), Path::new("/b/v/state"));
         assert_eq!(l.backing("v"), Path::new("/b/v/backing"));
         assert_eq!(l.csi_json("v"), Path::new("/b/v/csi.json"));
-        assert_eq!(l.node_marker("n1"), Path::new("/b/.nodes/n1"));
+        assert_eq!(l.retained_json("v"), Path::new("/b/v/csi.retained.json"));
         assert_eq!(l.socket("v"), Path::new("/n/run/v/history.sock"));
         assert_eq!(l.staged_record("v"), Path::new("/n/staged/v.json"));
         assert_eq!(

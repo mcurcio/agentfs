@@ -1,15 +1,17 @@
 //! `agentfs-csi`: the agentfs CSI driver (design §14.2, docs/csi.md).
 //!
-//! `--mode controller` runs beside csi-provisioner and csi-attacher;
-//! `--mode node` in the node DaemonSet, privileged; `--mode all` both, for
-//! csi-sanity and single-node clusters.
+//! Runs in the node DaemonSet on every node, privileged, beside
+//! csi-provisioner (`--node-deployment`) and node-driver-registrar, and
+//! serves the Identity, Controller and Node services (F8 R8). Its base
+//! path must be on the node's own disk: a network filesystem is refused
+//! before anything is served (F8 R1).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
 use agentfs_core::config::parse_duration;
 use agentfs_csi::controller::ControllerService;
@@ -18,16 +20,9 @@ use agentfs_csi::launcher::{AgentfsLauncher, FrontOptions, PluginIdentity};
 use agentfs_csi::layout::{Layout, validate_node};
 use agentfs_csi::mounter::KernelMounter;
 use agentfs_csi::node::NodeService;
-use agentfs_csi::publisher::Publisher;
+use agentfs_csi::release_scan::ReleaseScan;
 use agentfs_csi::server;
 use agentfs_csi::supervisor::{Backoff, NodeConfig, Supervisor};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Mode {
-    Controller,
-    Node,
-    All,
-}
 
 fn duration(value: &str) -> Result<Duration, String> {
     parse_duration(value).ok_or_else(|| format!("{value:?} is not a duration (use e.g. 500ms, 5s)"))
@@ -37,17 +32,14 @@ fn duration(value: &str) -> Result<Duration, String> {
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Which CSI services to serve.
-    #[arg(long, env = "AGENTFS_CSI_MODE", value_enum)]
-    mode: Mode,
     /// The CSI socket.
     #[arg(long, env = "CSI_ENDPOINT", default_value = "unix:///csi/csi.sock")]
     endpoint: String,
-    /// This node's name (node and all modes): `spec.nodeName`.
+    /// This node's name: `spec.nodeName`.
     #[arg(long, env = "NODE_NAME")]
-    node_id: Option<String>,
-    /// Where volumes live: one filesystem, at the same path on the
-    /// controller and every node.
+    node_id: String,
+    /// Where this node's worktrees live: a directory on the node's own
+    /// disk (a network filesystem is refused).
     #[arg(long, default_value = "/var/lib/agentfs-csi/volumes")]
     base_path: PathBuf,
     /// The node's records of staged and published volumes, and the history
@@ -94,10 +86,11 @@ struct Cli {
     /// The plugin pod's namespace.
     #[arg(long, env = "AGENTFS_CSI_NAMESPACE", default_value = "")]
     namespace: String,
-    /// How often the node plugin looks for forks whose deletion asked for
-    /// them to be finished and published (design §11.5).
-    #[arg(long, env = "AGENTFS_CSI_FORK_SCAN_INTERVAL", default_value = "30s", value_parser = duration)]
-    fork_scan_interval: Duration,
+    /// How often the release scan pushes the worktrees no pod stages, and
+    /// finishes the forks whose deletion asked for it (F8 D1, design
+    /// §11.5); the first delay after a failed push.
+    #[arg(long, env = "AGENTFS_CSI_RELEASE_SCAN_INTERVAL", default_value = "30s", value_parser = duration)]
+    release_scan_interval: Duration,
 }
 
 #[tokio::main]
@@ -127,14 +120,29 @@ async fn run(cli: Cli) -> Result<(), String> {
             cli.passthrough
         ));
     }
-    // Every volume's state lock lives under the base path: a filesystem
-    // whose locks would not keep another node out is refused before
-    // anything is served (design §14.2).
+    let node_id = cli.node_id.clone();
+    if node_id.is_empty() {
+        return Err("--node-id (or NODE_NAME) is required".into());
+    }
+    validate_node(&node_id).map_err(|e| e.to_string())?;
+    // Worktrees live on this node's own disk (F8 R1): a network
+    // filesystem is refused before anything is served, naming its type.
     std::fs::create_dir_all(&cli.base_path)
         .map_err(|e| agentfs_csi::volume::chain(&e))
         .and_then(|()| {
-            agentfs_core::shared_fs::require_safe_locks(&cli.base_path)
+            agentfs_core::shared_fs::network_filesystem(&cli.base_path)
                 .map_err(|e| agentfs_csi::volume::chain(&e))
+        })
+        .and_then(|network| match network {
+            None => Ok(()),
+            Some(mount) => Err(format!(
+                "it is on {} ({} at {}), a network filesystem: each node keeps its worktrees \
+                 on its own disk (design §14.2); use a local directory, ideally on a disk of its \
+                 own",
+                mount.fstype,
+                mount.source,
+                mount.mountpoint.display()
+            )),
         })
         .map_err(|e| format!("base path {}: {e}", cli.base_path.display()))?;
     let layout = Layout {
@@ -143,81 +151,68 @@ async fn run(cli: Cli) -> Result<(), String> {
         mount_dir: cli.mount_dir.clone(),
         profiles: cli.profiles_dir.clone(),
     };
-    let controller = matches!(cli.mode, Mode::Controller | Mode::All)
-        .then(|| ControllerService::new(layout.clone()));
-    let (stop_tx, stop_publisher) = tokio::sync::watch::channel(false);
-    let supervisor = if matches!(cli.mode, Mode::Node | Mode::All) {
-        let node_id = cli
-            .node_id
-            .clone()
-            .filter(|n| !n.is_empty())
-            .ok_or("--node-id (or NODE_NAME) is required in node mode")?;
-        validate_node(&node_id).map_err(|e| e.to_string())?;
-        let mut cfg = NodeConfig::new(node_id.clone(), layout.clone());
-        cfg.plugin = PluginIdentity {
-            namespace: cli.namespace.clone(),
-            pod: cli.pod.clone(),
-            node: node_id,
-        };
-        let plugin = cfg.plugin.clone();
-        cfg.front = FrontOptions {
-            passthrough: cli.passthrough.clone(),
-            threads: cli.front_threads,
-            history_wait: cli.history_wait,
-        };
-        cfg.stage_wait = cli.stage_wait;
-        cfg.publish_wait = cli.publish_wait;
-        cfg.unpublish_grace = cli.unpublish_grace;
-        cfg.unstage_grace = cli.unstage_grace;
-        cfg.backoff = Backoff {
-            max: cli.backoff_max,
-            ..Backoff::default()
-        };
-        let launcher = Arc::new(AgentfsLauncher {
-            bin: cli.agentfs_bin.clone(),
-        });
-        let supervisor = Supervisor::new(cfg, launcher.clone(), Arc::new(KernelMounter));
-        let report = supervisor.reconcile().await.map_err(|e| e.to_string())?;
-        for bad in &report.unreadable {
-            eprintln!("warning: an unreadable node record was skipped: {bad}");
-        }
-        eprintln!(
-            "reconciled: {} history service(s) started, {} front(s) recovering, {} record(s) \
-             dropped",
-            report.services, report.recovering, report.dropped
-        );
-        // Forks asked to finish, at once and then on an interval.
-        let publisher = Arc::new(Publisher::new(
-            Arc::new(layout.clone()),
-            launcher,
-            plugin,
-            cli.fork_scan_interval,
-        ));
-        tokio::spawn(publisher.run(stop_publisher.clone()));
-        Some(supervisor)
-    } else {
-        None
+    let (stop_tx, stop_scan) = tokio::sync::watch::channel(false);
+    let mut cfg = NodeConfig::new(node_id.clone(), layout.clone());
+    cfg.plugin = PluginIdentity {
+        namespace: cli.namespace.clone(),
+        pod: cli.pod.clone(),
+        node: node_id.clone(),
     };
+    let plugin = cfg.plugin.clone();
+    cfg.front = FrontOptions {
+        passthrough: cli.passthrough.clone(),
+        threads: cli.front_threads,
+        history_wait: cli.history_wait,
+    };
+    cfg.stage_wait = cli.stage_wait;
+    cfg.publish_wait = cli.publish_wait;
+    cfg.unpublish_grace = cli.unpublish_grace;
+    cfg.unstage_grace = cli.unstage_grace;
+    cfg.backoff = Backoff {
+        max: cli.backoff_max,
+        ..Backoff::default()
+    };
+    let backoff = cfg.backoff;
+    let launcher = Arc::new(AgentfsLauncher {
+        bin: cli.agentfs_bin.clone(),
+    });
+    let supervisor = Supervisor::new(cfg, launcher.clone(), Arc::new(KernelMounter));
+    let report = supervisor.reconcile().await.map_err(|e| e.to_string())?;
+    for bad in &report.unreadable {
+        eprintln!("warning: an unreadable node record was skipped: {bad}");
+    }
     eprintln!(
-        "agentfs-csi {} serving {:?} on {} (base path {})",
+        "reconciled: {} history service(s) started, {} front(s) recovering, {} record(s) \
+         dropped",
+        report.services, report.recovering, report.dropped
+    );
+    // Unstaged worktrees and forks asked to finish: at once, then on an
+    // interval and whenever DeleteVolume waits.
+    let release = Arc::new(ReleaseScan::new(
+        Arc::new(layout.clone()),
+        launcher,
+        plugin,
+        cli.release_scan_interval,
+        backoff,
+    ));
+    tokio::spawn(release.clone().run(stop_scan));
+    eprintln!(
+        "agentfs-csi {} serving on {} for node {node_id} (base path {})",
         env!("CARGO_PKG_VERSION"),
-        cli.mode,
         socket.display(),
         layout.base.display()
     );
     let result = server::serve(
         &socket,
-        IdentityService::new(controller.is_some()),
-        controller,
-        supervisor.clone().map(NodeService::new),
+        IdentityService::new(),
+        ControllerService::new(layout, node_id, release),
+        NodeService::new(supervisor.clone()),
         shutdown_signal(),
     )
     .await;
     let _ = stop_tx.send(true);
-    if let Some(supervisor) = supervisor {
-        eprintln!("stopping the fronts and history services");
-        supervisor.shutdown().await;
-    }
+    eprintln!("stopping the fronts and history services");
+    supervisor.shutdown().await;
     result.map_err(|e| e.to_string())
 }
 

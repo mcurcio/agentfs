@@ -1,0 +1,10 @@
+# Two worker nodes for the CSI move job (ci/e2e-csi-move.sh): each keeps
+# its own worktrees on its own disk, and one is stopped to move a volume
+# to the other. The node image is pinned by digest on the command line
+# (ci/install-kind.sh prints it as KIND_NODE_IMAGE).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

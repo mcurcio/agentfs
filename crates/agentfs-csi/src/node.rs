@@ -1,5 +1,7 @@
 //! The CSI Node service (design §14.2): validates the calls and hands them
-//! to the [`Supervisor`].
+//! to the [`Supervisor`]. NodeGetInfo reports this node's topology
+//! ([`crate::identity::TOPOLOGY_KEY`]), which the kubelet puts on the node
+//! as a label and the PVs' node affinity matches.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -172,10 +174,11 @@ impl Node for NodeService {
         &self,
         _request: Request<NodeGetInfoRequest>,
     ) -> Result<Response<NodeGetInfoResponse>, Status> {
+        let node_id = self.supervisor.config().node_id.clone();
         Ok(Response::new(NodeGetInfoResponse {
-            node_id: self.supervisor.config().node_id.clone(),
+            accessible_topology: Some(crate::controller::topology(&node_id)),
+            node_id,
             max_volumes_per_node: 0,
-            accessible_topology: None,
         }))
     }
 }

@@ -6,9 +6,9 @@ metadata:
   labels:
     {{- include "agentfs-csi.labels" . | nindent 4 }}
 spec:
-  # ControllerPublish only tracks the node, so that the attach/detach
-  # controller enforces one node per volume.
-  attachRequired: true
+  # No attach step: a worktree lives on one node's disk, and its PV's node
+  # affinity keeps its pods there.
+  attachRequired: false
   # NodePublish gets the pod's identity: each pod's front commits as itself.
   podInfoOnMount: true
   # PersistentVolumes only: inline volumes would let a pod author choose

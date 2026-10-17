@@ -116,22 +116,58 @@ impl StartPoint {
     /// branch must be a valid git branch name not starting with `refs/`;
     /// the commit a full id.
     pub fn parse(value: &str) -> Result<Self, BadStartPoint> {
-        let _ = value;
-        todo!("F8 S1")
+        let shape = || BadStartPoint::Shape {
+            value: value.to_owned(),
+        };
+        // The commit has no `@` and the remote no `:`, so the last `@` and
+        // the first `:` split it.
+        let (rest, commit) = value.rsplit_once('@').ok_or_else(shape)?;
+        let (remote, branch) = rest.split_once(':').ok_or_else(shape)?;
+        if remote.is_empty() || branch.is_empty() || commit.is_empty() {
+            return Err(shape());
+        }
+        if crate::config::validate_name(START_REMOTE_KEY, remote).is_err() {
+            return Err(BadStartPoint::BadRemote {
+                remote: remote.to_owned(),
+            });
+        }
+        if branch.starts_with("refs/")
+            || !git2::Reference::is_valid_name(&format!("refs/heads/{branch}"))
+        {
+            return Err(BadStartPoint::NotABranch {
+                branch: branch.to_owned(),
+            });
+        }
+        let commit = full_commit(commit).ok_or_else(|| BadStartPoint::BadCommit {
+            commit: commit.to_owned(),
+        })?;
+        Ok(Self {
+            remote: remote.to_owned(),
+            branch: branch.to_owned(),
+            commit,
+        })
     }
 
     /// `refs/heads/<branch>`.
     pub fn refname(&self) -> String {
-        todo!("F8 S1")
+        format!("refs/heads/{}", self.branch)
     }
 }
 
 impl std::fmt::Display for StartPoint {
     /// `<remote>:<branch>@<commit>`, which [`StartPoint::parse`] reads back.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!("F8 S1")
+        write!(f, "{}:{}@{}", self.remote, self.branch, self.commit)
     }
+}
+
+/// `value` as a commit id, when it is a full one as agentfs writes it
+/// ([`crate::config::is_full_oid`]: never a prefix, which git would pad).
+/// What `startFrom` and `agentfs start accept --tip` take.
+pub fn full_commit(value: &str) -> Option<Oid> {
+    crate::config::is_full_oid(value)
+        .then(|| Oid::from_str(value).ok())
+        .flatten()
 }
 
 /// `refs/agentfs/<volume>/accepted/`: the prefix of the start-branch tips
@@ -147,4 +183,90 @@ pub fn accepted_prefix(volume: &str) -> String {
 /// this volume's name.
 pub fn accepted_ref(volume: &str, tip: Oid) -> String {
     format!("{}{tip}", accepted_prefix(volume))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const C: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn a_start_point_round_trips() {
+        let value = format!("origin:agentfs/ns.data.pvc-1@{C}");
+        let start = StartPoint::parse(&value).unwrap();
+        assert_eq!(
+            start,
+            StartPoint {
+                remote: "origin".into(),
+                branch: "agentfs/ns.data.pvc-1".into(),
+                commit: Oid::from_str(C).unwrap(),
+            }
+        );
+        assert_eq!(start.refname(), "refs/heads/agentfs/ns.data.pvc-1");
+        assert_eq!(start.to_string(), value);
+        assert_eq!(StartPoint::parse(&start.to_string()).unwrap(), start);
+        // An `@` inside the branch: the last one splits.
+        let at = StartPoint::parse(&format!("o:team@x/v@{C}")).unwrap();
+        assert_eq!(at.branch, "team@x/v");
+    }
+
+    #[test]
+    fn every_bad_start_point() {
+        let shape = |v: &str| BadStartPoint::Shape { value: v.into() };
+        for value in [
+            "",
+            "origin",
+            "origin:agentfs/v",
+            &format!("agentfs/v@{C}"),
+            &format!(":agentfs/v@{C}"),
+            &format!("origin:@{C}"),
+            "origin:agentfs/v@",
+        ] {
+            assert_eq!(StartPoint::parse(value), Err(shape(value)), "{value:?}");
+        }
+        assert_eq!(
+            StartPoint::parse(&format!("../x:agentfs/v@{C}")),
+            Err(BadStartPoint::BadRemote {
+                remote: "../x".into()
+            })
+        );
+        for branch in [
+            "refs/agentfs/v1/diverged/20261016T000000Z",
+            "refs/heads/agentfs/v1",
+            "a..b",
+            "a b",
+            "x.lock",
+        ] {
+            let err = StartPoint::parse(&format!("origin:{branch}@{C}")).unwrap_err();
+            assert_eq!(
+                err,
+                BadStartPoint::NotABranch {
+                    branch: branch.into()
+                }
+            );
+        }
+        let diverged = StartPoint::parse(&format!("origin:refs/agentfs/v/diverged/x@{C}"))
+            .unwrap_err()
+            .to_string();
+        assert!(diverged.contains("not a branch"), "{diverged}");
+        for commit in ["abc", &C.to_uppercase(), &format!("{C}0")] {
+            assert_eq!(
+                StartPoint::parse(&format!("origin:agentfs/v@{commit}")),
+                Err(BadStartPoint::BadCommit {
+                    commit: commit.into()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_refs_live_in_the_volumes_namespace() {
+        let tip = Oid::from_str(C).unwrap();
+        assert_eq!(accepted_prefix("v2"), "refs/agentfs/v2/accepted/");
+        assert_eq!(
+            accepted_ref("v2", tip),
+            format!("refs/agentfs/v2/accepted/{C}")
+        );
+    }
 }

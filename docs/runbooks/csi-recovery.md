@@ -167,14 +167,14 @@ node; the next retry then finds no volume and succeeds.
 ## A fork that will not delete
 
 **Symptoms.** A deleted fork claim's PV stays `Released`, and the
-csi-provisioner's log says `DeleteVolume … Unavailable desc = fork <pv> is
-active` (or `finished`, or `refused`) `: DeleteVolume completes once it is
+csi-provisioner's log says `DeleteVolume … Unavailable desc = volume <pv>: the
+fork is active` (or `finished`, or `refused`) `: it is deleted once it is
 published or abandoned`.
 
 This is the design working (design §11.5, [csi.md §14](../csi.md#14-forks)):
 a fork is deleted only once its fork remote holds its change and finish
-refs. The node plugin's publisher runs `agentfs fork finish` for it at
-start and every `--fork-scan-interval`; the finisher retries with
+refs. The node plugin's release scan runs `agentfs fork finish` for it at
+start and every `--release-scan-interval`; the finisher retries with
 backoff until the remote takes the push, or refuses it for good. First
 look at the fork, in the node plugin pod (no lock, no network):
 
@@ -201,7 +201,7 @@ says why.
    ```
 
    Exit 0 is published, 1 not yet or refused (it says why), 75 means the
-   publisher's own finisher holds the fork: add `--wait-lock 6m` (it
+   release scan's own finisher holds the fork: add `--wait-lock 6m` (it
    frees the lock at its 5-minute timeout).
 3. `FAILED_PRECONDITION … reading the fork status …; nothing deleted`:
    the fork's settings or `meta/fork.json` cannot be read. The volume is
@@ -209,7 +209,7 @@ says why.
    `meta/fork.json` aside (the next publish writes it again once the
    remote confirms; a refusal or an abandon it recorded is lost with it).
 4. **Refused** (`state: refused`; the alarm `ForkRefused`, once; the
-   publisher starts no further finisher): the fork remote refuses for
+   release scan starts no further finisher): the fork remote refuses for
    good, and `publish:` names the reason. Each reason, its fix, and
    publishing again with `fork finish --retry`, are in
    [fork-refused.md](fork-refused.md).

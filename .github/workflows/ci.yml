@@ -336,7 +336,7 @@ jobs:
         run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
 
   e2e-nfs:
-    name: e2e (NFS, one node at a time, passthrough ${{ matrix.passthrough }})
+    name: e2e (NFS state areas, passthrough ${{ matrix.passthrough }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:

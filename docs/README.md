@@ -46,7 +46,8 @@ that point to it.
 | [Upgrading the sidecar](runbooks/upgrading-the-sidecar.md) | Rolling out a new image for the phase 1 sidecar |
 | [The history service is down](runbooks/history-service-down.md) | Fronts failing with `EIO` (`HistoryServiceUnavailable`) |
 | [Recovering CSI volumes](runbooks/csi-recovery.md) | Incidents under the CSI driver |
-| [A node is lost](runbooks/node-lost.md) | A node powered off or cut off with volumes attached |
+| [Moving a volume to another node](runbooks/moving.md) | A node lost or retired: a new volume started from the old branch |
+| [The start branch moved](runbooks/start-branch-moved.md) | `StartBranchMoved`: the old branch received commits after a move |
 | [A fork's publish is refused](runbooks/fork-refused.md) | `ForkRefused`, by reason |
 | [A moved directory could not be reconciled](runbooks/reconcile-failed.md) | `ReconcileFailed` |
 | [Worktree paths found by the heuristic](runbooks/worktree-heuristic.md) | `agentfs.nested.gitdir_heuristic` counting |

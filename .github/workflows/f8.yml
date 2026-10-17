@@ -1,0 +1,73 @@
+name: f8
+
+# F8, one branch per worktree (design §14.2): end-to-end jobs on kind
+# that need more than one node, each on its own runner. e2e-csi-move moves
+# a volume between the two workers of ci/kind/two-workers.yaml
+# (ci/e2e-csi-move.sh, docs/runbooks/moving.md), with the CSI chart from
+# this tree and the example git server as a pod.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: f8-${{ github.ref }}
+  cancel-in-progress: true
+
+# bash -eo pipefail: a failure inside a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  HELM_VERSION: v3.22.1
+
+jobs:
+  e2e-csi-move:
+    name: e2e (CSI move between nodes)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The image as image.yml builds it, from its cache (read only here).
+      - name: build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: agentfs:ci
+          cache-from: type=gha,scope=agentfs-image
+          provenance: false
+      - name: build the git server image
+        run: docker build -t agentfs-git-server:ci examples/docker/git-server
+      - name: FUSE
+        run: |
+          sudo modprobe fuse
+          ls -l /dev/fuse
+          uname -a
+      - name: install kind and kubectl
+        run: |
+          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
+          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+      - name: create the cluster
+        run: |
+          kind create cluster --name agentfs-move --config ci/kind/two-workers.yaml \
+            --image "$KIND_NODE_IMAGE" --wait 180s
+          kind load docker-image agentfs:ci agentfs-git-server:ci --name agentfs-move
+          kubectl get nodes -o wide
+      - run: ci/e2e-csi-move.sh
+      - name: diagnose
+        if: failure()
+        run: ci/e2e-csi-move.sh diagnose
+      - name: clean up
+        if: always()
+        run: kind delete cluster --name agentfs-move || true

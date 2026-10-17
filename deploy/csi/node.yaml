@@ -1,8 +1,11 @@
-# The node plugin: `agentfs-csi --mode node` under tini on every node,
-# with node-driver-registrar and livenessprobe (design §14.2, docs/csi.md
-# "Architecture"). NodeStage starts one `agentfs serve-history` per volume,
+# The node plugin: `agentfs-csi` under tini on every node, with
+# csi-provisioner (`--node-deployment`), node-driver-registrar and
+# livenessprobe (design §14.2, docs/csi.md "Architecture"). Each node
+# provisions the worktrees on its own disk: CreateVolume makes one under
+# the base path, NodeStage starts one `agentfs serve-history` per volume,
 # NodePublish one `agentfs mount --history-service` front per pod,
-# bind-mounted onto the kubelet's target.
+# bind-mounted onto the kubelet's target, and the release scan pushes the
+# worktrees no pod stages.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -25,7 +28,8 @@ spec:
         app.kubernetes.io/name: agentfs-csi-node
     spec:
       serviceAccountName: agentfs-csi-node
-      # The node plugin never talks to the API server.
+      # Only csi-provisioner talks to the API server: the token is mounted
+      # into it alone (the `api-token` volume), never into agentfs-csi.
       automountServiceAccountToken: false
       priorityClassName: system-node-critical
       # Longer than --unpublish-grace (20s) + --unstage-grace (30s): a
@@ -46,7 +50,6 @@ spec:
           # hostPID it is not PID 1, so it registers as a subreaper (-s).
           command: [tini, -s, --, agentfs-csi]
           args:
-            - --mode=node
             - --endpoint=unix:///csi/csi.sock
             - --base-path=/var/lib/agentfs-csi/volumes
             - --node-state=/var/lib/agentfs-csi/node
@@ -80,6 +83,7 @@ spec:
             # The kubelet's targets: the binds made here must reach the
             # host, and the workloads' containers.
             - { name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional }
+            # This node's worktrees, on its own disk.
             - { name: base, mountPath: /var/lib/agentfs-csi/volumes, mountPropagation: HostToContainer }
             # Staged and published records: what a restarted plugin
             # reconciles from.
@@ -89,6 +93,31 @@ spec:
             - { name: profiles, mountPath: /etc/agentfs-csi/profiles, readOnly: true }
             - { name: credentials, mountPath: /etc/agentfs-csi/credentials, readOnly: true }
             - { name: dev-fuse, mountPath: /dev/fuse }
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner
+          args:
+            - --csi-address=/csi/csi.sock
+            # PVC name and namespace for the volume name.
+            - --extra-create-metadata
+            # One provisioner per node: it creates and deletes only the
+            # worktrees of its own node (NODE_NAME).
+            - --node-deployment
+            # A start class's CreateVolume fetches the start branch once.
+            - --timeout=300s
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          securityContext:
+            # Root (with no capabilities) to reach agentfs-csi's socket,
+            # which is root's and mode 0660.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            readOnlyRootFilesystem: true
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+            - { name: api-token, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true }
         - name: node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar
           args:
@@ -131,3 +160,15 @@ spec:
           configMap: { name: agentfs-csi-profiles }
         - name: credentials
           secret: { secretName: agentfs-csi-credentials, defaultMode: 0400 }
+        # The token of csi-provisioner (never mounted into agentfs-csi).
+        - name: api-token
+          projected:
+            sources:
+              - serviceAccountToken: { path: token, expirationSeconds: 3600 }
+              - configMap:
+                  name: kube-root-ca.crt
+                  items: [{ key: ca.crt, path: ca.crt }]
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef: { fieldPath: metadata.namespace }

@@ -1,10 +1,13 @@
-//! Volumes on disk: creating one (CreateVolume, or a static PV adopted at
-//! ControllerPublish or NodeStage), the profile's rules, and the access
-//! modes the driver supports (design §14.2).
+//! Worktrees on this node's disk: creating one (CreateVolume: an empty
+//! one, one started from another worktree's branch, or a fork), adopting
+//! one through a static PV, the profile's rules, and the access modes the
+//! driver supports (design §14.2).
 //!
-//! A volume exists while `<base>/<handle>/csi.json` does. It is written
-//! last, after the backing tree and the state area, so a half-created
-//! volume is created again by the CO's retry.
+//! A worktree is a volume while `<base>/<handle>/csi.json` exists. It is
+//! written last, after the backing tree and the state area, so a
+//! half-created volume is created again by the CO's retry. Its identity
+//! (the volume name, its branch `agentfs/<volume>` and its start point)
+//! is in the state area's own config and never changes (F8 rule 1).
 
 use std::fs::{self, DirBuilder};
 use std::io;
@@ -13,6 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentfs_core::fork::create::{self as fork_create, CreateError, CreateRequest};
+use agentfs_core::fork::start::{self, StartError, StartRequest};
 use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::volume::{self, StateDir};
 
@@ -22,7 +26,7 @@ use crate::csi::v1::volume_capability::access_mode::Mode;
 use crate::error::Error;
 use crate::layout::Layout;
 use crate::params::{ForkClass, VolumeParams};
-use crate::records::{self, MultiNodeFields, VolumeRecord};
+use crate::records::{self, VolumeRecord};
 
 /// What a refused multi-node access mode says: the decision, with where
 /// it is recorded. `ci/e2e-csi.sh` waits for "multi-node" in it.
@@ -88,44 +92,16 @@ pub fn check_capabilities(caps: &[VolumeCapability]) -> Result<(), Error> {
         .try_for_each(|c| check_capability(c).map(|_| ()))
 }
 
-/// The volume's record, if it exists, for a call that would use it: a
-/// record written by the multi-node build is `FAILED_PRECONDITION`.
+/// The volume's record, if it exists on this node.
 pub fn load(layout: &Layout, handle: &str) -> Result<Option<VolumeRecord>, Error> {
-    match load_any(layout, handle)? {
-        Some((_, Some(_))) => Err(Error::FailedPrecondition(format!(
-            "volume {handle} was created by the multi-node build: {MULTI_NODE}. Detach it from \
-             every node, or delete it (docs/csi.md §7)"
-        ))),
-        found => Ok(found.map(|(record, _)| record)),
-    }
-}
-
-/// The volume's record with the multi-node build's fields, if any: for
-/// ControllerUnpublish and DeleteVolume, which still work on such a volume.
-pub fn load_any(
-    layout: &Layout,
-    handle: &str,
-) -> Result<Option<(VolumeRecord, Option<MultiNodeFields>)>, Error> {
     let path = layout.csi_json(handle);
-    records::load_volume(&path).map_err(|e| Error::io(format!("reading {}", path.display()), e))
+    records::load(&path).map_err(|e| Error::io(format!("reading {}", path.display()), e))
 }
 
 /// Writes the volume's record.
 pub fn store(layout: &Layout, handle: &str, record: &VolumeRecord) -> Result<(), Error> {
-    store_any(layout, handle, record, None)
-}
-
-/// Writes the volume's record, keeping the multi-node build's fields while
-/// any node is still in them.
-pub fn store_any(
-    layout: &Layout,
-    handle: &str,
-    record: &VolumeRecord,
-    legacy: Option<&MultiNodeFields>,
-) -> Result<(), Error> {
     let path = layout.csi_json(handle);
-    records::store_volume(&path, record, legacy)
-        .map_err(|e| Error::io(format!("writing {}", path.display()), e))
+    records::store(&path, record).map_err(|e| Error::io(format!("writing {}", path.display()), e))
 }
 
 /// The profile's config fragment, which must exist.
@@ -142,97 +118,159 @@ pub fn profile_config(layout: &Layout, profile: &str) -> Result<PathBuf, Error> 
     }
 }
 
-/// Creates the volume (or finishes a half-created one): its directory
-/// (0700), the backing tree, the state area with the profile's config
-/// included, the profile's rules, then `csi.json`. An existing state area
-/// must name the same volume and branch; it may not be in use.
-pub fn create(
-    layout: &Layout,
-    handle: &str,
-    params: &VolumeParams,
-    capacity_bytes: i64,
-    static_volume: bool,
-) -> Result<VolumeRecord, Error> {
-    let config = profile_config(layout, &params.profile)?;
-    let dir = layout.volume_dir(handle);
+/// The volume's directory (0700) and backing tree (0755).
+fn make_dirs(layout: &Layout, handle: &str) -> Result<(), Error> {
     fs::create_dir_all(&layout.base)
         .map_err(|e| Error::io(format!("creating {}", layout.base.display()), e))?;
-    for (path, mode) in [(&dir, 0o700), (&layout.backing(handle), 0o755)] {
+    for (path, mode) in [
+        (&layout.volume_dir(handle), 0o700),
+        (&layout.backing(handle), 0o755),
+    ] {
         DirBuilder::new()
             .recursive(true)
             .mode(mode)
             .create(path)
             .map_err(|e| Error::io(format!("creating {}", path.display()), e))?;
     }
+    Ok(())
+}
+
+/// The record of a volume made now.
+fn new_record(params: VolumeParams, capacity_bytes: i64, static_volume: bool) -> VolumeRecord {
+    VolumeRecord {
+        params,
+        capacity_bytes,
+        created: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        static_volume,
+        finish_requested: false,
+    }
+}
+
+/// Writes `record` last, and drops a retained record of the same name: a
+/// worktree made again over a retained one is no longer only retained.
+fn finish(layout: &Layout, handle: &str, record: &VolumeRecord) -> Result<(), Error> {
+    store(layout, handle, record)?;
+    records::remove(&layout.retained_json(handle))
+        .map_err(|e| Error::io("removing the retained record", e))
+}
+
+/// Creates the worktree CreateVolume asks for (or finishes a half-created
+/// one): its directory, the backing tree, the state area with the
+/// profile's config included (an empty one, or started from the class's
+/// `startFrom`, [`start::start_from`]), the profile's rules, then
+/// `csi.json`. An existing state area must be this volume's; it may not
+/// be in use.
+pub fn create(
+    layout: &Layout,
+    handle: &str,
+    params: &VolumeParams,
+    capacity_bytes: i64,
+) -> Result<VolumeRecord, Error> {
+    let config = profile_config(layout, &params.profile)?;
+    let start = params
+        .start_point()
+        .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+    make_dirs(layout, handle)?;
     let state = StateDir::new(layout.state(handle));
     let _lock = if state.git().join("config").exists() {
         Some(lock(&state, "agentfs-csi create")?)
     } else {
         None
     };
-    volume::init_with(
-        &state,
-        &params.volume,
-        params.branch.as_deref(),
-        Some(&[config]),
-    )
-    .map_err(|e| match e {
-        volume::VolumeError::OtherVolume { .. } | volume::VolumeError::OtherBranch { .. } => {
-            Error::AlreadyExists(format!("{}: {e}", state.root().display()))
+    match &start {
+        None => volume::init_with(&state, &params.volume, None, Some(&[config]))
+            .map(|_| ())
+            .map_err(|e| match e {
+                volume::VolumeError::OtherVolume { .. }
+                | volume::VolumeError::OtherBranch { .. } => {
+                    Error::AlreadyExists(format!("{}: {e}", state.root().display()))
+                }
+                e => Error::Internal(format!(
+                    "initialising {}: {}",
+                    state.root().display(),
+                    chain(&e)
+                )),
+            })?,
+        Some(start) => {
+            start::start_from(&StartRequest {
+                state: &state,
+                tree: &layout.backing(handle),
+                volume: &params.volume,
+                includes: &[config],
+                start,
+            })
+            .map_err(start_error)?;
         }
-        e => Error::Internal(format!(
-            "initialising {}: {}",
-            state.root().display(),
-            chain(&e)
-        )),
-    })?;
+    }
     install_rules(layout, handle, &params.profile)?;
-    let record = VolumeRecord {
-        params: params.clone(),
-        capacity_bytes,
-        created: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
-        published_node: None,
-        static_volume,
-        finish_requested: false,
-    };
-    store(layout, handle, &record)?;
-    // Re-created over a retained volume: it is no longer only retained.
-    records::remove(&layout.retained_json(handle))
-        .map_err(|e| Error::io("removing the retained record", e))?;
+    let record = new_record(params.clone(), capacity_bytes, false);
+    finish(layout, handle, &record)?;
     Ok(record)
+}
+
+/// Adopts a static PV (NodeStage of a handle with no `csi.json`): only
+/// over an existing worktree whose `agentfs.volume` is `params.volume`
+/// (rule 1: NodeStage never creates). Writes `csi.json` with
+/// `static_volume`; the state area is checked and its includes set by
+/// the caller ([`volume::reopen_with`]).
+pub fn adopt(
+    layout: &Layout,
+    node_id: &str,
+    handle: &str,
+    params: &VolumeParams,
+) -> Result<VolumeRecord, Error> {
+    let config = profile_config(layout, &params.profile)?;
+    let state = StateDir::new(layout.state(handle));
+    volume::reopen_with(&state, &params.volume, &[config])
+        .map_err(|e| reopen_error(layout, node_id, e))?;
+    let record = new_record(params.clone(), 0, true);
+    finish(layout, handle, &record)?;
+    Ok(record)
+}
+
+/// [`volume::reopen_with`]'s error as the CSI code the CO acts on: a
+/// missing worktree is `NOT_FOUND` (the pod waits, naming it), another
+/// volume's state area `ALREADY_EXISTS`.
+pub fn reopen_error(layout: &Layout, node_id: &str, e: volume::VolumeError) -> Error {
+    match e {
+        volume::VolumeError::NoWorktree { path } => Error::NotFound(format!(
+            "no worktree on node {node_id} under {}; the pod waits (nothing at {}: a worktree \
+             lives on the node that created it, docs/csi.md)",
+            layout.base.display(),
+            path.display()
+        )),
+        e @ volume::VolumeError::OtherVolume { .. } => Error::AlreadyExists(chain(&e)),
+        e => Error::FailedPrecondition(chain(&e)),
+    }
 }
 
 /// Creates a fork of `source_handle` (CreateVolume with a fork class,
 /// design §11.5): directories as [`create`], then
 /// [`agentfs_core::fork::create::create`] with the source profile's config
 /// as the fork's include, the source's profile rules, and `csi.json`
-/// last. The source is read without its lock, so it may be in use.
+/// last. The source is read without its lock, so it may be in use; it
+/// must be on this node (`FAILED_PRECONDITION` otherwise: a fork's pod
+/// needs affinity to its source's pods).
 pub fn create_fork(
     layout: &Layout,
+    node_id: &str,
     handle: &str,
     class: &ForkClass,
     source_handle: &str,
     capacity_bytes: i64,
 ) -> Result<VolumeRecord, Error> {
     let Some(source) = load(layout, source_handle)? else {
-        return Err(Error::NotFound(format!(
-            "the source volume {source_handle} does not exist"
+        return Err(Error::FailedPrecondition(format!(
+            "the source volume {source_handle} is not on node {node_id} (under {}): a fork is \
+             made on its source's node; give the fork's pod affinity to its source's pods",
+            layout.base.display()
         )));
     };
     let params = class.params(&source.params);
     let config = profile_config(layout, &params.profile)?;
-    let dir = layout.volume_dir(handle);
-    fs::create_dir_all(&layout.base)
-        .map_err(|e| Error::io(format!("creating {}", layout.base.display()), e))?;
-    for (path, mode) in [(&dir, 0o700), (&layout.backing(handle), 0o755)] {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(mode)
-            .create(path)
-            .map_err(|e| Error::io(format!("creating {}", path.display()), e))?;
-    }
+    make_dirs(layout, handle)?;
     let state = StateDir::new(layout.state(handle));
     let lock = lock(&state, "agentfs-csi create")?;
     let source_state = StateDir::new(layout.state(source_handle));
@@ -248,19 +286,8 @@ pub fn create_fork(
     .map_err(create_error)?;
     drop(lock);
     install_rules(layout, handle, &params.profile)?;
-    let record = VolumeRecord {
-        params,
-        capacity_bytes,
-        created: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
-        published_node: None,
-        static_volume: false,
-        finish_requested: false,
-    };
-    store(layout, handle, &record)?;
-    records::remove(&layout.retained_json(handle))
-        .map_err(|e| Error::io("removing the retained record", e))?;
+    let record = new_record(params, capacity_bytes, false);
+    finish(layout, handle, &record)?;
     eprintln!(
         "created fork {handle} of {source_handle} (agentfs volume {} of {} at {})",
         identity.fork, identity.source, identity.base
@@ -281,6 +308,24 @@ pub fn create_error(e: CreateError) -> Error {
         CreateError::BadName { .. } => Error::InvalidArgument(message),
         CreateError::Exists { .. } => Error::AlreadyExists(message),
         CreateError::SourceUnreadable(_) => Error::Unavailable(message),
+        _ => Error::Internal(message),
+    }
+}
+
+/// A start class's [`StartError`] as the CSI code the CO acts on (F8 S1).
+pub fn start_error(e: StartError) -> Error {
+    let message = chain(&e);
+    match e {
+        StartError::NoSuchRemote { .. } | StartError::OwnBranch { .. } | StartError::LocalOnly => {
+            Error::InvalidArgument(message)
+        }
+        StartError::NotReachable { .. } | StartError::NoSuchBranch { .. } => {
+            Error::FailedPrecondition(message)
+        }
+        StartError::Unreachable { .. } | StartError::LfsObjectMissing { .. } => {
+            Error::Unavailable(message)
+        }
+        StartError::Exists { .. } => Error::AlreadyExists(message),
         _ => Error::Internal(message),
     }
 }
@@ -402,59 +447,88 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_node_record_is_refused_for_use_and_other_unknown_fields_fail() {
+    fn start_errors_map_to_their_codes() {
+        let oid = git2::Oid::from_str(&"1".repeat(40)).unwrap();
+        let cases = [
+            (
+                StartError::NoSuchRemote { remote: "x".into() },
+                "InvalidArgument",
+            ),
+            (
+                StartError::OwnBranch { branch: "b".into() },
+                "InvalidArgument",
+            ),
+            (StartError::LocalOnly, "InvalidArgument"),
+            (
+                StartError::NotReachable {
+                    commit: oid,
+                    branch: "b".into(),
+                },
+                "FailedPrecondition",
+            ),
+            (
+                StartError::NoSuchBranch {
+                    remote: "r".into(),
+                    branch: "b".into(),
+                },
+                "FailedPrecondition",
+            ),
+            (
+                StartError::Unreachable {
+                    remote: "r".into(),
+                    message: "m".into(),
+                },
+                "Unavailable",
+            ),
+            (
+                StartError::LfsObjectMissing {
+                    path: "p".into(),
+                    message: "m".into(),
+                },
+                "Unavailable",
+            ),
+            (StartError::Exists { found: "f".into() }, "AlreadyExists"),
+        ];
+        for (error, code) in cases {
+            let mapped = format!("{:?}", start_error(error));
+            assert!(mapped.starts_with(code), "{mapped}");
+        }
+    }
+
+    #[test]
+    fn a_static_pv_is_adopted_only_over_its_worktree() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout {
-            base: dir.path().to_path_buf(),
+            base: dir.path().join("base"),
             node_state: dir.path().join("node"),
             mount_dir: dir.path().join("mnt"),
             profiles: dir.path().join("profiles"),
         };
-        let record = VolumeRecord {
-            params: VolumeParams {
-                profile: "p".into(),
-                volume: "v".into(),
-                branch: None,
-                on_delete: crate::params::OnDelete::Delete,
-                workload_mounts: Vec::new(),
-            },
-            capacity_bytes: 0,
-            created: 1,
-            published_node: None,
-            static_volume: false,
-            finish_requested: false,
+        fs::create_dir_all(&layout.profiles).unwrap();
+        fs::write(layout.profile_file("p", "config"), "").unwrap();
+        let params = VolumeParams::from_context(
+            "h",
+            &[("profile", "p"), ("volumeName", "v")]
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        )
+        .unwrap();
+        let Err(Error::NotFound(message)) = adopt(&layout, "node-1", "h", &params) else {
+            panic!("no worktree: NOT_FOUND");
         };
-        let mut json = serde_json::to_value(&record).unwrap();
-        json["multi_node"] = true.into();
-        json["published_nodes"] = serde_json::json!(["n1", "n2"]);
-        fs::create_dir_all(layout.volume_dir("v")).unwrap();
-        fs::write(layout.csi_json("v"), json.to_string()).unwrap();
-        // ControllerPublish and NodeStage read the volume through load().
-        let Err(Error::FailedPrecondition(message)) = load(&layout, "v") else {
-            panic!("a multi-node record must be FAILED_PRECONDITION");
-        };
-        assert!(message.contains(MULTI_NODE), "{message}");
-        let (read, legacy) = load_any(&layout, "v").unwrap().unwrap();
-        assert_eq!(read, record);
-        assert_eq!(
-            legacy
-                .unwrap()
-                .published_nodes
-                .into_iter()
-                .collect::<Vec<_>>(),
-            ["n1", "n2"]
-        );
-        json["shards"] = 2.into();
-        fs::write(layout.csi_json("v"), json.to_string()).unwrap();
-        for err in [
-            load(&layout, "v").unwrap_err(),
-            load_any(&layout, "v").unwrap_err(),
-        ] {
-            let Error::Internal(message) = err else {
-                panic!("{err:?}");
-            };
-            assert!(message.contains("unknown field `shards`"), "{message}");
-        }
+        assert!(message.contains("no worktree on node node-1"), "{message}");
+        assert!(!layout.csi_json("h").exists(), "nothing is created");
+        volume::init(&StateDir::new(layout.state("h")), "other", None).unwrap();
+        assert!(matches!(
+            adopt(&layout, "node-1", "h", &params),
+            Err(Error::AlreadyExists(_))
+        ));
+        fs::remove_dir_all(layout.volume_dir("h")).unwrap();
+        volume::init(&StateDir::new(layout.state("h")), "v", None).unwrap();
+        let record = adopt(&layout, "node-1", "h", &params).unwrap();
+        assert!(record.static_volume);
+        assert_eq!(load(&layout, "h").unwrap(), Some(record));
     }
 
     #[test]

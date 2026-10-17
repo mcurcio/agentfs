@@ -26,19 +26,10 @@ Kubernetes: `>=1.30.0-0`
 |-----|------|---------|-------------|
 | alerts.enabled | bool | `false` | Install the example alert rules of deploy/alerts as a Prometheus Operator PrometheusRule (docs/deployment.md "Alerts"). Needs its CRD. |
 | alerts.labels | object | `{}` | More labels on the PrometheusRule, for your Prometheus's ruleSelector (kube-prometheus-stack selects `release: <its release>`). |
-| basePath.path | string | `"/var/lib/agentfs-csi/volumes"` | Where volumes live (`--base-path`): one filesystem, at this path on the controller and every node (docs/csi.md §3). |
-| basePath.volume | object | `{}` | The volume mounted at `path` in the controller and the node plugin, as a pod volume source: one shared filesystem on several nodes, which on NFS must be 4.1 or later (docs/csi.md §11). Empty means a hostPath of `path`, right for a single node. |
-| controller.affinity | object | `{}` | The controller's affinity. |
-| controller.extraArgs | list | `[]` |  |
-| controller.nodeSelector | object | `{}` | The controller's node selector. |
-| controller.podAnnotations | object | `{}` | Annotations on the controller's pods. |
-| controller.priorityClassName | string | `"system-cluster-critical"` | The controller's priority class. |
-| controller.replicas | int | `1` | Controller replicas. The sidecars elect a leader: a second replica is a hot standby. |
-| controller.resources | object | `{}` | The agentfs-csi container's resources. |
-| controller.tolerations | list | `[]` | The controller's tolerations. |
+| basePath.path | string | `"/var/lib/agentfs-csi/volumes"` | Where each node keeps its worktrees (`--base-path`): a hostPath directory on the node's own disk, ideally a disk of its own, since a full disk makes the kubelet evict every pod on the node. A network filesystem is refused (docs/csi.md §11). |
+| classAdmission.enabled | bool | `true` | Install the ValidatingAdmissionPolicy `agentfs-class`, which refuses any StorageClass of the driver whose reclaim policy is not Delete, so DeleteVolume always runs and the release decider always answers (docs/csi.md §5). Off: a class with Retain loses nothing, but its PVs stay Released for ever. |
 | credentials.existingSecret | string | `""` | Use this existing Secret for remote credentials instead of the chart's; create it out of band (`kubectl create secret generic`). |
 | credentials.stringData | object | `{}` | Keys of the chart's own Secret, mounted at `/etc/agentfs-csi/credentials/<key>`. Prefer `existingSecret`: values end up in the release record. |
-| forkAdmission.enabled | bool | `true` | Install the ValidatingAdmissionPolicy that refuses a fork class whose reclaim policy is not Delete (docs/csi.md §14). |
 | image.digest | string | `""` | A digest (`sha256:...`); when set, it pins the image. |
 | image.pullPolicy | string | `""` | The pull policy; empty leaves the Kubernetes default. |
 | image.repository | string | `"ghcr.io/mcurcio/agentfs"` | The agentfs image: `agentfs-csi` and the `agentfs` it starts. |
@@ -47,7 +38,7 @@ Kubernetes: `>=1.30.0-0`
 | kubeletDir | string | `"/var/lib/kubelet"` | The kubelet's directory on the nodes. Some distributions move it (k0s: `/var/lib/k0s/kubelet`). |
 | node.affinity | object | `{}` | The node plugin's affinity. |
 | node.env | list | `[{"name":"OTEL_SDK_DISABLED","value":"true"}]` | Environment of the node plugin, inherited by every history service and front: the `OTEL_*` variables (docs/telemetry.md). Point `OTEL_EXPORTER_OTLP_ENDPOINT` at your collector to turn telemetry on. |
-| node.extraArgs | list | `[]` |  |
+| node.extraArgs | list | `[]` | More `agentfs-csi` flags (docs/configuration.md), e.g. `--release-scan-interval=10s`. |
 | node.nodeSelector | object | `{}` | The node plugin's node selector. |
 | node.podAnnotations | object | `{}` | Annotations on the node plugin's pods. |
 | node.priorityClassName | string | `"system-node-critical"` | The node plugin's priority class. |
@@ -56,11 +47,6 @@ Kubernetes: `>=1.30.0-0`
 | node.terminationGracePeriodSeconds | int | `60` | Longer than `--unpublish-grace` plus `--unstage-grace`, so a stopped plugin lets its children make their final commits. |
 | node.tolerations | list | `[{"operator":"Exists"}]` | The node plugin runs on every node by default. |
 | profiles | object | `{}` | Profiles: every setting of a volume, by name (docs/csi.md "Profiles and credentials"). Each is `{config, exclude, attributes}`: the git-config fragment and the optional rule files. A StorageClass picks one with the parameter `profile: <name>`. Load files with `--set-file profiles.<name>.config=<path>`. |
-| sidecars.attacher.extraArgs | list | `[]` | More csi-attacher flags. |
-| sidecars.attacher.image.digest | string | `"sha256:d1a26170efed45491074ca4545c81844eee2b9043fb885ac01fb4aed6f8b72d2"` | csi-attacher's digest. |
-| sidecars.attacher.image.repository | string | `"registry.k8s.io/sig-storage/csi-attacher"` | csi-attacher's image. |
-| sidecars.attacher.image.tag | string | `"v4.13.0"` | csi-attacher's tag. |
-| sidecars.attacher.resources | object | `{}` | csi-attacher's resources. |
 | sidecars.livenessProbe.image.digest | string | `"sha256:19f2cf2f40e1987c7943945deca5f65cd4e4bf5cc0657fc78a5df131861578e8"` | livenessprobe's digest. |
 | sidecars.livenessProbe.image.repository | string | `"registry.k8s.io/sig-storage/livenessprobe"` | livenessprobe's image. |
 | sidecars.livenessProbe.image.tag | string | `"v2.20.0"` | livenessprobe's tag. |
@@ -71,7 +57,7 @@ Kubernetes: `>=1.30.0-0`
 | sidecars.nodeDriverRegistrar.resources | object | `{}` | node-driver-registrar's resources. |
 | sidecars.provisioner.extraArgs | list | `[]` | More csi-provisioner flags, e.g. `--retry-interval-max=20s`. |
 | sidecars.provisioner.image.digest | string | `"sha256:6ebe60fd8ed67a7f8a90d34402e9e706b274e53612d6fa5fbb8285728db622e2"` | csi-provisioner's digest. |
-| sidecars.provisioner.image.repository | string | `"registry.k8s.io/sig-storage/csi-provisioner"` | csi-provisioner's image. |
+| sidecars.provisioner.image.repository | string | `"registry.k8s.io/sig-storage/csi-provisioner"` | csi-provisioner's image: in the node plugin pod of every node (`--node-deployment`), provisioning that node's worktrees. |
 | sidecars.provisioner.image.tag | string | `"v6.4.0"` | csi-provisioner's tag. |
 | sidecars.provisioner.resources | object | `{}` | csi-provisioner's resources. |
-| storageClasses | list | `[]` | StorageClasses of the driver: `[{name, parameters, reclaimPolicy, volumeBindingMode, annotations}]`. `parameters` go to the driver as written (docs/configuration.md "The CSI driver"). `reclaimPolicy` defaults to Delete for a fork class (`fork: "true"`) and Retain otherwise; `volumeBindingMode` to WaitForFirstConsumer. |
+| storageClasses | list | `[]` | StorageClasses of the driver: `[{name, parameters, reclaimPolicy, volumeBindingMode, annotations}]`. `parameters` go to the driver as written (docs/configuration.md "The CSI driver"). `reclaimPolicy` defaults to Delete (the class admission policy refuses any other; a worktree is kept by `onDelete: retain`, the default); `volumeBindingMode` to WaitForFirstConsumer, which picks the node first. |

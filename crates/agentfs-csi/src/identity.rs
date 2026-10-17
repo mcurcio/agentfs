@@ -1,5 +1,7 @@
 //! The CSI Identity service (design §14.2): the driver's name and version,
-//! and whether this process serves the Controller service.
+//! and its capabilities: the Controller service, served by every node
+//! plugin (F8 R8), and volume accessibility constraints, since a worktree
+//! lives on one node's disk ([`TOPOLOGY_KEY`]).
 
 use std::collections::HashMap;
 
@@ -13,15 +15,18 @@ use crate::csi::v1::{
     GetPluginInfoResponse, PluginCapability, ProbeRequest, ProbeResponse,
 };
 
-#[derive(Debug, Clone)]
-pub struct IdentityService {
-    controller: bool,
-}
+/// The topology key of every agentfs worktree: the node whose disk holds
+/// it. NodeGetInfo reports it (the kubelet labels the node with it), and
+/// CreateVolume answers it, so the PV's node affinity keeps a worktree's
+/// pods on its node.
+pub const TOPOLOGY_KEY: &str = "topology.agentfs.mcurcio.github.io/node";
+
+#[derive(Debug, Clone, Default)]
+pub struct IdentityService;
 
 impl IdentityService {
-    /// `controller`: this process serves the Controller service.
-    pub fn new(controller: bool) -> Self {
-        Self { controller }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -42,17 +47,17 @@ impl Identity for IdentityService {
         &self,
         _request: Request<GetPluginCapabilitiesRequest>,
     ) -> Result<Response<GetPluginCapabilitiesResponse>, Status> {
-        let capabilities = self
-            .controller
-            .then(|| PluginCapability {
-                r#type: Some(plugin_capability::Type::Service(
-                    plugin_capability::Service {
-                        r#type: service::Type::ControllerService as i32,
-                    },
-                )),
-            })
-            .into_iter()
-            .collect();
+        let capabilities = [
+            service::Type::ControllerService,
+            service::Type::VolumeAccessibilityConstraints,
+        ]
+        .into_iter()
+        .map(|t| PluginCapability {
+            r#type: Some(plugin_capability::Type::Service(
+                plugin_capability::Service { r#type: t as i32 },
+            )),
+        })
+        .collect();
         Ok(Response::new(GetPluginCapabilitiesResponse {
             capabilities,
         }))

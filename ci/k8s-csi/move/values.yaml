@@ -1,0 +1,28 @@
+# charts/agentfs-csi's values for the CSI move job (ci/e2e-csi-move.sh):
+# the image the job built, the `ci` profile of ci/k8s-csi/driver (pushing
+# every 2 seconds to the git-server Service, which the script runs as a pod
+# on the second worker), its credentials, a release scan every 5 seconds,
+# and the move's ordinary class.
+image:
+  repository: agentfs
+  tag: ci
+credentials:
+  stringData:
+    # A CI-only password for the throwaway git server (ci/e2e-csi-move.sh).
+    ci-origin: |
+      username=agentfs
+      password=ci-csi-password
+node:
+  extraArgs:
+    - --release-scan-interval=5s
+    - --backoff-max=10s
+sidecars:
+  provisioner:
+    # DeleteVolume is retried within 20 seconds once the remote is back.
+    extraArgs:
+      - --retry-interval-max=20s
+storageClasses:
+  - name: agentfs-move
+    parameters:
+      profile: ci
+      onDelete: delete

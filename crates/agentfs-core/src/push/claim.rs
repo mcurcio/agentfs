@@ -47,13 +47,13 @@ impl Claim {
     /// needs in its own connection (status, `applied/*`, inbox deletions,
     /// `accepted/*`).
     pub fn is_ours(self) -> bool {
-        todo!("S1: matches!(self, UpToDate | FastForward)")
+        matches!(self, Self::UpToDate | Self::FastForward)
     }
 
     /// Whether the remote holds the head: what the release decider counts
     /// as held ([`crate::release::decide`]).
     pub fn holds_head(self) -> bool {
-        todo!("S1: self == UpToDate")
+        self == Self::UpToDate
     }
 }
 
@@ -66,8 +66,12 @@ impl Claim {
 /// negotiation, from each update's old value), its queue push, its
 /// divergence save, and the fork finisher through it.
 pub fn claim(advertised: Option<Oid>, head: Oid, on_history: impl Fn(Oid) -> bool) -> Claim {
-    let _ = (advertised, head, &on_history);
-    todo!("S1")
+    match advertised {
+        None => Claim::Create,
+        Some(remote) if remote == head => Claim::UpToDate,
+        Some(remote) if on_history(remote) => Claim::FastForward,
+        Some(_) => Claim::Diverged,
+    }
 }
 
 /// The start-branch alarm: the branch this volume started from holds
@@ -102,6 +106,88 @@ pub fn start_branch_moved(
     advertised: Option<Oid>,
     on_history: impl Fn(Oid) -> bool,
 ) -> Option<StartBranchMoved> {
-    let _ = (start, advertised, &on_history);
-    todo!("S1")
+    let tip = advertised?;
+    if tip == start.commit || on_history(tip) {
+        return None;
+    }
+    Some(StartBranchMoved {
+        remote: start.remote.clone(),
+        refname: start.refname(),
+        pinned: start.commit,
+        tip,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(n: u8) -> Oid {
+        Oid::from_bytes(&[n; 20]).unwrap()
+    }
+
+    fn never(_: Oid) -> bool {
+        panic!("on_history must not be asked")
+    }
+
+    #[test]
+    fn each_claim_from_what_the_remote_advertises() {
+        let head = oid(1);
+        // Never asked for a missing ref or for the head itself.
+        assert_eq!(claim(None, head, never), Claim::Create);
+        assert_eq!(claim(Some(head), head, never), Claim::UpToDate);
+        assert_eq!(
+            claim(Some(oid(2)), head, |o| o == oid(2)),
+            Claim::FastForward
+        );
+        assert_eq!(claim(Some(oid(3)), head, |_| false), Claim::Diverged);
+    }
+
+    #[test]
+    fn a_remote_behind_the_head_waits() {
+        let all = [
+            Claim::Create,
+            Claim::UpToDate,
+            Claim::FastForward,
+            Claim::Diverged,
+        ];
+        let ours: Vec<Claim> = all.into_iter().filter(|c| c.is_ours()).collect();
+        assert_eq!(ours, [Claim::UpToDate, Claim::FastForward]);
+        // Only a remote at the head holds it: one behind (FastForward), or
+        // without the branch (Create), lacks commits.
+        let held: Vec<Claim> = all.into_iter().filter(|c| c.holds_head()).collect();
+        assert_eq!(held, [Claim::UpToDate]);
+    }
+
+    fn start() -> StartPoint {
+        StartPoint {
+            remote: "origin".into(),
+            branch: "agentfs/v1".into(),
+            commit: oid(1),
+        }
+    }
+
+    #[test]
+    fn the_start_branch_alarm() {
+        let start = start();
+        // The branch is gone, or still at the pin: no alarm, nothing asked.
+        assert_eq!(start_branch_moved(&start, None, never), None);
+        assert_eq!(start_branch_moved(&start, Some(oid(1)), never), None);
+        // The tip is on this history: taken in, or reached by an accepted
+        // ref (the caller's predicate covers both).
+        assert_eq!(
+            start_branch_moved(&start, Some(oid(2)), |o| o == oid(2)),
+            None
+        );
+        // A tip unknown here.
+        assert_eq!(
+            start_branch_moved(&start, Some(oid(3)), |_| false),
+            Some(StartBranchMoved {
+                remote: "origin".into(),
+                refname: "refs/heads/agentfs/v1".into(),
+                pinned: oid(1),
+                tip: oid(3),
+            })
+        );
+    }
 }

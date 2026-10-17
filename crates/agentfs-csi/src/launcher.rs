@@ -1,8 +1,9 @@
 //! Starting the `agentfs` children the node plugin supervises (design
 //! §14.2, §17.2): one `agentfs serve-history` per staged volume, one
-//! `agentfs mount --history-service` front per published target, and one
-//! `agentfs fork finish` per fork whose deletion asked for it to be
-//! finished ([`crate::publisher`], design §11.5).
+//! `agentfs mount --history-service` front per published target, and the
+//! release scan's children ([`crate::release_scan`]): one `agentfs push`
+//! per worktree no pod stages, and one `agentfs fork finish` per fork
+//! whose deletion asked for it to be finished (design §11.5).
 //!
 //! The children are the same commands the single-node deployments run, so
 //! a crashed front or service never takes the gRPC server down. Their
@@ -214,13 +215,23 @@ fn secs(d: Duration) -> OsString {
     os(format!("{}ms", d.as_millis()))
 }
 
-/// `agentfs --state S --root B serve-history --listen unix:<socket> ...`
+/// How long a history service waits for its volume's state lock.
+pub const SERVICE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// `agentfs --state S --root B --wait-lock 30000ms serve-history --listen unix:<socket> ...`
+///
+/// It waits up to [`SERVICE_LOCK_WAIT`] for the state lock, which the
+/// release scan's `agentfs push` of the then unstaged worktree, a
+/// finisher or DeleteVolume's listing may hold for a moment as the volume
+/// is staged.
 pub fn service_spec(layout: &Layout, handle: &str, plugin: &PluginIdentity) -> ProcessSpec {
     let args = vec![
         os("--state"),
         layout.state(handle).into_os_string(),
         os("--root"),
         layout.backing(handle).into_os_string(),
+        os("--wait-lock"),
+        secs(SERVICE_LOCK_WAIT),
         os("serve-history"),
         os("--listen"),
         os(format!("unix:{}", layout.socket(handle).display())),
@@ -242,8 +253,25 @@ pub fn service_spec(layout: &Layout, handle: &str, plugin: &PluginIdentity) -> P
     }
 }
 
+/// `agentfs --state <state> push` for the release scan, with the plugin's identity env.
+pub fn push_spec(layout: &Layout, handle: &str, identity: &PluginIdentity) -> ProcessSpec {
+    ProcessSpec {
+        label: format!("push {handle}"),
+        args: vec![
+            os("--state"),
+            layout.state(handle).into_os_string(),
+            os("push"),
+        ],
+        env: vec![
+            (os("AGENTFS_NAMESPACE"), os(identity.namespace.as_str())),
+            (os("AGENTFS_POD"), os(identity.pod.as_str())),
+            (os("AGENTFS_NODE"), os(identity.node.as_str())),
+        ],
+    }
+}
+
 /// How long one finisher child publishes before it exits 1 and frees the
-/// fork's state lock; the publisher's next scan starts another. Between
+/// fork's state lock; the release scan's next pass starts another. Between
 /// them an operator's `fork abandon --wait-lock` gets the lock (design
 /// §11.5).
 pub const FINISH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -384,7 +412,7 @@ mod tests {
         assert_eq!(spec.label, "service v");
         assert_eq!(
             strings(&spec).join(" "),
-            "--state /b/v/state --root /b/v/backing serve-history --listen \
+            "--state /b/v/state --root /b/v/backing --wait-lock 30000ms serve-history --listen \
              unix:/n/run/v/history.sock --namespace agentfs-csi --pod agentfs-csi-node-x \
              --node n1 --shutdown-grace 10s --push-grace 5s"
         );

@@ -17,10 +17,14 @@ configMapGenerator:
       - profiles/cifork.config
 
 patches:
+  # csi-provisioner, the node plugin's second container.
   - target:
-      kind: Deployment
-      name: agentfs-csi-controller
+      kind: DaemonSet
+      name: agentfs-csi-node
     patch: |-
+      - op: test
+        path: /spec/template/spec/containers/1/name
+        value: csi-provisioner
       - op: add
-        path: /spec/template/spec/containers/0/args/-
+        path: /spec/template/spec/containers/1/args/-
         value: --retry-interval-max=20s

@@ -2,8 +2,11 @@
 //! serve-history` per staged volume, one `agentfs mount --history-service`
 //! front per published target, and their recovery.
 //!
-//! - **Stage** initialises the state area under its lock (static PVs are
-//!   created here too), installs the profile's rules, records the volume
+//! - **Stage** checks the worktree under its lock: it never creates one
+//!   (F8 rule 1); a worktree missing from this node's disk is `NOT_FOUND`,
+//!   and a static PV is adopted only over an existing worktree of its
+//!   volume. It then sets the profile's include, installs the profile's
+//!   rules, records the volume
 //!   in `<node-state>/staged/`, starts the service on a node-local socket
 //!   and waits for it to write its address (at most `stage_wait`; then
 //!   `UNAVAILABLE`, and the kubelet retries while the service recovers its
@@ -29,7 +32,7 @@
 //!   targets are published, then stops the service (SIGTERM, SIGKILL after
 //!   `unstage_grace`; the journal makes that safe). The service makes its
 //!   final commit and pushes it once more within `--push-grace`.
-//! - **Reconcile**, at plugin start, registers the node and rebuilds the
+//! - **Reconcile**, at plugin start, rebuilds the
 //!   above from the records: services for staged volumes, front recovery
 //!   for targets whose topmost mount is a stale agentfs mount.
 //! - **A restart that cannot spawn** (a failed fork under PID or memory
@@ -114,7 +117,7 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    /// The defaults of `agentfs-csi --mode node`.
+    /// The defaults of `agentfs-csi`.
     pub fn new(node_id: impl Into<String>, layout: Layout) -> Self {
         Self {
             node_id: node_id.into(),
@@ -333,11 +336,13 @@ impl Supervisor {
             let _lock = self.lock_volume(handle).await;
             if !self.children().services.contains_key(handle) {
                 let layout = self.layout().clone();
+                let node_id = self.cfg.node_id.clone();
                 let h = handle.to_owned();
                 let context = req.volume_context.clone();
-                let params = tokio::task::spawn_blocking(move || prepare(&layout, &h, &context))
-                    .await
-                    .map_err(|e| Error::Internal(format!("staging task failed: {e}")))??;
+                let params =
+                    tokio::task::spawn_blocking(move || prepare(&layout, &node_id, &h, &context))
+                        .await
+                        .map_err(|e| Error::Internal(format!("staging task failed: {e}")))??;
                 self.start_service(handle, None, true)?;
                 eprintln!(
                     "staging volume {handle} (agentfs volume {}): history service started",
@@ -1090,17 +1095,10 @@ impl Supervisor {
 
     // ----- start and stop -------------------------------------------------
 
-    /// At plugin start: registers the node, starts the services of staged
-    /// volumes and recovers published targets (in the background).
+    /// At plugin start: starts the services of staged volumes and recovers
+    /// published targets (in the background).
     pub async fn reconcile(self: &Arc<Self>) -> Result<ReconcileReport, Error> {
         let layout = self.layout().clone();
-        let marker = layout.node_marker(&self.cfg.node_id);
-        fs::create_dir_all(layout.nodes_dir())
-            .and_then(|()| fs::write(&marker, format!("{}\n", self.cfg.node_id)))
-            .map_err(io_error(format!(
-                "registering the node at {}",
-                marker.display()
-            )))?;
         let mut report = ReconcileReport::default();
         let (staged, bad) = records::load_all::<StagedRecord>(&layout.staged_dir())
             .map_err(io_error("reading the staged records"))?;
@@ -1276,45 +1274,52 @@ fn who(record: &PublishedRecord) -> String {
     }
 }
 
-/// Stage's blocking part: the volume (created from a static PV's context
-/// if needed), its state area, rules and staged record.
+/// Stage's blocking part: the worktree's checks (rule 1, "NodeStage never
+/// creates": it must be on this node's disk and name the volume; a static
+/// PV is adopted only over its worktree), its includes, rules and staged
+/// record. A missing worktree is `NOT_FOUND` naming the node: the pod
+/// waits, and its events say why.
 fn prepare(
     layout: &Layout,
+    node_id: &str,
     handle: &str,
     context: &HashMap<String, String>,
 ) -> Result<VolumeParams, Error> {
-    let record = match volume::load(layout, handle)? {
-        Some(record) => record,
-        None if context.contains_key("profile") => {
-            let params = VolumeParams::from_context(handle, context)
-                .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-            volume::create(layout, handle, &params, 0, true)?
-        }
-        None => {
-            return Err(Error::NotFound(format!(
-                "volume {handle} does not exist under {}",
-                layout.base.display()
-            )));
-        }
-    };
-    let params = record.params;
-    let config = volume::profile_config(layout, &params.profile)?;
     let state = StateDir::new(layout.state(handle));
+    let missing = || {
+        volume::reopen_error(
+            layout,
+            node_id,
+            core_volume::VolumeError::NoWorktree {
+                path: state.root().to_path_buf(),
+            },
+        )
+    };
+    let record = volume::load(layout, handle)?;
+    let params = match &record {
+        Some(record) => record.params.clone(),
+        None if context.contains_key("profile") => VolumeParams::from_context(handle, context)
+            .map_err(|e| Error::InvalidArgument(e.to_string()))?,
+        None => return Err(missing()),
+    };
+    // Checked before the lock, whose file would create the state area.
+    if !state.git().join("config").exists() {
+        return Err(missing());
+    }
+    let config = volume::profile_config(layout, &params.profile)?;
     {
         let _lock = volume::lock(&state, "agentfs-csi stage")?;
-        core_volume::init_with(
-            &state,
-            &params.volume,
-            params.branch.as_deref(),
-            Some(&[config]),
-        )
-        .map_err(|e| {
-            Error::FailedPrecondition(format!(
-                "checking {}: {}",
-                state.root().display(),
-                volume::chain(&e)
-            ))
-        })?;
+        match record {
+            Some(_) => core_volume::reopen_with(&state, &params.volume, &[config])
+                .map_err(|e| volume::reopen_error(layout, node_id, e))?,
+            None => {
+                volume::adopt(layout, node_id, handle, &params)?;
+                eprintln!(
+                    "adopted static volume {handle} over its worktree (agentfs volume {})",
+                    params.volume
+                );
+            }
+        }
     }
     volume::install_rules(layout, handle, &params.profile)?;
     let staged = layout.staged_record(handle);

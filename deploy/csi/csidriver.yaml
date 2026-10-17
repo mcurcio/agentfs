@@ -4,11 +4,9 @@ kind: CSIDriver
 metadata:
   name: agentfs.mcurcio.github.io
 spec:
-  # ControllerPublish is called (and tracks the node) only so that the
-  # attach/detach controller enforces one node per volume: its
-  # Multi-Attach check refuses a second node while the first one holds
-  # the VolumeAttachment.
-  attachRequired: true
+  # No attach step: a worktree lives on one node's disk, and its PV's node
+  # affinity (the topology CreateVolume answers) keeps its pods there.
+  attachRequired: false
   # NodePublish gets the pod's name, namespace, uid and service account:
   # each pod's front commits under its own identity.
   podInfoOnMount: true

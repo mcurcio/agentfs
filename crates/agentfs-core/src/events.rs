@@ -188,6 +188,14 @@ pub enum Event {
         remote_head: Option<Oid>,
         diverged_ref: String,
     },
+    /// The branch this volume started from holds commits it does not have (F8 R9). Raised at every
+    /// push attempt to the start remote while it holds; the same severity as Diverged.
+    StartBranchMoved {
+        remote: String,
+        refname: String,
+        pinned: Oid,
+        tip: Oid,
+    },
     /// The backlog was larger than the remote's `agentfsMaxPushSize`, so
     /// only part of it was pushed (design §11.3): the branch now stands at
     /// `pushed`, a first-parent ancestor of `head`, with `commits_left`
@@ -334,6 +342,7 @@ impl Event {
             Self::ReconcileFailed { .. } => "reconcile_failed",
             Self::PushFailed { .. } => "push_failed",
             Self::Diverged { .. } => "diverged",
+            Self::StartBranchMoved { .. } => "start_branch_moved",
             Self::PushLimited { .. } => "push_limited",
             Self::RemoteMisconfigured { .. } => "remote_misconfigured",
             Self::PushSucceeded { .. } => "push_succeeded",
@@ -416,6 +425,18 @@ impl fmt::Display for Event {
                 "{remote} diverged: remote branch is at {}, local head {local_head} \
                  saved as {diverged_ref}",
                 oid_or(*remote_head, "unknown"),
+            ),
+            Self::StartBranchMoved {
+                remote,
+                refname,
+                pinned,
+                tip,
+            } => write!(
+                f,
+                "start branch moved: {refname} on {remote}, which this volume started from at \
+                 {pinned}, is now at {tip}; commits {pinned}..{tip} are not on this volume (take \
+                 them in, then `agentfs start accept --tip {tip}`; \
+                 docs/runbooks/start-branch-moved.md)"
             ),
             Self::PushLimited {
                 remote,

@@ -292,8 +292,8 @@ fn params(volume: &str) -> VolumeParams {
     VolumeParams {
         profile: "p".into(),
         volume: volume.into(),
-        branch: None,
         on_delete: OnDelete::Delete,
+        start_from: None,
         workload_mounts: Vec::new(),
     }
 }
@@ -311,7 +311,7 @@ impl Node {
         fs::create_dir_all(&layout.profiles).unwrap();
         fs::write(layout.profiles.join("p.config"), "").unwrap();
         for v in ["v", "w"] {
-            agentfs_csi::volume::create(&layout, v, &params(v), 0, false).unwrap();
+            agentfs_csi::volume::create(&layout, v, &params(v), 0).unwrap();
         }
         let fake = Fake::default();
         let sup = Supervisor::new(
@@ -422,6 +422,39 @@ async fn stage_starts_one_service_and_waits_for_its_address() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
+/// F8 rule 1: NodeStage never creates. A worktree missing from this
+/// node's disk (another node's, or a wiped disk) is NOT_FOUND naming the
+/// node, whatever the volume context says, and nothing is made.
+#[tokio::test]
+async fn stage_never_creates_a_worktree() {
+    let n = Node::new();
+    let context: HashMap<String, String> = [("profile", "p"), ("volume", "x")]
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    for handle in ["elsewhere", "v"] {
+        if handle == "v" {
+            fs::remove_dir_all(n.layout.volume_dir("v")).unwrap();
+        }
+        let err = n
+            .sup
+            .stage(StageRequest {
+                handle: handle.into(),
+                volume_context: context.clone(),
+            })
+            .await
+            .unwrap_err();
+        let Error::NotFound(message) = err else {
+            panic!("{err:?}");
+        };
+        assert!(message.contains("no worktree on node node-1"), "{message}");
+        assert!(message.contains("the pod waits"), "{message}");
+        assert!(!n.layout.volume_dir(handle).exists(), "nothing is created");
+        assert!(!n.layout.staged_record(handle).exists());
+    }
+    assert!(n.fake.spawns("service").is_empty());
 }
 
 #[tokio::test]
@@ -685,7 +718,6 @@ async fn reconcile_rebuilds_services_and_fronts_from_the_records() {
     assert_eq!(report.services, 1);
     assert_eq!(report.recovering, 1);
     assert_eq!(report.dropped, 2);
-    assert!(n.layout.node_marker("node-1").exists());
     eventually("the recovered front", || {
         n.fake.stack(&live) == [false, true]
     })
@@ -835,7 +867,7 @@ async fn publishing_a_target_again_with_other_flags_is_already_exists() {
 #[tokio::test]
 async fn a_finished_fork_is_published_read_only() {
     let n = Node::new();
-    agentfs_csi::volume::create(&n.layout, "f", &params("f"), 0, false).unwrap();
+    agentfs_csi::volume::create(&n.layout, "f", &params("f"), 0).unwrap();
     let state = StateDir::new(n.layout.state("f"));
     fs::remove_dir_all(state.root()).unwrap();
     let base = "1".repeat(40);

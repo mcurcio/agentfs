@@ -32,7 +32,7 @@ use crate::claims::PathClaims;
 use crate::config::{ConfigError, validate_name};
 use crate::confined;
 use crate::events::{CheckStage, Event, Events};
-use crate::fork::identity::{self as fork_identity, ForkIdentity, PushTarget};
+use crate::fork::identity::{self as fork_identity, ForkIdentity, PushTarget, StartPoint};
 use crate::fsync_class::{self, FsyncClass, GroupMembers};
 use crate::history::{Committed, History, HistoryError};
 use crate::history_service::{ClientError, FrontLease, HistoryClient, PathStamp};
@@ -260,6 +260,15 @@ pub enum VolumeError {
     OtherBranch { found: String, wanted: String },
     #[error("this state area is fork {found:?}, not {wanted:?}; nothing was changed")]
     OtherFork { found: String, wanted: String },
+    #[error(
+        "this state area was started from {found}, not {wanted}; nothing was changed (a start \
+         point is fixed at create)"
+    )]
+    OtherStart { found: String, wanted: String },
+    /// NodeStage never creates (F8 rule 1): the worktree is not on this
+    /// node's disk.
+    #[error("no worktree at {}", path.display())]
+    NoWorktree { path: PathBuf },
     #[error("fork {fork} is finished: it is read-only (design §19.1)")]
     ForkFinished { fork: String },
 }
@@ -371,7 +380,42 @@ pub fn init_with(
     branch: Option<&str>,
     includes: Option<&[PathBuf]>,
 ) -> Result<Init, VolumeError> {
-    init_inner(state, volume, branch, includes, None)
+    init_inner(state, volume, branch, includes, None, None)
+}
+
+/// A started volume's state area: init_with, plus the three start keys in its own config. An
+/// existing area must hold the same start point, else VolumeError::OtherStart.
+pub fn init_started(
+    state: &StateDir,
+    volume: &str,
+    start: &StartPoint,
+    includes: &[PathBuf],
+) -> Result<Init, VolumeError> {
+    init_inner(state, volume, None, Some(includes), None, Some(start))
+}
+
+/// NodeStage's check (rule 1, "NodeStage never creates"): the state area exists and names
+/// `volume`; its includes become `includes`. Missing: VolumeError::NoWorktree.
+pub fn reopen_with(
+    state: &StateDir,
+    volume: &str,
+    includes: &[PathBuf],
+) -> Result<(), VolumeError> {
+    validate_name("agentfs.volume", volume).map_err(config_error)?;
+    let git = state.git();
+    match existing_identity(&git)? {
+        None => Err(VolumeError::NoWorktree {
+            path: state.root().to_path_buf(),
+        }),
+        Some((found, _)) if found != volume => Err(VolumeError::OtherVolume {
+            found,
+            wanted: volume.to_owned(),
+        }),
+        Some(_) => {
+            restore_info_files(&git)?;
+            finish_layout(state, Some(includes))
+        }
+    }
 }
 
 /// Creates the state area of the fork `identity` (design §11.5), or
@@ -386,16 +430,24 @@ pub fn init_fork(
     identity: &ForkIdentity,
     includes: &[PathBuf],
 ) -> Result<Init, VolumeError> {
-    init_inner(state, &identity.fork, None, Some(includes), Some(identity))
+    init_inner(
+        state,
+        &identity.fork,
+        None,
+        Some(includes),
+        Some(identity),
+        None,
+    )
 }
 
-/// [`init_with`] and [`init_fork`].
+/// [`init_with`], [`init_fork`] and [`init_started`].
 fn init_inner(
     state: &StateDir,
     volume: &str,
     branch: Option<&str>,
     includes: Option<&[PathBuf]>,
     fork: Option<&ForkIdentity>,
+    start: Option<&StartPoint>,
 ) -> Result<Init, VolumeError> {
     validate_name("agentfs.volume", volume).map_err(config_error)?;
     if let Some(fork) = fork {
@@ -407,6 +459,11 @@ fn init_inner(
         && found == volume
     {
         check_fork(&git, fork)?;
+    }
+    if let (Some((found, found_branch)), Some(start)) = (&existing, start)
+        && found == volume
+    {
+        check_start(&git, found_branch, start)?;
     }
     let outcome = match existing {
         Some((found, _)) if found != volume => {
@@ -424,13 +481,7 @@ fn init_inner(
                     wanted: wanted.to_owned(),
                 });
             }
-            for name in ["exclude", "attributes"] {
-                let path = git.join("info").join(name);
-                if !path.exists() {
-                    std::fs::create_dir_all(git.join("info"))?;
-                    std::fs::write(path, "")?;
-                }
-            }
+            restore_info_files(&git)?;
             Init::AlreadyInitialised
         }
         None => {
@@ -438,9 +489,33 @@ fn init_inner(
             if let Some(fork) = fork {
                 write_fork_identity(&git, fork)?;
             }
+            if let Some(start) = start {
+                write_start_identity(&git, start)?;
+            }
             Init::Created
         }
     };
+    finish_layout(state, includes)?;
+    Ok(outcome)
+}
+
+/// `info/exclude` and `info/attributes`, empty, where they are missing.
+fn restore_info_files(git: &Path) -> Result<(), VolumeError> {
+    for name in ["exclude", "attributes"] {
+        let path = git.join("info").join(name);
+        if !path.exists() {
+            std::fs::create_dir_all(git.join("info"))?;
+            std::fs::write(path, "")?;
+        }
+    }
+    Ok(())
+}
+
+/// The state area's directories, its includes when given, and one open
+/// of the result, so a bad fragment fails here rather than at the first
+/// mount.
+fn finish_layout(state: &StateDir, includes: Option<&[PathBuf]>) -> Result<(), VolumeError> {
+    let git = state.git();
     std::fs::create_dir_all(state.journal().parent().expect("journal has a parent"))?;
     // Not `PendingStore::open`: a running front's half-written copies
     // must survive an `init` beside it.
@@ -451,7 +526,55 @@ fn init_inner(
         crate::history::write_includes(&git, includes)?;
     }
     History::open(&git)?;
-    Ok(outcome)
+    Ok(())
+}
+
+/// An existing state area named like a started volume: it must hold
+/// `wanted`. One whose start keys were never written (a crash after the
+/// repository was created), with no history yet, gets them now.
+fn check_start(git: &Path, branch: &str, wanted: &StartPoint) -> Result<(), VolumeError> {
+    let config = git2::Config::open(&git.join("config")).map_err(HistoryError::from)?;
+    let get =
+        |key: &str| crate::config::string(&config, key).map_err(|e| VolumeError::History(e.into()));
+    let found = (
+        get(fork_identity::START_REMOTE_KEY)?,
+        get(fork_identity::START_BRANCH_KEY)?,
+        get(fork_identity::START_COMMIT_KEY)?,
+    );
+    let other = |found: String| VolumeError::OtherStart {
+        found,
+        wanted: wanted.to_string(),
+    };
+    match found {
+        (Some(remote), Some(start_branch), Some(commit)) => {
+            let found = format!("{remote}:{start_branch}@{commit}");
+            if found == wanted.to_string() {
+                Ok(())
+            } else {
+                Err(other(found))
+            }
+        }
+        _ => {
+            let repo = git2::Repository::open_bare(git).map_err(HistoryError::from)?;
+            if repo.find_reference(&format!("refs/heads/{branch}")).is_ok() {
+                return Err(other("no start point".into()));
+            }
+            write_start_identity(git, wanted)
+        }
+    }
+}
+
+/// The three start keys, in the state area's own config.
+fn write_start_identity(git: &Path, start: &StartPoint) -> Result<(), VolumeError> {
+    let mut config = git2::Config::open(&git.join("config")).map_err(HistoryError::from)?;
+    for (key, value) in [
+        (fork_identity::START_REMOTE_KEY, start.remote.clone()),
+        (fork_identity::START_BRANCH_KEY, start.branch.clone()),
+        (fork_identity::START_COMMIT_KEY, start.commit.to_string()),
+    ] {
+        config.set_str(key, &value).map_err(HistoryError::from)?;
+    }
+    Ok(())
 }
 
 /// The volume and branch an existing state area's own config names, or

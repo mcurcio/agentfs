@@ -9,24 +9,28 @@
 //! | Parameter | Meaning |
 //! |---|---|
 //! | `profile` | required: `<profile>.config`, `.exclude`, `.attributes` in the profiles directory |
-//! | `volumeName` | the agentfs volume name, a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}`; default [`DEFAULT_TEMPLATE`] (with the provisioner's `--extra-create-metadata`), else the PV name. In a static PV's attributes, a literal name |
-//! | `branch` | the history branch (default `agentfs/<volume>`) |
-//! | `onDelete` | `retain` (default: DeleteVolume keeps the directory) or `delete` |
+//! | `volumeName` | the agentfs volume name, a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}` that must contain `{pvName}`; default [`DEFAULT_TEMPLATE`] (with the provisioner's `--extra-create-metadata`), else the PV name. In a static PV's attributes, a literal name |
+//! | `onDelete` | `retain` (default: DeleteVolume keeps the directory) or `delete` ([`OnDelete`]) |
+//! | `startFrom` | `<remote>:<branch>@<commit>`: the new worktree starts from that commit of another worktree's branch (F8 R2; [`StartPoint`]) |
 //! | `fork` | `"true"`: a fork class ([`ForkClass`], design §11.5); `"false"` or absent: an ordinary one |
 //!
 //! Keys under `csi.storage.k8s.io/` (the provisioner's metadata) are read
-//! for the template and otherwise ignored; any other key is refused.
+//! for the template and otherwise ignored; any other key is refused,
+//! `branch` too: a worktree's branch is always `agentfs/<volume>` (F8
+//! rule 1, one branch per worktree, for good).
 //!
-//! The default name includes the PV name, so it is unique per volume
-//! (design §11.4): a claim deleted and created again gets a new branch
-//! instead of a fresh root commit on the old claim's branch, which every
-//! push would then find diverged (design §11.3).
+//! The name must include the PV name, so it is unique per volume (design
+//! §11.4, F8 rule 1): a claim deleted and created again is a new worktree
+//! with a new branch, never a second writer of the old claim's branch.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 use agentfs_core::config::validate_name;
+use agentfs_core::fork::identity::{BadStartPoint, StartPoint};
+
+pub use agentfs_core::release::OnDelete;
 
 /// The provisioner's metadata keys (`--extra-create-metadata`).
 pub const PVC_NAME: &str = "csi.storage.k8s.io/pvc/name";
@@ -65,13 +69,13 @@ pub enum ParamError {
     )]
     BadProfile(String),
     #[error(
-        "unknown StorageClass parameter {0:?} (known: profile, volumeName, branch, onDelete, \
-         workloadMounts, fork)"
+        "unknown StorageClass parameter {0:?} (known: profile, volumeName, onDelete, startFrom, \
+         workloadMounts, fork; a worktree's branch is always agentfs/<volume>)"
     )]
     UnknownKey(String),
     #[error(
-        "unknown volume attribute {0:?} (known: profile, volumeName (or volume), branch, onDelete, \
-         workloadMounts)"
+        "unknown volume attribute {0:?} (known: profile, volumeName (or volume), onDelete, \
+         workloadMounts; a worktree's branch is always agentfs/<volume>)"
     )]
     UnknownAttribute(String),
     #[error("the volume attributes name two volumes, {a:?} and {b:?} (volume and volumeName)")]
@@ -88,56 +92,25 @@ pub enum ParamError {
         "volumeName {template:?} gives {value:?}, which is not a valid agentfs volume name ([A-Za-z0-9][A-Za-z0-9._-]*, no '..', no .lock suffix)"
     )]
     BadVolumeName { template: String, value: String },
-    #[error("branch {0:?} is not a valid branch name")]
-    BadBranch(String),
-    #[error("onDelete {0:?} must be retain or delete")]
-    BadOnDelete(String),
+    #[error(transparent)]
+    BadOnDelete(#[from] agentfs_core::release::BadOnDelete),
+    #[error(transparent)]
+    BadStartFrom(#[from] BadStartPoint),
     #[error("workloadMounts: {0}")]
     BadWorkloadMount(String),
     #[error(
-        "a fork class (fork: \"true\") must not set {0}: a fork's profile is its source's and \
-         its branch is fixed"
+        "a fork class (fork: \"true\") must not set {0}: a fork's profile is its source's, its \
+         branch is its own and it starts from its source's head"
     )]
     ForkClassSets(&'static str),
     #[error("fork {0:?} must be \"true\" or \"false\"")]
     BadFork(String),
+    /// Any class: volumeName must contain {pvName} (rule 1).
     #[error(
-        "volumeName {template:?} of a fork class must contain {{pvName}}, so each fork is unique \
-         on the remote"
+        "volumeName {template:?} must contain {{pvName}}, so each claim is a worktree with its \
+         own branch (one branch per worktree, for good)"
     )]
-    ForkNameNotUnique { template: String },
-}
-
-/// What DeleteVolume does with the volume's directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OnDelete {
-    /// Keep the backing tree and history (re-usable through a static PV).
-    #[default]
-    Retain,
-    /// Remove the directory.
-    Delete,
-}
-
-impl std::str::FromStr for OnDelete {
-    type Err = ParamError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "retain" => Ok(Self::Retain),
-            "delete" => Ok(Self::Delete),
-            other => Err(ParamError::BadOnDelete(other.to_owned())),
-        }
-    }
-}
-
-impl std::fmt::Display for OnDelete {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Retain => "retain",
-            Self::Delete => "delete",
-        })
-    }
+    NameNotUnique { template: String },
 }
 
 /// A volume's settings, from CreateVolume's parameters or a static PV's
@@ -145,11 +118,13 @@ impl std::fmt::Display for OnDelete {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeParams {
     pub profile: String,
-    /// The agentfs volume name (`agentfs.volume`).
+    /// `branch` is gone: the branch is always agentfs/<volume> (rule 1).
     pub volume: String,
-    /// The history branch; `None` is `agentfs/<volume>`.
-    pub branch: Option<String>,
     pub on_delete: OnDelete,
+    /// The class's raw `startFrom`, kept in csi.json only so that a retried CreateVolume with other
+    /// parameters is AlreadyExists; the worktree's identity (agentfs.start.*) is the authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_from: Option<String>,
     /// Where pods mount the volume (`workloadMounts`: comma-separated
     /// `PATH` or `PATH=DIR`), passed to every front as `--workload-mount`
     /// so absolute worktree `gitdir:` targets map exactly (design §5).
@@ -166,15 +141,18 @@ impl VolumeParams {
     ) -> Result<Self, ParamError> {
         let mut profile = None;
         let mut template = None;
-        let mut branch = None;
         let mut on_delete = OnDelete::default();
+        let mut start_from = None;
         let mut workload_mounts = Vec::new();
         for (key, value) in parameters {
             match key.as_str() {
                 "profile" => profile = Some(value.clone()),
                 "volumeName" => template = Some(value.clone()),
-                "branch" => branch = Some(value.clone()),
                 "onDelete" => on_delete = value.parse()?,
+                "startFrom" => {
+                    StartPoint::parse(value)?;
+                    start_from = Some(value.clone());
+                }
                 "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
                 // An ordinary class may say so; a fork class is a ForkClass.
                 "fork" if value == "false" => {}
@@ -185,43 +163,46 @@ impl VolumeParams {
         }
         let profile = profile.ok_or(ParamError::MissingProfile)?;
         validate_profile(&profile)?;
-        let template = template.unwrap_or_else(|| default_template(parameters));
-        let volume = volume_name(name, &template, parameters)?;
-        if let Some(branch) = &branch {
-            validate_branch(branch)?;
-        }
+        let volume = unique_volume_name(name, template, parameters)?;
         Ok(Self {
             profile,
             volume,
-            branch,
             on_delete,
+            start_from,
             workload_mounts,
         })
+    }
+
+    /// The class's start point, if it names one.
+    pub fn start_point(&self) -> Result<Option<StartPoint>, ParamError> {
+        Ok(self
+            .start_from
+            .as_deref()
+            .map(StartPoint::parse)
+            .transpose()?)
     }
 
     /// From a volume context: what CreateVolume returned, or a static PV's
     /// `volumeAttributes`: `profile` (required), `volumeName` (a literal
     /// name, not a template; `volume`, as CreateVolume returns it, is the
-    /// same; default: the volume handle), `branch`, `onDelete` and
+    /// same; default: the volume handle), `onDelete` and
     /// `workloadMounts`. Keys
     /// under the CO's prefixes (`csi.storage.k8s.io/`,
     /// `storage.kubernetes.io/csiProvisionerIdentity`) are ignored; any
-    /// other key is refused, so a typo in a static PV fails loudly rather
-    /// than naming the volume after its handle.
+    /// other key is refused (`branch` too), so a typo in a static PV fails
+    /// loudly rather than naming the volume after its handle.
     pub fn from_context(
         handle: &str,
         context: &HashMap<String, String>,
     ) -> Result<Self, ParamError> {
         let mut profile = None;
         let mut names: Vec<&str> = Vec::new();
-        let mut branch = None;
         let mut on_delete = OnDelete::default();
         let mut workload_mounts = Vec::new();
         for (key, value) in context {
             match key.as_str() {
                 "profile" => profile = Some(value.clone()),
                 "volume" | "volumeName" => names.push(value),
-                "branch" => branch = Some(value.clone()).filter(|b| !b.is_empty()),
                 "onDelete" => on_delete = value.parse()?,
                 "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
                 k if CO_CONTEXT_PREFIXES.iter().any(|p| k.starts_with(p)) => {}
@@ -247,32 +228,28 @@ impl VolumeParams {
                 value: volume,
             });
         }
-        if let Some(branch) = &branch {
-            validate_branch(branch)?;
-        }
         Ok(Self {
             profile,
             volume,
-            branch,
             on_delete,
+            start_from: None,
             workload_mounts,
         })
     }
 
-    /// The branch history is written to.
+    /// "agentfs/<volume>".
     pub fn branch_name(&self) -> String {
-        self.branch
-            .clone()
-            .unwrap_or_else(|| format!("agentfs/{}", self.volume))
+        format!("agentfs/{}", self.volume)
     }
 
     /// The volume context CreateVolume returns, which every node call
-    /// carries back.
+    /// carries back. It reads back with [`VolumeParams::from_context`]
+    /// (NodeStage of a worktree whose `csi.json` is gone), so it carries
+    /// no key that a static PV may not set.
     pub fn to_context(&self) -> HashMap<String, String> {
         let mut context = HashMap::from([
             ("profile".to_owned(), self.profile.clone()),
             ("volume".to_owned(), self.volume.clone()),
-            ("branch".to_owned(), self.branch_name()),
             ("onDelete".to_owned(), self.on_delete.to_string()),
         ]);
         if !self.workload_mounts.is_empty() {
@@ -290,6 +267,21 @@ fn default_template(parameters: &HashMap<String, String>) -> String {
     } else {
         "{pvName}".to_owned()
     }
+}
+
+/// The volume name of a class's `volumeName` template (default
+/// [`default_template`]) for the PV `name`: it must contain `{pvName}`
+/// (rule 1, [`ParamError::NameNotUnique`]).
+fn unique_volume_name(
+    name: &str,
+    template: Option<String>,
+    parameters: &HashMap<String, String>,
+) -> Result<String, ParamError> {
+    let template = template.unwrap_or_else(|| default_template(parameters));
+    if !template.contains("{pvName}") {
+        return Err(ParamError::NameNotUnique { template });
+    }
+    volume_name(name, &template, parameters)
 }
 
 /// `template` rendered for the PV `name`, as a valid volume name.
@@ -322,9 +314,10 @@ pub struct ForkClass {
 
 impl ForkClass {
     /// `Ok(None)` unless `parameters` has `fork: "true"`. A fork class must
-    /// not set `profile` or `branch`, and its `volumeName` template must
-    /// contain `{pvName}`; `onDelete` defaults to `delete` (publishing
-    /// already gates deletion, design §19.1 "Fork onDelete").
+    /// not set `profile`, `branch` or `startFrom`, and its `volumeName`
+    /// template must contain `{pvName}`, as every class's; `onDelete`
+    /// defaults to `delete` (publishing already gates deletion, design
+    /// §19.1 "Fork onDelete").
     pub fn from_create(
         name: &str,
         parameters: &HashMap<String, String>,
@@ -342,6 +335,7 @@ impl ForkClass {
                 "fork" => {}
                 "profile" => return Err(ParamError::ForkClassSets("profile")),
                 "branch" => return Err(ParamError::ForkClassSets("branch")),
+                "startFrom" => return Err(ParamError::ForkClassSets("startFrom")),
                 "volumeName" => template = Some(value.clone()),
                 "onDelete" => on_delete = value.parse()?,
                 "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
@@ -349,24 +343,20 @@ impl ForkClass {
                 other => return Err(ParamError::UnknownKey(other.to_owned())),
             }
         }
-        let template = template.unwrap_or_else(|| default_template(parameters));
-        if !template.contains("{pvName}") {
-            return Err(ParamError::ForkNameNotUnique { template });
-        }
         Ok(Some(Self {
-            volume: volume_name(name, &template, parameters)?,
+            volume: unique_volume_name(name, template, parameters)?,
             on_delete,
             workload_mounts,
         }))
     }
 
-    /// The fork's parameters: the source's profile, no branch.
+    /// The fork's parameters: the source's profile.
     pub fn params(&self, source: &VolumeParams) -> VolumeParams {
         VolumeParams {
             profile: source.profile.clone(),
             volume: self.volume.clone(),
-            branch: None,
             on_delete: self.on_delete,
+            start_from: None,
             workload_mounts: self.workload_mounts.clone(),
         }
     }
@@ -411,27 +401,6 @@ pub fn validate_profile(profile: &str) -> Result<(), ParamError> {
         Ok(())
     } else {
         Err(ParamError::BadProfile(profile.to_owned()))
-    }
-}
-
-/// A conservative subset of git's ref-name rules (the branch becomes
-/// `refs/heads/<branch>`).
-fn validate_branch(branch: &str) -> Result<(), ParamError> {
-    let ok = !branch.is_empty()
-        && branch
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-' | b'/'))
-        && !branch.starts_with(['-', '/', '.'])
-        && !branch.ends_with(['/', '.'])
-        && !branch.ends_with(".lock")
-        && !branch.contains("..")
-        && !branch.contains("//")
-        && !branch.contains("/.")
-        && !branch.split('/').any(|c| c.ends_with(".lock"));
-    if ok {
-        Ok(())
-    } else {
-        Err(ParamError::BadBranch(branch.to_owned()))
     }
 }
 
@@ -534,12 +503,12 @@ mod tests {
         let source = VolumeParams::from_create("pvc-1", &map(&[("profile", "example")])).unwrap();
         let params = class.params(&source);
         assert_eq!(params.profile, "example");
-        assert_eq!(params.branch, None);
+        assert_eq!(params.start_from, None);
         assert_eq!(params.branch_name(), "agentfs/agents.sandbox.pvc-9");
-        for (key, what) in [("profile", "profile"), ("branch", "branch")] {
+        for key in ["profile", "branch", "startFrom"] {
             assert_eq!(
                 ForkClass::from_create("pvc-9", &with(&[("fork", "true"), (key, "x")])),
-                Err(ParamError::ForkClassSets(what))
+                Err(ParamError::ForkClassSets(key))
             );
         }
         assert!(matches!(
@@ -547,7 +516,7 @@ mod tests {
                 "pvc-9",
                 &with(&[("fork", "true"), ("volumeName", "{pvcName}")])
             ),
-            Err(ParamError::ForkNameNotUnique { .. })
+            Err(ParamError::NameNotUnique { .. })
         ));
         assert_eq!(
             ForkClass::from_create("pvc-9", &with(&[("fork", "yes")])),
@@ -581,18 +550,80 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.volume, "agents.data.pvc-1234");
-        assert_eq!(p.branch, None);
         assert_eq!(p.branch_name(), "agentfs/agents.data.pvc-1234");
         assert_eq!(p.on_delete, OnDelete::Retain);
         let ctx = p.to_context();
         assert_eq!(ctx["profile"], "example");
         assert_eq!(ctx["volume"], "agents.data.pvc-1234");
-        assert_eq!(ctx["branch"], "agentfs/agents.data.pvc-1234");
         assert_eq!(ctx["onDelete"], "retain");
-        // The context round-trips (branch now explicit).
+        assert!(!ctx.contains_key("branch"), "{ctx:?}");
+        // The context round-trips.
         let back = VolumeParams::from_context("pvc-1234", &ctx).unwrap();
         assert_eq!(back.volume, p.volume);
         assert_eq!(back.branch_name(), p.branch_name());
+    }
+
+    /// F8 rule 1: every class's name names the PV, and no class or static
+    /// PV names a branch.
+    #[test]
+    fn every_name_is_unique_and_no_class_names_a_branch() {
+        for template in ["team-{pvcName}", "{pvcNamespace}.{pvcName}", "fixed"] {
+            let err = VolumeParams::from_create(
+                "pvc-1",
+                &map(&[
+                    ("profile", "p"),
+                    ("volumeName", template),
+                    (PVC_NAME, "data"),
+                    (PVC_NAMESPACE, "ns"),
+                ]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                ParamError::NameNotUnique {
+                    template: template.into()
+                }
+            );
+        }
+        assert_eq!(
+            VolumeParams::from_create("v", &map(&[("profile", "p"), ("branch", "team/x")])),
+            Err(ParamError::UnknownKey("branch".into()))
+        );
+        assert_eq!(
+            VolumeParams::from_context("h", &map(&[("profile", "p"), ("branch", "team/x")])),
+            Err(ParamError::UnknownAttribute("branch".into()))
+        );
+    }
+
+    #[test]
+    fn a_start_class() {
+        let c = "0123456789abcdef0123456789abcdef01234567";
+        let value = format!("origin:agentfs/ns.data.pvc-1@{c}");
+        let p =
+            VolumeParams::from_create("pvc-2", &map(&[("profile", "p"), ("startFrom", &value)]))
+                .unwrap();
+        assert_eq!(p.start_from.as_deref(), Some(value.as_str()));
+        assert_eq!(p.start_point().unwrap().unwrap().to_string(), value);
+        assert!(
+            !p.to_context().contains_key("startFrom"),
+            "the identity is the authority"
+        );
+        let diverged = format!("origin:refs/agentfs/ns.data.pvc-1/diverged/x@{c}");
+        let err =
+            VolumeParams::from_create("pvc-2", &map(&[("profile", "p"), ("startFrom", &diverged)]))
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParamError::BadStartFrom(BadStartPoint::NotABranch { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("not a branch"), "{err}");
+        assert!(matches!(
+            VolumeParams::from_create("pvc-2", &map(&[("profile", "p"), ("startFrom", "x")])),
+            Err(ParamError::BadStartFrom(BadStartPoint::Shape { .. }))
+        ));
     }
 
     #[test]
@@ -617,31 +648,34 @@ mod tests {
             m.insert("volumeName".into(), t.into());
             VolumeParams::from_create("pvc-1", &m)
         };
-        assert_eq!(with("team-{pvcName}").unwrap().volume, "team-data");
+        assert_eq!(
+            with("team-{pvcName}-{pvName}").unwrap().volume,
+            "team-data-pvc-1"
+        );
         assert_eq!(with("{pvName}").unwrap().volume, "pvc-1");
         assert_eq!(
             with("{pvcNamespace}_{pvcName}_{pvName}").unwrap().volume,
             "ns_data_pvc-1"
         );
         assert!(matches!(
-            with("{pod}").unwrap_err(),
+            with("{pod}.{pvName}").unwrap_err(),
             ParamError::UnknownPlaceholder { .. }
         ));
         assert!(matches!(
-            with("a/{pvcName}").unwrap_err(),
+            with("a/{pvName}").unwrap_err(),
             ParamError::BadVolumeName { .. }
         ));
         assert!(matches!(
-            with("{pvcName}..x").unwrap_err(),
+            with("{pvName}..x").unwrap_err(),
             ParamError::BadVolumeName { .. }
         ));
         assert!(matches!(
-            with("{pvcName}.lock").unwrap_err(),
+            with("{pvName}.lock").unwrap_err(),
             ParamError::BadVolumeName { .. }
         ));
         let err = VolumeParams::from_create(
             "pvc-1",
-            &map(&[("profile", "p"), ("volumeName", "{pvcName}")]),
+            &map(&[("profile", "p"), ("volumeName", "{pvcName}.{pvName}")]),
         )
         .unwrap_err();
         assert!(matches!(err, ParamError::MissingMetadata { .. }));
@@ -677,31 +711,15 @@ mod tests {
     }
 
     #[test]
-    fn on_delete_branch_and_unknown_keys() {
-        let p = VolumeParams::from_create(
-            "v",
-            &map(&[
-                ("profile", "p"),
-                ("onDelete", "delete"),
-                ("branch", "team/x"),
-            ]),
-        )
-        .unwrap();
+    fn on_delete_and_unknown_keys() {
+        let p = VolumeParams::from_create("v", &map(&[("profile", "p"), ("onDelete", "delete")]))
+            .unwrap();
         assert_eq!(p.on_delete, OnDelete::Delete);
-        assert_eq!(p.branch.as_deref(), Some("team/x"));
         assert_eq!(
             VolumeParams::from_create("v", &map(&[("profile", "p"), ("onDelete", "keep")]))
                 .unwrap_err(),
-            ParamError::BadOnDelete("keep".into())
+            ParamError::BadOnDelete(agentfs_core::release::BadOnDelete("keep".into()))
         );
-        for bad in [
-            "", "-x", "a..b", "a.lock", "a/.b", "a b", "a/", "/a", "x.lock/y",
-        ] {
-            assert!(
-                VolumeParams::from_create("v", &map(&[("profile", "p"), ("branch", bad)])).is_err(),
-                "{bad:?}"
-            );
-        }
         assert_eq!(
             VolumeParams::from_create("v", &map(&[("profile", "p"), ("remote", "x")])).unwrap_err(),
             ParamError::UnknownKey("remote".into())
@@ -756,7 +774,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.volume, "retained-1");
-        assert_eq!(p.branch, None);
+        assert_eq!(p.branch_name(), "agentfs/retained-1");
         assert_eq!(
             VolumeParams::from_context("h", &map(&[])).unwrap_err(),
             ParamError::MissingProfile

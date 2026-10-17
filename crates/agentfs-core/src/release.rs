@@ -54,15 +54,20 @@ impl FromStr for OnDelete {
     type Err = BadOnDelete;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let _ = s;
-        todo!("F8 S1: moved from agentfs-csi::params")
+        match s {
+            "retain" => Ok(Self::Retain),
+            "delete" => Ok(Self::Delete),
+            other => Err(BadOnDelete(other.to_owned())),
+        }
     }
 }
 
 impl fmt::Display for OnDelete {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!("F8 S1: moved from agentfs-csi::params")
+        f.write_str(match self {
+            Self::Retain => "retain",
+            Self::Delete => "delete",
+        })
     }
 }
 
@@ -94,8 +99,13 @@ impl<'a> Declared<'a> {
     /// How `settings` declares its remotes; `seen` must hold one entry per
     /// valid push remote of `settings` (ignored otherwise).
     pub fn of(settings: &Settings, seen: &'a [Seen]) -> Self {
-        let _ = (settings, seen);
-        todo!("F8 S1; F8 S3 reads config::Remotes")
+        if !settings.remotes.is_empty() {
+            Self::Pushed(seen)
+        } else if settings.invalid_remotes.iter().any(|r| !r.fork_remote) {
+            Self::NoneValid
+        } else {
+            Self::Undeclared
+        }
     }
 }
 
@@ -157,6 +167,228 @@ pub enum Waiting {
 /// The release decision for `worktree` (see the module docs). Remotes are
 /// weighed in order and the first that does not hold the head is named.
 pub fn decide(worktree: &Worktree<'_>) -> Release {
-    let _ = worktree;
-    todo!("F8 S1")
+    let held = || match worktree.on_delete {
+        OnDelete::Delete => Release::Delete,
+        OnDelete::Retain => Release::Keep(Kept::Retained),
+    };
+    if !worktree.has_history {
+        return held();
+    }
+    if let Some(state) = worktree.fork {
+        return if state.may_delete() {
+            held()
+        } else {
+            Release::Wait(Waiting::ForkUnpublished { state })
+        };
+    }
+    match worktree.remotes {
+        Declared::LocalOnly => Release::Keep(Kept::LocalOnly),
+        Declared::Undeclared => Release::Keep(Kept::Undeclared),
+        Declared::NoneValid => Release::Wait(Waiting::NoneValid),
+        Declared::Pushed(seen) => {
+            for remote in seen {
+                let name = || remote.remote.clone();
+                let waiting = match &remote.branch {
+                    Ok(claim) if claim.holds_head() => continue,
+                    Ok(Claim::Diverged) => Waiting::Diverged { remote: name() },
+                    Ok(_) => Waiting::Lacking { remote: name() },
+                    Err(why) => Waiting::Unreachable {
+                        remote: name(),
+                        message: why.message.clone(),
+                    },
+                };
+                return Release::Wait(waiting);
+            }
+            held()
+        }
+    }
+}
+
+impl fmt::Display for Waiting {
+    /// Why DeleteVolume waits, for its `UNAVAILABLE` message.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lacking { remote } => write!(
+                f,
+                "remote {remote} does not hold the branch's head yet (the node plugin's release \
+                 scan pushes it)"
+            ),
+            Self::Unreachable { remote, message } => write!(
+                f,
+                "remote {remote} could not be listed ({message}); the node plugin's release scan \
+                 keeps pushing"
+            ),
+            Self::Diverged { remote } => write!(
+                f,
+                "remote {remote}'s branch was written by another worktree (diverged); the \
+                 worktree is kept until an operator resolves it (docs/runbooks/divergence.md)"
+            ),
+            Self::NoneValid => f.write_str(
+                "every remote section of the volume's profile is invalid: nothing can be pushed \
+                 until the profile is fixed",
+            ),
+            Self::ForkUnpublished { state } => write!(
+                f,
+                "the fork is {}: it is deleted once it is published or abandoned (the node \
+                 plugin publishes it)",
+                state.as_str()
+            ),
+        }
+    }
+}
+
+impl fmt::Display for Kept {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Retained => "onDelete: retain",
+            Self::LocalOnly => "local-only: no remote holds its history",
+            Self::Undeclared => "no remote is declared: nothing elsewhere holds its history",
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::PushFailureKind;
+
+    fn seen(remote: &str, branch: Result<Claim, Unreachable>) -> Seen {
+        Seen {
+            remote: remote.into(),
+            branch,
+        }
+    }
+
+    fn worktree<'a>(on_delete: OnDelete, remotes: Declared<'a>) -> Worktree<'a> {
+        Worktree {
+            has_history: true,
+            on_delete,
+            remotes,
+            fork: None,
+        }
+    }
+
+    fn unreachable() -> Unreachable {
+        Unreachable {
+            kind: PushFailureKind::Unreachable,
+            message: "connection refused".into(),
+        }
+    }
+
+    #[test]
+    fn on_delete_parses_and_prints() {
+        for (text, value) in [("retain", OnDelete::Retain), ("delete", OnDelete::Delete)] {
+            assert_eq!(text.parse::<OnDelete>().unwrap(), value);
+            assert_eq!(value.to_string(), text);
+        }
+        assert_eq!("keep".parse::<OnDelete>(), Err(BadOnDelete("keep".into())));
+        assert_eq!(OnDelete::default(), OnDelete::Retain);
+    }
+
+    #[test]
+    fn every_release_answer() {
+        let held = [
+            seen("a", Ok(Claim::UpToDate)),
+            seen("b", Ok(Claim::UpToDate)),
+        ];
+        let decide_with = |on_delete, remotes| decide(&worktree(on_delete, remotes));
+        assert_eq!(
+            decide_with(OnDelete::Delete, Declared::Pushed(&held)),
+            Release::Delete
+        );
+        assert_eq!(
+            decide_with(OnDelete::Retain, Declared::Pushed(&held)),
+            Release::Keep(Kept::Retained)
+        );
+        for on_delete in [OnDelete::Delete, OnDelete::Retain] {
+            assert_eq!(
+                decide_with(on_delete, Declared::LocalOnly),
+                Release::Keep(Kept::LocalOnly)
+            );
+            assert_eq!(
+                decide_with(on_delete, Declared::Undeclared),
+                Release::Keep(Kept::Undeclared)
+            );
+            assert_eq!(
+                decide_with(on_delete, Declared::NoneValid),
+                Release::Wait(Waiting::NoneValid)
+            );
+        }
+        // No history: nothing can be lost, and nothing is asked.
+        let none = Worktree {
+            has_history: false,
+            ..worktree(OnDelete::Delete, Declared::NoneValid)
+        };
+        assert_eq!(decide(&none), Release::Delete);
+        let none = Worktree {
+            on_delete: OnDelete::Retain,
+            ..none
+        };
+        assert_eq!(decide(&none), Release::Keep(Kept::Retained));
+    }
+
+    #[test]
+    fn retain_waits_for_the_push_like_delete() {
+        for (claim, waiting) in [
+            (Claim::Create, Waiting::Lacking { remote: "b".into() }),
+            (Claim::FastForward, Waiting::Lacking { remote: "b".into() }),
+            (Claim::Diverged, Waiting::Diverged { remote: "b".into() }),
+        ] {
+            let remotes = [seen("a", Ok(Claim::UpToDate)), seen("b", Ok(claim))];
+            for on_delete in [OnDelete::Delete, OnDelete::Retain] {
+                assert_eq!(
+                    decide(&worktree(on_delete, Declared::Pushed(&remotes))),
+                    Release::Wait(waiting.clone()),
+                    "{claim:?}, {on_delete}"
+                );
+            }
+        }
+        let remotes = [seen("a", Err(unreachable()))];
+        assert_eq!(
+            decide(&worktree(OnDelete::Retain, Declared::Pushed(&remotes))),
+            Release::Wait(Waiting::Unreachable {
+                remote: "a".into(),
+                message: "connection refused".into()
+            })
+        );
+    }
+
+    #[test]
+    fn the_first_remote_that_does_not_hold_the_head_is_named() {
+        let remotes = [
+            seen("a", Ok(Claim::UpToDate)),
+            seen("b", Err(unreachable())),
+            seen("c", Ok(Claim::Diverged)),
+        ];
+        let Release::Wait(waiting) =
+            decide(&worktree(OnDelete::Delete, Declared::Pushed(&remotes)))
+        else {
+            panic!("must wait");
+        };
+        assert!(matches!(&waiting, Waiting::Unreachable { remote, .. } if remote == "b"));
+        assert!(waiting.to_string().contains("remote b"), "{waiting}");
+    }
+
+    #[test]
+    fn a_forks_state_wins_over_its_remotes() {
+        // A fork's remotes are not asked: publishing is its gate.
+        let lacking = [seen("forks", Ok(Claim::Create))];
+        let fork = |state, on_delete| Worktree {
+            fork: Some(state),
+            ..worktree(on_delete, Declared::Pushed(&lacking))
+        };
+        for state in [ForkState::Active, ForkState::Finished, ForkState::Refused] {
+            assert_eq!(
+                decide(&fork(state, OnDelete::Delete)),
+                Release::Wait(Waiting::ForkUnpublished { state })
+            );
+        }
+        for state in [ForkState::Published, ForkState::Abandoned] {
+            assert_eq!(decide(&fork(state, OnDelete::Delete)), Release::Delete);
+            assert_eq!(
+                decide(&fork(state, OnDelete::Retain)),
+                Release::Keep(Kept::Retained)
+            );
+        }
+    }
 }

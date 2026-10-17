@@ -34,3 +34,35 @@ Against `.handoff/f8-design.md` (run 6 revision 2). Resolved in `.handoff/f8-sli
 7. Brief: `.handoff/f8-slices.md` is to be written in the main checkout, which this isolated
    worktree may not write. Written to the worktree's `.handoff/f8-slices.md` instead; the
    orchestrator copies it.
+
+## 2026-10-17, F8 S1 implementer (f8-s1)
+
+None of these stopped the slice; each was resolved as below and is reported with it.
+
+1. Brief: `.handoff/f8-slices.md` was not in the main checkout (erratum 7 above: not copied).
+   Read from the architect's worktree (`.claude/worktrees/wf_1a3a42d9-2d6-3/.handoff/`).
+2. Owned files, incomplete: renaming `node-lost.md` and retiring `--fork-scan-interval`, the
+   publisher and the shared base path break links and facts outside the list:
+   `docs/deployment.md`, `docs/operator-guide.md`, `docs/development.md`,
+   `docs/runbooks/csi-recovery.md`, `docs/runbooks/fork-refused.md`, and design sections
+   other than §11.3, §14.2, §19 (§11.5, §13's tables, §15's runbook table, §17.1's command
+   list, which `reference_tests.rs` enforces, §17.2, §17.3, §18). Edited minimally (links,
+   names, the retired flag). Not edited: `AGENTS.md` (its CI table names the NFS job "one
+   node at a time" and lists no f8 workflow) and `fork/finish.rs`'s doc ("the node
+   plugin's publisher"), owned by no F8 slice; the orchestrator should fix both.
+3. DeleteVolume of a worktree whose settings cannot be read (its profile removed or broken):
+   the frozen page is silent. The old test said `onDelete: retain` releases it without
+   reading settings; under D1 retain waits like delete, so the remotes must be asked and
+   cannot be. Chosen: `FAILED_PRECONDITION`, nothing deleted or released (the test now says
+   so). A design choice.
+4. `agentfs start accept --tip OID`: the binary has no runtime `git2` dependency and its
+   `Cargo.toml` is not owned, so `fork::identity::full_commit` (core, owned) parses the id;
+   `StartPoint::parse` uses it too (one validator).
+5. The release scan's `agentfs push` holds the state lock for a moment; a NodeStage then
+   made `serve-history` exit 75 (`FAILED_PRECONDITION`, kubelet retry). The service now
+   starts with `--wait-lock 30s` (`launcher::SERVICE_LOCK_WAIT`). Not in the frozen page.
+6. `ReleaseScan::wake` also forgets which heads were held, so a DeleteVolume that found a
+   remote lacking a head the scan believed pushed is pushed once more. Not in the frozen
+   page; costs one listing per unstaged worktree per wake.
+7. With `--mode` gone, `IdentityService::new()` takes no argument and `server::serve`
+   takes the controller and node services unconditionally (both unfrozen).

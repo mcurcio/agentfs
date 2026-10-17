@@ -4,7 +4,6 @@ StorageClasses of the driver. `parameters` go to the driver as written
 operator's, and pod authors only choose the class.
 */}}
 {{- range .Values.storageClasses }}
-{{- $fork := eq (toString (dig "fork" "" (.parameters | default dict))) "true" }}
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -21,7 +20,9 @@ provisioner: {{ include "agentfs-csi.driverName" $ }}
 parameters:
   {{- toYaml . | nindent 2 }}
 {{- end }}
-reclaimPolicy: {{ .reclaimPolicy | default (ternary "Delete" "Retain" $fork) }}
+# Always Delete (the class admission policy refuses any other):
+# DeleteVolume decides what a released worktree needs.
+reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
 volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
 allowVolumeExpansion: false
 {{- end }}

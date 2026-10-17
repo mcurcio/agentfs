@@ -23,6 +23,7 @@
 //!   it carry its trace context.
 //! - **Observable gauges**, read from state when metrics are collected:
 //!   the journal backlog, each remote's push backlog, age and divergence,
+//!   the start-branch alarm of a started volume (`agentfs.start.moved`),
 //!   misconfigured remotes, the size of the state area and the patch queue
 //!   (`agentfs.patch.queue_depth`, `agentfs.patch.blocked`, from
 //!   `meta/patch.json`).
@@ -61,6 +62,7 @@ pub mod names {
     pub const PUSH_FAILURES: &str = "agentfs.push.failures";
     pub const PUSH_LIMITED: &str = "agentfs.push.limited";
     pub const PUSH_DIVERGED: &str = "agentfs.push.diverged";
+    pub const START_MOVED: &str = "agentfs.start.moved";
     pub const PRECHECK_REJECTED_PATHS: &str = "agentfs.precheck.rejected_paths";
     pub const STATE_BYTES: &str = "agentfs.state.bytes";
     pub const REMOTE_MISCONFIGURED: &str = "agentfs.remote.misconfigured";
@@ -382,6 +384,25 @@ impl Telemetry {
                 }
             })
             .build();
+        if let Some(start) = &settings.start {
+            // As the last attempt to the start remote saw it: 0 before the
+            // first one, and after one that did not raise it.
+            let remote = start.remote.clone();
+            let push_state = state.push_state(&remote);
+            inner
+                .meter
+                .u64_observable_gauge(names::START_MOVED)
+                .with_unit("{remote}")
+                .with_description(
+                    "1 while the branch this volume started from holds commits it does not \
+                     have (StartBranchMoved, F8)",
+                )
+                .with_callback(move |observer| {
+                    let moved = push::PushState::load(&push_state).start_moved.is_some();
+                    observer.observe(u64::from(moved), &[remote_attr(&remote)]);
+                })
+                .build();
+        }
         let invalid: Vec<String> = settings
             .invalid_remotes
             .iter()
@@ -725,6 +746,7 @@ impl EventSink for TelemetrySink {
             Event::PushLimited { remote, .. } => inner.push_limited.add(1, &[remote_attr(remote)]),
             // Their gauges are read from state.
             Event::Diverged { .. }
+            | Event::StartBranchMoved { .. }
             | Event::RemoteMisconfigured { .. }
             | Event::PushSucceeded { .. }
             | Event::PatchApplied { .. }
@@ -776,6 +798,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::ReconcileFailed { .. } => "agentfs.reconcile_failed",
         Event::PushFailed { .. } => "agentfs.push_failed",
         Event::Diverged { .. } => "agentfs.diverged",
+        Event::StartBranchMoved { .. } => "agentfs.start_branch_moved",
         Event::PushLimited { .. } => "agentfs.push_limited",
         Event::RemoteMisconfigured { .. } => "agentfs.remote_misconfigured",
         Event::PushSucceeded { .. } => "agentfs.push_succeeded",
@@ -873,6 +896,17 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
                 out.push(("agentfs.remote_head", oid(r)));
             }
             out.push(("agentfs.diverged_ref", s(diverged_ref)));
+        }
+        Event::StartBranchMoved {
+            remote,
+            refname,
+            pinned,
+            tip,
+        } => {
+            out.push(("agentfs.remote", s(remote)));
+            out.push(("agentfs.start.ref", s(refname)));
+            out.push(("agentfs.start.pinned", oid(pinned)));
+            out.push(("agentfs.start.tip", oid(tip)));
         }
         Event::PushLimited {
             remote,

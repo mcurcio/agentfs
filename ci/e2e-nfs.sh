@@ -1,35 +1,33 @@
 #!/usr/bin/env bash
-# agentfs on NFS, one node at a time (design §14.2, §18 test 16): an NFS
+# agentfs state areas on NFS (design §2.3, §14.2, §18 test 16): an NFS
 # server on the runner exports one directory, mounted by two NFSv4
 # clients: client A in the host's network namespace ("node-1") and client
 # B in a network and UTS namespace of its own ("node-2"), each with its
-# own client id and locks, both in the host's mount namespace. A volume
-# is used from one node at a time; it may move between nodes on the
-# shared export. Each claim is one assertion:
+# own client id and locks, both in the host's mount namespace. A CLI or
+# sidecar state area may live on NFS 4.1 or later; agentfs-csi keeps its
+# worktrees on each node's own disk and refuses a base path on NFS. Each
+# claim is one assertion:
 #
 # a. B sees A's writes, and nfsd counts two clients;
 # b. with serve-history serving on A, a second serve-history on B's view
 #    exits 75 naming command=serve-history (the holder line reached the
 #    other client);
 # c. on the export mounted again with vers=4.0, serve-history exits 1
-#    naming the reason, and so does agentfs-csi with its base path there,
-#    before serving; the same with local_lock=flock is NOT RUN, since
-#    Linux drops local_lock on every NFSv4 mount (see step c);
+#    naming the reason; the same with local_lock=flock is NOT RUN, since
+#    Linux drops local_lock on every NFSv4 mount (see step c); and
+#    agentfs-csi refuses a base path on the export, NFS 4.2 or 4.0,
+#    before serving, naming the filesystem type (F8 R1);
 # d. a front on A over the NFS tree: an mmap write is recorded; 50 SQLite
 #    commits are recorded and pass integrity_check;
 # e. a file held open through the front and removed through it leaves a
 #    .nfs name in the backing directory; the directory is renamed through
 #    the front; no .nfs name ever reaches history, and the directory's
-#    other file is at its new path;
-# f. DeleteVolume on a base path on the export (agentfs-csi's ignored
-#    grpc test delete_volume_on_a_shared_base_path) leaves nothing behind;
-# g. a volume moves between nodes (agentfs-csi's ignored grpc test
-#    a_volume_moves_between_nodes_on_a_shared_base_path): agentfs-csi
-#    node plugins for node-1 on A's view of one base path and node-2 on
-#    B's, and a controller. NodeStage on node-2 fails FAILED_PRECONDITION
-#    while node-1 has the volume staged; after node-1 unstages and the
-#    attachment moves, node-2 serves node-1's file, whose commit names
-#    node-1, and records its own write as node-2.
+#    other file is at its new path.
+#
+# Steps f and g (DeleteVolume on a shared base path, a volume moving
+# between two node plugins on it) are retired: a worktree never leaves
+# its node's disk, and moving is a new volume started from the old branch
+# (ci/e2e-csi-move.sh).
 #
 # GitHub ubuntu-24.04 runners only: it installs nfs-kernel-server and
 # changes the host. Reproducible on a disposable Linux VM with /dev/fuse,
@@ -47,7 +45,6 @@ sudo -n true 2>/dev/null || fail "this test needs passwordless sudo"
 AGENTFS_CSI_BIN=${AGENTFS_CSI_BIN:-$(dirname "$AGENTFS_BIN")/agentfs-csi}
 [ -x "$AGENTFS_CSI_BIN" ] || fail "AGENTFS_CSI_BIN ($AGENTFS_CSI_BIN) is not built"
 
-HERE=$(cd "$(dirname "$0")" && pwd)
 P=${AGENTFS_TEST_PASSTHROUGH:-auto}
 EXPORT=${RUNNER_TEMP:-/tmp}/nfs-export
 A=/mnt/nfs-a
@@ -148,14 +145,20 @@ CSI_TMP=$(mktemp -d)
 check_refused() { # mnt reason
   refused "serve-history on $1" "$2" \
     sudo "$AGENTFS_BIN" --state "$1/lockvol/state" --root "$1/lockvol/tree" serve-history
-  refused "agentfs-csi with its base path on $1" "$2" \
-    sudo "$AGENTFS_CSI_BIN" --mode controller --base-path "$1/csi" \
-    --profiles-dir "$CSI_TMP" --endpoint "unix://$CSI_TMP/csi.sock"
+}
+# agentfs-csi keeps worktrees on its node's own disk: a base path on NFS
+# is refused, whatever the version, naming the type (F8 R1).
+csi_refused() { # mnt
+  refused "agentfs-csi with its base path on $1" "on nfs4" \
+    sudo "$AGENTFS_CSI_BIN" --node-id node-1 --base-path "$1/csi" \
+    --node-state "$CSI_TMP/node" --profiles-dir "$CSI_TMP" --endpoint "unix://$CSI_TMP/csi.sock"
   [ ! -e "$CSI_TMP/csi.sock" ] || fail "agentfs-csi served with its base path on $1"
 }
+csi_refused "$A"
 nfs_mount "$SERVER_IP" "$V40" vers=4.0,hard,nosharecache,timeo=50,retrans=2
 assert_contains "$(findmnt -no OPTIONS "$V40")" "vers=4.0" "the second mount is NFS 4.0"
 check_refused "$V40" "NFS version 4.0"
+csi_refused "$V40"
 # The local_lock refusal cannot fire on Linux. nfs_fs_context_validate()
 # in fs/nfs/fs_context.c (v6.17, the runner's kernel series) clears
 # NFS_MOUNT_LOCAL_FLOCK, NFS_MOUNT_LOCAL_FCNTL and NFS_MOUNT_NONLM
@@ -256,45 +259,6 @@ sudo kill -TERM "$FRONT"
 wait "$FRONT" || fail "the front did not stop cleanly"
 sudo kill -TERM "$SVC"
 wait "$SVC" || fail "the service did not stop cleanly"
-
-step "f. DeleteVolume on a base path on the export"
-sudo mkdir -p "$A/csi"
-sudo chown "$(id -u):$(id -g)" "$A/csi"
-(cd "$HERE/.." && AGENTFS_CSI_TEST_BASE=$A/csi cargo test --locked --release -p agentfs-csi \
-  --test grpc -- --ignored --exact delete_volume_on_a_shared_base_path)
-pass "DeleteVolume on NFS leaves neither the volume nor a .nfs name"
-
-step "g. a volume moves between nodes on the shared base path"
-CSI=$(mktemp -d)
-chmod 755 "$CSI"
-mkdir "$CSI/profiles"
-printf '[agentfs]\n\tcommitWindow = 100ms\n' >"$CSI/profiles/p.config"
-CSI_PIDS=()
-csi_bg() { # name mode base [command prefix...]
-  local name=$1 mode=$2 base=$3
-  shift 3
-  sudo "$@" "$AGENTFS_CSI_BIN" --mode "$mode" --node-id "$name" --base-path "$base" \
-    --node-state "$CSI/$name/state" --mount-dir "$CSI/$name/mounts" \
-    --profiles-dir "$CSI/profiles" --agentfs-bin "$AGENTFS_BIN" --passthrough "$P" \
-    --endpoint "unix://$CSI/$name.sock" >>"$LOGS/csi-$name.log" 2>&1 &
-  PIDS+=("$!")
-  CSI_PIDS+=("$!")
-  wait_for 30 test -S "$CSI/$name.sock" || fail "agentfs-csi $name never served"
-}
-csi_bg controller controller "$A/move"
-csi_bg node-1 node "$A/move"
-# B's network namespace, but the host's mount namespace (not `ip netns
-# exec`, which makes a mount namespace of its own): the test reads
-# node-2's mounts.
-csi_bg node-2 node "$B/move" nsenter --net="/run/netns/$NS"
-# The test runs as root (`sudo -E`): the volume is root's, 0700.
-(cd "$HERE/.." && AGENTFS_CSI_TEST_CONTROLLER=$CSI/controller.sock \
-  AGENTFS_CSI_TEST_NODE1=$CSI/node-1.sock AGENTFS_CSI_TEST_NODE2=$CSI/node-2.sock \
-  AGENTFS_CSI_TEST_BASE=$B/move cargo --config "target.'cfg(all())'.runner = 'sudo -E'" \
-  test --locked --release -p agentfs-csi --test grpc -- --ignored --exact a_volume_moves_between_nodes_on_a_shared_base_path)
-pass "the volume moved from node-1 to node-2, refused on node-2 while staged on node-1"
-for pid in "${CSI_PIDS[@]}"; do sudo kill -TERM "$pid"; done
-for pid in "${CSI_PIDS[@]}"; do wait "$pid" || fail "an agentfs-csi plugin did not stop cleanly"; done
 
 for what in "${NOT_RUN[@]}"; do
   echo "NOT RUN: $what"

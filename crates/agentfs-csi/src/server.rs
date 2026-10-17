@@ -47,14 +47,14 @@ pub fn parse_endpoint(endpoint: &str) -> Result<PathBuf, EndpointError> {
 }
 
 /// Binds `socket` (replacing a stale one, mode 0660) and serves Identity,
-/// plus Controller and Node when given, until `shutdown` completes; then
-/// stops accepting calls, lets running ones finish, and removes the
-/// socket.
+/// Controller and Node (every node plugin serves all three, F8 R8) until
+/// `shutdown` completes; then stops accepting calls, lets running ones
+/// finish, and removes the socket.
 pub async fn serve<N: Node>(
     socket: &Path,
     identity: IdentityService,
-    controller: Option<ControllerService>,
-    node: Option<N>,
+    controller: ControllerService,
+    node: N,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), ServerError> {
     let io_err = |what, source| ServerError::Io {
@@ -83,8 +83,8 @@ pub async fn serve<N: Node>(
         .map_err(|e| io_err("setting the mode of", e))?;
     let result = tonic::transport::Server::builder()
         .add_service(IdentityServer::new(identity))
-        .add_optional_service(controller.map(ControllerServer::new))
-        .add_optional_service(node.map(NodeServer::new))
+        .add_service(ControllerServer::new(controller))
+        .add_service(NodeServer::new(node))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
         .await;
     let _ = fs::remove_file(socket);

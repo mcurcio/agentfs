@@ -4,9 +4,13 @@
 # ci/k8s-csi/apps, and checks, from real pods:
 #
 #   - deploy/csi passes server-side validation, the driver registers on
-#     the node, and the RBAC inventory holds (`kubectl auth can-i`);
+#     the node with its topology, the RBAC inventory holds (`kubectl auth
+#     can-i`: the node plugin's account is csi-provisioner's, and its token
+#     reaches no other container), and the class admission policy refuses
+#     a class with reclaim policy Retain;
 #   - two restricted pods (uid 10000 and 10001, primary groups 3000 and
-#     3001, one fsGroup) on one RWO claim both write; the remote branch
+#     3001, one fsGroup) on one RWO claim, its PV pinned to the node by the
+#     driver's topology, both write; the remote branch
 #     on the runner's git server gets commits from both, with distinct
 #     committers, pod trailers and uid authors; `agentfs status` in the
 #     node plugin shows the service and two fronts;
@@ -24,7 +28,7 @@
 #     once and are pushed;
 #   - deleting the pods unpublishes and unstages (no mounts left, the
 #     socket gone, the final commit made), and deleting the claim removes
-#     the volume directory.
+#     the volume directory once the remote holds its head.
 #
 # Needs docker, kind and kubectl (ci/install-kind.sh), a kind cluster
 # $KIND_CLUSTER (default agentfs-csi) with the image agentfs:ci loaded,
@@ -70,14 +74,14 @@ diagnose() {
   step "diagnose"
   kubectl get nodes -o wide
   kubectl get pods -A -o wide
-  kubectl get csidriver,csinode,volumeattachments,pv -o wide
+  kubectl get csidriver,csinode,pv -o wide
   ka get pvc,pods -o wide
   ka describe pods
   kd describe pods
   ka get events --sort-by=.lastTimestamp | tail -n 60
   kd get events --sort-by=.lastTimestamp | tail -n 40
   for pod in $(kd get pods -o name); do
-    for c in agentfs-csi csi-provisioner csi-attacher node-driver-registrar; do
+    for c in agentfs-csi csi-provisioner node-driver-registrar; do
       kd logs "$pod" -c "$c" --tail=200 2>/dev/null | sed "s|^|$pod/$c: |"
       kd logs "$pod" -c "$c" --previous --tail=100 2>/dev/null | sed "s|^|$pod/$c (previous): |"
     done
@@ -227,7 +231,6 @@ kustomize) kubectl apply -k ci/k8s-csi/driver ;;
 chart) helm status agentfs-csi -n "$DNS" >/dev/null || fail "no agentfs-csi release (ci/helm-csi-install.sh)" ;;
 *) fail "CSI_INSTALL is kustomize or chart, not $CSI_INSTALL" ;;
 esac
-kd rollout status deployment/agentfs-csi-controller --timeout=300s
 deadline=$((SECONDS + 300))
 until [ -n "$(plugin_pod)" ]; do
   [ $SECONDS -lt $deadline ] || fail "no node plugin pod appeared"
@@ -244,22 +247,53 @@ done
 pass "CSINode $NODE_NAME lists $DRIVER"
 assert_eq "$NODE_NAME" "$(kubectl get csinode "$NODE_NAME" -o jsonpath="{.spec.drivers[?(@.name==\"$DRIVER\")].nodeID}")" \
   "the node id is the node's name"
+TOPOLOGY=topology.agentfs.mcurcio.github.io/node
+assert_eq "$TOPOLOGY" "$(kubectl get csinode "$NODE_NAME" -o jsonpath="{.spec.drivers[?(@.name==\"$DRIVER\")].topologyKeys[0]}")" \
+  "the driver's topology key"
+deadline=$((SECONDS + 60))
+until [ "$(kubectl get node "$NODE_NAME" -o go-template="{{index .metadata.labels \"$TOPOLOGY\"}}")" = "$NODE_NAME" ]; do
+  [ $SECONDS -lt $deadline ] || fail "the node never got the label $TOPOLOGY=$NODE_NAME"
+  sleep 1
+done
+pass "the node is labelled $TOPOLOGY=$NODE_NAME"
 
 step "(c) the RBAC inventory (design §14.2)"
-for check in "get pods" "list secrets" "get persistentvolumes" "create events" "list nodes" "get volumeattachments.storage.k8s.io"; do
+for check in "get secrets" "list secrets" "create pods" "get pods" "get volumeattachments.storage.k8s.io" "update leases.coordination.k8s.io"; do
   # shellcheck disable=SC2086
   assert_eq no "$(can_i agentfs-csi-node $check)" "the node plugin's account cannot $check"
-done
-for check in "get secrets" "list secrets" "create pods" "get pods"; do
   # shellcheck disable=SC2086
-  assert_eq no "$(can_i agentfs-csi-controller $check)" "the controller's account cannot $check"
-  # shellcheck disable=SC2086
-  assert_eq no "$(can_i agentfs-csi-controller $check $APPS)" "the controller's account cannot $check in $APPS"
+  assert_eq no "$(can_i agentfs-csi-node $check $APPS)" "the node plugin's account cannot $check in $APPS"
 done
-assert_eq yes "$(can_i agentfs-csi-controller create persistentvolumes)" "the controller's account creates PVs"
-assert_eq yes "$(can_i agentfs-csi-controller patch volumeattachments/status)" "the controller's account patches attachment status"
-assert_eq yes "$(can_i agentfs-csi-controller update leases.coordination.k8s.io)" "the controller's account updates its leases"
-assert_eq no "$(can_i agentfs-csi-controller update leases.coordination.k8s.io kube-system)" "but not elsewhere"
+assert_eq yes "$(can_i agentfs-csi-node create persistentvolumes)" "csi-provisioner (the node plugin's account) creates PVs"
+assert_eq yes "$(can_i agentfs-csi-node list nodes)" "and reads the nodes' topology"
+kd get serviceaccount agentfs-csi-controller >/dev/null 2>&1 &&
+  fail "an agentfs-csi-controller account exists: there is no controller Deployment"
+pass "no controller account"
+in_plugin test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token ||
+  fail "the agentfs-csi container holds an API token"
+pass "the agentfs-csi container holds no API token"
+denied=
+deadline=$((SECONDS + 90))
+while [ $SECONDS -lt $deadline ]; do
+  if out=$(kubectl apply -f - 2>&1 <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: agentfs-ci-retain
+provisioner: $DRIVER
+parameters: { profile: ci }
+reclaimPolicy: Retain
+EOF
+  ); then
+    kubectl delete storageclass agentfs-ci-retain --ignore-not-found >/dev/null
+    sleep 3
+    continue
+  fi
+  denied=$out
+  break
+done
+[ -n "$denied" ] || fail "a class with reclaimPolicy Retain was admitted"
+assert_contains "$denied" "agentfs-class" "a class with reclaimPolicy Retain is denied by the class policy"
 
 step "(d) two restricted pods on one claim"
 kubectl apply -k ci/k8s-csi/apps
@@ -276,8 +310,9 @@ SOCK=$NODE_STATE/run/$PV/history.sock
 UID_A=$(ka get pod writer-a -o jsonpath='{.metadata.uid}')
 UID_B=$(ka get pod writer-b -o jsonpath='{.metadata.uid}')
 echo "volume $PV, writer-a $UID_A, writer-b $UID_B"
-assert_eq "$NODE_NAME" "$(kubectl get volumeattachments -o jsonpath="{.items[?(@.spec.source.persistentVolumeName==\"$PV\")].spec.nodeName}")" \
-  "the volume is attached to the node"
+assert_eq "$TOPOLOGY $NODE_NAME" \
+  "$(kubectl get pv "$PV" -o jsonpath='{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].key} {.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}')" \
+  "the PV is pinned to the node that holds its worktree"
 
 step "(e) both pods write; commits from both reach the remote"
 # A group-writable directory: fsGroup gives it the group, umask the mode.
@@ -434,10 +469,15 @@ while docker exec "$NODE" test -e "$SOCK"; do
 done
 pass "the history service stopped and removed its socket"
 assert_eq final "$(in_plugin git --git-dir "$STATE/git" show "$BRANCH:final.txt")" "the final commit is in the volume's history"
-# The service has exited, so nothing pushes any more: the remote has the
-# final commit now or never (the final push at NodeUnstage, design §14.2).
-assert_eq "$(in_plugin git --git-dir "$STATE/git" rev-parse "$BRANCH")" "$(rgit rev-parse "$BRANCH")" \
-  "the remote has the volume's last commit before the claim is deleted"
+# The service has exited: the final push at NodeUnstage sent the final
+# commit (design §14.2), or the release scan's push of the unstaged
+# worktree does at once.
+deadline=$((SECONDS + 60))
+until [ "$(in_plugin git --git-dir "$STATE/git" rev-parse "$BRANCH")" = "$(rgit rev-parse "$BRANCH")" ]; do
+  [ $SECONDS -lt $deadline ] || fail "the remote never got the volume's last commit"
+  sleep 1
+done
+pass "the remote has the volume's last commit before the claim is deleted"
 assert_eq final "$(rgit show "$BRANCH:final.txt")" "final.txt reached the remote"
 assert_contains "$(plugin_log)" "unstaged volume $PV" "the volume was unstaged"
 ka delete pvc shared --wait --timeout=180s

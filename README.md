@@ -153,8 +153,12 @@ mount to the host, so it is not supported.
 ### Kubernetes: the CSI driver with Helm
 
 The driver gives pods agentfs volumes as ordinary claims, with no
-privilege in the workload. Create the namespace and the credentials, then
-install the chart (the full steps and the values: [docs/helm.md](docs/helm.md)):
+privilege in the workload. Each claim is a worktree on the disk of the
+node its first pod runs on, writing only its own branch, and pushed to
+the profile's remotes; to continue on another node, a new claim starts
+from that branch ([moving](docs/runbooks/moving.md)). Create the
+namespace and the credentials, then install the chart (the full steps
+and the values: [docs/helm.md](docs/helm.md)):
 
 ```sh
 kubectl apply -f deploy/csi/namespace.yaml
@@ -249,10 +253,11 @@ passes its tests, and the Helm charts as `<version>-main.<run>`.
 | Recording, commits, push to any remote, path rules, recovery, OpenTelemetry, the Kubernetes sidecar | Built, tested end to end in CI including a kind cluster |
 | Git LFS, databases (the `fsync` class) | Built |
 | The patch queue | Built |
-| Several pods on one volume, and the CSI driver | Built for one node per volume at a time |
+| Several pods on one volume, and the CSI driver | Built: one node per volume, its worktree on that node's disk; moving is a new volume started from its branch |
 | Forked volumes | Built |
 | Docker examples, Helm charts, example alert rules | Built and tested in CI |
-| Local-only volumes on node-local disk with a git backend | In design |
+| Node-local worktrees, one branch each, with any remote as the backend | Built (CSI driver) |
+| Local-only volumes (no remote, declared) | In design |
 | Several nodes writing one volume | Not supported, by decision ([design §19.1](docs/design.md#191-decisions-2026-10-12)) |
 
 Each phase's scope is in [design §1.3](docs/design.md#13-baseline-extras-phases),

@@ -11,7 +11,7 @@ page says *where*. Section references (§) are to design.md.
 | `agentfs-core` | library | The engine: path rules, the journal, frozen copies, commits, pushes, restores, the patch queue, the history service, LFS, telemetry. No FUSE and no CLI |
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary (§2.1, §3.1, §6) |
 | `agentfs` | binary | The `agentfs` command (§17.1): `init`, `mount`, `run`, `record`, `flush`, `push`, `status`, `probe`, `serve-history`, `restore`, `revert`, `patch`, `fork`; OpenTelemetry export |
-| `agentfs-csi` | library and binary | The CSI driver (§14.2): `agentfs-csi --mode controller\|node\|all`, which supervises `agentfs serve-history` and `agentfs mount` children |
+| `agentfs-csi` | library and binary | The CSI driver (§14.2): `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs push` children |
 
 The dependencies run one way: `agentfs-csi` → (`agentfs` as a child
 process) → `agentfs-fuse` → `agentfs-core`. `agentfs-csi` links
@@ -73,7 +73,7 @@ missing from these tables or a row names a module that no longer exists;
 | `confined.rs` | `openat2`-confined access to the tree for restores (§6, §15) |
 | `operations.rs` | Restores and reverts in progress: their writes become one operation commit (§15) |
 | `lock.rs` | The state-area lock, an `flock` on `meta/lock`, taken only on a filesystem whose locks keep other nodes out (§2.3) |
-| `shared_fs.rs` | Which filesystems a state area may live on: refuses NFS below 4.1, `nolock` and `local_lock` other than `none`, whenever the lock is taken and when agentfs-csi starts (§2.3, §14.2) |
+| `shared_fs.rs` | Which filesystems a state area may live on: refuses NFS below 4.1, `nolock` and `local_lock` other than `none` whenever the lock is taken (§2.3); tells a network filesystem from a node's own disk for agentfs-csi's base path (§14.2) |
 | `mountinfo.rs` | The one parser of `/proc/self/mountinfo`: device, root, mount point, fstype, source and super options of each mount, and the mount holding a path |
 | `local_socket.rs` | Unix sockets in the state area with peer-credential checks, for the control socket and the history service |
 | `fsutil.rs` | Small helpers for the state files under `<state>/meta` |
@@ -143,6 +143,7 @@ missing from these tables or a row names a module that no longer exists;
 | `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly (§15) |
 | `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
 | `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon`, `list` and `deliver` (§11.5) |
+| `start_cmd.rs` | `agentfs start accept --tip`: a started volume's answer to the start-branch alarm (§11.3) |
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it (§7) |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads (§13) |
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters (§13) |
@@ -154,18 +155,18 @@ missing from these tables or a row names a module that no longer exists;
 | Module | Role |
 |---|---|
 | `lib.rs` | Crate root, the driver name and overview |
-| `main.rs` | The `agentfs-csi` command (`Cli`) |
+| `main.rs` | The `agentfs-csi` command (`Cli`): one node plugin serving every service; refuses a base path on a network filesystem |
 | `csi.rs` | The CSI v1 protocol, generated at build time |
 | `server.rs` | Serving the CSI services on a Unix socket |
-| `identity.rs` | The CSI Identity service |
-| `controller.rs` | The Controller service: CreateVolume, DeleteVolume, ControllerPublish |
-| `node.rs` | The Node service: validates calls and hands them to the supervisor |
-| `supervisor.rs` | One `serve-history` per staged volume and one front per pod, restarted when they crash; a finished fork published read-only |
+| `identity.rs` | The CSI Identity service and the topology key |
+| `controller.rs` | The Controller service on each node: CreateVolume on this node (topology, start classes, forks of a local source), DeleteVolume through the release decider |
+| `node.rs` | The Node service: validates calls and hands them to the supervisor; this node's topology |
+| `supervisor.rs` | One `serve-history` per staged volume and one front per pod, restarted when they crash; NodeStage never creates a worktree; a finished fork published read-only |
 | `launcher.rs` | Starting the `agentfs` children |
-| `publisher.rs` | The node plugin's fork publisher: finishes and publishes the forks whose deletion asked for it, one `agentfs fork finish` each, skipping refused and abandoned forks (§11.5) |
+| `release_scan.rs` | The release scan: one `agentfs push` per worktree no pod stages, until it exits 0 at the head, with backoff; one `agentfs fork finish` per fork whose deletion asked for it, skipping refused and abandoned forks (§11.5, §14.2) |
 | `mounter.rs` | The node plugin's mount operations: bind mounts onto the kubelet's targets |
 | `params.rs` | StorageClass and PersistentVolume parameters |
-| `volume.rs` | Volumes on disk: creating one, adopting a static PV |
+| `volume.rs` | Worktrees on this node's disk: creating one (empty, started, a fork), adopting a static PV over its worktree |
 | `records.rs` | The driver's persisted records (`csi.json`) |
 | `layout.rs` | Where the driver keeps things |
 | `error.rs` | Errors mapped onto gRPC status codes |
@@ -258,9 +259,14 @@ order:
    `agentfsMaxLfsObjectSize` refused first. A failure ends the attempt at
    stage `lfs` with no ref pushed. The remote's proxy (`proxy.rs`), if
    set, carries these requests and libgit2's `http(s)` connections below;
-3. **refs**: the branch and the volume's `diverged/*` refs, never forced;
-   a non-fast-forward the remote's history explains is a divergence
-   (§11.3); the push state records the last pushed commit;
+3. **refs**: the branch and the volume's `diverged/*` and `accepted/*`
+   refs, never forced. In libgit2's push negotiation, from the branch's
+   old value in that connection, `push/claim.rs` decides: the branch is
+   created or fast-forwarded only; one another worktree wrote stops the
+   push before anything is sent, and is a divergence (§11.3, F8 rule 2).
+   The push state records the last pushed commit. For a started volume
+   pushing to its start remote, the start branch is listed first and
+   `start_branch_moved` raises the start-branch alarm (§11.3);
 4. **the queue**, for the patch remote only and after every branch
    attempt, failed or not (§12): the status ref (forced, a snapshot) and,
    only when the branch push worked, the `applied/<n>` refs; then, once

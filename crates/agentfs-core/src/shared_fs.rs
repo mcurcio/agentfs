@@ -4,7 +4,12 @@
 //! a second history service off a volume. On NFS it holds across nodes
 //! only when the server enforces it: NFS 4.1 or later, without `nolock`
 //! and with `local_lock=none`. [`require_safe_locks`] is checked whenever
-//! the lock is taken and when the CSI driver starts.
+//! the lock is taken (CLI and sidecar state areas, F7 decision).
+//!
+//! [`network_filesystem`] tells a node's own disk from a network
+//! filesystem: agentfs-csi keeps every worktree on its node's disk and
+//! refuses a `--base-path` on a network filesystem at start (F8 R1,
+//! design §14.2).
 
 use std::path::{Path, PathBuf};
 
@@ -95,6 +100,42 @@ fn major_minor(version: &str) -> Option<(u32, u32)> {
 /// let another node take a lock this one holds: canonicalises it, finds
 /// its mount in `/proc/self/mountinfo` and [`assess`]es that.
 pub fn require_safe_locks(path: &Path) -> Result<(), CheckError> {
+    let entry = mount_of(path)?;
+    Ok(assess(&entry, path)?)
+}
+
+/// The filesystem types that are network filesystems: their files live on
+/// another machine.
+pub const NETWORK_FILESYSTEMS: [&str; 11] = [
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "ceph",
+    "fuse.glusterfs",
+    "glusterfs",
+    "lustre",
+    "gpfs",
+    "afs",
+];
+
+/// The mount `path` is on, when it is a network filesystem (nfs, nfs4, cifs, smb3, smbfs, ceph,
+/// fuse.glusterfs, glusterfs, lustre, gpfs, afs). agentfs-csi refuses such a --base-path (R1). The
+/// state lock's NFS 4.1 check for CLI and sidecar state areas is unchanged (F7 decision).
+pub fn network_filesystem(path: &Path) -> Result<Option<MountEntry>, CheckError> {
+    let entry = mount_of(path)?;
+    Ok(is_network(&entry).then_some(entry))
+}
+
+/// Whether `entry` mounts a network filesystem ([`NETWORK_FILESYSTEMS`]).
+pub fn is_network(entry: &MountEntry) -> bool {
+    NETWORK_FILESYSTEMS.contains(&entry.fstype.as_str())
+}
+
+/// The mount holding `path` (which must exist), from
+/// `/proc/self/mountinfo`.
+fn mount_of(path: &Path) -> Result<MountEntry, CheckError> {
     let io_err = |source| CheckError::Io {
         path: path.to_path_buf(),
         source,
@@ -102,7 +143,7 @@ pub fn require_safe_locks(path: &Path) -> Result<(), CheckError> {
     let resolved = path.canonicalize().map_err(io_err)?;
     let entries = mountinfo::read().map_err(io_err)?;
     match mountinfo::containing(&entries, &resolved) {
-        Some(entry) => Ok(assess(entry, path)?),
+        Some(entry) => Ok(entry.clone()),
         None => Err(io_err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no mount holds it in /proc/self/mountinfo",
@@ -208,6 +249,31 @@ mod tests {
         let missing = Path::new("/no/such/agentfs/dir");
         let err = require_safe_locks(missing).unwrap_err();
         assert!(matches!(err, CheckError::Io { .. }), "{err:?}");
+        assert!(err.to_string().contains("/no/such/agentfs/dir"), "{err}");
+    }
+
+    /// F8 R1: agentfs-csi's base path must be a node's own disk.
+    #[test]
+    fn network_filesystems_are_told_apart() {
+        for fstype in NETWORK_FILESYSTEMS {
+            assert!(is_network(&mount(fstype, "rw")), "{fstype}");
+        }
+        // Whatever its version or lock options: NFS 4.2 is still remote.
+        assert!(is_network(&mount("nfs4", "rw,vers=4.2,local_lock=none")));
+        for fstype in [
+            "ext4",
+            "xfs",
+            "btrfs",
+            "zfs",
+            "overlay",
+            "tmpfs",
+            "fuse.agentfs",
+        ] {
+            assert!(!is_network(&mount(fstype, "rw")), "{fstype}");
+        }
+        // A missing path is an error naming it (ci/e2e-nfs.sh refuses a
+        // real NFS base path).
+        let err = network_filesystem(Path::new("/no/such/agentfs/dir")).unwrap_err();
         assert!(err.to_string().contains("/no/such/agentfs/dir"), "{err}");
     }
 }

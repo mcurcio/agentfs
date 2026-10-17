@@ -1,5 +1,7 @@
-//! The CSI gRPC services end to end over a Unix socket: Identity and
-//! Controller (design §14.2), with the error codes csi-sanity expects.
+//! The CSI gRPC services end to end over a Unix socket: Identity,
+//! Controller and Node validation (design §14.2), with the error codes
+//! csi-sanity expects, the release decider against prepared `file://`
+//! remotes, and start classes.
 
 use std::collections::HashMap;
 use std::fs;
@@ -22,13 +24,14 @@ use agentfs_csi::csi::v1::node_client::NodeClient;
 use agentfs_csi::csi::v1::volume_capability::access_mode::Mode;
 use agentfs_csi::csi::v1::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
 use agentfs_csi::csi::v1::*;
-use agentfs_csi::identity::IdentityService;
-use agentfs_csi::launcher::AgentfsLauncher;
+use agentfs_csi::identity::{IdentityService, TOPOLOGY_KEY};
+use agentfs_csi::launcher::{AgentfsLauncher, PluginIdentity};
 use agentfs_csi::layout::Layout;
 use agentfs_csi::mounter::KernelMounter;
 use agentfs_csi::node::NodeService;
+use agentfs_csi::release_scan::ReleaseScan;
 use agentfs_csi::server;
-use agentfs_csi::supervisor::{NodeConfig, Supervisor};
+use agentfs_csi::supervisor::{Backoff, NodeConfig, Supervisor};
 use agentfs_csi::volume::MULTI_NODE;
 
 struct Driver {
@@ -42,19 +45,8 @@ struct Driver {
 impl Driver {
     async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base");
-        Self::start_in(dir, base).await
-    }
-
-    /// A driver whose volumes live under `base` (a shared filesystem in
-    /// ci/e2e-nfs.sh); everything else is in a temporary directory.
-    async fn start_at(base: &Path) -> Self {
-        Self::start_in(tempfile::tempdir().unwrap(), base.to_path_buf()).await
-    }
-
-    async fn start_in(dir: tempfile::TempDir, base: PathBuf) -> Self {
         let layout = Layout {
-            base,
+            base: dir.path().join("base"),
             node_state: dir.path().join("node"),
             mount_dir: dir.path().join("mounts"),
             profiles: dir.path().join("profiles"),
@@ -66,32 +58,31 @@ impl Driver {
         )
         .unwrap();
         fs::write(layout.profiles.join("p.exclude"), "*.tmp\n").unwrap();
-        fs::create_dir_all(layout.nodes_dir()).unwrap();
-        fs::write(layout.node_marker("node-1"), "").unwrap();
-        fs::write(layout.node_marker("node-2"), "").unwrap();
         let socket = dir.path().join("csi.sock");
         let (stop, stopped) = oneshot::channel::<()>();
+        // The validation tests never get as far as starting a child.
+        let launcher = Arc::new(AgentfsLauncher {
+            bin: "/bin/false".into(),
+        });
+        let release = Arc::new(ReleaseScan::new(
+            Arc::new(layout.clone()),
+            launcher.clone(),
+            PluginIdentity::default(),
+            Duration::from_secs(30),
+            Backoff::default(),
+        ));
         let task = tokio::spawn({
             let socket = socket.clone();
-            let controller = ControllerService::new(layout.clone());
-            // The validation tests never get as far as starting a child.
+            let controller = ControllerService::new(layout.clone(), "node-1".into(), release);
             let node = NodeService::new(Supervisor::new(
                 NodeConfig::new("node-1", layout.clone()),
-                Arc::new(AgentfsLauncher {
-                    bin: "/bin/false".into(),
-                }),
+                launcher,
                 Arc::new(KernelMounter),
             ));
             async move {
-                server::serve(
-                    &socket,
-                    IdentityService::new(true),
-                    Some(controller),
-                    Some(node),
-                    async {
-                        let _ = stopped.await;
-                    },
-                )
+                server::serve(&socket, IdentityService::new(), controller, node, async {
+                    let _ = stopped.await;
+                })
                 .await
                 .unwrap();
             }
@@ -108,6 +99,19 @@ impl Driver {
 
     fn controller(&self) -> ControllerClient<Channel> {
         ControllerClient::new(self.channel.clone())
+    }
+
+    /// A bare repository under the test's directory, and a profile
+    /// `name` pushing to it as `origin` (plus `extra` config lines).
+    fn remote_profile(&self, name: &str, extra: &str) -> PathBuf {
+        let remote = self.dir.path().join(format!("{name}.git"));
+        git2::Repository::init_bare(&remote).unwrap();
+        fs::write(
+            self.layout.profiles.join(format!("{name}.config")),
+            format!("[remote \"origin\"]\n\turl = {}\n{extra}", remote.display()),
+        )
+        .unwrap();
+        remote
     }
 
     async fn stop(mut self) {
@@ -158,18 +162,69 @@ fn create_req(name: &str, params: &[(&str, &str)]) -> CreateVolumeRequest {
     }
 }
 
-fn publish_req(volume: &str, node: &str) -> ControllerPublishVolumeRequest {
-    ControllerPublishVolumeRequest {
-        volume_id: volume.into(),
-        node_id: node.into(),
-        volume_capability: Some(mount_cap(Mode::SingleNodeWriter)),
+fn delete_req(id: &str) -> DeleteVolumeRequest {
+    DeleteVolumeRequest {
+        volume_id: id.into(),
         ..Default::default()
+    }
+}
+
+fn topology(node: &str) -> Topology {
+    Topology {
+        segments: HashMap::from([(TOPOLOGY_KEY.to_owned(), node.to_owned())]),
     }
 }
 
 #[track_caller]
 fn code<T: std::fmt::Debug>(r: Result<T, tonic::Status>) -> Code {
     r.expect_err("expected an error").code()
+}
+
+/// A commit holding `files` on `refname` in `repo`, on top of its tip:
+/// what a history service, or another worktree, writes.
+fn commit(repo: &Path, refname: &str, files: &[(&str, &str)]) -> git2::Oid {
+    let repo = git2::Repository::open_bare(repo).unwrap();
+    let parent = repo
+        .refname_to_id(refname)
+        .ok()
+        .map(|id| repo.find_commit(id).unwrap());
+    let mut builder = repo
+        .treebuilder(parent.as_ref().map(|p| p.tree().unwrap()).as_ref())
+        .unwrap();
+    for (name, content) in files {
+        let blob = repo.blob(content.as_bytes()).unwrap();
+        builder.insert(name, blob, 0o100644).unwrap();
+    }
+    let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+    let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+    let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+    repo.commit(
+        Some(refname),
+        &sig,
+        &sig,
+        "write\n\nAgentfs-Seq: 1\nAgentfs-Trigger: close\n",
+        &tree,
+        &parents,
+    )
+    .unwrap()
+}
+
+/// Pushes the volume `handle`'s branch to every remote, as the release
+/// scan's `agentfs push` would.
+fn push(layout: &Layout, handle: &str) {
+    let state = agentfs_core::volume::StateDir::new(layout.state(handle));
+    let settings = agentfs_core::config::Settings::load(&state.git()).unwrap();
+    for remote in &settings.remotes {
+        let mut pusher = agentfs_core::push::RemotePusher::open(
+            &state,
+            &settings,
+            remote,
+            Arc::new(agentfs_core::events::NullSink),
+            &agentfs_core::telemetry::Telemetry::noop(),
+        )
+        .unwrap();
+        assert!(pusher.push_once().is_success());
+    }
 }
 
 #[tokio::test]
@@ -188,7 +243,22 @@ async fn identity() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(caps.capabilities.len(), 1);
+    let services: Vec<i32> = caps
+        .capabilities
+        .iter()
+        .filter_map(|c| match &c.r#type {
+            Some(plugin_capability::Type::Service(s)) => Some(s.r#type),
+            _ => None,
+        })
+        .collect();
+    use plugin_capability::service::Type as Service;
+    assert_eq!(
+        services,
+        [
+            Service::ControllerService as i32,
+            Service::VolumeAccessibilityConstraints as i32
+        ]
+    );
     let probe = id.probe(ProbeRequest {}).await.unwrap().into_inner();
     assert_eq!(probe.ready, Some(true));
 
@@ -198,30 +268,43 @@ async fn identity() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(caps.capabilities.len(), 4);
-    let clone = controller_service_capability::Type::Rpc(controller_service_capability::Rpc {
-        r#type: controller_service_capability::rpc::Type::CloneVolume as i32,
-    });
-    assert!(
-        caps.capabilities
-            .iter()
-            .any(|c| c.r#type.as_ref() == Some(&clone)),
-        "CLONE_VOLUME is advertised"
+    use controller_service_capability::rpc::Type as Rpc;
+    let rpcs: Vec<i32> = caps
+        .capabilities
+        .iter()
+        .filter_map(|c| match &c.r#type {
+            Some(controller_service_capability::Type::Rpc(r)) => Some(r.r#type),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rpcs,
+        [
+            Rpc::CreateDeleteVolume as i32,
+            Rpc::SingleNodeMultiWriter as i32,
+            Rpc::CloneVolume as i32
+        ],
+        "no PUBLISH_UNPUBLISH_VOLUME: there is no attach step"
     );
-    // Everything else is UNIMPLEMENTED.
+    // Everything else is UNIMPLEMENTED, ControllerPublish included.
     let r = d
         .controller()
         .list_volumes(ListVolumesRequest::default())
+        .await;
+    assert_eq!(code(r), Code::Unimplemented);
+    let r = d
+        .controller()
+        .controller_publish_volume(ControllerPublishVolumeRequest::default())
         .await;
     assert_eq!(code(r), Code::Unimplemented);
     d.stop().await;
 }
 
 #[tokio::test]
-async fn create_volume_makes_a_state_area_from_the_profile() {
+async fn create_volume_makes_a_worktree_on_this_node() {
     let d = Driver::start().await;
     let mut c = d.controller();
-    let req = create_req(
+    let mut req = create_req(
         "pvc-1",
         &[
             ("profile", "p"),
@@ -230,6 +313,10 @@ async fn create_volume_makes_a_state_area_from_the_profile() {
             ("csi.storage.k8s.io/pv/name", "pvc-1"),
         ],
     );
+    req.accessibility_requirements = Some(TopologyRequirement {
+        requisite: vec![topology("node-1")],
+        preferred: vec![topology("node-1")],
+    });
     let vol = c
         .create_volume(req.clone())
         .await
@@ -241,11 +328,16 @@ async fn create_volume_makes_a_state_area_from_the_profile() {
     assert_eq!(vol.capacity_bytes, 1 << 30);
     assert_eq!(vol.volume_context["profile"], "p");
     assert_eq!(vol.volume_context["volume"], "team.data.pvc-1");
-    assert_eq!(vol.volume_context["branch"], "agentfs/team.data.pvc-1");
     assert_eq!(vol.volume_context["onDelete"], "retain");
+    assert!(!vol.volume_context.contains_key("branch"));
+    assert_eq!(vol.accessible_topology, [topology("node-1")]);
 
     let history = History::open(&d.layout.state("pvc-1").join("git")).unwrap();
     assert_eq!(history.settings().volume, "team.data.pvc-1");
+    assert_eq!(
+        history.settings().branch_ref,
+        "refs/heads/agentfs/team.data.pvc-1"
+    );
     assert_eq!(
         history.settings().commit_window,
         Duration::from_millis(100),
@@ -268,8 +360,19 @@ async fn create_volume_makes_a_state_area_from_the_profile() {
     });
     assert_eq!(code(c.create_volume(bigger).await), Code::AlreadyExists);
     let mut other = req.clone();
-    other.parameters.insert("branch".into(), "other".into());
+    other.parameters.insert("onDelete".into(), "delete".into());
     assert_eq!(code(c.create_volume(other).await), Code::AlreadyExists);
+
+    // Another node's volume is never made here.
+    let mut elsewhere = create_req("pvc-2", &[("profile", "p")]);
+    elsewhere.accessibility_requirements = Some(TopologyRequirement {
+        requisite: vec![topology("node-2")],
+        preferred: Vec::new(),
+    });
+    let err = c.create_volume(elsewhere).await.unwrap_err();
+    assert_eq!(err.code(), Code::ResourceExhausted, "{}", err.message());
+    assert!(err.message().contains("node-2"), "{}", err.message());
+    assert!(!d.layout.volume_dir("pvc-2").exists());
     d.stop().await;
 }
 
@@ -304,6 +407,19 @@ async fn create_volume_refuses_what_it_does_not_support() {
         "unknown parameter",
         create_req("v", &[("profile", "p"), ("x", "y")]),
     ));
+    // F8 rule 1: no class names a branch, and every name names the PV.
+    cases.push((
+        "a branch",
+        create_req("v", &[("profile", "p"), ("branch", "team/x")]),
+    ));
+    cases.push((
+        "a name without {pvName}",
+        create_req("v", &[("profile", "p"), ("volumeName", "fixed")]),
+    ));
+    cases.push((
+        "a bad startFrom",
+        create_req("v", &[("profile", "p"), ("startFrom", "origin:agentfs/x")]),
+    ));
     cases.push(("no profile", create_req("v", &[])));
     cases.push(("missing profile", create_req("v", &[("profile", "nope")])));
     cases.push(("bad handle", create_req("a/b", &[("profile", "p")])));
@@ -329,6 +445,124 @@ async fn create_volume_refuses_what_it_does_not_support() {
     d.stop().await;
 }
 
+/// F8 R2: a start class starts a new worktree from a pinned commit of
+/// another worktree's branch, fetched once from the start remote, with
+/// each refusal's code (design §14.2 error table).
+#[tokio::test]
+async fn create_volume_on_a_start_class() {
+    let d = Driver::start().await;
+    let remote = d.remote_profile("r", "");
+    let old = "refs/heads/agentfs/v1";
+    let f = commit(&remote, old, &[("f.txt", "f")]);
+    let g = commit(&remote, old, &[("g.txt", "g")]);
+    let mut c = d.controller();
+    let start = format!("origin:agentfs/v1@{f}");
+    let req = create_req(
+        "pvc-2",
+        &[
+            ("profile", "r"),
+            ("volumeName", "{pvName}"),
+            ("startFrom", &start),
+        ],
+    );
+    let vol = c
+        .create_volume(req.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    assert_eq!(vol.volume_context["volume"], "pvc-2");
+    assert_eq!(
+        fs::read_to_string(d.layout.backing("pvc-2").join("f.txt")).unwrap(),
+        "f"
+    );
+    assert!(
+        !d.layout.backing("pvc-2").join("g.txt").exists(),
+        "g is after the pin"
+    );
+    let settings =
+        agentfs_core::config::Settings::load(&d.layout.state("pvc-2").join("git")).unwrap();
+    assert_eq!(settings.start.unwrap().to_string(), start);
+    let repo = git2::Repository::open_bare(d.layout.state("pvc-2").join("git")).unwrap();
+    assert_eq!(repo.refname_to_id("refs/heads/agentfs/pvc-2").unwrap(), f);
+    // Retried: the same volume; another start point: another volume.
+    c.create_volume(req.clone()).await.unwrap();
+    let mut other = req.clone();
+    other
+        .parameters
+        .insert("startFrom".into(), format!("origin:agentfs/v1@{g}"));
+    assert_eq!(code(c.create_volume(other).await), Code::AlreadyExists);
+    assert_eq!(
+        git2::Repository::open_bare(&remote)
+            .unwrap()
+            .refname_to_id(old)
+            .unwrap(),
+        g,
+        "nothing was written to the start branch"
+    );
+
+    let unrelated = commit(&remote, "refs/heads/other", &[("x", "x")]);
+    let refused = |name: &str, start: String| {
+        create_req(
+            name,
+            &[
+                ("profile", "r"),
+                ("volumeName", "{pvName}"),
+                ("startFrom", &start),
+            ],
+        )
+    };
+    for (name, start, wanted) in [
+        (
+            "pvc-3",
+            format!("origin:agentfs/v1@{unrelated}"),
+            Code::FailedPrecondition,
+        ),
+        (
+            "pvc-4",
+            format!("origin:agentfs/none@{f}"),
+            Code::FailedPrecondition,
+        ),
+        (
+            "pvc-5",
+            format!("backup:agentfs/v1@{f}"),
+            Code::InvalidArgument,
+        ),
+        (
+            "pvc-6",
+            format!("origin:agentfs/pvc-6@{f}"),
+            Code::InvalidArgument,
+        ),
+    ] {
+        let err = c.create_volume(refused(name, start)).await.unwrap_err();
+        assert_eq!(err.code(), wanted, "{name}: {}", err.message());
+        assert!(!d.layout.csi_json(name).exists(), "{name}");
+    }
+    // An unreachable start remote is UNAVAILABLE: the CO retries.
+    fs::write(
+        d.layout.profiles.join("gone.config"),
+        format!(
+            "[remote \"origin\"]\n\turl = {}\n",
+            d.dir.path().join("gone.git").display()
+        ),
+    )
+    .unwrap();
+    let err = c
+        .create_volume(create_req(
+            "pvc-7",
+            &[
+                ("profile", "gone"),
+                ("volumeName", "{pvName}"),
+                ("startFrom", &start),
+            ],
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    d.stop().await;
+}
+
 #[tokio::test]
 async fn delete_volume_retains_or_deletes() {
     let d = Driver::start().await;
@@ -336,27 +570,19 @@ async fn delete_volume_retains_or_deletes() {
     let r = c.delete_volume(DeleteVolumeRequest::default()).await;
     assert_eq!(code(r), Code::InvalidArgument);
     for id in ["missing", "bad/id", ".."] {
-        c.delete_volume(DeleteVolumeRequest {
-            volume_id: id.into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        c.delete_volume(delete_req(id)).await.unwrap();
     }
 
+    // No history: nothing can be lost.
     c.create_volume(create_req("kept", &[("profile", "p")]))
         .await
         .unwrap();
     fs::write(d.layout.backing("kept").join("f"), "x").unwrap();
-    let delete = |id: &str| DeleteVolumeRequest {
-        volume_id: id.into(),
-        ..Default::default()
-    };
-    c.delete_volume(delete("kept")).await.unwrap();
+    c.delete_volume(delete_req("kept")).await.unwrap();
     assert!(!d.layout.csi_json("kept").exists());
     assert!(d.layout.retained_json("kept").exists());
     assert!(d.layout.backing("kept").join("f").exists());
-    c.delete_volume(delete("kept")).await.unwrap();
+    c.delete_volume(delete_req("kept")).await.unwrap();
     // The retained directory is re-usable under the same name.
     c.create_volume(create_req("kept", &[("profile", "p")]))
         .await
@@ -370,45 +596,176 @@ async fn delete_volume_retains_or_deletes() {
     ))
     .await
     .unwrap();
-    // Attached: refused.
-    c.controller_publish_volume(publish_req("gone", "node-1"))
-        .await
-        .unwrap();
-    assert_eq!(
-        code(c.delete_volume(delete("gone")).await),
-        Code::FailedPrecondition
+    // Staged on this node: refused.
+    fs::create_dir_all(d.layout.staged_dir()).unwrap();
+    fs::write(d.layout.staged_record("gone"), "{}").unwrap();
+    let err = c.delete_volume(delete_req("gone")).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message().contains("staged on this node"),
+        "{}",
+        err.message()
     );
-    c.controller_unpublish_volume(ControllerUnpublishVolumeRequest {
-        volume_id: "gone".into(),
-        node_id: "node-1".into(),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    // Locked (a history service runs): refused, naming the holder.
+    fs::remove_file(d.layout.staged_record("gone")).unwrap();
+    // Locked (a push or a history service runs): refused, naming the holder.
     let state = agentfs_core::volume::StateDir::new(d.layout.state("gone"));
     let lock =
         agentfs_core::lock::StateLock::acquire(&state, "serve-history", Duration::ZERO).unwrap();
-    let err = c.delete_volume(delete("gone")).await.unwrap_err();
+    let err = c.delete_volume(delete_req("gone")).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
     assert!(err.message().contains("serve-history"), "{}", err.message());
     drop(lock);
-    c.delete_volume(delete("gone")).await.unwrap();
+    c.delete_volume(delete_req("gone")).await.unwrap();
     assert!(!d.layout.volume_dir("gone").exists());
     assert!(!d.layout.deleting_dir("gone").exists());
     // Files an earlier delete left aside go at the next delete of the name.
     fs::create_dir_all(d.layout.deleting_dir("gone").join("state")).unwrap();
-    c.delete_volume(delete("gone")).await.unwrap();
+    c.delete_volume(delete_req("gone")).await.unwrap();
     assert!(!d.layout.deleting_dir("gone").exists());
     d.stop().await;
 }
 
-/// DeleteVolume of an ordinary `onDelete: retain` volume never reads its
-/// settings: one whose profile was removed from the ConfigMap, or holds a
-/// bad value, is still deleted (whether it is a fork is read from the
-/// state area's own config, design §11.5).
+/// F8 rule 3: DeleteVolume asks each remote what it holds, in a listing
+/// made for the call, and removes nothing a remote lacks; every `Release`
+/// answer against prepared `file://` remotes.
 #[tokio::test]
-async fn an_ordinary_volume_with_unreadable_settings_is_still_deleted() {
+async fn delete_volume_asks_the_remotes() {
+    let d = Driver::start().await;
+    let remote = d.remote_profile("r", "");
+    let mut c = d.controller();
+    for (handle, on_delete) in [("v", "delete"), ("kept", "retain")] {
+        c.create_volume(create_req(
+            handle,
+            &[
+                ("profile", "r"),
+                ("onDelete", on_delete),
+                ("volumeName", "{pvName}"),
+            ],
+        ))
+        .await
+        .unwrap();
+        // A commit, as a history service's final commit leaves it.
+        commit(
+            &d.layout.state(handle).join("git"),
+            &format!("refs/heads/agentfs/{handle}"),
+            &[("a.txt", "a")],
+        );
+    }
+    // The remote lacks it: UNAVAILABLE, naming the remote; retain waits too.
+    for handle in ["v", "kept"] {
+        let err = c.delete_volume(delete_req(handle)).await.unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+        assert!(
+            err.message().contains("remote origin does not hold"),
+            "{}",
+            err.message()
+        );
+        assert!(d.layout.csi_json(handle).exists());
+    }
+    // Pushed (the release scan's work), but behind the head: still waits.
+    push(&d.layout, "v");
+    commit(
+        &d.layout.state("v").join("git"),
+        "refs/heads/agentfs/v",
+        &[("b.txt", "b")],
+    );
+    assert_eq!(
+        code(c.delete_volume(delete_req("v")).await),
+        Code::Unavailable
+    );
+    // Held: delete removes, retain keeps.
+    push(&d.layout, "v");
+    c.delete_volume(delete_req("v")).await.unwrap();
+    assert!(!d.layout.volume_dir("v").exists());
+    push(&d.layout, "kept");
+    c.delete_volume(delete_req("kept")).await.unwrap();
+    assert!(d.layout.retained_json("kept").exists());
+    assert!(d.layout.state("kept").exists());
+
+    // Another worktree wrote the branch: diverged, never removed.
+    c.create_volume(create_req(
+        "w",
+        &[
+            ("profile", "r"),
+            ("onDelete", "delete"),
+            ("volumeName", "{pvName}"),
+        ],
+    ))
+    .await
+    .unwrap();
+    commit(
+        &d.layout.state("w").join("git"),
+        "refs/heads/agentfs/w",
+        &[("a.txt", "a")],
+    );
+    commit(&remote, "refs/heads/agentfs/w", &[("theirs.txt", "x")]);
+    let err = c.delete_volume(delete_req("w")).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable);
+    assert!(err.message().contains("diverged"), "{}", err.message());
+    assert!(d.layout.volume_dir("w").exists());
+
+    // An unreachable remote: UNAVAILABLE, naming it.
+    fs::write(
+        d.layout.profiles.join("u.config"),
+        format!(
+            "[remote \"far\"]\n\turl = {}\n",
+            d.dir.path().join("nope.git").display()
+        ),
+    )
+    .unwrap();
+    c.create_volume(create_req(
+        "u",
+        &[
+            ("profile", "u"),
+            ("onDelete", "delete"),
+            ("volumeName", "{pvName}"),
+        ],
+    ))
+    .await
+    .unwrap();
+    commit(
+        &d.layout.state("u").join("git"),
+        "refs/heads/agentfs/u",
+        &[("a.txt", "a")],
+    );
+    let err = c.delete_volume(delete_req("u")).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable);
+    assert!(
+        err.message().contains("remote far could not be listed"),
+        "{}",
+        err.message()
+    );
+
+    // No remote declared: kept whatever onDelete says.
+    c.create_volume(create_req(
+        "solo",
+        &[
+            ("profile", "p"),
+            ("onDelete", "delete"),
+            ("volumeName", "{pvName}"),
+        ],
+    ))
+    .await
+    .unwrap();
+    commit(
+        &d.layout.state("solo").join("git"),
+        "refs/heads/agentfs/solo",
+        &[("a.txt", "a")],
+    );
+    c.delete_volume(delete_req("solo")).await.unwrap();
+    assert!(d.layout.retained_json("solo").exists());
+    assert!(
+        d.layout.state("solo").exists(),
+        "nothing elsewhere holds it"
+    );
+    d.stop().await;
+}
+
+/// DeleteVolume cannot ask the remotes of a worktree whose settings fail
+/// to load (its profile removed from the ConfigMap, or holding a bad
+/// value): FAILED_PRECONDITION, and nothing deleted or released.
+#[tokio::test]
+async fn a_volume_with_unreadable_settings_is_not_released() {
     let d = Driver::start().await;
     let mut c = d.controller();
     for profile in ["removed", "broken"] {
@@ -420,8 +777,6 @@ async fn an_ordinary_volume_with_unreadable_settings_is_still_deleted() {
         c.create_volume(create_req(profile, &[("profile", profile)]))
             .await
             .unwrap();
-        let state = agentfs_core::volume::StateDir::new(d.layout.state(profile));
-        assert!(state.git().join("config").exists());
     }
     fs::remove_file(d.layout.profiles.join("removed.config")).unwrap();
     fs::write(
@@ -435,167 +790,16 @@ async fn an_ordinary_volume_with_unreadable_settings_is_still_deleted() {
             agentfs_core::config::Settings::load(&state.git()).is_err(),
             "{profile}: its settings must fail to load for this test to mean anything"
         );
-        c.delete_volume(DeleteVolumeRequest {
-            volume_id: profile.into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap_or_else(|e| panic!("{profile}: {e}"));
-        assert!(!d.layout.csi_json(profile).exists());
-        assert!(d.layout.retained_json(profile).exists());
+        let err = c.delete_volume(delete_req(profile)).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
+        assert!(
+            err.message().contains("nothing deleted"),
+            "{}",
+            err.message()
+        );
+        assert!(d.layout.csi_json(profile).exists());
     }
     d.stop().await;
-}
-
-/// DeleteVolume on the shared base path of an NFS export (ci/e2e-nfs.sh
-/// step f, `AGENTFS_CSI_TEST_BASE`): the volume and its aside copy are
-/// gone, and no silly-renamed lock file is left behind.
-#[tokio::test]
-#[ignore = "needs AGENTFS_CSI_TEST_BASE on a shared filesystem (ci/e2e-nfs.sh)"]
-async fn delete_volume_on_a_shared_base_path() {
-    let base = PathBuf::from(
-        std::env::var_os("AGENTFS_CSI_TEST_BASE").expect("AGENTFS_CSI_TEST_BASE is not set"),
-    );
-    fs::create_dir_all(&base).unwrap();
-    let d = Driver::start_at(&base).await;
-    let mut c = d.controller();
-    let pv = format!("pv-shared-{}", std::process::id());
-    c.create_volume(create_req(&pv, &[("profile", "p"), ("onDelete", "delete")]))
-        .await
-        .unwrap();
-    assert!(d.layout.csi_json(&pv).exists());
-    c.delete_volume(DeleteVolumeRequest {
-        volume_id: pv.clone(),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    assert!(!base.join(&pv).exists(), "{pv} is still there");
-    assert!(!base.join(format!(".deleting.{pv}")).exists());
-    let silly: Vec<_> = fs::read_dir(&base)
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .filter(|n| n.to_string_lossy().starts_with(".nfs"))
-        .collect();
-    assert!(silly.is_empty(), "left in {}: {silly:?}", base.display());
-    d.stop().await;
-}
-
-/// The message of the newest commit on `branch` that added `path`.
-fn added_by(git: &Path, branch: &str, path: &str) -> Option<String> {
-    let repo = git2::Repository::open_bare(git).ok()?;
-    let mut walk = repo.revwalk().ok()?;
-    walk.push_ref(&format!("refs/heads/{branch}")).ok()?;
-    let has = |c: &git2::Commit| c.tree().is_ok_and(|t| t.get_path(Path::new(path)).is_ok());
-    for id in walk {
-        let commit = repo.find_commit(id.ok()?).ok()?;
-        if has(&commit) && !commit.parents().any(|p| has(&p)) {
-            return Some(commit.message().unwrap_or_default().to_owned());
-        }
-    }
-    None
-}
-
-/// A volume moves between nodes on a shared base path (ci/e2e-nfs.sh step
-/// g; design §14.2, §19.1 "One node per volume"): real `agentfs-csi`
-/// plugins, node-1 on one NFS client's view of the base path and node-2 on
-/// another's, and a controller. While node-1 has the volume staged, the
-/// state lock refuses NodeStage on node-2 across the clients. Once node-1
-/// unstages and the attachment moves, node-2 serves node-1's file, whose
-/// commit names node-1, and records its own writes as node-2.
-#[tokio::test]
-#[ignore = "needs ci/e2e-nfs.sh's plugins (AGENTFS_CSI_TEST_CONTROLLER, _NODE1, _NODE2, _BASE), as root"]
-async fn a_volume_moves_between_nodes_on_a_shared_base_path() {
-    let env = |name: &str| {
-        PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is not set")))
-    };
-    let mut c = ControllerClient::new(connect(&env("AGENTFS_CSI_TEST_CONTROLLER")).await);
-    let mut n1 = NodeClient::new(connect(&env("AGENTFS_CSI_TEST_NODE1")).await);
-    let mut n2 = NodeClient::new(connect(&env("AGENTFS_CSI_TEST_NODE2")).await);
-    // Node-2's view: its history service writes the newest commits.
-    let git = |pv: &str| env("AGENTFS_CSI_TEST_BASE").join(pv).join("state/git");
-    let dir = tempfile::tempdir().unwrap();
-    let (t1, t2) = (dir.path().join("node-1"), dir.path().join("node-2"));
-    let pv = format!("pv-move-{}", std::process::id());
-    let volume = c
-        .create_volume(create_req(&pv, &[("profile", "p")]))
-        .await
-        .unwrap()
-        .into_inner()
-        .volume
-        .unwrap();
-    let branch = &volume.volume_context["branch"];
-    let unpublish = |target: &Path| NodeUnpublishVolumeRequest {
-        volume_id: pv.clone(),
-        target_path: target.to_str().unwrap().into(),
-    };
-    let unstage = || NodeUnstageVolumeRequest {
-        volume_id: pv.clone(),
-        staging_target_path: "/staging".into(),
-    };
-    let detach = |node: &str| ControllerUnpublishVolumeRequest {
-        volume_id: pv.clone(),
-        node_id: node.into(),
-        ..Default::default()
-    };
-
-    c.controller_publish_volume(publish_req(&pv, "node-1"))
-        .await
-        .unwrap();
-    n1.node_stage_volume(stage_req(&pv, "/staging"))
-        .await
-        .unwrap();
-    n1.node_publish_volume(node_publish_req(&pv, t1.to_str().unwrap()))
-        .await
-        .unwrap();
-    fs::write(t1.join("moved.txt"), "from node-1").unwrap();
-    let err = n2
-        .node_stage_volume(stage_req(&pv, "/staging"))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
-    assert!(
-        err.message().contains("command=serve-history"),
-        "{}",
-        err.message()
-    );
-
-    n1.node_unpublish_volume(unpublish(&t1)).await.unwrap();
-    n1.node_unstage_volume(unstage()).await.unwrap();
-    c.controller_unpublish_volume(detach("node-1"))
-        .await
-        .unwrap();
-    c.controller_publish_volume(publish_req(&pv, "node-2"))
-        .await
-        .unwrap();
-    n2.node_stage_volume(stage_req(&pv, "/staging"))
-        .await
-        .unwrap();
-    n2.node_publish_volume(node_publish_req(&pv, t2.to_str().unwrap()))
-        .await
-        .unwrap();
-    assert_eq!(
-        fs::read_to_string(t2.join("moved.txt")).unwrap(),
-        "from node-1"
-    );
-    let first = added_by(&git(&pv), branch, "moved.txt").expect("moved.txt is not in history");
-    assert!(first.contains("Agentfs-Node: node-1\n"), "{first}");
-    fs::write(t2.join("after.txt"), "from node-2").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let second = loop {
-        if let Some(message) = added_by(&git(&pv), branch, "after.txt") {
-            break message;
-        }
-        assert!(Instant::now() < deadline, "after.txt never reached history");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-    assert!(second.contains("Agentfs-Node: node-2\n"), "{second}");
-
-    n2.node_unpublish_volume(unpublish(&t2)).await.unwrap();
-    n2.node_unstage_volume(unstage()).await.unwrap();
-    c.controller_unpublish_volume(detach("node-2"))
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -632,13 +836,6 @@ async fn multi_node_modes_are_refused_with_the_decision() {
         assert!(no.confirmed.is_none(), "{mode:?}");
         assert_eq!(no.message, MULTI_NODE, "{mode:?}");
 
-        let mut req = publish_req("v", "node-1");
-        req.volume_capability = Some(mount_cap(mode));
-        refused(
-            c.controller_publish_volume(req).await.unwrap_err(),
-            "ControllerPublish",
-        );
-
         let mut req = stage_req("v", "/staging");
         req.volume_capability = Some(mount_cap(mode));
         refused(n.node_stage_volume(req).await.unwrap_err(), "NodeStage");
@@ -647,112 +844,6 @@ async fn multi_node_modes_are_refused_with_the_decision() {
         req.volume_capability = Some(mount_cap(mode));
         refused(n.node_publish_volume(req).await.unwrap_err(), "NodePublish");
     }
-    d.stop().await;
-}
-
-#[tokio::test]
-async fn controller_publish_tracks_one_node() {
-    let d = Driver::start().await;
-    let mut c = d.controller();
-    c.create_volume(create_req("v", &[("profile", "p")]))
-        .await
-        .unwrap();
-    let mut r = publish_req("v", "node-1");
-    r.volume_id.clear();
-    assert_eq!(
-        code(c.controller_publish_volume(r).await),
-        Code::InvalidArgument
-    );
-    let mut r = publish_req("v", "node-1");
-    r.node_id.clear();
-    assert_eq!(
-        code(c.controller_publish_volume(r).await),
-        Code::InvalidArgument
-    );
-    let mut r = publish_req("v", "node-1");
-    r.volume_capability = None;
-    assert_eq!(
-        code(c.controller_publish_volume(r).await),
-        Code::InvalidArgument
-    );
-    assert_eq!(
-        code(
-            c.controller_publish_volume(publish_req("nope", "node-1"))
-                .await
-        ),
-        Code::NotFound
-    );
-    assert_eq!(
-        code(
-            c.controller_publish_volume(publish_req("v", "node-9"))
-                .await
-        ),
-        Code::NotFound
-    );
-
-    c.controller_publish_volume(publish_req("v", "node-1"))
-        .await
-        .unwrap();
-    c.controller_publish_volume(publish_req("v", "node-1"))
-        .await
-        .unwrap();
-    assert_eq!(
-        code(
-            c.controller_publish_volume(publish_req("v", "node-2"))
-                .await
-        ),
-        Code::FailedPrecondition
-    );
-    let unpublish = |node: &str| ControllerUnpublishVolumeRequest {
-        volume_id: "v".into(),
-        node_id: node.into(),
-        ..Default::default()
-    };
-    // Another node's detach changes nothing.
-    c.controller_unpublish_volume(unpublish("node-2"))
-        .await
-        .unwrap();
-    assert_eq!(
-        code(
-            c.controller_publish_volume(publish_req("v", "node-2"))
-                .await
-        ),
-        Code::FailedPrecondition
-    );
-    c.controller_unpublish_volume(unpublish("node-1"))
-        .await
-        .unwrap();
-    c.controller_unpublish_volume(unpublish("node-1"))
-        .await
-        .unwrap();
-    c.controller_publish_volume(publish_req("v", "node-2"))
-        .await
-        .unwrap();
-    let r = c
-        .controller_unpublish_volume(ControllerUnpublishVolumeRequest::default())
-        .await;
-    assert_eq!(code(r), Code::InvalidArgument);
-    d.stop().await;
-}
-
-#[tokio::test]
-async fn controller_publish_adopts_a_static_volume() {
-    let d = Driver::start().await;
-    let mut c = d.controller();
-    let mut r = publish_req("static-1", "node-1");
-    r.volume_context = HashMap::from([
-        ("profile".to_owned(), "p".to_owned()),
-        ("volume".to_owned(), "legacy".to_owned()),
-    ]);
-    c.controller_publish_volume(r).await.unwrap();
-    let history = History::open(&d.layout.state("static-1").join("git")).unwrap();
-    assert_eq!(history.settings().volume, "legacy");
-    let rec: agentfs_csi::records::VolumeRecord =
-        agentfs_csi::records::load(&d.layout.csi_json("static-1"))
-            .unwrap()
-            .unwrap();
-    assert!(rec.static_volume);
-    assert_eq!(rec.published_node.as_deref(), Some("node-1"));
     d.stop().await;
 }
 
@@ -823,6 +914,7 @@ async fn node_calls_are_validated() {
         .unwrap()
         .into_inner();
     assert_eq!(info.node_id, "node-1");
+    assert_eq!(info.accessible_topology, Some(topology("node-1")));
     let caps = n
         .node_get_capabilities(NodeGetCapabilitiesRequest {})
         .await
@@ -852,10 +944,16 @@ async fn node_calls_are_validated() {
             "{what}"
         );
     }
-    // A volume that does not exist, and one without a profile.
-    assert_eq!(
-        code(n.node_stage_volume(stage_req("missing", "/staging")).await),
-        Code::NotFound
+    // No worktree on this node: NOT_FOUND, naming the node (the pod waits).
+    let err = n
+        .node_stage_volume(stage_req("missing", "/staging"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+    assert!(
+        err.message().contains("no worktree on node node-1"),
+        "{}",
+        err.message()
     );
 
     let mut publish_cases = vec![
@@ -921,9 +1019,10 @@ async fn node_calls_are_validated() {
     d.stop().await;
 }
 
-/// A volume kept by `onDelete: retain` is mounted again through a static
-/// PV written as docs/csi.md §5 shows it: `volumeName` names the volume
-/// the state area holds, and a misspelt attribute is refused.
+/// A worktree kept by `onDelete: retain` is mounted again through a static
+/// PV written as docs/csi.md shows it: `volumeName` names the volume the
+/// state area holds, a misspelt attribute is refused, and NodeStage
+/// adopts it (writes its `csi.json`) only over that worktree.
 #[tokio::test]
 async fn a_retained_volume_is_adopted_through_the_documented_attributes() {
     let d = Driver::start().await;
@@ -948,38 +1047,41 @@ async fn a_retained_volume_is_adopted_through_the_documented_attributes() {
         name, "ns.claim.pvc-0b6f",
         "the default name is unique per PV"
     );
-    c.delete_volume(DeleteVolumeRequest {
-        volume_id: "pvc-0b6f".into(),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    c.delete_volume(delete_req("pvc-0b6f")).await.unwrap();
     assert!(d.layout.retained_json("pvc-0b6f").exists());
 
-    let attrs = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
-        pairs
+    let mut n = NodeClient::new(d.channel.clone());
+    let stage = |pairs: &[(&str, &str)]| {
+        let mut r = stage_req("pvc-0b6f", "/staging");
+        r.volume_context = pairs
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect()
+            .collect();
+        r
     };
     // A typo fails loudly instead of naming the volume after its handle.
-    let mut r = publish_req("pvc-0b6f", "node-1");
-    r.volume_context = attrs(&[("profile", "p"), ("volumename", &name)]);
     assert_eq!(
-        code(c.controller_publish_volume(r).await),
+        code(
+            n.node_stage_volume(stage(&[("profile", "p"), ("volumename", &name)]))
+                .await
+        ),
         Code::InvalidArgument
     );
     // Another name than the state area's is refused.
-    let mut r = publish_req("pvc-0b6f", "node-1");
-    r.volume_context = attrs(&[("profile", "p"), ("volumeName", "other")]);
     assert_eq!(
-        code(c.controller_publish_volume(r).await),
+        code(
+            n.node_stage_volume(stage(&[("profile", "p"), ("volumeName", "other")]))
+                .await
+        ),
         Code::AlreadyExists
     );
-    // The documented attributes adopt it.
-    let mut r = publish_req("pvc-0b6f", "node-1");
-    r.volume_context = attrs(&[("profile", "p"), ("volumeName", &name)]);
-    c.controller_publish_volume(r).await.unwrap();
+    assert!(!d.layout.csi_json("pvc-0b6f").exists());
+    // The documented attributes adopt it (the service this test's
+    // launcher starts, /bin/false, then exits: that is the stage's own
+    // failure, after the adoption).
+    let _ = n
+        .node_stage_volume(stage(&[("profile", "p"), ("volumeName", &name)]))
+        .await;
     let rec: agentfs_csi::records::VolumeRecord =
         agentfs_csi::records::load(&d.layout.csi_json("pvc-0b6f"))
             .unwrap()
@@ -988,68 +1090,6 @@ async fn a_retained_volume_is_adopted_through_the_documented_attributes() {
     assert_eq!(rec.params.volume, name);
     let history = History::open(&d.layout.state("pvc-0b6f").join("git")).unwrap();
     assert_eq!(history.settings().volume, name);
-    d.stop().await;
-}
-
-/// `onDelete: delete` refuses while a remote lacks commits of the branch:
-/// removing the directory would lose them.
-#[tokio::test]
-async fn delete_volume_keeps_history_no_remote_holds() {
-    let d = Driver::start().await;
-    let remote = d.dir.path().join("remote.git");
-    git2::Repository::init_bare(&remote).unwrap();
-    fs::write(
-        d.layout.profiles.join("r.config"),
-        format!("[remote \"origin\"]\n\turl = {}\n", remote.display()),
-    )
-    .unwrap();
-    let mut c = d.controller();
-    c.create_volume(create_req(
-        "v",
-        &[
-            ("profile", "r"),
-            ("onDelete", "delete"),
-            ("volumeName", "{pvName}"),
-        ],
-    ))
-    .await
-    .unwrap();
-    let state = agentfs_core::volume::StateDir::new(d.layout.state("v"));
-    let delete = || DeleteVolumeRequest {
-        volume_id: "v".into(),
-        ..Default::default()
-    };
-    // A commit (what a history service's final commit leaves) no remote has.
-    let repo = git2::Repository::open_bare(state.git()).unwrap();
-    let tree = repo.treebuilder(None).unwrap().write().unwrap();
-    let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
-    let head = repo
-        .commit(
-            Some("refs/heads/agentfs/v"),
-            &sig,
-            &sig,
-            "final",
-            &repo.find_tree(tree).unwrap(),
-            &[],
-        )
-        .unwrap();
-    let err = c.delete_volume(delete()).await.unwrap_err();
-    assert_eq!(err.code(), Code::FailedPrecondition);
-    assert!(
-        err.message().contains("origin lacks 1 commit"),
-        "{}",
-        err.message()
-    );
-    assert!(d.layout.volume_dir("v").join("state").exists());
-    assert!(d.layout.csi_json("v").exists());
-    // Once pushed, it goes.
-    let pushed = agentfs_core::push::PushState {
-        last_pushed: Some(head.to_string()),
-        ..Default::default()
-    };
-    pushed.save(&state.push_state("origin")).unwrap();
-    c.delete_volume(delete()).await.unwrap();
-    assert!(!d.layout.volume_dir("v").exists());
     d.stop().await;
 }
 
@@ -1064,18 +1104,12 @@ fn clone_of(id: &str) -> Option<VolumeContentSource> {
     })
 }
 
-/// A12, A13: CreateVolume of a fork class clones a source volume, and
-/// DeleteVolume waits until the fork is published.
+/// A12, A13: CreateVolume of a fork class clones a source volume on this
+/// node, and DeleteVolume waits until the fork is published.
 #[tokio::test]
 async fn forks_are_cloned_and_deleted_once_published() {
     let d = Driver::start().await;
-    let remote = d.dir.path().join("remote.git");
-    git2::Repository::init_bare(&remote).unwrap();
-    fs::write(
-        d.layout.profiles.join("r.config"),
-        format!("[remote \"origin\"]\n\turl = {}\n", remote.display()),
-    )
-    .unwrap();
+    d.remote_profile("r", "");
     let mut c = d.controller();
     c.create_volume(create_req(
         "src",
@@ -1084,22 +1118,11 @@ async fn forks_are_cloned_and_deleted_once_published() {
     .await
     .unwrap();
     // The source's history: one file, as a history service commits it.
-    let source = git2::Repository::open_bare(d.layout.state("src").join("git")).unwrap();
-    let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
-    let blob = source.blob(b"from the source\n").unwrap();
-    let mut tree = source.treebuilder(None).unwrap();
-    tree.insert("a.txt", blob, 0o100644).unwrap();
-    let tree = source.find_tree(tree.write().unwrap()).unwrap();
-    let base = source
-        .commit(
-            Some("refs/heads/agentfs/src"),
-            &sig,
-            &sig,
-            "write: a.txt\n\nAgentfs-Seq: 1\nAgentfs-Trigger: close\n",
-            &tree,
-            &[],
-        )
-        .unwrap();
+    let base = commit(
+        &d.layout.state("src").join("git"),
+        "refs/heads/agentfs/src",
+        &[("a.txt", "from the source\n")],
+    );
 
     let fork_params = [
         ("fork", "true"),
@@ -1127,6 +1150,7 @@ async fn forks_are_cloned_and_deleted_once_published() {
     for (key, value) in [
         ("profile", "r"),
         ("branch", "b"),
+        ("startFrom", "origin:agentfs/src@x"),
         ("volumeName", "{pvcName}"),
     ] {
         let mut params = fork_params.to_vec();
@@ -1144,6 +1168,12 @@ async fn forks_are_cloned_and_deleted_once_published() {
             err.message()
         );
     }
+    // A source on another node: refused, naming the remedy.
+    let mut r = create_req("fork-1", &fork_params);
+    r.volume_content_source = clone_of("elsewhere");
+    let err = c.create_volume(r).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
+    assert!(err.message().contains("affinity"), "{}", err.message());
 
     let mut req = create_req("fork-1", &fork_params);
     req.volume_content_source = clone_of("src");
@@ -1155,6 +1185,7 @@ async fn forks_are_cloned_and_deleted_once_published() {
         .volume
         .unwrap();
     assert_eq!(vol.content_source, clone_of("src"));
+    assert_eq!(vol.accessible_topology, [topology("node-1")]);
     assert_eq!(vol.volume_context["profile"], "r");
     assert_eq!(vol.volume_context["volume"], "agents.sandbox.fork-1");
     assert_eq!(vol.volume_context["onDelete"], "delete");
@@ -1171,11 +1202,7 @@ async fn forks_are_cloned_and_deleted_once_published() {
     c.create_volume(req).await.unwrap();
 
     // Unpublished: UNAVAILABLE, the request stored, nothing deleted.
-    let delete = || DeleteVolumeRequest {
-        volume_id: "fork-1".into(),
-        ..Default::default()
-    };
-    let err = c.delete_volume(delete()).await.unwrap_err();
+    let err = c.delete_volume(delete_req("fork-1")).await.unwrap_err();
     assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
     assert!(err.message().contains("is active"), "{}", err.message());
     let record = agentfs_csi::volume::load(&d.layout, "fork-1")
@@ -1199,7 +1226,7 @@ async fn forks_are_cloned_and_deleted_once_published() {
     fs::write(state.fork_mark(), "{").unwrap();
     drop(finisher);
     drop(lock);
-    let err = c.delete_volume(delete()).await.unwrap_err();
+    let err = c.delete_volume(delete_req("fork-1")).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
     assert!(
         err.message().contains("nothing deleted"),
@@ -1207,7 +1234,7 @@ async fn forks_are_cloned_and_deleted_once_published() {
         err.message()
     );
     fs::remove_file(state.fork_mark()).unwrap();
-    let err = c.delete_volume(delete()).await.unwrap_err();
+    let err = c.delete_volume(delete_req("fork-1")).await.unwrap_err();
     assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
     assert!(err.message().contains("is finished"), "{}", err.message());
 
@@ -1231,7 +1258,7 @@ async fn forks_are_cloned_and_deleted_once_published() {
     );
     drop(finisher);
     drop(lock);
-    c.delete_volume(delete()).await.unwrap();
+    c.delete_volume(delete_req("fork-1")).await.unwrap();
     assert!(!d.layout.volume_dir("fork-1").exists());
 
     // B4: an abandoned fork, never published, is deleted as onDelete says.
@@ -1241,11 +1268,7 @@ async fn forks_are_cloned_and_deleted_once_published() {
     let mut req = create_req("fork-2", &params);
     req.volume_content_source = clone_of("src");
     c.create_volume(req).await.unwrap();
-    let delete2 = || DeleteVolumeRequest {
-        volume_id: "fork-2".into(),
-        ..Default::default()
-    };
-    let err = c.delete_volume(delete2()).await.unwrap_err();
+    let err = c.delete_volume(delete_req("fork-2")).await.unwrap_err();
     assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
     let state = agentfs_core::volume::StateDir::new(d.layout.state("fork-2"));
     let lock = agentfs_core::lock::StateLock::acquire(&state, "test", Duration::ZERO).unwrap();
@@ -1261,9 +1284,9 @@ async fn forks_are_cloned_and_deleted_once_published() {
         agentfs_core::fork::finish::ForkState::Abandoned
     );
     drop(lock);
-    c.delete_volume(delete2()).await.unwrap();
+    c.delete_volume(delete_req("fork-2")).await.unwrap();
     assert!(!d.layout.volume_dir("fork-2").exists());
-    // The source is untouched, and ordinary volumes delete as before.
+    // The source is untouched.
     assert!(d.layout.volume_dir("src").exists());
     d.stop().await;
 }

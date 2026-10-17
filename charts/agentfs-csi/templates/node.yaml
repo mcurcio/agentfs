@@ -1,6 +1,7 @@
-# The node plugin: `agentfs-csi --mode node` under tini on every node, with
-# node-driver-registrar and livenessprobe (design §14.2, docs/csi.md
-# "Architecture").
+# The node plugin: `agentfs-csi` under tini on every node, with
+# csi-provisioner (`--node-deployment`), node-driver-registrar and
+# livenessprobe (design §14.2, docs/csi.md "Architecture"). Each node
+# provisions the worktrees on its own disk.
 {{- $kubelet := .Values.kubeletDir }}
 {{- $pluginDir := printf "%s/plugins/%s" $kubelet (include "agentfs-csi.driverName" .) }}
 apiVersion: apps/v1
@@ -29,6 +30,8 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: agentfs-csi-node
+      # Only csi-provisioner talks to the API server: the token is mounted
+      # into it alone (the `api-token` volume), never into agentfs-csi.
       automountServiceAccountToken: false
       {{- with .Values.node.priorityClassName }}
       priorityClassName: {{ . }}
@@ -60,7 +63,6 @@ spec:
           # PID 1, so it registers as a subreaper (-s).
           command: [tini, -s, --, agentfs-csi]
           args:
-            - --mode=node
             - --endpoint=unix:///csi/csi.sock
             - --base-path={{ .Values.basePath.path }}
             - --node-state={{ .Values.node.stateDir }}
@@ -105,6 +107,31 @@ spec:
             - { name: profiles, mountPath: /etc/agentfs-csi/profiles, readOnly: true }
             - { name: credentials, mountPath: /etc/agentfs-csi/credentials, readOnly: true }
             - { name: dev-fuse, mountPath: /dev/fuse }
+        - name: csi-provisioner
+          {{- include "agentfs-csi.sidecarImage" .Values.sidecars.provisioner | nindent 10 }}
+          args:
+            - --csi-address=/csi/csi.sock
+            # PVC name and namespace for the volume name.
+            - --extra-create-metadata
+            # One provisioner per node: it creates and deletes only the
+            # worktrees of its own node (NODE_NAME).
+            - --node-deployment
+            # A start class's CreateVolume fetches the start branch once.
+            - --timeout=300s
+            {{- with .Values.sidecars.provisioner.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          {{- include "agentfs-csi.sidecarSecurityContext" . | nindent 10 }}
+          {{- with .Values.sidecars.provisioner.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+            - { name: api-token, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true }
         - name: node-driver-registrar
           {{- include "agentfs-csi.sidecarImage" .Values.sidecars.nodeDriverRegistrar | nindent 10 }}
           args:
@@ -143,7 +170,8 @@ spec:
           hostPath: { path: {{ $kubelet }}/plugins_registry, type: Directory }
         - name: kubelet-dir
           hostPath: { path: {{ $kubelet }}, type: Directory }
-        {{- include "agentfs-csi.baseVolume" . | nindent 8 }}
+        - name: base
+          hostPath: { path: {{ .Values.basePath.path }}, type: DirectoryOrCreate }
         - name: node-state
           hostPath: { path: {{ .Values.node.stateDir }}, type: DirectoryOrCreate }
         - name: mounts
@@ -154,3 +182,4 @@ spec:
           configMap: { name: agentfs-csi-profiles }
         - name: credentials
           secret: { secretName: {{ include "agentfs-csi.credentialsSecret" . }}, defaultMode: 0400 }
+        {{- include "agentfs-csi.apiTokenVolume" . | nindent 8 }}

@@ -113,6 +113,10 @@ pub enum ConfigError {
     PartialForkIdentity,
     #[error("agentfs.branch is set in a fork's config; a fork's push target is fixed at create")]
     ForkBranch,
+    #[error("agentfs.start.remote, .branch and .commit must be set together")]
+    PartialStartPoint,
+    #[error(transparent)]
+    BadStartPoint(crate::fork::identity::BadStartPoint),
     #[error(
         "remote.{remote}: a fork remote must name its own LFS endpoint (lfsurl or lfspushurl): \
          lfs.url and lfs.pushurl would send a fork's LFS objects to the source's store"
@@ -169,6 +173,9 @@ pub const KEYS: &[&str] = &[
     "agentfs.fork.source",
     "agentfs.fork.base",
     "agentfs.fork.pushTarget",
+    "agentfs.start.remote",
+    "agentfs.start.branch",
+    "agentfs.start.commit",
     "lfs.url",
     "lfs.pushurl",
     "lfs.concurrenttransfers",
@@ -462,6 +469,9 @@ pub struct Settings {
     /// (design §11.5), fixed in each fork's identity at create, so a
     /// change here never moves a fork that exists.
     pub fork_refs: PushTarget,
+    /// This volume's start point (agentfs.start.*), read only from the volume's own config, like
+    /// the fork identity; `None` when it was not started from another branch.
+    pub start: Option<crate::fork::identity::StartPoint>,
 }
 
 /// How a volume declares its push remotes (F8 S3, R4: zero remotes is a
@@ -589,6 +599,28 @@ fn fork_identity_of(
     }))
 }
 
+/// The start point in `config` (F8 S1): the three `agentfs.start.*` keys
+/// or none, read as [`StartPoint::parse`] reads a StorageClass's
+/// `startFrom`, so both spellings have one validator.
+///
+/// [`StartPoint::parse`]: crate::fork::identity::StartPoint::parse
+fn start_point_of(
+    config: &git2::Config,
+) -> Result<Option<crate::fork::identity::StartPoint>, ConfigError> {
+    let remote = string(config, fork_identity::START_REMOTE_KEY)?;
+    let branch = string(config, fork_identity::START_BRANCH_KEY)?;
+    let commit = string(config, fork_identity::START_COMMIT_KEY)?;
+    match (remote, branch, commit) {
+        (None, None, None) => Ok(None),
+        (Some(remote), Some(branch), Some(commit)) => {
+            crate::fork::identity::StartPoint::parse(&format!("{remote}:{branch}@{commit}"))
+                .map(Some)
+                .map_err(ConfigError::BadStartPoint)
+        }
+        _ => Err(ConfigError::PartialStartPoint),
+    }
+}
+
 /// A push target key (`agentfs.forkRefs`, `agentfs.fork.pushTarget`):
 /// `branch` or `hidden`; unset is `None`.
 fn push_target(config: &git2::Config, key: &str) -> Result<Option<PushTarget>, ConfigError> {
@@ -701,6 +733,7 @@ impl Settings {
         validate_name("agentfs.volume", &volume)?;
         let own_branch = string(config, "agentfs.branch")?;
         let fork = fork_identity_of(config, &volume)?;
+        let start = start_point_of(config)?;
         if fork.is_some() && own_branch.is_some() {
             return Err(ConfigError::ForkBranch);
         }
@@ -795,6 +828,7 @@ impl Settings {
             fork_remote: split.fork_remote,
             fork_refs,
             fork,
+            start,
             includes,
             volume,
         })
@@ -844,7 +878,8 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
         // The volume's identity belongs to its state area (`agentfs
         // init`): a shared fragment naming one would silently turn every
         // volume using it into the same volume.
-        // A fork's identity likewise (design §11.5).
+        // A fork's identity likewise (design §11.5), and a started
+        // volume's start point (F8 S1).
         let fragment = git2::Config::open(&path)?;
         for key in [
             "agentfs.volume",
@@ -852,6 +887,9 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
             fork_identity::SOURCE_KEY,
             fork_identity::BASE_KEY,
             fork_identity::PUSH_TARGET_KEY,
+            fork_identity::START_REMOTE_KEY,
+            fork_identity::START_BRANCH_KEY,
+            fork_identity::START_COMMIT_KEY,
         ] {
             if is_set(&fragment, key)? {
                 return Err(ConfigError::IncludeSetsIdentity { path, key });
@@ -2100,6 +2138,61 @@ mod tests {
             assert!(
                 matches!(&s, Err(ConfigError::IncludeSetsIdentity { key: k, .. })
                     if *k == format!("agentfs.{key}")),
+                "{s:?}"
+            );
+        }
+    }
+
+    /// F8 S1: the start point is identity, all three keys or none, from
+    /// the volume's own config only.
+    #[test]
+    fn a_started_volumes_start_point() {
+        let own = |start: &str| {
+            format!(
+                "[agentfs]\n\tvolume = v2\n[agentfs \"start\"]\n{start}[include]\n\tpath = FRAGMENT\n"
+            )
+        };
+        let all = format!("\tremote = origin\n\tbranch = agentfs/v1\n\tcommit = {BASE}\n");
+        let (_d, s) = with_include(&own(&all), "[remote \"origin\"]\n\turl = /o\n");
+        let s = s.unwrap();
+        let start = s.start.expect("a start point");
+        assert_eq!(start.to_string(), format!("origin:agentfs/v1@{BASE}"));
+        assert_eq!(
+            s.branch_ref, "refs/heads/agentfs/v2",
+            "its own branch is unchanged"
+        );
+        let (_d, s) = with_include(
+            "[agentfs]\n\tvolume = v\n[include]\n\tpath = FRAGMENT\n",
+            "",
+        );
+        assert_eq!(s.unwrap().start, None);
+        for partial in [
+            "\tremote = origin\n".to_owned(),
+            format!("\tbranch = agentfs/v1\n\tcommit = {BASE}\n"),
+        ] {
+            let (_d, s) = with_include(&own(&partial), "");
+            assert!(matches!(s, Err(ConfigError::PartialStartPoint)), "{s:?}");
+        }
+        let bad = "\tremote = origin\n\tbranch = refs/agentfs/v1/diverged/x\n\tcommit = abc\n";
+        let (_d, s) = with_include(&own(bad), "");
+        assert!(
+            matches!(
+                s,
+                Err(ConfigError::BadStartPoint(
+                    crate::fork::identity::BadStartPoint::NotABranch { .. }
+                ))
+            ),
+            "{s:?}"
+        );
+        // No include may name one.
+        for key in ["remote", "branch", "commit"] {
+            let (_d, s) = with_include(
+                "[agentfs]\n\tvolume = v\n[include]\n\tpath = FRAGMENT\n",
+                &format!("[agentfs \"start\"]\n\t{key} = x\n"),
+            );
+            assert!(
+                matches!(&s, Err(ConfigError::IncludeSetsIdentity { key: k, .. })
+                    if *k == format!("agentfs.start.{key}")),
                 "{s:?}"
             );
         }

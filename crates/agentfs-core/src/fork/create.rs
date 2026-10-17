@@ -238,7 +238,7 @@ fn copy_rules(source: &StateDir, fork: &StateDir) -> Result<(), CreateError> {
 }
 
 /// Syncs the directories above the ref `name` in `git`.
-fn sync_parents(git: &Path, name: &str) -> io::Result<()> {
+pub(super) fn sync_parents(git: &Path, name: &str) -> io::Result<()> {
     let mut dir = git.join(name);
     while dir.pop() && dir.starts_with(git) {
         std::fs::File::open(&dir)?.sync_all()?;
@@ -246,42 +246,64 @@ fn sync_parents(git: &Path, name: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Base's tree into the fork's backing tree, through the restore engine's
-/// confined writer: beneath the tree's root, never through a symlink, and
-/// nothing recorded, since the tree then equals history.
+/// Base's tree into the fork's backing tree ([`materialize`]), its LFS
+/// content from the source's cache.
 fn write_tree(
     request: &CreateRequest<'_>,
     fork: &Repository,
     identity: &ForkIdentity,
 ) -> Result<(), CreateError> {
-    std::fs::create_dir_all(request.tree)?;
-    let mut plan = match restore::plan(
+    let objects = SourceObjects {
+        source: ObjectCache::at(request.source.lfs())?,
+        fork: ObjectCache::at(request.fork.lfs())?,
+    };
+    materialize(
         fork,
         &identity.history_ref(),
+        identity.base,
+        request.tree,
+        &objects,
+    )
+    .map_err(restore_error)
+}
+
+/// `commit`'s tree into a new worktree's backing tree `tree` (empty, or
+/// what an earlier try wrote), through the restore engine's confined
+/// writer: beneath the tree's root, never through a symlink, and nothing
+/// recorded, since the tree then equals history. `commit` must be on
+/// `branch_ref` in `repo`; `objects` gives the LFS content. The one tree
+/// writer of a fork ([`create`]) and a started volume
+/// ([`super::start::start_from`]).
+pub(super) fn materialize(
+    repo: &Repository,
+    branch_ref: &str,
+    commit: Oid,
+    tree: &Path,
+    objects: &dyn LfsObjects,
+) -> Result<(), RestoreError> {
+    std::fs::create_dir_all(tree)?;
+    let mut plan = match restore::plan(
+        repo,
+        branch_ref,
         &Request::Restore {
             spec: Pathspec::Root,
-            commit: identity.base.to_string(),
+            commit: commit.to_string(),
         },
     ) {
         Ok(plan) => plan,
         // An empty tree: nothing to write.
         Err(RestoreError::NothingAtPath { .. }) => return Ok(()),
-        Err(e) => return Err(restore_error(e)),
+        Err(e) => return Err(e),
     };
     // From nothing: the tree is new, and holds at most what an earlier
     // try wrote.
     for step in &mut plan.steps {
         step.current = None;
     }
-    let dir = Dir::open(request.tree)?;
-    let objects = SourceObjects {
-        source: ObjectCache::at(request.source.lfs())?,
-        fork: ObjectCache::at(request.fork.lfs())?,
-    };
-    let plan = restore::check(plan, fork, &Materialize, &objects, &dir, &NotLive, true)
-        .map_err(restore_error)?;
-    restore::apply(&plan, fork, &objects, &dir, &NotLive, true)
-        .map_err(|e| CreateError::Io(io::Error::other(format!("writing base's tree: {e}"))))?;
+    let dir = Dir::open(tree)?;
+    let plan = restore::check(plan, repo, &Materialize, objects, &dir, &NotLive, true)?;
+    restore::apply(&plan, repo, objects, &dir, &NotLive, true)
+        .map_err(|e| RestoreError::Io(io::Error::other(format!("writing {commit}'s tree: {e}"))))?;
     Ok(())
 }
 
@@ -363,9 +385,16 @@ pub fn unique_name(prefix: &str) -> Result<String, CreateError> {
     Ok(name)
 }
 
-/// The keys a CLI source may set in its own config: its identity. Every
+/// The keys a CLI source may set in its own config: its identity, and its
+/// start point when it was started from another branch (F8 S1). Every
 /// other setting must come from an include, which the fork reads too.
-const OWN_KEYS: [&str; 2] = ["agentfs.volume", "agentfs.branch"];
+const OWN_KEYS: [&str; 5] = [
+    "agentfs.volume",
+    "agentfs.branch",
+    "agentfs.start.remote",
+    "agentfs.start.branch",
+    "agentfs.start.commit",
+];
 
 /// Calls `f` with each entry of `config`: its name, lowercased as git
 /// compares names, and its value.

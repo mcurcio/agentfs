@@ -10,7 +10,9 @@ to turn it on and what to expect.
 `mount`, `run`, `record`, `flush`, `push`, `serve-history`, `patch apply`,
 `fork finish`, `fork abandon`, and `restore` and `revert` without a mount
 export telemetry; a front (`mount` or `record` with `--history-service`)
-exports its own.
+exports its own. Under the CSI driver, the release scan's `agentfs push`
+of each worktree no pod stages exports its own too, so its failures reach
+the collector as `PushFailed` with the node plugin's `OTEL_*` settings.
 
 ```sh
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
@@ -45,14 +47,17 @@ agentfs run
 ## Signals
 
 - **Metrics:** the journal and push backlogs, failures by stage and
-  reason, the patch queue, the state area's size, the history service and
-  its fronts, and fork publishing: the table in
-  [design §13](design.md#13-observability-opentelemetry).
+  reason, divergence, a started volume's start-branch alarm
+  (`agentfs.start.moved{remote}`, 1 while its start branch holds commits
+  it has not taken in or accepted), the patch queue, the state area's
+  size, the history service and its fronts, and fork publishing: the
+  table in [design §13](design.md#13-observability-opentelemetry).
 - **Spans:** `agentfs.record`, `agentfs.commit`, `agentfs.push`,
   `agentfs.patch`, `agentfs.fork.finish` and `agentfs.fork.publish`,
   carrying journal sequence numbers, commit ids and outcomes.
 - **Logs:** every alarm is a log record (`agentfs.path_refused`,
-  `agentfs.push_failed`, ...) with its details as `agentfs.*` attributes
+  `agentfs.push_failed`, `agentfs.start_branch_moved`, ...) with its
+  details as `agentfs.*` attributes
   and the trace of the operation that raised it; a fork's lifecycle is
   logged at INFO. Alarms are printed to stderr as well, with telemetry on
   or off. The alarms and when each is raised: the events table in

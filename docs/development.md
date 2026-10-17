@@ -210,7 +210,7 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   `test (all)` job runs the first two as well.
 - **e2e csi-sanity** ([`ci/csi-sanity.sh`](../ci/csi-sanity.sh)): the
   Kubernetes CSI conformance suite csi-test (`csi-sanity` v5.6.0, pinned)
-  against `agentfs-csi --mode all` with real history services and FUSE
+  against `agentfs-csi` with real history services and FUSE
   fronts: every controller and node call, error codes, idempotency and
   cleanup, then no mount, record or volume directory left behind.
 - **e2e runbooks** ([`ci/e2e-runbooks.sh`](../ci/e2e-runbooks.sh)): runs the

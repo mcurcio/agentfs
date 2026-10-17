@@ -24,8 +24,8 @@ retrying it until an operator acts.
   on its `publish:` line, the reason, when, which remote and the message;
   `--json` has them under `refused`.
 - Under CSI: the deleted claim's PV stays `Released`, DeleteVolume says
-  `fork <pv> is refused`, and the node plugin's publisher starts no
-  further finisher for the fork.
+  `volume <pv>: the fork is refused`, and the node plugin's release scan
+  starts no further finisher for the fork.
 
 Look at the fork first. Outside Kubernetes:
 
@@ -117,7 +117,7 @@ and pushes nothing. Outside Kubernetes:
 agentfs --state "$STATE" --root "$BACKING" fork finish --retry --timeout 2m
 ```
 
-Under CSI (`--wait-lock 6m` waits out the publisher's own finisher):
+Under CSI (`--wait-lock 6m` waits out the release scan's own finisher):
 
 ```sh
 kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \

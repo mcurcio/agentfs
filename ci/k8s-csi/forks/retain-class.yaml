@@ -1,5 +1,5 @@
 # A fork class with reclaim policy Retain: the admission policy
-# (deploy/csi/fork-admission.yaml) must deny it (ci/e2e-csi-forks.sh).
+# (deploy/csi/class-admission.yaml) must deny it (ci/e2e-csi-forks.sh).
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:

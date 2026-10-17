@@ -1,31 +1,36 @@
-//! The CSI Controller service (design §14.2).
+//! The CSI Controller service (design §14.2), served by every node plugin
+//! pod, with csi-provisioner beside it (`--node-deployment`, F8 R8): each
+//! node provisions and deletes the worktrees on its own disk.
 //!
-//! - CreateVolume makes `<base>/<pv-name>/{backing,state,csi.json}` and
-//!   initialises the state area in-process. With a fork class
-//!   (`fork: "true"`) and a `dataSource` claim, it makes a fork of that
-//!   volume (design §11.5) from its local history, without its lock or
-//!   any credentials; nothing is fetched, and nothing else is cloned.
-//! - DeleteVolume of a fork asks for it to be finished (`finish_requested`
-//!   in `csi.json`) and answers `UNAVAILABLE` until the node plugin's
-//!   publisher has published it; then it applies `onDelete`.
-//! - DeleteVolume removes the directory (`onDelete: delete`) or keeps it
-//!   for a static PV (`retain`, the default), renaming `csi.json` to
-//!   `csi.retained.json`. It refuses while the volume is attached to a
-//!   node or its state area is locked, and `delete` refuses while a
-//!   remote lacks commits of the branch (the history service's final
-//!   push at unstage failed): removing the directory would lose them.
-//!   `delete` renames the directory to `.deleting.<handle>` under the
-//!   state lock and removes it after releasing the lock, so that on NFS
-//!   the held lock file is never unlinked (a silly rename would keep the
-//!   directory from being removed).
-//! - ControllerPublish only records the node in `csi.json`: with
-//!   `attachRequired: true`, Kubernetes' attach/detach controller then
-//!   refuses to use a ReadWriteOnce volume from a second node
-//!   (Multi-Attach), and so does this service (`FAILED_PRECONDITION`).
-//!   A static PV is adopted (created) here, since attach precedes
-//!   NodeStage.
+//! - CreateVolume makes `<base>/<pv-name>/{backing,state,csi.json}` on
+//!   this node, which the request's accessibility requirements must
+//!   include (`RESOURCE_EXHAUSTED` otherwise), and answers with this
+//!   node's topology. A start class (`startFrom`) starts the worktree from
+//!   another worktree's branch, fetched once from the start remote
+//!   ([`agentfs_core::fork::start::start_from`]). A fork class (`fork:
+//!   "true"`) with a `dataSource` claim makes a fork (design §11.5) of a
+//!   source on this node, from its local history, without its lock or any
+//!   credentials.
+//! - DeleteVolume asks the one release decider
+//!   ([`agentfs_core::release::decide`], F8 rule 3) over facts gathered
+//!   here: the worktree's declared remotes, what each pushed remote
+//!   advertises for the branch in a listing made for this call
+//!   ([`agentfs_core::push::RemotePusher::branch_claim`]), the class's
+//!   `onDelete`, and a fork's status. `Delete` removes the directory;
+//!   `Keep` releases the volume and keeps the worktree, renaming
+//!   `csi.json` to `csi.retained.json`; `Wait` is `UNAVAILABLE`, naming
+//!   the remote and why, and wakes the node plugin's release scan, which
+//!   pushes the worktree (DeleteVolume never pushes). A fork's deletion is
+//!   its request to be finished (`finish_requested` in `csi.json`), which
+//!   the release scan carries out. It refuses a worktree staged on this
+//!   node, or whose state area is locked. `Delete` renames the directory
+//!   to `.deleting.<handle>` under the state lock and removes it after
+//!   releasing the lock.
+//! - ControllerPublish and ControllerUnpublish are `UNIMPLEMENTED`: there
+//!   is no attach step (`attachRequired: false`); the PV's node affinity
+//!   keeps a worktree's pods on its node.
 //!
-//! Calls are serialised: each is a few local file operations.
+//! Calls are serialised. DeleteVolume's listing is the only network call.
 
 use std::fs;
 use std::io;
@@ -35,7 +40,12 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
 use agentfs_core::config::Settings;
-use agentfs_core::push;
+use agentfs_core::events::NullSink;
+use agentfs_core::fork::finish::ForkState;
+use agentfs_core::history::History;
+use agentfs_core::push::RemotePusher;
+use agentfs_core::release::{self, Declared, Release, Seen, Worktree};
+use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::StateDir;
 
 use crate::csi::v1::controller_server::Controller;
@@ -46,24 +56,31 @@ use crate::csi::v1::{
     ControllerGetCapabilitiesRequest, ControllerGetCapabilitiesResponse,
     ControllerPublishVolumeRequest, ControllerPublishVolumeResponse, ControllerServiceCapability,
     ControllerUnpublishVolumeRequest, ControllerUnpublishVolumeResponse, CreateVolumeRequest,
-    CreateVolumeResponse, DeleteVolumeRequest, DeleteVolumeResponse,
+    CreateVolumeResponse, DeleteVolumeRequest, DeleteVolumeResponse, Topology,
     ValidateVolumeCapabilitiesRequest, ValidateVolumeCapabilitiesResponse, Volume,
 };
 use crate::error::Error;
-use crate::layout::{Layout, validate_handle, validate_node};
+use crate::identity::TOPOLOGY_KEY;
+use crate::layout::{Layout, validate_handle};
 use crate::params::{ForkClass, OnDelete, VolumeParams};
+use crate::records::VolumeRecord;
+use crate::release_scan::ReleaseScan;
 use crate::volume;
 
 #[derive(Clone)]
 pub struct ControllerService {
     layout: Arc<Layout>,
+    node_id: Arc<str>,
+    release: Arc<ReleaseScan>,
     serial: Arc<Mutex<()>>,
 }
 
 impl ControllerService {
-    pub fn new(layout: Layout) -> Self {
+    pub fn new(layout: Layout, node_id: String, release: Arc<ReleaseScan>) -> Self {
         Self {
             layout: Arc::new(layout),
+            node_id: node_id.into(),
+            release,
             serial: Arc::new(Mutex::new(())),
         }
     }
@@ -71,11 +88,13 @@ impl ControllerService {
     /// Runs `f` on the blocking pool, one call at a time.
     async fn run<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&Layout) -> Result<T, Error> + Send + 'static,
+        f: impl FnOnce(&Layout, &str, &ReleaseScan) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Status> {
         let _serial = self.serial.lock().await;
         let layout = self.layout.clone();
-        tokio::task::spawn_blocking(move || f(&layout))
+        let node_id = self.node_id.clone();
+        let release = self.release.clone();
+        tokio::task::spawn_blocking(move || f(&layout, &node_id, &release))
             .await
             .map_err(|e| Status::internal(format!("controller task failed: {e}")))?
             .map_err(Status::from)
@@ -119,8 +138,43 @@ fn capacity(req: &CreateVolumeRequest) -> Result<i64, Error> {
     })
 }
 
+/// This node's topology segment: `{TOPOLOGY_KEY: node_id}`.
+pub fn topology(node_id: &str) -> Topology {
+    Topology {
+        segments: [(TOPOLOGY_KEY.to_owned(), node_id.to_owned())].into(),
+    }
+}
+
+/// `RESOURCE_EXHAUSTED` when the request's requisite topologies name
+/// other nodes only: a worktree is made on this node's disk or not at
+/// all. A segment without this driver's key does not constrain.
+fn check_accessible(req: &CreateVolumeRequest, node_id: &str) -> Result<(), Error> {
+    let Some(wanted) = &req.accessibility_requirements else {
+        return Ok(());
+    };
+    let here = |t: &Topology| {
+        t.segments
+            .get(TOPOLOGY_KEY)
+            .is_none_or(|node| node == node_id)
+    };
+    if wanted.requisite.is_empty() || wanted.requisite.iter().any(here) {
+        return Ok(());
+    }
+    let nodes: Vec<&str> = wanted
+        .requisite
+        .iter()
+        .filter_map(|t| t.segments.get(TOPOLOGY_KEY).map(String::as_str))
+        .collect();
+    Err(Error::ResourceExhausted(format!(
+        "the volume must be on node {}, and this is node {node_id}: each node provisions its own \
+         worktrees",
+        nodes.join(" or ")
+    )))
+}
+
 pub(crate) fn create_volume(
     layout: &Layout,
+    node_id: &str,
     req: &CreateVolumeRequest,
 ) -> Result<CreateVolumeResponse, Error> {
     required(&req.name, "the volume name")?;
@@ -159,21 +213,23 @@ pub(crate) fn create_volume(
             None,
         ),
     };
+    check_accessible(req, node_id)?;
+    let response = |record: &VolumeRecord, content_source| CreateVolumeResponse {
+        volume: Some(Volume {
+            capacity_bytes: record.capacity_bytes,
+            volume_id: handle.to_owned(),
+            volume_context: record.params.to_context(),
+            content_source,
+            accessible_topology: vec![topology(node_id)],
+        }),
+    };
     if let Some((class, source)) = fork {
         validate_handle(&source).map_err(|e| Error::NotFound(e.to_string()))?;
         let record = match volume::load(layout, handle)? {
             Some(existing) => existing,
-            None => volume::create_fork(layout, handle, &class, &source, capacity_bytes)?,
+            None => volume::create_fork(layout, node_id, handle, &class, &source, capacity_bytes)?,
         };
-        return Ok(CreateVolumeResponse {
-            volume: Some(Volume {
-                capacity_bytes: record.capacity_bytes,
-                volume_id: handle.to_owned(),
-                volume_context: record.params.to_context(),
-                content_source: req.volume_content_source.clone(),
-                accessible_topology: Vec::new(),
-            }),
-        });
+        return Ok(response(&record, req.volume_content_source.clone()));
     }
     let params = params.expect("an ordinary volume has its parameters");
     let record = match volume::load(layout, handle)? {
@@ -193,9 +249,15 @@ pub(crate) fn create_volume(
             existing
         }
         None => {
-            let record = volume::create(layout, handle, &params, capacity_bytes, false)?;
+            let record = volume::create(layout, handle, &params, capacity_bytes)?;
+            let started = params
+                .start_from
+                .as_deref()
+                .map(|s| format!(", started from {s}"))
+                .unwrap_or_default();
             eprintln!(
-                "created volume {handle} (agentfs volume {}, branch {}, profile {}, onDelete {})",
+                "created volume {handle} on node {node_id} (agentfs volume {}, branch {}, profile \
+                 {}, onDelete {}{started})",
                 params.volume,
                 params.branch_name(),
                 params.profile,
@@ -204,18 +266,14 @@ pub(crate) fn create_volume(
             record
         }
     };
-    Ok(CreateVolumeResponse {
-        volume: Some(Volume {
-            capacity_bytes: record.capacity_bytes,
-            volume_id: handle.to_owned(),
-            volume_context: record.params.to_context(),
-            content_source: None,
-            accessible_topology: Vec::new(),
-        }),
-    })
+    Ok(response(&record, None))
 }
 
-pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Result<(), Error> {
+pub(crate) fn delete_volume(
+    layout: &Layout,
+    release: &ReleaseScan,
+    req: &DeleteVolumeRequest,
+) -> Result<(), Error> {
     required(&req.volume_id, "the volume id")?;
     let handle = req.volume_id.as_str();
     if validate_handle(handle).is_err() {
@@ -226,61 +284,32 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
     if let Err(e) = remove_tree(&layout.deleting_dir(handle)) {
         eprintln!("{e}");
     }
-    // A record of the multi-node build too: it can still be deleted.
-    let Some((record, legacy)) = volume::load_any(layout, handle)? else {
+    let Some(record) = volume::load(layout, handle)? else {
         return Ok(());
     };
-    let mut attached: Vec<&str> = legacy
-        .iter()
-        .flat_map(|f| f.published_nodes.iter().map(String::as_str))
-        .chain(record.published_node.as_deref())
-        .collect();
-    attached.sort_unstable();
-    attached.dedup();
-    if !attached.is_empty() {
+    if layout.staged_record(handle).exists() {
         return Err(Error::FailedPrecondition(format!(
-            "volume {handle} is still attached to node {}",
-            attached.join(", ")
+            "volume {handle} is staged on this node: its pods still use it"
         )));
     }
     let state = StateDir::new(layout.state(handle));
-    // A fork is deleted only once it is published (design §11.5): its
-    // deletion is the request to finish it, which the node plugin carries
-    // out while this answers UNAVAILABLE. Checked before the lock, which
-    // the finisher holds while it publishes, and again under it.
-    fork_gate(layout, handle, &state, &record, legacy.as_ref())?;
+    // A fork's deletion asks for it to be finished (design §11.5): checked
+    // before the lock, which the finisher holds while it publishes, and
+    // again under it.
+    fork_gate(layout, handle, &state, &record)?;
     let lock = if state.root().exists() {
         Some(volume::lock(&state, "agentfs-csi delete")?)
     } else {
         None
     };
-    let is_fork = fork_gate(layout, handle, &state, &record, legacy.as_ref())?;
-    match record.params.on_delete {
-        OnDelete::Delete => {
+    let fork = fork_gate(layout, handle, &state, &record)?;
+    let decision = decide(handle, &state, record.params.on_delete, fork)?;
+    match decision {
+        Release::Delete => {
             let dir = layout.volume_dir(handle);
-            // Publishing is a fork's gate: its remote holds its history.
-            if !is_fork && state.git().join("config").exists() {
-                let lacking = unpushed(&state)?;
-                if !lacking.is_empty() {
-                    let list: Vec<String> = lacking
-                        .iter()
-                        .map(|(remote, n)| format!("{remote} lacks {n} commit(s)"))
-                        .collect();
-                    return Err(Error::FailedPrecondition(format!(
-                        "volume {handle} has history no remote holds ({}); nothing deleted. Push \
-                         it (`agentfs --state {} push`), or remove {} by hand to discard it \
-                         (docs/csi.md §9)",
-                        list.join(", "),
-                        state.root().display(),
-                        dir.display()
-                    )));
-                }
-            }
             // Under the lock, the volume goes aside in one rename (it no
             // longer exists for any call); the files go after the lock is
-            // dropped. On NFS, unlinking the lock file this process holds
-            // open would leave a silly-rename `.nfs*` file behind, and the
-            // directory could never be removed.
+            // dropped, so the held lock file is never unlinked under it.
             let aside = layout.deleting_dir(handle);
             remove_tree(&aside)?;
             match fs::rename(&dir, &aside) {
@@ -295,59 +324,116 @@ pub(crate) fn delete_volume(layout: &Layout, req: &DeleteVolumeRequest) -> Resul
                 // or the operator, removes what is left.
                 eprintln!("deleted volume {handle}, but its files remain: {e}");
             } else {
-                eprintln!("deleted volume {handle} ({})", dir.display());
+                eprintln!(
+                    "deleted volume {handle} ({}): nothing a remote lacks was on it",
+                    dir.display()
+                );
             }
-            return Ok(());
+            Ok(())
         }
-        OnDelete::Retain => {
+        Release::Keep(kept) => {
             let to = layout.retained_json(handle);
             fs::rename(layout.csi_json(handle), &to)
                 .map_err(|e| Error::io(format!("writing {}", to.display()), e))?;
+            drop(lock);
             eprintln!(
-                "deleted volume {handle}; its files and history are retained in {} (onDelete: \
-                 retain)",
+                "deleted volume {handle}; its worktree stays in {} ({kept})",
                 layout.volume_dir(handle).display()
             );
+            Ok(())
+        }
+        Release::Wait(waiting) => {
+            drop(lock);
+            release.wake();
+            Err(Error::Unavailable(format!(
+                "volume {handle}: {waiting}; nothing deleted, DeleteVolume is retried"
+            )))
         }
     }
-    drop(lock);
-    Ok(())
 }
 
-/// For a fork: records that its deletion asks for it to be finished,
-/// and is `UNAVAILABLE` until it may be deleted (published or abandoned);
-/// a status that cannot be read is `FAILED_PRECONDITION`. Whether the
-/// volume is a fork.
+/// The release decision for the worktree in `state`, from facts gathered
+/// here ([`release::decide`]). Settings that cannot be read are
+/// `FAILED_PRECONDITION`: what the remotes hold cannot be asked, so
+/// nothing is deleted or released.
+fn decide(
+    handle: &str,
+    state: &StateDir,
+    on_delete: OnDelete,
+    fork: Option<ForkState>,
+) -> Result<Release, Error> {
+    let unreadable = |e: &dyn std::error::Error| {
+        Error::FailedPrecondition(format!(
+            "volume {handle}: reading {}: {}; nothing deleted",
+            state.root().display(),
+            volume::chain(e)
+        ))
+    };
+    if !state.git().join("config").exists() {
+        return Ok(release::decide(&Worktree {
+            has_history: false,
+            on_delete,
+            remotes: Declared::Undeclared,
+            fork,
+        }));
+    }
+    let history = History::open(&state.git()).map_err(|e| unreadable(&e))?;
+    let head = history
+        .head()
+        .map_err(|e| unreadable(&e))?
+        .map(|commit| commit.id());
+    let settings: Settings = history.settings().clone();
+    let mut seen = Vec::new();
+    // A fork's remotes are not asked: publishing is its gate.
+    if let (Some(head), None) = (head, fork) {
+        for remote in &settings.remotes {
+            let pusher = RemotePusher::open(
+                state,
+                &settings,
+                remote,
+                Arc::new(NullSink),
+                &Telemetry::noop(),
+            )
+            .map_err(|e| unreadable(&e))?;
+            seen.push(Seen {
+                remote: remote.name.clone(),
+                branch: pusher.branch_claim(head),
+            });
+        }
+    }
+    Ok(release::decide(&Worktree {
+        has_history: head.is_some(),
+        on_delete,
+        remotes: Declared::of(&settings, &seen),
+        fork,
+    }))
+}
+
+/// For a fork: records that its deletion asks for it to be finished, and
+/// its state; a status that cannot be read is `FAILED_PRECONDITION`.
+/// `None` for any other worktree.
 fn fork_gate(
     layout: &Layout,
     handle: &str,
     state: &StateDir,
-    record: &crate::records::VolumeRecord,
-    legacy: Option<&crate::records::MultiNodeFields>,
-) -> Result<bool, Error> {
+    record: &VolumeRecord,
+) -> Result<Option<ForkState>, Error> {
     if !state.git().join("config").exists() {
-        return Ok(false);
+        return Ok(None);
     }
     let status = match fork_status(state) {
         Err(why) => return Err(Error::FailedPrecondition(format!("{why}; nothing deleted"))),
-        Ok(None) => return Ok(false),
+        Ok(None) => return Ok(None),
         Ok(Some(status)) => status,
     };
-    let stored = volume::load_any(layout, handle)?.map(|(r, _)| r);
+    let stored = volume::load(layout, handle)?;
     if !stored.as_ref().unwrap_or(record).finish_requested {
         let mut requested = record.clone();
         requested.finish_requested = true;
-        volume::store_any(layout, handle, &requested, legacy)?;
+        volume::store(layout, handle, &requested)?;
         eprintln!("fork {handle}: finishing requested by DeleteVolume");
     }
-    if !status.state.may_delete() {
-        return Err(Error::Unavailable(format!(
-            "fork {handle} is {}: DeleteVolume completes once it is published or abandoned \
-             (the node plugin publishes it)",
-            status.state.as_str()
-        )));
-    }
-    Ok(true)
+    Ok(Some(status.state))
 }
 
 /// The fork status of the state area, or why it cannot be read.
@@ -369,123 +455,6 @@ fn remove_tree(dir: &std::path::Path) -> Result<(), Error> {
         }
         _ => Ok(()),
     }
-}
-
-/// Remotes that lack commits of the volume's branch, with how many: what
-/// `onDelete: delete` would destroy. The history service pushes once more
-/// when it stops, but that push can fail, and nothing pushes an unstaged
-/// volume.
-fn unpushed(state: &StateDir) -> Result<Vec<(String, usize)>, Error> {
-    let what = |e: &dyn std::error::Error| {
-        Error::FailedPrecondition(format!(
-            "reading the push state of {}: {}; nothing deleted",
-            state.root().display(),
-            volume::chain(e)
-        ))
-    };
-    let settings = Settings::load(&state.git()).map_err(|e| what(&e))?;
-    let status = push::status(state, &settings).map_err(|e| what(&e))?;
-    Ok(status
-        .into_iter()
-        .filter_map(|r| match r.unpushed {
-            Some(n) if n > 0 => Some((r.name, n)),
-            _ => None,
-        })
-        .collect())
-}
-
-pub(crate) fn publish(layout: &Layout, req: &ControllerPublishVolumeRequest) -> Result<(), Error> {
-    required(&req.volume_id, "the volume id")?;
-    required(&req.node_id, "the node id")?;
-    let cap = req
-        .volume_capability
-        .as_ref()
-        .ok_or_else(|| Error::InvalidArgument("the volume capability is required".into()))?;
-    volume::check_capability(cap)?;
-    let handle = req.volume_id.as_str();
-    let not_found = || Error::NotFound(format!("volume {handle} does not exist"));
-    validate_handle(handle).map_err(|_| not_found())?;
-    let mut record = match volume::load(layout, handle)? {
-        Some(record) => record,
-        // A static PV: its volumeAttributes name a profile.
-        None if req.volume_context.contains_key("profile") => {
-            let params = VolumeParams::from_context(handle, &req.volume_context)
-                .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-            let record = volume::create(layout, handle, &params, 0, true)?;
-            eprintln!(
-                "adopted static volume {handle} (agentfs volume {})",
-                params.volume
-            );
-            record
-        }
-        None => return Err(not_found()),
-    };
-    let node = req.node_id.as_str();
-    let unknown_node = || {
-        Error::NotFound(format!(
-            "node {node} has no agentfs-csi node plugin (no {})",
-            layout.node_marker(node).display()
-        ))
-    };
-    validate_node(node).map_err(|_| unknown_node())?;
-    if !layout.node_marker(node).exists() {
-        return Err(unknown_node());
-    }
-    match &record.published_node {
-        Some(n) if n == node => Ok(()),
-        Some(other) => Err(Error::FailedPrecondition(format!(
-            "volume {handle} is attached to node {other}; one node per volume (design §14.2)"
-        ))),
-        None => {
-            record.published_node = Some(node.to_owned());
-            volume::store(layout, handle, &record)?;
-            eprintln!("attached volume {handle} to node {node}");
-            Ok(())
-        }
-    }
-}
-
-pub(crate) fn unpublish(
-    layout: &Layout,
-    req: &ControllerUnpublishVolumeRequest,
-) -> Result<(), Error> {
-    required(&req.volume_id, "the volume id")?;
-    let handle = req.volume_id.as_str();
-    if validate_handle(handle).is_err() {
-        return Ok(());
-    }
-    // A volume that is gone is not attached anywhere. A record of the
-    // multi-node build is detached node by node, and written in this
-    // build's format once no node is left.
-    let Some((mut record, mut legacy)) = volume::load_any(layout, handle)? else {
-        return Ok(());
-    };
-    // No node id: every node.
-    let detaches = |n: &String| req.node_id.is_empty() || *n == req.node_id;
-    let mut detached: Vec<String> = record
-        .published_node
-        .take_if(|n| detaches(n))
-        .into_iter()
-        .collect();
-    if let Some(fields) = &mut legacy {
-        detached.extend(
-            fields
-                .published_nodes
-                .iter()
-                .filter(|n| detaches(n))
-                .cloned(),
-        );
-        fields.published_nodes.retain(|n| !detaches(n));
-    }
-    if !detached.is_empty() || legacy.is_some() {
-        volume::store_any(layout, handle, &record, legacy.as_ref())?;
-    }
-    detached.sort_unstable();
-    detached.dedup();
-    for n in detached {
-        eprintln!("detached volume {handle} from node {n}");
-    }
-    Ok(())
 }
 
 pub(crate) fn validate(
@@ -528,7 +497,7 @@ impl Controller for ControllerService {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l| create_volume(l, &req))
+        self.run(move |l, node, _| create_volume(l, node, &req))
             .await
             .map(Response::new)
     }
@@ -538,26 +507,28 @@ impl Controller for ControllerService {
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l| delete_volume(l, &req)).await?;
+        self.run(move |l, _, release| delete_volume(l, release, &req))
+            .await?;
         Ok(Response::new(DeleteVolumeResponse {}))
     }
 
     async fn controller_publish_volume(
         &self,
-        request: Request<ControllerPublishVolumeRequest>,
+        _request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
-        let req = request.into_inner();
-        self.run(move |l| publish(l, &req)).await?;
-        Ok(Response::new(ControllerPublishVolumeResponse::default()))
+        Err(Status::unimplemented(
+            "agentfs-csi has no attach step (attachRequired: false): a worktree's pods run on its \
+             node",
+        ))
     }
 
     async fn controller_unpublish_volume(
         &self,
-        request: Request<ControllerUnpublishVolumeRequest>,
+        _request: Request<ControllerUnpublishVolumeRequest>,
     ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
-        let req = request.into_inner();
-        self.run(move |l| unpublish(l, &req)).await?;
-        Ok(Response::new(ControllerUnpublishVolumeResponse {}))
+        Err(Status::unimplemented(
+            "agentfs-csi has no attach step (attachRequired: false)",
+        ))
     }
 
     async fn validate_volume_capabilities(
@@ -565,7 +536,7 @@ impl Controller for ControllerService {
         request: Request<ValidateVolumeCapabilitiesRequest>,
     ) -> Result<Response<ValidateVolumeCapabilitiesResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l| validate(l, &req))
+        self.run(move |l, _, _| validate(l, &req))
             .await
             .map(Response::new)
     }
@@ -577,7 +548,6 @@ impl Controller for ControllerService {
         Ok(Response::new(ControllerGetCapabilitiesResponse {
             capabilities: [
                 rpc::Type::CreateDeleteVolume,
-                rpc::Type::PublishUnpublishVolume,
                 rpc::Type::SingleNodeMultiWriter,
                 rpc::Type::CloneVolume,
             ]
@@ -591,109 +561,47 @@ impl Controller for ControllerService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::csi::v1::TopologyRequirement;
     use crate::csi::v1::VolumeCapability;
     use crate::csi::v1::volume_capability::access_mode::Mode;
     use crate::csi::v1::volume_capability::{AccessMode, AccessType, MountVolume};
-    use crate::records::{MultiNodeFields, VolumeRecord};
 
-    /// A volume whose `csi.json` the multi-node build wrote, attached to
-    /// `nodes`.
-    fn multi_node_volume(nodes: &[&str]) -> (tempfile::TempDir, Layout) {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout {
-            base: dir.path().join("base"),
-            node_state: dir.path().join("node"),
-            mount_dir: dir.path().join("mnt"),
-            profiles: dir.path().join("profiles"),
-        };
-        let record = VolumeRecord {
-            params: VolumeParams {
-                profile: "p".into(),
-                volume: "v".into(),
-                branch: None,
-                on_delete: OnDelete::Delete,
-                workload_mounts: Vec::new(),
-            },
-            capacity_bytes: 0,
-            created: 1,
-            published_node: None,
-            static_volume: false,
-            finish_requested: false,
-        };
-        let fields = MultiNodeFields {
-            multi_node: true,
-            published_nodes: nodes.iter().map(|n| (*n).to_owned()).collect(),
-        };
-        volume::store_any(&layout, "v", &record, Some(&fields)).unwrap();
-        (dir, layout)
-    }
-
-    fn delete(layout: &Layout) -> Result<(), Error> {
-        delete_volume(
-            layout,
-            &DeleteVolumeRequest {
-                volume_id: "v".into(),
-                ..Default::default()
-            },
-        )
-    }
-
-    fn detach(layout: &Layout, node: &str) -> Result<(), Error> {
-        unpublish(
-            layout,
-            &ControllerUnpublishVolumeRequest {
-                volume_id: "v".into(),
-                node_id: node.into(),
-                ..Default::default()
-            },
-        )
-    }
-
-    #[test]
-    fn a_multi_node_volume_can_be_detached_and_deleted() {
-        let (_dir, layout) = multi_node_volume(&["n1", "n2"]);
-        let err = delete(&layout).unwrap_err();
-        assert_eq!(
-            err,
-            Error::FailedPrecondition("volume v is still attached to node n1, n2".into())
-        );
-        detach(&layout, "n1").unwrap();
-        let text = fs::read_to_string(layout.csi_json("v")).unwrap();
-        assert!(
-            text.contains("\"n2\"") && !text.contains("\"n1\""),
-            "{text}"
-        );
-        assert!(delete(&layout).is_err(), "n2 is still attached");
-        detach(&layout, "n2").unwrap();
-        // No node left: written in this build's format.
-        let text = fs::read_to_string(layout.csi_json("v")).unwrap();
-        assert!(!text.contains("multi_node"), "{text}");
-        assert!(volume::load(&layout, "v").unwrap().is_some());
-        delete(&layout).unwrap();
-        assert!(!layout.volume_dir("v").exists());
-    }
-
-    #[test]
-    fn a_multi_node_volume_is_not_published() {
-        let (_dir, layout) = multi_node_volume(&["n1"]);
-        let err = publish(
-            &layout,
-            &ControllerPublishVolumeRequest {
-                volume_id: "v".into(),
-                node_id: "n1".into(),
-                volume_capability: Some(VolumeCapability {
-                    access_mode: Some(AccessMode {
-                        mode: Mode::SingleNodeWriter as i32,
-                    }),
-                    access_type: Some(AccessType::Mount(MountVolume::default())),
+    fn request(requisite: &[&str]) -> CreateVolumeRequest {
+        CreateVolumeRequest {
+            name: "v".into(),
+            volume_capabilities: vec![VolumeCapability {
+                access_mode: Some(AccessMode {
+                    mode: Mode::SingleNodeWriter as i32,
                 }),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        let Error::FailedPrecondition(message) = err else {
+                access_type: Some(AccessType::Mount(MountVolume::default())),
+            }],
+            accessibility_requirements: Some(TopologyRequirement {
+                requisite: requisite.iter().map(|n| topology(n)).collect(),
+                preferred: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_this_nodes_volumes_are_provisioned_here() {
+        check_accessible(&request(&[]), "node-a").unwrap();
+        check_accessible(&request(&["node-a"]), "node-a").unwrap();
+        check_accessible(&request(&["node-b", "node-a"]), "node-a").unwrap();
+        let err = check_accessible(&request(&["node-b"]), "node-a").unwrap_err();
+        let Error::ResourceExhausted(message) = err else {
             panic!("{err:?}");
         };
-        assert!(message.contains(volume::MULTI_NODE), "{message}");
+        assert!(message.contains("node node-b"), "{message}");
+        // A segment without this driver's key does not constrain.
+        let mut req = request(&[]);
+        req.accessibility_requirements
+            .as_mut()
+            .unwrap()
+            .requisite
+            .push(Topology {
+                segments: [("zone".to_owned(), "z1".to_owned())].into(),
+            });
+        check_accessible(&req, "node-a").unwrap();
     }
 }

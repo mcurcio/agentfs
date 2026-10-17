@@ -39,6 +39,10 @@
 //! (but not a front), `run`, `record`, `restore`, `revert` and `patch
 //! apply` refuse it.
 //!
+//! `start accept --tip OID` accepts a tip of the branch a volume started
+//! from, clearing the start-branch alarm ([`start_cmd`], design §11.3); it
+//! takes no lock.
+//!
 //! `mount`, `flush`, `record`, `push` and `run` export telemetry over OTLP
 //! when the standard `OTEL_*` variables configure an endpoint (see
 //! [`otel`], design §13); alarms are also printed to stderr. `init` and
@@ -59,6 +63,7 @@ mod recovery;
 #[cfg(test)]
 mod reference_tests;
 mod serve_history;
+mod start_cmd;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -271,6 +276,12 @@ enum Command {
         #[command(subcommand)]
         command: fork_cmd::ForkCommand,
     },
+    /// A volume started from another branch (F8, design §11.3): accept a
+    /// tip of that branch, which clears the start-branch alarm.
+    Start {
+        #[command(subcommand)]
+        command: start_cmd::StartCommand,
+    },
 }
 
 /// Being a front of a history service (design §14).
@@ -390,6 +401,17 @@ fn real_main() -> Result<ExitCode> {
                 .with_context(|| format!("opening {}", state.root().display()))?;
             println!("volume:    {}", history.settings().volume);
             println!("branch:    {}", history.settings().branch_ref);
+            if let Some(start) = &history.settings().start {
+                // As the last push to the start remote saw it (F8 R9).
+                println!("start:     {start}");
+                let pushed = push::PushState::load(&state.push_state(&start.remote));
+                if let Some(moved) = pushed.start_moved {
+                    println!(
+                        "start branch moved: {}..{} (agentfs start accept --tip {})",
+                        moved.pinned, moved.tip, moved.tip
+                    );
+                }
+            }
             match inspection.head {
                 Some(head) => println!("head:      {head}"),
                 None => println!("head:      (none)"),
@@ -572,6 +594,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Fork { command } => {
             return fork_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
         }
+        Command::Start { command } => return start_cmd::run(command, &state),
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
             // A restarted sidecar whose daemon died (design §17.1).

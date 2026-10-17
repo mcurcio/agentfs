@@ -175,6 +175,17 @@ pub struct PushState {
     /// The status commit then pushed, with its applied refs and inbox
     /// deletions: the queue push is skipped while it is still current.
     pub queue_synced_status: Option<String>,
+    /// The start-branch alarm as the last attempt to this remote saw it, for `agentfs status`.
+    #[serde(default)]
+    pub start_moved: Option<StartMoved>,
+}
+
+/// The start-branch alarm as persisted ([`StartBranchMoved`], F8 R9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartMoved {
+    pub refname: String,
+    pub pinned: String,
+    pub tip: String,
 }
 
 impl PushState {
@@ -338,6 +349,10 @@ struct Attempt {
     updates: Vec<(String, Oid)>,
     /// `(remote ref, the remote's rejection message)`.
     rejected: Vec<(String, String)>,
+    /// The claim the push negotiation computed from the branch update's
+    /// old value (F8 rule 2), for a branch push; `None` for other pushes.
+    /// [`Claim::Diverged`] stopped the push before anything was sent.
+    branch_claim: Option<Claim>,
 }
 
 /// Pushes one remote. Owns its own repository handle, so each remote can
@@ -554,6 +569,7 @@ impl RemotePusher {
             Err(e) => return self.failed(PushFailureKind::Local, e.to_string(), None),
         };
         *head_out = Some(head);
+        self.check_start(head);
         // A maximum push size (design §11.3): measured before pushing, from
         // the branch the remote advertises.
         let mut step = None;
@@ -619,8 +635,63 @@ impl RemotePusher {
                 PushStage::Lfs,
             );
         }
-        let attempt = self.attempt(&refspecs, &[]);
+        let attempt = self.attempt_branch(&refspecs, head);
         self.conclude(head, &refspecs, attempt)
+    }
+
+    /// The start-branch check (F8 R9): when this remote is the volume's
+    /// start remote, lists the start branch and asks
+    /// [`start_branch_moved`], with `on_history` true for a commit known
+    /// here that is `head`, or an `accepted/*` tip, or an ancestor of
+    /// either. Raises [`Event::StartBranchMoved`] and keeps it in the push
+    /// state while it holds; clears it otherwise. A listing that fails
+    /// leaves the last answer: the push reports the remote's failure.
+    fn check_start(&mut self, head: Oid) {
+        let Some(start) = self.settings.start.clone() else {
+            return;
+        };
+        if start.remote != self.remote.name {
+            return;
+        }
+        let refname = start.refname();
+        let Ok(listed) = self.list_remote_refs(|name| name == refname) else {
+            return;
+        };
+        let mut tips = vec![head];
+        let accepted = crate::fork::identity::accepted_prefix(&self.volume);
+        if let Ok(refs) = self.repo.references_glob(&format!("{accepted}*")) {
+            tips.extend(refs.flatten().filter_map(|r| r.target()));
+        }
+        let repo = &self.repo;
+        let on_history = |tip: Oid| {
+            repo.odb().is_ok_and(|odb| odb.exists(tip))
+                && tips
+                    .iter()
+                    .any(|t| *t == tip || repo.graph_descendant_of(*t, tip).unwrap_or(false))
+        };
+        match start_branch_moved(&start, listed.get(&refname).copied(), on_history) {
+            Some(moved) => {
+                self.state.start_moved = Some(StartMoved {
+                    refname: moved.refname.clone(),
+                    pinned: moved.pinned.to_string(),
+                    tip: moved.tip.to_string(),
+                });
+                self.events.emit(Event::StartBranchMoved {
+                    remote: moved.remote,
+                    refname: moved.refname,
+                    pinned: moved.pinned,
+                    tip: moved.tip,
+                });
+            }
+            None => self.state.start_moved = None,
+        }
+    }
+
+    /// Whether `oid` is in this repository and is `head` or an ancestor of
+    /// it: [`claim`]'s `on_history`.
+    fn on_history(&self, head: Oid, oid: Oid) -> bool {
+        self.repo.odb().is_ok_and(|odb| odb.exists(oid))
+            && (oid == head || self.repo.graph_descendant_of(head, oid).unwrap_or(false))
     }
 
     /// One step of a backlog larger than the remote's `agentfsMaxPushSize`
@@ -639,7 +710,7 @@ impl RemotePusher {
             Err(e) => return self.failed_at(e.kind, e.message, Some(commit), PushStage::Lfs),
         }
         let refspecs = vec![format!("{commit}:{}", self.branch_ref)];
-        let attempt = self.attempt(&refspecs, &[]);
+        let attempt = self.attempt_branch(&refspecs, commit);
         let outcome = self.conclude(commit, &refspecs, attempt);
         match outcome {
             PushOutcome::Pushed { from, to, .. } => {
@@ -676,6 +747,18 @@ impl RemotePusher {
             .find(|(name, _)| *name == self.branch_ref)
             .map(|(_, oid)| *oid)
             .filter(|oid| !oid.is_zero());
+
+        // Rule 2: the negotiation stopped the push before anything was
+        // sent, because the remote's branch is not on this history.
+        if attempt.branch_claim == Some(Claim::Diverged) {
+            let message = format!(
+                "{}: the remote holds {}, which is not on this volume's history (another \
+                 worktree wrote it); nothing was sent",
+                self.branch_ref,
+                remote_branch.map_or_else(|| "an unknown commit".to_owned(), |o| o.to_string())
+            );
+            return self.diverged(head, remote_branch, message);
+        }
 
         match &attempt.result {
             Ok(()) if attempt.rejected.is_empty() => {
@@ -876,8 +959,16 @@ impl RemotePusher {
     /// [`Claim::UpToDate`] is the only answer the release decider counts
     /// as held.
     pub fn branch_claim(&self, head: Oid) -> Result<Claim, Unreachable> {
-        let _ = head;
-        todo!("F8 S1")
+        let branch = self.branch_ref.as_str();
+        let listed = self
+            .list_remote_refs(|name| name == branch)
+            .map_err(|(kind, message)| Unreachable {
+                kind,
+                message: scrub_userinfo(&message, self.remote.push_url()),
+            })?;
+        Ok(claim(listed.get(branch).copied(), head, |oid| {
+            self.on_history(head, oid)
+        }))
     }
 
     /// Replaces this worktree's own branch on the remote with the local
@@ -917,18 +1008,24 @@ impl RemotePusher {
     }
 
     /// `<oid>:<ref>` for the branch and every
-    /// `refs/agentfs/<volume>/diverged/*` ref, never forced. The patch
-    /// queue's refs have their own push ([`RemotePusher::queue_push`]).
+    /// `refs/agentfs/<volume>/diverged/*` and `accepted/*` ref (F8 D2),
+    /// never forced: those two never move, so they are created where the
+    /// remote lacks them and otherwise left as they are. The patch queue's
+    /// refs have their own push ([`RemotePusher::queue_push`]).
     fn refspecs(&self, head: Oid) -> Result<Vec<String>, GitError> {
         let mut refspecs = vec![format!("{head}:{}", self.branch_ref)];
-        let glob = format!("refs/agentfs/{}/diverged/*", self.volume);
-        for reference in self.repo.references_glob(&glob)? {
-            let reference = reference?;
-            let (Ok(name), Ok(target)) = (reference.name(), reference.resolve()) else {
-                continue;
-            };
-            if let Some(oid) = target.target() {
-                refspecs.push(format!("{oid}:{name}"));
+        for glob in [
+            format!("refs/agentfs/{}/diverged/*", self.volume),
+            format!("{}*", crate::fork::identity::accepted_prefix(&self.volume)),
+        ] {
+            for reference in self.repo.references_glob(&glob)? {
+                let reference = reference?;
+                let (Ok(name), Ok(target)) = (reference.name(), reference.resolve()) else {
+                    continue;
+                };
+                if let Some(oid) = target.target() {
+                    refspecs.push(format!("{oid}:{name}"));
+                }
             }
         }
         Ok(refspecs)
@@ -1139,6 +1236,7 @@ impl RemotePusher {
                 host_key_failure: auth.host_key_failure(),
                 updates: Vec::new(),
                 rejected: Vec::new(),
+                branch_claim: None,
             };
             self.attempt_error(&attempt)
                 .unwrap_or((PushFailureKind::Unreachable, "listing the remote".into()))
@@ -1183,16 +1281,40 @@ impl RemotePusher {
     /// One libgit2 push of `refspecs`. A ref in `expect` must hold the
     /// given oid on the remote, or the push is stopped before it is sent.
     fn attempt(&self, refspecs: &[String], expect: &[(String, Oid)]) -> Attempt {
+        self.attempt_guarded(refspecs, expect, None)
+    }
+
+    /// The branch push of `refspecs`, whose branch update pushes `head`:
+    /// in the negotiation, from the old value the remote reports for the
+    /// branch in this very connection, [`claim`] decides (F8 rule 2), and
+    /// [`Claim::Diverged`] stops the push before anything is sent.
+    fn attempt_branch(&self, refspecs: &[String], head: Oid) -> Attempt {
+        self.attempt_guarded(refspecs, &[], Some(head))
+    }
+
+    fn attempt_guarded(
+        &self,
+        refspecs: &[String],
+        expect: &[(String, Oid)],
+        branch_head: Option<Oid>,
+    ) -> Attempt {
         let negotiated = Cell::new(false);
         let auth = AuthState::new();
         let _scope = self.auth.ssh_scope(&auth);
         let updates = RefCell::new(Vec::new());
         let rejected = RefCell::new(Vec::new());
+        let branch_claim = Cell::new(None);
         let result = (|| {
             let mut remote = self.repo.remote_anonymous(self.remote.push_url())?;
             let mut callbacks = self.auth.callbacks(&auth);
             callbacks.push_negotiation(|ups| {
                 negotiated.set(true);
+                updates.borrow_mut().extend(ups.iter().map(|u| {
+                    (
+                        String::from_utf8_lossy(u.dst_refname_bytes()).into_owned(),
+                        u.src(),
+                    )
+                }));
                 for update in ups {
                     let name = String::from_utf8_lossy(update.dst_refname_bytes());
                     if let Some((_, want)) = expect.iter().find(|(n, _)| *n == name)
@@ -1203,13 +1325,20 @@ impl RemotePusher {
                             update.src()
                         )));
                     }
+                    if let Some(head) = branch_head
+                        && name == self.branch_ref
+                    {
+                        let old = Some(update.src()).filter(|o| !o.is_zero());
+                        let judged = claim(old, head, |oid| self.on_history(head, oid));
+                        branch_claim.set(Some(judged));
+                        if judged == Claim::Diverged {
+                            return Err(GitError::from_str(&format!(
+                                "{name} on the remote is not on this volume's history; nothing \
+                                 was sent"
+                            )));
+                        }
+                    }
                 }
-                updates.borrow_mut().extend(ups.iter().map(|u| {
-                    (
-                        String::from_utf8_lossy(u.dst_refname_bytes()).into_owned(),
-                        u.src(),
-                    )
-                }));
                 Ok(())
             });
             callbacks.push_update_reference(|name, status| {
@@ -1235,6 +1364,7 @@ impl RemotePusher {
             host_key_failure: auth.host_key_failure(),
             updates: updates.into_inner(),
             rejected: rejected.into_inner(),
+            branch_claim: branch_claim.get(),
         }
     }
 
@@ -2817,6 +2947,197 @@ mod tests {
         assert_eq!(saved.diverged_ref, Some(name));
         assert_eq!(saved.pending_ref, None);
         assert_eq!(saved.since_ms, 1000);
+    }
+
+    /// F8 rule 2: the branch push decides in libgit2's negotiation, from
+    /// the old value the remote reports, and a branch another repository
+    /// wrote stops the push before any ref is sent.
+    #[test]
+    fn the_negotiation_stops_a_push_to_a_branch_another_repository_wrote() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let url = format!("file://{}", remote.display());
+        let mut v = Vol::new("vol", &[("origin", &url)]);
+        v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        let theirs = write_remote(remote, "refs/heads/agentfs/vol");
+        let ours = v.commit();
+        // A ref that would go out in the same push as the branch.
+        let accepted = crate::fork::identity::accepted_ref("vol", ours);
+        v.com
+            .history()
+            .repo()
+            .reference(&accepted, ours, false, "t")
+            .unwrap();
+        let (events, sink_events) = sink();
+        let mut pusher = v.pusher("origin", sink_events);
+        let outcome = pusher.push_once();
+        assert!(
+            matches!(&outcome, PushOutcome::Diverged { local_head, remote_head: Some(r), diverged_ref: Some(_) }
+                if *local_head == ours && *r == theirs),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            remote_ref(remote, &accepted),
+            None,
+            "nothing of the branch push was sent"
+        );
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(theirs));
+        let got = events.take();
+        assert!(
+            matches!(&got[..], [Event::Diverged { .. }, Event::PushFailed { kind: PushFailureKind::NonFastForward, message, .. }]
+                if message.contains("nothing was sent")),
+            "{got:?}"
+        );
+    }
+
+    /// F8 rule 3: what a remote advertises for the branch, judged against
+    /// the head, without pushing or touching the push state.
+    #[test]
+    fn branch_claim_asks_the_remote() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new(
+            "vol",
+            &[
+                ("origin", &remote.display().to_string()),
+                ("gone", &remote.join("nope").display().to_string()),
+            ],
+        );
+        let first = v.commit();
+        let pusher = v.pusher("origin", Arc::new(NullSink));
+        assert_eq!(pusher.branch_claim(first), Ok(Claim::Create));
+        assert!(
+            v.pusher("origin", Arc::new(NullSink))
+                .push_once()
+                .is_success()
+        );
+        let before = fs::read(v.state.push_state("origin")).unwrap();
+        assert_eq!(pusher.branch_claim(first), Ok(Claim::UpToDate));
+        let second = v.commit();
+        assert_eq!(pusher.branch_claim(second), Ok(Claim::FastForward));
+        write_remote(remote, "refs/heads/agentfs/vol");
+        assert_eq!(pusher.branch_claim(second), Ok(Claim::Diverged));
+        assert_eq!(
+            fs::read(v.state.push_state("origin")).unwrap(),
+            before,
+            "the push state is untouched"
+        );
+        let Err(unreachable) = v.pusher("gone", Arc::new(NullSink)).branch_claim(second) else {
+            panic!("a missing remote cannot be listed");
+        };
+        assert_eq!(unreachable.kind, PushFailureKind::Unreachable);
+    }
+
+    /// F8 R9 and D2: a started volume raises StartBranchMoved at every
+    /// push to its start remote while the old branch holds commits it
+    /// does not have, and an accepted tip clears it (and is pushed,
+    /// create-only, with the branch).
+    #[test]
+    fn the_start_branch_alarm_and_an_accepted_tip() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let url = remote.display().to_string();
+        let mut v1 = Vol::new("v1", &[("origin", &url)]);
+        let f = v1.commit();
+        assert!(
+            v1.pusher("origin", Arc::new(NullSink))
+                .push_once()
+                .is_success()
+        );
+        let f_text = f.to_string();
+        let mut v2 = Vol::with_config(
+            "v2",
+            &[("origin", &url)],
+            &[
+                ("agentfs.start.remote", "origin"),
+                ("agentfs.start.branch", "agentfs/v1"),
+                ("agentfs.start.commit", &f_text),
+            ],
+        );
+        assert_eq!(
+            v2.settings.start.as_ref().map(ToString::to_string),
+            Some(format!("origin:agentfs/v1@{f}"))
+        );
+        v2.commit();
+        let (events, sink_events) = sink();
+        let mut pusher = v2.pusher("origin", sink_events);
+        assert!(pusher.push_once().is_success());
+        assert!(
+            !events
+                .take()
+                .iter()
+                .any(|e| matches!(e, Event::StartBranchMoved { .. })),
+            "at the pin: no alarm"
+        );
+        assert_eq!(pusher.state().start_moved, None);
+
+        // The old node's late commit reaches its own branch.
+        let g = v1.commit();
+        assert!(
+            v1.pusher("origin", Arc::new(NullSink))
+                .push_once()
+                .is_success()
+        );
+        v2.commit();
+        for _ in 0..2 {
+            assert!(
+                pusher.push_once().is_success(),
+                "the alarm never stops the push"
+            );
+            let got = events.take();
+            assert!(
+                got.contains(&Event::StartBranchMoved {
+                    remote: "origin".into(),
+                    refname: "refs/heads/agentfs/v1".into(),
+                    pinned: f,
+                    tip: g,
+                }),
+                "{got:?}"
+            );
+            let saved = PushState::load(&v2.state.push_state("origin"));
+            assert_eq!(
+                saved.start_moved,
+                Some(StartMoved {
+                    refname: "refs/heads/agentfs/v1".into(),
+                    pinned: f.to_string(),
+                    tip: g.to_string(),
+                })
+            );
+        }
+
+        // The operator takes g in and accepts it (what `agentfs start
+        // accept` writes): no alarm, and the accepted ref is pushed.
+        let repo = v2.com.history().repo();
+        repo.remote_anonymous(&url)
+            .unwrap()
+            .fetch(&["refs/heads/agentfs/v1"], None, None)
+            .unwrap();
+        let accepted = crate::fork::identity::accepted_ref("v2", g);
+        repo.reference(&accepted, g, false, "accepted").unwrap();
+        assert!(pusher.push_once().is_success());
+        assert!(
+            !events
+                .take()
+                .iter()
+                .any(|e| matches!(e, Event::StartBranchMoved { .. }))
+        );
+        assert_eq!(pusher.state().start_moved, None);
+        assert_eq!(remote_ref(remote, &accepted), Some(g));
+        // Another volume's pushes never ask (it has no start point).
+        let (others, sink_events) = sink();
+        v1.commit();
+        assert!(v1.pusher("origin", sink_events).push_once().is_success());
+        assert!(
+            !others
+                .take()
+                .iter()
+                .any(|e| matches!(e, Event::StartBranchMoved { .. }))
+        );
     }
 
     #[test]

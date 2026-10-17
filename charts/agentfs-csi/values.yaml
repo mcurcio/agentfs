@@ -19,7 +19,8 @@ imagePullSecrets: []
 sidecars:
   provisioner:
     image:
-      # -- csi-provisioner's image.
+      # -- csi-provisioner's image: in the node plugin pod of every node
+      # (`--node-deployment`), provisioning that node's worktrees.
       repository: registry.k8s.io/sig-storage/csi-provisioner
       # -- csi-provisioner's tag.
       tag: v6.4.0
@@ -28,18 +29,6 @@ sidecars:
     # -- More csi-provisioner flags, e.g. `--retry-interval-max=20s`.
     extraArgs: []
     # -- csi-provisioner's resources.
-    resources: {}
-  attacher:
-    image:
-      # -- csi-attacher's image.
-      repository: registry.k8s.io/sig-storage/csi-attacher
-      # -- csi-attacher's tag.
-      tag: v4.13.0
-      # -- csi-attacher's digest.
-      digest: sha256:d1a26170efed45491074ca4545c81844eee2b9043fb885ac01fb4aed6f8b72d2
-    # -- More csi-attacher flags.
-    extraArgs: []
-    # -- csi-attacher's resources.
     resources: {}
   nodeDriverRegistrar:
     image:
@@ -67,33 +56,11 @@ sidecars:
 kubeletDir: /var/lib/kubelet
 
 basePath:
-  # -- Where volumes live (`--base-path`): one filesystem, at this path on
-  # the controller and every node (docs/csi.md §3).
+  # -- Where each node keeps its worktrees (`--base-path`): a hostPath
+  # directory on the node's own disk, ideally a disk of its own, since a
+  # full disk makes the kubelet evict every pod on the node. A network
+  # filesystem is refused (docs/csi.md §11).
   path: /var/lib/agentfs-csi/volumes
-  # -- The volume mounted at `path` in the controller and the node plugin,
-  # as a pod volume source: one shared filesystem on several nodes, which
-  # on NFS must be 4.1 or later (docs/csi.md §11). Empty means a hostPath
-  # of `path`, right for a single node.
-  volume: {}
-
-controller:
-  # -- Controller replicas. The sidecars elect a leader: a second replica
-  # is a hot standby.
-  replicas: 1
-  # -- The controller's priority class.
-  priorityClassName: system-cluster-critical
-  # -- More `agentfs-csi --mode controller` flags (docs/configuration.md).
-  extraArgs: []
-  # -- The agentfs-csi container's resources.
-  resources: {}
-  # -- Annotations on the controller's pods.
-  podAnnotations: {}
-  # -- The controller's node selector.
-  nodeSelector: {}
-  # -- The controller's tolerations.
-  tolerations: []
-  # -- The controller's affinity.
-  affinity: {}
 
 node:
   # -- The node plugin's priority class.
@@ -104,7 +71,8 @@ node:
   # -- Where the node keeps its staged and published records
   # (`--node-state`); must survive plugin restarts.
   stateDir: /var/lib/agentfs-csi/node
-  # -- More `agentfs-csi --mode node` flags (docs/configuration.md).
+  # -- More `agentfs-csi` flags (docs/configuration.md), e.g.
+  # `--release-scan-interval=10s`.
   extraArgs: []
   # -- Environment of the node plugin, inherited by every history service
   # and front: the `OTEL_*` variables (docs/telemetry.md). Point
@@ -141,9 +109,12 @@ credentials:
   # end up in the release record.
   stringData: {}
 
-forkAdmission:
-  # -- Install the ValidatingAdmissionPolicy that refuses a fork class
-  # whose reclaim policy is not Delete (docs/csi.md §14).
+classAdmission:
+  # -- Install the ValidatingAdmissionPolicy `agentfs-class`, which refuses
+  # any StorageClass of the driver whose reclaim policy is not Delete, so
+  # DeleteVolume always runs and the release decider always answers
+  # (docs/csi.md §5). Off: a class with Retain loses nothing, but its PVs
+  # stay Released for ever.
   enabled: true
 
 alerts:
@@ -157,6 +128,7 @@ alerts:
 # -- StorageClasses of the driver: `[{name, parameters, reclaimPolicy,
 # volumeBindingMode, annotations}]`. `parameters` go to the driver as
 # written (docs/configuration.md "The CSI driver"). `reclaimPolicy`
-# defaults to Delete for a fork class (`fork: "true"`) and Retain
-# otherwise; `volumeBindingMode` to WaitForFirstConsumer.
+# defaults to Delete (the class admission policy refuses any other; a
+# worktree is kept by `onDelete: retain`, the default); `volumeBindingMode`
+# to WaitForFirstConsumer, which picks the node first.
 storageClasses: []

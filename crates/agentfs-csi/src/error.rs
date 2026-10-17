@@ -23,6 +23,10 @@ pub enum Error {
     /// Not ready yet; the CO retries (`UNAVAILABLE`).
     #[error("{0}")]
     Unavailable(String),
+    /// The request cannot be met here, such as a topology that excludes
+    /// this node (`RESOURCE_EXHAUSTED`).
+    #[error("{0}")]
+    ResourceExhausted(String),
     /// Anything else (`INTERNAL`).
     #[error("{0}")]
     Internal(String),
@@ -44,6 +48,7 @@ impl From<Error> for tonic::Status {
             Error::FailedPrecondition(m) => tonic::Status::failed_precondition(m),
             Error::Aborted(m) => tonic::Status::aborted(m),
             Error::Unavailable(m) => tonic::Status::unavailable(m),
+            Error::ResourceExhausted(m) => tonic::Status::resource_exhausted(m),
             Error::Internal(m) => tonic::Status::internal(m),
         }
     }
@@ -68,6 +73,10 @@ mod tests {
             ),
             (Error::Aborted("a".into()), tonic::Code::Aborted),
             (Error::Unavailable("a".into()), tonic::Code::Unavailable),
+            (
+                Error::ResourceExhausted("a".into()),
+                tonic::Code::ResourceExhausted,
+            ),
             (Error::Internal("a".into()), tonic::Code::Internal),
         ];
         for (error, code) in cases {

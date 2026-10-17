@@ -1,6 +1,7 @@
 # A fork class (design §11.5, docs/csi.md §14): a claim on it whose
 # dataSource is a claim of the `agentfs` class is a fork of that volume,
-# with its profile. A pod-scoped ephemeral claim finishes the fork when the
+# with its profile, made on the source's node (give the fork's pod
+# affinity to its source's pods). A pod-scoped ephemeral claim finishes the fork when the
 # pod goes; the driver deletes the volume once the fork is published to its
 # fork remote.
 apiVersion: storage.k8s.io/v1

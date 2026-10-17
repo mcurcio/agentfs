@@ -11,13 +11,13 @@
 #   2. the sandbox's writes reach refs/heads/agentfs/<fork> on the fork
 #      remote by its interval pushes, and nothing of the fork reaches the
 #      source's remote or branch;
-#   3. the admission policy denies a fork class with reclaim policy
-#      Retain, and admits the shipped agentfs-fork class;
+#   3. the class admission policy denies a fork class with reclaim
+#      policy Retain, and admits the shipped agentfs-fork class;
 #   4. with the fork remote blocked, deleting the sandbox pod leaves the PV
 #      Released and DeleteVolume UNAVAILABLE, across a restart of the node
 #      plugin pod; once the remote is reachable again, the node plugin's
-#      publisher publishes the change and finish refs and the PV goes, with
-#      no operator action;
+#      release scan publishes the change and finish refs and the PV goes,
+#      with no operator action;
 #   5. a second sandbox's fork, whose remote's pre-receive hook refuses
 #      refs/agentfs/*, is refused (`rejected`) once its pod is deleted, and
 #      the node plugin starts no further finisher for it;
@@ -67,7 +67,7 @@ diagnose() {
   ka get events --sort-by=.lastTimestamp | tail -n 60
   kd get events --sort-by=.lastTimestamp | tail -n 40
   for pod in $(kd get pods -o name); do
-    for c in agentfs-csi csi-provisioner csi-attacher; do
+    for c in agentfs-csi csi-provisioner; do
       kd logs "$pod" -c "$c" --tail=200 2>/dev/null | sed "s|^|$pod/$c: |"
       kd logs "$pod" -c "$c" --previous --tail=60 2>/dev/null | sed "s|^|$pod/$c (previous): |"
     done
@@ -105,7 +105,7 @@ plugin_ready() {
   kd wait --for=condition=Ready pod -l "$PLUGIN_LABEL" --timeout=300s >/dev/null ||
     fail "the node plugin never became Ready"
 }
-provisioner_log() { kd logs deployment/agentfs-csi-controller -c csi-provisioner; }
+provisioner_log() { kd logs "$(plugin_pod)" -c csi-provisioner; }
 in_pod() { ka exec "$1" -- sh -c "$2"; }
 
 # Checks for until_ok.
@@ -122,7 +122,7 @@ node_path_gone() { ! docker exec "$NODE" test -e "$1"; }
 delete_unavailable() { # pv
   local said # captured first: grep -q closing a pipe would fail it (pipefail)
   said=$(provisioner_log 2>/dev/null)
-  grep -q "Unavailable.*fork $1 is" <<<"$said"
+  grep -q "Unavailable.*volume $1: the fork is" <<<"$said"
 }
 ref_exists() { git --git-dir "$1" rev-parse -q --verify "$2" >/dev/null 2>&1; }
 fork_mark_has() { # pv text
@@ -179,7 +179,6 @@ endpoints:
   - addresses: ["$GW"]
 EOF
 kubectl apply -k ci/k8s-csi/forks/driver
-kd rollout status deployment/agentfs-csi-controller --timeout=300s
 until_ok 300 "a node plugin pod exists" has_plugin_pod
 plugin_ready
 NODE_NAME=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
@@ -220,7 +219,7 @@ pass "the source's branch is unchanged by the fork"
 fgit rev-parse -q --verify "$SOURCE_BRANCH" >/dev/null && fail "the source pushed to its fork remote"
 pass "the source never pushes to its fork remote"
 
-step "(3) admission: a fork class must be reclaim Delete"
+step "(3) admission: every class, a fork class too, must be reclaim Delete"
 denied=
 deadline=$((SECONDS + 90))
 while [ $SECONDS -lt $deadline ]; do
@@ -233,7 +232,7 @@ while [ $SECONDS -lt $deadline ]; do
   break
 done
 [ -n "$denied" ] || fail "a fork class with reclaimPolicy Retain was admitted"
-assert_contains "$denied" "agentfs-fork-class" "the Retain fork class is denied by the policy"
+assert_contains "$denied" "agentfs-class" "the Retain fork class is denied by the policy"
 kubectl apply --dry-run=server -f deploy/csi/example/fork-storageclass.yaml >/dev/null ||
   fail "the shipped agentfs-fork class is not admitted"
 pass "the shipped agentfs-fork class is admitted"
@@ -251,17 +250,16 @@ old=$(plugin_pod)
 kd delete pod "$old" --wait --timeout=120s
 until_ok 300 "a new node plugin pod" has_plugin_pod
 plugin_ready
-sleep 10
+# The new pod's csi-provisioner retries the deletion.
+until_ok 120 "DeleteVolume still answers UNAVAILABLE after the restart" \
+  delete_unavailable "$FORK_PV"
 assert_eq Released "$(kubectl get pv "$FORK_PV" -o jsonpath='{.status.phase}')" \
   "across the node plugin's restart, the PV stays Released"
-said=$(provisioner_log)
-assert_contains "$(grep 'Volume deletion failed' <<<"$said" | tail -n 1)" \
-  "code = Unavailable" "DeleteVolume still answers UNAVAILABLE"
 ref_exists "$FORKS_REMOTE" "refs/agentfs/$FORK/finish" && fail "the finish ref reached a blocked remote"
 pass "a blocked fork remote has no finish ref"
-# Reachable again: the publisher alone (no operator action) publishes it.
+# Reachable again: the release scan alone (no operator action) publishes it.
 chmod "$mode" "$FORKS_REMOTE"
-until_ok 600 "the publisher puts the finish ref on the fork remote" \
+until_ok 600 "the release scan puts the finish ref on the fork remote" \
   ref_exists "$FORKS_REMOTE" "refs/agentfs/$FORK/finish"
 CHANGE=$(fgit rev-parse "refs/agentfs/$FORK/change") || fail "no change ref"
 sgit merge-base --is-ancestor "$(fgit rev-parse "$CHANGE^")" "$SOURCE_BRANCH" ||
@@ -301,7 +299,7 @@ until_ok 120 "the fork remote has the second fork's branch with sandbox2.txt" \
 ka delete pod sandbox2 --wait --timeout=180s
 until_ok 300 "the publish is refused as rejected, on record" fork_mark_has "$FORK2_PV" '"reason": "rejected"'
 started=$(finishers_started "$FORK2_PV")
-sleep 45 # more than the node plugin's 30 s fork scan
+sleep 45 # more than the node plugin's 30 s release scan
 assert_eq "$started" "$(finishers_started "$FORK2_PV")" \
   "the node plugin starts no further finisher for a refused fork"
 assert_eq Released "$(kubectl get pv "$FORK2_PV" -o jsonpath='{.status.phase}')" \

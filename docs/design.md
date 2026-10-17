@@ -1872,6 +1872,20 @@ agentfs does not scan content for secrets and does not hold pushes.
   - raises an alarm (`PushFailed`, §13) with the reason and the commit;
   - keeps retrying with backoff (§11.2);
   - keeps the remote's last successful commit, so the backlog is visible.
+- **A worktree creates or fast-forwards its own branch, as the remote shows
+  it** (one branch per worktree, F8 rule 2, 2026-10-16). In libgit2's push
+  negotiation, from the old value the remote reports for the branch in the
+  very connection that sends the update, `push::claim` decides: no such
+  branch is a create (sent with a zero old value), the head itself is up
+  to date, a commit known here and an ancestor of the head is a
+  fast-forward (leased on that value by the smart protocol's old-value
+  check); anything else, a commit unknown here or not an ancestor, is
+  someone else's, and the negotiation stops the push before any ref or
+  object is sent. The push record is never an input: it stays
+  bookkeeping (§11.2). libgit2's local and `file://` transports update an
+  existing ref without compare-and-swap, so a writer racing between the
+  negotiation and the update there can still be overwritten; smart HTTP
+  and SSH servers compare and swap.
 - **Non-fast-forward on the branch means someone else wrote it.**
   - The recorder pushes its head to
     `refs/agentfs/<volume>/diverged/<UTC timestamp, no colons>`
@@ -1887,9 +1901,35 @@ agentfs does not scan content for secrets and does not hold pushes.
   - An operator resolves it (§15,
     [divergence.md](runbooks/divergence.md)). The divergence clears when a
     branch push next succeeds.
-  - The branch push carries only the branch and the `diverged/*` refs. A
-    non-fast-forward on a diverged ref is reported like any other and saves
+  - The branch push carries only the branch and the `diverged/*` and
+    `accepted/*` refs, both create-only (they never move). A
+    non-fast-forward on one is reported like any other and saves
     nothing.
+- **The start-branch alarm** (F8 R9, 2026-10-16). A volume started from
+  another worktree's branch (a start class, §14.2) keeps its start point
+  in its identity (`agentfs.start.remote`, `.branch`, `.commit`). At
+  every push attempt to the start remote it lists the start branch first,
+  and `push::start_branch_moved` decides: the branch holding commits this
+  volume does not have (the tip unknown here, or not an ancestor of the
+  head or of one of its `refs/agentfs/<volume>/accepted/*` refs) raises
+  `StartBranchMoved` (an error, like `Diverged`, §13), naming the branch,
+  the pinned commit and the tip, at every such attempt while it holds; it
+  is kept in that remote's push state for `agentfs status` (`start branch
+  moved: <pinned>..<tip>`) and the gauge `agentfs.start.moved`. It never
+  stops a push: the new volume writes only its own branch. This is how an
+  old node's late commits, which its release scan pushes to the old
+  branch after a move, are saved and alarmed, never overwritten: the new
+  volume raises the alarm; the old node needs no knowledge of the move.
+  The operator takes the commits in (a patch, or by hand) or decides
+  against them, then `agentfs start accept --tip <tip>`, which fetches the
+  start branch, checks the tip is on it and creates
+  `refs/agentfs/<volume>/accepted/<tip>` (never moved), pushed
+  create-only with the branch: the alarm stops for every commit the tip
+  reaches, comes back if the old branch moves again, and the old commits
+  are saved under the new volume's name too
+  ([runbook](runbooks/start-branch-moved.md)). Not covered: the alarm
+  waits for the new volume's next push and watches only the start remote;
+  nothing is fetched to raise it.
 - **The patch queue has its own push** (§12), to the patch remote only,
   after every branch push attempt, failed ones included (an LFS upload
   failure, a refused or unreachable branch), under the same lock, so the
@@ -2049,7 +2089,7 @@ busy remote, a refused branch push, a moved branch) is pending and retried
 with backoff. A refusal writes the `refused` mark (finish, remote, reason,
 message, time) and raises `ForkRefused` once; the fork is `refused`, a
 publish of it returns the refusal without pushing, and the node plugin's
-publisher never starts a finisher for it. `agentfs fork finish --retry`
+release scan never starts a finisher for it, nor pushes it. `agentfs fork finish --retry`
 clears the mark and publishes again.
 
 **Abandoned.** `agentfs fork abandon --reason TEXT`
@@ -2326,6 +2366,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.push.oldest_unpushed_age` | gauge, per remote | Backlog age, the main push alarm |
 | `agentfs.push.failures` | counter, per remote, reason and stage | Rejected, non-fast-forward, authentication, untrusted host, network, too large (`too_large`, §11.3); stage `git`, `lfs` for the LFS upload before the git push (§7), or `queue` for the patch remote's queue refs (§11.3, §12) |
 | `agentfs.push.diverged` | gauge, per remote | 1 while diverged |
+| `agentfs.start.moved` | gauge, per remote (the start remote of a started volume) | 1 while the start-branch alarm holds, as the last push to that remote saw it; 0 before the first push and after one that does not raise it (§11.3) |
 | `agentfs.push.limited` | counter, per remote | Pushes that sent only part of the backlog because it was over `agentfsMaxPushSize` (§11.3) |
 | `agentfs.remote.misconfigured` | gauge, per remote | 1 for each invalid `[remote]` section (§11.1) |
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
@@ -2402,6 +2443,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `ReconcileFailed` | Reconciling a moved directory (§3.1) failed 5 times over at least 30 s, with both paths and the error: the move is committed as journaled, and files beneath the destination that recording the tree would have added, dropped or recorded again differ from the tree until each changes again or is recorded with `agentfs record` |
 | `PushFailed` | A push attempt fails, with the remote, the kind (`unreachable`, `auth`, `untrusted_host`, `non_fast_forward`, `refused`, `local`, `too_large`), the stage (`git`, or `lfs` when uploading LFS objects failed and no ref was pushed, §7; `too_large` at stage `lfs` is an object over the remote's `agentfsMaxLfsObjectSize`), the head, the last pushed commit, the consecutive failure count and the next retry; stage `queue` for the patch remote's status, applied and inbox refs (§11.3), which never counts against the branch |
 | `Diverged` | The local head was saved under a diverged ref (§11.3) |
+| `StartBranchMoved` | A started volume's start branch holds commits it does not have: the start remote, the branch, the pinned commit and the tip, at every push to the start remote while it holds; an error, like `Diverged`; log event `agentfs.start_branch_moved` with `agentfs.remote`, `agentfs.start.ref`, `agentfs.start.pinned`, `agentfs.start.tip` (§11.3) |
 | `PushLimited` | A push sent only part of the backlog because it was over the remote's `agentfsMaxPushSize`: the commit pushed, the head, the limit and the first-parent commits left; the next step follows at once (§11.3); a warning |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
 | `RepackFailed` | The periodic `git repack` (§8) failed, or refreshing the object database after it; tried again an interval later |
@@ -2834,20 +2876,37 @@ ratios (§19.1).
 
 `agentfs-csi` (crate `crates/agentfs-csi`, §17.2) is a CSI v1.13 driver,
 `agentfs.mcurcio.github.io`, in the agentfs image. The operator's guide is
-[csi.md](csi.md). A volume is used from one node at a time, by any
-number of pods on that node; every multi-node access mode is refused
-(below, §19.1).
+[csi.md](csi.md). Each claim is a **worktree**: its files and its own
+branch `agentfs/<volume>`, on the disk of the node that created it, for
+good (F8 "one branch per worktree", §19.1 2026-10-16). Any number of pods
+on that node share it; every multi-node access mode is refused (below,
+§19.1). Continuing a volume elsewhere is a new volume started from the
+old branch; which branch is current is the operator's choice, never
+fenced.
+
+**Shape** (§19.1 2026-10-16, R1, R8). There is no controller Deployment
+and no attach step. One DaemonSet runs on every node: `agentfs-csi`,
+which serves the Identity, Controller and Node services, beside
+csi-provisioner in `--node-deployment` mode (it provisions the claims
+whose pods are scheduled to its node, and deletes the PVs of its node's
+worktrees), node-driver-registrar and livenessprobe. The driver
+advertises `VOLUME_ACCESSIBILITY_CONSTRAINTS`; NodeGetInfo and
+CreateVolume answer the node's topology,
+`topology.agentfs.mcurcio.github.io/node = <node>`, so the PV's node
+affinity keeps every pod of the claim on that node (`WaitForFirstConsumer`
+picks the node first; prior art: local-path, TopoLVM).
+`CSIDriver.attachRequired` is `false`; ControllerPublish and
+ControllerUnpublish are not offered.
 
 **Lifecycle mapping.**
 
 | CSI call | Where | agentfs |
 |---|---|---|
-| CreateVolume | controller | `<basePath>/<pv>/{backing,state,csi.json}`; the state area initialised in-process (`init_with`) with the profile's config included and its rules installed |
-| ControllerPublish | controller | records the node in `csi.json`, so a second node is refused (`FAILED_PRECONDITION`); Kubernetes' Multi-Attach check enforces the same (`attachRequired: true`) |
-| NodeStage | node plugin | starts `agentfs serve-history` for the volume, waits a bounded time for it to listen |
+| CreateVolume | the node's plugin | `<basePath>/<pv>/{backing,state,csi.json}` on this node, which the request's topology must include (`RESOURCE_EXHAUSTED` otherwise); the state area initialised in-process (`init_with`, or `start_from` for a start class) with the profile's config included and its rules installed; the answer carries the node's topology |
+| NodeStage | node plugin | checks the worktree (it never creates one: missing is `NOT_FOUND` naming the node, and a static PV is adopted only over an existing worktree of its volume, `reopen_with`), starts `agentfs serve-history` for the volume (which waits up to 30 s for the state lock a release-scan push or DeleteVolume's listing may hold), waits a bounded time for it to listen |
 | NodePublish | node plugin | starts a front, `agentfs mount --history-service`, with the pod's identity, mounted at a private source; bind-mounts it onto the kubelet's target |
 | NodeUnpublish, NodeUnstage | node plugin | stop the front, the service (final commit, and one more push of it within `--push-grace`) |
-| DeleteVolume | controller | removes or keeps the directory (`onDelete`; `delete` renames it to `.deleting.<handle>` under the state lock and removes it after, so no held lock file is unlinked on NFS); `delete` refuses while a remote lacks commits of the branch |
+| DeleteVolume | the node's plugin | asks the release decider (below), never pushes: delete renames the directory to `.deleting.<handle>` under the state lock and removes it after; keep renames `csi.json` to `csi.retained.json`; wait answers `UNAVAILABLE` and wakes the release scan |
 
 The node plugin spawns the `agentfs` binary for every long-running piece
 rather than linking FUSE into the gRPC server: a crashed front or service
@@ -2861,54 +2920,126 @@ a StorageClass (or static PV) names a `profile`, whose
 and whose credentials are files of a Secret there, both mounted into the
 driver's pods. Pod authors choose only the class. Other parameters:
 `volumeName` (a template over the claim's namespace and name and the PV
-name, by default all three, so a re-created claim never reuses a branch
-whose remote history it does not share, §11.3, §11.4; a literal name in a
-static PV, whose unknown attributes are refused), `branch`,
-`onDelete`. Inline ephemeral volumes are refused (`volumeLifecycleModes:
-[Persistent]`), since their parameters would be the pod author's.
+name, by default all three; it must contain `{pvName}`, so a re-made
+claim is a new worktree with a new branch, F8 rule 1; a literal name in
+a static PV, whose unknown attributes are refused), `onDelete`, and
+`startFrom` (below). There is no `branch`: a worktree's branch is always
+`agentfs/<volume>`, named once in its identity, which no include, static
+PV, stage or start can change. Inline ephemeral volumes are refused
+(`volumeLifecycleModes: [Persistent]`), since their parameters would be
+the pod author's.
+
+**One branch per worktree** (F8 rules 1 and 2). The invariant: no path
+writes a branch its worktree did not create. A worktree writes its
+branch only when the remote has none or holds a commit already on its
+own history, decided in the push's own negotiation (§11.3). Another
+worktree's tip reaches a worktree only by a start or a fork, both of
+which name a new branch; a CLI or sidecar volume reusing a name is an
+unrelated history, saved as a divergence. Not covered: a hand-copied
+state area, local and `file://` remotes (libgit2 updates them without
+compare-and-swap), and anyone holding the remote's credentials.
+
+**Start classes** (R2, R3). A StorageClass with `startFrom:
+"<remote>:<branch>@<commit>"` makes every claim on it a new worktree
+whose history begins at that commit of another worktree's branch:
+CreateVolume (`fork::start::start_from`) fetches the branch once from
+that remote, a push section of the profile, with its credentials;
+checks the commit is the branch's tip or an ancestor of it; writes the
+start point into the new volume's own config (`agentfs.start.*`, never
+from an include, never changed); points the new branch at the commit;
+and writes its tree through the fork's confined tree writer, with LFS
+content from the start remote's endpoint. It writes nothing to any
+remote, and never the start branch. A start point names a branch only:
+a `refs/...` name, such as a `diverged/*` ref (which never moves, so
+nothing could alarm on it), is refused (`INVALID_ARGUMENT`, "not a
+branch"), and so is the new volume's own branch. Codes:
+`INVALID_ARGUMENT` (shape, remote not in the profile, own branch),
+`FAILED_PRECONDITION` (no such branch, commit not on it), `UNAVAILABLE`
+(the fetch or an LFS download failed; retried), `ALREADY_EXISTS` (the
+name exists with another start point). Moving a volume is a runbook
+([moving](runbooks/moving.md)); its old node's late commits raise the
+start-branch alarm on the new volume (§11.3).
 
 **Identity.** `podInfoOnMount` gives NodePublish the pod's name, namespace
 and uid, which the front passes on as its origin (§9): each pod commits
 as itself, and the service journals the origin so replays keep it.
 
-**Little network work in a call.** No call fetches over the network, and only
-NodeUnstage waits on a push (the service's final push, bounded by
-`--push-grace`).
-A volume starts empty, except a fork (decided 2026-10-16, §19.1
-"Content sources"; §11.5): CreateVolume from a fork class
-clones its `dataSource` claim locally, copying the source's history up to
-its latest commit and writing that commit's tree, with no credentials and
-no network.
+**Little network work in a call.** CreateVolume of a start class
+fetches once; DeleteVolume lists each remote once; NodeUnstage waits on
+the service's final push (bounded by `--push-grace`). No call pushes.
+A volume otherwise starts empty, except a fork (decided 2026-10-16,
+§19.1 "Content sources"; §11.5): CreateVolume from a fork class clones
+its `dataSource` claim locally, copying the source's history up to its
+latest commit and writing that commit's tree, with no credentials and no
+network. The source must be on the fork's node (`FAILED_PRECONDITION`
+otherwise, naming the remedy: pod affinity to the source's pods).
+
+**The release decider** (F8 rule 3, D1). `agentfs_core::release::decide`
+is the only deletion decider. It is pure; DeleteVolume gathers its
+facts: whether the branch exists, the declared remotes (`Declared::of`),
+what each pushed remote advertises for the branch in a listing made for
+that call (`RemotePusher::branch_claim`, judged by `claim`; the push
+record is not asked), the class's `onDelete`, and a fork's state. It
+weighs, in order, no history, then the fork's state, then the remotes:
+
+- **Delete**: every declared remote holds the head (or there is no
+  history), and `onDelete: delete`;
+- **Keep**: the volume is released and the worktree stays on its node:
+  `onDelete: retain` once every remote holds the head, or a profile with
+  no remote declared (nothing elsewhere can hold it);
+- **Wait**: `UNAVAILABLE`, naming the first remote that does not hold the
+  head and why (lacking, unreachable, diverged), every remote section
+  invalid, or a fork not yet published or abandoned.
+
+Every class of the driver has `reclaimPolicy: Delete`, enforced by the
+chart's admission policy (`agentfs-class`), so DeleteVolume always runs
+and the decider always answers; data safety is the decider's, not
+Kubernetes': with `onDelete: retain` (the default) the worktree stays on
+disk after its PV goes. DeleteVolume refuses (`FAILED_PRECONDITION`) a
+worktree staged on its node, one whose state lock is held, and one whose
+settings cannot be read (nothing deleted or released).
+
+**The release scan** (D1). The node plugin's release scan
+(`release_scan.rs`) runs at start, every `--release-scan-interval`
+(30 s) and whenever DeleteVolume waits. For every `csi.json` or
+`csi.retained.json` on its node that no pod stages, it runs `agentfs
+push` (the one push path, with the plugin's identity) unless the last
+push of it exited 0 at its current head (kept in memory: a restarted
+plugin pushes each once more), backing off per worktree after a failure
+from the interval, doubling up to `--backoff-max`; exit 75 is retried at
+the next scan. Each failed attempt raises `PushFailed` through the
+child's own alarms and OpenTelemetry export: that is what alarms while
+unpushed commits sit in an unstaged worktree, whether its claim is gone,
+it is kept (a static PV with `Retain`), or it is only between pods. A
+fork asked to finish gets `agentfs fork finish` instead (below); a
+refused or abandoned fork is never pushed.
 
 **Forks** (§11.5). A fork class is a StorageClass with `fork: "true"`;
-it must not set `profile` or `branch` (the fork has its source's profile
-and a fixed branch), its `volumeName` must name `{pvName}`, and its
-`onDelete` defaults to `delete` (§19.1 "Fork onDelete"). The controller
+it must not set `profile`, `branch` or `startFrom` (the fork has its
+source's profile, its own branch, and starts from its source's head),
+its `volumeName` must name `{pvName}` like every class's, and its
+`onDelete` defaults to `delete` (§19.1 "Fork onDelete"). The driver
 advertises `CLONE_VOLUME` and clones only into a fork class; any other
-content source, and every snapshot, is `INVALID_ARGUMENT`. A shipped
-ValidatingAdmissionPolicy refuses a fork class whose reclaim policy is
-not `Delete`, since only DeleteVolume tells the driver a claim is gone.
-DeleteVolume of a fork records `finish_requested` in `csi.json` and
-answers `UNAVAILABLE` until the fork is published or abandoned (`agentfs
-fork abandon`, run in the node plugin: [csi.md](csi.md) §14), then
-applies `onDelete`; a fork status that cannot be read is
-`FAILED_PRECONDITION`, nothing deleted. The node plugin's publisher
-(`publisher.rs`) scans the base path at start and every
-`--fork-scan-interval`, and runs one `agentfs fork finish --timeout 300s`
-per fork asked to finish that no node stages, no finisher of its own
-already serves, and that is neither refused nor abandoned; it is the only
-writer of a finished fork, and holds the fork remote's credentials
-through the profile. The timeout frees the fork's lock between scans, for
-an operator's `fork abandon --wait-lock`. A finished fork staged again
-(through a static PV of its retained directory) starts its history
-service, its front mounts it read-only (`ro`, so the kernel answers
-`EROFS`), and NodePublish bind-mounts it read-only (`MS_RDONLY`) whatever
-the request asked. The service pushes on its
-interval (§11.2), and before it listens fetches the patch inbox (bounded
-by `agentfs.patchFetchTimeout`, §12) and applies queued patches.
-NodeStage only waits for it, at most `--stage-wait` (60 s), and answers
-`UNAVAILABLE` past that while the service keeps starting; the kubelet
-retries.
+content source, and every snapshot, is `INVALID_ARGUMENT`. DeleteVolume
+of a fork records `finish_requested` in `csi.json` and answers
+`UNAVAILABLE` until the fork is published or abandoned (`agentfs fork
+abandon`, run in the node plugin: [csi.md](csi.md) §14), then applies
+`onDelete`; a fork status that cannot be read is `FAILED_PRECONDITION`,
+nothing deleted. The release scan runs one `agentfs fork finish
+--timeout 300s` per fork asked to finish that no node stages, no
+finisher of its own already serves, and that is neither refused nor
+abandoned; it is the only writer of a finished fork, and holds the fork
+remote's credentials through the profile. The timeout frees the fork's
+lock between scans, for an operator's `fork abandon --wait-lock`. A
+finished fork staged again (through a static PV of its retained
+directory) starts its history service, its front mounts it read-only
+(`ro`, so the kernel answers `EROFS`), and NodePublish bind-mounts it
+read-only (`MS_RDONLY`) whatever the request asked. The service pushes on
+its interval (§11.2), and before it listens fetches the patch inbox
+(bounded by `agentfs.patchFetchTimeout`, §12) and applies queued
+patches. NodeStage only waits for it, at most `--stage-wait` (60 s), and
+answers `UNAVAILABLE` past that while the service keeps starting; the
+kubelet retries.
 
 **Recovery, specified and tested** (§18 test 16):
 
@@ -2943,9 +3074,15 @@ retries.
   full disk) is tried again with backoff; entries and records stay, at a
   restart as at reconcile.
 - *Unpushed history.* NodeUnstage's service pushes its final commit once
-  more within `--push-grace`; if that fails, `onDelete: delete` refuses
-  DeleteVolume while any remote lacks commits of the branch (read from
-  the push state, §11.2), so history no remote holds is never deleted.
+  more within `--push-grace`; then the release scan pushes the unstaged
+  worktree until a remote holds its head, and the release decider keeps
+  DeleteVolume waiting meanwhile: history no remote holds is never
+  deleted.
+- *A lost node, a wiped disk.* A worktree whose node is gone is not
+  recovered elsewhere: the operator starts a new volume from its branch
+  ([moving](runbooks/moving.md)). A worktree whose directory is gone
+  makes NodeStage answer `NOT_FOUND`, and the pod waits, its events
+  naming the node.
 
 **One node per volume.** Several pods on one node share a volume, each
 committing as itself: `ReadWriteOnce` (`SINGLE_NODE_WRITER` or
@@ -2955,14 +3092,10 @@ mount. Every multi-node access mode (`MULTI_NODE_READER_ONLY`,
 `MULTI_NODE_SINGLE_WRITER`, `MULTI_NODE_MULTI_WRITER`, so
 `ReadWriteMany` and `ReadOnlyMany`) is refused with one message naming
 the decision (§19.1), at CreateVolume, ValidateVolumeCapabilities,
-ControllerPublish, NodeStage and NodePublish, and a `csi.json` with
-fields the driver does not know (one written by a multi-node build) is
-refused rather than read as a single-node volume. The attach step makes
-Kubernetes refuse a second node while the first holds the
-VolumeAttachment; ControllerPublish refuses it too. On a shared basePath
-a volume moves to another node after it is detached from the first,
-never onto two at once. Pods on other nodes read its history from the
-remote it pushes to.
+NodeStage and NodePublish, and a `csi.json` with fields the driver does
+not know (one written by an earlier build) is refused rather than half
+read. The PV's node affinity keeps the worktree's pods on its node; pods
+on other nodes read its history from the remote it pushes to.
 
 **Upgrading the node plugin.** A live hand-over of a node's FUSE
 sessions to a new plugin is not built: the fronts are the plugin's
@@ -2973,15 +3106,14 @@ is per node: cordon, evict that node's agentfs pods, delete its plugin
 pod (the DaemonSet stays `OnDelete`), wait until it is Ready, uncordon
 ([csi.md](csi.md#9-operations)).
 
-**RBAC inventory.** csi-provisioner: PVs (get, list, watch, create, patch,
-delete), PVCs (get, list, watch, update), StorageClasses, CSINodes and
-Nodes (get, list, watch), Events (list, watch, create, update, patch).
-csi-attacher: PVs (get, list, watch, patch), CSINodes (get, list, watch),
-VolumeAttachments (get, list, watch, patch) and their status (patch).
-Leases in the driver's namespace for leader election. No Secrets, pods or
-snapshots anywhere: credentials are mounted files, never API reads. The
-node plugin's account has no bindings and its token is not mounted; in
-the controller only the two sidecars get a token. The table with the
+**RBAC inventory.** csi-provisioner, the only container with a token
+(projected into it alone; the node plugin's account is not
+automounted): PVs (get, list, watch, create, patch, delete), PVCs (get,
+list, watch, update), StorageClasses, CSINodes and Nodes (get, list,
+watch), Events (list, watch, create, update, patch), bound to the node
+plugin's account. No attacher, no leases, no Secrets, pods or snapshots
+anywhere: credentials are mounted files, never API reads. Each node's
+provisioner holds PV and claim rights cluster-wide. The table with the
 reasons is in [csi.md](csi.md#10-security); `ci/e2e-csi.sh` checks it with
 `kubectl auth can-i`.
 
@@ -2990,37 +3122,23 @@ reasons is in [csi.md](csi.md#10-security); `ci/e2e-csi.sh` checks it with
 shares the host's pid namespace (`hostPID`, so its fronts see callers'
 real pids and can read their supplementary groups, §6) (FUSE
 mounts, `Bidirectional` propagation into `/var/lib/kubelet`, passthrough's
-`CAP_SYS_ADMIN`, `CAP_CHOWN`/`CAP_FOWNER` for ownership); the controller's
-`agentfs-csi` is root with only `DAC_OVERRIDE` and `FOWNER` and a
-read-only root filesystem; the sidecars run as root without capabilities
+`CAP_SYS_ADMIN`, `CAP_CHOWN`/`CAP_FOWNER` for ownership); the sidecars
+run as root without capabilities and with a read-only root filesystem
 (to reach the root-owned 0660 socket). Workload namespaces can enforce
 `restricted`: a pod only mounts a claim. Hardened node images (Talos) are
 untested.
 
-**Shared filesystems.** basePath must be one filesystem the controller
-and every node see at the same path; for volumes to move between nodes
-that is a shared filesystem. The state lock (§2.3) is then the only
-guard against a second history service on another node, so the lock and
-`agentfs-csi`'s start refuse a state area or basePath on NFS older than
-4.1, mounted `nolock`, or with `local_lock` other than `none` (read from
-`/proc/self/mountinfo`): there an `flock` excludes only the node's own
-processes. Other shared filesystems are neither checked nor tested.
-`hard` and `lookupcache=positive` mounts and a `no_root_squash` export
-are recommended ([csi.md](csi.md#11-shared-filesystems)). Reflinks do not
-cross NFS, so freezes copy (§3.2); passthrough is decided per inode and
-falls back where the kernel refuses a backing file (§17.1).
-
-*The forced-detach residual.* On a shared basePath, a node that is cut
-off but still running keeps its history service and pods writing. If
-Kubernetes force-detaches the volume (the attach-detach controller's
-timeout; NOT VERIFIED for Kubernetes 1.37), or an operator taints the
-node out of service while it still runs, a service on another node can
-take the lock once the NFS server's lease for the cut-off client
-expires. When the network returns there are two writers, and the journal
-can be corrupted. This was true before 2026-10-15's multi-node work and
-remains so; the only strong guard is a node-local basePath, which pins
-each volume to its node. A lost node is handled by
-[runbooks/node-lost.md](runbooks/node-lost.md).
+**Where worktrees live** (R1, "B"). `--base-path` is any directory on the
+node's own disk (the chart's `basePath.path`, a hostPath); sizes are not
+enforced, so a full disk makes the kubelet evict every pod on the node,
+and the docs recommend a disk of its own. `agentfs-csi` refuses a base
+path on a network filesystem (nfs, nfs4, cifs, smb3, smbfs, ceph,
+fuse.glusterfs, glusterfs, lustre, gpfs, afs; `shared_fs::network_filesystem`)
+before it serves anything, naming its type. The optional shared storage
+is an ordinary git remote (a server on a claim of any StorageClass, NFS
+4.0 or iSCSI included), never the base path. The state lock's NFS checks
+(§2.3) still guard CLI and sidecar state areas, which may live on NFS 4.1
+or later (F7 decision).
 
 Tested on NFS (`ci/e2e-nfs.sh`, CI job `e2e-nfs`, passthrough `auto` and
 `off`): a kernel NFS server on the runner exports one directory to two
@@ -3028,17 +3146,20 @@ NFSv4.2 clients (the second in network and UTS namespaces of its own, so
 a separate client id, lease and set of locks). It checks that the state
 lock and its holder line hold across the clients, that an NFS 4.0 mount
 is refused at start, mmap and SQLite single-writer through a front on the
-NFS tree, that NFS silly renames never reach history, DeleteVolume on a
-base path on the export, and a volume moving between two `agentfs-csi`
-node plugins, one on each client's view of the base path: NodeStage on
-the second is refused (`FAILED_PRECONDITION`, the state lock) while the
-first has the volume staged, and after the first unstages and the
-attachment moves, the second serves the first's file, whose commit names
-the first node, and records its own writes. The `local_lock` refusal is
-NOT RUN and cannot run on Linux: the kernel clears `local_lock` and
-`nolock` on every NFSv4 mount (`nfs_fs_context_validate` in
-`fs/nfs/fs_context.c`), and NFSv2/3, which keep them, are refused for
-their version first.
+NFS tree, that NFS silly renames never reach history, and that
+`agentfs-csi` refuses a base path on the export (4.2 and 4.0). The
+`local_lock` refusal is NOT RUN and cannot run on Linux: the kernel
+clears `local_lock` and `nolock` on every NFSv4 mount
+(`nfs_fs_context_validate` in `fs/nfs/fs_context.c`), and NFSv2/3, which
+keep them, are refused for their version first.
+
+Moving between nodes is tested on a two-worker kind cluster
+(`ci/e2e-csi-move.sh`, the f8 workflow's `e2e (CSI move between nodes)`
+job): the steps of [moving](runbooks/moving.md), the old node's late
+commit reaching the old branch through its release scan, the start-branch
+alarm and its acceptance, a second writer of an old name diverged, a
+start class on a `diverged/*` ref refused, and a missing worktree making
+a pod wait.
 
 ## 15. Recovery and undo
 
@@ -3055,6 +3176,8 @@ operator runbooks ([runbooks](README.md#runbooks)):
 | [crashed-sidecar.md](runbooks/crashed-sidecar.md) | A sidecar whose daemon died: automatic recovery by stacking, when to step in, the pod restart (§17.1) |
 | [patch-queue.md](runbooks/patch-queue.md) | Submitting patches (with agentfs or plain git), a blocked queue, replacing or skipping a patch (§12) |
 | [fork-refused.md](runbooks/fork-refused.md) | A fork whose publish is refused for good: each reason, how it shows, retry or abandon (§11.5) |
+| [moving.md](runbooks/moving.md) | Continuing a CSI volume on another node: a new volume started from the old branch (§14.2) |
+| [start-branch-moved.md](runbooks/start-branch-moved.md) | `StartBranchMoved`: taking in or accepting the commits an old branch received after a move (§11.3) |
 
 **The supported path:**
 
@@ -3315,8 +3438,10 @@ one-time migration of Hermes' existing data and the initial import in
 - **`agentfs`, a binary:**
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
     `serve-history` (§14), `restore`, `revert`, `patch` (`submit`,
-    `apply`, `status`), `lfs` (`fetch`, `prune`) and `fork` (`create`,
-    `finish`, `status`, `abandon`, `list`, `deliver`, §11.5); a test
+    `apply`, `status`), `lfs` (`fetch`, `prune`), `fork` (`create`,
+    `finish`, `status`, `abandon`, `list`, `deliver`, §11.5) and `start`
+    (`accept`, §11.3: a started volume accepts a tip of its start branch,
+    clearing the start-branch alarm; no lock); a test
     (`crates/agentfs/src/reference_tests.rs`) checks this list against the
     CLI;
   - `fork finish [--retry] [--timeout D]` finishes once and publishes
@@ -3605,8 +3730,9 @@ one-time migration of Hermes' existing data and the initial import in
 ### 17.2 Layer 2: CSI driver (Rust)
 
 Phase 4 (§14.2). The crate `crates/agentfs-csi` is a library and the
-binary `agentfs-csi --mode controller|node|all`. It depends on
-`agentfs-core` (`init_with`, the state lock, `FrontLease::holders`, name
+binary `agentfs-csi`, one per node (§14.2). It depends on
+`agentfs-core` (`init_with`, `start_from`, `reopen_with`, the release
+decider, `branch_claim`, the state lock, `FrontLease::holders`, name
 validation) and `agentfs-fuse` (only the mount-state probe), never on the
 CLI. Modules:
 
@@ -3655,7 +3781,7 @@ restartable (§14.2). The controller runs no children.
 | Front/service gRPC (2026-10-15) | `tonic` 0.14 (`codegen`, `router`, `server`; never `channel` or TLS), `tonic-prost`, `tonic-health` for `grpc.health.v1`, `prost` 0.14, and `hyper` 1 (`http2` client) with `hyper-util` and `tokio-stream`, on `tokio` (in `agentfs-core`) | The front's client is hyper's HTTP/2 connection over the Unix socket, so a request hyper hands back unsent is known never to have left (§14.1); tonic's `channel` would hide that. No TLS: the socket is node-local. `ci/check-deps.sh` checks the default build still links no ring or rustls |
 | gRPC codegen | `protox` 0.10 and `tonic-prost-build` 0.14 in `build.rs` (both crates) | A pure-Rust protobuf compiler with the well-known types bundled: no `protoc` on build hosts or in the image |
 | CSI spec | `csi.proto` v1.13.0, vendored in `crates/agentfs-csi/proto` | Pinned by copy; updating it is a deliberate change |
-| CSI sidecars | csi-provisioner v6.4.0, csi-attacher v4.13.0, csi-node-driver-registrar v2.18.0, livenessprobe v2.20.0 from `registry.k8s.io/sig-storage` | Pinned by digest in `deploy/csi/kustomization.yaml` |
+| CSI sidecars | csi-provisioner v6.4.0 (`--node-deployment`, in the node plugin pod), csi-node-driver-registrar v2.18.0, livenessprobe v2.20.0 from `registry.k8s.io/sig-storage` | Pinned by digest in `deploy/csi/kustomization.yaml` |
 
 ## 18. Acceptance tests
 
@@ -3778,7 +3904,7 @@ restartable (§14.2). The controller runs no children.
     claim in use; its pushes reach only the fork remote; a Retain fork
     class is denied at admission; with the fork remote blocked, deleting
     the sandbox leaves the PV Released and DeleteVolume UNAVAILABLE across
-    a node-plugin restart; once reachable, the publisher alone publishes
+    a node-plugin restart; once reachable, the release scan alone publishes
     the change and finish refs and the PV goes; for a second fork, a
     pre-receive hook refusing `refs/agentfs/*` makes the publish refused
     and no further finisher starts; that finished fork's directory
@@ -3791,8 +3917,8 @@ restartable (§14.2). The controller runs no children.
     read-only recorder are tested in `fork/tests.rs`; `fork status`,
     `abandon`, `list` (forged change refs skipped), `finish --retry`, the
     read-only commands and submit's early refusal end to end in
-    `cli_fork.rs`; the publisher skipping refused and abandoned forks in
-    `publisher.rs`; the read-only publish in `tests/supervisor.rs`;
+    `cli_fork.rs`; the release scan skipping refused and abandoned forks in
+    `release_scan.rs`; the read-only publish in `tests/supervisor.rs`;
     DeleteVolume after abandon in `tests/grpc.rs`. `fork deliver`
     (`cli_fork_deliver.rs`): the inbox method queues exactly the checked
     change commit in the named volume's inbox, once; the branch method's
@@ -3917,10 +4043,11 @@ over a real socket), `tests/supervisor.rs` (the supervisor with a fake
 launcher and mounter: restarts in the same slot, bind stacking,
 reconcile, ordering) and `crates/agentfs/tests/csi_service.rs` (the
 supervisor driving a real `serve-history`: two pods' committers, a `kill
--9` with a journaled commit, the final commit at unstage); in the
-`csi-sanity` job (`ci/csi-sanity.sh`: csi-test v5.6.0 against
-`agentfs-csi --mode all` with real services and FUSE fronts, then nothing
-left behind); and in the `e2e-csi` job of the `image` workflow
+-9` with a journaled commit, the final commit at unstage; the release
+scan pushing an unstaged worktree with the real `agentfs push` until its
+remote holds it); in the `csi-sanity` job (`ci/csi-sanity.sh`: csi-test
+v5.6.0 against `agentfs-csi` with real services and FUSE fronts, then
+nothing left behind); and in the `e2e-csi` job of the `image` workflow
 (`ci/e2e-csi.sh`, kind, the image just built): the RBAC inventory through
 `kubectl auth can-i`, two restricted pods (uid 10000 and 10001, one
 fsGroup) on one claim with distinct committers, trailers and uid authors
@@ -3950,10 +4077,10 @@ run in `crates/agentfs/tests/cli_identity.rs` (every variable, the
 fallbacks, refusals, fronts, a template change across a service
 restart), through a mount and a front in the `fuse` job, and with custom
 templates checked exactly in `e2e-kind` and `e2e-csi`.
-Not automated yet: the CSI driver on hardened node images (Talos) and
-across node reboots, and a volume moving between two nodes of a cluster
-on a shared basePath (the NFS e2e moves one between two node plugins on
-two clients of one export, driven over gRPC without Kubernetes).
+A volume continued on another node of a two-worker kind cluster, by a
+new volume started from its branch, runs in the f8 workflow
+(`ci/e2e-csi-move.sh`, §14.2). Not automated yet: the CSI driver on
+hardened node images (Talos) and across node reboots.
 
 The `fuse` job also runs the README's from-source quick start as
 written, as root (`ci/readme-quickstart.sh`): its remote log after
@@ -4060,18 +4187,18 @@ runner.
 | Repair origins (2026-10-13) | A repair keeps the pod that failed to record it; the service trusts an origin a front names only on `sweep` records whose committer renders, and journals the front's own otherwise (§3.5, §14.1) |
 | Protocol evolution (2026-10-13) | Additions are optional fields and new variants only, and the service lists what it supports in `Welcome.features` (`stamps`, `repair_origin`, `listen`, `still_last`, `move`); the version changes only with the transport (1 to 2 with gRPC, 2026-10-15) (§14.1) |
 | Locks across fronts | POSIX and BSD locks are per FUSE mount, so not shared between pods; a lock-coordinated database (SQLite, the `fsync` class) must be written from one pod (§14) |
-| CSI driver shape | One binary, `agentfs-csi` (`--mode` controller, node or all), in the agentfs image; tonic over a Unix socket, the spec compiled without `protoc`; the node plugin spawns the `agentfs` binary for the service and each front instead of linking FUSE in-process (§14.2, §17.2) |
-| CSI volumes | PersistentVolumes only (no inline ephemeral volumes); `<basePath>/<pv>/{backing,state,csi.json}`; basePath one filesystem seen by the controller and every node; size recorded, not enforced (§14.2) |
-| One node per volume (2026-10-15) | A volume is used from one node at a time. Several pods on that node share it, each committing as itself: `ReadWriteOnce` (`SINGLE_NODE_MULTI_WRITER`) or `ReadWriteOncePod` (`SINGLE_NODE_SINGLE_WRITER`); `SINGLE_NODE_READER_ONLY` is a read-only mount. Every multi-node access mode is refused with one message naming this row, at CreateVolume, ValidateVolumeCapabilities, ControllerPublish, NodeStage and NodePublish, and a `csi.json` the driver does not understand is refused. With a shared basePath (NFS) a volume moves to another node after it is detached, never onto two at once. Pods on other nodes read its history from the remote it pushes to. The owner, asked whether sandboxes write to the directory or only read it, and whether they can run on Hermes's node: "Write, same node is fine". Asked whether volumes still move between nodes on shared NFS (2a) or stay on one node's disk (2b): "2a". On cross-node support he had said: "It is acceptable for the final answer to be that RWX is not supported in some or all cases. I want to do the diligence to know for sure, but if the complexity is not worth the value, then we can drop it" (all 2026-10-15) (§14.2, §19.2 item 2) |
-| Mount options on shared storage (2026-10-15) | The state lock and `agentfs-csi`'s start refuse a state area or basePath on NFS older than 4.1, mounted `nolock`, or with `local_lock` other than `none` (read from `/proc/self/mountinfo`), since the state lock is the only guard against a second history service. Other shared filesystems are neither checked nor tested. This is a design choice, not an owner statement (§2.3, §14.2) |
+| CSI driver shape | One binary, `agentfs-csi`, in the agentfs image, run by one DaemonSet on every node beside csi-provisioner in `--node-deployment` mode: every node plugin serves the Identity, Controller and Node services, answers its node's topology (`topology.agentfs.mcurcio.github.io/node`), and provisions and deletes the worktrees on its own disk; classes use `WaitForFirstConsumer`, `attachRequired` is `false`, and there is no controller Deployment, attacher or `--mode` (superseded 2026-10-16 by F8: it was `--mode` controller, node or all, with a controller Deployment). The owner, asked whether a provisioner runs beside the node plugin on every node (F8 gate, Q3): "a" (2026-10-16, R8). tonic over a Unix socket, the spec compiled without `protoc`; the node plugin spawns the `agentfs` binary for the service, each front and the release scan instead of linking FUSE in-process (§14.2, §17.2) |
+| CSI volumes | PersistentVolumes only (no inline ephemeral volumes); a worktree `<basePath>/<pv>/{backing,state,csi.json}` on the disk of the node that created it, for good; basePath is any local directory on each node (a hostPath, ideally a disk of its own), a network filesystem refused at start; size recorded, not enforced (§14.2). Superseded 2026-10-16 by F8: it was one basePath filesystem seen by the controller and every node. The owner (R1): "use local disk for working code and an optional backend storage_class (NFS or iscsi or other) for persisting the changes and storing branches and inboxes and such"; on where a node keeps volumes: “B seems like the most straightforward "kubernetes way"”, then "go" (2026-10-16) |
+| One node per volume (2026-10-15) | A volume is used from one node, for good. Several pods on that node share it, each committing as itself: `ReadWriteOnce` (`SINGLE_NODE_MULTI_WRITER`) or `ReadWriteOncePod` (`SINGLE_NODE_SINGLE_WRITER`); `SINGLE_NODE_READER_ONLY` is a read-only mount. Every multi-node access mode is refused with one message naming this row, at CreateVolume, ValidateVolumeCapabilities, NodeStage and NodePublish, and a `csi.json` the driver does not understand is refused. A volume never moves: its worktree stays on its node, and continuing elsewhere is a new volume started from its branch (superseded 2026-10-16 by F8 "One branch per worktree", which replaced the "2a" answer below: a volume moved over a shared NFS basePath once detached). Pods on other nodes read its history from the remote it pushes to. The owner, asked whether sandboxes write to the directory or only read it, and whether they can run on Hermes's node: "Write, same node is fine". Asked whether volumes still move between nodes on shared NFS (2a) or stay on one node's disk (2b): "2a". On cross-node support he had said: "It is acceptable for the final answer to be that RWX is not supported in some or all cases. I want to do the diligence to know for sure, but if the complexity is not worth the value, then we can drop it" (all 2026-10-15) (§14.2, §19.2 item 2) |
+| Mount options on shared storage (2026-10-15) | The state lock refuses a CLI or sidecar state area on NFS older than 4.1, mounted `nolock`, or with `local_lock` other than `none` (read from `/proc/self/mountinfo`), since the state lock is the only guard against a second writer there. `agentfs-csi` instead refuses a base path on any network filesystem (nfs, nfs4, cifs, smb3, smbfs, ceph, glusterfs, lustre, gpfs, afs), naming its type (superseded 2026-10-16 by F8 R1, "use local disk for working code": it applied the NFS 4.1 check to a shared basePath). Other shared filesystems are neither checked nor tested for state areas. A design choice, not an owner statement (§2.3, §14.2) |
 | NFS silly renames (2026-10-15) | Silly-rename names (`.nfs` and 24 hex digits) are never recorded (§4) |
-| Node plugin upgrades (2026-10-15, default, owner to confirm) | Drain a node: cordon, evict that node's agentfs pods, delete the plugin pod, wait until it is Ready, uncordon; the DaemonSet is `OnDelete`. A live FUSE hand-over is not built (§14.2, [csi.md](csi.md#9-operations)) |
+| Node plugin upgrades (2026-10-15, default, owner to confirm) | Drain a node: cordon, evict that node's agentfs pods, delete the plugin pod, wait until it is Ready, uncordon; the DaemonSet is `OnDelete`. A live FUSE hand-over is not built. Since F8 (2026-10-16) the evicted pods wait for their node (their PVs are pinned to it) instead of moving (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI parameters | A StorageClass or PV names a `profile` whose config fragment, rules and credentials live in the driver's namespace (a ConfigMap without hash suffix, a Secret), mounted into its pods; no Secret RBAC; pod authors choose only the class (§14.2) |
 | CSI identity | `podInfoOnMount`: each pod's front commits under the pod's name, namespace and uid (§9, §14.2) |
 | CSI recovery | Crashed fronts and services restarted with backoff (1 s to 30 s); a front in its predecessor's slot (`--history-slot`), its mount bind-stacked over the stale target, made shared so `HostToContainer` containers see it; reconcile from node records after a plugin restart; DaemonSet `OnDelete` (§14.2) |
-| CSI RBAC | csi-provisioner and csi-attacher's minimal ClusterRoles plus leader-election leases; no Secrets, pods or snapshots; the node plugin has no API access and no token (§14.2, [csi.md](csi.md#10-security)) |
-| CSI volume names | The default `volumeName` is `{pvcNamespace}.{pvcName}.{pvName}`: unique per volume, so a claim deleted and created again starts a new branch instead of a root commit on the old one, which every push would find diverged (§11.3, §11.4); a template without `{pvName}` is the operator's choice and documented as unsafe. A static PV's `volumeName` (or `volume`) is literal, and its unknown attributes are refused (§14.2, [csi.md](csi.md#5-parameters)) |
-| CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2): NodeUnstage follows the last pod, and nothing else would push that commit. `onDelete: delete` refuses DeleteVolume while a remote lacks commits of the branch; the operator pushes by hand or removes the directory (§14.2, [csi.md](csi.md#9-operations)) |
+| CSI RBAC | csi-provisioner's minimal ClusterRole (PVs, PVCs, StorageClasses, Events, CSINodes, Nodes), bound to the node plugin's account, whose token is projected into that sidecar alone; no Secrets, pods or snapshots; the `agentfs-csi` container holds no token. Superseded 2026-10-16 by F8 R8: it was csi-provisioner and csi-attacher in a controller Deployment with leader-election leases, and a node plugin with no API access. Each node's provisioner now holds PV and claim rights cluster-wide, the stated cost of R8 (§14.2, [csi.md](csi.md#10-security)) |
+| CSI volume names | Every class's `volumeName` must contain `{pvName}` (`INVALID_ARGUMENT` otherwise; superseded 2026-10-16 by F8 rule 1: a template without it was the operator's choice, documented as unsafe), and there is no `branch` parameter or attribute: each claim is a worktree with its own branch, `agentfs/<volume>`, named once in its identity. The default is `{pvcNamespace}.{pvcName}.{pvName}`. A re-made claim is a new volume: the owner, on "re-made claim = new volume (a)": "Go" (2026-10-16, R3). A static PV's `volumeName` (or `volume`) is literal, its unknown attributes are refused, and it is adopted only over an existing worktree of that volume (§14.2, [csi.md](csi.md#5-parameters)) |
+| CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2); NodeUnstage follows the last pod. After it, the node plugin's release scan pushes every unstaged worktree until a push exits 0 at its head, raising `PushFailed` at each failure, and DeleteVolume never pushes (superseded 2026-10-17 by F8 "Release decider": nothing else pushed an unstaged volume, and `onDelete: delete` refused DeleteVolume while a remote lacked commits) (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it, and runs with `hostPID: true` so its fronts can read callers' groups, §6); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
 | CSI error codes | Unknown or invalid volumes are a success for DeleteVolume, ControllerUnpublish, NodeUnpublish and NodeUnstage (idempotent teardown the kubelet can always finish); NodeStage waits at most `--stage-wait` and answers `UNAVAILABLE` while the service starts; `SINGLE_NODE_READER_ONLY` is accepted as a read-only mount; checked by csi-sanity (§14.2) |
 | Crash testing (2026-10-13) | Failpoints in the durable path (`agentfs_core::failpoints`), compiled only with the `failpoints` cargo feature (release builds have none; such a build says `+failpoints` in `--version` and warns when `AGENTFS_FAILPOINTS` is set), configured by `AGENTFS_FAILPOINTS` (`name=kill\|error\|panic\|sleep(ms)[@n]`); three harness tiers with one oracle, run in the `crash` job; power loss by `dm-log-writes` and `replay-log` in the `power-loss` workflow (§18 test 3) |
@@ -4082,13 +4209,13 @@ runner.
 | Fork delivery (2026-10-15) | The CSI driver only publishes; a receiver lands a published change in its source with `agentfs patch submit`. The library and the CLI also deliver a change, by four built-in methods: inbox, branch, command and webhook. The owner: "2 a for CSI and b for the library". Built: the CSI side (§14.2), and the library's methods with `agentfs fork deliver` (§11.5 "Delivery", forked volumes unit 3) |
 | Fork content (2026-10-15) | Everything agentfs itself does with a fork's content treats it as potentially hostile: names, paths, sizes, symlinks and gitlinks are checked, and nothing is run. agentfs adds no CI filtering: forks publish where users' own CI can act on them (§1.1). The owner: "3 potentially hostile, but don't limit CI capabilities that users could create". Built for create (base's tree through the confined writer), publish (create-only refs), a finished fork (read-only: no record, and a read-only CSI publish) and `fork list` (every published change checked against its finish commit, §11.5) |
 | Fork remote (2026-10-16) | Forks publish to the source's own remote by default, with no setup (the remote its patch queue uses, §12: a design choice). An explicit fork-remote setting may name another remote, which is then never one of the source's push remotes, never sets its limits and never becomes its patch remote (a design choice, design rule 1). The stated cost: wherever that repository's CI may write, a sandbox's CI file can write the source's inbox, so the gate is only as strong as that repository's CI write permissions. The owner, answering the design gate's question on where forks publish: "b". Built (§11.5) |
-| Fork hostile residual (2026-10-16) | Accepted and stated, with no hardening work now: a sandbox's file calls are served by the privileged node plugin, which holds every profile's credentials, so a bug in that front would expose node root and every profile's credentials; and volume size is not enforced on the shared base path (§14.2), so a sandbox can fill it for every volume there. The owner, answering the design gate's question on the hostile residual: "a" |
+| Fork hostile residual (2026-10-16) | Accepted and stated, with no hardening work now: a sandbox's file calls are served by the privileged node plugin, which holds every profile's credentials, so a bug in that front would expose node root and every profile's credentials; and volume size is not enforced on the node's base path (§14.2), so a sandbox can fill it for every volume on that node. The owner, answering the design gate's question on the hostile residual: "a" |
 | Fork design rules (2026-10-16) | (1) A fork's push target is fixed at create: `agentfs/<fork>` on the fork remote, never the source's branch; every other setting is read from the source's settings files at each open, and settings that cannot be read stop the fork opening. (2) A fork finishes once, writing one finish record, and the finisher retries publishing until the fork remote holds the change; the fork is not deleted until it is published, or until an operator abandons it on record. (3) agentfs publishes and the receiver gates: a receiver lands the exact change commit it reviewed, and the source applies a given change at most once. Approved with the design gate's answers, with no notes (2026-10-16). Built (§11.5) |
 | Fork scope (2026-10-16) | Four units, tracer first, docs with each: (1) the tracer: fork identity and fork remote; create, finish and publish; CSI cloning of a claim, a fork StorageClass with `fork: "true"` and reclaim policy Delete, and its admission check; DeleteVolume waiting until the fork is published; the source applying a given change at most once; (2) refused and abandoned forks, settings that fail closed, finished forks read-only, `fork status` and `fork list`; (3) library delivery: the delivery contract, its four methods, `fork deliver`; (4) hidden refs, the history-rewrite runbook covering forks, telemetry, the runbook for refused publishes. The owner, answering the design gate's question on scope: "a" (build units 1 to 4 as outlined). All four are built (§11.5) |
-| Content sources (2026-10-16) | Reverses §14.2's "nothing clones": CreateVolume clones a claim's `dataSource` claim when the StorageClass is a fork class (`fork: "true"`), copying the source's history up to its latest commit and writing that commit's tree locally, with no credentials. Any other content source, and every snapshot, stays refused. Follows from "Forked volumes" and "Fork scope". Built (§14.2) |
+| Content sources (2026-10-16) | Reverses §14.2's "nothing clones": CreateVolume clones a claim's `dataSource` claim when the StorageClass is a fork class (`fork: "true"`), copying the source's history up to its latest commit and writing that commit's tree locally, with no credentials; since F8 (2026-10-16) only from a source on the same node. Any other content source, and every snapshot, stays refused. Follows from "Forked volumes" and "Fork scope". Built (§14.2). A start class (`startFrom`, F8, 2026-10-17, "Start points are branches") also fills a new worktree, from a pinned commit fetched once from a remote: CreateVolume's one fetch |
 | Fork remote flag (2026-10-16) | The explicit fork-remote setting of "Fork remote" is `remote.<name>.agentfsForkRemote = true` on one remote section of the source's settings: that section is only for forks, never one of the source's push remotes, never its patch remote and never a source of its record-time limits; with none, forks push to the source's patch remote. Two flagged sections, or an invalid one, leave no fork remote, and forks are refused rather than fall back. A design choice (forked volumes unit 1), not the owner's words |
 | Patch duplicates (2026-10-16) | The source applies a given change at most once ("Fork design rules" 3) by a rule for every producer, keyed by the patch commit's id: a queued patch commit that an earlier inbox number already applied is consumed with a marker commit and `PatchDuplicate`, never merged again (§12). Cost: a producer can no longer resubmit the identical commit to apply it again (it must make a new commit), and a replaced or replayed copy of a change has another id and is not caught. A design choice (forked volumes unit 1), not the owner's words |
-| Fork onDelete (2026-10-16) | A fork class's `onDelete` defaults to `delete`: publishing is a fork's gate before deletion, so the unpushed-branch check of ordinary volumes does not apply to it. A design choice (forked volumes unit 1), not the owner's words |
+| Fork onDelete (2026-10-16) | A fork class's `onDelete` defaults to `delete`: publishing is a fork's gate before deletion, so the release decider weighs a fork's state, not its remotes. A design choice (forked volumes unit 1), not the owner's words |
 | Published (2026-10-16) | A fork is published when the finisher has seen its fork remote hold `refs/agentfs/<fork>/change` and `refs/agentfs/<fork>/finish` at exactly their ids after pushing them create-only; the fork's branch is pushed first, and a branch a forge moved is §11.3 divergence (saved and alarmed), which never blocks publishing. A design choice (forked volumes unit 1), not the owner's words |
 | Refused publish (2026-10-16) | One function, `fork::finish::refused_reason`, decides what is permanent: another writer's create-only ref (`another_writer`), the create-only push refused by the remote (`rejected`), one commit over `agentfsMaxPushSize` or one LFS object over `agentfsMaxLfsObjectSize` (`too_large`), and a finish naming a remote that is no longer the fork's fork remote (`remote_gone`); everything else stays pending and is retried. A refusal is recorded in `meta/fork.json`, raises `ForkRefused` once, is never retried by the node plugin, and is cleared by `agentfs fork finish --retry`. Cost: a branch push refused by a hook stays pending, since a volume's own pushes treat it so (§11.3). A design choice (forked volumes unit 2), not the owner's words |
 | Abandon (2026-10-16) | `agentfs fork abandon --reason TEXT`, under the fork's state lock, records the reason, time, uid and state in `meta/fork.json`, in any state but published; then no finisher pushes the fork (each attempt reads the mark first) and DeleteVolume applies `onDelete`. Not covered: a push already running finishes (libgit2 cannot cancel it), and a fork mounted again pushes its branch on its interval as any volume does. The node plugin's finisher runs `--timeout 300s`, so the lock is free between scans for an operator's `--wait-lock`. A design choice (forked volumes unit 2, "Fork design rules" 2), not the owner's words |
@@ -4104,6 +4231,12 @@ runner.
 | Alert volume label (2026-10-16) | The example rules join on `job`, `instance` and `agentfs_volume`, and deployment.md requires promoting `agentfs.volume` under the CSI driver, where every volume on a node reports the node plugin's pod as `instance` (found in the review of F9 to F11). Chosen over a distinct `service.instance.id` per history service, which would change what `instance` means (the pod) for every consumer. Cost: a Prometheus that does not promote it merges a node's volumes' series, which no rule can detect; a CLI command run in the sidecar shares the daemon's series for its run. A design choice, not the owner's words |
 | Docker (2026-10-16) | Docker support is examples of the container pattern (§17.1 "Docker"): `docker run` and Compose, one agentfs container per volume with `/dev/fuse`, `CAP_SYS_ADMIN` and AppArmor unconfined rather than `--privileged`, a host directory on a shared mount, and workloads bound to it read-only and `rslave` with writable submounts; each example runs in the `docker` workflow. A Docker managed volume plugin was evaluated and not built: it needs its own long-running service for Docker's volume plugin API, the per-volume daemon supervision the CSI node plugin already has (duplicated, or factored out of `agentfs-csi` first), and a `docker plugin push` release path, and one plugin process would hold every volume's mount ([docker.md](docker.md#7-why-there-is-no-docker-volume-plugin)). Cost: no `docker volume create -d agentfs`, and no Docker Desktop, which cannot propagate mounts to the host. Volumes with no remote use what agentfs allows today (no `[remote]` section); a declared local-only mode is F8's. The ask, from the milestone brief: "examples of how to use agentfs as a docker volume", with "a Docker volume plugin ... implement it if it is a reasonable size, otherwise document why not". The size judgement is a design choice, not the owner's words |
 | Helm charts (2026-10-16) | Milestone F9's brief asked for Helm support. `charts/agentfs-csi` (application) installs the driver and `charts/agentfs-sidecar` (library) gives a workload's own chart the phase 1 sidecar's containers, volumes and objects. `deploy/` stays the kustomize source; CI checks that the charts render the same objects, ignoring only Helm's labels, `checksum/` annotations, the release Namespace and kustomize's hash suffix. The driver is one per cluster with fixed object names; the chart does not create its namespace. Defaults: no profile and no StorageClass, credentials from `existingSecret` or an empty chart Secret, StorageClass `parameters` passed through as written, and the sidecar library refuses to render without an image tag or digest; `alerts.enabled` (off by default) installs `deploy/alerts`' rules as a PrometheusRule, read from that one file. Published to `oci://ghcr.io/mcurcio/charts` from main as `<version>-main.<run>` and from `vX.Y.Z` tags as `X.Y.Z`, the CSI chart's appVersion the commit. Design choices, not the owner's words (docs/helm.md) |
+| One branch per worktree (2026-10-16) | A worktree (a volume's files and its branch on one node; pods mount and may share one) writes only its own branch `agentfs/<volume>`, for good: it creates the branch or fast-forwards it, decided from the remote's old value in the push's own negotiation (`push::claim`, F8 rule 2), and a branch another writer moved is saved and alarmed as a divergence, never overwritten (§11.3). Continuing elsewhere is a new volume started from the old branch (a start class, §14.2); which branch is current is the operator's choice, never fenced. Proposed after six design stops and accepted: the owner, on "one branch per worktree, for good" (moving = a new volume started from the old branch; operator picks which branch is current): "Go" (2026-10-16, R2) |
+| Remotes on any storage (2026-10-16) | Worktrees are node-local, and what outlives a node is an ordinary git remote, which may live on a claim of any StorageClass, NFS 4.0 and iSCSI included. The owner: "my NFS server doesnt support 4.1 so I need a solution that works with NFS 4 or iscsi" (2026-10-16), and on sandboxes "Write, same node is fine" (2026-10-15) (R6). A fork is made on its source's node (§14.2) |
+| Start-branch alarm (2026-10-16) | A started volume lists its start branch at every push to its start remote and raises `StartBranchMoved` while it holds commits the volume has not taken in or accepted (`push::start_branch_moved`); the new volume raises it, never the old node, so an old node's late commits, pushed to the old branch by its release scan after a move, are saved and alarmed, never overwritten (§11.3). The owner chose the option whose text said the old node's "unpushed changes saved and alarmed, never overwritten": "a" (F8 reframe Q1), and later "go" on the alarm "raised by the new volume when its start branch moves past the pinned start commit" (both 2026-10-16, R9) |
+| Release decider (2026-10-17) | One pure decider, `release::decide`, answers DeleteVolume: delete (every declared remote holds the head, or no history, and `onDelete: delete`), keep (`onDelete: retain` once every remote holds it, or a profile with no remote declared) or wait (`UNAVAILABLE`: a remote lacks the head, cannot be listed or diverged; every remote section invalid; a fork not published). Its facts are gathered by DeleteVolume, one listing per remote (`RemotePusher::branch_claim`), never the push record. Every class of the driver has `reclaimPolicy: Delete`, enforced by the chart's admission policy `agentfs-class` (widened from fork classes), so DeleteVolume always runs; DeleteVolume never pushes; the node plugin's release scan (the fork publisher, generalised) pushes every unstaged worktree until held, raising `PushFailed` at each failure; CreateVolume does not refuse `onDelete: delete` on a profile without remotes (the decider keeps such a worktree). A design choice (F8 S1, "D1"), not the owner's words |
+| Accepting a start-branch tip (2026-10-17) | The start-branch alarm is cleared by `agentfs start accept --tip <oid>` on the new volume: it fetches the start branch, checks `<oid>` is on it and creates `refs/agentfs/<volume>/accepted/<oid>` (never moved, pushed create-only with the branch); the alarm then stops for every commit the tip reaches and comes back if the old branch moves again. "Deleting the old branch clears it" was dropped. A design choice (F8 S1, "D2"), not the owner's words |
+| Start points are branches (2026-10-17) | A `startFrom` names a branch, never a `refs/...` ref: a `diverged/*` ref is refused at parse (`BadStartPoint::NotABranch`, CreateVolume `INVALID_ARGUMENT`), since it never moves and nothing could alarm on it. The release decider answers wait for a diverged remote, so a diverged worktree is never removed and its release-scan pushes keep alarming. A design choice (F8 S1, "D3"), not the owner's words |
 
 ### 19.2 Open questions
 
@@ -4119,7 +4252,13 @@ runner.
    distributed locking"; client-go's `leaderelection` says it gives no
    fencing); the redesign that would fence in the storage did not
    converge; and no consumer needs it (the owner:
-   "Write, same node is fine"). Upgrading the node plugin drains the node (§14.2). The round
+   "Write, same node is fine"). *Closed further (2026-10-16, F8)*: a
+   volume does not move between nodes either. Each worktree stays on its
+   node's disk with its own branch, for good, and continuing elsewhere is
+   a new volume started from the old branch (§19.1, "One branch per
+   worktree"), so no fence is needed: two worktrees never share a branch,
+   and the shared basePath and its forced-detach residual are gone.
+   Upgrading the node plugin drains the node (§14.2). The round
    trip per boundary over gRPC is measured on one node (§14.1, CI run
    38819854746, commit 2526397, `ubuntu-24.04`, ext4): the
    `grpc.health.v1` round trip is 148 µs (passthrough `auto` job) and

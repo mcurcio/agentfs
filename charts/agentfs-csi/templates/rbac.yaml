@@ -1,14 +1,7 @@
 # The driver's whole RBAC inventory (design §14.2, docs/csi.md
-# "Security"). No rule grants secrets, pods or snapshots.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: agentfs-csi-controller
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "agentfs-csi.labels" . | nindent 4 }}
----
-# The node plugin never talks to the API server: no bindings, no token.
+# "Security"). No rule grants secrets, pods or snapshots. The node
+# plugin's account is used by csi-provisioner (`--node-deployment`) alone:
+# its token is projected into that sidecar only.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -45,67 +38,16 @@ rules:
     verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: agentfs-csi-attacher
-  labels:
-    {{- include "agentfs-csi.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: [persistentvolumes]
-    verbs: [get, list, watch, patch]
-  - apiGroups: [storage.k8s.io]
-    resources: [csinodes]
-    verbs: [get, list, watch]
-  - apiGroups: [storage.k8s.io]
-    resources: [volumeattachments]
-    verbs: [get, list, watch, patch]
-  - apiGroups: [storage.k8s.io]
-    resources: [volumeattachments/status]
-    verbs: [patch]
-{{- range $role := list "provisioner" "attacher" }}
----
-apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: agentfs-csi-{{ $role }}
-  labels:
-    {{- include "agentfs-csi.labels" $ | nindent 4 }}
-subjects:
-  - kind: ServiceAccount
-    name: agentfs-csi-controller
-    namespace: {{ $.Release.Namespace }}
-roleRef:
-  kind: ClusterRole
-  name: agentfs-csi-{{ $role }}
-  apiGroup: rbac.authorization.k8s.io
-{{- end }}
----
-# Leader election of the two sidecars, in the driver's namespace only.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: agentfs-csi-leader-election
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "agentfs-csi.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [coordination.k8s.io]
-    resources: [leases]
-    verbs: [get, watch, list, delete, update, create]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: agentfs-csi-leader-election
-  namespace: {{ .Release.Namespace }}
+  name: agentfs-csi-provisioner
   labels:
     {{- include "agentfs-csi.labels" . | nindent 4 }}
 subjects:
   - kind: ServiceAccount
-    name: agentfs-csi-controller
+    name: agentfs-csi-node
     namespace: {{ .Release.Namespace }}
 roleRef:
-  kind: Role
-  name: agentfs-csi-leader-election
+  kind: ClusterRole
+  name: agentfs-csi-provisioner
   apiGroup: rbac.authorization.k8s.io

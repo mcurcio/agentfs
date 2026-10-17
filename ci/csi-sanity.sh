@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# csi-sanity (kubernetes-csi/csi-test) against `agentfs-csi --mode all`
-# (design §14.2, §18 test 16): every CSI call of the controller and node
-# services, with real history services and FUSE fronts, checked for the
-# spec's error codes, idempotency and cleanup. Then checks that no agentfs
-# mount is left behind.
+# csi-sanity (kubernetes-csi/csi-test) against `agentfs-csi`, which serves
+# the identity, controller and node services of one node (design §14.2,
+# §18 test 16): every CSI call, with real history services and FUSE
+# fronts, checked for the spec's error codes, idempotency, topology and
+# cleanup. Then checks that no agentfs mount is left behind.
 #
 # Needs Linux with /dev/fuse, fuse3, passwordless sudo and csi-sanity on
 # PATH (`go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0`);
@@ -51,8 +51,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-step "start agentfs-csi --mode all"
-sudo "$AGENTFS_CSI_BIN" --mode all \
+step "start agentfs-csi"
+sudo "$AGENTFS_CSI_BIN" \
   --endpoint "unix://$SOCK" \
   --node-id sanity \
   --base-path "$W/base" \

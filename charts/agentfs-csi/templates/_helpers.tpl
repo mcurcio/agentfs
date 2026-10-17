@@ -40,17 +40,7 @@ image: {{ include "agentfs-csi.image" (dict "image" .image "tag" "") }}
 {{- .Values.credentials.existingSecret | default "agentfs-csi-credentials" }}
 {{- end }}
 
-{{/* The basePath volume: the operator's source, or a hostPath. */}}
-{{- define "agentfs-csi.baseVolume" -}}
-- name: base
-{{- if .Values.basePath.volume }}
-{{- toYaml .Values.basePath.volume | nindent 2 }}
-{{- else }}
-  hostPath: { path: {{ .Values.basePath.path }}, type: DirectoryOrCreate }
-{{- end }}
-{{- end }}
-
-{{/* The token of the controller's sidecars (never mounted into agentfs-csi). */}}
+{{/* The token of csi-provisioner (never mounted into agentfs-csi). */}}
 {{- define "agentfs-csi.apiTokenVolume" -}}
 - name: api-token
   projected:

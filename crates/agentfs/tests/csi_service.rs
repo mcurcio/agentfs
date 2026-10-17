@@ -4,7 +4,9 @@
 //! same path as a front mount) commit under their own pods' identities,
 //! a `kill -9` of the service is recovered by the supervisor with the
 //! journaled record committed under its original committer, and
-//! NodeUnstage makes the final commit. No FUSE, no root.
+//! NodeUnstage makes the final commit; and the release scan pushes an
+//! unstaged worktree with the real `agentfs push` until a remote holds it
+//! (F8 D1). No FUSE, no root.
 
 use std::collections::HashMap;
 use std::fs;
@@ -135,11 +137,11 @@ async fn the_supervisor_runs_and_recovers_a_real_history_service() {
     let params = VolumeParams {
         profile: "test".into(),
         volume: "demo".into(),
-        branch: None,
         on_delete: OnDelete::Delete,
+        start_from: None,
         workload_mounts: Vec::new(),
     };
-    agentfs_csi::volume::create(&layout, "pvc-1", &params, 0, false).unwrap();
+    agentfs_csi::volume::create(&layout, "pvc-1", &params, 0).unwrap();
 
     let mut cfg = NodeConfig::new("node-1", layout.clone());
     cfg.plugin = PluginIdentity {
@@ -227,4 +229,97 @@ async fn the_supervisor_runs_and_recovers_a_real_history_service() {
         .refname_to_id("refs/heads/agentfs/demo")
         .ok();
     assert_eq!(pushed, Some(local), "the final push");
+}
+
+/// F8 D1: the node plugin's release scan pushes a worktree no pod stages
+/// with the real `agentfs push`, and holds it only once that exits 0 (the
+/// load-bearing exit status: 0 only when every remote succeeded). A remote
+/// that cannot be reached is pushed again after a backoff; once it is
+/// back, its branch holds the head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_release_scan_pushes_an_unstaged_worktree_until_a_remote_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout {
+        base: dir.path().join("base"),
+        node_state: dir.path().join("node"),
+        mount_dir: dir.path().join("mounts"),
+        profiles: dir.path().join("profiles"),
+    };
+    fs::create_dir_all(&layout.profiles).unwrap();
+    let remote = dir.path().join("remote.git");
+    fs::write(
+        layout.profiles.join("test.config"),
+        format!("[remote \"origin\"]\n\turl = {}\n", remote.display()),
+    )
+    .unwrap();
+    let params = VolumeParams {
+        profile: "test".into(),
+        volume: "late".into(),
+        on_delete: OnDelete::Delete,
+        start_from: None,
+        workload_mounts: Vec::new(),
+    };
+    agentfs_csi::volume::create(&layout, "pvc-2", &params, 0).unwrap();
+    // The old node's late commit: in its history, on no remote.
+    let repo = git2::Repository::open_bare(layout.state("pvc-2").join("git")).unwrap();
+    let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+    let tree = repo.treebuilder(None).unwrap().write().unwrap();
+    let head = repo
+        .commit(
+            Some("refs/heads/agentfs/late"),
+            &sig,
+            &sig,
+            "late\n\nAgentfs-Seq: 1\nAgentfs-Trigger: close\n",
+            &repo.find_tree(tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+
+    let scan = agentfs_csi::release_scan::ReleaseScan::new(
+        Arc::new(layout.clone()),
+        Arc::new(AgentfsLauncher {
+            bin: env!("CARGO_BIN_EXE_agentfs").into(),
+        }),
+        PluginIdentity {
+            namespace: "agentfs-csi".into(),
+            pod: "agentfs-csi-node-test".into(),
+            node: "node-1".into(),
+        },
+        Duration::from_millis(300),
+        Backoff {
+            initial: Duration::from_millis(300),
+            max: Duration::from_secs(1),
+            reset_after: Duration::from_secs(60),
+        },
+    );
+    assert_eq!(scan.scan().await.pushing, ["pvc-2"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let report = scan.scan().await;
+        if !report.backing_off.is_empty() {
+            break;
+        }
+        assert!(report.held.is_empty(), "held without a remote: {report:?}");
+        assert!(
+            Instant::now() < deadline,
+            "the failing push never backed off"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The remote is back: the next push holds the head.
+    git2::Repository::init_bare(&remote).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let report = scan.scan().await;
+        if report.held == ["pvc-2"] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never held: {report:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let pushed = git2::Repository::open_bare(&remote)
+        .unwrap()
+        .refname_to_id("refs/heads/agentfs/late")
+        .ok();
+    assert_eq!(pushed, Some(head), "the late commit reached its own branch");
 }
