@@ -61,8 +61,14 @@ None of these stopped the slice; each was resolved as below and is reported with
 5. The release scan's `agentfs push` holds the state lock for a moment; a NodeStage then
    made `serve-history` exit 75 (`FAILED_PRECONDITION`, kubelet retry). The service now
    starts with `--wait-lock 30s` (`launcher::SERVICE_LOCK_WAIT`). Not in the frozen page.
-6. `ReleaseScan::wake` also forgets which heads were held, so a DeleteVolume that found a
-   remote lacking a head the scan believed pushed is pushed once more. Not in the frozen
-   page; costs one listing per unstaged worktree per wake.
+6. `ReleaseScan::wake` only wakes: a head a push exited 0 at stays held until the plugin
+   restarts, so a remote that later loses it (its branch deleted by hand) waits for a
+   restart of the plugin before DeleteVolume can complete. Clearing it at each wake would
+   re-push every unstaged worktree at every DeleteVolume retry.
 7. With `--mode` gone, `IdentityService::new()` takes no argument and `server::serve`
    takes the controller and node services unconditionally (both unfrozen).
+8. CSI, DeleteVolume of a fork not yet published: answered `UNAVAILABLE` before the state
+   lock (the finisher holds it while it publishes), through `release::decide` with the
+   fork's state, as the code before F8 did; under the lock only for a published or
+   abandoned fork. The frozen page's error table puts "its state lock is held" at
+   `FAILED_PRECONDITION` without this exception; the forks e2e (step 4) found it.

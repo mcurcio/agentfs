@@ -246,20 +246,10 @@ impl ReleaseScan {
         }
     }
 
-    /// Runs a scan now (DeleteVolume answering Wait calls it).
-    ///
-    /// It also forgets which heads were held: DeleteVolume found a remote
-    /// that lacks one, so every unstaged worktree is pushed once more
-    /// (failed ones keep their backoff).
+    /// Runs a scan now (DeleteVolume answering Wait calls it). What was
+    /// held stays held, and what backs off keeps its delay: a wake starts
+    /// what is due, such as a fork's finisher, sooner.
     pub fn wake(&self) {
-        for slot in self
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values_mut()
-        {
-            slot.held_at = None;
-        }
         self.wake.notify_one();
     }
 }
@@ -691,12 +681,13 @@ mod tests {
         );
         commit(&layout, "retained");
         assert_eq!(scan.scan().await.pushing, ["retained"]);
-        // wake() forgets what was held: everything is pushed once more.
+        // A wake keeps what is held: nothing is pushed twice at a head.
         fake.exit(5, 0);
         assert!(scan.scan().await.held.contains(&"retained".to_owned()));
         scan.wake();
         let report = scan.scan().await;
-        assert_eq!(report.pushing, ["fork-b", "retained"], "{report:?}");
+        assert!(report.pushing.is_empty(), "{report:?}");
+        assert_eq!(report.held, ["empty", "fork-b", "retained"]);
         assert!(
             !fake
                 .labels()

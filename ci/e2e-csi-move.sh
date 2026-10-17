@@ -102,8 +102,9 @@ on() { # node command...
 }
 plugin_log() { kd logs "$(plugin_on "$1")" -c agentfs-csi 2>/dev/null; }
 provisioner_log() { kd logs "$(plugin_on "$1")" -c csi-provisioner 2>/dev/null; }
-# The remote, while the server runs.
-sgit() { kd exec deploy/git-server -c git-server -- git --git-dir "$REPO" "$@"; }
+# The remote, while the server runs (as root, in a repository www-data
+# owns: git's ownership check is waived for this command only).
+sgit() { kd exec deploy/git-server -c git-server -- git -c safe.directory='*' --git-dir "$REPO" "$@"; }
 in_pod() { ka exec "$1" -- sh -c "$2"; }
 
 # Waits up to <seconds> for <command...> to succeed.
@@ -270,6 +271,9 @@ spec:
       # Worker B: its disk keeps the repositories while the server is
       # stopped, and A can be stopped without taking the remote down.
       nodeSelector: { kubernetes.io/hostname: $NODE_B }
+      # No API token: it would mount under /run/secrets, which the
+      # credentials file holds read-only.
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 2
       containers:
         - name: git-server

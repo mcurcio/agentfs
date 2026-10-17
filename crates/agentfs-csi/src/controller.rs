@@ -295,8 +295,21 @@ pub(crate) fn delete_volume(
     let state = StateDir::new(layout.state(handle));
     // A fork's deletion asks for it to be finished (design §11.5): checked
     // before the lock, which the finisher holds while it publishes, and
-    // again under it.
-    fork_gate(layout, handle, &state, &record)?;
+    // again under it. A fork not yet published or abandoned is answered
+    // here, without the lock: the decider asks it nothing else.
+    if let Some(fork) = fork_gate(layout, handle, &state, &record)?
+        && !fork.may_delete()
+    {
+        let unpublished = release::decide(&Worktree {
+            has_history: true,
+            on_delete: record.params.on_delete,
+            remotes: Declared::Pushed(&[]),
+            fork: Some(fork),
+        });
+        if let Release::Wait(waiting) = unpublished {
+            return Err(wait(handle, release, &waiting));
+        }
+    }
     let lock = if state.root().exists() {
         Some(volume::lock(&state, "agentfs-csi delete")?)
     } else {
@@ -344,12 +357,19 @@ pub(crate) fn delete_volume(
         }
         Release::Wait(waiting) => {
             drop(lock);
-            release.wake();
-            Err(Error::Unavailable(format!(
-                "volume {handle}: {waiting}; nothing deleted, DeleteVolume is retried"
-            )))
+            Err(wait(handle, release, &waiting))
         }
     }
+}
+
+/// DeleteVolume's answer to [`Release::Wait`]: `UNAVAILABLE`, naming why,
+/// after waking the release scan, which pushes (or finishes) the worktree
+/// meanwhile.
+fn wait(handle: &str, release: &ReleaseScan, waiting: &release::Waiting) -> Error {
+    release.wake();
+    Error::Unavailable(format!(
+        "volume {handle}: {waiting}; nothing deleted, DeleteVolume is retried"
+    ))
 }
 
 /// The release decision for the worktree in `state`, from facts gathered
