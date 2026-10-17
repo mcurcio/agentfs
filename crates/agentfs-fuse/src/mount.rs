@@ -334,6 +334,7 @@ fn check_layout(
     }
     for (remote, key, path) in settings
         .remotes
+        .pushed()
         .iter()
         .flat_map(|r| r.files().into_iter().map(move |(k, p)| (&r.name, k, p)))
         .chain(
@@ -1008,7 +1009,10 @@ mod tests {
         let git = dir.path().join("git");
         agentfs_core::history::History::init(&git, "vol", None).unwrap();
         let mut s = Settings::load(&git).unwrap();
-        s.remotes = remotes;
+        s.remotes = match agentfs_core::non_empty::NonEmpty::new(remotes) {
+            Some(remotes) => agentfs_core::config::Remotes::Pushed(remotes),
+            None => agentfs_core::config::Remotes::LocalOnly,
+        };
         s
     }
 

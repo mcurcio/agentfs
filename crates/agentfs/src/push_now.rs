@@ -14,6 +14,10 @@
 //!   ([`crate::recovery`]); `run` answers `busy` with the reason, so the
 //!   exit status stays 75 as when it held the lock without a socket.
 //!
+//! - **receive_fork**: a fork of this local-only volume publishes into its
+//!   history through the daemon that holds its lock
+//!   ([`crate::fork_cmd::serve_receive`], F8 S3).
+//!
 //! [`client`] is the command's side: it asks the daemon first and returns
 //! `None` when none answers (no socket, or a daemon from before `push`
 //! existed), and the command then pushes directly, taking the lock.
@@ -57,15 +61,18 @@ pub enum Restores {
 pub const RUN_SERVES_NO_RESTORES: &str = "`agentfs run` holds the state area and serves no \
      restores; stop it (or mount the volume instead), then retry";
 
-/// The control socket's handler for a daemon whose service is `service`.
-/// `misconfigured` lists the remotes the settings refused, with why.
+/// The control socket's handler for a daemon of the state area `state`
+/// whose service is `service`. `misconfigured` lists the remotes the
+/// settings refused, with why.
 pub fn handler(
+    state: StateDir,
     service: ServiceHandle,
     misconfigured: Vec<(String, String)>,
     restores: Restores,
 ) -> control::Handler {
     Arc::new(move |request: Request, peer| match request.op {
         Op::Push => serve_push(&service, &misconfigured, &request),
+        Op::ReceiveFork => crate::fork_cmd::serve_receive(&state, &request),
         Op::Restore | Op::Revert => match &restores {
             Restores::Serve(daemon) => daemon.serve(request, peer),
             Restores::ServeFronts(daemon) => daemon.serve(request, peer),
@@ -251,8 +258,8 @@ pub fn client(state: &StateDir, remotes: &[String], timeout: Duration) -> Option
             eprintln!("error: {message}");
             ExitCode::from(EXIT_LOCKED)
         }
-        Reply::Ok(_) => {
-            eprintln!("push failed: the daemon answered with a restore's reply");
+        Reply::Ok(_) | Reply::Received { .. } => {
+            eprintln!("push failed: the daemon answered another request's reply");
             ExitCode::FAILURE
         }
     })

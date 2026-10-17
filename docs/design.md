@@ -75,7 +75,7 @@ Built beside the phases, and planned:
 | Docker examples, `docker run` and Compose ([docker.md](docker.md)) | Built, tested in the `docker` workflow |
 | Helm charts: the CSI driver and the sidecar library ([helm.md](helm.md)) | Built, tested in the `helm` workflow, published to `oci://ghcr.io/mcurcio/charts` |
 | Example Prometheus alert rules with runbooks (§13, `deploy/alerts`) | Built, tested in the `alerts` workflow |
-| Local-only volumes on node-local disk with a git backend | In design; nothing built |
+| Local-only volumes: zero remotes declared, `agentfs init --local-only` (§11.1); a local-only source's forks publish into its own history (§11.5) | Built (F8 S3), tested through the CLI and the CSI driver in process |
 
 ### 1.4 Not goals
 
@@ -1566,6 +1566,23 @@ agentfs does not scan content for secrets and does not hold pushes.
   and `file://` URLs work too, which is how pushing is tested.
 - **Several push remotes** can be configured. Each has its own push state and
   alarms.
+- **Zero remotes is a declared mode** (F8 S3, R4; §19.1 "Zero remotes
+  declared"). `config::Remotes` is how a volume declares them, decided once
+  by `Settings::load`: **pushed** (one or more valid push sections, held
+  in a `NonEmpty` so "pushed, with no remote" cannot be expressed), **none
+  valid** (push sections, all invalid: each alarms, never called
+  local-only), **local-only** (`agentfs.remotes = none` and no push
+  section) and **undeclared** (neither, or `none` beside a push section,
+  which is then never pushed and is reported misconfigured). Status
+  (`remotes:`), the gauge `agentfs.remotes.mode` and the alarms say which
+  (§13). An undeclared volume raises `RemotesUndeclared` at open and at
+  every push interval, and `agentfs init` and CSI CreateVolume refuse one;
+  an existing volume keeps recording (principle 1). A local-only volume
+  pushes nothing by declaration (`agentfs push`: `local-only: nothing to
+  push`, exit 0), is never deleted by the release decider (§14.2), and
+  dies with its disk. A section with `agentfsForkRemote` is never a push
+  section. Readers that only iterate take `Remotes::pushed()`; what
+  reports or decides on the mode matches on the enum.
 - **Configuration** is the standard `[remote "<name>"]` sections (`url`, and
   `pushurl`, which wins as in git) plus agentfs's own keys (§4.3), read only
   from the history repository's own config file. libgit2's system, XDG,
@@ -2048,6 +2065,28 @@ invalid, so a fork's LFS objects never reach the source's store. The
 default fork remote, the source's own, is unaffected. A fork pushes only to its fork remote, at
 its push target, and has no patch queue.
 
+**A local-only source's forks** (F8 S3, R4: a no-remote source's fork
+publishes `agentfs/<fork>` into its own history, never applied). A
+source declared local-only (§11.1) with no flagged section has the fork
+remote `ForkRemote::SourceHistory`: create records the source's state
+area in the fork's own config (`agentfs.fork.sourceState`, an identity
+key no include may set), the finish names the fork remote `(source
+history)`, which no remote section can be called, and publishing is
+`fork::receive::receive_fork_change` instead of a push: the fork's
+objects and LFS objects are copied into the source's state area, then
+its history ref (by the branch rule's `claim`: created, or
+fast-forwarded from a commit on the fork's history), `change` and
+`finish` (create-only) are written there, each judged before any is
+written. It never touches the source's branch, patch queue or tree:
+whatever reads the source's history gates it. It runs through the
+source's control socket when a daemon holds the source's lock (§2.3),
+else under that lock; while another command holds it, `fork finish`
+exits 75. A branch name another writer holds there is `AnotherWriter`,
+and a source state area that is gone is `RemoteGone` (both refused, the
+fork can be abandoned). The fork itself is local-only and pushes
+nothing. Cost: the source must stay on the node at its path until the
+fork is published, and receiving is not visible to any remote.
+
 **The push target** is where a fork's history is kept and pushed, fixed
 at create in its identity (`agentfs.fork.pushTarget`, §19.1 "Hidden
 forks"): `branch` (the default, unset) is `refs/heads/agentfs/<fork>`,
@@ -2391,6 +2430,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.start.moved` | gauge, per remote (the start remote of a started volume) | 1 while the start-branch alarm holds, as the last push to that remote saw it; 0 before the first push and after one that does not raise it (§11.3) |
 | `agentfs.push.limited` | counter, per remote | Pushes that sent only part of the backlog because it was over `agentfsMaxPushSize` (§11.3) |
 | `agentfs.remote.misconfigured` | gauge, per remote | 1 for each invalid `[remote]` section (§11.1) |
+| `agentfs.remotes.mode` | gauge, by `mode` | 1, with how the volume declares its remotes: `pushed`, `none_valid`, `local_only` or `undeclared` (§11.1, F8 S3) |
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
 | `agentfs.patch.queue_depth` | gauge | Patches queued after the last applied one, the blocked one included (§12) |
 | `agentfs.patch.blocked` | gauge | 1 while the patch queue is blocked (§12) |
@@ -2469,6 +2509,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `StartBranchMoved` | A started volume's start branch holds commits it does not have: the start remote, the branch, the pinned commit and the tip, at every push to the start remote while it holds; an error, like `Diverged`; log event `agentfs.start_branch_moved` with `agentfs.remote`, `agentfs.start.ref`, `agentfs.start.pinned`, `agentfs.start.tip` (§11.3) |
 | `PushLimited` | A push sent only part of the backlog because it was over the remote's `agentfsMaxPushSize`: the commit pushed, the head, the limit and the first-parent commits left; the next step follows at once (§11.3); a warning |
 | `RemoteMisconfigured` | A `[remote "<name>"]` section is invalid, so that remote is left out (§11.1); raised when a volume opens and by `agentfs push` |
+| `RemotesUndeclared` | The volume declares no remote and is not declared local-only, or sets `agentfs.remotes = none` beside a push section (`beside` names it): nothing is pushed (§11.1); raised when a volume opens, at every push interval of a running service, and by `agentfs push`; log event `agentfs.remotes_undeclared`, with `agentfs.remote` for `beside` |
 | `RepackFailed` | The periodic `git repack` (§8) failed, or refreshing the object database after it; tried again an interval later |
 | `PushSucceeded` | A push attempt succeeded, including one with nothing new (not an alarm; sinks filter) |
 | `PatchBlocked` | A patch could not be applied at mount: the inbox number, the patch, the reason (§12) and the queue depth; inbox 0 with reason `failed` when the queue could not run at all; the volume mounts anyway |
@@ -3012,8 +3053,8 @@ then the fork's state, then the remotes:
   delete`;
 - **Keep**: the volume is released and the worktree stays on its node:
   `onDelete: retain` once every remote holds the head and the journal is
-  committed, or a profile with no remote declared (nothing elsewhere can
-  hold it);
+  committed, or a profile declared local-only, or one that declares
+  nothing (nothing elsewhere can hold it), whatever `onDelete` says;
 - **Wait**: `UNAVAILABLE`, naming the first remote that does not hold the
   head and why (lacking, unreachable, diverged), every remote section
   invalid, a journal holding records history lacks, or a fork not yet
@@ -3222,7 +3263,7 @@ operator runbooks ([runbooks](README.md#runbooks)):
 | [recovery-and-undo.md](runbooks/recovery-and-undo.md) | Finding a change, pausing the workload, restore and revert, refusals, plain-git alternatives |
 | [divergence.md](runbooks/divergence.md) | Resolving `refs/agentfs/<volume>/diverged/*` (§11.3) |
 | [history-rewrite.md](runbooks/history-rewrite.md) | Removing a recorded secret from the state area and each remote (§10) |
-| [stuck-pushes.md](runbooks/stuck-pushes.md) | Pushes that keep failing |
+| [stuck-pushes.md](runbooks/stuck-pushes.md) | Pushes that keep failing, or no remote declared (`RemotesUndeclared`) |
 | [crashed-sidecar.md](runbooks/crashed-sidecar.md) | A sidecar whose daemon died: automatic recovery by stacking, when to step in, the pod restart (§17.1) |
 | [patch-queue.md](runbooks/patch-queue.md) | Submitting patches (with agentfs or plain git), a blocked queue, replacing or skipping a patch (§12) |
 | [fork-refused.md](runbooks/fork-refused.md) | A fork whose publish is refused for good: each reason, how it shows, retry or abandon (§11.5) |
@@ -4331,6 +4372,8 @@ runner.
 | Divergence save follows the head (2026-10-17) | A diverged worktree's `diverged/<T>` save is created once per divergence and then pushed again whenever the head moved past the one it holds, judged by `push::claim` in that push's negotiation: fast-forwarded (leased on the remote's value), re-created if the remote lacks it, kept and named in the alarm if another writer moved it. Before, it was pushed once and the worktree's later commits never reached the remote. Cost: one more push per attempt while diverged and the head moves. A design choice (F8 S2, "D3"), not the owner's words |
 | Every write by the branch rule (2026-10-17) | The patch queue push writes the status, `applied/*` and inbox deletions only while the branch the remote advertises, in a listing made for that push, is on this worktree's history (`push::claim`), and carries the branch as a no-op update leased on that value, so the negotiation stops it if the branch moved since. A branch that is not this worktree's (none yet, or another writer's) writes nothing and is no queue failure. Cost: the status no longer reaches a remote whose branch is missing or diverged, so iac reads an older status there until the branch is resolved; one more ref in each queue push. A design choice (F8 S2, design rule 2), not the owner's words |
 | The operator's lease push (2026-10-17) | Operators replace a worktree's own branch only with `agentfs push --force-with-lease <oid>`: one remote, direct (never through a daemon), under that remote's push lock, refused when the lease and the head share no commit, a lease the state area lacks fetched into a removed scratch repository (never into the state area); divergence case A and history-rewrite step 9 use it. Runbooks never `git push` a branch: a docs test holds every runbook `git push` to destinations literally under `refs/agentfs/`, with no force and no lease but the create-only `--force-with-lease=<ref>:` of patch submission (§12, kept from "Patch submission" above). The history rewrite's fork step deletes other worktrees' refs on each server (`git update-ref -d <ref> <oid>`) or with a forge's tools, no longer by `git push`. Cost: on a forge, that deletion has no lease; `--force-with-lease` does not step through `agentfsMaxPushSize`. A design choice (F8 S2), not the owner's words; it serves R2, the owner's "Go" to one branch per worktree, for good (2026-10-16) |
+| Zero remotes declared (2026-10-16) | A volume declares its remotes: pushed, none valid, local-only (`agentfs.remotes = none`, `agentfs init --local-only`) or undeclared, which alarms (`RemotesUndeclared`) and which `agentfs init` and CSI CreateVolume refuse; status, the `agentfs.remotes.mode` gauge and the alarms say which (§11.1). A fork of a local-only source publishes `agentfs/<fork>` into the source's own history and is never applied (§11.5). The owner, on the F8 reframe's question 2, "publish a no-remote source's fork as agentfs/<fork> in the source's own history, never applied automatically": "yes"; and the frame he accepted: "zero remotes is a declared mode; a no-remote source's fork publishes agentfs/<fork> in the source's own history, never applied automatically" (2026-10-16, R4, `.handoff/f8-f12-notes.md`). Built (F8 S3) |
+| Declaring remotes, the details (2026-10-17) | Design choices (F8 S3), not the owner's words: `none` beside a push section is undeclared, and that section is never pushed and is reported misconfigured, so the mount preflight still checks its files; `agentfs init` refuses an undeclared result on an existing state area too (the state area stays, as with a bad include), so an init container of a volume that never declared fails until its profile declares; a local-only `agentfs push` prints `local-only: nothing to push` and exits 0, an undeclared one alarms and exits 1; CreateVolume removes the worktree it made for an undeclared profile; a start class on a local-only profile is `StartError::LocalOnly`. A fork of a local-only source finds it by `agentfs.fork.sourceState`, written at create (the source must stay at that path until the fork is published); its finish names the fork remote `(source history)`, which no remote section can be called; it receives through the source's control socket (`receive_fork`) when a daemon holds the source's lock, else under the lock, and `fork finish` exits 75 while another command holds it; the fork's LFS objects are copied into the source's cache; a ref another writer holds there is `AnotherWriter` and a source that is gone `RemoteGone`, both refused (§11.5) |
 
 ### 19.2 Open questions
 

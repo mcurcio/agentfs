@@ -31,6 +31,24 @@ pub struct Setup {
 
 impl Setup {
     pub fn new(fork_remote: bool) -> Self {
+        Self::with_profile(|s| {
+            let mut profile = format!("[remote \"origin\"]\n\turl = {}\n", s.url("origin.git"));
+            if fork_remote {
+                profile.push_str(&format!(
+                    "[remote \"forks\"]\n\turl = {}\n\tagentfsForkRemote = true\n",
+                    s.url("forks.git")
+                ));
+            }
+            profile
+        })
+    }
+
+    /// The source declared local-only by its profile (F8 S3): no remote.
+    pub fn local_only() -> Self {
+        Self::with_profile(|_| "[agentfs]\n\tremotes = none\n".into())
+    }
+
+    fn with_profile(profile: impl FnOnce(&Self) -> String) -> Self {
         let s = Self {
             dir: tempfile::tempdir().unwrap(),
         };
@@ -38,13 +56,7 @@ impl Setup {
         fs::create_dir_all(s.path("home")).unwrap();
         Repository::init_bare(s.path("origin.git")).unwrap();
         Repository::init_bare(s.path("forks.git")).unwrap();
-        let mut profile = format!("[remote \"origin\"]\n\turl = {}\n", s.url("origin.git"));
-        if fork_remote {
-            profile.push_str(&format!(
-                "[remote \"forks\"]\n\turl = {}\n\tagentfsForkRemote = true\n",
-                s.url("forks.git")
-            ));
-        }
+        let profile = profile(&s);
         fs::write(s.path("profile"), profile).unwrap();
         let profile = s.path("profile").display().to_string();
         s.ok(

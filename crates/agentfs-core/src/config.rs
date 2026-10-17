@@ -108,7 +108,7 @@ pub enum ConfigError {
     BadForkBase { key: String, value: String },
     #[error(
         "agentfs.fork.source and agentfs.fork.base must be set together, and \
-         agentfs.fork.pushTarget only with them"
+         agentfs.fork.pushTarget and agentfs.fork.sourceState only with them"
     )]
     PartialForkIdentity,
     #[error("agentfs.branch is set in a fork's config; a fork's push target is fixed at create")]
@@ -162,6 +162,7 @@ pub const KEYS: &[&str] = &[
     "agentfs.pushInterval",
     "agentfs.sweepInterval",
     "agentfs.repackInterval",
+    "agentfs.remotes",
     "agentfs.patchRemote",
     "agentfs.patchFetchTimeout",
     "agentfs.lfsThreshold",
@@ -173,6 +174,7 @@ pub const KEYS: &[&str] = &[
     "agentfs.fork.source",
     "agentfs.fork.base",
     "agentfs.fork.pushTarget",
+    "agentfs.fork.sourceState",
     "agentfs.start.remote",
     "agentfs.start.branch",
     "agentfs.start.commit",
@@ -440,8 +442,9 @@ pub struct Settings {
     /// remote without its own `remote.<name>.proxy`. A bad value
     /// misconfigures every remote; `None` then.
     pub http_proxy: Option<String>,
-    /// Push remotes, sorted by name.
-    pub remotes: Vec<RemoteSettings>,
+    /// How the volume declares its push remotes, and the valid ones,
+    /// sorted by name (design §11.1; F8 S3).
+    pub remotes: Remotes,
     /// Remote sections that could not be used, sorted by name. They are
     /// left out of `remotes` and reported as alarms; they never fail the
     /// volume (design §11.1).
@@ -458,13 +461,20 @@ pub struct Settings {
     /// This volume's fork identity; `None` when it is not a fork (design
     /// §11.5).
     pub fork: Option<ForkIdentity>,
-    /// Where forks of this volume push, and for a fork its one push
-    /// remote: the one valid section with `agentfsForkRemote = true`, else
-    /// the remote the patch remote resolves to (design §19.1, gate answer
-    /// Q1 b), else `None`. `None` too when a flagged section is invalid or
-    /// more than one is flagged: a fork never falls back past the
-    /// operator's choice.
-    pub fork_remote: Option<RemoteSettings>,
+    /// Where forks of this volume publish, and where a fork publishes: the
+    /// one valid section with `agentfsForkRemote = true`, else for a
+    /// local-only volume (or a fork recording its local-only source's
+    /// state area, [`Settings::source_state`]) the source's own history
+    /// ([`ForkRemote::SourceHistory`]), else the remote the patch remote
+    /// resolves to (design §19.1, gate answer Q1 b), else `None`. `None`
+    /// too when a flagged section is invalid or more than one is flagged:
+    /// a fork never falls back past the operator's choice.
+    pub fork_remote: Option<ForkRemote>,
+    /// A fork of a local-only source: the source's state area
+    /// (`agentfs.fork.sourceState`, written at create from the fork's own
+    /// config only, like the fork identity), into whose history the fork
+    /// publishes ([`crate::fork::receive`]). `None` for any other volume.
+    pub source_state: Option<PathBuf>,
     /// `agentfs.forkRefs`: the push target new forks of this volume get
     /// (design §11.5), fixed in each fork's identity at create, so a
     /// change here never moves a fork that exists.
@@ -475,10 +485,11 @@ pub struct Settings {
 }
 
 /// How a volume declares its push remotes (F8 S3, R4: zero remotes is a
-/// declared mode). It replaces `Settings::remotes: Vec<RemoteSettings>`
-/// in F8 S3; [`Settings::load`] stays the one decider. Push sections and
+/// declared mode); [`Settings::load`] is the one decider. Push sections and
 /// the flagged fork-remote section are disjoint inputs, so the two cannot
-/// disagree.
+/// disagree. A fork's mode follows its fork remote: `Pushed` with that one
+/// remote, `LocalOnly` when it publishes into its source's history,
+/// `NoneValid` when a flagged section is invalid, else `Undeclared`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Remotes {
     /// One or more valid push sections, sorted by name; invalid sections
@@ -503,7 +514,86 @@ impl Remotes {
     /// readers that only iterate; anything that reports or decides on the
     /// mode matches on the enum.
     pub fn pushed(&self) -> &[RemoteSettings] {
-        todo!("F8 S3")
+        match self {
+            Self::Pushed(remotes) => remotes,
+            Self::NoneValid | Self::LocalOnly | Self::Undeclared { .. } => &[],
+        }
+    }
+
+    /// [`Remotes::pushed`], to change in a test.
+    #[cfg(test)]
+    pub(crate) fn pushed_mut(&mut self) -> &mut [RemoteSettings] {
+        match self {
+            Self::Pushed(remotes) => remotes.as_mut_slice(),
+            Self::NoneValid | Self::LocalOnly | Self::Undeclared { .. } => &mut [],
+        }
+    }
+
+    /// The mode's name in status, telemetry (`agentfs.remotes.mode`) and
+    /// logs.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::Pushed(_) => "pushed",
+            Self::NoneValid => "none_valid",
+            Self::LocalOnly => "local_only",
+            Self::Undeclared { .. } => "undeclared",
+        }
+    }
+}
+
+/// `agentfs.remotes`: its only value.
+pub const REMOTES_NONE: &str = "none";
+
+/// Declares the volume at `git_dir` local-only: `agentfs.remotes = none`
+/// in its own config (`agentfs init --local-only`, F8 S3).
+pub fn declare_local_only(git_dir: &Path) -> Result<(), ConfigError> {
+    let mut config = git2::Config::open(&git_dir.join("config"))?;
+    config.set_str("agentfs.remotes", REMOTES_NONE)?;
+    Ok(())
+}
+
+/// The error of each push section beside `agentfs.remotes = none`.
+const BESIDE_NONE: &str = "agentfs.remotes = none is set beside this push section: remove one";
+
+/// How a volume that is not a fork declares its remotes: `declared_none`
+/// is `agentfs.remotes = none`; `own` its valid push sections and
+/// `invalid` every invalid section (flagged ones are not push sections).
+/// Valid sections beside `none` are never pushed: they join `invalid`, so
+/// they alarm and the mount preflight still checks their files.
+fn declared(
+    declared_none: bool,
+    own: Vec<RemoteSettings>,
+    invalid: &mut Vec<InvalidRemote>,
+) -> Remotes {
+    let any_invalid = invalid.iter().any(|r| !r.fork_remote);
+    if !declared_none {
+        return match crate::non_empty::NonEmpty::new(own) {
+            Some(own) => Remotes::Pushed(own),
+            None if any_invalid => Remotes::NoneValid,
+            None => Remotes::Undeclared { beside: None },
+        };
+    }
+    if own.is_empty() && !any_invalid {
+        return Remotes::LocalOnly;
+    }
+    invalid.extend(own.into_iter().map(|r| {
+        InvalidRemote {
+            files: r
+                .files()
+                .into_iter()
+                .map(|(k, p)| (k, p.to_path_buf()))
+                .collect(),
+            name: r.name,
+            error: BESIDE_NONE.into(),
+            fork_remote: false,
+        }
+    }));
+    invalid.sort_by(|a, b| a.name.cmp(&b.name));
+    Remotes::Undeclared {
+        beside: invalid
+            .iter()
+            .find(|r| !r.fork_remote)
+            .map(|r| r.name.clone()),
     }
 }
 
@@ -539,7 +629,20 @@ impl Settings {
     /// with `agentfsForkRemote` is never one: it is not in `remotes`, and
     /// an invalid one does not count against the automatic choice.
     pub fn patch_remote(&self) -> Option<&RemoteSettings> {
-        resolve_patch_remote(&self.patch_remote, &self.remotes, &self.invalid_remotes)
+        resolve_patch_remote(
+            &self.patch_remote,
+            self.remotes.pushed(),
+            &self.invalid_remotes,
+        )
+    }
+
+    /// The fork remote when it is a remote section, not the source's
+    /// history.
+    pub fn fork_remote_section(&self) -> Option<&RemoteSettings> {
+        match &self.fork_remote {
+            Some(ForkRemote::Remote(remote)) => Some(remote),
+            Some(ForkRemote::SourceHistory) | None => None,
+        }
     }
 
     /// Whether this volume is a fork (design §11.5).
@@ -599,6 +702,21 @@ fn fork_identity_of(
     }))
 }
 
+/// `agentfs.fork.sourceState` (F8 S3): an absolute path, set only beside
+/// a fork identity.
+fn source_state_of(config: &git2::Config, fork: bool) -> Result<Option<PathBuf>, ConfigError> {
+    let key = crate::fork::receive::SOURCE_STATE_KEY;
+    match string(config, key)? {
+        None => Ok(None),
+        Some(_) if !fork => Err(ConfigError::PartialForkIdentity),
+        Some(value) if !Path::new(&value).is_absolute() => Err(ConfigError::RelativePath {
+            key: key.into(),
+            value,
+        }),
+        Some(value) => Ok(Some(PathBuf::from(value))),
+    }
+}
+
 /// The start point in `config` (F8 S1): the three `agentfs.start.*` keys
 /// or none, read as [`StartPoint::parse`] reads a StorageClass's
 /// `startFrom`, so both spellings have one validator.
@@ -647,16 +765,26 @@ pub fn is_full_oid(value: &str) -> bool {
 /// The volume's own remotes and the fork remote, from every valid and
 /// invalid section (design §11.5): see [`Settings::fork_remote`].
 struct SplitRemotes {
-    remotes: Vec<RemoteSettings>,
+    remotes: Remotes,
     invalid: Vec<InvalidRemote>,
-    fork_remote: Option<RemoteSettings>,
+    fork_remote: Option<ForkRemote>,
+}
+
+/// What [`split_remotes`] weighs beside the sections.
+struct Declaration<'a> {
+    patch_remote: &'a PatchRemote,
+    /// `agentfs.remotes = none`.
+    none: bool,
+    /// The volume is a fork.
+    fork: bool,
+    /// The fork records its local-only source's state area.
+    source_history: bool,
 }
 
 fn split_remotes(
     valid: Vec<RemoteSettings>,
     mut invalid: Vec<InvalidRemote>,
-    patch_remote: &PatchRemote,
-    fork: bool,
+    declaration: &Declaration<'_>,
 ) -> SplitRemotes {
     let (mut flagged, own): (Vec<_>, Vec<_>) = valid.into_iter().partition(|r| r.fork_remote);
     if flagged.len() > 1 {
@@ -675,25 +803,50 @@ fn split_remotes(
         invalid.sort_by(|a, b| a.name.cmp(&b.name));
     }
     let any_flagged_invalid = invalid.iter().any(|r| r.fork_remote);
-    let fork_remote = match flagged.pop() {
-        Some(one) if !any_flagged_invalid => Some(one),
-        Some(_) => None,
-        None if any_flagged_invalid => None,
-        None => resolve_patch_remote(patch_remote, &own, &invalid).cloned(),
+    let flagged = match flagged.pop() {
+        Some(one) if !any_flagged_invalid => Ok(Some(one)),
+        Some(_) => Err(()),
+        None if any_flagged_invalid => Err(()),
+        None => Ok(None),
     };
-    if fork {
-        SplitRemotes {
-            remotes: fork_remote.iter().cloned().collect(),
+    let remote = |r: RemoteSettings| ForkRemote::Remote(Box::new(r));
+    if declaration.fork {
+        let fork_remote = match flagged {
+            Ok(Some(one)) => Some(remote(one)),
+            Err(()) => None,
+            Ok(None) if declaration.source_history => Some(ForkRemote::SourceHistory),
+            Ok(None) => resolve_patch_remote(declaration.patch_remote, &own, &invalid)
+                .cloned()
+                .map(remote),
+        };
+        let remotes = match &fork_remote {
+            Some(ForkRemote::Remote(one)) => {
+                Remotes::Pushed(crate::non_empty::NonEmpty::one((**one).clone()))
+            }
+            Some(ForkRemote::SourceHistory) => Remotes::LocalOnly,
+            None if any_flagged_invalid => Remotes::NoneValid,
+            None => Remotes::Undeclared { beside: None },
+        };
+        return SplitRemotes {
+            remotes,
             // An unflagged section is not a fork's remote: nothing to raise.
             invalid: invalid.into_iter().filter(|r| r.fork_remote).collect(),
             fork_remote,
-        }
-    } else {
-        SplitRemotes {
-            remotes: own,
-            invalid,
-            fork_remote,
-        }
+        };
+    }
+    let remotes = declared(declaration.none, own, &mut invalid);
+    let fork_remote = match flagged {
+        Ok(Some(one)) => Some(remote(one)),
+        Err(()) => None,
+        Ok(None) if remotes == Remotes::LocalOnly => Some(ForkRemote::SourceHistory),
+        Ok(None) => resolve_patch_remote(declaration.patch_remote, remotes.pushed(), &invalid)
+            .cloned()
+            .map(remote),
+    };
+    SplitRemotes {
+        remotes,
+        invalid,
+        fork_remote,
     }
 }
 
@@ -712,6 +865,7 @@ pub fn declares_fork(git_dir: &Path) -> Result<bool, git2::Error> {
         fork_identity::SOURCE_KEY,
         fork_identity::BASE_KEY,
         fork_identity::PUSH_TARGET_KEY,
+        crate::fork::receive::SOURCE_STATE_KEY,
     ] {
         if is_set(&config, key)? {
             return Ok(true);
@@ -782,7 +936,28 @@ impl Settings {
                 PatchRemote::Named(name.to_owned())
             }
         };
-        let split = split_remotes(valid, invalid, &patch_remote, fork.is_some());
+        let none = match string(config, "agentfs.remotes")?.as_deref() {
+            None => false,
+            Some(REMOTES_NONE) => true,
+            Some(other) => {
+                return Err(ConfigError::BadChoice {
+                    key: "agentfs.remotes".into(),
+                    value: other.into(),
+                    allowed: REMOTES_NONE,
+                });
+            }
+        };
+        let source_state = source_state_of(config, fork.is_some())?;
+        let split = split_remotes(
+            valid,
+            invalid,
+            &Declaration {
+                patch_remote: &patch_remote,
+                none,
+                fork: fork.is_some(),
+                source_history: source_state.is_some(),
+            },
+        );
         let fork_refs = push_target(config, "agentfs.forkRefs")?.unwrap_or_default();
         Ok(Self {
             branch_ref,
@@ -826,6 +1001,7 @@ impl Settings {
             remotes: split.remotes,
             invalid_remotes: split.invalid,
             fork_remote: split.fork_remote,
+            source_state,
             fork_refs,
             fork,
             start,
@@ -887,6 +1063,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
             fork_identity::SOURCE_KEY,
             fork_identity::BASE_KEY,
             fork_identity::PUSH_TARGET_KEY,
+            crate::fork::receive::SOURCE_STATE_KEY,
             fork_identity::START_REMOTE_KEY,
             fork_identity::START_BRANCH_KEY,
             fork_identity::START_COMMIT_KEY,
@@ -1380,7 +1557,7 @@ mod tests {
         // Both remotes were read whole, whether or not this build supports
         // ssh: their keys are read before the transport is validated.
         assert_eq!(
-            settings.remotes.len() + settings.invalid_remotes.len(),
+            settings.remotes.pushed().len() + settings.invalid_remotes.len(),
             2,
             "{settings:?}"
         );
@@ -1540,9 +1717,9 @@ mod tests {
              [remote \"a.b\"]\n\turl = file:///srv/ab.git\n",
         );
         let s = Settings::from_config(&c).unwrap();
-        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["a.b", "alpha", "zeta"]);
-        let alpha = &s.remotes[1];
+        let alpha = &s.remotes.pushed()[1];
         assert_eq!(alpha.url, "https://example.com/a.git");
         assert_eq!(alpha.push_url(), "https://push.example.com/a.git");
         assert_eq!(
@@ -1550,17 +1727,23 @@ mod tests {
             Some(Path::new("/run/secrets/alpha"))
         );
         assert_eq!(alpha.max_blob_size, None);
-        let zeta = &s.remotes[2];
+        let zeta = &s.remotes.pushed()[2];
         assert_eq!(zeta.push_url(), "/srv/zeta.git");
         assert_eq!(zeta.max_blob_size, Some(104_857_600));
         assert_eq!(zeta.max_push_size, Some(2 << 30));
         assert_eq!(alpha.max_push_size, None);
         assert_eq!(zeta.max_lfs_object_size, Some(5 << 30));
         assert_eq!(alpha.max_lfs_object_size, None);
-        assert_eq!(s.remotes[0].url, "file:///srv/ab.git");
+        assert_eq!(s.remotes.pushed()[0].url, "file:///srv/ab.git");
 
         let (_d, c) = config_with("[agentfs]\n\tvolume = v\n");
-        assert!(Settings::from_config(&c).unwrap().remotes.is_empty());
+        assert!(
+            Settings::from_config(&c)
+                .unwrap()
+                .remotes
+                .pushed()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1572,7 +1755,7 @@ mod tests {
                 "[agentfs]\n\tvolume = v\n[remote \"good\"]\n\turl = /g\n{section}"
             ));
             let s = Settings::from_config(&c).unwrap();
-            let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+            let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
             assert_eq!(names, ["good"], "{section}");
             assert_eq!(s.invalid_remotes.len(), 1, "{section}");
             s.invalid_remotes[0].clone()
@@ -1627,13 +1810,16 @@ mod tests {
             "[agentfs]\n\tvolume = v\n[remote \"good\"]\n\turl = /g\n[remote \"r\"]\n{section}"
         ));
         let s = Settings::from_config(&c).unwrap();
-        assert!(s.remotes.iter().any(|r| r.name == "good"), "{section}");
+        assert!(
+            s.remotes.pushed().iter().any(|r| r.name == "good"),
+            "{section}"
+        );
         s
     }
 
     fn invalid_error(section: &str) -> InvalidRemote {
         let s = one_remote(section);
-        assert_eq!(s.remotes.len(), 1, "{section}: {:?}", s.remotes);
+        assert_eq!(s.remotes.pushed().len(), 1, "{section}: {:?}", s.remotes);
         assert_eq!(s.invalid_remotes.len(), 1, "{section}");
         s.invalid_remotes[0].clone()
     }
@@ -1645,7 +1831,7 @@ mod tests {
                     \tagentfsKnownHosts = /run/secrets/ssh/known_hosts\n";
         let s = one_remote(full);
         if cfg!(feature = "ssh") {
-            let r = s.remotes.iter().find(|r| r.name == "r").unwrap();
+            let r = s.remotes.pushed().iter().find(|r| r.name == "r").unwrap();
             assert_eq!(r.transport(), Transport::Ssh);
             assert_eq!(
                 r.ssh_key.as_deref(),
@@ -1672,7 +1858,12 @@ mod tests {
                 let s = one_remote(&format!(
                     "{url}\tagentfsSshKey = /k\n\tagentfsKnownHosts = /kh\n"
                 ));
-                assert_eq!(s.remotes.len(), 2, "{url}: {:?}", s.invalid_remotes);
+                assert_eq!(
+                    s.remotes.pushed().len(),
+                    2,
+                    "{url}: {:?}",
+                    s.invalid_remotes
+                );
             }
             // An agent instead of a key, and a key with a passphrase file.
             for identity in [
@@ -1682,8 +1873,13 @@ mod tests {
                 let s = one_remote(&format!(
                     "\turl = ssh://h/r\n{identity}\tagentfsKnownHosts = /kh\n"
                 ));
-                assert_eq!(s.remotes.len(), 2, "{identity}: {:?}", s.invalid_remotes);
-                let r = s.remotes.iter().find(|r| r.name == "r").unwrap();
+                assert_eq!(
+                    s.remotes.pushed().len(),
+                    2,
+                    "{identity}: {:?}",
+                    s.invalid_remotes
+                );
+                let r = s.remotes.pushed().iter().find(|r| r.name == "r").unwrap();
                 assert_eq!(r.files().len(), 2 + usize::from(r.ssh_key.is_some()));
             }
         } else {
@@ -1817,7 +2013,7 @@ mod tests {
                 ..LfsSettings::default()
             }
         );
-        let r = &s.remotes[0];
+        let r = &s.remotes.pushed()[0];
         assert_eq!(r.lfs_url.as_deref(), Some("http://lfs.example/r/info/lfs"));
         assert_eq!(r.lfs_push_url.as_deref(), Some("file:///srv/up.git"));
         assert_eq!(
@@ -1890,7 +2086,7 @@ mod tests {
         // https needs the feature.
         let s = one_remote("\turl = /x\n\tlfsurl = https://lfs.example/r\n");
         if cfg!(feature = "https") {
-            assert_eq!(s.remotes.len(), 2, "{:?}", s.invalid_remotes);
+            assert_eq!(s.remotes.pushed().len(), 2, "{:?}", s.invalid_remotes);
         } else {
             assert_eq!(s.invalid_remotes.len(), 1);
             assert!(
@@ -1914,7 +2110,7 @@ mod tests {
             ));
             let s = Settings::from_config(&c).unwrap();
             assert_eq!(s.lfs.concurrent_transfers, n, "{value}");
-            assert_eq!(s.remotes.len(), 1, "{value}");
+            assert_eq!(s.remotes.pushed().len(), 1, "{value}");
         }
         for bad in ["0", "65", "x", "-1", "\"\""] {
             let (_d, c) = config_with(&format!(
@@ -1923,7 +2119,7 @@ mod tests {
             ));
             // Never the volume: every remote.
             let s = Settings::from_config(&c).unwrap();
-            assert!(s.remotes.is_empty(), "{bad}");
+            assert!(s.remotes.pushed().is_empty(), "{bad}");
             assert_eq!(s.invalid_remotes.len(), 2, "{bad}");
             for r in &s.invalid_remotes {
                 assert!(
@@ -1951,6 +2147,7 @@ mod tests {
         assert_eq!(s.http_proxy.as_deref(), Some("http://proxy.example:3128"));
         let proxy = |name: &str| {
             s.remotes
+                .pushed()
                 .iter()
                 .find(|r| r.name == name)
                 .unwrap()
@@ -1988,7 +2185,7 @@ mod tests {
              [remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n\tproxy = \"\"\n",
         );
         let s = Settings::from_config(&c).unwrap();
-        assert!(s.remotes.is_empty());
+        assert!(s.remotes.pushed().is_empty());
         assert_eq!(s.http_proxy, None);
         for r in &s.invalid_remotes {
             assert!(r.error.starts_with("http.proxy:"), "{}", r.error);
@@ -1997,7 +2194,7 @@ mod tests {
         let (_d, c) = config_with("[agentfs]\n\tvolume = v\n[remote \"a\"]\n\turl = /a\n");
         let s = Settings::from_config(&c).unwrap();
         assert_eq!(
-            (s.http_proxy.clone(), s.remotes[0].proxy.clone()),
+            (s.http_proxy.clone(), s.remotes.pushed()[0].proxy.clone()),
             (None, None)
         );
     }
@@ -2009,7 +2206,7 @@ mod tests {
              [remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n",
         );
         let s = Settings::from_config(&c).unwrap();
-        assert!(s.remotes.is_empty());
+        assert!(s.remotes.pushed().is_empty());
         let names: Vec<&str> = s.invalid_remotes.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["a", "b"]);
         for bad in &s.invalid_remotes {
@@ -2064,8 +2261,8 @@ mod tests {
         let s = s.unwrap();
         assert_eq!(s.push_interval, Duration::from_secs(7));
         assert_eq!(s.nested, Nested::WorkingTree);
-        assert_eq!(s.remotes.len(), 1);
-        assert_eq!(s.remotes[0].url, "https://git.example/r.git");
+        assert_eq!(s.remotes.pushed().len(), 1);
+        assert_eq!(s.remotes.pushed()[0].url, "https://git.example/r.git");
         assert_eq!(s.includes, [dir.path().join("fragment")]);
         // No includes: an empty list.
         let (_d, c) = config_with("[agentfs]\n\tvolume = v\n");
@@ -2220,14 +2417,14 @@ mod tests {
         let with = Settings::from_config(&c).unwrap();
         assert_eq!(with.remotes, without.remotes);
         assert_eq!(
-            crate::checks::Limits::from_remotes(&with.remotes),
-            crate::checks::Limits::from_remotes(&without.remotes)
+            crate::checks::Limits::from_remotes(with.remotes.pushed()),
+            crate::checks::Limits::from_remotes(without.remotes.pushed())
         );
         assert_eq!(with.patch_remote(), without.patch_remote());
         assert_eq!(with.patch_remote().map(|r| r.name.as_str()), Some("origin"));
         assert!(with.invalid_remotes.is_empty());
         assert_eq!(
-            with.fork_remote.as_ref().map(|r| r.name.as_str()),
+            with.fork_remote_section().map(|r| r.name.as_str()),
             Some("forks")
         );
         assert!(!with.is_fork());
@@ -2261,7 +2458,7 @@ mod tests {
         let (_d, c) = config_with(&format!("{own}{forks}"));
         let s = Settings::from_config(&c).unwrap();
         assert_eq!(s.fork_remote, None);
-        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["origin"]);
         assert_eq!(s.invalid_remotes.len(), 1);
         assert!(s.invalid_remotes[0].fork_remote);
@@ -2276,7 +2473,7 @@ mod tests {
             let (_d, c) = config_with(&format!("{own}{forks}\t{key} = http://lfs.example/forks\n"));
             let s = Settings::from_config(&c).unwrap();
             assert_eq!(
-                s.fork_remote.as_ref().map(|r| r.name.as_str()),
+                s.fork_remote_section().map(|r| r.name.as_str()),
                 Some("forks"),
                 "{key}"
             );
@@ -2284,7 +2481,7 @@ mod tests {
         let (_d, c) = config_with(own);
         let s = Settings::from_config(&c).unwrap();
         assert_eq!(
-            s.fork_remote.as_ref().map(|r| r.name.as_str()),
+            s.fork_remote_section().map(|r| r.name.as_str()),
             Some("origin")
         );
         assert!(s.invalid_remotes.is_empty());
@@ -2299,7 +2496,7 @@ mod tests {
              [remote \"b\"]\n\turl = /b\n\tagentfsForkRemote = true\n",
         );
         let s = Settings::from_config(&c).unwrap();
-        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["origin"]);
         let bad: Vec<(&str, &str)> = s
             .invalid_remotes
@@ -2326,17 +2523,17 @@ mod tests {
         assert_eq!(fork.source, "src");
         assert_eq!(fork.base.to_string(), BASE);
         assert_eq!(s.branch_ref, "refs/heads/agentfs/f-1");
-        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["forks"]);
         assert_eq!(s.patch_remote, PatchRemote::Disabled);
         assert_eq!(s.patch_remote(), None);
         // No flagged section: the source's patch remote (gate answer Q1 b).
         let (_d, c) = config_with(&fork_config("[remote \"origin\"]\n\turl = /o\n"));
         let s = Settings::from_config(&c).unwrap();
-        let names: Vec<&str> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["origin"]);
         assert_eq!(
-            s.fork_remote.as_ref().map(|r| r.name.as_str()),
+            s.fork_remote_section().map(|r| r.name.as_str()),
             Some("origin")
         );
         assert_eq!(s.patch_remote(), None);
@@ -2345,7 +2542,7 @@ mod tests {
             "[remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n",
         ));
         let s = Settings::from_config(&c).unwrap();
-        assert!(s.remotes.is_empty());
+        assert!(s.remotes.pushed().is_empty());
         assert_eq!(s.fork_remote, None);
         // An unflagged invalid section is not the fork's: nothing raised.
         let (_d, c) = config_with(&fork_config(
@@ -2354,14 +2551,14 @@ mod tests {
         ));
         let s = Settings::from_config(&c).unwrap();
         assert!(s.invalid_remotes.is_empty(), "{:?}", s.invalid_remotes);
-        assert_eq!(s.remotes.len(), 1);
+        assert_eq!(s.remotes.pushed().len(), 1);
         // Two flagged sections: both invalid, nothing pushed.
         let (_d, c) = config_with(&fork_config(
             "[remote \"a\"]\n\turl = /a\n\tagentfsForkRemote = true\n\
              [remote \"b\"]\n\turl = /b\n\tagentfsForkRemote = true\n",
         ));
         let s = Settings::from_config(&c).unwrap();
-        assert!(s.remotes.is_empty());
+        assert!(s.remotes.pushed().is_empty());
         assert_eq!(s.invalid_remotes.len(), 2);
         assert_eq!(s.fork_remote, None);
     }
@@ -2472,6 +2669,146 @@ mod tests {
         assert!(matches!(
             Settings::from_config(&c),
             Err(ConfigError::PartialForkIdentity)
+        ));
+    }
+
+    /// F8 S3 acceptance 1: each `Remotes` answer from config fragments.
+    #[test]
+    fn remotes_are_declared_one_way() {
+        let mode = |lines: &str| {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{lines}"));
+            Settings::from_config(&c).unwrap().remotes
+        };
+        let pushed = mode("[remote \"b\"]\n\turl = /b\n[remote \"a\"]\n\turl = /a\n");
+        let names: Vec<&str> = pushed.pushed().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(pushed.mode(), "pushed");
+        // An invalid section beside a valid one alarms; still pushed.
+        let beside_bad = "[remote \"a\"]\n\turl = /a\n[remote \"bad\"]\n\turl = /b\n\
+                          \tagentfsMaxBlobSize = 0\n";
+        assert_eq!(mode(beside_bad).mode(), "pushed");
+        assert_eq!(
+            mode("[remote \"bad\"]\n\turl = /b\n\tagentfsMaxBlobSize = 0\n"),
+            Remotes::NoneValid
+        );
+        assert_eq!(mode("[agentfs]\n\tremotes = none\n"), Remotes::LocalOnly);
+        assert_eq!(mode(""), Remotes::Undeclared { beside: None });
+        // A flagged section is not a push section: alone, nothing is
+        // declared, and beside `none` it is local-only.
+        let flagged = "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n";
+        assert_eq!(mode(flagged), Remotes::Undeclared { beside: None });
+        assert_eq!(
+            mode(&format!("[agentfs]\n\tremotes = none\n{flagged}")),
+            Remotes::LocalOnly
+        );
+    }
+
+    /// `none` beside a push section is undeclared, naming it; the section
+    /// is never pushed, alarms, and its files stay checked.
+    #[test]
+    fn none_beside_a_section_is_undeclared() {
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n\tremotes = none\n[remote \"origin\"]\n\turl = /o\n\
+             \tagentfsCredentials = /run/c\n",
+        );
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(
+            s.remotes,
+            Remotes::Undeclared {
+                beside: Some("origin".into())
+            }
+        );
+        assert!(s.remotes.pushed().is_empty());
+        assert_eq!(s.invalid_remotes.len(), 1);
+        assert_eq!(s.invalid_remotes[0].name, "origin");
+        assert_eq!(
+            s.invalid_remotes[0].files,
+            [("agentfsCredentials", PathBuf::from("/run/c"))]
+        );
+        assert_eq!(s.patch_remote(), None);
+        assert_eq!(s.fork_remote, None);
+        // An invalid section beside it counts too.
+        let (_d, c) = config_with(
+            "[agentfs]\n\tvolume = v\n\tremotes = none\n[remote \"bad\"]\n\turl = /b\n\
+             \tagentfsMaxBlobSize = 0\n",
+        );
+        assert_eq!(
+            Settings::from_config(&c).unwrap().remotes,
+            Remotes::Undeclared {
+                beside: Some("bad".into())
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_remotes_value_is_refused() {
+        for value in ["None", "local", "", "origin"] {
+            let (_d, c) = config_with(&format!(
+                "[agentfs]\n\tvolume = v\n\tremotes = \"{value}\"\n"
+            ));
+            assert!(
+                matches!(
+                    Settings::from_config(&c),
+                    Err(ConfigError::BadChoice { ref key, allowed, .. })
+                        if key == "agentfs.remotes" && allowed == "none"
+                ),
+                "remotes = {value:?}"
+            );
+        }
+    }
+
+    /// `ForkRemote::SourceHistory` only for a local-only source with no
+    /// flagged section, and for a fork recording its source's state area.
+    #[test]
+    fn only_a_local_only_source_forks_into_its_history() {
+        let fork_remote = |lines: &str| {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{lines}"));
+            Settings::from_config(&c).unwrap().fork_remote
+        };
+        let none = "[agentfs]\n\tremotes = none\n";
+        let flagged = "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n";
+        assert_eq!(fork_remote(none), Some(ForkRemote::SourceHistory));
+        assert!(matches!(
+            fork_remote(&format!("{none}{flagged}")),
+            Some(ForkRemote::Remote(r)) if r.name == "forks"
+        ));
+        assert!(matches!(
+            fork_remote("[remote \"origin\"]\n\turl = /o\n"),
+            Some(ForkRemote::Remote(r)) if r.name == "origin"
+        ));
+        assert_eq!(fork_remote(""), None);
+        assert_eq!(
+            fork_remote("[remote \"bad\"]\n\turl = /b\n\tagentfsMaxBlobSize = 0\n"),
+            None
+        );
+        // A fork: its source's state area recorded, it publishes there and
+        // is local-only itself; a flagged section still wins.
+        let state = "[agentfs \"fork\"]\n\tsourceState = /srv/src/state\n";
+        let (_d, c) = config_with(&fork_config(state));
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.fork_remote, Some(ForkRemote::SourceHistory));
+        assert_eq!(s.remotes, Remotes::LocalOnly);
+        assert_eq!(s.source_state, Some(PathBuf::from("/srv/src/state")));
+        let (_d, c) = config_with(&fork_config(&format!("{state}{flagged}")));
+        let s = Settings::from_config(&c).unwrap();
+        assert!(matches!(&s.fork_remote, Some(ForkRemote::Remote(r)) if r.name == "forks"));
+        assert_eq!(s.remotes.pushed()[0].name, "forks");
+        // A fork with no fork remote is undeclared.
+        let (_d, c) = config_with(&fork_config(""));
+        assert_eq!(
+            Settings::from_config(&c).unwrap().remotes,
+            Remotes::Undeclared { beside: None }
+        );
+        // Only beside a fork identity, and only absolute.
+        let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{state}"));
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::PartialForkIdentity)
+        ));
+        let (_d, c) = config_with(&fork_config("[agentfs \"fork\"]\n\tsourceState = rel\n"));
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::RelativePath { ref key, .. }) if key == "agentfs.fork.sourceState"
         ));
     }
 }

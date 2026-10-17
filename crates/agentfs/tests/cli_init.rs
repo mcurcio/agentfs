@@ -85,10 +85,10 @@ fn s(p: &Path) -> &str {
 #[test]
 fn a_rerun_for_the_same_volume_succeeds_and_changes_nothing() {
     let d = Dir::new();
-    let out = d.ok(["init", "--volume", "demo"]);
+    let out = d.ok(["init", "--volume", "demo", "--local-only"]);
     assert!(out.contains("initialised volume demo in"), "{out}");
     let before = d.config();
-    let out = d.ok(["init", "--volume", "demo"]);
+    let out = d.ok(["init", "--volume", "demo", "--local-only"]);
     assert!(out.contains("volume demo already initialised in"), "{out}");
     let out = d.ok(["init", "--volume", "demo", "--branch", "agentfs/demo"]);
     assert!(out.contains("already initialised"), "{out}");
@@ -106,7 +106,7 @@ fn a_rerun_for_the_same_volume_succeeds_and_changes_nothing() {
 #[test]
 fn another_volume_or_branch_is_refused_and_nothing_changes() {
     let d = Dir::new();
-    d.ok(["init", "--volume", "demo"]);
+    d.ok(["init", "--volume", "demo", "--local-only"]);
     let before = d.config();
     let out = d.run(["init", "--volume", "other"]);
     assert_eq!(out.status.code(), Some(1));
@@ -128,12 +128,12 @@ fn another_volume_or_branch_is_refused_and_nothing_changes() {
 #[test]
 fn a_rerun_takes_the_state_area_lock() {
     let d = Dir::new();
-    d.ok(["init", "--volume", "demo"]);
+    d.ok(["init", "--volume", "demo", "--local-only"]);
     let lock = StateLock::acquire(&d.state(), "test", Duration::ZERO).unwrap();
-    let out = d.run(["init", "--volume", "demo"]);
+    let out = d.run(["init", "--volume", "demo", "--local-only"]);
     assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
     drop(lock);
-    d.ok(["init", "--volume", "demo"]);
+    d.ok(["init", "--volume", "demo", "--local-only"]);
 }
 
 #[test]
@@ -143,7 +143,10 @@ fn includes_are_set_once_and_replaced() {
         "a.conf",
         "[agentfs]\n\tpushInterval = 7s\n[remote \"origin\"]\n\turl = /srv/history.git\n",
     );
-    let b = d.fragment("b.conf", "[agentfs]\n\tcommitWindow = 1s\n");
+    let b = d.fragment(
+        "b.conf",
+        "[agentfs]\n\tcommitWindow = 1s\n[remote \"backup\"]\n\turl = /srv/b.git\n",
+    );
     d.ok(["init", "--volume", "demo", "--include", s(&a)]);
     d.ok(["init", "--volume", "demo", "--include", s(&a)]);
     assert_eq!(d.config().matches("path = ").count(), 1, "{}", d.config());
@@ -186,7 +189,14 @@ fn a_relative_include_is_made_absolute() {
     let out = d
         .command()
         .current_dir(d.dir.path())
-        .args(["init", "--volume", "demo", "--include", "a.conf"])
+        .args([
+            "init",
+            "--volume",
+            "demo",
+            "--include",
+            "a.conf",
+            "--local-only",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
@@ -206,7 +216,7 @@ fn a_missing_include_fails() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("cannot be read"), "{}", stderr(&out));
     // Repaired by a re-run with a file that exists.
-    let good = d.fragment("good.conf", "");
+    let good = d.fragment("good.conf", "[agentfs]\n\tremotes = none\n");
     d.ok(["init", "--volume", "demo", "--include", s(&good)]);
     d.ok(["status"]);
 }
@@ -221,6 +231,7 @@ fn root_is_created() {
         "init".as_ref(),
         "--volume".as_ref(),
         "demo".as_ref(),
+        "--local-only".as_ref(),
     ]);
     assert!(out.contains("created the backing tree"), "{out}");
     assert!(root.is_dir());
@@ -245,9 +256,63 @@ fn existing_rule_files_are_kept() {
     let info = d.p("state/git/info");
     std::fs::create_dir_all(&info).unwrap();
     std::fs::write(info.join("exclude"), "*.log\n").unwrap();
-    d.ok(["init", "--volume", "demo"]);
+    d.ok(["init", "--volume", "demo", "--local-only"]);
     assert_eq!(
         std::fs::read_to_string(info.join("exclude")).unwrap(),
         "*.log\n"
     );
+}
+
+/// F8 S3 acceptance 3: a volume declares its remotes. Without a remote
+/// section and without --local-only, init is refused; with --local-only,
+/// status says so and `agentfs push` has nothing to do.
+#[test]
+fn init_needs_remotes_declared() {
+    let d = Dir::new();
+    let out = d.run(["init", "--volume", "demo"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains(
+            "declare remotes: add a [remote] section to an include, or pass --local-only"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    let out = d.ok(["init", "--volume", "demo", "--local-only"]);
+    assert!(out.contains("demo"), "{out}");
+    assert!(d.config().contains("remotes = none"), "{}", d.config());
+    let status = d.ok(["status"]);
+    assert!(
+        status.contains("remotes:   local-only (declared)"),
+        "{status}"
+    );
+    let out = d.run(["push"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "local-only: nothing to push");
+
+    // A remote section beside the declaration is neither: refused, naming
+    // it; status says so.
+    let d = Dir::new();
+    let a = d.fragment("a.conf", "[remote \"origin\"]\n\turl = /srv/history.git\n");
+    let out = d.run([
+        "init",
+        "--volume",
+        "demo",
+        "--include",
+        s(&a),
+        "--local-only",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("agentfs.remotes = none is set beside remote section \"origin\""),
+        "{}",
+        stderr(&out)
+    );
+    let status = d.ok(["status"]);
+    assert!(status.contains("remotes:   undeclared"), "{status}");
+    // A remote section declares remotes by itself.
+    let d = Dir::new();
+    let a = d.fragment("a.conf", "[remote \"origin\"]\n\turl = /srv/history.git\n");
+    d.ok(["init", "--volume", "demo", "--include", s(&a)]);
+    assert!(d.ok(["status"]).contains("remotes:   1 pushed"));
 }

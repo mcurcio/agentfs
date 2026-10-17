@@ -309,7 +309,11 @@ impl Node {
             profiles: root.join("profiles"),
         };
         fs::create_dir_all(&layout.profiles).unwrap();
-        fs::write(layout.profiles.join("p.config"), "").unwrap();
+        fs::write(
+            layout.profiles.join("p.config"),
+            "[agentfs]\n\tremotes = none\n",
+        )
+        .unwrap();
         for v in ["v", "w"] {
             agentfs_csi::volume::create(&layout, v, &params(v), 0).unwrap();
         }

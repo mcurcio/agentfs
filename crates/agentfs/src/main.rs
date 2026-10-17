@@ -74,7 +74,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use agentfs_core::config::parse_duration;
+use agentfs_core::config::{Remotes, parse_duration};
 use agentfs_core::events::{Event, Events, PushStage};
 use agentfs_core::history::History;
 use agentfs_core::identity::Context;
@@ -143,6 +143,11 @@ enum Command {
         /// state area's includes.
         #[arg(long = "include", value_name = "FILE")]
         includes: Vec<PathBuf>,
+        /// Declare the volume local-only: `agentfs.remotes = none` in the
+        /// state area's own config. Without it, and without a remote
+        /// section in an include, init is refused (F8 S3).
+        #[arg(long)]
+        local_only: bool,
     },
     /// Show the branch head, the last committed sequence and the backlog.
     Status(Pod),
@@ -390,6 +395,7 @@ fn real_main() -> Result<ExitCode> {
             volume,
             branch,
             includes,
+            local_only,
         } => init(
             &state,
             cli.root.as_deref(),
@@ -397,6 +403,7 @@ fn real_main() -> Result<ExitCode> {
             &volume,
             branch,
             includes,
+            local_only,
         )?,
         Command::Status(_pod) => {
             // Read-only: no recovery, no lock, so it is safe beside a
@@ -449,10 +456,16 @@ fn real_main() -> Result<ExitCode> {
                 Some(bytes) => println!("lfs:       files over {bytes} byte(s) are stored as LFS"),
                 None => println!("lfs:       no size threshold (only lfs attributes select LFS)"),
             }
+            println!("remotes:   {}", remotes_line(&settings.remotes));
             for remote in push::status(&state, settings)? {
                 println!("{}", remote_line(&remote));
                 // Where its LFS objects go: resolved from config, no network.
-                if let Some(r) = settings.remotes.iter().find(|r| r.name == remote.name) {
+                if let Some(r) = settings
+                    .remotes
+                    .pushed()
+                    .iter()
+                    .find(|r| r.name == remote.name)
+                {
                     match lfs::endpoint::resolve(settings, r, lfs::Direction::Upload) {
                         Ok(endpoint) => println!("           lfs: {}", endpoint.describe()),
                         Err(e) => println!("           lfs: none ({e})"),
@@ -555,6 +568,17 @@ fn real_main() -> Result<ExitCode> {
                 let code = push_with_lease(&state, &remotes, &lease, &session)?;
                 session.finish();
                 return Ok(code);
+            }
+            // Declared local-only: nothing is ever pushed, daemon or not.
+            if remotes.is_empty()
+                && History::open(&state.git())
+                    .with_context(|| format!("opening {}", state.root().display()))?
+                    .settings()
+                    .remotes
+                    == Remotes::LocalOnly
+            {
+                println!("{LOCAL_ONLY_PUSH}");
+                return Ok(ExitCode::SUCCESS);
             }
             // A running daemon pushes for us (design §2.3).
             if let Some(code) = push_now::client(&state, &remotes, timeout) {
@@ -668,7 +692,9 @@ fn refuse_finished(state: &StateDir) -> Result<()> {
 }
 
 /// `agentfs init`: creates the state area or checks an existing one
-/// (design §2.3, §17.1), and creates `--root` when it is missing.
+/// (design §2.3, §17.1), and creates `--root` when it is missing. A
+/// result that declares no remote is refused (F8 S3): the state area
+/// stays, as with a bad include, and init with a declaration fixes it.
 fn init(
     state: &StateDir,
     root: Option<&Path>,
@@ -676,6 +702,7 @@ fn init(
     volume: &str,
     branch: Option<String>,
     includes: Vec<PathBuf>,
+    local_only: bool,
 ) -> Result<()> {
     // An existing state area may be in use: take its lock. A new one is
     // created whole, so there is nothing to lock yet (and a refused name
@@ -693,6 +720,26 @@ fn init(
     let includes = (!includes.is_empty()).then_some(includes.as_slice());
     let outcome = volume::init_with(state, volume, branch.as_deref(), includes)
         .with_context(|| format!("initialising {}", state.root().display()))?;
+    if local_only {
+        agentfs_core::config::declare_local_only(&state.git())
+            .with_context(|| format!("declaring {} local-only", state.root().display()))?;
+    }
+    let settings = History::open(&state.git())
+        .with_context(|| format!("opening {}", state.root().display()))?
+        .settings()
+        .remotes
+        .clone();
+    if let Remotes::Undeclared { beside } = settings {
+        match beside {
+            None => {
+                bail!("declare remotes: add a [remote] section to an include, or pass --local-only")
+            }
+            Some(remote) => bail!(
+                "declare remotes: agentfs.remotes = none is set beside remote section \
+                 {remote:?}; remove one of them"
+            ),
+        }
+    }
     if let Some(root) = root
         && !root.exists()
     {
@@ -738,21 +785,36 @@ fn push_once(state: &StateDir, only: &[String], session: &Session) -> Result<Exi
         if settings.invalid_remotes.iter().any(|r| r.name == *name) {
             continue;
         }
-        if !settings.remotes.iter().any(|r| r.name == *name) {
+        if !settings.remotes.pushed().iter().any(|r| r.name == *name) {
             bail!("no remote named {name:?} is configured");
         }
     }
+    match &settings.remotes {
+        Remotes::LocalOnly => {
+            println!("{LOCAL_ONLY_PUSH}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Remotes::Undeclared { .. } => {
+            if let Some(event) = agentfs_core::service::remotes_undeclared(settings) {
+                eprintln!("{event}");
+                events.emit(event);
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+        Remotes::Pushed(_) | Remotes::NoneValid => {}
+    }
     let selected: Vec<_> = settings
         .remotes
+        .pushed()
         .iter()
         .filter(|r| only.is_empty() || only.contains(&r.name))
         .collect();
     if selected.is_empty() {
-        if ok {
-            println!("no remotes configured");
-            return Ok(ExitCode::SUCCESS);
-        }
-        return Ok(ExitCode::FAILURE);
+        return Ok(if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
     }
     for remote in selected {
         let mut pusher =
@@ -806,10 +868,11 @@ fn push_with_lease(
     let remote = match only {
         [name] => settings
             .remotes
+            .pushed()
             .iter()
             .find(|r| r.name == *name)
             .with_context(|| format!("no remote named {name:?} is configured"))?,
-        [] => match settings.remotes.as_slice() {
+        [] => match settings.remotes.pushed() {
             [remote] => remote,
             [] => bail!("--force-with-lease: no remote is configured"),
             _ => bail!("--force-with-lease needs --remote NAME: this volume has several remotes"),
@@ -907,6 +970,25 @@ fn describe(outcome: &PushOutcome) -> String {
     }
 }
 
+/// What `agentfs push` prints for a volume declared local-only.
+const LOCAL_ONLY_PUSH: &str = "local-only: nothing to push";
+
+/// `agentfs status`'s `remotes:` line: how the volume declares its
+/// remotes (F8 S3).
+fn remotes_line(remotes: &Remotes) -> String {
+    match remotes {
+        Remotes::Pushed(list) => format!("{} pushed", list.len()),
+        Remotes::NoneValid => "none valid (every remote section is misconfigured)".into(),
+        Remotes::LocalOnly => "local-only (declared)".into(),
+        Remotes::Undeclared { beside: None } => {
+            "undeclared (add a remote section, or agentfs.remotes = none)".into()
+        }
+        Remotes::Undeclared {
+            beside: Some(remote),
+        } => format!("undeclared (agentfs.remotes = none beside remote {remote:?})"),
+    }
+}
+
 /// One `status` line per remote.
 fn remote_line(remote: &RemoteStatus) -> String {
     let state = &remote.state;
@@ -973,6 +1055,7 @@ fn run(
     let control = start_control(
         state,
         push_now::handler(
+            state.clone(),
             service.handle(),
             misconfigured(&settings),
             push_now::Restores::Refuse(push_now::RUN_SERVES_NO_RESTORES),
@@ -1372,6 +1455,7 @@ fn mount(
     let control = start_control(
         state,
         push_now::handler(
+            state.clone(),
             service.handle(),
             misconfigured(&settings),
             push_now::Restores::Serve(recovery::Daemon {

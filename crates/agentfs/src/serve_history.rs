@@ -131,6 +131,7 @@ pub(crate) fn serve(
     let control = start_control(
         state,
         push_now::handler(
+            state.clone(),
             service.handle(),
             misconfigured(&settings),
             push_now::Restores::ServeFronts(recovery::ServiceDaemon {

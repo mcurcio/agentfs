@@ -66,6 +66,7 @@ pub mod names {
     pub const PRECHECK_REJECTED_PATHS: &str = "agentfs.precheck.rejected_paths";
     pub const STATE_BYTES: &str = "agentfs.state.bytes";
     pub const REMOTE_MISCONFIGURED: &str = "agentfs.remote.misconfigured";
+    pub const REMOTES_MODE: &str = "agentfs.remotes.mode";
     pub const PATCH_QUEUE_DEPTH: &str = "agentfs.patch.queue_depth";
     pub const PATCH_BLOCKED: &str = "agentfs.patch.blocked";
     pub const FRONT_ROUND_TRIP: &str = "agentfs.front.round_trip";
@@ -419,6 +420,17 @@ impl Telemetry {
                 }
             })
             .build();
+        let mode = settings.remotes.mode();
+        inner
+            .meter
+            .u64_observable_gauge(names::REMOTES_MODE)
+            .with_unit("{volume}")
+            .with_description(
+                "1, with the volume's remotes mode: pushed, none_valid, local_only or undeclared \
+                 (F8 S3)",
+            )
+            .with_callback(move |observer| observer.observe(1, &[KeyValue::new("mode", mode)]))
+            .build();
         let patch_state = state.patch_state();
         inner
             .meter
@@ -748,6 +760,7 @@ impl EventSink for TelemetrySink {
             Event::Diverged { .. }
             | Event::StartBranchMoved { .. }
             | Event::RemoteMisconfigured { .. }
+            | Event::RemotesUndeclared { .. }
             | Event::PushSucceeded { .. }
             | Event::PatchApplied { .. }
             | Event::PatchDuplicate { .. }
@@ -801,6 +814,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::StartBranchMoved { .. } => "agentfs.start_branch_moved",
         Event::PushLimited { .. } => "agentfs.push_limited",
         Event::RemoteMisconfigured { .. } => "agentfs.remote_misconfigured",
+        Event::RemotesUndeclared { .. } => "agentfs.remotes_undeclared",
         Event::PushSucceeded { .. } => "agentfs.push_succeeded",
         Event::PatchApplied { .. } => "agentfs.patch_applied",
         Event::PatchDuplicate { .. } => "agentfs.patch_duplicate",
@@ -927,6 +941,11 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
         Event::RemoteMisconfigured { remote, error } => {
             out.push(("agentfs.remote", s(remote)));
             out.push(("agentfs.error", s(error)));
+        }
+        Event::RemotesUndeclared { beside } => {
+            if let Some(remote) = beside {
+                out.push(("agentfs.remote", s(remote)));
+            }
         }
         Event::PushSucceeded {
             remote,

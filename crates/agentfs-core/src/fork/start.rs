@@ -28,10 +28,11 @@ use std::path::{Path, PathBuf};
 
 use git2::{AutotagOption, ErrorCode, FetchOptions, FetchPrune, Oid, Repository};
 
-use crate::config::{ConfigError, RemoteSettings, Settings};
+use crate::config::{ConfigError, RemoteSettings, Remotes, Settings};
 use crate::events::PushFailureKind;
 use crate::history::HistoryError;
 use crate::lfs::fetch::Fetcher;
+use crate::non_empty::NonEmpty;
 use crate::push::{classify, scrub_userinfo};
 use crate::remote_auth::{AuthState, RemoteAuth};
 use crate::restore::RestoreError;
@@ -122,8 +123,12 @@ pub fn start_from(request: &StartRequest<'_>) -> Result<StartPoint, StartError> 
         }
     })?;
     let settings = Settings::load(&request.state.git()).map_err(StartError::Settings)?;
+    if settings.remotes == Remotes::LocalOnly {
+        return Err(StartError::LocalOnly);
+    }
     let remote = settings
         .remotes
+        .pushed()
         .iter()
         .find(|r| r.name == start.remote)
         .ok_or_else(|| StartError::NoSuchRemote {
@@ -167,7 +172,7 @@ pub fn start_from(request: &StartRequest<'_>) -> Result<StartPoint, StartError> 
     }
     // LFS content of the pinned tree from the start remote's endpoint.
     let mut from_start = settings.clone();
-    from_start.remotes.retain(|r| r.name == start.remote);
+    from_start.remotes = Remotes::Pushed(NonEmpty::one(remote.clone()));
     let objects = Fetcher::new(request.state, &from_start)?;
     super::create::materialize(&repo, branch_ref, start.commit, request.tree, &objects).map_err(
         |e| match e {
@@ -292,6 +297,7 @@ pub fn accept(state: &StateDir, tip: Oid) -> Result<String, AcceptError> {
     };
     let remote = settings
         .remotes
+        .pushed()
         .iter()
         .find(|r| r.name == start.remote)
         .ok_or_else(|| AcceptError::NoSuchRemote {

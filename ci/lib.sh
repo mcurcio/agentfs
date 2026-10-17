@@ -78,7 +78,8 @@ new_volume() { # volume-name
   STATE=$VOL/state
   TREE=$VOL/tree
   mkdir -p "$TREE"
-  agentfs init --volume "$1" >/dev/null
+  # Declared local-only until volume_config adds a remote (F8 S3).
+  agentfs init --volume "$1" --local-only >/dev/null
 }
 
 # Runs agentfs against the current volume.
@@ -99,6 +100,8 @@ agentfs_start() { # log args...
 # Sets keys in the volume's history repository config.
 volume_config() { # key value
   git --git-dir "$STATE/git" config "$1" "$2"
+  # A remote section declares the remotes: drop `--local-only` (F8 S3).
+  case $1 in remote.*) git --git-dir "$STATE/git" config --unset agentfs.remotes || true ;; esac
 }
 
 local_head() { # volume-name

@@ -16,10 +16,13 @@
 //! - request: `{"v":1,"op":"restore"|"revert","path":...,"commit":...,
 //!   "force":false,"dry_run":false}` (`path` for restore only), or
 //!   `{"v":1,"op":"push","remotes":[...],"timeout_ms":N}` (both
-//!   optional), at most [`MAX_REQUEST`] bytes, read within
-//!   [`READ_TIMEOUT`];
+//!   optional), or `{"v":1,"op":"receive_fork","path":...}` (a finished
+//!   fork's state area, F8 S3), at most [`MAX_REQUEST`] bytes, read
+//!   within [`READ_TIMEOUT`];
 //! - reply: `{"ok":{...}}` (a restore or revert), `{"pushed":{...}}` (a
-//!   push), `{"refused":{"kind":...,"message":...,"hint":...}}`,
+//!   push), `{"received":{"change":...}}` (a fork received into this
+//!   local-only volume's history),
+//!   `{"refused":{"kind":...,"message":...,"hint":...}}`,
 //!   `{"busy":"..."}` (another restore is running, or this daemon serves
 //!   no restores) or `{"error":"..."}`.
 //!
@@ -57,6 +60,9 @@ pub enum Op {
     Revert,
     /// Commit and push now (design §2.3): every daemon serves it.
     Push,
+    /// Receive a finished fork into this local-only volume's history (F8
+    /// S3): every daemon serves it, beside the others.
+    ReceiveFork,
 }
 
 impl Op {
@@ -99,6 +105,21 @@ impl Request {
             dry_run: false,
             remotes,
             timeout_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+        }
+    }
+
+    /// A request to receive the finished fork whose state area is `from`
+    /// (an absolute path).
+    pub fn receive_fork(from: String) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            op: Op::ReceiveFork,
+            path: Some(from),
+            commit: String::new(),
+            force: false,
+            dry_run: false,
+            remotes: Vec::new(),
+            timeout_ms: None,
         }
     }
 }
@@ -157,6 +178,11 @@ pub struct Outcome {
 pub enum Reply {
     Ok(Outcome),
     Pushed(PushReply),
+    /// The fork's change (or its finish, when it changed nothing), now in
+    /// this volume's history.
+    Received {
+        change: String,
+    },
     Refused {
         kind: String,
         message: String,

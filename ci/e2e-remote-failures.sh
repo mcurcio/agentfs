@@ -119,9 +119,10 @@ git init -q --bare "$REFUSED"
 git init -q --bare "$GIT_SERVER_REPOS/badauth.git"
 printf '#!/bin/sh\necho "refused by policy" >&2\nexit 1\n' >"$REFUSED/hooks/pre-receive"
 chmod +x "$REFUSED/hooks/pre-receive"
-sagentfs init --volume demo >/dev/null
+sagentfs init --volume demo --local-only >/dev/null
 sgit config agentfs.commitWindow 100ms
 sgit config agentfs.pushInterval 1s
+sgit config --unset agentfs.remotes  # a remote declares the remotes (F8 S3)
 sgit config remote.good.url "$GIT_HTTP_BASE/good.git"
 sgit config remote.good.agentfsCredentials "$CREDS/good"
 mount_volume

@@ -369,8 +369,12 @@ async fn the_release_scan_commits_the_journal_and_pushes_to_a_remote_added_later
         profiles: dir.path().join("profiles"),
     };
     fs::create_dir_all(&layout.profiles).unwrap();
-    // No remote yet.
-    fs::write(layout.profiles.join("test.config"), "").unwrap();
+    // No remote yet: declared local-only (F8 S3).
+    fs::write(
+        layout.profiles.join("test.config"),
+        "[agentfs]\n\tremotes = none\n",
+    )
+    .unwrap();
     let params = VolumeParams {
         profile: "test".into(),
         volume: "journaled".into(),

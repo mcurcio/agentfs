@@ -35,7 +35,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Settings;
+use crate::config::{Remotes, Settings};
 use crate::fork::finish::ForkState;
 use crate::push::{Claim, Unreachable};
 
@@ -87,8 +87,7 @@ pub struct Seen {
 }
 
 /// How the worktree declares its remotes, with what each pushed one
-/// shows. F8 S1 builds it from today's `Settings::remotes`; F8 S3 from
-/// `config::Remotes`, without changing [`decide`].
+/// shows, mapped one to one from `config::Remotes` ([`Declared::of`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Declared<'a> {
     /// One entry per valid push remote, in `Settings` order.
@@ -98,7 +97,7 @@ pub enum Declared<'a> {
     NoneValid,
     /// `agentfs.remotes = none` (F8 S3).
     LocalOnly,
-    /// No push section and no declaration.
+    /// No push section and no declaration, or `none` beside a section.
     Undeclared,
 }
 
@@ -106,12 +105,11 @@ impl<'a> Declared<'a> {
     /// How `settings` declares its remotes; `seen` must hold one entry per
     /// valid push remote of `settings` (ignored otherwise).
     pub fn of(settings: &Settings, seen: &'a [Seen]) -> Self {
-        if !settings.remotes.is_empty() {
-            Self::Pushed(seen)
-        } else if settings.invalid_remotes.iter().any(|r| !r.fork_remote) {
-            Self::NoneValid
-        } else {
-            Self::Undeclared
+        match settings.remotes {
+            Remotes::Pushed(_) => Self::Pushed(seen),
+            Remotes::NoneValid => Self::NoneValid,
+            Remotes::LocalOnly => Self::LocalOnly,
+            Remotes::Undeclared { .. } => Self::Undeclared,
         }
     }
 }
@@ -453,5 +451,33 @@ mod tests {
             ..worktree(OnDelete::Delete, Declared::Pushed(&held))
         };
         assert_eq!(decide(&fork), Release::Delete);
+    }
+
+    /// F8 S3 acceptance 2: `Declared::of` maps each mode one to one, and a
+    /// local-only worktree is kept whatever `onDelete` says.
+    #[test]
+    fn declared_follows_the_remotes_mode() {
+        let settings = |lines: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config");
+            std::fs::write(&path, format!("[agentfs]\n\tvolume = v\n{lines}")).unwrap();
+            Settings::from_config(&git2::Config::open(&path).unwrap()).unwrap()
+        };
+        let held = [seen("origin", Ok(Claim::UpToDate))];
+        let pushed = settings("[remote \"origin\"]\n\turl = /o\n");
+        assert_eq!(Declared::of(&pushed, &held), Declared::Pushed(&held));
+        let none_valid = settings("[remote \"bad\"]\n\turl = /b\n\tagentfsMaxBlobSize = 0\n");
+        assert_eq!(Declared::of(&none_valid, &[]), Declared::NoneValid);
+        let local = settings("[agentfs]\n\tremotes = none\n");
+        assert_eq!(Declared::of(&local, &[]), Declared::LocalOnly);
+        assert_eq!(Declared::of(&settings(""), &[]), Declared::Undeclared);
+        let beside = settings("[agentfs]\n\tremotes = none\n[remote \"origin\"]\n\turl = /o\n");
+        assert_eq!(Declared::of(&beside, &[]), Declared::Undeclared);
+        for on_delete in [OnDelete::Delete, OnDelete::Retain] {
+            assert_eq!(
+                decide(&worktree(on_delete, Declared::of(&local, &[]))),
+                Release::Keep(Kept::LocalOnly)
+            );
+        }
     }
 }

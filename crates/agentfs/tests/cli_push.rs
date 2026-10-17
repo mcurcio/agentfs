@@ -17,7 +17,7 @@ impl Volume {
         };
         fs::create_dir_all(v.tree()).unwrap();
         fs::create_dir_all(v.home()).unwrap();
-        let out = v.run(&["init", "--volume", "demo"]);
+        let out = v.run(&["init", "--volume", "demo", "--local-only"]);
         assert!(out.status.success(), "{}", stderr(&out));
         v
     }
@@ -39,6 +39,10 @@ impl Volume {
         let mut config = git2::Config::open(&self.state().join("git/config")).unwrap();
         for (k, v) in pairs {
             config.set_str(k, v).unwrap();
+            // A remote section declares the volume's remotes: drop `--local-only` (F8 S3).
+            if k.starts_with("remote.") {
+                let _ = config.remove("agentfs.remotes");
+            }
         }
     }
 
@@ -149,7 +153,7 @@ fn push_with_nothing_committed_or_configured() {
     let v = Volume::new();
     let out = v.run(&["push"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(stdout(&out).trim(), "no remotes configured");
+    assert_eq!(stdout(&out).trim(), "local-only: nothing to push");
 
     let remote = v.dir.path().join("r.git");
     bare(&remote);

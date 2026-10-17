@@ -30,7 +30,7 @@ impl Layout {
     }
 
     fn init(&self, state: &Path) {
-        let out = run(state, &["init", "--volume", "demo"]);
+        let out = run(state, &["init", "--volume", "demo", "--local-only"]);
         assert!(out.status.success(), "{}", stderr(&out));
     }
 }
@@ -204,6 +204,7 @@ fn an_include_inside_the_backing_tree() {
             "demo",
             "--include",
             s(&l.p("backing/agentfs.conf")),
+            "--local-only",
         ],
     );
     assert!(out.status.success(), "{}", stderr(&out));

@@ -56,7 +56,7 @@ impl Vol {
         let v = Self { dir };
         fs::create_dir_all(v.backing()).unwrap();
         fs::create_dir_all(v.mnt()).unwrap();
-        v.ok("", &["init", "--volume", "demo"]);
+        v.ok("", &["init", "--volume", "demo", "--local-only"]);
         let mut c = git2::Config::open(&v.state().join("git/config")).unwrap();
         c.set_str("agentfs.commitWindow", "50ms").unwrap();
         v

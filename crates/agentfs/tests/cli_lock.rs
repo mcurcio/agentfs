@@ -22,7 +22,16 @@ impl Volume {
         };
         std::fs::create_dir_all(v.tree()).unwrap();
         std::fs::write(v.tree().join("a"), "1").unwrap();
-        let out = v.run(["init", "--volume", "demo"]);
+        // A remote, so that `push` has work and needs the lock.
+        let profile = v.dir.path().join("profile");
+        std::fs::write(&profile, "[remote \"r\"]\n\turl = /nowhere\n").unwrap();
+        let out = v.run([
+            "init".as_ref(),
+            "--volume".as_ref(),
+            "demo".as_ref(),
+            "--include".as_ref(),
+            profile.as_os_str(),
+        ]);
         assert!(out.status.success(), "{}", stderr(&out));
         v
     }

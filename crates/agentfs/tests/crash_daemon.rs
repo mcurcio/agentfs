@@ -57,8 +57,10 @@ impl Setup {
         fs::create_dir_all(s.tree()).unwrap();
         fs::create_dir_all(s.home()).unwrap();
         Repository::init_bare(s.remote()).unwrap();
-        s.ok(&["init", "--volume", "demo"]);
+        s.ok(&["init", "--volume", "demo", "--local-only"]);
         let mut config = git2::Config::open(&s.state().join("git/config")).unwrap();
+        // A remote section declares the volume's remotes: drop `--local-only` (F8 S3).
+        let _ = config.remove("agentfs.remotes");
         config
             .set_str(
                 "remote.origin.url",

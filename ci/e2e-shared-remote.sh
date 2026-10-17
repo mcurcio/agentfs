@@ -78,9 +78,10 @@ for v in a b; do
   mkdir -p "$W/$v/backing" "$W/$v/mnt"
   chmod 755 "$W/$v" "$W/$v/backing" "$W/$v/mnt"
   printf 'username=vol-%s\npassword=pw-%s\n' "$v" "$v" >"$CREDS/$v"
-  vagentfs "$v" init --volume "vol-$v" >/dev/null
+  vagentfs "$v" init --volume "vol-$v" --local-only >/dev/null
   vgit "$v" config agentfs.commitWindow 100ms
   vgit "$v" config agentfs.pushInterval 1s
+  vgit "$v" config --unset agentfs.remotes  # a remote declares the remotes (F8 S3)
   vgit "$v" config remote.http.url "$GIT_HTTP_BASE/shared.git"
   vgit "$v" config remote.http.agentfsCredentials "$CREDS/$v"
   vgit "$v" config remote.file.url "$FILE_REPO"

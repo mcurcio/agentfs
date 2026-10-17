@@ -102,12 +102,13 @@ GitHub Actions runners can, so put such tests in a script under `ci/` and a job 
 
 | Workflow | Runs on | Typical duration | Covers |
 |---|---|---|---|
-| `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, remotes (http/https/ssh), LFS, telemetry, multipod, NFS (one export, two clients, one node at a time), patches, runbooks, csi-sanity |
+| `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, remotes (http/https/ssh), LFS, telemetry, multipod, NFS (CLI state areas on one export with two clients; agentfs-csi refusing an NFS base path), patches, runbooks, csi-sanity |
 | `image.yml` | every push and PR | ~5–9 min | container image, kind sidecar e2e, CSI on one kind node (no multi-node job); publishes to GHCR on main |
 | `alerts.yml` | pushes and PRs touching `deploy/alerts`, its `ci/` scripts or the telemetry code | ~4 min | promtool checks and unit tests of the example alert rules, the generated `PrometheusRule`, the rules against the binary's metrics in a real Prometheus |
 | `docker.yml` | pushes and PRs touching the image or `examples/docker` | ~5–8 min | the Docker examples (`docker run`, compose, compose with a git server remote) via `ci/e2e-docker.sh`, one job each |
 | `helm.yml` | every push and PR | ~3–4 min | Helm charts: helm lint, ct lint, READMEs current with helm-docs, charts equal to `deploy/`; `ct install` of the CSI chart on kind and `ci/e2e-csi.sh` against it; publishes charts to `oci://ghcr.io/mcurcio/charts` on main and `v*` tags (docs/helm.md) |
 | `docs.yml` | every push and PR | ~2–3 min | logo PNGs in `docs/assets/` match fresh renders of their SVGs (`ci/render-assets.sh`); the mdBook of `docs/` (`book.toml`, `docs/SUMMARY.md`; an mdbook warning fails it), deployed to GitHub Pages from main; the README's Docker quick start as written, against the published image |
+| `f8.yml` | every push and PR | ~5–6 min | F8 end to end on kind, each job on its own runner: a volume moved between two workers by the moving runbook, with the example git server as a pod (`ci/e2e-csi-move.sh`); the chart's own git server, `server.enabled` (`ci/e2e-chart-server.sh`) |
 | `power-loss.yml` | pushes to main (not docs-only), after landing | ~7 min | dm-log-writes replay on XFS and ext4 |
 | `bench.yml` | pushes to main (not docs-only), after landing | ~15–18 min | benchmarks on XFS and ext4, each in two parallel shards, against `ci/bench-budget.json` |
 

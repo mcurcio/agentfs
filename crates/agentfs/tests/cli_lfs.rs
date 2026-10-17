@@ -28,7 +28,7 @@ impl Volume {
         };
         fs::create_dir_all(v.tree()).unwrap();
         fs::create_dir_all(v.home()).unwrap();
-        v.ok(&["init", "--volume", "demo"]);
+        v.ok(&["init", "--volume", "demo", "--local-only"]);
         v.config(&[("agentfs.lfsThreshold", "16")]);
         fs::write(
             v.state().join("git/info/attributes"),
@@ -54,6 +54,10 @@ impl Volume {
         let mut config = git2::Config::open(&self.state().join("git/config")).unwrap();
         for (k, v) in pairs {
             config.set_str(k, v).unwrap();
+            // A remote section declares the volume's remotes: drop `--local-only` (F8 S3).
+            if k.starts_with("remote.") {
+                let _ = config.remove("agentfs.remotes");
+            }
         }
     }
 

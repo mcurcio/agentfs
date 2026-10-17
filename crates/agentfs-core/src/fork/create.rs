@@ -4,7 +4,9 @@
 //!
 //! [`create`] reads the source's settings and branch head (the base). It
 //! refuses a source that is a fork or that has no fork remote. It then
-//! makes the fork's state area: the identity in the fork's own config,
+//! makes the fork's state area: the identity in the fork's own config
+//! (with the source's state area when the source is local-only, F8 S3:
+//! the fork publishes into its history, [`super::receive`]),
 //! the source's settings files as its includes, the objects of base's
 //! history copied in (no alternates, so a fork outlives its source), the
 //! fork's history ref at base, and base's tree written into the fork's
@@ -17,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use git2::{Oid, Repository};
 
-use crate::config::{ConfigError, Settings, validate_name};
+use crate::config::{ConfigError, ForkRemote, Settings, validate_name};
 use crate::confined::Dir;
 use crate::history::HistoryError;
 use crate::lfs::fetch::LfsObjects;
@@ -65,7 +67,8 @@ pub enum CreateError {
     SourceIsFork { volume: String },
     #[error(
         "volume {volume} has no fork remote: forks push to its patch remote, or to the one \
-         remote with agentfsForkRemote = true (design §19.1)"
+         remote with agentfsForkRemote = true, or into its own history when it is declared \
+         local-only (agentfs.remotes = none; design §19.1)"
     )]
     NoForkRemote { volume: String },
     #[error(
@@ -110,6 +113,9 @@ pub fn create(request: &CreateRequest<'_>) -> Result<ForkIdentity, CreateError> 
         }
         e => CreateError::Volume(e),
     })?;
+    if source.local_only {
+        record_source_state(request)?;
+    }
     // The identity the fork has: an earlier try's base wins.
     let settings = Settings::load(&request.fork.git()).map_err(HistoryError::from)?;
     let identity = settings.fork.clone().ok_or_else(|| CreateError::Exists {
@@ -165,6 +171,31 @@ struct Source {
     volume: String,
     base: Oid,
     repo: Repository,
+    /// Its forks publish into its history ([`ForkRemote::SourceHistory`]).
+    local_only: bool,
+}
+
+/// The source's state area in the fork's own config
+/// ([`super::receive::SOURCE_STATE_KEY`]), absolute; an earlier try's is
+/// kept.
+fn record_source_state(request: &CreateRequest<'_>) -> Result<(), CreateError> {
+    let key = super::receive::SOURCE_STATE_KEY;
+    let mut config =
+        git2::Config::open(&request.fork.git().join("config")).map_err(HistoryError::from)?;
+    match config.get_string(key) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {}
+        Err(e) => return Err(HistoryError::from(e).into()),
+    }
+    let path = std::path::absolute(request.source.root())?;
+    let value = path.to_str().ok_or_else(|| {
+        io::Error::other(format!(
+            "the source's state area {} is not valid UTF-8",
+            path.display()
+        ))
+    })?;
+    config.set_str(key, value).map_err(HistoryError::from)?;
+    Ok(())
 }
 
 fn read_source(state: &StateDir) -> Result<Source, CreateError> {
@@ -174,9 +205,10 @@ fn read_source(state: &StateDir) -> Result<Source, CreateError> {
     if settings.is_fork() {
         return Err(CreateError::SourceIsFork { volume });
     }
-    if settings.fork_remote.is_none() {
-        return Err(CreateError::NoForkRemote { volume });
-    }
+    let local_only = match &settings.fork_remote {
+        None => return Err(CreateError::NoForkRemote { volume }),
+        Some(remote) => *remote == ForkRemote::SourceHistory,
+    };
     let unreadable = |e: git2::Error| CreateError::SourceUnreadable(e.into());
     let repo = Repository::open_bare(&git).map_err(unreadable)?;
     let base = match repo.find_reference(&settings.branch_ref) {
@@ -186,7 +218,12 @@ fn read_source(state: &StateDir) -> Result<Source, CreateError> {
         }
         Err(e) => return Err(unreadable(e)),
     };
-    Ok(Source { volume, base, repo })
+    Ok(Source {
+        volume,
+        base,
+        repo,
+        local_only,
+    })
 }
 
 /// Every object reachable from `base`, packed from the source into the
@@ -385,12 +422,15 @@ pub fn unique_name(prefix: &str) -> Result<String, CreateError> {
     Ok(name)
 }
 
-/// The keys a CLI source may set in its own config: its identity, and its
-/// start point when it was started from another branch (F8 S1). Every
-/// other setting must come from an include, which the fork reads too.
-const OWN_KEYS: [&str; 5] = [
+/// The keys a CLI source may set in its own config: its identity, its
+/// start point when it was started from another branch (F8 S1), and
+/// `agentfs.remotes` (`init --local-only`, F8 S3), which its forks need
+/// not read: they publish into its history. Every other setting must come
+/// from an include, which the fork reads too.
+const OWN_KEYS: [&str; 6] = [
     "agentfs.volume",
     "agentfs.branch",
+    "agentfs.remotes",
     "agentfs.start.remote",
     "agentfs.start.branch",
     "agentfs.start.commit",

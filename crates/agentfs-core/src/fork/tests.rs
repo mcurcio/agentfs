@@ -1078,8 +1078,8 @@ fn settings_that_cannot_be_trusted_fail_closed() {
     drop(finisher);
     // The source is unaffected: its own remote is valid.
     let settings = crate::config::Settings::load(&source.state.git()).unwrap();
-    assert_eq!(settings.remotes.len(), 1);
-    assert_eq!(settings.remotes[0].name, "origin");
+    assert_eq!(settings.remotes.pushed().len(), 1);
+    assert_eq!(settings.remotes.pushed()[0].name, "origin");
 
     // The profile file gone: nothing opens, nothing reads a status.
     fs::remove_file(source.fragment.as_path()).unwrap();
@@ -1233,4 +1233,153 @@ fn finish_records_parse_only_from_agentfs_trailers() {
             "{bad}"
         );
     }
+}
+
+/// A volume declared local-only by its profile (F8 S3): no remote at all.
+fn local_only(name: &str) -> Vol {
+    let vol = Vol::new(name);
+    fs::write(&vol.fragment, "[agentfs]\n\tremotes = none\n").unwrap();
+    vol
+}
+
+/// F8 S3 (R4): a fork of a local-only source publishes into the source's
+/// own history, through no remote: its branch and its change and finish
+/// refs, never the source's branch or tree; a second publish changes
+/// nothing.
+#[test]
+fn a_local_only_sources_fork_publishes_into_its_history() {
+    let source = local_only("src");
+    source.change(&[("a.txt", "a\n")]);
+    let base = source.head().unwrap();
+    let fork = Fork::new();
+    let identity = fork.create(&source, "src-1").unwrap();
+    let settings = crate::config::Settings::load(&fork.state.git()).unwrap();
+    assert_eq!(
+        settings.fork_remote,
+        Some(crate::config::ForkRemote::SourceHistory)
+    );
+    assert_eq!(
+        settings.source_state.as_deref(),
+        Some(std::path::absolute(source.state.root()).unwrap().as_path())
+    );
+    fork.as_vol().write("b.txt", "b\n");
+    let source_tree = fs::read_dir(&source.tree).unwrap().count();
+
+    let lock = fork.lock();
+    let mut finisher = fork.finisher(&lock).unwrap();
+    let record = finisher.finish().unwrap();
+    assert_eq!(record.remote, super::receive::SOURCE_HISTORY);
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Published
+    );
+    let repo = source.repo();
+    assert_eq!(
+        repo.refname_to_id("refs/heads/agentfs/src-1").unwrap(),
+        record.finish
+    );
+    let change = record.change.unwrap();
+    assert_eq!(repo.refname_to_id(&change_ref("src-1")).unwrap(), change);
+    assert_eq!(
+        repo.refname_to_id(&finish_ref("src-1")).unwrap(),
+        record.finish
+    );
+    let received = repo.find_commit(change).unwrap();
+    assert_eq!(received.parent_ids().collect::<Vec<_>>(), [base]);
+    assert!(received.tree().unwrap().get_name("b.txt").is_some());
+    // Never applied: the source's branch and tree are as they were.
+    assert_eq!(source.head(), Some(base));
+    assert_eq!(fs::read_dir(&source.tree).unwrap().count(), source_tree);
+    assert!(!source.tree.join("b.txt").exists());
+    assert_eq!(
+        finish::status(&fork.state).unwrap().unwrap().state,
+        ForkState::Published
+    );
+
+    // Idempotent: received again, the same refs.
+    let refs = source.snapshot();
+    super::receive::receive_fork_change(&source.state, &identity, &fork.state).unwrap();
+    assert_eq!(source.snapshot(), refs);
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Published
+    );
+}
+
+/// What a local-only source refuses or is not there for: a branch another
+/// writer holds is refused, nothing written; a source in use stops the
+/// publish (exit 75 from the CLI); a source gone is refused.
+#[test]
+fn receiving_refuses_another_writer_and_waits_for_a_busy_source() {
+    let source = local_only("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    let identity = fork.create(&source, "src-2").unwrap();
+    fork.as_vol().write("b.txt", "b\n");
+    let lock = fork.lock();
+    let mut finisher = fork.finisher(&lock).unwrap();
+    finisher.finish().unwrap();
+
+    let held = StateLock::acquire(&source.state, "test", Duration::ZERO).unwrap();
+    assert!(matches!(
+        finisher.publish(Some(soon())),
+        Err(FinishError::SourceBusy(_))
+    ));
+    drop(held);
+
+    // The fork's branch name taken in the source, at a commit off the
+    // fork's history.
+    let repo = source.repo();
+    let other = source.head().unwrap();
+    let tree = repo.find_commit(other).unwrap().tree().unwrap();
+    let sig = git2::Signature::now("x", "x@e").unwrap();
+    let stray = repo
+        .commit(None, &sig, &sig, "another writer", &tree, &[])
+        .unwrap();
+    repo.reference("refs/heads/agentfs/src-2", stray, false, "test")
+        .unwrap();
+    let before = source.snapshot();
+    assert!(matches!(
+        super::receive::receive_fork_change(&source.state, &identity, &fork.state),
+        Err(super::receive::ReceiveError::Diverged { ref refname })
+            if refname == "refs/heads/agentfs/src-2"
+    ));
+    assert_eq!(source.snapshot(), before, "nothing is written");
+    assert!(matches!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Refused {
+            reason: RefusedReason::AnotherWriter,
+            ..
+        }
+    ));
+
+    // Gone: refused, never retried by the release scan.
+    finisher.retry_refused().unwrap();
+    fs::remove_dir_all(source.state.root()).unwrap();
+    assert!(matches!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Refused {
+            reason: RefusedReason::RemoteGone,
+            ..
+        }
+    ));
+    assert!(!source.state.root().exists(), "nothing made where it was");
+}
+
+/// A fork not finished has nothing to receive.
+#[test]
+fn an_active_fork_is_not_received() {
+    let source = local_only("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    let identity = fork.create(&source, "src-3").unwrap();
+    assert!(matches!(
+        super::receive::receive_fork_change(&source.state, &identity, &fork.state),
+        Err(super::receive::ReceiveError::NotPublished)
+    ));
+}
+
+/// A deadline for a publish that should not wait.
+fn soon() -> Instant {
+    Instant::now() + Duration::from_secs(5)
 }

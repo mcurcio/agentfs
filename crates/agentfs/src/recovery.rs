@@ -128,7 +128,7 @@ impl Ask {
                 None => Err(RestoreError::MissingPath),
             },
             Op::Revert => Ok(Self::revert(r.commit, r.force, r.dry_run)),
-            Op::Push => Err(other("a push is not a restore or revert")),
+            Op::Push | Op::ReceiveFork => Err(other("not a restore or revert")),
         }
     }
 
@@ -280,8 +280,8 @@ fn print_reply(command: &str, reply: Reply) -> ExitCode {
             eprintln!("{command} failed: {message}");
             ExitCode::FAILURE
         }
-        Reply::Pushed(_) => {
-            eprintln!("{command} failed: the daemon answered with a push's reply");
+        Reply::Pushed(_) | Reply::Received { .. } => {
+            eprintln!("{command} failed: the daemon answered another request's reply");
             ExitCode::FAILURE
         }
     }

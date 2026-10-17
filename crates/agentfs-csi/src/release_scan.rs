@@ -355,6 +355,7 @@ fn to_release(layout: &Layout) -> (Vec<(String, Work)>, Unreadable) {
                         remotes: history
                             .settings()
                             .remotes
+                            .pushed()
                             .iter()
                             .map(|r| {
                                 format!("{} {}", r.name, r.push_url.as_deref().unwrap_or(&r.url))

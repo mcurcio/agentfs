@@ -79,8 +79,9 @@ manifest=$work/manifest
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME=$work
 agentfs_() { "$AGENTFS_BIN" --state "$mnt/state" --root "$mnt/tree" "$@"; }
 mkdir -p "$mnt/tree"
-agentfs_ init --volume demo >/dev/null
+agentfs_ init --volume demo --local-only >/dev/null
 git init -q --bare "$mnt/remote.git"
+git --git-dir "$mnt/state/git" config --unset agentfs.remotes  # a remote declares the remotes (F8 S3)
 git --git-dir "$mnt/state/git" config remote.origin.url "file://$mnt/remote.git"
 git --git-dir "$mnt/state/git" config agentfs.commitWindow 10ms
 : >"$mnt/promises"

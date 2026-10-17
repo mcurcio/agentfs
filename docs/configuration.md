@@ -103,6 +103,7 @@ suffix (`512k`, `100m`).
 | `agentfs.pushInterval` | duration | `60s` | How often each remote is pushed; also the base of the failure backoff, which doubles up to `max(pushInterval, 15m)` (§11.2) |
 | `agentfs.sweepInterval` | duration, at least `1s` | `30s` | How often the mount records files held open and retries failed records (§3.1, §3.5) |
 | `agentfs.repackInterval` | duration, at least `1m`, or `0`/`off` | `1h` | How often the commit loop (`mount`, `run`) repacks the history with `git repack -d --geometric=2`, delta-compressing versions of files changed in place (§8). Needs the `git` CLI; skipped while a push runs or when nothing is loose; a failure raises `RepackFailed`. git runs with one thread and bounded windows, about 256 MiB, in a cleared environment; commits wait while it runs, and a stop kills it. `0` or `off` never repacks |
+| `agentfs.remotes` | `none` | unset | Declares the volume local-only (F8 S3): `agentfs init --local-only` writes it in the state area's own config, or an include sets it (a CSI profile). Beside a push section it is not local-only but undeclared ([Declaring remotes](#declaring-remotes)). Any other value fails the volume (`BadChoice`) |
 | `agentfs.patchRemote` | remote name, or `none` | the only remote, when exactly one is configured; else none | Where the patch queue (§12) is fetched from at mount, and the only remote that gets the queue push (status ref, `applied/<n>`, deleted `inbox/<n>`). A name that is not a valid remote means none. With none, patches already in the local inbox still apply |
 | `agentfs.patchFetchTimeout` | duration, or `0`/`off` | `30s` | How long a mount (or `agentfs patch apply`) waits for the inbox fetch; on timeout or failure it raises `PatchFetchFailed` and applies what is already fetched. `0` or `off` skips the fetch |
 | `agentfs.lfsThreshold` | positive size | unset: no size rule | Content larger than this (strictly `>`) is stored as Git LFS instead of a git blob (§7). Unset, only `agentfs.store=lfs` and `filter=lfs` in `info/attributes` select LFS. Setting it needs an LFS server for every remote (see [Git LFS](#git-lfs)) |
@@ -112,6 +113,33 @@ Operator path rules are not config keys: they are `<state>/git/info/exclude`
 (git ignore syntax: paths never recorded when new) and
 `<state>/git/info/attributes` (`-agentfs` and the other `agentfs.*`
 attributes, §4.2; see [Operator attributes](#operator-attributes)).
+
+### Declaring remotes
+
+Every volume declares how its history leaves the node (design §11.1, F8
+S3), in one of four modes, which `agentfs status` prints as its
+`remotes:` line and telemetry reports as the gauge `agentfs.remotes.mode`
+(attribute `mode`, value 1):
+
+| Mode (`mode`) | When | What happens |
+|---|---|---|
+| pushed (`pushed`) | one or more valid `[remote "<name>"]` push sections | each is pushed; invalid sections beside them raise `RemoteMisconfigured` |
+| none valid (`none_valid`) | push sections, all invalid | nothing is pushed; each raises `RemoteMisconfigured`; never called local-only |
+| local-only (`local_only`) | `agentfs.remotes = none` and no push section | nothing is pushed, by declaration: `agentfs push` prints `local-only: nothing to push` and exits 0; DeleteVolume keeps the worktree whatever `onDelete` says; forks publish into its own history |
+| undeclared (`undeclared`) | neither, or `none` beside a push section | nothing is pushed; `RemotesUndeclared` is raised at open and every `pushInterval`; `agentfs push` exits 1; `agentfs init` and CSI CreateVolume refuse it; an existing volume keeps recording |
+
+A section with `agentfsForkRemote = true` is not a push section. A push
+section beside `none` is never pushed and is reported misconfigured
+(`agentfs.remotes = none is set beside this push section`). A remote
+added later, with `none` removed, gets all the history.
+
+A fork of a local-only source with no `agentfsForkRemote` section
+publishes into the source's own history (R4): `refs/heads/agentfs/<fork>`
+(or its hidden ref), `refs/agentfs/<fork>/change` and `/finish` in the
+source's state area, through the source's running daemon when one holds
+its lock, else under that lock. Nothing applies it: whatever reads the
+source's history does the gating. The fork records where the source is
+in `agentfs.fork.sourceState`.
 
 ### `[agentfs "identity"]`
 
@@ -147,15 +175,18 @@ A fork's identity (design §11.5), fixed when the fork is created
 in the fork's own state-area config, beside `agentfs.volume`. Never set
 them by hand, and never in an include: a fragment that sets any of them
 fails with `IncludeSetsIdentity`. `source` and `base` are set together,
-or neither, and `pushTarget` only with them (`PartialForkIdentity`); a
-fork's config must not set `agentfs.branch`. A fork's history ref is its
-push target, its only push remote is its fork remote (see
-`agentfsForkRemote`), and it has no patch queue.
+or neither, and `pushTarget` and `sourceState` only with them
+(`PartialForkIdentity`); a fork's config must not set `agentfs.branch`.
+A fork's history ref is its push target, its only push remote is its
+fork remote (see `agentfsForkRemote`), or, for a fork of a local-only
+source, none: it publishes into the source's history ([Declaring
+remotes](#declaring-remotes)). It has no patch queue.
 
 | Key | Type | Default | Meaning and validation |
 |---|---|---|---|
 | `agentfs.fork.source` | name | unset: not a fork | The source volume's name, as `agentfs.volume` |
 | `agentfs.fork.base` | full commit id | unset: not a fork | The source branch's head when the fork was created: 40 lowercase hex digits |
+| `agentfs.fork.sourceState` | absolute path | unset: publishes to a fork remote | A fork of a local-only source (F8 S3): the source's state area, written at create; the fork publishes into its history there, unless a section sets `agentfsForkRemote`. A relative path fails the fork (`RelativePath`) |
 | `agentfs.fork.pushTarget` | `branch` or `hidden` | `branch` | Where the fork's history is kept and pushed, from the source's `agentfs.forkRefs` at create (written only for `hidden`): `branch` is `refs/heads/agentfs/<fork>`, `hidden` is `refs/agentfs/<fork>/history`. Any other value fails the fork (`BadChoice`) |
 
 ### `[agentfs "start"]`
@@ -765,6 +796,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init`: the volume's name; `patch submit`: the volume the patch is for |
 | `--branch NAME` | | `agentfs/<volume>` | `init`: the history branch; `patch submit`: the volume's branch |
 | `--include FILE` (repeatable) | | keep the existing includes | `init`: exactly these `include.path` entries |
+| `--local-only` | | off | `init`: declare the volume local-only, `agentfs.remotes = none` in the state area's own config ([Declaring remotes](#declaring-remotes)) |
 | `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount` |
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | `mount` |
 | `--no-allow-other` | | | `mount`: only the mounting user can use the mount |
@@ -852,6 +884,13 @@ Kubernetes init container does:
   when it is missing.
 - The result is opened once before `init` exits, so a bad setting or
   include fails `init`, not the first mount.
+- **Remotes declared** (F8 S3): a result with no push section and no
+  `agentfs.remotes = none`, or `none` beside a push section, is refused
+  (exit 1, `declare remotes: add a [remote] section to an include, or
+  pass --local-only`); the state area stays, and `init` again with a
+  declaration fixes it. `--local-only` writes the declaration
+  ([Declaring remotes](#declaring-remotes)). A re-run without
+  `--local-only` keeps an earlier declaration.
 
 ## Environment variables
 

@@ -52,9 +52,11 @@ impl Driver {
             profiles: dir.path().join("profiles"),
         };
         fs::create_dir_all(&layout.profiles).unwrap();
+        // Declared local-only (F8 S3): CreateVolume refuses a profile that
+        // declares nothing.
         fs::write(
             layout.profiles.join("p.config"),
-            "[agentfs]\n\tcommitWindow = 100ms\n",
+            "[agentfs]\n\tcommitWindow = 100ms\n\tremotes = none\n",
         )
         .unwrap();
         fs::write(layout.profiles.join("p.exclude"), "*.tmp\n").unwrap();
@@ -214,7 +216,7 @@ fn commit(repo: &Path, refname: &str, files: &[(&str, &str)]) -> git2::Oid {
 fn push(layout: &Layout, handle: &str) {
     let state = agentfs_core::volume::StateDir::new(layout.state(handle));
     let settings = agentfs_core::config::Settings::load(&state.git()).unwrap();
-    for remote in &settings.remotes {
+    for remote in settings.remotes.pushed() {
         let mut pusher = agentfs_core::push::RemotePusher::open(
             &state,
             &settings,
@@ -775,7 +777,7 @@ async fn delete_volume_asks_the_remotes() {
         err.message()
     );
 
-    // No remote declared: kept whatever onDelete says.
+    // Declared local-only: kept whatever onDelete says.
     c.create_volume(create_req(
         "solo",
         &[
@@ -810,7 +812,7 @@ async fn a_volume_with_unreadable_settings_is_not_released() {
     for profile in ["removed", "broken"] {
         fs::write(
             d.layout.profiles.join(format!("{profile}.config")),
-            "[agentfs]\n\tcommitWindow = 100ms\n",
+            "[agentfs]\n\tcommitWindow = 100ms\n\tremotes = none\n",
         )
         .unwrap();
         c.create_volume(create_req(profile, &[("profile", profile)]))
@@ -1337,4 +1339,48 @@ fn fork_context() -> agentfs_core::identity::Context {
         pod_uid: "u".into(),
         ..Default::default()
     }
+}
+
+/// F8 S3: CreateVolume refuses a profile that declares no remote, or
+/// `none` beside a remote section, naming the profile, and leaves no
+/// worktree behind; a local-only profile with `onDelete: delete` is not
+/// refused (the release decider keeps it).
+#[tokio::test]
+async fn create_volume_refuses_an_undeclared_profile() {
+    let d = Driver::start().await;
+    let mut c = d.controller();
+    fs::write(
+        d.layout.profiles.join("bare.config"),
+        "[agentfs]\n\tcommitWindow = 100ms\n",
+    )
+    .unwrap();
+    let remote = d.remote_profile("both", "[agentfs]\n\tremotes = none\n");
+    for (profile, says) in [
+        ("bare", "declares no remote"),
+        (
+            "both",
+            "agentfs.remotes = none beside remote section \"origin\"",
+        ),
+    ] {
+        let name = format!("u-{profile}");
+        let err = c
+            .create_volume(create_req(&name, &[("profile", profile)]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{}", err.message());
+        assert!(
+            err.message().contains(&format!("profile {profile:?}")) && err.message().contains(says),
+            "{}",
+            err.message()
+        );
+        assert!(!d.layout.volume_dir(&name).exists(), "{name} left behind");
+    }
+    assert!(remote.exists());
+    c.create_volume(create_req(
+        "solo-delete",
+        &[("profile", "p"), ("onDelete", "delete")],
+    ))
+    .await
+    .unwrap();
+    d.stop().await;
 }

@@ -10,7 +10,9 @@
 //! [`Finisher::publish`] pushes the history, the change and the finish
 //! commit to the fork remote, with §11.2 backoff, until the remote holds
 //! the change and finish refs at exactly their ids, and only then writes
-//! the published mark. A remote that refuses for good (see
+//! the published mark. A fork of a local-only source publishes into the
+//! source's own history instead ([`super::receive`], F8 S3), through its
+//! [`Receiver`], and is published once the source holds the same refs. A remote that refuses for good (see
 //! [`refused_reason`], the single decider) is recorded as refused and not
 //! retried until the operator clears it ([`Finisher::retry_refused`]).
 //! [`abandon`] records the operator's discard, after which nothing agentfs
@@ -25,7 +27,7 @@ use git2::{Oid, Repository};
 use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 
-use crate::config::Settings;
+use crate::config::{ForkRemote, Settings};
 use crate::events::{Event, Events, PushFailureKind};
 use crate::history::{HistoryError, finish_from_message};
 use crate::identity::Context;
@@ -39,6 +41,7 @@ use crate::telemetry::{Telemetry, spans};
 use crate::volume::{self, Committer, Input, Recorder, StateDir, VolumeError};
 
 use super::identity::{ForkIdentity, change_ref, finish_ref};
+use super::receive::{ReceiveError, Receiver, ReceiverError, SOURCE_HISTORY, UnderLock};
 
 /// `Agentfs-Trigger` of a finish commit.
 pub const FINISH_TRIGGER: &str = "finish";
@@ -67,7 +70,8 @@ pub struct FinishRecord {
     /// The change; `None` when the fork's final tree is base's.
     pub change: Option<Oid>,
     /// The fork remote, by name, as the fork's settings named it at
-    /// finish. "Published" is judged against this remote.
+    /// finish, or [`SOURCE_HISTORY`] for a fork of a local-only source.
+    /// "Published" is judged against it.
     pub remote: String,
     /// Paths the finish could not record, each alarmed.
     pub unrecorded: u64,
@@ -162,13 +166,14 @@ pub enum Met {
     CreateOnly(PushFailureKind),
     /// A create-only ref on the remote holds another object.
     AnotherWriter,
-    /// The finish names a remote that is not the fork's fork remote now.
+    /// The finish names a remote that is not the fork's fork remote now,
+    /// or the local-only source whose history it names is gone.
     RemoteGone,
 }
 
 /// The single decider of "permanent" (design §11.5): what makes a publish
-/// refused, alarmed once and never retried by the node plugin's
-/// publisher. Everything else (unreachable, auth, a moved branch, a busy
+/// refused, alarmed once and never retried by the node plugin's release
+/// scan. Everything else (unreachable, auth, a moved branch, a busy
 /// remote) is pending and retried with backoff (§11.3).
 pub fn refused_reason(met: Met) -> Option<RefusedReason> {
     match met {
@@ -298,6 +303,9 @@ pub enum FinishError {
     NoForkRemote { fork: String },
     #[error("fork {fork} was abandoned; nothing agentfs runs pushes it")]
     Abandoned { fork: String },
+    /// The local-only source is in use and no service of it answered.
+    #[error(transparent)]
+    SourceBusy(crate::lock::LockError),
     #[error(transparent)]
     Volume(#[from] VolumeError),
     #[error(transparent)]
@@ -334,6 +342,7 @@ pub struct Finisher {
     committer: Committer,
     events: Events,
     telemetry: Telemetry,
+    receiver: Box<dyn Receiver>,
 }
 
 impl Finisher {
@@ -367,7 +376,14 @@ impl Finisher {
             committer,
             events,
             telemetry: telemetry.clone(),
+            receiver: Box::new(UnderLock),
         })
+    }
+
+    /// How a fork of a local-only source reaches it ([`UnderLock`] by
+    /// default; the CLI asks the source's service first).
+    pub fn set_receiver(&mut self, receiver: Box<dyn Receiver>) {
+        self.receiver = receiver;
     }
 
     /// Finishes the fork once (see the module docs). A fork already
@@ -408,13 +424,10 @@ impl Finisher {
     fn finish_once(&mut self, fork: &str) -> Result<FinishRecord, FinishError> {
         let fork = fork.to_owned();
         let history = self.committer.history();
-        let Some(remote) = history
-            .settings()
-            .fork_remote
-            .as_ref()
-            .map(|r| r.name.clone())
-        else {
-            return Err(FinishError::NoForkRemote { fork });
+        let remote = match &history.settings().fork_remote {
+            Some(ForkRemote::Remote(r)) => r.name.clone(),
+            Some(ForkRemote::SourceHistory) => SOURCE_HISTORY.to_owned(),
+            None => return Err(FinishError::NoForkRemote { fork }),
         };
         let unrecorded = self.record_repairs();
         self.committer.commit_now()?;
@@ -663,7 +676,7 @@ impl Finisher {
                     message: refused.message.clone(),
                 });
             }
-            let failed = match self.publish_once(record, &mut pusher) {
+            let failed = match self.publish_once(record, &mut pusher)? {
                 Ok(()) => {
                     let published = PublishedMark {
                         finish: finish.clone(),
@@ -738,23 +751,29 @@ impl Finisher {
     /// create-only. `Ok` once the remote holds both refs at exactly their
     /// ids. The settings are read again first, so a fork remote removed
     /// meanwhile is seen at once.
+    /// `Err` stops publishing: the local-only source is busy.
     fn publish_once(
         &self,
         record: &FinishRecord,
         pusher: &mut Option<RemotePusher>,
-    ) -> Result<(), Failed> {
-        let local = |message: String| Failed::branch(PushFailureKind::Local, message);
-        let settings = Settings::load(&self.state.git()).map_err(|e| {
-            local(format!(
-                "the fork's settings cannot be read, so nothing is pushed: {e}"
-            ))
-        })?;
-        let Some(remote) = settings
-            .fork_remote
-            .as_ref()
-            .filter(|r| r.name == record.remote)
-        else {
-            return Err(Failed {
+    ) -> Result<Result<(), Failed>, FinishError> {
+        let settings = match Settings::load(&self.state.git()) {
+            Ok(settings) => settings,
+            Err(e) => {
+                return Ok(Err(Failed::branch(
+                    PushFailureKind::Local,
+                    format!("the fork's settings cannot be read, so nothing is pushed: {e}"),
+                )));
+            }
+        };
+        match &settings.fork_remote {
+            Some(ForkRemote::SourceHistory) if record.remote == SOURCE_HISTORY => {
+                self.receive(&settings)
+            }
+            Some(ForkRemote::Remote(remote)) if remote.name == record.remote => {
+                Ok(self.push_once(record, &settings, remote, pusher))
+            }
+            _ => Ok(Err(Failed {
                 met: Met::RemoteGone,
                 kind: PushFailureKind::Local,
                 message: format!(
@@ -762,12 +781,55 @@ impl Finisher {
                      finish names",
                     record.remote
                 ),
-            });
+            })),
+        }
+    }
+
+    /// One attempt into the local-only source's history, through the
+    /// [`Receiver`] ([`Finisher::set_receiver`]).
+    fn receive(&self, settings: &Settings) -> Result<Result<(), Failed>, FinishError> {
+        let failed = |met: Met, kind: PushFailureKind, message: String| {
+            Ok(Err(Failed { met, kind, message }))
         };
+        let Some(source) = settings.source_state.as_deref().map(StateDir::new) else {
+            return failed(
+                Met::RemoteGone,
+                PushFailureKind::Local,
+                "the fork records no source state area to publish into".into(),
+            );
+        };
+        match self.receiver.receive(&source, &self.identity, &self.state) {
+            Ok(_) => Ok(Ok(())),
+            Err(ReceiverError::Busy(busy)) => Err(FinishError::SourceBusy(busy)),
+            Err(ReceiverError::Receive(e @ ReceiveError::SourceRemoved)) => failed(
+                Met::RemoteGone,
+                PushFailureKind::Local,
+                format!("{e}: {}", source.root().display()),
+            ),
+            Err(ReceiverError::Receive(e @ ReceiveError::Diverged { .. })) => {
+                failed(Met::AnotherWriter, PushFailureKind::Refused, e.to_string())
+            }
+            Err(e) => failed(
+                Met::Branch(PushFailureKind::Local),
+                PushFailureKind::Local,
+                e.to_string(),
+            ),
+        }
+    }
+
+    /// One attempt to the fork remote `remote`.
+    fn push_once(
+        &self,
+        record: &FinishRecord,
+        settings: &Settings,
+        remote: &crate::config::RemoteSettings,
+        pusher: &mut Option<RemotePusher>,
+    ) -> Result<(), Failed> {
+        let local = |message: String| Failed::branch(PushFailureKind::Local, message);
         if pusher.is_none() {
             let opened = RemotePusher::open(
                 &self.state,
-                &settings,
+                settings,
                 remote,
                 self.events.clone(),
                 &self.telemetry,

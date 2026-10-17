@@ -15,15 +15,35 @@
 //! node plugin run it through the source's control socket when its
 //! service is up (design §2.3), else directly under the source's state
 //! lock.
+//!
+//! The fork finds its source by [`SOURCE_STATE_KEY`], written into the
+//! fork's own config at create when the source is local-only
+//! (`config::Settings::source_state`). [`Receiver`] is how a finisher
+//! reaches it: [`UnderLock`] in this process, or the CLI's, which asks the
+//! source's running service first.
 
-use std::io;
+use std::io::{self, Write as _};
+use std::time::Duration;
 
-use git2::Oid;
+use git2::{Oid, Repository};
 
-use crate::history::HistoryError;
+use crate::config::Settings;
+use crate::history::{HistoryError, finish_from_message};
+use crate::lfs::ObjectCache;
+use crate::lock::{LockError, StateLock};
+use crate::push::{Claim, claim};
 use crate::volume::StateDir;
 
-use super::identity::ForkIdentity;
+use super::identity::{ForkIdentity, change_ref, finish_ref};
+
+/// `agentfs.fork.sourceState`: the source's state area, in a fork of a
+/// local-only source (its own config only, like the fork identity).
+pub const SOURCE_STATE_KEY: &str = "agentfs.fork.sourceState";
+
+/// The fork remote a finish names when it publishes into the source's
+/// history: not a valid remote name (`config::validate_name`), so no
+/// remote section can be mistaken for it.
+pub const SOURCE_HISTORY: &str = "(source history)";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiveError {
@@ -44,15 +64,218 @@ pub enum ReceiveError {
     Io(#[from] io::Error),
 }
 
+impl From<git2::Error> for ReceiveError {
+    fn from(e: git2::Error) -> Self {
+        Self::History(e.into())
+    }
+}
+
 /// Writes `fork`'s branch, change and finish refs from the fork's state
 /// area `from` into the source's state area `source` (see the module
-/// docs). Returns the change commit. Idempotent: a retry after a crash
-/// finds the refs at the same ids and succeeds.
+/// docs). Returns the change commit, or the finish commit when the fork
+/// changed nothing. Idempotent: a retry after a crash finds the refs at
+/// the same ids and succeeds. The caller holds the source's state lock,
+/// or is the source's own service.
+///
+/// A state area at `source` that is not `fork`'s source (another volume,
+/// or a fork) is [`ReceiveError::SourceRemoved`]: the source that was
+/// there is gone.
 pub fn receive_fork_change(
     source: &StateDir,
     fork: &ForkIdentity,
     from: &StateDir,
 ) -> Result<Oid, ReceiveError> {
-    let _ = (source, fork, from);
-    todo!("F8 S3")
+    crate::history::init_libgit2();
+    let source_git = source.git();
+    if !source_git.join("config").is_file() {
+        return Err(ReceiveError::SourceRemoved);
+    }
+    let settings = Settings::load(&source_git).map_err(HistoryError::from)?;
+    if settings.volume != fork.source || settings.is_fork() {
+        return Err(ReceiveError::SourceRemoved);
+    }
+    let forked = Repository::open_bare(from.git())?;
+    let history_ref = fork.history_ref();
+    let head = match forked.find_reference(&history_ref) {
+        Ok(r) => r.peel_to_commit()?,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {
+            return Err(ReceiveError::NotPublished);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let record = finish_from_message(head.message_raw().unwrap_or_default(), head.id())
+        .filter(|r| r.fork == fork.fork)
+        .ok_or(ReceiveError::NotPublished)?;
+    let repo = Repository::open_bare(&source_git)?;
+
+    // Every ref is judged before anything is written.
+    let advertised = existing(&repo, &history_ref)?;
+    let on_history = |oid: Oid| {
+        forked.odb().is_ok_and(|odb| odb.exists(oid))
+            && forked
+                .graph_descendant_of(record.finish, oid)
+                .unwrap_or(false)
+    };
+    let branch = claim(advertised, record.finish, on_history);
+    if branch == Claim::Diverged {
+        return Err(ReceiveError::Diverged {
+            refname: history_ref,
+        });
+    }
+    let mut create_only = vec![(finish_ref(&fork.fork), record.finish)];
+    if let Some(change) = record.change {
+        create_only.insert(0, (change_ref(&fork.fork), change));
+    }
+    for (name, oid) in &create_only {
+        if existing(&repo, name)?.is_some_and(|found| found != *oid) {
+            return Err(ReceiveError::Diverged {
+                refname: name.clone(),
+            });
+        }
+    }
+
+    copy_objects(&forked, &repo, &record, fork.base, advertised)?;
+    copy_lfs(from, source)?;
+    let message = format!("agentfs: fork {} received", fork.fork);
+    match (branch, advertised) {
+        (Claim::Create, _) => {
+            repo.reference(&history_ref, record.finish, false, &message)?;
+        }
+        // Leased on the value judged, as a push is.
+        (Claim::FastForward, Some(current)) => {
+            repo.reference_matching(&history_ref, record.finish, true, current, &message)?;
+        }
+        _ => {}
+    }
+    for (name, oid) in &create_only {
+        if existing(&repo, name)?.is_none() {
+            repo.reference(name, *oid, false, &message)?;
+        }
+    }
+    for name in std::iter::once(&history_ref).chain(create_only.iter().map(|(n, _)| n)) {
+        super::create::sync_parents(&source_git, name)?;
+    }
+    Ok(record.change.unwrap_or(record.finish))
+}
+
+/// The ref `name` in `repo`, `None` when there is none.
+fn existing(repo: &Repository, name: &str) -> Result<Option<Oid>, git2::Error> {
+    match repo.refname_to_id(name) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The fork's history and change, packed into the source's object store,
+/// less what the source has: base, and the branch value it holds.
+fn copy_objects(
+    forked: &Repository,
+    repo: &Repository,
+    record: &crate::fork::finish::FinishRecord,
+    base: Oid,
+    held: Option<Oid>,
+) -> Result<(), ReceiveError> {
+    let odb = repo.odb()?;
+    let mut walk = forked.revwalk()?;
+    walk.push(record.finish)?;
+    if let Some(change) = record.change {
+        walk.push(change)?;
+    }
+    for have in [Some(base), held].into_iter().flatten() {
+        if odb.exists(have) {
+            walk.hide(have)?;
+        }
+    }
+    let mut pack = forked.packbuilder()?;
+    pack.insert_walk(&mut walk)?;
+    let mut writer = odb.packwriter()?;
+    let mut write_error = None;
+    let packed = pack.foreach(|chunk| match writer.write_all(chunk) {
+        Ok(()) => true,
+        Err(e) => {
+            write_error = Some(e);
+            false
+        }
+    });
+    if let Some(e) = write_error {
+        return Err(e.into());
+    }
+    packed?;
+    writer.commit()?;
+    for oid in [Some(record.finish), record.change].into_iter().flatten() {
+        if !odb.exists(oid) {
+            return Err(io::Error::other(format!(
+                "commit {oid} is not in the source after copying the fork's objects"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Every LFS object in the fork's cache that the source's lacks: the
+/// fork's history, now the source's too, refers to them, and the fork's
+/// cache goes with the fork.
+fn copy_lfs(from: &StateDir, source: &StateDir) -> io::Result<()> {
+    let forked = ObjectCache::at(from.lfs())?;
+    let cache = ObjectCache::at(source.lfs())?;
+    for (pointer, _) in forked.list()? {
+        if !cache.contains(&pointer) {
+            cache.insert_file(&forked.path(&pointer.oid))?;
+        }
+    }
+    Ok(())
+}
+
+/// Why a [`Receiver`] did not receive the change.
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiverError {
+    /// The source's state lock is held and no service of it answered:
+    /// `agentfs fork finish` exits 75, as other lock commands do.
+    #[error(transparent)]
+    Busy(LockError),
+    #[error(transparent)]
+    Receive(#[from] ReceiveError),
+    /// The source's service, or its lock, failed otherwise: retried.
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+/// How a finisher reaches its local-only source.
+pub trait Receiver: Send {
+    /// [`receive_fork_change`] of `fork` from `from` into `source`, with
+    /// whatever makes it safe there.
+    fn receive(
+        &self,
+        source: &StateDir,
+        fork: &ForkIdentity,
+        from: &StateDir,
+    ) -> Result<(), ReceiverError>;
+}
+
+/// [`receive_fork_change`] in this process, under the source's state
+/// lock, taken without waiting past the lock's minimum.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnderLock;
+
+impl Receiver for UnderLock {
+    fn receive(
+        &self,
+        source: &StateDir,
+        fork: &ForkIdentity,
+        from: &StateDir,
+    ) -> Result<(), ReceiverError> {
+        // Locking creates `meta/`: never in a state area that is gone.
+        if !source.git().join("config").is_file() {
+            return Err(ReceiveError::SourceRemoved.into());
+        }
+        let _lock =
+            StateLock::acquire(source, "fork receive", Duration::ZERO).map_err(|e| match e {
+                busy @ LockError::Busy { .. } => ReceiverError::Busy(busy),
+                other => ReceiverError::Unavailable(other.to_string()),
+            })?;
+        receive_fork_change(source, fork, from)?;
+        Ok(())
+    }
 }

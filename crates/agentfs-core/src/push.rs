@@ -1837,6 +1837,7 @@ pub fn open_all(
 ) -> Result<Vec<RemotePusher>, PushError> {
     settings
         .remotes
+        .pushed()
         .iter()
         .map(|remote| RemotePusher::open(state, settings, remote, events.clone(), telemetry))
         .collect()
@@ -1858,6 +1859,7 @@ pub fn status(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteStatus>
     let repo = Repository::open_bare(state.git())?;
     settings
         .remotes
+        .pushed()
         .iter()
         .map(|remote| {
             let push_state = PushState::load(&state.push_state(&remote.name));
@@ -1895,6 +1897,7 @@ pub fn backlog(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteBacklo
     let repo = Repository::open_bare(state.git())?;
     settings
         .remotes
+        .pushed()
         .iter()
         .map(|remote| {
             let push_state = PushState::load(&state.push_state(&remote.name));
@@ -2178,6 +2181,7 @@ mod tests {
             let r = self
                 .settings
                 .remotes
+                .pushed()
                 .iter()
                 .find(|r| r.name == remote)
                 .unwrap();
@@ -2963,7 +2967,7 @@ mod tests {
         let remote = remote_dir.path();
         bare(remote);
         let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
-        assert_eq!(v.settings.remotes[0].max_push_size, None);
+        assert_eq!(v.settings.remotes.pushed()[0].max_push_size, None);
         let head = v.commit_file("big", &random(2 << 20, 5));
         let mut pusher = v.pusher("origin", Arc::new(NullSink));
         assert!(matches!(
@@ -2999,7 +3003,7 @@ mod tests {
             fs::remove_file(path).unwrap();
         };
         forget(&v);
-        v.settings.remotes[0].max_push_size = Some(1 << 20);
+        v.settings.remotes.pushed_mut()[0].max_push_size = Some(1 << 20);
 
         // Up to date already: nothing measured, nothing refused.
         let (events, sink_events) = sink();
@@ -4077,7 +4081,7 @@ mod tests {
         let cred = remote_dir.path().join("token");
         fs::write(&cred, "tok\n").unwrap();
         let mut v = Vol::new("vol", &[("origin", "https://git.example/o/r.git")]);
-        v.settings.remotes[0].credentials = Some(cred);
+        v.settings.remotes.pushed_mut()[0].credentials = Some(cred);
         let pusher = v.pusher("origin", Arc::new(NullSink));
         let calls = Cell::new(0);
         let url = "https://git.example/o/r.git";
@@ -4149,7 +4153,7 @@ mod tests {
             crate::known_hosts::tests::line("[git.example]:2222", known),
         )
         .unwrap();
-        let r = &mut v.settings.remotes[0];
+        let r = &mut v.settings.remotes.pushed_mut()[0];
         r.url = SSH_URL.into();
         r.ssh_key = Some(key.clone());
         r.known_hosts = Some(kh.clone());
@@ -4200,7 +4204,7 @@ mod tests {
                 .unwrap_err()
                 .contains("reading credentials")
         );
-        v.settings.remotes[0].ssh_key = None;
+        v.settings.remotes.pushed_mut()[0].ssh_key = None;
         let pusher = v.pusher("origin", Arc::new(NullSink));
         let err = pusher.auth.ssh_remote().unwrap().key(SSH_URL).unwrap_err();
         assert!(err.contains("agentfsSshKey is not set"), "{err}");
@@ -4409,7 +4413,7 @@ mod tests {
             v.commit_file("big.bin", b"large content of 33 bytes, really");
             // The limit is set after the commit: the record-time check
             // never saw it.
-            v.settings.remotes[0].max_lfs_object_size = Some(16);
+            v.settings.remotes.pushed_mut()[0].max_lfs_object_size = Some(16);
             let (events, sink) = sink();
             let mut pusher = v.pusher("origin", sink);
             let outcome = pusher.push_once();

@@ -8,7 +8,10 @@
 //!   ([`agentfs_core::fork::create::settings_files`]).
 //! - `fork finish` takes the fork's state-area lock, finishes the fork
 //!   once and publishes it to its fork remote, retrying with backoff;
-//!   `--retry` clears a refused publish first.
+//!   `--retry` clears a refused publish first. A fork of a local-only
+//!   source publishes into the source's history instead (F8 S3): through
+//!   the source's running daemon ([`serve_receive`]), else under the
+//!   source's lock (exit 75 while another command holds it).
 //! - `fork status` reads the fork's state, record and publish result,
 //!   with no lock and no network.
 //! - `fork abandon` records the operator's discard, with the state lock.
@@ -31,16 +34,20 @@ use agentfs_core::events::Event;
 use agentfs_core::fork::create::{self, CreateRequest};
 use agentfs_core::fork::deliver::{self, DEFAULT_PREFIX, Delivered, DeliveryMethod, Shape};
 use agentfs_core::fork::finish::{
-    self, AbandonedMark, FinishRecord, Finisher, ForkState, ForkStatus, PublishOutcome,
-    RefusedMark, RefusedReason,
+    self, AbandonedMark, FinishError, FinishRecord, Finisher, ForkState, ForkStatus,
+    PublishOutcome, RefusedMark, RefusedReason,
 };
+use agentfs_core::fork::identity::{ForkIdentity, full_commit};
 use agentfs_core::fork::listing;
+use agentfs_core::fork::receive::{
+    self, ReceiveError, Receiver, ReceiverError, SOURCE_HISTORY, UnderLock,
+};
 use agentfs_core::lock::StateLock;
 use agentfs_core::patch::submit::GitCli;
 use agentfs_core::record::Caller;
 use agentfs_core::volume::StateDir;
 
-use crate::{Pod, Session};
+use crate::{Pod, Session, control};
 
 /// Where an operator reads what to do about a refused publish: one section
 /// per [`RefusedReason`], headed by its name.
@@ -275,13 +282,24 @@ pub fn run(
                 session.telemetry(),
                 &lock,
             )?;
+            finisher.set_receiver(Box::new(ThroughService));
             if args.retry {
                 finisher.retry_refused()?;
             }
             let record = finisher.finish()?;
             println!("{}", describe(&record));
             let deadline = args.timeout.map(|t| Instant::now() + t);
-            let code = match finisher.publish(deadline)? {
+            let outcome = match finisher.publish(deadline) {
+                Ok(outcome) => outcome,
+                // Exit 75, as every command meeting a held lock.
+                Err(FinishError::SourceBusy(busy)) => return Err(busy.into()),
+                Err(e) => return Err(e.into()),
+            };
+            let code = match outcome {
+                PublishOutcome::Published if record.remote == SOURCE_HISTORY => {
+                    println!("published into the history of volume {}", record.source);
+                    ExitCode::SUCCESS
+                }
                 PublishOutcome::Published => {
                     println!("published to {}", record.remote);
                     ExitCode::SUCCESS
@@ -522,6 +540,76 @@ fn print_status(doc: &ForkStatusDoc) {
         "not finished".to_owned()
     };
     println!("publish:   {result}");
+}
+
+/// The CLI's way into a local-only source (F8 S3): its running daemon,
+/// which holds its lock, through the control socket; else
+/// [`UnderLock`] in this process.
+struct ThroughService;
+
+impl Receiver for ThroughService {
+    fn receive(
+        &self,
+        source: &StateDir,
+        fork: &ForkIdentity,
+        from: &StateDir,
+    ) -> std::result::Result<(), ReceiverError> {
+        let unavailable = |m: String| ReceiverError::Unavailable(m);
+        let path = std::path::absolute(from.root())
+            .map_err(|e| unavailable(format!("resolving {}: {e}", from.root().display())))?;
+        let request = control::Request::receive_fork(path.display().to_string());
+        let reply = match control::call(&source.control_dir(), &request) {
+            Ok(reply) => reply,
+            Err(control::ClientError::NotRunning) => return UnderLock.receive(source, fork, from),
+            Err(e) => return Err(unavailable(format!("the source's daemon: {e}"))),
+        };
+        match reply {
+            control::Reply::Received { change } => full_commit(&change)
+                .map(|_| ())
+                .ok_or_else(|| unavailable(format!("the source's daemon answered {change:?}"))),
+            control::Reply::Refused { kind, message, .. } => Err(match kind.as_str() {
+                "diverged" => ReceiveError::Diverged { refname: message }.into(),
+                "source_removed" => ReceiveError::SourceRemoved.into(),
+                "not_published" => ReceiveError::NotPublished.into(),
+                _ => unavailable(message),
+            }),
+            control::Reply::Busy(message) | control::Reply::Error(message) => {
+                Err(unavailable(format!("the source's daemon: {message}")))
+            }
+            control::Reply::Ok(_) | control::Reply::Pushed(_) => Err(unavailable(
+                "the source's daemon answered another request's reply".into(),
+            )),
+        }
+    }
+}
+
+/// The daemon's side of `receive_fork`: receives the finished fork whose
+/// state area the request names into `state`, the local-only source this
+/// daemon holds the lock of.
+pub fn serve_receive(state: &StateDir, request: &control::Request) -> control::Reply {
+    let refused = |kind: &str, message: String| control::Reply::Refused {
+        kind: kind.into(),
+        message,
+        hint: None,
+    };
+    let Some(path) = request.path.as_deref() else {
+        return control::Reply::Error("receive_fork names no fork state area".into());
+    };
+    let from = StateDir::new(path);
+    let identity = match finish::status(&from) {
+        Ok(Some(status)) => status.identity,
+        Ok(None) => return refused("not_a_fork", format!("{path} is not a fork")),
+        Err(e) => return control::Reply::Error(format!("reading the fork at {path}: {e}")),
+    };
+    match receive::receive_fork_change(state, &identity, &from) {
+        Ok(change) => control::Reply::Received {
+            change: change.to_string(),
+        },
+        Err(ReceiveError::Diverged { refname }) => refused("diverged", refname),
+        Err(e @ ReceiveError::SourceRemoved) => refused("source_removed", e.to_string()),
+        Err(e @ ReceiveError::NotPublished) => refused("not_published", e.to_string()),
+        Err(e) => control::Reply::Error(e.to_string()),
+    }
 }
 
 /// `fork create`: the line to print, or why it was refused.

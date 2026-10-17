@@ -148,3 +148,47 @@ None of these stopped the slice; each was resolved as below and is reported with
    the runbook gives a manual new-volume procedure; not exercised in CI.
 9. S1's §19.1 row "Start points are branches" gave "it never moves" as a reason; with D3's
    save following the head that is no longer true, and the clause is removed.
+
+## 2026-10-17, F8 S3 implementer (f8-s3)
+
+None of these stopped the slice; each was resolved as below and is reported with it.
+
+1. The frozen page never says how a fork finds its local-only source: `receive_fork_change`
+   takes the source's `StateDir`, and the control socket lives in it, but neither the fork
+   identity nor `csi.json` records where the source is, and `fork finish` names only the fork.
+   Resolved: create writes `agentfs.fork.sourceState` (absolute, own config only, an identity
+   key no include may set) when the source's fork remote is `SourceHistory`; a fork's
+   `ForkRemote::SourceHistory` is "no flagged section and a recorded source state area".
+   Cost: the source must stay at that path until the fork is published.
+2. `init --local-only` writes `agentfs.remotes = none` in the own config, but
+   `fork::create::settings_files` refuses a CLI source with settings in its own config, and a
+   fork reads only the source's includes: a CLI local-only source could not be forked, and its
+   fork would not see the declaration. Resolved: `agentfs.remotes` joins `OWN_KEYS`; a fork's
+   mode follows its fork remote (item 1), never the declaration.
+3. `history::finish_from_message` validates the fork remote trailer as a remote name, so a
+   finish into the source's history needs a name no section can have: `(source history)`
+   (`fork::receive::SOURCE_HISTORY`), which the parser accepts. Without it the finish record
+   never parsed and publish retried forever (found by the new test).
+4. Not on the frozen page: core cannot call the binary's control client, so the finisher takes
+   a `fork::receive::Receiver` (`UnderLock` by default, `Finisher::set_receiver`; the CLI's asks
+   the source's daemon first, op `receive_fork`), and "exit 75 when it is busy" needs
+   `FinishError::SourceBusy`. `push_now::handler` takes the daemon's `StateDir`.
+5. `receive_fork_change` "returns the change commit", but a fork that changed nothing has no
+   change: it returns the finish commit then. A state area at the recorded path that holds
+   another volume is `SourceRemoved` (no variant says "replaced"). In the finisher,
+   `SourceRemoved` maps to `RefusedReason::RemoteGone` and `Diverged` to `AnotherWriter` (no new
+   refusal reason, so the refused runbook needs no new section).
+6. "`agentfs init` refuses a result that is `Undeclared`" breaks the documented flow "init, then
+   add a remote to the own config" (README and operator-guide quick starts, about 20 test
+   harnesses, 12 `ci/` scripts): a remote must now come from an include, or `--local-only`
+   followed by removing the declaration. Taken literally, for an existing state area too
+   (an init container of a volume that never declared fails until it declares); the docs
+   quick starts now pass the remote in an include, and the harnesses drop the declaration
+   when they add a remote section. The owner may prefer refusing only new state areas.
+7. `none` beside a push section: with `Remotes::pushed()` empty that section vanished from
+   `Settings`, so the mount preflight would no longer check its credential files. Resolved: the
+   section joins `invalid_remotes` (`RemoteMisconfigured`, never pushed) beside
+   `RemotesUndeclared { beside }`.
+8. Slice page counts ("about 38 test files", "nine `ci/e2e-*.sh`"): the harnesses that needed a
+   declaration were 13 CLI test files, the core and CSI fixtures, `ci/lib.sh` and 11 other
+   scripts, and the csi-sanity profile; deploy and chart profiles already name remotes.

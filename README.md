@@ -72,10 +72,12 @@ audit trail can use it.
 - **Git idioms for rules.** `.gitignore`, `.gitattributes`, `.lfsconfig`,
   `$GIT_DIR/info/*` and git-config syntax; nested repositories are
   excluded by default ([design §4](docs/design.md#4-path-rules)).
-- **Any remote, or several.** Local paths, `file://`, `http(s)://` with a
+- **Any remote, several, or none declared.** Local paths, `file://`, `http(s)://` with a
   token file, and SSH with verified host keys. Pushes are fast-forward
   only and never forced; a divergence is saved and raises an alarm
-  ([design §11](docs/design.md#11-remotes-and-pushing)).
+  ([design §11](docs/design.md#11-remotes-and-pushing)). A volume with no
+  remote says so (`agentfs init --local-only`); one that declares
+  nothing raises an alarm.
 - **Git LFS** for large files, uploaded before the commits that use them
   ([configuration](docs/configuration.md#git-lfs)).
 - **Databases.** SQLite and other files changed in place are captured
@@ -110,9 +112,9 @@ On Linux 5.6+ with `/dev/fuse`, as root, in a clone of this repository
 cargo build --release -p agentfs
 export PATH=$PWD/target/release:$PATH
 mkdir -p /data/backing /workspace
-agentfs --state /data/state init --volume demo
 git init --bare /data/remote.git
-git --git-dir /data/state/git config remote.origin.url /data/remote.git
+printf '[remote "origin"]\n\turl = /data/remote.git\n' > /data/agentfs.conf
+agentfs --state /data/state init --volume demo --include /data/agentfs.conf
 agentfs --state /data/state mount /data/backing /workspace &
 until agentfs probe /workspace >/dev/null; do sleep 0.2; done   # mounted
 
@@ -257,7 +259,7 @@ passes its tests, and the Helm charts as `<version>-main.<run>`.
 | Forked volumes | Built |
 | Docker examples, Helm charts, example alert rules | Built and tested in CI |
 | Node-local worktrees, one branch each, with any remote as the backend | Built (CSI driver) |
-| Local-only volumes (no remote, declared) | In design |
+| Local-only volumes (no remote, declared: `agentfs init --local-only`), whose forks publish into their own history | Built ([configuration](docs/configuration.md#declaring-remotes)) |
 | Several nodes writing one volume | Not supported, by decision ([design §19.1](docs/design.md#191-decisions-2026-10-12)) |
 
 Each phase's scope is in [design §1.3](docs/design.md#13-baseline-extras-phases),

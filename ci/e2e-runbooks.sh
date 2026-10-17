@@ -175,7 +175,7 @@ git init -q --bare "$REMOTE"
 URL=file://$REMOTE
 
 step "a volume pushing to a file:// remote"
-agentfs init --volume "$VOL" >/dev/null
+agentfs init --volume "$VOL" --local-only >/dev/null
 volume_config remote.origin.url "$URL"
 echo one >"$BACKING/a.txt"
 agentfs record a.txt >/dev/null
@@ -305,7 +305,7 @@ STATE=$LW/state
 BACKING=$LW/backing
 TREE=$BACKING
 mkdir -p "$BACKING"
-agentfs init --volume lfsbook >/dev/null
+agentfs init --volume lfsbook --local-only >/dev/null
 volume_config agentfs.lfsThreshold 1k
 for r in one two; do
   git init -q --bare "$LW/$r.git"

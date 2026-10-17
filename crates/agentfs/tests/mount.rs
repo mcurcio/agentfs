@@ -90,7 +90,7 @@ impl Vol {
             fs::create_dir_all(v.p(d)).unwrap();
             fs::set_permissions(v.p(d), fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let out = v.agentfs(&["init", "--volume", "demo"]);
+        let out = v.agentfs(&["init", "--volume", "demo", "--local-only"]);
         assert!(out.status.success(), "{}", text(&out.stderr));
         v.config("agentfs.commitWindow", "50ms");
         v
@@ -115,6 +115,10 @@ impl Vol {
     fn config(&self, key: &str, value: &str) {
         let mut c = git2::Config::open(&self.state().join("git/config")).unwrap();
         c.set_str(key, value).unwrap();
+        // A remote section declares the volume's remotes: drop `--local-only` (F8 S3).
+        if key.starts_with("remote.") {
+            let _ = c.remove("agentfs.remotes");
+        }
     }
 
     fn command(&self) -> Command {

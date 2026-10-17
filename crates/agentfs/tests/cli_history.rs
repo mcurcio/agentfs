@@ -41,7 +41,7 @@ impl Volume {
             dir: tempfile::tempdir().unwrap(),
         };
         fs::create_dir_all(v.tree()).unwrap();
-        let out = v.run(["init", "--volume", "demo"]);
+        let out = v.run(["init", "--volume", "demo", "--local-only"]);
         assert!(out.status.success(), "{}", stderr(&out));
         // Commit at once, so the history is there when a test looks.
         git2::Config::open(&v.state().git().join("config"))
@@ -398,6 +398,8 @@ fn the_history_service_pushes_now() {
     git2::Repository::init_bare(&remote).unwrap();
     let mut config = git2::Config::open(&v.state().git().join("config")).unwrap();
     config.set_str("agentfs.pushInterval", "1h").unwrap();
+    // A remote section declares the volume's remotes: drop `--local-only` (F8 S3).
+    let _ = config.remove("agentfs.remotes");
     config
         .set_str("remote.origin.url", &remote.display().to_string())
         .unwrap();

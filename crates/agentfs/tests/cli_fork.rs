@@ -770,3 +770,82 @@ fn a_hidden_fork_publishes_off_every_branch() {
         Some(finish(&hidden))
     );
 }
+
+/// F8 S3 acceptance 4 (R4): a fork of a local-only source finishes into
+/// the source's own history, with no remote: `agentfs/<fork>` and its
+/// change and finish refs, never the source's branch or tree; a second
+/// finish changes nothing. With the source's daemon running, the fork
+/// publishes through it (its control socket); a source in use without
+/// one exits 75.
+#[test]
+fn a_local_only_sources_fork_finishes_into_its_history() {
+    let s = Setup::local_only();
+    s.record("state", "tree", "a.txt", "a\n");
+    let out = s.ok("state", "tree", &["push"]);
+    assert_eq!(out.trim(), "local-only: nothing to push");
+    let base = s.source_head();
+    let fork = s.create_fork();
+    s.record("fork", "fork-tree", "b.txt", "from the fork\n");
+
+    {
+        let held =
+            StateLock::acquire(&StateDir::new(s.path("state")), "test", Duration::ZERO).unwrap();
+        let out = s.agentfs("fork", "fork-tree", &["fork", "finish"]);
+        assert_eq!(out.status.code(), Some(75), "{}", text(&out.stderr));
+        drop(held);
+    }
+    let out = s.ok("fork", "fork-tree", &["fork", "finish"]);
+    assert!(
+        out.contains("published into the history of volume src"),
+        "{out}"
+    );
+    let refs = s.refs("state/git");
+    let get = |name: &str| refs.iter().find(|(n, _)| n == name).map(|(_, o)| *o);
+    let finish = get(&format!("refs/agentfs/{fork}/finish")).unwrap();
+    let change = get(&format!("refs/agentfs/{fork}/change")).unwrap();
+    assert_eq!(get(&format!("refs/heads/agentfs/{fork}")), Some(finish));
+    let repo = Repository::open_bare(s.path("state/git")).unwrap();
+    let tree = repo.find_commit(change).unwrap().tree().unwrap();
+    assert!(tree.get_name("b.txt").is_some());
+    // Never applied.
+    assert_eq!(s.source_head(), base);
+    assert!(!s.path("tree/b.txt").exists());
+    let status = status_json(&s);
+    assert_eq!(status["state"], "published", "{status}");
+    // Idempotent.
+    let out = s.ok("fork", "fork-tree", &["fork", "finish"]);
+    assert!(out.contains("published into"), "{out}");
+    assert_eq!(s.refs("state/git"), refs);
+
+    // A second fork, while the source's daemon holds its lock.
+    let second = s.create_fork_in("fork2", "fork2-tree");
+    s.record("fork2", "fork2-tree", "c.txt", "c\n");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_agentfs"));
+    daemon
+        .arg("--state")
+        .arg(s.path("state"))
+        .arg("--root")
+        .arg(s.path("tree"))
+        .arg("run");
+    s.hermetic(&mut daemon);
+    let mut daemon = daemon.spawn().unwrap();
+    let socket = s.path("state/meta/control/agentfs.sock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !socket.exists() {
+        assert!(std::time::Instant::now() < deadline, "no control socket");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = s.ok(
+        "fork2",
+        "fork2-tree",
+        &["fork", "finish", "--timeout", "30s"],
+    );
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    assert!(out.contains("published into"), "{out}");
+    assert!(
+        s.remote_ref("state/git", &format!("refs/heads/agentfs/{second}"))
+            .is_some()
+    );
+    assert_eq!(s.source_head(), base);
+}

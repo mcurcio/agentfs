@@ -106,7 +106,7 @@ mount_rows() { # path
 }
 
 step "a volume with SQLite databases in the fsync class, mounted"
-af init --volume demo >/dev/null
+af init --volume demo --local-only >/dev/null
 sgit config agentfs.commitWindow 200ms
 # The operator's file (design §4.3): every member of a database's group.
 sudo tee "$STATE/git/info/attributes" >/dev/null <<ATTR

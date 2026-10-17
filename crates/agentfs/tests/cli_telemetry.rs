@@ -147,7 +147,7 @@ impl Volume {
         };
         fs::create_dir_all(v.tree()).unwrap();
         fs::create_dir_all(v.dir.path().join("home")).unwrap();
-        let out = v.run(&["init", "--volume", "demo"], &[]);
+        let out = v.run(&["init", "--volume", "demo", "--local-only"], &[]);
         assert!(out.status.success(), "{}", stderr(&out));
         v
     }
@@ -378,6 +378,8 @@ fn push_exports_its_span() {
     let remote = v.dir.path().join("remote.git");
     git2::Repository::init_bare(&remote).unwrap();
     let mut config = git2::Config::open(&v.dir.path().join("state/git/config")).unwrap();
+    // A remote section declares the volume's remotes: drop `--local-only` (F8 S3).
+    let _ = config.remove("agentfs.remotes");
     config
         .set_str("remote.origin.url", &remote.display().to_string())
         .unwrap();
@@ -1596,5 +1598,76 @@ fn a_fork_finish_and_publish_export_spans_events_and_duration() {
             ("remote", "origin")
         ),
         0
+    );
+}
+
+/// Every `mode` attribute `agentfs.remotes.mode` was exported with at 1.
+fn remotes_modes(collector: &Collector) -> Vec<String> {
+    use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point};
+    let mut out = Vec::new();
+    for body in collector.bodies("/v1/metrics") {
+        let request = ExportMetricsServiceRequest::decode(&body[..]).unwrap();
+        for rm in request.resource_metrics {
+            for sm in rm.scope_metrics {
+                for m in sm
+                    .metrics
+                    .into_iter()
+                    .filter(|m| m.name == "agentfs.remotes.mode")
+                {
+                    let Some(metric::Data::Gauge(gauge)) = m.data else {
+                        continue;
+                    };
+                    for point in gauge.data_points {
+                        if point.value == Some(number_data_point::Value::AsInt(1))
+                            && let Some(mode) = string_attr(&point.attributes, "mode")
+                        {
+                            out.push(mode);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// F8 S3 acceptance 5: the remotes mode reaches the collector as a gauge,
+/// and an undeclared volume's alarm as a log record.
+#[test]
+fn the_remotes_mode_and_the_undeclared_alarm_are_exported() {
+    let collector = Collector::start();
+    let v = Volume::new();
+    fs::write(v.tree().join("a.txt"), "a\n").unwrap();
+    let endpoint = collector.endpoint();
+    let otel = [("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str())];
+    let out = v.run(&["record", "a.txt"], &otel);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(remotes_modes(&collector), ["local_only"]);
+
+    // The declaration removed: undeclared, alarmed, still recording.
+    let mut config = git2::Config::open(&v.dir.path().join("state/git/config")).unwrap();
+    config.remove("agentfs.remotes").unwrap();
+    fs::write(v.tree().join("a.txt"), "a2\n").unwrap();
+    let out = v.run(&["record", "a.txt"], &otel);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no remote is declared"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(remotes_modes(&collector).contains(&"undeclared".to_owned()));
+    let mut logs = Vec::new();
+    for body in collector.bodies("/v1/logs") {
+        let request = ExportLogsServiceRequest::decode(&body[..]).unwrap();
+        for rl in request.resource_logs {
+            for sl in rl.scope_logs {
+                logs.extend(sl.log_records);
+            }
+        }
+    }
+    assert!(
+        logs.iter()
+            .any(|r| r.event_name == "agentfs.remotes_undeclared"),
+        "no remotes_undeclared log: {logs:?}"
     );
 }

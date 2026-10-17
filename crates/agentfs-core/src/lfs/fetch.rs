@@ -168,7 +168,7 @@ impl Fetcher {
 
 impl LfsObjects for Fetcher {
     fn prefetch(&self, pointers: &[Pointer]) {
-        let remotes: Vec<&RemoteSettings> = self.settings.remotes.iter().collect();
+        let remotes: Vec<&RemoteSettings> = self.settings.remotes.pushed().iter().collect();
         let report = download(&self.cache, &remotes, pointers, |remote, left| {
             self.with_transfer(remote, |t| {
                 t.download_many(left, &self.cache, &self.settings.branch_ref)
@@ -188,7 +188,7 @@ impl LfsObjects for Fetcher {
             return Err(Self::not_found(pointer, problems));
         }
         let mut problems = Vec::new();
-        for remote in &self.settings.remotes {
+        for remote in self.settings.remotes.pushed() {
             let result = self.with_transfer(remote, |t| {
                 t.download(pointer, &self.cache, &self.settings.branch_ref)
             });
@@ -327,6 +327,7 @@ pub fn fetch(
     let _lock = CacheLock::shared(cache.dir())?;
     let chosen: Vec<&RemoteSettings> = settings
         .remotes
+        .pushed()
         .iter()
         .filter(|r| remotes.is_none_or(|names| names.contains(&r.name)))
         .collect();

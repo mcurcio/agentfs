@@ -59,7 +59,7 @@ step "everything reached the collector"
 for name in \
   agentfs.record.duration agentfs.commit.count agentfs.journal.backlog \
   agentfs.push.unpushed_commits agentfs.push.oldest_unpushed_age \
-  agentfs.push.failures agentfs.push.diverged agentfs.remote.misconfigured \
+  agentfs.push.failures agentfs.push.diverged agentfs.remote.misconfigured agentfs.remotes.mode \
   agentfs.precheck.rejected_paths agentfs.state.bytes \
   agentfs.patch.queue_depth agentfs.patch.blocked; do
   wait_for 20 grep -q "\"$name\"" "$OTEL_OUT" || fail "metric $name never arrived"
@@ -156,7 +156,7 @@ VOL=$(mktemp -d)
 STATE=$VOL/state
 TREE=$VOL/tree
 mkdir -p "$TREE"
-sudo "$AGENTFS_BIN" --state "$STATE" --root "$TREE" init --volume fronts >/dev/null
+sudo "$AGENTFS_BIN" --state "$STATE" --root "$TREE" init --volume fronts --local-only >/dev/null
 sudo git --git-dir "$STATE/git" config agentfs.commitWindow 50ms
 SOCK=$STATE/meta/history/history.sock
 MNT_A=$VOL/mnt-a

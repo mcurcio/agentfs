@@ -146,13 +146,13 @@ pub fn plan(
             candidates.push(pointer);
         }
     }
-    if settings.remotes.is_empty() {
+    if settings.remotes.pushed().is_empty() {
         plan.no_remotes = true;
         return Ok(plan);
     }
     // Resolve every endpoint before asking any server.
     let mut transfers = Vec::new();
-    for remote in &settings.remotes {
+    for remote in settings.remotes.pushed() {
         let upload = transfer_for(settings, remote, Direction::Upload).map_err(|e| {
             PruneError::NoEndpoint {
                 remote: remote.name.clone(),

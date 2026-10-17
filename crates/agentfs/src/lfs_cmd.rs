@@ -208,7 +208,7 @@ fn fetch_cmd(
         volume::inspect(state).with_context(|| format!("opening {}", state.root().display()))?;
     let settings = history.settings().clone();
     for name in remotes {
-        if !settings.remotes.iter().any(|r| r.name == *name) {
+        if !settings.remotes.pushed().iter().any(|r| r.name == *name) {
             match settings.invalid_remotes.iter().find(|r| r.name == *name) {
                 Some(bad) => bail!("remote {name} is misconfigured: {}", bad.error),
                 None => bail!("no remote named {name:?} is configured"),

@@ -993,7 +993,11 @@ pub fn finish_from_message(message: &str, finish: Oid) -> Option<FinishRecord> {
         base: oid(fields.get(f::BASE_TRAILER)?)?,
         finish,
         change,
-        remote: name(f::FORK_REMOTE_TRAILER)?,
+        // A remote section's name, or the source's own history (F8 S3).
+        remote: match fields.get(f::FORK_REMOTE_TRAILER) {
+            Some(&value) if value == crate::fork::receive::SOURCE_HISTORY => value.to_owned(),
+            _ => name(f::FORK_REMOTE_TRAILER)?,
+        },
         unrecorded: unrecorded.parse().ok()?,
     })
 }
@@ -1908,7 +1912,7 @@ mod tests {
         let h = History::open(&git).unwrap();
         assert_eq!(h.settings().includes, [a.clone(), b.clone()]);
         assert_eq!(h.settings().push_interval, Duration::from_secs(7));
-        assert_eq!(h.settings().remotes[0].url, "/srv/r.git");
+        assert_eq!(h.settings().remotes.pushed()[0].url, "/srv/r.git");
         let once = own();
         h.set_includes(&[a.clone(), b.clone()]).unwrap();
         assert_eq!(own(), once);
@@ -1922,7 +1926,7 @@ mod tests {
         h.set_includes(&[]).unwrap();
         let h = History::open(&git).unwrap();
         assert!(h.settings().includes.is_empty());
-        assert!(h.settings().remotes.is_empty());
+        assert!(h.settings().remotes.pushed().is_empty());
         assert_eq!(h.settings().volume, "v");
     }
 }

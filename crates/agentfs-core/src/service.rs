@@ -17,6 +17,12 @@
 //!   [`Event::RepackFailed`] and is tried again an interval later. A stop
 //!   kills a repack in progress, so shutdown never waits for one.
 //!
+//! - **Undeclared remotes** (thread `agentfs-remotes`, F8 S3): while the
+//!   volume declares no remote and is not declared local-only
+//!   ([`crate::config::Remotes::Undeclared`]), [`Event::RemotesUndeclared`]
+//!   is raised again every `pushInterval`, as a failing push would be
+//!   ([`crate::volume::open`] raised it first).
+//!
 //! [`Service::shutdown`] stops every loop, makes the final commit, then
 //! gives each remote that lacks commits one more push attempt, all within
 //! one grace period (design §11.2): stopping never waits longer than that
@@ -48,10 +54,22 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::{Remotes, Settings};
 use crate::events::{Event, Events};
 use crate::push::{PushOutcome, QueuePush, RemotePusher, backoff};
 use crate::repack::{self, RepackOutcome, RepackSchedule};
 use crate::volume::{CommitReport, Committer, VolumeError};
+
+/// [`Event::RemotesUndeclared`] when `settings` declare no remote and are
+/// not declared local-only (F8 S3).
+pub fn remotes_undeclared(settings: &Settings) -> Option<Event> {
+    match &settings.remotes {
+        Remotes::Undeclared { beside } => Some(Event::RemotesUndeclared {
+            beside: beside.clone(),
+        }),
+        Remotes::Pushed(_) | Remotes::NoneValid | Remotes::LocalOnly => None,
+    }
+}
 
 /// The longest wait between commit attempts after failures.
 pub const COMMIT_BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -399,6 +417,8 @@ pub struct Service {
     /// is released.
     deadline: Arc<Mutex<Option<Instant>>>,
     commit: JoinHandle<Result<CommitReport, VolumeError>>,
+    /// Raises [`Event::RemotesUndeclared`] while it holds.
+    undeclared: Option<JoinHandle<()>>,
     pushes: Vec<PushThread>,
     push_done: mpsc::Receiver<(String, FinalPush)>,
     events: Events,
@@ -435,6 +455,9 @@ impl Service {
         let deadline = Arc::new(Mutex::new(None));
         let mut names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
         names.sort();
+        let settings = committer.history().settings();
+        let undeclared = remotes_undeclared(settings)
+            .map(|event| (event, settings.push_interval.max(MIN_DELAY)));
         let commit = {
             let stop = stop.clone();
             let signal = signal.clone();
@@ -484,6 +507,29 @@ impl Service {
                 }
             }
         }
+        let undeclared = match undeclared {
+            None => None,
+            Some((event, interval)) => {
+                let (stop_flag, events) = (stop.clone(), events.clone());
+                let spawned =
+                    thread::Builder::new()
+                        .name("agentfs-remotes".into())
+                        .spawn(move || {
+                            while !stop_flag.wait(interval) {
+                                events.emit(event.clone());
+                            }
+                        });
+                match spawned {
+                    Ok(handle) => Some(handle),
+                    Err(e) => {
+                        stop.stop();
+                        signal.update(|s| s.stop = true);
+                        committed.stop();
+                        return Err(e);
+                    }
+                }
+            }
+        };
         Ok(Self {
             stop,
             signal,
@@ -491,6 +537,7 @@ impl Service {
             committed,
             deadline,
             commit,
+            undeclared,
             pushes,
             push_done,
             events,
@@ -523,6 +570,9 @@ impl Service {
             s.stop = true;
             s.closed = true;
         });
+        if let Some(undeclared) = self.undeclared {
+            let _ = undeclared.join();
+        }
         let final_commit = self.commit.join().unwrap_or_else(|_| {
             let error = "the commit thread panicked";
             self.events.emit(Event::CommitFailed {

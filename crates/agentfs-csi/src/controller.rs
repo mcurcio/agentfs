@@ -415,7 +415,7 @@ fn decide(
     let mut seen = Vec::new();
     // A fork's remotes are not asked: publishing is its gate.
     if let (Some(head), None) = (head, fork) {
-        for remote in &settings.remotes {
+        for remote in settings.remotes.pushed() {
             let pusher = RemotePusher::open(
                 state,
                 &settings,

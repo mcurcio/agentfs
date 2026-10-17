@@ -211,6 +211,11 @@ pub enum Event {
     /// A `[remote "<name>"]` section is invalid, so the remote is never
     /// pushed; recording and other remotes carry on (design §11.1).
     RemoteMisconfigured { remote: String, error: String },
+    /// No push section and no `agentfs.remotes = none`, or `none` beside a
+    /// push section (`beside`, F8 S3): nothing is pushed, and nothing
+    /// says the volume is meant to be local-only. Raised at open and at
+    /// every push-loop interval while it holds.
+    RemotesUndeclared { beside: Option<String> },
     /// A push attempt succeeded, including one with nothing new to send.
     PushSucceeded {
         remote: String,
@@ -345,6 +350,7 @@ impl Event {
             Self::StartBranchMoved { .. } => "start_branch_moved",
             Self::PushLimited { .. } => "push_limited",
             Self::RemoteMisconfigured { .. } => "remote_misconfigured",
+            Self::RemotesUndeclared { .. } => "remotes_undeclared",
             Self::PushSucceeded { .. } => "push_succeeded",
             Self::PatchApplied { .. } => "patch_applied",
             Self::PatchDuplicate { .. } => "patch_duplicate",
@@ -456,6 +462,17 @@ impl fmt::Display for Event {
                     "remote {remote:?} is misconfigured and is not pushed: {error}"
                 )
             }
+            Self::RemotesUndeclared { beside: None } => f.write_str(
+                "no remote is declared, so nothing is pushed: add a [remote] section to an \
+                 include, or declare the volume local-only (agentfs.remotes = none)",
+            ),
+            Self::RemotesUndeclared {
+                beside: Some(remote),
+            } => write!(
+                f,
+                "agentfs.remotes = none beside remote section {remote:?}, so nothing is pushed: \
+                 remove one of them"
+            ),
             Self::PushSucceeded {
                 remote,
                 head,
