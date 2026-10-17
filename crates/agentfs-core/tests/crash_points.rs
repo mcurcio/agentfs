@@ -242,6 +242,7 @@ impl Env {
         let settings = committer.history().settings();
         let remote = settings
             .remotes
+            .pushed()
             .iter()
             .find(|r| r.name == name)
             .expect("remote configured");

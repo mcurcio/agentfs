@@ -1227,6 +1227,12 @@ fn an_external_unmount_stops_the_daemon() {
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn the_lock_holds_while_mounted() {
     let v = Vol::new("lock");
+    // A remote, so that `push` has work to hand the mount.
+    git2::Repository::init_bare(v.p("remote.git")).unwrap();
+    v.config(
+        "remote.origin.url",
+        &format!("file://{}", v.p("remote.git").display()),
+    );
     let m = v.mount(&[]);
     let root = v.backing().to_str().unwrap().to_owned();
     for args in [&["run"][..], &["flush"], &["--root", &root, "record", "f"]] {
