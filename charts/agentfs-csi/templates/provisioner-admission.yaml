@@ -1,0 +1,71 @@
+# What RBAC cannot scope (design §14.2 "RBAC inventory"; docs/csi.md
+# §10): the node plugin's account, csi-provisioner on every node, may
+# create, change and delete only this driver's PVs pinned to its own node
+# (the node its pod-bound token names), and update only this driver's
+# claims. Without it one compromised node could delete any PV in the
+# cluster.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: agentfs-provisioner
+  labels:
+    {{- include "agentfs-csi.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["persistentvolumes"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["persistentvolumeclaims"]
+  matchConditions:
+    - name: the-node-plugins-account
+      expression: request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:agentfs-csi-node'
+  variables:
+    - name: node
+      expression: >-
+        'authentication.kubernetes.io/node-name' in request.userInfo.extra
+        ? request.userInfo.extra['authentication.kubernetes.io/node-name'][0] : ''
+    # The PV as it is and as it would be: none for a claim.
+    - name: pvs
+      expression: >-
+        request.resource.resource != 'persistentvolumes' ? [] :
+        request.operation == 'CREATE' ? [object] :
+        request.operation == 'DELETE' ? [oldObject] : [object, oldObject]
+  validations:
+    - expression: >-
+        variables.pvs.all(pv, has(pv.spec.csi) &&
+        pv.spec.csi.driver == '{{ include "agentfs-csi.driverName" . }}')
+      message: the node plugin's account may only create, change or delete PVs of the agentfs driver
+    - expression: >-
+        variables.pvs.size() == 0 || variables.node != '' && variables.pvs.all(pv,
+        has(pv.spec.nodeAffinity) && has(pv.spec.nodeAffinity.required) &&
+        pv.spec.nodeAffinity.required.nodeSelectorTerms.all(t,
+        has(t.matchExpressions) && t.matchExpressions.exists(e,
+        e.key == 'topology.agentfs.mcurcio.github.io/node' && e.operator == 'In' &&
+        e.values == [variables.node])))
+      message: >-
+        the node plugin's account may only create, change or delete PVs pinned
+        to its own node (topology.agentfs.mcurcio.github.io/node), with a token
+        bound to a pod on that node
+    - expression: >-
+        request.resource.resource != 'persistentvolumeclaims' ||
+        (has(oldObject.metadata.annotations) &&
+        ['volume.kubernetes.io/storage-provisioner', 'volume.beta.kubernetes.io/storage-provisioner'].exists(k,
+        k in oldObject.metadata.annotations &&
+        oldObject.metadata.annotations[k] == '{{ include "agentfs-csi.driverName" . }}'))
+      message: the node plugin's account may only update claims the agentfs driver provisions
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: agentfs-provisioner
+  labels:
+    {{- include "agentfs-csi.labels" . | nindent 4 }}
+spec:
+  policyName: agentfs-provisioner
+  validationActions: [Deny]

@@ -622,6 +622,45 @@ async fn delete_volume_retains_or_deletes() {
     fs::create_dir_all(d.layout.deleting_dir("gone").join("state")).unwrap();
     c.delete_volume(delete_req("gone")).await.unwrap();
     assert!(!d.layout.deleting_dir("gone").exists());
+
+    // No branch yet, but a record journaled and never committed (a history
+    // service killed at NodeUnstage): it was promised, so nothing goes.
+    c.create_volume(create_req(
+        "journaled",
+        &[("profile", "p"), ("onDelete", "delete")],
+    ))
+    .await
+    .unwrap();
+    let state = agentfs_core::volume::StateDir::new(d.layout.state("journaled"));
+    let (journal, _) =
+        agentfs_core::journal::Journal::open(state.journal(), 0, Box::new(|| Ok(()))).unwrap();
+    journal
+        .record(agentfs_core::record::Draft {
+            trigger: agentfs_core::record::Trigger::Unlink,
+            caller: agentfs_core::record::Caller {
+                uid: 0,
+                gid: 0,
+                pid: 1,
+            },
+            time_ms: 0,
+            changes: vec![agentfs_core::record::Change::Remove {
+                path: agentfs_core::paths::RepoPath::new("f").unwrap(),
+            }],
+            operation: None,
+            atomic: false,
+            origin: None,
+        })
+        .unwrap();
+    drop(journal);
+    let err = c.delete_volume(delete_req("journaled")).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    assert!(
+        err.message().contains("journal holds 1 record(s)"),
+        "{}",
+        err.message()
+    );
+    assert!(d.layout.csi_json("journaled").exists());
+    assert!(state.journal().exists());
     d.stop().await;
 }
 

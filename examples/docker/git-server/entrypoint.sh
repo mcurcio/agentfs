@@ -31,6 +31,13 @@ die() {
 init() {
   [ -d "$repo" ] || git init -q --bare "$repo"
   git --git-dir "$repo" config http.receivepack true
+  # git's default (`committed,-loose-object`) does not fsync loose objects,
+  # which is how a push of fewer than transfer.unpackLimit objects
+  # arrives, while it does fsync the ref update: an unclean shutdown could
+  # leave a branch naming objects that are gone, after agentfs saw the
+  # branch and deleted its own copy (docs/csi.md §7). Set at every init,
+  # so an existing repository gets it too.
+  git --git-dir "$repo" config core.fsync committed
   if $root; then chown -R www-data:www-data /srv/git; fi
   echo "git-server: $repo is ready"
 }

@@ -11,7 +11,7 @@ page says *where*. Section references (§) are to design.md.
 | `agentfs-core` | library | The engine: path rules, the journal, frozen copies, commits, pushes, restores, the patch queue, the history service, LFS, telemetry. No FUSE and no CLI |
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary (§2.1, §3.1, §6) |
 | `agentfs` | binary | The `agentfs` command (§17.1): `init`, `mount`, `run`, `record`, `flush`, `push`, `status`, `probe`, `serve-history`, `restore`, `revert`, `patch`, `fork`; OpenTelemetry export |
-| `agentfs-csi` | library and binary | The CSI driver (§14.2): `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs push` children |
+| `agentfs-csi` | library and binary | The CSI driver (§14.2): `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs flush` and `agentfs push` children |
 
 The dependencies run one way: `agentfs-csi` → (`agentfs` as a child
 process) → `agentfs-fuse` → `agentfs-core`. `agentfs-csi` links
@@ -59,7 +59,7 @@ missing from these tables or a row names a module that no longer exists;
 | `service.rs` | The background loops: commit loop, one push loop per remote, repack (§3.4, §11.2) |
 | `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
 | `push/claim.rs` | The branch rule's pure deciders: `claim` (create or fast-forward, from the remote's value in the connection) and `start_branch_moved` (the start-branch alarm) |
-| `release.rs` | The one deletion decider: delete, keep or wait for a worktree, from its declared remotes, what each advertises, `onDelete` and a fork's status (F8 rule 3) |
+| `release.rs` | The one deletion decider: delete, keep or wait for a worktree, from its declared remotes, what each advertises, the journal's backlog, `onDelete` and a fork's status (F8 rule 3) |
 | `push_size.rs` | Measuring a push's git pack against `agentfsMaxPushSize` before connecting, and the first-parent step that fits (§11.3) |
 | `remote_auth.rs` | Credentials and host-key checks for one remote, shared by push and patch fetch, and the scope that hands an SSH remote to the transport (§11.1) |
 | `ssh_transport.rs` | `ssh` feature: agentfs's libgit2 subtransport for SSH URLs over russh: host key or certificate check before authentication, the key (decrypted) or ssh-agent identities, timeouts (§11.1) |
@@ -163,7 +163,7 @@ missing from these tables or a row names a module that no longer exists;
 | `node.rs` | The Node service: validates calls and hands them to the supervisor; this node's topology |
 | `supervisor.rs` | One `serve-history` per staged volume and one front per pod, restarted when they crash; NodeStage never creates a worktree; a finished fork published read-only |
 | `launcher.rs` | Starting the `agentfs` children |
-| `release_scan.rs` | The release scan: one `agentfs push` per worktree no pod stages, until it exits 0 at the head, with backoff; one `agentfs fork finish` per fork whose deletion asked for it, skipping refused and abandoned forks (§11.5, §14.2) |
+| `release_scan.rs` | The release scan: one `agentfs flush` per worktree no pod stages whose journal holds records history lacks, then one `agentfs push` until it exits 0 at the head and remotes, with backoff; one `agentfs fork finish` per fork whose deletion asked for it, skipping refused and abandoned forks (§11.5, §14.2) |
 | `mounter.rs` | The node plugin's mount operations: bind mounts onto the kubelet's targets |
 | `params.rs` | StorageClass and PersistentVolume parameters |
 | `volume.rs` | Worktrees on this node's disk: creating one (empty, started, a fork), adopting a static PV over its worktree |

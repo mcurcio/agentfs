@@ -13,7 +13,8 @@
 #   b. the install's notes name the server's URL and the credentials key;
 #   c. a pod writes a file: `git ls-remote` through `kubectl port-forward`
 #      to the Service shows agentfs/<volume> at the worktree's head, and
-#      that commit holds the file;
+#      that commit holds the file; the repository has core.fsync
+#      committed (loose objects synced before the ref);
 #   d. a wrong password is refused, and the server logs the mismatch;
 #   e. the server pod is deleted and comes back with the repository intact
 #      (its claim), and the next write reaches it;
@@ -236,6 +237,10 @@ ONE=$(remote_ref "refs/heads/agentfs/$V")
 git init -q --bare "$WORK/clone.git"
 git --git-dir "$WORK/clone.git" fetch -q "$(url "$PASSWORD")" "refs/heads/agentfs/$V"
 assert_eq one "$(git --git-dir "$WORK/clone.git" show "$ONE:one.txt")" "the pushed commit $ONE holds one.txt"
+# A small push arrives as loose objects, which git's default core.fsync
+# leaves unsynced while it syncs the ref (entrypoint.sh).
+assert_eq committed "$(kd exec "$SERVER-0" -c git-server -- git --git-dir /srv/git/history.git config core.fsync)" \
+  "the server fsyncs loose objects before the ref names them"
 
 step "(d) a wrong password is refused"
 if git ls-remote "$(url wrong-password)" >"$WORK/wrong.log" 2>&1; then

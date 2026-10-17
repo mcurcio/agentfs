@@ -3,17 +3,24 @@
 //!
 //! [`decide`] is pure. Its inputs are the worktree's declared remotes,
 //! what each pushed remote advertises for the branch in a listing made
-//! for this call (rule 3: it asks the remote, never the push record), the
-//! class's `onDelete`, and, for a fork, its status. It answers:
+//! for this call (rule 3: it asks the remote, never the push record), how
+//! many journaled records history lacks, the class's `onDelete`, and, for
+//! a fork, its status. It answers:
 //!
 //! - [`Release::Delete`]: every declared remote holds the head, or the
-//!   worktree has no history, and `onDelete` is `delete`;
+//!   worktree has no history, its journal holds nothing history lacks,
+//!   and `onDelete` is `delete`;
 //! - [`Release::Keep`]: the volume is released but the worktree stays on
 //!   its node's disk: `onDelete: retain` once every declared remote holds
-//!   the head, or nothing elsewhere can hold it (local-only, undeclared);
+//!   the head and the journal is committed, or nothing elsewhere can hold
+//!   it (local-only, undeclared);
 //! - [`Release::Wait`]: not yet. DeleteVolume answers `UNAVAILABLE`, the
-//!   CO retries, and the node plugin's release scan pushes the worktree
-//!   meanwhile, raising `PushFailed` at each failed attempt.
+//!   CO retries, and the node plugin's release scan commits (`agentfs
+//!   flush`) and pushes the worktree meanwhile, raising `PushFailed` at
+//!   each failed push. A journal history lacks is what a history service
+//!   stopped with `SIGKILL`, or crash-looping, at NodeUnstage leaves: the
+//!   head alone would call those records held, or, with no branch yet,
+//!   call the worktree empty.
 //!
 //! Nothing else decides deletion: not CreateVolume, not a class
 //! parameter's validation, not the release scan. A StorageClass's
@@ -112,9 +119,13 @@ impl<'a> Declared<'a> {
 /// Everything [`decide`] weighs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree<'a> {
-    /// The branch exists locally. Without it nothing can be lost, and the
-    /// remotes are not asked.
+    /// The branch exists locally. Without it only the journal can hold
+    /// anything, and the remotes are not asked.
     pub has_history: bool,
+    /// Journaled records history lacks ([`crate::volume::inspect`]'s
+    /// backlog): durable, promised to their callers, and on no remote. A
+    /// fork's finish commits them, so a fork's status is its gate instead.
+    pub uncommitted: usize,
     pub on_delete: OnDelete,
     pub remotes: Declared<'a>,
     /// A fork's status (design §11.5): publishing is its gate, so its
@@ -136,7 +147,8 @@ pub enum Release {
 /// Why a released worktree stays on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kept {
-    /// `onDelete: retain`, and every declared remote holds the head.
+    /// `onDelete: retain`, every declared remote holds the head, and the
+    /// journal is committed.
     Retained,
     /// Declared local-only: no remote holds it, by declaration.
     LocalOnly,
@@ -149,6 +161,9 @@ pub enum Kept {
 /// it once its deletion asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Waiting {
+    /// The journal holds `records` history lacks: the release scan
+    /// commits them (`agentfs flush`), then pushes.
+    Uncommitted { records: usize },
     /// The remote does not hold the head ([`Claim::Create`] or
     /// [`Claim::FastForward`]).
     Lacking { remote: String },
@@ -168,6 +183,11 @@ pub enum Waiting {
 /// weighed in order and the first that does not hold the head is named.
 pub fn decide(worktree: &Worktree<'_>) -> Release {
     let held = || match worktree.on_delete {
+        _ if worktree.fork.is_none() && worktree.uncommitted > 0 => {
+            Release::Wait(Waiting::Uncommitted {
+                records: worktree.uncommitted,
+            })
+        }
         OnDelete::Delete => Release::Delete,
         OnDelete::Retain => Release::Keep(Kept::Retained),
     };
@@ -208,6 +228,11 @@ impl fmt::Display for Waiting {
     /// Why DeleteVolume waits, for its `UNAVAILABLE` message.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Uncommitted { records } => write!(
+                f,
+                "its journal holds {records} record(s) not yet committed (the node plugin's \
+                 release scan commits and pushes them)"
+            ),
             Self::Lacking { remote } => write!(
                 f,
                 "remote {remote} does not hold the branch's head yet (the node plugin's release \
@@ -262,6 +287,7 @@ mod tests {
     fn worktree<'a>(on_delete: OnDelete, remotes: Declared<'a>) -> Worktree<'a> {
         Worktree {
             has_history: true,
+            uncommitted: 0,
             on_delete,
             remotes,
             fork: None,
@@ -314,7 +340,8 @@ mod tests {
                 Release::Wait(Waiting::NoneValid)
             );
         }
-        // No history: nothing can be lost, and nothing is asked.
+        // No history and an empty journal: nothing can be lost, and
+        // nothing is asked.
         let none = Worktree {
             has_history: false,
             ..worktree(OnDelete::Delete, Declared::NoneValid)
@@ -390,5 +417,41 @@ mod tests {
                 Release::Keep(Kept::Retained)
             );
         }
+    }
+
+    /// A journal history lacks holds deletion and retention alike, with a
+    /// branch or without one, whatever the remotes hold; a fork's status
+    /// is its gate instead (its finish commits the journal).
+    #[test]
+    fn an_uncommitted_journal_waits() {
+        let held = [seen("a", Ok(Claim::UpToDate))];
+        let waiting = Waiting::Uncommitted { records: 2 };
+        for has_history in [true, false] {
+            for on_delete in [OnDelete::Delete, OnDelete::Retain] {
+                let journaled = Worktree {
+                    has_history,
+                    uncommitted: 2,
+                    ..worktree(on_delete, Declared::Pushed(&held))
+                };
+                assert_eq!(
+                    decide(&journaled),
+                    Release::Wait(waiting.clone()),
+                    "{has_history} {on_delete}"
+                );
+            }
+        }
+        assert!(waiting.to_string().contains("2 record(s)"), "{waiting}");
+        // Nothing elsewhere can hold it: kept, journal and all.
+        let local = Worktree {
+            uncommitted: 2,
+            ..worktree(OnDelete::Delete, Declared::LocalOnly)
+        };
+        assert_eq!(decide(&local), Release::Keep(Kept::LocalOnly));
+        let fork = Worktree {
+            uncommitted: 2,
+            fork: Some(ForkState::Abandoned),
+            ..worktree(OnDelete::Delete, Declared::Pushed(&held))
+        };
+        assert_eq!(decide(&fork), Release::Delete);
     }
 }

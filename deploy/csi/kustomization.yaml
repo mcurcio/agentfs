@@ -11,6 +11,9 @@ resources:
   - namespace.yaml
   - csidriver.yaml
   - rbac.yaml
+  # What RBAC cannot scope: the node plugin's account touches only this
+  # driver's PVs on its own node (docs/csi.md §10).
+  - provisioner-admission.yaml
   - credentials.yaml
   - node.yaml
   # Every class of the driver must have reclaim policy Delete (docs/csi.md §5).

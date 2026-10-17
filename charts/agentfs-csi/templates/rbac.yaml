@@ -1,7 +1,9 @@
 # The driver's whole RBAC inventory (design §14.2, docs/csi.md
 # "Security"). No rule grants secrets, pods or snapshots. The node
 # plugin's account is used by csi-provisioner (`--node-deployment`) alone:
-# its token is projected into that sidecar only.
+# its token is projected into that sidecar only. RBAC cannot scope PVs by
+# driver or node: provisioner-admission.yaml narrows these rights to this
+# driver's PVs on the token's own node.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

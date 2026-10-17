@@ -268,7 +268,7 @@ tests the container image on every push:
   another kind cluster, with [`deploy/csi`](../deploy/csi) through its CI
   overlay [`ci/k8s-csi`](../ci/k8s-csi). It validates the manifests, checks
   the driver's registration and its RBAC inventory with `kubectl auth
-  can-i`, runs two restricted pods (uid 10000 and 10001, primary groups
+  can-i` and the provisioner admission policy, runs two restricted pods (uid 10000 and 10001, primary groups
   other than their shared `fsGroup`) on one claim, has them create the
   same new names at once, checks their distinct committers, trailers and
   authors on the runner's git server, kills one pod's front (the other

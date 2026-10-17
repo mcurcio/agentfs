@@ -6,8 +6,11 @@
 #   - deploy/csi passes server-side validation, the driver registers on
 #     the node with its topology, the RBAC inventory holds (`kubectl auth
 #     can-i`: the node plugin's account is csi-provisioner's, and its token
-#     reaches no other container), and the class admission policy refuses
-#     a class with reclaim policy Retain;
+#     reaches no other container), the class admission policy refuses
+#     a class with reclaim policy Retain, and the provisioner policy
+#     refuses that account another driver's PV, and this driver's without
+#     a token naming the PV's node (every claim below is provisioned and
+#     deleted through it, with the real token);
 #   - two restricted pods (uid 10000 and 10001, primary groups 3000 and
 #     3001, one fsGroup) on one RWO claim, its PV pinned to the node by the
 #     driver's topology, both write; the remote branch
@@ -294,6 +297,42 @@ EOF
 done
 [ -n "$denied" ] || fail "a class with reclaimPolicy Retain was admitted"
 assert_contains "$denied" "agentfs-class" "a class with reclaimPolicy Retain is denied by the class policy"
+# RBAC lets the node plugin's account delete any PV; the provisioner
+# policy narrows it to this driver's PVs on the token's own node. As that
+# account (impersonated: no node in the token), a server-side dry run.
+pv_as_node() { # driver
+  kubectl create --dry-run=server --as "system:serviceaccount:$DNS:agentfs-csi-node" -f - 2>&1 <<EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: agentfs-ci-foreign
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: $TOPOLOGY, operator: In, values: [$NODE_NAME] }
+  csi: { driver: $1, volumeHandle: agentfs-ci-foreign }
+EOF
+}
+denied=
+deadline=$((SECONDS + 90))
+while [ $SECONDS -lt $deadline ]; do
+  if ! out=$(pv_as_node other.example.com); then
+    denied=$out
+    break
+  fi
+  sleep 3
+done
+[ -n "$denied" ] || fail "the node plugin's account may create another driver's PV"
+assert_contains "$denied" "agentfs-provisioner" "another driver's PV is denied to the node plugin's account"
+assert_contains "$denied" "PVs of the agentfs driver" "named as another driver's"
+out=$(pv_as_node "$DRIVER") && fail "a PV created with a token naming no node was admitted: $out"
+assert_contains "$out" "pinned to its own node" "this driver's PV needs a token bound to a pod on its node"
 
 step "(d) two restricted pods on one claim"
 kubectl apply -k ci/k8s-csi/apps

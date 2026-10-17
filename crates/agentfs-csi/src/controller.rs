@@ -15,12 +15,14 @@
 //!   ([`agentfs_core::release::decide`], F8 rule 3) over facts gathered
 //!   here: the worktree's declared remotes, what each pushed remote
 //!   advertises for the branch in a listing made for this call
-//!   ([`agentfs_core::push::RemotePusher::branch_claim`]), the class's
-//!   `onDelete`, and a fork's status. `Delete` removes the directory;
-//!   `Keep` releases the volume and keeps the worktree, renaming
-//!   `csi.json` to `csi.retained.json`; `Wait` is `UNAVAILABLE`, naming
-//!   the remote and why, and wakes the node plugin's release scan, which
-//!   pushes the worktree (DeleteVolume never pushes). A fork's deletion is
+//!   ([`agentfs_core::push::RemotePusher::branch_claim`]), the journal's
+//!   backlog ([`agentfs_core::volume::inspect`], read under the state
+//!   lock), the class's `onDelete`, and a fork's status. `Delete` removes
+//!   the directory; `Keep` releases the volume and keeps the worktree,
+//!   renaming `csi.json` to `csi.retained.json`; `Wait` is `UNAVAILABLE`,
+//!   naming the remote (or the journal) and why, and wakes the node
+//!   plugin's release scan, which commits and pushes the worktree
+//!   (DeleteVolume never commits or pushes). A fork's deletion is
 //!   its request to be finished (`finish_requested` in `csi.json`), which
 //!   the release scan carries out. It refuses a worktree staged on this
 //!   node, or whose state area is locked. `Delete` renames the directory
@@ -42,11 +44,11 @@ use tonic::{Request, Response, Status};
 use agentfs_core::config::Settings;
 use agentfs_core::events::NullSink;
 use agentfs_core::fork::finish::ForkState;
-use agentfs_core::history::History;
+use agentfs_core::journal;
 use agentfs_core::push::RemotePusher;
-use agentfs_core::release::{self, Declared, Release, Seen, Worktree};
+use agentfs_core::release::{self, Declared, Release, Seen, Waiting, Worktree};
 use agentfs_core::telemetry::Telemetry;
-use agentfs_core::volume::StateDir;
+use agentfs_core::volume::{self as core_volume, StateDir};
 
 use crate::csi::v1::controller_server::Controller;
 use crate::csi::v1::controller_service_capability::{self, rpc};
@@ -302,6 +304,7 @@ pub(crate) fn delete_volume(
     {
         let unpublished = release::decide(&Worktree {
             has_history: true,
+            uncommitted: 0,
             on_delete: record.params.on_delete,
             remotes: Declared::Pushed(&[]),
             fork: Some(fork),
@@ -363,9 +366,14 @@ pub(crate) fn delete_volume(
 }
 
 /// DeleteVolume's answer to [`Release::Wait`]: `UNAVAILABLE`, naming why,
-/// after waking the release scan, which pushes (or finishes) the worktree
-/// meanwhile.
-fn wait(handle: &str, release: &ReleaseScan, waiting: &release::Waiting) -> Error {
+/// after waking the release scan, which commits and pushes (or finishes)
+/// the worktree meanwhile. A remote that lacks the head contradicts the
+/// scan's memory of a push that held it (the remote lost the branch since,
+/// or was added after): the scan forgets it and pushes again.
+fn wait(handle: &str, release: &ReleaseScan, waiting: &Waiting) -> Error {
+    if let Waiting::Lacking { .. } = waiting {
+        release.forget(handle);
+    }
     release.wake();
     Error::Unavailable(format!(
         "volume {handle}: {waiting}; nothing deleted, DeleteVolume is retried"
@@ -390,18 +398,19 @@ fn decide(
         ))
     };
     if !state.git().join("config").exists() {
+        let (records, _) = journal::read_records(&state.journal()).map_err(|e| unreadable(&e))?;
         return Ok(release::decide(&Worktree {
             has_history: false,
+            uncommitted: records.len(),
             on_delete,
             remotes: Declared::Undeclared,
             fork,
         }));
     }
-    let history = History::open(&state.git()).map_err(|e| unreadable(&e))?;
-    let head = history
-        .head()
-        .map_err(|e| unreadable(&e))?
-        .map(|commit| commit.id());
+    // Under the state lock: the journal's backlog is what a stopped (or
+    // killed) history service left uncommitted, and nothing appends to it.
+    let (history, inspection) = core_volume::inspect(state).map_err(|e| unreadable(&e))?;
+    let head = inspection.head;
     let settings: Settings = history.settings().clone();
     let mut seen = Vec::new();
     // A fork's remotes are not asked: publishing is its gate.
@@ -423,6 +432,7 @@ fn decide(
     }
     Ok(release::decide(&Worktree {
         has_history: head.is_some(),
+        uncommitted: inspection.backlog,
         on_delete,
         remotes: Declared::of(&settings, &seen),
         fork,

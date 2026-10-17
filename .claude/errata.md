@@ -94,3 +94,20 @@ None of these stopped the slice; each was resolved as below and is reported with
    `history.git`, and NOTES.txt prints that URL.
 5. The slice page was not at the path the brief gave (`.handoff/f8-slices.md` of the main
    checkout); it was read from the worktree `wf_1a3a42d9-2d6-3`.
+
+## 2026-10-17, F8 fix agent (fix-f8)
+
+1. Brief: `.handoff/f8-slices.md` is still not in the main checkout (errata 7, S1 1, S4 5);
+   not needed for these four findings, which name their files.
+2. Design §14.2 "Unpushed history" ("history no remote holds is never deleted") and
+   `release::decide`'s "no history: nothing can be lost" were wrong: they weighed only the
+   head, so a journal a history service killed at NodeUnstage left (records promised
+   durable) was deleted. The journal's backlog is now a decider fact
+   (`Waiting::Uncommitted`), and the release scan runs `agentfs flush` before pushing.
+3. S1 erratum 6 is resolved, not by clearing at every wake: the scan holds a push at its
+   head and the profile's remotes (a remote added later is pushed to), and DeleteVolume
+   answering `Lacking` forgets that one handle (`ReleaseScan::forget`).
+4. Security finding: the provisioner admission policy `agentfs-provisioner` (always
+   installed, no value to turn it off) is a design choice beyond the doc correction the
+   finding allowed; it needs Kubernetes 1.30's node-name claim in pod-bound tokens, which
+   the chart's `kubeVersion: >=1.30` already implies.

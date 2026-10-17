@@ -1,8 +1,9 @@
 //! Starting the `agentfs` children the node plugin supervises (design
 //! §14.2, §17.2): one `agentfs serve-history` per staged volume, one
 //! `agentfs mount --history-service` front per published target, and the
-//! release scan's children ([`crate::release_scan`]): one `agentfs push`
-//! per worktree no pod stages, and one `agentfs fork finish` per fork
+//! release scan's children ([`crate::release_scan`]): one `agentfs flush`
+//! then one `agentfs push` per worktree no pod stages, and one `agentfs
+//! fork finish` per fork
 //! whose deletion asked for it to be finished (design §11.5).
 //!
 //! The children are the same commands the single-node deployments run, so
@@ -262,12 +263,33 @@ pub fn push_spec(layout: &Layout, handle: &str, identity: &PluginIdentity) -> Pr
             layout.state(handle).into_os_string(),
             os("push"),
         ],
-        env: vec![
-            (os("AGENTFS_NAMESPACE"), os(identity.namespace.as_str())),
-            (os("AGENTFS_POD"), os(identity.pod.as_str())),
-            (os("AGENTFS_NODE"), os(identity.node.as_str())),
-        ],
+        env: identity_env(identity),
     }
+}
+
+/// `agentfs --state <state> --root <backing> flush` for the release scan:
+/// commits what a stopped history service left in the journal, before the
+/// push; with the plugin's identity env.
+pub fn flush_spec(layout: &Layout, handle: &str, identity: &PluginIdentity) -> ProcessSpec {
+    ProcessSpec {
+        label: format!("flush {handle}"),
+        args: vec![
+            os("--state"),
+            layout.state(handle).into_os_string(),
+            os("--root"),
+            layout.backing(handle).into_os_string(),
+            os("flush"),
+        ],
+        env: identity_env(identity),
+    }
+}
+
+fn identity_env(identity: &PluginIdentity) -> Vec<(OsString, OsString)> {
+    vec![
+        (os("AGENTFS_NAMESPACE"), os(identity.namespace.as_str())),
+        (os("AGENTFS_POD"), os(identity.pod.as_str())),
+        (os("AGENTFS_NODE"), os(identity.node.as_str())),
+    ]
 }
 
 /// How long one finisher child publishes before it exits 1 and frees the

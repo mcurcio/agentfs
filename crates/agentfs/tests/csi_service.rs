@@ -4,9 +4,10 @@
 //! same path as a front mount) commit under their own pods' identities,
 //! a `kill -9` of the service is recovered by the supervisor with the
 //! journaled record committed under its original committer, and
-//! NodeUnstage makes the final commit; and the release scan pushes an
-//! unstaged worktree with the real `agentfs push` until a remote holds it
-//! (F8 D1). No FUSE, no root.
+//! NodeUnstage makes the final commit; and the release scan commits an
+//! unstaged worktree's journal with the real `agentfs flush` and pushes it
+//! with the real `agentfs push` until every remote holds it, a remote
+//! added later too (F8 D1). No FUSE, no root.
 
 use std::collections::HashMap;
 use std::fs;
@@ -275,23 +276,7 @@ async fn the_release_scan_pushes_an_unstaged_worktree_until_a_remote_holds_it() 
         )
         .unwrap();
 
-    let scan = agentfs_csi::release_scan::ReleaseScan::new(
-        Arc::new(layout.clone()),
-        Arc::new(AgentfsLauncher {
-            bin: env!("CARGO_BIN_EXE_agentfs").into(),
-        }),
-        PluginIdentity {
-            namespace: "agentfs-csi".into(),
-            pod: "agentfs-csi-node-test".into(),
-            node: "node-1".into(),
-        },
-        Duration::from_millis(300),
-        Backoff {
-            initial: Duration::from_millis(300),
-            max: Duration::from_secs(1),
-            reset_after: Duration::from_secs(60),
-        },
-    );
+    let scan = release_scan(&layout);
     assert_eq!(scan.scan().await.pushing, ["pvc-2"]);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -322,4 +307,141 @@ async fn the_release_scan_pushes_an_unstaged_worktree_until_a_remote_holds_it() 
         .refname_to_id("refs/heads/agentfs/late")
         .ok();
     assert_eq!(pushed, Some(head), "the late commit reached its own branch");
+}
+
+/// The node plugin's release scan with the real `agentfs` children.
+fn release_scan(layout: &Layout) -> agentfs_csi::release_scan::ReleaseScan {
+    agentfs_csi::release_scan::ReleaseScan::new(
+        Arc::new(layout.clone()),
+        Arc::new(AgentfsLauncher {
+            bin: env!("CARGO_BIN_EXE_agentfs").into(),
+        }),
+        PluginIdentity {
+            namespace: "agentfs-csi".into(),
+            pod: "agentfs-csi-node-test".into(),
+            node: "node-1".into(),
+        },
+        Duration::from_millis(300),
+        Backoff {
+            initial: Duration::from_millis(300),
+            max: Duration::from_secs(1),
+            reset_after: Duration::from_secs(60),
+        },
+    )
+}
+
+/// Scans until `done` holds for a report, for at most 30 s.
+async fn scan_until(
+    scan: &agentfs_csi::release_scan::ReleaseScan,
+    what: &str,
+    done: impl Fn(&agentfs_csi::release_scan::ScanReport) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let report = scan.scan().await;
+        if done(&report) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what}: {report:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// What a history service stopped with SIGKILL at NodeUnstage leaves: a
+/// record journaled (its call returned) and never committed, on a
+/// worktree with no branch yet. The release scan commits it with the
+/// real `agentfs flush` and only then pushes; and once a push to no
+/// remote held it, a remote added to the profile is still pushed to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_release_scan_commits_the_journal_and_pushes_to_a_remote_added_later() {
+    use agentfs_core::events::NullSink;
+    use agentfs_core::identity::Context;
+    use agentfs_core::paths::RepoPath;
+    use agentfs_core::record::{Caller, Trigger};
+    use agentfs_core::telemetry::Telemetry;
+    use agentfs_core::volume::{self, Input, StateDir};
+
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout {
+        base: dir.path().join("base"),
+        node_state: dir.path().join("node"),
+        mount_dir: dir.path().join("mounts"),
+        profiles: dir.path().join("profiles"),
+    };
+    fs::create_dir_all(&layout.profiles).unwrap();
+    // No remote yet.
+    fs::write(layout.profiles.join("test.config"), "").unwrap();
+    let params = VolumeParams {
+        profile: "test".into(),
+        volume: "journaled".into(),
+        on_delete: OnDelete::Delete,
+        start_from: None,
+        workload_mounts: Vec::new(),
+    };
+    agentfs_csi::volume::create(&layout, "pvc-3", &params, 0).unwrap();
+    let state = StateDir::new(layout.state("pvc-3"));
+    {
+        let (recorder, _committer, _) = volume::open(
+            &state,
+            &layout.backing("pvc-3"),
+            Context {
+                volume: "journaled".into(),
+                namespace: "team".into(),
+                pod: "writer".into(),
+                pod_uid: "writer-uid".into(),
+                node: "node-1".into(),
+                replica: "writer".into(),
+            },
+            Arc::new(NullSink),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        recorder
+            .record(
+                Trigger::Symlink,
+                Caller {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                },
+                vec![Input::Symlink {
+                    path: RepoPath::new("link").unwrap(),
+                    target: "promised".into(),
+                }],
+            )
+            .unwrap();
+    }
+    let (_, before) = volume::inspect(&state).unwrap();
+    assert_eq!((before.head, before.backlog), (None, 1), "journaled only");
+
+    let scan = release_scan(&layout);
+    assert_eq!(scan.scan().await.flushing, ["pvc-3"]);
+    scan_until(&scan, "never held after the flush", |r| r.held == ["pvc-3"]).await;
+    let (history, after) = volume::inspect(&state).unwrap();
+    assert_eq!(after.backlog, 0, "the flush committed the journal");
+    let head = after.head.expect("the flush made the branch");
+    let tree = history.repo().find_commit(head).unwrap().tree().unwrap();
+    assert!(tree.get_name("link").is_some(), "the record is in history");
+
+    // A remote added to the profile: the held head is pushed to it.
+    let remote = dir.path().join("remote.git");
+    git2::Repository::init_bare(&remote).unwrap();
+    fs::write(
+        layout.profiles.join("test.config"),
+        format!("[remote \"origin\"]\n\turl = {}\n", remote.display()),
+    )
+    .unwrap();
+    scan_until(&scan, "never pushed to the new remote", |r| {
+        r.pushing == ["pvc-3"]
+    })
+    .await;
+    scan_until(&scan, "never held at the new remote", |r| {
+        r.held == ["pvc-3"]
+    })
+    .await;
+    let pushed = git2::Repository::open_bare(&remote)
+        .unwrap()
+        .refname_to_id("refs/heads/agentfs/journaled")
+        .ok();
+    assert_eq!(pushed, Some(head), "the new remote holds the head");
 }

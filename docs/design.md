@@ -2979,17 +2979,29 @@ is the only deletion decider. It is pure; DeleteVolume gathers its
 facts: whether the branch exists, the declared remotes (`Declared::of`),
 what each pushed remote advertises for the branch in a listing made for
 that call (`RemotePusher::branch_claim`, judged by `claim`; the push
-record is not asked), the class's `onDelete`, and a fork's state. It
-weighs, in order, no history, then the fork's state, then the remotes:
+record is not asked), how many journaled records history lacks (the
+journal's backlog, `volume::inspect`, read under the state lock), the
+class's `onDelete`, and a fork's state. It weighs, in order, no history,
+then the fork's state, then the remotes:
 
 - **Delete**: every declared remote holds the head (or there is no
-  history), and `onDelete: delete`;
+  history), the journal holds nothing history lacks, and `onDelete:
+  delete`;
 - **Keep**: the volume is released and the worktree stays on its node:
-  `onDelete: retain` once every remote holds the head, or a profile with
-  no remote declared (nothing elsewhere can hold it);
+  `onDelete: retain` once every remote holds the head and the journal is
+  committed, or a profile with no remote declared (nothing elsewhere can
+  hold it);
 - **Wait**: `UNAVAILABLE`, naming the first remote that does not hold the
   head and why (lacking, unreachable, diverged), every remote section
-  invalid, or a fork not yet published or abandoned.
+  invalid, a journal holding records history lacks, or a fork not yet
+  published or abandoned.
+
+A journal history lacks is what a history service stopped with `SIGKILL`
+at NodeUnstage (after `--unstage-grace`), or crash-looping then, leaves:
+its records were promised durable to their callers, and the head alone
+would call them held, or, with no branch yet, call the worktree empty. A
+fork's finish commits its journal, so a fork's state is its gate
+instead.
 
 Every class of the driver has `reclaimPolicy: Delete`, enforced by the
 chart's admission policy (`agentfs-class`), so DeleteVolume always runs
@@ -3003,11 +3015,16 @@ settings cannot be read (nothing deleted or released).
 (`release_scan.rs`) runs at start, every `--release-scan-interval`
 (30 s) and whenever DeleteVolume waits. For every `csi.json` or
 `csi.retained.json` on its node that no pod stages, it runs `agentfs
-push` (the one push path, with the plugin's identity) unless the last
-push of it exited 0 at its current head (kept in memory: a restarted
-plugin pushes each once more), backing off per worktree after a failure
-from the interval, doubling up to `--backoff-max`; exit 75 is retried at
-the next scan. Each failed attempt raises `PushFailed` through the
+flush` (the one commit path, offline, under the state lock) while the
+journal holds records history lacks, then `agentfs push` (the one push
+path; both with the plugin's identity) unless the last push of it exited
+0 at its current head with the same remotes (`<name> <push URL>`: a
+remote added to the profile since, or given another URL, is pushed to).
+That is kept in memory: a restarted plugin pushes each once more, and
+DeleteVolume finding a remote that lacks the head (its branch deleted by
+hand since) makes the scan forget it. A failed flush or push backs off
+per worktree from the interval, doubling up to `--backoff-max`; exit 75
+is retried at the next scan. Each failed push raises `PushFailed` through the
 child's own alarms and OpenTelemetry export: that is what alarms while
 unpushed commits sit in an unstaged worktree, whether its claim is gone,
 it is kept (a static PV with `Retain`), or it is only between pods. A
@@ -3074,10 +3091,11 @@ kubelet retries.
   full disk) is tried again with backoff; entries and records stay, at a
   restart as at reconcile.
 - *Unpushed history.* NodeUnstage's service pushes its final commit once
-  more within `--push-grace`; then the release scan pushes the unstaged
-  worktree until a remote holds its head, and the release decider keeps
-  DeleteVolume waiting meanwhile: history no remote holds is never
-  deleted.
+  more within `--push-grace`; then the release scan commits what its
+  journal still holds (a service killed at unstage) and pushes the
+  unstaged worktree until every remote holds its head, and the release
+  decider keeps DeleteVolume waiting meanwhile: history no remote holds,
+  and records the journal promised, are never deleted.
 - *A lost node, a wiped disk.* A worktree whose node is gone is not
   recovered elsewhere: the operator starts a new volume from its branch
   ([moving](runbooks/moving.md)). A worktree whose directory is gone
@@ -3112,10 +3130,19 @@ automounted): PVs (get, list, watch, create, patch, delete), PVCs (get,
 list, watch, update), StorageClasses, CSINodes and Nodes (get, list,
 watch), Events (list, watch, create, update, patch), bound to the node
 plugin's account. No attacher, no leases, no Secrets, pods or snapshots
-anywhere: credentials are mounted files, never API reads. Each node's
-provisioner holds PV and claim rights cluster-wide. The table with the
-reasons is in [csi.md](csi.md#10-security); `ci/e2e-csi.sh` checks it with
-`kubectl auth can-i`.
+anywhere: credentials are mounted files, never API reads. RBAC cannot
+scope PVs by driver or node, so those rights alone would let one node
+delete any PV in the cluster; the admission policy `agentfs-provisioner`
+narrows them: requests from the node plugin's account may create, change
+or delete only PVs of this driver whose node affinity pins them to the
+node its pod-bound token names
+(`authentication.kubernetes.io/node-name`), and update only claims whose
+`storage-provisioner` annotation is this driver. What it leaves: a
+compromised node can still provision on, and delete, its own node's
+worktrees (whose files it holds anyway), and change this driver's
+claims anywhere. The table with the reasons is in
+[csi.md](csi.md#10-security); `ci/e2e-csi.sh` checks it with `kubectl
+auth can-i` and server-side dry runs as that account.
 
 **Pod Security inventory.** The driver's namespace enforces `privileged`
 (warn and audit `baseline`): the node plugin is privileged and root, and
@@ -4049,7 +4076,8 @@ remote holds it); in the `csi-sanity` job (`ci/csi-sanity.sh`: csi-test
 v5.6.0 against `agentfs-csi` with real services and FUSE fronts, then
 nothing left behind); and in the `e2e-csi` job of the `image` workflow
 (`ci/e2e-csi.sh`, kind, the image just built): the RBAC inventory through
-`kubectl auth can-i`, two restricted pods (uid 10000 and 10001, one
+`kubectl auth can-i` and the provisioner admission policy through
+server-side dry runs as the node plugin's account, two restricted pods (uid 10000 and 10001, one
 fsGroup) on one claim with distinct committers, trailers and uid authors
 on the runner's git server, `kill -9` of one front (the other pod
 unaffected, the front back in its slot and live through
@@ -4196,7 +4224,7 @@ runner.
 | CSI parameters | A StorageClass or PV names a `profile` whose config fragment, rules and credentials live in the driver's namespace (a ConfigMap without hash suffix, a Secret), mounted into its pods; no Secret RBAC; pod authors choose only the class (§14.2) |
 | CSI identity | `podInfoOnMount`: each pod's front commits under the pod's name, namespace and uid (§9, §14.2) |
 | CSI recovery | Crashed fronts and services restarted with backoff (1 s to 30 s); a front in its predecessor's slot (`--history-slot`), its mount bind-stacked over the stale target, made shared so `HostToContainer` containers see it; reconcile from node records after a plugin restart; DaemonSet `OnDelete` (§14.2) |
-| CSI RBAC | csi-provisioner's minimal ClusterRole (PVs, PVCs, StorageClasses, Events, CSINodes, Nodes), bound to the node plugin's account, whose token is projected into that sidecar alone; no Secrets, pods or snapshots; the `agentfs-csi` container holds no token. Superseded 2026-10-16 by F8 R8: it was csi-provisioner and csi-attacher in a controller Deployment with leader-election leases, and a node plugin with no API access. Each node's provisioner now holds PV and claim rights cluster-wide, the stated cost of R8 (§14.2, [csi.md](csi.md#10-security)) |
+| CSI RBAC | csi-provisioner's minimal ClusterRole (PVs, PVCs, StorageClasses, Events, CSINodes, Nodes), bound to the node plugin's account, whose token is projected into that sidecar alone; no Secrets, pods or snapshots; the `agentfs-csi` container holds no token. Superseded 2026-10-16 by F8 R8: it was csi-provisioner and csi-attacher in a controller Deployment with leader-election leases, and a node plugin with no API access. Each node's provisioner holds PV and claim rights cluster-wide, which RBAC cannot scope; amended 2026-10-17 (F8 fixes): the always-installed admission policy `agentfs-provisioner` admits the account's PV writes only for this driver's PVs pinned to the node its pod-bound token names, and claim updates only for this driver's claims (the upstream pattern for `--node-deployment`; a design choice, not the owner's words) (§14.2, [csi.md](csi.md#10-security)) |
 | CSI volume names | Every class's `volumeName` must contain `{pvName}` (`INVALID_ARGUMENT` otherwise; superseded 2026-10-16 by F8 rule 1: a template without it was the operator's choice, documented as unsafe), and there is no `branch` parameter or attribute: each claim is a worktree with its own branch, `agentfs/<volume>`, named once in its identity. The default is `{pvcNamespace}.{pvcName}.{pvName}`. A re-made claim is a new volume: the owner, on "re-made claim = new volume (a)": "Go" (2026-10-16, R3). A static PV's `volumeName` (or `volume`) is literal, its unknown attributes are refused, and it is adopted only over an existing worktree of that volume (§14.2, [csi.md](csi.md#5-parameters)) |
 | CSI final push | `serve-history` pushes once more at shutdown, after its final commit, within `--push-grace`, as every long-running mode does (§11.2); NodeUnstage follows the last pod. After it, the node plugin's release scan pushes every unstaged worktree until a push exits 0 at its head, raising `PushFailed` at each failure, and DeleteVolume never pushes (superseded 2026-10-17 by F8 "Release decider": nothing else pushed an unstaged volume, and `onDelete: delete` refused DeleteVolume while a remote lacked commits) (§14.2, [csi.md](csi.md#9-operations)) |
 | CSI Pod Security | The driver's namespace is `privileged` (the node plugin needs it, and runs with `hostPID: true` so its fronts can read callers' groups, §6); the controller's agentfs container has only `DAC_OVERRIDE` and `FOWNER`; workloads can run under `restricted` (§14.2) |
@@ -4234,8 +4262,8 @@ runner.
 | One branch per worktree (2026-10-16) | A worktree (a volume's files and its branch on one node; pods mount and may share one) writes only its own branch `agentfs/<volume>`, for good: it creates the branch or fast-forwards it, decided from the remote's old value in the push's own negotiation (`push::claim`, F8 rule 2), and a branch another writer moved is saved and alarmed as a divergence, never overwritten (§11.3). Continuing elsewhere is a new volume started from the old branch (a start class, §14.2); which branch is current is the operator's choice, never fenced. Proposed after six design stops and accepted: the owner, on "one branch per worktree, for good" (moving = a new volume started from the old branch; operator picks which branch is current): "Go" (2026-10-16, R2) |
 | Remotes on any storage (2026-10-16) | Worktrees are node-local, and what outlives a node is an ordinary git remote, which may live on a claim of any StorageClass, NFS 4.0 and iSCSI included. The owner: "my NFS server doesnt support 4.1 so I need a solution that works with NFS 4 or iscsi" (2026-10-16), and on sandboxes "Write, same node is fine" (2026-10-15) (R6). A fork is made on its source's node (§14.2) |
 | Start-branch alarm (2026-10-16) | A started volume lists its start branch at every push to its start remote and raises `StartBranchMoved` while it holds commits the volume has not taken in or accepted (`push::start_branch_moved`); the new volume raises it, never the old node, so an old node's late commits, pushed to the old branch by its release scan after a move, are saved and alarmed, never overwritten (§11.3). The owner chose the option whose text said the old node's "unpushed changes saved and alarmed, never overwritten": "a" (F8 reframe Q1), and later "go" on the alarm "raised by the new volume when its start branch moves past the pinned start commit" (both 2026-10-16, R9) |
-| The chart's git server (2026-10-16) | `charts/agentfs-csi` has an optional `server:` section, off by default: one pod of a StatefulSet running the minimal git server image `ghcr.io/mcurcio/agentfs-git-server` (`examples/docker/git-server`: nginx, basic auth, `git http-backend`; non-root, read-only root filesystem), its repositories on a claim of any StorageClass, behind the Service `agentfs-git-server`. Its credentials are wired once: one Secret holds the server's `htpasswd` and the profiles' `token`, which the node plugin mounts as credentials key `agentfs-server`; the chart makes it with a random password kept across upgrades, or takes `server.credentials.existingSecret`. No fencing, per-volume keys, launch commits or hooks; it is left out of `deploy/`. The owner, asked for a reference server, Forgejo or lighter: "Something lighter. This is a minimal fit remote. Pull Requests and the like can be achieved by configuring agentfs to include GitHub (or similar) as a remote. The point of this core server is for kubernetes-native replication"; on where it lives: "Ideally it's optional config in the one helm chart"; and on fencing, choosing the smallest F8 with no fencing server: "A and jj" (all 2026-10-16, R5). The StatefulSet, the Secret's shape and leaving it out of `deploy/` are design choices (F8 S4), not the owner's words ([helm.md](helm.md#the-git-server)) |
-| Release decider (2026-10-17) | One pure decider, `release::decide`, answers DeleteVolume: delete (every declared remote holds the head, or no history, and `onDelete: delete`), keep (`onDelete: retain` once every remote holds it, or a profile with no remote declared) or wait (`UNAVAILABLE`: a remote lacks the head, cannot be listed or diverged; every remote section invalid; a fork not published). Its facts are gathered by DeleteVolume, one listing per remote (`RemotePusher::branch_claim`), never the push record. Every class of the driver has `reclaimPolicy: Delete`, enforced by the chart's admission policy `agentfs-class` (widened from fork classes), so DeleteVolume always runs; DeleteVolume never pushes; the node plugin's release scan (the fork publisher, generalised) pushes every unstaged worktree until held, raising `PushFailed` at each failure; CreateVolume does not refuse `onDelete: delete` on a profile without remotes (the decider keeps such a worktree). A design choice (F8 S1, "D1"), not the owner's words |
+| The chart's git server (2026-10-16) | `charts/agentfs-csi` has an optional `server:` section, off by default: one pod of a StatefulSet running the minimal git server image `ghcr.io/mcurcio/agentfs-git-server` (`examples/docker/git-server`: nginx, basic auth, `git http-backend`; non-root, read-only root filesystem), its repositories on a claim of any StorageClass, behind the Service `agentfs-git-server`. Its credentials are wired once: one Secret holds the server's `htpasswd` and the profiles' `token`, which the node plugin mounts as credentials key `agentfs-server`; the chart makes it with a random password kept across upgrades, or takes `server.credentials.existingSecret`. No fencing, per-volume keys, launch commits or hooks; it is left out of `deploy/`. Its repository has `core.fsync committed` (amended 2026-10-17, F8 fixes: git's default leaves loose objects unsynced while it syncs the ref, and the release decider deletes a worktree once the server lists its head). The owner, asked for a reference server, Forgejo or lighter: "Something lighter. This is a minimal fit remote. Pull Requests and the like can be achieved by configuring agentfs to include GitHub (or similar) as a remote. The point of this core server is for kubernetes-native replication"; on where it lives: "Ideally it's optional config in the one helm chart"; and on fencing, choosing the smallest F8 with no fencing server: "A and jj" (all 2026-10-16, R5). The StatefulSet, the Secret's shape and leaving it out of `deploy/` are design choices (F8 S4), not the owner's words ([helm.md](helm.md#the-git-server)) |
+| Release decider (2026-10-17) | One pure decider, `release::decide`, answers DeleteVolume: delete (every declared remote holds the head, or no history, and `onDelete: delete`), keep (`onDelete: retain` once every remote holds it, or a profile with no remote declared) or wait (`UNAVAILABLE`: a remote lacks the head, cannot be listed or diverged; every remote section invalid; a fork not published). Its facts are gathered by DeleteVolume, one listing per remote (`RemotePusher::branch_claim`), never the push record. Every class of the driver has `reclaimPolicy: Delete`, enforced by the chart's admission policy `agentfs-class` (widened from fork classes), so DeleteVolume always runs; DeleteVolume never pushes; the node plugin's release scan (the fork publisher, generalised) pushes every unstaged worktree until held, raising `PushFailed` at each failure; CreateVolume does not refuse `onDelete: delete` on a profile without remotes (the decider keeps such a worktree). Amended 2026-10-17 (F8 fixes): a journal holding records history lacks (a history service killed at NodeUnstage) is a wait fact, and the release scan commits it with `agentfs flush` before it pushes; the scan holds a push at its head and the profile's remotes, so a remote added later is pushed to, and forgets it when DeleteVolume finds a remote lacking the head. A design choice (F8 S1, "D1"), not the owner's words |
 | Accepting a start-branch tip (2026-10-17) | The start-branch alarm is cleared by `agentfs start accept --tip <oid>` on the new volume: it fetches the start branch, checks `<oid>` is on it and creates `refs/agentfs/<volume>/accepted/<oid>` (never moved, pushed create-only with the branch); the alarm then stops for every commit the tip reaches and comes back if the old branch moves again. "Deleting the old branch clears it" was dropped. A design choice (F8 S1, "D2"), not the owner's words |
 | Start points are branches (2026-10-17) | A `startFrom` names a branch, never a `refs/...` ref: a `diverged/*` ref is refused at parse (`BadStartPoint::NotABranch`, CreateVolume `INVALID_ARGUMENT`), since it never moves and nothing could alarm on it. The release decider answers wait for a diverged remote, so a diverged worktree is never removed and its release-scan pushes keep alarming. A design choice (F8 S1, "D3"), not the owner's words |
 

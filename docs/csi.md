@@ -208,7 +208,7 @@ A StorageClass's `parameters`:
 |---|---|---|
 | `profile` | required: the profile (`<profile>.config` must exist); a DNS label | |
 | `volumeName` | the agentfs volume name (commit trailers, identity templates), a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}` that must contain `{pvName}`. The branch is always `agentfs/<volumeName>` | `{pvcNamespace}.{pvcName}.{pvName}` (the provisioner runs with `--extra-create-metadata`), else the PV name |
-| `onDelete` | what DeleteVolume does once nothing would be lost: `retain` keeps the worktree on its node (renaming `csi.json` to `csi.retained.json`), `delete` removes it. Either way DeleteVolume waits while a remote lacks the head (§7) | `retain` |
+| `onDelete` | what DeleteVolume does once nothing would be lost: `retain` keeps the worktree on its node (renaming `csi.json` to `csi.retained.json`), `delete` removes it. Either way DeleteVolume waits while a remote lacks the head, or the journal holds records not yet committed (§7) | `retain` |
 | `startFrom` | `<remote>:<branch>@<commit>`: a **start class**. A claim on it is a new worktree whose history begins at that commit of another worktree's branch (§11, [moving](runbooks/moving.md)) | none |
 | `workloadMounts` | where pods mount the volume, comma-separated `PATH` or `PATH=DIR` (a `subPath` of the tree's directory `DIR`): passed to every front as `--workload-mount`, so the absolute `gitdir:` that `git worktree add` writes maps exactly to its repository (design §5). The node plugin cannot learn a container's `mountPath` otherwise; without it worktree paths are resolved by their suffixes and counted in `agentfs.nested.gitdir_heuristic` ([runbook](runbooks/worktree-heuristic.md)) | none |
 
@@ -346,7 +346,7 @@ See `deploy/csi/example/deployment.yaml`.
 | Call | Does | Fails with |
 |---|---|---|
 | CreateVolume | Validates the parameters and capabilities; creates `<basePath>/<pv>/{backing,state}` on this node, initialises the state area with the profile's config included (a start class: fetched and written from its start point, §5) and its rules installed, writes `csi.json`, and answers this node's topology. Idempotent for the same name, capacity and parameters. With a fork class and a `dataSource` claim, creates a fork of that volume (§14) and returns the content source | `InvalidArgument` (bad parameters: a `volumeName` without `{pvName}`, `branch`, a bad `startFrom`, an unknown key; any multi-node access mode, block volumes, mount flags; a content source on an ordinary class, a fork class without one, a snapshot; a start class naming a remote the profile lacks, or the volume's own branch), `ResourceExhausted` (the accessibility requirements exclude this node), `AlreadyExists` (same name, other capacity or parameters; a state area of another volume or start point), `FailedPrecondition` (a start branch missing, or not reaching the pinned commit; for a fork, a source not on this node, with no history, a fork, with no fork remote, a missing LFS object), `Unavailable` (the start remote could not be fetched; a fork's source could not be read; retried) |
-| DeleteVolume | Asks the release decider over facts gathered here: whether the branch exists, each pushed remote's branch in a listing made for this call, `onDelete`, and for a fork its state. **Delete** (every remote holds the head, or there is no history, and `onDelete: delete`) moves the directory to `<basePath>/.deleting.<handle>` under the state lock, then removes it; **Keep** (`onDelete: retain` once every remote holds the head, or a profile with no remote) renames `csi.json` to `csi.retained.json` and leaves the worktree; **Wait** answers `Unavailable` naming the remote and why (it lacks the head, it could not be listed, its branch diverged; every remote section invalid; a fork not yet published) and wakes the release scan, which pushes it. A fork's deletion is its request to be finished (`finish_requested`, §14). DeleteVolume never pushes. An unknown volume is a success | `FailedPrecondition` while the volume is staged on this node, or its state lock is held (a history service, a push), or its settings cannot be read (nothing is deleted or released); `Unavailable` (Wait; a fork not yet published is answered so before the lock, which its finisher holds while it publishes) |
+| DeleteVolume | Asks the release decider over facts gathered here: whether the branch exists, each pushed remote's branch in a listing made for this call, how many journaled records history lacks (read under the state lock), `onDelete`, and for a fork its state. **Delete** (every remote holds the head, or there is no history, the journal holds nothing uncommitted, and `onDelete: delete`) moves the directory to `<basePath>/.deleting.<handle>` under the state lock, then removes it; **Keep** (`onDelete: retain` once every remote holds the head and the journal is committed, or a profile with no remote) renames `csi.json` to `csi.retained.json` and leaves the worktree; **Wait** answers `Unavailable` naming the remote and why (it lacks the head, it could not be listed, its branch diverged; every remote section invalid; the journal holds records a history service killed at NodeUnstage never committed; a fork not yet published) and wakes the release scan, which commits and pushes it. A fork's deletion is its request to be finished (`finish_requested`, §14). DeleteVolume never commits or pushes. An unknown volume is a success | `FailedPrecondition` while the volume is staged on this node, or its state lock is held (a history service, a push), or its settings cannot be read (nothing is deleted or released); `Unavailable` (Wait; a fork not yet published is answered so before the lock, which its finisher holds while it publishes) |
 | ControllerPublish, ControllerUnpublish | Not offered (`Unimplemented`): there is no attach step (`attachRequired: false`) | |
 | NodeStage | Checks the worktree: it never creates one. A worktree missing from this node's disk is `NotFound` naming the node; a static PV is adopted only over an existing worktree of its volume. Then sets the profile's include, reinstalls its rules, starts the volume's history service, and waits up to `--stage-wait` for it to listen (it recovers the journal and applies queued patches first) | `NotFound` (`no worktree on node <n> under <base>; the pod waits`), `Unavailable` when the service is still starting (the kubelet retries; the service keeps running), `FailedPrecondition` when it exited (with its last log lines), `AlreadyExists` (a static PV naming another volume than the worktree's), `InvalidArgument` (a multi-node access mode) |
 | NodePublish | Starts a front for the pod (its slot, identity and passthrough), waits up to `--publish-wait` for its mount, binds it onto the target (read-only for read-only mounts), records it | `FailedPrecondition` (not staged; a `SINGLE_NODE_SINGLE_WRITER` volume published elsewhere), `AlreadyExists` (the target is published with another read-only flag or access mode), `InvalidArgument` (inline ephemeral volume; a multi-node access mode) |
@@ -505,7 +505,11 @@ makes its final commit and pushes once more to every remote that lacks
 commits, within `--push-grace` (5 s). From then on the node plugin's
 **release scan** pushes the worktree (`agentfs push`), at once and every
 `--release-scan-interval` (30 s), backing off after a failure, until a
-push exits 0 at the branch's head; every failed attempt raises
+push exits 0 at the branch's head with the profile's remotes as they
+are: a remote added to the profile later is pushed to as well. First,
+if the journal holds records history lacks (a service killed after
+`--unstage-grace`, or crash-looping, at NodeUnstage), it commits them
+with `agentfs flush`. Every failed push raises
 `PushFailed` through that push's own alarms and telemetry. That covers a
 worktree between pods, one whose claim was deleted (DeleteVolume waits
 meanwhile, and wakes the scan), and one kept on the node. A diverged
@@ -529,9 +533,20 @@ or snapshots through the API.
 
 The node plugin pod sets `automountServiceAccountToken: false` and
 mounts a projected token only into csi-provisioner; the `agentfs-csi`
-container never holds one. With each node's provisioner holding PV and
-claim rights cluster-wide, a compromised node can create or delete PVs
-of this driver's claims anywhere: keep the node plugin's namespace to
+container never holds one. RBAC cannot scope PVs by driver or node: the
+ClusterRole alone would let a compromised node create, patch or delete
+**any** PV in the cluster, other drivers' included. The admission policy
+`agentfs-provisioner` (`deploy/csi/provisioner-admission.yaml`, always
+installed) narrows it. For requests from the node plugin's account:
+
+| Request | Admitted only when |
+|---|---|
+| create, change or delete a PV | the PV (before and after) is this driver's (`spec.csi.driver`), and its node affinity pins it with `topology.agentfs.mcurcio.github.io/node In [<node>]`, where `<node>` is the node the pod-bound token names (`authentication.kubernetes.io/node-name`, Kubernetes 1.30 and later) |
+| update a claim | its `volume.kubernetes.io/storage-provisioner` (or the beta) annotation names this driver |
+
+What is left: a compromised node can still create and delete this
+driver's PVs on its own node (whose worktrees it holds anyway) and change
+this driver's claims anywhere. Keep the node plugin's namespace to
 cluster administrators.
 
 **Pod Security inventory.**
@@ -675,7 +690,10 @@ included), never the base path.
 - **kind** (`ci/e2e-csi.sh`, the `e2e-csi` job in the image workflow, with
   the image just built): the RBAC inventory with `kubectl auth can-i`
   and no token in the `agentfs-csi` container, the node's topology label
-  and the PV's node affinity, the class admission policy, two restricted
+  and the PV's node affinity, the class admission policy, the
+  provisioner admission policy (as the node plugin's account, a server-side
+  dry run of another driver's PV and of this driver's PV with a token
+  naming no node, both denied), two restricted
   pods on one claim with distinct committers and pushes to a git server,
   `kill -9` of a front, of the service and deletion of the node plugin
   pod, each recovered, the refusals of inline volumes and

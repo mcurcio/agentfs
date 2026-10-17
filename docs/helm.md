@@ -17,7 +17,7 @@ checks that they do (§5).
 
 | Chart | Type | What |
 |---|---|---|
-| [`charts/agentfs-csi`](../charts/agentfs-csi) | application | The CSI driver ([csi.md](csi.md)): CSIDriver, RBAC, the node plugin DaemonSet with its per-node csi-provisioner, profiles, credentials, the class admission policy and StorageClasses; optionally a minimal git server (§2) |
+| [`charts/agentfs-csi`](../charts/agentfs-csi) | application | The CSI driver ([csi.md](csi.md)): CSIDriver, RBAC with the provisioner admission policy that narrows it, the node plugin DaemonSet with its per-node csi-provisioner, profiles, credentials, the class admission policy and StorageClasses; optionally a minimal git server (§2) |
 | [`charts/agentfs-sidecar`](../charts/agentfs-sidecar) | library | Helpers that add the phase 1 sidecar ([deployment.md](deployment.md)) to a workload's own chart |
 | [`deploy/examples/helm-sidecar`](../deploy/examples/helm-sidecar) | application, not published | A workload using the helpers: `deploy/sidecar` as Helm renders it |
 
@@ -26,7 +26,7 @@ Both published charts are at `oci://ghcr.io/mcurcio/charts` (§7).
 ## 2. Install the CSI driver
 
 The driver is one per cluster: its name, `agentfs.mcurcio.github.io`, and
-its cluster-wide objects (CSIDriver, ClusterRoles, the admission policy)
+its cluster-wide objects (CSIDriver, ClusterRoles, the admission policies)
 have fixed names, and object names do not carry the release name.
 
 The node plugin is privileged (csi.md §10). Helm installs into a
@@ -86,7 +86,11 @@ one helm chart" (2026-10-16, design §19.1). It is off by default.
   ([`examples/docker/git-server`](../examples/docker/git-server): nginx,
   basic auth and `git http-backend`), as uid 33 with a read-only root
   filesystem. An init container creates the bare repository
-  `history.git` once. The Service serves it at
+  `history.git` once, and at every start sets `core.fsync committed`:
+  git's default leaves loose objects (how a small push arrives) unsynced
+  while it syncs the ref, so an unclean shutdown of the server's node
+  could leave a branch naming objects that are gone, after a driver saw
+  that branch and deleted its own copy (csi.md §7). The Service serves it at
   `http://agentfs-git-server.<namespace>.svc:<server.service.port>/git/history.git`
   (port 8080 by default).
 - **Where the history lives.** On the claim `repos-agentfs-git-server-0`,
@@ -293,7 +297,8 @@ on every push and pull request:
   then `helm install` on one kind node and
   [`ci/e2e-chart-server.sh`](../ci/e2e-chart-server.sh): a pod's write
   reaches the server as `agentfs/<volume>` at the worktree's head (read
-  with `git ls-remote` through `kubectl port-forward`), a wrong password
+  with `git ls-remote` through `kubectl port-forward`), the repository
+  has `core.fsync committed`, a wrong password
   is refused, the repository survives deleting the server pod, and
   `helm upgrade` keeps the password.
 - **git server image**, in the image workflow: the image is built, then

@@ -15,19 +15,27 @@
 //!   the lock is free between scans for an operator's `fork abandon`); a
 //!   refused or abandoned fork is left to the operator and never pushed,
 //!   and a published one is done;
+//! - every other worktree whose journal holds records history lacks gets
+//!   `agentfs flush` ([`launcher::flush_spec`]) first: a history service
+//!   stopped with `SIGKILL` at NodeUnstage, or crash-looping then, leaves
+//!   them, and nothing else would ever commit them. The push follows at
+//!   the next scan, once the journal is committed;
 //! - every other worktree gets `agentfs push`
 //!   ([`launcher::push_spec`]) unless the last push of it exited 0 at its
-//!   current branch head. That is kept in memory: a restarted plugin
-//!   pushes each once more (one listing each). A push that fails backs off
-//!   per worktree, from the interval, doubling up to the cap; each failed
-//!   attempt raises `PushFailed` through the child's own alarms and
+//!   current branch head with the same remotes (a remote added since, or
+//!   given another URL, is pushed to). That is kept in memory: a restarted
+//!   plugin pushes each once more (one listing each), and DeleteVolume
+//!   finding a remote that lacks the head makes the scan forget it
+//!   ([`ReleaseScan::forget`]). A flush or push that fails backs off per
+//!   worktree, from the interval, doubling up to the cap; each failed
+//!   push raises `PushFailed` through the child's own alarms and
 //!   OpenTelemetry export, which is what alarms while unpushed commits sit
 //!   in an unstaged worktree. Exit 75 (another process holds the state
 //!   area) is tried again at the next scan without backing off.
 //!
-//! One push path: the scan never pushes itself, and DeleteVolume never
-//! pushes; both rely on `agentfs push` exiting 0 only when every remote
-//! succeeded.
+//! One commit path and one push path: the scan never commits or pushes
+//! itself, and DeleteVolume never does either; both rely on `agentfs
+//! push` exiting 0 only when every remote succeeded.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,8 +45,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, watch};
 
 use agentfs_core::fork::finish::{self, ForkState};
-use agentfs_core::history::History;
-use agentfs_core::volume::StateDir;
+use agentfs_core::volume::{self as core_volume, StateDir};
 
 use crate::launcher::{self, Exit, Launcher, PluginIdentity, Spawned};
 use crate::layout::{Layout, validate_handle};
@@ -50,23 +57,36 @@ use crate::supervisor::Backoff;
 pub struct ScanReport {
     /// `agentfs fork finish` started (forks whose deletion asked for it).
     pub finishing: Vec<String>,
+    /// `agentfs flush` started (a journal history lacks).
+    pub flushing: Vec<String>,
     /// `agentfs push` started.
     pub pushing: Vec<String>,
     /// A child from an earlier scan still runs.
     pub running: Vec<String>,
-    /// The last push exited 0 at the current head: nothing to do.
+    /// The last push exited 0 at the current head and remotes: nothing
+    /// to do.
     pub held: Vec<String>,
     pub backing_off: Vec<(String, Duration)>,
     pub unreadable: Vec<(PathBuf, String)>,
+}
+
+/// What one push is of: the branch head, to the remotes the settings
+/// declare (`<name> <push URL>`, in settings order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    head: String,
+    remotes: Vec<String>,
 }
 
 /// What the scan does for one worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Work {
     Finish,
-    /// Push the branch at `head` (`None`: no history, nothing to push).
+    /// Commit the journal's backlog; the push follows at a later scan.
+    Flush,
+    /// Push `target` (`None`: no history, nothing to push).
     Push {
-        head: Option<String>,
+        target: Option<Target>,
     },
 }
 
@@ -75,8 +95,8 @@ enum Work {
 struct Slot {
     /// The child an earlier scan started, and for what.
     child: Option<(Spawned, Work)>,
-    /// The branch head the last push that exited 0 pushed.
-    held_at: Option<String>,
+    /// What the last push that exited 0 pushed.
+    held_at: Option<Target>,
     /// After a failed push: not before this instant; the delay that set it.
     backoff: Option<(Instant, Duration)>,
 }
@@ -144,28 +164,30 @@ impl ReleaseScan {
                     }
                 }
             }
-            let head = match &work {
-                Work::Finish => None,
-                Work::Push { head: None } => {
+            match &work {
+                Work::Finish => {}
+                Work::Push { target: None } => {
                     report.held.push(handle);
                     continue;
                 }
-                Work::Push { head: Some(head) } => {
-                    if slot.held_at.as_ref() == Some(head) {
-                        report.held.push(handle);
-                        continue;
-                    }
+                Work::Push {
+                    target: Some(target),
+                } if slot.held_at.as_ref() == Some(target) => {
+                    report.held.push(handle);
+                    continue;
+                }
+                Work::Flush | Work::Push { .. } => {
                     if let Some((at, _)) = slot.backoff
                         && now < at
                     {
                         report.backing_off.push((handle, at - now));
                         continue;
                     }
-                    Some(head.clone())
                 }
-            };
+            }
             let spec = match &work {
                 Work::Finish => launcher::fork_finish_spec(&self.layout, &handle, &self.identity),
+                Work::Flush => launcher::flush_spec(&self.layout, &handle, &self.identity),
                 Work::Push { .. } => launcher::push_spec(&self.layout, &handle, &self.identity),
             };
             match self.launcher.spawn(spec) {
@@ -175,6 +197,13 @@ impl ReleaseScan {
                             eprintln!("fork {handle}: finishing and publishing it");
                             report.finishing.push(handle.clone());
                         }
+                        Work::Flush => {
+                            eprintln!(
+                                "release scan: committing the journal of {handle}, which no pod \
+                                 stages on this node"
+                            );
+                            report.flushing.push(handle.clone());
+                        }
                         Work::Push { .. } => {
                             eprintln!(
                                 "release scan: pushing {handle}, which no pod stages on this node"
@@ -182,10 +211,6 @@ impl ReleaseScan {
                             report.pushing.push(handle.clone());
                         }
                     }
-                    let work = match work {
-                        Work::Push { .. } => Work::Push { head },
-                        other => other,
-                    };
                     slot.child = Some((child, work));
                 }
                 Err(e) => report.unreadable.push((
@@ -198,14 +223,19 @@ impl ReleaseScan {
     }
 
     /// Bookkeeping for a child that exited: a push that exited 0 holds its
-    /// head; 75 is retried at the next scan; any other exit backs off.
+    /// target; 75 is retried at the next scan; any other exit of a flush
+    /// or push backs off.
     fn exited(&self, handle: &str, slot: &mut Slot, work: Work, exit: Exit, now: Instant) {
-        let Work::Push { head } = work else {
-            return;
+        let what = match work {
+            Work::Finish => return,
+            Work::Flush => "commit of the journal",
+            Work::Push { .. } => "push",
         };
         match exit {
             Exit::Code(0) => {
-                slot.held_at = head;
+                if let Work::Push { target } = work {
+                    slot.held_at = target;
+                }
                 slot.backoff = None;
             }
             Exit::Code(75) => {}
@@ -216,7 +246,7 @@ impl ReleaseScan {
                     None => self.interval.min(cap),
                 };
                 eprintln!(
-                    "release scan: the push of {handle} failed ({other}); the next in {delay:?}"
+                    "release scan: the {what} of {handle} failed ({other}); the next in {delay:?}"
                 );
                 slot.backoff = Some((now + delay, delay));
             }
@@ -251,6 +281,16 @@ impl ReleaseScan {
     /// what is due, such as a fork's finisher, sooner.
     pub fn wake(&self) {
         self.wake.notify_one();
+    }
+
+    /// Forgets that a push of `handle` held its target, so the next scan
+    /// pushes it again: DeleteVolume found a remote that lacks the head
+    /// (its branch deleted by hand since, say).
+    pub fn forget(&self, handle: &str) {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = slots.get_mut(handle) {
+            slot.held_at = None;
+        }
     }
 }
 
@@ -307,17 +347,26 @@ fn to_release(layout: &Layout) -> (Vec<(String, Work)>, Unreadable) {
             // nothing pushes them.
             Some(ForkState::Published | ForkState::Refused | ForkState::Abandoned) => continue,
             // Any other worktree, a fork between pods too.
-            _ => {
-                let head = History::open(&state.git())
-                    .and_then(|h| h.head().map(|c| c.map(|c| c.id().to_string())));
-                match head {
-                    Ok(head) => Work::Push { head },
-                    Err(e) => {
-                        unreadable.push((layout.state(&handle), e.to_string()));
-                        continue;
-                    }
+            _ => match core_volume::inspect(&state) {
+                Ok((_, inspection)) if inspection.backlog > 0 => Work::Flush,
+                Ok((history, inspection)) => Work::Push {
+                    target: inspection.head.map(|head| Target {
+                        head: head.to_string(),
+                        remotes: history
+                            .settings()
+                            .remotes
+                            .iter()
+                            .map(|r| {
+                                format!("{} {}", r.name, r.push_url.as_deref().unwrap_or(&r.url))
+                            })
+                            .collect(),
+                    }),
+                },
+                Err(e) => {
+                    unreadable.push((layout.state(&handle), e.to_string()));
+                    continue;
                 }
-            }
+            },
         };
         wanted.push((handle, work));
     }
@@ -428,7 +477,8 @@ mod tests {
         crate::volume::store(layout, handle, &record(handle, requested)).unwrap();
     }
 
-    /// A commit on `handle`'s branch, as a history service makes one.
+    /// A commit on `handle`'s branch, as a history service makes one: it
+    /// holds the journal through sequence 0.
     fn commit(layout: &Layout, handle: &str) -> Oid {
         let repo = Repository::open_bare(layout.state(handle).join("git")).unwrap();
         let sig = git2::Signature::now("t", "t@example.com").unwrap();
@@ -440,7 +490,8 @@ mod tests {
             .ok()
             .map(|id| repo.find_commit(id).unwrap());
         let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
-        repo.commit(Some(&branch), &sig, &sig, "write", &tree, &parents)
+        let message = "write\n\nAgentfs-Seq: 0\nAgentfs-Trigger: close\n";
+        repo.commit(Some(&branch), &sig, &sig, message, &tree, &parents)
             .unwrap()
     }
 
@@ -697,5 +748,109 @@ mod tests {
              pushed: {:?}",
             fake.labels()
         );
+    }
+
+    /// A record journaled and never committed (a history service killed
+    /// at NodeUnstage), as the record's call left it: sequence 1, past
+    /// what [`commit`] holds.
+    fn journal_a_record(layout: &Layout, handle: &str) {
+        use agentfs_core::journal::Journal;
+        use agentfs_core::paths::RepoPath;
+        use agentfs_core::record::{Caller, Change, Draft, Trigger};
+        let state = StateDir::new(layout.state(handle));
+        let (journal, _) = Journal::open(state.journal(), 1, Box::new(|| Ok(()))).unwrap();
+        journal
+            .record(Draft {
+                trigger: Trigger::Unlink,
+                caller: Caller {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                },
+                time_ms: 0,
+                changes: vec![Change::Remove {
+                    path: RepoPath::new("gone").unwrap(),
+                }],
+                operation: None,
+                atomic: false,
+                origin: None,
+            })
+            .unwrap();
+    }
+
+    /// A journal history lacks is committed (`agentfs flush`, backing off
+    /// when it fails) before anything is pushed, with or without a branch.
+    #[tokio::test]
+    async fn the_journal_is_committed_before_the_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Arc::new(layout(dir.path()));
+        volume(&layout, "fresh", false, false);
+        journal_a_record(&layout, "fresh");
+        volume(&layout, "late", false, false);
+        commit(&layout, "late");
+        journal_a_record(&layout, "late");
+
+        let fake = Arc::new(Fake::default());
+        let scan = scanner(&layout, &fake);
+        let report = scan.scan().await;
+        assert_eq!(report.flushing, ["fresh", "late"], "{report:?}");
+        assert!(
+            report.pushing.is_empty() && report.held.is_empty(),
+            "{report:?}"
+        );
+        let started = fake.started.lock().unwrap().clone();
+        let state = layout.state("fresh").display().to_string();
+        let root = layout.backing("fresh").display().to_string();
+        assert_eq!(
+            args(&started[0]),
+            ["--state", state.as_str(), "--root", root.as_str(), "flush"]
+        );
+        assert_eq!(started[0].label, "flush fresh");
+        assert_eq!(
+            started[0].env.len(),
+            3,
+            "AGENTFS_NAMESPACE, AGENTFS_POD, AGENTFS_NODE"
+        );
+        // fresh's flush failed: it backs off; late's committed the journal.
+        fake.exit(0, 1);
+        fs::remove_file(StateDir::new(layout.state("late")).journal()).unwrap();
+        commit(&layout, "late");
+        fake.exit(1, 0);
+        let report = scan.scan().await;
+        assert_eq!(report.pushing, ["late"], "{report:?}");
+        assert_eq!(report.backing_off.len(), 1, "{report:?}");
+        assert_eq!(report.backing_off[0].0, "fresh");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(scan.scan().await.flushing, ["fresh"]);
+    }
+
+    /// A push that held its head is pushed again once the remotes change
+    /// (a remote added to the profile), and once DeleteVolume found a
+    /// remote lacking the head ([`ReleaseScan::forget`]).
+    #[tokio::test]
+    async fn a_held_head_is_pushed_again_to_new_remotes_or_once_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Arc::new(layout(dir.path()));
+        volume(&layout, "v", false, false);
+        commit(&layout, "v");
+
+        let fake = Arc::new(Fake::default());
+        let scan = scanner(&layout, &fake);
+        assert_eq!(scan.scan().await.pushing, ["v"]);
+        fake.exit(0, 0);
+        assert_eq!(scan.scan().await.held, ["v"], "no remote: held at once");
+        let repo = Repository::open_bare(layout.state("v").join("git")).unwrap();
+        let remote = dir.path().join("remote.git");
+        repo.config()
+            .unwrap()
+            .set_str("remote.origin.url", &remote.display().to_string())
+            .unwrap();
+        assert_eq!(scan.scan().await.pushing, ["v"], "a remote added");
+        fake.exit(1, 0);
+        assert_eq!(scan.scan().await.held, ["v"]);
+        scan.forget("v");
+        assert_eq!(scan.scan().await.pushing, ["v"], "forgotten");
+        fake.exit(2, 0);
+        assert_eq!(scan.scan().await.held, ["v"]);
     }
 }
