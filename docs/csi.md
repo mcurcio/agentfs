@@ -185,6 +185,21 @@ passphrase file in the same Secret, beside the key. The kubelet
 refreshes the files when the Secret changes, and agentfs re-reads them at
 each push: rotation needs no restart.
 
+**Pushing to the chart's git server.** With `server.enabled=true`, the
+chart runs a minimal git server in its namespace and mounts its password
+into the node plugin as the key `agentfs-server` ([helm.md](helm.md#the-git-server)).
+A profile pushes every volume's branch there with:
+
+```ini
+[remote "server"]
+    url = http://agentfs-git-server.agentfs-csi.svc:8080/git/history.git
+    agentfsCredentials = /etc/agentfs-csi/credentials/agentfs-server
+```
+
+This is an ordinary remote: a profile may list it beside others (GitHub,
+say) and may use it as its start remote when a volume moves
+([runbooks/moving.md](runbooks/moving.md)).
+
 ## 5. Parameters
 
 A StorageClass's `parameters`:

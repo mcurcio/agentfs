@@ -1,0 +1,155 @@
+{{- /*
+The chart's minimal git server (server.enabled; design §14.2 "The
+server", docs/helm.md "The git server"): one pod of the
+examples/docker/git-server image, its repositories on a claim of any
+StorageClass, behind the Service agentfs-git-server. Its credentials are
+wired once: one Secret holds `htpasswd` (read by the server) and `token`
+(mounted into the node plugin as credentials key agentfs-server,
+node.yaml). No fencing, per-volume keys or hooks.
+*/}}
+{{- if .Values.server.enabled }}
+{{- $name := "agentfs-git-server" }}
+{{- $secret := include "agentfs-csi.serverSecret" . }}
+{{- if not .Values.server.credentials.existingSecret }}
+{{- /* A random password, kept across upgrades: the Secret as it is. */}}
+{{- $old := lookup "v1" "Secret" .Release.Namespace $secret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secret }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    {{- include "agentfs-csi.labels" . | nindent 4 }}
+type: Opaque
+data:
+  {{- if and $old $old.data $old.data.htpasswd $old.data.token }}
+  htpasswd: {{ $old.data.htpasswd }}
+  token: {{ $old.data.token }}
+  {{- else }}
+  {{- $password := randAlphaNum 32 }}
+  htpasswd: {{ printf "%s\n" (htpasswd "agentfs" $password) | b64enc }}
+  token: {{ printf "username=agentfs\npassword=%s\n" $password | b64enc }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    {{- include "agentfs-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ $name }}
+  ports:
+    - { name: http, port: {{ .Values.server.service.port }}, targetPort: http }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    {{- include "agentfs-csi.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  # One replica: a git remote on one claim, not a cluster.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+      {{- with .Values.server.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 10
+      # www-data, as the image's root mode runs it, so a repository moved
+      # between the two keeps its owner.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 33
+        runAsGroup: 33
+        fsGroup: 33
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # Creates /srv/git/history.git once; an existing one is kept.
+        - name: init
+          {{- include "agentfs-csi.serverImage" . | nindent 10 }}
+          args: [init]
+          {{- include "agentfs-csi.serverSecurityContext" . | nindent 10 }}
+          volumeMounts:
+            - { name: repos, mountPath: /srv/git }
+      containers:
+        - name: git-server
+          {{- include "agentfs-csi.serverImage" . | nindent 10 }}
+          args: [serve]
+          env:
+            - name: GIT_SERVER_HTPASSWD
+              value: /etc/git-server/credentials/htpasswd
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            tcpSocket: { port: http }
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: http }
+            periodSeconds: 20
+          {{- include "agentfs-csi.serverSecurityContext" . | nindent 10 }}
+          {{- with .Values.server.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: repos, mountPath: /srv/git }
+            - { name: run, mountPath: /run/git-server }
+            - { name: credentials, mountPath: /etc/git-server/credentials, readOnly: true }
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: credentials
+          secret:
+            secretName: {{ $secret }}
+            items: [{ key: htpasswd, path: htpasswd }]
+            defaultMode: 0440
+  volumeClaimTemplates:
+    - metadata:
+        name: repos
+        labels:
+          app.kubernetes.io/name: {{ $name }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.server.storage.accessModes | nindent 10 }}
+        {{- with .Values.server.storage.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.server.storage.size }}
+{{- end }}

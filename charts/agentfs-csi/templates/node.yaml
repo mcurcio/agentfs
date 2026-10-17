@@ -180,6 +180,19 @@ spec:
           hostPath: { path: /dev/fuse, type: CharDevice }
         - name: profiles
           configMap: { name: agentfs-csi-profiles }
+        {{- if .Values.server.enabled }}
+        # The credentials, and the chart's git server's `token` as key
+        # agentfs-server (server.yaml).
+        - name: credentials
+          projected:
+            defaultMode: 0400
+            sources:
+              - secret: { name: {{ include "agentfs-csi.credentialsSecret" . }} }
+              - secret:
+                  name: {{ include "agentfs-csi.serverSecret" . }}
+                  items: [{ key: token, path: agentfs-server }]
+        {{- else }}
         - name: credentials
           secret: { secretName: {{ include "agentfs-csi.credentialsSecret" . }}, defaultMode: 0400 }
+        {{- end }}
         {{- include "agentfs-csi.apiTokenVolume" . | nindent 8 }}

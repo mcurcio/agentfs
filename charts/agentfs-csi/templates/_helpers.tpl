@@ -40,6 +40,30 @@ image: {{ include "agentfs-csi.image" (dict "image" .image "tag" "") }}
 {{- .Values.credentials.existingSecret | default "agentfs-csi-credentials" }}
 {{- end }}
 
+{{/*
+The git server's Secret (server.yaml): `htpasswd` for the server, `token`
+for the profiles, mounted into the node plugin as credentials key
+`agentfs-server` (node.yaml). One Secret, one source of the password.
+*/}}
+{{- define "agentfs-csi.serverSecret" -}}
+{{- .Values.server.credentials.existingSecret | default "agentfs-git-server" }}
+{{- end }}
+
+{{- define "agentfs-csi.serverImage" -}}
+image: {{ include "agentfs-csi.image" (dict "image" .Values.server.image "tag" .Chart.AppVersion) }}
+{{- with .Values.server.image.pullPolicy }}
+imagePullPolicy: {{ . }}
+{{- end }}
+{{- end }}
+
+{{/* The git server's containers: non-root, a read-only root filesystem. */}}
+{{- define "agentfs-csi.serverSecurityContext" -}}
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities: { drop: [ALL] }
+  readOnlyRootFilesystem: true
+{{- end }}
+
 {{/* The token of csi-provisioner (never mounted into agentfs-csi). */}}
 {{- define "agentfs-csi.apiTokenVolume" -}}
 - name: api-token

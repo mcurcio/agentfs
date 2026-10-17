@@ -927,7 +927,12 @@ remotes and rules come from a **profile** in the driver's
 the keys of this page, included by the volume's state area like
 `init --include` does; `<profile>.exclude` and `<profile>.attributes`
 become its `info/exclude` and `info/attributes`. Credentials files are
-under `/etc/agentfs-csi/credentials/` in the driver's pods. Each claim's
+under `/etc/agentfs-csi/credentials/` in the driver's pods; with the
+chart's git server on (the `server.*` values: `enabled`, `image`,
+`storage`, `credentials.existingSecret`, `service.port` and the pod's
+scheduling, listed in the [chart's README](../charts/agentfs-csi/README.md)),
+`agentfs-server` there is its credentials file, for a profile's
+`agentfsCredentials` ([helm.md](helm.md#the-git-server)). Each claim's
 worktree (its files and its branch `agentfs/<volumeName>`) lives on the
 disk of the node that created it, for good.
 

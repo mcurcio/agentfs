@@ -17,7 +17,7 @@ checks that they do (§5).
 
 | Chart | Type | What |
 |---|---|---|
-| [`charts/agentfs-csi`](../charts/agentfs-csi) | application | The CSI driver ([csi.md](csi.md)): CSIDriver, RBAC, the node plugin DaemonSet with its per-node csi-provisioner, profiles, credentials, the class admission policy and StorageClasses |
+| [`charts/agentfs-csi`](../charts/agentfs-csi) | application | The CSI driver ([csi.md](csi.md)): CSIDriver, RBAC, the node plugin DaemonSet with its per-node csi-provisioner, profiles, credentials, the class admission policy and StorageClasses; optionally a minimal git server (§2) |
 | [`charts/agentfs-sidecar`](../charts/agentfs-sidecar) | library | Helpers that add the phase 1 sidecar ([deployment.md](deployment.md)) to a workload's own chart |
 | [`deploy/examples/helm-sidecar`](../deploy/examples/helm-sidecar) | application, not published | A workload using the helpers: `deploy/sidecar` as Helm renders it |
 
@@ -73,6 +73,64 @@ evict every pod on the node.
 the new plugin when you delete its pod, one drained node at a time
 ([runbooks/csi-recovery.md](runbooks/csi-recovery.md)). Profiles reach
 the running pods without a restart (csi.md §4).
+
+### The git server
+
+`server.enabled=true` runs the chart's minimal git server, a remote for
+the profiles inside the cluster: the owner asked for "Something lighter.
+This is a minimal fit remote" and "Ideally it's optional config in the
+one helm chart" (2026-10-16, design §19.1). It is off by default.
+
+- **What runs.** One pod of the StatefulSet `agentfs-git-server`, the
+  image `ghcr.io/mcurcio/agentfs-git-server`
+  ([`examples/docker/git-server`](../examples/docker/git-server): nginx,
+  basic auth and `git http-backend`), as uid 33 with a read-only root
+  filesystem. An init container creates the bare repository
+  `history.git` once. The Service serves it at
+  `http://agentfs-git-server.<namespace>.svc:<server.service.port>/git/history.git`
+  (port 8080 by default).
+- **Where the history lives.** On the claim `repos-agentfs-git-server-0`,
+  of `server.storage.storageClassName` (empty: the cluster default) with
+  `server.storage.size` and `server.storage.accessModes`. Any
+  StorageClass works, NFS 4.0 and iSCSI included. The claim template is
+  fixed at install, since a StatefulSet's cannot change, and
+  `helm uninstall` keeps the claim.
+- **Credentials, wired once.** One Secret holds `htpasswd`, which the
+  server reads, and `token`, an agentfs credentials file (`username=`
+  and `password=` lines) that the node plugin mounts as
+  `/etc/agentfs-csi/credentials/agentfs-server`. With
+  `server.credentials.existingSecret` empty, the chart makes the Secret
+  `agentfs-git-server` with user `agentfs` and a random password, and
+  keeps it on upgrade (`lookup`; `helm template` and `--dry-run` show a
+  fresh one each time). To bring your own, put the same password in both
+  keys:
+
+  ```sh
+  kubectl -n agentfs-csi create secret generic my-git-server \
+    --from-literal=htpasswd="$(htpasswd -nbB agentfs "$PASSWORD")" \
+    --from-literal=token=$'username=agentfs\npassword='"$PASSWORD"
+  ```
+
+  The credentials Secret
+  (`credentials.*`) must not have its own `agentfs-server` key.
+- **A profile pushing to it**, as the release notes print it (csi.md §4):
+
+  ```ini
+  [remote "server"]
+      url = http://agentfs-git-server.agentfs-csi.svc:8080/git/history.git
+      agentfsCredentials = /etc/agentfs-csi/credentials/agentfs-server
+  ```
+
+  Node plugins already running when the server is first enabled see the
+  `agentfs-server` key only after their pod is deleted (`OnDelete`,
+  above).
+
+What it does not do: there is one replica and no fencing, no per-volume
+keys and no hooks (design "The server"), so any profile with the token
+can write any ref. It speaks plain HTTP inside the cluster, with no TLS.
+If its node is lost and its claim is on that node's disk, the remote is
+down until the node returns. Pull requests and the like come from adding
+another remote, such as GitHub, to the profile.
 
 ## 3. Values
 
@@ -185,6 +243,13 @@ charts render the same objects:
 - `charts/agentfs-csi` with `alerts.enabled=true` renders
   `deploy/alerts/prometheusrule.yaml` (in the release namespace).
 
+The git server (`server.enabled`, §2) is the chart's alone: `deploy/csi`
+has no kustomize equivalent, and the comparison renders it off, which
+leaves the node plugin's credentials volume the plain Secret of
+`deploy/csi`. A kustomize user runs the image from
+[`examples/docker/git-server`](../examples/docker/git-server) with
+their own manifests.
+
 The comparison ([`ci/helm-equivalence.py`](../ci/helm-equivalence.py))
 is object by object and field by field. It ignores only what Helm adds by
 design: the release's Namespace object, Helm's standard labels, `checksum/`
@@ -221,6 +286,18 @@ on every push and pull request:
   `charts/agentfs-csi` from this tree on a two-worker kind cluster
   ([`ci/k8s-csi/move/values.yaml`](../ci/k8s-csi/move/values.yaml)), and
   [`ci/e2e-csi-move.sh`](../ci/e2e-csi-move.sh) (csi.md §13).
+- **e2e (the chart's git server)**, in the f8 workflow: `helm lint
+  --strict` and rendering checks with
+  [`charts/agentfs-csi/ci/server.yaml`](../charts/agentfs-csi/ci/server.yaml)
+  (not named `*-values.yaml`, so `ct install` above does not take it),
+  then `helm install` on one kind node and
+  [`ci/e2e-chart-server.sh`](../ci/e2e-chart-server.sh): a pod's write
+  reaches the server as `agentfs/<volume>` at the worktree's head (read
+  with `git ls-remote` through `kubectl port-forward`), a wrong password
+  is refused, the repository survives deleting the server pod, and
+  `helm upgrade` keeps the password.
+- **git server image**, in the image workflow: the image is built, then
+  takes a push and refuses a wrong password, run as the chart runs it.
 
 Not tested: the forks e2e (`ci/e2e-csi-forks.sh`) against the chart,
 `helm upgrade` between chart versions, the `PrometheusRule` against a
@@ -243,7 +320,10 @@ job packages both charts and pushes them with the workflow's
 The appVersion is the default image tag, `ghcr.io/mcurcio/agentfs:<commit>`,
 which image.yml publishes from `main` once its own tests pass; the two
 workflows run side by side, so the image can appear a few minutes after
-the chart, or not at all if image.yml fails. Nothing here creates tags.
+the chart, or not at all if image.yml fails. The git server's default
+tag is the same appVersion: image.yml publishes
+`ghcr.io/mcurcio/agentfs-git-server:<commit>` and `:latest` from `main`
+once its own test passes. Nothing here creates tags.
 
 ```sh
 helm show values oci://ghcr.io/mcurcio/charts/agentfs-csi --version <version>

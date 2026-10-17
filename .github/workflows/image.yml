@@ -3,7 +3,9 @@ name: image
 # The container image (Dockerfile) and the Kubernetes deployment
 # (deploy/sidecar): built on every push and pull request, tested in a kind
 # cluster, and published to ghcr.io/mcurcio/agentfs from main once the
-# test passes (docs/deployment.md).
+# test passes (docs/deployment.md). The CSI chart's git server image
+# (examples/docker/git-server) likewise, published to
+# ghcr.io/mcurcio/agentfs-git-server (docs/helm.md).
 
 on:
   push:
@@ -198,6 +200,93 @@ jobs:
         run: |
           kind delete cluster --name agentfs-forks || true
           ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
+
+  # The chart's git server image (examples/docker/git-server, docs/helm.md
+  # "The git server"): built, then a push and a refused password as the
+  # chart runs it (uid 33, read-only root filesystem, htpasswd from a
+  # file). The chart on kind is f8.yml's e2e-chart-server.
+  git-server:
+    name: git server image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: build
+        run: |
+          docker build -t agentfs-git-server:ci \
+            --label org.opencontainers.image.source=https://github.com/mcurcio/agentfs \
+            --label "org.opencontainers.image.description=The agentfs CSI chart's minimal git server" \
+            examples/docker/git-server
+      - name: a push, and a wrong password refused
+        run: |
+          d=$RUNNER_TEMP/git-server
+          mkdir -p "$d/credentials" "$d/repos" "$d/work"
+          chmod 0777 "$d/repos"
+          docker run --rm --entrypoint sh agentfs-git-server:ci \
+            -c 'printf "agentfs:%s\n" "$(openssl passwd -apr1 smoke-password)"' >"$d/credentials/htpasswd"
+          as_chart() { docker run --user 33:33 --read-only -v "$d/repos:/srv/git" "$@"; }
+          as_chart --rm agentfs-git-server:ci init
+          as_chart -d --name git-server --tmpfs /run/git-server:mode=1777 -p 18080:8080 \
+            -e GIT_SERVER_HTPASSWD=/credentials/htpasswd -v "$d/credentials:/credentials:ro" \
+            agentfs-git-server:ci serve
+          url=http://agentfs:smoke-password@127.0.0.1:18080/git/history.git
+          for _ in $(seq 30); do git ls-remote "$url" && break; sleep 1; done
+          git -C "$d/work" init -q -b main
+          git -C "$d/work" -c user.name=ci -c user.email=ci@ci.invalid commit -q --allow-empty -m smoke
+          git -C "$d/work" push "$url" HEAD:refs/heads/agentfs/smoke
+          test "$(git ls-remote "$url" refs/heads/agentfs/smoke | cut -f1)" = "$(git -C "$d/work" rev-parse HEAD)"
+          if GIT_TERMINAL_PROMPT=0 git ls-remote http://agentfs:wrong@127.0.0.1:18080/git/history.git; then
+            echo "::error::the git server accepted a wrong password"; exit 1
+          fi
+          docker logs git-server 2>&1 | grep 'password mismatch'
+      - name: logs
+        if: failure()
+        run: docker logs git-server || true
+      - name: save
+        run: docker save agentfs-git-server:ci -o "$RUNNER_TEMP/git-server-image.tar"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: git-server-image
+          path: ${{ runner.temp }}/git-server-image.tar
+          retention-days: 1
+
+  # Pushes the git server image the job above tested, from main only, as
+  # ghcr.io/mcurcio/agentfs-git-server:<commit> (the chart's appVersion)
+  # and :latest.
+  publish-git-server:
+    needs: git-server
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: git-server-image
+          path: ${{ runner.temp }}
+      - run: docker load -i "$RUNNER_TEMP/git-server-image.tar"
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: push
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          for tag in "$SHA" latest; do
+            docker tag agentfs-git-server:ci "ghcr.io/mcurcio/agentfs-git-server:$tag"
+            docker push "ghcr.io/mcurcio/agentfs-git-server:$tag"
+          done
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "ghcr.io/mcurcio/agentfs-git-server:$SHA")
+          {
+            echo "### Published"
+            echo
+            echo "- \`ghcr.io/mcurcio/agentfs-git-server:$SHA\`"
+            echo "- \`ghcr.io/mcurcio/agentfs-git-server:latest\`"
+            echo "- digest: \`$digest\`"
+          } >>"$GITHUB_STEP_SUMMARY"
 
   # Pushes the image e2e-kind, e2e-csi and e2e-csi-forks tested (the same
   # tar, not a rebuild), from main only.

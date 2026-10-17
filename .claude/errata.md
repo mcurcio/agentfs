@@ -72,3 +72,25 @@ None of these stopped the slice; each was resolved as below and is reported with
    fork's state, as the code before F8 did; under the lock only for a published or
    abandoned fork. The frozen page's error table puts "its state lock is held" at
    `FAILED_PRECONDITION` without this exception; the forks e2e (step 4) found it.
+
+## 2026-10-17, F8 S4 implementer (f8-s4)
+
+1. The frozen values page says the Secret's `token` key is `user:password`. agentfs's
+   credentials file is a bare token (sent as the password, with the URL's user or
+   `x-access-token`) or `username=`/`password=` lines (`credentials.rs::parse`), so
+   `user:password` would be refused with 401. `token` holds `username=`/`password=` lines;
+   the key names, mount path and every value key are as frozen.
+2. "The node plugin mounts the `token` key of the same Secret" needs `templates/node.yaml`
+   (a projected credentials volume when `server.enabled`), `values.schema.json` (root
+   `additionalProperties: false` refuses `server:`) and `_helpers.tpl` (the Secret's name,
+   shared by node.yaml and server.yaml); none is in S4's owned files. Edited minimally; with
+   the server off node.yaml renders as before, so helm-equivalence is unchanged.
+3. chart-testing takes every `charts/agentfs-csi/ci/*-values.yaml` for `ct install` too, and
+   helm.yml's e2e (`ci/helm-csi-install.sh`, fixed release name, no server image loaded)
+   would install the server values and fail. The server values are
+   `charts/agentfs-csi/ci/server.yaml`, linted by `helm lint --strict` in e2e-chart-server,
+   not by `ct lint`.
+4. The frozen values have no repository name: the chart serves the image's default,
+   `history.git`, and NOTES.txt prints that URL.
+5. The slice page was not at the path the brief gave (`.handoff/f8-slices.md` of the main
+   checkout); it was read from the worktree `wf_1a3a42d9-2d6-3`.

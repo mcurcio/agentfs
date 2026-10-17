@@ -47,6 +47,21 @@ Kubernetes: `>=1.30.0-0`
 | node.terminationGracePeriodSeconds | int | `60` | Longer than `--unpublish-grace` plus `--unstage-grace`, so a stopped plugin lets its children make their final commits. |
 | node.tolerations | list | `[{"operator":"Exists"}]` | The node plugin runs on every node by default. |
 | profiles | object | `{}` | Profiles: every setting of a volume, by name (docs/csi.md "Profiles and credentials"). Each is `{config, exclude, attributes}`: the git-config fragment and the optional rule files. A StorageClass picks one with the parameter `profile: <name>`. Load files with `--set-file profiles.<name>.config=<path>`. |
+| server.affinity | object | `{}` | The server's affinity. |
+| server.credentials.existingSecret | string | `""` | An existing Secret with keys `htpasswd` (read by the server) and `token` (an agentfs credentials file, `username=` and `password=` lines, mounted for profiles at /etc/agentfs-csi/credentials/agentfs-server). Empty: the chart makes one with a random password, kept across upgrades (lookup). |
+| server.enabled | bool | `false` | Run the chart's minimal git server (smart HTTP, basic auth). Off by default. |
+| server.image.digest | string | `""` | A digest (`sha256:...`); when set, it pins the image. |
+| server.image.pullPolicy | string | `""` | The pull policy; empty leaves the Kubernetes default. |
+| server.image.repository | string | `"ghcr.io/mcurcio/agentfs-git-server"` | The server's image (examples/docker/git-server). |
+| server.image.tag | string | `""` | Empty: the chart's appVersion. |
+| server.nodeSelector | object | `{}` | The server's node selector. |
+| server.podAnnotations | object | `{}` | Annotations on the server's pod. |
+| server.resources | object | `{}` | The server container's resources. |
+| server.service.port | int | `8080` | The Service's port. |
+| server.storage.accessModes | list | `["ReadWriteOnce"]` | The claim's access modes; one pod uses it. |
+| server.storage.size | string | `"10Gi"` | The claim's size. Fixed at install: a StatefulSet's claim template cannot change. |
+| server.storage.storageClassName | string | `""` | StorageClass of the server's claim (any: NFS 4.0, iSCSI, local). Empty: the cluster default. |
+| server.tolerations | list | `[]` | The server's tolerations. |
 | sidecars.livenessProbe.image.digest | string | `"sha256:19f2cf2f40e1987c7943945deca5f65cd4e4bf5cc0657fc78a5df131861578e8"` | livenessprobe's digest. |
 | sidecars.livenessProbe.image.repository | string | `"registry.k8s.io/sig-storage/livenessprobe"` | livenessprobe's image. |
 | sidecars.livenessProbe.image.tag | string | `"v2.20.0"` | livenessprobe's tag. |

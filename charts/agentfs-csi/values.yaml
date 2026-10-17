@@ -125,6 +125,50 @@ alerts:
   # ruleSelector (kube-prometheus-stack selects `release: <its release>`).
   labels: {}
 
+# The chart's minimal git server (docs/helm.md "The git server"): one pod
+# serving /git/history.git at
+# http://agentfs-git-server.<namespace>.svc:<server.service.port>, for
+# profiles to push to. A git remote, not a forge.
+server:
+  # -- Run the chart's minimal git server (smart HTTP, basic auth). Off by default.
+  enabled: false
+  image:
+    # -- The server's image (examples/docker/git-server).
+    repository: ghcr.io/mcurcio/agentfs-git-server
+    # -- Empty: the chart's appVersion.
+    tag: ""
+    # -- A digest (`sha256:...`); when set, it pins the image.
+    digest: ""
+    # -- The pull policy; empty leaves the Kubernetes default.
+    pullPolicy: ""
+  storage:
+    # -- StorageClass of the server's claim (any: NFS 4.0, iSCSI, local). Empty: the cluster default.
+    storageClassName: ""
+    # -- The claim's size. Fixed at install: a StatefulSet's claim template
+    # cannot change.
+    size: 10Gi
+    # -- The claim's access modes; one pod uses it.
+    accessModes: [ReadWriteOnce]
+  credentials:
+    # -- An existing Secret with keys `htpasswd` (read by the server) and `token`
+    # (an agentfs credentials file, `username=` and `password=` lines,
+    # mounted for profiles at /etc/agentfs-csi/credentials/agentfs-server).
+    # Empty: the chart makes one with a random password, kept across upgrades (lookup).
+    existingSecret: ""
+  service:
+    # -- The Service's port.
+    port: 8080
+  # -- The server container's resources.
+  resources: {}
+  # -- The server's node selector.
+  nodeSelector: {}
+  # -- The server's tolerations.
+  tolerations: []
+  # -- The server's affinity.
+  affinity: {}
+  # -- Annotations on the server's pod.
+  podAnnotations: {}
+
 # -- StorageClasses of the driver: `[{name, parameters, reclaimPolicy,
 # volumeBindingMode, annotations}]`. `parameters` go to the driver as
 # written (docs/configuration.md "The CSI driver"). `reclaimPolicy`

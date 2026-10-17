@@ -23,6 +23,17 @@ one with --set-file profiles.<name>.config=<file> (docs/csi.md §4).
 Remote credentials come from Secret {{ .Values.credentials.existingSecret }}; the node plugin
 does not start until it exists.
 {{- end }}
+{{- if .Values.server.enabled }}
+{{- $url := printf "http://agentfs-git-server.%s.svc:%v/git/history.git" .Release.Namespace .Values.server.service.port }}
+
+The git server serves {{ $url }}
+(user and password: key `token` of Secret {{ include "agentfs-csi.serverSecret" . }}). A profile pushes to it with:
+  [remote "server"]
+      url = {{ $url }}
+      agentfsCredentials = /etc/agentfs-csi/credentials/agentfs-server
+Node plugins started before the server was enabled see agentfs-server only once their pod
+is deleted (updateStrategy OnDelete, docs/helm.md).
+{{- end }}
 {{- if .Values.storageClasses }}
 
 StorageClasses: {{ range $i, $c := .Values.storageClasses }}{{ if $i }}, {{ end }}{{ $c.name }}{{ end }}

@@ -163,6 +163,16 @@ secret (never committed), and drop the `git-server` service. SSH remotes
 and LFS take the keys in [configuration.md](configuration.md#ssh-remotes),
 as on Kubernetes.
 
+The same image is the CSI chart's git server ([helm.md](helm.md#the-git-server)),
+published as `ghcr.io/mcurcio/agentfs-git-server`. Its entrypoint takes
+`init` (create `/srv/git/history.git` if it is missing, then exit),
+`serve`, or nothing (both, as here). Started as root, as here, it runs
+nginx's workers and `git http-backend` as `www-data`; started as another
+user, as the chart does, it can have a read-only root filesystem, and
+needs `/srv/git` and `/run/git-server` writable. `GIT_SERVER_HTPASSWD`
+names an htpasswd file to use instead of `/run/secrets/origin`, and
+`GIT_REPO` another repository name.
+
 **Settings:** `VOLUME`, `AGENTFS_IMAGE`, `WORKLOAD_IMAGE` and
 `WORKLOAD_USER` are read from the environment or an `.env` file.
 
