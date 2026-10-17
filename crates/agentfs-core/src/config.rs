@@ -464,6 +464,53 @@ pub struct Settings {
     pub fork_refs: PushTarget,
 }
 
+/// How a volume declares its push remotes (F8 S3, R4: zero remotes is a
+/// declared mode). It replaces `Settings::remotes: Vec<RemoteSettings>`
+/// in F8 S3; [`Settings::load`] stays the one decider. Push sections and
+/// the flagged fork-remote section are disjoint inputs, so the two cannot
+/// disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remotes {
+    /// One or more valid push sections, sorted by name; invalid sections
+    /// beside them alarm (§11.1).
+    Pushed(crate::non_empty::NonEmpty<RemoteSettings>),
+    /// Push sections, all invalid: each alarms; commits wait. Never
+    /// reported local-only.
+    NoneValid,
+    /// `agentfs.remotes = none` and no push section: status, telemetry
+    /// and alarms say local-only. A remote added later (and `none`
+    /// removed) gets all history.
+    LocalOnly,
+    /// Neither, or `none` beside a push section (`beside` names it):
+    /// pushes nothing and raises `RemotesUndeclared`; `agentfs init` and
+    /// CreateVolume refuse it; an existing volume keeps opening
+    /// (principle 1).
+    Undeclared { beside: Option<String> },
+}
+
+impl Remotes {
+    /// The valid push remotes: empty unless [`Remotes::Pushed`]. For the
+    /// readers that only iterate; anything that reports or decides on the
+    /// mode matches on the enum.
+    pub fn pushed(&self) -> &[RemoteSettings] {
+        todo!("F8 S3")
+    }
+}
+
+/// Where a volume's forks publish (design §11.5; F8 S3). `None` in
+/// `Settings`: forks are refused, as today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkRemote {
+    /// The one valid section with `agentfsForkRemote = true`, else the
+    /// remote the patch remote resolves to; any source mode. Boxed: the
+    /// other variant is empty (`clippy::large_enum_variant`).
+    Remote(Box<RemoteSettings>),
+    /// Only for a [`Remotes::LocalOnly`] source with no flagged section:
+    /// the fork publishes `agentfs/<fork>` into the source's own history
+    /// ([`crate::fork::receive::receive_fork_change`]), never applied.
+    SourceHistory,
+}
+
 /// `agentfs.patchRemote` (design §12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchRemote {

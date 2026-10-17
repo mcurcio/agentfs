@@ -40,6 +40,7 @@ missing from these tables or a row names a module that no longer exists;
 | `reconcile.rs` | Directory moves: the duties that reconcile a moved tree before its move is committed (§3.1) |
 | `rules.rs` | Path rules: recorded or skipped, and why, from `info/exclude`, `info/attributes` and optionally tree rules (§4, §5) |
 | `nested.rs` | Detects nested git repositories, including ones being created (§5) |
+| `non_empty.rs` | A list with at least one element by construction (`config::Remotes::Pushed`) |
 | `probe.rs` | Bounded, non-blocking reads of small workload files (`.gitignore`, `.git` files) during the synchronous step |
 | `paths.rs` | Repository-relative paths and the names git refuses to store |
 | `checks.rs` | git fsck rules and remote limits, checked at record time and again at commit (§3.4) |
@@ -52,9 +53,13 @@ missing from these tables or a row names a module that no longer exists;
 | `fork/finish.rs` | The finisher: the change and finish commits, publishing to the fork remote, the single decider of a refused publish, the operator's abandon, and the fork status DeleteVolume reads |
 | `fork/listing.rs` | The published changes on a fork remote, each checked (fork name, finish trailers, change id, parent, tree), read in a receiver's repository with its own git (§11.5) |
 | `fork/deliver.rs` | Library delivery of a published change (§11.5 "Delivery"): the `Delivery` contract, its four methods (inbox, branch, command, webhook), the payload (schema 1) and the one factory that validates a method; never used by the CSI driver |
+| `fork/start.rs` | Starting a volume from a pinned commit of another worktree's branch on a remote (F8 R2), and the operator's `start accept` that saves an old-branch tip under the volume's own `accepted/*` refs |
+| `fork/receive.rs` | A local-only source receiving its fork's branch, change and finish refs into its own history, never applied (F8 R4) |
 | `identity.rs` | Committer and author identities from templates (§9) |
 | `service.rs` | The background loops: commit loop, one push loop per remote, repack (§3.4, §11.2) |
 | `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
+| `push/claim.rs` | The branch rule's pure deciders: `claim` (create or fast-forward, from the remote's value in the connection) and `start_branch_moved` (the start-branch alarm) |
+| `release.rs` | The one deletion decider: delete, keep or wait for a worktree, from its declared remotes, what each advertises, `onDelete` and a fork's status (F8 rule 3) |
 | `push_size.rs` | Measuring a push's git pack against `agentfsMaxPushSize` before connecting, and the first-parent step that fits (§11.3) |
 | `remote_auth.rs` | Credentials and host-key checks for one remote, shared by push and patch fetch, and the scope that hands an SSH remote to the transport (§11.1) |
 | `ssh_transport.rs` | `ssh` feature: agentfs's libgit2 subtransport for SSH URLs over russh: host key or certificate check before authentication, the key (decrypted) or ssh-agent identities, timeouts (§11.1) |

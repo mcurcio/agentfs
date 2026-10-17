@@ -67,3 +67,84 @@ pub fn change_ref(fork: &str) -> String {
 pub fn finish_ref(fork: &str) -> String {
     format!("refs/agentfs/{fork}/finish")
 }
+
+/// `agentfs.start.remote`: the push remote a started volume came from
+/// (F8 S1). The three start keys are identity: set together by
+/// [`super::start::start_from`] in the volume's own config, never by an
+/// include, and never changed.
+pub const START_REMOTE_KEY: &str = "agentfs.start.remote";
+/// `agentfs.start.branch`: the branch it came from, without `refs/heads/`.
+pub const START_BRANCH_KEY: &str = "agentfs.start.branch";
+/// `agentfs.start.commit`: the full id of the commit it was pinned at.
+pub const START_COMMIT_KEY: &str = "agentfs.start.commit";
+
+/// Where a started volume began (F8 R2: continuing elsewhere is a new
+/// volume started from the old branch): a StorageClass's
+/// `startFrom: "<remote>:<branch>@<commit>"`, kept in the new worktree's
+/// identity. Only a branch: a `diverged/*` or any other `refs/agentfs/`
+/// ref never moves, so the start-branch alarm could never watch it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartPoint {
+    /// A push section of the new volume's own profile.
+    pub remote: String,
+    /// A branch name, e.g. `agentfs/V1`; never this volume's own branch.
+    pub branch: String,
+    /// Pinned in the class; must be the branch's tip or an ancestor of it
+    /// on the remote when the volume is created.
+    pub commit: Oid,
+}
+
+/// A `startFrom` value that cannot be a [`StartPoint`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BadStartPoint {
+    #[error("startFrom {value:?} is not <remote>:<branch>@<commit>")]
+    Shape { value: String },
+    #[error("startFrom remote {remote:?} is not a valid remote name")]
+    BadRemote { remote: String },
+    #[error(
+        "startFrom names {branch:?}, which is not a branch: a start point is a branch such as \
+         agentfs/<volume>, never a refs/... name (a diverged/* ref never moves, so nothing could \
+         alarm on it)"
+    )]
+    NotABranch { branch: String },
+    #[error("startFrom commit {commit:?} is not a full commit id (40 lower-case hex digits)")]
+    BadCommit { commit: String },
+}
+
+impl StartPoint {
+    /// `<remote>:<branch>@<commit>`, as a StorageClass writes it. The
+    /// branch must be a valid git branch name not starting with `refs/`;
+    /// the commit a full id.
+    pub fn parse(value: &str) -> Result<Self, BadStartPoint> {
+        let _ = value;
+        todo!("F8 S1")
+    }
+
+    /// `refs/heads/<branch>`.
+    pub fn refname(&self) -> String {
+        todo!("F8 S1")
+    }
+}
+
+impl std::fmt::Display for StartPoint {
+    /// `<remote>:<branch>@<commit>`, which [`StartPoint::parse`] reads back.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = f;
+        todo!("F8 S1")
+    }
+}
+
+/// `refs/agentfs/<volume>/accepted/`: the prefix of the start-branch tips
+/// an operator accepted (`agentfs start accept`, F8 S1).
+pub fn accepted_prefix(volume: &str) -> String {
+    format!("refs/agentfs/{volume}/accepted/")
+}
+
+/// `refs/agentfs/<volume>/accepted/<tip>`: a start-branch tip the operator
+/// accepted, created once (never moved) in this volume's own namespace and
+/// pushed create-only with the branch. The start-branch alarm stops
+/// watching every commit it reaches, and the old commits are saved under
+/// this volume's name.
+pub fn accepted_ref(volume: &str, tip: Oid) -> String {
+    format!("{}{tip}", accepted_prefix(volume))
+}

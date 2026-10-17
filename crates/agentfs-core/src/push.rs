@@ -73,9 +73,47 @@ use crate::remote_auth::{AuthState, RemoteAuth};
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::StateDir;
 
+mod claim;
+
+pub use claim::{Claim, StartBranchMoved, claim, start_branch_moved};
+
 /// The longest delay between retries of a failing remote, unless
 /// `pushInterval` is longer.
 pub const PUSH_BACKOFF_CAP: Duration = Duration::from_secs(900);
+
+/// Why a remote could not be listed (F8 rule 3: the release decider asks
+/// the remote, [`RemotePusher::branch_claim`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreachable {
+    pub kind: PushFailureKind,
+    /// Scrubbed of any userinfo in the push URL.
+    pub message: String,
+}
+
+/// What [`RemotePusher::push_with_lease`] did (F8 S2; runbooks:
+/// divergence case A, history rewrite step 9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseOutcome {
+    /// The branch does not exist locally.
+    NothingToPush,
+    /// The remote already holds the head.
+    UpToDate { head: Oid },
+    /// The remote's branch was `from`, the lease, and is now the head.
+    Pushed { from: Oid, to: Oid },
+    /// The remote's branch is not the lease (`found`; `None`: no branch):
+    /// nothing was written.
+    LeaseBroken { found: Option<Oid> },
+    /// The lease and the head share no commit: the remote's branch is
+    /// another history, never replaced by this command (a rewrite that
+    /// changes the root continues under a new name).
+    Unrelated { lease: Oid, head: Oid },
+    Failed {
+        kind: PushFailureKind,
+        message: String,
+    },
+    /// Another process holds this remote's push lock.
+    Busy,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
@@ -829,6 +867,32 @@ impl RemotePusher {
             "the remote accepted the push but does not list every ref".into(),
         ));
         failed(kind, message)
+    }
+
+    /// What this remote advertises for the volume's branch, judged
+    /// against `head` by [`claim`] (F8 S1, rule 3): one listing
+    /// connection, with this remote's authentication and proxy; never
+    /// pushes, never takes the push lock, never touches the push state.
+    /// [`Claim::UpToDate`] is the only answer the release decider counts
+    /// as held.
+    pub fn branch_claim(&self, head: Oid) -> Result<Claim, Unreachable> {
+        let _ = head;
+        todo!("F8 S1")
+    }
+
+    /// Replaces this worktree's own branch on the remote with the local
+    /// head, leased on `lease`: the value the operator saw on the remote
+    /// (F8 S2; design §15). Under this remote's push lock, not the state
+    /// lock. `lease` is fetched from the remote when it is not in this
+    /// repository; the push is refused ([`LeaseOutcome::Unrelated`]) when
+    /// `lease` and the head share no commit, and stopped in libgit2's push
+    /// negotiation ([`LeaseOutcome::LeaseBroken`]) when the remote's old
+    /// value is not `lease`. Only `branch_ref`, never another ref; the
+    /// `diverged/*` refs stay. Success clears the divergence in the push
+    /// state and is recorded like any push.
+    pub fn push_with_lease(&mut self, lease: Oid) -> LeaseOutcome {
+        let _ = lease;
+        todo!("F8 S2")
     }
 
     /// This remote's push lock file: held while a push runs, and by a
