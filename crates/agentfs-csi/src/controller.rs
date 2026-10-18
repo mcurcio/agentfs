@@ -19,7 +19,8 @@
 //!   of forks received into its history
 //!   ([`agentfs_core::push::RemotePusher::received_lacking`]), the journal's
 //!   backlog ([`agentfs_core::volume::inspect`], read under the state
-//!   lock), the class's `onDelete`, and a fork's status. `Delete` removes
+//!   lock), the class's `onDelete`, a fork's status, and whether it is an
+//!   unlinked fork (local-only, it is deleted unpushed). `Delete` removes
 //!   the directory; `Keep` releases the volume and keeps the worktree,
 //!   renaming `csi.json` to `csi.retained.json`; `Wait` is `UNAVAILABLE`,
 //!   naming the remote (or the journal) and why, and wakes the node
@@ -310,6 +311,7 @@ pub(crate) fn delete_volume(
             on_delete: record.params.on_delete,
             remotes: Declared::Pushed(&[]),
             fork: Some(fork),
+            unlinked_fork: false,
         });
         if let Release::Wait(waiting) = unpublished {
             return Err(wait(handle, release, &waiting));
@@ -343,7 +345,8 @@ pub(crate) fn delete_volume(
                 eprintln!("deleted volume {handle}, but its files remain: {e}");
             } else {
                 eprintln!(
-                    "deleted volume {handle} ({}): nothing a remote lacks was on it",
+                    "deleted volume {handle} ({}): nothing a remote lacks was on it, or it \
+                     was an unlinked fork with no remote of its own",
                     dir.display()
                 );
             }
@@ -409,6 +412,7 @@ fn decide(
             // Never weighed: with no history only the journal counts.
             remotes: Declared::LocalOnly,
             fork,
+            unlinked_fork: false,
         }));
     }
     // Under the state lock: the journal's backlog is what a stopped (or
@@ -448,6 +452,7 @@ fn decide(
         on_delete,
         remotes: Declared::of(&settings, &seen),
         fork,
+        unlinked_fork: settings.is_unlinked_fork(),
     }))
 }
 

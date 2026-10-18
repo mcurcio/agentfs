@@ -8,7 +8,8 @@
 //! with its link (design §11.5), and, for a linked fork of a local-only
 //! source, the source's state area (F8 S3: the fork publishes into its
 //! history, [`super::receive`]; an unlinked fork records no path to it),
-//! the source's settings files as its includes, the objects of base's
+//! for an unlinked fork its own remotes file, if any (it never pushes to
+//! its source's remotes), the source's settings files as its includes, the objects of base's
 //! history copied in (no alternates, so a fork outlives its source), the
 //! fork's history ref at base, and base's tree written into the fork's
 //! backing tree before anything can mount it. It is idempotent per name:
@@ -56,6 +57,13 @@ pub struct CreateRequest<'a> {
     /// or a fork class's `link` parameter. Fixed at create like the push
     /// target; a fork that already exists keeps its own.
     pub link: ForkLink,
+    /// An unlinked fork's own remotes: an absolute path to a config file
+    /// of `[remote "<name>"]` sections (`agentfs.fork.remotes`, from
+    /// `fork create --remotes` or a fork class's `remotes` profile), read
+    /// at every open; `None`, the fork is local-only. Only for
+    /// [`ForkLink::Unlinked`] ([`CreateError::RemotesNeedUnlinked`]). An
+    /// earlier try's is kept.
+    pub remotes: Option<&'a Path>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +89,13 @@ pub enum CreateError {
          included files: move them to a fragment named by include.path"
     )]
     SourceSettingsNotIncluded { volume: String, keys: Vec<String> },
+    #[error(
+        "remotes of the fork's own are an unlinked fork's (--link unlinked, or link: unlinked): \
+         a linked fork pushes only to its source's fork remote"
+    )]
+    RemotesNeedUnlinked,
+    #[error("the fork's remotes file {} is not an absolute path", path.display())]
+    RemotesNotAbsolute { path: PathBuf },
     #[error("{name:?} is not a valid fork name: {why}")]
     BadName { name: String, why: String },
     #[error("the fork's state area already belongs to {found}; nothing was changed")]
@@ -105,7 +120,18 @@ pub fn create(request: &CreateRequest<'_>) -> Result<ForkIdentity, CreateError> 
         name: name.to_owned(),
         why: e.to_string(),
     })?;
-    let source = read_source(request.source)?;
+    match request.remotes {
+        Some(_) if request.link == ForkLink::Linked => {
+            return Err(CreateError::RemotesNeedUnlinked);
+        }
+        Some(path) if !path.is_absolute() => {
+            return Err(CreateError::RemotesNotAbsolute {
+                path: path.to_path_buf(),
+            });
+        }
+        _ => {}
+    }
+    let source = read_source(request.source, request.link)?;
     let wanted = ForkIdentity {
         fork: name.to_owned(),
         source: source.volume.clone(),
@@ -119,10 +145,14 @@ pub fn create(request: &CreateRequest<'_>) -> Result<ForkIdentity, CreateError> 
         }
         e => CreateError::Volume(e),
     })?;
+    if let Some(remotes) = request.remotes {
+        record_once(request.fork, super::identity::REMOTES_KEY, remotes)?;
+    }
     // The identity the fork has: an earlier try's base and link win.
     let identity = fork_identity(request.fork)?;
     if source.local_only && identity.link == ForkLink::Linked {
-        record_source_state(request)?;
+        let path = std::path::absolute(request.source.root())?;
+        record_once(request.fork, super::receive::SOURCE_STATE_KEY, &path)?;
     }
     let fork = Repository::open_bare(request.fork.git()).map_err(HistoryError::from)?;
     let history_ref = identity.history_ref();
@@ -186,39 +216,36 @@ struct Source {
     local_only: bool,
 }
 
-/// The source's state area in the fork's own config
-/// ([`super::receive::SOURCE_STATE_KEY`]), absolute; an earlier try's is
-/// kept.
-fn record_source_state(request: &CreateRequest<'_>) -> Result<(), CreateError> {
-    let key = super::receive::SOURCE_STATE_KEY;
-    let mut config =
-        git2::Config::open(&request.fork.git().join("config")).map_err(HistoryError::from)?;
+/// The absolute `path` at `key` in the fork's own config: the source's
+/// state area ([`super::receive::SOURCE_STATE_KEY`]) or the fork's own
+/// remotes ([`super::identity::REMOTES_KEY`]); an earlier try's is kept.
+fn record_once(fork: &StateDir, key: &str, path: &Path) -> Result<(), CreateError> {
+    let mut config = git2::Config::open(&fork.git().join("config")).map_err(HistoryError::from)?;
     match config.get_string(key) {
         Ok(_) => return Ok(()),
         Err(e) if e.code() == git2::ErrorCode::NotFound => {}
         Err(e) => return Err(HistoryError::from(e).into()),
     }
-    let path = std::path::absolute(request.source.root())?;
-    let value = path.to_str().ok_or_else(|| {
-        io::Error::other(format!(
-            "the source's state area {} is not valid UTF-8",
-            path.display()
-        ))
-    })?;
+    let value = path
+        .to_str()
+        .ok_or_else(|| io::Error::other(format!("{key}: {} is not valid UTF-8", path.display())))?;
     config.set_str(key, value).map_err(HistoryError::from)?;
     Ok(())
 }
 
-fn read_source(state: &StateDir) -> Result<Source, CreateError> {
+/// An unlinked fork needs no fork remote: it never pushes to its
+/// source's remotes.
+fn read_source(state: &StateDir, link: ForkLink) -> Result<Source, CreateError> {
     let git = state.git();
     let settings = source_settings(state)?;
     let volume = settings.volume.clone();
     if settings.is_fork() {
         return Err(CreateError::SourceIsFork { volume });
     }
-    let local_only = match &settings.fork_remote {
-        None => return Err(CreateError::NoForkRemote { volume }),
-        Some(remote) => *remote == ForkRemote::SourceHistory,
+    let local_only = match (&settings.fork_remote, link) {
+        (None, ForkLink::Linked) => return Err(CreateError::NoForkRemote { volume }),
+        (None, ForkLink::Unlinked) => false,
+        (Some(remote), _) => *remote == ForkRemote::SourceHistory,
     };
     let unreadable = |e: git2::Error| CreateError::SourceUnreadable(e.into());
     let repo = Repository::open_bare(&git).map_err(unreadable)?;

@@ -216,3 +216,18 @@ None of these stopped the work; each was resolved as below and is reported with 
    sleep after the `commit` before the failing scan (same assertion, `["lost", "retained"]`),
    so it is wall-clock time outrunning the 400 ms backoff, not 5772feb's helper refactor. Fixed
    by reading tokio's clock in `release_scan` and pausing it in the two backoff tests.
+
+## 2026-10-17, unlinked fork remotes (unlinked-fork-remotes)
+
+1. The brief says deleting a local-only unlinked fork "(CSI DeleteVolume or the CLI)" removes
+   its history without the hold. The CLI has no delete command and no hold: a CLI volume is
+   deleted by removing its state area by hand, for every volume alike. Nothing changed in the
+   CLI for deletion; the docs say so. Only DeleteVolume's release decider changed
+   (`Worktree::unlinked_fork`).
+2. The "Fork link" §19.1 row's design choices (an unlinked fork pushes where a linked one would
+   publish; create refuses it without a fork remote) are superseded by the new row "Unlinked
+   fork remotes", noted in the old row rather than rewritten.
+3. An unlinked fork made before this change (same day) loses its parent's remote: it becomes
+   local-only, and with `onDelete: delete` (a fork class's default) DeleteVolume now removes it
+   unpushed. No backwards compatibility, by rule; operators with such forks must copy their
+   state areas, or recreate them on a class with `remotes`, before deleting their claims.

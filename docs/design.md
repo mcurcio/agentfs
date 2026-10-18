@@ -2064,7 +2064,7 @@ rather than fall back. While `lfs.url` or `lfs.pushurl` (the source's LFS
 store) is set, a flagged section must name its own `lfsurl` or
 `lfspushurl`, which it reads before the global keys; without one it is
 invalid, so a fork's LFS objects never reach the source's store. The
-default fork remote, the source's own, is unaffected. A fork pushes only to its fork remote, at
+default fork remote, the source's own, is unaffected. A linked fork pushes only to its fork remote (an unlinked one only to its own remotes, "The link" below), at
 its push target, and has no patch queue.
 
 **A local-only source's forks** (F8 S3, R4: a no-remote source's fork
@@ -2122,15 +2122,33 @@ fork remote or into a local-only source's history by the recorded
 publish waits and alarms (a push failure is pending and retried, a
 remote or source gone is refused), and it never delivers anywhere else.
 `unlinked` is an independent fork: `config::Settings` gives it no fork
-remote, its push remote is the one a linked fork would publish to (the
-flagged section, else the source's patch remote) at its own history
-ref, and a local-only source's unlinked fork records no source path
-(`UnlinkedSourceState` refuses one) and is local-only. It is never
-finished (`Finisher::open` refuses it, `FinishError::Unlinked`), so it
-never becomes read-only, and `fork::finish::status` is `None` for it:
+remote and never reads its source's remote sections, flagged or not, or
+the source's `lfs.url` and `lfs.pushurl`. It pushes its own history ref
+only to remotes configured for it (§19.1 "Unlinked fork remotes", the
+owner: "B. And if no remote is configured, the volume is lost, and
+that's a choice the user is allowed to make."): the `[remote "<name>"]`
+sections of its own remotes file, an absolute path in its identity
+(`agentfs.fork.remotes`, written at create, an identity key no include
+may set) from `agentfs fork create --remotes FILE` or a fork class's
+`remotes` profile (`<remotes>.config` in the profiles directory). The
+file is read alone at every open, holds only remote sections (without
+`agentfsForkRemote`), `lfs.url` and `lfs.pushurl` (`ForkRemotesKey`
+refuses anything else), and must be readable (`ForkRemotesUnreadable`);
+its sections are the fork's remotes mode as any volume's (§11.1), so an
+empty file is local-only and a section added later is pushed everything.
+Create refuses the file for a linked fork (`RemotesNeedUnlinked`), and
+does not require the source to have a fork remote for an unlinked one.
+Without the file the fork is local-only: nothing is pushed, a local-only
+source's unlinked fork records no source path (`UnlinkedSourceState`
+refuses one), and deleting it removes its history: DeleteVolume with
+`onDelete: delete` (a fork class's default) is `Delete` without waiting
+for any remote or the journal (§14.2), and under the CLI removing its
+state area is the deletion, which nothing holds. It is never finished
+(`Finisher::open` refuses it, `FinishError::Unlinked`), so it never
+becomes read-only, and `fork::finish::status` is `None` for it:
 DeleteVolume and the node plugin's release scan treat it as any
-worktree, waiting until its remotes hold its head, and `fork status`
-and `fork abandon` have nothing to act on.
+worktree, waiting until its own remotes hold its head, and `fork
+status` and `fork abandon` have nothing to act on.
 
 **Create** (`fork::create`) reads the source's settings and branch head
 without its lock and with no credentials, and refuses a source with no
@@ -3076,16 +3094,22 @@ what each pushed remote advertises for the branch in a listing made for
 that call (`RemotePusher::branch_claim`, judged by `claim`; the push
 record is not asked), how many journaled records history lacks (the
 journal's backlog, `volume::inspect`, read under the state lock), the
-class's `onDelete`, and a fork's state. It weighs, in order, no history,
-then the fork's state, then the remotes:
+class's `onDelete`, a fork's state, and whether it is an unlinked fork.
+It weighs, in order, an unlinked fork with no remote of its own, no
+history, then the fork's state, then the remotes:
 
 - **Delete**: every push remote holds the head (or there is no
   history), the journal holds nothing history lacks, and `onDelete:
-  delete`;
+  delete`; or an unlinked fork with no remote of its own (local-only,
+  §11.5) and `onDelete: delete`, whatever its history and journal hold.
+  That is the one exception to "never remove unpushed history", and the
+  owner's (§19.1 "Unlinked fork remotes"): every other worktree, a
+  linked fork included, keeps it;
 - **Keep**: the volume is released and the worktree stays on its node:
   `onDelete: retain` once every remote holds the head and the journal is
   committed, or a local-only profile (no remote section: nothing
-  elsewhere can hold it), whatever `onDelete` says;
+  elsewhere can hold it), whatever `onDelete` says, except that an
+  unlinked local-only fork is kept only with `onDelete: retain`;
 - **Wait**: `UNAVAILABLE`, naming the first remote that does not hold the
   head and why (lacking, unreachable, diverged), or that holds it but
   lacks a ref of a fork received into the history (§11.5), every remote section
@@ -4388,7 +4412,8 @@ runner.
 | Delivery payload v1 (2026-10-16) | The command and webhook methods send one JSON document, schema 1: `schema`, `fork`, `source`, `base`, `change`, `finish` and `fetch` (`remote` as the runner named it, and the `change`, `finish` and `history` refs). `change` is the key receivers dedupe on, and the webhook's `Idempotency-Key`. A new field or meaning is a new schema number, never a silent change. Both methods are at least once; the inbox method is at most once by the §12 duplicate rule. A design choice (forked volumes unit 3), not the owner's words |
 | Branch delivery idempotency (2026-10-16) | The branch method decides "already delivered" by content: its squash commit is deterministic (the change commit's author and committer, the message `change of fork <fork>` with `Agentfs-Change: <change>`), so the target ref at exactly the commit it would create is already delivered, and a ref at any other commit is refused and never moved; a trailer is never trusted, since anyone who may write the target can forge one. It pushes create-only (`--force-with-lease=<ref>:`). Cost: with `--onto`, a branch that moved since the first delivery makes a repeat refused rather than already delivered, and a receiver that rewrote the branch (a rebase in its pull request) gets the same refusal. A design choice (forked volumes unit 3), not the owner's words |
 | Hidden forks (2026-10-16) | A fork's push target is `branch` (`refs/heads/agentfs/<fork>`, the default) or `hidden` (`refs/agentfs/<fork>/history`, never under `refs/heads/`); new forks get the source's `agentfs.forkRefs`, and the fork keeps it in its identity (`agentfs.fork.pushTarget`, written only for `hidden`), so changing the setting moves no fork that exists. Any other value of either key is refused (`BadChoice`), and an include may not set `pushTarget`. It is unit 4 of "Fork scope". Cost: whether a forge runs CI or webhooks on pushes to `refs/agentfs/*` is not verified (§19.2), and an operator who switches to `hidden` to contain exposure must abandon or finish the forks that already push branches. A design choice (forked volumes unit 4), not the owner's words |
-| Fork link (2026-10-17) | A fork is created `linked` (the default, today's behaviour) or `unlinked`, recorded in its identity (`agentfs.fork.link`) at create and never changed after; set per fork class (`link` StorageClass parameter) and per fork (`agentfs fork create --link`). A linked fork's finish delivers its change back to the source: through its fork remote, or into a local-only source's history by the recorded `agentfs.fork.sourceState`; while it cannot reach the source it waits and alarms, and never delivers anywhere else. An unlinked fork is independent: it delivers nothing, records no source path, is never finished (`FinishError::Unlinked`) and has no fork status, so DeleteVolume and the release scan treat it as any worktree (§11.5). The owner, asked whether a fork records its source's path to deliver into a no-remote source (.handoff/f8-f12-notes.md, "Answers on the two F8 follow-ups", 2026-10-17): "A fork can be created with or without a remote link back to its parent. Configurable."; on the restated change (fork setting linked or unlinked, default linked, per StorageClass and per CLI fork): "Go". Design choices, not the owner's words: an unlinked fork pushes its own history ref to the remote a linked fork would publish to (the flagged fork remote, else the source's patch remote), so no fork output bypasses an operator's `agentfsForkRemote`; it is local-only when its source is; it keeps the push target and has no patch queue, as every fork; create refuses it, as a linked one, when the source has no fork remote; `link` in an ordinary class is refused |
+| Fork link (2026-10-17) | A fork is created `linked` (the default, today's behaviour) or `unlinked`, recorded in its identity (`agentfs.fork.link`) at create and never changed after; set per fork class (`link` StorageClass parameter) and per fork (`agentfs fork create --link`). A linked fork's finish delivers its change back to the source: through its fork remote, or into a local-only source's history by the recorded `agentfs.fork.sourceState`; while it cannot reach the source it waits and alarms, and never delivers anywhere else. An unlinked fork is independent: it delivers nothing, records no source path, is never finished (`FinishError::Unlinked`) and has no fork status, so DeleteVolume and the release scan treat it as any worktree (§11.5). The owner, asked whether a fork records its source's path to deliver into a no-remote source (.handoff/f8-f12-notes.md, "Answers on the two F8 follow-ups", 2026-10-17): "A fork can be created with or without a remote link back to its parent. Configurable."; on the restated change (fork setting linked or unlinked, default linked, per StorageClass and per CLI fork): "Go". Design choices, not the owner's words: an unlinked fork pushes its own history ref to the remote a linked fork would publish to (the flagged fork remote, else the source's patch remote), so no fork output bypasses an operator's `agentfsForkRemote`; it is local-only when its source is; it keeps the push target and has no patch queue, as every fork; create refuses it, as a linked one, when the source has no fork remote; `link` in an ordinary class is refused. Where it pushes, and create's refusal without a fork remote, superseded 2026-10-17 by "Unlinked fork remotes" |
+| Unlinked fork remotes (2026-10-17) | An unlinked fork never pushes to its source's remotes: not the fork remote, not the patch remote, not the source's other remote sections, and not the source's LFS store. It pushes only to remotes configured for it, the `[remote "<name>"]` sections of its own remotes file (`agentfs.fork.remotes`, fixed at create from `agentfs fork create --remotes FILE` or a fork class's `remotes` profile, which needs `link: unlinked`). With none it is local-only, and deleting it removes its history: DeleteVolume with `onDelete: delete` deletes it unpushed, and the CLI's deletion is removing its state area. The "never remove unpushed history" hold stays for every other volume, linked forks included (§11.5, §14.2). The owner, asked where an unlinked fork pushes, (a) its parent's remote on its own branch or (b) only a remote of its own (.handoff/f8-f12-notes.md, "Answers on the two F8 follow-ups", 2026-10-17): "B. And if no remote is configured, the volume is lost, and that's a choice the user is allowed to make." Design choices, not the owner's words: the remotes are a separate file rather than an include, so which sections are the fork's own needs no provenance tracking; the file may hold only remote sections, `lfs.url` and `lfs.pushurl`, and anything else is refused; a fork class names a profile for it, not a path, as `profile` does; with `onDelete: retain` a local-only unlinked fork is kept; a file whose sections are all invalid waits as any volume does. Resolves §19.2 question 10 |
 | Fork telemetry (2026-10-16) | The finisher reports through §13's existing signals: spans `agentfs.fork.finish` (once, when the finish commit is written) and `agentfs.fork.publish` (one publish call, its outcome and refusal reason, with the pushes inside it), the histogram `agentfs.fork.publish.duration` (seconds from the finish commit to published, one point per fork, written with the published mark), and the events `ForkFinished` and `ForkPublished`, which are not alarms. A fork's lifecycle events (finished, published, abandoned) become INFO log records beside the alarms (`Event::is_logged`), so a fork's life is in the same log as its refusal. Cost: a duration measured from the finish commit's time trusts the node's clock, and a fork retried after a refusal counts the time it waited for the operator. A design choice (forked volumes unit 4), not the owner's words |
 | Forks in history rewrites (2026-10-16) | The history-rewrite runbook covers forks by reachability, not a list: the affected refs are those containing the first commit that recorded the content, in mirror clones of the source's remotes and fork remotes; only forks whose base contains it are abandoned, before the rewrite, and their refs deleted with a lease; forks based earlier keep their ids and publish as before. What agentfs cannot enumerate (delivery targets, receivers' clones, CI caches, retained fork directories) is listed for the operator. Cost: a change based after the bad commit and not yet landed becomes unlandable (`parent_not_in_history`). A design choice (forked volumes unit 4), not the owner's words |
 | Alert rules (2026-10-16) | Milestone F11 ships example alert rules and runbooks, without the Hermes end-to-end test it first planned. Asked whether to (a) drop that test and keep the alert rules and runbooks or (b) keep it, given "Design it, but leave Hermes out of it. We're building an open source project" (2026-10-15), the owner answered "3 a" (2026-10-16, in a Claude Code session). The rules are one Prometheus rules file, `deploy/alerts/agentfs.rules.yml`, with the `PrometheusRule` generated from it and checked in CI, so they have one home; they use the names of Prometheus's default OTLP translation, and each counter rule matches a counter's first sample (§13). The Helm option to install them waits for the chart (F9). Cost: another translation strategy, or a collector that renames metrics, needs the rules edited; the `PrometheusRule` is not applied to a Prometheus Operator in CI. The file layout, names and thresholds are design choices, not the owner's words |
@@ -4506,18 +4531,11 @@ runner.
    verified; a bare repository runs only its own hooks. Open: check each
    forge an operator relies on before choosing `hidden` to keep a
    sandbox's output away from its CI.
-10. **Where an unlinked fork pushes** (§11.5, §19.1 "Fork link"). An
-   unlinked fork pushes its own branch to the remote a linked fork would
-   publish to: the flagged fork remote, else the source's patch remote,
-   so with no flagged section the parent's remote holds every commit of
-   the fork, and a forge that acts on `agentfs/*` branches may treat
-   them as deliveries. It follows the source's profile include, so a
-   local-only source that gains a remote takes its unlinked forks from
-   local-only to pushing there. This is a design choice, not the
-   owner's words ("A fork can be created with or without a remote link
-   back to its parent"), and it was not restated to him. Open, for the
-   owner: should an unlinked fork push to the parent's remote at all, or
-   only to a remote of its own?
+10. **Where an unlinked fork pushes** (§11.5). Resolved 2026-10-17: only
+   to a remote of its own, and with none it is local-only and lost when
+   deleted (§19.1 "Unlinked fork remotes"; the owner: "B. And if no
+   remote is configured, the volume is lost, and that's a choice the
+   user is allowed to make.").
 
 ## 20. Prior art
 

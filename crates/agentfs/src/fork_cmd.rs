@@ -6,7 +6,9 @@
 //!   source's state area, read without the source's lock; the fork reads
 //!   its settings from the source's included files
 //!   ([`agentfs_core::fork::create::settings_files`]). `--link unlinked`
-//!   makes an independent fork, which never delivers to its source.
+//!   makes an independent fork, which never delivers to its source and
+//!   pushes only to the remotes in its own `--remotes` file (none:
+//!   local-only).
 //! - `fork finish` takes the fork's state-area lock, finishes the fork
 //!   once and publishes it to its fork remote, retrying with backoff;
 //!   `--retry` clears a refused publish first. A fork of a local-only
@@ -122,6 +124,12 @@ pub struct CreateArgs {
     /// §11.5). Fixed at create.
     #[arg(long, value_enum, default_value = "linked")]
     pub link: LinkArg,
+    /// With --link unlinked: a config file of the fork's own `[remote
+    /// "<name>"]` sections (agentfs.fork.remotes), read at every open; it
+    /// never pushes to its source's remotes. Without it the fork is
+    /// local-only, and removing its state area loses its history.
+    #[arg(long, value_name = "FILE")]
+    pub remotes: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -667,6 +675,11 @@ fn create_cmd(args: &CreateArgs, state: &StateDir, root: &Path) -> Result<String
             create::unique_name(&prefix)?
         }
     };
+    let remotes = args
+        .remotes
+        .as_deref()
+        .map(std::path::absolute)
+        .transpose()?;
     let identity = create::create(&CreateRequest {
         source: &source,
         fork: state,
@@ -675,15 +688,24 @@ fn create_cmd(args: &CreateArgs, state: &StateDir, root: &Path) -> Result<String
         includes: &includes,
         push_target,
         link: args.link.into(),
+        remotes: remotes.as_deref(),
     })?;
+    let own = Settings::load(&state.git())?.fork_remotes;
     Ok(format!(
         "fork {} of {} at {}{}",
         identity.fork,
         identity.source,
         identity.base,
-        match identity.link {
-            ForkLink::Linked => "",
-            ForkLink::Unlinked => " (unlinked: nothing is delivered to the source)",
+        match (identity.link, own) {
+            (ForkLink::Linked, _) => String::new(),
+            (ForkLink::Unlinked, Some(own)) => format!(
+                " (unlinked: nothing is delivered to the source; it pushes only to the remotes in \
+                 {})",
+                own.display()
+            ),
+            (ForkLink::Unlinked, None) => " (unlinked and local-only: nothing is delivered to the \
+                 source and nothing is pushed; removing it loses its history)"
+                .to_owned(),
         }
     ))
 }

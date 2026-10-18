@@ -915,12 +915,15 @@ fn a_remote_added_to_a_local_only_source_gets_its_forks() {
 }
 
 /// Design §11.5 "Fork link": `fork create --link unlinked` makes an
-/// independent fork. It pushes its own branch where a linked fork would
-/// publish (the flagged `forks` remote here), `fork finish` refuses it and
+/// independent fork. It pushes only to remotes of its own (`--remotes`),
+/// never to its source's (owner, 2026-10-17: "B. And if no remote is
+/// configured, the volume is lost, and that's a choice the user is
+/// allowed to make."): without them it is local-only, even beside the
+/// source's `origin` and flagged `forks`. `fork finish` refuses it and
 /// delivers nothing, and `fork status` says why it has no state. Of a
 /// local-only source, it records no path and is local-only.
 #[test]
-fn an_unlinked_fork_pushes_its_branch_and_never_finishes() {
+fn an_unlinked_fork_pushes_only_to_its_own_remotes_and_never_finishes() {
     let s = Setup::new(true);
     s.record("state", "tree", "a.txt", "a\n");
     let source = s.path("state").display().to_string();
@@ -932,8 +935,58 @@ fn an_unlinked_fork_pushes_its_branch_and_never_finishes() {
         "--link",
         "unlinked",
     ];
-    let out = s.ok("fork", "fork-tree", &unlinked);
+    // Remotes of its own are an unlinked fork's.
+    fs::write(
+        s.path("fork-remotes"),
+        format!("[remote \"mine\"]\n\turl = {}\n", s.url("mine.git")),
+    )
+    .unwrap();
+    Repository::init_bare(s.path("mine.git")).unwrap();
+    let remotes = s.path("fork-remotes").display().to_string();
+    let out = s.agentfs(
+        "linked",
+        "linked-tree",
+        &[
+            "fork",
+            "create",
+            "--source-state",
+            &source,
+            "--remotes",
+            &remotes,
+        ],
+    );
+    assert!(!out.status.success(), "{}", text(&out.stdout));
+    assert!(
+        stderr_of(&out).contains("unlinked fork's"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    // No remote of its own: local-only, the source's remotes untouched.
+    let out = s.ok("lone", "lone-tree", &unlinked);
+    assert!(out.contains("(unlinked and local-only"), "{out}");
+    let lone = out
+        .strip_prefix("fork ")
+        .and_then(|l| l.split(' ').next())
+        .unwrap()
+        .to_owned();
+    s.record("lone", "lone-tree", "b.txt", "b\n");
+    let out = s.ok("lone", "lone-tree", &["push"]);
+    assert_eq!(out.trim(), "local-only: nothing to push");
+    for remote in ["forks.git", "origin.git"] {
+        assert!(
+            s.refs(remote).iter().all(|(r, _)| !r.contains(&lone)),
+            "{remote}: {:?}",
+            s.refs(remote)
+        );
+    }
+
+    // Its own remote, and only that.
+    let mut with_remotes = unlinked.to_vec();
+    with_remotes.extend(["--remotes", &remotes]);
+    let out = s.ok("fork", "fork-tree", &with_remotes);
     assert!(out.contains("(unlinked"), "{out}");
+    assert!(out.contains("fork-remotes"), "{out}");
     let fork = out
         .strip_prefix("fork ")
         .and_then(|l| l.split(' ').next())
@@ -943,6 +996,10 @@ fn an_unlinked_fork_pushes_its_branch_and_never_finishes() {
         s.own_config("fork", "agentfs.fork.link").as_deref(),
         Some("unlinked")
     );
+    assert_eq!(
+        s.own_config("fork", "agentfs.fork.remotes").as_deref(),
+        Some(remotes.as_str())
+    );
     s.record("fork", "fork-tree", "b.txt", "b\n");
     s.ok("fork", "fork-tree", &["push"]);
     let branch = format!("refs/heads/agentfs/{fork}");
@@ -950,7 +1007,8 @@ fn an_unlinked_fork_pushes_its_branch_and_never_finishes() {
         .unwrap()
         .refname_to_id(&branch)
         .unwrap();
-    assert_eq!(s.remote_ref("forks.git", &branch), Some(head));
+    assert_eq!(s.remote_ref("mine.git", &branch), Some(head));
+    assert!(s.remote_ref("forks.git", &branch).is_none());
     assert!(s.remote_ref("origin.git", &branch).is_none());
 
     let out = s.agentfs("fork", "fork-tree", &["fork", "finish"]);
@@ -968,7 +1026,7 @@ fn an_unlinked_fork_pushes_its_branch_and_never_finishes() {
         stderr_of(&out)
     );
     // Nothing delivered, and the fork still records.
-    for remote in ["forks.git", "origin.git"] {
+    for remote in ["forks.git", "origin.git", "mine.git"] {
         assert!(
             s.refs(remote)
                 .iter()

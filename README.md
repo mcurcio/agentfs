@@ -256,7 +256,7 @@ passes its tests, and the Helm charts as `<version>-main.<run>`.
 | Git LFS, databases (the `fsync` class) | Built |
 | The patch queue | Built |
 | Several pods on one volume, and the CSI driver | Built: one node per volume, its worktree on that node's disk; moving is a new volume started from its branch |
-| Forked volumes, linked (delivering their change back to the source) or unlinked (independent) | Built ([forks](docs/forks.md)) |
+| Forked volumes, linked (delivering their change back to the source) or unlinked (independent, pushing only to remotes of its own, or local-only) | Built ([forks](docs/forks.md)) |
 | Docker examples, Helm charts, example alert rules | Built and tested in CI |
 | Node-local worktrees, one branch each, with any remote as the backend | Built (CSI driver) |
 | Local-only volumes (no remote section), whose forks publish into their own history | Built ([configuration](docs/configuration.md#remotes-modes)) |

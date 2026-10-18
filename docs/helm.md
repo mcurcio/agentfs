@@ -57,11 +57,15 @@ storageClasses:
       onDelete: retain
   # A fork class (csi.md §14): claims cloning an `agentfs` claim. `link:
   # unlinked` makes independent forks that never deliver back to their
-  # source; omit it (or `linked`) for forks that do.
+  # source and never push to its remotes; omit it (or `linked`) for forks
+  # that do deliver. `remotes` names the profile holding the forks' own
+  # remotes (`profiles.sandbox-remotes.config`); without it they are
+  # local-only, and deleting a claim deletes its history.
   - name: agentfs-sandbox
     parameters:
       fork: "true"
       link: unlinked
+      remotes: sandbox-remotes
 ```
 
 The release notes (`helm status`) warn when the namespace enforces a Pod

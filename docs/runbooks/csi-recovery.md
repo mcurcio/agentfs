@@ -175,8 +175,16 @@ This is the design working (design §11.5, [csi.md §14](../csi.md#14-forks)):
 a linked fork (the default) is deleted only once its fork remote holds
 its change and finish refs. An unlinked fork (`link: unlinked` in its
 class) never answers this way: it is never finished, and its
-DeleteVolume waits only as any worktree's does, while a remote lacks its
-head ([A claim that will not delete](#a-claim-that-will-not-delete)). The node plugin's release scan runs `agentfs fork finish` for it at
+DeleteVolume waits only as any worktree's does, while one of its own
+remotes (its class's `remotes` profile) lacks its head ([A claim that
+will not delete](#a-claim-that-will-not-delete)). With no remote of its
+own it never waits: `onDelete: delete`, a fork class's default, removes
+it with its history, and `retain` keeps it on the node. Recover such a
+fork's history only before deleting its claim: copy
+`<basePath>/<pv>/state` off the node, or give the class a `remotes`
+profile for the forks made after (the profile path is fixed in each
+fork's identity at create, so a fork made without one stays
+local-only). The node plugin's release scan runs `agentfs fork finish` for it at
 start and every `--release-scan-interval`; the finisher retries with
 backoff until the remote takes the push, or refuses it for good. First
 look at the fork, in the node plugin pod (no lock, no network):

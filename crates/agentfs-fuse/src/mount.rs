@@ -173,17 +173,19 @@ pub enum PreflightError {
         outer: &'static str,
         outer_path: PathBuf,
     },
-    /// An operator config fragment (`include.path`, design §4.3) is under
-    /// the backing tree or the mount point: the workload could rewrite the
-    /// operator's settings and remotes.
+    /// An operator config fragment (`include.path`, design §4.3, or an
+    /// unlinked fork's `agentfs.fork.remotes`, §11.5) is under the backing
+    /// tree or the mount point: the workload could rewrite the operator's
+    /// settings and remotes.
     #[error(
-        "include.path {} is inside {outer} {}, where the workload could change the \
+        "{key} {} is inside {outer} {}, where the workload could change the \
          operator's settings; keep config fragments outside the backing tree and the mount \
          point",
         path.display(),
         outer_path.display()
     )]
     IncludeExposed {
+        key: &'static str,
         path: PathBuf,
         outer: &'static str,
         outer_path: PathBuf,
@@ -357,11 +359,19 @@ fn check_layout(
             }
         }
     }
-    for include in &settings.includes {
+    // An unlinked fork's own remotes file is settings as an include is.
+    let fragments = (settings.includes.iter().map(|p| ("include.path", p))).chain(
+        settings
+            .fork_remotes
+            .iter()
+            .map(|p| (agentfs_core::fork::identity::REMOTES_KEY, p)),
+    );
+    for (key, include) in fragments {
         let path = canonical_any(include);
         for (outer, outer_path) in [(BACKING, &backing), (MOUNTPOINT, &mountpoint)] {
             if path.starts_with(outer_path) {
                 return Err(PreflightError::IncludeExposed {
+                    key,
                     path,
                     outer,
                     outer_path: outer_path.clone(),
@@ -1240,6 +1250,17 @@ mod tests {
             );
             assert!(err.to_string().contains("include.path"), "{err}");
         }
+        // An unlinked fork's own remotes file likewise (design §11.5).
+        s.includes = vec![l.p("operator.conf")];
+        s.fork_remotes = Some(l.p("operator-remotes.conf"));
+        l.check_with("state", "backing", "mnt", &s).unwrap();
+        s.fork_remotes = Some(l.p("backing/remotes.conf"));
+        let err = l.check_with("state", "backing", "mnt", &s).unwrap_err();
+        assert!(
+            matches!(&err, PreflightError::IncludeExposed { key, outer, .. }
+                if *key == "agentfs.fork.remotes" && *outer == BACKING),
+            "{err}"
+        );
     }
 
     #[test]

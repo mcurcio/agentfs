@@ -14,6 +14,10 @@ pub const BASE_KEY: &str = "agentfs.fork.base";
 pub const PUSH_TARGET_KEY: &str = "agentfs.fork.pushTarget";
 /// `agentfs.fork.link`: `linked` (unset) or `unlinked` ([`ForkLink`]).
 pub const LINK_KEY: &str = "agentfs.fork.link";
+/// `agentfs.fork.remotes`: an unlinked fork's own remotes, an absolute
+/// path to a config file of `[remote "<name>"]` sections (design §11.5,
+/// §19.1 "Unlinked fork remotes"); unset, the fork is local-only.
+pub const REMOTES_KEY: &str = "agentfs.fork.remotes";
 
 /// Whether a fork delivers back to its source, fixed at create (design
 /// §11.5; §19.1 "Fork link", 2026-10-17). The owner: "A fork can be

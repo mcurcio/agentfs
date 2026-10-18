@@ -108,8 +108,8 @@ pub enum ConfigError {
     BadForkBase { key: String, value: String },
     #[error(
         "agentfs.fork.source and agentfs.fork.base must be set together, and \
-         agentfs.fork.pushTarget, agentfs.fork.link and agentfs.fork.sourceState only with \
-         them"
+         agentfs.fork.pushTarget, agentfs.fork.link, agentfs.fork.sourceState and \
+         agentfs.fork.remotes only with them"
     )]
     PartialForkIdentity,
     #[error(
@@ -117,6 +117,26 @@ pub enum ConfigError {
          to its source and records no path to it"
     )]
     UnlinkedSourceState,
+    #[error(
+        "agentfs.fork.remotes is set in a linked fork: a linked fork pushes only to its fork \
+         remote; remotes of its own are an unlinked fork's (fork create --link unlinked)"
+    )]
+    LinkedForkRemotes,
+    #[error(
+        "agentfs.fork.remotes: {} cannot be read ({source}); create it (it may hold no \
+         remote section), or the fork cannot open",
+        path.display()
+    )]
+    ForkRemotesUnreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(
+        "agentfs.fork.remotes: {} sets {key}; an unlinked fork's remotes file holds only \
+         [remote \"<name>\"] sections (without agentfsForkRemote), lfs.url and lfs.pushurl",
+        path.display()
+    )]
+    ForkRemotesKey { path: PathBuf, key: String },
     #[error("agentfs.branch is set in a fork's config; a fork's push target is fixed at create")]
     ForkBranch,
     #[error("agentfs.start.remote, .branch and .commit must be set together")]
@@ -181,6 +201,7 @@ pub const KEYS: &[&str] = &[
     "agentfs.fork.pushTarget",
     "agentfs.fork.link",
     "agentfs.fork.sourceState",
+    "agentfs.fork.remotes",
     "agentfs.start.remote",
     "agentfs.start.branch",
     "agentfs.start.commit",
@@ -475,9 +496,18 @@ pub struct Settings {
     /// resolves to (design §19.1, gate answer Q1 b), else `None`. `None`
     /// too when a flagged section is invalid or more than one is flagged:
     /// a fork never falls back past the operator's choice. Always `None`
-    /// in an unlinked fork, which delivers nothing ([`ForkLink`]); its
-    /// `remotes` are still the remote a linked fork would publish to.
+    /// in an unlinked fork, which delivers nothing ([`ForkLink`]) and
+    /// pushes only to its own remotes ([`Settings::fork_remotes`]).
     pub fork_remote: Option<ForkRemote>,
+    /// An unlinked fork's own remotes file (`agentfs.fork.remotes`,
+    /// written at create from the fork's own config only, like the fork
+    /// identity): its push remotes, and its `lfs.url` and `lfs.pushurl`,
+    /// come from this file alone, never from its source's settings
+    /// (design §11.5; owner, 2026-10-17: "B. And if no remote is
+    /// configured, the volume is lost, and that's a choice the user is
+    /// allowed to make."). `None` for any other volume, and for an
+    /// unlinked fork with no remotes of its own, which is local-only.
+    pub fork_remotes: Option<PathBuf>,
     /// A fork of a local-only source: the source's state area
     /// (`agentfs.fork.sourceState`, written at create from the fork's own
     /// config only, like the fork identity), into whose history the fork
@@ -498,8 +528,10 @@ pub struct Settings {
 /// zero remotes"): a volume with no push section is local-only, and one
 /// that gains a section later pushes everything. Push sections and the
 /// flagged fork-remote section are disjoint inputs, so the two cannot
-/// disagree. A fork's mode follows its fork remote: `Pushed` with that one
-/// remote, `NoneValid` when a flagged section is invalid, else `LocalOnly`.
+/// disagree. A linked fork's mode follows its fork remote: `Pushed` with
+/// that one remote, `NoneValid` when a flagged section is invalid, else
+/// `LocalOnly`; an unlinked fork's follows its own remotes file
+/// ([`Settings::fork_remotes`]), `LocalOnly` without one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Remotes {
     /// One or more valid push sections, sorted by name; invalid sections
@@ -608,6 +640,14 @@ impl Settings {
     pub fn is_fork(&self) -> bool {
         self.fork.is_some()
     }
+
+    /// Whether this volume is an unlinked fork (design §11.5,
+    /// [`ForkLink::Unlinked`]).
+    pub fn is_unlinked_fork(&self) -> bool {
+        self.fork
+            .as_ref()
+            .is_some_and(|f| f.link == ForkLink::Unlinked)
+    }
 }
 
 /// `setting` against the valid `remotes` and the `invalid` sections;
@@ -705,6 +745,65 @@ fn source_state_of(
     }
 }
 
+/// `agentfs.fork.remotes` (design §11.5): an absolute path, set only
+/// beside an unlinked fork's identity.
+fn fork_remotes_of(
+    config: &git2::Config,
+    fork: Option<&ForkIdentity>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let key = fork_identity::REMOTES_KEY;
+    match string(config, key)? {
+        None => Ok(None),
+        Some(_) if fork.is_none() => Err(ConfigError::PartialForkIdentity),
+        Some(_) if fork.is_some_and(|f| f.link == ForkLink::Linked) => {
+            Err(ConfigError::LinkedForkRemotes)
+        }
+        Some(value) if !Path::new(&value).is_absolute() => Err(ConfigError::RelativePath {
+            key: key.into(),
+            value,
+        }),
+        Some(value) => Ok(Some(PathBuf::from(value))),
+    }
+}
+
+/// An unlinked fork's remotes file, opened alone (no source setting
+/// reaches it): a readable regular file holding only `[remote "<name>"]`
+/// sections without `agentfsForkRemote` (forks of forks are not
+/// supported), `lfs.url` and `lfs.pushurl`. Anything else is refused, so
+/// a setting put there by mistake fails loudly rather than being ignored.
+fn open_fork_remotes(path: &Path) -> Result<git2::Config, ConfigError> {
+    let readable = std::fs::File::open(path).and_then(|file| {
+        if file.metadata()?.is_file() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("not a regular file"))
+        }
+    });
+    if let Err(source) = readable {
+        return Err(ConfigError::ForkRemotesUnreadable {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    let file = git2::Config::open(path)?;
+    let mut entries = file.entries(None)?;
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        let name = String::from_utf8_lossy(entry.name_bytes()).into_owned();
+        let lower = name.to_ascii_lowercase();
+        let allowed = matches!(lower.as_str(), "lfs.url" | "lfs.pushurl")
+            || (lower.starts_with("remote.") && !lower.ends_with(".agentfsforkremote"));
+        if !allowed {
+            return Err(ConfigError::ForkRemotesKey {
+                path: path.to_path_buf(),
+                key: name,
+            });
+        }
+    }
+    drop(entries);
+    Ok(file)
+}
+
 /// The start point in `config` (F8 S1): the three `agentfs.start.*` keys
 /// or none, read as [`StartPoint::parse`] reads a StorageClass's
 /// `startFrom`, so both spellings have one validator.
@@ -761,10 +860,9 @@ struct SplitRemotes {
 /// What [`split_remotes`] weighs beside the sections.
 struct SplitInputs<'a> {
     patch_remote: &'a PatchRemote,
-    /// The volume is a fork.
+    /// The volume is a linked fork (an unlinked one never splits: it has
+    /// only its own remotes).
     fork: bool,
-    /// The fork is unlinked ([`ForkLink::Unlinked`]).
-    unlinked: bool,
     /// The fork records its local-only source's state area.
     source_history: bool,
 }
@@ -813,18 +911,15 @@ fn split_remotes(
             }
             Some(ForkRemote::SourceHistory) => Remotes::LocalOnly,
             None if any_flagged_invalid => Remotes::NoneValid,
-            // Nowhere to push: an unlinked fork of a local-only source
-            // (it records no path to it, design §11.5), or a fork whose
-            // source's include lost its remote.
+            // Nowhere to push: a fork whose source's include lost its
+            // remote.
             None => Remotes::LocalOnly,
         };
         return SplitRemotes {
             remotes,
             // An unflagged section is not a fork's remote: nothing to raise.
             invalid: invalid.into_iter().filter(|r| r.fork_remote).collect(),
-            // An unlinked fork pushes its history where a linked one would
-            // publish, and delivers nothing: it has no fork remote.
-            fork_remote: fork_remote.filter(|_| !inputs.unlinked),
+            fork_remote,
         };
     }
     let remotes = mode_of(own, &invalid);
@@ -859,6 +954,7 @@ pub fn declares_fork(git_dir: &Path) -> Result<bool, git2::Error> {
         fork_identity::BASE_KEY,
         fork_identity::PUSH_TARGET_KEY,
         fork_identity::LINK_KEY,
+        fork_identity::REMOTES_KEY,
         crate::fork::receive::SOURCE_STATE_KEY,
     ] {
         if is_set(&config, key)? {
@@ -893,6 +989,21 @@ impl Settings {
             ),
         };
         let defaults = Templates::default();
+        let unlinked = fork.as_ref().is_some_and(|f| f.link == ForkLink::Unlinked);
+        let fork_remotes = fork_remotes_of(config, fork.as_ref())?;
+        let fork_remotes_file = fork_remotes.as_deref().map(open_fork_remotes).transpose()?;
+        // Where the remote sections and the global LFS endpoints are read:
+        // an unlinked fork's own remotes file, or nothing, never its
+        // source's settings (design §11.5); every other volume's config.
+        let remotes_config = if unlinked {
+            fork_remotes_file.as_ref()
+        } else {
+            Some(config)
+        };
+        let lfs_url = |key| match remotes_config {
+            Some(c) => string(c, key),
+            None => Ok(None),
+        };
         let (concurrent_transfers, concurrent_transfers_error) = concurrent_transfers(config)?;
         let lfs = LfsSettings {
             threshold: match int(config, "agentfs.lfsThreshold")? {
@@ -905,8 +1016,8 @@ impl Settings {
                     });
                 }
             },
-            url: string(config, "lfs.url")?,
-            push_url: string(config, "lfs.pushurl")?,
+            url: lfs_url("lfs.url")?,
+            push_url: lfs_url("lfs.pushurl")?,
             concurrent_transfers,
             concurrent_transfers_error,
         };
@@ -921,7 +1032,10 @@ impl Settings {
                 .to_string()
             }),
         };
-        let (valid, invalid) = remotes(config, &lfs, &http_proxy)?;
+        let (valid, invalid) = match remotes_config {
+            Some(c) => remotes(c, &lfs, &http_proxy)?,
+            None => (Vec::new(), Vec::new()),
+        };
         let patch_remote = match string(config, "agentfs.patchRemote")?.as_deref() {
             None | Some("") => PatchRemote::Auto,
             Some("none") => PatchRemote::Disabled,
@@ -931,16 +1045,25 @@ impl Settings {
             }
         };
         let source_state = source_state_of(config, fork.as_ref())?;
-        let split = split_remotes(
-            valid,
-            invalid,
-            &SplitInputs {
-                patch_remote: &patch_remote,
-                fork: fork.is_some(),
-                unlinked: fork.as_ref().is_some_and(|f| f.link == ForkLink::Unlinked),
-                source_history: source_state.is_some(),
-            },
-        );
+        let split = if unlinked {
+            // Its own sections only, and no fork remote: it delivers
+            // nothing.
+            SplitRemotes {
+                remotes: mode_of(valid, &invalid),
+                invalid,
+                fork_remote: None,
+            }
+        } else {
+            split_remotes(
+                valid,
+                invalid,
+                &SplitInputs {
+                    patch_remote: &patch_remote,
+                    fork: fork.is_some(),
+                    source_history: source_state.is_some(),
+                },
+            )
+        };
         let fork_refs = push_target(config, "agentfs.forkRefs")?.unwrap_or_default();
         Ok(Self {
             branch_ref,
@@ -984,6 +1107,7 @@ impl Settings {
             remotes: split.remotes,
             invalid_remotes: split.invalid,
             fork_remote: split.fork_remote,
+            fork_remotes,
             source_state,
             fork_refs,
             fork,
@@ -1047,6 +1171,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
             fork_identity::BASE_KEY,
             fork_identity::PUSH_TARGET_KEY,
             fork_identity::LINK_KEY,
+            fork_identity::REMOTES_KEY,
             crate::fork::receive::SOURCE_STATE_KEY,
             fork_identity::START_REMOTE_KEY,
             fork_identity::START_BRANCH_KEY,
@@ -2657,10 +2782,10 @@ mod tests {
     }
 
     /// A fork's link (design §11.5, §19.1 "Fork link"): its own config's,
-    /// `linked` when unset. An unlinked fork has no fork remote, pushes
-    /// its history where a linked one would publish, is local-only with no
-    /// section at all, and may not record a source path. Any other value
-    /// is `BadChoice`, and `link` alone is a partial identity.
+    /// `linked` when unset. An unlinked fork has no fork remote, never
+    /// takes its source's sections (flagged or not), is local-only without
+    /// remotes of its own, and may not record a source path. Any other
+    /// value is `BadChoice`, and `link` alone is a partial identity.
     #[test]
     fn fork_links() {
         let link = |extra: &str| {
@@ -2677,24 +2802,24 @@ mod tests {
         let unlinked = "[agentfs \"fork\"]\n\tlink = unlinked\n";
         let s = link(&format!("{unlinked}{origin}")).unwrap();
         assert_eq!(s.fork.as_ref().unwrap().link, ForkLink::Unlinked);
+        assert!(s.is_unlinked_fork() && !linked.is_unlinked_fork());
         assert_eq!(s.fork_remote, None);
+        assert_eq!(s.fork_remotes, None);
         assert_eq!(s.branch_ref, "refs/heads/agentfs/f-1");
-        let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["origin"]);
         assert_eq!(s.patch_remote(), None);
-        // A flagged section: the fork remote, never the source's own.
+        // Never the source's sections (owner, 2026-10-17: "B."): not its
+        // patch remote, not its flagged fork remote, not its branch
+        // remotes, and not their alarms. With none of its own it is
+        // local-only.
         let flagged = "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n";
-        let s = link(&format!("{unlinked}{origin}{flagged}")).unwrap();
-        assert_eq!(s.remotes.pushed()[0].name, "forks");
-        assert_eq!(s.fork_remote, None);
-        // No section, or two unflagged and no patch remote: nothing to
-        // push to, local-only, as a linked fork.
-        assert_eq!(link(unlinked).unwrap().remotes, Remotes::LocalOnly);
         let two = "[remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n";
-        assert_eq!(
-            link(&format!("{unlinked}{two}")).unwrap().remotes,
-            Remotes::LocalOnly
-        );
+        let bad = "[remote \"bad\"]\n\turl = /x\n\tagentfsCredentials = relative\n";
+        for sections in ["", origin, flagged, two, bad] {
+            let s = link(&format!("{unlinked}{origin}{sections}")).unwrap();
+            assert_eq!(s.remotes, Remotes::LocalOnly, "{sections}");
+            assert!(s.invalid_remotes.is_empty(), "{sections}");
+        }
+        assert_eq!(link(unlinked).unwrap().remotes, Remotes::LocalOnly);
         assert_eq!(link("").unwrap().remotes, Remotes::LocalOnly);
         assert!(matches!(
             link(&format!("{unlinked}\tsourceState = /srv/src/state\n")),
@@ -2712,6 +2837,96 @@ mod tests {
         }
         let (_d, c) =
             config_with("[agentfs]\n\tvolume = f\n[agentfs \"fork\"]\n\tlink = unlinked\n");
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::PartialForkIdentity)
+        ));
+    }
+
+    /// An unlinked fork's own remotes (design §11.5, `agentfs.fork.remotes`):
+    /// the sections of its remotes file alone, with that file's `lfs.url`
+    /// and `lfs.pushurl` and never the source's; anything else in the file,
+    /// a file that cannot be read, a relative path and the key in a linked
+    /// fork or a non-fork are refused.
+    #[test]
+    fn an_unlinked_forks_own_remotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fork-remotes.config");
+        let source = "[lfs]\n\turl = http://lfs.example/source\n\
+                      [remote \"origin\"]\n\turl = /o\n";
+        let load = |link: &str, body: Option<&str>| {
+            if let Some(body) = body {
+                std::fs::write(&file, body).unwrap();
+            }
+            let (_d, c) = config_with(&fork_config(&format!(
+                "\tlink = {link}\n\tremotes = {}\n{source}",
+                file.display()
+            )));
+            Settings::from_config(&c)
+        };
+        let own = "[remote \"mine\"]\n\turl = /m\n[remote \"also\"]\n\turl = /a\n";
+        let s = load("unlinked", Some(own)).unwrap();
+        assert_eq!(s.fork_remotes.as_deref(), Some(file.as_path()));
+        let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["also", "mine"]);
+        assert_eq!(s.fork_remote, None);
+        assert_eq!(
+            s.lfs.url, None,
+            "the source's LFS store is never the fork's"
+        );
+        let s = load(
+            "unlinked",
+            Some("[lfs]\n\turl = http://lfs.example/fork\n[remote \"mine\"]\n\turl = /m\n"),
+        )
+        .unwrap();
+        assert_eq!(s.lfs.url.as_deref(), Some("http://lfs.example/fork"));
+        // Remotes come and go: an empty file is local-only, a bad section
+        // alarms as any volume's.
+        assert_eq!(
+            load("unlinked", Some("")).unwrap().remotes,
+            Remotes::LocalOnly
+        );
+        let s = load(
+            "unlinked",
+            Some("[remote \"bad\"]\n\turl = /x\n\tagentfsCredentials = relative\n"),
+        )
+        .unwrap();
+        assert_eq!(s.remotes, Remotes::NoneValid);
+        assert_eq!(s.invalid_remotes[0].name, "bad");
+        for body in [
+            "[remote \"f\"]\n\turl = /f\n\tagentfsForkRemote = true\n",
+            "[agentfs]\n\tcommitWindow = 1s\n",
+            "[http]\n\tproxy = http://p.example:3128\n",
+            "[include]\n\tpath = /etc/other\n",
+        ] {
+            assert!(
+                matches!(
+                    load("unlinked", Some(body)),
+                    Err(ConfigError::ForkRemotesKey { ref path, .. }) if *path == file
+                ),
+                "{body}"
+            );
+        }
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(
+            load("unlinked", None),
+            Err(ConfigError::ForkRemotesUnreadable { .. })
+        ));
+        assert!(matches!(
+            load("linked", Some(own)),
+            Err(ConfigError::LinkedForkRemotes)
+        ));
+        let (_d, c) = config_with(&fork_config(
+            "\tlink = unlinked\n\tremotes = fork-remotes.config\n",
+        ));
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::RelativePath { ref key, .. }) if key == "agentfs.fork.remotes"
+        ));
+        let (_d, c) = config_with(&format!(
+            "[agentfs]\n\tvolume = v\n[agentfs \"fork\"]\n\tremotes = {}\n",
+            file.display()
+        ));
         assert!(matches!(
             Settings::from_config(&c),
             Err(ConfigError::PartialForkIdentity)

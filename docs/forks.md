@@ -38,10 +38,16 @@ agentfs patch submit --volume src <change commit>
   the source as above, and while it cannot reach the source it waits and
   alarms, never delivering anywhere else. `fork create --link unlinked`
   (or `link: unlinked` in a fork StorageClass) makes an independent fork
-  instead: it pushes its own branch where a linked fork would publish,
-  and nothing is ever delivered to the source. It is never finished
-  (`fork finish` refuses it), records no path to a local-only source and
-  is then local-only itself. The link is fixed at create
+  instead: nothing is ever delivered to the source, and it never pushes
+  to the source's remotes, its fork remote included. It pushes its own
+  branch only to remotes of its own: `fork create --link unlinked
+  --remotes FILE` (a config file of `[remote "<name>"]` sections), or a
+  fork class's `remotes: <profile>` (that profile's config). Without
+  them it is local-only, and deleting it deletes its history: the
+  owner's choice, "if no remote is configured, the volume is lost, and
+  that's a choice the user is allowed to make" (2026-10-17). It is never
+  finished (`fork finish` refuses it) and records no path to a local-only
+  source. The link and the remotes file's path are fixed at create
   ([design §11.5](design.md#115-forks), "The link").
 - Under CSI, a claim with a `dataSource` claim on a fork StorageClass
   (`fork: "true"`, reclaim policy `Delete`) is a fork; deleting it

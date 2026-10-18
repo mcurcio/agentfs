@@ -249,7 +249,8 @@ pub fn reopen_error(layout: &Layout, node_id: &str, e: volume::VolumeError) -> E
 /// Creates a fork of `source_handle` (CreateVolume with a fork class,
 /// design §11.5): directories as [`create`], then
 /// [`agentfs_core::fork::create::create`] with the source profile's config
-/// as the fork's include, the source's profile rules, and `csi.json`
+/// as the fork's include, an unlinked fork class's `remotes` profile's
+/// config as its own remotes, the source's profile rules, and `csi.json`
 /// last. The source is read without its lock, so it may be in use; it
 /// must be on this node (`FAILED_PRECONDITION` otherwise: a fork's pod
 /// needs affinity to its source's pods).
@@ -270,6 +271,13 @@ pub fn create_fork(
     };
     let params = class.params(&source.params);
     let config = profile_config(layout, &params.profile)?;
+    // An unlinked fork's own remotes: its `remotes` profile's config,
+    // which must exist, as the source's.
+    let remotes = class
+        .remotes
+        .as_deref()
+        .map(|profile| profile_config(layout, profile))
+        .transpose()?;
     make_dirs(layout, handle)?;
     let state = StateDir::new(layout.state(handle));
     let lock = lock(&state, "agentfs-csi create")?;
@@ -283,6 +291,7 @@ pub fn create_fork(
         includes: &[config],
         push_target,
         link: class.link,
+        remotes: remotes.as_deref(),
     })
     .map_err(create_error)?;
     drop(lock);
@@ -306,7 +315,9 @@ pub fn create_error(e: CreateError) -> Error {
         | CreateError::NoForkRemote { .. }
         | CreateError::SourceSettingsNotIncluded { .. }
         | CreateError::LfsObjectMissing { .. } => Error::FailedPrecondition(message),
-        CreateError::BadName { .. } => Error::InvalidArgument(message),
+        CreateError::BadName { .. }
+        | CreateError::RemotesNeedUnlinked
+        | CreateError::RemotesNotAbsolute { .. } => Error::InvalidArgument(message),
         CreateError::Exists { .. } => Error::AlreadyExists(message),
         CreateError::SourceUnreadable(_) => Error::Unavailable(message),
         _ => Error::Internal(message),

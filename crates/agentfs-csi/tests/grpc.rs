@@ -1417,12 +1417,23 @@ async fn create_volume_takes_a_profile_without_remotes() {
 /// Owner, 2026-10-17: "A fork can be created with or without a remote link
 /// back to its parent. Configurable." A fork class's `link` reaches the
 /// fork's identity at CreateVolume. An unlinked fork has no fork status:
-/// DeleteVolume never asks it to finish, and treats it as any worktree,
-/// asking its remote, then applying `onDelete`.
+/// DeleteVolume never asks it to finish. On where it pushes (owner,
+/// 2026-10-17): "B. And if no remote is configured, the volume is lost,
+/// and that's a choice the user is allowed to make." With its class's
+/// `remotes` profile it pushes there only, never to its source's remote,
+/// and DeleteVolume asks that remote; without one it is local-only and
+/// DeleteVolume removes it unpushed.
 #[tokio::test]
 async fn a_fork_class_link_reaches_the_fork() {
     let d = Driver::start().await;
-    d.remote_profile("r", "");
+    let source_remote = d.remote_profile("r", "");
+    let own_remote = d.dir.path().join("mine.git");
+    git2::Repository::init_bare(&own_remote).unwrap();
+    fs::write(
+        d.layout.profiles.join("mine.config"),
+        format!("[remote \"mine\"]\n\turl = {}\n", own_remote.display()),
+    )
+    .unwrap();
     let mut c = d.controller();
     c.create_volume(create_req(
         "src",
@@ -1440,10 +1451,11 @@ async fn a_fork_class_link_reaches_the_fork() {
         let settings = agentfs_core::config::Settings::load(&state.git()).unwrap();
         settings.fork.unwrap().link
     };
-    for (handle, link) in [
-        ("fork-default", None),
-        ("fork-linked", Some("linked")),
-        ("fork-unlinked", Some("unlinked")),
+    for (handle, link, remotes) in [
+        ("fork-default", None, None),
+        ("fork-linked", Some("linked"), None),
+        ("fork-unlinked", Some("unlinked"), None),
+        ("fork-own", Some("unlinked"), Some("mine")),
     ] {
         let mut params = vec![
             ("fork", "true"),
@@ -1452,6 +1464,7 @@ async fn a_fork_class_link_reaches_the_fork() {
             ("csi.storage.k8s.io/pv/name", handle),
         ];
         params.extend(link.map(|l| ("link", l)));
+        params.extend(remotes.map(|r| ("remotes", r)));
         let mut req = create_req(handle, &params);
         req.volume_content_source = clone_of("src");
         c.create_volume(req).await.unwrap();
@@ -1461,27 +1474,42 @@ async fn a_fork_class_link_reaches_the_fork() {
     assert_eq!(link_of("fork-linked"), ForkLink::Linked);
     assert_eq!(link_of("fork-unlinked"), ForkLink::Unlinked);
 
-    // The unlinked fork: never asked to finish; its remote is asked.
-    let state = agentfs_core::volume::StateDir::new(d.layout.state("fork-unlinked"));
+    // The unlinked fork with its own remote: never asked to finish; that
+    // remote, and only that, is asked and pushed to.
+    let state = agentfs_core::volume::StateDir::new(d.layout.state("fork-own"));
     let branch = agentfs_core::config::Settings::load(&state.git())
         .unwrap()
         .branch_ref;
     commit(&state.git(), &branch, &[("b.txt", "the fork's\n")]);
-    let err = c
-        .delete_volume(delete_req("fork-unlinked"))
-        .await
-        .unwrap_err();
+    let err = c.delete_volume(delete_req("fork-own")).await.unwrap_err();
     assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
     assert!(
-        err.message().contains("remote origin does not hold"),
+        err.message().contains("remote mine does not hold"),
         "{}",
         err.message()
     );
-    let record = agentfs_csi::volume::load(&d.layout, "fork-unlinked")
+    let record = agentfs_csi::volume::load(&d.layout, "fork-own")
         .unwrap()
         .unwrap();
     assert!(!record.finish_requested, "an unlinked fork never finishes");
-    push(&d.layout, "fork-unlinked");
+    push(&d.layout, "fork-own");
+    let on = |remote: &Path| {
+        git2::Repository::open_bare(remote)
+            .unwrap()
+            .refname_to_id(&branch)
+            .ok()
+    };
+    assert!(on(&own_remote).is_some());
+    assert_eq!(on(&source_remote), None, "never the source's remote");
+    c.delete_volume(delete_req("fork-own")).await.unwrap();
+    assert!(!d.layout.volume_dir("fork-own").exists());
+
+    // No remote of its own: local-only, so DeleteVolume removes it with
+    // its unpushed commit (the class's onDelete defaults to delete).
+    let state = agentfs_core::volume::StateDir::new(d.layout.state("fork-unlinked"));
+    let settings = agentfs_core::config::Settings::load(&state.git()).unwrap();
+    assert_eq!(settings.remotes, agentfs_core::config::Remotes::LocalOnly);
+    commit(&state.git(), &settings.branch_ref, &[("b.txt", "lost\n")]);
     c.delete_volume(delete_req("fork-unlinked")).await.unwrap();
     assert!(!d.layout.volume_dir("fork-unlinked").exists());
     d.stop().await;

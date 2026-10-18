@@ -14,6 +14,7 @@
 //! | `startFrom` | `<remote>:<branch>@<commit>`: the new worktree starts from that commit of another worktree's branch (F8 R2; [`StartPoint`]) |
 //! | `fork` | `"true"`: a fork class ([`ForkClass`], design §11.5); `"false"` or absent: an ordinary one |
 //! | `link` | a fork class only: `linked` (default: the fork's finish delivers its change back to the source) or `unlinked` (an independent fork, nothing ever delivered; [`ForkLink`]) |
+//! | `remotes` | a fork class with `link: unlinked` only: a profile whose `<remotes>.config` holds the fork's own `[remote "<name>"]` sections (`agentfs.fork.remotes`); without it the fork is local-only, and DeleteVolume with `onDelete: delete` removes it unpushed |
 //!
 //! Keys under `csi.storage.k8s.io/` (the provisioner's metadata) are read
 //! for the template and otherwise ignored; any other key is refused,
@@ -71,7 +72,7 @@ pub enum ParamError {
     BadProfile(String),
     #[error(
         "unknown StorageClass parameter {0:?} (known: profile, volumeName, onDelete, startFrom, \
-         workloadMounts, fork, link; a worktree's branch is always agentfs/<volume>)"
+         workloadMounts, fork, link, remotes; a worktree's branch is always agentfs/<volume>)"
     )]
     UnknownKey(String),
     #[error(
@@ -108,8 +109,13 @@ pub enum ParamError {
     BadFork(String),
     #[error("link {0:?} must be \"linked\" or \"unlinked\"")]
     BadLink(String),
-    #[error("link is a fork class's parameter (fork: \"true\"); an ordinary class has no source")]
-    LinkWithoutFork,
+    #[error("{0} is a fork class's parameter (fork: \"true\"); an ordinary class has no source")]
+    ForkOnly(&'static str),
+    #[error(
+        "remotes is an unlinked fork class's parameter (link: unlinked): a linked fork pushes \
+         only to its source's fork remote"
+    )]
+    RemotesNeedUnlinked,
     /// Any class: volumeName must contain {pvName} (rule 1).
     #[error(
         "volumeName {template:?} must contain {{pvName}}, so each claim is a worktree with its \
@@ -162,7 +168,8 @@ impl VolumeParams {
                 // An ordinary class may say so; a fork class is a ForkClass.
                 "fork" if value == "false" => {}
                 "fork" => return Err(ParamError::BadFork(value.clone())),
-                "link" => return Err(ParamError::LinkWithoutFork),
+                "link" => return Err(ParamError::ForkOnly("link")),
+                "remotes" => return Err(ParamError::ForkOnly("remotes")),
                 k if k.starts_with(CO_PREFIX) => {}
                 other => return Err(ParamError::UnknownKey(other.to_owned())),
             }
@@ -319,6 +326,9 @@ pub struct ForkClass {
     /// `link`: whether the fork delivers back to its source, written into
     /// its identity at create and never changed after (design §11.5).
     pub link: ForkLink,
+    /// `remotes`: an unlinked fork's own remotes, the profile whose
+    /// `.config` holds them (design §11.5); `None`, it is local-only.
+    pub remotes: Option<String>,
 }
 
 impl ForkClass {
@@ -340,12 +350,17 @@ impl ForkClass {
         let mut on_delete = OnDelete::Delete;
         let mut workload_mounts = Vec::new();
         let mut link = ForkLink::default();
+        let mut remotes = None;
         for (key, value) in parameters {
             match key.as_str() {
                 "fork" => {}
                 "link" => {
                     link =
                         ForkLink::parse(value).ok_or_else(|| ParamError::BadLink(value.clone()))?;
+                }
+                "remotes" => {
+                    validate_profile(value)?;
+                    remotes = Some(value.clone());
                 }
                 "profile" => return Err(ParamError::ForkClassSets("profile")),
                 "branch" => return Err(ParamError::ForkClassSets("branch")),
@@ -357,11 +372,15 @@ impl ForkClass {
                 other => return Err(ParamError::UnknownKey(other.to_owned())),
             }
         }
+        if remotes.is_some() && link == ForkLink::Linked {
+            return Err(ParamError::RemotesNeedUnlinked);
+        }
         Ok(Some(Self {
             volume: unique_volume_name(name, template, parameters)?,
             on_delete,
             workload_mounts,
             link,
+            remotes,
         }))
     }
 
@@ -534,7 +553,39 @@ mod tests {
         }
         assert_eq!(
             VolumeParams::from_create("pvc-1", &map(&[("profile", "p"), ("link", "unlinked")])),
-            Err(ParamError::LinkWithoutFork)
+            Err(ParamError::ForkOnly("link"))
+        );
+        // An unlinked fork's own remotes: a profile name, and only with
+        // link: unlinked.
+        let class = ForkClass::from_create(
+            "pvc-9",
+            &with(&[
+                ("fork", "true"),
+                ("link", "unlinked"),
+                ("remotes", "sandbox-git"),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(class.remotes.as_deref(), Some("sandbox-git"));
+        assert_eq!(
+            ForkClass::from_create("pvc-9", &with(&[("fork", "true"), ("remotes", "r")])),
+            Err(ParamError::RemotesNeedUnlinked)
+        );
+        assert_eq!(
+            ForkClass::from_create(
+                "pvc-9",
+                &with(&[
+                    ("fork", "true"),
+                    ("link", "unlinked"),
+                    ("remotes", "Bad_Name")
+                ])
+            ),
+            Err(ParamError::BadProfile("Bad_Name".into()))
+        );
+        assert_eq!(
+            VolumeParams::from_create("pvc-1", &map(&[("profile", "p"), ("remotes", "r")])),
+            Err(ParamError::ForkOnly("remotes"))
         );
         let source = VolumeParams::from_create("pvc-1", &map(&[("profile", "example")])).unwrap();
         let params = class.params(&source);

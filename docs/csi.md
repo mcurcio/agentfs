@@ -346,7 +346,7 @@ See `deploy/csi/example/deployment.yaml`.
 | Call | Does | Fails with |
 |---|---|---|
 | CreateVolume | Validates the parameters and capabilities; creates `<basePath>/<pv>/{backing,state}` on this node, initialises the state area with the profile's config included (a start class: fetched and written from its start point, §5) and its rules installed, writes `csi.json`, and answers this node's topology. Idempotent for the same name, capacity and parameters. With a fork class and a `dataSource` claim, creates a fork of that volume (§14) and returns the content source | `InvalidArgument` (bad parameters: a `volumeName` without `{pvName}`, `branch`, a bad `startFrom`, an unknown key; any multi-node access mode, block volumes, mount flags; a content source on an ordinary class, a fork class without one, a snapshot; a start class naming a remote the profile lacks, or the volume's own branch, or on a local-only profile), `ResourceExhausted` (the accessibility requirements exclude this node), `AlreadyExists` (same name, other capacity or parameters; a state area of another volume or start point), `FailedPrecondition` (a start branch missing, or not reaching the pinned commit; for a fork, a source not on this node, with no history, a fork, with no fork remote (a local-only source has one: its own history), a missing LFS object), `Unavailable` (the start remote could not be fetched; a fork's source could not be read; retried) |
-| DeleteVolume | Asks the release decider over facts gathered here: whether the branch exists, each pushed remote's branch in a listing made for this call, how many journaled records history lacks (read under the state lock), `onDelete`, and for a fork its state. **Delete** (every remote holds the head, or there is no history, the journal holds nothing uncommitted, and `onDelete: delete`) moves the directory to `<basePath>/.deleting.<handle>` under the state lock, then removes it; **Keep** (`onDelete: retain` once every remote holds the head and the journal is committed, or a local-only profile (no remote section), whatever `onDelete` says) renames `csi.json` to `csi.retained.json` and leaves the worktree; **Wait** answers `Unavailable` naming the remote and why (it lacks the head, it could not be listed, its branch diverged, it lacks a ref of a fork received while the profile was local-only; every remote section invalid; the journal holds records a history service killed at NodeUnstage never committed; a fork not yet published) and wakes the release scan, which commits and pushes it. A fork's deletion is its request to be finished (`finish_requested`, §14). DeleteVolume never commits or pushes. An unknown volume is a success | `FailedPrecondition` while the volume is staged on this node, or its state lock is held (a history service, a push), or its settings cannot be read (nothing is deleted or released); `Unavailable` (Wait; a fork not yet published is answered so before the lock, which its finisher holds while it publishes) |
+| DeleteVolume | Asks the release decider over facts gathered here: whether the branch exists, each pushed remote's branch in a listing made for this call, how many journaled records history lacks (read under the state lock), `onDelete`, and for a fork its state. **Delete** (every remote holds the head, or there is no history, the journal holds nothing uncommitted, and `onDelete: delete`; or an unlinked fork with no remote of its own and `onDelete: delete`, unpushed, §14) moves the directory to `<basePath>/.deleting.<handle>` under the state lock, then removes it; **Keep** (`onDelete: retain` once every remote holds the head and the journal is committed, or a local-only profile (no remote section), whatever `onDelete` says, except an unlinked fork's) renames `csi.json` to `csi.retained.json` and leaves the worktree; **Wait** answers `Unavailable` naming the remote and why (it lacks the head, it could not be listed, its branch diverged, it lacks a ref of a fork received while the profile was local-only; every remote section invalid; the journal holds records a history service killed at NodeUnstage never committed; a fork not yet published) and wakes the release scan, which commits and pushes it. A fork's deletion is its request to be finished (`finish_requested`, §14). DeleteVolume never commits or pushes. An unknown volume is a success | `FailedPrecondition` while the volume is staged on this node, or its state lock is held (a history service, a push), or its settings cannot be read (nothing is deleted or released); `Unavailable` (Wait; a fork not yet published is answered so before the lock, which its finisher holds while it publishes) |
 | ControllerPublish, ControllerUnpublish | Not offered (`Unimplemented`): there is no attach step (`attachRequired: false`) | |
 | NodeStage | Checks the worktree: it never creates one. A worktree missing from this node's disk is `NotFound` naming the node; a static PV is adopted only over an existing worktree of its volume. Then sets the profile's include, reinstalls its rules, starts the volume's history service, and waits up to `--stage-wait` for it to listen (it recovers the journal and applies queued patches first) | `NotFound` (`no worktree on node <n> under <base>; the pod waits`), `Unavailable` when the service is still starting (the kubelet retries; the service keeps running), `FailedPrecondition` when it exited (with its last log lines), `AlreadyExists` (a static PV naming another volume than the worktree's), `InvalidArgument` (a multi-node access mode) |
 | NodePublish | Starts a front for the pod (its slot, identity and passthrough), waits up to `--publish-wait` for its mount, binds it onto the target (read-only for read-only mounts), records it | `FailedPrecondition` (not staged; a `SINGLE_NODE_SINGLE_WRITER` volume published elsewhere), `AlreadyExists` (the target is published with another read-only flag or access mode), `InvalidArgument` (inline ephemeral volume; a multi-node access mode) |
@@ -647,8 +647,10 @@ included), never the base path.
   each refusal's code, DeleteVolume for every release answer against
   prepared `file://` remotes (held, behind, absent, diverged,
   unreachable, local-only), CreateVolume taking a profile with no remote,
-  a fork class's `link` reaching the fork's identity and an unlinked
-  fork's DeleteVolume asking its remote, the adoption of a retained worktree
+  a fork class's `link` reaching the fork's identity, an unlinked fork
+  with a `remotes` profile pushing there and never to its source's
+  remote, its DeleteVolume asking that remote, and one without removed
+  unpushed, the adoption of a retained worktree
   through the documented attributes, and every multi-node access mode
   refused with the decision (`crates/agentfs-csi/tests/grpc.rs`); the
   release scan with a fake launcher: it pushes an unstaged worktree,
@@ -724,18 +726,31 @@ off every branch ([configuration](configuration.md#agentfs)).
 - **Linked or unlinked.** A fork class's `link` parameter sets whether its
   forks deliver back to their source (design §11.5 "Fork link"):
   `linked`, the default, is everything below; `unlinked` makes
-  independent forks. An unlinked fork pushes its branch where a linked
-  one would publish, and nothing is ever delivered to the source: it is
-  never finished, `fork status` has nothing to show, and DeleteVolume
-  treats it as any worktree (it waits while a remote lacks the head, then
-  applies `onDelete`). The value is written into each fork's identity at
-  CreateVolume (`agentfs.fork.link`); editing the class moves no fork
-  that exists. `link` in a class without `fork: "true"` is refused.
+  independent forks. Nothing is ever delivered from an unlinked fork to
+  the source: it is never finished, `fork status` has nothing to show,
+  and DeleteVolume treats it as any worktree. It never pushes to the
+  source's remotes, its fork remote included (design §19.1 "Unlinked
+  fork remotes"): only to the remotes of the class's `remotes`
+  parameter, a profile whose `<remotes>.config` in the profiles
+  ConfigMap holds the fork's own `[remote "<name>"]` sections (and, if
+  its LFS store is not derived from them, `lfs.url` or `lfs.pushurl`;
+  nothing else). With them, DeleteVolume waits while one of them lacks
+  the head, then applies `onDelete`. Without them the fork is local-only,
+  and DeleteVolume with `onDelete: delete` (a fork class's default)
+  removes it with its history unpushed: the owner, 2026-10-17: "if no
+  remote is configured, the volume is lost, and that's a choice the user
+  is allowed to make". `link` and `remotes` are written into each fork's
+  identity at CreateVolume (`agentfs.fork.link`, `agentfs.fork.remotes`,
+  the path of that config); editing the class moves no fork that exists,
+  while editing the profile changes the remotes of every fork made with
+  it. `link` or `remotes` in a class without `fork: "true"` is refused,
+  and so is `remotes` without `link: unlinked`.
 
   ```yaml
   parameters:
     fork: "true"
     link: unlinked
+    remotes: sandbox-remotes   # sandbox-remotes.config; omit: local-only
   ```
 - **Create, on the source's node.** CreateVolume clones the source
   locally: its settings and branch head read without its lock (the

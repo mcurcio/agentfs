@@ -193,6 +193,16 @@ impl Fork {
         name: &str,
         link: ForkLink,
     ) -> Result<ForkIdentity, CreateError> {
+        self.create_with_remotes(source, name, link, None)
+    }
+
+    fn create_with_remotes(
+        &self,
+        source: &Vol,
+        name: &str,
+        link: ForkLink,
+        remotes: Option<&Path>,
+    ) -> Result<ForkIdentity, CreateError> {
         create::create(&CreateRequest {
             source: &source.state,
             fork: &self.state,
@@ -201,6 +211,7 @@ impl Fork {
             includes: std::slice::from_ref(&source.fragment),
             push_target: PushTarget::Branch,
             link,
+            remotes,
         })
     }
 
@@ -1405,18 +1416,46 @@ fn soon() -> Instant {
 }
 
 /// Design §11.5 "Fork link" (owner, 2026-10-17: "A fork can be created
-/// with or without a remote link back to its parent. Configurable."): an
-/// unlinked fork pushes its own branch where a linked one would publish,
+/// with or without a remote link back to its parent. Configurable."; on
+/// where an unlinked fork pushes: "B. And if no remote is configured, the
+/// volume is lost, and that's a choice the user is allowed to make."): an
+/// unlinked fork pushes only to its own remotes, never to its source's,
 /// and nothing is ever delivered to its source: no finish, no change or
 /// finish ref, no fork status, no abandon. Its link is its identity's,
 /// fixed at create.
 #[test]
-fn an_unlinked_fork_pushes_its_branch_and_delivers_nothing() {
+fn an_unlinked_fork_pushes_only_to_its_own_remotes_and_delivers_nothing() {
     let source = Vol::new("src");
+    // The source's fork remote, which a linked fork would publish to.
+    let forks = source.dir.path().join("forks.git");
+    Repository::init_bare(&forks).unwrap();
+    fs::write(
+        &source.fragment,
+        format!(
+            "[remote \"origin\"]\n\turl = {}\n[remote \"forks\"]\n\turl = {}\n\
+             \tagentfsForkRemote = true\n",
+            source.remote.display(),
+            forks.display()
+        ),
+    )
+    .unwrap();
     source.change(&[("a.txt", "a\n")]);
+    let own = source.dir.path().join("own.git");
+    Repository::init_bare(&own).unwrap();
+    let remotes = source.dir.path().join("fork-remotes.config");
+    fs::write(
+        &remotes,
+        format!("[remote \"mine\"]\n\turl = {}\n", own.display()),
+    )
+    .unwrap();
+    // Remotes of its own are an unlinked fork's.
+    assert!(matches!(
+        Fork::new().create_with_remotes(&source, "src-l", ForkLink::Linked, Some(&remotes)),
+        Err(CreateError::RemotesNeedUnlinked)
+    ));
     let fork = Fork::new();
     let identity = fork
-        .create_with(&source, "src-u", ForkLink::Unlinked)
+        .create_with_remotes(&source, "src-u", ForkLink::Unlinked, Some(&remotes))
         .unwrap();
     assert_eq!(identity.link, ForkLink::Unlinked);
     // A second create asking linked keeps the identity it has.
@@ -1428,10 +1467,10 @@ fn an_unlinked_fork_pushes_its_branch_and_delivers_nothing() {
     assert_eq!(settings.fork.as_ref(), Some(&identity));
     assert_eq!(settings.fork_remote, None);
     assert_eq!(settings.source_state, None);
+    assert_eq!(settings.fork_remotes.as_deref(), Some(remotes.as_path()));
     fork.as_vol().write("b.txt", "b\n");
 
-    // Pushed as any volume's branch, to the remote a linked fork would
-    // publish to.
+    // Pushed as any volume's branch, to its own remote only.
     let mut pushers = crate::push::open_all(
         &fork.state,
         &settings,
@@ -1445,12 +1484,29 @@ fn an_unlinked_fork_pushes_its_branch_and_delivers_nothing() {
         .unwrap()
         .refname_to_id("refs/heads/agentfs/src-u")
         .unwrap();
-    let on_remote = remote_refs(&source.remote);
-    assert_eq!(on_remote.get("refs/heads/agentfs/src-u"), Some(&head));
+    let on_own = remote_refs(&own);
+    assert_eq!(on_own.get("refs/heads/agentfs/src-u"), Some(&head));
     assert!(
-        on_remote.keys().all(|r| !r.starts_with("refs/agentfs/")),
-        "nothing delivered: {on_remote:?}"
+        on_own.keys().all(|r| !r.starts_with("refs/agentfs/")),
+        "nothing delivered: {on_own:?}"
     );
+    for parents in [&source.remote, &forks] {
+        let refs = remote_refs(parents);
+        assert!(
+            refs.keys().all(|r| !r.contains("src-u")),
+            "nothing reaches the source's remotes: {refs:?}"
+        );
+    }
+
+    // Without remotes of its own it is local-only, even beside the
+    // source's remotes.
+    let alone = Fork::new();
+    alone
+        .create_with(&source, "src-v", ForkLink::Unlinked)
+        .unwrap();
+    let settings = crate::config::Settings::load(&alone.state.git()).unwrap();
+    assert_eq!(settings.remotes, crate::config::Remotes::LocalOnly);
+    assert!(settings.invalid_remotes.is_empty());
 
     // Never finished, so never read-only, and no fork status.
     let lock = fork.lock();

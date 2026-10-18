@@ -16,8 +16,10 @@ source waits and alarms; it never delivers anywhere else, so the fixes
 below are always on the fork remote (or the source's state area), never
 a different target. An unlinked fork delivers nothing: `fork finish`
 refuses it (`fork <fork> is unlinked`) and `fork status` has no state for
-it; its pushes are an ordinary volume's
-([stuck-pushes.md](stuck-pushes.md)).
+it. It pushes only to its own remotes (`agentfs.fork.remotes`), never to
+the source's, and those pushes are an ordinary volume's
+([stuck-pushes.md](stuck-pushes.md)); with none it is local-only and
+pushes nothing ([design §11.5](../design.md#115-forks), "The link").
 
 ## How it shows
 

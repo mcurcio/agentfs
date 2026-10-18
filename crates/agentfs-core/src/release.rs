@@ -11,7 +11,12 @@
 //! - [`Release::Delete`]: every declared remote holds the head (and the
 //!   refs of every fork received into this history), or the
 //!   worktree has no history, its journal holds nothing history lacks,
-//!   and `onDelete` is `delete`;
+//!   and `onDelete` is `delete`; or it is an unlinked fork with no remote
+//!   of its own and `onDelete` is `delete`, whatever its history and
+//!   journal hold (design §11.5; owner, 2026-10-17: "if no remote is
+//!   configured, the volume is lost, and that's a choice the user is
+//!   allowed to make"). That is the one exception to "never remove
+//!   unpushed history": a linked fork, and every other worktree, keeps it;
 //! - [`Release::Keep`]: the volume is released but the worktree stays on
 //!   its node's disk: `onDelete: retain` once every declared remote holds
 //!   the head and the journal is committed, or nothing elsewhere can hold
@@ -131,6 +136,10 @@ pub struct Worktree<'a> {
     /// A fork's status (design §11.5): publishing is its gate, so its
     /// remotes are not asked; `None` for any other worktree.
     pub fork: Option<ForkState>,
+    /// An unlinked fork ([`Settings::is_unlinked_fork`]): it has no fork
+    /// status, and when it is local-only (no remote of its own) nothing
+    /// holds its history, so `onDelete: delete` removes it unpushed.
+    pub unlinked_fork: bool,
 }
 
 /// What DeleteVolume does with a worktree.
@@ -193,6 +202,14 @@ pub fn decide(worktree: &Worktree<'_>) -> Release {
         OnDelete::Delete => Release::Delete,
         OnDelete::Retain => Release::Keep(Kept::Retained),
     };
+    // The user chose no remote for an unlinked fork: deleting it loses
+    // its history, and nothing waits (design §11.5).
+    if worktree.unlinked_fork && worktree.remotes == Declared::LocalOnly {
+        return match worktree.on_delete {
+            OnDelete::Delete => Release::Delete,
+            OnDelete::Retain => Release::Keep(Kept::LocalOnly),
+        };
+    }
     if !worktree.has_history {
         return held();
     }
@@ -303,6 +320,7 @@ mod tests {
             on_delete,
             remotes,
             fork: None,
+            unlinked_fork: false,
         }
     }
 
@@ -487,6 +505,60 @@ mod tests {
             ..worktree(OnDelete::Delete, Declared::Pushed(&held))
         };
         assert_eq!(decide(&fork), Release::Delete);
+    }
+
+    /// An unlinked fork with no remote of its own (design §11.5; owner,
+    /// 2026-10-17: "B. And if no remote is configured, the volume is lost,
+    /// and that's a choice the user is allowed to make."): `onDelete:
+    /// delete` removes it unpushed, its journal and all, with history or
+    /// without; `retain` keeps it on disk. With remotes of its own it waits
+    /// like any worktree, and a local-only worktree that is not an unlinked
+    /// fork is still kept whatever `onDelete` says.
+    #[test]
+    fn an_unlinked_local_only_fork_is_deleted_unpushed() {
+        for (has_history, uncommitted) in [(true, 0), (true, 3), (false, 3), (false, 0)] {
+            let lone = Worktree {
+                has_history,
+                uncommitted,
+                unlinked_fork: true,
+                ..worktree(OnDelete::Delete, Declared::LocalOnly)
+            };
+            assert_eq!(
+                decide(&lone),
+                Release::Delete,
+                "{has_history} {uncommitted}"
+            );
+            let retained = Worktree {
+                on_delete: OnDelete::Retain,
+                ..lone.clone()
+            };
+            assert_eq!(decide(&retained), Release::Keep(Kept::LocalOnly));
+            let ordinary = Worktree {
+                unlinked_fork: false,
+                ..lone.clone()
+            };
+            // With something to lose, any other local-only worktree is
+            // still held.
+            if has_history || uncommitted > 0 {
+                assert_ne!(decide(&ordinary), Release::Delete, "the hold stays");
+            }
+        }
+        let lacking = [seen("mine", Ok(Claim::Create))];
+        let with_remote = Worktree {
+            unlinked_fork: true,
+            ..worktree(OnDelete::Delete, Declared::Pushed(&lacking))
+        };
+        assert_eq!(
+            decide(&with_remote),
+            Release::Wait(Waiting::Lacking {
+                remote: "mine".into()
+            })
+        );
+        let none_valid = Worktree {
+            unlinked_fork: true,
+            ..worktree(OnDelete::Delete, Declared::NoneValid)
+        };
+        assert_eq!(decide(&none_valid), Release::Wait(Waiting::NoneValid));
     }
 
     /// `Declared::of` maps each mode one to one, and a local-only worktree

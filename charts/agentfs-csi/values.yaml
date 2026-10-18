@@ -177,5 +177,8 @@ server:
 # to WaitForFirstConsumer, which picks the node first. A fork class
 # (`fork: "true"`) may set `link: linked` (the default: its forks deliver
 # their change back to the source) or `link: unlinked` (independent forks,
-# nothing ever delivered; docs/csi.md §14).
+# nothing ever delivered, never pushed to the source's remotes). An
+# unlinked class's `remotes: <profile>` names the profile whose config
+# holds the forks' own remotes; without it they are local-only and
+# deleting a claim loses its history (docs/csi.md §14).
 storageClasses: []
