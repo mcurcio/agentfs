@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "agentfs",
+  "project_id": "1ef68c1c-b697-4bbc-86ca-ec569f7fd934"
+}

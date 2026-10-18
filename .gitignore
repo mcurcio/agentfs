@@ -3,3 +3,9 @@
 .DS_Store
 /deploy/examples/helm-sidecar/charts/
 /deploy/examples/helm-sidecar/Chart.lock
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
