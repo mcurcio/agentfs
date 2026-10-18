@@ -63,6 +63,12 @@ impl Volume {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_as("state", "backing", args)
+    }
+
+    /// Runs `agentfs` on another volume beside this one: `state` and
+    /// `root` under the same directory.
+    fn run_as(&self, state: &str, root: &str, args: &[&str]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
         for (name, _) in std::env::vars_os() {
             let n = name.to_string_lossy();
@@ -71,9 +77,9 @@ impl Volume {
             }
         }
         cmd.arg("--state")
-            .arg(self.dir.path().join("state"))
+            .arg(self.dir.path().join(state))
             .arg("--root")
-            .arg(self.tree())
+            .arg(self.dir.path().join(root))
             .args(args)
             .env("AGENTFS_REPLICA", "test-0")
             .output()
@@ -219,6 +225,41 @@ fn the_csi_example_profile_loads() {
     assert_eq!(recorded, set(&kept));
     assert_eq!(skipped, set(&dropped));
     assert_eq!(v.history(), set(&kept));
+}
+
+/// The example unlinked fork class's own remotes (docs/helm.md, csi.md
+/// §14): `deploy/csi/profiles/sandbox-remotes.config` is accepted as a
+/// fork's `remotes` file, and the fork's only remote is its own.
+#[test]
+fn the_csi_example_fork_remotes_load() {
+    let v = Volume::profile("example");
+    v.record(&["notes.md"]);
+    let source = v.dir.path().join("state");
+    let remotes = repo_root().join("deploy/csi/profiles/sandbox-remotes.config");
+    let out = v.run_as(
+        "fork",
+        "fork-tree",
+        &[
+            "fork",
+            "create",
+            "--source-state",
+            source.to_str().unwrap(),
+            "--link",
+            "unlinked",
+            "--remotes",
+            remotes.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = v.run_as("fork", "fork-tree", &["status"]);
+    let status = text(&out.stdout);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        status.contains("remote:    sandbox https://git.example.com/acme/sandbox-history.git"),
+        "{status}"
+    );
+    assert!(!status.contains("origin"), "never the source's: {status}");
+    assert!(!status.contains("misconfigured"), "{status}");
 }
 
 /// The lines of `deploy/sidecar/deployment.yaml` without comments.

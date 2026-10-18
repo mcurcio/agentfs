@@ -37,12 +37,14 @@ and the credentials Secret out of band:
 ```sh
 kubectl apply -f deploy/csi/namespace.yaml        # or create and label agentfs-csi
 kubectl -n agentfs-csi create secret generic agentfs-csi-credentials \
-  --from-literal=example-origin=$'username=agentfs\npassword=<token>'
+  --from-literal=example-origin=$'username=agentfs\npassword=<token>' \
+  --from-literal=sandbox=$'username=agentfs\npassword=<token>'
 helm install agentfs-csi oci://ghcr.io/mcurcio/charts/agentfs-csi \
   --namespace agentfs-csi --version <version> \
   --set credentials.existingSecret=agentfs-csi-credentials \
   --set-file profiles.example.config=deploy/csi/profiles/example.config \
   --set-file profiles.example.exclude=deploy/csi/profiles/example.exclude \
+  --set-file profiles.sandbox-remotes.config=deploy/csi/profiles/sandbox-remotes.config \
   -f storageclasses.yaml
 ```
 
@@ -59,7 +61,8 @@ storageClasses:
   # unlinked` makes independent forks that never deliver back to their
   # source and never push to its remotes; omit it (or `linked`) for forks
   # that do deliver. `remotes` names the profile holding the forks' own
-  # remotes (`profiles.sandbox-remotes.config`); without it they are
+  # remotes (`profiles.sandbox-remotes.config`, set above from
+  # deploy/csi/profiles/sandbox-remotes.config); without it they are
   # local-only, and deleting a claim deletes its history.
   - name: agentfs-sandbox
     parameters:
