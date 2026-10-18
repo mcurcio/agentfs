@@ -158,3 +158,13 @@ Install real tools this way rather than writing substitutes.
 ## Large changes
 
 For milestone-sized work, use the orchestration method in [.claude/skills/milestone-orchestration/SKILL.md](.claude/skills/milestone-orchestration/SKILL.md). Its steps are architect, implementer, adversarial reviewer, one bounded fix round, CI as the referee, and a completeness critic.
+
+## Work items (beads)
+
+Open work lives in [beads](https://github.com/steveyegge/beads) (`bd`), configured in `.beads/`. Its database is not in git: it syncs to GitHub under `refs/dolt/data`, and every change pushes automatically (`dolt.auto-push` in `.beads/config.yaml`).
+
+- **Fresh clone or new machine:** run `bd bootstrap`. It clones the issues from `refs/dolt/data` and never deletes existing ones.
+- **Pick work:** `bd ready` lists unblocked items; `bd show <id>` gives the brief.
+- **Claim:** `bd update <id> --claim`. **Finish:** `bd close <id>` once the work has landed on main with CI green.
+- Each bead names its files and done condition. A bead that needs the owner's answer (a design gate, deleting branches) says so: ask before acting.
+- The repo runs bd's git hooks (`core.hooksPath` = `.beads/hooks`); never bypass them.
