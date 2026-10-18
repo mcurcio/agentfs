@@ -94,8 +94,10 @@ nothing is lost. Then put the branch back at the volume's head with
 `agentfs push --force-with-lease`, leased on the tip you inspected: it
 replaces only this volume's own branch, on one remote, and only if that
 remote still holds the lease (it fetches it aside if the state area lacks
-it) and the lease shares a commit with the head. This is the one case
-where the branch is replaced, by an operator (§15).
+it), the lease shares a commit with the head, and none of the commits it
+drops was made by an agentfs recorder (an `Agentfs-Seq` trailer) unless
+the head holds it rewritten. This is the one case where the branch is
+replaced, by an operator (§15).
 
 <!-- ci: divergence-case-a -->
 ```sh
@@ -108,14 +110,18 @@ It prints `<remote>: replaced <lease> with <head>` and exits 0. Exit 1
 with `lease broken` means the branch moved again since you inspected it
 (inspect again); `shares no commit` means the remote's branch is another
 history, which this command never replaces (see the table: rename this
-volume). This works while the volume is mounted: it never goes through
+volume); `which agentfs recorded` names a commit an agentfs recorder made
+that this state area lacks: it is case B or another worktree's branch,
+never replaced (see the table). This works while the volume is mounted: it never goes through
 the daemon and takes only that remote's push lock (exit 75 while a push
 to it runs: retry).
 
 ## 4. Case B: the state area is stale
 
 The remote holds this volume's newer history; this state area, restored
-from a backup or replaced, must not write the branch again. Continue under
+from a backup or replaced, must not write the branch again
+(`agentfs push --force-with-lease` refuses it: `which agentfs
+recorded`). Continue under
 a new name, started from the branch, so nothing on either side is lost:
 
 1. Stop the workload and the stale volume, and keep its state area as it

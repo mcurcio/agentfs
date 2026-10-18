@@ -10,13 +10,20 @@
 //!   (its [`StartPoint`]) moved past the commit it was pinned at, to
 //!   commits this worktree does not have? The one decider of the
 //!   start-branch alarm, raised by the new volume, never by the old node.
+//! - [`lease_claim`]: may the operator's lease push (design §15) drop the
+//!   commits the remote's branch holds beyond the head? Only those no
+//!   agentfs recorder made (divergence case A), or ones the head holds
+//!   rewritten (a history rewrite); never history a recorder wrote that
+//!   the head lacks (case B, another worktree).
 //!
-//! Both are pure: the inputs are what the remote advertised and a
-//! predicate over this worktree's own history. The push record
+//! All are pure: the inputs are what the remote advertised and a
+//! predicate over, or facts from, this worktree's own history. The push record
 //! ([`super::PushState`]) is never an input: it stays bookkeeping
 //! (§11.2), and `measure_base` stays a hint. A remote's value that is not
 //! in this repository is never fetched to decide: it counts as not on
 //! this history.
+
+use std::collections::HashSet;
 
 use git2::Oid;
 
@@ -118,6 +125,65 @@ pub fn start_branch_moved(
     })
 }
 
+/// A commit as an agentfs recorder made it (design §9): its
+/// `Agentfs-Seq` and its author and committer. A history rewrite (`git
+/// filter-repo`, design §15) keeps all of these and changes the tree, the
+/// id and the ids quoted in the message; the same sequence number recorded
+/// again from a stale state area differs in its time at least.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Recording {
+    pub seq: u64,
+    pub author: Stamp,
+    pub committer: Stamp,
+}
+
+/// One signature of a [`Recording`]: name, email and time, as git keeps
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Stamp {
+    pub name: Vec<u8>,
+    pub email: Vec<u8>,
+    pub seconds: i64,
+    pub offset_minutes: i32,
+}
+
+/// What the operator's lease push may do with the remote's branch, from
+/// the commits it would drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseClaim {
+    /// Every commit dropped is a foreign writer's (no recorder made it) or
+    /// one the head holds rewritten: replace the branch.
+    Replace,
+    /// This commit, which a recorder made, is on the remote's branch and on
+    /// the head neither as is nor rewritten: the branch holds history this
+    /// state area did not write (a stale state area, divergence case B, or
+    /// another worktree under the same name). Never replaced.
+    Recorded(Oid),
+}
+
+/// Whether the lease push may drop `dropped`: the commits on the remote's
+/// branch that the head lacks, each with its [`Recording`] (`None`: no
+/// recorder made it). `kept` holds the recordings of the commits on the
+/// head that the remote's branch lacks: a dropped recording found there is
+/// the same record rewritten (design §15). The first dropped recording not
+/// found there is [`LeaseClaim::Recorded`].
+///
+/// Git keeps no record of who created a remote branch, and the push record
+/// is never an input (it stays bookkeeping, §11.2): who made each commit
+/// (its trailers, §9) is what tells a foreign writer (case A) from this
+/// volume's own newer history (case B). A foreign commit that copies an
+/// agentfs message, a cherry-pick, counts as recorded and is refused: the
+/// safe side.
+pub fn lease_claim(
+    dropped: impl IntoIterator<Item = (Oid, Option<Recording>)>,
+    kept: &HashSet<Recording>,
+) -> LeaseClaim {
+    dropped
+        .into_iter()
+        .find_map(|(oid, recording)| recording.filter(|r| !kept.contains(r)).map(|_| oid))
+        .map_or(LeaseClaim::Replace, LeaseClaim::Recorded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +254,49 @@ mod tests {
                 pinned: oid(1),
                 tip: oid(3),
             })
+        );
+    }
+
+    fn recording(seq: u64, seconds: i64) -> Recording {
+        let stamp = |name: &[u8]| Stamp {
+            name: name.to_vec(),
+            email: b"e@example.invalid".to_vec(),
+            seconds,
+            offset_minutes: 0,
+        };
+        Recording {
+            seq,
+            author: stamp(b"agent"),
+            committer: stamp(b"agentfs"),
+        }
+    }
+
+    /// Case A replaces, a rewrite replaces, case B is refused.
+    #[test]
+    fn a_lease_push_drops_only_foreign_or_rewritten_commits() {
+        let none = HashSet::new();
+        assert_eq!(lease_claim([], &none), LeaseClaim::Replace);
+        // Case A: a person's commits.
+        assert_eq!(
+            lease_claim([(oid(1), None), (oid(2), None)], &none),
+            LeaseClaim::Replace
+        );
+        // Case B: a recorder's commit the head lacks, under a foreign one.
+        assert_eq!(
+            lease_claim([(oid(1), None), (oid(2), Some(recording(7, 100)))], &none),
+            LeaseClaim::Recorded(oid(2))
+        );
+        // A rewrite: the head holds the same record under another id.
+        let kept = HashSet::from([recording(7, 100)]);
+        assert_eq!(
+            lease_claim([(oid(2), Some(recording(7, 100)))], &kept),
+            LeaseClaim::Replace
+        );
+        // The same sequence number recorded again later is another record.
+        let later = HashSet::from([recording(7, 160)]);
+        assert_eq!(
+            lease_claim([(oid(2), Some(recording(7, 100)))], &later),
+            LeaseClaim::Recorded(oid(2))
         );
     }
 }
