@@ -51,7 +51,10 @@
 //!
 //! None of these affect recording or committing. A per-remote `flock` on
 //! `<remote>.lock` keeps two processes (`agentfs push` and `agentfs run`)
-//! from pushing the same remote at once.
+//! from pushing the same remote at once. The lease push's scratch
+//! repository, `<remote>.lease.git` beside it, holds the remote's history
+//! (design §15): it is removed on every exit path, and whoever next takes
+//! a push lock removes any a killed push left.
 //!
 //! libgit2's local transport updates a remote ref without compare-and-swap
 //! once the ref exists, so a writer moving a local or `file://` remote
@@ -85,7 +88,9 @@ use crate::volume::StateDir;
 
 mod claim;
 
-pub use claim::{Claim, StartBranchMoved, claim, start_branch_moved};
+pub use claim::{
+    Claim, LeaseClaim, Recording, Stamp, StartBranchMoved, claim, lease_claim, start_branch_moved,
+};
 
 /// The longest delay between retries of a failing remote, unless
 /// `pushInterval` is longer.
@@ -117,6 +122,12 @@ pub enum LeaseOutcome {
     /// another history, never replaced by this command (a rewrite that
     /// changes the root continues under a new name).
     Unrelated { lease: Oid, head: Oid },
+    /// The remote's branch holds `commit`, which an agentfs recorder made
+    /// and the head holds neither as is nor rewritten ([`lease_claim`]):
+    /// this volume's newer history (divergence case B, a stale state area)
+    /// or another worktree's. Never replaced: it continues under a new
+    /// name.
+    Recorded { commit: Oid },
     Failed {
         kind: PushFailureKind,
         message: String,
@@ -358,11 +369,17 @@ pub enum CreateOnlyOutcome {
     AnotherWriter { name: String, found: Oid },
 }
 
-/// Whether a lease and the head share a commit
+/// Whether a lease and the head share a commit, and whether the commits
+/// the lease push would drop are its to drop
 /// ([`RemotePusher::push_with_lease`]).
 enum LeaseCheck {
-    Related,
+    /// They share a commit, and [`lease_claim`] lets the branch be
+    /// replaced.
+    Replace,
     Unrelated,
+    /// [`LeaseClaim::Recorded`]: the remote's branch holds this commit, a
+    /// recorder's, which the head lacks.
+    Recorded(Oid),
     /// The remote's branch moved off the lease while it was fetched.
     Moved(Option<Oid>),
 }
@@ -433,6 +450,10 @@ pub struct RemotePusher {
     /// the branch there.
     #[cfg(test)]
     after_queue_listing: Option<Box<dyn Fn() + Send>>,
+    /// Runs in the lease check once the lease is fetched into the scratch
+    /// repository: a test interrupts the push there.
+    #[cfg(test)]
+    in_lease_scratch: Option<Box<dyn Fn() + Send>>,
 }
 
 impl RemotePusher {
@@ -472,6 +493,8 @@ impl RemotePusher {
             step_pending: false,
             #[cfg(test)]
             after_queue_listing: None,
+            #[cfg(test)]
+            in_lease_scratch: None,
         })
     }
 
@@ -1119,9 +1142,13 @@ impl RemotePusher {
     /// (F8 S2; design §15). Under this remote's push lock, not the state
     /// lock. `lease` is fetched from the remote when it is not in this
     /// repository; the push is refused ([`LeaseOutcome::Unrelated`]) when
-    /// `lease` and the head share no commit, and stopped in libgit2's push
-    /// negotiation ([`LeaseOutcome::LeaseBroken`]) when the remote's old
-    /// value is not `lease`. Only `branch_ref`, never another ref; the
+    /// `lease` and the head share no commit, refused
+    /// ([`LeaseOutcome::Recorded`]) when the commits it would drop hold
+    /// history an agentfs recorder wrote that the head lacks
+    /// ([`lease_claim`]: divergence case B, F8 "one branch per worktree"),
+    /// and stopped in libgit2's push negotiation
+    /// ([`LeaseOutcome::LeaseBroken`]) when the remote's old value is not
+    /// `lease`. Only `branch_ref`, never another ref; the
     /// `diverged/*` refs stay. Success clears the divergence in the push
     /// state and is recorded like any push.
     pub fn push_with_lease(&mut self, lease: Oid) -> LeaseOutcome {
@@ -1156,8 +1183,9 @@ impl RemotePusher {
             return LeaseOutcome::LeaseBroken { found };
         }
         match self.lease_check(lease, head) {
-            Ok(LeaseCheck::Related) => {}
+            Ok(LeaseCheck::Replace) => {}
             Ok(LeaseCheck::Unrelated) => return LeaseOutcome::Unrelated { lease, head },
+            Ok(LeaseCheck::Recorded(commit)) => return LeaseOutcome::Recorded { commit },
             Ok(LeaseCheck::Moved(found)) => return LeaseOutcome::LeaseBroken { found },
             Err((kind, message)) => return failed(kind, message),
         }
@@ -1206,7 +1234,9 @@ impl RemotePusher {
         }
     }
 
-    /// Whether `lease` and `head` share a commit. A lease not in this
+    /// Whether `lease` and `head` share a commit, and then [`lease_claim`]
+    /// on the commits only `lease` reaches against those only `head`
+    /// reaches. A lease not in this
     /// repository is fetched first, with the branch the remote advertises
     /// (it is the lease, or the lease is broken), into a scratch repository
     /// beside the push lock that borrows this repository's objects
@@ -1215,18 +1245,36 @@ impl RemotePusher {
     /// rewrite removed (history-rewrite runbook, step 9).
     fn lease_check(&self, lease: Oid, head: Oid) -> Result<LeaseCheck, (PushFailureKind, String)> {
         let local = |e: GitError| (PushFailureKind::Local, e.message().to_owned());
-        let related = |repo: &Repository| match repo.merge_base(head, lease) {
-            Ok(_) => Ok(LeaseCheck::Related),
-            Err(e) if e.code() == ErrorCode::NotFound => Ok(LeaseCheck::Unrelated),
-            Err(e) => Err(local(e)),
+        let related = |repo: &Repository| {
+            match repo.merge_base(head, lease) {
+                Ok(_) => {}
+                Err(e) if e.code() == ErrorCode::NotFound => return Ok(LeaseCheck::Unrelated),
+                Err(e) => return Err(local(e)),
+            }
+            let dropped = commits_beyond(repo, lease, head).map_err(local)?;
+            // The head's side is walked only when a dropped commit is a
+            // recorder's: case A drops none, and its walk would be wasted.
+            let kept = if dropped.iter().any(|(_, recording)| recording.is_some()) {
+                commits_beyond(repo, head, lease)
+                    .map_err(local)?
+                    .into_iter()
+                    .filter_map(|(_, recording)| recording)
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+            Ok(match lease_claim(dropped, &kept) {
+                LeaseClaim::Replace => LeaseCheck::Replace,
+                LeaseClaim::Recorded(commit) => LeaseCheck::Recorded(commit),
+            })
         };
         if self.repo.odb().is_ok_and(|odb| odb.exists(lease)) {
             return related(&self.repo);
         }
-        let scratch = self.lock_path.with_extension("lease.git");
-        let _ = fs::remove_dir_all(&scratch);
-        let checked = (|| {
-            Repository::init_bare(&scratch).map_err(local)?;
+        let guard = LeaseScratch::new(lease_scratch(&self.lock_path));
+        let scratch = guard.path();
+        (|| {
+            Repository::init_bare(scratch).map_err(local)?;
             let objects = fs::canonicalize(self.repo.path().join("objects"))
                 .map_err(|e| (PushFailureKind::Local, e.to_string()))?;
             fs::write(
@@ -1234,19 +1282,21 @@ impl RemotePusher {
                 format!("{}\n", objects.display()),
             )
             .map_err(|e| (PushFailureKind::Local, e.to_string()))?;
-            let repo = Repository::open_bare(&scratch).map_err(local)?;
+            let repo = Repository::open_bare(scratch).map_err(local)?;
             // What the fetch negotiates from: the remote sends only what
             // this history lacks.
             repo.reference("refs/heads/head", head, true, "agentfs lease check")
                 .map_err(local)?;
             let tip = crate::fork::start::fetch_branch(&repo, &self.remote, &self.branch_ref)?;
+            #[cfg(test)]
+            if let Some(hook) = &self.in_lease_scratch {
+                hook();
+            }
             if tip != Some(lease) {
                 return Ok(LeaseCheck::Moved(tip));
             }
             related(&repo)
-        })();
-        let _ = fs::remove_dir_all(&scratch);
-        checked
+        })()
     }
 
     /// This remote's push lock file: held while a push runs, and by a
@@ -1255,7 +1305,8 @@ impl RemotePusher {
         &self.lock_path
     }
 
-    /// Takes this remote's push lock without waiting.
+    /// Takes this remote's push lock without waiting, then sweeps the lease
+    /// scratch repositories a killed push left ([`sweep_lease_scratch`]).
     fn lock(&self) -> io::Result<Option<File>> {
         let file = OpenOptions::new()
             .write(true)
@@ -1263,11 +1314,11 @@ impl RemotePusher {
             .truncate(false)
             .mode(0o600)
             .open(&self.lock_path)?;
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(file)),
-            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-            Err(e) => Err(e.into()),
+        if !try_flock(&file)? {
+            return Ok(None);
         }
+        sweep_lease_scratch(&self.lock_path);
+        Ok(Some(file))
     }
 
     /// `<oid>:<ref>` for the branch and every
@@ -1920,6 +1971,130 @@ fn another_writer(
             found: *found,
         }),
         _ => None,
+    })
+}
+
+/// What a lease scratch repository's name ends with, after its remote's
+/// name: `<remote>.lease.git`, beside `<remote>.lock`.
+const LEASE_SCRATCH_SUFFIX: &str = ".lease.git";
+
+/// The lease check's scratch repository for the remote whose push lock is
+/// `lock` (`<push dir>/<remote>.lock`).
+fn lease_scratch(lock: &Path) -> PathBuf {
+    let mut name = lock.file_stem().unwrap_or_default().to_os_string();
+    name.push(LEASE_SCRATCH_SUFFIX);
+    lock.with_file_name(name)
+}
+
+/// The lease check's scratch repository (design §15), which holds the
+/// remote's history, the old history a rewrite removed included: removed
+/// when created (a leftover is never reused) and when dropped, so no exit
+/// path, an error or a panic unwinding, leaves it behind. A process killed
+/// meanwhile skips the drop; the next push sweeps it
+/// ([`sweep_lease_scratch`]).
+struct LeaseScratch(PathBuf);
+
+impl LeaseScratch {
+    fn new(path: PathBuf) -> Self {
+        let _ = fs::remove_dir_all(&path);
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for LeaseScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Removes every lease scratch repository beside `own_lock`, a push lock
+/// the caller holds: its own remote's, and any other remote's, a
+/// configured one or one since removed, whose push lock is free. A scratch
+/// repository is only made under its remote's lock, so one whose lock is
+/// free (or whose lock file is gone) is what a killed lease push left; one
+/// whose lock another process holds is in use and stays. Best effort: a
+/// failure leaves it for the next push.
+fn sweep_lease_scratch(own_lock: &Path) {
+    let Some(dir) = own_lock.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(remote) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(LEASE_SCRATCH_SUFFIX))
+        else {
+            continue;
+        };
+        let lock = dir.join(format!("{remote}.lock"));
+        // Held for the removal only, and never this process's own lock
+        // twice: flock locks are per open file, so a second open would
+        // conflict with the one the caller holds.
+        let _held = if lock == own_lock {
+            None
+        } else {
+            match File::open(&lock) {
+                Ok(file) => match try_flock(&file) {
+                    Ok(true) => Some(file),
+                    Ok(false) | Err(_) => continue,
+                },
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => continue,
+            }
+        };
+        let _ = fs::remove_dir_all(&path);
+    }
+}
+
+/// Takes an exclusive `flock` on `file` without waiting: `false` when
+/// another open file holds it.
+fn try_flock(file: &File) -> io::Result<bool> {
+    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The commits `from` reaches and `hidden` does not, newest first, each
+/// with its [`Recording`] ([`lease_claim`]'s inputs).
+fn commits_beyond(
+    repo: &Repository,
+    from: Oid,
+    hidden: Oid,
+) -> Result<Vec<(Oid, Option<Recording>)>, GitError> {
+    let mut walk = repo.revwalk()?;
+    walk.push(from)?;
+    walk.hide(hidden)?;
+    walk.map(|oid| {
+        let oid = oid?;
+        Ok((oid, recording(&repo.find_commit(oid)?)))
+    })
+    .collect()
+}
+
+/// `commit` as a recorder made it: `None` without an `Agentfs-Seq`
+/// trailer (design §9), which every agentfs commit carries.
+fn recording(commit: &git2::Commit) -> Option<Recording> {
+    let seq = crate::history::seq_from_message(&String::from_utf8_lossy(commit.message_bytes()))?;
+    let stamp = |sig: git2::Signature| Stamp {
+        name: sig.name_bytes().to_vec(),
+        email: sig.email_bytes().to_vec(),
+        seconds: sig.when().seconds(),
+        offset_minutes: sig.when().offset_minutes(),
+    };
+    Some(Recording {
+        seq,
+        author: stamp(commit.author()),
+        committer: stamp(commit.committer()),
     })
 }
 
@@ -3660,6 +3835,242 @@ mod tests {
         let held = v.pusher("origin", Arc::new(NullSink));
         let _lock = held.lock().unwrap().unwrap();
         assert_eq!(pusher.push_with_lease(lease), LeaseOutcome::Busy);
+    }
+
+    /// Writes onto `remote`'s `branch` a commit an agentfs recorder made
+    /// (it carries `Agentfs-Seq`) that this repository lacks: the volume's
+    /// newer history, written from a newer copy of its state area.
+    fn write_remote_recorded(remote: &Path, branch: &str, seq: u64) -> Oid {
+        let repo = Repository::open_bare(remote).unwrap();
+        let parent = repo
+            .find_commit(repo.refname_to_id(branch).unwrap())
+            .unwrap();
+        let sig = git2::Signature::now("agent", "agent@example.invalid").unwrap();
+        let tree = parent.tree().unwrap();
+        let message = format!("close f9\n\nAgentfs-Seq: {seq}\nAgentfs-Trigger: close\n");
+        repo.commit(Some(branch), &sig, &sig, &message, &tree, &[&parent])
+            .unwrap()
+    }
+
+    /// Bead agentfs-4lb.1: a lease push interrupted while the remote's old
+    /// history sits in its scratch repository (here a panic, unwinding)
+    /// leaves no scratch repository behind.
+    #[test]
+    fn an_interrupted_lease_push_leaves_no_scratch_repository() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        let theirs = write_remote(remote, "refs/heads/agentfs/vol");
+        v.commit();
+        let scratch = pusher.lock_path().with_extension("lease.git");
+        let seen = scratch.clone();
+        pusher.in_lease_scratch = Some(Box::new(move || {
+            assert!(seen.join("objects").exists(), "the lease was fetched aside");
+            panic!("interrupted mid-push");
+        }));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pusher.push_with_lease(theirs)
+        }));
+        assert!(interrupted.is_err(), "the hook ran");
+        assert!(
+            !scratch.exists(),
+            "the remote's old history is left at {}",
+            scratch.display()
+        );
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(theirs));
+    }
+
+    /// Bead agentfs-4lb.1: a scratch repository a killed lease push left
+    /// (for this remote, or one no longer configured) is removed by the
+    /// next push of any remote; one whose remote's push lock another
+    /// process holds is in use and stays.
+    #[test]
+    fn a_push_sweeps_lease_scratch_repositories_a_killed_push_left() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        bare(remote_dir.path());
+        let mut v = Vol::new(
+            "vol",
+            &[("origin", &remote_dir.path().display().to_string())],
+        );
+        v.commit();
+        let dir = v.state.push_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let stale = |name: &str| {
+            let scratch = dir.join(format!("{name}.lease.git"));
+            Repository::init_bare(&scratch).unwrap();
+            scratch
+        };
+        let own = stale("origin");
+        let gone = stale("gone.remote");
+        let busy = stale("busy");
+        let held = File::create(dir.join("busy.lock")).unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        assert!(!own.exists(), "{} is left", own.display());
+        assert!(!gone.exists(), "{} is left", gone.display());
+        assert!(busy.exists(), "a scratch in use stays");
+        drop(held);
+    }
+
+    /// Bead agentfs-4lb.2, F8 "one branch per worktree": the lease push
+    /// replaces a foreign writer's commits (divergence case A) and refuses
+    /// a branch holding history an agentfs recorder wrote that this state
+    /// area lacks (case B: a stale state area; the branch is not its to
+    /// replace).
+    #[test]
+    fn a_lease_push_replaces_case_a_and_refuses_case_b() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        bare(a_dir.path());
+        bare(b_dir.path());
+        let mut v = Vol::new(
+            "vol",
+            &[
+                ("a", &a_dir.path().display().to_string()),
+                ("b", &b_dir.path().display().to_string()),
+            ],
+        );
+        v.commit();
+        let mut a = v.pusher("a", Arc::new(NullSink));
+        let mut b = v.pusher("b", Arc::new(NullSink));
+        assert!(a.push_once().is_success());
+        assert!(b.push_once().is_success());
+        let branch = "refs/heads/agentfs/vol";
+        let seq = v.com.history().head_seq().unwrap().unwrap();
+        // Case A: a person's commit on the volume's branch.
+        let foreign = write_remote(a_dir.path(), branch);
+        // Case B: this volume's own newer history, recorded elsewhere.
+        let newer = write_remote_recorded(b_dir.path(), branch, seq + 1);
+        let head = v.commit();
+        assert!(matches!(a.push_once(), PushOutcome::Diverged { .. }));
+        assert!(matches!(b.push_once(), PushOutcome::Diverged { .. }));
+
+        assert_eq!(
+            a.push_with_lease(foreign),
+            LeaseOutcome::Pushed {
+                from: foreign,
+                to: head
+            }
+        );
+        assert_eq!(remote_ref(a_dir.path(), branch), Some(head));
+
+        let outcome = b.push_with_lease(newer);
+        assert_eq!(
+            remote_ref(b_dir.path(), branch),
+            Some(newer),
+            "case B is never replaced: {outcome:?}"
+        );
+        assert_eq!(outcome, LeaseOutcome::Recorded { commit: newer });
+        assert!(b.state().diverged.is_some(), "still diverged");
+        assert!(!b.lock_path().with_extension("lease.git").exists());
+        assert!(
+            v.com.history().repo().find_commit(newer).is_err(),
+            "the remote's history was not taken in"
+        );
+    }
+
+    /// Case B as it happens: the newer copy of the state area recorded the
+    /// same `Agentfs-Seq` with the same author and committer as this stale
+    /// one, at another time. Only the time tells the records apart, and the
+    /// branch is refused.
+    #[test]
+    fn a_lease_push_refuses_the_same_record_made_at_another_time() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        let pushed = v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        let stale = v.commit();
+        let repo = v.com.history().repo();
+        let ours = repo.find_commit(stale).unwrap();
+        let later = |sig: git2::Signature| {
+            git2::Signature::new(
+                sig.name().unwrap(),
+                sig.email().unwrap(),
+                &git2::Time::new(sig.when().seconds() + 3600, sig.when().offset_minutes()),
+            )
+            .unwrap()
+        };
+        let theirs = {
+            let remote_repo = Repository::open_bare(remote).unwrap();
+            let parent = remote_repo.find_commit(pushed).unwrap();
+            remote_repo
+                .commit(
+                    Some("refs/heads/agentfs/vol"),
+                    &later(ours.author()),
+                    &later(ours.committer()),
+                    ours.message().unwrap(),
+                    &parent.tree().unwrap(),
+                    &[&parent],
+                )
+                .unwrap()
+        };
+        assert!(matches!(pusher.push_once(), PushOutcome::Diverged { .. }));
+        assert_eq!(
+            pusher.push_with_lease(theirs),
+            LeaseOutcome::Recorded { commit: theirs }
+        );
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(theirs));
+    }
+
+    /// The history-rewrite runbook's step 9: the remote's old commits were
+    /// recorded by agentfs, and the head holds each one rewritten (the same
+    /// `Agentfs-Seq`, author and committer; another tree): replaced.
+    #[test]
+    fn a_lease_push_replaces_a_history_the_head_rewrote() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        let clean = v.commit();
+        v.commit_file("secret", b"s3cret");
+        let old = v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        // filter-repo, in short: every commit since `clean` again, with the
+        // secret dropped from its tree and nothing else changed.
+        let repo = v.com.history().repo();
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(old).unwrap();
+        walk.hide(clean).unwrap();
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+            .unwrap();
+        let mut parent = repo.find_commit(clean).unwrap();
+        for oid in walk {
+            let commit = repo.find_commit(oid.unwrap()).unwrap();
+            let mut tree = repo.treebuilder(Some(&commit.tree().unwrap())).unwrap();
+            if tree.get("secret").unwrap().is_some() {
+                tree.remove("secret").unwrap();
+            }
+            let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+            let rewritten = repo
+                .commit(
+                    None,
+                    &commit.author(),
+                    &commit.committer(),
+                    commit.message().unwrap(),
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            parent = repo.find_commit(rewritten).unwrap();
+        }
+        let new = parent.id();
+        repo.reference("refs/heads/agentfs/vol", new, true, "rewrite")
+            .unwrap();
+        assert_eq!(
+            pusher.push_with_lease(old),
+            LeaseOutcome::Pushed { from: old, to: new }
+        );
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(new));
     }
 
     /// F8 rule 2: the branch push decides in libgit2's negotiation, from
