@@ -614,7 +614,9 @@ impl Receiver for ThroughService {
                 .map(|_| ())
                 .ok_or_else(|| unavailable(format!("the source's daemon answered {change:?}"))),
             control::Reply::Refused { kind, message, .. } => {
-                Err(match ReceiveError::from_refusal(&kind, message.clone()) {
+                let refused = receive::RefusalKind::parse(&kind)
+                    .and_then(|kind| ReceiveError::from_refusal(kind, message.clone()));
+                Err(match refused {
                     Some(refused) => refused.into(),
                     None => unavailable(message),
                 })
@@ -652,7 +654,7 @@ pub fn serve_receive(state: &StateDir, request: &control::Request) -> control::R
             change: change.to_string(),
         },
         Err(e) => match e.refusal() {
-            Some((kind, message)) => refused(kind, message),
+            Some((kind, message)) => refused(kind.as_str(), message),
             None => control::Reply::Error(e.to_string()),
         },
     }

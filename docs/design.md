@@ -2088,14 +2088,17 @@ and a source state area that is gone is `RemoteGone` (both refused, the
 fork can be abandoned). The fork's output is untrusted (§19.1 "Fork
 content"), so receiving refuses, writing no ref (`unsafe`, refused): a
 ref that is the source's own, its branch or one under
-`refs/agentfs/<source>/` (a fork named as its source, or a source branch
-renamed to a fork's); a base that is not on the source's branch (never
+`refs/agentfs/<source>/`, compared ignoring ASCII case since a loose ref
+is a file and some filesystems ignore case (a fork named as its source
+in any case, or a source branch renamed to a fork's); a base that is not on the source's branch (never
 the source's, or gone from a history rewritten by §15's runbook, which
 the fork would bring back); and an LFS object whose content is not its
 name. Each is one path in `fork::receive`: refs are written only from a
 judged `ForkRefs`, objects are copied only less a base judged on the
 branch (`OnBranch`), and LFS objects are taken only through the cache's
-verified insert, which keeps the bytes it hashed. The fork itself is local-only and pushes
+verified insert, which keeps the bytes it hashed; `ForkRefs` and
+`OnBranch` live in a private module whose private fields leave their
+`judge` the only constructor. The fork itself is local-only and pushes
 nothing. The received refs are the source's history too: once the source
 gains a remote, every push that writes its branch
 carries them after it, create-only (`fork::receive::received_refs`; one

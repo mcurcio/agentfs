@@ -1513,6 +1513,27 @@ fn a_fork_never_writes_the_sources_own_refs() {
     assert_eq!(source.snapshot(), before, "nothing is written");
 }
 
+/// Ref names that differ only in ASCII case are one ref on a
+/// case-insensitive filesystem (loose refs are files), so a fork named as
+/// its source in another case is the source's too, on every filesystem.
+#[test]
+fn a_fork_named_as_its_source_in_another_case_is_refused() {
+    let (source, fork, identity) = finished_fork_of_local_only("SRC");
+    let head = source.head();
+    let before = source.snapshot();
+    let received = super::receive::receive_fork_change(&source.state, &identity, &fork.state);
+    assert!(
+        matches!(
+            received,
+            Err(super::receive::ReceiveError::SourcesRef { ref refname })
+                if refname == "refs/heads/agentfs/SRC"
+        ),
+        "received into the source's own refs in another case: {received:?}"
+    );
+    assert_eq!(source.head(), head, "the source's branch never moves");
+    assert_eq!(source.snapshot(), before, "nothing is written");
+}
+
 /// A fork's base must be on the source's branch: one the source never
 /// had, or no longer has (its history rewritten, design §15), is refused
 /// and nothing is written, so a fork never brings history the source
@@ -1570,6 +1591,28 @@ fn a_fork_whose_base_is_not_on_the_sources_branch_is_refused() {
             ..
         }
     ));
+
+    // A source with no branch at all: nothing holds the base.
+    let (source, fork, identity) = finished_fork_of_local_only("src-8");
+    let branch = crate::config::Settings::load(&source.state.git())
+        .unwrap()
+        .branch_ref;
+    source
+        .repo()
+        .find_reference(&branch)
+        .unwrap()
+        .delete()
+        .unwrap();
+    let before = source.snapshot();
+    let received = super::receive::receive_fork_change(&source.state, &identity, &fork.state);
+    assert!(
+        matches!(
+            received,
+            Err(super::receive::ReceiveError::BaseNotOnBranch { base }) if base == identity.base
+        ),
+        "received into a source with no branch: {received:?}"
+    );
+    assert_eq!(source.snapshot(), before, "nothing is written");
 }
 
 /// The fork's LFS objects are taken into the source's cache only as
@@ -1627,34 +1670,26 @@ fn a_forks_lfs_objects_are_kept_only_as_verified() {
 /// itself (`receive_fork`), and nothing else is read as one.
 #[test]
 fn receive_refusals_round_trip_the_control_socket() {
-    use super::receive::ReceiveError;
-    let base = Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
-    for refused in [
-        ReceiveError::SourceRemoved,
-        ReceiveError::NotPublished,
-        ReceiveError::Diverged {
-            refname: "refs/heads/agentfs/f".into(),
-        },
-        ReceiveError::SourcesRef {
-            refname: "refs/heads/agentfs/src".into(),
-        },
-        ReceiveError::BaseNotOnBranch { base },
-        ReceiveError::LfsMismatch {
-            message: "LFS object x arrived as y".into(),
-        },
-    ] {
-        let (kind, message) = refused.refusal().unwrap();
-        let back = ReceiveError::from_refusal(kind, message).unwrap();
-        assert_eq!(back.to_string(), refused.to_string(), "{kind}");
-        assert_eq!(back.refusal(), refused.refusal(), "{kind}");
+    use super::receive::{ReceiveError, RefusalKind};
+    // A message each kind can carry: a commit id parses as any.
+    let message = "0123456789abcdef0123456789abcdef01234567";
+    let mut names = std::collections::BTreeSet::new();
+    for kind in RefusalKind::ALL {
+        assert!(names.insert(kind.as_str()), "{kind:?} named twice");
+        assert_eq!(RefusalKind::parse(kind.as_str()), Some(kind));
+        let refused = ReceiveError::from_refusal(kind, message.into()).unwrap();
+        let (sent, text) = refused.refusal().unwrap();
+        assert_eq!(sent, kind);
+        let back = ReceiveError::from_refusal(sent, text).unwrap();
+        assert_eq!(back.to_string(), refused.to_string(), "{kind:?}");
     }
     assert!(
         ReceiveError::Io(std::io::Error::other("x"))
             .refusal()
             .is_none()
     );
-    assert!(ReceiveError::from_refusal("base_not_on_branch", "abc".into()).is_none());
-    assert!(ReceiveError::from_refusal("not_a_fork", "x".into()).is_none());
+    assert!(ReceiveError::from_refusal(RefusalKind::BaseNotOnBranch, "abc".into()).is_none());
+    assert_eq!(RefusalKind::parse("not_a_fork"), None);
 }
 
 /// A deadline for a publish that should not wait.
