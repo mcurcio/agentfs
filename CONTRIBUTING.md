@@ -47,14 +47,14 @@ Mounts, root, kind, Helm, sshd and the other end-to-end tests need Linux
 with `/dev/fuse` and usually root, so they run as scripts under `ci/` in
 GitHub Actions. Run what you can locally and let CI run the rest.
 
-### A local Linux gate with Podman
+### A local Linux gate in a container
 
 On macOS, or without the toolchain installed, run the gate in a container.
-Build a development image once, from the same Rust image the
-[Dockerfile](Dockerfile) builds with:
+Build a development image once with Docker (Podman takes the same commands),
+from the same Rust image the [Dockerfile](Dockerfile) builds with:
 
 ```sh
-podman build -t agentfs-dev -f - . <<'EOF'
+docker build -t agentfs-dev -f - . <<'EOF'
 FROM docker.io/library/rust:1.99-trixie
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libssl-dev pkg-config git-lfs \
@@ -67,11 +67,13 @@ Then run any cargo command against your checkout, with the build and the
 registry in named volumes so they survive between runs:
 
 ```sh
-podman run --rm -v "$PWD":/src:Z -v agentfs-target:/target \
+docker run --rm -v "$PWD":/src -v agentfs-target:/target \
   -v agentfs-cargo:/usr/local/cargo/registry -e CARGO_TARGET_DIR=/target \
   -w /src agentfs-dev cargo test --workspace
 ```
 
+The build output and the registry stay in the container engine's storage, so
+put that storage on a disk with room (a full Rust build is several GB).
 FUSE mounts do not work in this container; CI runs them.
 
 ### The logo
