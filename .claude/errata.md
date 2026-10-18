@@ -192,3 +192,20 @@ None of these stopped the slice; each was resolved as below and is reported with
 8. Slice page counts ("about 38 test files", "nine `ci/e2e-*.sh`"): the harnesses that needed a
    declaration were 13 CLI test files, the core and CSI fixtures, `ci/lib.sh` and 11 other
    scripts, and the csi-sanity profile; deploy and chart profiles already name remotes.
+
+## 2026-10-17, F8 zero-remotes implementer (f8-zero-remotes)
+
+1. LAND PROTOCOL ("every workflow run on your SHA green") cannot hold for this change: the
+   `docs` workflow's `README Docker quick start` job runs the README block against the
+   published `ghcr.io/mcurcio/agentfs:latest`, and that image (built before this change)
+   refuses `agentfs init` of the no-remote `examples/docker/config/local` ("declare remotes:
+   add a [remote] section to an include, or pass --local-only"). It can only turn green after
+   this change's image is published from main. Every other run on 900dcce is green. The only
+   in-repo way to green it on the branch is keeping `agentfs.remotes = none` in the example for
+   the old image, a backwards-compatibility shim the global rules forbid. Stopped before main:
+   the choice (land and rerun `docs` once `image` publishes; the shim; or a branch `docs` job
+   against the commit's own image) is the orchestrator's or the owner's.
+2. The brief's "fork-create refusals of undeclared volumes": fork create had no refusal of its
+   own; an undeclared source simply had no fork remote (`NoForkRemote`). With the declaration
+   gone, any source with no remote section is local-only, so its forks publish into its own
+   history (`ForkRemote::SourceHistory`). Only `OWN_KEYS` read the removed key in fork code.
