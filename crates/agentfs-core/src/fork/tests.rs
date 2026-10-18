@@ -1255,10 +1255,10 @@ fn finish_records_parse_only_from_agentfs_trailers() {
     }
 }
 
-/// A volume declared local-only by its profile (F8 S3): no remote at all.
+/// A local-only volume: its profile has no remote section at all.
 fn local_only(name: &str) -> Vol {
     let vol = Vol::new(name);
-    fs::write(&vol.fragment, "[agentfs]\n\tremotes = none\n").unwrap();
+    fs::write(&vol.fragment, "").unwrap();
     vol
 }
 

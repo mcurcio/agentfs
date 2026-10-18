@@ -143,11 +143,6 @@ enum Command {
         /// state area's includes.
         #[arg(long = "include", value_name = "FILE")]
         includes: Vec<PathBuf>,
-        /// Declare the volume local-only: `agentfs.remotes = none` in the
-        /// state area's own config. Without it, and without a remote
-        /// section in an include, init is refused (F8 S3).
-        #[arg(long)]
-        local_only: bool,
     },
     /// Show the branch head, the last committed sequence and the backlog.
     Status(Pod),
@@ -395,7 +390,6 @@ fn real_main() -> Result<ExitCode> {
             volume,
             branch,
             includes,
-            local_only,
         } => init(
             &state,
             cli.root.as_deref(),
@@ -403,7 +397,6 @@ fn real_main() -> Result<ExitCode> {
             &volume,
             branch,
             includes,
-            local_only,
         )?,
         Command::Status(_pod) => {
             // Read-only: no recovery, no lock, so it is safe beside a
@@ -569,7 +562,7 @@ fn real_main() -> Result<ExitCode> {
                 session.finish();
                 return Ok(code);
             }
-            // Declared local-only: nothing is ever pushed, daemon or not.
+            // Local-only: nothing is pushed, daemon or not.
             if remotes.is_empty()
                 && History::open(&state.git())
                     .with_context(|| format!("opening {}", state.root().display()))?
@@ -692,9 +685,7 @@ fn refuse_finished(state: &StateDir) -> Result<()> {
 }
 
 /// `agentfs init`: creates the state area or checks an existing one
-/// (design §2.3, §17.1), and creates `--root` when it is missing. A
-/// result that declares no remote is refused (F8 S3): the state area
-/// stays, as with a bad include, and init with a declaration fixes it.
+/// (design §2.3, §17.1), and creates `--root` when it is missing.
 fn init(
     state: &StateDir,
     root: Option<&Path>,
@@ -702,7 +693,6 @@ fn init(
     volume: &str,
     branch: Option<String>,
     includes: Vec<PathBuf>,
-    local_only: bool,
 ) -> Result<()> {
     // An existing state area may be in use: take its lock. A new one is
     // created whole, so there is nothing to lock yet (and a refused name
@@ -720,26 +710,6 @@ fn init(
     let includes = (!includes.is_empty()).then_some(includes.as_slice());
     let outcome = volume::init_with(state, volume, branch.as_deref(), includes)
         .with_context(|| format!("initialising {}", state.root().display()))?;
-    if local_only {
-        agentfs_core::config::declare_local_only(&state.git())
-            .with_context(|| format!("declaring {} local-only", state.root().display()))?;
-    }
-    let settings = History::open(&state.git())
-        .with_context(|| format!("opening {}", state.root().display()))?
-        .settings()
-        .remotes
-        .clone();
-    if let Remotes::Undeclared { beside } = settings {
-        match beside {
-            None => {
-                bail!("declare remotes: add a [remote] section to an include, or pass --local-only")
-            }
-            Some(remote) => bail!(
-                "declare remotes: agentfs.remotes = none is set beside remote section \
-                 {remote:?}; remove one of them"
-            ),
-        }
-    }
     if let Some(root) = root
         && !root.exists()
     {
@@ -793,13 +763,6 @@ fn push_once(state: &StateDir, only: &[String], session: &Session) -> Result<Exi
         Remotes::LocalOnly => {
             println!("{LOCAL_ONLY_PUSH}");
             return Ok(ExitCode::SUCCESS);
-        }
-        Remotes::Undeclared { .. } => {
-            if let Some(event) = agentfs_core::service::remotes_undeclared(settings) {
-                eprintln!("{event}");
-                events.emit(event);
-            }
-            return Ok(ExitCode::FAILURE);
         }
         Remotes::Pushed(_) | Remotes::NoneValid => {}
     }
@@ -970,22 +933,16 @@ fn describe(outcome: &PushOutcome) -> String {
     }
 }
 
-/// What `agentfs push` prints for a volume declared local-only.
+/// What `agentfs push` prints for a local-only volume (no remote section).
 const LOCAL_ONLY_PUSH: &str = "local-only: nothing to push";
 
-/// `agentfs status`'s `remotes:` line: how the volume declares its
-/// remotes (F8 S3).
+/// `agentfs status`'s `remotes:` line: the volume's remotes mode (design
+/// §11.1).
 fn remotes_line(remotes: &Remotes) -> String {
     match remotes {
         Remotes::Pushed(list) => format!("{} pushed", list.len()),
         Remotes::NoneValid => "none valid (every remote section is misconfigured)".into(),
-        Remotes::LocalOnly => "local-only (declared)".into(),
-        Remotes::Undeclared { beside: None } => {
-            "undeclared (add a remote section, or agentfs.remotes = none)".into()
-        }
-        Remotes::Undeclared {
-            beside: Some(remote),
-        } => format!("undeclared (agentfs.remotes = none beside remote {remote:?})"),
+        Remotes::LocalOnly => "local-only (no remote)".into(),
     }
 }
 

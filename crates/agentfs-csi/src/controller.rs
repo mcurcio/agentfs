@@ -406,7 +406,8 @@ fn decide(
             has_history: false,
             uncommitted: records.len(),
             on_delete,
-            remotes: Declared::Undeclared,
+            // Never weighed: with no history only the journal counts.
+            remotes: Declared::LocalOnly,
             fork,
         }));
     }

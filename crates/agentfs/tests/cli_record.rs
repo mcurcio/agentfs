@@ -17,7 +17,7 @@ impl Volume {
         };
         fs::create_dir_all(v.tree()).unwrap();
         fs::create_dir_all(v.home()).unwrap();
-        let out = v.run(&["init", "--volume", "demo", "--local-only"]);
+        let out = v.run(&["init", "--volume", "demo"]);
         assert!(out.status.success(), "{}", stderr(&out));
         v
     }

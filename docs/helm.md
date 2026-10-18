@@ -156,7 +156,7 @@ The defaults are those of `deploy/`, with these differences:
 |---|---|---|
 | `image.tag` (CSI) | the chart's appVersion | a published chart pins the image of its own commit (§7); in the repository it is `latest` |
 | `image.tag` (sidecar) | none, required | the library cannot know its consumer's release, so it refuses to render without a tag or digest |
-| `profiles` | none | `deploy/csi`'s `example` profile points at a placeholder remote; every profile declares its remotes, a `[remote]` section or `agentfs.remotes = none`, or CreateVolume refuses it ([configuration](configuration.md#declaring-remotes)) |
+| `profiles` | none | `deploy/csi`'s `example` profile points at a placeholder remote; a profile with no `[remote]` section makes local-only volumes ([configuration](configuration.md#remotes-modes)) |
 | `credentials.existingSecret` | empty: the chart renders an empty `agentfs-csi-credentials` Secret | set it to keep secrets out of the release record |
 | `storageClasses` | none | they belong to the workloads' operator; `deploy/csi/example` has two |
 

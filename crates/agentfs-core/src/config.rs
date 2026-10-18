@@ -168,7 +168,6 @@ pub const KEYS: &[&str] = &[
     "agentfs.pushInterval",
     "agentfs.sweepInterval",
     "agentfs.repackInterval",
-    "agentfs.remotes",
     "agentfs.patchRemote",
     "agentfs.patchFetchTimeout",
     "agentfs.lfsThreshold",
@@ -493,12 +492,14 @@ pub struct Settings {
     pub start: Option<crate::fork::identity::StartPoint>,
 }
 
-/// How a volume declares its push remotes (F8 S3, R4: zero remotes is a
-/// declared mode); [`Settings::load`] is the one decider. Push sections and
-/// the flagged fork-remote section are disjoint inputs, so the two cannot
+/// Which push remotes a volume has (design §11.1); [`Settings::load`] is the
+/// one decider. Zero remotes is never an error and needs no declaration
+/// (owner, 2026-10-17: "Remotes can come and go. It's not a error to have
+/// zero remotes"): a volume with no push section is local-only, and one
+/// that gains a section later pushes everything. Push sections and the
+/// flagged fork-remote section are disjoint inputs, so the two cannot
 /// disagree. A fork's mode follows its fork remote: `Pushed` with that one
-/// remote, `LocalOnly` when it publishes into its source's history,
-/// `NoneValid` when a flagged section is invalid, else `Undeclared`.
+/// remote, `NoneValid` when a flagged section is invalid, else `LocalOnly`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Remotes {
     /// One or more valid push sections, sorted by name; invalid sections
@@ -507,16 +508,11 @@ pub enum Remotes {
     /// Push sections, all invalid: each alarms; commits wait. Never
     /// reported local-only.
     NoneValid,
-    /// `agentfs.remotes = none` and no push section: status, telemetry
-    /// and alarms say local-only. A remote added later (and `none`
-    /// removed) gets all history: the branch, and the refs of the forks
-    /// received meanwhile (`fork::receive::received_refs`).
+    /// No push section: nothing is pushed, and status and telemetry say
+    /// local-only; no alarm. A remote added later gets all history: the
+    /// branch, and the refs of the forks received meanwhile
+    /// (`fork::receive::received_refs`).
     LocalOnly,
-    /// Neither, or `none` beside a push section (`beside` names it):
-    /// pushes nothing and raises `RemotesUndeclared`; `agentfs init` and
-    /// CreateVolume refuse it; an existing volume keeps opening
-    /// (principle 1).
-    Undeclared { beside: Option<String> },
 }
 
 impl Remotes {
@@ -526,7 +522,7 @@ impl Remotes {
     pub fn pushed(&self) -> &[RemoteSettings] {
         match self {
             Self::Pushed(remotes) => remotes,
-            Self::NoneValid | Self::LocalOnly | Self::Undeclared { .. } => &[],
+            Self::NoneValid | Self::LocalOnly => &[],
         }
     }
 
@@ -535,7 +531,7 @@ impl Remotes {
     pub(crate) fn pushed_mut(&mut self) -> &mut [RemoteSettings] {
         match self {
             Self::Pushed(remotes) => remotes.as_mut_slice(),
-            Self::NoneValid | Self::LocalOnly | Self::Undeclared { .. } => &mut [],
+            Self::NoneValid | Self::LocalOnly => &mut [],
         }
     }
 
@@ -546,64 +542,17 @@ impl Remotes {
             Self::Pushed(_) => "pushed",
             Self::NoneValid => "none_valid",
             Self::LocalOnly => "local_only",
-            Self::Undeclared { .. } => "undeclared",
         }
     }
 }
 
-/// `agentfs.remotes`: its only value.
-pub const REMOTES_NONE: &str = "none";
-
-/// Declares the volume at `git_dir` local-only: `agentfs.remotes = none`
-/// in its own config (`agentfs init --local-only`, F8 S3).
-pub fn declare_local_only(git_dir: &Path) -> Result<(), ConfigError> {
-    let mut config = git2::Config::open(&git_dir.join("config"))?;
-    config.set_str("agentfs.remotes", REMOTES_NONE)?;
-    Ok(())
-}
-
-/// The error of each push section beside `agentfs.remotes = none`.
-const BESIDE_NONE: &str = "agentfs.remotes = none is set beside this push section: remove one";
-
-/// How a volume that is not a fork declares its remotes: `declared_none`
-/// is `agentfs.remotes = none`; `own` its valid push sections and
-/// `invalid` every invalid section (flagged ones are not push sections).
-/// Valid sections beside `none` are never pushed: they join `invalid`, so
-/// they alarm and the mount preflight still checks their files.
-fn declared(
-    declared_none: bool,
-    own: Vec<RemoteSettings>,
-    invalid: &mut Vec<InvalidRemote>,
-) -> Remotes {
-    let any_invalid = invalid.iter().any(|r| !r.fork_remote);
-    if !declared_none {
-        return match crate::non_empty::NonEmpty::new(own) {
-            Some(own) => Remotes::Pushed(own),
-            None if any_invalid => Remotes::NoneValid,
-            None => Remotes::Undeclared { beside: None },
-        };
-    }
-    if own.is_empty() && !any_invalid {
-        return Remotes::LocalOnly;
-    }
-    invalid.extend(own.into_iter().map(|r| {
-        InvalidRemote {
-            files: r
-                .files()
-                .into_iter()
-                .map(|(k, p)| (k, p.to_path_buf()))
-                .collect(),
-            name: r.name,
-            error: BESIDE_NONE.into(),
-            fork_remote: false,
-        }
-    }));
-    invalid.sort_by(|a, b| a.name.cmp(&b.name));
-    Remotes::Undeclared {
-        beside: invalid
-            .iter()
-            .find(|r| !r.fork_remote)
-            .map(|r| r.name.clone()),
+/// A volume's mode from its valid push sections (`own`) and every invalid
+/// section (`invalid`; flagged ones are not push sections).
+fn mode_of(own: Vec<RemoteSettings>, invalid: &[InvalidRemote]) -> Remotes {
+    match crate::non_empty::NonEmpty::new(own) {
+        Some(own) => Remotes::Pushed(own),
+        None if invalid.iter().any(|r| !r.fork_remote) => Remotes::NoneValid,
+        None => Remotes::LocalOnly,
     }
 }
 
@@ -810,10 +759,8 @@ struct SplitRemotes {
 }
 
 /// What [`split_remotes`] weighs beside the sections.
-struct Declaration<'a> {
+struct SplitInputs<'a> {
     patch_remote: &'a PatchRemote,
-    /// `agentfs.remotes = none`.
-    none: bool,
     /// The volume is a fork.
     fork: bool,
     /// The fork is unlinked ([`ForkLink::Unlinked`]).
@@ -825,7 +772,7 @@ struct Declaration<'a> {
 fn split_remotes(
     valid: Vec<RemoteSettings>,
     mut invalid: Vec<InvalidRemote>,
-    declaration: &Declaration<'_>,
+    inputs: &SplitInputs<'_>,
 ) -> SplitRemotes {
     let (mut flagged, own): (Vec<_>, Vec<_>) = valid.into_iter().partition(|r| r.fork_remote);
     if flagged.len() > 1 {
@@ -851,12 +798,12 @@ fn split_remotes(
         None => Ok(None),
     };
     let remote = |r: RemoteSettings| ForkRemote::Remote(Box::new(r));
-    if declaration.fork {
+    if inputs.fork {
         let fork_remote = match flagged {
             Ok(Some(one)) => Some(remote(one)),
             Err(()) => None,
-            Ok(None) if declaration.source_history => Some(ForkRemote::SourceHistory),
-            Ok(None) => resolve_patch_remote(declaration.patch_remote, &own, &invalid)
+            Ok(None) if inputs.source_history => Some(ForkRemote::SourceHistory),
+            Ok(None) => resolve_patch_remote(inputs.patch_remote, &own, &invalid)
                 .cloned()
                 .map(remote),
         };
@@ -866,12 +813,10 @@ fn split_remotes(
             }
             Some(ForkRemote::SourceHistory) => Remotes::LocalOnly,
             None if any_flagged_invalid => Remotes::NoneValid,
-            // An unlinked fork of a local-only source records no path to
-            // it (design §11.5): with no section at all it is local-only.
-            None if declaration.unlinked && own.is_empty() && invalid.is_empty() => {
-                Remotes::LocalOnly
-            }
-            None => Remotes::Undeclared { beside: None },
+            // Nowhere to push: an unlinked fork of a local-only source
+            // (it records no path to it, design §11.5), or a fork whose
+            // source's include lost its remote.
+            None => Remotes::LocalOnly,
         };
         return SplitRemotes {
             remotes,
@@ -879,15 +824,15 @@ fn split_remotes(
             invalid: invalid.into_iter().filter(|r| r.fork_remote).collect(),
             // An unlinked fork pushes its history where a linked one would
             // publish, and delivers nothing: it has no fork remote.
-            fork_remote: fork_remote.filter(|_| !declaration.unlinked),
+            fork_remote: fork_remote.filter(|_| !inputs.unlinked),
         };
     }
-    let remotes = declared(declaration.none, own, &mut invalid);
+    let remotes = mode_of(own, &invalid);
     let fork_remote = match flagged {
         Ok(Some(one)) => Some(remote(one)),
         Err(()) => None,
         Ok(None) if remotes == Remotes::LocalOnly => Some(ForkRemote::SourceHistory),
-        Ok(None) => resolve_patch_remote(declaration.patch_remote, remotes.pushed(), &invalid)
+        Ok(None) => resolve_patch_remote(inputs.patch_remote, remotes.pushed(), &invalid)
             .cloned()
             .map(remote),
     };
@@ -985,24 +930,12 @@ impl Settings {
                 PatchRemote::Named(name.to_owned())
             }
         };
-        let none = match string(config, "agentfs.remotes")?.as_deref() {
-            None => false,
-            Some(REMOTES_NONE) => true,
-            Some(other) => {
-                return Err(ConfigError::BadChoice {
-                    key: "agentfs.remotes".into(),
-                    value: other.into(),
-                    allowed: REMOTES_NONE,
-                });
-            }
-        };
         let source_state = source_state_of(config, fork.as_ref())?;
         let split = split_remotes(
             valid,
             invalid,
-            &Declaration {
+            &SplitInputs {
                 patch_remote: &patch_remote,
-                none,
                 fork: fork.is_some(),
                 unlinked: fork.as_ref().is_some_and(|f| f.link == ForkLink::Unlinked),
                 source_history: source_state.is_some(),
@@ -2754,18 +2687,15 @@ mod tests {
         let s = link(&format!("{unlinked}{origin}{flagged}")).unwrap();
         assert_eq!(s.remotes.pushed()[0].name, "forks");
         assert_eq!(s.fork_remote, None);
-        // No section: local-only; two unflagged and no patch remote:
-        // nothing to push to, undeclared, as a linked fork.
+        // No section, or two unflagged and no patch remote: nothing to
+        // push to, local-only, as a linked fork.
         assert_eq!(link(unlinked).unwrap().remotes, Remotes::LocalOnly);
         let two = "[remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n";
         assert_eq!(
             link(&format!("{unlinked}{two}")).unwrap().remotes,
-            Remotes::Undeclared { beside: None }
+            Remotes::LocalOnly
         );
-        assert_eq!(
-            link("").unwrap().remotes,
-            Remotes::Undeclared { beside: None }
-        );
+        assert_eq!(link("").unwrap().remotes, Remotes::LocalOnly);
         assert!(matches!(
             link(&format!("{unlinked}\tsourceState = /srv/src/state\n")),
             Err(ConfigError::UnlinkedSourceState)
@@ -2788,9 +2718,10 @@ mod tests {
         ));
     }
 
-    /// F8 S3 acceptance 1: each `Remotes` answer from config fragments.
+    /// Each `Remotes` answer from config fragments. Zero remotes is
+    /// local-only, with nothing to declare (owner, 2026-10-17).
     #[test]
-    fn remotes_are_declared_one_way() {
+    fn remotes_modes() {
         let mode = |lines: &str| {
             let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{lines}"));
             Settings::from_config(&c).unwrap().remotes
@@ -2807,70 +2738,11 @@ mod tests {
             mode("[remote \"bad\"]\n\turl = /b\n\tagentfsMaxBlobSize = 0\n"),
             Remotes::NoneValid
         );
-        assert_eq!(mode("[agentfs]\n\tremotes = none\n"), Remotes::LocalOnly);
-        assert_eq!(mode(""), Remotes::Undeclared { beside: None });
-        // A flagged section is not a push section: alone, nothing is
-        // declared, and beside `none` it is local-only.
+        assert_eq!(mode(""), Remotes::LocalOnly);
+        assert_eq!(mode("").mode(), "local_only");
+        // A flagged section is not a push section: alone, local-only.
         let flagged = "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n";
-        assert_eq!(mode(flagged), Remotes::Undeclared { beside: None });
-        assert_eq!(
-            mode(&format!("[agentfs]\n\tremotes = none\n{flagged}")),
-            Remotes::LocalOnly
-        );
-    }
-
-    /// `none` beside a push section is undeclared, naming it; the section
-    /// is never pushed, alarms, and its files stay checked.
-    #[test]
-    fn none_beside_a_section_is_undeclared() {
-        let (_d, c) = config_with(
-            "[agentfs]\n\tvolume = v\n\tremotes = none\n[remote \"origin\"]\n\turl = /o\n\
-             \tagentfsCredentials = /run/c\n",
-        );
-        let s = Settings::from_config(&c).unwrap();
-        assert_eq!(
-            s.remotes,
-            Remotes::Undeclared {
-                beside: Some("origin".into())
-            }
-        );
-        assert!(s.remotes.pushed().is_empty());
-        assert_eq!(s.invalid_remotes.len(), 1);
-        assert_eq!(s.invalid_remotes[0].name, "origin");
-        assert_eq!(
-            s.invalid_remotes[0].files,
-            [("agentfsCredentials", PathBuf::from("/run/c"))]
-        );
-        assert_eq!(s.patch_remote(), None);
-        assert_eq!(s.fork_remote, None);
-        // An invalid section beside it counts too.
-        let (_d, c) = config_with(
-            "[agentfs]\n\tvolume = v\n\tremotes = none\n[remote \"bad\"]\n\turl = /b\n\
-             \tagentfsMaxBlobSize = 0\n",
-        );
-        assert_eq!(
-            Settings::from_config(&c).unwrap().remotes,
-            Remotes::Undeclared {
-                beside: Some("bad".into())
-            }
-        );
-    }
-
-    #[test]
-    fn a_bad_remotes_value_is_refused() {
-        for value in ["None", "local", "", "origin"] {
-            let (_d, c) = config_with(&format!(
-                "[agentfs]\n\tvolume = v\n\tremotes = \"{value}\"\n"
-            ));
-            assert!(
-                matches!(
-                    Settings::from_config(&c),
-                    Err(ConfigError::BadChoice { ref key, allowed, .. })
-                        if key == "agentfs.remotes" && allowed == "none"
-                ),
-                "remotes = {value:?}"
-            );
-        }
+        assert_eq!(mode(flagged), Remotes::LocalOnly);
     }
 
     /// `ForkRemote::SourceHistory` only for a local-only source with no
@@ -2881,18 +2753,16 @@ mod tests {
             let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{lines}"));
             Settings::from_config(&c).unwrap().fork_remote
         };
-        let none = "[agentfs]\n\tremotes = none\n";
         let flagged = "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n";
-        assert_eq!(fork_remote(none), Some(ForkRemote::SourceHistory));
+        assert_eq!(fork_remote(""), Some(ForkRemote::SourceHistory));
         assert!(matches!(
-            fork_remote(&format!("{none}{flagged}")),
+            fork_remote(flagged),
             Some(ForkRemote::Remote(r)) if r.name == "forks"
         ));
         assert!(matches!(
             fork_remote("[remote \"origin\"]\n\turl = /o\n"),
             Some(ForkRemote::Remote(r)) if r.name == "origin"
         ));
-        assert_eq!(fork_remote(""), None);
         assert_eq!(
             fork_remote("[remote \"bad\"]\n\turl = /b\n\tagentfsMaxBlobSize = 0\n"),
             None
@@ -2909,11 +2779,11 @@ mod tests {
         let s = Settings::from_config(&c).unwrap();
         assert!(matches!(&s.fork_remote, Some(ForkRemote::Remote(r)) if r.name == "forks"));
         assert_eq!(s.remotes.pushed()[0].name, "forks");
-        // A fork with no fork remote is undeclared.
+        // A fork with no fork remote has nowhere to push: local-only.
         let (_d, c) = config_with(&fork_config(""));
         assert_eq!(
             Settings::from_config(&c).unwrap().remotes,
-            Remotes::Undeclared { beside: None }
+            Remotes::LocalOnly
         );
         // Only beside a fork identity, and only absolute.
         let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{state}"));

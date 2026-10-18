@@ -52,11 +52,10 @@ impl Driver {
             profiles: dir.path().join("profiles"),
         };
         fs::create_dir_all(&layout.profiles).unwrap();
-        // Declared local-only (F8 S3): CreateVolume refuses a profile that
-        // declares nothing.
+        // No remote: local-only.
         fs::write(
             layout.profiles.join("p.config"),
-            "[agentfs]\n\tcommitWindow = 100ms\n\tremotes = none\n",
+            "[agentfs]\n\tcommitWindow = 100ms\n",
         )
         .unwrap();
         fs::write(layout.profiles.join("p.exclude"), "*.tmp\n").unwrap();
@@ -777,7 +776,7 @@ async fn delete_volume_asks_the_remotes() {
         err.message()
     );
 
-    // Declared local-only: kept whatever onDelete says.
+    // Local-only (no remote section): kept whatever onDelete says.
     c.create_volume(create_req(
         "solo",
         &[
@@ -855,7 +854,7 @@ async fn a_volume_with_unreadable_settings_is_not_released() {
     for profile in ["removed", "broken"] {
         fs::write(
             d.layout.profiles.join(format!("{profile}.config")),
-            "[agentfs]\n\tcommitWindow = 100ms\n\tremotes = none\n",
+            "[agentfs]\n\tcommitWindow = 100ms\n",
         )
         .unwrap();
         c.create_volume(create_req(profile, &[("profile", profile)]))
@@ -1384,12 +1383,12 @@ fn fork_context() -> agentfs_core::identity::Context {
     }
 }
 
-/// F8 S3: CreateVolume refuses a profile that declares no remote, or
-/// `none` beside a remote section, naming the profile, and leaves no
-/// worktree behind; a local-only profile with `onDelete: delete` is not
-/// refused (the release decider keeps it).
+/// Owner, 2026-10-17: "Remotes can come and go. It's not a error to have
+/// zero remotes". CreateVolume takes a profile with no remote section, with
+/// or without `onDelete: delete`: the worktree is local-only (the release
+/// decider keeps it).
 #[tokio::test]
-async fn create_volume_refuses_an_undeclared_profile() {
+async fn create_volume_takes_a_profile_without_remotes() {
     let d = Driver::start().await;
     let mut c = d.controller();
     fs::write(
@@ -1397,33 +1396,93 @@ async fn create_volume_refuses_an_undeclared_profile() {
         "[agentfs]\n\tcommitWindow = 100ms\n",
     )
     .unwrap();
-    let remote = d.remote_profile("both", "[agentfs]\n\tremotes = none\n");
-    for (profile, says) in [
-        ("bare", "declares no remote"),
-        (
-            "both",
-            "agentfs.remotes = none beside remote section \"origin\"",
-        ),
-    ] {
-        let name = format!("u-{profile}");
-        let err = c
-            .create_volume(create_req(&name, &[("profile", profile)]))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument, "{}", err.message());
-        assert!(
-            err.message().contains(&format!("profile {profile:?}")) && err.message().contains(says),
-            "{}",
-            err.message()
+    for (handle, on_delete) in [("bare", "retain"), ("bare-delete", "delete")] {
+        c.create_volume(create_req(
+            handle,
+            &[("profile", "bare"), ("onDelete", on_delete)],
+        ))
+        .await
+        .unwrap();
+        let state = agentfs_core::volume::StateDir::new(d.layout.state(handle));
+        let settings = agentfs_core::config::Settings::load(&state.git()).unwrap();
+        assert_eq!(
+            settings.remotes,
+            agentfs_core::config::Remotes::LocalOnly,
+            "{handle}"
         );
-        assert!(!d.layout.volume_dir(&name).exists(), "{name} left behind");
     }
-    assert!(remote.exists());
+    d.stop().await;
+}
+
+/// Owner, 2026-10-17: "A fork can be created with or without a remote link
+/// back to its parent. Configurable." A fork class's `link` reaches the
+/// fork's identity at CreateVolume. An unlinked fork has no fork status:
+/// DeleteVolume never asks it to finish, and treats it as any worktree,
+/// asking its remote, then applying `onDelete`.
+#[tokio::test]
+async fn a_fork_class_link_reaches_the_fork() {
+    let d = Driver::start().await;
+    d.remote_profile("r", "");
+    let mut c = d.controller();
     c.create_volume(create_req(
-        "solo-delete",
-        &[("profile", "p"), ("onDelete", "delete")],
+        "src",
+        &[("profile", "r"), ("volumeName", "{pvName}")],
     ))
     .await
     .unwrap();
+    commit(
+        &d.layout.state("src").join("git"),
+        "refs/heads/agentfs/src",
+        &[("a.txt", "from the source\n")],
+    );
+    let link_of = |handle: &str| {
+        let state = agentfs_core::volume::StateDir::new(d.layout.state(handle));
+        let settings = agentfs_core::config::Settings::load(&state.git()).unwrap();
+        settings.fork.unwrap().link
+    };
+    for (handle, link) in [
+        ("fork-default", None),
+        ("fork-linked", Some("linked")),
+        ("fork-unlinked", Some("unlinked")),
+    ] {
+        let mut params = vec![
+            ("fork", "true"),
+            ("csi.storage.k8s.io/pvc/name", handle),
+            ("csi.storage.k8s.io/pvc/namespace", "agents"),
+            ("csi.storage.k8s.io/pv/name", handle),
+        ];
+        params.extend(link.map(|l| ("link", l)));
+        let mut req = create_req(handle, &params);
+        req.volume_content_source = clone_of("src");
+        c.create_volume(req).await.unwrap();
+    }
+    use agentfs_core::fork::ForkLink;
+    assert_eq!(link_of("fork-default"), ForkLink::Linked);
+    assert_eq!(link_of("fork-linked"), ForkLink::Linked);
+    assert_eq!(link_of("fork-unlinked"), ForkLink::Unlinked);
+
+    // The unlinked fork: never asked to finish; its remote is asked.
+    let state = agentfs_core::volume::StateDir::new(d.layout.state("fork-unlinked"));
+    let branch = agentfs_core::config::Settings::load(&state.git())
+        .unwrap()
+        .branch_ref;
+    commit(&state.git(), &branch, &[("b.txt", "the fork's\n")]);
+    let err = c
+        .delete_volume(delete_req("fork-unlinked"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    assert!(
+        err.message().contains("remote origin does not hold"),
+        "{}",
+        err.message()
+    );
+    let record = agentfs_csi::volume::load(&d.layout, "fork-unlinked")
+        .unwrap()
+        .unwrap();
+    assert!(!record.finish_requested, "an unlinked fork never finishes");
+    push(&d.layout, "fork-unlinked");
+    c.delete_volume(delete_req("fork-unlinked")).await.unwrap();
+    assert!(!d.layout.volume_dir("fork-unlinked").exists());
     d.stop().await;
 }

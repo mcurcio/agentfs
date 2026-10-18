@@ -86,10 +86,9 @@ agentfs --state /data/state init --volume hermes --include /etc/agentfs/config
 agentfs --state /data/state mount /data/backing /workspace
 ```
 
-`init` refuses a volume that declares no remote: give it one in an
-include, as here, or pass `--local-only` for a volume whose history stays
-in its state area
-([configuration reference](configuration.md#declaring-remotes)).
+A volume with no remote section is local-only: its history stays in its
+state area until a remote is added, and its first push then sends all
+of it ([configuration reference](configuration.md#remotes-modes)).
 
 Over SSH instead (a binary built with `--features ssh`), name a known_hosts
 file and either a private key or an ssh-agent socket; none of them may be
@@ -135,9 +134,8 @@ Global flags (every command):
 
 `agentfs init` takes `--volume NAME` (`AGENTFS_VOLUME`), `--branch NAME`,
 `--include FILE` (repeatable: operator config fragments, set as the
-config's `include.path` entries) and `--local-only` (declares the volume
-local-only, `agentfs.remotes = none`), creates `--root` when it is
-missing, and refuses a result that declares no remote.
+config's `include.path` entries), and creates `--root` when it is
+missing.
 It is safe to re-run: for the same volume it exits 0 and changes nothing
 but missing directories and the includes; for another volume or branch
 it exits 1 and changes nothing

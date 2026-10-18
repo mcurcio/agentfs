@@ -95,10 +95,9 @@ submit() { # producer-dir args...
 }
 
 step "a volume with an HTTP remote, mounted and pushed"
-af init --volume demo --local-only >/dev/null
+af init --volume demo >/dev/null
 sgit config agentfs.commitWindow 200ms
 sgit config agentfs.pushInterval 1s
-sgit config --unset agentfs.remotes  # a remote declares the remotes (F8 S3)
 sgit config remote.origin.url "$URL"
 sgit config remote.origin.agentfsCredentials "$W/creds"
 start_mount

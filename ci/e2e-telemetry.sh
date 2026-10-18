@@ -156,7 +156,7 @@ VOL=$(mktemp -d)
 STATE=$VOL/state
 TREE=$VOL/tree
 mkdir -p "$TREE"
-sudo "$AGENTFS_BIN" --state "$STATE" --root "$TREE" init --volume fronts --local-only >/dev/null
+sudo "$AGENTFS_BIN" --state "$STATE" --root "$TREE" init --volume fronts >/dev/null
 sudo git --git-dir "$STATE/git" config agentfs.commitWindow 50ms
 SOCK=$STATE/meta/history/history.sock
 MNT_A=$VOL/mnt-a

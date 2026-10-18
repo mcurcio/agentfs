@@ -160,12 +160,11 @@ committer_of() { # path
 }
 
 step "a volume with a remote"
-sudo "$AGENTFS_BIN" --state "$STATE" init --volume demo --local-only >/dev/null
+sudo "$AGENTFS_BIN" --state "$STATE" init --volume demo >/dev/null
 sgit config agentfs.commitWindow 200ms
 sgit config agentfs.sweepInterval 1s
 sgit config agentfs.pushInterval 1s
 sudo git init -q --bare "$REMOTE"
-sgit config --unset agentfs.remotes  # a remote declares the remotes (F8 S3)
 sgit config remote.origin.url "$REMOTE"
 
 step "a front without a service exits without mounting"

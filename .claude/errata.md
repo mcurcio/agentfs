@@ -192,3 +192,27 @@ None of these stopped the slice; each was resolved as below and is reported with
 8. Slice page counts ("about 38 test files", "nine `ci/e2e-*.sh`"): the harnesses that needed a
    declaration were 13 CLI test files, the core and CSI fixtures, `ci/lib.sh` and 11 other
    scripts, and the csi-sanity profile; deploy and chart profiles already name remotes.
+
+## 2026-10-17, F8 follow-ups fix agent (fix-f8-followups)
+
+None of these stopped the work; each was resolved as below and is reported with it.
+
+1. The brief asks for §19.1 rows "dated 2026-10-16"; the owner's answers ("Remotes can come and
+   go. It's not a error to have zero remotes", and "Go" on the restatement) are dated
+   2026-10-17 in `.handoff/f8-f12-notes.md`. The row is dated as the notes are: "Zero remotes
+   (2026-10-16, superseded 2026-10-17)".
+2. "No declaration" removes `agentfs.remotes`, `agentfs init --local-only`,
+   `Remotes::Undeclared`, `RemotesUndeclared` and CreateVolume's refusal. A state area that
+   still sets `agentfs.remotes = none` (made by S3's `init --local-only`) now carries an unread
+   key: harmless, never validated (no backwards compatibility, by rule). A linked fork whose
+   fork remote cannot be resolved (no flagged section and an ambiguous patch remote) was
+   "undeclared"; it is now local-only, as any volume with nowhere to push.
+3. Verifier finding 5 (an unlinked fork pushes its branch to the parent's remote) is not a
+   code bug against the spec: 5772feb's design text says so and marks it a design choice. It
+   is the owner's call and was never restated to him, so behaviour is unchanged and it is
+   §19.2 open question 10. The finding's second path (an unlinked fork ignoring the source's
+   `agentfs.remotes = none`) is gone with the declaration.
+4. Finding 4 (the red `release_scan` test on main): reproduced deterministically by a 450 ms
+   sleep after the `commit` before the failing scan (same assertion, `["lost", "retained"]`),
+   so it is wall-clock time outrunning the 400 ms backoff, not 5772feb's helper refactor. Fixed
+   by reading tokio's clock in `release_scan` and pausing it in the two backoff tests.

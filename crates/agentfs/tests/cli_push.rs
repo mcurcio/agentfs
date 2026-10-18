@@ -17,7 +17,7 @@ impl Volume {
         };
         fs::create_dir_all(v.tree()).unwrap();
         fs::create_dir_all(v.home()).unwrap();
-        let out = v.run(&["init", "--volume", "demo", "--local-only"]);
+        let out = v.run(&["init", "--volume", "demo"]);
         assert!(out.status.success(), "{}", stderr(&out));
         v
     }
@@ -39,10 +39,6 @@ impl Volume {
         let mut config = git2::Config::open(&self.state().join("git/config")).unwrap();
         for (k, v) in pairs {
             config.set_str(k, v).unwrap();
-            // A remote section declares the volume's remotes: drop `--local-only` (F8 S3).
-            if k.starts_with("remote.") {
-                let _ = config.remove("agentfs.remotes");
-            }
         }
     }
 
@@ -146,6 +142,52 @@ fn push_to_two_remotes_one_failing() {
         "{}",
         stderr(&out)
     );
+}
+
+/// Owner, 2026-10-17: "Remotes can come and go. It's not a error to have
+/// zero remotes". A volume made with no remote is local-only, with no
+/// alarm, and `agentfs push` has nothing to do. A remote added later gets
+/// the whole branch with nothing else changed; with its section removed
+/// again, the volume is local-only again.
+#[test]
+fn remotes_come_and_go() {
+    let v = Volume::new();
+    v.record("a.txt", "one\n");
+    let local_only = |v: &Volume| {
+        let out = v.run(&["status"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(
+            stdout(&out).contains("remotes:   local-only (no remote)"),
+            "{}",
+            stdout(&out)
+        );
+        assert!(!stderr(&out).contains("alarm"), "{}", stderr(&out));
+        let out = v.run(&["push"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out).trim(), "local-only: nothing to push");
+        assert!(!stderr(&out).contains("alarm"), "{}", stderr(&out));
+    };
+    local_only(&v);
+
+    let remote = v.dir.path().join("r.git");
+    bare(&remote);
+    v.config(&[("remote.r.url", &remote.display().to_string())]);
+    let out = v.run(&["push"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(branch(&remote), Some(v.head()));
+    let out = v.run(&["status"]);
+    assert!(
+        stdout(&out).contains("remotes:   1 pushed"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!stderr(&out).contains("alarm"), "{}", stderr(&out));
+
+    let mut config = git2::Config::open(&v.state().join("git/config")).unwrap();
+    config.remove("remote.r.url").unwrap();
+    drop(config);
+    v.record("b.txt", "two\n");
+    local_only(&v);
 }
 
 #[test]

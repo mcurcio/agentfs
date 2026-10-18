@@ -850,8 +850,9 @@ fn a_local_only_sources_fork_finishes_into_its_history() {
     assert_eq!(s.source_head(), base);
 }
 
-/// F8 S3: forks a local-only source received are its history too. Once a
-/// remote is declared (`none` removed), `agentfs push` carries each
+/// F8 S3: forks a local-only source received are its history too. Once
+/// its profile gains a remote section, with nothing else changed (owner,
+/// 2026-10-17: "Remotes can come and go"), `agentfs push` carries each
 /// fork's branch, change and finish refs there, create-only; a remote
 /// holding one at another commit fails the push and keeps its value.
 #[test]

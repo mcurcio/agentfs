@@ -2,7 +2,7 @@
 //! no-remote source's fork publishes `agentfs/<fork>` into its own
 //! history, never applied).
 //!
-//! When the source declares no remote and no section is flagged
+//! When the source has no remote section and no section is flagged
 //! `agentfsForkRemote` (`config::ForkRemote::SourceHistory`), the fork's
 //! finisher publishes into the source's repository instead of a remote:
 //! [`receive_fork_change`] copies the fork's objects and writes

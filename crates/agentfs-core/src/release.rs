@@ -15,7 +15,7 @@
 //! - [`Release::Keep`]: the volume is released but the worktree stays on
 //!   its node's disk: `onDelete: retain` once every declared remote holds
 //!   the head and the journal is committed, or nothing elsewhere can hold
-//!   it (local-only, undeclared);
+//!   it (local-only);
 //! - [`Release::Wait`]: not yet. DeleteVolume answers `UNAVAILABLE`, the
 //!   CO retries, and the node plugin's release scan commits (`agentfs
 //!   flush`) and pushes the worktree meanwhile, raising `PushFailed` at
@@ -100,10 +100,8 @@ pub enum Declared<'a> {
     /// Push sections, all invalid: nothing can be pushed until the
     /// profile is fixed.
     NoneValid,
-    /// `agentfs.remotes = none` (F8 S3).
+    /// No push section: no remote holds it.
     LocalOnly,
-    /// No push section and no declaration, or `none` beside a section.
-    Undeclared,
 }
 
 impl<'a> Declared<'a> {
@@ -114,7 +112,6 @@ impl<'a> Declared<'a> {
             Remotes::Pushed(_) => Self::Pushed(seen),
             Remotes::NoneValid => Self::NoneValid,
             Remotes::LocalOnly => Self::LocalOnly,
-            Remotes::Undeclared { .. } => Self::Undeclared,
         }
     }
 }
@@ -153,10 +150,8 @@ pub enum Kept {
     /// `onDelete: retain`, every declared remote holds the head, and the
     /// journal is committed.
     Retained,
-    /// Declared local-only: no remote holds it, by declaration.
+    /// Local-only: no remote holds it.
     LocalOnly,
-    /// No remote and no declaration: nothing elsewhere holds it.
-    Undeclared,
 }
 
 /// Why DeleteVolume waits. Every case but [`Waiting::ForkUnpublished`]
@@ -210,7 +205,6 @@ pub fn decide(worktree: &Worktree<'_>) -> Release {
     }
     match worktree.remotes {
         Declared::LocalOnly => Release::Keep(Kept::LocalOnly),
-        Declared::Undeclared => Release::Keep(Kept::Undeclared),
         Declared::NoneValid => Release::Wait(Waiting::NoneValid),
         Declared::Pushed(seen) => {
             for remote in seen {
@@ -285,7 +279,6 @@ impl fmt::Display for Kept {
         f.write_str(match self {
             Self::Retained => "onDelete: retain",
             Self::LocalOnly => "local-only: no remote holds its history",
-            Self::Undeclared => "no remote is declared: nothing elsewhere holds its history",
         })
     }
 }
@@ -349,10 +342,6 @@ mod tests {
             assert_eq!(
                 decide_with(on_delete, Declared::LocalOnly),
                 Release::Keep(Kept::LocalOnly)
-            );
-            assert_eq!(
-                decide_with(on_delete, Declared::Undeclared),
-                Release::Keep(Kept::Undeclared)
             );
             assert_eq!(
                 decide_with(on_delete, Declared::NoneValid),
@@ -500,8 +489,8 @@ mod tests {
         assert_eq!(decide(&fork), Release::Delete);
     }
 
-    /// F8 S3 acceptance 2: `Declared::of` maps each mode one to one, and a
-    /// local-only worktree is kept whatever `onDelete` says.
+    /// `Declared::of` maps each mode one to one, and a local-only worktree
+    /// (no remote section) is kept whatever `onDelete` says.
     #[test]
     fn declared_follows_the_remotes_mode() {
         let settings = |lines: &str| {
@@ -515,11 +504,8 @@ mod tests {
         assert_eq!(Declared::of(&pushed, &held), Declared::Pushed(&held));
         let none_valid = settings("[remote \"bad\"]\n\turl = /b\n\tagentfsMaxBlobSize = 0\n");
         assert_eq!(Declared::of(&none_valid, &[]), Declared::NoneValid);
-        let local = settings("[agentfs]\n\tremotes = none\n");
+        let local = settings("");
         assert_eq!(Declared::of(&local, &[]), Declared::LocalOnly);
-        assert_eq!(Declared::of(&settings(""), &[]), Declared::Undeclared);
-        let beside = settings("[agentfs]\n\tremotes = none\n[remote \"origin\"]\n\turl = /o\n");
-        assert_eq!(Declared::of(&beside, &[]), Declared::Undeclared);
         for on_delete in [OnDelete::Delete, OnDelete::Retain] {
             assert_eq!(
                 decide(&worktree(on_delete, Declared::of(&local, &[]))),

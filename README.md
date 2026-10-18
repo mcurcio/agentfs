@@ -72,12 +72,12 @@ audit trail can use it.
 - **Git idioms for rules.** `.gitignore`, `.gitattributes`, `.lfsconfig`,
   `$GIT_DIR/info/*` and git-config syntax; nested repositories are
   excluded by default ([design §4](docs/design.md#4-path-rules)).
-- **Any remote, several, or none declared.** Local paths, `file://`, `http(s)://` with a
+- **Any remote, several, or none.** Local paths, `file://`, `http(s)://` with a
   token file, and SSH with verified host keys. Pushes are fast-forward
   only and never forced; a divergence is saved and raises an alarm
-  ([design §11](docs/design.md#11-remotes-and-pushing)). A volume with no
-  remote says so (`agentfs init --local-only`); one that declares
-  nothing raises an alarm.
+  ([design §11](docs/design.md#11-remotes-and-pushing)). Remotes can come
+  and go: a volume with none is local-only, not an error, and a remote
+  added later gets all its history.
 - **Git LFS** for large files, uploaded before the commits that use them
   ([configuration](docs/configuration.md#git-lfs)).
 - **Databases.** SQLite and other files changed in place are captured
@@ -259,7 +259,7 @@ passes its tests, and the Helm charts as `<version>-main.<run>`.
 | Forked volumes, linked (delivering their change back to the source) or unlinked (independent) | Built ([forks](docs/forks.md)) |
 | Docker examples, Helm charts, example alert rules | Built and tested in CI |
 | Node-local worktrees, one branch each, with any remote as the backend | Built (CSI driver) |
-| Local-only volumes (no remote, declared: `agentfs init --local-only`), whose forks publish into their own history | Built ([configuration](docs/configuration.md#declaring-remotes)) |
+| Local-only volumes (no remote section), whose forks publish into their own history | Built ([configuration](docs/configuration.md#remotes-modes)) |
 | Several nodes writing one volume | Not supported, by decision ([design §19.1](docs/design.md#191-decisions-2026-10-12)) |
 
 Each phase's scope is in [design §1.3](docs/design.md#13-baseline-extras-phases),

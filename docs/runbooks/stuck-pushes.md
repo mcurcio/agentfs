@@ -24,9 +24,6 @@ with the next successful push. Design:
 
 - `RemoteMisconfigured` (gauge `agentfs.remote.misconfigured`): that
   remote is not pushed at all (below).
-- `RemotesUndeclared` (log `agentfs.remotes_undeclared`, gauge
-  `agentfs.remotes.mode{mode="undeclared"}`, `remotes:   undeclared` in
-  status): nothing is pushed anywhere ([below](#remotes-undeclared)).
 
 ## Diagnose by kind
 
@@ -57,26 +54,6 @@ names the key; the full list is in the
 [configuration reference](../configuration.md#remote-name). Fix the
 section in `<state>/git/config`; the change takes effect at the next
 start of the mount (or the next `agentfs push`).
-
-## Remotes undeclared
-
-**`RemotesUndeclared`**, raised at open, at every `pushInterval` and by
-`agentfs push` (exit 1): the volume has no push section and is not
-declared local-only, or it sets `agentfs.remotes = none` beside a push
-section (the alarm names it; that section is also `RemoteMisconfigured`
-and never pushed). Commits are safe in the state area, but no remote
-holds them, and the release decider never deletes such a worktree
-([declaring remotes](../configuration.md#declaring-remotes)). Decide
-which it is meant to be, in its include (a CSI profile) or its own
-config:
-
-- pushed: add a `[remote "<name>"]` section and remove
-  `agentfs.remotes = none` if set; the first push sends all the history;
-- local-only: remove every push section and set `agentfs.remotes =
-  none` (`agentfs init --local-only` writes it).
-
-The change takes effect at the next start of the mount (or the next
-`agentfs push`); `agentfs status` shows the mode.
 
 ## Pushed in steps
 

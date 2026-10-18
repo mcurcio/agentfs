@@ -65,10 +65,10 @@ pub enum StartError {
         "startFrom names remote {remote:?}, which is not a push remote of the volume's profile"
     )]
     NoSuchRemote { remote: String },
-    /// The profile declares no remote (F8 S3): there is nothing to start
-    /// from (`InvalidArgument`).
+    /// The profile has no remote section: there is nothing to start from
+    /// (`InvalidArgument`).
     #[error(
-        "the volume's profile is local-only (agentfs.remotes = none): it has no remote to start from"
+        "the volume's profile is local-only (no remote section): it has no remote to start from"
     )]
     LocalOnly,
     /// The start branch is the new volume's own branch (rule 1;
