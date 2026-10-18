@@ -720,6 +720,22 @@ source's patch remote), never the source's branch, or with
 `agentfs.forkRefs = hidden` in the profile `refs/agentfs/<fork>/history`,
 off every branch ([configuration](configuration.md#agentfs)).
 
+- **Linked or unlinked.** A fork class's `link` parameter sets whether its
+  forks deliver back to their source (design §11.5 "Fork link"):
+  `linked`, the default, is everything below; `unlinked` makes
+  independent forks. An unlinked fork pushes its branch where a linked
+  one would publish, and nothing is ever delivered to the source: it is
+  never finished, `fork status` has nothing to show, and DeleteVolume
+  treats it as any worktree (it waits while a remote lacks the head, then
+  applies `onDelete`). The value is written into each fork's identity at
+  CreateVolume (`agentfs.fork.link`); editing the class moves no fork
+  that exists. `link` in a class without `fork: "true"` is refused.
+
+  ```yaml
+  parameters:
+    fork: "true"
+    link: unlinked
+  ```
 - **Create, on the source's node.** CreateVolume clones the source
   locally: its settings and branch head read without its lock (the
   source may be in use), its history up to that head copied, and the
@@ -747,7 +763,9 @@ off every branch ([configuration](configuration.md#agentfs)).
   history, then the change and finish refs create-only, retrying with
   backoff until the fork remote holds them. The next DeleteVolume deletes
   the volume (`onDelete: delete` by default). Restarts of the node plugin
-  carry on: the request is in `csi.json`.
+  carry on: the request is in `csi.json`. A linked fork whose fork remote
+  is unreachable waits and alarms (`PushFailed`); it never delivers
+  anywhere else.
 - **Receiving.** Whatever reads the fork remote gates the change: a PR on
   the fork's branch, or `agentfs patch submit <change>` into the source's
   inbox, which applies a given change commit at most once.

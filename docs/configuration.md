@@ -142,7 +142,9 @@ publishes into the source's own history (R4): `refs/heads/agentfs/<fork>`
 source's state area, through the source's running daemon when one holds
 its lock, else under that lock. Nothing applies it: whatever reads the
 source's history does the gating. The fork records where the source is
-in `agentfs.fork.sourceState`.
+in `agentfs.fork.sourceState`. An unlinked fork (`agentfs.fork.link =
+unlinked`) of such a source records no path and is local-only itself:
+nothing it does reaches the source.
 
 ### `[agentfs "identity"]`
 
@@ -178,18 +180,20 @@ A fork's identity (design §11.5), fixed when the fork is created
 in the fork's own state-area config, beside `agentfs.volume`. Never set
 them by hand, and never in an include: a fragment that sets any of them
 fails with `IncludeSetsIdentity`. `source` and `base` are set together,
-or neither, and `pushTarget` and `sourceState` only with them
+or neither, and `pushTarget`, `link` and `sourceState` only with them
 (`PartialForkIdentity`); a fork's config must not set `agentfs.branch`.
 A fork's history ref is its push target, its only push remote is its
 fork remote (see `agentfsForkRemote`), or, for a fork of a local-only
-source, none: it publishes into the source's history ([Declaring
-remotes](#declaring-remotes)). It has no patch queue.
+source, none: a linked one publishes into the source's history
+([Declaring remotes](#declaring-remotes)), an unlinked one is
+local-only. It has no patch queue.
 
 | Key | Type | Default | Meaning and validation |
 |---|---|---|---|
 | `agentfs.fork.source` | name | unset: not a fork | The source volume's name, as `agentfs.volume` |
 | `agentfs.fork.base` | full commit id | unset: not a fork | The source branch's head when the fork was created: 40 lowercase hex digits |
-| `agentfs.fork.sourceState` | absolute path | unset: publishes to a fork remote | A fork of a local-only source (F8 S3): the source's state area, written at create; the fork publishes into its history there, unless a section sets `agentfsForkRemote`. A relative path fails the fork (`RelativePath`) |
+| `agentfs.fork.sourceState` | absolute path | unset: publishes to a fork remote | A linked fork of a local-only source (F8 S3): the source's state area, written at create; the fork publishes into its history there, unless a section sets `agentfsForkRemote`. A relative path fails the fork (`RelativePath`), and so does any value in an unlinked fork (`UnlinkedSourceState`) |
+| `agentfs.fork.link` | `linked` or `unlinked` | `linked` | Whether the fork delivers back to its source (design §11.5 "Fork link"), from `fork create --link` or a fork class's `link` at create (written only for `unlinked`), never changed after. `linked`: its finish publishes the change to its fork remote, or into a local-only source's history; it waits and alarms while it cannot reach it, and never delivers anywhere else. `unlinked`: an independent fork that pushes its history ref to the remote a linked fork would publish to and delivers nothing: `fork finish` refuses it (`Unlinked`), it has no `fork status`, and DeleteVolume treats it as any worktree. Any other value fails the fork (`BadChoice`) |
 | `agentfs.fork.pushTarget` | `branch` or `hidden` | `branch` | Where the fork's history is kept and pushed, from the source's `agentfs.forkRefs` at create (written only for `hidden`): `branch` is `refs/heads/agentfs/<fork>`, `hidden` is `refs/agentfs/<fork>/history`. Any other value fails the fork (`BadChoice`) |
 
 ### `[agentfs "start"]`
@@ -836,6 +840,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--attempts N` | | `10` | `patch submit`: inbox numbers to try when other submitters race |
 | `--source-state DIR` | | none: required | `fork create`: the source volume's state area, read without its lock; its settings must be in included files, which the fork includes too |
 | `--name NAME` | | the source's name | `fork create`: the fork's name before its random suffix (`<name>-<8 hex digits>`) |
+| `--link linked\|unlinked` | | `linked` | `fork create`: whether the fork delivers back to its source (`agentfs.fork.link`, fixed at create); `unlinked` makes an independent fork, which `fork finish` refuses and which has no `fork status` |
 | `--timeout DURATION` | | until published | `fork finish`: stop publishing after this long and exit 1 (the CSI node plugin's finisher runs with `300000ms`, so the fork's lock is free between its scans) |
 | `--retry` | | | `fork finish`: clear a refused publish (the `refused` mark in `meta/fork.json`) and try again; without it a refused fork exits 1 at once, pushing nothing |
 | `--json` | | | `fork status`: the status document, version 1 (`version`, `fork`, `source`, `base`, `state`, `change`, `finish`, `remote`, `published_at_ms`, `refused`, `abandoned`); `fork list`: the listing (`changes`, `skipped`) |
@@ -989,6 +994,7 @@ disk of the node that created it, for good.
 | `startFrom` | none | `<remote>:<branch>@<commit>`: a start class. Each claim on it is a new worktree whose history begins at `<commit>` of another worktree's `<branch>`, fetched once from `<remote>` (a push section of the profile) at CreateVolume, and kept in its identity (`[agentfs "start"]`). `<branch>` is a branch name such as `agentfs/<old volume>`, never a `refs/...` ref (a `diverged/*` ref is refused: "not a branch"), never the new volume's own branch; `<commit>` is a full id on it. Moving a volume to another node: [runbooks/moving.md](runbooks/moving.md). Not a static PV attribute |
 | `workloadMounts` | none | where pods mount the volume: comma-separated `PATH` or `PATH=DIR`, passed to every front as `--workload-mount` so worktree `gitdir:` paths map exactly (design §5, docs/csi.md §5) |
 | `fork` | `"false"` | `"true"` makes a fork class (design §11.5): a claim on it with a `dataSource` claim is a fork of that claim's volume, with the source's profile, made on the source's node (give the fork's pod affinity to its source's pods; elsewhere CreateVolume answers `FAILED_PRECONDITION`). A fork class must not set `profile`, `branch` or `startFrom`, its `onDelete` defaults to `delete`. Not a static PV attribute |
+| `link` | `linked` | a fork class only (`INVALID_ARGUMENT` in any other): `linked` forks deliver their change back to the source when their claim is deleted; `unlinked` forks are independent, never finished, and DeleteVolume applies `onDelete` once their remotes hold the head, as for any worktree. Written into each fork's identity (`agentfs.fork.link`) at CreateVolume; changing the class moves no fork that exists. Not a static PV attribute |
 
 Every class of the driver must have `reclaimPolicy: Delete`, so that
 DeleteVolume always runs and the release decider answers; the chart's

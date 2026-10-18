@@ -5,7 +5,9 @@
 //! When it finishes (its claim is deleted, or `agentfs fork finish`), it
 //! publishes one change, a commit whose parent is the base it started
 //! from, to its fork remote. Whatever receives that change does all the
-//! gating: agentfs never reviews, accepts or merges.
+//! gating: agentfs never reviews, accepts or merges. That is a linked
+//! fork, the default; an unlinked one ([`ForkLink::Unlinked`], fixed at
+//! create) is independent: it never finishes and delivers nothing.
 //!
 //! - [`identity`]: what a fork is, fixed at create, and its ref names;
 //! - [`create`]: a fork from a source's state area, read without the
@@ -32,4 +34,4 @@ pub mod start;
 #[cfg(test)]
 mod tests;
 
-pub use identity::{ForkIdentity, PushTarget, change_ref, finish_ref};
+pub use identity::{ForkIdentity, ForkLink, PushTarget, change_ref, finish_ref};

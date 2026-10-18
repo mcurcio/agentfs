@@ -5,7 +5,8 @@
 //! - `fork create` makes the fork's state area and backing tree from the
 //!   source's state area, read without the source's lock; the fork reads
 //!   its settings from the source's included files
-//!   ([`agentfs_core::fork::create::settings_files`]).
+//!   ([`agentfs_core::fork::create::settings_files`]). `--link unlinked`
+//!   makes an independent fork, which never delivers to its source.
 //! - `fork finish` takes the fork's state-area lock, finishes the fork
 //!   once and publishes it to its fork remote, retrying with backoff;
 //!   `--retry` clears a refused publish first. A fork of a local-only
@@ -37,7 +38,7 @@ use agentfs_core::fork::finish::{
     self, AbandonedMark, FinishError, FinishRecord, Finisher, ForkState, ForkStatus,
     PublishOutcome, RefusedMark, RefusedReason,
 };
-use agentfs_core::fork::identity::{ForkIdentity, full_commit};
+use agentfs_core::fork::identity::{ForkIdentity, ForkLink, full_commit};
 use agentfs_core::fork::listing;
 use agentfs_core::fork::receive::{
     self, ReceiveError, Receiver, ReceiverError, SOURCE_HISTORY, UnderLock,
@@ -116,6 +117,26 @@ pub struct CreateArgs {
     /// name).
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
+    /// linked: its finish delivers the change back to the source;
+    /// unlinked: an independent fork, nothing ever delivered (design
+    /// §11.5). Fixed at create.
+    #[arg(long, value_enum, default_value = "linked")]
+    pub link: LinkArg,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LinkArg {
+    Linked,
+    Unlinked,
+}
+
+impl From<LinkArg> for ForkLink {
+    fn from(arg: LinkArg) -> Self {
+        match arg {
+            LinkArg::Linked => Self::Linked,
+            LinkArg::Unlinked => Self::Unlinked,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -325,6 +346,19 @@ pub fn run(
         }
         ForkCommand::Status { json } => {
             let Some(status) = finish::status(state)? else {
+                let unlinked = Settings::load(&state.git())
+                    .ok()
+                    .and_then(|s| s.fork)
+                    .filter(|f| f.link == ForkLink::Unlinked);
+                if let Some(f) = unlinked {
+                    bail!(
+                        "fork {} of {} at {} is unlinked: it delivers nothing to its source, so \
+                         it has no fork status (its pushes are in `agentfs status`)",
+                        f.fork,
+                        f.source,
+                        f.base
+                    );
+                }
                 bail!("{} is not a fork", state.root().display());
             };
             let doc = ForkStatusDoc::new(&status);
@@ -640,10 +674,17 @@ fn create_cmd(args: &CreateArgs, state: &StateDir, root: &Path) -> Result<String
         name: &name,
         includes: &includes,
         push_target,
+        link: args.link.into(),
     })?;
     Ok(format!(
-        "fork {} of {} at {}",
-        identity.fork, identity.source, identity.base
+        "fork {} of {} at {}{}",
+        identity.fork,
+        identity.source,
+        identity.base,
+        match identity.link {
+            ForkLink::Linked => "",
+            ForkLink::Unlinked => " (unlinked: nothing is delivered to the source)",
+        }
     ))
 }
 

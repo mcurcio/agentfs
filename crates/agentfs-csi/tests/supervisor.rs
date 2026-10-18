@@ -880,6 +880,7 @@ async fn a_finished_fork_is_published_read_only() {
         source: "src".into(),
         base: git2::Oid::from_str(&base).unwrap(),
         push_target: agentfs_core::fork::PushTarget::Branch,
+        link: agentfs_core::fork::ForkLink::Linked,
     };
     let config = agentfs_csi::volume::profile_config(&n.layout, "p").unwrap();
     agentfs_core::volume::init_fork(&state, &identity, &[config]).unwrap();

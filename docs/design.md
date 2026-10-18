@@ -2049,8 +2049,8 @@ reviews, accepts or merges.
 
 **Identity.** `agentfs.fork.source` and `agentfs.fork.base` sit in the
 fork's own state-area config beside `agentfs.volume`, written once at
-create; no include may set them (or `agentfs.fork.pushTarget`), and a
-fork's config may not set `agentfs.branch`. `config::Settings` is the one
+create; no include may set them (or `agentfs.fork.pushTarget` or
+`agentfs.fork.link`), and a fork's config may not set `agentfs.branch`. `config::Settings` is the one
 decider of a fork's refs and remotes. Every other setting comes from the
 source's settings files, which the fork includes and reads at every open.
 
@@ -2109,6 +2109,28 @@ own identity. Every consumer of the fork's history ref (pushes, restore,
 status, the finisher, `fork list` and `fork deliver`) takes either name.
 Whether a forge runs CI or webhooks on a push to `refs/agentfs/*` is the
 forge's own behaviour, not verified here (§19.2).
+
+**The link** (§19.1 "Fork link", 2026-10-17; the owner: "A fork can be
+created with or without a remote link back to its parent.
+Configurable.") is fixed at create in the fork's identity
+(`agentfs.fork.link`, `fork::identity::ForkLink`), from `agentfs fork
+create --link` or a fork class's `link` parameter, and never changed
+after. `linked` (the default, unset) is everything this section
+describes: the finish delivers the change back to the source, through the
+fork remote or into a local-only source's history by the recorded
+`agentfs.fork.sourceState`; while the source cannot be reached the
+publish waits and alarms (a push failure is pending and retried, a
+remote or source gone is refused), and it never delivers anywhere else.
+`unlinked` is an independent fork: `config::Settings` gives it no fork
+remote, its push remote is the one a linked fork would publish to (the
+flagged section, else the source's patch remote) at its own history
+ref, and a local-only source's unlinked fork records no source path
+(`UnlinkedSourceState` refuses one) and is local-only. It is never
+finished (`Finisher::open` refuses it, `FinishError::Unlinked`), so it
+never becomes read-only, and `fork::finish::status` is `None` for it:
+DeleteVolume and the node plugin's release scan treat it as any
+worktree, waiting until its remotes hold its head, and `fork status`
+and `fork abandon` have nothing to act on.
 
 **Create** (`fork::create`) reads the source's settings and branch head
 without its lock and with no credentials, and refuses a source with no
@@ -4367,6 +4389,7 @@ runner.
 | Delivery payload v1 (2026-10-16) | The command and webhook methods send one JSON document, schema 1: `schema`, `fork`, `source`, `base`, `change`, `finish` and `fetch` (`remote` as the runner named it, and the `change`, `finish` and `history` refs). `change` is the key receivers dedupe on, and the webhook's `Idempotency-Key`. A new field or meaning is a new schema number, never a silent change. Both methods are at least once; the inbox method is at most once by the §12 duplicate rule. A design choice (forked volumes unit 3), not the owner's words |
 | Branch delivery idempotency (2026-10-16) | The branch method decides "already delivered" by content: its squash commit is deterministic (the change commit's author and committer, the message `change of fork <fork>` with `Agentfs-Change: <change>`), so the target ref at exactly the commit it would create is already delivered, and a ref at any other commit is refused and never moved; a trailer is never trusted, since anyone who may write the target can forge one. It pushes create-only (`--force-with-lease=<ref>:`). Cost: with `--onto`, a branch that moved since the first delivery makes a repeat refused rather than already delivered, and a receiver that rewrote the branch (a rebase in its pull request) gets the same refusal. A design choice (forked volumes unit 3), not the owner's words |
 | Hidden forks (2026-10-16) | A fork's push target is `branch` (`refs/heads/agentfs/<fork>`, the default) or `hidden` (`refs/agentfs/<fork>/history`, never under `refs/heads/`); new forks get the source's `agentfs.forkRefs`, and the fork keeps it in its identity (`agentfs.fork.pushTarget`, written only for `hidden`), so changing the setting moves no fork that exists. Any other value of either key is refused (`BadChoice`), and an include may not set `pushTarget`. It is unit 4 of "Fork scope". Cost: whether a forge runs CI or webhooks on pushes to `refs/agentfs/*` is not verified (§19.2), and an operator who switches to `hidden` to contain exposure must abandon or finish the forks that already push branches. A design choice (forked volumes unit 4), not the owner's words |
+| Fork link (2026-10-17) | A fork is created `linked` (the default, today's behaviour) or `unlinked`, recorded in its identity (`agentfs.fork.link`) at create and never changed after; set per fork class (`link` StorageClass parameter) and per fork (`agentfs fork create --link`). A linked fork's finish delivers its change back to the source: through its fork remote, or into a local-only source's history by the recorded `agentfs.fork.sourceState`; while it cannot reach the source it waits and alarms, and never delivers anywhere else. An unlinked fork is independent: it delivers nothing, records no source path, is never finished (`FinishError::Unlinked`) and has no fork status, so DeleteVolume and the release scan treat it as any worktree (§11.5). The owner, asked whether a fork records its source's path to deliver into a no-remote source (.handoff/f8-f12-notes.md, "Answers on the two F8 follow-ups", 2026-10-17): "A fork can be created with or without a remote link back to its parent. Configurable."; on the restated change (fork setting linked or unlinked, default linked, per StorageClass and per CLI fork): "Go". Design choices, not the owner's words: an unlinked fork pushes its own history ref to the remote a linked fork would publish to (the flagged fork remote, else the source's patch remote), so no fork output bypasses an operator's `agentfsForkRemote`; it is local-only when its source is; it keeps the push target and has no patch queue, as every fork; create refuses it, as a linked one, when the source has no fork remote; `link` in an ordinary class is refused |
 | Fork telemetry (2026-10-16) | The finisher reports through §13's existing signals: spans `agentfs.fork.finish` (once, when the finish commit is written) and `agentfs.fork.publish` (one publish call, its outcome and refusal reason, with the pushes inside it), the histogram `agentfs.fork.publish.duration` (seconds from the finish commit to published, one point per fork, written with the published mark), and the events `ForkFinished` and `ForkPublished`, which are not alarms. A fork's lifecycle events (finished, published, abandoned) become INFO log records beside the alarms (`Event::is_logged`), so a fork's life is in the same log as its refusal. Cost: a duration measured from the finish commit's time trusts the node's clock, and a fork retried after a refusal counts the time it waited for the operator. A design choice (forked volumes unit 4), not the owner's words |
 | Forks in history rewrites (2026-10-16) | The history-rewrite runbook covers forks by reachability, not a list: the affected refs are those containing the first commit that recorded the content, in mirror clones of the source's remotes and fork remotes; only forks whose base contains it are abandoned, before the rewrite, and their refs deleted with a lease; forks based earlier keep their ids and publish as before. What agentfs cannot enumerate (delivery targets, receivers' clones, CI caches, retained fork directories) is listed for the operator. Cost: a change based after the bad commit and not yet landed becomes unlandable (`parent_not_in_history`). A design choice (forked volumes unit 4), not the owner's words |
 | Alert rules (2026-10-16) | Milestone F11 ships example alert rules and runbooks, without the Hermes end-to-end test it first planned. Asked whether to (a) drop that test and keep the alert rules and runbooks or (b) keep it, given "Design it, but leave Hermes out of it. We're building an open source project" (2026-10-15), the owner answered "3 a" (2026-10-16, in a Claude Code session). The rules are one Prometheus rules file, `deploy/alerts/agentfs.rules.yml`, with the `PrometheusRule` generated from it and checked in CI, so they have one home; they use the names of Prometheus's default OTLP translation, and each counter rule matches a counter's first sample (§13). The Helm option to install them waits for the chart (F9). Cost: another translation strategy, or a collector that renames metrics, needs the rules edited; the `PrometheusRule` is not applied to a Prometheus Operator in CI. The file layout, names and thresholds are design choices, not the owner's words |

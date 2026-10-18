@@ -318,6 +318,7 @@ pub fn create_fork(
         name: &params.volume,
         includes: &[config],
         push_target,
+        link: class.link,
     })
     .map_err(create_error)?;
     drop(lock);

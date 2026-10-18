@@ -34,6 +34,15 @@ agentfs patch submit --volume src <change commit>
   state>/git log agentfs/<fork>`;
   [configuration](configuration.md#declaring-remotes)). Once the source
   declares a remote, its pushes carry those refs there too, create-only.
+- A fork is `linked` by default: its finish delivers the change back to
+  the source as above, and while it cannot reach the source it waits and
+  alarms, never delivering anywhere else. `fork create --link unlinked`
+  (or `link: unlinked` in a fork StorageClass) makes an independent fork
+  instead: it pushes its own branch where a linked fork would publish,
+  and nothing is ever delivered to the source. It is never finished
+  (`fork finish` refuses it), records no path to a local-only source and
+  is then local-only itself. The link is fixed at create
+  ([design §11.5](design.md#115-forks), "The link").
 - Under CSI, a claim with a `dataSource` claim on a fork StorageClass
   (`fork: "true"`, reclaim policy `Delete`) is a fork; deleting it
   finishes the fork, and the driver deletes the volume only once it is

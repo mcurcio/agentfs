@@ -4,9 +4,10 @@
 //!
 //! [`create`] reads the source's settings and branch head (the base). It
 //! refuses a source that is a fork or that has no fork remote. It then
-//! makes the fork's state area: the identity in the fork's own config
-//! (with the source's state area when the source is local-only, F8 S3:
-//! the fork publishes into its history, [`super::receive`]),
+//! makes the fork's state area: the identity in the fork's own config,
+//! with its link (design §11.5), and, for a linked fork of a local-only
+//! source, the source's state area (F8 S3: the fork publishes into its
+//! history, [`super::receive`]; an unlinked fork records no path to it),
 //! the source's settings files as its includes, the objects of base's
 //! history copied in (no alternates, so a fork outlives its source), the
 //! fork's history ref at base, and base's tree written into the fork's
@@ -28,7 +29,7 @@ use crate::paths::RepoPath;
 use crate::restore::{self, NotLive, Pathspec, RecordPolicy, Request, RestoreError};
 use crate::volume::{self, StateDir, VolumeError};
 
-use super::identity::{ForkIdentity, PushTarget};
+use super::identity::{ForkIdentity, ForkLink, PushTarget};
 
 /// What to create.
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +52,10 @@ pub struct CreateRequest<'a> {
     /// CSI controller pass. Written into the fork's identity, so it is
     /// fixed at create; a fork that already exists keeps its own.
     pub push_target: PushTarget,
+    /// Whether the fork delivers back to its source: `fork create --link`
+    /// or a fork class's `link` parameter. Fixed at create like the push
+    /// target; a fork that already exists keeps its own.
+    pub link: ForkLink,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +111,7 @@ pub fn create(request: &CreateRequest<'_>) -> Result<ForkIdentity, CreateError> 
         source: source.volume.clone(),
         base: source.base,
         push_target: request.push_target,
+        link: request.link,
     };
     volume::init_fork(request.fork, &wanted, request.includes).map_err(|e| match e {
         VolumeError::OtherVolume { found, .. } | VolumeError::OtherFork { found, .. } => {
@@ -113,14 +119,11 @@ pub fn create(request: &CreateRequest<'_>) -> Result<ForkIdentity, CreateError> 
         }
         e => CreateError::Volume(e),
     })?;
-    if source.local_only {
+    // The identity the fork has: an earlier try's base and link win.
+    let identity = fork_identity(request.fork)?;
+    if source.local_only && identity.link == ForkLink::Linked {
         record_source_state(request)?;
     }
-    // The identity the fork has: an earlier try's base wins.
-    let settings = Settings::load(&request.fork.git()).map_err(HistoryError::from)?;
-    let identity = settings.fork.clone().ok_or_else(|| CreateError::Exists {
-        found: settings.volume.clone(),
-    })?;
     let fork = Repository::open_bare(request.fork.git()).map_err(HistoryError::from)?;
     let history_ref = identity.history_ref();
     let head = match fork.refname_to_id(&history_ref) {
@@ -142,6 +145,14 @@ pub fn create(request: &CreateRequest<'_>) -> Result<ForkIdentity, CreateError> 
     }
     write_tree(request, &fork, &identity)?;
     Ok(identity)
+}
+
+/// The fork identity in `fork`'s own config.
+fn fork_identity(fork: &StateDir) -> Result<ForkIdentity, CreateError> {
+    let settings = Settings::load(&fork.git()).map_err(HistoryError::from)?;
+    settings.fork.ok_or(CreateError::Exists {
+        found: settings.volume,
+    })
 }
 
 /// The push target new forks of the source at `source` get: its

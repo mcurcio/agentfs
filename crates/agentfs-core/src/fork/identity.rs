@@ -12,6 +12,46 @@ pub const SOURCE_KEY: &str = "agentfs.fork.source";
 pub const BASE_KEY: &str = "agentfs.fork.base";
 /// `agentfs.fork.pushTarget`: `branch` (unset) or `hidden`.
 pub const PUSH_TARGET_KEY: &str = "agentfs.fork.pushTarget";
+/// `agentfs.fork.link`: `linked` (unset) or `unlinked` ([`ForkLink`]).
+pub const LINK_KEY: &str = "agentfs.fork.link";
+
+/// Whether a fork delivers back to its source, fixed at create (design
+/// §11.5; §19.1 "Fork link", 2026-10-17). The owner: "A fork can be
+/// created with or without a remote link back to its parent.
+/// Configurable."
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ForkLink {
+    /// Its finish publishes the change to its fork remote, or into a
+    /// local-only source's history through the source's state area
+    /// recorded at create. A linked fork that cannot reach its source
+    /// waits and alarms; it never delivers anywhere else.
+    #[default]
+    Linked,
+    /// An independent fork: it records and pushes its own history ref
+    /// where any fork's goes, but nothing is ever delivered to its source.
+    /// It never finishes, has no fork status, and records no source path.
+    Unlinked,
+}
+
+impl ForkLink {
+    /// The value as `agentfs.fork.link`, `fork create --link` and a fork
+    /// class's `link` parameter write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linked => "linked",
+            Self::Unlinked => "unlinked",
+        }
+    }
+
+    /// `linked` or `unlinked`; anything else is `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "linked" => Some(Self::Linked),
+            "unlinked" => Some(Self::Unlinked),
+            _ => None,
+        }
+    }
+}
 
 /// Where a fork's history is kept and pushed, fixed at create.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -48,6 +88,8 @@ pub struct ForkIdentity {
     pub base: Oid,
     /// Where the fork's history goes ([`PUSH_TARGET_KEY`]).
     pub push_target: PushTarget,
+    /// Whether it delivers back to its source ([`LINK_KEY`]).
+    pub link: ForkLink,
 }
 
 impl ForkIdentity {

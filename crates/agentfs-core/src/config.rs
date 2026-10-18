@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::fork::identity::{self as fork_identity, ForkIdentity, PushTarget};
+use crate::fork::identity::{self as fork_identity, ForkIdentity, ForkLink, PushTarget};
 use crate::identity::Templates;
 use crate::proxy::ProxySetting;
 use crate::remote_url::{self, Transport};
@@ -108,9 +108,15 @@ pub enum ConfigError {
     BadForkBase { key: String, value: String },
     #[error(
         "agentfs.fork.source and agentfs.fork.base must be set together, and \
-         agentfs.fork.pushTarget and agentfs.fork.sourceState only with them"
+         agentfs.fork.pushTarget, agentfs.fork.link and agentfs.fork.sourceState only with \
+         them"
     )]
     PartialForkIdentity,
+    #[error(
+        "agentfs.fork.sourceState is set in an unlinked fork: an unlinked fork delivers nothing \
+         to its source and records no path to it"
+    )]
+    UnlinkedSourceState,
     #[error("agentfs.branch is set in a fork's config; a fork's push target is fixed at create")]
     ForkBranch,
     #[error("agentfs.start.remote, .branch and .commit must be set together")]
@@ -174,6 +180,7 @@ pub const KEYS: &[&str] = &[
     "agentfs.fork.source",
     "agentfs.fork.base",
     "agentfs.fork.pushTarget",
+    "agentfs.fork.link",
     "agentfs.fork.sourceState",
     "agentfs.start.remote",
     "agentfs.start.branch",
@@ -468,7 +475,9 @@ pub struct Settings {
     /// ([`ForkRemote::SourceHistory`]), else the remote the patch remote
     /// resolves to (design §19.1, gate answer Q1 b), else `None`. `None`
     /// too when a flagged section is invalid or more than one is flagged:
-    /// a fork never falls back past the operator's choice.
+    /// a fork never falls back past the operator's choice. Always `None`
+    /// in an unlinked fork, which delivers nothing ([`ForkLink`]); its
+    /// `remotes` are still the remote a linked fork would publish to.
     pub fork_remote: Option<ForkRemote>,
     /// A fork of a local-only source: the source's state area
     /// (`agentfs.fork.sourceState`, written at create from the fork's own
@@ -681,9 +690,15 @@ fn fork_identity_of(
     let source = string(config, fork_identity::SOURCE_KEY)?;
     let base = string(config, fork_identity::BASE_KEY)?;
     let push_target = push_target(config, fork_identity::PUSH_TARGET_KEY)?;
-    let (source, base, push_target) = match (source, base, push_target) {
-        (None, None, None) => return Ok(None),
-        (Some(source), Some(base), push_target) => (source, base, push_target.unwrap_or_default()),
+    let link = fork_link(config)?;
+    let (source, base, push_target, link) = match (source, base, push_target, link) {
+        (None, None, None, None) => return Ok(None),
+        (Some(source), Some(base), push_target, link) => (
+            source,
+            base,
+            push_target.unwrap_or_default(),
+            link.unwrap_or_default(),
+        ),
         _ => return Err(ConfigError::PartialForkIdentity),
     };
     validate_name(fork_identity::SOURCE_KEY, &source)?;
@@ -700,16 +715,39 @@ fn fork_identity_of(
         source,
         base: base_oid,
         push_target,
+        link,
     }))
 }
 
+/// `agentfs.fork.link` (design §11.5): `linked` or `unlinked`; unset is
+/// `None`.
+fn fork_link(config: &git2::Config) -> Result<Option<ForkLink>, ConfigError> {
+    let key = fork_identity::LINK_KEY;
+    match string(config, key)? {
+        None => Ok(None),
+        Some(value) => ForkLink::parse(&value)
+            .map(Some)
+            .ok_or_else(|| ConfigError::BadChoice {
+                key: key.into(),
+                value,
+                allowed: "linked, unlinked",
+            }),
+    }
+}
+
 /// `agentfs.fork.sourceState` (F8 S3): an absolute path, set only beside
-/// a fork identity.
-fn source_state_of(config: &git2::Config, fork: bool) -> Result<Option<PathBuf>, ConfigError> {
+/// a linked fork's identity.
+fn source_state_of(
+    config: &git2::Config,
+    fork: Option<&ForkIdentity>,
+) -> Result<Option<PathBuf>, ConfigError> {
     let key = crate::fork::receive::SOURCE_STATE_KEY;
     match string(config, key)? {
         None => Ok(None),
-        Some(_) if !fork => Err(ConfigError::PartialForkIdentity),
+        Some(_) if fork.is_none() => Err(ConfigError::PartialForkIdentity),
+        Some(_) if fork.is_some_and(|f| f.link == ForkLink::Unlinked) => {
+            Err(ConfigError::UnlinkedSourceState)
+        }
         Some(value) if !Path::new(&value).is_absolute() => Err(ConfigError::RelativePath {
             key: key.into(),
             value,
@@ -778,6 +816,8 @@ struct Declaration<'a> {
     none: bool,
     /// The volume is a fork.
     fork: bool,
+    /// The fork is unlinked ([`ForkLink::Unlinked`]).
+    unlinked: bool,
     /// The fork records its local-only source's state area.
     source_history: bool,
 }
@@ -826,13 +866,20 @@ fn split_remotes(
             }
             Some(ForkRemote::SourceHistory) => Remotes::LocalOnly,
             None if any_flagged_invalid => Remotes::NoneValid,
+            // An unlinked fork of a local-only source records no path to
+            // it (design §11.5): with no section at all it is local-only.
+            None if declaration.unlinked && own.is_empty() && invalid.is_empty() => {
+                Remotes::LocalOnly
+            }
             None => Remotes::Undeclared { beside: None },
         };
         return SplitRemotes {
             remotes,
             // An unflagged section is not a fork's remote: nothing to raise.
             invalid: invalid.into_iter().filter(|r| r.fork_remote).collect(),
-            fork_remote,
+            // An unlinked fork pushes its history where a linked one would
+            // publish, and delivers nothing: it has no fork remote.
+            fork_remote: fork_remote.filter(|_| !declaration.unlinked),
         };
     }
     let remotes = declared(declaration.none, own, &mut invalid);
@@ -866,6 +913,7 @@ pub fn declares_fork(git_dir: &Path) -> Result<bool, git2::Error> {
         fork_identity::SOURCE_KEY,
         fork_identity::BASE_KEY,
         fork_identity::PUSH_TARGET_KEY,
+        fork_identity::LINK_KEY,
         crate::fork::receive::SOURCE_STATE_KEY,
     ] {
         if is_set(&config, key)? {
@@ -948,7 +996,7 @@ impl Settings {
                 });
             }
         };
-        let source_state = source_state_of(config, fork.is_some())?;
+        let source_state = source_state_of(config, fork.as_ref())?;
         let split = split_remotes(
             valid,
             invalid,
@@ -956,6 +1004,7 @@ impl Settings {
                 patch_remote: &patch_remote,
                 none,
                 fork: fork.is_some(),
+                unlinked: fork.as_ref().is_some_and(|f| f.link == ForkLink::Unlinked),
                 source_history: source_state.is_some(),
             },
         );
@@ -1064,6 +1113,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
             fork_identity::SOURCE_KEY,
             fork_identity::BASE_KEY,
             fork_identity::PUSH_TARGET_KEY,
+            fork_identity::LINK_KEY,
             crate::fork::receive::SOURCE_STATE_KEY,
             fork_identity::START_REMOTE_KEY,
             fork_identity::START_BRANCH_KEY,
@@ -2596,7 +2646,7 @@ mod tests {
             Settings::from_config(&c),
             Err(ConfigError::BadName { .. })
         ));
-        for key in ["source", "base", "pushTarget"] {
+        for key in ["source", "base", "pushTarget", "link"] {
             let (_d, s) = with_include(
                 "[agentfs]\n\tvolume = v\n[include]\n\tpath = FRAGMENT\n",
                 &format!("[agentfs \"fork\"]\n\t{key} = x\n"),
@@ -2667,6 +2717,71 @@ mod tests {
         }
         let (_d, c) =
             config_with("[agentfs]\n\tvolume = f\n[agentfs \"fork\"]\n\tpushTarget = hidden\n");
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::PartialForkIdentity)
+        ));
+    }
+
+    /// A fork's link (design §11.5, §19.1 "Fork link"): its own config's,
+    /// `linked` when unset. An unlinked fork has no fork remote, pushes
+    /// its history where a linked one would publish, is local-only with no
+    /// section at all, and may not record a source path. Any other value
+    /// is `BadChoice`, and `link` alone is a partial identity.
+    #[test]
+    fn fork_links() {
+        let link = |extra: &str| {
+            let (_d, c) = config_with(&fork_config(extra));
+            Settings::from_config(&c)
+        };
+        let origin = "[remote \"origin\"]\n\turl = /o\n";
+        let linked = link(origin).unwrap();
+        assert_eq!(linked.fork.as_ref().unwrap().link, ForkLink::Linked);
+        let explicit = link(&format!("[agentfs \"fork\"]\n\tlink = linked\n{origin}")).unwrap();
+        assert_eq!(explicit.fork, linked.fork);
+        assert!(linked.fork_remote.is_some());
+
+        let unlinked = "[agentfs \"fork\"]\n\tlink = unlinked\n";
+        let s = link(&format!("{unlinked}{origin}")).unwrap();
+        assert_eq!(s.fork.as_ref().unwrap().link, ForkLink::Unlinked);
+        assert_eq!(s.fork_remote, None);
+        assert_eq!(s.branch_ref, "refs/heads/agentfs/f-1");
+        let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["origin"]);
+        assert_eq!(s.patch_remote(), None);
+        // A flagged section: the fork remote, never the source's own.
+        let flagged = "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n";
+        let s = link(&format!("{unlinked}{origin}{flagged}")).unwrap();
+        assert_eq!(s.remotes.pushed()[0].name, "forks");
+        assert_eq!(s.fork_remote, None);
+        // No section: local-only; two unflagged and no patch remote:
+        // nothing to push to, undeclared, as a linked fork.
+        assert_eq!(link(unlinked).unwrap().remotes, Remotes::LocalOnly);
+        let two = "[remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n";
+        assert_eq!(
+            link(&format!("{unlinked}{two}")).unwrap().remotes,
+            Remotes::Undeclared { beside: None }
+        );
+        assert_eq!(
+            link("").unwrap().remotes,
+            Remotes::Undeclared { beside: None }
+        );
+        assert!(matches!(
+            link(&format!("{unlinked}\tsourceState = /srv/src/state\n")),
+            Err(ConfigError::UnlinkedSourceState)
+        ));
+        for value in ["Unlinked", "none", "", "true"] {
+            assert!(
+                matches!(
+                    link(&format!("[agentfs \"fork\"]\n\tlink = \"{value}\"\n")),
+                    Err(ConfigError::BadChoice { ref key, allowed, .. })
+                        if key == "agentfs.fork.link" && allowed == "linked, unlinked"
+                ),
+                "link = {value:?}"
+            );
+        }
+        let (_d, c) =
+            config_with("[agentfs]\n\tvolume = f\n[agentfs \"fork\"]\n\tlink = unlinked\n");
         assert!(matches!(
             Settings::from_config(&c),
             Err(ConfigError::PartialForkIdentity)

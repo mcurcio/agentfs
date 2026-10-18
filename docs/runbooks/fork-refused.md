@@ -10,6 +10,15 @@ retry can ever succeed. One function, `fork::finish::refused_reason`,
 decides which; those make the fork **refused**, and agentfs stops
 retrying it until an operator acts.
 
+Only a **linked** fork (the default, `agentfs.fork.link` unset) publishes,
+so only a linked one can be refused. A linked fork that cannot reach its
+source waits and alarms; it never delivers anywhere else, so the fixes
+below are always on the fork remote (or the source's state area), never
+a different target. An unlinked fork delivers nothing: `fork finish`
+refuses it (`fork <fork> is unlinked`) and `fork status` has no state for
+it; its pushes are an ordinary volume's
+([stuck-pushes.md](stuck-pushes.md)).
+
 ## How it shows
 
 - The alarm `ForkRefused`, raised once when the refusal is recorded,

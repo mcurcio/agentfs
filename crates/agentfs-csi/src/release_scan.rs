@@ -386,7 +386,7 @@ mod tests {
     use agentfs_core::fork::finish::{
         AbandonedMark, ForkMark, PublishedMark, RefusedMark, RefusedReason,
     };
-    use agentfs_core::fork::{ForkIdentity, PushTarget};
+    use agentfs_core::fork::{ForkIdentity, ForkLink, PushTarget};
 
     use super::*;
     use crate::launcher::ProcessSpec;
@@ -462,14 +462,20 @@ mod tests {
     /// A volume `handle`; a fork when `fork`, asked to finish when
     /// `requested`.
     fn volume(layout: &Layout, handle: &str, fork: bool, requested: bool) {
+        volume_linked(layout, handle, fork.then_some(ForkLink::Linked), requested);
+    }
+
+    /// [`volume`], a fork with `link` when there is one.
+    fn volume_linked(layout: &Layout, handle: &str, link: Option<ForkLink>, requested: bool) {
         fs::create_dir_all(layout.backing(handle)).unwrap();
         let state = StateDir::new(layout.state(handle));
-        if fork {
+        if let Some(link) = link {
             let identity = ForkIdentity {
                 fork: handle.into(),
                 source: "src".into(),
                 base: Oid::from_str(&"1".repeat(40)).unwrap(),
                 push_target: PushTarget::Branch,
+                link,
             };
             agentfs_core::volume::init_fork(&state, &identity, &[]).unwrap();
         } else {
@@ -617,14 +623,22 @@ mod tests {
         volume(&layout, "staged", true, true);
         fs::create_dir_all(layout.staged_dir()).unwrap();
         fs::write(layout.staged_record("staged"), "{}").unwrap();
+        // An unlinked fork is never finished: it is pushed like any
+        // worktree, even when its deletion asked (design §11.5).
+        volume_linked(&layout, "solo", Some(ForkLink::Unlinked), true);
+        commit(&layout, "solo");
 
         let fake = Arc::new(Fake::default());
         let scan = scanner(&layout, &fake);
         let report = scan.scan().await;
         assert_eq!(report.finishing, ["fork-a"], "{report:?}");
+        assert_eq!(report.pushing, ["solo"], "{report:?}");
         assert!(report.unreadable.is_empty(), "{report:?}");
         let started = fake.started.lock().unwrap().clone();
-        assert_eq!(started.len(), 1);
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[1].label, "push solo");
+        // Its push worked: held at its head from now on.
+        fake.exit(1, 0);
         let state = layout.state("fork-a").display().to_string();
         let root = layout.backing("fork-a").display().to_string();
         assert_eq!(
@@ -657,7 +671,9 @@ mod tests {
         let restarted = scanner(&layout, &fake);
         assert_eq!(restarted.scan().await.finishing, ["fork-a"]);
         assert!(
-            fake.labels().iter().all(|l| l == "fork fork-a"),
+            fake.labels()
+                .iter()
+                .all(|l| l == "fork fork-a" || l == "push solo"),
             "a finisher started for a refused, abandoned or published fork: {:?}",
             fake.labels()
         );

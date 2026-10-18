@@ -13,6 +13,7 @@
 //! | `onDelete` | `retain` (default: DeleteVolume keeps the directory) or `delete` ([`OnDelete`]) |
 //! | `startFrom` | `<remote>:<branch>@<commit>`: the new worktree starts from that commit of another worktree's branch (F8 R2; [`StartPoint`]) |
 //! | `fork` | `"true"`: a fork class ([`ForkClass`], design §11.5); `"false"` or absent: an ordinary one |
+//! | `link` | a fork class only: `linked` (default: the fork's finish delivers its change back to the source) or `unlinked` (an independent fork, nothing ever delivered; [`ForkLink`]) |
 //!
 //! Keys under `csi.storage.k8s.io/` (the provisioner's metadata) are read
 //! for the template and otherwise ignored; any other key is refused,
@@ -28,7 +29,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use agentfs_core::config::validate_name;
-use agentfs_core::fork::identity::{BadStartPoint, StartPoint};
+use agentfs_core::fork::identity::{BadStartPoint, ForkLink, StartPoint};
 
 pub use agentfs_core::release::OnDelete;
 
@@ -70,7 +71,7 @@ pub enum ParamError {
     BadProfile(String),
     #[error(
         "unknown StorageClass parameter {0:?} (known: profile, volumeName, onDelete, startFrom, \
-         workloadMounts, fork; a worktree's branch is always agentfs/<volume>)"
+         workloadMounts, fork, link; a worktree's branch is always agentfs/<volume>)"
     )]
     UnknownKey(String),
     #[error(
@@ -105,6 +106,10 @@ pub enum ParamError {
     ForkClassSets(&'static str),
     #[error("fork {0:?} must be \"true\" or \"false\"")]
     BadFork(String),
+    #[error("link {0:?} must be \"linked\" or \"unlinked\"")]
+    BadLink(String),
+    #[error("link is a fork class's parameter (fork: \"true\"); an ordinary class has no source")]
+    LinkWithoutFork,
     /// Any class: volumeName must contain {pvName} (rule 1).
     #[error(
         "volumeName {template:?} must contain {{pvName}}, so each claim is a worktree with its \
@@ -157,6 +162,7 @@ impl VolumeParams {
                 // An ordinary class may say so; a fork class is a ForkClass.
                 "fork" if value == "false" => {}
                 "fork" => return Err(ParamError::BadFork(value.clone())),
+                "link" => return Err(ParamError::LinkWithoutFork),
                 k if k.starts_with(CO_PREFIX) => {}
                 other => return Err(ParamError::UnknownKey(other.to_owned())),
             }
@@ -310,6 +316,9 @@ pub struct ForkClass {
     pub volume: String,
     pub on_delete: OnDelete,
     pub workload_mounts: Vec<String>,
+    /// `link`: whether the fork delivers back to its source, written into
+    /// its identity at create and never changed after (design §11.5).
+    pub link: ForkLink,
 }
 
 impl ForkClass {
@@ -330,9 +339,14 @@ impl ForkClass {
         let mut template = None;
         let mut on_delete = OnDelete::Delete;
         let mut workload_mounts = Vec::new();
+        let mut link = ForkLink::default();
         for (key, value) in parameters {
             match key.as_str() {
                 "fork" => {}
+                "link" => {
+                    link =
+                        ForkLink::parse(value).ok_or_else(|| ParamError::BadLink(value.clone()))?;
+                }
                 "profile" => return Err(ParamError::ForkClassSets("profile")),
                 "branch" => return Err(ParamError::ForkClassSets("branch")),
                 "startFrom" => return Err(ParamError::ForkClassSets("startFrom")),
@@ -347,6 +361,7 @@ impl ForkClass {
             volume: unique_volume_name(name, template, parameters)?,
             on_delete,
             workload_mounts,
+            link,
         }))
     }
 
@@ -500,6 +515,27 @@ mod tests {
             .unwrap();
         assert_eq!(class.volume, "agents.sandbox.pvc-9");
         assert_eq!(class.on_delete, OnDelete::Delete);
+        assert_eq!(class.link, ForkLink::Linked);
+        for (value, want) in [
+            ("linked", ForkLink::Linked),
+            ("unlinked", ForkLink::Unlinked),
+        ] {
+            let class =
+                ForkClass::from_create("pvc-9", &with(&[("fork", "true"), ("link", value)]))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(class.link, want);
+        }
+        for value in ["Unlinked", "none", ""] {
+            assert_eq!(
+                ForkClass::from_create("pvc-9", &with(&[("fork", "true"), ("link", value)])),
+                Err(ParamError::BadLink(value.into()))
+            );
+        }
+        assert_eq!(
+            VolumeParams::from_create("pvc-1", &map(&[("profile", "p"), ("link", "unlinked")])),
+            Err(ParamError::LinkWithoutFork)
+        );
         let source = VolumeParams::from_create("pvc-1", &map(&[("profile", "example")])).unwrap();
         let params = class.params(&source);
         assert_eq!(params.profile, "example");

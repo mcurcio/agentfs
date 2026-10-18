@@ -17,7 +17,7 @@ use super::finish::{
     self, AbandonError, FinishError, Finisher, ForkState, Met, PublishOutcome, RefusedReason,
     StatusError, refused_reason,
 };
-use super::identity::{ForkIdentity, PushTarget, change_ref, finish_ref};
+use super::identity::{ForkIdentity, ForkLink, PushTarget, change_ref, finish_ref};
 use crate::confined::Dir;
 use crate::events::{Event, Events, NullSink, PushFailureKind};
 use crate::identity::Context;
@@ -184,6 +184,15 @@ impl Fork {
     }
 
     fn create(&self, source: &Vol, name: &str) -> Result<ForkIdentity, CreateError> {
+        self.create_with(source, name, ForkLink::Linked)
+    }
+
+    fn create_with(
+        &self,
+        source: &Vol,
+        name: &str,
+        link: ForkLink,
+    ) -> Result<ForkIdentity, CreateError> {
         create::create(&CreateRequest {
             source: &source.state,
             fork: &self.state,
@@ -191,6 +200,7 @@ impl Fork {
             name,
             includes: std::slice::from_ref(&source.fragment),
             push_target: PushTarget::Branch,
+            link,
         })
     }
 
@@ -672,13 +682,23 @@ fn publish_waits_for_an_unreachable_remote() {
     let parked = source.dir.path().join("parked.git");
     fs::rename(source.remote.as_path(), &parked).unwrap();
     let lock = fork.lock();
-    let mut finisher = fork.finisher(&lock).unwrap();
+    let (events, seen) = recording();
+    let mut finisher = fork.finisher_with(&lock, events).unwrap();
     let outcome = finisher
         .publish(Some(Instant::now() + Duration::from_millis(300)))
         .unwrap();
     assert!(
         matches!(outcome, PublishOutcome::Pending { .. }),
         "{outcome:?}"
+    );
+    // A linked fork that cannot reach its source alarms, and its change
+    // reached nowhere else (design §11.5 "Fork link").
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::PushFailed { .. })),
+        "no alarm while the fork remote is unreachable"
     );
     assert!(!fork.state.fork_mark().exists());
     assert_eq!(
@@ -1382,4 +1402,105 @@ fn an_active_fork_is_not_received() {
 /// A deadline for a publish that should not wait.
 fn soon() -> Instant {
     Instant::now() + Duration::from_secs(5)
+}
+
+/// Design §11.5 "Fork link" (owner, 2026-10-17: "A fork can be created
+/// with or without a remote link back to its parent. Configurable."): an
+/// unlinked fork pushes its own branch where a linked one would publish,
+/// and nothing is ever delivered to its source: no finish, no change or
+/// finish ref, no fork status, no abandon. Its link is its identity's,
+/// fixed at create.
+#[test]
+fn an_unlinked_fork_pushes_its_branch_and_delivers_nothing() {
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    let identity = fork
+        .create_with(&source, "src-u", ForkLink::Unlinked)
+        .unwrap();
+    assert_eq!(identity.link, ForkLink::Unlinked);
+    // A second create asking linked keeps the identity it has.
+    assert_eq!(
+        fork.create(&source, "src-u").unwrap().link,
+        ForkLink::Unlinked
+    );
+    let settings = crate::config::Settings::load(&fork.state.git()).unwrap();
+    assert_eq!(settings.fork.as_ref(), Some(&identity));
+    assert_eq!(settings.fork_remote, None);
+    assert_eq!(settings.source_state, None);
+    fork.as_vol().write("b.txt", "b\n");
+
+    // Pushed as any volume's branch, to the remote a linked fork would
+    // publish to.
+    let mut pushers = crate::push::open_all(
+        &fork.state,
+        &settings,
+        Arc::new(NullSink),
+        &Telemetry::noop(),
+    )
+    .unwrap();
+    assert_eq!(pushers.len(), 1);
+    assert!(pushers[0].push_once().is_success());
+    let head = Repository::open_bare(fork.state.git())
+        .unwrap()
+        .refname_to_id("refs/heads/agentfs/src-u")
+        .unwrap();
+    let on_remote = remote_refs(&source.remote);
+    assert_eq!(on_remote.get("refs/heads/agentfs/src-u"), Some(&head));
+    assert!(
+        on_remote.keys().all(|r| !r.starts_with("refs/agentfs/")),
+        "nothing delivered: {on_remote:?}"
+    );
+
+    // Never finished, so never read-only, and no fork status.
+    let lock = fork.lock();
+    assert!(matches!(
+        fork.finisher(&lock),
+        Err(FinishError::Unlinked { ref fork }) if fork == "src-u"
+    ));
+    assert_eq!(finish::status(&fork.state).unwrap(), None);
+    assert!(matches!(
+        finish::abandon(&fork.state, &lock, "no", CALLER),
+        Err(AbandonError::NotAFork)
+    ));
+    volume::refuse_finished(&fork.state).unwrap();
+    let repo = Repository::open_bare(fork.state.git()).unwrap();
+    assert!(repo.find_reference(&change_ref("src-u")).is_err());
+    assert!(repo.find_reference(&finish_ref("src-u")).is_err());
+}
+
+/// An unlinked fork of a local-only source records no path to it and is
+/// local-only itself: nothing it does reaches the source's state area. A
+/// linked one beside it still records the path (F8 S3).
+#[test]
+fn an_unlinked_fork_of_a_local_only_source_records_no_path() {
+    let source = local_only("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    fork.create_with(&source, "src-u", ForkLink::Unlinked)
+        .unwrap();
+    let before = source.snapshot();
+    let settings = crate::config::Settings::load(&fork.state.git()).unwrap();
+    assert_eq!(settings.source_state, None);
+    assert_eq!(settings.fork_remote, None);
+    assert_eq!(settings.remotes, crate::config::Remotes::LocalOnly);
+    let config = fs::read_to_string(fork.state.git().join("config")).unwrap();
+    assert!(!config.contains("sourceState"), "{config}");
+    assert!(config.contains("link = unlinked"), "{config}");
+    fork.as_vol().write("b.txt", "b\n");
+    let lock = fork.lock();
+    assert!(matches!(
+        fork.finisher(&lock),
+        Err(FinishError::Unlinked { .. })
+    ));
+    assert_eq!(source.snapshot(), before, "nothing reaches the source");
+
+    let linked = Fork::new();
+    linked.create(&source, "src-l").unwrap();
+    let settings = crate::config::Settings::load(&linked.state.git()).unwrap();
+    assert!(settings.source_state.is_some());
+    assert_eq!(
+        settings.fork_remote,
+        Some(crate::config::ForkRemote::SourceHistory)
+    );
 }

@@ -55,6 +55,13 @@ storageClasses:
       profile: example
       volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
       onDelete: retain
+  # A fork class (csi.md §14): claims cloning an `agentfs` claim. `link:
+  # unlinked` makes independent forks that never deliver back to their
+  # source; omit it (or `linked`) for forks that do.
+  - name: agentfs-sandbox
+    parameters:
+      fork: "true"
+      link: unlinked
 ```
 
 The release notes (`helm status`) warn when the namespace enforces a Pod

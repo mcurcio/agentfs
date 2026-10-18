@@ -912,3 +912,94 @@ fn a_remote_added_to_a_local_only_source_gets_its_forks() {
         Some(s.source_head())
     );
 }
+
+/// Design §11.5 "Fork link": `fork create --link unlinked` makes an
+/// independent fork. It pushes its own branch where a linked fork would
+/// publish (the flagged `forks` remote here), `fork finish` refuses it and
+/// delivers nothing, and `fork status` says why it has no state. Of a
+/// local-only source, it records no path and is local-only.
+#[test]
+fn an_unlinked_fork_pushes_its_branch_and_never_finishes() {
+    let s = Setup::new(true);
+    s.record("state", "tree", "a.txt", "a\n");
+    let source = s.path("state").display().to_string();
+    let unlinked = [
+        "fork",
+        "create",
+        "--source-state",
+        &source,
+        "--link",
+        "unlinked",
+    ];
+    let out = s.ok("fork", "fork-tree", &unlinked);
+    assert!(out.contains("(unlinked"), "{out}");
+    let fork = out
+        .strip_prefix("fork ")
+        .and_then(|l| l.split(' ').next())
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        s.own_config("fork", "agentfs.fork.link").as_deref(),
+        Some("unlinked")
+    );
+    s.record("fork", "fork-tree", "b.txt", "b\n");
+    s.ok("fork", "fork-tree", &["push"]);
+    let branch = format!("refs/heads/agentfs/{fork}");
+    let head = Repository::open_bare(s.path("fork/git"))
+        .unwrap()
+        .refname_to_id(&branch)
+        .unwrap();
+    assert_eq!(s.remote_ref("forks.git", &branch), Some(head));
+    assert!(s.remote_ref("origin.git", &branch).is_none());
+
+    let out = s.agentfs("fork", "fork-tree", &["fork", "finish"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        stderr_of(&out).contains("is unlinked"),
+        "{}",
+        stderr_of(&out)
+    );
+    let out = s.agentfs("fork", "fork-tree", &["fork", "status"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("is unlinked"),
+        "{}",
+        stderr_of(&out)
+    );
+    // Nothing delivered, and the fork still records.
+    for remote in ["forks.git", "origin.git"] {
+        assert!(
+            s.refs(remote)
+                .iter()
+                .all(|(r, _)| !r.starts_with("refs/agentfs/")),
+            "{remote}: {:?}",
+            s.refs(remote)
+        );
+    }
+    s.record("fork", "fork-tree", "c.txt", "c\n");
+
+    let s = Setup::local_only();
+    s.record("state", "tree", "a.txt", "a\n");
+    let source = s.path("state").display().to_string();
+    let unlinked = [
+        "fork",
+        "create",
+        "--source-state",
+        &source,
+        "--link",
+        "unlinked",
+    ];
+    s.ok("fork", "fork-tree", &unlinked);
+    assert_eq!(s.own_config("fork", "agentfs.fork.sourceState"), None);
+    s.record("fork", "fork-tree", "b.txt", "b\n");
+    let out = s.ok("fork", "fork-tree", &["push"]);
+    assert_eq!(out.trim(), "local-only: nothing to push");
+    // Nothing of the fork reached the source's history.
+    let refs = s.refs("state/git");
+    assert!(
+        refs.iter()
+            .all(|(r, _)| !r.starts_with("refs/heads/agentfs/src-")
+                && !r.starts_with("refs/agentfs/src-")),
+        "{refs:?}"
+    );
+}

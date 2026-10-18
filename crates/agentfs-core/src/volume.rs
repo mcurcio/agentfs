@@ -32,7 +32,9 @@ use crate::claims::PathClaims;
 use crate::config::{ConfigError, validate_name};
 use crate::confined;
 use crate::events::{CheckStage, Event, Events};
-use crate::fork::identity::{self as fork_identity, ForkIdentity, PushTarget, StartPoint};
+use crate::fork::identity::{
+    self as fork_identity, ForkIdentity, ForkLink, PushTarget, StartPoint,
+};
 use crate::fsync_class::{self, FsyncClass, GroupMembers};
 use crate::history::{Committed, History, HistoryError};
 use crate::history_service::{ClientError, FrontLease, HistoryClient, PathStamp};
@@ -625,15 +627,21 @@ fn check_fork(git: &Path, wanted: &ForkIdentity) -> Result<(), VolumeError> {
 }
 
 /// The fork identity keys, in the state area's own config. The push
-/// target goes first: a crash after it leaves no source (so the next try
-/// writes every key again), never a fork that reads as `branch` because
-/// its `hidden` was lost.
+/// target and the link go first: a crash after them leaves no source (so
+/// the next try writes every key again), never a fork that reads as
+/// `branch` or `linked` because its `hidden` or `unlinked` was lost.
 fn write_fork_identity(git: &Path, fork: &ForkIdentity) -> Result<(), VolumeError> {
     let mut config = git2::Config::open(&git.join("config")).map_err(HistoryError::from)?;
     // Unset is `branch`: only the other target is written.
     if fork.push_target == PushTarget::Hidden {
         config
             .set_str(fork_identity::PUSH_TARGET_KEY, "hidden")
+            .map_err(HistoryError::from)?;
+    }
+    // Unset is `linked`, likewise.
+    if fork.link == ForkLink::Unlinked {
+        config
+            .set_str(fork_identity::LINK_KEY, ForkLink::Unlinked.as_str())
             .map_err(HistoryError::from)?;
     }
     config

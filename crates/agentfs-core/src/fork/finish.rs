@@ -18,6 +18,9 @@
 //! [`abandon`] records the operator's discard, after which nothing agentfs
 //! runs pushes the fork. [`status`] reads, without a lock or credentials,
 //! what DeleteVolume asks: whether the fork is published or abandoned.
+//! An unlinked fork (design §11.5, [`ForkLink::Unlinked`]) delivers
+//! nothing: it never finishes ([`FinishError::Unlinked`]) and has no
+//! status, so DeleteVolume and the release scan treat it as any worktree.
 
 use std::io;
 use std::path::Path;
@@ -40,7 +43,7 @@ use crate::record::{Caller, Trigger, read_repairs};
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::{self, Committer, Input, Recorder, StateDir, VolumeError};
 
-use super::identity::{ForkIdentity, change_ref, finish_ref};
+use super::identity::{ForkIdentity, ForkLink, change_ref, finish_ref};
 use super::receive::{ReceiveError, Receiver, ReceiverError, SOURCE_HISTORY, UnderLock};
 
 /// `Agentfs-Trigger` of a finish commit.
@@ -283,7 +286,7 @@ pub enum StatusError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AbandonError {
-    #[error("this volume is not a fork")]
+    #[error("this volume is not a fork, or is an unlinked one: it delivers nothing to discard")]
     NotAFork,
     #[error("fork {fork} is published; there is nothing to discard")]
     Published { fork: String },
@@ -301,6 +304,11 @@ pub enum FinishError {
     NotAFork,
     #[error("fork {fork} has no valid fork remote in its settings; it stays active")]
     NoForkRemote { fork: String },
+    #[error(
+        "fork {fork} is unlinked: it delivers nothing to its source, so it is never finished; \
+         its history is pushed like any volume's"
+    )]
+    Unlinked { fork: String },
     #[error("fork {fork} was abandoned; nothing agentfs runs pushes it")]
     Abandoned { fork: String },
     /// The local-only source is in use and no service of it answered.
@@ -365,6 +373,11 @@ impl Finisher {
         }
         let settings = Settings::load(&state.git()).map_err(HistoryError::from)?;
         let identity = settings.fork.ok_or(FinishError::NotAFork)?;
+        if identity.link == ForkLink::Unlinked {
+            return Err(FinishError::Unlinked {
+                fork: identity.fork,
+            });
+        }
         refuse_abandoned(state, &identity.fork)?;
         let (recorder, committer, _) =
             volume::open(state, tree, context, events.clone(), telemetry)?;
@@ -979,7 +992,8 @@ fn now_ms() -> u64 {
 }
 
 /// The fork status of the state area at `state`, read without a lock or
-/// credentials: `Ok(None)` for a volume that is not a fork. What cannot be
+/// credentials: `Ok(None)` for a volume that is not a fork, and for an
+/// unlinked fork, which delivers nothing (design §11.5). What cannot be
 /// read is an error, never a state, so a caller deciding whether to
 /// delete waits. Abandoned wins, then published, then refused (each
 /// naming the branch head's finish commit), then finished or active.
@@ -995,6 +1009,9 @@ pub fn status(state: &StateDir) -> Result<Option<ForkStatus>, StatusError> {
     let Some(identity) = settings.fork.clone() else {
         return Ok(None);
     };
+    if identity.link == ForkLink::Unlinked {
+        return Ok(None);
+    }
     let repo = Repository::open_bare(state.git()).map_err(HistoryError::from)?;
     let record = match repo.find_reference(&settings.branch_ref) {
         Ok(r) => {

@@ -48,7 +48,7 @@ missing from these tables or a row names a module that no longer exists;
 | `fsync_class.rs` | The `fsync` class for databases: membership and groups (§8) |
 | `history.rs` | The bare history repository: records to commits with `Agentfs-*` trailers (§3.3, §3.4, §9) |
 | `fork/mod.rs` | Forked volumes: a volume started from another's latest commit that publishes one change for a receiver to gate (§11.5, §19.1 "Forked volumes") |
-| `fork/identity.rs` | A fork's identity, fixed at create (source, base, push target), and its ref names |
+| `fork/identity.rs` | A fork's identity, fixed at create (source, base, push target, link: linked or unlinked), and its ref names |
 | `fork/create.rs` | Creating a fork from a source's state area, without the source's lock or any credentials |
 | `fork/finish.rs` | The finisher: the change and finish commits, publishing to the fork remote, the single decider of a refused publish, the operator's abandon, and the fork status DeleteVolume reads |
 | `fork/listing.rs` | The published changes on a fork remote, each checked (fork name, finish trailers, change id, parent, tree), read in a receiver's repository with its own git (§11.5) |
