@@ -379,6 +379,15 @@ fn create_refuses_and_changes_nothing() {
         Err(CreateError::NoForkRemote { .. })
     ));
     assert!(!third.state.root().exists());
+    // An unlinked fork needs no fork remote: the same source forks, and
+    // the fork is local-only (it never pushes to its source's remotes).
+    let unlinked = Fork::new();
+    unlinked
+        .create_with(&source, "src-3", ForkLink::Unlinked)
+        .unwrap();
+    let settings = crate::config::Settings::load(&unlinked.state.git()).unwrap();
+    assert!(settings.is_unlinked_fork());
+    assert_eq!(settings.remotes, crate::config::Remotes::LocalOnly);
 
     // A state area of another volume.
     let source = Vol::new("src");
