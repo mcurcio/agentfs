@@ -1486,7 +1486,13 @@ fn revert_through_the_mount() {
         true,
     );
     v.expect(&tree(&[("d/y", Exec("y".into())), ("keep", f("k"))]));
-    v.sh_as(Some(UID), "printf x > x", true);
+    // One open, one write, one close: one record, so the head is the commit
+    // that added x. A shell `printf x > x` would not do: dash opens x, dups it
+    // onto stdout and closes the original before printf writes, and that
+    // close's FLUSH records x empty (design §3.1). When the write's FLUSH
+    // comes more than a commit window later, the head adds nothing and only
+    // writes x, and reverting it writes x back to empty.
+    v.sh_as(Some(UID), "printf x | tee x >/dev/null", true);
     v.expect(&tree(&[
         ("d/y", Exec("y".into())),
         ("keep", f("k")),
