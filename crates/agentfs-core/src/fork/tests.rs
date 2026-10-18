@@ -830,6 +830,7 @@ fn refused_reasons_are_decided_in_one_place() {
         refused_reason(Met::RemoteGone),
         Some(RefusedReason::RemoteGone)
     );
+    assert_eq!(refused_reason(Met::Unsafe), Some(RefusedReason::Unsafe));
     assert_eq!(
         refused_reason(Met::CreateOnly(Refused)),
         Some(RefusedReason::Rejected)
@@ -853,6 +854,7 @@ fn refused_reasons_are_decided_in_one_place() {
         (RefusedReason::TooLarge, "too_large"),
         (RefusedReason::Rejected, "rejected"),
         (RefusedReason::RemoteGone, "remote_gone"),
+        (RefusedReason::Unsafe, "unsafe"),
     ] {
         assert_eq!(reason.as_str(), text);
         assert_eq!(
@@ -1417,6 +1419,242 @@ fn an_active_fork_is_not_received() {
         super::receive::receive_fork_change(&source.state, &identity, &fork.state),
         Err(super::receive::ReceiveError::NotPublished)
     ));
+}
+
+/// A local-only source with one commit, and a finished fork of it named
+/// `name` that added `b.txt`.
+fn finished_fork_of_local_only(name: &str) -> (Vol, Fork, ForkIdentity) {
+    let source = local_only("src");
+    source.change(&[("a.txt", "a\n")]);
+    let fork = Fork::new();
+    let identity = fork.create(&source, name).unwrap();
+    fork.as_vol().write("b.txt", "b\n");
+    let lock = fork.lock();
+    fork.finisher(&lock).unwrap().finish().unwrap();
+    (source, fork, identity)
+}
+
+/// The fork's output is untrusted (forked-volume gate answer Q3,
+/// 2026-10-15: "potentially hostile"): a fork whose refs are the
+/// source's own (its branch, or `refs/agentfs/<source>/`) is refused and
+/// nothing is written, however its name or the source's branch came to
+/// collide.
+#[test]
+fn a_fork_never_writes_the_sources_own_refs() {
+    // Named as its source: its branch is the source's, its change and
+    // finish refs in the source's namespace.
+    let (source, fork, identity) = finished_fork_of_local_only("src");
+    let head = source.head();
+    let before = source.snapshot();
+    let received = super::receive::receive_fork_change(&source.state, &identity, &fork.state);
+    assert!(
+        matches!(
+            received,
+            Err(super::receive::ReceiveError::SourcesRef { ref refname })
+                if refname == "refs/heads/agentfs/src"
+        ),
+        "received into the source's own refs: {received:?}"
+    );
+    assert_eq!(source.head(), head, "the source's branch never moves");
+    assert_eq!(source.snapshot(), before, "nothing is written");
+    // Hidden, its history ref is in the source's namespace.
+    let hidden = ForkIdentity {
+        push_target: PushTarget::Hidden,
+        ..identity.clone()
+    };
+    let forked = Repository::open_bare(fork.state.git()).unwrap();
+    let finish = forked.refname_to_id(&identity.history_ref()).unwrap();
+    forked
+        .reference(&hidden.history_ref(), finish, false, "test")
+        .unwrap();
+    assert!(matches!(
+        super::receive::receive_fork_change(&source.state, &hidden, &fork.state),
+        Err(super::receive::ReceiveError::SourcesRef { ref refname })
+            if refname == "refs/agentfs/src/history"
+    ));
+    assert_eq!(source.snapshot(), before, "nothing is written");
+    // Through the finisher: refused for good, as `unsafe`.
+    let lock = fork.lock();
+    assert!(matches!(
+        fork.finisher(&lock).unwrap().publish(Some(soon())).unwrap(),
+        PublishOutcome::Refused {
+            reason: RefusedReason::Unsafe,
+            ..
+        }
+    ));
+    assert_eq!(source.head(), head, "the source's branch never moves");
+
+    // The source's branch renamed (later) to the fork's, at base: base is
+    // on it, and the fork's history fast-forwards from it.
+    let (source, fork, identity) = finished_fork_of_local_only("src-4");
+    git2::Config::open(&source.state.git().join("config"))
+        .unwrap()
+        .set_str("agentfs.branch", "agentfs/src-4")
+        .unwrap();
+    source
+        .repo()
+        .reference(&identity.history_ref(), identity.base, false, "test")
+        .unwrap();
+    let before = source.snapshot();
+    let received = super::receive::receive_fork_change(&source.state, &identity, &fork.state);
+    assert!(
+        matches!(
+            received,
+            Err(super::receive::ReceiveError::SourcesRef { ref refname })
+                if refname == "refs/heads/agentfs/src-4"
+        ),
+        "received into the source's branch: {received:?}"
+    );
+    assert_eq!(
+        source.head(),
+        Some(identity.base),
+        "the source's branch never moves"
+    );
+    assert_eq!(source.snapshot(), before, "nothing is written");
+}
+
+/// A fork's base must be on the source's branch: one the source never
+/// had, or no longer has (its history rewritten, design §15), is refused
+/// and nothing is written, so a fork never brings history the source
+/// does not hold.
+#[test]
+fn a_fork_whose_base_is_not_on_the_sources_branch_is_refused() {
+    // A base the source never had: the fork's own finish commit.
+    let (source, fork, identity) = finished_fork_of_local_only("src-5");
+    let finish = Repository::open_bare(fork.state.git())
+        .unwrap()
+        .refname_to_id(&identity.history_ref())
+        .unwrap();
+    let foreign = ForkIdentity {
+        base: finish,
+        ..identity.clone()
+    };
+    let before = source.snapshot();
+    let received = super::receive::receive_fork_change(&source.state, &foreign, &fork.state);
+    assert!(
+        matches!(
+            received,
+            Err(super::receive::ReceiveError::BaseNotOnBranch { base }) if base == finish
+        ),
+        "received off a foreign base: {received:?}"
+    );
+    assert_eq!(source.snapshot(), before, "nothing is written");
+
+    // The source's branch rewritten to a new root: base is still in its
+    // object store, but no longer on its branch.
+    let repo = source.repo();
+    let branch = crate::config::Settings::load(&source.state.git())
+        .unwrap()
+        .branch_ref;
+    let tree = repo.find_commit(identity.base).unwrap().tree().unwrap();
+    let sig = git2::Signature::now("x", "x@e").unwrap();
+    let root = repo
+        .commit(None, &sig, &sig, "rewritten", &tree, &[])
+        .unwrap();
+    repo.reference(&branch, root, true, "test").unwrap();
+    let before = source.snapshot();
+    let received = super::receive::receive_fork_change(&source.state, &identity, &fork.state);
+    assert!(
+        matches!(
+            received,
+            Err(super::receive::ReceiveError::BaseNotOnBranch { base }) if base == identity.base
+        ),
+        "received off a rewritten base: {received:?}"
+    );
+    assert_eq!(source.snapshot(), before, "nothing is written");
+    let lock = fork.lock();
+    assert!(matches!(
+        fork.finisher(&lock).unwrap().publish(Some(soon())).unwrap(),
+        PublishOutcome::Refused {
+            reason: RefusedReason::Unsafe,
+            ..
+        }
+    ));
+}
+
+/// The fork's LFS objects are taken into the source's cache only as
+/// verified: the bytes kept are the bytes hashed, under the name they
+/// hash to. An object whose content is not its name is refused and
+/// nothing of it is kept, under that name or any other.
+#[test]
+fn a_forks_lfs_objects_are_kept_only_as_verified() {
+    use crate::lfs::cache::ObjectCache;
+    use crate::lfs::pointer::Pointer;
+    let plant = |fork: &Fork, name: &Pointer, content: &[u8]| {
+        let path = ObjectCache::at(fork.state.lfs()).unwrap().path(&name.oid);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    };
+    let source_objects = |source: &Vol| {
+        let mut list: Vec<_> = ObjectCache::at(source.state.lfs())
+            .unwrap()
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p.oid.to_string())
+            .collect();
+        list.sort();
+        list
+    };
+
+    // A whole object is copied, byte for byte.
+    let (source, fork, identity) = finished_fork_of_local_only("src-6");
+    let good = Pointer::of_reader(&b"real object\n"[..]).unwrap();
+    plant(&fork, &good, b"real object\n");
+    super::receive::receive_fork_change(&source.state, &identity, &fork.state).unwrap();
+    let cache = ObjectCache::at(source.state.lfs()).unwrap();
+    assert_eq!(fs::read(cache.path(&good.oid)).unwrap(), b"real object\n");
+
+    // One whose content is not its name, of the name's size.
+    let (source, fork, identity) = finished_fork_of_local_only("src-7");
+    let named = Pointer::of_reader(&b"real object\n"[..]).unwrap();
+    plant(&fork, &named, b"fake object\n");
+    let objects = source_objects(&source);
+    let refs = source.snapshot();
+    let received = super::receive::receive_fork_change(&source.state, &identity, &fork.state);
+    assert!(
+        matches!(
+            received,
+            Err(super::receive::ReceiveError::LfsMismatch { .. })
+        ),
+        "kept an object that is not its name: {received:?}"
+    );
+    assert_eq!(source_objects(&source), objects, "nothing of it is kept");
+    assert_eq!(source.snapshot(), refs, "no ref is written");
+}
+
+/// Every refusal a receive makes crosses the source's control socket as
+/// itself (`receive_fork`), and nothing else is read as one.
+#[test]
+fn receive_refusals_round_trip_the_control_socket() {
+    use super::receive::ReceiveError;
+    let base = Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+    for refused in [
+        ReceiveError::SourceRemoved,
+        ReceiveError::NotPublished,
+        ReceiveError::Diverged {
+            refname: "refs/heads/agentfs/f".into(),
+        },
+        ReceiveError::SourcesRef {
+            refname: "refs/heads/agentfs/src".into(),
+        },
+        ReceiveError::BaseNotOnBranch { base },
+        ReceiveError::LfsMismatch {
+            message: "LFS object x arrived as y".into(),
+        },
+    ] {
+        let (kind, message) = refused.refusal().unwrap();
+        let back = ReceiveError::from_refusal(kind, message).unwrap();
+        assert_eq!(back.to_string(), refused.to_string(), "{kind}");
+        assert_eq!(back.refusal(), refused.refusal(), "{kind}");
+    }
+    assert!(
+        ReceiveError::Io(std::io::Error::other("x"))
+            .refusal()
+            .is_none()
+    );
+    assert!(ReceiveError::from_refusal("base_not_on_branch", "abc".into()).is_none());
+    assert!(ReceiveError::from_refusal("not_a_fork", "x".into()).is_none());
 }
 
 /// A deadline for a publish that should not wait.

@@ -75,6 +75,10 @@ fn refused_hint(reason: RefusedReason) -> String {
         RefusedReason::RemoteGone => {
             "the fork's settings no longer have the fork remote its finish names"
         }
+        RefusedReason::Unsafe => {
+            "the local-only source refuses what the fork brings: a ref that is the source's own, \
+             a base off the source's branch, or an LFS object that is not its name"
+        }
     };
     format!("{fix}; see {REFUSED_RUNBOOK}#{}", reason.as_str())
 }
@@ -609,12 +613,12 @@ impl Receiver for ThroughService {
             control::Reply::Received { change } => full_commit(&change)
                 .map(|_| ())
                 .ok_or_else(|| unavailable(format!("the source's daemon answered {change:?}"))),
-            control::Reply::Refused { kind, message, .. } => Err(match kind.as_str() {
-                "diverged" => ReceiveError::Diverged { refname: message }.into(),
-                "source_removed" => ReceiveError::SourceRemoved.into(),
-                "not_published" => ReceiveError::NotPublished.into(),
-                _ => unavailable(message),
-            }),
+            control::Reply::Refused { kind, message, .. } => {
+                Err(match ReceiveError::from_refusal(&kind, message.clone()) {
+                    Some(refused) => refused.into(),
+                    None => unavailable(message),
+                })
+            }
             control::Reply::Busy(message) | control::Reply::Error(message) => {
                 Err(unavailable(format!("the source's daemon: {message}")))
             }
@@ -647,10 +651,10 @@ pub fn serve_receive(state: &StateDir, request: &control::Request) -> control::R
         Ok(change) => control::Reply::Received {
             change: change.to_string(),
         },
-        Err(ReceiveError::Diverged { refname }) => refused("diverged", refname),
-        Err(e @ ReceiveError::SourceRemoved) => refused("source_removed", e.to_string()),
-        Err(e @ ReceiveError::NotPublished) => refused("not_published", e.to_string()),
-        Err(e) => control::Reply::Error(e.to_string()),
+        Err(e) => match e.refusal() {
+            Some((kind, message)) => refused(kind, message),
+            None => control::Reply::Error(e.to_string()),
+        },
     }
 }
 

@@ -10,9 +10,17 @@
 //! fast-forwarded from a value on the fork's history), then the change
 //! and finish refs, create-only. It never touches the source's own
 //! branch, its patch queue or its tree: whatever reads the source's
-//! history does the gating (principle 9). Once the source declares a
-//! remote, its pushes carry those refs ([`received_refs`]). The fork and the source are on
-//! one node (forks are placed on their source's node). The CLI and the
+//! history does the gating (principle 9).
+//!
+//! The fork's output is untrusted (design §11.5, "potentially hostile"),
+//! so each way it enters the source has one judged path: refs only
+//! through [`ForkRefs`], which refuses the source's own branch and
+//! namespace; objects only less a base [`OnBranch`] proved on the
+//! source's branch; LFS objects only through the cache's verified insert,
+//! which keeps the bytes it hashed.
+//!
+//! Once the source declares a remote, its pushes carry those refs
+//! ([`received_refs`]). The fork and the source are on one node (forks are placed on their source's node). The CLI and the
 //! node plugin run it through the source's control socket when its
 //! service is up (design §2.3), else directly under the source's state
 //! lock.
@@ -29,6 +37,8 @@ use std::time::Duration;
 use git2::{Oid, Repository};
 
 use crate::config::Settings;
+use crate::events::PushFailureKind;
+use crate::fork::finish::FinishRecord;
 use crate::history::{HistoryError, finish_from_message};
 use crate::lfs::ObjectCache;
 use crate::lock::{LockError, StateLock};
@@ -59,10 +69,58 @@ pub enum ReceiveError {
     /// history ([`crate::push::Claim::Diverged`]): nothing was written.
     #[error("{refname} in the source's history is another writer's; nothing was written")]
     Diverged { refname: String },
+    /// `refname`, a ref the fork would write, is the source's own: its
+    /// branch, or a ref under `refs/agentfs/<source>/` ([`ForkRefs`]).
+    /// Nothing was written.
+    #[error("{refname} is the source's own ref, never a fork's; nothing was written")]
+    SourcesRef { refname: String },
+    /// The fork's base is not on the source's branch ([`OnBranch`]): the
+    /// source never had it, or its history was rewritten since. Nothing
+    /// was written.
+    #[error("the fork's base {base} is not on the source's branch; nothing was written")]
+    BaseNotOnBranch { base: Oid },
+    /// An LFS object in the fork's cache is not what its name says (its
+    /// SHA-256 or size differ): nothing of it was kept, and no ref was
+    /// written.
+    #[error("{message}")]
+    LfsMismatch { message: String },
     #[error(transparent)]
     History(#[from] HistoryError),
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+impl ReceiveError {
+    /// The refusal kind and message a source's service answers with over
+    /// its control socket (`receive_fork`); `None` for an error that is
+    /// not a refusal. [`ReceiveError::from_refusal`] reads it back.
+    pub fn refusal(&self) -> Option<(&'static str, String)> {
+        Some(match self {
+            Self::SourceRemoved => ("source_removed", self.to_string()),
+            Self::NotPublished => ("not_published", self.to_string()),
+            Self::Diverged { refname } => ("diverged", refname.clone()),
+            Self::SourcesRef { refname } => ("sources_ref", refname.clone()),
+            Self::BaseNotOnBranch { base } => ("base_not_on_branch", base.to_string()),
+            Self::LfsMismatch { message } => ("lfs_mismatch", message.clone()),
+            Self::History(_) | Self::Io(_) => return None,
+        })
+    }
+
+    /// The refusal [`ReceiveError::refusal`] wrote; `None` for a kind it
+    /// never writes, or a message that cannot be its.
+    pub fn from_refusal(kind: &str, message: String) -> Option<Self> {
+        Some(match kind {
+            "source_removed" => Self::SourceRemoved,
+            "not_published" => Self::NotPublished,
+            "diverged" => Self::Diverged { refname: message },
+            "sources_ref" => Self::SourcesRef { refname: message },
+            "base_not_on_branch" => Self::BaseNotOnBranch {
+                base: super::identity::full_commit(&message)?,
+            },
+            "lfs_mismatch" => Self::LfsMismatch { message },
+            _ => return None,
+        })
+    }
 }
 
 impl From<git2::Error> for ReceiveError {
@@ -107,10 +165,12 @@ pub fn receive_fork_change(
     let record = finish_from_message(head.message_raw().unwrap_or_default(), head.id())
         .filter(|r| r.fork == fork.fork)
         .ok_or(ReceiveError::NotPublished)?;
+    let refs = ForkRefs::judge(&settings, fork, &record)?;
     let repo = Repository::open_bare(&source_git)?;
+    let base = OnBranch::judge(&repo, &settings.branch_ref, fork.base)?;
 
     // Every ref is judged before anything is written.
-    let advertised = existing(&repo, &history_ref)?;
+    let advertised = existing(&repo, &refs.history)?;
     let on_history = |oid: Oid| {
         forked.odb().is_ok_and(|odb| odb.exists(oid))
             && forked
@@ -120,14 +180,10 @@ pub fn receive_fork_change(
     let branch = claim(advertised, record.finish, on_history);
     if branch == Claim::Diverged {
         return Err(ReceiveError::Diverged {
-            refname: history_ref,
+            refname: refs.history,
         });
     }
-    let mut create_only = vec![(finish_ref(&fork.fork), record.finish)];
-    if let Some(change) = record.change {
-        create_only.insert(0, (change_ref(&fork.fork), change));
-    }
-    for (name, oid) in &create_only {
+    for (name, oid) in &refs.create_only {
         if existing(&repo, name)?.is_some_and(|found| found != *oid) {
             return Err(ReceiveError::Diverged {
                 refname: name.clone(),
@@ -135,28 +191,103 @@ pub fn receive_fork_change(
         }
     }
 
-    copy_objects(&forked, &repo, &record, fork.base, advertised)?;
+    copy_objects(&forked, &repo, &record, base, advertised)?;
     copy_lfs(from, source)?;
     let message = format!("agentfs: fork {} received", fork.fork);
     match (branch, advertised) {
         (Claim::Create, _) => {
-            repo.reference(&history_ref, record.finish, false, &message)?;
+            repo.reference(&refs.history, record.finish, false, &message)?;
         }
         // Leased on the value judged, as a push is.
         (Claim::FastForward, Some(current)) => {
-            repo.reference_matching(&history_ref, record.finish, true, current, &message)?;
+            repo.reference_matching(&refs.history, record.finish, true, current, &message)?;
         }
         _ => {}
     }
-    for (name, oid) in &create_only {
+    for (name, oid) in &refs.create_only {
         if existing(&repo, name)?.is_none() {
             repo.reference(name, *oid, false, &message)?;
         }
     }
-    for name in std::iter::once(&history_ref).chain(create_only.iter().map(|(n, _)| n)) {
+    for name in refs.names() {
         super::create::sync_parents(&source_git, name)?;
     }
     Ok(record.change.unwrap_or(record.finish))
+}
+
+/// The refs a receive writes into the source: the fork's history ref,
+/// then its change (when there is one) and finish refs, create-only.
+/// Made only by [`ForkRefs::judge`], so no ref is written that was not
+/// judged the fork's.
+#[derive(Debug)]
+struct ForkRefs {
+    history: String,
+    create_only: Vec<(String, Oid)>,
+}
+
+impl ForkRefs {
+    /// `fork`'s refs for `record`, refused ([`ReceiveError::SourcesRef`])
+    /// when any is the source's own: its branch (`agentfs.branch` may
+    /// name any), or under its namespace `refs/agentfs/<source>/`, which
+    /// holds its patch queue, divergence saves and accepted tips. The
+    /// fork's name is a valid volume name (`finish_from_message` checks
+    /// the record's, which must equal it), so no `/` in it reaches into
+    /// another volume's namespace.
+    fn judge(
+        source: &Settings,
+        fork: &ForkIdentity,
+        record: &FinishRecord,
+    ) -> Result<Self, ReceiveError> {
+        let mut create_only = vec![(finish_ref(&fork.fork), record.finish)];
+        if let Some(change) = record.change {
+            create_only.insert(0, (change_ref(&fork.fork), change));
+        }
+        let refs = Self {
+            history: fork.history_ref(),
+            create_only,
+        };
+        let namespace = format!("refs/agentfs/{}/", source.volume);
+        if let Some(own) = refs
+            .names()
+            .find(|name| **name == source.branch_ref || name.starts_with(&namespace))
+        {
+            return Err(ReceiveError::SourcesRef {
+                refname: own.clone(),
+            });
+        }
+        Ok(refs)
+    }
+
+    /// Every ref name, the history ref first.
+    fn names(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.history).chain(self.create_only.iter().map(|(n, _)| n))
+    }
+}
+
+/// A commit on the source's branch: the fork's base, judged by
+/// [`OnBranch::judge`]. [`copy_objects`] takes only this, so the fork's
+/// objects are copied less what a commit the source holds reaches, never
+/// less a base the fork merely names.
+#[derive(Debug, Clone, Copy)]
+struct OnBranch(Oid);
+
+impl OnBranch {
+    /// `base` when the source's branch `branch_ref` is at it or descends
+    /// from it; else [`ReceiveError::BaseNotOnBranch`]: a base the source
+    /// never had, or one its rewritten history (design §15) no longer
+    /// holds, whose fork would bring that history back.
+    fn judge(repo: &Repository, branch_ref: &str, base: Oid) -> Result<Self, ReceiveError> {
+        let on = match existing(repo, branch_ref)? {
+            Some(head) if head == base => true,
+            Some(head) => repo.odb()?.exists(base) && repo.graph_descendant_of(head, base)?,
+            None => false,
+        };
+        if on {
+            Ok(Self(base))
+        } else {
+            Err(ReceiveError::BaseNotOnBranch { base })
+        }
+    }
 }
 
 /// The refs [`receive_fork_change`] wrote into `repo`, the history of the
@@ -214,8 +345,8 @@ fn existing(repo: &Repository, name: &str) -> Result<Option<Oid>, git2::Error> {
 fn copy_objects(
     forked: &Repository,
     repo: &Repository,
-    record: &crate::fork::finish::FinishRecord,
-    base: Oid,
+    record: &FinishRecord,
+    base: OnBranch,
     held: Option<Oid>,
 ) -> Result<(), ReceiveError> {
     let odb = repo.odb()?;
@@ -224,7 +355,7 @@ fn copy_objects(
     if let Some(change) = record.change {
         walk.push(change)?;
     }
-    for have in [Some(base), held].into_iter().flatten() {
+    for have in [Some(base.0), held].into_iter().flatten() {
         if odb.exists(have) {
             walk.hide(have)?;
         }
@@ -258,14 +389,24 @@ fn copy_objects(
 
 /// Every LFS object in the fork's cache that the source's lacks: the
 /// fork's history, now the source's too, refers to them, and the fork's
-/// cache goes with the fork.
-fn copy_lfs(from: &StateDir, source: &StateDir) -> io::Result<()> {
+/// cache goes with the fork. Each is read once, through the cache's
+/// verified insert, which hashes the bytes as it writes them and keeps
+/// them only under the name they hash to: what is kept is what was
+/// checked ([`ReceiveError::LfsMismatch`] otherwise).
+fn copy_lfs(from: &StateDir, source: &StateDir) -> Result<(), ReceiveError> {
     let forked = ObjectCache::at(from.lfs())?;
     let cache = ObjectCache::at(source.lfs())?;
     for (pointer, _) in forked.list()? {
-        if !cache.contains(&pointer) {
-            cache.insert_file(&forked.path(&pointer.oid))?;
+        if cache.contains(&pointer) {
+            continue;
         }
+        let mut object = forked.open_object(&pointer)?;
+        cache
+            .insert_verified(&pointer, &mut object)
+            .map_err(|e| match e.kind {
+                PushFailureKind::Refused => ReceiveError::LfsMismatch { message: e.message },
+                _ => ReceiveError::Io(io::Error::other(e.message)),
+            })?;
     }
     Ok(())
 }
