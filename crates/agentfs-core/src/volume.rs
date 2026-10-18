@@ -701,11 +701,6 @@ pub fn open(
             error: bad.error.clone(),
         });
     }
-    // Nothing is pushed and nothing says it is meant (F8 S3); the service
-    // raises it again at every push interval.
-    if let Some(event) = crate::service::remotes_undeclared(history.settings()) {
-        events.emit(event);
-    }
     let checks = Arc::new(Checks::new(Limits::from_remotes(
         history.settings().remotes.pushed(),
     )));
@@ -3019,9 +3014,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path().join("state"));
         init(&state, "vol", None).unwrap();
-        // Declared, as `agentfs init` requires (F8 S3); a test adding a
-        // remote section drops it.
-        crate::config::declare_local_only(&state.git()).unwrap();
         (dir, state)
     }
 
@@ -3399,7 +3391,6 @@ mod tests {
 
     fn set_remote_limit(state: &StateDir, remote: &str, limit: u64) {
         let mut config = git2::Config::open(&state.git().join("config")).unwrap();
-        let _ = config.remove("agentfs.remotes");
         config
             .set_str(&format!("remote.{remote}.url"), "/nowhere")
             .unwrap();
@@ -3410,7 +3401,6 @@ mod tests {
 
     fn set_lfs_limit(state: &StateDir, remote: &str, limit: u64) {
         let mut config = git2::Config::open(&state.git().join("config")).unwrap();
-        let _ = config.remove("agentfs.remotes");
         config
             .set_str(&format!("remote.{remote}.url"), "/nowhere")
             .unwrap();

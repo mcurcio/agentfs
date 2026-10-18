@@ -37,7 +37,7 @@ that point to it.
 |---|---|
 | [Recovery and undo](runbooks/recovery-and-undo.md) | Finding a change and bringing files back, or undoing a commit |
 | [Recording failures](runbooks/recording-failures.md) | `close` fails with `EIO`, `RecordFailed` or `CommitFailed` |
-| [Pushes that keep failing](runbooks/stuck-pushes.md) | `PushFailed` again and again, a growing push backlog; `RemotesUndeclared` |
+| [Pushes that keep failing](runbooks/stuck-pushes.md) | `PushFailed` again and again, a growing push backlog |
 | [A diverged remote](runbooks/divergence.md) | Someone else moved the volume's branch (`Diverged`) |
 | [Removing a recorded secret](runbooks/history-rewrite.md) | A secret reached history: rewrite it, the one documented force-push |
 | [The patch queue](runbooks/patch-queue.md) | A blocked or stuck queue (`PatchBlocked`) |

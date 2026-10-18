@@ -77,19 +77,11 @@ mount.
 ## 3. Quick start
 
 ```sh
-cat > /etc/agentfs/config <<'EOF'
-[remote "origin"]
-	url = https://github.com/acme/agent-history.git
-	agentfsCredentials = /run/secrets/agentfs/origin
-EOF
-agentfs --state /data/state init --volume hermes --include /etc/agentfs/config
+agentfs --state /data/state init --volume hermes
+git --git-dir /data/state/git config remote.origin.url https://github.com/acme/agent-history.git
+git --git-dir /data/state/git config remote.origin.agentfsCredentials /run/secrets/agentfs/origin
 agentfs --state /data/state mount /data/backing /workspace
 ```
-
-`init` refuses a volume that declares no remote: give it one in an
-include, as here, or pass `--local-only` for a volume whose history stays
-in its state area
-([configuration reference](configuration.md#declaring-remotes)).
 
 Over SSH instead (a binary built with `--features ssh`), name a known_hosts
 file and either a private key or an ssh-agent socket; none of them may be
@@ -133,11 +125,9 @@ Global flags (every command):
 | `--root DIR` | `AGENTFS_ROOT` | | The backing tree, for `record`, `flush` and `run`, and for `restore` and `revert` when no mount is running. With `mount` it must match the positional backing tree |
 | `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s` | Wait this long for another process to release the state area instead of exiting 75 (§9) |
 
-`agentfs init` takes `--volume NAME` (`AGENTFS_VOLUME`), `--branch NAME`,
-`--include FILE` (repeatable: operator config fragments, set as the
-config's `include.path` entries) and `--local-only` (declares the volume
-local-only, `agentfs.remotes = none`), creates `--root` when it is
-missing, and refuses a result that declares no remote.
+`agentfs init` takes `--volume NAME` (`AGENTFS_VOLUME`), `--branch NAME`
+and `--include FILE` (repeatable: operator config fragments, set as the
+config's `include.path` entries), and creates `--root` when it is missing.
 It is safe to re-run: for the same volume it exits 0 and changes nothing
 but missing directories and the includes; for another volume or branch
 it exits 1 and changes nothing

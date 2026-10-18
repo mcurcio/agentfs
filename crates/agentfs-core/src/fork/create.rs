@@ -67,8 +67,8 @@ pub enum CreateError {
     SourceIsFork { volume: String },
     #[error(
         "volume {volume} has no fork remote: forks push to its patch remote, or to the one \
-         remote with agentfsForkRemote = true, or into its own history when it is declared \
-         local-only (agentfs.remotes = none; design §19.1)"
+         remote with agentfsForkRemote = true, or into its own history when it has no remote \
+         section (design §19.1)"
     )]
     NoForkRemote { volume: String },
     #[error(
@@ -422,15 +422,12 @@ pub fn unique_name(prefix: &str) -> Result<String, CreateError> {
     Ok(name)
 }
 
-/// The keys a CLI source may set in its own config: its identity, its
-/// start point when it was started from another branch (F8 S1), and
-/// `agentfs.remotes` (`init --local-only`, F8 S3), which its forks need
-/// not read: they publish into its history. Every other setting must come
-/// from an include, which the fork reads too.
-const OWN_KEYS: [&str; 6] = [
+/// The keys a CLI source may set in its own config: its identity and its
+/// start point when it was started from another branch (F8 S1). Every
+/// other setting must come from an include, which the fork reads too.
+const OWN_KEYS: [&str; 5] = [
     "agentfs.volume",
     "agentfs.branch",
-    "agentfs.remotes",
     "agentfs.start.remote",
     "agentfs.start.branch",
     "agentfs.start.commit",

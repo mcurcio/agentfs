@@ -82,7 +82,7 @@ trap 'annotate_log "$LOGS/e2e-nfs.out.log" 25' ERR
 new_nfs_volume() { # dir
   sudo rm -rf "$A/$1"
   sudo mkdir -p "$A/$1/tree"
-  sudo "$AGENTFS_BIN" --state "$A/$1/state" init --volume "$1" --local-only >/dev/null
+  sudo "$AGENTFS_BIN" --state "$A/$1/state" init --volume "$1" >/dev/null
   sudo git --git-dir "$A/$1/state/git" config agentfs.commitWindow 200ms
   sudo git --git-dir "$A/$1/state/git" config agentfs.sweepInterval 1s
   wait_for 10 test -d "$B/$1/state/git" || fail "client B does not see $1"

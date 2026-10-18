@@ -43,9 +43,9 @@ impl Setup {
         })
     }
 
-    /// The source declared local-only by its profile (F8 S3): no remote.
+    /// A local-only source: its profile has no remote section.
     pub fn local_only() -> Self {
-        Self::with_profile(|_| "[agentfs]\n\tremotes = none\n".into())
+        Self::with_profile(|_| String::new())
     }
 
     fn with_profile(profile: impl FnOnce(&Self) -> String) -> Self {

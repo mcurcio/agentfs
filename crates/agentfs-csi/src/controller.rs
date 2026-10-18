@@ -406,7 +406,7 @@ fn decide(
             has_history: false,
             uncommitted: records.len(),
             on_delete,
-            remotes: Declared::Undeclared,
+            remotes: Declared::LocalOnly,
             fork,
         }));
     }

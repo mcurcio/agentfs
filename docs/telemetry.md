@@ -49,10 +49,10 @@ agentfs run
 - **Metrics:** the journal and push backlogs, failures by stage and
   reason, divergence, a started volume's start-branch alarm
   (`agentfs.start.moved{remote}`, 1 while its start branch holds commits
-  it has not taken in or accepted), how the volume declares its remotes
+  it has not taken in or accepted), the volume's remotes mode
   (`agentfs.remotes.mode{mode}`, 1, with `mode` one of `pushed`,
-  `none_valid`, `local_only`, `undeclared`;
-  [configuration](configuration.md#declaring-remotes)), the patch queue,
+  `none_valid`, `local_only`;
+  [configuration](configuration.md#remotes-modes)), the patch queue,
   the state area's size, the history service and its fronts, and fork
   publishing: the table in
   [design §13](design.md#13-observability-opentelemetry).
@@ -60,8 +60,7 @@ agentfs run
   `agentfs.patch`, `agentfs.fork.finish` and `agentfs.fork.publish`,
   carrying journal sequence numbers, commit ids and outcomes.
 - **Logs:** every alarm is a log record (`agentfs.path_refused`,
-  `agentfs.push_failed`, `agentfs.start_branch_moved`,
-  `agentfs.remotes_undeclared`, ...) with its
+  `agentfs.push_failed`, `agentfs.start_branch_moved`, ...) with its
   details as `agentfs.*` attributes
   and the trace of the operation that raised it; a fork's lifecycle is
   logged at INFO. Alarms are printed to stderr as well, with telemetry on

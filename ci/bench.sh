@@ -188,7 +188,7 @@ mount_volume() { # name [key value]...
   LOG=$OUT/mount-$NAME.log
   sudo mkdir -p "$BACKING"
   mkdir -p "$MNT"
-  af init --volume "$NAME" --local-only >/dev/null
+  af init --volume "$NAME" >/dev/null
   # No repack in the middle of a measurement.
   sgit config agentfs.repackInterval off
   while [ $# -gt 0 ]; do sgit config "$1" "$2"; shift 2; done

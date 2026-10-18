@@ -25,15 +25,15 @@ agentfs patch submit --volume src <change commit>
   `agentfs.forkRefs = hidden` in the source's settings, new forks keep
   their history at `refs/agentfs/<fork>/history` instead, off every
   branch ([docs/configuration.md](configuration.md#agentfs)).
-- A source declared local-only (`agentfs.remotes = none`, no flagged
-  section) has no remote to publish to: its forks publish the same refs
+- A local-only source (no remote section, none flagged) has no remote
+  to publish to: its forks publish the same refs
   into the source's own history, in its state area on the same disk,
   through the source's running daemon or under its lock (`fork finish`
   exits 75 while another command holds it). Nothing applies them:
   whatever reads the source's history decides (`git --git-dir <source
   state>/git log agentfs/<fork>`;
-  [configuration](configuration.md#declaring-remotes)). Once the source
-  declares a remote, its pushes carry those refs there too, create-only.
+  [configuration](configuration.md#remotes-modes)). Once the source
+  has a remote, its pushes carry those refs there too, create-only.
 - Under CSI, a claim with a `dataSource` claim on a fork StorageClass
   (`fork: "true"`, reclaim policy `Delete`) is a fork; deleting it
   finishes the fork, and the driver deletes the volume only once it is

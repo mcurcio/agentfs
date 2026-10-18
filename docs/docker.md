@@ -213,15 +213,12 @@ as root clears it; the next `up` mounts again.
 
 ## 6. Volumes with no remote
 
-The examples without `compose.remote.yaml` are declared local-only:
-[`config/local`](../examples/docker/config/local) sets
-`agentfs.remotes = none` and has no `[remote]` section, so agentfs
+The examples without `compose.remote.yaml` configure no remote: agentfs
 records and commits every change to the history in the Docker volume and
-never pushes, and `agentfs status` says `remotes:   local-only
-(declared)` ([configuration](configuration.md#declaring-remotes)). A fragment with
-neither a remote nor the declaration is refused by `agentfs init`. Back
-up the Docker volume, or add a remote (and remove the declaration), if
-the history must outlive the host.
+never pushes, and `agentfs status` says `remotes:   local-only (no
+remote section)` ([configuration](configuration.md#remotes-modes)).
+Back up the Docker volume, or add a remote (the first push sends the
+whole history), if the history must outlive the host.
 
 ## 7. Why there is no Docker volume plugin
 

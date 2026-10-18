@@ -18,8 +18,9 @@ patch queue and `diverged/*` refs stay with the old branch. A start
 writes the commit's tree, so files history does not record (ignored or
 oversize ones), ownership (set the pod's `fsGroup`), modes beyond the
 executable bit, timestamps, xattrs and empty directories are not carried
-over. A local-only volume (no remote) cannot move: its history dies with
-its disk.
+over. A local-only volume (no remote) cannot move until it has one: add
+a `[remote]` section to its profile, and its first push sends the whole
+history; until then its history dies with its disk.
 
 This procedure is not run in CI as written; `ci/e2e-csi-move.sh` runs the
 same steps on a two-node kind cluster.

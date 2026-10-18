@@ -15,7 +15,6 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentfs_core::config::Remotes;
 use agentfs_core::fork::create::{self as fork_create, CreateError, CreateRequest};
 use agentfs_core::fork::start::{self, StartError, StartRequest};
 use agentfs_core::lock::{LockError, StateLock};
@@ -162,9 +161,8 @@ fn finish(layout: &Layout, handle: &str, record: &VolumeRecord) -> Result<(), Er
 /// profile's config included (an empty one, or started from the class's
 /// `startFrom`, [`start::start_from`]), the profile's rules, then
 /// `csi.json`. An existing state area must be this volume's; it may not
-/// be in use. A profile that declares no remote is refused
-/// (`INVALID_ARGUMENT`, F8 S3), and a worktree this call made for it is
-/// removed again.
+/// be in use. A profile with no remote section makes a local-only volume
+/// (design §11.1): zero remotes is not an error.
 pub fn create(
     layout: &Layout,
     handle: &str,
@@ -175,7 +173,6 @@ pub fn create(
     let start = params
         .start_point()
         .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-    let new = !layout.volume_dir(handle).exists();
     make_dirs(layout, handle)?;
     let state = StateDir::new(layout.state(handle));
     let _lock = if state.git().join("config").exists() {
@@ -208,42 +205,10 @@ pub fn create(
             .map_err(start_error)?;
         }
     }
-    if let Err(e) = refuse_undeclared(&state, &params.profile) {
-        drop(_lock);
-        if new {
-            let dir = layout.volume_dir(handle);
-            fs::remove_dir_all(&dir)
-                .map_err(|e| Error::io(format!("removing {}", dir.display()), e))?;
-        }
-        return Err(e);
-    }
     install_rules(layout, handle, &params.profile)?;
     let record = new_record(params.clone(), capacity_bytes, false);
     finish(layout, handle, &record)?;
     Ok(record)
-}
-
-/// `INVALID_ARGUMENT` when the worktree at `state`, with `profile`'s
-/// config, declares no remote ([`Remotes::Undeclared`], F8 S3). It does
-/// not refuse `onDelete: delete` on a local-only profile: the release
-/// decider keeps a local-only worktree whatever `onDelete` says.
-fn refuse_undeclared(state: &StateDir, profile: &str) -> Result<(), Error> {
-    let history = agentfs_core::history::History::open(&state.git()).map_err(|e| {
-        Error::Internal(format!("opening {}: {}", state.root().display(), chain(&e)))
-    })?;
-    match &history.settings().remotes {
-        Remotes::Undeclared { beside: None } => Err(Error::InvalidArgument(format!(
-            "profile {profile:?} declares no remote: add a [remote] section to its config, or \
-             agentfs.remotes = none for local-only volumes"
-        ))),
-        Remotes::Undeclared {
-            beside: Some(remote),
-        } => Err(Error::InvalidArgument(format!(
-            "profile {profile:?} sets agentfs.remotes = none beside remote section {remote:?}: \
-             remove one of them"
-        ))),
-        Remotes::Pushed(_) | Remotes::NoneValid | Remotes::LocalOnly => Ok(()),
-    }
 }
 
 /// Adopts a static PV (NodeStage of a handle with no `csi.json`): only
@@ -541,11 +506,7 @@ mod tests {
             profiles: dir.path().join("profiles"),
         };
         fs::create_dir_all(&layout.profiles).unwrap();
-        fs::write(
-            layout.profile_file("p", "config"),
-            "[agentfs]\n\tremotes = none\n",
-        )
-        .unwrap();
+        fs::write(layout.profile_file("p", "config"), "").unwrap();
         let params = VolumeParams::from_context(
             "h",
             &[("profile", "p"), ("volumeName", "v")]

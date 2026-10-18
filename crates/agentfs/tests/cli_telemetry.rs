@@ -147,7 +147,7 @@ impl Volume {
         };
         fs::create_dir_all(v.tree()).unwrap();
         fs::create_dir_all(v.dir.path().join("home")).unwrap();
-        let out = v.run(&["init", "--volume", "demo", "--local-only"], &[]);
+        let out = v.run(&["init", "--volume", "demo"], &[]);
         assert!(out.status.success(), "{}", stderr(&out));
         v
     }
@@ -378,8 +378,6 @@ fn push_exports_its_span() {
     let remote = v.dir.path().join("remote.git");
     git2::Repository::init_bare(&remote).unwrap();
     let mut config = git2::Config::open(&v.dir.path().join("state/git/config")).unwrap();
-    // A remote section declares the volume's remotes: drop `--local-only` (F8 S3).
-    let _ = config.remove("agentfs.remotes");
     config
         .set_str("remote.origin.url", &remote.display().to_string())
         .unwrap();
@@ -1631,10 +1629,11 @@ fn remotes_modes(collector: &Collector) -> Vec<String> {
     out
 }
 
-/// F8 S3 acceptance 5: the remotes mode reaches the collector as a gauge,
-/// and an undeclared volume's alarm as a log record.
+/// The remotes mode reaches the collector as a gauge: a volume with no
+/// remote section is local-only and raises no alarm (zero remotes is not
+/// an error, owner 2026-10-17); one with a remote added later is pushed.
 #[test]
-fn the_remotes_mode_and_the_undeclared_alarm_are_exported() {
+fn the_remotes_mode_is_exported_and_zero_remotes_is_no_alarm() {
     let collector = Collector::start();
     let v = Volume::new();
     fs::write(v.tree().join("a.txt"), "a\n").unwrap();
@@ -1642,20 +1641,8 @@ fn the_remotes_mode_and_the_undeclared_alarm_are_exported() {
     let otel = [("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str())];
     let out = v.run(&["record", "a.txt"], &otel);
     assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("remote"), "{}", stderr(&out));
     assert_eq!(remotes_modes(&collector), ["local_only"]);
-
-    // The declaration removed: undeclared, alarmed, still recording.
-    let mut config = git2::Config::open(&v.dir.path().join("state/git/config")).unwrap();
-    config.remove("agentfs.remotes").unwrap();
-    fs::write(v.tree().join("a.txt"), "a2\n").unwrap();
-    let out = v.run(&["record", "a.txt"], &otel);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("no remote is declared"),
-        "{}",
-        stderr(&out)
-    );
-    assert!(remotes_modes(&collector).contains(&"undeclared".to_owned()));
     let mut logs = Vec::new();
     for body in collector.bodies("/v1/logs") {
         let request = ExportLogsServiceRequest::decode(&body[..]).unwrap();
@@ -1666,8 +1653,19 @@ fn the_remotes_mode_and_the_undeclared_alarm_are_exported() {
         }
     }
     assert!(
-        logs.iter()
-            .any(|r| r.event_name == "agentfs.remotes_undeclared"),
-        "no remotes_undeclared log: {logs:?}"
+        !logs.iter().any(|r| r.event_name.contains("remote")),
+        "a remotes alarm for zero remotes: {logs:?}"
     );
+
+    // A remote added later: pushed.
+    let remote = v.dir.path().join("remote.git");
+    git2::Repository::init_bare(&remote).unwrap();
+    git2::Config::open(&v.dir.path().join("state/git/config"))
+        .unwrap()
+        .set_str("remote.origin.url", &remote.display().to_string())
+        .unwrap();
+    fs::write(v.tree().join("a.txt"), "a2\n").unwrap();
+    let out = v.run(&["record", "a.txt"], &otel);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(remotes_modes(&collector).contains(&"pushed".to_owned()));
 }

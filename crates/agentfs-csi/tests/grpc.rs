@@ -52,11 +52,10 @@ impl Driver {
             profiles: dir.path().join("profiles"),
         };
         fs::create_dir_all(&layout.profiles).unwrap();
-        // Declared local-only (F8 S3): CreateVolume refuses a profile that
-        // declares nothing.
+        // No remote section: a local-only volume (design §11.1).
         fs::write(
             layout.profiles.join("p.config"),
-            "[agentfs]\n\tcommitWindow = 100ms\n\tremotes = none\n",
+            "[agentfs]\n\tcommitWindow = 100ms\n",
         )
         .unwrap();
         fs::write(layout.profiles.join("p.exclude"), "*.tmp\n").unwrap();
@@ -777,7 +776,7 @@ async fn delete_volume_asks_the_remotes() {
         err.message()
     );
 
-    // Declared local-only: kept whatever onDelete says.
+    // Local-only (no remote section): kept whatever onDelete says.
     c.create_volume(create_req(
         "solo",
         &[
@@ -855,7 +854,7 @@ async fn a_volume_with_unreadable_settings_is_not_released() {
     for profile in ["removed", "broken"] {
         fs::write(
             d.layout.profiles.join(format!("{profile}.config")),
-            "[agentfs]\n\tcommitWindow = 100ms\n\tremotes = none\n",
+            "[agentfs]\n\tcommitWindow = 100ms\n",
         )
         .unwrap();
         c.create_volume(create_req(profile, &[("profile", profile)]))
@@ -1384,12 +1383,12 @@ fn fork_context() -> agentfs_core::identity::Context {
     }
 }
 
-/// F8 S3: CreateVolume refuses a profile that declares no remote, or
-/// `none` beside a remote section, naming the profile, and leaves no
-/// worktree behind; a local-only profile with `onDelete: delete` is not
-/// refused (the release decider keeps it).
+/// Remotes can come and go (owner, 2026-10-17): CreateVolume accepts a
+/// profile with no remote section, the volume records and stays on disk
+/// at DeleteVolume whatever `onDelete` says; a remote added to its
+/// profile later gets the whole history, and DeleteVolume then deletes.
 #[tokio::test]
-async fn create_volume_refuses_an_undeclared_profile() {
+async fn a_profile_with_no_remote_makes_a_volume() {
     let d = Driver::start().await;
     let mut c = d.controller();
     fs::write(
@@ -1397,33 +1396,47 @@ async fn create_volume_refuses_an_undeclared_profile() {
         "[agentfs]\n\tcommitWindow = 100ms\n",
     )
     .unwrap();
-    let remote = d.remote_profile("both", "[agentfs]\n\tremotes = none\n");
-    for (profile, says) in [
-        ("bare", "declares no remote"),
-        (
-            "both",
-            "agentfs.remotes = none beside remote section \"origin\"",
-        ),
-    ] {
-        let name = format!("u-{profile}");
-        let err = c
-            .create_volume(create_req(&name, &[("profile", profile)]))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument, "{}", err.message());
-        assert!(
-            err.message().contains(&format!("profile {profile:?}")) && err.message().contains(says),
-            "{}",
-            err.message()
+    for name in ["u-kept", "u-later"] {
+        c.create_volume(create_req(
+            name,
+            &[
+                ("profile", "bare"),
+                ("onDelete", "delete"),
+                ("volumeName", "{pvName}"),
+            ],
+        ))
+        .await
+        .unwrap();
+        commit(
+            &d.layout.state(name).join("git"),
+            &format!("refs/heads/agentfs/{name}"),
+            &[("a.txt", "a")],
         );
-        assert!(!d.layout.volume_dir(&name).exists(), "{name} left behind");
     }
-    assert!(remote.exists());
-    c.create_volume(create_req(
-        "solo-delete",
-        &[("profile", "p"), ("onDelete", "delete")],
-    ))
-    .await
+    c.delete_volume(delete_req("u-kept")).await.unwrap();
+    assert!(d.layout.state("u-kept").exists(), "no remote holds it");
+    // A remote added to the profile later: DeleteVolume waits until the
+    // branch is pushed there, then deletes.
+    let remote = d.dir.path().join("later.git");
+    git2::Repository::init_bare(&remote).unwrap();
+    fs::write(
+        d.layout.profiles.join("bare.config"),
+        format!(
+            "[agentfs]\n\tcommitWindow = 100ms\n[remote \"origin\"]\n\turl = {}\n",
+            remote.display()
+        ),
+    )
     .unwrap();
+    let err = c.delete_volume(delete_req("u-later")).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    push(&d.layout, "u-later");
+    assert!(
+        git2::Repository::open_bare(&remote)
+            .unwrap()
+            .find_reference("refs/heads/agentfs/u-later")
+            .is_ok()
+    );
+    c.delete_volume(delete_req("u-later")).await.unwrap();
+    assert!(!d.layout.volume_dir("u-later").exists());
     d.stop().await;
 }
