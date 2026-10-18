@@ -5,3 +5,7 @@
 # never pushes, and pushes everything once a remote is added.
 [agentfs]
 	commitWindow = 200ms
+# Read by no agentfs since zero remotes needs no declaration: it stays only
+# until the published image (which the README quick start pulls) is one
+# that takes zero remotes, then goes.
+	remotes = none
