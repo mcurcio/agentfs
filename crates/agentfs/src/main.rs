@@ -881,9 +881,11 @@ fn push_with_lease(
         }
         LeaseOutcome::Recorded { commit } => {
             println!(
-                "{name}: refused: the remote's branch holds {commit}, which agentfs recorded and \
-                 this state area lacks; it is this volume's newer history or another worktree's, \
-                 and is never replaced (continue under a new name)"
+                "{name}: refused: the remote's branch holds {commit}, which carries agentfs \
+                 trailers and this state area lacks: this volume's newer history, another \
+                 worktree's, or agentfs commits someone amended, rebased, cherry-picked or \
+                 squashed; it is never replaced (divergence runbook: continue under a new name, \
+                 or remove those commits from the branch by hand)"
             );
             false
         }

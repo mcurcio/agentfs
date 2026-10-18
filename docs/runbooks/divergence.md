@@ -110,9 +110,21 @@ It prints `<remote>: replaced <lease> with <head>` and exits 0. Exit 1
 with `lease broken` means the branch moved again since you inspected it
 (inspect again); `shares no commit` means the remote's branch is another
 history, which this command never replaces (see the table: rename this
-volume); `which agentfs recorded` names a commit an agentfs recorder made
-that this state area lacks: it is case B or another worktree's branch,
-never replaced (see the table). This works while the volume is mounted: it never goes through
+volume); `which carries agentfs trailers` names a commit with an
+`Agentfs-Seq` trailer that this state area lacks, which is never
+replaced. It is one of:
+
+- case B or another worktree's branch (see the table): continue under a
+  new name;
+- this volume's own commits that a person amended, rebased,
+  cherry-picked or squashed onto the branch (a squash-merge whose message
+  keeps the trailers counts too): they carry the trailers but are new
+  commits. Either continue under a new name, or have whoever wrote them
+  take those commits off the branch from their own clone (leaving the
+  volume's commits and their own foreign ones), then inspect again
+  (step 1) and repeat case A with the new tip.
+
+This works while the volume is mounted: it never goes through
 the daemon and takes only that remote's push lock (exit 75 while a push
 to it runs: retry).
 
@@ -120,8 +132,8 @@ to it runs: retry).
 
 The remote holds this volume's newer history; this state area, restored
 from a backup or replaced, must not write the branch again
-(`agentfs push --force-with-lease` refuses it: `which agentfs
-recorded`). Continue under
+(`agentfs push --force-with-lease` refuses it: `which carries agentfs
+trailers`). Continue under
 a new name, started from the branch, so nothing on either side is lost:
 
 1. Stop the workload and the stale volume, and keep its state area as it

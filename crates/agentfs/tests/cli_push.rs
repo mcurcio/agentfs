@@ -828,7 +828,7 @@ fn force_with_lease_refuses_history_agentfs_recorded() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
         stdout(&out).contains(&format!(
-            "origin: refused: the remote's branch holds {newer}, which agentfs recorded"
+            "origin: refused: the remote's branch holds {newer}, which carries agentfs trailers"
         )),
         "{}",
         stdout(&out)

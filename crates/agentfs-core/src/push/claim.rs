@@ -171,9 +171,11 @@ pub enum LeaseClaim {
 /// Git keeps no record of who created a remote branch, and the push record
 /// is never an input (it stays bookkeeping, §11.2): who made each commit
 /// (its trailers, §9) is what tells a foreign writer (case A) from this
-/// volume's own newer history (case B). A foreign commit that copies an
-/// agentfs message, a cherry-pick, counts as recorded and is refused: the
-/// safe side.
+/// volume's own newer history (case B). A person's commit that keeps an
+/// agentfs message (an amend, rebase, cherry-pick or squash-merge) counts
+/// as recorded and is refused: the safe side. A branch a person made on
+/// this volume's pushed commits drops only untrailered commits and is
+/// replaced, like case A (design §15 "Not covered").
 pub fn lease_claim(
     dropped: impl IntoIterator<Item = (Oid, Option<Recording>)>,
     kept: &HashSet<Recording>,

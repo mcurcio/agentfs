@@ -1252,11 +1252,17 @@ impl RemotePusher {
                 Err(e) => return Err(local(e)),
             }
             let dropped = commits_beyond(repo, lease, head).map_err(local)?;
-            let kept = commits_beyond(repo, head, lease)
-                .map_err(local)?
-                .into_iter()
-                .filter_map(|(_, recording)| recording)
-                .collect();
+            // The head's side is walked only when a dropped commit is a
+            // recorder's: case A drops none, and its walk would be wasted.
+            let kept = if dropped.iter().any(|(_, recording)| recording.is_some()) {
+                commits_beyond(repo, head, lease)
+                    .map_err(local)?
+                    .into_iter()
+                    .filter_map(|(_, recording)| recording)
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
             Ok(match lease_claim(dropped, &kept) {
                 LeaseClaim::Replace => LeaseCheck::Replace,
                 LeaseClaim::Recorded(commit) => LeaseCheck::Recorded(commit),
@@ -3967,6 +3973,52 @@ mod tests {
             v.com.history().repo().find_commit(newer).is_err(),
             "the remote's history was not taken in"
         );
+    }
+
+    /// Case B as it happens: the newer copy of the state area recorded the
+    /// same `Agentfs-Seq` with the same author and committer as this stale
+    /// one, at another time. Only the time tells the records apart, and the
+    /// branch is refused.
+    #[test]
+    fn a_lease_push_refuses_the_same_record_made_at_another_time() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        let pushed = v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        let stale = v.commit();
+        let repo = v.com.history().repo();
+        let ours = repo.find_commit(stale).unwrap();
+        let later = |sig: git2::Signature| {
+            git2::Signature::new(
+                sig.name().unwrap(),
+                sig.email().unwrap(),
+                &git2::Time::new(sig.when().seconds() + 3600, sig.when().offset_minutes()),
+            )
+            .unwrap()
+        };
+        let theirs = {
+            let remote_repo = Repository::open_bare(remote).unwrap();
+            let parent = remote_repo.find_commit(pushed).unwrap();
+            remote_repo
+                .commit(
+                    Some("refs/heads/agentfs/vol"),
+                    &later(ours.author()),
+                    &later(ours.committer()),
+                    ours.message().unwrap(),
+                    &parent.tree().unwrap(),
+                    &[&parent],
+                )
+                .unwrap()
+        };
+        assert!(matches!(pusher.push_once(), PushOutcome::Diverged { .. }));
+        assert_eq!(
+            pusher.push_with_lease(theirs),
+            LeaseOutcome::Recorded { commit: theirs }
+        );
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(theirs));
     }
 
     /// The history-rewrite runbook's step 9: the remote's old commits were

@@ -152,7 +152,7 @@ looked (`lease broken`), and refuses a branch that shares no commit with
 the rewritten one (`shares no commit`: the secret was in the first
 commit, so the rewrite changed the root; continue under a new name
 instead, as in [divergence.md](divergence.md) case B). It also refuses
-(`which agentfs recorded`) when an old commit it would drop has no
+(`which carries agentfs trailers`) when an old commit it would drop has no
 rewritten copy on the head, the same `Agentfs-Seq`, author and committer:
 a commit filter-repo pruned (step 4 keeps them all with `--prune-empty
 never`), or one recorded elsewhere that this state area never had. The old tip, gone
