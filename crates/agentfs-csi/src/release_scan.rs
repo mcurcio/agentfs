@@ -40,9 +40,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{Notify, watch};
+// Tokio's clock, which is the system's outside a paused test runtime: the
+// backoff tests pause it, so a slow runner cannot outrun a delay.
+use tokio::time::Instant;
 
 use agentfs_core::fork::finish::{self, ForkState};
 use agentfs_core::volume::{self as core_volume, StateDir};
@@ -681,7 +684,7 @@ mod tests {
 
     /// F8 D1: every unstaged worktree is pushed until a push exits 0 at
     /// its head; a failed push backs off; exit 75 is retried at once.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn it_pushes_every_unstaged_worktree_until_held() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Arc::new(layout(dir.path()));
@@ -797,7 +800,7 @@ mod tests {
 
     /// A journal history lacks is committed (`agentfs flush`, backing off
     /// when it fails) before anything is pushed, with or without a branch.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_journal_is_committed_before_the_push() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Arc::new(layout(dir.path()));
