@@ -49,7 +49,7 @@ use agentfs_core::events::NullSink;
 use agentfs_core::fork::finish::ForkState;
 use agentfs_core::journal;
 use agentfs_core::push::RemotePusher;
-use agentfs_core::release::{self, Declared, Release, Seen, Waiting, Worktree};
+use agentfs_core::release::{self, Declared, Kind, Release, Seen, Waiting, Worktree};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self as core_volume, StateDir};
 
@@ -310,8 +310,7 @@ pub(crate) fn delete_volume(
             uncommitted: 0,
             on_delete: record.params.on_delete,
             remotes: Declared::Pushed(&[]),
-            fork: Some(fork),
-            unlinked_fork: false,
+            kind: Kind::LinkedFork(fork),
         });
         if let Release::Wait(waiting) = unpublished {
             return Err(wait(handle, release, &waiting));
@@ -411,8 +410,9 @@ fn decide(
             on_delete,
             // Never weighed: with no history only the journal counts.
             remotes: Declared::LocalOnly,
-            fork,
-            unlinked_fork: false,
+            // No config: no settings name it a fork, and fork_gate finds
+            // no status.
+            kind: fork.map_or(Kind::Ordinary, Kind::LinkedFork),
         }));
     }
     // Under the state lock: the journal's backlog is what a stopped (or
@@ -451,8 +451,7 @@ fn decide(
         uncommitted: inspection.backlog,
         on_delete,
         remotes: Declared::of(&settings, &seen),
-        fork,
-        unlinked_fork: settings.is_unlinked_fork(),
+        kind: Kind::of(fork, &settings),
     }))
 }
 

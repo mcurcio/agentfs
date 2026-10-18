@@ -133,13 +133,35 @@ pub struct Worktree<'a> {
     pub uncommitted: usize,
     pub on_delete: OnDelete,
     pub remotes: Declared<'a>,
-    /// A fork's status (design §11.5): publishing is its gate, so its
-    /// remotes are not asked; `None` for any other worktree.
-    pub fork: Option<ForkState>,
+    pub kind: Kind,
+}
+
+/// Which worktree [`decide`] weighs (design §11.5): one value, so a
+/// linked fork's status and an unlinked fork cannot both be claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Not a fork: its remotes are its gate.
+    Ordinary,
+    /// A linked fork, with its status: publishing is its gate, so its
+    /// remotes are not asked.
+    LinkedFork(ForkState),
     /// An unlinked fork ([`Settings::is_unlinked_fork`]): it has no fork
     /// status, and when it is local-only (no remote of its own) nothing
     /// holds its history, so `onDelete: delete` removes it unpushed.
-    pub unlinked_fork: bool,
+    UnlinkedFork,
+}
+
+impl Kind {
+    /// The kind of the worktree `settings` describe, given the fork status
+    /// read from its state area (`None` when it has none). A status wins:
+    /// a fork that has one is gated by it, never deleted unpushed.
+    pub fn of(fork: Option<ForkState>, settings: &Settings) -> Self {
+        match fork {
+            Some(state) => Self::LinkedFork(state),
+            None if settings.is_unlinked_fork() => Self::UnlinkedFork,
+            None => Self::Ordinary,
+        }
+    }
 }
 
 /// What DeleteVolume does with a worktree.
@@ -193,18 +215,20 @@ pub enum Waiting {
 /// The release decision for `worktree` (see the module docs). Remotes are
 /// weighed in order and the first that does not hold the head is named.
 pub fn decide(worktree: &Worktree<'_>) -> Release {
+    let fork = match worktree.kind {
+        Kind::LinkedFork(state) => Some(state),
+        Kind::Ordinary | Kind::UnlinkedFork => None,
+    };
     let held = || match worktree.on_delete {
-        _ if worktree.fork.is_none() && worktree.uncommitted > 0 => {
-            Release::Wait(Waiting::Uncommitted {
-                records: worktree.uncommitted,
-            })
-        }
+        _ if fork.is_none() && worktree.uncommitted > 0 => Release::Wait(Waiting::Uncommitted {
+            records: worktree.uncommitted,
+        }),
         OnDelete::Delete => Release::Delete,
         OnDelete::Retain => Release::Keep(Kept::Retained),
     };
     // The user chose no remote for an unlinked fork: deleting it loses
     // its history, and nothing waits (design §11.5).
-    if worktree.unlinked_fork && worktree.remotes == Declared::LocalOnly {
+    if worktree.kind == Kind::UnlinkedFork && worktree.remotes == Declared::LocalOnly {
         return match worktree.on_delete {
             OnDelete::Delete => Release::Delete,
             OnDelete::Retain => Release::Keep(Kept::LocalOnly),
@@ -213,7 +237,7 @@ pub fn decide(worktree: &Worktree<'_>) -> Release {
     if !worktree.has_history {
         return held();
     }
-    if let Some(state) = worktree.fork {
+    if let Some(state) = fork {
         return if state.may_delete() {
             held()
         } else {
@@ -319,8 +343,7 @@ mod tests {
             uncommitted: 0,
             on_delete,
             remotes,
-            fork: None,
-            unlinked_fork: false,
+            kind: Kind::Ordinary,
         }
     }
 
@@ -453,7 +476,7 @@ mod tests {
         // A fork's remotes are not asked: publishing is its gate.
         let lacking = [seen("forks", Ok(Claim::Create))];
         let fork = |state, on_delete| Worktree {
-            fork: Some(state),
+            kind: Kind::LinkedFork(state),
             ..worktree(on_delete, Declared::Pushed(&lacking))
         };
         for state in [ForkState::Active, ForkState::Finished, ForkState::Refused] {
@@ -501,7 +524,7 @@ mod tests {
         assert_eq!(decide(&local), Release::Keep(Kept::LocalOnly));
         let fork = Worktree {
             uncommitted: 2,
-            fork: Some(ForkState::Abandoned),
+            kind: Kind::LinkedFork(ForkState::Abandoned),
             ..worktree(OnDelete::Delete, Declared::Pushed(&held))
         };
         assert_eq!(decide(&fork), Release::Delete);
@@ -520,7 +543,7 @@ mod tests {
             let lone = Worktree {
                 has_history,
                 uncommitted,
-                unlinked_fork: true,
+                kind: Kind::UnlinkedFork,
                 ..worktree(OnDelete::Delete, Declared::LocalOnly)
             };
             assert_eq!(
@@ -534,7 +557,7 @@ mod tests {
             };
             assert_eq!(decide(&retained), Release::Keep(Kept::LocalOnly));
             let ordinary = Worktree {
-                unlinked_fork: false,
+                kind: Kind::Ordinary,
                 ..lone.clone()
             };
             // With something to lose, any other local-only worktree is
@@ -545,7 +568,7 @@ mod tests {
         }
         let lacking = [seen("mine", Ok(Claim::Create))];
         let with_remote = Worktree {
-            unlinked_fork: true,
+            kind: Kind::UnlinkedFork,
             ..worktree(OnDelete::Delete, Declared::Pushed(&lacking))
         };
         assert_eq!(
@@ -555,10 +578,41 @@ mod tests {
             })
         );
         let none_valid = Worktree {
-            unlinked_fork: true,
+            kind: Kind::UnlinkedFork,
             ..worktree(OnDelete::Delete, Declared::NoneValid)
         };
         assert_eq!(decide(&none_valid), Release::Wait(Waiting::NoneValid));
+    }
+
+    /// `Kind::of`: a fork status makes a linked fork, even if the settings
+    /// say unlinked, so a fork with a status is never deleted unpushed; an
+    /// unlinked fork's settings without a status make an unlinked fork.
+    #[test]
+    fn kind_follows_the_status_then_the_settings() {
+        use crate::fork::{ForkIdentity, ForkLink, PushTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(&path, "[agentfs]\n\tvolume = v\n").unwrap();
+        let ordinary = Settings::from_config(&git2::Config::open(&path).unwrap()).unwrap();
+        let with_link = |link| Settings {
+            fork: Some(ForkIdentity {
+                fork: "f".into(),
+                source: "src".into(),
+                base: git2::Oid::ZERO_SHA1,
+                push_target: PushTarget::Branch,
+                link,
+            }),
+            ..ordinary.clone()
+        };
+        let (linked, unlinked) = (with_link(ForkLink::Linked), with_link(ForkLink::Unlinked));
+        assert_eq!(Kind::of(None, &ordinary), Kind::Ordinary);
+        assert_eq!(Kind::of(None, &unlinked), Kind::UnlinkedFork);
+        for settings in [&ordinary, &linked, &unlinked] {
+            assert_eq!(
+                Kind::of(Some(ForkState::Active), settings),
+                Kind::LinkedFork(ForkState::Active)
+            );
+        }
     }
 
     /// `Declared::of` maps each mode one to one, and a local-only worktree
