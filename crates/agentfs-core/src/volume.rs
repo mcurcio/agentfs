@@ -4719,8 +4719,13 @@ mod tests {
         assert_eq!(groups, [vec![0, 1], vec![2], vec![3], vec![4, 5]]);
     }
 
+    /// The time [`journal_from`] stamps on every record.
+    const FRONT_TIME_MS: u64 = 1_700_000_000_000;
+
     /// Journals a write of `name` holding `content` as if a front of
-    /// `origin` had sent it, the way the history service does.
+    /// `origin` had sent it, the way the history service does. Every such
+    /// record bears one time, so only their origins split them into
+    /// commits, never how long the test took between them.
     fn journal_from(rec: &Recorder, dir: &Path, origin: &Origin, name: &str, content: &str) {
         let Input::Write { path, backing, .. } = write(dir, name, content) else {
             unreachable!()
@@ -4730,7 +4735,7 @@ mod tests {
             .record(Draft {
                 trigger: Trigger::Close,
                 caller: CALLER,
-                time_ms: now_ms(),
+                time_ms: FRONT_TIME_MS,
                 changes: vec![Change::Write {
                     path,
                     pending: id,

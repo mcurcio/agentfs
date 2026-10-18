@@ -68,6 +68,21 @@ const DECISION_SETTLE: Duration = Duration::from_secs(2);
 /// read them.
 const COMMIT_RESULTS_KEPT: usize = 64;
 
+/// The time [`Service::shutdown`]'s grace period runs on (design §11.2):
+/// the system's monotonic clock, or a test's that stands still.
+trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+/// [`Instant::now`].
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 /// A stop flag loops can sleep on.
 #[derive(Debug, Default)]
 pub struct Stop {
@@ -398,6 +413,8 @@ pub struct Service {
     /// When the final push must have started by; set before `committed`
     /// is released.
     deadline: Arc<Mutex<Option<Instant>>>,
+    /// What the deadline is measured on.
+    clock: Arc<dyn Clock>,
     commit: JoinHandle<Result<CommitReport, VolumeError>>,
     pushes: Vec<PushThread>,
     push_done: mpsc::Receiver<(String, FinalPush)>,
@@ -429,6 +446,18 @@ impl Service {
         events: Events,
         repack: Option<RepackSchedule>,
     ) -> io::Result<Self> {
+        Self::spawn(committer, pushers, events, repack, Arc::new(SystemClock))
+    }
+
+    /// [`Service::start_with_repack`] with the shutdown grace measured on
+    /// `clock`.
+    fn spawn(
+        committer: Committer,
+        pushers: Vec<RemotePusher>,
+        events: Events,
+        repack: Option<RepackSchedule>,
+        clock: Arc<dyn Clock>,
+    ) -> io::Result<Self> {
         let stop = Arc::new(Stop::default());
         let signal = Arc::new(Signal::default());
         let committed = Arc::new(Stop::default());
@@ -454,6 +483,7 @@ impl Service {
             let signal_flag = signal.clone();
             let committed_flag = committed.clone();
             let deadline = deadline.clone();
+            let clock = clock.clone();
             let done = done_tx.clone();
             let pushing = Arc::new(AtomicBool::new(false));
             let pushing_flag = pushing.clone();
@@ -466,7 +496,7 @@ impl Service {
                     let deadline = *deadline
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let result = final_push(&mut pusher, deadline, &pushing_flag);
+                    let result = final_push(&mut pusher, deadline, &*clock, &pushing_flag);
                     let _ = done.send((pusher.name().to_owned(), result));
                 });
             match spawned {
@@ -490,6 +520,7 @@ impl Service {
             remotes: Arc::new(names),
             committed,
             deadline,
+            clock,
             commit,
             pushes,
             push_done,
@@ -517,7 +548,7 @@ impl Service {
     /// is abandoned; a grace of zero skips the final push. Push-now
     /// requests still waiting return [`PushNowError::Stopping`].
     pub fn shutdown(self, push_grace: Duration) -> ShutdownReport {
-        let deadline = Instant::now() + push_grace;
+        let deadline = self.clock.now() + push_grace;
         self.stop.stop();
         self.signal.update(|s| {
             s.stop = true;
@@ -551,7 +582,7 @@ impl Service {
         // for that decision rather than call it abandoned.
         let settle = deadline + DECISION_SETTLE;
         while !pending.is_empty() {
-            let now = Instant::now();
+            let now = self.clock.now();
             let deciding = pending
                 .iter()
                 .any(|p| !p.pushing.load(Ordering::SeqCst) && !p.handle.is_finished());
@@ -654,6 +685,7 @@ fn push_loop(pusher: &mut RemotePusher, signal: &Signal, pushing: &AtomicBool) {
 fn final_push(
     pusher: &mut RemotePusher,
     deadline: Option<Instant>,
+    clock: &dyn Clock,
     pushing: &AtomicBool,
 ) -> FinalPush {
     let unpushed = match pusher.unpushed() {
@@ -662,7 +694,7 @@ fn final_push(
         // Unknown: an attempt finds out.
         Err(_) => None,
     };
-    if deadline.is_some_and(|d| Instant::now() < d) {
+    if deadline.is_some_and(|d| clock.now() < d) {
         pushing.store(true, Ordering::SeqCst);
         let outcome = pusher.push_once();
         pushing.store(false, Ordering::SeqCst);
@@ -1048,6 +1080,82 @@ mod tests {
         (dir, state, rec, service)
     }
 
+    /// A clock that stands still until a test moves it, so a shutdown's
+    /// deadline passes exactly when the test says, however slow the
+    /// machine.
+    struct PausedClock(Mutex<Instant>);
+
+    impl PausedClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(Instant::now())))
+        }
+
+        fn advance(&self, by: Duration) {
+            *self.0.lock().unwrap() += by;
+        }
+    }
+
+    impl Clock for PausedClock {
+        fn now(&self) -> Instant {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// Makes `remote`'s config a FIFO: libgit2 blocks opening it, which
+    /// stands in for a push hung on the network. Returns the FIFO.
+    fn hang(remote: &Path) -> std::path::PathBuf {
+        let fifo = remote.join("config");
+        fs::remove_file(&fifo).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        fifo
+    }
+
+    /// Lets the thread blocked opening `fifo` go.
+    fn release(fifo: &Path) {
+        use std::io::Write as _;
+        let mut writer = fs::OpenOptions::new().write(true).open(fifo).unwrap();
+        writer.write_all(b"").unwrap();
+    }
+
+    /// Waits until `what` holds, failing after a minute.
+    fn wait_for(what: &str, holds: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !holds() {
+            assert!(Instant::now() < deadline, "never: {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Shuts `service` down with `grace` on `clock` and moves the clock to
+    /// the deadline once `ready` holds: the shutdown has set its deadline,
+    /// and `ready` says the remotes are where the test wants them. The
+    /// shutdown must still be waiting then; it must return once the clock
+    /// reaches the deadline.
+    fn shutdown_at_deadline(
+        service: Service,
+        clock: &PausedClock,
+        grace: Duration,
+        ready: impl Fn() -> bool,
+    ) -> ShutdownReport {
+        let deadline = service.deadline.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(service.shutdown(grace)).unwrap());
+        wait_for("the deadline is set and the remotes are ready", || {
+            deadline.lock().unwrap().is_some() && ready()
+        });
+        assert!(rx.try_recv().is_err(), "returned before the deadline");
+        clock.advance(grace);
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("returned at the deadline")
+    }
+
     /// Every shutdown pushes its final commit within the grace period.
     #[test]
     fn a_final_push_sends_the_final_commit() {
@@ -1170,35 +1278,37 @@ mod tests {
     /// The final push is abandoned at the deadline when the remote hangs.
     #[test]
     fn final_push_respects_the_deadline() {
-        use std::io::Write as _;
-
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (dir, state, rec, service) = idle_service(remote.path());
+        let (dir, state) = setup(&[
+            ("agentfs.commitWindow", "1h"),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.origin.url", &remote.path().display().to_string()),
+        ]);
+        let (rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
+        let clock = PausedClock::new();
+        let service =
+            Service::spawn(com, pushers, Arc::new(NullSink), None, clock.clone()).unwrap();
+        let pushing = service.pushes[0].pushing.clone();
+        // The first push (of nothing) is done; the next waits an hour.
+        let first = service
+            .handle()
+            .push_now(&[], Duration::from_secs(60))
+            .unwrap();
+        assert!(first.still_running.is_empty(), "{first:?}");
         record(&rec, dir.path(), "a");
-        // Now the remote hangs: libgit2 blocks opening a FIFO config.
-        let fifo = remote.path().join("config");
-        fs::remove_file(&fifo).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
-        let start = Instant::now();
-        let report = service.shutdown(Duration::from_millis(300));
-        let took = start.elapsed();
-        assert!(took >= Duration::from_millis(250), "{took:?}");
-        assert!(took < Duration::from_secs(5), "{took:?}");
+        // Now the remote hangs.
+        let fifo = hang(remote.path());
+        // The final push starts, since the clock stands before the
+        // deadline, and hangs.
+        let report = shutdown_at_deadline(service, &clock, Duration::from_millis(300), || {
+            pushing.load(Ordering::SeqCst)
+        });
         report.final_commit.unwrap();
         assert!(local_head(&state).is_some());
         assert_eq!(report.abandoned_pushes, ["origin"]);
-        assert!(report.final_pushes.is_empty());
-        // Release the detached thread.
-        let mut writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        writer.write_all(b"").unwrap();
+        assert!(report.final_pushes.is_empty(), "{:?}", report.final_pushes);
+        release(&fifo);
     }
 
     #[test]
@@ -1233,49 +1343,54 @@ mod tests {
         assert!(report.abandoned_pushes.is_empty());
     }
 
+    /// A push still running at the deadline is abandoned; a remote that
+    /// finished its final push within the grace is not.
     #[test]
     fn a_push_still_running_is_abandoned_after_the_grace_period() {
-        use std::io::Write as _;
-
-        // A remote whose config is a FIFO: libgit2 blocks opening it, which
-        // stands in for a push hung on the network.
-        let remote = tempfile::tempdir().unwrap();
-        git2::Repository::init_bare(remote.path()).unwrap();
-        let fifo = remote.path().join("config");
-        fs::remove_file(&fifo).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
+        let hung = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(hung.path()).unwrap();
+        let fifo = hang(hung.path());
+        let idle = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(idle.path()).unwrap();
         let (dir, state) = setup(&[
             ("agentfs.commitWindow", "10ms"),
-            ("remote.hung.url", &remote.path().display().to_string()),
-            (
-                "remote.idle.url",
-                &remote.path().join("missing").display().to_string(),
-            ),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.hung.url", &hung.path().display().to_string()),
+            ("remote.idle.url", &idle.path().display().to_string()),
         ]);
         let (rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
         record(&rec, dir.path(), "a");
         com.commit_pending().unwrap();
-        let service = Service::start(com, pushers, Arc::new(NullSink)).unwrap();
-        thread::sleep(Duration::from_millis(100));
+        let clock = PausedClock::new();
+        let service =
+            Service::spawn(com, pushers, Arc::new(NullSink), None, clock.clone()).unwrap();
+        let hung_pushing = service
+            .pushes
+            .iter()
+            .find(|p| p.name == "hung")
+            .unwrap()
+            .pushing
+            .clone();
+        // The idle remote has everything and waits an hour: its final push
+        // finds nothing new.
+        let idle_push = service
+            .handle()
+            .push_now(&["idle".to_owned()], Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(idle_push.remotes[0].unpushed, Some(0), "{idle_push:?}");
+        // The hung remote's first push is stuck.
+        wait_for("the hung push started", || {
+            hung_pushing.load(Ordering::SeqCst)
+        });
 
-        let start = Instant::now();
-        let report = service.shutdown(Duration::from_millis(200));
-        let took = start.elapsed();
-        assert!(took >= Duration::from_millis(150), "{took:?}");
-        assert!(took < Duration::from_secs(3), "{took:?}");
+        let report = shutdown_at_deadline(service, &clock, Duration::from_millis(200), || true);
         report.final_commit.unwrap();
         assert_eq!(report.abandoned_pushes, ["hung"]);
-
-        // Release the detached thread.
-        let mut writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        writer.write_all(b"").unwrap();
+        assert_eq!(
+            report.final_pushes,
+            [("idle".to_owned(), FinalPush::NothingNew)]
+        );
+        release(&fifo);
     }
 
     fn record_as(rec: &Recorder, dir: &Path, name: &str, caller: Caller) {
