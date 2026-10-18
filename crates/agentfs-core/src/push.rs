@@ -51,7 +51,10 @@
 //!
 //! None of these affect recording or committing. A per-remote `flock` on
 //! `<remote>.lock` keeps two processes (`agentfs push` and `agentfs run`)
-//! from pushing the same remote at once.
+//! from pushing the same remote at once. The lease push's scratch
+//! repository, `<remote>.lease.git` beside it, holds the remote's history
+//! (design §15): it is removed on every exit path, and whoever next takes
+//! a push lock removes any a killed push left.
 //!
 //! libgit2's local transport updates a remote ref without compare-and-swap
 //! once the ref exists, so a writer moving a local or `file://` remote
@@ -447,6 +450,10 @@ pub struct RemotePusher {
     /// the branch there.
     #[cfg(test)]
     after_queue_listing: Option<Box<dyn Fn() + Send>>,
+    /// Runs in the lease check once the lease is fetched into the scratch
+    /// repository: a test interrupts the push there.
+    #[cfg(test)]
+    in_lease_scratch: Option<Box<dyn Fn() + Send>>,
 }
 
 impl RemotePusher {
@@ -486,6 +493,8 @@ impl RemotePusher {
             step_pending: false,
             #[cfg(test)]
             after_queue_listing: None,
+            #[cfg(test)]
+            in_lease_scratch: None,
         })
     }
 
@@ -1256,10 +1265,10 @@ impl RemotePusher {
         if self.repo.odb().is_ok_and(|odb| odb.exists(lease)) {
             return related(&self.repo);
         }
-        let scratch = self.lock_path.with_extension("lease.git");
-        let _ = fs::remove_dir_all(&scratch);
-        let checked = (|| {
-            Repository::init_bare(&scratch).map_err(local)?;
+        let guard = LeaseScratch::new(lease_scratch(&self.lock_path));
+        let scratch = guard.path();
+        (|| {
+            Repository::init_bare(scratch).map_err(local)?;
             let objects = fs::canonicalize(self.repo.path().join("objects"))
                 .map_err(|e| (PushFailureKind::Local, e.to_string()))?;
             fs::write(
@@ -1267,19 +1276,21 @@ impl RemotePusher {
                 format!("{}\n", objects.display()),
             )
             .map_err(|e| (PushFailureKind::Local, e.to_string()))?;
-            let repo = Repository::open_bare(&scratch).map_err(local)?;
+            let repo = Repository::open_bare(scratch).map_err(local)?;
             // What the fetch negotiates from: the remote sends only what
             // this history lacks.
             repo.reference("refs/heads/head", head, true, "agentfs lease check")
                 .map_err(local)?;
             let tip = crate::fork::start::fetch_branch(&repo, &self.remote, &self.branch_ref)?;
+            #[cfg(test)]
+            if let Some(hook) = &self.in_lease_scratch {
+                hook();
+            }
             if tip != Some(lease) {
                 return Ok(LeaseCheck::Moved(tip));
             }
             related(&repo)
-        })();
-        let _ = fs::remove_dir_all(&scratch);
-        checked
+        })()
     }
 
     /// This remote's push lock file: held while a push runs, and by a
@@ -1288,7 +1299,8 @@ impl RemotePusher {
         &self.lock_path
     }
 
-    /// Takes this remote's push lock without waiting.
+    /// Takes this remote's push lock without waiting, then sweeps the lease
+    /// scratch repositories a killed push left ([`sweep_lease_scratch`]).
     fn lock(&self) -> io::Result<Option<File>> {
         let file = OpenOptions::new()
             .write(true)
@@ -1296,11 +1308,11 @@ impl RemotePusher {
             .truncate(false)
             .mode(0o600)
             .open(&self.lock_path)?;
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(file)),
-            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-            Err(e) => Err(e.into()),
+        if !try_flock(&file)? {
+            return Ok(None);
         }
+        sweep_lease_scratch(&self.lock_path);
+        Ok(Some(file))
     }
 
     /// `<oid>:<ref>` for the branch and every
@@ -1954,6 +1966,96 @@ fn another_writer(
         }),
         _ => None,
     })
+}
+
+/// What a lease scratch repository's name ends with, after its remote's
+/// name: `<remote>.lease.git`, beside `<remote>.lock`.
+const LEASE_SCRATCH_SUFFIX: &str = ".lease.git";
+
+/// The lease check's scratch repository for the remote whose push lock is
+/// `lock` (`<push dir>/<remote>.lock`).
+fn lease_scratch(lock: &Path) -> PathBuf {
+    let mut name = lock.file_stem().unwrap_or_default().to_os_string();
+    name.push(LEASE_SCRATCH_SUFFIX);
+    lock.with_file_name(name)
+}
+
+/// The lease check's scratch repository (design §15), which holds the
+/// remote's history, the old history a rewrite removed included: removed
+/// when created (a leftover is never reused) and when dropped, so no exit
+/// path, an error or a panic unwinding, leaves it behind. A process killed
+/// meanwhile skips the drop; the next push sweeps it
+/// ([`sweep_lease_scratch`]).
+struct LeaseScratch(PathBuf);
+
+impl LeaseScratch {
+    fn new(path: PathBuf) -> Self {
+        let _ = fs::remove_dir_all(&path);
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for LeaseScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Removes every lease scratch repository beside `own_lock`, a push lock
+/// the caller holds: its own remote's, and any other remote's, a
+/// configured one or one since removed, whose push lock is free. A scratch
+/// repository is only made under its remote's lock, so one whose lock is
+/// free (or whose lock file is gone) is what a killed lease push left; one
+/// whose lock another process holds is in use and stays. Best effort: a
+/// failure leaves it for the next push.
+fn sweep_lease_scratch(own_lock: &Path) {
+    let Some(dir) = own_lock.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(remote) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(LEASE_SCRATCH_SUFFIX))
+        else {
+            continue;
+        };
+        let lock = dir.join(format!("{remote}.lock"));
+        // Held for the removal only, and never this process's own lock
+        // twice: flock locks are per open file, so a second open would
+        // conflict with the one the caller holds.
+        let _held = if lock == own_lock {
+            None
+        } else {
+            match File::open(&lock) {
+                Ok(file) => match try_flock(&file) {
+                    Ok(true) => Some(file),
+                    Ok(false) | Err(_) => continue,
+                },
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => continue,
+            }
+        };
+        let _ = fs::remove_dir_all(&path);
+    }
+}
+
+/// Takes an exclusive `flock` on `file` without waiting: `false` when
+/// another open file holds it.
+fn try_flock(file: &File) -> io::Result<bool> {
+    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The commits `from` reaches and `hidden` does not, newest first, each
@@ -3742,6 +3844,72 @@ mod tests {
         let message = format!("close f9\n\nAgentfs-Seq: {seq}\nAgentfs-Trigger: close\n");
         repo.commit(Some(branch), &sig, &sig, &message, &tree, &[&parent])
             .unwrap()
+    }
+
+    /// Bead agentfs-4lb.1: a lease push interrupted while the remote's old
+    /// history sits in its scratch repository (here a panic, unwinding)
+    /// leaves no scratch repository behind.
+    #[test]
+    fn an_interrupted_lease_push_leaves_no_scratch_repository() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = remote_dir.path();
+        bare(remote);
+        let mut v = Vol::new("vol", &[("origin", &remote.display().to_string())]);
+        v.commit();
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        let theirs = write_remote(remote, "refs/heads/agentfs/vol");
+        v.commit();
+        let scratch = pusher.lock_path().with_extension("lease.git");
+        let seen = scratch.clone();
+        pusher.in_lease_scratch = Some(Box::new(move || {
+            assert!(seen.join("objects").exists(), "the lease was fetched aside");
+            panic!("interrupted mid-push");
+        }));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pusher.push_with_lease(theirs)
+        }));
+        assert!(interrupted.is_err(), "the hook ran");
+        assert!(
+            !scratch.exists(),
+            "the remote's old history is left at {}",
+            scratch.display()
+        );
+        assert_eq!(remote_ref(remote, "refs/heads/agentfs/vol"), Some(theirs));
+    }
+
+    /// Bead agentfs-4lb.1: a scratch repository a killed lease push left
+    /// (for this remote, or one no longer configured) is removed by the
+    /// next push of any remote; one whose remote's push lock another
+    /// process holds is in use and stays.
+    #[test]
+    fn a_push_sweeps_lease_scratch_repositories_a_killed_push_left() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        bare(remote_dir.path());
+        let mut v = Vol::new(
+            "vol",
+            &[("origin", &remote_dir.path().display().to_string())],
+        );
+        v.commit();
+        let dir = v.state.push_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let stale = |name: &str| {
+            let scratch = dir.join(format!("{name}.lease.git"));
+            Repository::init_bare(&scratch).unwrap();
+            scratch
+        };
+        let own = stale("origin");
+        let gone = stale("gone.remote");
+        let busy = stale("busy");
+        let held = File::create(dir.join("busy.lock")).unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+
+        let mut pusher = v.pusher("origin", Arc::new(NullSink));
+        assert!(pusher.push_once().is_success());
+        assert!(!own.exists(), "{} is left", own.display());
+        assert!(!gone.exists(), "{} is left", gone.display());
+        assert!(busy.exists(), "a scratch in use stays");
+        drop(held);
     }
 
     /// Bead agentfs-4lb.2, F8 "one branch per worktree": the lease push

@@ -157,7 +157,9 @@ rewritten copy on the head, the same `Agentfs-Seq`, author and committer:
 a commit filter-repo pruned (step 4 keeps them all with `--prune-empty
 never`), or one recorded elsewhere that this state area never had. The old tip, gone
 from the state area since step 6, is fetched into a scratch repository
-for that check, never into the state area. `git ls-remote`, the fetch and the
+for that check, never into the state area, and removed when the command
+ends, however it ends; one left by a killed command
+(`$STATE/meta/push/<remote>.lease.git`) is removed by the next push. `git ls-remote`, the fetch and the
 deletions need git credentials for the remote, as in
 [divergence.md](divergence.md).
 

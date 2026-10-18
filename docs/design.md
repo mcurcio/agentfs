@@ -3535,9 +3535,14 @@ and not the state lock, so it works while the volume is mounted. It lists
 the remote's branch: at the head is up to date; not at `<oid>` is a
 broken lease, and nothing is written. A lease not in the state area is
 fetched, with the remote's branch, into a scratch repository beside the
-push lock that borrows the state area's objects
-(`objects/info/alternates`) and is removed afterwards, so the state area
-never takes in the remote's objects (a rewrite's old history above). A
+push lock (`meta/push/<remote>.lease.git`) that borrows the state area's
+objects (`objects/info/alternates`), so the state area never takes in the
+remote's objects (a rewrite's old history above). It is removed on every
+exit path, an error or a panic included (a guard dropped with it); one a
+killed push left is removed by the next push of any remote, which takes
+that scratch's own remote lock for it and leaves it while another process
+holds that lock (2026-10-18, bead agentfs-4lb.1).
+A
 lease that shares no commit with the head is refused: another history is
 never replaced, it continues under a new name. So is a branch whose
 commits beyond the head hold history an agentfs recorder wrote
