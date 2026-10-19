@@ -195,13 +195,34 @@ Replacing the branch does not remove the old objects from the server. What does
 depends on the host:
 
 - **A bare repository you run** (ssh, a file server): expire its reflog
-  and collect garbage on the server, where `$SERVER_REPO` is its path:
+  and collect garbage on the server, where `$SERVER_REPO` is its path.
+  Every push to it, the deletions above included, starts git's own
+  maintenance in the background (`git maintenance run --auto --detach`,
+  `receive.autogc`). Since git 2.54 that repacks the existing packs into
+  a new one, unreachable objects and all, and a repack still running
+  when `gc` deletes the old packs writes the secret back in a pack of
+  its own. So the block first turns that off and waits until no
+  maintenance or repack is left running on the server, then collects
+  garbage, then turns it back on:
 
   <!-- ci: rewrite-purge-bare -->
   ```sh
+  command -v pgrep >/dev/null || { echo "pgrep (procps) is needed"; false; }
+  git --git-dir "$SERVER_REPO" config receive.autogc false
+  while pgrep -f 'git[ -](maintenance run|repack|gc)' >/dev/null; do sleep 1; done
   git --git-dir "$SERVER_REPO" reflog expire --expire=now --all
   git --git-dir "$SERVER_REPO" gc -q --prune=now
+  git --git-dir "$SERVER_REPO" config --unset receive.autogc
   ```
+
+  The wait is for every git repack on the server, not only this
+  repository's: it may wait longer than needed, never too little. If
+  the server had `receive.autogc` set, set it back to that value
+  instead of unsetting it. A push from another client that is already
+  being received when the block starts can still start maintenance;
+  stop the other volumes that push there first if the repository is
+  shared, or check the server afterwards as in step 7, with
+  `--git-dir "$SERVER_REPO"`.
 
 - **GitHub**: the objects stay reachable by id, in cached views, pull
   request refs and forks. Ask GitHub Support to purge them (they need the
