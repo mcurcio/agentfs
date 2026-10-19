@@ -139,15 +139,20 @@ pub enum RefusedReason {
     Rejected,
     /// The fork's settings no longer define the remote the finish named.
     RemoteGone,
+    /// A local-only source refuses what the fork brings: a ref that is
+    /// the source's own, a base off the source's branch, or an LFS object
+    /// that is not its name (`fork::receive`).
+    Unsafe,
 }
 
 impl RefusedReason {
     /// Every reason, for what must cover each (the runbook, its hints).
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::AnotherWriter,
         Self::TooLarge,
         Self::Rejected,
         Self::RemoteGone,
+        Self::Unsafe,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -156,6 +161,7 @@ impl RefusedReason {
             Self::TooLarge => "too_large",
             Self::Rejected => "rejected",
             Self::RemoteGone => "remote_gone",
+            Self::Unsafe => "unsafe",
         }
     }
 }
@@ -172,6 +178,9 @@ pub enum Met {
     /// The finish names a remote that is not the fork's fork remote now,
     /// or the local-only source whose history it names is gone.
     RemoteGone,
+    /// The local-only source refused what the fork brings
+    /// ([`RefusedReason::Unsafe`]).
+    Unsafe,
 }
 
 /// The single decider of "permanent" (design §11.5): what makes a publish
@@ -182,6 +191,7 @@ pub fn refused_reason(met: Met) -> Option<RefusedReason> {
     match met {
         Met::AnotherWriter => Some(RefusedReason::AnotherWriter),
         Met::RemoteGone => Some(RefusedReason::RemoteGone),
+        Met::Unsafe => Some(RefusedReason::Unsafe),
         // One commit over agentfsMaxPushSize, or one LFS object over
         // agentfsMaxLfsObjectSize (§11.3): no retry can send it.
         Met::Branch(PushFailureKind::TooLarge) | Met::CreateOnly(PushFailureKind::TooLarge) => {
@@ -814,14 +824,30 @@ impl Finisher {
         match self.receiver.receive(&source, &self.identity, &self.state) {
             Ok(_) => Ok(Ok(())),
             Err(ReceiverError::Busy(busy)) => Err(FinishError::SourceBusy(busy)),
-            Err(ReceiverError::Receive(e @ ReceiveError::SourceRemoved)) => failed(
-                Met::RemoteGone,
-                PushFailureKind::Local,
-                format!("{e}: {}", source.root().display()),
-            ),
-            Err(ReceiverError::Receive(e @ ReceiveError::Diverged { .. })) => {
-                failed(Met::AnotherWriter, PushFailureKind::Refused, e.to_string())
-            }
+            // Every receive error decided here, so a new one is a compile
+            // error until it is.
+            Err(ReceiverError::Receive(e)) => match e {
+                ReceiveError::SourceRemoved => failed(
+                    Met::RemoteGone,
+                    PushFailureKind::Local,
+                    format!("{e}: {}", source.root().display()),
+                ),
+                ReceiveError::Diverged { .. } => {
+                    failed(Met::AnotherWriter, PushFailureKind::Refused, e.to_string())
+                }
+                ReceiveError::SourcesRef { .. }
+                | ReceiveError::BaseNotOnBranch { .. }
+                | ReceiveError::LfsMismatch { .. } => {
+                    failed(Met::Unsafe, PushFailureKind::Refused, e.to_string())
+                }
+                ReceiveError::NotPublished | ReceiveError::History(_) | ReceiveError::Io(_) => {
+                    failed(
+                        Met::Branch(PushFailureKind::Local),
+                        PushFailureKind::Local,
+                        e.to_string(),
+                    )
+                }
+            },
             Err(e) => failed(
                 Met::Branch(PushFailureKind::Local),
                 PushFailureKind::Local,
