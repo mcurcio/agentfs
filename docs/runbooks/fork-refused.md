@@ -118,6 +118,50 @@ publishes it elsewhere.
 **Fix.** Restore the remote, under the same name, in the source's
 settings files (under CSI, the profile's config).
 
+## `unsafe`
+
+**What happened.** The fork's source is local-only, so the fork
+publishes into the source's own history, and the source refused what
+the fork brings (design [§11.5](../design.md#115-forks), "A local-only
+source's forks"). agentfs treats a fork's output as untrusted, and wrote
+no ref. The message says which of three it was:
+
+- `<ref> is the source's own ref, never a fork's`: the fork's branch is
+  the source's branch, or one of its refs is under
+  `refs/agentfs/<source>/`, compared ignoring ASCII case (on a
+  case-insensitive filesystem `agentfs/SRC` and `agentfs/src` are one
+  ref). A fork named as its source, in any case, does this, as does a
+  source whose `agentfs.branch` was renamed to the fork's branch.
+- `the fork's base <commit> is not on the source's branch`: the source
+  never had that commit, or its history was rewritten
+  ([history-rewrite.md](history-rewrite.md)) since the fork was made.
+  Receiving it would bring the removed history back.
+- `LFS object <oid> ... arrived as ...`: an object in the fork's LFS
+  cache (`$STATE/lfs/objects/`) is not the object its name says. Nothing
+  of it was kept in the source's cache.
+
+**Fix.** None of these changes on a retry: the fork's history and cache
+are what they are. `$SOURCE_STATE` is the source's state area (the
+fork's `agentfs.fork.sourceState`). Find the source's branch (unset means
+`agentfs/<source>`) and whether the fork's base is on it:
+
+```sh
+SOURCE_STATE=$(git --git-dir "$STATE/git" config agentfs.fork.sourceState)
+SOURCE=$(agentfs --state "$STATE" fork status --json | jq -r .source)
+BASE=$(agentfs --state "$STATE" fork status --json | jq -r .base)
+BRANCH=$(git --git-dir "$SOURCE_STATE/git" config agentfs.branch || echo "agentfs/$SOURCE")
+git --git-dir "$SOURCE_STATE/git" merge-base --is-ancestor "$BASE" "refs/heads/$BRANCH" \
+  && echo "base is on the branch"
+```
+
+If the source's branch was renamed by mistake, set `agentfs.branch` back
+in the source's config, then take [exit 1](#the-two-exits) below (fix
+the cause, then `fork finish --retry`). Otherwise
+[give the fork up](#the-two-exits): a fork off a rewritten history, or
+one with a damaged LFS cache, should not reach the source. If the change
+is wanted, copy the files out of the fork's backing tree by hand and
+review them before writing them into the source.
+
 ## The two exits
 
 **1. Fix the cause, then retry.** `--retry` clears the refusal and
