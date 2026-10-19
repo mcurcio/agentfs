@@ -14,15 +14,20 @@
 //! - **Repack** (on the commit thread): every `repackInterval` (design §8)
 //!   the commit loop runs [`crate::repack::repack`] between commits, then
 //!   refreshes the committer's object database. A failure emits
-//!   [`Event::RepackFailed`] and is tried again an interval later. A stop
+//!   [`Event::RepackFailed`] and is tried again an interval later; a round
+//!   a push put off is tried again `retry` (a second) later. A stop
 //!   kills a repack in progress, so shutdown never waits for one.
 //!
 //! [`Service::shutdown`] stops every loop, makes the final commit, then
 //! gives each remote that lacks commits one more push attempt, all within
-//! one grace period (design §11.2): stopping never waits longer than that
-//! for a push, and a grace of zero skips the final push. libgit2 cannot
-//! cancel a push, so a push still running after the grace period is left
-//! on its detached thread until the process exits. Every long-running mode
+//! one grace period (design §11.2), and a grace of zero skips the final
+//! push. At the grace's end each push is cancelled ([`PushStop`]): one
+//! that has not finished its negotiation sends nothing, and one still
+//! sending over the network is left on its detached thread until the
+//! process exits. A push to a local remote past its negotiation is
+//! updating that remote's pack and refs, which libgit2 cannot stop and an
+//! exit would leave locked, so shutdown waits for it, at most
+//! [`LOCAL_UPDATE_CAP`] more. Every long-running mode
 //! (`mount`, `run`, `serve-history`) stops this way, so the last commit
 //! before a stop reaches the remotes when they answer in time, and
 //! otherwise waits for the next start.
@@ -42,14 +47,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::events::{Event, Events};
-use crate::push::{PushOutcome, QueuePush, RemotePusher, backoff};
+use crate::push::{PushOutcome, PushPhase, PushStop, QueuePush, RemotePusher, backoff};
 use crate::repack::{self, RepackOutcome, RepackSchedule};
 use crate::volume::{CommitReport, Committer, VolumeError};
 
@@ -64,9 +68,41 @@ const MIN_DELAY: Duration = Duration::from_millis(10);
 /// decision (a local read: whether the remote lacks commits).
 const DECISION_SETTLE: Duration = Duration::from_secs(2);
 
+/// How often [`Service::shutdown`] looks at its clock while it waits.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
+/// How long past the push grace [`Service::shutdown`] still waits for a
+/// push to a local remote that is updating the remote's pack and refs
+/// (design §11.2). That is disk work only (the transfer over a network
+/// never waits), so it is short unless the disk is stalled; the cap keeps
+/// a hung filesystem from holding the stop forever. It is also the
+/// shutdown's ceiling: past the grace plus this, nothing at all is waited
+/// for (a decision's [`DECISION_SETTLE`] included). 10 s: the default
+/// grace (5 s) plus this stays within Kubernetes' default 30 s
+/// termination grace, and the CSI node plugin's 30 s unstage grace, with
+/// room for the final commit.
+pub const LOCAL_UPDATE_CAP: Duration = Duration::from_secs(10);
+
 /// How many push-now commit results are kept for the waiters still to
 /// read them.
 const COMMIT_RESULTS_KEPT: usize = 64;
+
+/// The time the service's deadlines run on: [`Service::shutdown`]'s grace
+/// period (design §11.2) and [`ServiceHandle::push_now`]'s timeout. The
+/// system's monotonic clock, or a test's that stands still.
+trait Clock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Instant;
+}
+
+/// [`Instant::now`].
+#[derive(Debug)]
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
 
 /// A stop flag loops can sleep on.
 #[derive(Debug, Default)]
@@ -122,8 +158,13 @@ pub struct ShutdownReport {
     /// The final push of each remote whose push thread finished within the
     /// grace period, in name order.
     pub final_pushes: Vec<(String, FinalPush)>,
-    /// Remotes whose push was still running when the grace period ended.
+    /// Remotes whose push was still running when the grace period ended,
+    /// before it could update the remote.
     pub abandoned_pushes: Vec<String>,
+    /// Local remotes whose push was still updating the remote's pack and
+    /// refs [`LOCAL_UPDATE_CAP`] after the grace period: a ref lock may
+    /// remain in the remote.
+    pub abandoned_updates: Vec<String>,
 }
 
 /// A remote's result in a [`PushNowReport`].
@@ -237,6 +278,7 @@ impl Signal {
     /// returns the state at that point and whether `done` held.
     fn wait_until(
         &self,
+        clock: &dyn Clock,
         deadline: Instant,
         done: impl Fn(&SignalState) -> bool,
     ) -> (std::sync::MutexGuard<'_, SignalState>, bool) {
@@ -245,7 +287,7 @@ impl Signal {
             if done(&guard) {
                 return (guard, true);
             }
-            let now = Instant::now();
+            let now = clock.now();
             if guard.closed || guard.stop || now >= deadline {
                 return (guard, false);
             }
@@ -266,6 +308,8 @@ pub struct ServiceHandle {
     signal: Arc<Signal>,
     /// Remotes with a push loop, in name order.
     remotes: Arc<Vec<String>>,
+    /// What the timeout is measured on: the service's clock.
+    clock: Arc<dyn Clock>,
 }
 
 impl ServiceHandle {
@@ -285,7 +329,7 @@ impl ServiceHandle {
         remotes: &[String],
         timeout: Duration,
     ) -> Result<PushNowReport, PushNowError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = self.clock.now() + timeout;
         if let Some(unknown) = remotes.iter().find(|r| !self.remotes.contains(r)) {
             return Err(PushNowError::UnknownRemote(unknown.clone()));
         }
@@ -306,9 +350,9 @@ impl ServiceHandle {
             s.commit_requested
         };
         self.signal.cond.notify_all();
-        let (state, done) = self
-            .signal
-            .wait_until(deadline, |s| s.commit_done >= commit_generation);
+        let (state, done) = self.signal.wait_until(&*self.clock, deadline, |s| {
+            s.commit_done >= commit_generation
+        });
         if !done {
             if state.closed || state.stop {
                 return Err(PushNowError::Stopping);
@@ -341,7 +385,7 @@ impl ServiceHandle {
                 .get(name)
                 .is_some_and(|d| d.generation >= generation)
         };
-        let (state, _) = self.signal.wait_until(deadline, |s| {
+        let (state, _) = self.signal.wait_until(&*self.clock, deadline, |s| {
             generations
                 .iter()
                 .all(|(name, generation)| finished(s, name, *generation))
@@ -380,10 +424,11 @@ impl ServiceHandle {
 struct PushThread {
     name: String,
     handle: JoinHandle<()>,
-    /// Set while the thread is inside a push attempt (network I/O); clear
-    /// while it sleeps or decides its final push, which reads only local
-    /// state.
-    pushing: Arc<AtomicBool>,
+    /// Where the thread is ([`PushPhase`]: idle, while it sleeps or
+    /// decides its final push from local state; in an attempt; or
+    /// updating a local remote), and cancels its attempts at the grace's
+    /// end.
+    stop: Arc<PushStop>,
 }
 
 /// The running commit and push loops.
@@ -398,6 +443,16 @@ pub struct Service {
     /// When the final push must have started by; set before `committed`
     /// is released.
     deadline: Arc<Mutex<Option<Instant>>>,
+    /// What the deadline is measured on.
+    clock: Arc<dyn Clock>,
+    /// [`LOCAL_UPDATE_CAP`]; a test shortens it.
+    update_cap: Duration,
+    /// [`DECISION_SETTLE`]; a test shortens it.
+    decision_settle: Duration,
+    /// How many repack rounds the commit loop ran and scheduled the next
+    /// of ([`Repacker::rounds`]).
+    #[cfg(test)]
+    repack_rounds: Arc<std::sync::atomic::AtomicUsize>,
     commit: JoinHandle<Result<CommitReport, VolumeError>>,
     pushes: Vec<PushThread>,
     push_done: mpsc::Receiver<(String, FinalPush)>,
@@ -429,23 +484,42 @@ impl Service {
         events: Events,
         repack: Option<RepackSchedule>,
     ) -> io::Result<Self> {
+        Self::spawn(committer, pushers, events, repack, Arc::new(SystemClock))
+    }
+
+    /// [`Service::start_with_repack`] with the shutdown grace measured on
+    /// `clock`.
+    fn spawn(
+        committer: Committer,
+        pushers: Vec<RemotePusher>,
+        events: Events,
+        repack: Option<RepackSchedule>,
+        clock: Arc<dyn Clock>,
+    ) -> io::Result<Self> {
         let stop = Arc::new(Stop::default());
         let signal = Arc::new(Signal::default());
         let committed = Arc::new(Stop::default());
         let deadline = Arc::new(Mutex::new(None));
         let mut names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
         names.sort();
+        #[cfg(test)]
+        let repack_rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let commit = {
             let stop = stop.clone();
             let signal = signal.clone();
+            let clock = clock.clone();
             let repacker = repack.map(|schedule| Repacker {
                 schedule,
                 push_locks: pushers.iter().map(|p| p.lock_path().to_owned()).collect(),
                 events: events.clone(),
+                #[cfg(test)]
+                rounds: repack_rounds.clone(),
             });
             thread::Builder::new()
                 .name("agentfs-commit".into())
-                .spawn(move || commit_loop(&committer, &stop, &signal, repacker.as_ref()))?
+                .spawn(move || {
+                    commit_loop(&committer, &stop, &signal, repacker.as_ref(), &*clock)
+                })?
         };
         let (done_tx, push_done) = mpsc::channel();
         let mut pushes = Vec::with_capacity(pushers.len());
@@ -454,26 +528,32 @@ impl Service {
             let signal_flag = signal.clone();
             let committed_flag = committed.clone();
             let deadline = deadline.clone();
+            let clock = clock.clone();
             let done = done_tx.clone();
-            let pushing = Arc::new(AtomicBool::new(false));
-            let pushing_flag = pushing.clone();
+            let push_stop = pusher.stop_handle();
+            let phase = push_stop.clone();
             let spawned = thread::Builder::new()
                 .name(format!("agentfs-push-{name}"))
                 .spawn(move || {
-                    push_loop(&mut pusher, &signal_flag, &pushing_flag);
+                    push_loop(&mut pusher, &signal_flag, &phase);
                     // The final commit may hold what this remote lacks.
                     while !committed_flag.wait(Duration::from_secs(3600)) {}
                     let deadline = *deadline
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let result = final_push(&mut pusher, deadline, &pushing_flag);
+                    let result = final_push(&mut pusher, deadline, &*clock, &phase);
+                    #[cfg(test)]
+                    pusher.before_report();
                     let _ = done.send((pusher.name().to_owned(), result));
+                    // Only now: the shutdown waits for a local push up to
+                    // its report.
+                    phase.end_attempt();
                 });
             match spawned {
                 Ok(handle) => pushes.push(PushThread {
                     name,
                     handle,
-                    pushing,
+                    stop: push_stop,
                 }),
                 Err(e) => {
                     // Wind down what already started before reporting.
@@ -490,6 +570,11 @@ impl Service {
             remotes: Arc::new(names),
             committed,
             deadline,
+            clock,
+            update_cap: LOCAL_UPDATE_CAP,
+            decision_settle: DECISION_SETTLE,
+            #[cfg(test)]
+            repack_rounds,
             commit,
             pushes,
             push_done,
@@ -507,17 +592,20 @@ impl Service {
         ServiceHandle {
             signal: self.signal.clone(),
             remotes: self.remotes.clone(),
+            clock: self.clock.clone(),
         }
     }
 
     /// Stops every loop: makes the final commit, then gives every remote
     /// that lacks commits one more push attempt (the final commit's among
     /// them), all within `push_grace` from the call. An attempt is only
-    /// started before the deadline, and one still running at the deadline
-    /// is abandoned; a grace of zero skips the final push. Push-now
-    /// requests still waiting return [`PushNowError::Stopping`].
+    /// started before the deadline; at the deadline every attempt is
+    /// cancelled, and one still running is abandoned, unless it is
+    /// updating a local remote: that one is waited for, up to
+    /// [`LOCAL_UPDATE_CAP`] more. A grace of zero skips the final push.
+    /// Push-now requests still waiting return [`PushNowError::Stopping`].
     pub fn shutdown(self, push_grace: Duration) -> ShutdownReport {
-        let deadline = Instant::now() + push_grace;
+        let deadline = self.clock.now() + push_grace;
         self.stop.stop();
         self.signal.update(|s| {
             s.stop = true;
@@ -548,19 +636,36 @@ impl Service {
         };
         // Past the deadline, a remote that is not inside an attempt is only
         // deciding (it finds the deadline passed and skips): wait a little
-        // for that decision rather than call it abandoned.
-        let settle = deadline + DECISION_SETTLE;
+        // for that decision rather than call it abandoned. A local update
+        // let finish past the deadline gets as long again after it. Nothing
+        // is waited for past the ceiling, whatever hangs.
+        let ceiling = deadline + self.update_cap.max(self.decision_settle);
+        let mut settle = deadline + self.decision_settle;
         while !pending.is_empty() {
-            let now = Instant::now();
-            let deciding = pending
-                .iter()
-                .any(|p| !p.pushing.load(Ordering::SeqCst) && !p.handle.is_finished());
+            let now = self.clock.now();
             let until = if now < deadline {
                 deadline
-            } else if deciding {
-                settle
             } else {
-                now
+                // Nothing is sent from now on; a local update in progress
+                // is let finish, up to its report. Every push is cancelled,
+                // each read once.
+                let phases: Vec<PushPhase> = pending.iter().map(|p| p.stop.cancel()).collect();
+                let updating = phases.iter().any(|p| p.must_wait());
+                if updating {
+                    settle = settle.max(now + self.decision_settle);
+                }
+                let deciding = pending
+                    .iter()
+                    .zip(&phases)
+                    .any(|(p, &phase)| phase == PushPhase::Idle && !p.handle.is_finished());
+                let mut until = now;
+                if deciding {
+                    until = until.max(settle);
+                }
+                if updating {
+                    until = ceiling;
+                }
+                until.min(ceiling)
             };
             let remaining = until.saturating_duration_since(now);
             if remaining.is_zero() {
@@ -571,7 +676,9 @@ impl Service {
                 }
                 break;
             }
-            match self.push_done.recv_timeout(remaining) {
+            // Looks again at least every `SHUTDOWN_POLL`: the deadline is on
+            // `clock`, which need not be the time `recv_timeout` measures.
+            match self.push_done.recv_timeout(remaining.min(SHUTDOWN_POLL)) {
                 Ok(done) => take(&mut pending, done),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 // Every sender gone: the rest panicked; join reports it.
@@ -581,27 +688,32 @@ impl Service {
         // Threads that finished without reporting (a panic) are not
         // abandoned; reap them.
         let mut abandoned = Vec::new();
+        let mut abandoned_updates = Vec::new();
         for thread in pending {
             if thread.handle.is_finished() {
                 let _ = thread.handle.join();
+            } else if thread.stop.cancel().must_wait() {
+                abandoned_updates.push(thread.name);
             } else {
                 abandoned.push(thread.name);
             }
         }
         abandoned.sort();
+        abandoned_updates.sort();
         final_pushes.sort_by(|a, b| a.0.cmp(&b.0));
         ShutdownReport {
             final_commit,
             final_pushes,
             abandoned_pushes: abandoned,
+            abandoned_updates,
         }
     }
 }
 
 /// One remote's push loop until the stop: an attempt, then a sleep of
 /// [`RemotePusher::next_delay`] that a push-now request cuts short.
-/// `pushing` is set for the length of each attempt.
-fn push_loop(pusher: &mut RemotePusher, signal: &Signal, pushing: &AtomicBool) {
+/// `phase` is in an attempt for the length of each.
+fn push_loop(pusher: &mut RemotePusher, signal: &Signal, phase: &PushStop) {
     let name = pusher.name().to_owned();
     let mut served = 0u64;
     loop {
@@ -614,9 +726,9 @@ fn push_loop(pusher: &mut RemotePusher, signal: &Signal, pushing: &AtomicBool) {
             }
             s.push_requested.get(&name).copied().unwrap_or(0)
         };
-        pushing.store(true, Ordering::SeqCst);
+        phase.begin_attempt();
         let outcome = pusher.push_once();
-        pushing.store(false, Ordering::SeqCst);
+        phase.end_attempt();
         let result = RemoteResult {
             name: name.clone(),
             outcome,
@@ -648,13 +760,16 @@ fn push_loop(pusher: &mut RemotePusher, signal: &Signal, pushing: &AtomicBool) {
 }
 
 /// The final push of one remote: one attempt if it lacks commits and the
-/// deadline has not passed. `pushing` is set for the length of the attempt,
-/// so [`Service::shutdown`] tells an attempt still running (abandoned) from
-/// a decision not yet reported (skipped).
+/// deadline has not passed. `phase` is in an attempt from its start, and
+/// the caller ends it once the result is reported, so
+/// [`Service::shutdown`] tells an attempt still running (abandoned, or
+/// waited for while it updates a local remote) from a decision not yet
+/// reported (skipped).
 fn final_push(
     pusher: &mut RemotePusher,
     deadline: Option<Instant>,
-    pushing: &AtomicBool,
+    clock: &dyn Clock,
+    phase: &PushStop,
 ) -> FinalPush {
     let unpushed = match pusher.unpushed() {
         Ok(None | Some(0)) => return FinalPush::NothingNew,
@@ -662,11 +777,9 @@ fn final_push(
         // Unknown: an attempt finds out.
         Err(_) => None,
     };
-    if deadline.is_some_and(|d| Instant::now() < d) {
-        pushing.store(true, Ordering::SeqCst);
-        let outcome = pusher.push_once();
-        pushing.store(false, Ordering::SeqCst);
-        FinalPush::Pushed(outcome)
+    if deadline.is_some_and(|d| clock.now() < d) {
+        phase.begin_attempt();
+        FinalPush::Pushed(pusher.push_once())
     } else {
         FinalPush::Skipped {
             unpushed: unpushed.unwrap_or(0),
@@ -679,19 +792,24 @@ struct Repacker {
     schedule: RepackSchedule,
     push_locks: Vec<PathBuf>,
     events: Events,
+    /// Counts the rounds the commit loop ran and scheduled the next of:
+    /// a test that sees the count knows when the next round is due.
+    #[cfg(test)]
+    rounds: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Repacker {
     /// Repacks the committer's repository; failures become events. A stop
-    /// kills a repack in progress.
-    fn run(&self, committer: &Committer, stop: &Stop) {
+    /// kills a repack in progress. Returns how long until the next round:
+    /// the schedule's `retry` when a push put this one off, else its
+    /// `interval`.
+    fn run(&self, committer: &Committer, stop: &Stop) -> Duration {
         let repo = committer.history().repo();
         let result = repack::repack(Path::new("git"), repo.path(), &self.push_locks, stop);
-        if matches!(
-            result,
-            Ok(RepackOutcome::PushInProgress | RepackOutcome::NothingToDo)
-        ) {
-            return;
+        match result {
+            Ok(RepackOutcome::PushInProgress) => return self.schedule.retry,
+            Ok(RepackOutcome::NothingToDo) => return self.schedule.interval,
+            _ => {}
         }
         // A repack that failed late may still have moved objects into new
         // packs: see them either way.
@@ -699,9 +817,10 @@ impl Repacker {
         let error = match (result, refreshed) {
             (Err(e), _) => e.to_string(),
             (Ok(_), Err(e)) => format!("refreshing the object database: {e}"),
-            (Ok(_), Ok(())) => return,
+            (Ok(_), Ok(())) => return self.schedule.interval,
         };
         self.events.emit(Event::RepackFailed { error });
+        self.schedule.interval
     }
 }
 
@@ -710,10 +829,12 @@ fn commit_loop(
     stop: &Stop,
     signal: &Signal,
     repacker: Option<&Repacker>,
+    clock: &dyn Clock,
 ) -> Result<CommitReport, VolumeError> {
     let window = committer.history().settings().commit_window.max(MIN_DELAY);
     let mut failures = 0u32;
-    let mut next_repack = repacker.map(|r| Instant::now() + r.schedule.first);
+    // The repack schedule runs on `clock`.
+    let mut next_repack = repacker.map(|r| clock.now() + r.schedule.first);
     loop {
         let delay = backoff(window, failures, COMMIT_BACKOFF_CAP);
         let woke = signal.wait(delay, |s| {
@@ -743,10 +864,15 @@ fn commit_loop(
             continue;
         }
         if let (Some(r), Some(at)) = (repacker, next_repack)
-            && Instant::now() >= at
+            && clock.now() >= at
         {
-            r.run(committer, stop);
-            next_repack = Some(Instant::now() + r.schedule.interval.max(MIN_DELAY));
+            let wait = r.run(committer, stop);
+            next_repack = Some(clock.now() + wait.max(MIN_DELAY));
+            // Counted only once the next round is scheduled: a test that
+            // moves the clock after seeing the count moves it past a due
+            // time already read from the clock, never before it is read.
+            #[cfg(test)]
+            r.rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         if committer.backlog() == 0 {
             continue;
@@ -770,6 +896,7 @@ fn now_ms() -> u64 {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::events::{Event, MemorySink, NullSink, PushFailureKind};
@@ -877,14 +1004,13 @@ mod tests {
         let schedule = RepackSchedule {
             first: Duration::ZERO,
             interval: Duration::from_millis(20),
+            retry: Duration::from_millis(20),
         };
         let service =
             Service::start_with_repack(com, pushers, sink.clone(), Some(schedule)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while local_head(&state).is_none() || packs(&state) == 0 {
-            assert!(Instant::now() < deadline, "never committed and repacked");
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_for("committed and repacked", || {
+            local_head(&state).is_some() && packs(&state) > 0
+        });
         // The committer still reads and writes the history after a repack.
         record(&rec, dir.path(), "b");
         let report = service.shutdown(Duration::ZERO);
@@ -904,18 +1030,155 @@ mod tests {
             "{events:?}"
         );
     }
+
+    /// A round a push put off is due again `retry` later, not an interval
+    /// later, so pushes that keep coming cannot starve the repack; the
+    /// commit loop schedules its next round by what [`Repacker::run`]
+    /// returns. Each round here is called directly, so the test knows a
+    /// round met the held lock rather than hoping one ran in time.
+    #[test]
+    fn a_repack_a_push_put_off_is_tried_again_soon() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("git is not installed: skipped");
+            return;
+        }
+        let (dir, state) = setup(&[]);
+        // Something loose to pack.
+        git2::Repository::open_bare(state.git())
+            .unwrap()
+            .blob(b"loose")
+            .unwrap();
+        // A push in progress, as far as the repack can tell.
+        let lock_path = state.push_lock("good");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let sink = Arc::new(MemorySink::default());
+        let (_rec, com, _pushers) = open(dir.path(), &state, sink.clone());
+        let schedule = RepackSchedule {
+            first: Duration::ZERO,
+            interval: Duration::from_secs(3600),
+            retry: Duration::from_millis(50),
+        };
+        let repacker = Repacker {
+            schedule,
+            push_locks: vec![lock_path],
+            events: sink.clone(),
+            rounds: Arc::default(),
+        };
+        let stop = Stop::default();
+        assert_eq!(
+            repacker.run(&com, &stop),
+            schedule.retry,
+            "a round a push put off is due again after retry"
+        );
+        assert_eq!(packs(&state), 0, "a repack ran while a push held its lock");
+        drop(lock);
+        assert_eq!(
+            repacker.run(&com, &stop),
+            schedule.interval,
+            "a round that ran is due again after the interval"
+        );
+        assert!(packs(&state) > 0, "the round after the push did not repack");
+        let events = sink.take();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::RepackFailed { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// The commit loop schedules its next round by what the round
+    /// returned: one a push put off is due again `retry` later on the
+    /// clock, not an interval later.
+    #[test]
+    fn the_commit_loop_tries_a_put_off_repack_again_after_retry() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("git is not installed: skipped");
+            return;
+        }
+        let nowhere = tempfile::tempdir().unwrap();
+        let (dir, state) = setup(&[
+            ("agentfs.commitWindow", "10ms"),
+            ("agentfs.pushInterval", "1h"),
+            (
+                "remote.origin.url",
+                &nowhere.path().join("missing").display().to_string(),
+            ),
+        ]);
+        // Something loose to pack.
+        git2::Repository::open_bare(state.git())
+            .unwrap()
+            .blob(b"loose")
+            .unwrap();
+        // A push in progress, as far as the repack can tell.
+        let lock_path = state.push_lock("origin");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let (_rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
+        let retry = Duration::from_secs(1);
+        let schedule = RepackSchedule {
+            first: Duration::ZERO,
+            interval: Duration::from_secs(3600),
+            retry,
+        };
+        let clock = PausedClock::new();
+        let service = Service::spawn(
+            com,
+            pushers,
+            Arc::new(NullSink),
+            Some(schedule),
+            clock.clone(),
+        )
+        .unwrap();
+        let rounds = service.repack_rounds.clone();
+        // Counted once the next round is scheduled, so the clock moves
+        // only after the loop has read it.
+        wait_for("a round met the push's lock", || {
+            rounds.load(Ordering::SeqCst) >= 1
+        });
+        assert_eq!(packs(&state), 0, "a repack ran while a push held its lock");
+        drop(lock);
+        clock.advance(retry);
+        wait_for("the round due after retry repacked", || packs(&state) > 0);
+        service.shutdown(Duration::ZERO).final_commit.unwrap();
+    }
+
     #[test]
     fn stop_wakes_waiters() {
         let stop = Arc::new(Stop::default());
         assert!(!stop.wait(Duration::from_millis(1)));
-        let waiter = {
+        // A waiter for an hour: only the stop can end its wait in time.
+        let (tx, rx) = mpsc::channel();
+        {
             let stop = stop.clone();
-            thread::spawn(move || stop.wait(Duration::from_secs(60)))
-        };
-        let start = Instant::now();
+            thread::spawn(move || tx.send(stop.wait(Duration::from_secs(3600))).unwrap());
+        }
         stop.stop();
-        assert!(waiter.join().unwrap());
-        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the stop woke the waiter")
+        );
         assert!(stop.is_stopped());
         assert!(stop.wait(Duration::from_secs(60)), "already stopped");
     }
@@ -934,7 +1197,7 @@ mod tests {
         ]);
         let sink = Arc::new(MemorySink::new());
         let (rec, com, pushers) = open(dir.path(), &state, sink.clone());
-        let service = Service::start(com, pushers, sink.clone()).unwrap();
+        let service = Service::spawn(com, pushers, sink.clone(), None, PausedClock::new()).unwrap();
         let mut remotes: Vec<&str> = service.remotes().collect();
         remotes.sort();
         assert_eq!(remotes, ["bad", "good"]);
@@ -942,25 +1205,26 @@ mod tests {
         record(&rec, dir.path(), "b");
 
         let remote_repo = git2::Repository::open_bare(remote.path()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        wait_for("the good remote caught up", || {
             let local = local_head(&state);
             let pushed = remote_repo.refname_to_id("refs/heads/agentfs/vol").ok();
-            if local.is_some() && local == pushed {
-                let head = remote_repo.find_commit(pushed.unwrap()).unwrap();
-                if head.tree().unwrap().len() == 2 {
-                    break;
-                }
-            }
-            assert!(Instant::now() < deadline, "the good remote never caught up");
-            thread::sleep(Duration::from_millis(20));
-        }
+            local.is_some()
+                && local == pushed
+                && remote_repo
+                    .find_commit(pushed.unwrap())
+                    .unwrap()
+                    .tree()
+                    .unwrap()
+                    .len()
+                    == 2
+        });
 
-        let start = Instant::now();
-        let report = service.shutdown(Duration::from_secs(1));
-        assert!(start.elapsed() < Duration::from_secs(3));
-        report.final_commit.unwrap();
-        assert!(report.abandoned_pushes.is_empty());
+        // The clock stands still, so every final push, the failing one's
+        // too, finishes within the grace, and the shutdown returns with
+        // them, never at the deadline.
+        let report = shutdown_watched(service, Duration::from_secs(1));
+        report.final_commit.as_ref().unwrap();
+        assert!(report.abandoned_pushes.is_empty(), "{report:?}");
 
         let events = sink.take();
         let failed: Vec<(&str, PushFailureKind)> = events
@@ -1002,10 +1266,10 @@ mod tests {
         let (rec, com, pushers) = open_with(dir.path(), &state, events.clone(), &h.telemetry);
         let settings = com.history().settings().clone();
         h.telemetry.observe_volume(&state, &settings);
-        let service = Service::start(com, pushers, events).unwrap();
+        let service = Service::spawn(com, pushers, events, None, PausedClock::new()).unwrap();
         record(&rec, dir.path(), "a");
         assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(1));
-        let report = service.shutdown(Duration::from_secs(5));
+        let report = shutdown_watched(service, Duration::from_secs(5));
         report.final_commit.unwrap();
 
         assert_eq!(h.sum(names::COMMIT_COUNT, &[]), Some(1));
@@ -1034,18 +1298,133 @@ mod tests {
     }
 
     /// A remote, intervals of an hour, and the first push (of nothing)
-    /// done, so only the final push can send what is recorded next.
-    fn idle_service(remote: &Path) -> (tempfile::TempDir, StateDir, Recorder, Service) {
+    /// done, so only the final push or a request can send what is
+    /// recorded next. The service runs on the returned paused clock: its
+    /// deadlines pass only when the test moves it.
+    fn idle_service(
+        remote: &Path,
+    ) -> (
+        tempfile::TempDir,
+        StateDir,
+        Recorder,
+        Service,
+        Arc<PausedClock>,
+    ) {
         let (dir, state) = setup(&[
             ("agentfs.commitWindow", "1h"),
             ("agentfs.pushInterval", "1h"),
             ("remote.origin.url", &remote.display().to_string()),
         ]);
         let (rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
-        let service = Service::start(com, pushers, Arc::new(NullSink)).unwrap();
-        // Let the first push (of nothing) happen.
-        thread::sleep(Duration::from_millis(100));
-        (dir, state, rec, service)
+        let clock = PausedClock::new();
+        let service =
+            Service::spawn(com, pushers, Arc::new(NullSink), None, clock.clone()).unwrap();
+        // The first push (of nothing) is done; the loop now waits an hour.
+        let first = push_now(&service.handle(), &[]);
+        assert!(first.still_running.is_empty(), "{first:?}");
+        (dir, state, rec, service, clock)
+    }
+
+    /// [`ServiceHandle::push_now`] of `remotes` on a service whose clock
+    /// stands still: it returns once every attempt is done, failing the
+    /// test after a minute.
+    fn push_now(handle: &ServiceHandle, remotes: &[&str]) -> PushNowReport {
+        let handle = handle.clone();
+        let remotes: Vec<String> = remotes.iter().map(|&r| r.to_owned()).collect();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            tx.send(handle.push_now(&remotes, Duration::from_secs(60)))
+                .unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("the push-now request returned")
+            .unwrap()
+    }
+
+    /// Shuts `service` down with `grace`, failing the test if that takes
+    /// a minute. On a clock that stands still the deadline never passes,
+    /// so it returns once every final push is reported.
+    fn shutdown_watched(service: Service, grace: Duration) -> ShutdownReport {
+        let (rx, _) = shutdown_in_background(service, grace);
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("the shutdown returned")
+    }
+
+    /// A clock that stands still until a test moves it, so a shutdown's
+    /// deadline passes exactly when the test says, however slow the
+    /// machine.
+    #[derive(Debug)]
+    struct PausedClock(Mutex<Instant>);
+
+    impl PausedClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(Instant::now())))
+        }
+
+        fn advance(&self, by: Duration) {
+            *self.0.lock().unwrap() += by;
+        }
+    }
+
+    impl Clock for PausedClock {
+        fn now(&self) -> Instant {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// Makes `remote`'s config a FIFO: libgit2 blocks opening it, which
+    /// stands in for a push hung on the network. Returns the FIFO.
+    fn hang(remote: &Path) -> std::path::PathBuf {
+        let fifo = remote.join("config");
+        fs::remove_file(&fifo).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        fifo
+    }
+
+    /// Lets the thread blocked opening `fifo` go.
+    fn release(fifo: &Path) {
+        use std::io::Write as _;
+        let mut writer = fs::OpenOptions::new().write(true).open(fifo).unwrap();
+        writer.write_all(b"").unwrap();
+    }
+
+    /// Waits until `what` holds, failing after a minute.
+    fn wait_for(what: &str, holds: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !holds() {
+            assert!(Instant::now() < deadline, "never: {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Shuts `service` down with `grace` on `clock` and moves the clock to
+    /// the deadline once `ready` holds: the shutdown has set its deadline,
+    /// and `ready` says the remotes are where the test wants them. The
+    /// shutdown must still be waiting then; it must return once the clock
+    /// reaches the deadline.
+    fn shutdown_at_deadline(
+        service: Service,
+        clock: &PausedClock,
+        grace: Duration,
+        ready: impl Fn() -> bool,
+    ) -> ShutdownReport {
+        let deadline = service.deadline.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(service.shutdown(grace)).unwrap());
+        wait_for("the deadline is set and the remotes are ready", || {
+            deadline.lock().unwrap().is_some() && ready()
+        });
+        assert!(rx.try_recv().is_err(), "returned before the deadline");
+        clock.advance(grace);
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("returned at the deadline")
     }
 
     /// Every shutdown pushes its final commit within the grace period.
@@ -1053,9 +1432,9 @@ mod tests {
     fn a_final_push_sends_the_final_commit() {
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (dir, state, rec, service) = idle_service(remote.path());
+        let (dir, state, rec, service, _clock) = idle_service(remote.path());
         record(&rec, dir.path(), "a");
-        let report = service.shutdown(Duration::from_secs(10));
+        let report = shutdown_watched(service, Duration::from_secs(10));
         report.final_commit.unwrap();
         assert!(report.abandoned_pushes.is_empty());
         let local = local_head(&state).expect("the final commit");
@@ -1074,8 +1453,8 @@ mod tests {
     fn nothing_new_makes_no_final_push() {
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (_dir, _state, _rec, service) = idle_service(remote.path());
-        let report = service.shutdown(Duration::from_secs(10));
+        let (_dir, _state, _rec, service, _clock) = idle_service(remote.path());
+        let report = shutdown_watched(service, Duration::from_secs(10));
         assert_eq!(
             report.final_pushes,
             [("origin".to_owned(), FinalPush::NothingNew)]
@@ -1087,9 +1466,9 @@ mod tests {
     fn zero_grace_skips_the_final_push() {
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (dir, state, rec, service) = idle_service(remote.path());
+        let (dir, state, rec, service, _clock) = idle_service(remote.path());
         record(&rec, dir.path(), "a");
-        let report = service.shutdown(Duration::ZERO);
+        let report = shutdown_watched(service, Duration::ZERO);
         let commit = report.final_commit.unwrap();
         assert_eq!(commit.commits, 1);
         assert!(local_head(&state).is_some());
@@ -1113,8 +1492,8 @@ mod tests {
     fn zero_grace_with_nothing_new_is_not_abandoned() {
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (_dir, _state, _rec, service) = idle_service(remote.path());
-        let report = service.shutdown(Duration::ZERO);
+        let (_dir, _state, _rec, service, _clock) = idle_service(remote.path());
+        let report = shutdown_watched(service, Duration::ZERO);
         assert!(report.abandoned_pushes.is_empty(), "{report:?}");
         assert_eq!(
             report.final_pushes,
@@ -1131,6 +1510,7 @@ mod tests {
         let handle = ServiceHandle {
             signal: signal.clone(),
             remotes: Arc::new(Vec::new()),
+            clock: Arc::new(SystemClock),
         };
         let waiters: Vec<_> = (0..2)
             .map(|_| {
@@ -1141,9 +1521,11 @@ mod tests {
         // A stand-in commit loop: once both requests are in, it serves
         // generation 1 (5 records) and then 2 (none) under one lock, so no
         // waiter can read between them.
-        let (state, both) = signal.wait_until(Instant::now() + Duration::from_secs(30), |s| {
-            s.commit_requested == 2
-        });
+        let (state, both) = signal.wait_until(
+            &SystemClock,
+            Instant::now() + Duration::from_secs(30),
+            |s| s.commit_requested == 2,
+        );
         assert!(both);
         drop(state);
         signal.update(|s| {
@@ -1170,35 +1552,37 @@ mod tests {
     /// The final push is abandoned at the deadline when the remote hangs.
     #[test]
     fn final_push_respects_the_deadline() {
-        use std::io::Write as _;
-
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (dir, state, rec, service) = idle_service(remote.path());
+        let (dir, state) = setup(&[
+            ("agentfs.commitWindow", "1h"),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.origin.url", &remote.path().display().to_string()),
+        ]);
+        let (rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
+        let clock = PausedClock::new();
+        let service =
+            Service::spawn(com, pushers, Arc::new(NullSink), None, clock.clone()).unwrap();
+        let pushing = service.pushes[0].stop.clone();
+        // The first push (of nothing) is done; the next waits an hour.
+        let first = service
+            .handle()
+            .push_now(&[], Duration::from_secs(60))
+            .unwrap();
+        assert!(first.still_running.is_empty(), "{first:?}");
         record(&rec, dir.path(), "a");
-        // Now the remote hangs: libgit2 blocks opening a FIFO config.
-        let fifo = remote.path().join("config");
-        fs::remove_file(&fifo).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
-        let start = Instant::now();
-        let report = service.shutdown(Duration::from_millis(300));
-        let took = start.elapsed();
-        assert!(took >= Duration::from_millis(250), "{took:?}");
-        assert!(took < Duration::from_secs(5), "{took:?}");
+        // Now the remote hangs.
+        let fifo = hang(remote.path());
+        // The final push starts, since the clock stands before the
+        // deadline, and hangs.
+        let report = shutdown_at_deadline(service, &clock, Duration::from_millis(300), || {
+            pushing.phase() != PushPhase::Idle
+        });
         report.final_commit.unwrap();
         assert!(local_head(&state).is_some());
         assert_eq!(report.abandoned_pushes, ["origin"]);
-        assert!(report.final_pushes.is_empty());
-        // Release the detached thread.
-        let mut writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        writer.write_all(b"").unwrap();
+        assert!(report.final_pushes.is_empty(), "{:?}", report.final_pushes);
+        release(&fifo);
     }
 
     #[test]
@@ -1223,59 +1607,486 @@ mod tests {
         let service = Service::start(com, pushers, Arc::new(NullSink)).unwrap();
         assert_eq!(service.remotes().count(), 0);
         record(&rec, dir.path(), "a");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while local_head(&state).is_none() {
-            assert!(Instant::now() < deadline, "never committed");
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_for("committed", || local_head(&state).is_some());
         let report = service.shutdown(Duration::ZERO);
         assert_eq!(report.final_commit.unwrap(), CommitReport::default());
         assert!(report.abandoned_pushes.is_empty());
     }
 
+    /// A push still running at the deadline is abandoned; a remote that
+    /// finished its final push within the grace is not.
     #[test]
     fn a_push_still_running_is_abandoned_after_the_grace_period() {
-        use std::io::Write as _;
-
-        // A remote whose config is a FIFO: libgit2 blocks opening it, which
-        // stands in for a push hung on the network.
-        let remote = tempfile::tempdir().unwrap();
-        git2::Repository::init_bare(remote.path()).unwrap();
-        let fifo = remote.path().join("config");
-        fs::remove_file(&fifo).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
+        let hung = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(hung.path()).unwrap();
+        let fifo = hang(hung.path());
+        let idle = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(idle.path()).unwrap();
         let (dir, state) = setup(&[
             ("agentfs.commitWindow", "10ms"),
-            ("remote.hung.url", &remote.path().display().to_string()),
-            (
-                "remote.idle.url",
-                &remote.path().join("missing").display().to_string(),
-            ),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.hung.url", &hung.path().display().to_string()),
+            ("remote.idle.url", &idle.path().display().to_string()),
         ]);
         let (rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
         record(&rec, dir.path(), "a");
         com.commit_pending().unwrap();
-        let service = Service::start(com, pushers, Arc::new(NullSink)).unwrap();
-        thread::sleep(Duration::from_millis(100));
+        let clock = PausedClock::new();
+        let service =
+            Service::spawn(com, pushers, Arc::new(NullSink), None, clock.clone()).unwrap();
+        let hung_pushing = service
+            .pushes
+            .iter()
+            .find(|p| p.name == "hung")
+            .unwrap()
+            .stop
+            .clone();
+        // The idle remote has everything and waits an hour: its final push
+        // finds nothing new.
+        let idle_push = service
+            .handle()
+            .push_now(&["idle".to_owned()], Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(idle_push.remotes[0].unpushed, Some(0), "{idle_push:?}");
+        // The hung remote's first push is stuck.
+        wait_for("the hung push started", || {
+            hung_pushing.phase() != PushPhase::Idle
+        });
 
-        let start = Instant::now();
-        let report = service.shutdown(Duration::from_millis(200));
-        let took = start.elapsed();
-        assert!(took >= Duration::from_millis(150), "{took:?}");
-        assert!(took < Duration::from_secs(3), "{took:?}");
+        let report = shutdown_at_deadline(service, &clock, Duration::from_millis(200), || true);
         report.final_commit.unwrap();
         assert_eq!(report.abandoned_pushes, ["hung"]);
+        assert_eq!(
+            report.final_pushes,
+            [("idle".to_owned(), FinalPush::NothingNew)]
+        );
+        release(&fifo);
+    }
 
-        // Release the detached thread.
-        let mut writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        writer.write_all(b"").unwrap();
+    /// Holds a push at the end of its negotiation, once armed, until
+    /// released: a push to a local remote is then inside its update.
+    #[derive(Default)]
+    struct Gate {
+        /// `(armed, entered, released)`.
+        state: Mutex<(bool, bool, bool)>,
+        cond: Condvar,
+    }
+
+    impl Gate {
+        fn arm(&self) {
+            self.state.lock().unwrap().0 = true;
+        }
+
+        fn pass(&self) {
+            let mut state = self.state.lock().unwrap();
+            if !state.0 {
+                return;
+            }
+            state.1 = true;
+            self.cond.notify_all();
+            while !state.2 {
+                state = self.cond.wait(state).unwrap();
+            }
+        }
+
+        fn entered(&self) -> bool {
+            self.state.lock().unwrap().1
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().2 = true;
+            self.cond.notify_all();
+        }
+    }
+
+    /// What [`held_final_push`] sets up.
+    struct Held {
+        remote: tempfile::TempDir,
+        _dir: tempfile::TempDir,
+        state: StateDir,
+        service: Service,
+        clock: Arc<PausedClock>,
+        gate: Arc<Gate>,
+        stop: Arc<PushStop>,
+    }
+
+    /// Where [`held_final_push`] holds the final push.
+    enum Hold {
+        /// Inside its update of the local remote.
+        InUpdate,
+        /// Its update ended, its bookkeeping not done.
+        AfterUpdate,
+        /// Its final push done, its report not yet sent.
+        BeforeReport,
+    }
+
+    /// A service on a paused clock whose one local remote has had its
+    /// first push, with `a` recorded, and its final push held by the gate
+    /// where `hold` says.
+    fn held_final_push(hold: Hold) -> Held {
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let (dir, state) = setup(&[
+            ("agentfs.commitWindow", "1h"),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.origin.url", &remote.path().display().to_string()),
+        ]);
+        let (rec, com, mut pushers) = open(dir.path(), &state, Arc::new(NullSink));
+        let gate = Arc::new(Gate::default());
+        let held = gate.clone();
+        match hold {
+            Hold::InUpdate => pushers[0].set_after_negotiation(move || held.pass()),
+            Hold::AfterUpdate => pushers[0].set_after_update(move || held.pass()),
+            Hold::BeforeReport => pushers[0].set_before_report(move || held.pass()),
+        }
+        let stop = pushers[0].stop_handle();
+        let clock = PausedClock::new();
+        let service =
+            Service::spawn(com, pushers, Arc::new(NullSink), None, clock.clone()).unwrap();
+        let first = service
+            .handle()
+            .push_now(&[], Duration::from_secs(60))
+            .unwrap();
+        assert!(first.still_running.is_empty(), "{first:?}");
+        record(&rec, dir.path(), "a");
+        gate.arm();
+        Held {
+            remote,
+            _dir: dir,
+            state,
+            service,
+            clock,
+            gate,
+            stop,
+        }
+    }
+
+    /// Ref locks left in `remote`.
+    fn ref_locks(remote: &Path) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.extension().is_some_and(|e| e == "lock") {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&remote.join("refs"), &mut found);
+        found
+    }
+
+    /// Shuts `service` down on another thread: the report arrives on the
+    /// receiver, and the flag is set once it was sent.
+    fn shutdown_in_background(
+        service: Service,
+        grace: Duration,
+    ) -> (mpsc::Receiver<ShutdownReport>, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel();
+        let returned = Arc::new(AtomicBool::new(false));
+        let flag = returned.clone();
+        thread::spawn(move || {
+            tx.send(service.shutdown(grace)).unwrap();
+            flag.store(true, Ordering::SeqCst);
+        });
+        (rx, returned)
+    }
+
+    /// A push to a local remote that is updating the remote when the
+    /// grace ends is waited for, not left to die with the process inside
+    /// the remote's ref update, which left `<remote>/refs/...lock` and
+    /// every later push refused (design §11.2).
+    #[test]
+    fn a_local_update_running_at_the_grace_end_is_waited_for() {
+        let held = held_final_push(Hold::InUpdate);
+        let grace = Duration::from_millis(300);
+        let (rx, returned) = shutdown_in_background(held.service, grace);
+        wait_for("the final push is updating the remote", || {
+            held.gate.entered()
+        });
+        held.clock.advance(grace);
+        wait_for("the shutdown cancelled the push, or returned", || {
+            held.stop.cancelled() || returned.load(Ordering::SeqCst)
+        });
+        assert!(
+            !returned.load(Ordering::SeqCst),
+            "the shutdown returned while the push was updating the local remote"
+        );
+        held.gate.release();
+        let report = rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        report.final_commit.as_ref().unwrap();
+        assert!(report.abandoned_pushes.is_empty(), "{report:?}");
+        assert!(report.abandoned_updates.is_empty(), "{report:?}");
+        let local = local_head(&held.state).expect("the final commit");
+        assert!(
+            matches!(
+                &report.final_pushes[..],
+                [(name, FinalPush::Pushed(PushOutcome::Pushed { to, .. }))]
+                    if name == "origin" && *to == local
+            ),
+            "{:?}",
+            report.final_pushes
+        );
+        assert_eq!(remote_head(held.remote.path()), Some(local));
+        assert!(ref_locks(held.remote.path()).is_empty());
+    }
+
+    /// A local update still running at the cap is abandoned, named apart
+    /// from pushes abandoned before they touched the remote: the stop
+    /// cannot wait for a hung filesystem forever.
+    #[test]
+    fn a_local_update_still_running_at_the_cap_is_abandoned() {
+        let mut held = held_final_push(Hold::InUpdate);
+        let cap = Duration::from_millis(200);
+        held.service.update_cap = cap;
+        held.service.decision_settle = Duration::from_millis(100);
+        let grace = Duration::from_millis(300);
+        let (rx, returned) = shutdown_in_background(held.service, grace);
+        wait_for("the final push is updating the remote", || {
+            held.gate.entered()
+        });
+        held.clock.advance(grace);
+        wait_for("the shutdown cancelled the push", || held.stop.cancelled());
+        assert!(!returned.load(Ordering::SeqCst), "returned before the cap");
+        held.clock.advance(cap);
+        let report = rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        report.final_commit.as_ref().unwrap();
+        assert!(report.abandoned_pushes.is_empty(), "{report:?}");
+        assert_eq!(report.abandoned_updates, ["origin"]);
+        assert!(report.final_pushes.is_empty(), "{report:?}");
+        held.gate.release();
+    }
+
+    /// A local push whose update has ended but which has not reported
+    /// yet is still waited for, past the window a decision gets: a
+    /// shutdown that looked in between once listed it abandoned. `hold`
+    /// is where it is held: in its bookkeeping (its push state, its
+    /// alarms), or with its report not yet sent.
+    fn a_local_push_is_waited_for_until_it_reports(hold: Hold) {
+        let mut held = held_final_push(hold);
+        // A decision gets 100 ms; the update up to 5 s.
+        held.service.decision_settle = Duration::from_millis(100);
+        held.service.update_cap = Duration::from_secs(5);
+        let grace = Duration::from_millis(300);
+        let (rx, returned) = shutdown_in_background(held.service, grace);
+        wait_for("the final push updated the remote", || held.gate.entered());
+        // Past the decision's window, before the cap.
+        held_past(
+            &held.clock,
+            &held.stop,
+            &returned,
+            grace + Duration::from_secs(1),
+        );
+        held.gate.release();
+        let report = rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        report.final_commit.as_ref().unwrap();
+        assert!(report.abandoned_pushes.is_empty(), "{report:?}");
+        assert!(report.abandoned_updates.is_empty(), "{report:?}");
+        let local = local_head(&held.state).expect("the final commit");
+        assert!(
+            matches!(
+                &report.final_pushes[..],
+                [(_, FinalPush::Pushed(PushOutcome::Pushed { to, .. }))] if *to == local
+            ),
+            "{:?}",
+            report.final_pushes
+        );
+    }
+
+    #[test]
+    fn a_local_push_finishing_after_its_update_is_waited_for() {
+        a_local_push_is_waited_for_until_it_reports(Hold::AfterUpdate);
+    }
+
+    #[test]
+    fn a_local_push_about_to_report_is_waited_for() {
+        a_local_push_is_waited_for_until_it_reports(Hold::BeforeReport);
+    }
+
+    /// Moves `clock` on by `by` and waits until the shutdown has looked
+    /// twice since, asserting it has not returned.
+    fn held_past(clock: &PausedClock, stop: &PushStop, returned: &AtomicBool, by: Duration) {
+        let before = stop.cancels();
+        clock.advance(by);
+        wait_for("the shutdown looked twice, or returned", || {
+            stop.cancels() >= before + 2 || returned.load(Ordering::SeqCst)
+        });
+        assert!(
+            !returned.load(Ordering::SeqCst),
+            "the shutdown returned while a push was still to be waited for"
+        );
+    }
+
+    /// One remote's thread held deciding its final push, another's held
+    /// in its local update: the shutdown still returns once the clock
+    /// passes the deadline plus the cap, naming both (design §11.2: the
+    /// stop is bounded however its pushes hang).
+    #[test]
+    fn a_stop_is_bounded_with_a_hung_update_and_a_hung_decision() {
+        let local = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(local.path()).unwrap();
+        let slow = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(slow.path()).unwrap();
+        let (dir, state) = setup(&[
+            ("agentfs.commitWindow", "1h"),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.local.url", &local.path().display().to_string()),
+            ("remote.slow.url", &slow.path().display().to_string()),
+        ]);
+        let (rec, com, mut pushers) = open(dir.path(), &state, Arc::new(NullSink));
+        let updating = Arc::new(Gate::default());
+        let deciding = Arc::new(Gate::default());
+        let mut stop = None;
+        for pusher in &mut pushers {
+            if pusher.name() == "local" {
+                let gate = updating.clone();
+                pusher.set_after_negotiation(move || gate.pass());
+                stop = Some(pusher.stop_handle());
+            } else {
+                let gate = deciding.clone();
+                pusher.set_before_unpushed(move || gate.pass());
+            }
+        }
+        let stop = stop.unwrap();
+        let clock = PausedClock::new();
+        let mut service =
+            Service::spawn(com, pushers, Arc::new(NullSink), None, clock.clone()).unwrap();
+        let first = push_now(&service.handle(), &[]);
+        assert!(first.still_running.is_empty(), "{first:?}");
+        record(&rec, dir.path(), "a");
+        updating.arm();
+        deciding.arm();
+        service.update_cap = Duration::from_millis(200);
+        service.decision_settle = Duration::from_millis(100);
+        let grace = Duration::from_millis(300);
+        let (rx, returned) = shutdown_in_background(service, grace);
+        wait_for("both final pushes are held", || {
+            updating.entered() && deciding.entered()
+        });
+        held_past(&clock, &stop, &returned, grace);
+        // Far past the cap: whatever still hangs is given up on.
+        clock.advance(Duration::from_secs(60));
+        let report = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the shutdown returned past the deadline plus the cap");
+        report.final_commit.as_ref().unwrap();
+        assert_eq!(report.abandoned_updates, ["local"]);
+        assert_eq!(report.abandoned_pushes, ["slow"]);
+        updating.release();
+        deciding.release();
+    }
+
+    /// What [`late_update`] leaves running.
+    struct LateUpdate {
+        _remote: tempfile::TempDir,
+        _dir: tempfile::TempDir,
+        clock: Arc<PausedClock>,
+        stop: Arc<PushStop>,
+        deciding: Arc<Gate>,
+        returned: Arc<AtomicBool>,
+        rx: mpsc::Receiver<ShutdownReport>,
+    }
+
+    /// A push-loop attempt updates a local remote across the deadline,
+    /// until the clock stands `ends` past it, and the thread then decides
+    /// its final push, held there by `deciding`. The shutdown gives a
+    /// decision `settle` and waits for nothing past `ceiling` after the
+    /// deadline.
+    fn late_update(settle: Duration, ceiling: Duration, ends: Duration) -> LateUpdate {
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let (dir, state) = setup(&[
+            ("agentfs.commitWindow", "1h"),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.origin.url", &remote.path().display().to_string()),
+        ]);
+        let (rec, com, mut pushers) = open(dir.path(), &state, Arc::new(NullSink));
+        let updating = Arc::new(Gate::default());
+        let deciding = Arc::new(Gate::default());
+        let gate = updating.clone();
+        pushers[0].set_after_negotiation(move || gate.pass());
+        let gate = deciding.clone();
+        pushers[0].set_before_unpushed(move || gate.pass());
+        let stop = pushers[0].stop_handle();
+        let clock = PausedClock::new();
+        let mut service =
+            Service::spawn(com, pushers, Arc::new(NullSink), None, clock.clone()).unwrap();
+        let first = push_now(&service.handle(), &[]);
+        assert!(first.still_running.is_empty(), "{first:?}");
+        record(&rec, dir.path(), "a");
+        updating.arm();
+        // A push-now attempt, held in its update; the request returns
+        // `Stopping` at the shutdown.
+        let handle = service.handle();
+        thread::spawn(move || handle.push_now(&[], Duration::from_secs(60)));
+        wait_for("the push-now attempt is updating", || updating.entered());
+        service.decision_settle = settle;
+        service.update_cap = ceiling;
+        let deadline = service.deadline.clone();
+        let grace = Duration::from_millis(300);
+        let (rx, returned) = shutdown_in_background(service, grace);
+        wait_for("the deadline is set", || deadline.lock().unwrap().is_some());
+        held_past(&clock, &stop, &returned, grace + ends);
+        deciding.arm();
+        updating.release();
+        wait_for("the thread decides after its update", || deciding.entered());
+        LateUpdate {
+            _remote: remote,
+            _dir: dir,
+            clock,
+            stop,
+            deciding,
+            returned,
+            rx,
+        }
+    }
+
+    /// A decision right after a local update that ended past the window a
+    /// decision gets from the deadline gets its window again, and the
+    /// remote is reported, not abandoned.
+    #[test]
+    fn a_decision_after_a_late_local_update_gets_its_window() {
+        let late = late_update(
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_millis(500),
+        );
+        let before = late.stop.cancels();
+        wait_for("the shutdown looked twice, or returned", || {
+            late.stop.cancels() >= before + 2 || late.returned.load(Ordering::SeqCst)
+        });
+        assert!(
+            !late.returned.load(Ordering::SeqCst),
+            "the shutdown gave up on a decision right after a late update"
+        );
+        late.deciding.release();
+        let report = late.rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(report.abandoned_pushes.is_empty(), "{report:?}");
+        assert!(report.abandoned_updates.is_empty(), "{report:?}");
+        assert_eq!(report.final_pushes.len(), 1, "{report:?}");
+    }
+
+    /// The window a decision gets after an update never reaches past the
+    /// ceiling: an update ending just before it and a decision that hangs
+    /// still end the stop there.
+    #[test]
+    fn a_decision_after_an_update_never_outlasts_the_ceiling() {
+        let late = late_update(
+            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_millis(900),
+        );
+        // Past the ceiling, inside the window the update's end opened.
+        late.clock.advance(Duration::from_millis(200));
+        let report = late
+            .rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the shutdown returned at the ceiling");
+        assert_eq!(report.abandoned_pushes, ["origin"]);
+        assert!(report.abandoned_updates.is_empty(), "{report:?}");
+        late.deciding.release();
     }
 
     fn record_as(rec: &Recorder, dir: &Path, name: &str, caller: Caller) {
@@ -1299,11 +2110,11 @@ mod tests {
     fn push_now_commits_and_pushes() {
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (dir, state, rec, service) = idle_service(remote.path());
+        let (dir, state, rec, service, _clock) = idle_service(remote.path());
         let handle = service.handle();
         assert_eq!(handle.remotes(), ["origin"]);
         record(&rec, dir.path(), "a");
-        let report = handle.push_now(&[], Duration::from_secs(30)).unwrap();
+        let report = push_now(&handle, &[]);
         let committed = report.committed.clone().unwrap();
         assert_eq!((committed.records, committed.commits), (1, 1));
         assert!(report.still_running.is_empty());
@@ -1318,15 +2129,13 @@ mod tests {
         );
         assert_eq!(result.unpushed, Some(0));
         // A second request with nothing new is up to date.
-        let again = handle
-            .push_now(&["origin".to_owned()], Duration::from_secs(30))
-            .unwrap();
-        assert_eq!(again.committed.unwrap().records, 0);
-        assert!(matches!(
-            again.remotes[0].outcome,
-            PushOutcome::UpToDate { .. }
-        ));
-        let report = service.shutdown(Duration::from_secs(5));
+        let again = push_now(&handle, &["origin"]);
+        assert_eq!(again.committed.as_ref().unwrap().records, 0);
+        assert!(
+            matches!(again.remotes[0].outcome, PushOutcome::UpToDate { .. }),
+            "{again:?}"
+        );
+        let report = shutdown_watched(service, Duration::from_secs(5));
         assert_eq!(
             report.final_pushes,
             [("origin".to_owned(), FinalPush::NothingNew)]
@@ -1338,41 +2147,37 @@ mod tests {
     fn push_now_bypasses_backoff() {
         let dir = tempfile::tempdir().unwrap();
         let remote = dir.path().join("later.git");
-        let (dir2, state, rec, service) = idle_service(&remote);
+        let (dir2, state, rec, service, _clock) = idle_service(&remote);
         // The first push failed (the remote does not exist), so the loop
         // backs off for an hour; now the remote appears.
         git2::Repository::init_bare(&remote).unwrap();
         record(&rec, dir2.path(), "a");
-        let started = Instant::now();
-        let report = service
-            .handle()
-            .push_now(&[], Duration::from_secs(30))
-            .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(20));
+        // Without the bypass, the request would wait out the hour.
+        let report = push_now(&service.handle(), &[]);
         assert!(report.remotes[0].outcome.is_success(), "{report:?}");
         assert_eq!(remote_head(&remote), local_head(&state));
-        service.shutdown(Duration::ZERO);
+        shutdown_watched(service, Duration::ZERO);
     }
 
     #[test]
     fn push_now_unknown_remote() {
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (_dir, _state, _rec, service) = idle_service(remote.path());
+        let (_dir, _state, _rec, service, _clock) = idle_service(remote.path());
         assert_eq!(
             service
                 .handle()
                 .push_now(&["nope".to_owned()], Duration::from_secs(1)),
             Err(PushNowError::UnknownRemote("nope".into()))
         );
-        service.shutdown(Duration::ZERO);
+        shutdown_watched(service, Duration::ZERO);
     }
 
     #[test]
     fn push_now_after_close_is_stopping() {
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (dir, state, rec, service) = idle_service(remote.path());
+        let (dir, state, rec, service, _clock) = idle_service(remote.path());
         let handle = service.handle();
         handle.close();
         assert_eq!(
@@ -1382,7 +2187,7 @@ mod tests {
         // Closing refuses requests only: the loops still run, and the
         // shutdown still commits and pushes.
         record(&rec, dir.path(), "a");
-        let report = service.shutdown(Duration::from_secs(10));
+        let report = shutdown_watched(service, Duration::from_secs(10));
         assert_eq!(report.final_commit.unwrap().commits, 1);
         assert_eq!(remote_head(remote.path()), local_head(&state));
         assert_eq!(
@@ -1395,40 +2200,35 @@ mod tests {
     /// names the remote; the attempt carries on.
     #[test]
     fn push_now_times_out_and_reports_still_running() {
-        use std::io::Write as _;
-
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (dir, state, rec, service) = idle_service(remote.path());
+        let (dir, state, rec, service, clock) = idle_service(remote.path());
+        let pushing = service.pushes[0].stop.clone();
         record(&rec, dir.path(), "a");
-        let fifo = remote.path().join("config");
-        fs::remove_file(&fifo).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
-        // The timeout also covers the commit made first: long enough for
-        // it on a loaded CI runner (500 ms was not, once).
-        let started = Instant::now();
-        let report = service
-            .handle()
-            .push_now(&[], Duration::from_secs(2))
+        let fifo = hang(remote.path());
+        let handle = service.handle();
+        let timeout = Duration::from_millis(200);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(handle.push_now(&[], timeout)).unwrap());
+        // The loop waits an hour, so the attempt that starts serves the
+        // request, after its commit; it hangs, and the request waits for
+        // it until the clock reaches the timeout.
+        wait_for("the request's push started", || {
+            pushing.phase() != PushPhase::Idle
+        });
+        assert!(rx.try_recv().is_err(), "returned before its timeout");
+        clock.advance(timeout);
+        let report = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("returned at its timeout")
             .unwrap();
-        let took = started.elapsed();
-        assert!(took >= Duration::from_millis(1900), "{took:?}");
-        assert!(took < Duration::from_secs(10), "{took:?}");
         assert_eq!(report.committed.unwrap().commits, 1);
         assert!(local_head(&state).is_some());
         assert!(report.remotes.is_empty());
         assert_eq!(report.still_running, ["origin"]);
-        let report = service.shutdown(Duration::from_millis(100));
+        let report = shutdown_at_deadline(service, &clock, Duration::from_millis(100), || true);
         assert_eq!(report.abandoned_pushes, ["origin"]);
-        let mut writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        writer.write_all(b"").unwrap();
+        release(&fifo);
     }
 
     /// Push now never commits an operation still running (a restore):
@@ -1439,7 +2239,7 @@ mod tests {
 
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
-        let (dir, state, rec, service) = idle_service(remote.path());
+        let (dir, state, rec, service, _clock) = idle_service(remote.path());
         record(&rec, dir.path(), "a");
         let guard = rec
             .begin_operation(
@@ -1451,10 +2251,7 @@ mod tests {
             )
             .unwrap();
         record_as(&rec, dir.path(), "b", Caller { pid: 77, ..CALLER });
-        let report = service
-            .handle()
-            .push_now(&[], Duration::from_secs(30))
-            .unwrap();
+        let report = push_now(&service.handle(), &[]);
         assert_eq!(report.committed.unwrap().records, 1);
         let repo = git2::Repository::open_bare(state.git()).unwrap();
         let tree = repo
@@ -1466,7 +2263,7 @@ mod tests {
         assert!(tree.get_name("b").is_none(), "the restore is still running");
         assert_eq!(remote_head(remote.path()), local_head(&state));
         guard.finish();
-        let report = service.shutdown(Duration::from_secs(10));
+        let report = shutdown_watched(service, Duration::from_secs(10));
         assert_eq!(report.final_commit.unwrap().records, 1);
         assert_eq!(remote_head(remote.path()), local_head(&state));
     }
