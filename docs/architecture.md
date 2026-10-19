@@ -243,8 +243,8 @@ One loop per remote (`service.rs`), every `pushInterval`, with backoff
 after failures (§11.2). Each attempt (`push.rs`, `push_once`), in this
 order:
 
-1. takes the remote's push lock (a repack skips its round while any push
-   holds one, so a push never reads a pack being deleted) and reloads the
+1. takes the remote's push lock (a repack waits a second and tries again
+   while any push holds one, so a push never reads a pack being deleted) and reloads the
    remote's push state, since another process may have pushed;
    with `agentfsMaxPushSize` set, measures the pack the remote lacks
    (`push_size.rs`) before connecting: over the limit, only the longest

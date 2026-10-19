@@ -14,7 +14,8 @@
 //! - **Repack** (on the commit thread): every `repackInterval` (design §8)
 //!   the commit loop runs [`crate::repack::repack`] between commits, then
 //!   refreshes the committer's object database. A failure emits
-//!   [`Event::RepackFailed`] and is tried again an interval later. A stop
+//!   [`Event::RepackFailed`] and is tried again an interval later; a round
+//!   a push put off is tried again `retry` (a second) later. A stop
 //!   kills a repack in progress, so shutdown never waits for one.
 //!
 //! [`Service::shutdown`] stops every loop, makes the final commit, then
@@ -715,15 +716,16 @@ struct Repacker {
 
 impl Repacker {
     /// Repacks the committer's repository; failures become events. A stop
-    /// kills a repack in progress.
-    fn run(&self, committer: &Committer, stop: &Stop) {
+    /// kills a repack in progress. Returns how long until the next round:
+    /// the schedule's `retry` when a push put this one off, else its
+    /// `interval`.
+    fn run(&self, committer: &Committer, stop: &Stop) -> Duration {
         let repo = committer.history().repo();
         let result = repack::repack(Path::new("git"), repo.path(), &self.push_locks, stop);
-        if matches!(
-            result,
-            Ok(RepackOutcome::PushInProgress | RepackOutcome::NothingToDo)
-        ) {
-            return;
+        match result {
+            Ok(RepackOutcome::PushInProgress) => return self.schedule.retry,
+            Ok(RepackOutcome::NothingToDo) => return self.schedule.interval,
+            _ => {}
         }
         // A repack that failed late may still have moved objects into new
         // packs: see them either way.
@@ -731,9 +733,10 @@ impl Repacker {
         let error = match (result, refreshed) {
             (Err(e), _) => e.to_string(),
             (Ok(_), Err(e)) => format!("refreshing the object database: {e}"),
-            (Ok(_), Ok(())) => return,
+            (Ok(_), Ok(())) => return self.schedule.interval,
         };
         self.events.emit(Event::RepackFailed { error });
+        self.schedule.interval
     }
 }
 
@@ -777,8 +780,8 @@ fn commit_loop(
         if let (Some(r), Some(at)) = (repacker, next_repack)
             && Instant::now() >= at
         {
-            r.run(committer, stop);
-            next_repack = Some(Instant::now() + r.schedule.interval.max(MIN_DELAY));
+            let wait = r.run(committer, stop);
+            next_repack = Some(Instant::now() + wait.max(MIN_DELAY));
         }
         if committer.backlog() == 0 {
             continue;
@@ -909,6 +912,7 @@ mod tests {
         let schedule = RepackSchedule {
             first: Duration::ZERO,
             interval: Duration::from_millis(20),
+            retry: Duration::from_millis(20),
         };
         let service =
             Service::start_with_repack(com, pushers, sink.clone(), Some(schedule)).unwrap();
@@ -936,6 +940,72 @@ mod tests {
             "{events:?}"
         );
     }
+
+    /// A round a push put off is tried again `retry` later, not an
+    /// interval later, so pushes that keep coming cannot starve the repack.
+    #[test]
+    fn a_repack_a_push_put_off_is_tried_again_soon() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("git is not installed: skipped");
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let url = remote.path().display().to_string();
+        let (dir, state) = setup(&[
+            ("agentfs.commitWindow", "10ms"),
+            ("agentfs.pushInterval", "1h"),
+            ("remote.good.url", &url),
+        ]);
+        // Something loose to pack.
+        git2::Repository::open_bare(state.git())
+            .unwrap()
+            .blob(b"loose")
+            .unwrap();
+        // A push in progress, as far as the repack can tell.
+        let lock_path = state.push_lock("good");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let sink = Arc::new(MemorySink::default());
+        let (_rec, com, pushers) = open(dir.path(), &state, sink.clone());
+        let schedule = RepackSchedule {
+            first: Duration::ZERO,
+            interval: Duration::from_secs(3600),
+            retry: Duration::from_millis(50),
+        };
+        let service =
+            Service::start_with_repack(com, pushers, sink.clone(), Some(schedule)).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(packs(&state), 0, "a repack ran while a push held its lock");
+        drop(lock);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while packs(&state) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the round the push put off was not tried again"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        service.shutdown(Duration::ZERO).final_commit.unwrap();
+        let events = sink.take();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::RepackFailed { .. })),
+            "{events:?}"
+        );
+    }
+
     #[test]
     fn stop_wakes_waiters() {
         let stop = Arc::new(Stop::default());

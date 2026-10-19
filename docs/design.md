@@ -1402,9 +1402,11 @@ naming the line), rather than being ignored as git ignores unknown values.
   `0` or `off` disables, at least 1m) the commit loop runs
   `git repack -d -q --geometric=2` between commits, so versions of a
   database are delta-compressed into packs. It never prunes. It takes
-  every remote's push lock without waiting and skips the round if a push
-  is running; a failure raises `RepackFailed` (§13) and is tried again an
-  interval later. The container image ships the `git` CLI for this;
+  every remote's push lock without waiting; if a push is running it tries
+  again a second later, not an interval later, so pushes that keep coming
+  (several remotes, a short `pushInterval`, retries) cannot put it off
+  round after round. A failure raises `RepackFailed` (§13) and is tried
+  again an interval later. The container image ships the `git` CLI for this;
   without it, every round fails with `RepackFailed`.
   - *Bounded.* A round with no loose objects is skipped without starting
     git. git runs with one thread, `pack.windowMemory=64m`,
@@ -4354,7 +4356,7 @@ runner.
 | `fsync` class: capture | Class handles are never passthrough; every content or name change of a member holds a writer-preferring gate around its syscall, and a capture freezes the gate and copies every member as one atomic record. Triggers: `fsync` (rate-limited, and a capture failure does not fail the `fsync`), a trailing timer at max(first change, last attempt) + interval, the group's last close (`EIO` on failure), last release, unmount. A member's own namespace changes are folded into the next capture; a group an operator operation changes is captured once, at the operation's end. The capture holds the mount's name lock, so namespace changes anywhere on the mount wait for the copy. A member read error other than `ENOENT`/`ENOTDIR` fails the capture (§8) |
 | Atomic records | A journal record flag: at record time a refused member, or one a path rule skips (`group_member_skipped`), skips the rest of the group (`GroupRefused`), at commit time a refused change drops the whole record; a refused capture counts as done (§3.4, §8) |
 | `agentfs.maxSize` | An operator attribute for any path, refusing larger content (`max_size`) whatever the store, checked on the size on disk and on the frozen copy at record time, not again at commit; a file moved by a directory rename is checked against its new path's limit by the move's reconciliation and removed if over it (§3.1, §4.2, §8) |
-| Repack | `git repack -d -q --geometric=2` with bitmaps off, one thread, bounded window, delta cache and big-file threshold (about 256 MiB), a cleared environment and system and global config ignored, skipped when nothing is loose, killed on stop, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); skipped while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
+| Repack | `git repack -d -q --geometric=2` with bitmaps off, one thread, bounded window, delta cache and big-file threshold (about 256 MiB), a cleared environment and system and global config ignored, skipped when nothing is loose, killed on stop, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); put off by a second while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
 | Patch submission | A patch is a single commit pushed to `inbox/<n>` with a create-only lease (`--force-with-lease=<ref>:`); a race loses and takes `n+1`. `agentfs patch submit` wraps the producer's `git`; plain git works the same (§12, [runbook](runbooks/patch-queue.md)) |
 | Patch application | At mount only, after journal replay and before the service and FUSE start; a cherry-pick through the restore engine's checks, recorded as one atomic operation of kind `patch` with the patch's author and agentfs as committer; the first failure blocks the queue, raises `PatchBlocked`, and the volume mounts anyway (§12) |
 | Patch idempotency | Decided by the branch's trailers (`Agentfs-Inbox`, `Agentfs-Patch`), never by refs or a cache; refs move after the commit, so a crash anywhere re-applies nothing (§12) |

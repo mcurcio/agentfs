@@ -35,8 +35,10 @@
 //! the committer; afterwards the committer's object database is refreshed
 //! so it sees the new packs. It runs only while no push is in progress (it
 //! takes every remote's push lock, without waiting), so a push never reads
-//! a pack being deleted; when a push holds a lock, the repack waits for
-//! the next round. A stop (shutdown) kills a repack in progress: git
+//! a pack being deleted. A round a push put off is tried again
+//! [`REPACK_RETRY`] later, not an interval later, so pushes that keep
+//! coming (several remotes, a short `pushInterval`, retries) cannot put
+//! the repack off round after round. A stop (shutdown) kills a repack in progress: git
 //! writes new packs before it deletes old ones, so a killed repack loses
 //! nothing (it may leave a temporary file, which the next one ignores).
 
@@ -75,6 +77,9 @@ pub const REPACK_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 /// How often a running repack checks for a stop.
 const POLL: Duration = Duration::from_millis(100);
 
+/// How soon a round a push put off is tried again.
+pub const REPACK_RETRY: Duration = Duration::from_secs(1);
+
 #[derive(Debug, thiserror::Error)]
 pub enum RepackError {
     #[error("running git: {0}")]
@@ -109,14 +114,18 @@ pub struct RepackSchedule {
     pub first: Duration,
     /// Between repacks.
     pub interval: Duration,
+    /// After a round a push put off ([`RepackOutcome::PushInProgress`]).
+    pub retry: Duration,
 }
 
 impl RepackSchedule {
-    /// The first repack one `interval` after start, then every `interval`.
+    /// The first repack one `interval` after start, then every `interval`;
+    /// a round a push put off is tried again [`REPACK_RETRY`] later.
     pub fn every(interval: Duration) -> Self {
         Self {
             first: interval,
             interval,
+            retry: REPACK_RETRY,
         }
     }
 }
