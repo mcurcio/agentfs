@@ -130,6 +130,27 @@ final push prints its reason (`final push: origin: failed (...)`), and
 `--push-grace 0s` skips it (`final push: origin: skipped, ...`). Nothing
 is lost; the commits are pushed by the next start.
 
+A push to a path or `file://` remote writes that remote's pack and refs
+from this process, so one already doing so at the deadline is let
+finish, at most 10 s more (design §11.2). Only a stalled disk outlasts
+that: shutdown then prints
+
+```
+final push: origin: still updating the local remote 10s after the push grace's end; abandoned, and a ref lock may remain in the remote ...
+```
+
+and the process may have exited holding the remote's ref lock. Every
+later push of that remote then fails `refused` with `failed to lock file
+'<remote>/refs/heads/agentfs/<volume>.lock' for writing`. Make sure
+nothing else pushes that branch (no other mount, `run`, `serve-history`
+or `agentfs push` of the volume, on any node, and no other writer of
+the remote), then remove the lock and push:
+
+```sh
+rm <remote>/refs/heads/agentfs/<volume>.lock
+agentfs --state "$STATE" push
+```
+
 ## A remote that hangs
 
 A remote that accepts the connection and then never answers holds only

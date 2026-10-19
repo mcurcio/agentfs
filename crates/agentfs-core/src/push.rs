@@ -64,6 +64,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -80,12 +81,15 @@ use crate::lfs::upload::objects_to_upload;
 use crate::lfs::{Direction, LfsError, ObjectCache, Transfer, UploadReport, transfer_for};
 use crate::push_size::Step;
 use crate::remote_auth::{AuthState, RemoteAuth};
+use crate::remote_url::Transport;
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::StateDir;
 
 mod claim;
+mod stop;
 
 pub use claim::{Claim, StartBranchMoved, claim, start_branch_moved};
+pub use stop::PushStop;
 
 /// The longest delay between retries of a failing remote, unless
 /// `pushInterval` is longer.
@@ -429,6 +433,12 @@ pub struct RemotePusher {
     /// The last attempt pushed only part of the backlog (design §11.3):
     /// the next follows at once.
     step_pending: bool,
+    /// Cancels its attempts at shutdown (design §11.2).
+    stop: Arc<PushStop>,
+    /// Runs at the end of a push's negotiation, once its update began: a
+    /// test holds a push there.
+    #[cfg(test)]
+    after_negotiation: Option<Box<dyn Fn() + Send>>,
     /// Runs between the queue push's listing and its pushes: a test moves
     /// the branch there.
     #[cfg(test)]
@@ -470,9 +480,24 @@ impl RemotePusher {
                 .is_some_and(|p| p.name == remote.name),
             queue: None,
             step_pending: false,
+            stop: Arc::default(),
+            #[cfg(test)]
+            after_negotiation: None,
             #[cfg(test)]
             after_queue_listing: None,
         })
+    }
+
+    /// What cancels this pusher's attempts (design §11.2).
+    pub fn stop_handle(&self) -> Arc<PushStop> {
+        self.stop.clone()
+    }
+
+    /// Runs `hook` at the end of each push's negotiation, once its update
+    /// began.
+    #[cfg(test)]
+    pub(crate) fn set_after_negotiation(&mut self, hook: impl Fn() + Send + 'static) {
+        self.after_negotiation = Some(Box::new(hook));
     }
 
     /// What the last [`RemotePusher::push_once`]'s queue push did; `None`
@@ -1639,6 +1664,13 @@ impl RemotePusher {
                         }
                     }
                 }
+                // The last point where libgit2 lets a push stop.
+                self.stop
+                    .enter(self.remote.transport() == Transport::Local)?;
+                #[cfg(test)]
+                if let Some(hook) = &self.after_negotiation {
+                    hook();
+                }
                 Ok(())
             });
             callbacks.push_update_reference(|name, status| {
@@ -1657,6 +1689,7 @@ impl RemotePusher {
             ));
             remote.push(refspecs, Some(&mut options))
         })();
+        self.stop.leave();
         Attempt {
             result,
             negotiated: negotiated.get(),
@@ -3283,6 +3316,32 @@ mod tests {
         assert_eq!(
             remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
             Some(head)
+        );
+    }
+
+    /// A push cancelled at shutdown stops at its negotiation: nothing
+    /// reaches the remote, and no ref of it is locked or moved.
+    #[test]
+    fn a_cancelled_push_sends_nothing() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        bare(remote_dir.path());
+        let mut v = Vol::new(
+            "vol",
+            &[("origin", &remote_dir.path().display().to_string())],
+        );
+        v.commit();
+        let (_events, sink_events) = sink();
+        let mut pusher = v.pusher("origin", sink_events);
+        assert!(!pusher.stop_handle().cancel(), "nothing is updating");
+        let outcome = pusher.push_once();
+        assert!(
+            matches!(&outcome, PushOutcome::Failed { message, .. }
+                if message.contains("cancelled at shutdown")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
+            None
         );
     }
 

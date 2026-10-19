@@ -1790,9 +1790,22 @@ agentfs does not scan content for secrets and does not hold pushes.
   (`mount`, `run`, `serve-history`) gives each remote that lacks commits
   one more push attempt, all within `--push-grace` (default 5 s) from the
   stop: stopping a pod waits at most that long for a push, never retries,
-  and never waits longer. An attempt is only started before the deadline,
-  and a remote still inside an attempt then is left (`abandoned`); what
-  stays unpushed goes out on the next start. A remote that started no
+  and never waits longer, but for one case below. An attempt is only
+  started before the deadline. At the deadline every attempt is
+  cancelled: one that has not finished its negotiation sends nothing,
+  and a remote still inside an attempt over the network is left
+  (`abandoned`); what stays unpushed goes out on the next start. As with
+  git's receive-pack, a transfer may be dropped, but a ref update
+  completes or never starts. A path or `file://` remote is updated by
+  this process itself (libgit2's local transport writes the pack, then
+  takes `<remote>/refs/...lock` for each ref), and libgit2 cannot stop
+  it past its negotiation. Exiting inside it left the ref lock, and every
+  later push of that ref was refused. So a push to a local remote that is
+  past its negotiation at the deadline is waited for, at most
+  `LOCAL_UPDATE_CAP` (10 s) more; if it is still running then, shutdown
+  exits as before and says a ref lock may remain (`still updating the
+  local remote ...`, [stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)).
+  A remote that started no
   attempt is reported as skipped or up to date, never abandoned (shutdown
   waits up to 2 s past the deadline for that local decision).
   `--push-grace 0s` skips the final push. Each remote's result is printed
@@ -4299,7 +4312,7 @@ runner.
 | LFS object size limit | `remote.<name>.agentfsMaxLfsObjectSize`, per object: the smallest across valid remotes refuses LFS content at record time (`PathRefused`, `lfs_object_too_large`, also before the freeze) with a commit-time backstop, never falling back to a blob; each remote's own limit fails its push as `too_large` at stage `lfs` before any upload; no per-push LFS byte budget (§7, §11.3, 2026-10) |
 | Push size limit | `remote.<name>.agentfsMaxPushSize`, measured before connecting with libgit2's pack builder (git pack only, not LFS); a backlog over it pushed in first-parent steps with `PushLimited` and the next step at once, applied and diverged refs held for the full push; a single commit over it fails as `too_large` with backoff, nothing sent; `agentfs push` steps until up to date (§11.3, 2026-10-13) |
 | Remotes | Any git remote, several at once (§11.1) |
-| Push timing | Intervals, independent of pod lifecycle, plus one bounded push at shutdown in `mount`, `run` and `serve-history`: after the final commit, one attempt per remote that lacks commits, within `--push-grace` (5 s; `0s` skips it), never retried and never extending shutdown past the grace. This sits beside the earlier decision that pushes run at intervals and that a pod's stop never waits on a push: the stop waits at most the grace, and what stays unpushed goes out on the next start (§11.2, 2026-10-13) |
+| Push timing | Intervals, independent of pod lifecycle, plus one bounded push at shutdown in `mount`, `run` and `serve-history`: after the final commit, one attempt per remote that lacks commits, within `--push-grace` (5 s; `0s` skips it), never retried and never extending shutdown past the grace. This sits beside the earlier decision that pushes run at intervals and that a pod's stop never waits on a push: the stop waits at most the grace, and what stays unpushed goes out on the next start (§11.2, 2026-10-13). Amended 2026-10-18: at the grace's end every push is cancelled, and a push to a path or `file://` remote already past its negotiation is waited for, up to `LOCAL_UPDATE_CAP` (10 s) more, rather than cut off. The reason: an abandoned local push died with the process inside libgit2's ref update and left `remote.git/refs/heads/agentfs/<volume>.lock`, and every later push was refused, so "what stays unpushed goes out on the next start" did not hold (found in `csi_service.rs` on a slow disk). The cost: a stop can take up to the grace plus 10 s when a local remote's disk is slow. A design choice (the flaky-test fix), not the owner's words |
 | Recovery | `agentfs restore` and `agentfs revert`, plus operator runbooks; further tooling discovered from use (§15) |
 | Telemetry | OpenTelemetry (§13) |
 | Secret scanning | Not in scope (§10) |
