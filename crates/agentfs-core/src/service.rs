@@ -994,8 +994,11 @@ mod tests {
         );
     }
 
-    /// A round a push put off is tried again `retry` later, not an
-    /// interval later, so pushes that keep coming cannot starve the repack.
+    /// A round a push put off is due again `retry` later, not an interval
+    /// later, so pushes that keep coming cannot starve the repack; the
+    /// commit loop schedules its next round by what [`Repacker::run`]
+    /// returns. Each round here is called directly, so the test knows a
+    /// round met the held lock rather than hoping one ran in time.
     #[test]
     fn a_repack_a_push_put_off_is_tried_again_soon() {
         if std::process::Command::new("git")
@@ -1006,14 +1009,7 @@ mod tests {
             eprintln!("git is not installed: skipped");
             return;
         }
-        let remote = tempfile::tempdir().unwrap();
-        git2::Repository::init_bare(remote.path()).unwrap();
-        let url = remote.path().display().to_string();
-        let (dir, state) = setup(&[
-            ("agentfs.commitWindow", "10ms"),
-            ("agentfs.pushInterval", "1h"),
-            ("remote.good.url", &url),
-        ]);
+        let (dir, state) = setup(&[]);
         // Something loose to pack.
         git2::Repository::open_bare(state.git())
             .unwrap()
@@ -1030,21 +1026,31 @@ mod tests {
             .unwrap();
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
         let sink = Arc::new(MemorySink::default());
-        let (_rec, com, pushers) = open(dir.path(), &state, sink.clone());
+        let (_rec, com, _pushers) = open(dir.path(), &state, sink.clone());
         let schedule = RepackSchedule {
             first: Duration::ZERO,
             interval: Duration::from_secs(3600),
             retry: Duration::from_millis(50),
         };
-        let service =
-            Service::start_with_repack(com, pushers, sink.clone(), Some(schedule)).unwrap();
-        thread::sleep(Duration::from_millis(300));
+        let repacker = Repacker {
+            schedule,
+            push_locks: vec![lock_path],
+            events: sink.clone(),
+        };
+        let stop = Stop::default();
+        assert_eq!(
+            repacker.run(&com, &stop),
+            schedule.retry,
+            "a round a push put off is due again after retry"
+        );
         assert_eq!(packs(&state), 0, "a repack ran while a push held its lock");
         drop(lock);
-        wait_for("the round the push put off tried again", || {
-            packs(&state) > 0
-        });
-        service.shutdown(Duration::ZERO).final_commit.unwrap();
+        assert_eq!(
+            repacker.run(&com, &stop),
+            schedule.interval,
+            "a round that ran is due again after the interval"
+        );
+        assert!(packs(&state) > 0, "the round after the push did not repack");
         let events = sink.take();
         assert!(
             !events
