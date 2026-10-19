@@ -86,7 +86,7 @@ mod tests {
             }
         }
         spawner.join().unwrap();
-        assert_eq!(busy, 0, "busy with no holder, {busy} times of {}", taken + busy);
+        assert_eq!(busy, 0, "busy with no holder, of {} takes", taken + busy);
     }
 
     #[test]
