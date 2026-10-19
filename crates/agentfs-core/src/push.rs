@@ -89,7 +89,7 @@ mod claim;
 mod stop;
 
 pub use claim::{Claim, StartBranchMoved, claim, start_branch_moved};
-pub use stop::PushStop;
+pub use stop::{PushPhase, PushStop};
 
 /// The longest delay between retries of a failing remote, unless
 /// `pushInterval` is longer.
@@ -439,6 +439,10 @@ pub struct RemotePusher {
     /// test holds a push there.
     #[cfg(test)]
     after_negotiation: Option<Box<dyn Fn() + Send>>,
+    /// Runs once a push's update ended, before its bookkeeping: a test
+    /// holds a push there.
+    #[cfg(test)]
+    after_update: Option<Box<dyn Fn() + Send>>,
     /// Runs between the queue push's listing and its pushes: a test moves
     /// the branch there.
     #[cfg(test)]
@@ -484,6 +488,8 @@ impl RemotePusher {
             #[cfg(test)]
             after_negotiation: None,
             #[cfg(test)]
+            after_update: None,
+            #[cfg(test)]
             after_queue_listing: None,
         })
     }
@@ -498,6 +504,12 @@ impl RemotePusher {
     #[cfg(test)]
     pub(crate) fn set_after_negotiation(&mut self, hook: impl Fn() + Send + 'static) {
         self.after_negotiation = Some(Box::new(hook));
+    }
+
+    /// Runs `hook` once each push's update ended, before its bookkeeping.
+    #[cfg(test)]
+    pub(crate) fn set_after_update(&mut self, hook: impl Fn() + Send + 'static) {
+        self.after_update = Some(Box::new(hook));
     }
 
     /// What the last [`RemotePusher::push_once`]'s queue push did; `None`
@@ -1690,6 +1702,10 @@ impl RemotePusher {
             remote.push(refspecs, Some(&mut options))
         })();
         self.stop.leave();
+        #[cfg(test)]
+        if let Some(hook) = &self.after_update {
+            hook();
+        }
         Attempt {
             result,
             negotiated: negotiated.get(),
@@ -3332,7 +3348,7 @@ mod tests {
         v.commit();
         let (_events, sink_events) = sink();
         let mut pusher = v.pusher("origin", sink_events);
-        assert!(!pusher.stop_handle().cancel(), "nothing is updating");
+        assert_eq!(pusher.stop_handle().cancel(), PushPhase::Idle);
         let outcome = pusher.push_once();
         assert!(
             matches!(&outcome, PushOutcome::Failed { message, .. }

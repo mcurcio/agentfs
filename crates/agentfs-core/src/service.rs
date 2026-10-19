@@ -47,14 +47,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::events::{Event, Events};
-use crate::push::{PushOutcome, PushStop, QueuePush, RemotePusher, backoff};
+use crate::push::{PushOutcome, PushPhase, PushStop, QueuePush, RemotePusher, backoff};
 use crate::repack::{self, RepackOutcome, RepackSchedule};
 use crate::volume::{CommitReport, Committer, VolumeError};
 
@@ -420,11 +419,10 @@ impl ServiceHandle {
 struct PushThread {
     name: String,
     handle: JoinHandle<()>,
-    /// Set while the thread is inside a push attempt (network I/O); clear
-    /// while it sleeps or decides its final push, which reads only local
-    /// state.
-    pushing: Arc<AtomicBool>,
-    /// Cancels its attempts at the grace's end.
+    /// Where the thread is ([`PushPhase`]: idle, while it sleeps or
+    /// decides its final push from local state; in an attempt; or
+    /// updating a local remote), and cancels its attempts at the grace's
+    /// end.
     stop: Arc<PushStop>,
 }
 
@@ -514,26 +512,27 @@ impl Service {
             let deadline = deadline.clone();
             let clock = clock.clone();
             let done = done_tx.clone();
-            let pushing = Arc::new(AtomicBool::new(false));
-            let pushing_flag = pushing.clone();
             let push_stop = pusher.stop_handle();
+            let phase = push_stop.clone();
             let spawned = thread::Builder::new()
                 .name(format!("agentfs-push-{name}"))
                 .spawn(move || {
-                    push_loop(&mut pusher, &signal_flag, &pushing_flag);
+                    push_loop(&mut pusher, &signal_flag, &phase);
                     // The final commit may hold what this remote lacks.
                     while !committed_flag.wait(Duration::from_secs(3600)) {}
                     let deadline = *deadline
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let result = final_push(&mut pusher, deadline, &*clock, &pushing_flag);
+                    let result = final_push(&mut pusher, deadline, &*clock, &phase);
                     let _ = done.send((pusher.name().to_owned(), result));
+                    // Only now: the shutdown waits for a local push up to
+                    // its report.
+                    phase.end_attempt();
                 });
             match spawned {
                 Ok(handle) => pushes.push(PushThread {
                     name,
                     handle,
-                    pushing,
                     stop: push_stop,
                 }),
                 Err(e) => {
@@ -614,22 +613,27 @@ impl Service {
         };
         // Past the deadline, a remote that is not inside an attempt is only
         // deciding (it finds the deadline passed and skips): wait a little
-        // for that decision rather than call it abandoned.
-        let settle = deadline + DECISION_SETTLE;
+        // for that decision rather than call it abandoned. A local update
+        // let finish past the deadline gets as long again after it.
+        let mut settle = deadline + DECISION_SETTLE;
         let cap = deadline + self.update_cap;
         while !pending.is_empty() {
             let now = self.clock.now();
-            let deciding = pending
-                .iter()
-                .any(|p| !p.pushing.load(Ordering::SeqCst) && !p.handle.is_finished());
             let until = if now < deadline {
                 deadline
             } else {
                 // Nothing is sent from now on; a local update in progress
-                // is let finish. Every push is cancelled: no short circuit.
-                let updating = pending
+                // is let finish, up to its report. Every push is cancelled,
+                // each read once.
+                let phases: Vec<PushPhase> = pending.iter().map(|p| p.stop.cancel()).collect();
+                let updating = phases.iter().any(|p| p.must_wait());
+                if updating {
+                    settle = settle.max(now + DECISION_SETTLE);
+                }
+                let deciding = pending
                     .iter()
-                    .fold(false, |updating, p| p.stop.cancel() | updating);
+                    .zip(&phases)
+                    .any(|(p, &phase)| phase == PushPhase::Idle && !p.handle.is_finished());
                 let mut until = now;
                 if deciding {
                     until = until.max(settle);
@@ -662,7 +666,7 @@ impl Service {
         for thread in pending {
             if thread.handle.is_finished() {
                 let _ = thread.handle.join();
-            } else if thread.stop.cancel() {
+            } else if thread.stop.cancel().must_wait() {
                 abandoned_updates.push(thread.name);
             } else {
                 abandoned.push(thread.name);
@@ -682,8 +686,8 @@ impl Service {
 
 /// One remote's push loop until the stop: an attempt, then a sleep of
 /// [`RemotePusher::next_delay`] that a push-now request cuts short.
-/// `pushing` is set for the length of each attempt.
-fn push_loop(pusher: &mut RemotePusher, signal: &Signal, pushing: &AtomicBool) {
+/// `phase` is in an attempt for the length of each.
+fn push_loop(pusher: &mut RemotePusher, signal: &Signal, phase: &PushStop) {
     let name = pusher.name().to_owned();
     let mut served = 0u64;
     loop {
@@ -696,9 +700,9 @@ fn push_loop(pusher: &mut RemotePusher, signal: &Signal, pushing: &AtomicBool) {
             }
             s.push_requested.get(&name).copied().unwrap_or(0)
         };
-        pushing.store(true, Ordering::SeqCst);
+        phase.begin_attempt();
         let outcome = pusher.push_once();
-        pushing.store(false, Ordering::SeqCst);
+        phase.end_attempt();
         let result = RemoteResult {
             name: name.clone(),
             outcome,
@@ -730,14 +734,16 @@ fn push_loop(pusher: &mut RemotePusher, signal: &Signal, pushing: &AtomicBool) {
 }
 
 /// The final push of one remote: one attempt if it lacks commits and the
-/// deadline has not passed. `pushing` is set for the length of the attempt,
-/// so [`Service::shutdown`] tells an attempt still running (abandoned) from
-/// a decision not yet reported (skipped).
+/// deadline has not passed. `phase` is in an attempt from its start, and
+/// the caller ends it once the result is reported, so
+/// [`Service::shutdown`] tells an attempt still running (abandoned, or
+/// waited for while it updates a local remote) from a decision not yet
+/// reported (skipped).
 fn final_push(
     pusher: &mut RemotePusher,
     deadline: Option<Instant>,
     clock: &dyn Clock,
-    pushing: &AtomicBool,
+    phase: &PushStop,
 ) -> FinalPush {
     let unpushed = match pusher.unpushed() {
         Ok(None | Some(0)) => return FinalPush::NothingNew,
@@ -746,10 +752,8 @@ fn final_push(
         Err(_) => None,
     };
     if deadline.is_some_and(|d| clock.now() < d) {
-        pushing.store(true, Ordering::SeqCst);
-        let outcome = pusher.push_once();
-        pushing.store(false, Ordering::SeqCst);
-        FinalPush::Pushed(outcome)
+        phase.begin_attempt();
+        FinalPush::Pushed(pusher.push_once())
     } else {
         FinalPush::Skipped {
             unpushed: unpushed.unwrap_or(0),
@@ -855,6 +859,7 @@ fn now_ms() -> u64 {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::events::{Event, MemorySink, NullSink, PushFailureKind};
@@ -1448,7 +1453,7 @@ mod tests {
         let clock = PausedClock::new();
         let service =
             Service::spawn(com, pushers, Arc::new(NullSink), None, clock.clone()).unwrap();
-        let pushing = service.pushes[0].pushing.clone();
+        let pushing = service.pushes[0].stop.clone();
         // The first push (of nothing) is done; the next waits an hour.
         let first = service
             .handle()
@@ -1461,7 +1466,7 @@ mod tests {
         // The final push starts, since the clock stands before the
         // deadline, and hangs.
         let report = shutdown_at_deadline(service, &clock, Duration::from_millis(300), || {
-            pushing.load(Ordering::SeqCst)
+            pushing.phase() != PushPhase::Idle
         });
         report.final_commit.unwrap();
         assert!(local_head(&state).is_some());
@@ -1524,7 +1529,7 @@ mod tests {
             .iter()
             .find(|p| p.name == "hung")
             .unwrap()
-            .pushing
+            .stop
             .clone();
         // The idle remote has everything and waits an hour: its final push
         // finds nothing new.
@@ -1535,7 +1540,7 @@ mod tests {
         assert_eq!(idle_push.remotes[0].unpushed, Some(0), "{idle_push:?}");
         // The hung remote's first push is stuck.
         wait_for("the hung push started", || {
-            hung_pushing.load(Ordering::SeqCst)
+            hung_pushing.phase() != PushPhase::Idle
         });
 
         let report = shutdown_at_deadline(service, &clock, Duration::from_millis(200), || true);
@@ -1595,10 +1600,18 @@ mod tests {
         stop: Arc<PushStop>,
     }
 
+    /// Where [`held_final_push`] holds the final push.
+    enum Hold {
+        /// Inside its update of the local remote.
+        InUpdate,
+        /// Its update ended, its bookkeeping not done.
+        AfterUpdate,
+    }
+
     /// A service on a paused clock whose one local remote has had its
-    /// first push, with `a` recorded, and its final push held in its
-    /// update by the gate.
-    fn held_final_push() -> Held {
+    /// first push, with `a` recorded, and its final push held by the gate
+    /// where `hold` says.
+    fn held_final_push(hold: Hold) -> Held {
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
         let (dir, state) = setup(&[
@@ -1609,7 +1622,10 @@ mod tests {
         let (rec, com, mut pushers) = open(dir.path(), &state, Arc::new(NullSink));
         let gate = Arc::new(Gate::default());
         let held = gate.clone();
-        pushers[0].set_after_negotiation(move || held.pass());
+        match hold {
+            Hold::InUpdate => pushers[0].set_after_negotiation(move || held.pass()),
+            Hold::AfterUpdate => pushers[0].set_after_update(move || held.pass()),
+        }
         let stop = pushers[0].stop_handle();
         let clock = PausedClock::new();
         let service =
@@ -1671,7 +1687,7 @@ mod tests {
     /// every later push refused (design §11.2).
     #[test]
     fn a_local_update_running_at_the_grace_end_is_waited_for() {
-        let held = held_final_push();
+        let held = held_final_push(Hold::InUpdate);
         let grace = Duration::from_millis(300);
         let (rx, returned) = shutdown_in_background(held.service, grace);
         wait_for("the final push is updating the remote", || {
@@ -1709,7 +1725,7 @@ mod tests {
     /// cannot wait for a hung filesystem forever.
     #[test]
     fn a_local_update_still_running_at_the_cap_is_abandoned() {
-        let mut held = held_final_push();
+        let mut held = held_final_push(Hold::InUpdate);
         let cap = Duration::from_millis(200);
         held.service.update_cap = cap;
         let grace = Duration::from_millis(300);
@@ -1727,6 +1743,43 @@ mod tests {
         assert_eq!(report.abandoned_updates, ["origin"]);
         assert!(report.final_pushes.is_empty(), "{report:?}");
         held.gate.release();
+    }
+
+    /// A local push whose update has ended but which has not reported
+    /// yet (its push state, its alarms) is still waited for: a shutdown
+    /// that looked in between once listed it abandoned.
+    #[test]
+    fn a_local_push_finishing_after_its_update_is_waited_for() {
+        let mut held = held_final_push(Hold::AfterUpdate);
+        // With the clock standing at the deadline, the shutdown looks
+        // again every 50 ms of real time.
+        held.service.update_cap = Duration::from_millis(50);
+        let grace = Duration::from_millis(300);
+        let (rx, returned) = shutdown_in_background(held.service, grace);
+        wait_for("the final push updated the remote", || held.gate.entered());
+        held.clock.advance(grace);
+        wait_for(
+            "the shutdown looked twice past the deadline, or returned",
+            || held.stop.cancels() >= 2 || returned.load(Ordering::SeqCst),
+        );
+        assert!(
+            !returned.load(Ordering::SeqCst),
+            "the shutdown returned while the push was finishing"
+        );
+        held.gate.release();
+        let report = rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        report.final_commit.as_ref().unwrap();
+        assert!(report.abandoned_pushes.is_empty(), "{report:?}");
+        assert!(report.abandoned_updates.is_empty(), "{report:?}");
+        let local = local_head(&held.state).expect("the final commit");
+        assert!(
+            matches!(
+                &report.final_pushes[..],
+                [(_, FinalPush::Pushed(PushOutcome::Pushed { to, .. }))] if *to == local
+            ),
+            "{:?}",
+            report.final_pushes
+        );
     }
 
     fn record_as(rec: &Recorder, dir: &Path, name: &str, caller: Caller) {
@@ -1843,7 +1896,7 @@ mod tests {
         let remote = tempfile::tempdir().unwrap();
         git2::Repository::init_bare(remote.path()).unwrap();
         let (dir, state, rec, service, clock) = idle_service(remote.path());
-        let pushing = service.pushes[0].pushing.clone();
+        let pushing = service.pushes[0].stop.clone();
         record(&rec, dir.path(), "a");
         let fifo = hang(remote.path());
         let handle = service.handle();
@@ -1854,7 +1907,7 @@ mod tests {
         // request, after its commit; it hangs, and the request waits for
         // it until the clock reaches the timeout.
         wait_for("the request's push started", || {
-            pushing.load(Ordering::SeqCst)
+            pushing.phase() != PushPhase::Idle
         });
         assert!(rx.try_recv().is_err(), "returned before its timeout");
         clock.advance(timeout);

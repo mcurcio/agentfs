@@ -14,33 +14,81 @@
 //! push at the grace's end. A push that has not finished its negotiation
 //! stops there with nothing sent. A local push past its negotiation has no
 //! point left where libgit2 can stop it, so [`PushStop::cancel`] says so
-//! and the shutdown waits for it.
+//! and the shutdown waits for it, through the bookkeeping after its update
+//! until the push thread says the attempt is over.
+//!
+//! One [`PushPhase`] under one lock: a cancel and a push changing phase never
+//! interleave, and no moment of an attempt is in no phase.
 
 use std::sync::{Mutex, PoisonError};
 
 use git2::Error as GitError;
 
-/// What a push and the shutdown that may cancel it share. One lock, so a
-/// cancel and a push entering its local update never both proceed.
+/// Where a remote's push thread is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PushPhase {
+    /// Between attempts: sleeping, or deciding its final push from local
+    /// state.
+    #[default]
+    Idle,
+    /// Inside an attempt that may still be dropped: before the end of its
+    /// negotiation, or any push over the network.
+    Attempting,
+    /// A local push past its negotiation, writing the remote's pack and
+    /// refs.
+    Updating,
+    /// That update ended; the attempt's bookkeeping (its push state,
+    /// alarms, any further step) runs until the thread ends the attempt.
+    Finishing,
+}
+
+impl PushPhase {
+    /// The shutdown must not exit while the push is here.
+    pub fn must_wait(self) -> bool {
+        matches!(self, Self::Updating | Self::Finishing)
+    }
+}
+
+/// What a remote's push thread and the shutdown that may cancel it share.
 #[derive(Debug, Default)]
 pub struct PushStop(Mutex<State>);
 
 #[derive(Debug, Default)]
 struct State {
     cancelled: bool,
-    /// A local push is past its negotiation: it writes the remote's pack
-    /// and refs until it returns.
-    updating: bool,
+    phase: PushPhase,
+    /// How many times [`PushStop::cancel`] was called.
+    #[cfg(test)]
+    cancels: u64,
 }
 
 impl PushStop {
-    /// Stops every attempt from sending anything from now on. Returns
-    /// true if a local push is inside its update now: it cannot be
-    /// stopped, and the process must not exit before it returns.
-    pub fn cancel(&self) -> bool {
+    /// The push thread starts an attempt.
+    pub fn begin_attempt(&self) {
+        self.lock().phase = PushPhase::Attempting;
+    }
+
+    /// The push thread's attempt is over, its result handed on.
+    pub fn end_attempt(&self) {
+        self.lock().phase = PushPhase::Idle;
+    }
+
+    /// Where the push thread is.
+    pub fn phase(&self) -> PushPhase {
+        self.lock().phase
+    }
+
+    /// Stops every attempt from sending anything from now on, and says
+    /// where the push thread is: if [`PushPhase::must_wait`], the process must
+    /// not exit yet.
+    pub fn cancel(&self) -> PushPhase {
         let mut state = self.lock();
         state.cancelled = true;
-        state.updating
+        #[cfg(test)]
+        {
+            state.cancels += 1;
+        }
+        state.phase
     }
 
     /// At the end of a push's negotiation: an error if the push was
@@ -53,19 +101,32 @@ impl PushStop {
                 "the push was cancelled at shutdown; nothing was sent",
             ));
         }
-        state.updating = local;
+        if local {
+            state.phase = PushPhase::Updating;
+        }
         Ok(())
     }
 
-    /// The push returned: its update, if any, is over.
+    /// The push returned: an update in progress has ended, and its
+    /// bookkeeping follows.
     pub(super) fn leave(&self) {
-        self.lock().updating = false;
+        let mut state = self.lock();
+        if state.phase == PushPhase::Updating {
+            state.phase = PushPhase::Finishing;
+        }
     }
 
     /// Whether [`PushStop::cancel`] was called.
     #[cfg(test)]
     pub(crate) fn cancelled(&self) -> bool {
         self.lock().cancelled
+    }
+
+    /// How many times [`PushStop::cancel`] was called: each is one look
+    /// by a shutdown past its deadline.
+    #[cfg(test)]
+    pub(crate) fn cancels(&self) -> u64 {
+        self.lock().cancels
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -78,19 +139,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_cancel_before_the_update_stops_it_and_one_during_it_waits() {
+    fn a_local_attempt_is_waited_for_from_its_update_to_its_end() {
         let stop = PushStop::default();
+        stop.begin_attempt();
+        assert_eq!(stop.phase(), PushPhase::Attempting);
         stop.enter(true).unwrap();
-        assert!(stop.cancel(), "inside the update: wait for it");
+        assert!(stop.cancel().must_wait(), "inside the update");
         stop.leave();
-        assert!(!stop.cancel());
+        assert!(stop.cancel().must_wait(), "its bookkeeping");
+        stop.end_attempt();
+        assert_eq!(stop.cancel(), PushPhase::Idle);
         assert!(stop.enter(true).is_err(), "cancelled: nothing is sent");
     }
 
     #[test]
     fn a_network_push_is_never_waited_for() {
         let stop = PushStop::default();
+        stop.begin_attempt();
         stop.enter(false).unwrap();
-        assert!(!stop.cancel());
+        assert_eq!(stop.cancel(), PushPhase::Attempting);
+        stop.leave();
+        assert_eq!(stop.cancel(), PushPhase::Attempting);
     }
 }

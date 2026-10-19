@@ -59,7 +59,7 @@ missing from these tables or a row names a module that no longer exists;
 | `service.rs` | The background loops: commit loop, one push loop per remote, repack (§3.4, §11.2) |
 | `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
 | `push/claim.rs` | The branch rule's pure deciders: `claim` (create or fast-forward, from the remote's value in the connection) and `start_branch_moved` (the start-branch alarm) |
-| `push/stop.rs` | Cancelling a push at shutdown: nothing is sent after the cancel, and a local push already updating the remote's pack and refs is waited for, never cut off (§11.2) |
+| `push/stop.rs` | A push thread's phase (idle, attempting, updating a local remote, finishing) under one lock, and cancelling it at shutdown: nothing is sent after the cancel, and a local push already updating the remote's pack and refs is waited for until it reports, never cut off (§11.2) |
 | `release.rs` | The one deletion decider: delete, keep or wait for a worktree, from its remotes mode, what each remote advertises, the journal's backlog, `onDelete` and a fork's status (F8 rule 3) |
 | `push_size.rs` | Measuring a push's git pack against `agentfsMaxPushSize` before connecting, and the first-parent step that fits (§11.3) |
 | `remote_auth.rs` | Credentials and host-key checks for one remote, shared by push and patch fetch, and the scope that hands an SSH remote to the transport (§11.1) |
