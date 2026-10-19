@@ -60,9 +60,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -86,9 +85,11 @@ use crate::telemetry::{Telemetry, spans};
 use crate::volume::StateDir;
 
 mod claim;
+mod lock;
 mod stop;
 
 pub use claim::{Claim, StartBranchMoved, claim, start_branch_moved};
+pub use lock::PushLock;
 pub use stop::{PushPhase, PushStop};
 
 /// The longest delay between retries of a failing remote, unless
@@ -1333,18 +1334,8 @@ impl RemotePusher {
     }
 
     /// Takes this remote's push lock without waiting.
-    fn lock(&self) -> io::Result<Option<File>> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&self.lock_path)?;
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(file)),
-            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+    fn lock(&self) -> io::Result<Option<PushLock>> {
+        PushLock::try_take(&self.lock_path)
     }
 
     /// `<oid>:<ref>` for the branch and every
@@ -4267,7 +4258,7 @@ mod tests {
         v.commit();
         let (events, sink_events) = sink();
         let mut pusher = v.pusher("origin", sink_events);
-        let held = File::create(v.state.push_lock("origin")).unwrap();
+        let held = fs::File::create(v.state.push_lock("origin")).unwrap();
         rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
         assert_eq!(pusher.push_once(), PushOutcome::Busy);
         assert!(!PushOutcome::Busy.is_success());

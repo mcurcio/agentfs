@@ -449,7 +449,8 @@ pub struct Service {
     update_cap: Duration,
     /// [`DECISION_SETTLE`]; a test shortens it.
     decision_settle: Duration,
-    /// How many repack rounds the commit loop ran.
+    /// How many repack rounds the commit loop ran and scheduled the next
+    /// of ([`Repacker::rounds`]).
     #[cfg(test)]
     repack_rounds: Arc<std::sync::atomic::AtomicUsize>,
     commit: JoinHandle<Result<CommitReport, VolumeError>>,
@@ -791,7 +792,8 @@ struct Repacker {
     schedule: RepackSchedule,
     push_locks: Vec<PathBuf>,
     events: Events,
-    /// Counts the rounds run.
+    /// Counts the rounds the commit loop ran and scheduled the next of:
+    /// a test that sees the count knows when the next round is due.
     #[cfg(test)]
     rounds: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -802,9 +804,6 @@ impl Repacker {
     /// the schedule's `retry` when a push put this one off, else its
     /// `interval`.
     fn run(&self, committer: &Committer, stop: &Stop) -> Duration {
-        #[cfg(test)]
-        self.rounds
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let repo = committer.history().repo();
         let result = repack::repack(Path::new("git"), repo.path(), &self.push_locks, stop);
         match result {
@@ -869,6 +868,11 @@ fn commit_loop(
         {
             let wait = r.run(committer, stop);
             next_repack = Some(clock.now() + wait.max(MIN_DELAY));
+            // Counted only once the next round is scheduled: a test that
+            // moves the clock after seeing the count moves it past a due
+            // time already read from the clock, never before it is read.
+            #[cfg(test)]
+            r.rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         if committer.backlog() == 0 {
             continue;
@@ -1148,6 +1152,8 @@ mod tests {
         )
         .unwrap();
         let rounds = service.repack_rounds.clone();
+        // Counted once the next round is scheduled, so the clock moves
+        // only after the loop has read it.
         wait_for("a round met the push's lock", || {
             rounds.load(Ordering::SeqCst) >= 1
         });
@@ -2124,11 +2130,11 @@ mod tests {
         assert_eq!(result.unpushed, Some(0));
         // A second request with nothing new is up to date.
         let again = push_now(&handle, &["origin"]);
-        assert_eq!(again.committed.unwrap().records, 0);
-        assert!(matches!(
-            again.remotes[0].outcome,
-            PushOutcome::UpToDate { .. }
-        ));
+        assert_eq!(again.committed.as_ref().unwrap().records, 0);
+        assert!(
+            matches!(again.remotes[0].outcome, PushOutcome::UpToDate { .. }),
+            "{again:?}"
+        );
         let report = shutdown_watched(service, Duration::from_secs(5));
         assert_eq!(
             report.final_pushes,

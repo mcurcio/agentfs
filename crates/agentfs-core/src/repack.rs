@@ -42,13 +42,12 @@
 //! writes new packs before it deletes old ones, so a killed repack loses
 //! nothing (it may leave a temporary file, which the next one ignores).
 
-use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::push::PushLock;
 use crate::service::Stop;
 
 /// The arguments after `git`.
@@ -144,8 +143,8 @@ pub fn repack(
     }
     let mut held = Vec::with_capacity(push_locks.len());
     for path in push_locks {
-        match try_lock(path) {
-            Ok(Some(file)) => held.push(file),
+        match PushLock::try_take(path) {
+            Ok(Some(lock)) => held.push(lock),
             Ok(None) => return Ok(RepackOutcome::PushInProgress),
             Err(source) => {
                 return Err(RepackError::Lock {
@@ -247,21 +246,6 @@ fn loose_objects(git_dir: &Path) -> usize {
     fan_out(git_dir).map(Iterator::count).sum()
 }
 
-/// The push lock at `path`, unless another holder has it.
-fn try_lock(path: &Path) -> io::Result<Option<File>> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
-    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(file)),
-        Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -338,7 +322,7 @@ mod tests {
         };
 
         // A push in progress: nothing is done.
-        let held = try_lock(&lock).unwrap().unwrap();
+        let held = PushLock::try_take(&lock).unwrap().unwrap();
         assert_eq!(run().unwrap(), RepackOutcome::PushInProgress);
         drop(held);
 

@@ -1851,7 +1851,10 @@ agentfs does not scan content for secrets and does not hold pushes.
   push attempts on one remote from overlapping. Since the state-area lock
   (§2.3) a direct `agentfs push` can no longer run beside the service (it
   asks the running daemon instead), so this guards only pushes within one
-  process.
+  process. Its holder unlocks it before closing the file: a child process
+  spawned meanwhile (the repack's `git`) shares the file until its exec,
+  and closing alone would leave the lock held for that long, so the next
+  push would find it busy with no holder (`push/lock.rs`).
 - **Backoff.** After a failure the next attempt waits `pushInterval` doubled
   for each consecutive failure after the first, up to
   `max(pushInterval, 15m)`. A success resets it.
@@ -4287,10 +4290,11 @@ and through a front in the `fuse` job (`nothing_is_deleted_by_nesting`).
 Test 8's "the filesystem keeps working" runs through a live FUSE mount in
 the `e2e-shared-remotes` job (`ci/e2e-remote-failures.sh`: unreachable,
 hung, refused, auth, diverged and untrusted remotes at once, close
-latency against a healthy baseline, recovery, and the hung push
-abandoned at SIGTERM), and test 10's two volumes on one repository there
-too (`ci/e2e-shared-remote.sh`: two FUSE mounts pushing at once to one
-HTTP and one local repository, overlapping on the server) and as a unit
+latency against a healthy control volume mounted alongside, their closes
+interleaved, recovery, and the hung push abandoned at SIGTERM), and
+test 10's two volumes on one repository there too
+(`ci/e2e-shared-remote.sh`: two FUSE mounts pushing at once to one HTTP
+and one local repository, overlapping on the server) and as a unit
 test (`push.rs`, with a same-named rival). Test 10's identity templates
 run in `crates/agentfs/tests/cli_identity.rs` (every variable, the
 fallbacks, refusals, fronts, a template change across a service
