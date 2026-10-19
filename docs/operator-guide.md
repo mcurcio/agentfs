@@ -247,6 +247,12 @@ Each of these is recorded before the call returns (§3.1):
 | makes a hard link or symlink | the new name |
 | truncates a file, or changes its executable bit | the new content or mode |
 
+A shell redirection (`cmd > file`) is two records: the shell closes a
+duplicate of the descriptor before `cmd` writes, which records the file
+empty, and `cmd`'s close records its content. A slow command can put the
+empty file in a commit of its own; reverting the commit with the content
+then leaves the file empty, not gone (design §3.1).
+
 Two late backstops cover writes no close follows:
 
 - when the last descriptor and mapping of a file go away (RELEASE), a
@@ -292,7 +298,8 @@ and up to one interval late: see [Databases](#14-databases-the-fsync-class).
      included), printing `final push: <remote>: ...` per remote; a remote
      still pushing at the deadline is left (`... abandoned`), but a push
      already updating a local (path or `file://`) remote is let finish,
-     at most 10 s more (design §11.2), and with
+     at most 10 s more: pushes take at most `--push-grace` + 10 s
+     (design §11.2), and with
      `--push-grace 0s` nothing more is pushed (`... skipped, push grace
      spent`, or `nothing new`);
   5. flushes telemetry and releases the lock.

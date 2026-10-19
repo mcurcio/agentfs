@@ -81,7 +81,7 @@ use crate::lfs::upload::objects_to_upload;
 use crate::lfs::{Direction, LfsError, ObjectCache, Transfer, UploadReport, transfer_for};
 use crate::push_size::Step;
 use crate::remote_auth::{AuthState, RemoteAuth};
-use crate::remote_url::Transport;
+use crate::remote_url::{self, Transport};
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::StateDir;
 
@@ -257,6 +257,9 @@ pub enum PushOutcome {
     },
     /// Another process holds this remote's push lock.
     Busy,
+    /// The shutdown cancelled the attempt before it sent anything (design
+    /// §11.2). Not a failure: no alarm, nothing saved, no backoff.
+    Cancelled,
 }
 
 /// What the patch queue push of one attempt did (design §11.3, §12).
@@ -334,6 +337,7 @@ impl PushOutcome {
             Self::Diverged { .. } => "diverged",
             Self::Failed { .. } => "failed",
             Self::Busy => "busy",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -443,6 +447,14 @@ pub struct RemotePusher {
     /// holds a push there.
     #[cfg(test)]
     after_update: Option<Box<dyn Fn() + Send>>,
+    /// Runs as [`RemotePusher::unpushed`] starts: a test holds a push
+    /// thread there, deciding its final push.
+    #[cfg(test)]
+    before_unpushed: Option<Box<dyn Fn() + Send>>,
+    /// Run by the service's push thread just before it reports its final
+    /// push ([`RemotePusher::before_report`]).
+    #[cfg(test)]
+    before_report: Option<Box<dyn Fn() + Send>>,
     /// Runs between the queue push's listing and its pushes: a test moves
     /// the branch there.
     #[cfg(test)]
@@ -490,6 +502,10 @@ impl RemotePusher {
             #[cfg(test)]
             after_update: None,
             #[cfg(test)]
+            before_unpushed: None,
+            #[cfg(test)]
+            before_report: None,
+            #[cfg(test)]
             after_queue_listing: None,
         })
     }
@@ -510,6 +526,26 @@ impl RemotePusher {
     #[cfg(test)]
     pub(crate) fn set_after_update(&mut self, hook: impl Fn() + Send + 'static) {
         self.after_update = Some(Box::new(hook));
+    }
+
+    /// Runs `hook` as each [`RemotePusher::unpushed`] starts.
+    #[cfg(test)]
+    pub(crate) fn set_before_unpushed(&mut self, hook: impl Fn() + Send + 'static) {
+        self.before_unpushed = Some(Box::new(hook));
+    }
+
+    /// Runs `hook` where [`RemotePusher::before_report`] is called.
+    #[cfg(test)]
+    pub(crate) fn set_before_report(&mut self, hook: impl Fn() + Send + 'static) {
+        self.before_report = Some(Box::new(hook));
+    }
+
+    /// The service's push thread is about to report its final push.
+    #[cfg(test)]
+    pub(crate) fn before_report(&self) {
+        if let Some(hook) = &self.before_report {
+            hook();
+        }
     }
 
     /// What the last [`RemotePusher::push_once`]'s queue push did; `None`
@@ -543,6 +579,10 @@ impl RemotePusher {
     /// Commits on the branch the remote is not known to have; `None` if
     /// the branch does not exist yet.
     pub fn unpushed(&self) -> Result<Option<usize>, GitError> {
+        #[cfg(test)]
+        if let Some(hook) = &self.before_unpushed {
+            hook();
+        }
         unpushed(&self.repo, &self.branch_ref, self.state.last_pushed_oid())
             .map(|w| w.map(|w| w.count))
     }
@@ -1380,6 +1420,8 @@ impl RemotePusher {
                     self.state.queue_synced_status = Some(status.to_string());
                 }
             }
+            // A cancel at shutdown stopped it: nothing to record.
+            Err(_) if self.stop.stopped_an_attempt() => return None,
             Err((kind, message)) => {
                 let message = scrub_userinfo(&message, self.remote.push_url());
                 self.state.queue_error = Some(LastError {
@@ -1643,6 +1685,17 @@ impl RemotePusher {
         let judged_claim = Cell::new(None);
         let result = (|| {
             let mut remote = self.repo.remote_anonymous(self.remote.push_url())?;
+            // Where libgit2 will push, after any `url.<base>.insteadOf` or
+            // `pushInsteadOf` of the volume's own config: a path there is
+            // updated by this process.
+            let local = remote_url::transport(
+                remote
+                    .pushurl()
+                    .ok()
+                    .flatten()
+                    .or(remote.url().ok())
+                    .unwrap_or(self.remote.push_url()),
+            ) == Transport::Local;
             let mut callbacks = self.auth.callbacks(&auth);
             callbacks.push_negotiation(|ups| {
                 negotiated.set(true);
@@ -1677,8 +1730,7 @@ impl RemotePusher {
                     }
                 }
                 // The last point where libgit2 lets a push stop.
-                self.stop
-                    .enter(self.remote.transport() == Transport::Local)?;
+                self.stop.enter(local)?;
                 #[cfg(test)]
                 if let Some(hook) = &self.after_negotiation {
                     hook();
@@ -1927,6 +1979,10 @@ impl RemotePusher {
     ) -> PushOutcome {
         // libgit2 quotes the URL in its messages; never persist or emit the
         // userinfo it may carry.
+        // A cancel at shutdown stopped it: not the remote's failure.
+        if self.stop.stopped_an_attempt() {
+            return PushOutcome::Cancelled;
+        }
         let message = scrub_userinfo(&message, self.remote.push_url());
         self.state.consecutive_failures = self.state.consecutive_failures.saturating_add(1);
         self.state.last_error = Some(LastError {
@@ -3346,19 +3402,55 @@ mod tests {
             &[("origin", &remote_dir.path().display().to_string())],
         );
         v.commit();
-        let (_events, sink_events) = sink();
+        let (events, sink_events) = sink();
         let mut pusher = v.pusher("origin", sink_events);
         assert_eq!(pusher.stop_handle().cancel(), PushPhase::Idle);
         let outcome = pusher.push_once();
-        assert!(
-            matches!(&outcome, PushOutcome::Failed { message, .. }
-                if message.contains("cancelled at shutdown")),
-            "{outcome:?}"
-        );
+        assert_eq!(outcome, PushOutcome::Cancelled);
         assert_eq!(
             remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
             None
         );
+        // Not the remote's failure: no alarm, no failure counted or saved.
+        assert!(events.take().is_empty());
+        assert_eq!(pusher.state().consecutive_failures, 0);
+        assert_eq!(pusher.state().last_error, None);
+        let saved = PushState::load(&v.state.push_state("origin"));
+        assert_eq!(saved.consecutive_failures, 0);
+        assert_eq!(saved.last_error, None);
+    }
+
+    /// A push URL that `url.<base>.insteadOf` rewrites to a path is a
+    /// local push: libgit2 updates that remote in this process, so it is
+    /// waited for at shutdown like any path remote.
+    #[test]
+    fn an_insteadof_rewrite_to_a_path_is_a_local_push() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        bare(remote_dir.path());
+        let url = "git://example.invalid/r.git";
+        let mut v = Vol::with_config(
+            "vol",
+            &[("origin", url)],
+            &[(
+                &format!("url.{}.insteadOf", remote_dir.path().display()),
+                url,
+            )],
+        );
+        let head = v.commit();
+        let (_events, sink_events) = sink();
+        let mut pusher = v.pusher("origin", sink_events);
+        let stop = pusher.stop_handle();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let at = seen.clone();
+        let phase = stop.clone();
+        pusher.set_after_negotiation(move || *at.lock().unwrap() = Some(phase.phase()));
+        assert!(pusher.push_once().is_success());
+        assert_eq!(
+            remote_ref(remote_dir.path(), "refs/heads/agentfs/vol"),
+            Some(head),
+            "the rewrite took the push to the path"
+        );
+        assert_eq!(*seen.lock().unwrap(), Some(PushPhase::Updating));
     }
 
     /// Another writer adds a commit on top of the remote branch.
@@ -4087,7 +4179,9 @@ mod tests {
                                     diverged = true;
                                     done = true;
                                 }
-                                PushOutcome::Failed { .. } | PushOutcome::Busy => {
+                                PushOutcome::Failed { .. }
+                                | PushOutcome::Busy
+                                | PushOutcome::Cancelled => {
                                     std::thread::sleep(Duration::from_millis(5));
                                 }
                                 PushOutcome::NothingToPush => unreachable!("committed"),

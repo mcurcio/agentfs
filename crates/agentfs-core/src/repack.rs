@@ -139,7 +139,7 @@ pub fn repack(
     push_locks: &[PathBuf],
     stop: &Stop,
 ) -> Result<RepackOutcome, RepackError> {
-    if loose_objects(git_dir) == 0 {
+    if !has_loose_objects(git_dir) {
         return Ok(RepackOutcome::NothingToDo);
     }
     let mut held = Vec::with_capacity(push_locks.len());
@@ -219,21 +219,32 @@ fn command(git: &Path, git_dir: &Path) -> Command {
     cmd
 }
 
-/// How many loose objects `git_dir` holds (unreadable directories count
-/// as none).
-fn loose_objects(git_dir: &Path) -> usize {
-    let Ok(dirs) = std::fs::read_dir(git_dir.join("objects")) else {
-        return 0;
-    };
-    dirs.filter_map(Result::ok)
+/// The fan-out directories (`objects/xx`) of `git_dir`, read (unreadable
+/// ones are left out).
+fn fan_out(git_dir: &Path) -> impl Iterator<Item = std::fs::ReadDir> {
+    std::fs::read_dir(git_dir.join("objects"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
         .filter(|e| {
             let name = e.file_name();
             let name = name.as_encoded_bytes();
             name.len() == 2 && name.iter().all(u8::is_ascii_hexdigit)
         })
         .filter_map(|e| std::fs::read_dir(e.path()).ok())
-        .map(Iterator::count)
-        .sum()
+}
+
+/// Whether `git_dir` holds any loose object. It stops at the first one,
+/// so a round tried again every second while a push runs reads one
+/// directory entry, not all 256 directories.
+fn has_loose_objects(git_dir: &Path) -> bool {
+    fan_out(git_dir).any(|mut entries| entries.next().is_some())
+}
+
+/// How many loose objects `git_dir` holds.
+#[cfg(test)]
+fn loose_objects(git_dir: &Path) -> usize {
+    fan_out(git_dir).map(Iterator::count).sum()
 }
 
 /// The push lock at `path`, unless another holder has it.
@@ -314,6 +325,7 @@ mod tests {
             .commit(Some("refs/heads/agentfs/vol"), &sig, &sig, "c", &tree, &[])
             .unwrap();
         assert!(loose_objects(&state.git()) >= 3);
+        assert!(has_loose_objects(&state.git()));
         let stop = Stop::default();
         let lock = dir.path().join("push.lock");
         let run = || {
@@ -333,6 +345,7 @@ mod tests {
         let outcome = run().unwrap();
         assert!(matches!(outcome, RepackOutcome::Done(_)), "{outcome:?}");
         assert_eq!(loose_objects(&state.git()), 0);
+        assert!(!has_loose_objects(&state.git()));
         // The same handle finds the objects once its odb is refreshed.
         repo.odb().unwrap().refresh().unwrap();
         assert_eq!(repo.find_commit(commit).unwrap().tree_id(), tree.id());

@@ -12,7 +12,9 @@
 //!
 //! So [`Service::shutdown`](crate::service::Service::shutdown) cancels each
 //! push at the grace's end. A push that has not finished its negotiation
-//! stops there with nothing sent. A local push past its negotiation has no
+//! stops there with nothing sent, and its outcome is
+//! [`PushOutcome::Cancelled`](super::PushOutcome::Cancelled), not a
+//! failure. A local push past its negotiation has no
 //! point left where libgit2 can stop it, so [`PushStop::cancel`] says so
 //! and the shutdown waits for it, through the bookkeeping after its update
 //! until the push thread says the attempt is over.
@@ -56,6 +58,8 @@ pub struct PushStop(Mutex<State>);
 #[derive(Debug, Default)]
 struct State {
     cancelled: bool,
+    /// A cancel refused an attempt: what failed after it is the cancel.
+    stopped: bool,
     phase: PushPhase,
     /// How many times [`PushStop::cancel`] was called.
     #[cfg(test)]
@@ -97,6 +101,7 @@ impl PushStop {
     pub(super) fn enter(&self, local: bool) -> Result<(), GitError> {
         let mut state = self.lock();
         if state.cancelled {
+            state.stopped = true;
             return Err(GitError::from_str(
                 "the push was cancelled at shutdown; nothing was sent",
             ));
@@ -105,6 +110,11 @@ impl PushStop {
             state.phase = PushPhase::Updating;
         }
         Ok(())
+    }
+
+    /// Whether a cancel refused an attempt of this push.
+    pub(super) fn stopped_an_attempt(&self) -> bool {
+        self.lock().stopped
     }
 
     /// The push returned: an update in progress has ended, and its

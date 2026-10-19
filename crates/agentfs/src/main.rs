@@ -930,6 +930,7 @@ fn describe(outcome: &PushOutcome) -> String {
             stage,
         } => format!("failed ({kind}, stage {stage}): {message}; retry in {retry_in:?}"),
         PushOutcome::Busy => "busy: another push in progress".into(),
+        PushOutcome::Cancelled => "cancelled at the push grace's end; nothing was sent".into(),
     }
 }
 

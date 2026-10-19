@@ -127,27 +127,39 @@ gives each remote that lacks commits one more push, all within
 `--push-grace` (5 s by default), and then leaves them (`final push:
 origin: still running at the push grace's end; abandoned`). A failed
 final push prints its reason (`final push: origin: failed (...)`), and
-`--push-grace 0s` skips it (`final push: origin: skipped, ...`). Nothing
-is lost; the commits are pushed by the next start.
+`--push-grace 0s` skips it (`final push: origin: skipped, ...`). A push
+that had not started sending at the deadline is cancelled (`final push:
+origin: cancelled at the push grace's end; nothing was sent`), which is
+not a failure. Nothing is lost; the commits are pushed by the next start.
 
 A push to a path or `file://` remote writes that remote's pack and refs
 from this process, so one already doing so at the deadline is let
-finish, at most 10 s more (design §11.2). Only a stalled disk outlasts
-that: shutdown then prints
+finish, at most 10 s more: shutdown spends at most `--push-grace` + 10 s
+on pushes (design §11.2). Only a stalled disk outlasts that, or a kill
+that comes before it (the CSI node plugin kills the service 30 s after
+NodeUnstage; a pod, after its `terminationGracePeriodSeconds`). Shutdown
+then prints
 
 ```
 final push: origin: still updating the local remote 10s after the push grace's end; abandoned, and a ref lock may remain in the remote ...
 ```
 
-and the process may have exited holding the remote's ref lock. Every
-later push of that remote then fails `refused` with `failed to lock file
-'<remote>/refs/heads/agentfs/<volume>.lock' for writing`. Make sure
-nothing else pushes that branch (no other mount, `run`, `serve-history`
-or `agentfs push` of the volume, on any node, and no other writer of
-the remote), then remove the lock and push:
+(a kill prints nothing), and the process may have exited holding one of
+the remote's ref locks. Every later push of that ref then fails
+`refused` with `failed to lock file '<remote>/<ref>.lock' for writing`.
+The ref is the volume's branch (`refs/heads/agentfs/<volume>`), or one
+the same push carries: a divergence save
+(`refs/agentfs/<volume>/diverged/<timestamp>`), the patch queue's
+`refs/agentfs/<volume>/status` or `applied/<n>`, or a received fork's
+`refs/agentfs/<fork>/change` or `finish`; `packed-refs.lock` too. The
+error names it. Make sure nothing else writes that ref (no other mount,
+`run`, `serve-history` or `agentfs push` of the volume, on any node, no
+patch producer, and no other writer of the remote), then remove the
+locks under the volume's namespaces and push:
 
 ```sh
-rm <remote>/refs/heads/agentfs/<volume>.lock
+find <remote>/refs/heads/agentfs <remote>/refs/agentfs -name '*.lock'
+rm <the lock the error names>
 agentfs --state "$STATE" push
 ```
 

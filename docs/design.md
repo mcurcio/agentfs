@@ -301,9 +301,17 @@ Rules that make this precise:
   created file is recorded at its first FLUSH even when empty (`touch`);
   a write-open of an existing file takes its stamp at open, so opening
   and closing without a change records nothing.
-- **`O_TRUNC`.** `FUSE_ATOMIC_O_TRUNC` is negotiated, so a shell `>` is one
-  open with `O_TRUNC` and one record at close, even when nothing is written
-  after the truncation. `truncate`/`ftruncate` remain setattr boundaries.
+- **`O_TRUNC`.** `FUSE_ATOMIC_O_TRUNC` is negotiated, so a truncating
+  open is one open with `O_TRUNC`, not an open and a setattr.
+  `truncate`/`ftruncate` remain setattr boundaries.
+- **A shell's `>` is two records.** The shell (dash, bash) opens the
+  file, `dup2`s the descriptor onto the command's stdout and closes the
+  original before the command writes. That close is a FLUSH, so the file
+  is recorded empty (created, or truncated); the command's last close
+  then records its content. The two records share a commit when they
+  come within one commit window, but a slow command or a busy machine
+  puts the empty file in a commit of its own, and reverting the later
+  commit leaves the file empty rather than removing it.
 - **What is frozen.** FLUSH, RELEASE and the sweep hand the recorder
   `/proc/self/fd/<n>` of the handle's own descriptor, so the frozen content
   is exactly that inode's, whatever renames happened. Other boundaries open
@@ -1789,11 +1797,11 @@ agentfs does not scan content for secrets and does not hold pushes.
 - **At shutdown**, after the final commit, every long-running mode
   (`mount`, `run`, `serve-history`) gives each remote that lacks commits
   one more push attempt, all within `--push-grace` (default 5 s) from the
-  stop: stopping a pod waits at most that long for a push, never retries,
-  and never waits longer, but for one case below. An attempt is only
+  stop, and never retries. An attempt is only
   started before the deadline. At the deadline every attempt is
-  cancelled: one that has not finished its negotiation sends nothing,
-  and a remote still inside an attempt over the network is left
+  cancelled: one that has not finished its negotiation sends nothing and
+  is reported as cancelled, not as a failure (no alarm, no failure
+  counted), and a remote still inside an attempt over the network is left
   (`abandoned`); what stays unpushed goes out on the next start. As with
   git's receive-pack, a transfer may be dropped, but a ref update
   completes or never starts. A path or `file://` remote is updated by
@@ -1801,13 +1809,22 @@ agentfs does not scan content for secrets and does not hold pushes.
   takes `<remote>/refs/...lock` for each ref), and libgit2 cannot stop
   it past its negotiation. Exiting inside it left the ref lock, and every
   later push of that ref was refused. So a push to a local remote that is
-  past its negotiation at the deadline is waited for, at most
-  `LOCAL_UPDATE_CAP` (10 s) more; if it is still running then, shutdown
-  exits as before and says a ref lock may remain (`still updating the
-  local remote ...`, [stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)).
-  A remote that started no
-  attempt is reported as skipped or up to date, never abandoned (shutdown
-  waits up to 2 s past the deadline for that local decision).
+  past its negotiation at the deadline is waited for, until it reports
+  its result; if it is still running `LOCAL_UPDATE_CAP` (10 s) past the
+  deadline, shutdown exits as before and says a ref lock may remain
+  (`still updating the local remote ...`,
+  [stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)). A remote that
+  started no attempt is reported as skipped or up to date, never
+  abandoned: shutdown waits up to 2 s past the deadline for that local
+  decision, or 2 s past a local update it waited for. Nothing is waited
+  for past the deadline plus 10 s, whatever hangs: from the stop signal,
+  pushes take at most `--push-grace` + 10 s (the final commit before them
+  is not bounded). Under the CSI driver the node plugin kills the service
+  30 s after NodeUnstage asks it to stop (`unstage_grace`), so
+  `--push-grace` + 10 s + the final commit must stay under 30 s, or a
+  kill can cut a local update short and leave the lock again; the driver
+  sets `--push-grace 5s`. A sidecar's pod needs a
+  `terminationGracePeriodSeconds` above the same sum.
   `--push-grace 0s` skips the final push. Each remote's result is printed
   (`final push: <remote>: ...`). Without it the
   last commit before a stop would wait for the next start, and under the
@@ -4312,7 +4329,7 @@ runner.
 | LFS object size limit | `remote.<name>.agentfsMaxLfsObjectSize`, per object: the smallest across valid remotes refuses LFS content at record time (`PathRefused`, `lfs_object_too_large`, also before the freeze) with a commit-time backstop, never falling back to a blob; each remote's own limit fails its push as `too_large` at stage `lfs` before any upload; no per-push LFS byte budget (§7, §11.3, 2026-10) |
 | Push size limit | `remote.<name>.agentfsMaxPushSize`, measured before connecting with libgit2's pack builder (git pack only, not LFS); a backlog over it pushed in first-parent steps with `PushLimited` and the next step at once, applied and diverged refs held for the full push; a single commit over it fails as `too_large` with backoff, nothing sent; `agentfs push` steps until up to date (§11.3, 2026-10-13) |
 | Remotes | Any git remote, several at once (§11.1) |
-| Push timing | Intervals, independent of pod lifecycle, plus one bounded push at shutdown in `mount`, `run` and `serve-history`: after the final commit, one attempt per remote that lacks commits, within `--push-grace` (5 s; `0s` skips it), never retried and never extending shutdown past the grace. This sits beside the earlier decision that pushes run at intervals and that a pod's stop never waits on a push: the stop waits at most the grace, and what stays unpushed goes out on the next start (§11.2, 2026-10-13). Amended 2026-10-18: at the grace's end every push is cancelled, and a push to a path or `file://` remote already past its negotiation is waited for, up to `LOCAL_UPDATE_CAP` (10 s) more, rather than cut off. The reason: an abandoned local push died with the process inside libgit2's ref update and left `remote.git/refs/heads/agentfs/<volume>.lock`, and every later push was refused, so "what stays unpushed goes out on the next start" did not hold (found in `csi_service.rs` on a slow disk). The cost: a stop can take up to the grace plus 10 s when a local remote's disk is slow. A design choice (the flaky-test fix), not the owner's words |
+| Push timing | Intervals, independent of pod lifecycle, plus one bounded push at shutdown in `mount`, `run` and `serve-history`: after the final commit, one attempt per remote that lacks commits, started within `--push-grace` (5 s; `0s` skips it), never retried; at the grace's end every push is cancelled, and only a push to a path or `file://` remote already past its negotiation is waited for, until it reports, so shutdown spends at most the grace plus `LOCAL_UPDATE_CAP` (10 s) on pushes, whatever hangs. This sits beside the earlier decision that pushes run at intervals and that a pod's stop never waits on a push: what stays unpushed goes out on the next start (§11.2, 2026-10-13; the local-push wait and the 10 s ceiling 2026-10-18). The reason: an abandoned local push died with the process inside libgit2's ref update and left `remote.git/refs/heads/agentfs/<volume>.lock`, and every later push was refused, so "what stays unpushed goes out on the next start" did not hold (found in `csi_service.rs` on a slow disk). The cost: a stop can take up to the grace plus 10 s when a local remote's disk is slow, and that sum plus the final commit must stay under the CSI node plugin's 30 s unstage grace (and a sidecar's termination grace), or a kill cuts the update short and the lock returns. The 2026-10-18 part is a design choice (the flaky-test fix), not the owner's words |
 | Recovery | `agentfs restore` and `agentfs revert`, plus operator runbooks; further tooling discovered from use (§15) |
 | Telemetry | OpenTelemetry (§13) |
 | Secret scanning | Not in scope (§10) |
