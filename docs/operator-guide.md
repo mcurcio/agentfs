@@ -247,6 +247,12 @@ Each of these is recorded before the call returns (§3.1):
 | makes a hard link or symlink | the new name |
 | truncates a file, or changes its executable bit | the new content or mode |
 
+A shell redirection (`cmd > file`) is two records: the shell closes a
+duplicate of the descriptor before `cmd` writes, which records the file
+empty, and `cmd`'s close records its content. A slow command can put the
+empty file in a commit of its own; reverting the commit with the content
+then leaves the file empty, not gone (design §3.1).
+
 Two late backstops cover writes no close follows:
 
 - when the last descriptor and mapping of a file go away (RELEASE), a
@@ -290,7 +296,10 @@ and up to one interval late: see [Databases](#14-databases-the-fsync-class).
   4. makes the final commit, then pushes it once more to each remote that
      lacks commits, all within `--push-grace` (pushes in progress
      included), printing `final push: <remote>: ...` per remote; a remote
-     still pushing at the deadline is left (`... abandoned`), and with
+     still pushing at the deadline is left (`... abandoned`), but a push
+     already updating a local (path or `file://`) remote is let finish,
+     at most 10 s more: pushes take at most `--push-grace` + 10 s
+     (design §11.2), and with
      `--push-grace 0s` nothing more is pushed (`... skipped, push grace
      spent`, or `nothing new`);
   5. flushes telemetry and releases the lock.
@@ -849,7 +858,8 @@ makes the final commit and then, as `mount` and `run` do, pushes it: every
 remote that lacks commits gets one more attempt, all within `--push-grace`
 (pushes in progress included). The CSI driver stops the service after the volume's
 last pod, and nothing else would push that commit. A push still running
-at the deadline is abandoned, and a failed one leaves the commits for the
+at the deadline is abandoned (one already updating a local remote is let
+finish, at most 10 s more), and a failed one leaves the commits for the
 next start or an `agentfs push`.
 
 **Limits.**

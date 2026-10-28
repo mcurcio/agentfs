@@ -121,7 +121,8 @@ async fn the_supervisor_runs_and_recovers_a_real_history_service() {
     };
     fs::create_dir_all(&layout.profiles).unwrap();
     // A remote pushed at each start and then not for an hour: only the
-    // final push at unstage can send the last commit.
+    // final push at unstage, or the release scan after it, can send the
+    // last commit.
     let remote = dir.path().join("remote.git");
     git2::Repository::init_bare(&remote).unwrap();
     // A commit window long enough to kill the service between a record
@@ -220,7 +221,17 @@ async fn the_supervisor_runs_and_recovers_a_real_history_service() {
     assert!(!layout.socket("pvc-1").exists());
     assert!(!layout.staged_record("pvc-1").exists());
     assert!(sup.service_pid("pvc-1").is_none());
-    // The final commit was pushed as the service stopped (design §14.2).
+    // The final commit reaches the remote (design §14.2). The service's
+    // final push tries once within `--push-grace` and is abandoned if it
+    // is still running at its end, as it is on a slow disk ("still
+    // running at the push grace's end; abandoned"). The release scan then
+    // pushes the unstaged worktree until a push exits 0 at its head: that
+    // is the guarantee, so the test waits for it, not for the grace.
+    let scan = release_scan(&layout);
+    scan_until(&scan, "the final commit never held", |r| {
+        r.held == ["pvc-1"]
+    })
+    .await;
     let local = git2::Repository::open_bare(layout.state("pvc-1").join("git"))
         .unwrap()
         .refname_to_id("refs/heads/agentfs/demo")
@@ -229,7 +240,7 @@ async fn the_supervisor_runs_and_recovers_a_real_history_service() {
         .unwrap()
         .refname_to_id("refs/heads/agentfs/demo")
         .ok();
-    assert_eq!(pushed, Some(local), "the final push");
+    assert_eq!(pushed, Some(local), "the remote holds the final commit");
 }
 
 /// F8 D1: the node plugin's release scan pushes a worktree no pod stages

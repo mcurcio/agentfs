@@ -900,6 +900,10 @@ impl Finisher {
                 PushOutcome::Busy => {
                     return Err(local("another process is pushing the fork remote".into()));
                 }
+                // The finisher never cancels its pusher.
+                PushOutcome::Cancelled => {
+                    return Err(local("the push was cancelled".into()));
+                }
                 PushOutcome::NothingToPush => {
                     return Err(local("the fork has no history to push".into()));
                 }

@@ -50,12 +50,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+started() { [ "$(grep -c '^mounted ' "$LOG" 2>/dev/null)" -gt "$1" ]; }
 start_mount() {
+  # The log is appended to across mounts: wait for this mount's startup
+  # line, printed once its control socket listens (restores need it).
+  local before
+  before=$(grep -c '^mounted ' "$LOG" 2>/dev/null || true)
   sudo "$AGENTFS_BIN" --state "$STATE" mount \
     --passthrough "${AGENTFS_TEST_PASSTHROUGH:-auto}" "$BACKING" "$MNT" >>"$LOG" 2>&1 &
   MOUNT_PID=$!
   wait_for 20 mountpoint -q "$MNT" || fail "never mounted"
-  wait_for 20 grep -q '^mounted ' "$LOG" || fail "no startup line"
+  wait_for 20 started "${before:-0}" || fail "no startup line"
 }
 
 stop_mount() {
@@ -72,9 +77,13 @@ wait_history() { # path content
 
 step "a volume with a remote, mounted"
 af init --volume demo >/dev/null
-# Long enough that each step's writes (a few closes, milliseconds apart)
-# land in one commit, which GOOD and BAD below rely on.
-sgit config agentfs.commitWindow 500ms
+# GOOD and BAD below must each be one commit holding all of its step's
+# writes. A timed commit window cannot promise that: a shell `>` records
+# twice (the file empty at the close of the descriptor it dups onto stdout,
+# then its content, design §3.1), and a busy runner can spread a step's
+# records past any window. So nothing commits on its own while the workload
+# writes; `agentfs push` commits each step whole (design §11.2).
+sgit config agentfs.commitWindow 1h
 sudo git init -q --bare "$REMOTE"
 sgit config remote.origin.url "$REMOTE"
 start_mount
@@ -82,11 +91,20 @@ sudo chown 10000:10000 "$MNT"
 
 step "the workload writes, then breaks something"
 as_agent 'mkdir -p notes && printf "good\n" > notes/plan.md && printf "keep\n" > notes/todo.md'
+af push
 wait_history notes/plan.md good
 GOOD=$(head_of)
 as_agent 'printf "broken\n" > notes/plan.md && printf "junk\n" > notes/junk.md'
+af push
 wait_history notes/junk.md junk
 BAD=$(head_of)
+assert_eq "$GOOD" "$(sgit rev-parse "$BAD^")" "each step is one commit"
+# A restore through the mount waits up to 20 commit windows for history
+# to catch up, and its own commit waits for the next window: remount with
+# the default window for the rest.
+stop_mount
+sgit config --unset agentfs.commitWindow
+start_mount
 
 step "find the change (runbook: finding a change)"
 FOUND=$(sgit log --format='%H %s' --follow refs/heads/agentfs/demo -- notes/plan.md)

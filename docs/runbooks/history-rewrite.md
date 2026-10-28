@@ -195,13 +195,86 @@ Replacing the branch does not remove the old objects from the server. What does
 depends on the host:
 
 - **A bare repository you run** (ssh, a file server): expire its reflog
-  and collect garbage on the server, where `$SERVER_REPO` is its path:
+  and collect garbage on the server, where `$SERVER_REPO` is its path.
+  Every push to it, the deletions above included, starts git's own
+  maintenance in the background (`git maintenance run --auto --detach`,
+  `receive.autogc`). Since git 2.54 that repacks the existing packs into
+  a new one, unreachable objects and all, and a repack still running
+  when `gc` deletes the old packs writes the secret back in a pack of
+  its own. A pack with a `.keep` file beside it is never repacked or
+  deleted at all. So the block refuses while any `objects/pack/*.keep`
+  is there, turns that maintenance off, waits until no git `gc`, `repack`
+  or `maintenance` is left running on the server, collects garbage, puts
+  `receive.autogc` back as it was, and then checks the server's objects
+  against `$WORK/secret-blobs` (step 7), failing if any is left. Run it
+  on the server, in the same process namespace as the git that serves
+  the repository (the server's container, say), with `$WORK/secret-blobs`
+  copied there:
 
   <!-- ci: rewrite-purge-bare -->
   ```sh
-  git --git-dir "$SERVER_REPO" reflog expire --expire=now --all
-  git --git-dir "$SERVER_REPO" gc -q --prune=now
+  (
+    set -eu
+    test -s "$WORK/secret-blobs"
+    for keep in "$SERVER_REPO"/objects/pack/*.keep; do
+      if [ -e "$keep" ]; then
+        echo "refusing: $keep keeps its pack through gc, secret included." >&2
+        echo "A push being received or a repack holds it while it runs; with no git running on the server, it is stale: remove it and run this again." >&2
+        exit 1
+      fi
+    done
+    # Running git gc, repack or maintenance processes, one per line.
+    running() {
+      for proc in /proc/[0-9]*; do
+        tr '\0' '\n' <"$proc/cmdline" 2>/dev/null | awk -v pid="${proc#/proc/}" '
+          NR == 1 { if ($0 !~ /(^|\/)git(-(gc|repack|maintenance))?$/) exit
+                    git = 1; found = ($0 ~ /-(gc|repack|maintenance)$/) }
+          $0 == "gc" || $0 == "repack" || $0 == "maintenance" { found = 1 }
+          { args = args " " $0 }
+          END { if (git && found) print pid ":" args }' || true
+      done
+    }
+    autogc=$(git --git-dir "$SERVER_REPO" config --local --get receive.autogc || true)
+    restore() {
+      if [ -n "$autogc" ]; then
+        git --git-dir "$SERVER_REPO" config receive.autogc "$autogc"
+      else
+        git --git-dir "$SERVER_REPO" config --unset receive.autogc
+      fi
+    }
+    git --git-dir "$SERVER_REPO" config receive.autogc false
+    trap restore EXIT
+    waited=0
+    while busy=$(running) && [ -n "$busy" ]; do
+      if [ "$waited" -ge 600 ]; then
+        echo "giving up after 600 s; still running: $busy" >&2
+        exit 1
+      fi
+      if [ $((waited % 30)) -eq 0 ]; then echo "waiting for: $busy"; fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+    git --git-dir "$SERVER_REPO" reflog expire --expire=now --all
+    git --git-dir "$SERVER_REPO" gc -q --prune=now
+    git --git-dir "$SERVER_REPO" cat-file --batch-all-objects --batch-check='%(objectname)' >"$WORK/server-objects"
+    found=0
+    grep -F -x -f "$WORK/secret-blobs" "$WORK/server-objects" || found=$?
+    case $found in
+      0) echo "secret objects remain in $SERVER_REPO" >&2; exit 1 ;;
+      1) echo "no secret object left in $SERVER_REPO" ;;
+      *) echo "could not check $SERVER_REPO" >&2; exit 1 ;;
+    esac
+  )
   ```
+
+  It runs in a subshell that stops at the first failure, so pasted into a
+  shell it never goes on past one. The wait is for every git `gc`,
+  `repack` or `maintenance` on the server, not only this repository's: it
+  may wait longer than needed, never too little, and gives up after 10
+  minutes, naming what still runs. A push that another client starts
+  after the check can still bring maintenance back; the last check then
+  fails rather than leaving the secret silently: stop the other volumes
+  that push there and run the block again.
 
 - **GitHub**: the objects stay reachable by id, in cached views, pull
   request refs and forks. Ask GitHub Support to purge them (they need the
