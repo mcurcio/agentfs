@@ -805,8 +805,10 @@ fn push_once(state: &StateDir, only: &[String], session: &Session) -> Result<Exi
 
 /// `agentfs push --force-with-lease OID` (§15; the divergence and
 /// history-rewrite runbooks): replaces this volume's own branch on exactly
-/// one remote with the local head, if the remote holds `lease` and it
-/// shares a commit with the head. Direct, under the remote's push lock.
+/// one remote with the local head, if the remote holds `lease`, it shares
+/// a commit with the head, and the commits it would drop are no
+/// recorder's history the head lacks (`push::lease_claim`: divergence case
+/// A, never case B). Direct, under the remote's push lock.
 /// Exit 0 for pushed and up to date, 1 otherwise, 75 when the remote is
 /// being pushed.
 fn push_with_lease(
@@ -874,6 +876,16 @@ fn push_with_lease(
             println!(
                 "{name}: refused: the remote holds {lease}, which shares no commit with the head \
                  {head}; it is another history and is never replaced (continue under a new name)"
+            );
+            false
+        }
+        LeaseOutcome::Recorded { commit } => {
+            println!(
+                "{name}: refused: the remote's branch holds {commit}, which carries agentfs \
+                 trailers and this state area lacks: this volume's newer history, another \
+                 worktree's, or agentfs commits someone amended, rebased, cherry-picked or \
+                 squashed; it is never replaced (divergence runbook: continue under a new name, \
+                 or remove those commits from the branch by hand)"
             );
             false
         }

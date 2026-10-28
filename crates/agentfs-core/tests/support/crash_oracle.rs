@@ -216,6 +216,11 @@ fn seq_of(repo: &Repository, commit: Oid) -> Option<u64> {
 /// nothing is duplicated: each commit's tree is a model state later than
 /// the previous commit's, no commit is empty, and `Agentfs-Seq` strictly
 /// increases. Errors describe the first violation.
+///
+/// One exception: a root commit may hold the empty tree, state 0. With no
+/// branch yet, records that leave the tree empty still commit, so the
+/// head carries their `Agentfs-Seq` (design §3.3): a failed write dropped
+/// because its copy is gone, alone in its commit window, makes one.
 pub fn check_history(
     git_dir: &Path,
     branch_ref: &str,
@@ -242,6 +247,10 @@ pub fn check_history(
         }
         last_seq = Some(seq);
         let tree = tree_of(&repo, *c, lfs_objects);
+        if commit.parent_count() == 0 && tree == model.states[0] {
+            indices.push(0);
+            continue;
+        }
         let found = (next..model.states.len()).find(|i| model.states[*i] == tree);
         match found {
             Some(i) => {

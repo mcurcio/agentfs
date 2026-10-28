@@ -232,6 +232,24 @@ None of these stopped the work; each was resolved as below and is reported with 
    unpushed. No backwards compatibility, by rule; operators with such forks must copy their
    state areas, or recreate them on a class with `remotes`, before deleting their claims.
 
+## 2026-10-18, lease push hardening (beads agentfs-4lb.2, agentfs-4lb.1)
+
+Neither stopped the work; each was resolved as below.
+
+1. Brief for 4lb.2: "pick the mechanism by what the design already records about which branches
+   a worktree created". The design records no creator of a remote branch: git keeps none, and
+   the push record was rejected as an authority (f8-design.md, "Also rejected"; §11.2). What it
+   does record is who made each commit (the `Agentfs-*` trailers, §9), which is also the
+   divergence runbook's own A/B test. `push::lease_claim` decides from those (§19.1, "The lease
+   push drops no recorded history").
+2. Bead 4lb.2 / HANDOFF.md: "it can replace a human branch if `agentfs.branch` names one". A
+   human branch made apart from the volume shares no commit with it and was already refused
+   (`Unrelated`). One that does share commits holds the volume's pushed commits with a person's
+   on top, which is divergence case A by the runbook's definition and is still replaced: git
+   cannot tell "a person created it from our commits" from "we created it and a person added
+   commits". Not closed by this change; closing it needs a record of ref creation that does not
+   exist (an owner call: new state, or limiting `--force-with-lease` to `refs/heads/agentfs/*`).
+
 ## 2026-10-18, flaky-test fix agent (fix-flaky-csi-service)
 
 1. `csi_service.rs::the_supervisor_runs_and_recovers_a_real_history_service` (the AGENTS.md

@@ -1976,8 +1976,9 @@ agentfs does not scan content for secrets and does not hold pushes.
   - It never force-pushes.
   - An operator resolves it (§15,
     [divergence.md](runbooks/divergence.md)): case A replaces the branch
-    with `agentfs push --force-with-lease`. The divergence clears when a
-    branch push next succeeds.
+    with `agentfs push --force-with-lease`, which refuses case B, history
+    an agentfs recorder wrote that the head lacks (§15). The divergence
+    clears when a branch push next succeeds.
   - The branch push carries only the branch and the `diverged/*` and
     `accepted/*` refs, created where the remote lacks them and otherwise
     left (the divergence save moves only through its own push, above). A
@@ -3599,19 +3600,56 @@ and not the state lock, so it works while the volume is mounted. It lists
 the remote's branch: at the head is up to date; not at `<oid>` is a
 broken lease, and nothing is written. A lease not in the state area is
 fetched, with the remote's branch, into a scratch repository beside the
-push lock that borrows the state area's objects
-(`objects/info/alternates`) and is removed afterwards, so the state area
-never takes in the remote's objects (a rewrite's old history above). A
+push lock (`meta/push/<remote>.lease.git`) that borrows the state area's
+objects (`objects/info/alternates`), so the state area never takes in the
+remote's objects (a rewrite's old history above). It is removed on every
+exit path, an error or a panic included (a guard dropped with it); one a
+killed push left is removed by the next push of any remote, which takes
+that scratch's own remote lock for it and leaves it while another process
+holds that lock (2026-10-18, bead agentfs-4lb.1).
+A
 lease that shares no commit with the head is refused: another history is
-never replaced, it continues under a new name. Then the LFS objects are
+never replaced, it continues under a new name. So is a branch whose
+commits beyond the head hold history an agentfs recorder wrote
+(`push::lease_claim`, 2026-10-18): the push may drop only commits no
+recorder made (no `Agentfs-Seq` trailer, §9: a foreign writer, divergence
+case A) and recorded commits the head holds rewritten (the same
+`Agentfs-Seq`, author and committer, names, emails and times, under
+another id: a history rewrite keeps all of them). A recorded commit the
+head lacks is this volume's newer history written from another copy of
+its state area (case B) or another worktree's under the same name: the
+branch is not this state area's to replace, and it continues under a new
+name. Git keeps no record of who created a remote branch, and the push
+record is never an input, so who made each commit is what tells the
+cases apart. Not covered:
+- **A branch a person made on this volume's pushed commits** (their own
+  commits on top, under the name `agentfs.branch` gives) is replaced:
+  every commit dropped lacks a trailer, so git cannot tell it from case
+  A, a foreign writer adding to a branch this worktree created. A branch
+  made apart from the volume shares no commit and is refused. This stays
+  open by the owner's decision (§19.1 "Operators may overwrite history",
+  2026-10-18): the lease push is an operator's command, and an operator
+  may replace such a branch. So the operator checks whose commits the
+  branch holds before running it, with the divergence runbook's inspect
+  step ([divergence.md](runbooks/divergence.md), §1 and §2).
+- **This volume's commits rewritten by a person**: amended, rebased,
+  cherry-picked, or squash-merged with a message that keeps the trailers.
+  They carry `Agentfs-Seq` but are new records, so the branch is refused,
+  the safe side; the operator continues under a new name or has them
+  taken off the branch by hand
+  ([divergence.md](runbooks/divergence.md), case A).
+- **Forged trailers.**
+
+Then the LFS objects are
 uploaded and the branch is pushed forced, with `<oid>` as the expected old
 value in libgit2's negotiation and, on smart HTTP and SSH, the server's
 compare-and-swap (the local and `file://` transports have none, §11.3).
 Success is recorded like any push and clears the divergence; the
 `diverged/*` refs stay. Exit status 0 for pushed and up to date, 1 for a
-broken lease, an unrelated history or a failure (each printed with the
-remote's value), 75 while another push to that remote runs. A failure
-leaves the push state as it was: the operator reads it from the command.
+broken lease, an unrelated history, recorded history or a failure (each
+printed with the remote's value), 75 while another push to that remote
+runs. A failure leaves the push state as it was: the operator reads it
+from the command.
 
 **Runbooks never `git push` a branch.** A test
 (`runbooks_push_only_the_namespace` in `docs_reference.rs`) reads every
@@ -4496,6 +4534,8 @@ runner.
 | Divergence save follows the head (2026-10-17) | A diverged worktree's `diverged/<T>` save is created once per divergence and then pushed again whenever the head moved past the one it holds, judged by `push::claim` in that push's negotiation: fast-forwarded (leased on the remote's value), re-created if the remote lacks it, kept and named in the alarm if another writer moved it. Before, it was pushed once and the worktree's later commits never reached the remote. Cost: one more push per attempt while diverged and the head moves. A design choice (F8 S2, "D3"), not the owner's words |
 | Every write by the branch rule (2026-10-17) | The patch queue push writes the status, `applied/*` and inbox deletions only while the branch the remote advertises, in a listing made for that push, is on this worktree's history (`push::claim`), and carries the branch as a no-op update leased on that value, so the negotiation stops it if the branch moved since. A branch that is not this worktree's (none yet, or another writer's) writes nothing and is no queue failure. Cost: the status no longer reaches a remote whose branch is missing or diverged, so iac reads an older status there until the branch is resolved; one more ref in each queue push. A design choice (F8 S2, design rule 2), not the owner's words |
 | The operator's lease push (2026-10-17) | Operators replace a worktree's own branch only with `agentfs push --force-with-lease <oid>`: one remote, direct (never through a daemon), under that remote's push lock, refused when the lease and the head share no commit, a lease the state area lacks fetched into a removed scratch repository (never into the state area); divergence case A and history-rewrite step 9 use it. Runbooks never `git push` a branch: a docs test holds every runbook `git push` to destinations literally under `refs/agentfs/`, with no force and no lease but the create-only `--force-with-lease=<ref>:` of patch submission (§12, kept from "Patch submission" above). The history rewrite's fork step deletes other worktrees' refs on each server (`git update-ref -d <ref> <oid>`) or with a forge's tools, no longer by `git push`. Cost: on a forge, that deletion has no lease; `--force-with-lease` does not step through `agentfsMaxPushSize`. A design choice (F8 S2), not the owner's words; it serves R2, the owner's "Go" to one branch per worktree, for good (2026-10-16) |
+| The lease push drops no recorded history (2026-10-18) | `agentfs push --force-with-lease` also refuses a branch whose commits beyond the head include one an agentfs recorder made (an `Agentfs-Seq` trailer) that the head holds neither as is nor rewritten (the same `Agentfs-Seq`, author and committer under another id), decided by the pure `push::lease_claim` (§15). Sharing a commit was its only check, so it replaced divergence case B (a stale state area) and another worktree's history as readily as case A. Git records no creator of a remote branch and the push record is never an input (§11.2), so the commits' own trailers are the record used; a history rewrite keeps them, which is how step 9 still passes. Cost: this volume's commits amended, rebased, cherry-picked or squash-merged (trailers kept) onto the branch by a person are refused (the operator continues under a new name or has them taken off by hand); forged trailers are not defended (§1.1: mistakes, not malice). What it enforces is narrower than R2's invariant: the lease push never drops history an agentfs recorder wrote that the head lacks (case B, another worktree). It does not stop the lease push replacing a branch a person made on this volume's pushed commits, which git cannot tell from case A (§15 "Not covered"; left to the operator by the owner's decision, "Operators may overwrite history" below). A design choice (bead agentfs-4lb.2), not the owner's words; it serves R2, the owner's "Go" to one branch per worktree, for good (2026-10-16) |
+| Operators may overwrite history (2026-10-18) | The operator's lease push may replace a branch a person made on this volume's pushed commits (it drops only commits without trailers, which git cannot tell from divergence case A); nothing new is recorded to refuse it, and it is not limited to `refs/heads/agentfs/*`. Operators, who run `agentfs push --force-with-lease` outside the workload's reach (§1.1, §15), are the class allowed to fix issues and overwrite history; the operator inspects the branch first ([divergence.md](runbooks/divergence.md), §1 and §2). The owner, asked whether that lease push should refuse such a branch (record which branches a worktree created, or limit it to `refs/heads/agentfs/*`), told it is an operator-only command the workload cannot reach (2026-10-18): "an admin should have more expansive abilities to fix issues and overwrite history. it should be documented and auditable (where possible), but "admin" users are a specific class". Design reading, not his words: "admin" is this design's operator. How auditable a lease push is today, and what more it needs, is not settled here |
 | Zero remotes (2026-10-16, superseded 2026-10-17) | Zero remotes is never an error and needs no declaration: a volume with no push section is local-only, raises no alarm, and `agentfs init` and CSI CreateVolume take it; a remote added later gets all the history, and one removed leaves it local-only again; status and the `agentfs.remotes.mode` gauge say pushed, none valid or local-only (§11.1). A fork of a local-only source publishes `agentfs/<fork>` into the source's own history and is never applied (§11.5). The owner, on the F8 follow-up "init refusing volumes that never declared remotes" (`.handoff/f8-f12-notes.md`, "Answers on the two F8 follow-ups", 2026-10-17): "Remotes can come and go. It's not a error to have zero remotes"; on the restated change ("zero remotes never an error, no declaration"): "Go" (2026-10-17). Superseded 2026-10-17: it was a declared mode (`agentfs.remotes = none`, `agentfs init --local-only`), and a volume declaring nothing was "undeclared", alarmed (`RemotesUndeclared`) and refused by `init` and CreateVolume, from the frame he accepted on 2026-10-16 (R4): "zero remotes is a declared mode; a no-remote source's fork publishes `agentfs/<fork>` in the source's own history, never applied automatically"; his answer to the F8 reframe's question 2 on the fork half ("yes") stands. Built (F8 S3, F8 follow-ups) |
 | Local-only volumes, the details (2026-10-17) | Design choices (F8 S3), not the owner's words: a local-only `agentfs push` prints `local-only: nothing to push` and exits 0; a start class on a local-only profile is `StartError::LocalOnly`; a fork with nowhere to push (no fork remote and no invalid flagged section) is local-only. (The 2026-10-17 F8 follow-ups removed the declaration's details: `none` beside a push section, `init` and CreateVolume refusing an undeclared result.) A fork of a local-only source finds it by `agentfs.fork.sourceState`, written at create (the source must stay at that path until the fork is published); its finish names the fork remote `(source history)`, which no remote section can be called; it receives through the source's control socket (`receive_fork`) when a daemon holds the source's lock, else under the lock, and `fork finish` exits 75 while another command holds it; the fork's LFS objects are copied into the source's cache; a ref another writer holds there is `AnotherWriter` and a source that is gone `RemoteGone`, both refused (§11.5). Amended 2026-10-17 (F8 fixes): a source that gains a remote pushes the refs it received, create-only, after each branch push that worked (`fork::receive::received_refs` finds them by their `finish` ref; one held on the remote at another commit fails the push), and the release decider waits (`ReceivedLacking`) while a remote lacks one, so "a remote added later gets all the history" holds and DeleteVolume never removes a fork's only copy. Refusing to receive once the source has a remote was rejected: forks made while it was local-only could not publish, and what it already received would stay unpushed |
 
