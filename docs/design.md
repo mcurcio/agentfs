@@ -170,8 +170,10 @@ prune would wait for a restore, a partial download would look in use, a
 front would take a higher slot, and `status` would name a holder that is
 gone. So every advisory file lock agentfs takes goes through one type,
 `agentfs_core::file_lock::FileLock`, which unlocks when it is dropped, and
-`clippy.toml` disallows the lock calls (std's `File::lock` family,
-`rustix::fs::flock`, `libc::flock`) everywhere else. The probes (`status`,
+`clippy.toml` disallows the lock calls (std's `File::lock` family, `flock`
+and POSIX record locks through `libc`, `rustix` or `nix`) everywhere else.
+`FileLock` hands out no `&mut File`, through which the locked file could be
+swapped out and closed unlocked. The probes (`status`,
 a prune's check of a partial, the history service's scan of the slots) take
 and drop a shared or exclusive lock through it too.
 
