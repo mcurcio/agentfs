@@ -900,6 +900,7 @@ mod tests {
 
     use super::*;
     use crate::events::{Event, MemorySink, NullSink, PushFailureKind};
+    use crate::file_lock::{FileLock, Mode};
     use crate::identity::Context;
     use crate::paths::RepoPath;
     use crate::push;
@@ -1055,13 +1056,9 @@ mod tests {
         // A push in progress, as far as the repack can tell.
         let lock_path = state.push_lock("good");
         fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        let lock = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
+        let lock = FileLock::try_take(&lock_path, Mode::Exclusive)
+            .unwrap()
             .unwrap();
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
         let sink = Arc::new(MemorySink::default());
         let (_rec, com, _pushers) = open(dir.path(), &state, sink.clone());
         let schedule = RepackSchedule {
@@ -1128,13 +1125,9 @@ mod tests {
         // A push in progress, as far as the repack can tell.
         let lock_path = state.push_lock("origin");
         fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        let lock = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
+        let lock = FileLock::try_take(&lock_path, Mode::Exclusive)
+            .unwrap()
             .unwrap();
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
         let (_rec, com, pushers) = open(dir.path(), &state, Arc::new(NullSink));
         let retry = Duration::from_secs(1);
         let schedule = RepackSchedule {

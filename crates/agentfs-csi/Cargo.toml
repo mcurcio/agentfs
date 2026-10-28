@@ -2,6 +2,7 @@
 name = "agentfs-csi"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "The agentfs CSI driver: persistent volumes with a history service per volume and a front per pod"

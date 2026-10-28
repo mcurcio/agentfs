@@ -2,7 +2,8 @@
 //!
 //! Every command that opens a volume for writing (`mount`, `run`, `record`,
 //! `flush`, `push`) takes [`StateLock`] first: an exclusive `flock` on
-//! `<state>/meta/lock`. The kernel releases it when the holder exits, even
+//! `<state>/meta/lock` taken through [`crate::file_lock`], which unlocks it
+//! when it is dropped. The kernel releases it when the holder exits, even
 //! after `kill -9`, so a crash never leaves a stale lock. The file holds a
 //! one-line description of the holder (`pid=… command=… since=…`) for
 //! error messages and `agentfs status`; it is informational only, and a
@@ -18,14 +19,12 @@
 //! therefore keeps trying for at least [`MIN_ACQUIRE_WAIT`] even when asked
 //! not to wait.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{FlockOperation, flock};
-
+use crate::file_lock::{Attempt, FileLock, Mode};
 use crate::push::utc_basic;
 use crate::volume::StateDir;
 
@@ -56,8 +55,7 @@ pub enum LockError {
 /// the process exiting) releases the lock.
 #[derive(Debug)]
 pub struct StateLock {
-    // Held only for the lock it carries.
-    _file: File,
+    _lock: FileLock,
     path: PathBuf,
 }
 
@@ -81,32 +79,24 @@ impl StateLock {
                 source,
             }
         })?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)
-            .map_err(io_err)?;
+        let mut file = FileLock::open(&path).map_err(io_err)?;
         let deadline = Instant::now() + wait.max(MIN_ACQUIRE_WAIT);
-        loop {
-            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => break,
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(rustix::io::Errno::WOULDBLOCK) => {
+        let mut lock = loop {
+            match FileLock::try_lock(file, Mode::Exclusive).map_err(io_err)? {
+                Attempt::Taken(lock) => break lock,
+                Attempt::Busy(mut busy) => {
                     let now = Instant::now();
                     if now >= deadline {
                         return Err(LockError::Busy {
                             state: state.root().to_path_buf(),
-                            holder: describe(read_holder(&mut file)),
+                            holder: describe(read_holder(&mut busy)),
                         });
                     }
                     std::thread::sleep(POLL.min(deadline - now));
+                    file = busy;
                 }
-                Err(e) => return Err(io_err(e.into())),
             }
-        }
+        };
         let since = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -116,39 +106,30 @@ impl StateLock {
             utc_basic(since)
         );
         (|| {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(line.as_bytes())?;
+            lock.file().set_len(0)?;
+            lock.seek(SeekFrom::Start(0))?;
+            lock.write_all(line.as_bytes())?;
             // On NFS a write stays in this client's cache until a sync or a
             // close, and a lock file is never closed: other nodes would read
             // an empty holder line.
-            file.sync_data()
+            lock.file().sync_data()
         })()
         .map_err(io_err)?;
-        Ok(Self { _file: file, path })
+        Ok(Self { _lock: lock, path })
     }
 
     /// The holder's description if another process holds the lock on
     /// `state`, `None` if it is free (or the state area has no lock file).
     pub fn holder(state: &StateDir) -> io::Result<Option<String>> {
-        let mut file = match File::open(state.lock_file()) {
+        let file = match File::open(state.lock_file()) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        loop {
-            match flock(&file, FlockOperation::NonBlockingLockShared) {
-                Ok(()) => {
-                    flock(&file, FlockOperation::Unlock)?;
-                    return Ok(None);
-                }
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(rustix::io::Errno::WOULDBLOCK) => {
-                    return Ok(Some(describe(read_holder(&mut file))));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        Ok(match FileLock::try_lock(file, Mode::Shared)? {
+            Attempt::Taken(_probe) => None,
+            Attempt::Busy(mut file) => Some(describe(read_holder(&mut file))),
+        })
     }
 
     /// The lock file.
@@ -197,6 +178,18 @@ mod tests {
         );
         assert!(holder.contains("command=mount"), "{holder}");
         assert!(err.to_string().contains("is in use"), "{err}");
+    }
+
+    /// A lock let go is free at once, though another thread keeps spawning
+    /// processes that share its file until they exec.
+    #[test]
+    fn a_lock_let_go_is_free_while_children_spawn() {
+        let (_dir, state) = state();
+        let (busy, takes) = crate::file_lock::takes_while_children_spawn(|| {
+            drop(StateLock::acquire(&state, "run", Duration::ZERO).unwrap());
+            StateLock::holder(&state).unwrap().is_none()
+        });
+        assert_eq!(busy, 0, "busy with no holder, of {takes} takes");
     }
 
     #[test]
@@ -248,8 +241,7 @@ mod tests {
         let lock = StateLock::acquire(&state, "x", Duration::ZERO).unwrap();
         drop(lock);
         // Hold a shared lock briefly, as a probe would.
-        let probe = File::open(state.lock_file()).unwrap();
-        flock(&probe, FlockOperation::LockShared).unwrap();
+        let probe = FileLock::wait(File::open(state.lock_file()).unwrap(), Mode::Shared).unwrap();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             drop(probe);

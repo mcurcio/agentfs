@@ -2,24 +2,22 @@
 //!
 //! Fronts freeze into one shared `pending/`, each in a slot of its own
 //! ([`crate::pending::SLOT_SHIFT`]). A front leases its slot with an
-//! exclusive `flock` on `meta/fronts/slot-N.lock` for as long as it runs;
-//! the kernel releases it when the front exits, even after `kill -9`. The
-//! history service treats a leased slot's copies as the front's own and
-//! leaves them alone when it prunes `pending/`; an unleased slot's copies
-//! are orphans like any other.
+//! exclusive `flock` on `meta/fronts/slot-N.lock` ([`crate::file_lock`])
+//! for as long as it runs; the kernel releases it when the front exits,
+//! even after `kill -9`. The history service treats a leased slot's copies
+//! as the front's own and leaves them alone when it prunes `pending/`; an
+//! unleased slot's copies are orphans like any other.
 //!
 //! Slot 0 belongs to the holder of the state-area lock (single-process mode
 //! or the history service), so leases run from 1 to [`MAX_SLOT`].
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{FlockOperation, flock};
-
+use crate::file_lock::{Attempt, FileLock, Mode};
 use crate::push::utc_basic;
 use crate::volume::StateDir;
 
@@ -39,8 +37,7 @@ pub enum LeaseError {
 /// exiting) frees the slot.
 #[derive(Debug)]
 pub struct FrontLease {
-    // Held only for the lock it carries.
-    _file: File,
+    _lock: FileLock,
     slot: u16,
 }
 
@@ -94,17 +91,9 @@ impl FrontLease {
             path: path.clone(),
             source,
         };
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)
-            .map_err(io_err)?;
-        if !try_lock(&file, FlockOperation::NonBlockingLockExclusive).map_err(io_err)? {
+        let Some(mut lock) = FileLock::try_take(&path, Mode::Exclusive).map_err(io_err)? else {
             return Ok(None);
-        }
+        };
         let since = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -114,12 +103,12 @@ impl FrontLease {
             utc_basic(since)
         );
         (|| {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(line.as_bytes())
+            lock.file().set_len(0)?;
+            lock.seek(SeekFrom::Start(0))?;
+            lock.write_all(line.as_bytes())
         })()
         .map_err(io_err)?;
-        Ok(Some(Self { _file: file, slot }))
+        Ok(Some(Self { _lock: lock, slot }))
     }
 
     /// The leased slot.
@@ -183,26 +172,11 @@ impl FrontLease {
             };
             // A shared probe: it fails only against a holder's exclusive
             // lock, and never blocks a front's own acquire for long.
-            if try_lock(&file, FlockOperation::NonBlockingLockShared)? {
-                flock(&file, FlockOperation::Unlock)?;
-            } else {
+            if let Attempt::Busy(file) = FileLock::try_lock(file, Mode::Shared)? {
                 live.push((slot, file));
             }
         }
         Ok(live)
-    }
-}
-
-/// Takes `op` on `file`: `true` if taken, `false` if someone else holds a
-/// conflicting lock.
-fn try_lock(file: &File, op: FlockOperation) -> io::Result<bool> {
-    loop {
-        match flock(file, op) {
-            Ok(()) => return Ok(true),
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(false),
-            Err(e) => return Err(e.into()),
-        }
     }
 }
 
@@ -214,6 +188,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path().join("state"));
         (dir, state)
+    }
+
+    /// A slot let go is free at once, though another thread keeps spawning
+    /// processes that share its lease file until they exec.
+    #[test]
+    fn a_slot_let_go_is_free_while_children_spawn() {
+        let (_dir, state) = state();
+        let (busy, takes) = crate::file_lock::takes_while_children_spawn(|| {
+            let lease = FrontLease::acquire(&state, "pod=a").unwrap();
+            let first = lease.slot() == 1;
+            drop(lease);
+            first && FrontLease::live(&state).unwrap().is_empty()
+        });
+        assert_eq!(busy, 0, "busy with no holder, of {takes} takes");
     }
 
     #[test]

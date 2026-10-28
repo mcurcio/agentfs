@@ -78,6 +78,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{RemoteSettings, Settings};
 use crate::events::{Event, Events, PushFailureKind, PushStage};
+use crate::file_lock::{FileLock, Mode};
 use crate::history::init_libgit2;
 use crate::lfs::upload::objects_to_upload;
 use crate::lfs::{Direction, LfsError, ObjectCache, Transfer, UploadReport, transfer_for};
@@ -88,13 +89,11 @@ use crate::telemetry::{Telemetry, spans};
 use crate::volume::StateDir;
 
 mod claim;
-mod lock;
 mod stop;
 
 pub use claim::{
     Claim, LeaseClaim, Recording, Stamp, StartBranchMoved, claim, lease_claim, start_branch_moved,
 };
-pub use lock::PushLock;
 pub use stop::{PushPhase, PushStop};
 
 /// The longest delay between retries of a failing remote, unless
@@ -1385,8 +1384,8 @@ impl RemotePusher {
 
     /// Takes this remote's push lock without waiting, then sweeps the lease
     /// scratch repositories a killed push left ([`sweep_lease_scratch`]).
-    fn lock(&self) -> io::Result<Option<PushLock>> {
-        let Some(lock) = PushLock::try_take(&self.lock_path)? else {
+    fn lock(&self) -> io::Result<Option<FileLock>> {
+        let Some(lock) = FileLock::try_take(&self.lock_path, Mode::Exclusive)? else {
             return Ok(None);
         };
         sweep_lease_scratch(&self.lock_path);
@@ -2135,7 +2134,7 @@ fn sweep_lease_scratch(own_lock: &Path) {
             continue;
         };
         let lock = dir.join(format!("{remote}.lock"));
-        // Held for the removal only, through [`PushLock`] like every
+        // Held for the removal only, through [`FileLock`] like every
         // push lock, and never this process's own lock twice: flock locks
         // are per open file, so a second open would conflict with the one
         // the caller holds. Taking a removed remote's lock creates its
@@ -2143,7 +2142,7 @@ fn sweep_lease_scratch(own_lock: &Path) {
         let _held = if lock == own_lock {
             None
         } else {
-            match PushLock::try_take(&lock) {
+            match FileLock::try_take(&lock, Mode::Exclusive) {
                 Ok(Some(held)) => Some(held),
                 Ok(None) | Err(_) => continue,
             }
@@ -4057,7 +4056,9 @@ mod tests {
         let own = stale("origin");
         let gone = stale("gone.remote");
         let busy = stale("busy");
-        let held = PushLock::try_take(&dir.join("busy.lock")).unwrap().unwrap();
+        let held = FileLock::try_take(&dir.join("busy.lock"), Mode::Exclusive)
+            .unwrap()
+            .unwrap();
 
         let mut pusher = v.pusher("origin", Arc::new(NullSink));
         assert!(pusher.push_once().is_success());
@@ -4660,8 +4661,9 @@ mod tests {
         v.commit();
         let (events, sink_events) = sink();
         let mut pusher = v.pusher("origin", sink_events);
-        let held = fs::File::create(v.state.push_lock("origin")).unwrap();
-        rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let held = FileLock::try_take(&v.state.push_lock("origin"), Mode::Exclusive)
+            .unwrap()
+            .unwrap();
         assert_eq!(pusher.push_once(), PushOutcome::Busy);
         assert!(!PushOutcome::Busy.is_success());
         assert!(events.take().is_empty());

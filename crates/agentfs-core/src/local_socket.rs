@@ -183,6 +183,18 @@ mod tests {
         let (fd, first) = bind_private(&dir, "s").unwrap();
         let err = bind(&dir, "s").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        // A crashed server's socket: nothing listens on it. Dropping the
+        // listener alone is not that, while any thread of this test binary
+        // spawns a child: the child shares the listener from its fork until
+        // its exec, and connects succeed meanwhile. A shut-down listener
+        // refuses them at once (as `FileLock` unlocks before it closes).
+        // SAFETY: `first` is an open socket for the whole call.
+        assert_eq!(
+            unsafe { libc::shutdown(first.as_raw_fd(), libc::SHUT_RDWR) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
         drop(first);
         assert_eq!(
             connect(&dir, "s").unwrap_err().kind(),

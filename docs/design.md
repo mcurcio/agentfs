@@ -159,6 +159,24 @@ through the mount:
     fronts/slot-N.repairs that slot's repair queue (§3.5)
 ```
 
+**Every lock above is an `flock`, and its holder unlocks it before closing
+the file.** An `flock` belongs to the open file, which a child process
+spawned by any thread (the repack's `git`, `git` in tests) shares from its
+fork until its exec closes it; `O_CLOEXEC` closes it only at that exec.
+Released only by closing, a lock would stay held for that long after its
+holder let go, and the next taker would find it busy with no holder: a
+push or repack would wait for a push in progress that does not exist, a
+prune would wait for a restore, a partial download would look in use, a
+front would take a higher slot, and `status` would name a holder that is
+gone. So every advisory file lock agentfs takes goes through one type,
+`agentfs_core::file_lock::FileLock`, which unlocks when it is dropped, and
+`clippy.toml` disallows the lock calls (std's `File::lock` family, `flock`
+and POSIX record locks through `libc`, `rustix` or `nix`) everywhere else.
+`FileLock` hands out no `&mut File`, through which the locked file could be
+swapped out and closed unlocked. The probes (`status`,
+a prune's check of a partial, the history service's scan of the slots) take
+and drop a shared or exclusive lock through it too.
+
 ### 2.3 Single writer of history
 
 Exactly one recorder process owns the history repository and its branch. In
@@ -1851,10 +1869,9 @@ agentfs does not scan content for secrets and does not hold pushes.
   push attempts on one remote from overlapping. Since the state-area lock
   (§2.3) a direct `agentfs push` can no longer run beside the service (it
   asks the running daemon instead), so this guards only pushes within one
-  process. Its holder unlocks it before closing the file: a child process
-  spawned meanwhile (the repack's `git`) shares the file until its exec,
-  and closing alone would leave the lock held for that long, so the next
-  push would find it busy with no holder (`push/lock.rs`).
+  process. Like every lock in the state area it is unlocked before its
+  file is closed (§2.2), so a child process the repack spawns cannot make
+  the next push find it busy with no holder.
 - **Backoff.** After a failure the next attempt waits `pushInterval` doubled
   for each consecutive failure after the first, up to
   `max(pushInterval, 15m)`. A success resets it.

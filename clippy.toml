@@ -1,0 +1,18 @@
+# Every advisory file lock goes through agentfs_core::file_lock::FileLock,
+# which unlocks before it closes: a lock released only by closing stays held
+# by a child process between its fork and its exec (design §2.2).
+disallowed-methods = [
+    { path = "std::fs::File::lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "std::fs::File::lock_shared", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "std::fs::File::try_lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "std::fs::File::try_lock_shared", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "std::fs::File::unlock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "rustix::fs::flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+    { path = "libc::flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+    # POSIX record locks (F_SETLK, F_OFD_SETLK) are another family with the
+    # same trap; agentfs takes none.
+    { path = "libc::fcntl", reason = "take file locks through agentfs_core::file_lock::FileLock; fcntl's other uses go through rustix", allow-invalid = true },
+    { path = "rustix::fs::fcntl_lock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+    { path = "nix::fcntl::flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+    { path = "nix::fcntl::Flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+]

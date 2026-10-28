@@ -1,6 +1,7 @@
 //! The LFS cache lock, `<state>/lfs/lock` (design §2.2, §7): a `flock`
-//! that keeps `agentfs lfs prune` from deleting an object while anything
-//! that reads objects for writing them into the tree holds it.
+//! ([`crate::file_lock`]) that keeps `agentfs lfs prune` from deleting an
+//! object while anything that reads objects for writing them into the
+//! tree holds it.
 //!
 //! Restores, reverts, patch applies and `agentfs lfs fetch` hold it
 //! shared for as long as they use the cache ([`super::fetch::Fetcher`],
@@ -11,13 +12,12 @@
 //! take it: a prune deletes only objects every remote's servers hold,
 //! which a push never needs to upload and a commit may add again.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rustix::fs::{FlockOperation, flock};
+use crate::file_lock::{Attempt, FileLock, Mode};
 
 /// The lock file's name in `<state>/lfs`.
 pub const LOCK_FILE: &str = "lock";
@@ -28,44 +28,39 @@ const POLL: Duration = Duration::from_millis(100);
 /// A held cache lock, released when dropped.
 #[derive(Debug)]
 pub struct CacheLock {
-    _file: File,
+    _lock: FileLock,
 }
 
 fn open(dir: &Path) -> io::Result<File> {
     std::fs::create_dir_all(dir)?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(dir.join(LOCK_FILE))
+    FileLock::open(&dir.join(LOCK_FILE))
 }
 
 impl CacheLock {
     /// The lock of the cache at `dir` (`<state>/lfs`), shared, waiting
     /// while a prune holds it.
     pub fn shared(dir: &Path) -> io::Result<Self> {
-        let file = open(dir)?;
-        flock(&file, FlockOperation::LockShared)?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _lock: FileLock::wait(open(dir)?, Mode::Shared)?,
+        })
     }
 
     /// The lock exclusive, waiting up to `wait` while others hold it;
     /// `None` if they still do then.
     pub fn exclusive(dir: &Path, wait: Duration) -> io::Result<Option<Self>> {
-        let file = open(dir)?;
+        let mut file = open(dir)?;
         let deadline = Instant::now() + wait;
         loop {
-            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => return Ok(Some(Self { _file: file })),
-                Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
-                    if Instant::now() >= deadline {
+            match FileLock::try_lock(file, Mode::Exclusive)? {
+                Attempt::Taken(lock) => return Ok(Some(Self { _lock: lock })),
+                Attempt::Busy(busy) => {
+                    let now = Instant::now();
+                    if now >= deadline {
                         return Ok(None);
                     }
-                    std::thread::sleep(POLL.min(deadline - Instant::now()));
+                    std::thread::sleep(POLL.min(deadline - now));
+                    file = busy;
                 }
-                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -74,6 +69,20 @@ impl CacheLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lock let go is free at once, though another thread keeps spawning
+    /// processes that share its file until they exec.
+    #[test]
+    fn a_lock_let_go_is_free_while_children_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (busy, takes) = crate::file_lock::takes_while_children_spawn(|| {
+            drop(CacheLock::shared(dir.path()).unwrap());
+            CacheLock::exclusive(dir.path(), Duration::ZERO)
+                .unwrap()
+                .is_some()
+        });
+        assert_eq!(busy, 0, "busy with no holder, of {takes} takes");
+    }
 
     #[test]
     fn shared_holders_keep_the_exclusive_lock_out() {

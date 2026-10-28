@@ -4,12 +4,13 @@
 //! teardown and reconcile (design §14.2).
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agentfs_core::file_lock::{FileLock, Mode};
 use agentfs_core::volume::StateDir;
 use agentfs_csi::error::Error;
 use agentfs_csi::launcher::{Exit, Launcher, ProcessSpec, Spawned, push_line};
@@ -19,7 +20,6 @@ use agentfs_csi::params::{OnDelete, PodInfo, VolumeParams};
 use agentfs_csi::records::{self, PublishedRecord, StagedRecord};
 use agentfs_csi::supervisor::{Backoff, NodeConfig, PublishRequest, StageRequest, Supervisor};
 use agentfs_fuse::MountState;
-use rustix::fs::{FlockOperation, flock};
 use rustix::process::Signal;
 use tokio::sync::watch;
 
@@ -38,7 +38,7 @@ struct Proc {
     /// A front's mount and where.
     mount: Option<(u64, PathBuf)>,
     /// A front's lease, held like the real one.
-    lease: Option<File>,
+    lease: Option<FileLock>,
     address: Option<PathBuf>,
 }
 
@@ -174,16 +174,12 @@ impl Launcher for Fake {
             fs::create_dir_all(state.fronts_dir())?;
             let order = preferred.into_iter().chain(1..=1023);
             for slot in order {
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(state.front_lease(slot))?;
-                if flock(&file, FlockOperation::NonBlockingLockExclusive).is_ok() {
-                    file.set_len(0)?;
-                    writeln!(file, "pid={pid} command=mount since=x")?;
-                    proc.lease = Some(file);
+                if let Some(mut lease) =
+                    FileLock::try_take(&state.front_lease(slot), Mode::Exclusive)?
+                {
+                    lease.file().set_len(0)?;
+                    writeln!(lease, "pid={pid} command=mount since=x")?;
+                    proc.lease = Some(lease);
                     break;
                 }
             }
