@@ -301,9 +301,17 @@ Rules that make this precise:
   created file is recorded at its first FLUSH even when empty (`touch`);
   a write-open of an existing file takes its stamp at open, so opening
   and closing without a change records nothing.
-- **`O_TRUNC`.** `FUSE_ATOMIC_O_TRUNC` is negotiated, so a shell `>` is one
-  open with `O_TRUNC` and one record at close, even when nothing is written
-  after the truncation. `truncate`/`ftruncate` remain setattr boundaries.
+- **`O_TRUNC`.** `FUSE_ATOMIC_O_TRUNC` is negotiated, so a truncating
+  open is one open with `O_TRUNC`, not an open and a setattr.
+  `truncate`/`ftruncate` remain setattr boundaries.
+- **A shell's `>` is two records.** The shell (dash, bash) opens the
+  file, `dup2`s the descriptor onto the command's stdout and closes the
+  original before the command writes. That close is a FLUSH, so the file
+  is recorded empty (created, or truncated); the command's last close
+  then records its content. The two records share a commit when they
+  come within one commit window, but a slow command or a busy machine
+  puts the empty file in a commit of its own, and reverting the later
+  commit leaves the file empty rather than removing it.
 - **What is frozen.** FLUSH, RELEASE and the sweep hand the recorder
   `/proc/self/fd/<n>` of the handle's own descriptor, so the frozen content
   is exactly that inode's, whatever renames happened. Other boundaries open
@@ -1402,9 +1410,11 @@ naming the line), rather than being ignored as git ignores unknown values.
   `0` or `off` disables, at least 1m) the commit loop runs
   `git repack -d -q --geometric=2` between commits, so versions of a
   database are delta-compressed into packs. It never prunes. It takes
-  every remote's push lock without waiting and skips the round if a push
-  is running; a failure raises `RepackFailed` (§13) and is tried again an
-  interval later. The container image ships the `git` CLI for this;
+  every remote's push lock without waiting; if a push is running it tries
+  again a second later, not an interval later, so pushes that keep coming
+  (several remotes, a short `pushInterval`, retries) cannot put it off
+  round after round. A failure raises `RepackFailed` (§13) and is tried
+  again an interval later. The container image ships the `git` CLI for this;
   without it, every round fails with `RepackFailed`.
   - *Bounded.* A round with no loose objects is skipped without starting
     git. git runs with one thread, `pack.windowMemory=64m`,
@@ -1787,12 +1797,34 @@ agentfs does not scan content for secrets and does not hold pushes.
 - **At shutdown**, after the final commit, every long-running mode
   (`mount`, `run`, `serve-history`) gives each remote that lacks commits
   one more push attempt, all within `--push-grace` (default 5 s) from the
-  stop: stopping a pod waits at most that long for a push, never retries,
-  and never waits longer. An attempt is only started before the deadline,
-  and a remote still inside an attempt then is left (`abandoned`); what
-  stays unpushed goes out on the next start. A remote that started no
-  attempt is reported as skipped or up to date, never abandoned (shutdown
-  waits up to 2 s past the deadline for that local decision).
+  stop, and never retries. An attempt is only
+  started before the deadline. At the deadline every attempt is
+  cancelled: one that has not finished its negotiation sends nothing and
+  is reported as cancelled, not as a failure (no alarm, no failure
+  counted), and a remote still inside an attempt over the network is left
+  (`abandoned`); what stays unpushed goes out on the next start. As with
+  git's receive-pack, a transfer may be dropped, but a ref update
+  completes or never starts. A path or `file://` remote is updated by
+  this process itself (libgit2's local transport writes the pack, then
+  takes `<remote>/refs/...lock` for each ref), and libgit2 cannot stop
+  it past its negotiation. Exiting inside it left the ref lock, and every
+  later push of that ref was refused. So a push to a local remote that is
+  past its negotiation at the deadline is waited for, until it reports
+  its result; if it is still running `LOCAL_UPDATE_CAP` (10 s) past the
+  deadline, shutdown exits as before and says a ref lock may remain
+  (`still updating the local remote ...`,
+  [stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)). A remote that
+  started no attempt is reported as skipped or up to date, never
+  abandoned: shutdown waits up to 2 s past the deadline for that local
+  decision, or 2 s past a local update it waited for. Nothing is waited
+  for past the deadline plus 10 s, whatever hangs: from the stop signal,
+  pushes take at most `--push-grace` + 10 s (the final commit before them
+  is not bounded). Under the CSI driver the node plugin kills the service
+  30 s after NodeUnstage asks it to stop (`unstage_grace`), so
+  `--push-grace` + 10 s + the final commit must stay under 30 s, or a
+  kill can cut a local update short and leave the lock again; the driver
+  sets `--push-grace 5s`. A sidecar's pod needs a
+  `terminationGracePeriodSeconds` above the same sum.
   `--push-grace 0s` skips the final push. Each remote's result is printed
   (`final push: <remote>: ...`). Without it the
   last commit before a stop would wait for the next start, and under the
@@ -1819,7 +1851,10 @@ agentfs does not scan content for secrets and does not hold pushes.
   push attempts on one remote from overlapping. Since the state-area lock
   (§2.3) a direct `agentfs push` can no longer run beside the service (it
   asks the running daemon instead), so this guards only pushes within one
-  process.
+  process. Its holder unlocks it before closing the file: a child process
+  spawned meanwhile (the repack's `git`) shares the file until its exec,
+  and closing alone would leave the lock held for that long, so the next
+  push would find it busy with no holder (`push/lock.rs`).
 - **Backoff.** After a failure the next attempt waits `pushInterval` doubled
   for each consecutive failure after the first, up to
   `max(pushInterval, 15m)`. A success resets it.
@@ -2086,7 +2121,20 @@ source's control socket when a daemon holds the source's lock (§2.3),
 else under that lock; while another command holds it, `fork finish`
 exits 75. A branch name another writer holds there is `AnotherWriter`,
 and a source state area that is gone is `RemoteGone` (both refused, the
-fork can be abandoned). The fork itself is local-only and pushes
+fork can be abandoned). The fork's output is untrusted (§19.1 "Fork
+content"), so receiving refuses, writing no ref (`unsafe`, refused): a
+ref that is the source's own, its branch or one under
+`refs/agentfs/<source>/`, compared ignoring ASCII case since a loose ref
+is a file and some filesystems ignore case (a fork named as its source
+in any case, or a source branch renamed to a fork's); a base that is not on the source's branch (never
+the source's, or gone from a history rewritten by §15's runbook, which
+the fork would bring back); and an LFS object whose content is not its
+name. Each is one path in `fork::receive`: refs are written only from a
+judged `ForkRefs`, objects are copied only less a base judged on the
+branch (`OnBranch`), and LFS objects are taken only through the cache's
+verified insert, which keeps the bytes it hashed; `ForkRefs` and
+`OnBranch` live in a private module whose private fields leave their
+`judge` the only constructor. The fork itself is local-only and pushes
 nothing. The received refs are the source's history too: once the source
 gains a remote, every push that writes its branch
 carries them after it, create-only (`fork::receive::received_refs`; one
@@ -2196,7 +2244,9 @@ remote, such as a pre-receive hook on `refs/agentfs/*` (`rejected`); one
 commit over `agentfsMaxPushSize`, or one LFS object over
 `agentfsMaxLfsObjectSize`, in either push (`too_large`, §11.3); and a
 finish naming a remote that is no longer the fork's valid fork remote
-(`remote_gone`). Everything else (unreachable, auth, an untrusted host, a
+(`remote_gone`); and a local-only source refusing what the fork brings,
+its own refs, a base off its branch or an LFS object that is not its
+name (`unsafe`, "A local-only source's forks" above). Everything else (unreachable, auth, an untrusted host, a
 busy remote, a refused branch push, a moved branch) is pending and retried
 with backoff. A refusal writes the `refused` mark (finish, remote, reason,
 message, time) and raises `ForkRefused` once; the fork is `refused`, a
@@ -2569,7 +2619,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PatchDuplicate` | A queued patch commit was already applied under an earlier inbox number, so it was consumed with a marker commit and not applied again (§12; not an alarm) |
 | `ForkFinished` | A fork wrote its finish commit, with the fork and its change (none when nothing changed); once (§11.5; not an alarm, logged at INFO) |
 | `ForkPublished` | A fork's fork remote holds its change and finish refs at exactly their ids: the fork and the remote; once, when the published mark is written (§11.5; not an alarm, logged at INFO) |
-| `ForkRefused` | A fork's fork remote refuses its publish for good: the fork, the remote, the reason (`another_writer`, `too_large`, `rejected`, `remote_gone`) and the remote's message; once, when the refusal is recorded; nothing retries it until `agentfs fork finish --retry` ([fork-refused.md](runbooks/fork-refused.md), §11.5) |
+| `ForkRefused` | A fork's fork remote refuses its publish for good: the fork, the remote, the reason (`another_writer`, `too_large`, `rejected`, `remote_gone`, `unsafe`) and the remote's message; once, when the refusal is recorded; nothing retries it until `agentfs fork finish --retry` ([fork-refused.md](runbooks/fork-refused.md), §11.5) |
 | `ForkAbandoned` | An operator abandoned a fork on record, with the reason (§11.5; not an alarm, logged at INFO) |
 | `HistoryServiceUnavailable` | A front's request to the history service failed (unreachable, timed out, lost or refused) after it last succeeded: raised once per outage; boundaries fail with `EIO` until it is back (§3.5, §14) |
 | `HistoryServiceRestored` | A front's request succeeded again after `HistoryServiceUnavailable` (not an alarm; sinks filter, the CLI prints it) |
@@ -4293,10 +4343,11 @@ and through a front in the `fuse` job (`nothing_is_deleted_by_nesting`).
 Test 8's "the filesystem keeps working" runs through a live FUSE mount in
 the `e2e-shared-remotes` job (`ci/e2e-remote-failures.sh`: unreachable,
 hung, refused, auth, diverged and untrusted remotes at once, close
-latency against a healthy baseline, recovery, and the hung push
-abandoned at SIGTERM), and test 10's two volumes on one repository there
-too (`ci/e2e-shared-remote.sh`: two FUSE mounts pushing at once to one
-HTTP and one local repository, overlapping on the server) and as a unit
+latency against a healthy control volume mounted alongside, their closes
+interleaved, recovery, and the hung push abandoned at SIGTERM), and
+test 10's two volumes on one repository there too
+(`ci/e2e-shared-remote.sh`: two FUSE mounts pushing at once to one HTTP
+and one local repository, overlapping on the server) and as a unit
 test (`push.rs`, with a same-named rival). Test 10's identity templates
 run in `crates/agentfs/tests/cli_identity.rs` (every variable, the
 fallbacks, refusals, fronts, a template change across a service
@@ -4335,7 +4386,7 @@ runner.
 | LFS object size limit | `remote.<name>.agentfsMaxLfsObjectSize`, per object: the smallest across valid remotes refuses LFS content at record time (`PathRefused`, `lfs_object_too_large`, also before the freeze) with a commit-time backstop, never falling back to a blob; each remote's own limit fails its push as `too_large` at stage `lfs` before any upload; no per-push LFS byte budget (§7, §11.3, 2026-10) |
 | Push size limit | `remote.<name>.agentfsMaxPushSize`, measured before connecting with libgit2's pack builder (git pack only, not LFS); a backlog over it pushed in first-parent steps with `PushLimited` and the next step at once, applied and diverged refs held for the full push; a single commit over it fails as `too_large` with backoff, nothing sent; `agentfs push` steps until up to date (§11.3, 2026-10-13) |
 | Remotes | Any git remote, several at once (§11.1) |
-| Push timing | Intervals, independent of pod lifecycle, plus one bounded push at shutdown in `mount`, `run` and `serve-history`: after the final commit, one attempt per remote that lacks commits, within `--push-grace` (5 s; `0s` skips it), never retried and never extending shutdown past the grace. This sits beside the earlier decision that pushes run at intervals and that a pod's stop never waits on a push: the stop waits at most the grace, and what stays unpushed goes out on the next start (§11.2, 2026-10-13) |
+| Push timing | Intervals, independent of pod lifecycle, plus one bounded push at shutdown in `mount`, `run` and `serve-history`: after the final commit, one attempt per remote that lacks commits, started within `--push-grace` (5 s; `0s` skips it), never retried; at the grace's end every push is cancelled, and only a push to a path or `file://` remote already past its negotiation is waited for, until it reports, so shutdown spends at most the grace plus `LOCAL_UPDATE_CAP` (10 s) on pushes, whatever hangs. This sits beside the earlier decision that pushes run at intervals and that a pod's stop never waits on a push: what stays unpushed goes out on the next start (§11.2, 2026-10-13; the local-push wait and the 10 s ceiling 2026-10-18). The reason: an abandoned local push died with the process inside libgit2's ref update and left `remote.git/refs/heads/agentfs/<volume>.lock`, and every later push was refused, so "what stays unpushed goes out on the next start" did not hold (found in `csi_service.rs` on a slow disk). The cost: a stop can take up to the grace plus 10 s when a local remote's disk is slow, and that sum plus the final commit must stay under the CSI node plugin's 30 s unstage grace (and a sidecar's termination grace), or a kill cuts the update short and the lock returns. The 2026-10-18 part is a design choice (the flaky-test fix), not the owner's words |
 | Recovery | `agentfs restore` and `agentfs revert`, plus operator runbooks; further tooling discovered from use (§15) |
 | Telemetry | OpenTelemetry (§13) |
 | Secret scanning | Not in scope (§10) |
@@ -4392,7 +4443,7 @@ runner.
 | `fsync` class: capture | Class handles are never passthrough; every content or name change of a member holds a writer-preferring gate around its syscall, and a capture freezes the gate and copies every member as one atomic record. Triggers: `fsync` (rate-limited, and a capture failure does not fail the `fsync`), a trailing timer at max(first change, last attempt) + interval, the group's last close (`EIO` on failure), last release, unmount. A member's own namespace changes are folded into the next capture; a group an operator operation changes is captured once, at the operation's end. The capture holds the mount's name lock, so namespace changes anywhere on the mount wait for the copy. A member read error other than `ENOENT`/`ENOTDIR` fails the capture (§8) |
 | Atomic records | A journal record flag: at record time a refused member, or one a path rule skips (`group_member_skipped`), skips the rest of the group (`GroupRefused`), at commit time a refused change drops the whole record; a refused capture counts as done (§3.4, §8) |
 | `agentfs.maxSize` | An operator attribute for any path, refusing larger content (`max_size`) whatever the store, checked on the size on disk and on the frozen copy at record time, not again at commit; a file moved by a directory rename is checked against its new path's limit by the move's reconciliation and removed if over it (§3.1, §4.2, §8) |
-| Repack | `git repack -d -q --geometric=2` with bitmaps off, one thread, bounded window, delta cache and big-file threshold (about 256 MiB), a cleared environment and system and global config ignored, skipped when nothing is loose, killed on stop, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); skipped while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
+| Repack | `git repack -d -q --geometric=2` with bitmaps off, one thread, bounded window, delta cache and big-file threshold (about 256 MiB), a cleared environment and system and global config ignored, skipped when nothing is loose, killed on stop, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); put off by a second while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
 | Patch submission | A patch is a single commit pushed to `inbox/<n>` with a create-only lease (`--force-with-lease=<ref>:`); a race loses and takes `n+1`. `agentfs patch submit` wraps the producer's `git`; plain git works the same (§12, [runbook](runbooks/patch-queue.md)) |
 | Patch application | At mount only, after journal replay and before the service and FUSE start; a cherry-pick through the restore engine's checks, recorded as one atomic operation of kind `patch` with the patch's author and agentfs as committer; the first failure blocks the queue, raises `PatchBlocked`, and the volume mounts anyway (§12) |
 | Patch idempotency | Decided by the branch's trailers (`Agentfs-Inbox`, `Agentfs-Patch`), never by refs or a cache; refs move after the commit, so a crash anywhere re-applies nothing (§12) |
@@ -4432,7 +4483,7 @@ runner.
 | Forked volumes (2026-10-15) | A fork is a volume started from another volume's latest local commit (its source, at its base). It records, pushes and recovers like any volume; when it finishes it publishes one change, a commit whose parent is base, and whatever receives the change does all the gating: agentfs never reviews, accepts or merges. The owner's ask: "I want to gate the acceptance of changes upstream, but still want sandbox agents to interact with the normal filesystem. So with agentfs, I can grant them a worktree forked from the latest head, they edit whatever files they choose, and then when the sandbox ends those edits become an upstream merge patch — either through a PR or some automated flow, configurable/programmable by an implementer." Its scope: "Design it, but leave Hermes out of it. We're building an open source project; my application of it to my cluster stack will come later. Focus on capabilities. Configuration with sensible defaults". Where a change lands, the source volume or another repository as a PR: "A or b. I'm not sure" (both are supported); part of a volume: "Partial would be via a subpath mount rather than a partial clone"; one squashed patch or the full history: "Configurable". On the frame "agentfs forks and publishes; whatever receives the change does the gating": "Go" (all 2026-10-15, in a Claude Code session). Built (§11.5), in the four units of "Fork scope" |
 | Fork finish (2026-10-15) | A fork finishes when its claim is deleted (DeleteVolume of a volume from a fork class, whose reclaim policy must be Delete), and outside Kubernetes when `agentfs fork finish` runs. A restart of agentfs, the node plugin or the kubelet never finishes a fork; with a pod-scoped claim, a drain or rollout does. Asked when a sandbox is finished (a: its claim is deleted; b: its last pod stops; c: an explicit finish), the owner: "1a". Built (§11.5, §14.2) |
 | Fork delivery (2026-10-15) | The CSI driver only publishes; a receiver lands a published change in its source with `agentfs patch submit`. The library and the CLI also deliver a change, by four built-in methods: inbox, branch, command and webhook. The owner: "2 a for CSI and b for the library". Built: the CSI side (§14.2), and the library's methods with `agentfs fork deliver` (§11.5 "Delivery", forked volumes unit 3) |
-| Fork content (2026-10-15) | Everything agentfs itself does with a fork's content treats it as potentially hostile: names, paths, sizes, symlinks and gitlinks are checked, and nothing is run. agentfs adds no CI filtering: forks publish where users' own CI can act on them (§1.1). The owner: "3 potentially hostile, but don't limit CI capabilities that users could create". Built for create (base's tree through the confined writer), publish (create-only refs), a finished fork (read-only: no record, and a read-only CSI publish) and `fork list` (every published change checked against its finish commit, §11.5) |
+| Fork content (2026-10-15) | Everything agentfs itself does with a fork's content treats it as potentially hostile: names, paths, sizes, symlinks and gitlinks are checked, and nothing is run. agentfs adds no CI filtering: forks publish where users' own CI can act on them (§1.1). The owner: "3 potentially hostile, but don't limit CI capabilities that users could create". Built for create (base's tree through the confined writer), publish (create-only refs), a finished fork (read-only: no record, and a read-only CSI publish), `fork list` (every published change checked against its finish commit, §11.5) and, since 2026-10-18, receiving into a local-only source (none of the source's own refs, a base on its branch, LFS objects kept only as verified; refused as `unsafe`, §11.5) |
 | Fork remote (2026-10-16) | Forks publish to the source's own remote by default, with no setup (the remote its patch queue uses, §12: a design choice). An explicit fork-remote setting may name another remote, which is then never one of the source's push remotes, never sets its limits and never becomes its patch remote (a design choice, design rule 1). The stated cost: wherever that repository's CI may write, a sandbox's CI file can write the source's inbox, so the gate is only as strong as that repository's CI write permissions. The owner, answering the design gate's question on where forks publish: "b". Built (§11.5) |
 | Fork hostile residual (2026-10-16) | Accepted and stated, with no hardening work now: a sandbox's file calls are served by the privileged node plugin, which holds every profile's credentials, so a bug in that front would expose node root and every profile's credentials; and volume size is not enforced on the node's base path (§14.2), so a sandbox can fill it for every volume on that node. The owner, answering the design gate's question on the hostile residual: "a" |
 | Fork design rules (2026-10-16) | (1) A fork's push target is fixed at create: `agentfs/<fork>` on the fork remote, never the source's branch; every other setting is read from the source's settings files at each open, and settings that cannot be read stop the fork opening. (2) A fork finishes once, writing one finish record, and the finisher retries publishing until the fork remote holds the change; the fork is not deleted until it is published, or until an operator abandons it on record. (3) agentfs publishes and the receiver gates: a receiver lands the exact change commit it reviewed, and the source applies a given change at most once. Approved with the design gate's answers, with no notes (2026-10-16). Built (§11.5) |
@@ -4442,7 +4493,7 @@ runner.
 | Patch duplicates (2026-10-16) | The source applies a given change at most once ("Fork design rules" 3) by a rule for every producer, keyed by the patch commit's id: a queued patch commit that an earlier inbox number already applied is consumed with a marker commit and `PatchDuplicate`, never merged again (§12). Cost: a producer can no longer resubmit the identical commit to apply it again (it must make a new commit), and a replaced or replayed copy of a change has another id and is not caught. A design choice (forked volumes unit 1), not the owner's words |
 | Fork onDelete (2026-10-16) | A fork class's `onDelete` defaults to `delete`: publishing is a fork's gate before deletion, so the release decider weighs a fork's state, not its remotes. A design choice (forked volumes unit 1), not the owner's words |
 | Published (2026-10-16) | A fork is published when the finisher has seen its fork remote hold `refs/agentfs/<fork>/change` and `refs/agentfs/<fork>/finish` at exactly their ids after pushing them create-only; the fork's branch is pushed first, and a branch a forge moved is §11.3 divergence (saved and alarmed), which never blocks publishing. A design choice (forked volumes unit 1), not the owner's words |
-| Refused publish (2026-10-16) | One function, `fork::finish::refused_reason`, decides what is permanent: another writer's create-only ref (`another_writer`), the create-only push refused by the remote (`rejected`), one commit over `agentfsMaxPushSize` or one LFS object over `agentfsMaxLfsObjectSize` (`too_large`), and a finish naming a remote that is no longer the fork's fork remote (`remote_gone`); everything else stays pending and is retried. A refusal is recorded in `meta/fork.json`, raises `ForkRefused` once, is never retried by the node plugin, and is cleared by `agentfs fork finish --retry`. Cost: a branch push refused by a hook stays pending, since a volume's own pushes treat it so (§11.3). A design choice (forked volumes unit 2), not the owner's words |
+| Refused publish (2026-10-16) | One function, `fork::finish::refused_reason`, decides what is permanent: another writer's create-only ref (`another_writer`), the create-only push refused by the remote (`rejected`), one commit over `agentfsMaxPushSize` or one LFS object over `agentfsMaxLfsObjectSize` (`too_large`), and a finish naming a remote that is no longer the fork's fork remote (`remote_gone`); everything else stays pending and is retried. A refusal is recorded in `meta/fork.json`, raises `ForkRefused` once, is never retried by the node plugin, and is cleared by `agentfs fork finish --retry`. Cost: a branch push refused by a hook stays pending, since a volume's own pushes treat it so (§11.3). A design choice (forked volumes unit 2), not the owner's words. Amended 2026-10-18: a local-only source refusing what a fork brings (its own refs, a base off its branch, an LFS object that is not its name) is a fifth reason, `unsafe`, since no retry changes the fork's output; a design choice, from "Fork content" |
 | Abandon (2026-10-16) | `agentfs fork abandon --reason TEXT`, under the fork's state lock, records the reason, time, uid and state in `meta/fork.json`, in any state but published; then no finisher pushes the fork (each attempt reads the mark first) and DeleteVolume applies `onDelete`. Not covered: a push already running finishes (libgit2 cannot cancel it), and a fork mounted again pushes its branch on its interval as any volume does. The node plugin's finisher runs `--timeout 300s`, so the lock is free between scans for an operator's `--wait-lock`. A design choice (forked volumes unit 2, "Fork design rules" 2), not the owner's words |
 | Finished forks read-only (2026-10-16) | A fork whose branch head is its finish commit takes no record (`ForkFinished`, in the recorder itself); the CLI's changing commands refuse it before they start, while a CSI front of it FUSE-mounts it read-only (`ro`) and is bind-mounted read-only. The kind e2e found the read-only bind alone insufficient: the container still wrote, its runtime binding the target read-write. A design choice (forked volumes unit 2, "Fork content"), not the owner's words |
 | Fork remote LFS (2026-10-16) | A flagged fork remote must name its own `lfsurl` or `lfspushurl` while `lfs.url` or `lfs.pushurl` is set, and reads them before the global keys, so a fork's LFS objects never reach the source's store; without one the section is invalid and forks are refused. A design choice (forked volumes unit 2), not the owner's words |

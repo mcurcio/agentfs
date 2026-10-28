@@ -942,6 +942,7 @@ fn describe(outcome: &PushOutcome) -> String {
             stage,
         } => format!("failed ({kind}, stage {stage}): {message}; retry in {retry_in:?}"),
         PushOutcome::Busy => "busy: another push in progress".into(),
+        PushOutcome::Cancelled => "cancelled at the push grace's end; nothing was sent".into(),
     }
 }
 
@@ -1133,6 +1134,14 @@ fn report_stop(report: agentfs_core::service::ShutdownReport) -> ExitCode {
     }
     for name in &report.abandoned_pushes {
         println!("final push: {name}: still running at the push grace's end; abandoned");
+    }
+    for name in &report.abandoned_updates {
+        println!(
+            "final push: {name}: still updating the local remote {:?} after the push grace's \
+             end; abandoned, and a ref lock may remain in the remote (runbook: stuck-pushes.md, \
+             \"At shutdown\")",
+            agentfs_core::service::LOCAL_UPDATE_CAP
+        );
     }
     code
 }

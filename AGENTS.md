@@ -117,15 +117,7 @@ Rules:
 - Pin runners to `ubuntu-24.04`, never the floating `-latest` label. A test (`workflows_pin_runners`) enforces this.
 - A change is done when the **ci** and **image** runs for your final pushed SHA are green. Wait for both: `gh run list -R mcurcio/agentfs --commit <sha>`, then `gh run watch <id> -R mcurcio/agentfs --exit-status`. Don't report success while either is still in progress.
 - **bench** and **power-loss** run after the change lands on main and are checked afterwards (design §19.1, 2026-10-15). A bench budget warning or a power-loss failure is a follow-up to fix, not a reason to hold the change; report it.
-- Read failures with `gh run view <id> --log-failed`. Fix flaky jobs; a rerun alone is not a fix.
-
-Known flakes to watch:
-- the `e2e (operator runbooks)` history-rewrite step;
-- `csi_service.rs::the_supervisor_runs_and_recovers_a_real_history_service` under heavy local load;
-- one FUSE `e2e-recovery` failure, seen once;
-- `crates/agentfs/tests/mount.rs::revert_through_the_mount` (it assumes one commit per shell command);
-- the `e2e (OpenTelemetry collector)` job's `agentfs.repack.failures never counted` within 100 s: a repack is skipped while a push holds the push lock, so with four retrying remotes it can miss the wait;
-- `service::tests::final_push_respects_the_deadline` and `a_push_still_running_is_abandoned_after_the_grace_period` in `test (all)`, on timing under load.
+- Read failures with `gh run view <id> --log-failed`. A test that fails only sometimes is a broken test: find the mechanism, then fix the test or the product bug it exposes. Never rerun it as the fix, and never keep a list of tolerated flakes. The owner, 2026-10-18: "“Known flake” is not an acceptable category. Broken tests must be fixed".
 
 ## Git
 

@@ -123,10 +123,28 @@ if [ "${1:-}" = forks ]; then
     step "history-rewrite runbook: rewrite-fork-refs ($SERVER_REPO)"
     run_block history-rewrite.md rewrite-fork-refs
   done
+  # A stale .keep (a killed receive-pack's) would keep the secret's pack
+  # through gc: the block refuses, and changes nothing.
+  SERVER_REPO=$W/origin.git
+  git --git-dir "$SERVER_REPO" config receive.autogc true
+  keep=$SERVER_REPO/objects/pack/pack-stale.keep
+  touch "$keep"
+  step "history-rewrite runbook: rewrite-purge-bare refuses a .keep"
+  if out=$(run_block history-rewrite.md rewrite-purge-bare 2>&1); then
+    fail "the purge ran with $keep there: $out"
+  fi
+  assert_contains "$out" "refusing: $keep" "the purge names the .keep"
+  assert_eq true "$(git --git-dir "$SERVER_REPO" config --get receive.autogc)" \
+    "a refused purge leaves receive.autogc alone"
+  rm "$keep"
   for SERVER_REPO in "$W/origin.git" "$W/forks.git"; do
     step "history-rewrite runbook: rewrite-purge-bare ($SERVER_REPO)"
     run_block history-rewrite.md rewrite-purge-bare
   done
+  assert_eq true "$(git --git-dir "$W/origin.git" config --get receive.autogc)" \
+    "the purge puts an operator's receive.autogc back"
+  assert_eq "" "$(git --git-dir "$W/forks.git" config --get receive.autogc || true)" \
+    "the purge leaves no receive.autogc where there was none"
   step "history-rewrite runbook: rewrite-restart"
   run_block history-rewrite.md rewrite-restart
 

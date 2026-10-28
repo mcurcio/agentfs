@@ -35,18 +35,19 @@
 //! the committer; afterwards the committer's object database is refreshed
 //! so it sees the new packs. It runs only while no push is in progress (it
 //! takes every remote's push lock, without waiting), so a push never reads
-//! a pack being deleted; when a push holds a lock, the repack waits for
-//! the next round. A stop (shutdown) kills a repack in progress: git
+//! a pack being deleted. A round a push put off is tried again
+//! [`REPACK_RETRY`] later, not an interval later, so pushes that keep
+//! coming (several remotes, a short `pushInterval`, retries) cannot put
+//! the repack off round after round. A stop (shutdown) kills a repack in progress: git
 //! writes new packs before it deletes old ones, so a killed repack loses
 //! nothing (it may leave a temporary file, which the next one ignores).
 
-use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::push::PushLock;
 use crate::service::Stop;
 
 /// The arguments after `git`.
@@ -74,6 +75,9 @@ pub const REPACK_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 
 /// How often a running repack checks for a stop.
 const POLL: Duration = Duration::from_millis(100);
+
+/// How soon a round a push put off is tried again.
+pub const REPACK_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepackError {
@@ -109,14 +113,18 @@ pub struct RepackSchedule {
     pub first: Duration,
     /// Between repacks.
     pub interval: Duration,
+    /// After a round a push put off ([`RepackOutcome::PushInProgress`]).
+    pub retry: Duration,
 }
 
 impl RepackSchedule {
-    /// The first repack one `interval` after start, then every `interval`.
+    /// The first repack one `interval` after start, then every `interval`;
+    /// a round a push put off is tried again [`REPACK_RETRY`] later.
     pub fn every(interval: Duration) -> Self {
         Self {
             first: interval,
             interval,
+            retry: REPACK_RETRY,
         }
     }
 }
@@ -130,13 +138,13 @@ pub fn repack(
     push_locks: &[PathBuf],
     stop: &Stop,
 ) -> Result<RepackOutcome, RepackError> {
-    if loose_objects(git_dir) == 0 {
+    if !has_loose_objects(git_dir) {
         return Ok(RepackOutcome::NothingToDo);
     }
     let mut held = Vec::with_capacity(push_locks.len());
     for path in push_locks {
-        match try_lock(path) {
-            Ok(Some(file)) => held.push(file),
+        match PushLock::try_take(path) {
+            Ok(Some(lock)) => held.push(lock),
             Ok(None) => return Ok(RepackOutcome::PushInProgress),
             Err(source) => {
                 return Err(RepackError::Lock {
@@ -210,36 +218,32 @@ fn command(git: &Path, git_dir: &Path) -> Command {
     cmd
 }
 
-/// How many loose objects `git_dir` holds (unreadable directories count
-/// as none).
-fn loose_objects(git_dir: &Path) -> usize {
-    let Ok(dirs) = std::fs::read_dir(git_dir.join("objects")) else {
-        return 0;
-    };
-    dirs.filter_map(Result::ok)
+/// The fan-out directories (`objects/xx`) of `git_dir`, read (unreadable
+/// ones are left out).
+fn fan_out(git_dir: &Path) -> impl Iterator<Item = std::fs::ReadDir> {
+    std::fs::read_dir(git_dir.join("objects"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
         .filter(|e| {
             let name = e.file_name();
             let name = name.as_encoded_bytes();
             name.len() == 2 && name.iter().all(u8::is_ascii_hexdigit)
         })
         .filter_map(|e| std::fs::read_dir(e.path()).ok())
-        .map(Iterator::count)
-        .sum()
 }
 
-/// The push lock at `path`, unless another holder has it.
-fn try_lock(path: &Path) -> io::Result<Option<File>> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
-    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(file)),
-        Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+/// Whether `git_dir` holds any loose object. It stops at the first one,
+/// so a round tried again every second while a push runs reads one
+/// directory entry, not all 256 directories.
+fn has_loose_objects(git_dir: &Path) -> bool {
+    fan_out(git_dir).any(|mut entries| entries.next().is_some())
+}
+
+/// How many loose objects `git_dir` holds.
+#[cfg(test)]
+fn loose_objects(git_dir: &Path) -> usize {
+    fan_out(git_dir).map(Iterator::count).sum()
 }
 
 #[cfg(test)]
@@ -305,6 +309,7 @@ mod tests {
             .commit(Some("refs/heads/agentfs/vol"), &sig, &sig, "c", &tree, &[])
             .unwrap();
         assert!(loose_objects(&state.git()) >= 3);
+        assert!(has_loose_objects(&state.git()));
         let stop = Stop::default();
         let lock = dir.path().join("push.lock");
         let run = || {
@@ -317,13 +322,14 @@ mod tests {
         };
 
         // A push in progress: nothing is done.
-        let held = try_lock(&lock).unwrap().unwrap();
+        let held = PushLock::try_take(&lock).unwrap().unwrap();
         assert_eq!(run().unwrap(), RepackOutcome::PushInProgress);
         drop(held);
 
         let outcome = run().unwrap();
         assert!(matches!(outcome, RepackOutcome::Done(_)), "{outcome:?}");
         assert_eq!(loose_objects(&state.git()), 0);
+        assert!(!has_loose_objects(&state.git()));
         // The same handle finds the objects once its odb is refreshed.
         repo.odb().unwrap().refresh().unwrap();
         assert_eq!(repo.find_commit(commit).unwrap().tree_id(), tree.id());

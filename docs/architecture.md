@@ -59,6 +59,8 @@ missing from these tables or a row names a module that no longer exists;
 | `service.rs` | The background loops: commit loop, one push loop per remote, repack (§3.4, §11.2) |
 | `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
 | `push/claim.rs` | The branch rule's pure deciders: `claim` (create or fast-forward, from the remote's value in the connection) and `start_branch_moved` (the start-branch alarm) |
+| `push/lock.rs` | A remote's push lock, an `flock` held by a push and by a repack, unlocked before it is closed so a child process still sharing its file cannot hold it on (§8, §11.2) |
+| `push/stop.rs` | A push thread's phase (idle, attempting, updating a local remote, finishing) under one lock, and cancelling it at shutdown: nothing is sent after the cancel, and a local push already updating the remote's pack and refs is waited for until it reports, never cut off (§11.2) |
 | `release.rs` | The one deletion decider: delete, keep or wait for a worktree, from its remotes mode, what each remote advertises, the journal's backlog, `onDelete` and a fork's status (F8 rule 3) |
 | `push_size.rs` | Measuring a push's git pack against `agentfsMaxPushSize` before connecting, and the first-parent step that fits (§11.3) |
 | `remote_auth.rs` | Credentials and host-key checks for one remote, shared by push and patch fetch, and the scope that hands an SSH remote to the transport (§11.1) |
@@ -243,8 +245,8 @@ One loop per remote (`service.rs`), every `pushInterval`, with backoff
 after failures (§11.2). Each attempt (`push.rs`, `push_once`), in this
 order:
 
-1. takes the remote's push lock (a repack skips its round while any push
-   holds one, so a push never reads a pack being deleted) and reloads the
+1. takes the remote's push lock (a repack waits a second and tries again
+   while any push holds one, so a push never reads a pack being deleted) and reloads the
    remote's push state, since another process may have pushed;
    with `agentfsMaxPushSize` set, measures the pack the remote lacks
    (`push_size.rs`) before connecting: over the limit, only the longest
@@ -294,8 +296,10 @@ signal exits at once with status 130, which the journal makes safe. For
    open);
 6. each remote that lacks commits gets one more push of the final
    commit, all within `--push-grace` from the stop (pushes in progress
-   included); a push still running at the deadline is abandoned on its
-   thread, and `--push-grace 0s` skips the final push. `run` and
+   included); at the deadline every push is cancelled (`push/stop.rs`),
+   one still running is abandoned on its thread, unless it is updating a
+   local remote's pack and refs, which is waited for up to
+   `LOCAL_UPDATE_CAP`, and `--push-grace 0s` skips the final push. `run` and
    `serve-history` stop the same way (`Service::shutdown`, §11.2), so the
    last commit before a stop reaches the remotes when they answer in
    time, and otherwise goes out on the next start.

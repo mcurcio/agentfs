@@ -81,7 +81,10 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   and six failing ones (nothing listening, a server that never answers
   ([`ci/hung-server.sh`](../ci/hung-server.sh)), a refusing hook, a wrong
   password, a diverged branch, an untrusted certificate) keeps serving: the
-  close latency stays within max(3x a healthy baseline, 50 ms) at p99,
+  close latency stays within max(3x a healthy control's, 50 ms) at p99
+  (the control: a volume with only the good remote, mounted alongside,
+  its 2,000 closes interleaved with the failing mount's so the runner's
+  noise falls on both alike),
   renames, directories and a `git clone` work, everything reaches history
   and the good remote, `agentfs status` and the alarms name each failure's
   kind, the fixed remotes catch up, and SIGTERM ends the mount within its

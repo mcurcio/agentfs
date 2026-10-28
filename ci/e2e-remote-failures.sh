@@ -11,11 +11,13 @@
 #              the head saved as a diverged ref
 #   untrusted  https, self-signed       untrusted_host
 #
-# Through that mount: 4 KiB write-and-close cycles (their close latency
-# against a baseline taken on the same volume with only the good remote),
-# renames, mkdir and rmdir, and a `git clone`. Checks that the close
-# latency stays within max(3x baseline, 50 ms) at p99 and under 1 s at
-# most, that everything is in history and on the good remote, that
+# Through that mount: 4 KiB write-and-close cycles, renames, mkdir and
+# rmdir, and a `git clone`. The close latency is measured against a
+# control: a second volume, configured alike but with only the good
+# remote, mounted at the same time, its closes interleaved with the
+# failing mount's one for one, so the runner's noise falls on both alike.
+# Checks that the close latency stays within max(3x the control's, 50 ms)
+# at p99 and under 1 s at most, that everything is in history and on the good remote, that
 # `agentfs status` names each failure's kind and the alarms fired, that
 # the refused and badauth remotes catch up once fixed (hook removed,
 # credential rotated), and that SIGTERM ends the mount within its push
@@ -49,13 +51,19 @@ CREDS=$W/creds
 LOGS=${RUNNER_TEMP:-$W}/agentfs-remote-failures-logs
 LOG=$LOGS/mount.log
 HUNG_PORT=9419
-CLOSES=400
-mkdir -p "$BACKING" "$MNT" "$CREDS" "$LOGS"
-chmod 755 "$BACKING" "$MNT"
+# The control volume: state, backing directory and mount point.
+CONTROL=$W/control
+# Closes in each volume: p99 is then about the 20th-worst, so a burst of
+# runner noise a few closes long cannot decide it alone.
+CLOSES=2000
+mkdir -p "$BACKING" "$MNT" "$CREDS" "$LOGS" "$CONTROL/backing" "$CONTROL/mnt"
+chmod 755 "$BACKING" "$MNT" "$CONTROL" "$CONTROL/backing" "$CONTROL/mnt"
 : >"$LOG"
 MOUNT_PID=
+CONTROL_PID=
 
 sgit() { sudo git --git-dir "$STATE/git" "$@"; }
+cgit() { sudo git --git-dir "$CONTROL/state/git" "$@"; }
 sagentfs() { sudo env AGENTFS_POD=pod-0 "$AGENTFS_BIN" --state "$STATE" "$@"; }
 head_of() { sgit rev-parse refs/heads/agentfs/demo; }
 in_mnt() { sudo sh -c "cd '$MNT' && $1"; }
@@ -69,11 +77,12 @@ set_password() { # user password
 
 cleanup() {
   status=$?
-  if [ -n "$MOUNT_PID" ]; then
-    sudo kill -TERM "$MOUNT_PID" 2>/dev/null || true
-    wait "$MOUNT_PID" 2>/dev/null || true
-  fi
+  for pid in $MOUNT_PID $CONTROL_PID; do
+    sudo kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
   mountpoint -q "$MNT" && sudo umount -l "$MNT"
+  mountpoint -q "$CONTROL/mnt" && sudo umount -l "$CONTROL/mnt"
   "$HERE/hung-server.sh" stop "$W/hung.pid"
   if [ $status -ne 0 ]; then
     echo "---- $LOG"
@@ -97,17 +106,7 @@ stop_volume() {
   MOUNT_PID=
 }
 
-# Close latency through the mount: sets P99 and MAX (microseconds).
-latency() { # label
-  local json
-  in_mnt "mkdir -p lat-$1"
-  json=$(sudo python3 "$HERE/boundary-latency.py" --json "$MNT/lat-$1" "$CLOSES" "$1")
-  echo "$json"
-  P99=$(jq -r '.p99_us | floor' <<<"$json")
-  MAX=$(jq -r '.max_us | floor' <<<"$json")
-}
-
-step "a volume with a good remote: the baseline"
+step "a volume with a good remote and six failing ones, and a control"
 set_password good-user good-pw
 set_password bad-user right-pw
 printf 'username=good-user\npassword=good-pw\n' >"$CREDS/good"
@@ -120,17 +119,13 @@ git init -q --bare "$GIT_SERVER_REPOS/badauth.git"
 printf '#!/bin/sh\necho "refused by policy" >&2\nexit 1\n' >"$REFUSED/hooks/pre-receive"
 chmod +x "$REFUSED/hooks/pre-receive"
 sagentfs init --volume demo >/dev/null
-sgit config agentfs.commitWindow 100ms
-sgit config agentfs.pushInterval 1s
-sgit config remote.good.url "$GIT_HTTP_BASE/good.git"
-sgit config remote.good.agentfsCredentials "$CREDS/good"
-mount_volume
-latency baseline
-BASE_P99=$P99
-stop_volume
-pass "baseline p99 ${BASE_P99}us"
-
-step "six failing remotes"
+sudo env AGENTFS_POD=pod-0 "$AGENTFS_BIN" --state "$CONTROL/state" init --volume control >/dev/null
+for g in sgit cgit; do
+  $g config agentfs.commitWindow 100ms
+  $g config agentfs.pushInterval 1s
+  $g config remote.good.url "$GIT_HTTP_BASE/good.git"
+  $g config remote.good.agentfsCredentials "$CREDS/good"
+done
 "$HERE/hung-server.sh" start "$HUNG_PORT" "$W/hung.pid"
 # The diverged remote's branch already holds a commit of its own.
 DIVERGED=$W/diverged.git
@@ -148,11 +143,25 @@ sgit config remote.badauth.agentfsCredentials "$CREDS/bad"
 sgit config remote.diverged.url "$DIVERGED"
 sgit config remote.untrusted.url "$GIT_HTTPS_UNTRUSTED_BASE/untrusted.git"
 mount_volume
+sudo env AGENTFS_POD=pod-0 "$AGENTFS_BIN" --state "$CONTROL/state" mount --passthrough "$P" \
+  --unmount-grace 5s "$CONTROL/backing" "$CONTROL/mnt" >"$LOGS/control.log" 2>&1 &
+CONTROL_PID=$!
+wait_for 30 mountpoint -q "$CONTROL/mnt" || fail "the control never mounted"
 
 step "the workload through the mount while the remotes fail"
-latency failing
-FAIL_P99=$P99
-FAIL_MAX=$MAX
+# Close latency: the control's closes interleaved with the failing mount's.
+in_mnt "mkdir -p lat-failing"
+sudo mkdir -p "$CONTROL/mnt/lat-control"
+lat=$(sudo python3 "$HERE/boundary-latency.py" --json "$MNT/lat-failing" "$CLOSES" failing \
+  "$CONTROL/mnt/lat-control" control)
+echo "$lat"
+of() { jq -r "select(.label == \"$1\") | .$2 | floor" <<<"$lat"; } # label field
+BASE_P99=$(of control p99_us)
+FAIL_P99=$(of failing p99_us)
+FAIL_MAX=$(of failing max_us)
+sudo kill -TERM "$CONTROL_PID"
+wait "$CONTROL_PID" || fail "the control did not exit cleanly"
+CONTROL_PID=
 in_mnt "mkdir -p tree/a/b && echo one >tree/a/b/f.txt && mv tree/a/b/f.txt tree/a/g.txt"
 in_mnt "mkdir gone-dir && rmdir gone-dir && mv tree/a tree/c"
 for i in $(seq 50); do in_mnt "echo $i >small-$i.txt"; done
@@ -167,9 +176,9 @@ in_mnt "echo last >last.txt"
 limit=$((3 * BASE_P99))
 [ "$limit" -ge 50000 ] || limit=50000
 [ "$FAIL_P99" -le "$limit" ] ||
-  fail "close p99 ${FAIL_P99}us with failing remotes, over max(3x baseline ${BASE_P99}us, 50ms)"
+  fail "close p99 ${FAIL_P99}us with failing remotes, over max(3x the control's ${BASE_P99}us, 50ms)"
 [ "$FAIL_MAX" -lt 1000000 ] || fail "a close took ${FAIL_MAX}us with failing remotes"
-pass "close latency with failing remotes: p99 ${FAIL_P99}us (baseline ${BASE_P99}us), max ${FAIL_MAX}us"
+pass "close latency with failing remotes: p99 ${FAIL_P99}us (control ${BASE_P99}us), max ${FAIL_MAX}us"
 
 has_history() { # path content
   [ "$(sgit show "refs/heads/agentfs/demo:$1" 2>/dev/null)" = "$2" ]

@@ -249,3 +249,31 @@ Neither stopped the work; each was resolved as below.
    cannot tell "a person created it from our commits" from "we created it and a person added
    commits". Not closed by this change; closing it needs a record of ref creation that does not
    exist (an owner call: new state, or limiting `--force-with-lease` to `refs/heads/agentfs/*`).
+
+## 2026-10-18, flaky-test fix agent (fix-flaky-csi-service)
+
+1. `csi_service.rs::the_supervisor_runs_and_recovers_a_real_history_service` (the AGENTS.md
+   "known flake") fails on a slow disk at its last assertion, `the final push` (line 232):
+   reproduced 6/6 in the dev container with `docker run --device-write-iops /dev/vda:3`; the
+   service logs `final push: origin: still running at the push grace's end; abandoned`. The test
+   asserts a best-effort outcome (§11.2: one attempt within `--push-grace`, 5 s in
+   `launcher::service_spec`) as certain. 0 failures in 186 runs under CPU hogs, 24 parallel
+   copies, `--cpus=1` and `dd oflag=dsync` writers: it needs slow fsyncs, not CPU load.
+2. Stopping point, a product bug: the guaranteed path (§11.2 "what stays unpushed goes out on
+   the next start"; §14.2 the release scan pushes until a push exits 0 at its head) does not
+   hold for a local-path remote. The abandoned final push dies with the process inside
+   libgit2's local-transport ref update and leaves `<remote>/refs/heads/agentfs/<volume>.lock`;
+   every later push to that remote fails `refused: failed to lock file ... for writing` until
+   an operator deletes the lock. With the test changed to wait for the release scan to hold
+   the head, 4/6 failed this way at 3 IOPS. Fixing it needs a design call: wait past the grace
+   for a local push (contradicts "never waits longer"), push local remotes from a child that
+   outlives the service, or clear a stale remote ref lock (unsafe while another state area of
+   the same volume, F8 moving, may push that branch). Not landed; the test change is left
+   uncommitted in the worktree.
+3. Follow-up, same day: the main session decided (a design choice, not the owner's words) to
+   fix the product bug and land the test change with it. Built: at the push grace's end every
+   push is cancelled at its negotiation (`push/stop.rs`), and a push to a local remote already
+   past it is waited for up to `LOCAL_UPDATE_CAP` (10 s); design §11.2 and the §19.1 "Push
+   timing" row amended. git2-rs's push progress callbacks cannot return an error, so libgit2
+   offers no abort point after the negotiation: the brief's "cancel in the transfer callbacks"
+   was not available, and the whole local transfer is waited for, not only its ref update.
