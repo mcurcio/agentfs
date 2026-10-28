@@ -795,6 +795,47 @@ fn force_with_lease_replaces_only_the_leased_branch() {
     assert_eq!(branch(&remote), Some(unrelated));
 }
 
+/// Divergence case B (bead agentfs-4lb.2): the remote's branch holds this
+/// volume's newer history, recorded from another copy of its state area.
+/// `--force-with-lease` refuses it, exit 1, and the branch stays.
+#[test]
+fn force_with_lease_refuses_history_agentfs_recorded() {
+    let v = Volume::new();
+    let remote = v.dir.path().join("remote.git");
+    bare(&remote);
+    v.config(&[("remote.origin.url", &remote.display().to_string())]);
+    v.record("a.txt", "a");
+    assert!(v.run(&["push"]).status.success());
+    let repo = git2::Repository::open_bare(&remote).unwrap();
+    let parent = repo
+        .find_commit(repo.refname_to_id("refs/heads/agentfs/demo").unwrap())
+        .unwrap();
+    let sig = git2::Signature::now("agent", "agent@example.invalid").unwrap();
+    let newer = repo
+        .commit(
+            Some("refs/heads/agentfs/demo"),
+            &sig,
+            &sig,
+            "close c.txt\n\nAgentfs-Seq: 99\nAgentfs-Trigger: close\n",
+            &parent.tree().unwrap(),
+            &[&parent],
+        )
+        .unwrap();
+    v.record("b.txt", "b");
+    assert_eq!(v.run(&["push"]).status.code(), Some(1));
+
+    let out = v.run(&["push", "--force-with-lease", &newer.to_string()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains(&format!(
+            "origin: refused: the remote's branch holds {newer}, which carries agentfs trailers"
+        )),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(branch(&remote), Some(newer));
+}
+
 /// The lease push needs exactly one remote, and never goes through a
 /// running daemon.
 #[test]
