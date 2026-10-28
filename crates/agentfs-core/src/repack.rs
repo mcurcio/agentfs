@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::push::PushLock;
+use crate::file_lock::{FileLock, Mode};
 use crate::service::Stop;
 
 /// The arguments after `git`.
@@ -143,7 +143,7 @@ pub fn repack(
     }
     let mut held = Vec::with_capacity(push_locks.len());
     for path in push_locks {
-        match PushLock::try_take(path) {
+        match FileLock::try_take(path, Mode::Exclusive) {
             Ok(Some(lock)) => held.push(lock),
             Ok(None) => return Ok(RepackOutcome::PushInProgress),
             Err(source) => {
@@ -322,7 +322,7 @@ mod tests {
         };
 
         // A push in progress: nothing is done.
-        let held = PushLock::try_take(&lock).unwrap().unwrap();
+        let held = FileLock::try_take(&lock, Mode::Exclusive).unwrap().unwrap();
         assert_eq!(run().unwrap(), RepackOutcome::PushInProgress);
         drop(held);
 

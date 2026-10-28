@@ -10,9 +10,9 @@
 //! are written and refused unless they match.
 //!
 //! **Resumable downloads** ([`Partial`]) write into `incomplete/<oid>`
-//! (mode 0600) under an exclusive `flock` on that file, so one process
-//! and thread at a time downloads an object; another waits, then finds it
-//! cached. A partial survives failures, commands and restarts: the next
+//! (mode 0600) under an exclusive `flock` on that file
+//! ([`crate::file_lock`]), so one process and thread at a time downloads
+//! an object; another waits, then finds it cached. A partial survives failures, commands and restarts: the next
 //! download hashes what is there and asks the server for the rest (HTTP
 //! `Range`). On completion its size and SHA-256 are checked, and it is
 //! fsynced and renamed into `objects/`; a mismatch deletes it. `open`
@@ -25,11 +25,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fs::{FlockOperation, flock};
-
 use super::LfsError;
 use super::pointer::{Hashing, LfsOid, Pointer};
 use crate::events::PushFailureKind;
+use crate::file_lock::{Attempt, FileLock, Mode};
 
 /// The object cache of one state area.
 #[derive(Debug)]
@@ -156,10 +155,10 @@ impl ObjectCache {
             let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
                 continue;
             };
-            if flock(&file, FlockOperation::NonBlockingLockExclusive).is_err() {
+            let Ok(Attempt::Taken(lock)) = FileLock::try_lock(file, Mode::Exclusive) else {
                 continue; // A download holds it.
-            }
-            let len = file.metadata()?.len();
+            };
+            let len = lock.file().metadata()?.len();
             match fs::remove_file(&path) {
                 Ok(()) => {
                     removed.0 += 1;
@@ -194,22 +193,15 @@ impl ObjectCache {
             if self.contains(pointer) {
                 return Ok(None);
             }
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(&path)
-                .map_err(local)?;
-            flock(&file, FlockOperation::LockExclusive).map_err(|e| local(e.into()))?;
+            let file = FileLock::open(&path).map_err(local)?;
+            let lock = FileLock::wait(file, Mode::Exclusive).map_err(local)?;
             if self.contains(pointer) {
                 return Ok(None);
             }
             // The file locked must still be the one at the path: a holder
             // that finished renamed it into objects/, or a prune removed
             // it, while this caller waited.
-            let held = file.metadata().map_err(local)?;
+            let held = lock.file().metadata().map_err(local)?;
             match fs::metadata(&path) {
                 Ok(now) if now.ino() == held.ino() && now.dev() == held.dev() => {}
                 Ok(_) => continue,
@@ -217,7 +209,7 @@ impl ObjectCache {
                 Err(e) => return Err(local(e)),
             }
             let mut partial = Partial {
-                file,
+                lock,
                 path,
                 pointer: *pointer,
                 hashing: Hashing::new(),
@@ -348,7 +340,7 @@ impl ObjectCache {
 /// A resumable download in `incomplete/<oid>`, locked by its holder
 /// ([`ObjectCache::partial`]).
 pub struct Partial {
-    file: File,
+    lock: FileLock,
     path: PathBuf,
     pointer: Pointer,
     hashing: Hashing,
@@ -364,16 +356,16 @@ impl Partial {
     /// the object's start, so it is emptied.
     fn rehash(&mut self) -> io::Result<()> {
         self.hashing = Hashing::new();
-        let len = self.file.metadata()?.len();
+        let len = self.lock.file().metadata()?.len();
         if len > self.pointer.size {
             return self.restart();
         }
-        self.file.seek(SeekFrom::Start(0))?;
+        self.lock.file_mut().seek(SeekFrom::Start(0))?;
         let mut buf = vec![0u8; 64 << 10];
         let mut left = len;
         while left > 0 {
             let want = buf.len().min(left as usize);
-            let n = self.file.read(&mut buf[..want])?;
+            let n = self.lock.file_mut().read(&mut buf[..want])?;
             if n == 0 {
                 break;
             }
@@ -382,15 +374,15 @@ impl Partial {
         }
         // Whatever could not be read back is dropped.
         let held = self.hashing.size();
-        self.file.set_len(held)?;
-        self.file.seek(SeekFrom::Start(held))?;
+        self.lock.file().set_len(held)?;
+        self.lock.file_mut().seek(SeekFrom::Start(held))?;
         Ok(())
     }
 
     /// Empties it, for a download that starts again from the first byte.
     pub fn restart(&mut self) -> io::Result<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
+        self.lock.file().set_len(0)?;
+        self.lock.file_mut().seek(SeekFrom::Start(0))?;
         self.hashing = Hashing::new();
         Ok(())
     }
@@ -422,7 +414,7 @@ impl Partial {
                 self.discard();
                 return Err(mismatch(&self.pointer, "more bytes than its size"));
             }
-            self.file.write_all(&buf[..n]).map_err(|e| {
+            self.lock.file_mut().write_all(&buf[..n]).map_err(|e| {
                 LfsError::local(format!("writing LFS object {oid} to the cache: {e}"))
             })?;
             self.hashing.update(&buf[..n]);
@@ -455,7 +447,7 @@ impl Partial {
             ));
         }
         let local = |e: io::Error| LfsError::local(format!("writing to the LFS cache: {e}"));
-        self.file.sync_all().map_err(local)?;
+        self.lock.file().sync_all().map_err(local)?;
         // Renamed while still locked: a waiter then finds the object cached.
         publish_into(&cache.objects, &self.path, &pointer.oid).map_err(local)
     }
@@ -534,6 +526,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = ObjectCache::open(dir.path().join("lfs")).unwrap();
         (dir, cache)
+    }
+
+    /// A partial download let go is free at once, though another thread
+    /// keeps spawning processes that share its file until they exec.
+    #[test]
+    fn a_partial_let_go_is_free_while_children_spawn() {
+        let (_dir, cache) = cache();
+        let pointer = Pointer {
+            oid: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                .parse()
+                .unwrap(),
+            size: 5,
+        };
+        let (busy, takes) = crate::file_lock::takes_while_children_spawn(|| {
+            drop(cache.partial(&pointer).unwrap().unwrap());
+            cache.remove_free_partials().unwrap().0 == 1
+        });
+        assert_eq!(busy, 0, "busy with no holder, of {takes} takes");
     }
 
     #[test]

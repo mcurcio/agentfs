@@ -1,0 +1,12 @@
+# Every advisory file lock goes through agentfs_core::file_lock::FileLock,
+# which unlocks before it closes: a lock released only by closing stays held
+# by a child process between its fork and its exec (design §2.2).
+disallowed-methods = [
+    { path = "std::fs::File::lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "std::fs::File::lock_shared", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "std::fs::File::try_lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "std::fs::File::try_lock_shared", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "std::fs::File::unlock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
+    { path = "rustix::fs::flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+    { path = "libc::flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+]

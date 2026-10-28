@@ -688,8 +688,7 @@ fn lfs_prune_waits_for_the_cache_lock() {
     v.ok(&["push"]);
     let one = oid_at(&v, "agentfs/demo", "one.bin");
     // A restore (here, the test) holds the cache lock shared.
-    let lock = fs::File::create(v.state().join("lfs/lock")).unwrap();
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockShared).unwrap();
+    let lock = agentfs_core::lfs::lock::CacheLock::shared(&v.state().join("lfs")).unwrap();
     let out = v.run(&["--wait-lock", "300ms", "lfs", "prune"]);
     assert_eq!(out.status.code(), Some(75));
     assert!(

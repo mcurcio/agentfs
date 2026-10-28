@@ -75,6 +75,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{RemoteSettings, Settings};
 use crate::events::{Event, Events, PushFailureKind, PushStage};
+use crate::file_lock::{FileLock, Mode};
 use crate::history::init_libgit2;
 use crate::lfs::upload::objects_to_upload;
 use crate::lfs::{Direction, LfsError, ObjectCache, Transfer, UploadReport, transfer_for};
@@ -85,11 +86,9 @@ use crate::telemetry::{Telemetry, spans};
 use crate::volume::StateDir;
 
 mod claim;
-mod lock;
 mod stop;
 
 pub use claim::{Claim, StartBranchMoved, claim, start_branch_moved};
-pub use lock::PushLock;
 pub use stop::{PushPhase, PushStop};
 
 /// The longest delay between retries of a failing remote, unless
@@ -1334,8 +1333,8 @@ impl RemotePusher {
     }
 
     /// Takes this remote's push lock without waiting.
-    fn lock(&self) -> io::Result<Option<PushLock>> {
-        PushLock::try_take(&self.lock_path)
+    fn lock(&self) -> io::Result<Option<FileLock>> {
+        FileLock::try_take(&self.lock_path, Mode::Exclusive)
     }
 
     /// `<oid>:<ref>` for the branch and every
@@ -4258,8 +4257,9 @@ mod tests {
         v.commit();
         let (events, sink_events) = sink();
         let mut pusher = v.pusher("origin", sink_events);
-        let held = fs::File::create(v.state.push_lock("origin")).unwrap();
-        rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let held = FileLock::try_take(&v.state.push_lock("origin"), Mode::Exclusive)
+            .unwrap()
+            .unwrap();
         assert_eq!(pusher.push_once(), PushOutcome::Busy);
         assert!(!PushOutcome::Busy.is_success());
         assert!(events.take().is_empty());
