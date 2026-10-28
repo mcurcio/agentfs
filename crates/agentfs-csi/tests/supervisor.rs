@@ -178,7 +178,7 @@ impl Launcher for Fake {
                     FileLock::try_take(&state.front_lease(slot), Mode::Exclusive)?
                 {
                     lease.file().set_len(0)?;
-                    writeln!(lease.file_mut(), "pid={pid} command=mount since=x")?;
+                    writeln!(lease, "pid={pid} command=mount since=x")?;
                     proc.lease = Some(lease);
                     break;
                 }

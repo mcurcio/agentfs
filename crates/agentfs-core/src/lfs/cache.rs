@@ -12,10 +12,11 @@
 //! **Resumable downloads** ([`Partial`]) write into `incomplete/<oid>`
 //! (mode 0600) under an exclusive `flock` on that file
 //! ([`crate::file_lock`]), so one process and thread at a time downloads
-//! an object; another waits, then finds it cached. A partial survives failures, commands and restarts: the next
-//! download hashes what is there and asks the server for the rest (HTTP
-//! `Range`). On completion its size and SHA-256 are checked, and it is
-//! fsynced and renamed into `objects/`; a mismatch deletes it. `open`
+//! an object; another waits, then finds it cached. A partial survives
+//! failures, commands and restarts: the next download hashes what is
+//! there and asks the server for the rest (HTTP `Range`). On completion
+//! its size and SHA-256 are checked, and it is fsynced and renamed into
+//! `objects/`; a mismatch deletes it. `open`
 //! clears `tmp/` but never `incomplete/`; only `agentfs lfs prune` removes
 //! partials nobody holds.
 
@@ -360,12 +361,12 @@ impl Partial {
         if len > self.pointer.size {
             return self.restart();
         }
-        self.lock.file_mut().seek(SeekFrom::Start(0))?;
+        self.lock.seek(SeekFrom::Start(0))?;
         let mut buf = vec![0u8; 64 << 10];
         let mut left = len;
         while left > 0 {
             let want = buf.len().min(left as usize);
-            let n = self.lock.file_mut().read(&mut buf[..want])?;
+            let n = self.lock.read(&mut buf[..want])?;
             if n == 0 {
                 break;
             }
@@ -375,14 +376,14 @@ impl Partial {
         // Whatever could not be read back is dropped.
         let held = self.hashing.size();
         self.lock.file().set_len(held)?;
-        self.lock.file_mut().seek(SeekFrom::Start(held))?;
+        self.lock.seek(SeekFrom::Start(held))?;
         Ok(())
     }
 
     /// Empties it, for a download that starts again from the first byte.
     pub fn restart(&mut self) -> io::Result<()> {
         self.lock.file().set_len(0)?;
-        self.lock.file_mut().seek(SeekFrom::Start(0))?;
+        self.lock.seek(SeekFrom::Start(0))?;
         self.hashing = Hashing::new();
         Ok(())
     }
@@ -414,7 +415,7 @@ impl Partial {
                 self.discard();
                 return Err(mismatch(&self.pointer, "more bytes than its size"));
             }
-            self.lock.file_mut().write_all(&buf[..n]).map_err(|e| {
+            self.lock.write_all(&buf[..n]).map_err(|e| {
                 LfsError::local(format!("writing LFS object {oid} to the cache: {e}"))
             })?;
             self.hashing.update(&buf[..n]);

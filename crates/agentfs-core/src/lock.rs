@@ -105,15 +105,14 @@ impl StateLock {
             std::process::id(),
             utc_basic(since)
         );
-        let file = lock.file_mut();
         (|| {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(line.as_bytes())?;
+            lock.file().set_len(0)?;
+            lock.seek(SeekFrom::Start(0))?;
+            lock.write_all(line.as_bytes())?;
             // On NFS a write stays in this client's cache until a sync or a
             // close, and a lock file is never closed: other nodes would read
             // an empty holder line.
-            file.sync_data()
+            lock.file().sync_data()
         })()
         .map_err(io_err)?;
         Ok(Self { _lock: lock, path })

@@ -102,11 +102,10 @@ impl FrontLease {
             std::process::id(),
             utc_basic(since)
         );
-        let file = lock.file_mut();
         (|| {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(line.as_bytes())
+            lock.file().set_len(0)?;
+            lock.seek(SeekFrom::Start(0))?;
+            lock.write_all(line.as_bytes())
         })()
         .map_err(io_err)?;
         Ok(Some(Self { _lock: lock, slot }))

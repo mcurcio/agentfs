@@ -23,7 +23,7 @@
 )]
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -114,14 +114,34 @@ impl FileLock {
         Ok(Self::try_lock(Self::open(path)?, mode)?.taken())
     }
 
-    /// The locked file.
+    /// The locked file. There is no `&mut File`: replacing the file
+    /// through one would close the locked file without unlocking it, and
+    /// leave [`Drop`] unlocking another. Reads, writes and seeks go through
+    /// [`FileLock`] itself.
     pub fn file(&self) -> &File {
         &self.file
     }
+}
 
-    /// The locked file, to write or seek.
-    pub fn file_mut(&mut self) -> &mut File {
-        &mut self.file
+impl Read for FileLock {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (&self.file).read(buf)
+    }
+}
+
+impl Write for FileLock {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&self.file).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&self.file).flush()
+    }
+}
+
+impl Seek for FileLock {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        (&self.file).seek(pos)
     }
 }
 
@@ -224,12 +244,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.lock");
         let held = FileLock::try_take(&path, Mode::Exclusive).unwrap().unwrap();
+        let (waiting, about_to_wait) = std::sync::mpsc::channel();
         let waiter = {
             let path = path.clone();
-            std::thread::spawn(move || FileLock::wait(FileLock::open(&path).unwrap(), Mode::Shared))
+            std::thread::spawn(move || {
+                let file = FileLock::open(&path).unwrap();
+                waiting.send(()).unwrap();
+                FileLock::wait(file, Mode::Shared)
+            })
         };
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(!waiter.is_finished());
+        about_to_wait.recv().unwrap();
+        // Still held, so the waiter cannot have it yet.
+        assert!(FileLock::try_take(&path, Mode::Shared).unwrap().is_none());
         drop(held);
         waiter.join().unwrap().unwrap();
     }
