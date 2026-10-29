@@ -314,6 +314,12 @@ pub enum Event {
         reason: &'static str,
         message: String,
     },
+    /// A fork of a fork finished after its parent had (bead agentfs-mia.7):
+    /// the parent's finish ref was on the fork remote, so the change was
+    /// published as a top-level fork's, at `refs/agentfs/<fork>/change`,
+    /// and is not applied anywhere; nothing is lost. Raised once, when the
+    /// published mark is written.
+    ForkParentFinished { fork: String, parent: String },
     /// An operator abandoned a fork on record (design §11.5): nothing
     /// agentfs runs pushes it again, and DeleteVolume may proceed. Not an
     /// alarm.
@@ -387,6 +393,7 @@ impl Event {
             Self::ForkFinished { .. } => "fork_finished",
             Self::ForkPublished { .. } => "fork_published",
             Self::ForkRefused { .. } => "fork_refused",
+            Self::ForkParentFinished { .. } => "fork_parent_finished",
             Self::ForkAbandoned { .. } => "fork_abandoned",
             Self::HistoryServiceUnavailable { .. } => "history_service_unavailable",
             Self::HistoryServiceRestored { .. } => "history_service_restored",
@@ -585,6 +592,12 @@ impl fmt::Display for Event {
                 "fork {fork}: {remote} refuses its publish for good ({reason}): {message}; it is \
                  not retried until an operator runs `agentfs fork finish --retry` or abandons \
                  it (see docs/runbooks/fork-refused.md)"
+            ),
+            Self::ForkParentFinished { fork, parent } => write!(
+                f,
+                "fork {fork}: its parent fork {parent} finished first, so the change was \
+                 published as a top-level fork at refs/agentfs/{fork}/change and is not applied \
+                 anywhere; nothing is lost"
             ),
             Self::ForkAbandoned { fork, reason } => {
                 write!(f, "fork {fork} was abandoned: {reason}")

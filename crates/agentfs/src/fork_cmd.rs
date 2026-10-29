@@ -90,9 +90,10 @@ pub enum ForkCommand {
     /// nothing mounted, no lock on the source. Prints `fork <name> of
     /// <source> at <base>`.
     Create(CreateArgs),
-    /// Finish the fork (once) and publish it to its fork remote, retrying
-    /// with backoff: exit 0 published, 1 not yet at --timeout or refused,
-    /// 75 when the state area is busy.
+    /// Finish the fork (once) and publish it to its fork remote (a fork of
+    /// a fork: submit its change to its parent's inbox there), retrying
+    /// with backoff: exit 0 published or submitted, 1 not yet at --timeout
+    /// or refused, 75 when the state area is busy.
     Finish(FinishArgs),
     /// The fork's state, record and publish result (no lock, no network).
     Status {
@@ -335,6 +336,13 @@ pub fn run(
                 }
                 PublishOutcome::Published => {
                     println!("published to {}", record.remote);
+                    ExitCode::SUCCESS
+                }
+                PublishOutcome::Submitted { inbox } => {
+                    println!(
+                        "submitted to the inbox of volume {} as patch {inbox}",
+                        record.source
+                    );
                     ExitCode::SUCCESS
                 }
                 PublishOutcome::Pending { kind, message } => {

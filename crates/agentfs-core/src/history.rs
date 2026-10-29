@@ -950,7 +950,10 @@ impl History {
     /// head back to `since` (exclusive; the whole history when `None` or
     /// when `since` is not on it), by inbox number (design §12). Only a
     /// commit whose last message paragraph carries `Agentfs-Trigger:
-    /// patch`, `Agentfs-Patch` and `Agentfs-Inbox` counts.
+    /// patch`, `Agentfs-Patch` and `Agentfs-Inbox` counts. For a fork,
+    /// only the first-parent history after the fork's base: its inbox
+    /// numbers are its own queue's, never its source's (bead
+    /// agentfs-mia.7).
     pub fn find_inbox_commits(
         &self,
         since: Option<Oid>,
@@ -967,6 +970,11 @@ impl History {
             && (since == head.id() || self.repo.graph_descendant_of(head.id(), since)?)
         {
             walk.hide(since)?;
+        }
+        if let Some(base) = self.settings.fork.as_ref().map(|f| f.base)
+            && self.repo.odb()?.exists(base)
+        {
+            walk.hide(base)?;
         }
         for oid in walk {
             let oid = oid?;

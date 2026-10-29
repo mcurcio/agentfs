@@ -6,6 +6,9 @@ name: f8
 # docs/runbooks/moving.md), with the CSI chart from this tree and the
 # example git server as a pod. e2e-chart-server runs the chart's own git
 # server (server.enabled, ci/e2e-chart-server.sh, docs/helm.md).
+# e2e-csi-fork-of-fork forks a fork and rolls the grandchild's change up
+# into the child's queue on an authenticated fork remote
+# (ci/e2e-csi-fork-of-fork.sh, bead agentfs-mia.7).
 
 on:
   push:
@@ -118,3 +121,52 @@ jobs:
       - name: clean up
         if: always()
         run: kind delete cluster --name agentfs-server || true
+
+  # Forks of forks on the CSI driver (ci/e2e-csi-fork-of-fork.sh): the
+  # grandchild's roll-up into the child's queue logs in to the fork remote
+  # with its agentfsCredentials (nginx auth_basic, ci/git-http-server.sh).
+  e2e-csi-fork-of-fork:
+    name: e2e (CSI forks of forks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The image as image.yml builds it, from its cache (read only here).
+      - name: build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: agentfs:ci
+          cache-from: type=gha,scope=agentfs-image
+          provenance: false
+      - name: FUSE, nginx and fcgiwrap
+        run: |
+          sudo modprobe fuse
+          ls -l /dev/fuse
+          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+      - name: install kind and kubectl
+        run: |
+          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
+          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+      - name: create the cluster
+        run: |
+          kind create cluster --name agentfs-fork-of-fork --config ci/kind/cluster.yaml \
+            --image "$KIND_NODE_IMAGE" --wait 120s
+          kind load docker-image agentfs:ci --name agentfs-fork-of-fork
+          kubectl get nodes -o wide
+      - name: start git server
+        run: |
+          GIT_SERVER_EXTRA_LISTEN=$(ci/e2e-csi-fork-of-fork.sh gateway) \
+            ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
+      - run: ci/e2e-csi-fork-of-fork.sh
+      - name: diagnose
+        if: failure()
+        run: ci/e2e-csi-fork-of-fork.sh diagnose
+      - name: clean up
+        if: always()
+        run: |
+          kind delete cluster --name agentfs-fork-of-fork || true
+          ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"

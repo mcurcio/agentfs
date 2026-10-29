@@ -21,7 +21,18 @@
 //! An unlinked fork (design §11.5, [`ForkLink::Unlinked`]) delivers
 //! nothing: it never finishes ([`FinishError::Unlinked`]) and has no
 //! status, so DeleteVolume and the release scan treat it as any worktree.
+//!
+//! A fork of a fork ([`Settings::parent_fork`], bead agentfs-mia.7) rolls
+//! its change up one level instead of publishing change and finish refs:
+//! through the same [`RemotePusher`] (the fork remote's credentials), it
+//! pushes its history, lists `refs/agentfs/<parent>/` once, and queues the
+//! change create-only as the parent's next inbox number
+//! ([`PublishOutcome::Submitted`]), unless the parent already queued or
+//! applied it (at most once) or the parent has finished, when it publishes
+//! as a top-level fork and raises [`Event::ForkParentFinished`]. The
+//! parent's queue lands it like any patch.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,6 +46,8 @@ use crate::events::{Event, Events, PushFailureKind};
 use crate::history::{HistoryError, finish_from_message};
 use crate::identity::Context;
 use crate::lock::StateLock;
+use crate::patch::inbox_ref;
+use crate::patch::submit::{DEFAULT_ATTEMPTS, listed_as, next_seq};
 use crate::paths::RepoPath;
 use crate::push::{
     CreateOnlyOutcome, CreateOnlyRef, PUSH_BACKOFF_CAP, PushOutcome, RemotePusher, backoff,
@@ -208,6 +221,10 @@ pub enum PublishOutcome {
     /// The fork remote holds both refs at exactly their ids; the
     /// published mark is written.
     Published,
+    /// A fork of a fork: its change is queued in its parent's inbox as
+    /// patch `inbox` on the fork remote (or was already queued or applied
+    /// there); the published mark is written.
+    Submitted { inbox: u64 },
     /// Not yet: the deadline passed while the last attempt failed in a way
     /// that is retried (§11.3).
     Pending {
@@ -282,6 +299,10 @@ pub struct PublishedMark {
     pub finish: String,
     pub change: Option<String>,
     pub remote: String,
+    /// The parent's inbox number of a rolled-up change; `None` for a
+    /// top-level publish. Optional in the file: marks without it read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<u64>,
     /// When the remote confirmed it (milliseconds since the Unix epoch).
     pub at_ms: u64,
 }
@@ -348,6 +369,61 @@ impl Failed {
             kind,
             message,
         }
+    }
+
+    fn create_only(kind: PushFailureKind, message: String) -> Self {
+        Self {
+            met: Met::CreateOnly(kind),
+            kind,
+            message,
+        }
+    }
+}
+
+/// How one publish attempt delivered the fork.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Delivered {
+    /// Change and finish refs create-only, or into a local-only source.
+    Published,
+    /// Into the parent fork's inbox as patch `inbox`.
+    Submitted { inbox: u64 },
+    /// The parent had finished: published as a top-level fork.
+    ParentFinished { parent: String },
+}
+
+/// What a roll-up does next, from one listing of `refs/agentfs/<parent>/`
+/// on the fork remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollUp {
+    /// `change` is at the parent's `inbox/<n>` or `applied/<n>`
+    /// ([`crate::patch::submit::listed_as`]); nothing is pushed.
+    Delivered { inbox: u64 },
+    /// The parent's `finish` ref ([`super::identity::finish_ref`]) is
+    /// listed.
+    ParentFinished,
+    /// Push `inbox_ref(parent, inbox) = change` create-only;
+    /// `inbox` = [`crate::patch::submit::next_seq`].
+    Submit { inbox: u64 },
+}
+
+/// [`RollUp`] for `change` against `listed`. Delivered wins over
+/// ParentFinished, which wins over Submit.
+fn roll_up_step(parent: &str, change: Oid, listed: &BTreeMap<String, Oid>) -> RollUp {
+    let at = listed_as(
+        parent,
+        listed
+            .iter()
+            .filter(|(_, oid)| **oid == change)
+            .map(|(name, _)| name),
+    );
+    if let Some(inbox) = at.inbox.or(at.applied) {
+        return RollUp::Delivered { inbox };
+    }
+    if listed.contains_key(&finish_ref(parent)) {
+        return RollUp::ParentFinished;
+    }
+    RollUp::Submit {
+        inbox: next_seq(parent, listed.keys()),
     }
 }
 
@@ -657,6 +733,7 @@ impl Finisher {
             Ok(outcome) => {
                 let label = match outcome {
                     PublishOutcome::Published => "published",
+                    PublishOutcome::Submitted { .. } => "submitted",
                     PublishOutcome::Pending { .. } => "pending",
                     PublishOutcome::Refused { reason, .. } => {
                         span.set(KeyValue::new(
@@ -690,8 +767,11 @@ impl Finisher {
                     fork: record.fork.clone(),
                 });
             }
-            if mark.published.as_ref().is_some_and(|p| p.finish == finish) {
-                return Ok(PublishOutcome::Published);
+            if let Some(published) = mark.published.as_ref().filter(|p| p.finish == finish) {
+                return Ok(match published.inbox {
+                    Some(inbox) => PublishOutcome::Submitted { inbox },
+                    None => PublishOutcome::Published,
+                });
             }
             if let Some(refused) = mark.refused.as_ref().filter(|r| r.finish == finish) {
                 return Ok(PublishOutcome::Refused {
@@ -700,19 +780,33 @@ impl Finisher {
                 });
             }
             let failed = match self.publish_once(record, &mut pusher)? {
-                Ok(()) => {
+                Ok(delivered) => {
+                    let inbox = match &delivered {
+                        Delivered::Submitted { inbox } => Some(*inbox),
+                        Delivered::Published | Delivered::ParentFinished { .. } => None,
+                    };
                     let published = PublishedMark {
                         finish: finish.clone(),
                         change: record.change.map(|c| c.to_string()),
                         remote: record.remote.clone(),
+                        inbox,
                         at_ms: now_ms(),
                     };
                     update_mark(&self.state, |mark| {
                         mark.published = Some(published);
                         mark.refused = None;
                     })?;
+                    if let Delivered::ParentFinished { parent } = delivered {
+                        self.events.emit(Event::ForkParentFinished {
+                            fork: record.fork.clone(),
+                            parent,
+                        });
+                    }
                     self.published(record);
-                    return Ok(PublishOutcome::Published);
+                    return Ok(match inbox {
+                        Some(inbox) => PublishOutcome::Submitted { inbox },
+                        None => PublishOutcome::Published,
+                    });
                 }
                 Err(failed) => failed,
             };
@@ -771,15 +865,16 @@ impl Finisher {
     }
 
     /// One attempt: the history, then the change and finish refs,
-    /// create-only. `Ok` once the remote holds both refs at exactly their
-    /// ids. The settings are read again first, so a fork remote removed
-    /// meanwhile is seen at once.
+    /// create-only, or for a fork of a fork the roll-up into its parent's
+    /// inbox. `Ok` once the remote holds both refs at exactly their ids,
+    /// or the parent's queue holds the change. The settings are read again
+    /// first, so a fork remote removed meanwhile is seen at once.
     /// `Err` stops publishing: the local-only source is busy.
     fn publish_once(
         &self,
         record: &FinishRecord,
         pusher: &mut Option<RemotePusher>,
-    ) -> Result<Result<(), Failed>, FinishError> {
+    ) -> Result<Result<Delivered, Failed>, FinishError> {
         let settings = match Settings::load(&self.state.git()) {
             Ok(settings) => settings,
             Err(e) => {
@@ -810,7 +905,7 @@ impl Finisher {
 
     /// One attempt into the local-only source's history, through the
     /// [`Receiver`] ([`Finisher::set_receiver`]).
-    fn receive(&self, settings: &Settings) -> Result<Result<(), Failed>, FinishError> {
+    fn receive(&self, settings: &Settings) -> Result<Result<Delivered, Failed>, FinishError> {
         let failed = |met: Met, kind: PushFailureKind, message: String| {
             Ok(Err(Failed { met, kind, message }))
         };
@@ -822,7 +917,7 @@ impl Finisher {
             );
         };
         match self.receiver.receive(&source, &self.identity, &self.state) {
-            Ok(_) => Ok(Ok(())),
+            Ok(_) => Ok(Ok(Delivered::Published)),
             Err(ReceiverError::Busy(busy)) => Err(FinishError::SourceBusy(busy)),
             // Every receive error decided here, so a new one is a compile
             // error until it is.
@@ -856,14 +951,15 @@ impl Finisher {
         }
     }
 
-    /// One attempt to the fork remote `remote`.
+    /// One attempt to the fork remote `remote`: the history, then the
+    /// change and finish refs, or the roll-up into the parent fork.
     fn push_once(
         &self,
         record: &FinishRecord,
         settings: &Settings,
         remote: &crate::config::RemoteSettings,
         pusher: &mut Option<RemotePusher>,
-    ) -> Result<(), Failed> {
+    ) -> Result<Delivered, Failed> {
         let local = |message: String| Failed::branch(PushFailureKind::Local, message);
         if pusher.is_none() {
             let opened = RemotePusher::open(
@@ -909,32 +1005,91 @@ impl Finisher {
                 }
             }
         }
-        let mut refs = Vec::new();
-        if let Some(change) = record.change {
-            refs.push(CreateOnlyRef {
-                name: change_ref(&record.fork),
+        match settings.parent_fork() {
+            None => {
+                push_change_and_finish(record, pusher)?;
+                Ok(Delivered::Published)
+            }
+            Some(parent) => self.roll_up(record, parent, pusher),
+        }
+    }
+
+    /// A fork of a fork's change into its parent's inbox on the fork
+    /// remote, through `pusher` (see the module docs): at most
+    /// [`DEFAULT_ATTEMPTS`] numbers lost to other writers per attempt,
+    /// then the attempt fails and is retried. A fork with no change is
+    /// published once its history is.
+    fn roll_up(
+        &self,
+        record: &FinishRecord,
+        parent: &str,
+        pusher: &mut RemotePusher,
+    ) -> Result<Delivered, Failed> {
+        let Some(change) = record.change else {
+            return Ok(Delivered::Published);
+        };
+        let prefix = format!("refs/agentfs/{parent}/");
+        for _ in 0..DEFAULT_ATTEMPTS {
+            let listed = pusher
+                .list_refs(&prefix)
+                .map_err(|e| Failed::create_only(e.kind, e.message))?;
+            let inbox = match roll_up_step(parent, change, &listed) {
+                RollUp::Delivered { inbox } => return Ok(Delivered::Submitted { inbox }),
+                RollUp::ParentFinished => {
+                    push_change_and_finish(record, pusher)?;
+                    return Ok(Delivered::ParentFinished {
+                        parent: parent.to_owned(),
+                    });
+                }
+                RollUp::Submit { inbox } => inbox,
+            };
+            let refs = [CreateOnlyRef {
+                name: inbox_ref(parent, inbox),
                 oid: change,
-            });
+            }];
+            match pusher.push_create_only(&refs) {
+                CreateOnlyOutcome::Held => return Ok(Delivered::Submitted { inbox }),
+                // Someone took the number: list again and decide again.
+                CreateOnlyOutcome::AnotherWriter { .. } => continue,
+                CreateOnlyOutcome::Failed { kind, message } => {
+                    return Err(Failed::create_only(kind, message));
+                }
+            }
         }
+        Err(Failed::create_only(
+            PushFailureKind::NonFastForward,
+            format!(
+                "other writers took each of {DEFAULT_ATTEMPTS} inbox numbers of fork {parent} \
+                 this attempt tried; tried again later"
+            ),
+        ))
+    }
+}
+
+/// The change and finish refs of `record`, create-only: a top-level
+/// fork's publish, and a fork of a fork's whose parent finished first.
+fn push_change_and_finish(record: &FinishRecord, pusher: &mut RemotePusher) -> Result<(), Failed> {
+    let mut refs = Vec::new();
+    if let Some(change) = record.change {
         refs.push(CreateOnlyRef {
-            name: finish_ref(&record.fork),
-            oid: record.finish,
+            name: change_ref(&record.fork),
+            oid: change,
         });
-        match pusher.push_create_only(&refs) {
-            CreateOnlyOutcome::Held => Ok(()),
-            CreateOnlyOutcome::Failed { kind, message } => Err(Failed {
-                met: Met::CreateOnly(kind),
-                kind,
-                message,
-            }),
-            CreateOnlyOutcome::AnotherWriter { name, found } => Err(Failed {
-                met: Met::AnotherWriter,
-                kind: PushFailureKind::Refused,
-                message: format!(
-                    "{name} on the remote holds {found}, another writer's; it is never moved"
-                ),
-            }),
-        }
+    }
+    refs.push(CreateOnlyRef {
+        name: finish_ref(&record.fork),
+        oid: record.finish,
+    });
+    match pusher.push_create_only(&refs) {
+        CreateOnlyOutcome::Held => Ok(()),
+        CreateOnlyOutcome::Failed { kind, message } => Err(Failed::create_only(kind, message)),
+        CreateOnlyOutcome::AnotherWriter { name, found } => Err(Failed {
+            met: Met::AnotherWriter,
+            kind: PushFailureKind::Refused,
+            message: format!(
+                "{name} on the remote holds {found}, another writer's; it is never moved"
+            ),
+        }),
     }
 }
 
@@ -1075,4 +1230,87 @@ pub fn status(state: &StateDir) -> Result<Option<ForkStatus>, StatusError> {
         record,
         mark,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(n: u8) -> Oid {
+        Oid::from_bytes(&[n; 20]).unwrap()
+    }
+
+    fn listing(refs: &[(&str, Oid)]) -> BTreeMap<String, Oid> {
+        refs.iter().map(|(n, o)| ((*n).to_owned(), *o)).collect()
+    }
+
+    /// One listing decides the roll-up: already queued or applied wins,
+    /// then a finished parent, else the next number.
+    #[test]
+    fn roll_up_step_over_listings() {
+        let change = oid(1);
+        let other = oid(2);
+        assert_eq!(
+            roll_up_step("p", change, &listing(&[])),
+            RollUp::Submit { inbox: 1 }
+        );
+        let inbox_hit = listing(&[
+            ("refs/agentfs/p/inbox/0000000001", other),
+            ("refs/agentfs/p/inbox/0000000002", change),
+        ]);
+        assert_eq!(
+            roll_up_step("p", change, &inbox_hit),
+            RollUp::Delivered { inbox: 2 }
+        );
+        let applied_hit = listing(&[
+            ("refs/agentfs/p/applied/0000000004", change),
+            ("refs/agentfs/p/inbox/0000000005", other),
+        ]);
+        assert_eq!(
+            roll_up_step("p", change, &applied_hit),
+            RollUp::Delivered { inbox: 4 }
+        );
+        let finished = listing(&[
+            ("refs/agentfs/p/finish", other),
+            ("refs/agentfs/p/inbox/0000000001", other),
+        ]);
+        assert_eq!(roll_up_step("p", change, &finished), RollUp::ParentFinished);
+        let finished_and_queued = listing(&[
+            ("refs/agentfs/p/finish", other),
+            ("refs/agentfs/p/inbox/0000000003", change),
+        ]);
+        assert_eq!(
+            roll_up_step("p", change, &finished_and_queued),
+            RollUp::Delivered { inbox: 3 }
+        );
+        // Other numbers, the parent's change ref and malformed names: the
+        // next number past the highest well-formed one.
+        let taken = listing(&[
+            ("refs/agentfs/p/inbox/0000000001", other),
+            ("refs/agentfs/p/applied/0000000002", other),
+            ("refs/agentfs/p/change", change),
+            ("refs/agentfs/p/inbox/9", change),
+        ]);
+        assert_eq!(
+            roll_up_step("p", change, &taken),
+            RollUp::Submit { inbox: 3 }
+        );
+    }
+
+    /// A mark written before rolled-up changes existed reads, and a
+    /// top-level publish writes no `inbox`.
+    #[test]
+    fn a_published_mark_without_inbox_reads() {
+        let old =
+            r#"{"version":1,"published":{"finish":"f","change":null,"remote":"r","at_ms":1}}"#;
+        let mark: ForkMark = serde_json::from_str(old).unwrap();
+        assert_eq!(mark.published.as_ref().unwrap().inbox, None);
+        let written = serde_json::to_string(&mark).unwrap();
+        assert!(!written.contains("inbox"), "{written}");
+        let mut rolled = mark.clone();
+        rolled.published.as_mut().unwrap().inbox = Some(3);
+        let back: ForkMark =
+            serde_json::from_str(&serde_json::to_string(&rolled).unwrap()).unwrap();
+        assert_eq!(back, rolled);
+    }
 }

@@ -369,3 +369,4 @@ then re-dispatches mia.7.
    architect names where create learns the parent's push target (parent state area for the CLI,
    the profile for CSI).
 3. **Add the fork identity keys to `OWN_KEYS`** in `fork/create.rs`, as item 3 says.
+- **Code architect, 2026-10-29: mia.7 page re-cut** (bd design of agentfs-mia.7) for the three confirmed items: roll-up through the finisher's `RemotePusher` (new `RemotePusher::list_refs`, `patch::submit::listed_as`, `PublishOutcome::Submitted`, `PublishedMark.inbox`); `CreateError::ParentHistoryHidden`, read from the parent's own state-area identity for CLI and CSI alike (not the profile); fork identity keys in `OWN_KEYS`. Finding: under item 1 the `NoBranch` reason for item 2 is gone; the refusal stands as a revisable choice.

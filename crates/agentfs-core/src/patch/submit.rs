@@ -262,6 +262,34 @@ pub fn next_seq<'r>(volume: &str, refs: impl IntoIterator<Item = &'r String>) ->
         .map_or(1, |n| n + 1)
 }
 
+/// The inbox and applied numbers under which `volume`'s queue lists one
+/// commit: `names` are the remote refs that hold that commit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListedAs {
+    pub inbox: Option<u64>,
+    pub applied: Option<u64>,
+}
+
+/// [`ListedAs`] of the refs `names` (each holding the commit asked
+/// about): the first `inbox/<n>` and the first `applied/<n>` of `volume`
+/// by [`super::seq_of_ref`]; malformed names do not count. The one home of
+/// "this commit is already queued or applied", for `patch submit` and a
+/// fork's roll-up into its parent ([`crate::fork::finish`]).
+pub fn listed_as<'r>(volume: &str, names: impl IntoIterator<Item = &'r String>) -> ListedAs {
+    let inbox = inbox_prefix(volume);
+    let applied = applied_prefix(volume);
+    let mut listed = ListedAs::default();
+    for name in names {
+        if listed.inbox.is_none() {
+            listed.inbox = seq_of_ref(&inbox, name);
+        }
+        if listed.applied.is_none() {
+            listed.applied = seq_of_ref(&applied, name);
+        }
+    }
+    listed
+}
+
 /// How `git push --porcelain` reported one ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushLine {
@@ -565,14 +593,15 @@ fn refuse_submitted(
     listing: &BTreeMap<String, String>,
     oid: &str,
 ) -> Result<(), SubmitError> {
-    let at = |prefix: String| {
+    let listed = listed_as(
+        &req.volume,
         listing
             .iter()
             .filter(|(_, o)| o.as_str() == oid)
-            .find_map(|(name, _)| seq_of_ref(&prefix, name))
-    };
-    let inbox = at(inbox_prefix(&req.volume));
-    let applied = at(applied_prefix(&req.volume)).or_else(|| {
+            .map(|(name, _)| name),
+    );
+    let inbox = listed.inbox;
+    let applied = listed.applied.or_else(|| {
         let last = remote_status(git, &req.remote, &req.volume, listing)?;
         let last = last.get("last_applied")?;
         (last.get("patch")?.as_str()? == oid)
@@ -851,6 +880,42 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+
+    #[test]
+    fn listed_as_reads_the_first_inbox_and_applied_number() {
+        let refs =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|s| s.to_string()).collect() };
+        assert_eq!(listed_as("v", &refs(&[])), ListedAs::default());
+        assert_eq!(
+            listed_as(
+                "v",
+                &refs(&[
+                    "refs/agentfs/v/applied/0000000002",
+                    "refs/agentfs/v/applied/0000000004",
+                    "refs/agentfs/v/inbox/0000000003",
+                    "refs/agentfs/v/inbox/0000000009",
+                ])
+            ),
+            ListedAs {
+                inbox: Some(3),
+                applied: Some(2),
+            }
+        );
+        // Malformed names, other volumes and other kinds do not count.
+        assert_eq!(
+            listed_as(
+                "v",
+                &refs(&[
+                    "refs/agentfs/v/inbox/7",
+                    "refs/agentfs/v/applied/00000000099",
+                    "refs/agentfs/other/inbox/0000000001",
+                    "refs/agentfs/v/held/0000000001",
+                    "refs/agentfs/v/status",
+                ])
+            ),
+            ListedAs::default()
+        );
+    }
 
     #[test]
     fn next_seq_over_inbox_and_applied() {

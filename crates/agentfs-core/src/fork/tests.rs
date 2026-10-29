@@ -421,26 +421,9 @@ fn create_refuses_and_changes_nothing() {
     ));
     assert!(!fork.state.root().exists());
 
-    // A fork of a fork.
+    // No fork remote: two remotes and no patch remote.
     let source = Vol::new("src");
     source.change(&[("a.txt", "a\n")]);
-    let first = Fork::new();
-    first.create(&source, "src-1").unwrap();
-    let as_source = Vol {
-        dir: tempfile::tempdir().unwrap(),
-        state: first.state.clone(),
-        tree: first.tree.clone(),
-        fragment: source.fragment.clone(),
-        remote: source.remote.clone(),
-    };
-    let second = Fork::new();
-    assert!(matches!(
-        second.create(&as_source, "src-1-1"),
-        Err(CreateError::SourceIsFork { .. })
-    ));
-    assert!(!second.state.root().exists());
-
-    // No fork remote: two remotes and no patch remote.
     let mut two = fs::read_to_string(source.fragment.as_path()).unwrap();
     two.push_str("[remote \"other\"]\n\turl = /nowhere\n");
     fs::write(source.fragment.as_path(), two).unwrap();
@@ -1912,4 +1895,436 @@ fn an_unlinked_fork_of_a_local_only_source_records_no_path() {
         settings.fork_remote,
         Some(crate::config::ForkRemote::SourceHistory)
     );
+}
+
+// Forks of forks (bead agentfs-mia.7): done-numbers scoped to the volume,
+// and changes rolled up one level at a time into the parent's queue.
+
+/// Whether `git` is installed (the queue merges with it); says so when
+/// it is not.
+fn have_git() -> bool {
+    let found = crate::git_cli::find_git().is_some();
+    if !found {
+        eprintln!("skipping: git is not installed");
+    }
+    found
+}
+
+/// LFS content for a queue run: these tests store none.
+struct NoLfs;
+
+impl crate::lfs::fetch::LfsObjects for NoLfs {
+    fn ensure(&self, pointer: &crate::lfs::Pointer) -> Result<PathBuf, crate::lfs::LfsError> {
+        Err(crate::lfs::LfsError::local(format!(
+            "no object {}",
+            pointer.oid
+        )))
+    }
+}
+
+/// The fork `fork` as the source of another fork: its includes are its
+/// source's fragment, as the CLI and CSI pass them.
+fn fork_as_source(fork: &Fork, source: &Vol) -> Vol {
+    Vol {
+        dir: tempfile::tempdir().unwrap(),
+        state: fork.state.clone(),
+        tree: fork.tree.clone(),
+        fragment: source.fragment.clone(),
+        remote: source.remote.clone(),
+    }
+}
+
+/// A commit on `parent` in `repo` writing `path` (top level) as
+/// `content`, as a producer's patch.
+fn patch_commit(repo: &Repository, parent: Oid, path: &str, content: &str) -> Oid {
+    let parent = repo.find_commit(parent).unwrap();
+    let blob = repo.blob(content.as_bytes()).unwrap();
+    let mut builder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+    builder.insert(path, blob, 0o100644).unwrap();
+    let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+    let ada = git2::Signature::now("Ada Lovelace", "ada@example.com").unwrap();
+    repo.commit(
+        None,
+        &ada,
+        &ada,
+        &format!("patch {path}"),
+        &tree,
+        &[&parent],
+    )
+    .unwrap()
+}
+
+/// The patch queue of the volume at `state` run once, as at mount: with
+/// `fetch`, its inbox fetched from its patch remote first.
+fn run_queue(state: &StateDir, tree: &Path, fetch: bool) -> crate::patch::queue::QueueReport {
+    use crate::patch::accept::CleanMerge;
+    use crate::patch::integrate::GitMergeTree;
+    use crate::patch::queue::{Queue, QueueContext};
+    let settings = crate::config::Settings::load(&state.git()).unwrap();
+    let outcome = fetch.then(|| {
+        let remote = settings.patch_remote().expect("a patch remote");
+        let outcome = crate::patch::fetch::fetch_inbox(
+            &state.git(),
+            remote,
+            &settings.volume,
+            Duration::from_secs(30),
+        );
+        assert!(outcome.ok, "{outcome:?}");
+        outcome
+    });
+    let (recorder, committer, _) = volume::open(
+        state,
+        tree,
+        context(&settings.volume),
+        Arc::new(NullSink),
+        &Telemetry::noop(),
+    )
+    .unwrap();
+    let dir = Dir::open(tree).unwrap();
+    let telemetry = Telemetry::noop();
+    let integrator = GitMergeTree::new(state.git());
+    let mut queue = Queue::new(QueueContext {
+        state,
+        recorder: &recorder,
+        committer: &committer,
+        tree: &dir,
+        objects: &NoLfs,
+        telemetry: &telemetry,
+        caller: CALLER,
+        integrator: &integrator,
+        rule: &CleanMerge,
+    });
+    queue.process(outcome.as_ref()).unwrap()
+}
+
+/// The inbox commits the history of `state` counts (its high-water).
+fn inbox_numbers(state: &StateDir) -> Vec<u64> {
+    let history = crate::history::History::open(&state.git()).unwrap();
+    history
+        .find_inbox_commits(None)
+        .unwrap()
+        .keys()
+        .copied()
+        .collect()
+}
+
+/// Test 1: a fork's queue counts only what its own queue landed, never
+/// its source's numbers, so its own inbox/1 lands (it was stale before:
+/// the source's 1..3 were in the fork's first-parent history).
+#[test]
+fn a_forks_queue_ignores_its_sources_numbers() {
+    if !have_git() {
+        return;
+    }
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    for n in 1..=3 {
+        let repo = source.repo();
+        let patch = patch_commit(&repo, source.head().unwrap(), &format!("p{n}.txt"), "p\n");
+        repo.reference(&crate::patch::inbox_ref("src", n), patch, true, "test")
+            .unwrap();
+        let report = run_queue(&source.state, &source.tree, false);
+        assert_eq!(report.applied.len(), 1, "{report:?}");
+    }
+    assert_eq!(inbox_numbers(&source.state), [1, 2, 3]);
+
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+    assert_eq!(inbox_numbers(&fork.state), Vec::<u64>::new());
+    let repo = Repository::open_bare(fork.state.git()).unwrap();
+    let head = repo.refname_to_id("refs/heads/agentfs/src-1").unwrap();
+    let patch = patch_commit(&repo, head, "f.txt", "from the fork's queue\n");
+    repo.reference(&crate::patch::inbox_ref("src-1", 1), patch, true, "test")
+        .unwrap();
+    let report = run_queue(&fork.state, &fork.tree, false);
+    assert!(report.ignored.is_empty(), "{:?}", report.ignored);
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(
+        fs::read_to_string(fork.tree.join("f.txt")).unwrap(),
+        "from the fork's queue\n"
+    );
+    assert_eq!(inbox_numbers(&fork.state), [1]);
+}
+
+/// S -> F -> G, G finished with g.txt and published: rolled up into F's
+/// inbox on the fork remote.
+struct Tree3 {
+    source: Vol,
+    parent: Fork,
+    child: Fork,
+}
+
+impl Tree3 {
+    /// S with a.txt; F of S; G of F, which writes g.txt.
+    fn new() -> Self {
+        let source = Vol::new("src");
+        source.change(&[("a.txt", "a\n")]);
+        let parent = Fork::new();
+        parent.create(&source, "src-1").unwrap();
+        let child = Fork::new();
+        let identity = child
+            .create(&fork_as_source(&parent, &source), "src-1-1")
+            .unwrap();
+        assert_eq!(identity.source, "src-1");
+        child.as_vol().write("g.txt", "from the grandchild\n");
+        Self {
+            source,
+            parent,
+            child,
+        }
+    }
+
+    /// The fork remote's refs under F's inbox.
+    fn parent_inbox(&self) -> BTreeMap<String, Oid> {
+        remote_refs(&self.source.remote)
+            .into_iter()
+            .filter(|(name, _)| name.starts_with(&crate::patch::inbox_prefix("src-1")))
+            .collect()
+    }
+
+    fn child_change(&self) -> Oid {
+        Repository::open_bare(self.child.state.git())
+            .unwrap()
+            .refname_to_id(&change_ref("src-1-1"))
+            .unwrap()
+    }
+}
+
+/// Test 2: a fork of a fork rolls its change up into its parent's queue,
+/// which lands it; the parent's own change then carries it to the source.
+#[test]
+fn a_fork_of_a_fork_rolls_up() {
+    if !have_git() {
+        return;
+    }
+    let t = Tree3::new();
+    let settings = crate::config::Settings::load(&t.child.state.git()).unwrap();
+    assert_eq!(settings.parent_fork(), Some("src-1"));
+    let lock = t.child.lock();
+    let mut finisher = t.child.finisher(&lock).unwrap();
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Submitted { inbox: 1 }
+    );
+    let change = t.child_change();
+    assert_eq!(
+        t.parent_inbox(),
+        BTreeMap::from([(crate::patch::inbox_ref("src-1", 1), change)])
+    );
+    // A roll-up publishes no change or finish ref of its own.
+    let remote = remote_refs(&t.source.remote);
+    assert!(!remote.contains_key(&change_ref("src-1-1")), "{remote:?}");
+    assert!(!remote.contains_key(&finish_ref("src-1-1")), "{remote:?}");
+    let status = finish::status(&t.child.state).unwrap().unwrap();
+    assert_eq!(status.state, ForkState::Published);
+    assert_eq!(status.mark.unwrap().published.unwrap().inbox, Some(1));
+    // Run again: the same outcome from the mark, nothing pushed.
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Submitted { inbox: 1 }
+    );
+    drop(finisher);
+    drop(lock);
+
+    // F's queue lands it at its next run.
+    let report = run_queue(&t.parent.state, &t.parent.tree, true);
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1],
+        "{report:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(t.parent.tree.join("g.txt")).unwrap(),
+        "from the grandchild\n"
+    );
+
+    // F finishes: its change, published for S, contains G's.
+    let lock = t.parent.lock();
+    let mut finisher = t.parent.finisher(&lock).unwrap();
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Published
+    );
+    let remote = Repository::open_bare(&t.source.remote).unwrap();
+    let parent_change = remote
+        .find_commit(remote.refname_to_id(&change_ref("src-1")).unwrap())
+        .unwrap();
+    let entry = parent_change
+        .tree()
+        .unwrap()
+        .get_path(Path::new("g.txt"))
+        .unwrap();
+    assert_eq!(
+        remote.find_blob(entry.id()).unwrap().content(),
+        b"from the grandchild\n"
+    );
+}
+
+/// Test 3: a child finishing after its parent did publishes as a top-level
+/// fork, raises ForkParentFinished once, and writes nothing into the
+/// finished parent's inbox.
+#[test]
+fn a_child_after_its_parent() {
+    let t = Tree3::new();
+    {
+        let lock = t.parent.lock();
+        let mut finisher = t.parent.finisher(&lock).unwrap();
+        assert_eq!(
+            finisher.publish(Some(soon())).unwrap(),
+            PublishOutcome::Published
+        );
+    }
+    let (events, seen) = recording();
+    let lock = t.child.lock();
+    let mut finisher = t.child.finisher_with(&lock, events).unwrap();
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Published
+    );
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Published
+    );
+    let raised: Vec<Event> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::ForkParentFinished { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        raised,
+        [Event::ForkParentFinished {
+            fork: "src-1-1".into(),
+            parent: "src-1".into(),
+        }]
+    );
+    let remote = remote_refs(&t.source.remote);
+    assert_eq!(
+        remote.get(&change_ref("src-1-1")),
+        Some(&t.child_change()),
+        "{remote:?}"
+    );
+    assert!(remote.contains_key(&finish_ref("src-1-1")), "{remote:?}");
+    assert!(t.parent_inbox().is_empty(), "{:?}", t.parent_inbox());
+    let status = finish::status(&t.child.state).unwrap().unwrap();
+    assert_eq!(status.state, ForkState::Published);
+    assert_eq!(status.mark.unwrap().published.unwrap().inbox, None);
+}
+
+/// Test 4: a fork whose own forks could never roll up is refused as a
+/// source, each with its own error, and nothing is written for the child.
+#[test]
+fn unlinked_hidden_and_local_only_parents_are_refused() {
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let child_of = |parent: &Fork, source: &Vol, name: &str| {
+        let child = Fork::new();
+        let result = child.create(&fork_as_source(parent, source), name);
+        assert!(!child.state.root().exists(), "{name}");
+        result
+    };
+
+    let unlinked = Fork::new();
+    unlinked
+        .create_with(&source, "src-u", ForkLink::Unlinked)
+        .unwrap();
+    assert!(matches!(
+        child_of(&unlinked, &source, "src-u-1"),
+        Err(CreateError::SourceIsUnlinkedFork { volume }) if volume == "src-u"
+    ));
+
+    let hidden = Fork::new();
+    create::create(&CreateRequest {
+        source: &source.state,
+        fork: &hidden.state,
+        tree: &hidden.tree,
+        name: "src-h",
+        includes: std::slice::from_ref(&source.fragment),
+        push_target: PushTarget::Hidden,
+        link: ForkLink::Linked,
+        remotes: None,
+    })
+    .unwrap();
+    assert!(matches!(
+        child_of(&hidden, &source, "src-h-1"),
+        Err(CreateError::ParentHistoryHidden { volume }) if volume == "src-h"
+    ));
+
+    let local = local_only("lo");
+    local.change(&[("a.txt", "a\n")]);
+    let of_local = Fork::new();
+    of_local.create(&local, "lo-1").unwrap();
+    assert!(matches!(
+        child_of(&of_local, &local, "lo-1-1"),
+        Err(CreateError::ParentHasNoQueue { volume }) if volume == "lo-1"
+    ));
+}
+
+/// Test 6: a roll-up is delivered at most once: a crash after the push,
+/// before the mark, finds the change in the parent's inbox and pushes
+/// nothing more.
+#[test]
+fn a_roll_up_is_delivered_once() {
+    let t = Tree3::new();
+    let lock = t.child.lock();
+    let mut finisher = t.child.finisher(&lock).unwrap();
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Submitted { inbox: 1 }
+    );
+    fs::remove_file(t.child.state.fork_mark()).unwrap();
+    assert_eq!(
+        finish::status(&t.child.state).unwrap().unwrap().state,
+        ForkState::Finished
+    );
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Submitted { inbox: 1 }
+    );
+    assert_eq!(t.parent_inbox().len(), 1, "{:?}", t.parent_inbox());
+    assert_eq!(
+        finish::status(&t.child.state).unwrap().unwrap().state,
+        ForkState::Published
+    );
+}
+
+/// Test 6: numbers the parent's queue holds or applied are never taken.
+#[test]
+fn a_roll_up_takes_the_next_number() {
+    let t = Tree3::new();
+    let remote = Repository::open_bare(&t.source.remote).unwrap();
+    let ada = git2::Signature::now("Ada Lovelace", "ada@example.com").unwrap();
+    let empty = remote.treebuilder(None).unwrap().write().unwrap();
+    let other = remote
+        .commit(
+            None,
+            &ada,
+            &ada,
+            "another patch",
+            &remote.find_tree(empty).unwrap(),
+            &[],
+        )
+        .unwrap();
+    for name in [
+        crate::patch::inbox_ref("src-1", 1),
+        crate::patch::applied_ref("src-1", 2),
+    ] {
+        remote.reference(&name, other, false, "test").unwrap();
+    }
+    let lock = t.child.lock();
+    let mut finisher = t.child.finisher(&lock).unwrap();
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Submitted { inbox: 3 }
+    );
+    let refs = remote_refs(&t.source.remote);
+    assert_eq!(
+        refs.get(&crate::patch::inbox_ref("src-1", 3)),
+        Some(&t.child_change())
+    );
+    assert_eq!(refs.get(&crate::patch::inbox_ref("src-1", 1)), Some(&other));
 }

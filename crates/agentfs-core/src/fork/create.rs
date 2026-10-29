@@ -3,7 +3,10 @@
 //! CSI controller can run it inside CreateVolume.
 //!
 //! [`create`] reads the source's settings and branch head (the base). It
-//! refuses a source that is a fork or that has no fork remote. It then
+//! refuses a source that has no fork remote, and a source that is a fork
+//! its own forks could not roll up into (bead agentfs-mia.7): an unlinked
+//! fork, a fork whose history is hidden, or a fork of a local-only source.
+//! A fork of a fork records `agentfs.fork.sourceIsFork`. It then
 //! makes the fork's state area: the identity in the fork's own config,
 //! with its link (design §11.5), and, for a linked fork of a local-only
 //! source, the source's state area (F8 S3: the fork publishes into its
@@ -79,8 +82,20 @@ pub enum CreateError {
     SourceUnreadable(HistoryError),
     #[error("volume {volume} has no history yet: there is nothing to fork")]
     SourceHasNoHistory { volume: String },
-    #[error("volume {volume} is itself a fork; forks of forks are not supported")]
-    SourceIsFork { volume: String },
+    #[error(
+        "volume {volume} is an unlinked fork: it never finishes, so a fork of it could never roll up"
+    )]
+    SourceIsUnlinkedFork { volume: String },
+    #[error(
+        "volume {volume} is a fork whose history is hidden (agentfs.fork.pushTarget = hidden, \
+         from its source's agentfs.forkRefs): forks of a fork with hidden history are refused"
+    )]
+    ParentHistoryHidden { volume: String },
+    #[error(
+        "volume {volume} is a fork of a local-only source: it has no patch queue for a fork of it \
+         to roll up into"
+    )]
+    ParentHasNoQueue { volume: String },
     #[error(
         "volume {volume} has no fork remote: forks push to its patch remote, or to the one \
          remote with agentfsForkRemote = true, or into its own history when it has no \
@@ -150,6 +165,9 @@ pub fn create(request: &CreateRequest<'_>) -> Result<ForkIdentity, CreateError> 
     })?;
     if let Some(remotes) = request.remotes {
         record_once(request.fork, super::identity::REMOTES_KEY, remotes)?;
+    }
+    if source.is_fork {
+        record_value_once(request.fork, super::identity::SOURCE_IS_FORK_KEY, "true")?;
     }
     // The identity the fork has: an earlier try's base and link win.
     let identity = fork_identity(request.fork)?;
@@ -230,6 +248,9 @@ struct Source {
     /// Its change-line tip ([`crate::checkpoint::change_line_ref`]), when
     /// it has one.
     change_line: Option<Oid>,
+    /// It is itself a fork: the fork's change rolls up into its queue
+    /// (bead agentfs-mia.7).
+    is_fork: bool,
 }
 
 /// The absolute `path` at `key` in the fork's own config: the source's
@@ -255,14 +276,26 @@ fn record_value_once(fork: &StateDir, key: &str, value: &str) -> Result<(), Crea
 }
 
 /// An unlinked fork needs no fork remote: it never pushes to its
-/// source's remotes.
+/// source's remotes. A source that is a fork is read from its own state
+/// area's identity (its push target is never an include's): refused when
+/// it is unlinked, when its history is hidden, or when it is a fork of a
+/// local-only source, in that order (bead agentfs-mia.7).
 fn read_source(state: &StateDir, link: ForkLink) -> Result<Source, CreateError> {
     let git = state.git();
     let settings = source_settings(state)?;
     let volume = settings.volume.clone();
-    if settings.is_fork() {
-        return Err(CreateError::SourceIsFork { volume });
+    if let Some(fork) = &settings.fork {
+        if fork.link == ForkLink::Unlinked {
+            return Err(CreateError::SourceIsUnlinkedFork { volume });
+        }
+        if fork.push_target == PushTarget::Hidden {
+            return Err(CreateError::ParentHistoryHidden { volume });
+        }
+        if settings.fork_remote == Some(ForkRemote::SourceHistory) {
+            return Err(CreateError::ParentHasNoQueue { volume });
+        }
     }
+    let is_fork = settings.is_fork();
     let local_only = match (&settings.fork_remote, link) {
         (None, ForkLink::Linked) => return Err(CreateError::NoForkRemote { volume }),
         (None, ForkLink::Unlinked) => false,
@@ -288,6 +321,7 @@ fn read_source(state: &StateDir, link: ForkLink) -> Result<Source, CreateError> 
         repo,
         local_only,
         change_line,
+        is_fork,
     })
 }
 
@@ -487,15 +521,25 @@ pub fn unique_name(prefix: &str) -> Result<String, CreateError> {
     Ok(name)
 }
 
-/// The keys a CLI source may set in its own config: its identity, and its
-/// start point when it was started from another branch (F8 S1). Every
-/// other setting must come from an include, which the fork reads too.
-const OWN_KEYS: [&str; 5] = [
+/// The keys a CLI source may set in its own config: its identity, its
+/// start point (F8 S1), and, when it is itself a fork, its fork identity
+/// (written by [`create`] in its own config, never by an include).
+/// Lowercase, as [`for_each_entry`] compares names. Every other setting
+/// must come from an include, which the fork reads too.
+const OWN_KEYS: [&str; 13] = [
     "agentfs.volume",
     "agentfs.branch",
     "agentfs.start.remote",
     "agentfs.start.branch",
     "agentfs.start.commit",
+    "agentfs.fork.source",
+    "agentfs.fork.base",
+    "agentfs.fork.pushtarget",
+    "agentfs.fork.link",
+    "agentfs.fork.sourcestate",
+    "agentfs.fork.remotes",
+    "agentfs.fork.basechangeline",
+    "agentfs.fork.sourceisfork",
 ];
 
 /// Calls `f` with each entry of `config`: its name, lowercased as git
@@ -518,7 +562,7 @@ fn for_each_entry(
 /// settings from (design §11.5). Refuses
 /// [`CreateError::SourceSettingsNotIncluded`] when the source's own config
 /// sets any `agentfs.*`, `remote.*`, `lfs.*` or `http.*` key other than
-/// `agentfs.volume` and `agentfs.branch`: the fork would not see it.
+/// [`OWN_KEYS`]: the fork would not see it.
 pub fn settings_files(source: &StateDir) -> Result<Vec<PathBuf>, CreateError> {
     let git = source.git();
     let path = git.join("config");
@@ -563,4 +607,40 @@ pub fn settings_files(source: &StateDir) -> Result<Vec<PathBuf>, CreateError> {
         });
     }
     Ok(settings.includes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every identity key a fork's own config holds is one a CLI source
+    /// may hold, so a fork of a fork reads its parent's includes; a new
+    /// identity key cannot be forgotten silently.
+    #[test]
+    fn own_keys_cover_every_identity_key() {
+        use super::super::identity::{
+            BASE_KEY, LINK_KEY, PUSH_TARGET_KEY, REMOTES_KEY, SOURCE_IS_FORK_KEY, SOURCE_KEY,
+            START_BRANCH_KEY, START_COMMIT_KEY, START_REMOTE_KEY,
+        };
+        let identity = [
+            "agentfs.volume",
+            "agentfs.branch",
+            START_REMOTE_KEY,
+            START_BRANCH_KEY,
+            START_COMMIT_KEY,
+            SOURCE_KEY,
+            BASE_KEY,
+            PUSH_TARGET_KEY,
+            LINK_KEY,
+            super::super::receive::SOURCE_STATE_KEY,
+            REMOTES_KEY,
+            crate::checkpoint::BASE_CHANGE_LINE_KEY,
+            SOURCE_IS_FORK_KEY,
+        ];
+        let mut wanted: Vec<String> = identity.iter().map(|k| k.to_ascii_lowercase()).collect();
+        let mut own: Vec<String> = OWN_KEYS.iter().map(|k| (*k).to_owned()).collect();
+        wanted.sort();
+        own.sort();
+        assert_eq!(own, wanted);
+    }
 }
