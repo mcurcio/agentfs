@@ -4543,6 +4543,7 @@ runner.
 | The right technology for the job (2026-10-28) | The owner, 2026-10-28: "i never said \"no native libraries\". lets choose the right technology for the job". AGENTS.md's principle 4 read "Native libraries, not shelling out", worded as his priority without a quote; it now carries his words. A library or the `git` program is chosen per need, with its reason in §17.3. Said beside his answer that agentfs may run the `git` program to merge and ship mergiraf as a separate program (merge queue design, bead agentfs-mia.1) |
 | Three layers, each an integration point (2026-10-29) | The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into. So you don’t need to design a be-all-end-all singular technology so long as the necessary primitives exist and have good designs/API/docs". Library: `agentfs-core`. Filesystem: `agentfs-fuse` and the `agentfs` binary. Kubernetes adapter: `agentfs-csi`. A piece goes in the first layer whose question it passes: (1) usable as Rust calls with no mount and no agentfs process; (2) needs the mount or the running agentfs process (a command, the control socket, git over HTTP); (3) exists only because Kubernetes does. A higher layer may use any lower one. He accepted this placement ("Ok") |
 | Integrators decide when patches are applied (2026-10-29) | The owner, 2026-10-29: "Then the question isn’t “quiet moments or not” — it’s how do we provide an API so that an integrator can trigger this action?"; on the result: "I like that flow. Approved". agentfs sets no timing rule for writing queued patches into a running volume. Every layer offers two primitives: *notify* (agentfs tells the integrator a patch arrived; the files are unchanged) and *apply* (the integrator tells agentfs to write the waiting patches now). agentfs still applies by itself at mount, as today (§12). Designed, not built (§19.2 item 11) |
+| No live landing yet (2026-10-29) | The owner, 2026-10-29: "No live landing yet", then "Build incrementally". Patches keep landing only when no workload is attached, at mount (§12); an apply call while a workload is attached is answered "lands at next mount" and notifies. Landing while a workload runs is a later gate (§19.2 item 11) |
 
 ### 19.2 Open questions
 
@@ -4647,29 +4648,33 @@ runner.
    deleted (§19.1 "Unlinked fork remotes"; the owner: "B. And if no
    remote is configured, the volume is lost, and that's a choice the
    user is allowed to make.").
-11. **Merge queue (bead agentfs-mia).** Designed and approved by the
-   owner 2026-10-29; not built. The design page
-   (https://claude.ai/artifact/BXfv7vPhKtzGwjgcwSv2GU, the owner's
-   review copy) holds the interfaces. Short record:
+11. **Merge queue (bead agentfs-mia).** Approved by the owner 2026-10-29;
+   being built incrementally on today's queue (§12), one feature per bead;
+   not built yet. Short record:
    - *Requirements, his words:* "bring all of those patches back
      together in an automated way" (10-16); "A partial application has
      unknown side effects" (10-16); "Configurable with a sensible
      default" (10-29); "agentfs should be a legitimate git server, and
      its up to the specific use case to wire up the relationship of the
      various distributed remotes" (10-28); "agentfs should support
-     merging live" (10-28).
-   - *Current choices (revisable):* a patch is a branch; merge (default)
-     or rebase by the `git` program, mergiraf as its own program; a
-     conflicting patch is held whole while the rest go on; a barrier
-     holds everything behind it on its volume; an adapter's *checkpoint*
-     cuts one commit per change intent on a change line merged back
-     into the recorded branch; acceptance is an extension point
-     (default: a clean merge); `agentfs serve-git` makes agentfs a git
-     server; notify and apply as in §19.1.
-   - *Design rules:* each primitive lives in the lowest layer that can
-     own it; one queue model moved by events only, never a timer; a
-     patch is judged on the head it lands on, and nothing is rewritten.
-   - *Beads:* agentfs-mia.4 (tracer), mia.2, mia.3, mia.5 to mia.8.
+     merging live" (10-28), then "No live landing yet" (10-29).
+   - *Unchanged:* patches are written into files only when no workload
+     is attached, at mount (§12); inbox numbering, the high-water mark
+     and crash recovery stay as they are. The owner: "Build
+     incrementally" (10-29).
+   - *Features (current choices, revisable):* a patch is a branch,
+     merged by the `git` program (merge by default, or rebase; merge
+     drivers and mergiraf); a conflicting patch is held whole while the
+     rest go on; barriers, approvals and an acceptance-rule extension
+     point (default: a clean merge); `checkpoint` cuts one commit per
+     intent; notify (a `patch-notify` hook, a webhook under CSI) and
+     apply as in §19.1; `agentfs serve-git` with per-pusher rights;
+     forks of forks.
+   - *Later gate:* landing patches while a workload runs. Eight design
+     reviews (2026-10-29) found serious flaws each time, chiefly the race
+     between a landing and the workload's writes across pods.
+   - *Beads:* agentfs-mia.4 (tracer), mia.2, mia.3, mia.5, mia.6,
+     mia.9, mia.7, mia.8.
 
 ## 20. Prior art
 
