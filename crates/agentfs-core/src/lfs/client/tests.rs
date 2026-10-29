@@ -57,6 +57,7 @@ fn remote(url: &str) -> RemoteSettings {
         ssh_agent: None,
         ssh_key_passphrase: None,
         fork_remote: false,
+        push_source: crate::config::PushSource::Branch,
     }
 }
 

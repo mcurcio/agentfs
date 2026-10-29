@@ -27,6 +27,8 @@ use std::time::Duration;
 
 use crate::fork::identity::{self as fork_identity, ForkIdentity, ForkLink, PushTarget};
 use crate::identity::Templates;
+use crate::patch::accept::AcceptMode;
+use crate::patch::integrate::IntegrateMode;
 use crate::proxy::ProxySetting;
 use crate::remote_url::{self, Transport};
 
@@ -153,6 +155,12 @@ pub enum ConfigError {
          URL, a file:// URL or a path; design §7)"
     )]
     LfsUrl { key: String, value: String },
+    #[error("{key}: {value:?} is not a webhook agentfs can POST to: {why}")]
+    NotifyUrl {
+        key: String,
+        value: String,
+        why: &'static str,
+    },
     #[error("{key}: https LFS endpoints need agentfs built with the `https` cargo feature")]
     LfsHttpsUnsupported { key: String },
     #[error(
@@ -169,6 +177,11 @@ pub enum ConfigError {
     /// A global setting that makes every remote misconfigured.
     #[error("{0}")]
     Global(String),
+    #[error(
+        "agentfsPusher.{name}.tokenFile must be set: an absolute path to the pusher's token \
+         (serve-git, bead agentfs-mia.9)"
+    )]
+    PusherNeedsToken { name: String },
 }
 
 /// Every git config key agentfs reads, in the order docs/configuration.md
@@ -190,6 +203,12 @@ pub const KEYS: &[&str] = &[
     "agentfs.repackInterval",
     "agentfs.patchRemote",
     "agentfs.patchFetchTimeout",
+    "agentfs.patchAccept",
+    "agentfs.patchAcceptTimeout",
+    "agentfs.patchIntegrate",
+    "agentfs.patchNotifyUrl",
+    "agentfs.patchNotifyCredentialFile",
+    "agentfs.patchNotifyTimeout",
     "agentfs.lfsThreshold",
     "agentfs.forkRefs",
     "agentfs.identity.committerName",
@@ -202,6 +221,7 @@ pub const KEYS: &[&str] = &[
     "agentfs.fork.link",
     "agentfs.fork.sourceState",
     "agentfs.fork.remotes",
+    "agentfs.fork.baseChangeLine",
     "agentfs.start.remote",
     "agentfs.start.branch",
     "agentfs.start.commit",
@@ -226,6 +246,9 @@ pub const KEYS: &[&str] = &[
     "remote.<name>.agentfsLfsCredentials",
     "remote.<name>.proxy",
     "remote.<name>.agentfsForkRemote",
+    "remote.<name>.agentfsPush",
+    "agentfsPusher.<name>.tokenFile",
+    "agentfsPusher.<name>.right",
 ];
 
 /// Notes that `key` was read, for the test that checks [`KEYS`] against
@@ -248,12 +271,17 @@ pub(crate) mod reads {
         static READ: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     }
 
-    /// `remote.X.k` becomes `remote.<name>.k`; anything else is kept.
+    /// `remote.X.k` becomes `remote.<name>.k`, `agentfsPusher.X.k`
+    /// becomes `agentfsPusher.<name>.k`; anything else is kept.
     pub(crate) fn normalise(key: &str) -> String {
-        if let Some(rest) = key.strip_prefix("remote.")
-            && let Some((_, k)) = rest.rsplit_once('.')
-        {
-            return format!("remote.<name>.{k}");
+        for section in ["remote", "agentfsPusher"] {
+            if let Some(rest) = key
+                .strip_prefix(section)
+                .and_then(|rest| rest.strip_prefix('.'))
+                && let Some((_, k)) = rest.rsplit_once('.')
+            {
+                return format!("{section}.<name>.{k}");
+            }
         }
         key.to_owned()
     }
@@ -332,6 +360,22 @@ pub struct RemoteSettings {
     /// section is only for forks of the volume (design §11.5). It is never
     /// one of the volume's own push remotes.
     pub fork_remote: bool,
+    /// `remote.<name>.agentfsPush` (`branch`, the default, or
+    /// `changeLine`): what this remote's push sends to the volume's branch
+    /// ref there (design §19.2 item 11, [`crate::checkpoint`]).
+    pub push_source: PushSource,
+}
+
+/// What a remote's push sends to the remote's branch ref
+/// (`remote.<name>.agentfsPush`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PushSource {
+    /// The volume's branch: every recorded commit.
+    #[default]
+    Branch,
+    /// The change line (`refs/agentfs/<volume>/change-line`): only the
+    /// checkpoint commits and the patches they merged.
+    ChangeLine,
 }
 
 /// The agentfs keys of a remote section that name files, which the mount
@@ -482,6 +526,28 @@ pub struct Settings {
     /// `agentfs.patchFetchTimeout`: how long the mount waits for the
     /// patch fetch (design §12). Default 30s.
     pub patch_fetch_timeout: Duration,
+    /// `agentfs.patchAccept`: the acceptance rule that judges each cleanly
+    /// merged patch (design §12; bead agentfs-mia.2). Default
+    /// `cleanMerge`.
+    pub patch_accept: AcceptMode,
+    /// `agentfs.patchAcceptTimeout`: how long the `patch-accept` hook may
+    /// run. Default [`DEFAULT_PATCH_ACCEPT_TIMEOUT`]; `0` is refused.
+    pub patch_accept_timeout: Duration,
+    /// `agentfs.patchIntegrate`: how a patch is merged onto the head,
+    /// `merge` (the default) or `rebase` (design §12, §17.3; bead
+    /// agentfs-mia.3).
+    pub patch_integrate: IntegrateMode,
+    /// `agentfs.patchNotifyUrl`: where the patch queue's verdict changes
+    /// are POSTed (bead agentfs-mia.5; [`crate::patch::notify`]); `None`:
+    /// no webhook.
+    pub patch_notify_url: Option<String>,
+    /// `agentfs.patchNotifyCredentialFile`: an absolute path whose
+    /// contents are the webhook's bearer token.
+    pub patch_notify_credential_file: Option<PathBuf>,
+    /// `agentfs.patchNotifyTimeout`: how long the `patch-notify` hook and
+    /// the webhook may take. Default [`DEFAULT_PATCH_NOTIFY_TIMEOUT`];
+    /// `0` is refused.
+    pub patch_notify_timeout: Duration,
     /// Every `include.path`, in order: absolute, readable config fragments
     /// whose keys count as the repository's own (design §4.3).
     pub includes: Vec<PathBuf>,
@@ -520,6 +586,12 @@ pub struct Settings {
     /// This volume's start point (agentfs.start.*), read only from the volume's own config, like
     /// the fork identity; `None` when it was not started from another branch.
     pub start: Option<crate::fork::identity::StartPoint>,
+    /// `agentfs.fork.baseChangeLine`: a fork's source's change-line tip at
+    /// create, the first parent of the fork's first checkpoint (design
+    /// §19.2 item 11, [`crate::checkpoint`]); written by fork create only
+    /// when the source had a change line, read only beside a fork
+    /// identity, never from an include.
+    pub fork_base_change_line: Option<git2::Oid>,
 }
 
 /// Which push remotes a volume has (design §11.1); [`Settings::load`] is the
@@ -625,6 +697,16 @@ impl Settings {
             self.remotes.pushed(),
             &self.invalid_remotes,
         )
+    }
+
+    /// The local ref `remote`'s push sends to its branch ref there
+    /// ([`RemoteSettings::push_source`]): the branch, or the change line
+    /// ([`crate::checkpoint::change_line_ref`]).
+    pub fn push_source_ref(&self, remote: &RemoteSettings) -> String {
+        match remote.push_source {
+            PushSource::Branch => self.branch_ref.clone(),
+            PushSource::ChangeLine => crate::checkpoint::change_line_ref(&self.volume),
+        }
     }
 
     /// The fork remote when it is a remote section, not the source's
@@ -742,6 +824,29 @@ fn source_state_of(
             value,
         }),
         Some(value) => Ok(Some(PathBuf::from(value))),
+    }
+}
+
+/// `agentfs.fork.baseChangeLine`: a full commit id, set only beside a
+/// fork identity.
+fn base_change_line_of(
+    config: &git2::Config,
+    fork: Option<&ForkIdentity>,
+) -> Result<Option<git2::Oid>, ConfigError> {
+    let key = crate::checkpoint::BASE_CHANGE_LINE_KEY;
+    match string(config, key)? {
+        None => Ok(None),
+        Some(_) if fork.is_none() => Err(ConfigError::PartialForkIdentity),
+        Some(value) => {
+            let bad = || ConfigError::BadForkBase {
+                key: key.into(),
+                value: value.clone(),
+            };
+            if !is_full_oid(&value) {
+                return Err(bad());
+            }
+            git2::Oid::from_str(&value).map(Some).map_err(|_| bad())
+        }
     }
 }
 
@@ -956,6 +1061,7 @@ pub fn declares_fork(git_dir: &Path) -> Result<bool, git2::Error> {
         fork_identity::LINK_KEY,
         fork_identity::REMOTES_KEY,
         crate::fork::receive::SOURCE_STATE_KEY,
+        crate::checkpoint::BASE_CHANGE_LINE_KEY,
     ] {
         if is_set(&config, key)? {
             return Ok(true);
@@ -1045,6 +1151,7 @@ impl Settings {
             }
         };
         let source_state = source_state_of(config, fork.as_ref())?;
+        let fork_base_change_line = base_change_line_of(config, fork.as_ref())?;
         let split = if unlinked {
             // Its own sections only, and no fork remote: it delivers
             // nothing.
@@ -1102,6 +1209,19 @@ impl Settings {
                 patch_remote
             },
             patch_fetch_timeout: patch_fetch_timeout(config)?,
+            patch_accept: patch_accept(config)?,
+            patch_accept_timeout: patch_accept_timeout(config)?,
+            patch_integrate: patch_integrate(config)?,
+            patch_notify_url: patch_notify_url(config)?,
+            patch_notify_credential_file: absolute_path(
+                config,
+                "agentfs.patchNotifyCredentialFile",
+            )?,
+            patch_notify_timeout: positive_duration(
+                config,
+                "agentfs.patchNotifyTimeout",
+                DEFAULT_PATCH_NOTIFY_TIMEOUT,
+            )?,
             lfs,
             http_proxy: http_proxy.ok().flatten(),
             remotes: split.remotes,
@@ -1109,6 +1229,7 @@ impl Settings {
             fork_remote: split.fork_remote,
             fork_remotes,
             source_state,
+            fork_base_change_line,
             fork_refs,
             fork,
             start,
@@ -1173,6 +1294,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
             fork_identity::LINK_KEY,
             fork_identity::REMOTES_KEY,
             crate::fork::receive::SOURCE_STATE_KEY,
+            crate::checkpoint::BASE_CHANGE_LINE_KEY,
             fork_identity::START_REMOTE_KEY,
             fork_identity::START_BRANCH_KEY,
             fork_identity::START_COMMIT_KEY,
@@ -1282,10 +1404,24 @@ fn remote(
         lfs_credentials: path("agentfsLfsCredentials")?,
         proxy: remote_proxy(config, name, http_proxy)?,
         fork_remote: boolean(config, &key("agentfsForkRemote"))?.unwrap_or(false),
+        push_source: push_source(config, &key("agentfsPush"))?,
         name: name.to_owned(),
     };
     validate_transport(&remote)?;
     Ok(remote)
+}
+
+/// `remote.<name>.agentfsPush`: `branch` (or unset) or `changeLine`.
+fn push_source(config: &git2::Config, key: &str) -> Result<PushSource, ConfigError> {
+    match string(config, key)?.as_deref() {
+        None | Some("branch") => Ok(PushSource::Branch),
+        Some("changeLine") => Ok(PushSource::ChangeLine),
+        Some(other) => Err(ConfigError::BadChoice {
+            key: key.into(),
+            value: other.into(),
+            allowed: "branch, changeLine",
+        }),
+    }
 }
 
 /// A remote's effective proxy (design §11.1): `remote.<name>.proxy` (empty:
@@ -1469,6 +1605,46 @@ pub(crate) fn string(config: &git2::Config, key: &str) -> Result<Option<String>,
     }
 }
 
+/// Every value of the multi-valued `key`, in order (empty when unset).
+pub(crate) fn strings(config: &git2::Config, key: &str) -> Result<Vec<String>, git2::Error> {
+    note(key);
+    let mut entries = match config.multivar(key, None) {
+        Ok(entries) => entries,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut values = Vec::new();
+    while let Some(entry) = entries.next() {
+        values.push(String::from_utf8_lossy(entry?.value_bytes()).into_owned());
+    }
+    Ok(values)
+}
+
+/// The subsection names `<name>` of every `[<section> "<name>"]` that sets
+/// `key`, sorted. `section` and `key` as git-config spells them; git
+/// compares both without case, the name with case.
+pub(crate) fn subsections(
+    config: &git2::Config,
+    section: &str,
+    key: &str,
+) -> Result<BTreeSet<String>, git2::Error> {
+    note(&format!("{section}.<name>.{key}"));
+    let (section, key) = (section.to_ascii_lowercase(), key.to_ascii_lowercase());
+    let mut names = BTreeSet::new();
+    let mut entries = config.entries(Some(&format!(r"^{section}\..*\.{key}$")))?;
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        let Ok(full) = entry.name() else { continue };
+        if let Some(name) = full
+            .strip_prefix(&format!("{section}."))
+            .and_then(|rest| rest.strip_suffix(&format!(".{key}")))
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
 /// Whether `key` is set in `config`, read without noting it: a check that
 /// a fragment leaves a key alone, not a read of the setting.
 fn is_set(config: &git2::Config, key: &str) -> Result<bool, git2::Error> {
@@ -1557,6 +1733,109 @@ fn patch_fetch_timeout(config: &git2::Config) -> Result<Duration, ConfigError> {
     match string(config, key)?.as_deref() {
         Some("0" | "off") => Ok(Duration::ZERO),
         _ => Ok(duration(config, key)?.unwrap_or(DEFAULT_PATCH_FETCH_TIMEOUT)),
+    }
+}
+
+/// The default `agentfs.patchAcceptTimeout` (design §12).
+pub const DEFAULT_PATCH_ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `agentfs.patchAccept`: `cleanMerge` (the default), `approval` or
+/// `command`; anything else is [`ConfigError::BadChoice`].
+fn patch_accept(config: &git2::Config) -> Result<AcceptMode, ConfigError> {
+    let key = "agentfs.patchAccept";
+    match string(config, key)?.as_deref() {
+        None | Some("cleanMerge") => Ok(AcceptMode::CleanMerge),
+        Some("approval") => Ok(AcceptMode::Approval),
+        Some("command") => Ok(AcceptMode::Command),
+        Some(other) => Err(ConfigError::BadChoice {
+            key: key.into(),
+            value: other.into(),
+            allowed: "cleanMerge, approval, command",
+        }),
+    }
+}
+
+/// `agentfs.patchAcceptTimeout`: default [`DEFAULT_PATCH_ACCEPT_TIMEOUT`],
+/// else a duration above zero.
+fn patch_accept_timeout(config: &git2::Config) -> Result<Duration, ConfigError> {
+    positive_duration(
+        config,
+        "agentfs.patchAcceptTimeout",
+        DEFAULT_PATCH_ACCEPT_TIMEOUT,
+    )
+}
+
+/// `key`: `default` when unset, else a duration above zero (`0` is
+/// [`ConfigError::TooShort`]).
+fn positive_duration(
+    config: &git2::Config,
+    key: &str,
+    default: Duration,
+) -> Result<Duration, ConfigError> {
+    match duration(config, key)? {
+        None => Ok(default),
+        Some(d) if !d.is_zero() => Ok(d),
+        Some(_) => Err(ConfigError::TooShort {
+            key: key.into(),
+            value: string(config, key)?.unwrap_or_default(),
+            min: Duration::from_millis(1),
+        }),
+    }
+}
+
+/// `key`: unset, or an absolute path ([`ConfigError::RelativePath`]).
+pub(crate) fn absolute_path(
+    config: &git2::Config,
+    key: &str,
+) -> Result<Option<PathBuf>, ConfigError> {
+    match string(config, key)? {
+        None => Ok(None),
+        Some(value) if !Path::new(&value).is_absolute() => Err(ConfigError::RelativePath {
+            key: key.into(),
+            value,
+        }),
+        Some(value) => Ok(Some(PathBuf::from(value))),
+    }
+}
+
+/// The default `agentfs.patchNotifyTimeout` (bead agentfs-mia.5).
+pub const DEFAULT_PATCH_NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `agentfs.patchNotifyUrl`: unset, or an `http://` URL, or an `https://`
+/// one in a build with the `https` feature ([`ConfigError::NotifyUrl`]).
+fn patch_notify_url(config: &git2::Config) -> Result<Option<String>, ConfigError> {
+    let key = "agentfs.patchNotifyUrl";
+    let Some(url) = string(config, key)? else {
+        return Ok(None);
+    };
+    let lower = url.to_ascii_lowercase();
+    let https = lower.starts_with("https://");
+    let why = if !https && !lower.starts_with("http://") {
+        "it is not an http:// or https:// URL"
+    } else if https && !cfg!(feature = "https") {
+        "it is https, and this build has no TLS (the `https` feature)"
+    } else {
+        return Ok(Some(url));
+    };
+    Err(ConfigError::NotifyUrl {
+        key: key.into(),
+        value: url,
+        why,
+    })
+}
+
+/// `agentfs.patchIntegrate`: `merge` (the default) or `rebase`; anything
+/// else is [`ConfigError::BadChoice`].
+fn patch_integrate(config: &git2::Config) -> Result<IntegrateMode, ConfigError> {
+    let key = "agentfs.patchIntegrate";
+    match string(config, key)?.as_deref() {
+        None | Some("merge") => Ok(IntegrateMode::Merge),
+        Some("rebase") => Ok(IntegrateMode::Rebase),
+        Some(other) => Err(ConfigError::BadChoice {
+            key: key.into(),
+            value: other.into(),
+            allowed: "merge, rebase",
+        }),
     }
 }
 
@@ -1655,13 +1934,18 @@ mod tests {
                  \tlfspushurl = http://lfs.example/web-push\n\tagentfsLfsCredentials = /run/l\n\
                  \tproxy = http://other.example:8080\n\
                  [remote \"ssh\"]\n\turl = ssh://git@git.example/r.git\n\
-                 \tagentfsSshKey = /run/k\n\tagentfsKnownHosts = /run/h\n",
+                 \tagentfsSshKey = /run/k\n\tagentfsKnownHosts = /run/h\n\
+                 [agentfsPusher \"iac\"]\n\ttokenFile = /run/t\n\tright = offer\n",
                 fragment.display()
             ),
         )
         .unwrap();
         reads::take();
         let settings = Settings::load(dir.path()).unwrap();
+        // serve-git's pushers are read apart from the settings (bead
+        // agentfs-mia.9), from the same file.
+        let pushers = crate::patch::admit::pushers(&git2::Config::open(&path).unwrap()).unwrap();
+        assert_eq!(pushers.len(), 1);
         let read = reads::take();
         // Both remotes were read whole, whether or not this build supports
         // ssh: their keys are read before the transport is validated.
@@ -1757,6 +2041,104 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn patch_accept_and_its_timeout() {
+        let load = |extra: &str| {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{extra}"));
+            Settings::from_config(&c)
+        };
+        let s = load("").unwrap();
+        assert_eq!(s.patch_accept, AcceptMode::CleanMerge);
+        assert_eq!(s.patch_accept_timeout, DEFAULT_PATCH_ACCEPT_TIMEOUT);
+        for (value, mode) in [
+            ("cleanMerge", AcceptMode::CleanMerge),
+            ("approval", AcceptMode::Approval),
+            ("command", AcceptMode::Command),
+        ] {
+            let s = load(&format!("\tpatchAccept = {value}\n")).unwrap();
+            assert_eq!(s.patch_accept, mode, "{value}");
+        }
+        assert!(matches!(
+            load("\tpatchAccept = always\n"),
+            Err(ConfigError::BadChoice { .. })
+        ));
+        let s = load("\tpatchAcceptTimeout = 5s\n").unwrap();
+        assert_eq!(s.patch_accept_timeout, Duration::from_secs(5));
+        assert!(matches!(
+            load("\tpatchAcceptTimeout = 0s\n"),
+            Err(ConfigError::TooShort { .. })
+        ));
+        assert!(matches!(
+            load("\tpatchAcceptTimeout = soon\n"),
+            Err(ConfigError::BadDuration { .. })
+        ));
+    }
+
+    #[test]
+    fn patch_notify_keys() {
+        let load = |extra: &str| {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{extra}"));
+            Settings::from_config(&c)
+        };
+        let s = load("").unwrap();
+        assert_eq!(s.patch_notify_url, None);
+        assert_eq!(s.patch_notify_credential_file, None);
+        assert_eq!(s.patch_notify_timeout, DEFAULT_PATCH_NOTIFY_TIMEOUT);
+        let s = load(
+            "\tpatchNotifyUrl = http://127.0.0.1:9/hook\n\
+             \tpatchNotifyCredentialFile = /run/token\n\tpatchNotifyTimeout = 5s\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.patch_notify_url.as_deref(),
+            Some("http://127.0.0.1:9/hook")
+        );
+        assert_eq!(
+            s.patch_notify_credential_file,
+            Some(PathBuf::from("/run/token"))
+        );
+        assert_eq!(s.patch_notify_timeout, Duration::from_secs(5));
+        for bad in ["ftp://example.com/", "example.com"] {
+            assert!(
+                matches!(
+                    load(&format!("\tpatchNotifyUrl = {bad}\n")),
+                    Err(ConfigError::NotifyUrl { .. })
+                ),
+                "{bad}"
+            );
+        }
+        let https = load("\tpatchNotifyUrl = https://example.com/\n");
+        assert_eq!(https.is_ok(), cfg!(feature = "https"));
+        assert!(matches!(
+            load("\tpatchNotifyCredentialFile = token\n"),
+            Err(ConfigError::RelativePath { .. })
+        ));
+        assert!(matches!(
+            load("\tpatchNotifyTimeout = 0s\n"),
+            Err(ConfigError::TooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn patch_integrate_mode() {
+        let load = |extra: &str| {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{extra}"));
+            Settings::from_config(&c)
+        };
+        assert_eq!(load("").unwrap().patch_integrate, IntegrateMode::Merge);
+        for (value, mode) in [
+            ("merge", IntegrateMode::Merge),
+            ("rebase", IntegrateMode::Rebase),
+        ] {
+            let s = load(&format!("\tpatchIntegrate = {value}\n")).unwrap();
+            assert_eq!(s.patch_integrate, mode, "{value}");
+        }
+        assert!(matches!(
+            load("\tpatchIntegrate = squash\n"),
+            Err(ConfigError::BadChoice { .. })
+        ));
     }
 
     #[test]

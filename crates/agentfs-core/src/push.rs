@@ -433,7 +433,12 @@ pub struct RemotePusher {
     state_path: PathBuf,
     lock_path: PathBuf,
     volume: String,
+    /// The volume's branch ref: the name pushed to on the remote.
     branch_ref: String,
+    /// The local ref pushed there: the branch, or the change line for a
+    /// remote with `agentfsPush = changeLine` ([`Settings::push_source_ref`],
+    /// design §19.2 item 11). Claims and divergence are judged against it.
+    source_ref: String,
     push_interval: Duration,
     remote: RemoteSettings,
     /// Credentials, SSH key and known hosts (design §11.1).
@@ -504,6 +509,7 @@ impl RemotePusher {
             lock_path: state.push_lock(&remote.name),
             volume: settings.volume.clone(),
             branch_ref: settings.branch_ref.clone(),
+            source_ref: settings.push_source_ref(remote),
             push_interval: settings.push_interval,
             auth: RemoteAuth::new(remote),
             remote: remote.clone(),
@@ -606,7 +612,7 @@ impl RemotePusher {
         if let Some(hook) = &self.before_unpushed {
             hook();
         }
-        unpushed(&self.repo, &self.branch_ref, self.state.last_pushed_oid())
+        unpushed(&self.repo, &self.source_ref, self.state.last_pushed_oid())
             .map(|w| w.map(|w| w.count))
     }
 
@@ -795,7 +801,7 @@ impl RemotePusher {
         head_out: &mut Option<Oid>,
         lfs_out: &mut Option<UploadReport>,
     ) -> PushOutcome {
-        let head = match self.repo.refname_to_id(&self.branch_ref) {
+        let head = match self.repo.refname_to_id(&self.source_ref) {
             Ok(head) => head,
             Err(e) if e.code() == ErrorCode::NotFound => return PushOutcome::NothingToPush,
             Err(e) => return self.failed(PushFailureKind::Local, e.to_string(), None),
@@ -1243,7 +1249,7 @@ impl RemotePusher {
             }
         };
         self.state = PushState::load(&self.state_path);
-        let head = match self.repo.refname_to_id(&self.branch_ref) {
+        let head = match self.repo.refname_to_id(&self.source_ref) {
             Ok(head) => head,
             Err(e) if e.code() == ErrorCode::NotFound => return LeaseOutcome::NothingToPush,
             Err(e) => return failed(PushFailureKind::Local, e.message().to_owned()),
@@ -2220,8 +2226,8 @@ pub fn status(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteStatus>
         .iter()
         .map(|remote| {
             let push_state = PushState::load(&state.push_state(&remote.name));
-            let unpushed = unpushed(&repo, &settings.branch_ref, push_state.last_pushed_oid())?
-                .map(|w| w.count);
+            let source = settings.push_source_ref(remote);
+            let unpushed = unpushed(&repo, &source, push_state.last_pushed_oid())?.map(|w| w.count);
             Ok(RemoteStatus {
                 name: remote.name.clone(),
                 url: redact_url(remote.push_url()),
@@ -2258,7 +2264,8 @@ pub fn backlog(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteBacklo
         .iter()
         .map(|remote| {
             let push_state = PushState::load(&state.push_state(&remote.name));
-            let walk = unpushed(&repo, &settings.branch_ref, push_state.last_pushed_oid())?;
+            let source = settings.push_source_ref(remote);
+            let walk = unpushed(&repo, &source, push_state.last_pushed_oid())?;
             let oldest = match walk.and_then(|w| w.oldest) {
                 Some(oid) => Some(repo.find_commit(oid)?.committer().when().seconds()),
                 None => None,
@@ -2571,6 +2578,91 @@ mod tests {
     fn sink() -> (Arc<MemorySink>, Events) {
         let sink = Arc::new(MemorySink::new());
         (sink.clone(), sink)
+    }
+
+    /// A remote with `agentfsPush = changeLine` gets the change line at
+    /// its branch ref, never the branch; another remote gets the branch.
+    /// Claims, backlog and status follow each remote's own source.
+    #[test]
+    fn a_change_line_remote_gets_the_change_line() {
+        let lines = tempfile::tempdir().unwrap();
+        let branch = tempfile::tempdir().unwrap();
+        bare(lines.path());
+        bare(branch.path());
+        let mut v = Vol::with_config(
+            "vol",
+            &[
+                ("lines", &lines.path().display().to_string()),
+                ("all", &branch.path().display().to_string()),
+            ],
+            &[("remote.lines.agentfsPush", "changeLine")],
+        );
+        let remote = |name: &str| {
+            v.settings
+                .remotes
+                .pushed()
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .push_source
+        };
+        assert_eq!(remote("lines"), crate::config::PushSource::ChangeLine);
+        assert_eq!(remote("all"), crate::config::PushSource::Branch);
+        v.commit();
+        // No change line yet: nothing to push there.
+        let mut lines_pusher = v.pusher("lines", Arc::new(NullSink));
+        assert_eq!(lines_pusher.unpushed().unwrap(), None);
+        assert_eq!(lines_pusher.push_once(), PushOutcome::NothingToPush);
+
+        let request = crate::checkpoint::CheckpointRequest {
+            message: Some("one".into()),
+            caller: CALLER,
+        };
+        let crate::checkpoint::CheckpointOutcome::Cut { change, .. } =
+            crate::checkpoint::cut(&v.com, &request).unwrap()
+        else {
+            panic!("nothing cut");
+        };
+        v.commit();
+        let head = v.head();
+        assert_eq!(lines_pusher.unpushed().unwrap(), Some(1));
+        assert!(lines_pusher.push_once().is_success());
+        assert!(v.pusher("all", Arc::new(NullSink)).push_once().is_success());
+        assert_eq!(
+            remote_ref(lines.path(), "refs/heads/agentfs/vol"),
+            Some(change)
+        );
+        assert_eq!(
+            remote_ref(branch.path(), "refs/heads/agentfs/vol"),
+            Some(head)
+        );
+        assert_eq!(lines_pusher.unpushed().unwrap(), Some(0));
+        let status = status(&v.state, &v.settings).unwrap();
+        let unpushed: Vec<_> = status
+            .iter()
+            .map(|r| (r.name.as_str(), r.unpushed))
+            .collect();
+        assert_eq!(unpushed, [("all", Some(0)), ("lines", Some(0))]);
+        assert!(
+            backlog(&v.state, &v.settings)
+                .unwrap()
+                .iter()
+                .all(|b| b.unpushed == 0)
+        );
+        assert_eq!(lines_pusher.branch_claim(change).unwrap(), Claim::UpToDate);
+
+        // The next checkpoint fast-forwards the remote's change line.
+        v.commit();
+        let crate::checkpoint::CheckpointOutcome::Cut { change: next, .. } =
+            crate::checkpoint::cut(&v.com, &request).unwrap()
+        else {
+            panic!("nothing cut");
+        };
+        assert!(lines_pusher.push_once().is_success());
+        assert_eq!(
+            remote_ref(lines.path(), "refs/heads/agentfs/vol"),
+            Some(next)
+        );
     }
 
     #[test]

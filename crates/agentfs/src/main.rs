@@ -39,6 +39,10 @@
 //! (but not a front), `run`, `record`, `restore`, `revert` and `patch
 //! apply` refuse it.
 //!
+//! `serve-git` serves the volume's history repository to pushers over
+//! git's smart HTTP, as the volume's patch source ([`serve_git`], bead
+//! agentfs-mia.9): it takes no lock, and its hooks judge each push.
+//!
 //! `start accept --tip OID` accepts a tip of the branch a volume started
 //! from, clearing the start-branch alarm ([`start_cmd`], design §11.3); it
 //! takes no lock.
@@ -48,6 +52,7 @@
 //! [`otel`], design §13); alarms are also printed to stderr. `init` and
 //! `status` export nothing.
 
+mod checkpoint_cmd;
 mod control;
 mod daemon;
 #[cfg(test)]
@@ -62,6 +67,7 @@ mod push_now;
 mod recovery;
 #[cfg(test)]
 mod reference_tests;
+mod serve_git;
 mod serve_history;
 mod start_cmd;
 
@@ -181,6 +187,22 @@ enum Command {
         #[arg(long, default_value = "10s", value_parser = parse_grace)]
         shutdown_grace: Duration,
     },
+    /// Serve the volume's history repository to pushers over git's smart
+    /// HTTP as its patch source, until SIGINT or SIGTERM: pushers push
+    /// patches (`patch submit --remote http://NAME:TOKEN@ADDR/`) and
+    /// approvals by their rights (`[agentfsPusher "<name>"]`); each push is
+    /// admitted whole or refused, then judged and notified, never landed.
+    /// Needs agentfs.patchRemote = none. Takes no lock.
+    ServeGit {
+        /// Where to listen: HOST:PORT (port 0 picks one; the address is
+        /// printed). Required.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<String>,
+        #[command(flatten)]
+        pod: Pod,
+        #[command(subcommand)]
+        hook: Option<ServeGitHook>,
+    },
     /// Push the volume's refs to its remotes once. With a daemon running
     /// (`mount`, `run`, `serve-history`), asks it to commit and push now
     /// over its control socket; otherwise pushes directly. Exits 1 unless
@@ -198,6 +220,19 @@ enum Command {
         /// Replace this volume's own branch on one remote, leased on OID (runbooks only).
         #[arg(long, value_name = "OID")]
         force_with_lease: Option<String>,
+        #[command(flatten)]
+        pod: Pod,
+    },
+    /// Cut a checkpoint: one commit on the change line
+    /// (refs/agentfs/<volume>/change-line) with the branch head's tree and
+    /// the patches landed since, merged back into the branch. With a daemon
+    /// running, its commit loop cuts it; otherwise takes the state-area lock
+    /// (exit 75 when it is busy) and commits what is recorded first. Exit 0
+    /// also when there is nothing new.
+    Checkpoint {
+        /// The checkpoint's message (default: `checkpoint`).
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
         #[command(flatten)]
         pod: Pod,
     },
@@ -286,6 +321,17 @@ enum Command {
         #[command(subcommand)]
         command: start_cmd::StartCommand,
     },
+}
+
+/// `serve-git`'s git hooks, run by `git receive-pack` (bead agentfs-mia.9).
+#[derive(Subcommand)]
+enum ServeGitHook {
+    /// `pre-receive`: admit the whole push, or refuse it.
+    #[command(hide = true)]
+    Admit,
+    /// `post-receive`: judge the queue and notify; never land.
+    #[command(hide = true)]
+    Arrived,
 }
 
 /// Being a front of a history service (design §14).
@@ -548,6 +594,25 @@ fn real_main() -> Result<ExitCode> {
                 shutdown_grace,
             );
         }
+        Command::ServeGit { listen, pod, hook } => {
+            return match hook {
+                None => {
+                    // Optional for clap only: the hooks run without it.
+                    let Some(listen) = listen else {
+                        bail!("serve-git needs --listen ADDR (HOST:PORT)");
+                    };
+                    serve_git::serve(
+                        &state,
+                        cli.root.as_deref(),
+                        &listen,
+                        &pod,
+                        serve_git::SHUTDOWN_GRACE,
+                    )
+                }
+                Some(ServeGitHook::Admit) => serve_git::admit_hook(&state),
+                Some(ServeGitHook::Arrived) => serve_git::arrived_hook(&state, &pod),
+            };
+        }
         Command::Push {
             remotes,
             timeout,
@@ -582,6 +647,9 @@ fn real_main() -> Result<ExitCode> {
             let code = push_once(&state, &remotes, &session)?;
             session.finish();
             return Ok(code);
+        }
+        Command::Checkpoint { message, pod } => {
+            return checkpoint_cmd::run(&state, cli.root.as_deref(), cli.wait_lock, &pod, message);
         }
         Command::Run { pod, push_grace } => {
             refuse_finished(&state)?;
@@ -1019,6 +1087,7 @@ fn run(
     let settings = committer.history().settings().clone();
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
+    let applier = patch_cmd::Applier::new(&committer, events.clone(), session.telemetry());
     let service = Service::start(committer, pushers, events).context("starting the service")?;
     // `agentfs push` asks it to push now; restores are refused (design
     // §2.3).
@@ -1029,6 +1098,7 @@ fn run(
             service.handle(),
             misconfigured(&settings),
             push_now::Restores::Refuse(push_now::RUN_SERVES_NO_RESTORES),
+            applier,
         ),
     );
     eprintln!(
@@ -1402,6 +1472,7 @@ fn mount(
     let restorer = recorder.clone();
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
+    let applier = patch_cmd::Applier::new(&committer, events.clone(), session.telemetry());
     let service = Service::start(committer, pushers, events).context("starting the service")?;
     let config = MountConfig {
         volume: settings.volume.clone(),
@@ -1442,6 +1513,7 @@ fn mount(
                 view: mounted.view(),
                 commit_window: settings.commit_window,
             }),
+            applier,
         ),
     );
     add_mounted_views(&mountpoint);

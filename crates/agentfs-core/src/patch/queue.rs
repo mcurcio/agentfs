@@ -10,18 +10,36 @@
 //!    head cached in `meta/patch.json`, when that is still on the branch);
 //! 3. finishes the bookkeeping of inbox entries the branch already applies
 //!    (a crash between the commit and the ref moves), and reports other
-//!    entries at or below the last applied number as ignored;
-//! 4. applies the rest in order, the next number being the last applied
-//!    plus one (a missing number blocks with `gap`). Each patch must have
-//!    one parent on the branch, change at most [`MAX_PATCH_PATHS`] paths
-//!    and no gitlinks; it is merged onto the head with libgit2's
-//!    cherry-pick (a three-way merge against its parent), written into the
+//!    entries at or below the last applied number as ignored, except a
+//!    number this queue set aside before (a local
+//!    `refs/agentfs/<volume>/held/<n>` mark, [`super::held_ref`]), which
+//!    is judged again whatever commit it names now; a mark whose number the
+//!    branch applied, or whose inbox entry is gone (`withdrawn`), is
+//!    deleted;
+//! 4. judges the rest in order: the set-aside numbers and every entry above
+//!    the last applied one, which must each be the next number (one past
+//!    the highest applied or judged so far; a missing one stops the run
+//!    with `gap`). Each patch is a
+//!    branch ([`PatchBranch`]): a line of single-parent commits on a base,
+//!    the merge base of its tip and the head, changing at most
+//!    [`super::MAX_PATCH_PATHS`] paths and no gitlinks. It waits behind an
+//!    earlier set-aside barrier ([`super::BARRIER_TRAILER`]) or an earlier
+//!    set-aside patch changing one of its paths; else it is merged onto
+//!    the head by the context's [`Integrator`] (`git merge-tree`, a
+//!    three-way merge against the base), judged by the context's
+//!    [`AcceptanceRule`], written into the
 //!    backing tree with the restore engine ([`crate::restore`]), and
 //!    recorded as one atomic record of a patch operation, so it becomes one
 //!    commit carrying `Agentfs-Inbox: <n>`. A patch that changes nothing
 //!    gets a marker commit with the head's tree;
-//! 5. moves the refs (`applied/<n>` = the patch, `inbox/<n>` deleted) and
-//!    stops at the first patch it cannot apply;
+//! 5. moves the refs (`applied/<n>` = the patch's tip, `inbox/<n>` and
+//!    `held/<n>` deleted). A patch that cannot land is set aside whole
+//!    with a [`Verdict`] (held, for the reasons
+//!    [`BlockReason::holds_whole`] names; waiting; awaiting the rule; not
+//!    judged, when the rule could not judge), marked `held/<n>` before the
+//!    next number is judged, and the queue goes on; the run stops only at a
+//!    gap, unrecorded changes or a failure ([`Blocked`]). Set-aside patches
+//!    are judged again at every run (bead agentfs-mia.2);
 //! 6. writes the status ref and `meta/patch.json`.
 //!
 //! Every crash point converges on one commit per patch: a crash after the
@@ -37,6 +55,11 @@
 //! without an inbox number) before it applies anything: the tree never
 //! keeps content that history does not have.
 //!
+//! [`Queue::judge`] runs steps 2 to 4 read only, while a daemon holds the
+//! volume (bead agentfs-mia.5): no commit, no tree write, no ref but the
+//! status ref; a patch that would land is [`Verdict::Ready`]. Both use one
+//! home for the per-patch rules, `judge_one`.
+//!
 //! A write that fails part way is recorded as it stands, as a patch
 //! operation without an inbox number, so the tree matches history and the
 //! next merge picks up from there. A patch whose atomic record is refused
@@ -44,30 +67,38 @@
 
 use std::collections::BTreeMap;
 
-use git2::{FileMode, Oid, Repository};
+use git2::{Oid, Repository};
 use opentelemetry::KeyValue;
 
+use super::accept::{Acceptance, AcceptanceRule, Candidate};
 use super::fetch::FetchOutcome;
+use super::integrate::{IntegrateError, Integrated, Integrator, PatchBranch, Refusal};
 use super::status::{
     AppliedEntry, DuplicateEntry, FetchStatus, InFlight, PatchState, QueueEntry, STATUS_VERSION,
     StatusDoc, write_status_ref,
 };
 use super::{
-    BlockReason, Blocked, Ignored, MAX_PATCH_PATHS, PatchError, applied_ref, inbox_from_message,
-    inbox_prefix, inbox_ref, seq_of_ref,
+    BlockReason, Blocked, Ignored, PatchError, Verdict, WaitReason, applied_ref, held_prefix,
+    held_ref, inbox_from_message, inbox_prefix, inbox_ref, seq_of_ref,
 };
 use crate::confined::Dir;
-use crate::events::Event;
-use crate::history::InboxCommit;
+use crate::events::{Event, Events};
+use crate::history::{History, InboxCommit};
+use crate::identity::Identity;
 use crate::lfs::fetch::LfsObjects;
 use crate::paths::RepoPath;
 use crate::record::{Caller, Operation, OperationKind, PatchAuthor};
 use crate::restore::{self, Applied, NotLive, Plan, RecordMode, RestoreError, Step};
-use crate::telemetry::{Telemetry, spans};
+use crate::telemetry::{ActiveSpan, Telemetry, spans};
 use crate::volume::{Committer, OperationSpec, Recorder, StateDir};
 
 /// Inputs per record when a partial write is recorded.
 const PARTIAL_RECORD_CHUNK: usize = 4096;
+
+/// The rule a merge driver that cannot run is alarmed as
+/// (`PatchRuleFailed`; bead agentfs-mia.3): its verdict's rule is
+/// `merge driver <name>`.
+const MERGE_RULE: &str = "merge";
 
 /// What the queue runs against.
 pub struct QueueContext<'a> {
@@ -82,6 +113,40 @@ pub struct QueueContext<'a> {
     pub telemetry: &'a Telemetry,
     /// The applying process: the operations' actor and operator.
     pub caller: Caller,
+    /// How patches are merged onto the head (`agentfs.patchIntegrate`,
+    /// [`super::integrate::integrator`]).
+    pub integrator: &'a dyn Integrator,
+    /// Whether a cleanly merged patch may land (`agentfs.patchAccept`,
+    /// [`super::accept::rule`]).
+    pub rule: &'a dyn AcceptanceRule,
+}
+
+/// What judging needs: read access only (bead agentfs-mia.5).
+/// [`Queue::judge`] writes nothing but the status ref, signed by
+/// `committer`, and `meta/patch.json`.
+pub struct JudgeContext<'a> {
+    pub state: &'a StateDir,
+    pub history: &'a History,
+    pub integrator: &'a dyn Integrator,
+    pub rule: &'a dyn AcceptanceRule,
+    pub events: &'a Events,
+    pub telemetry: &'a Telemetry,
+    /// Who signs the status commit: the daemon's committer.
+    pub committer: &'a Identity,
+    /// How the fetch before it went, for the status document.
+    pub fetch: Option<&'a FetchOutcome>,
+}
+
+/// What one [`Queue::judge`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Judgement {
+    /// Every patch judged, ascending: [`Verdict::Ready`] for one that
+    /// would land now.
+    pub verdicts: Vec<(u64, Verdict)>,
+    /// Where judging stopped, if it did (a gap, or a patch that failed).
+    pub blocked: Option<Blocked>,
+    /// The status commit written.
+    pub status: Oid,
 }
 
 /// What one [`Queue::process`] did.
@@ -95,19 +160,72 @@ pub struct QueueReport {
     /// first), this run: consumed with a marker commit, not applied again.
     pub duplicates: Vec<(u64, u64)>,
     pub blocked: Option<Blocked>,
-    /// Patches still queued, the blocked one included.
+    /// Patches still queued, the set-aside and blocked ones included.
     pub queue_depth: usize,
     pub ignored: Vec<Ignored>,
     /// The highest inbox number applied on the branch.
     pub last_applied: u64,
     /// The status commit written.
     pub status: Oid,
+    /// Set aside in this run, with their verdicts, ascending.
+    pub set_aside: Vec<(u64, Verdict)>,
+    /// held/<n> marks deleted because the inbox entry was withdrawn.
+    pub withdrawn: Vec<u64>,
 }
 
-/// How one patch went.
-enum Step1 {
-    Applied(Oid),
-    Blocked(Blocked),
+/// How landing one patch went.
+enum Landing {
+    Landed(Oid),
+    /// Not landed; `failed` after a write, else refused by the check
+    /// before anything was written.
+    Refused(Blocked),
+}
+
+/// What the rules decided about one patch ([`judge_one`]).
+enum Assessed {
+    /// It may land: merged onto `head` as `merged`.
+    Ready {
+        head: Oid,
+        branch: PatchBranch,
+        merged: Oid,
+    },
+    /// Set aside: the queue goes on without it.
+    Aside(Aside),
+    /// The run stops at it.
+    Stop(Blocked),
+}
+
+/// What the rules read: the history, the merge and the acceptance rule.
+struct Judges<'a> {
+    history: &'a History,
+    integrator: &'a dyn Integrator,
+    rule: &'a dyn AcceptanceRule,
+}
+
+/// How judging and landing one patch went.
+enum Judged {
+    /// Landed as this branch commit.
+    Landed(Oid),
+    /// Set aside: the queue goes on without it.
+    Aside(Aside),
+    /// The run stops at it.
+    Stop(Blocked),
+}
+
+/// Why a patch did not merge onto the head.
+enum Unmerged {
+    /// A conflict, or a merge that could not run: [`refused`] decides.
+    Refused(Refusal),
+    /// A merge driver could not run: the patch is not judged.
+    NotJudged { rule: String, message: String },
+}
+
+/// A patch set aside, as later patches of the same run see it.
+struct Aside {
+    verdict: Verdict,
+    /// The paths it changes, when its branch could be read.
+    paths: Option<Vec<RepoPath>>,
+    barrier: bool,
 }
 
 /// The patch queue of one open volume.
@@ -123,7 +241,7 @@ impl<'a> Queue<'a> {
     /// Applies what is queued (see the module docs). `fetch` is how the
     /// fetch before it went, for the status document. Fails only when the
     /// history or the state area cannot be read; a patch that cannot be
-    /// applied blocks the queue instead.
+    /// applied is set aside or blocks the queue instead.
     ///
     /// A failure is recorded as blocked (`failed`, inbox 0) in
     /// `meta/patch.json` and, if it can be, the status ref
@@ -132,6 +250,173 @@ impl<'a> Queue<'a> {
         self.process_inner(fetch).inspect_err(|e| {
             let message = format!("the patch queue could not run: {e}");
             record_failure(self.cx.state, Some(self.cx.committer), &message);
+        })
+    }
+
+    /// Judges every queued patch against the head as it is, by the rules
+    /// [`Queue::process`] lands by (bead agentfs-mia.5): steps 2 to 4 of
+    /// the module docs, read only. Nothing is committed, written into the
+    /// tree or moved but the status ref and `meta/patch.json`; a held mark
+    /// is neither written nor deleted. A patch that would land is
+    /// [`Verdict::Ready`], and the later ones are judged against the same
+    /// head (it is not merged into it): ready is advisory until a landing.
+    /// A gap, or a patch whose judging failed, stops it as it stops a run.
+    pub fn judge(cx: &JudgeContext<'_>) -> Result<Judgement, PatchError> {
+        let history = cx.history;
+        let repo = history.repo();
+        let volume = history.settings().volume.clone();
+        let (mut inbox, mut ignored) = read_inbox(repo, &volume)?;
+        let marks = held_marks(repo, &volume)?;
+        let found = history.find_inbox_commits(None)?;
+        let last_applied = found.keys().copied().max().unwrap_or(0);
+        let mut set_aside_before = std::collections::BTreeSet::new();
+        for (n, oid) in marks {
+            if found.contains_key(&n) {
+                continue;
+            }
+            if inbox.contains_key(&n) {
+                set_aside_before.insert(n);
+            } else {
+                ignored.push(Ignored {
+                    ref_name: inbox_ref(&volume, n),
+                    inbox: Some(n),
+                    patch: Some(oid.to_string()),
+                    why: "withdrawn".into(),
+                });
+            }
+        }
+        let below: Vec<(u64, Oid)> = inbox
+            .range(..=last_applied)
+            .filter(|(n, _)| !set_aside_before.contains(*n))
+            .map(|(n, o)| (*n, *o))
+            .collect();
+        for (n, oid) in below {
+            inbox.remove(&n);
+            if found.get(&n).is_none_or(|c| c.patch != oid) {
+                ignored.push(Ignored {
+                    ref_name: inbox_ref(&volume, n),
+                    inbox: Some(n),
+                    patch: Some(oid.to_string()),
+                    why: "stale".into(),
+                });
+            }
+        }
+        ignored_events(cx.events, &ignored);
+
+        let judges = Judges {
+            history,
+            integrator: cx.integrator,
+            rule: cx.rule,
+        };
+        let mut first_applied: std::collections::HashMap<Oid, u64> =
+            std::collections::HashMap::new();
+        for (n, c) in &found {
+            first_applied.entry(c.patch).or_insert(*n);
+        }
+        let mut verdicts: BTreeMap<u64, Verdict> = BTreeMap::new();
+        let mut aside: BTreeMap<u64, Aside> = BTreeMap::new();
+        let mut stopped = None;
+        let mut judged = 0;
+        let queued: Vec<(u64, Oid)> = inbox.iter().map(|(n, o)| (*n, *o)).collect();
+        for (i, (n, patch)) in queued.iter().copied().enumerate() {
+            let waiting = queued.len() - i;
+            if n > last_applied {
+                let next = last_applied.max(judged) + 1;
+                if n != next {
+                    let b = gap(next, n);
+                    blocked_event(cx.events, &b, waiting);
+                    stopped = Some(b);
+                    break;
+                }
+            }
+            judged = judged.max(n);
+            // A duplicate is consumed, never merged: it would "land".
+            if first_applied.get(&patch).is_some_and(|&m| m < n) {
+                verdicts.insert(n, Verdict::Ready);
+                continue;
+            }
+            let span = patch_span(cx.telemetry, n, patch);
+            let assessed = judge_one(&judges, n, patch, &aside).unwrap_or_else(|e| {
+                Assessed::Stop(blocked(
+                    n,
+                    patch,
+                    BlockReason::Failed,
+                    e.to_string(),
+                    Vec::new(),
+                ))
+            });
+            match assessed {
+                Assessed::Ready { .. } => {
+                    span.set(KeyValue::new("agentfs.patch.outcome", "ready"));
+                    span.end();
+                    first_applied.entry(patch).or_insert(n);
+                    verdicts.insert(n, Verdict::Ready);
+                }
+                Assessed::Aside(a) => {
+                    aside_span(&span, &a.verdict);
+                    span.end();
+                    aside_events(cx.events, cx.rule.name(), n, patch, &a.verdict);
+                    verdicts.insert(n, a.verdict.clone());
+                    aside.insert(n, a);
+                }
+                Assessed::Stop(b) => {
+                    stop_span(&span, &b);
+                    span.end();
+                    blocked_event(cx.events, &b, waiting);
+                    stopped = Some(b);
+                    break;
+                }
+            }
+        }
+
+        let head = history.head()?.map(|c| c.id());
+        let last = found.get(&last_applied);
+        let doc = StatusDoc {
+            version: STATUS_VERSION,
+            volume: volume.clone(),
+            branch: history.settings().branch_ref.clone(),
+            head: head.map(|h| h.to_string()),
+            updated: crate::push::utc_basic(now_ms() / 1000),
+            last_applied: last.map(|c| AppliedEntry {
+                inbox: last_applied,
+                patch: c.patch.to_string(),
+                commit: c.commit.to_string(),
+            }),
+            applied_now: Vec::new(),
+            duplicate_now: Vec::new(),
+            queue: inbox
+                .iter()
+                .map(|(n, o)| QueueEntry {
+                    inbox: *n,
+                    patch: o.to_string(),
+                    verdict: verdicts.get(n).cloned(),
+                })
+                .collect(),
+            blocked: stopped.clone(),
+            ignored,
+            fetch: cx.fetch.map(|f| FetchStatus {
+                remote: f.remote.clone(),
+                ok: f.ok,
+                error: f.message.clone(),
+            }),
+        };
+        let signature = git2::Signature::now(&cx.committer.name, &cx.committer.email)?;
+        let status = write_status_ref(repo, &volume, &doc, &signature)?;
+        // The cache, for `agentfs status` and the gauges; what only a run
+        // keeps (the scan's head, an interrupted write) stays as it was.
+        let path = cx.state.patch_state();
+        let mut state = PatchState::load(&path);
+        state.version = STATUS_VERSION;
+        state.queue_depth = inbox.len() as u64;
+        state.held = aside.len() as u64;
+        state.blocked = stopped.clone();
+        state.status_oid = Some(status.to_string());
+        state.updated_ms = now_ms();
+        state.save(&path)?;
+        Ok(Judgement {
+            verdicts: verdicts.into_iter().collect(),
+            blocked: stopped,
+            status,
         })
     }
 
@@ -145,29 +430,11 @@ impl<'a> Queue<'a> {
         let mut state = PatchState::load(&state_path);
 
         // The local queue.
-        let prefix = inbox_prefix(&volume);
-        let mut inbox: BTreeMap<u64, Oid> = BTreeMap::new();
-        let mut ignored = Vec::new();
-        for reference in repo.references_glob(&format!("{prefix}*"))? {
-            let reference = reference?;
-            let Ok(name) = reference.name().map(str::to_owned) else {
-                continue;
-            };
-            let target = reference.resolve().ok().and_then(|r| r.target());
-            match (seq_of_ref(&prefix, &name), target) {
-                (Some(n), Some(oid)) => {
-                    inbox.insert(n, oid);
-                }
-                (n, _) => ignored.push(Ignored {
-                    ref_name: name,
-                    inbox: n,
-                    patch: target.map(|o| o.to_string()),
-                    why: "malformed".into(),
-                }),
-            }
-        }
+        let (mut inbox, mut ignored) = read_inbox(repo, &volume)?;
+        let marks = held_marks(repo, &volume)?;
 
-        // What the branch applies already.
+        // What the branch applies already. Held marks and an interrupted
+        // write are judged by the trailers of the whole branch.
         let head = history.head()?.map(|c| c.id());
         let cached = state
             .scanned_head
@@ -178,20 +445,45 @@ impl<'a> Queue<'a> {
                     *cached == head || repo.graph_descendant_of(head, *cached).unwrap_or(false)
                 }
                 None => false,
-            });
+            })
+            .filter(|_| marks.is_empty() && state.in_flight.is_none());
         let mut found = history.find_inbox_commits(cached)?;
         let mut full_scan = cached.is_none();
         let mut last_applied = found.keys().copied().max().unwrap_or(0);
         let mut last = found.get(&last_applied).copied();
-        if cached.is_some() && state.last_applied > last_applied {
+        if !full_scan && state.last_applied > last_applied {
             last_applied = state.last_applied;
             last = cached_last(&state);
         }
 
-        // Entries at or below it: finish their bookkeeping, or ignore them.
+        // Set aside before (bead agentfs-mia.2): a mark whose number the
+        // branch applied is left over from a crash after landing; one
+        // whose inbox entry is gone was withdrawn.
+        let mut set_aside_before = std::collections::BTreeSet::new();
+        let mut withdrawn = Vec::new();
+        for (n, oid) in marks {
+            if found.contains_key(&n) {
+                drop_held(repo, &volume, n)?;
+            } else if !inbox.contains_key(&n) {
+                drop_held(repo, &volume, n)?;
+                withdrawn.push(n);
+                ignored.push(Ignored {
+                    ref_name: inbox_ref(&volume, n),
+                    inbox: Some(n),
+                    patch: Some(oid.to_string()),
+                    why: "withdrawn".into(),
+                });
+            } else {
+                set_aside_before.insert(n);
+            }
+        }
+
+        // Entries at or below it: finish their bookkeeping, or ignore them;
+        // a set-aside one is judged again.
         let mut already = Vec::new();
         let below: Vec<(u64, Oid)> = inbox
             .range(..=last_applied)
+            .filter(|(n, _)| !set_aside_before.contains(*n))
             .map(|(n, o)| (*n, *o))
             .collect();
         for (n, oid) in below {
@@ -214,18 +506,15 @@ impl<'a> Queue<'a> {
             }
         }
 
-        for i in &ignored {
-            self.cx.recorder.events().emit(Event::PatchIgnored {
-                ref_name: i.ref_name.clone(),
-                inbox: i.inbox,
-                patch: i.patch.as_deref().and_then(|p| Oid::from_str(p).ok()),
-                why: i.why.clone(),
-            });
-        }
+        ignored_events(self.cx.recorder.events(), &ignored);
 
         // A write a crash interrupted, of a patch that has changed since.
-        if let Some(f) = state.in_flight.take() {
-            self.recover_in_flight(&f, last_applied, &inbox)?;
+        let in_flight = state.in_flight.take();
+        let in_flight_patch = in_flight
+            .as_ref()
+            .and_then(|f| Oid::from_str(&f.patch).ok());
+        if let Some(f) = &in_flight {
+            self.recover_in_flight(f, &found, &inbox)?;
         }
 
         // The rest, in order. A patch commit already applied under an
@@ -234,6 +523,7 @@ impl<'a> Queue<'a> {
         let mut applied = Vec::new();
         let mut duplicates = Vec::new();
         let mut blocked = None;
+        let mut aside: BTreeMap<u64, Aside> = BTreeMap::new();
         let queued: Vec<(u64, Oid)> = inbox.iter().map(|(n, o)| (*n, *o)).collect();
         if !queued.is_empty() && !full_scan {
             found = history.find_inbox_commits(None)?;
@@ -243,69 +533,86 @@ impl<'a> Queue<'a> {
         for (n, c) in &found {
             first_applied.entry(c.patch).or_insert(*n);
         }
+        // The highest number judged in this run, landed or set aside.
+        let mut judged = 0;
         for (i, (n, patch)) in queued.iter().copied().enumerate() {
             let waiting = queued.len() - i;
-            let next = last_applied + 1;
-            if n != next {
-                let b = Blocked {
-                    inbox: next,
-                    patch: None,
-                    reason: BlockReason::Gap,
-                    message: format!("patch {next} is not queued, and {n} comes after it"),
-                    paths: Vec::new(),
-                };
-                self.blocked_event(&b, waiting);
-                blocked = Some(b);
-                break;
+            if n > last_applied {
+                let next = last_applied.max(judged) + 1;
+                if n != next {
+                    let b = gap(next, n);
+                    blocked_event(self.cx.recorder.events(), &b, waiting);
+                    blocked = Some(b);
+                    break;
+                }
             }
-            if let Some(&m) = first_applied.get(&patch)
+            judged = judged.max(n);
+            let landed = if let Some(&m) = first_applied.get(&patch)
                 && m < n
             {
                 let commit = self.consume_duplicate(n, patch, m)?;
-                move_refs(repo, &volume, n, patch)?;
-                inbox.remove(&n);
-                last_applied = n;
-                last = Some(InboxCommit { commit, patch });
                 duplicates.push((n, m));
-                state.last_applied = n;
-                state.last_applied_patch = Some(patch.to_string());
-                state.last_applied_commit = Some(commit.to_string());
-                state.scanned_head = Some(commit.to_string());
-                let _ = state.save(&state_path);
                 self.cx.recorder.events().emit(Event::PatchDuplicate {
                     inbox: n,
                     patch,
                     applied_as: m,
                 });
-                continue;
-            }
-            match self.apply_one(n, patch) {
-                Step1::Applied(commit) => {
-                    first_applied.entry(patch).or_insert(n);
-                    crate::failpoints::hit("patch.after_commit")?;
-                    move_refs(repo, &volume, n, patch)?;
-                    inbox.remove(&n);
-                    last_applied = n;
-                    last = Some(InboxCommit { commit, patch });
-                    applied.push((n, commit));
-                    state.last_applied = n;
-                    state.last_applied_patch = Some(patch.to_string());
-                    state.last_applied_commit = Some(commit.to_string());
-                    state.scanned_head = Some(commit.to_string());
-                    // A cache: a lost update costs a rescan, nothing more.
-                    let _ = state.save(&state_path);
-                    self.cx.recorder.events().emit(Event::PatchApplied {
-                        inbox: n,
-                        patch,
-                        commit,
-                    });
+                commit
+            } else {
+                match self.judge_and_land(n, patch, &aside) {
+                    Judged::Landed(commit) => {
+                        first_applied.entry(patch).or_insert(n);
+                        crate::failpoints::hit("patch.after_commit")?;
+                        applied.push((n, commit));
+                        self.cx.recorder.events().emit(Event::PatchApplied {
+                            inbox: n,
+                            patch,
+                            commit,
+                        });
+                        commit
+                    }
+                    Judged::Aside(a) => {
+                        // Marked before the next number is judged, so a
+                        // crash never leaves it to read as stale.
+                        repo.reference(
+                            &held_ref(&volume, n),
+                            patch,
+                            true,
+                            "agentfs: patch set aside",
+                        )?;
+                        aside_events(
+                            self.cx.recorder.events(),
+                            self.cx.rule.name(),
+                            n,
+                            patch,
+                            &a.verdict,
+                        );
+                        aside.insert(n, a);
+                        continue;
+                    }
+                    Judged::Stop(b) => {
+                        blocked_event(self.cx.recorder.events(), &b, waiting);
+                        blocked = Some(b);
+                        break;
+                    }
                 }
-                Step1::Blocked(b) => {
-                    self.blocked_event(&b, waiting);
-                    blocked = Some(b);
-                    break;
-                }
+            };
+            move_refs(repo, &volume, n, patch)?;
+            drop_held(repo, &volume, n)?;
+            inbox.remove(&n);
+            if n > last_applied {
+                last_applied = n;
+                last = Some(InboxCommit {
+                    commit: landed,
+                    patch,
+                });
+                state.last_applied = n;
+                state.last_applied_patch = Some(patch.to_string());
+                state.last_applied_commit = Some(landed.to_string());
             }
+            state.scanned_head = Some(landed.to_string());
+            // A cache: a lost update costs a rescan, nothing more.
+            let _ = state.save(&state_path);
         }
 
         // Status.
@@ -339,6 +646,7 @@ impl<'a> Queue<'a> {
                 .map(|(n, o)| QueueEntry {
                     inbox: *n,
                     patch: o.to_string(),
+                    verdict: aside.get(n).map(|a| a.verdict.clone()),
                 })
                 .collect(),
             blocked: blocked.clone(),
@@ -358,9 +666,15 @@ impl<'a> Queue<'a> {
         state.last_applied_commit = last.map(|c| c.commit.to_string());
         state.scanned_head = head.map(|h| h.to_string());
         state.queue_depth = inbox.len() as u64;
+        state.held = aside.len() as u64;
         state.blocked = blocked.clone();
         state.status_oid = Some(status.to_string());
         state.updated_ms = now_ms();
+        // An interrupted write of a patch still queued and not landed in
+        // this run stays noted, so a later run can still put it back.
+        state.in_flight = in_flight.filter(|f| {
+            in_flight_patch.is_some() && inbox.get(&f.inbox).copied() == in_flight_patch
+        });
         state.save(&state_path)?;
         Ok(QueueReport {
             applied,
@@ -371,6 +685,8 @@ impl<'a> Queue<'a> {
             ignored,
             last_applied,
             status,
+            set_aside: aside.into_iter().map(|(n, a)| (n, a.verdict)).collect(),
+            withdrawn,
         })
     }
 
@@ -381,7 +697,7 @@ impl<'a> Queue<'a> {
     fn consume_duplicate(&self, n: u64, patch_oid: Oid, m: u64) -> Result<Oid, PatchError> {
         let repo = self.cx.committer.history().repo();
         let summary = match repo.find_commit(patch_oid) {
-            Ok(patch) => summary_of(&patch, n),
+            Ok(patch) => summary_of(&patch, n, &[], repo),
             Err(_) => format!("patch {n}"),
         };
         let op = Operation {
@@ -396,27 +712,25 @@ impl<'a> Queue<'a> {
         Ok(self.cx.committer.commit_patch_marker(&op)?)
     }
 
-    fn blocked_event(&self, b: &Blocked, queued: usize) {
-        self.cx.recorder.events().emit(Event::PatchBlocked {
-            inbox: b.inbox,
-            patch: b.patch.as_deref().and_then(|p| Oid::from_str(p).ok()),
-            reason: b.reason.as_str(),
-            message: b.message.clone(),
-            queued,
-        });
-    }
-
-    /// Applies patch `n` in an `agentfs.patch` span.
-    fn apply_one(&self, n: u64, patch: Oid) -> Step1 {
-        let span = self.cx.telemetry.span(spans::PATCH, || {
-            vec![
-                KeyValue::new("agentfs.patch.inbox", n as i64),
-                KeyValue::new("agentfs.patch.oid", patch.to_string()),
-            ]
-        });
-        let step = match self.apply_inner(n, patch) {
-            Ok(step) => step,
-            Err(e) => Step1::Blocked(blocked(
+    /// Judges patch `n` ([`judge_one`]) and lands it when it may, in an
+    /// `agentfs.patch` span. `aside` are the patches this run set aside so
+    /// far.
+    fn judge_and_land(&self, n: u64, patch: Oid, aside: &BTreeMap<u64, Aside>) -> Judged {
+        let span = patch_span(self.cx.telemetry, n, patch);
+        let judges = self.judges();
+        let judged = match judge_one(&judges, n, patch, aside).and_then(|assessed| {
+            Ok(match assessed {
+                Assessed::Ready {
+                    head,
+                    branch,
+                    merged,
+                } => self.landed(n, patch, head, &branch, merged, &span)?,
+                Assessed::Aside(a) => Judged::Aside(a),
+                Assessed::Stop(b) => Judged::Stop(b),
+            })
+        }) {
+            Ok(judged) => judged,
+            Err(e) => Judged::Stop(blocked(
                 n,
                 patch,
                 BlockReason::Failed,
@@ -424,22 +738,68 @@ impl<'a> Queue<'a> {
                 Vec::new(),
             )),
         };
-        match &step {
-            Step1::Applied(commit) => {
+        match &judged {
+            Judged::Landed(commit) => {
                 span.set(KeyValue::new("agentfs.patch.outcome", "applied"));
                 span.set(KeyValue::new("agentfs.patch.commit", commit.to_string()));
             }
-            Step1::Blocked(b) => {
-                span.set(KeyValue::new("agentfs.patch.outcome", "blocked"));
-                span.set(KeyValue::new("agentfs.patch.reason", b.reason.as_str()));
-                span.error(&b.message);
-            }
+            Judged::Aside(a) => aside_span(&span, &a.verdict),
+            Judged::Stop(b) => stop_span(&span, b),
         }
         span.end();
-        step
+        judged
     }
 
-    fn apply_inner(&self, n: u64, patch_oid: Oid) -> Result<Step1, PatchError> {
+    fn judges(&self) -> Judges<'_> {
+        Judges {
+            history: self.cx.committer.history(),
+            integrator: self.cx.integrator,
+            rule: self.cx.rule,
+        }
+    }
+
+    /// Lands patch `n`, which the rules accepted: landed, or (refused by
+    /// the check before anything was written) held whole when the reason
+    /// says so, else where the run stops.
+    fn landed(
+        &self,
+        n: u64,
+        patch_oid: Oid,
+        head: Oid,
+        branch: &PatchBranch,
+        merged: Oid,
+        span: &ActiveSpan,
+    ) -> Result<Judged, PatchError> {
+        Ok(match self.land(n, patch_oid, head, branch, merged, span)? {
+            Landing::Landed(commit) => Judged::Landed(commit),
+            Landing::Refused(b) => match refused(
+                n,
+                patch_oid,
+                Refusal {
+                    reason: b.reason,
+                    message: b.message,
+                    paths: b.paths,
+                },
+                Some(branch.paths.clone()),
+                branch.barrier,
+            ) {
+                Ok(a) => Judged::Aside(a),
+                Err(b) => Judged::Stop(b),
+            },
+        })
+    }
+
+    /// Writes the merged tree of patch `n` into the backing tree and
+    /// records it as one atomic operation (see the module docs).
+    fn land(
+        &self,
+        n: u64,
+        patch_oid: Oid,
+        head: Oid,
+        branch: &PatchBranch,
+        merged: Oid,
+        span: &ActiveSpan,
+    ) -> Result<Landing, PatchError> {
         let QueueContext {
             recorder,
             committer,
@@ -451,95 +811,24 @@ impl<'a> Queue<'a> {
         let history = committer.history();
         let repo = history.repo();
         let block = |reason, message: String, paths: Vec<String>| {
-            Ok(Step1::Blocked(blocked(
+            Ok(Landing::Refused(blocked(
                 n, patch_oid, reason, message, paths,
             )))
         };
-        let Ok(patch) = repo.find_commit(patch_oid) else {
-            return block(
-                BlockReason::Unsupported,
-                format!("{patch_oid} is not a commit"),
-                Vec::new(),
-            );
-        };
-        match patch.parent_count() {
-            1 => {}
-            0 => {
-                return block(
-                    BlockReason::Unsupported,
-                    "the patch is a root commit: it needs the branch commit it was written \
-                     against as its parent"
-                        .into(),
-                    Vec::new(),
-                );
-            }
-            parents => {
-                return block(
-                    BlockReason::MergeCommit,
-                    format!("the patch has {parents} parents; it must have one"),
-                    Vec::new(),
-                );
-            }
-        }
-        let parent = patch.parent_id(0)?;
-        let Some(head) = history.head()? else {
-            return block(
-                BlockReason::ParentNotInHistory,
-                "the volume's branch does not exist yet".into(),
-                Vec::new(),
-            );
-        };
-        let on_branch = repo.odb()?.exists(parent)
-            && (parent == head.id() || repo.graph_descendant_of(head.id(), parent)?);
-        if !on_branch {
-            return block(
-                BlockReason::ParentNotInHistory,
-                format!(
-                    "the patch's parent {parent} is not the branch head {} or one of its \
-                     ancestors",
-                    head.id()
-                ),
-                Vec::new(),
-            );
-        }
-        if let Some(step) = validate_diff(repo, &patch, parent)? {
-            return Ok(Step1::Blocked(blocked(
-                n, patch_oid, step.0, step.1, step.2,
-            )));
-        }
-        let mut index = repo.cherrypick_commit(&patch, &head, 0, None)?;
-        if index.has_conflicts() {
-            let mut paths = Vec::new();
-            for conflict in index.conflicts()? {
-                let conflict = conflict?;
-                let entry = conflict.our.or(conflict.their).or(conflict.ancestor);
-                if let Some(entry) = entry {
-                    let path = String::from_utf8_lossy(&entry.path).into_owned();
-                    if !paths.contains(&path) {
-                        paths.push(path);
-                    }
-                }
-            }
-            return block(
-                BlockReason::Conflict,
-                format!(
-                    "merging onto the branch head {} conflicts in {}",
-                    head.id(),
-                    paths.join(", ")
-                ),
-                paths,
-            );
-        }
-        let merged = index.write_tree_to(repo)?;
+        span.set(KeyValue::new(
+            "agentfs.patch.commits",
+            branch.commits.len() as i64,
+        ));
+        let patch = repo.find_commit(patch_oid)?;
         let spec = OperationSpec {
             kind: OperationKind::Patch,
             source: patch_oid.to_string(),
-            summary: summary_of(&patch, n),
+            summary: summary_of(&patch, n, &branch.commits, repo),
             caller: *caller,
             inbox: Some(n),
             author: Some(author_of(&patch)),
         };
-        let plan = restore::plan_tree(repo, head.id(), patch_oid, merged, spec.summary.clone())?;
+        let plan = restore::plan_tree(repo, head, patch_oid, merged, spec.summary.clone())?;
         if plan.steps.is_empty() {
             // Nothing the tree shows changes: a marker commit (design §3.4).
             let op = Operation {
@@ -551,7 +840,7 @@ impl<'a> Queue<'a> {
                 inbox: spec.inbox,
                 author: spec.author,
             };
-            return Ok(Step1::Applied(committer.commit_patch_marker(&op)?));
+            return Ok(Landing::Landed(committer.commit_patch_marker(&op)?));
         }
         let plan = match restore::check(plan, repo, *recorder, *objects, tree, &NotLive, false) {
             Ok(plan) => plan,
@@ -575,7 +864,7 @@ impl<'a> Queue<'a> {
         noted.in_flight = Some(InFlight {
             inbox: n,
             patch: patch_oid.to_string(),
-            head: head.id().to_string(),
+            head: head.to_string(),
             paths: plan.steps.iter().map(|s| s.path.to_string()).collect(),
         });
         noted.save(&state_path)?;
@@ -591,12 +880,12 @@ impl<'a> Queue<'a> {
                 let committed = committer.commit_pending();
                 let head_now = history.head()?;
                 let done = head_now.as_ref().is_some_and(|c| {
-                    c.id() != head.id()
+                    c.id() != head
                         && inbox_from_message(c.message_raw().unwrap_or_default())
                             == Some((n, patch_oid))
                 });
                 if let (true, Some(c)) = (done, head_now) {
-                    return Ok(Step1::Applied(c.id()));
+                    return Ok(Landing::Landed(c.id()));
                 }
                 committed?;
                 // Refused at record or commit time: nothing of it is in
@@ -662,11 +951,16 @@ impl<'a> Queue<'a> {
     fn recover_in_flight(
         &self,
         f: &InFlight,
-        last_applied: u64,
+        found: &BTreeMap<u64, InboxCommit>,
         inbox: &BTreeMap<u64, Oid>,
     ) -> Result<(), PatchError> {
         let patch = Oid::from_str(&f.patch).ok();
-        if f.inbox <= last_applied || (patch.is_some() && inbox.get(&f.inbox) == patch.as_ref()) {
+        // Applied is what the branch's trailers say, never the high-water
+        // mark: a set-aside number below it is not applied (bead
+        // agentfs-mia.2).
+        if found.contains_key(&f.inbox)
+            || (patch.is_some() && inbox.get(&f.inbox) == patch.as_ref())
+        {
             return Ok(());
         }
         if self.put_back(f, patch).is_ok() {
@@ -723,17 +1017,12 @@ impl<'a> Queue<'a> {
         if head.id().to_string() != f.head {
             return Err("the branch head moved".into());
         }
-        let patch = repo
-            .find_commit(patch.ok_or("not a commit id")?)
-            .map_err(|e| e.to_string())?;
-        let mut index = repo
-            .cherrypick_commit(&patch, &head, 0, None)
-            .map_err(|e| e.to_string())?;
-        if index.has_conflicts() {
-            return Err("the merge conflicts".into());
-        }
-        let merged = index.write_tree_to(repo).map_err(|e| e.to_string())?;
-        let plan = restore::plan_tree(repo, head.id(), patch.id(), merged, String::new())
+        let patch = patch.ok_or("not a commit id")?;
+        let merged = match merge(&self.judges(), head.id(), patch).map_err(|e| e.to_string())? {
+            Ok((_, merged)) => merged,
+            Err(refusal) => return Err(refusal.message),
+        };
+        let plan = restore::plan_tree(repo, head.id(), patch, merged, String::new())
             .map_err(|e| e.to_string())?;
         let paths: Vec<RepoPath> = plan.steps.iter().map(|s| s.path.clone()).collect();
         self.write_back(&plan, &paths, &paths)
@@ -777,6 +1066,381 @@ impl<'a> Queue<'a> {
     }
 }
 
+/// A refusal of patch `n`: set aside, held whole, when its reason says so
+/// ([`BlockReason::holds_whole`]), else (`Err`) where the run stops.
+/// `paths` are the paths it changes, when its branch could be read.
+fn refused(
+    n: u64,
+    patch: Oid,
+    refusal: Refusal,
+    paths: Option<Vec<RepoPath>>,
+    barrier: bool,
+) -> Result<Aside, Blocked> {
+    if refusal.reason.holds_whole() {
+        Ok(Aside {
+            verdict: Verdict::Held {
+                reason: refusal.reason,
+                message: refusal.message,
+                paths: refusal.paths,
+            },
+            paths,
+            barrier,
+        })
+    } else {
+        Err(blocked(
+            n,
+            patch,
+            refusal.reason,
+            refusal.message,
+            refusal.paths,
+        ))
+    }
+}
+
+/// [`refused`] as the rules' answer.
+fn assessed_refusal(
+    n: u64,
+    patch: Oid,
+    refusal: Refusal,
+    paths: Option<Vec<RepoPath>>,
+    barrier: bool,
+) -> Assessed {
+    match refused(n, patch, refusal, paths, barrier) {
+        Ok(a) => Assessed::Aside(a),
+        Err(b) => Assessed::Stop(b),
+    }
+}
+
+/// The rules for patch `n`, in order (beads agentfs-mia.2, mia.5), the
+/// one home both [`Queue::process`] and [`Queue::judge`] use: read the
+/// branch; wait behind an earlier set-aside barrier, or an earlier
+/// set-aside patch changing the same paths; merge onto the head; ask the
+/// acceptance rule. `aside` are the patches set aside so far. Nothing is
+/// written but the merge's objects.
+fn judge_one(
+    j: &Judges<'_>,
+    n: u64,
+    patch_oid: Oid,
+    aside: &BTreeMap<u64, Aside>,
+) -> Result<Assessed, PatchError> {
+    let repo = j.history.repo();
+    let tip_barrier = || {
+        repo.find_commit(patch_oid)
+            .is_ok_and(|c| super::integrate::is_barrier(&c))
+    };
+    let Some(head) = j.history.head()? else {
+        let refusal = Refusal {
+            reason: BlockReason::ParentNotInHistory,
+            message: "the volume's branch does not exist yet".into(),
+            paths: Vec::new(),
+        };
+        return Ok(assessed_refusal(n, patch_oid, refusal, None, tip_barrier()));
+    };
+    let head = head.id();
+    let branch = match PatchBranch::read(repo, head, patch_oid) {
+        Ok(branch) => branch,
+        Err(refusal) => {
+            return Ok(assessed_refusal(n, patch_oid, refusal, None, tip_barrier()));
+        }
+    };
+    let set_aside = |verdict| {
+        Ok(Assessed::Aside(Aside {
+            verdict,
+            paths: Some(branch.paths.clone()),
+            barrier: branch.barrier,
+        }))
+    };
+    let earlier = || aside.iter().filter(|(k, _)| **k < n);
+    let barriers: Vec<u64> = earlier()
+        .filter(|(_, a)| a.barrier)
+        .map(|(k, _)| *k)
+        .collect();
+    if !barriers.is_empty() {
+        return set_aside(Verdict::Waiting {
+            why: WaitReason::Barrier,
+            behind: barriers,
+        });
+    }
+    let same: Vec<u64> = earlier()
+        .filter(|(_, a)| {
+            a.paths
+                .as_ref()
+                .is_some_and(|paths| paths.iter().any(|p| branch.paths.contains(p)))
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    if !same.is_empty() {
+        return set_aside(Verdict::Waiting {
+            why: WaitReason::SameFiles,
+            behind: same,
+        });
+    }
+    let merged = match integrate(j, head, &branch)? {
+        Ok(merged) => merged,
+        Err(Unmerged::Refused(refusal)) => {
+            let paths = Some(branch.paths.clone());
+            return Ok(assessed_refusal(
+                n,
+                patch_oid,
+                refusal,
+                paths,
+                branch.barrier,
+            ));
+        }
+        Err(Unmerged::NotJudged { rule, message }) => {
+            return set_aside(Verdict::NotJudged { rule, message });
+        }
+    };
+    let candidate = Candidate {
+        volume: &j.history.settings().volume,
+        inbox: n,
+        patch: &branch,
+        head,
+        merged,
+    };
+    match j.rule.judge(repo, &candidate) {
+        Ok(Acceptance::Accept) => {}
+        Ok(Acceptance::Refuse { message }) => {
+            return set_aside(Verdict::Held {
+                reason: BlockReason::Refused,
+                message,
+                paths: Vec::new(),
+            });
+        }
+        Ok(Acceptance::Await { what }) => return set_aside(Verdict::Awaiting { what }),
+        Err(e) => {
+            return set_aside(Verdict::NotJudged {
+                rule: j.rule.name().to_owned(),
+                message: e.to_string(),
+            });
+        }
+    }
+    Ok(Assessed::Ready {
+        head,
+        branch,
+        merged,
+    })
+}
+
+/// Reads patch `tip` as a branch against `head` and merges it there:
+/// the branch and the merged tree, or why it does not land.
+fn merge(
+    j: &Judges<'_>,
+    head: Oid,
+    tip: Oid,
+) -> Result<Result<(PatchBranch, Oid), Refusal>, PatchError> {
+    let branch = match PatchBranch::read(j.history.repo(), head, tip) {
+        Ok(branch) => branch,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    Ok(match integrate(j, head, &branch)? {
+        Ok(tree) => Ok((branch, tree)),
+        Err(Unmerged::Refused(refusal)) => Err(refusal),
+        Err(Unmerged::NotJudged { message, .. }) => Err(Refusal {
+            reason: BlockReason::Failed,
+            message,
+            paths: Vec::new(),
+        }),
+    })
+}
+
+/// Merges `branch` onto `head`: the merged tree, whose objects this
+/// repository then sees, or why it does not land (a conflict, a merge
+/// that could not run, a merge driver that could not run).
+fn integrate(
+    j: &Judges<'_>,
+    head: Oid,
+    branch: &PatchBranch,
+) -> Result<Result<Oid, Unmerged>, PatchError> {
+    let tree = match j.integrator.integrate(head, branch) {
+        Ok(Integrated::Clean { tree }) => tree,
+        Ok(Integrated::Conflict { paths }) => {
+            return Ok(Err(Unmerged::Refused(Refusal {
+                reason: BlockReason::Conflict,
+                message: format!(
+                    "merging onto the branch head {head} conflicts in {}",
+                    paths.join(", ")
+                ),
+                paths,
+            })));
+        }
+        Err(IntegrateError::DriverNotWorking {
+            driver,
+            path,
+            detail,
+        }) => {
+            let rule = format!("{MERGE_RULE} driver {driver}");
+            let message = IntegrateError::DriverNotWorking {
+                driver,
+                path,
+                detail,
+            }
+            .to_string();
+            return Ok(Err(Unmerged::NotJudged { rule, message }));
+        }
+        Err(e) => {
+            return Ok(Err(Unmerged::Refused(Refusal {
+                reason: BlockReason::Failed,
+                message: e.to_string(),
+                paths: Vec::new(),
+            })));
+        }
+    };
+    // The objects git wrote, for this repository's object database.
+    j.history.repo().odb()?.refresh()?;
+    Ok(Ok(tree))
+}
+
+/// The inbox refs of `volume`: queued entries by number, and the
+/// malformed ones, ignored.
+fn read_inbox(
+    repo: &Repository,
+    volume: &str,
+) -> Result<(BTreeMap<u64, Oid>, Vec<Ignored>), git2::Error> {
+    let prefix = inbox_prefix(volume);
+    let mut inbox: BTreeMap<u64, Oid> = BTreeMap::new();
+    let mut ignored = Vec::new();
+    for reference in repo.references_glob(&format!("{prefix}*"))? {
+        let reference = reference?;
+        let Ok(name) = reference.name().map(str::to_owned) else {
+            continue;
+        };
+        let target = reference.resolve().ok().and_then(|r| r.target());
+        match (seq_of_ref(&prefix, &name), target) {
+            (Some(n), Some(oid)) => {
+                inbox.insert(n, oid);
+            }
+            (n, _) => ignored.push(Ignored {
+                ref_name: name,
+                inbox: n,
+                patch: target.map(|o| o.to_string()),
+                why: "malformed".into(),
+            }),
+        }
+    }
+    Ok((inbox, ignored))
+}
+
+/// A gap: `next` is not queued and `after` is.
+fn gap(next: u64, after: u64) -> Blocked {
+    Blocked {
+        inbox: next,
+        patch: None,
+        reason: BlockReason::Gap,
+        message: format!("patch {next} is not queued, and {after} comes after it"),
+        paths: Vec::new(),
+    }
+}
+
+fn ignored_events(events: &Events, ignored: &[Ignored]) {
+    for i in ignored {
+        events.emit(Event::PatchIgnored {
+            ref_name: i.ref_name.clone(),
+            inbox: i.inbox,
+            patch: i.patch.as_deref().and_then(|p| Oid::from_str(p).ok()),
+            why: i.why.clone(),
+        });
+    }
+}
+
+fn blocked_event(events: &Events, b: &Blocked, queued: usize) {
+    events.emit(Event::PatchBlocked {
+        inbox: b.inbox,
+        patch: b.patch.as_deref().and_then(|p| Oid::from_str(p).ok()),
+        reason: b.reason.as_str(),
+        message: b.message.clone(),
+        queued,
+    });
+}
+
+/// The alarms of a patch set aside: `PatchHeld` for held and not judged,
+/// and `PatchRuleFailed` for not judged (`rule` is the acceptance rule's
+/// name; another rule is a merge driver's). Waiting, awaiting and ready
+/// raise none (the status carries them).
+fn aside_events(events: &Events, rule: &'static str, n: u64, patch: Oid, verdict: &Verdict) {
+    match verdict {
+        Verdict::Held {
+            reason, message, ..
+        } => events.emit(Event::PatchHeld {
+            inbox: n,
+            patch: Some(patch),
+            verdict: verdict.kind(),
+            reason: reason.as_str(),
+            message: message.clone(),
+        }),
+        Verdict::NotJudged {
+            rule: judged_by,
+            message,
+        } => {
+            let rule = if judged_by == rule { rule } else { MERGE_RULE };
+            events.emit(Event::PatchHeld {
+                inbox: n,
+                patch: Some(patch),
+                verdict: verdict.kind(),
+                reason: rule,
+                message: message.clone(),
+            });
+            events.emit(Event::PatchRuleFailed {
+                inbox: n,
+                rule,
+                message: message.clone(),
+            });
+        }
+        Verdict::Waiting { .. } | Verdict::Awaiting { .. } | Verdict::Ready => {}
+    }
+}
+
+/// The `agentfs.patch` span of judging patch `n`.
+fn patch_span(telemetry: &Telemetry, n: u64, patch: Oid) -> ActiveSpan {
+    telemetry.span(spans::PATCH, || {
+        vec![
+            KeyValue::new("agentfs.patch.inbox", n as i64),
+            KeyValue::new("agentfs.patch.oid", patch.to_string()),
+        ]
+    })
+}
+
+fn aside_span(span: &ActiveSpan, verdict: &Verdict) {
+    span.set(KeyValue::new("agentfs.patch.outcome", verdict.kind()));
+    if let Verdict::Held { reason, .. } = verdict {
+        span.set(KeyValue::new("agentfs.patch.reason", reason.as_str()));
+    }
+}
+
+fn stop_span(span: &ActiveSpan, b: &Blocked) {
+    span.set(KeyValue::new("agentfs.patch.outcome", "blocked"));
+    span.set(KeyValue::new("agentfs.patch.reason", b.reason.as_str()));
+    span.error(&b.message);
+}
+
+/// The `held/<n>` marks of `volume` (malformed names are not marks).
+fn held_marks(repo: &Repository, volume: &str) -> Result<BTreeMap<u64, Oid>, git2::Error> {
+    let prefix = held_prefix(volume);
+    let mut marks = BTreeMap::new();
+    for reference in repo.references_glob(&format!("{prefix}*"))? {
+        let reference = reference?;
+        if let (Some(n), Some(oid)) = (
+            reference
+                .name()
+                .ok()
+                .and_then(|name| seq_of_ref(&prefix, name)),
+            reference.target(),
+        ) {
+            marks.insert(n, oid);
+        }
+    }
+    Ok(marks)
+}
+
+/// Deletes `held/<n>`, if there is one.
+fn drop_held(repo: &Repository, volume: &str, n: u64) -> Result<(), git2::Error> {
+    match repo.find_reference(&held_ref(volume, n)) {
+        Ok(mut mark) => mark.delete(),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn blocked(
     n: u64,
     patch: Oid,
@@ -808,52 +1472,11 @@ fn error_paths(e: &RestoreError) -> Vec<String> {
     }
 }
 
-/// Why the diff from `parent` to `patch` is not one the queue applies:
-/// too many paths, a gitlink, or a path agentfs cannot write.
-fn validate_diff(
-    repo: &Repository,
-    patch: &git2::Commit<'_>,
-    parent: Oid,
-) -> Result<Option<(BlockReason, String, Vec<String>)>, PatchError> {
-    let before = repo.find_commit(parent)?.tree()?;
-    let after = patch.tree()?;
-    let diff = repo.diff_tree_to_tree(Some(&before), Some(&after), None)?;
-    let count = diff.deltas().len();
-    if count > MAX_PATCH_PATHS {
-        return Ok(Some((
-            BlockReason::TooLarge,
-            format!("the patch changes {count} paths; at most {MAX_PATCH_PATHS} are applied"),
-            Vec::new(),
-        )));
-    }
-    for delta in diff.deltas() {
-        for file in [delta.old_file(), delta.new_file()] {
-            let Some(path) = file.path_bytes() else {
-                continue;
-            };
-            let path = String::from_utf8_lossy(path).into_owned();
-            if file.mode() == FileMode::Commit {
-                return Ok(Some((
-                    BlockReason::Unsupported,
-                    format!("{path} is a gitlink (submodule); agentfs never records those"),
-                    vec![path],
-                )));
-            }
-            if let Err(e) = RepoPath::new(path.clone()) {
-                return Ok(Some((
-                    BlockReason::Unsupported,
-                    format!("{path:?} is not a path agentfs records: {e}"),
-                    vec![path],
-                )));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// The commit message of a patch's commit: the patch's own, without a
-/// final trailer paragraph (agentfs adds its own trailers).
-pub fn summary_of(patch: &git2::Commit<'_>, n: u64) -> String {
+/// The commit message of a patch's commit: the tip's own, without a final
+/// trailer paragraph (agentfs adds its own trailers); for a patch of more
+/// than one commit (`commits`, oldest first), followed by a blank line and
+/// one line per commit, `<12-hex short oid> <subject>`.
+pub fn summary_of(patch: &git2::Commit<'_>, n: u64, commits: &[Oid], repo: &Repository) -> String {
     let raw = String::from_utf8_lossy(patch.message_raw_bytes()).into_owned();
     let mut paragraphs: Vec<&str> = raw
         .trim_end()
@@ -867,11 +1490,27 @@ pub fn summary_of(patch: &git2::Commit<'_>, n: u64) -> String {
         paragraphs.pop();
     }
     let message = paragraphs.join("\n\n").trim().to_owned();
-    if message.is_empty() {
+    let mut message = if message.is_empty() {
         format!("patch {n}")
     } else {
         message
+    };
+    if commits.len() > 1 {
+        message.push('\n');
+        for oid in commits {
+            let subject = repo
+                .find_commit(*oid)
+                .ok()
+                .and_then(|c| {
+                    c.summary_bytes()
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                })
+                .unwrap_or_default();
+            let short = oid.to_string();
+            message.push_str(&format!("\n{} {subject}", &short[..12]));
+        }
     }
+    message
 }
 
 /// `Token: value`, as git reads trailers.

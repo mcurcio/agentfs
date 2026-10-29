@@ -108,6 +108,7 @@ pub(crate) fn serve(
     }
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
+    let applier = patch_cmd::Applier::new(&committer, events.clone(), session.telemetry());
     let service = Service::start(committer, pushers, events).context("starting the service")?;
     let server = match HistoryServer::start(
         &address,
@@ -142,6 +143,7 @@ pub(crate) fn serve(
                 commit_window,
                 stopping: stopping.clone(),
             }),
+            applier,
         ),
     );
     let address_file = state.history_dir().join(ADDRESS_FILE);

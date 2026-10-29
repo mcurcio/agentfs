@@ -37,6 +37,12 @@ libc = "0.2.190"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
+# serve-git's HTTP/1.1 server in front of `git http-backend` (bead
+# agentfs-mia.9, design §17.3): synchronous, a thread per request, no
+# async runtime.
+tiny_http = "0.12.0"
+# serve-git's pre-receive hook reads the pushed (quarantined) objects.
+git2 = { version = "0.21.0", default-features = false }
 
 [dev-dependencies]
 # Drives a real `agentfs serve-history` through the CSI supervisor
@@ -48,7 +54,6 @@ opentelemetry-proto = { version = "0.33.1", default-features = false, features =
 # The fake gRPC collector.
 tonic = { version = "0.14", default-features = false, features = ["server", "router"] }
 prost = "0.14"
-git2 = { version = "0.21.0", default-features = false }
 tempfile = "3.27.0"
 # A port that refuses connections and that no other test can be handed
 # (agentfs-core/tests/support/closed_port.rs).

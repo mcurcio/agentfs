@@ -373,6 +373,7 @@ impl Fixture {
             ssh_agent: None,
             ssh_key_passphrase: None,
             fork_remote: false,
+            push_source: crate::config::PushSource::Branch,
         }
     }
 

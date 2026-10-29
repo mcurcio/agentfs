@@ -16,22 +16,42 @@
 //!   recorded as one atomic operation: one commit, authored by the patch
 //!   author, committed by agentfs, with `Agentfs-Trigger: patch`,
 //!   `Agentfs-Patch: <oid>` and `Agentfs-Inbox: <n>`;
-//! - the first patch that cannot be applied blocks the queue
-//!   ([`BlockReason`]): it and the later ones stay queued, an alarm is
-//!   raised, and the volume mounts anyway;
+//! - a patch that cannot land is set aside whole with a [`Verdict`] and
+//!   the queue goes on (bead agentfs-mia.2): held, waiting behind an
+//!   earlier set-aside barrier or patch on the same paths, or awaiting or
+//!   not judged by the acceptance rule ([`accept`]); a local
+//!   `held/<n>` mark keeps it queued. Only a gap, unrecorded changes or a
+//!   failure stop the queue ([`BlockReason::holds_whole`]): that patch and
+//!   the later ones stay queued, an alarm is raised, and the volume mounts
+//!   anyway;
 //! - whether a patch is applied is decided by the `Agentfs-Inbox`
 //!   trailers on the branch, so a crash anywhere never applies one twice;
 //!   `applied/<n>` refs and deleting `inbox/<n>` are bookkeeping;
 //! - the queue's state goes to `refs/agentfs/<volume>/status` (a commit
 //!   holding `status.json`, [`status::StatusDoc`]) and is cached in
 //!   `meta/patch.json` ([`status::PatchState`]) for `agentfs status` and
-//!   the telemetry gauges.
+//!   the telemetry gauges;
+//! - every verdict change is told to the integrator ([`notify`]: the
+//!   `patch-notify` hook, the notify webhook), and while a daemon holds
+//!   the volume `agentfs patch apply` only judges
+//!   ([`queue::Queue::judge`]) and answers "lands at next mount" (bead
+//!   agentfs-mia.5, design §19.1 "Integrators decide when patches are
+//!   applied").
+//!
+//! `agentfs serve-git` makes the state area's history repository the
+//! volume's patch source, a git server pushers push patches to; [`admit`]
+//! is who may push what, judged before git keeps anything (bead
+//! agentfs-mia.9).
 //!
 //! The queue's refs reach the remote with their own push
 //! ([`crate::push::RemotePusher::push_once`], stage `queue`), never in
 //! the branch push.
 
+pub mod accept;
+pub mod admit;
 pub mod fetch;
+pub mod integrate;
+pub mod notify;
 pub mod queue;
 pub mod status;
 pub mod submit;
@@ -70,6 +90,35 @@ pub fn inbox_ref(volume: &str, n: u64) -> String {
 pub fn applied_ref(volume: &str, n: u64) -> String {
     format!("{}{}", applied_prefix(volume), format_seq(n))
 }
+
+/// `refs/agentfs/<volume>/held/` (bead agentfs-mia.2).
+pub fn held_prefix(volume: &str) -> String {
+    format!("refs/agentfs/{volume}/held/")
+}
+
+/// Where patch `n` is marked as set aside (held, waiting, awaiting or not
+/// judged) by this volume's queue: the patch commit it set aside. The mark
+/// keeps `inbox/<n>` from being judged stale once later numbers land; it
+/// is deleted when `n` lands or its inbox ref is withdrawn (bead
+/// agentfs-mia.2). Local only: never pushed.
+pub fn held_ref(volume: &str, n: u64) -> String {
+    format!("{}{}", held_prefix(volume), format_seq(n))
+}
+
+/// `refs/agentfs/<volume>/approved/` (bead agentfs-mia.2).
+pub fn approved_prefix(volume: &str) -> String {
+    format!("refs/agentfs/{volume}/approved/")
+}
+
+/// Where `agentfs patch approve <n>` records its approval on the patch
+/// remote: the tip it approved (bead agentfs-mia.2).
+pub fn approved_ref(volume: &str, n: u64) -> String {
+    format!("{}{}", approved_prefix(volume), format_seq(n))
+}
+
+/// The trailer that makes a patch a barrier, read only from the last
+/// message paragraph of the patch's tip, value `yes` (bead agentfs-mia.2).
+pub const BARRIER_TRAILER: &str = "Agentfs-Barrier";
 
 /// The queue's status ref.
 pub fn status_ref(volume: &str) -> String {
@@ -117,6 +166,8 @@ pub enum BlockReason {
     Unrecorded,
     /// Writing or recording failed, or an LFS object is missing.
     Failed,
+    /// The acceptance rule refused it.
+    Refused,
 }
 
 impl BlockReason {
@@ -130,6 +181,25 @@ impl BlockReason {
             Self::TooLarge => "too_large",
             Self::Unrecorded => "unrecorded",
             Self::Failed => "failed",
+            Self::Refused => "refused",
+        }
+    }
+
+    /// Whether a patch refused for this reason is held whole while the
+    /// queue goes on (conflict, merge_commit, parent_not_in_history,
+    /// unsupported, too_large, refused); false: the run stops at it (gap,
+    /// unrecorded, failed: they are about the volume or the queue, not the
+    /// patch). The owner, 2026-10-16: "Whole seems best, right? A partial
+    /// application has unknown side effects".
+    pub fn holds_whole(self) -> bool {
+        match self {
+            Self::Conflict
+            | Self::MergeCommit
+            | Self::ParentNotInHistory
+            | Self::Unsupported
+            | Self::TooLarge
+            | Self::Refused => true,
+            Self::Gap | Self::Unrecorded | Self::Failed => false,
         }
     }
 
@@ -146,12 +216,16 @@ impl BlockReason {
                  the gap create-only)"
             }
             Self::ParentNotInHistory => {
-                "the patch must be written against a commit of the volume's branch; rebase it \
-                 and resubmit with --replace <n>"
+                "the patch must build on a commit of the volume's branch; rebase it and \
+                 resubmit with --replace <n>"
             }
-            Self::MergeCommit | Self::Unsupported | Self::TooLarge => {
-                "replace it with a single-parent commit of at most 4096 regular files and \
-                 symlinks (--replace <n>), or skip it (--skip <n>)"
+            Self::MergeCommit => {
+                "replace it with a line of single-parent commits on the volume's branch \
+                 (--replace <n>), or skip it (--skip <n>)"
+            }
+            Self::Unsupported | Self::TooLarge => {
+                "replace it with a patch changing at most 4096 regular files and symlinks \
+                 (--replace <n>), or skip it (--skip <n>)"
             }
             Self::Unrecorded => {
                 "the tree differs from history at the paths named (changes not recorded yet, or \
@@ -161,6 +235,10 @@ impl BlockReason {
             Self::Failed => {
                 "see the message; fix the cause (an LFS object the producer did not upload, a \
                  refused path, disk space) and remount, or skip the patch (--skip <n>)"
+            }
+            Self::Refused => {
+                "the acceptance rule (agentfs.patchAccept) refused it: replace it (--replace <n>) \
+                 or skip it (--skip <n>)"
             }
         }
     }
@@ -198,6 +276,67 @@ impl Blocked {
     }
 }
 
+/// What the queue decided about a patch it did not land (bead
+/// agentfs-mia.2): kept in `status.json` beside each queued entry. A
+/// patch with a verdict is set aside and the queue goes on past it; a
+/// queued entry with none was not reached (the queue stopped before it,
+/// [`Blocked`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Verdict {
+    /// Not landed until it is replaced or skipped, or (for `conflict`) a
+    /// later run merges it cleanly. `reason` is one that
+    /// `BlockReason::holds_whole` (bead agentfs-mia.2) says holds.
+    Held {
+        reason: BlockReason,
+        message: String,
+        #[serde(default)]
+        paths: Vec<String>,
+    },
+    /// Behind earlier set-aside patches: `behind` are their numbers.
+    Waiting { why: WaitReason, behind: Vec<u64> },
+    /// The acceptance rule has not accepted it yet.
+    Awaiting { what: accept::AwaitWhat },
+    /// The acceptance rule could not judge it (an alarm is raised).
+    NotJudged { rule: String, message: String },
+    /// Would land now: lands at the next mount or apply with nothing
+    /// attached. Only [`queue::Queue::judge`] gives it (bead agentfs-mia.5).
+    Ready,
+}
+
+impl Verdict {
+    /// `held`, `waiting`, `awaiting`, `not_judged` or `ready`, as in
+    /// `status.json`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Held { .. } => "held",
+            Self::Waiting { .. } => "waiting",
+            Self::Awaiting { .. } => "awaiting",
+            Self::NotJudged { .. } => "not_judged",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+impl WaitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SameFiles => "same_files",
+            Self::Barrier => "barrier",
+        }
+    }
+}
+
+/// Why a patch waits (bead agentfs-mia.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    /// It changes a path an earlier set-aside patch changes.
+    SameFiles,
+    /// An earlier set-aside patch is a barrier.
+    Barrier,
+}
+
 /// An inbox entry the queue does not apply and that does not block it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ignored {
@@ -207,7 +346,9 @@ pub struct Ignored {
     pub inbox: Option<u64>,
     pub patch: Option<String>,
     /// `malformed` (not ten digits), `stale` (numbered at or below the
-    /// last applied patch, with another commit than the one applied).
+    /// last applied patch, with another commit than the one applied, and
+    /// not set aside), `withdrawn` (a set-aside patch whose inbox ref is
+    /// gone: its `held/<n>` mark is deleted).
     pub why: String,
 }
 

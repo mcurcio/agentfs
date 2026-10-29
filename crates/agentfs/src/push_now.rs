@@ -17,6 +17,18 @@
 //! - **receive_fork**: a fork of this local-only volume publishes into its
 //!   history through the daemon that holds its lock
 //!   ([`crate::fork_cmd::serve_receive`], F8 S3).
+//! - **apply**: `agentfs patch apply` while a daemon holds the volume
+//!   ([`crate::patch_cmd::serve_apply`], bead agentfs-mia.5): a running
+//!   daemon always counts as attached, so the queue is judged and the
+//!   integrator notified, and nothing lands until the next mount.
+//!
+//! - **judge**: a push arrived at `agentfs serve-git`
+//!   ([`crate::patch_cmd::serve_judge`], bead agentfs-mia.9): the queue is
+//!   judged and the integrator notified, as for an apply; nothing lands.
+//!
+//! - **checkpoint**: `agentfs checkpoint` while a daemon holds the volume
+//!   ([`crate::checkpoint_cmd::serve`], bead agentfs-mia.6): the service's
+//!   commit loop cuts it ([`ServiceHandle::checkpoint`]).
 //!
 //! [`client`] is the command's side: it asks the daemon first and returns
 //! `None` when none answers (no socket, or a daemon from before `push`
@@ -35,6 +47,7 @@ use agentfs_core::service::{PushNowError, PushNowReport, RemoteResult, ServiceHa
 use agentfs_core::volume::StateDir;
 
 use crate::control::{self, ClientError, Op, PushReply, RemoteReply, Reply, Request};
+pub use crate::patch_cmd::Applier;
 use crate::{EXIT_LOCKED, describe, recovery};
 
 /// The shortest and longest wait a push request may ask for.
@@ -63,16 +76,20 @@ pub const RUN_SERVES_NO_RESTORES: &str = "`agentfs run` holds the state area and
 
 /// The control socket's handler for a daemon of the state area `state`
 /// whose service is `service`. `misconfigured` lists the remotes the
-/// settings refused, with why.
+/// settings refused, with why; `applier` is what an apply is judged with.
 pub fn handler(
     state: StateDir,
     service: ServiceHandle,
     misconfigured: Vec<(String, String)>,
     restores: Restores,
+    applier: Applier,
 ) -> control::Handler {
     Arc::new(move |request: Request, peer| match request.op {
         Op::Push => serve_push(&service, &misconfigured, &request),
         Op::ReceiveFork => crate::fork_cmd::serve_receive(&state, &request),
+        Op::Apply => crate::patch_cmd::serve_apply(&state, &applier, &request),
+        Op::Judge => crate::patch_cmd::serve_judge(&state, &applier),
+        Op::Checkpoint => crate::checkpoint_cmd::serve(&service, &request, peer),
         Op::Restore | Op::Revert => match &restores {
             Restores::Serve(daemon) => daemon.serve(request, peer),
             Restores::ServeFronts(daemon) => daemon.serve(request, peer),
@@ -258,7 +275,11 @@ pub fn client(state: &StateDir, remotes: &[String], timeout: Duration) -> Option
             eprintln!("error: {message}");
             ExitCode::from(EXIT_LOCKED)
         }
-        Reply::Ok(_) | Reply::Received { .. } => {
+        Reply::Ok(_)
+        | Reply::Received { .. }
+        | Reply::Attached { .. }
+        | Reply::Judged { .. }
+        | Reply::Checkpoint { .. } => {
             eprintln!("push failed: the daemon answered another request's reply");
             ExitCode::FAILURE
         }

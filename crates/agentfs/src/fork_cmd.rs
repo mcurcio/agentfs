@@ -624,7 +624,11 @@ impl Receiver for ThroughService {
             control::Reply::Busy(message) | control::Reply::Error(message) => {
                 Err(unavailable(format!("the source's daemon: {message}")))
             }
-            control::Reply::Ok(_) | control::Reply::Pushed(_) => Err(unavailable(
+            control::Reply::Ok(_)
+            | control::Reply::Pushed(_)
+            | control::Reply::Attached { .. }
+            | control::Reply::Judged { .. }
+            | control::Reply::Checkpoint { .. } => Err(unavailable(
                 "the source's daemon answered another request's reply".into(),
             )),
         }

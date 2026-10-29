@@ -70,6 +70,9 @@ missing from these tables or a row names a module that no longer exists;
 | `known_hosts.rs` | OpenSSH known_hosts parsing and matching, and `@cert-authority` host certificate checks (§11.1) |
 | `watched.rs` | Files re-read when their stat stamp changes: credentials, keys, known_hosts |
 | `repack.rs` | Periodic `git repack --geometric=2` of the history (§8) |
+| `checkpoint.rs` | Checkpoints: one change-line commit per intent (`refs/agentfs/<volume>/change-line`), with the head's tree and the patches landed since as parents, merged back into the branch by a two-parent marker (§19.2 item 11) |
+| `git_cli.rs` | Running the `git` program on a state area's git directory, in an environment of its own: the one home for `repack.rs` and the patch merge (§8, §12, §17.3) |
+| `command.rs` | Running an operator's program without a shell: `PATH` only, its own process group killed at the deadline, input on stdin; the one runner of fork delivery's command method and the `patch-accept` hook (§11.5, §12) |
 | `restore.rs` | Restore and revert: plan from history, check, apply to a tree (§15) |
 | `confined.rs` | `openat2`-confined access to the tree for restores (§6, §15) |
 | `operations.rs` | Restores and reverts in progress: their writes become one operation commit (§15) |
@@ -107,9 +110,13 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs/fetch.rs` | LFS objects for restores and `agentfs lfs fetch`: cache first, then the remotes |
 | `lfs/fake.rs` | An in-process LFS server for tests |
 | `patch/mod.rs` | The patch queue for iac (§12) |
+| `patch/admit.rs` | `serve-git`'s pushers and their rights, and admitting a push whole before git keeps it |
+| `patch/accept.rs` | Acceptance rules: whether a cleanly merged patch may land (clean merge, approval, the `patch-accept` hook) |
+| `patch/integrate.rs` | A patch branch, and merging it onto the branch head with the `git` program |
 | `patch/submit.rs` | `agentfs patch submit`: the producer side, driving the producer's own `git` |
 | `patch/fetch.rs` | Fetching the inbox refs from the patch remote, best effort |
-| `patch/queue.rs` | Applying the queue at mount, before the workload sees the tree |
+| `patch/notify.rs` | Telling the integrator of every verdict change: the `patch-notify` hook and the notify webhook, with the delivered cursor in `meta/notify.json` |
+| `patch/queue.rs` | Applying the queue at mount, before the workload sees the tree; judging it read only while a daemon holds the volume |
 | `patch/status.rs` | The status ref iac reads, and the local cache in `meta/patch.json` |
 
 ### `agentfs-fuse`
@@ -139,11 +146,13 @@ missing from these tables or a row names a module that no longer exists;
 | `daemon.rs` | Signals and shutdown for `run` and `mount` |
 | `front.rs` | `mount --history-service`: a front of a history service (§14) |
 | `serve_history.rs` | `agentfs serve-history`: the history service of a volume (§14) |
+| `serve_git.rs` | `agentfs serve-git`: the history repository as a git server for patch pushes (`git http-backend` behind an HTTP server), and its `pre-receive` and `post-receive` hooks |
 | `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount (`recover`, which mounts over it, is in `main.rs`) |
 | `control.rs` | The control socket of a running daemon (`mount`, `run`, `serve-history`), through which `push`, `restore` and `revert` act (§2.2, §2.3, §15) |
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
 | `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly (§15) |
 | `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
+| `checkpoint_cmd.rs` | `agentfs checkpoint`: through a running daemon's control socket (its commit loop cuts it), else under the state-area lock (§19.2 item 11) |
 | `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon`, `list` and `deliver` (§11.5) |
 | `start_cmd.rs` | `agentfs start accept --tip`: a started volume's answer to the start-branch alarm (§11.3) |
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it (§7) |

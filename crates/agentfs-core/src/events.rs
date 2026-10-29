@@ -254,6 +254,36 @@ pub enum Event {
         patch: Option<Oid>,
         why: String,
     },
+    /// A patch set aside whole (held or not judged) while the queue goes
+    /// on (design §12; bead agentfs-mia.2): nothing of it is written, and
+    /// it is judged again at the next run. An alarm.
+    PatchHeld {
+        inbox: u64,
+        patch: Option<Oid>,
+        /// `held` or `not_judged`.
+        verdict: &'static str,
+        /// For `held`, [`crate::patch::BlockReason::as_str`]; for
+        /// `not_judged`, the acceptance rule's name.
+        reason: &'static str,
+        message: String,
+    },
+    /// The acceptance rule could not judge a patch (a hook that did not
+    /// start, failed, or ran out of time; design §12): the patch is not
+    /// judged and stays queued. An alarm.
+    PatchRuleFailed {
+        inbox: u64,
+        /// `cleanMerge`, `approval` or `command`.
+        rule: &'static str,
+        message: String,
+    },
+    /// Telling the integrator of the patch queue's verdict changes failed
+    /// (bead agentfs-mia.5, [`crate::patch::notify`]): the notice is sent
+    /// again at the next queue run or apply. An alarm.
+    NotifyFailed {
+        /// `hook` or `webhook`.
+        method: &'static str,
+        message: String,
+    },
     /// Fetching the patch queue from its remote failed; the queue ran with
     /// what was already fetched (design §12).
     PatchFetchFailed {
@@ -350,6 +380,9 @@ impl Event {
             Self::PatchDuplicate { .. } => "patch_duplicate",
             Self::PatchBlocked { .. } => "patch_blocked",
             Self::PatchIgnored { .. } => "patch_ignored",
+            Self::PatchHeld { .. } => "patch_held",
+            Self::PatchRuleFailed { .. } => "patch_rule_failed",
+            Self::NotifyFailed { .. } => "notify_failed",
             Self::PatchFetchFailed { .. } => "patch_fetch_failed",
             Self::ForkFinished { .. } => "fork_finished",
             Self::ForkPublished { .. } => "fork_published",
@@ -500,6 +533,31 @@ impl fmt::Display for Event {
                 f,
                 "patch queue: ignoring {ref_name} ({}, {why}); it is never applied",
                 oid_or(*patch, "no commit"),
+            ),
+            Self::PatchHeld {
+                inbox,
+                patch,
+                verdict,
+                reason,
+                message,
+            } => write!(
+                f,
+                "patch {inbox} ({}) set aside, {verdict} ({reason}): {message}; the queue goes \
+                 on without it",
+                oid_or(*patch, "no patch"),
+            ),
+            Self::PatchRuleFailed {
+                inbox,
+                rule,
+                message,
+            } => write!(
+                f,
+                "the acceptance rule {rule} could not judge patch {inbox}: {message}"
+            ),
+            Self::NotifyFailed { method, message } => write!(
+                f,
+                "telling the integrator of the patch queue's changes failed ({method}): \
+                 {message}; sent again at the next queue run"
             ),
             Self::PatchFetchFailed {
                 remote,

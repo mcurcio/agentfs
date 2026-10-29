@@ -18,7 +18,7 @@ use std::path::Path;
 use git2::{Oid, Repository, Signature};
 use serde::{Deserialize, Serialize};
 
-use super::{Blocked, Ignored, PatchError, status_ref};
+use super::{Blocked, Ignored, PatchError, Verdict, status_ref};
 
 /// The status document's schema version.
 pub const STATUS_VERSION: u32 = 1;
@@ -51,6 +51,10 @@ pub struct PatchState {
     /// cleared when the run saves its state. Present at the start of a run
     /// only after a crash between the write and the record (design §12).
     pub in_flight: Option<InFlight>,
+    /// Patches set aside at the last run (held, waiting, awaiting or not
+    /// judged; bead agentfs-mia.2), counted in `queue_depth` too.
+    #[serde(default)]
+    pub held: u64,
 }
 
 /// A patch whose write into the tree may have been interrupted.
@@ -88,6 +92,9 @@ impl PatchState {
             0 => format!("none applied, {} queued", self.queue_depth),
             n => format!("last applied {n}, {} queued", self.queue_depth),
         };
+        if self.held > 0 {
+            line.push_str(&format!(" ({} set aside)", self.held));
+        }
         match &self.blocked {
             Some(b) => line.push_str(&format!(", blocked at {} ({})", b.inbox, b.reason)),
             None => line.push_str(", ok"),
@@ -110,6 +117,11 @@ pub struct AppliedEntry {
 pub struct QueueEntry {
     pub inbox: u64,
     pub patch: String,
+    /// What this run decided about it, when it set it aside; `None` for
+    /// the patch the run stopped at and those after it (an optional
+    /// field: the schema stays version 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
 }
 
 /// A patch consumed as a duplicate in this run (design §12): the same
@@ -148,7 +160,8 @@ pub struct StatusDoc {
     /// the schema stays version 1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub duplicate_now: Vec<DuplicateEntry>,
-    /// Still queued, in order, the blocked patch first.
+    /// Every patch still queued, ascending: those set aside with their
+    /// verdicts, the one the run stopped at and those after it without.
     pub queue: Vec<QueueEntry>,
     pub blocked: Option<Blocked>,
     pub ignored: Vec<Ignored>,
@@ -233,10 +246,16 @@ mod tests {
                 QueueEntry {
                     inbox: 2,
                     patch: "4".repeat(40),
+                    verdict: Some(Verdict::Held {
+                        reason: BlockReason::Conflict,
+                        message: "conflicts in b.txt".into(),
+                        paths: vec!["b.txt".into()],
+                    }),
                 },
                 QueueEntry {
                     inbox: 3,
                     patch: "5".repeat(40),
+                    verdict: None,
                 },
             ],
             blocked: Some(Blocked {
@@ -272,6 +291,7 @@ mod tests {
             status_oid: None,
             updated_ms: 5,
             in_flight: None,
+            held: 0,
         };
         state.save(&path).unwrap();
         assert_eq!(PatchState::load(&path), state);
@@ -279,6 +299,12 @@ mod tests {
             state.summary(),
             "last applied 1, 2 queued, blocked at 2 (conflict)"
         );
+        let held = PatchState {
+            held: 1,
+            blocked: None,
+            ..state.clone()
+        };
+        assert_eq!(held.summary(), "last applied 1, 2 queued (1 set aside), ok");
         fs::write(&path, "not json").unwrap();
         assert_eq!(PatchState::load(&path), PatchState::default());
     }
@@ -311,6 +337,16 @@ mod tests {
         assert_eq!(json["blocked"]["reason"], "conflict");
         assert_eq!(json["blocked"]["paths"][0], "b.txt");
         assert_eq!(json["queue"][1]["inbox"], 3);
+        assert_eq!(
+            json["queue"][0]["verdict"],
+            serde_json::json!({
+                "kind": "held",
+                "reason": "conflict",
+                "message": "conflicts in b.txt",
+                "paths": ["b.txt"],
+            })
+        );
+        assert!(json["queue"][1].get("verdict").is_none());
         assert_eq!(json["version"], 1);
     }
 

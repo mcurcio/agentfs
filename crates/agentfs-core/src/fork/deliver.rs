@@ -26,15 +26,14 @@
 //! A receiver that dedupes on [`DeliveryPayload::change`] turns the two
 //! at-least-once methods into at most once.
 
-use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::command::{Finished, RunError, run_with_stdin};
 use crate::config::validate_name;
+use crate::lfs::client::PostError;
 use crate::patch::submit::{
     self, DEFAULT_ATTEMPTS, GitRunner, PushLine, Source, SubmitError, SubmitRequest, check,
     parse_ls_remote,
@@ -338,6 +337,7 @@ impl<G: GitRunner> Delivery for InboxDelivery<'_, G> {
             replace: None,
             attempts: DEFAULT_ATTEMPTS,
             depth: None,
+            barrier: false,
         };
         match submit::submit(self.git, &request) {
             Ok(done) => Ok(Delivered::Submitted { inbox: done.inbox }),
@@ -594,81 +594,45 @@ impl CommandDelivery {
 const EXIT_TEMPFAIL: i32 = 75;
 
 impl Delivery for CommandDelivery {
+    /// Through [`crate::command::run_with_stdin`]: exit 0 accepts, 75 is
+    /// unavailable (retried), another status or a signal is a refusal; a
+    /// program that cannot start is a bad method, one killed at the
+    /// timeout unavailable.
     fn deliver(&self, change: &PublishedChange) -> Result<Delivered, DeliveryError> {
         let payload = serde_json::to_vec(&DeliveryPayload::new(change, &self.fork_remote))
             .map_err(|e| DeliveryError::BadMethod(e.to_string()))?;
         let program = &self.argv[0];
-        let mut cmd = Command::new(program);
-        cmd.args(&self.argv[1..])
-            .env_clear()
-            .stdin(Stdio::piped())
-            // Its output is the runner's log, never the runner's stdout.
-            .stdout(stderr_stdio())
-            .stderr(Stdio::inherit())
-            // Its own process group, so a timeout kills what it started.
-            .process_group(0);
-        if let Some(path) = std::env::var_os("PATH") {
-            cmd.env("PATH", path);
-        }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| DeliveryError::BadMethod(format!("cannot run {program:?}: {e}")))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            // A program that does not read the payload is its own affair.
-            let _ = stdin.write_all(&payload);
-        }
-        let deadline = Instant::now() + self.timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(DeliveryError::ReceiverUnavailable {
-                        detail: format!("waiting for {program:?}: {e}"),
-                    });
-                }
+        let finished = match run_with_stdin(&self.argv, &payload, self.timeout) {
+            Ok(finished) => finished,
+            Err(RunError::NotStarted(e)) => {
+                return Err(DeliveryError::BadMethod(format!(
+                    "cannot run {program:?}: {e}"
+                )));
             }
-            let now = Instant::now();
-            if now >= deadline {
-                let pid = rustix::process::Pid::from_child(&child);
-                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-                let _ = child.kill();
-                let _ = child.wait();
+            Err(RunError::TimedOut(after)) => {
                 return Err(DeliveryError::ReceiverUnavailable {
-                    detail: format!("{program:?} was killed after {:?}", self.timeout),
+                    detail: format!("{program:?} was killed after {after:?}"),
                 });
             }
-            std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+            Err(RunError::Wait(e)) => {
+                return Err(DeliveryError::ReceiverUnavailable {
+                    detail: format!("waiting for {program:?}: {e}"),
+                });
+            }
         };
-        match status.code() {
-            Some(0) => Ok(Delivered::Accepted),
-            Some(EXIT_TEMPFAIL) => Err(DeliveryError::ReceiverUnavailable {
+        match finished {
+            Finished::Code(0) => Ok(Delivered::Accepted),
+            Finished::Code(EXIT_TEMPFAIL) => Err(DeliveryError::ReceiverUnavailable {
                 detail: format!("{program:?} exited with {EXIT_TEMPFAIL} (try again)"),
             }),
-            Some(code) => Err(DeliveryError::ReceiverRefused {
+            Finished::Code(code) => Err(DeliveryError::ReceiverRefused {
                 detail: format!("{program:?} exited with {code}"),
             }),
-            None => {
-                use std::os::unix::process::ExitStatusExt as _;
-                Err(DeliveryError::ReceiverRefused {
-                    detail: format!(
-                        "{program:?} was killed by signal {}",
-                        status.signal().unwrap_or(0)
-                    ),
-                })
-            }
+            Finished::Signal(signal) => Err(DeliveryError::ReceiverRefused {
+                detail: format!("{program:?} was killed by signal {signal}"),
+            }),
         }
     }
-}
-
-/// This process's stderr, for a child's stdout; null if it cannot be
-/// duplicated.
-fn stderr_stdio() -> Stdio {
-    use std::os::fd::AsFd as _;
-    std::io::stderr()
-        .as_fd()
-        .try_clone_to_owned()
-        .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
 /// The webhook method: one POST of the payload.
@@ -699,13 +663,7 @@ impl Delivery for WebhookDelivery {
     fn deliver(&self, change: &PublishedChange) -> Result<Delivered, DeliveryError> {
         let payload = serde_json::to_vec(&DeliveryPayload::new(change, &self.fork_remote))
             .map_err(|e| DeliveryError::BadMethod(e.to_string()))?;
-        // No redirects and never a proxy from the environment, as the LFS
-        // client (design §7).
-        let agent = crate::lfs::client::agent(1, None);
-        let mut request = agent
-            .post(self.url.as_str())
-            .header("Content-Type", "application/json")
-            .header("Idempotency-Key", &change.change);
+        let mut headers = vec![("Idempotency-Key", change.change.clone())];
         if let Some(file) = &self.credential_file {
             let token = std::fs::read_to_string(file).map_err(|e| {
                 DeliveryError::BadMethod(format!(
@@ -713,34 +671,20 @@ impl Delivery for WebhookDelivery {
                     file.display()
                 ))
             })?;
-            request = request.header("Authorization", format!("Bearer {}", token.trim()));
+            headers.push(("Authorization", format!("Bearer {}", token.trim())));
         }
-        let response = request
-            .config()
-            .timeout_global(Some(self.timeout))
-            .build()
-            .send(&payload[..]);
-        let response = match response {
-            Ok(r) => r,
-            Err(e @ (ureq::Error::BadUri(_) | ureq::Error::Http(_))) => {
-                return Err(DeliveryError::BadMethod(format!(
-                    "the webhook request to {} is malformed: {e}",
-                    self.url
-                )));
+        let posted = match crate::lfs::client::post(&self.url, &payload, &headers, self.timeout) {
+            Ok(posted) => posted,
+            Err(e @ PostError::Malformed { .. }) => {
+                return Err(DeliveryError::BadMethod(format!("the webhook {e}")));
             }
-            Err(e) => {
+            Err(e @ PostError::Unreachable { .. }) => {
                 return Err(DeliveryError::ReceiverUnavailable {
-                    detail: format!("POST {}: {e}", self.url),
+                    detail: e.to_string(),
                 });
             }
         };
-        let status = response.status().as_u16();
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let body = crate::lfs::client::read_small(response);
+        let (status, location, body) = (posted.status, posted.location, posted.body);
         let body = String::from_utf8_lossy(&body);
         let detail = format!("POST {} answered {status}: {}", self.url, body.trim());
         match status {

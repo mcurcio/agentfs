@@ -9,8 +9,10 @@
 //! [`events::Event`]s, and [`telemetry::Telemetry`] turns them, with the
 //! engine's own measurements and spans, into OpenTelemetry signals.
 
+pub mod checkpoint;
 pub mod checks;
 pub mod claims;
+pub mod command;
 pub mod config;
 pub mod confined;
 pub mod credentials;
@@ -20,6 +22,7 @@ pub mod file_lock;
 pub mod fork;
 pub mod fsutil;
 pub mod fsync_class;
+pub mod git_cli;
 pub mod gitmodules;
 pub mod history;
 pub mod history_service;

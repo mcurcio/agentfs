@@ -25,8 +25,8 @@
 //!   the journal backlog, each remote's push backlog, age and divergence,
 //!   the start-branch alarm of a started volume (`agentfs.start.moved`),
 //!   misconfigured remotes, the size of the state area and the patch queue
-//!   (`agentfs.patch.queue_depth`, `agentfs.patch.blocked`, from
-//!   `meta/patch.json`).
+//!   (`agentfs.patch.queue_depth`, `agentfs.patch.blocked`,
+//!   `agentfs.patch.held`, from `meta/patch.json`).
 //!
 //! Metric attributes are short and low-cardinality (`trigger`, `remote`,
 //! `reason`, `stage`, `part`); paths never become metric attributes. Span
@@ -69,6 +69,7 @@ pub mod names {
     pub const REMOTES_MODE: &str = "agentfs.remotes.mode";
     pub const PATCH_QUEUE_DEPTH: &str = "agentfs.patch.queue_depth";
     pub const PATCH_BLOCKED: &str = "agentfs.patch.blocked";
+    pub const PATCH_HELD: &str = "agentfs.patch.held";
     pub const FRONT_ROUND_TRIP: &str = "agentfs.front.round_trip";
     pub const FRONT_SERVICE_FAILURES: &str = "agentfs.front.service_failures";
     pub const HISTORY_SERVICE_FRONTS: &str = "agentfs.history_service.fronts";
@@ -453,6 +454,20 @@ impl Telemetry {
                 observer.observe(u64::from(state.blocked.is_some()), &[]);
             })
             .build();
+        let patch_state = state.patch_state();
+        inner
+            .meter
+            .u64_observable_gauge(names::PATCH_HELD)
+            .with_unit("{patch}")
+            .with_description(
+                "Patches set aside (held, waiting, awaiting or not judged) at the last run of the \
+                 patch queue (design §12)",
+            )
+            .with_callback(move |observer| {
+                let state = crate::patch::status::PatchState::load(&patch_state);
+                observer.observe(state.held, &[]);
+            })
+            .build();
         let state = state.clone();
         inner
             .meter
@@ -765,6 +780,9 @@ impl EventSink for TelemetrySink {
             | Event::PatchDuplicate { .. }
             | Event::PatchBlocked { .. }
             | Event::PatchIgnored { .. }
+            | Event::PatchHeld { .. }
+            | Event::PatchRuleFailed { .. }
+            | Event::NotifyFailed { .. }
             | Event::PatchFetchFailed { .. }
             | Event::ForkFinished { .. }
             | Event::ForkPublished { .. }
@@ -818,6 +836,9 @@ fn event_name(event: &Event) -> &'static str {
         Event::PatchDuplicate { .. } => "agentfs.patch_duplicate",
         Event::PatchBlocked { .. } => "agentfs.patch_blocked",
         Event::PatchIgnored { .. } => "agentfs.patch_ignored",
+        Event::PatchHeld { .. } => "agentfs.patch_held",
+        Event::PatchRuleFailed { .. } => "agentfs.patch_rule_failed",
+        Event::NotifyFailed { .. } => "agentfs.notify_failed",
         Event::PatchFetchFailed { .. } => "agentfs.patch_fetch_failed",
         Event::ForkFinished { .. } => "agentfs.fork_finished",
         Event::ForkPublished { .. } => "agentfs.fork_published",
@@ -1001,6 +1022,34 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
                 out.push(("agentfs.patch.oid", oid(p)));
             }
             out.push(("agentfs.patch.why", s(why)));
+        }
+        Event::PatchHeld {
+            inbox,
+            patch,
+            verdict,
+            reason,
+            message,
+        } => {
+            out.push(("agentfs.patch.inbox", AnyValue::Int(*inbox as i64)));
+            if let Some(p) = patch {
+                out.push(("agentfs.patch.oid", oid(p)));
+            }
+            out.push(("agentfs.patch.verdict", AnyValue::from(*verdict)));
+            out.push(("agentfs.patch.reason", AnyValue::from(*reason)));
+            out.push(("agentfs.message", s(message)));
+        }
+        Event::PatchRuleFailed {
+            inbox,
+            rule,
+            message,
+        } => {
+            out.push(("agentfs.patch.inbox", AnyValue::Int(*inbox as i64)));
+            out.push(("agentfs.patch.rule", AnyValue::from(*rule)));
+            out.push(("agentfs.message", s(message)));
+        }
+        Event::NotifyFailed { method, message } => {
+            out.push(("agentfs.notify.method", AnyValue::from(*method)));
+            out.push(("agentfs.message", s(message)));
         }
         Event::PatchFetchFailed {
             remote,

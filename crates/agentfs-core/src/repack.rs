@@ -25,11 +25,12 @@
 //! (a large database) stored whole, compressed, never deltified. A repack
 //! then needs up to about 256 MiB besides the daemon.
 //!
-//! **Environment.** The child starts from an empty environment: a fixed
-//! `PATH`, `LC_ALL=C`, `HOME` set to the git directory, and the system and
-//! global git config switched off, so the CLI reads only the repository's
-//! own config, as libgit2 does (design §4.4), and nothing in the daemon's
-//! environment (`GIT_CONFIG_*`, `GIT_EXEC_PATH`) reaches it.
+//! **Environment.** The child starts from an empty environment
+//! ([`crate::git_cli::command`]): a fixed `PATH`, `LC_ALL=C`, `HOME` set to
+//! the git directory, and the system and global git config switched off, so
+//! the CLI reads only the repository's own config, as libgit2 does (design
+//! §4.4), and nothing in the daemon's environment (`GIT_CONFIG_*`,
+//! `GIT_EXEC_PATH`) reaches it.
 //!
 //! A repack runs on the commit thread, between commits, so it never races
 //! the committer; afterwards the committer's object database is refreshed
@@ -48,6 +49,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::file_lock::{FileLock, Mode};
+use crate::git_cli;
 use crate::service::Stop;
 
 /// The arguments after `git`.
@@ -69,9 +71,6 @@ pub const REPACK_ARGS: [&str; 16] = [
     "-q",
     "--geometric=2",
 ];
-
-/// The `PATH` git is looked up in and runs with.
-pub const REPACK_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// How often a running repack checks for a stop.
 const POLL: Duration = Duration::from_millis(100);
@@ -201,18 +200,8 @@ pub fn repack(
 
 /// The git command, in an environment of its own (see the module docs).
 fn command(git: &Path, git_dir: &Path) -> Command {
-    let mut cmd = Command::new(git);
+    let mut cmd = git_cli::command(git, git_dir);
     cmd.args(REPACK_ARGS)
-        .env_clear()
-        .env("PATH", REPACK_PATH)
-        .env("LC_ALL", "C")
-        .env("HOME", git_dir)
-        .env("GIT_DIR", git_dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .current_dir(git_dir)
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     cmd
@@ -464,7 +453,10 @@ mod tests {
             ],
             "{env}"
         );
-        assert!(env.contains(&format!("PATH={REPACK_PATH}\n")), "{env}");
+        assert!(
+            env.contains(&format!("PATH={}\n", git_cli::GIT_PATH)),
+            "{env}"
+        );
         assert!(env.contains("GIT_CONFIG_GLOBAL=/dev/null\n"), "{env}");
     }
 

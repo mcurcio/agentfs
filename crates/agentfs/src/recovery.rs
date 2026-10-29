@@ -116,6 +116,8 @@ impl Ask {
             dry_run: self.dry_run,
             remotes: Vec::new(),
             timeout_ms: None,
+            no_fetch: false,
+            message: None,
         }
     }
 
@@ -128,7 +130,9 @@ impl Ask {
                 None => Err(RestoreError::MissingPath),
             },
             Op::Revert => Ok(Self::revert(r.commit, r.force, r.dry_run)),
-            Op::Push | Op::ReceiveFork => Err(other("not a restore or revert")),
+            Op::Push | Op::ReceiveFork | Op::Apply | Op::Checkpoint | Op::Judge => {
+                Err(other("not a restore or revert"))
+            }
         }
     }
 
@@ -280,7 +284,11 @@ fn print_reply(command: &str, reply: Reply) -> ExitCode {
             eprintln!("{command} failed: {message}");
             ExitCode::FAILURE
         }
-        Reply::Pushed(_) | Reply::Received { .. } => {
+        Reply::Pushed(_)
+        | Reply::Received { .. }
+        | Reply::Attached { .. }
+        | Reply::Judged { .. }
+        | Reply::Checkpoint { .. } => {
             eprintln!("{command} failed: the daemon answered another request's reply");
             ExitCode::FAILURE
         }
@@ -878,6 +886,8 @@ mod tests {
             dry_run: false,
             remotes: Vec::new(),
             timeout_ms: None,
+            no_fetch: false,
+            message: None,
         }
     }
 

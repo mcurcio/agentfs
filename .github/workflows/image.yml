@@ -158,6 +158,22 @@ jobs:
           kind delete cluster --name agentfs-csi || true
           ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
 
+  # mergiraf as a merge driver in the built image (ci/e2e-mergiraf.sh;
+  # design §17.3): two patches to one .rs file land at one apply.
+  e2e-mergiraf:
+    name: e2e (mergiraf in the image)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentfs-image
+          path: ${{ runner.temp }}
+      - run: docker load -i "$RUNNER_TEMP/agentfs-image.tar"
+      - run: ci/e2e-mergiraf.sh
+
   # Forked volumes on the CSI driver (ci/e2e-csi-forks.sh): its own job,
   # so e2e-csi's wall time is unchanged; the cost is one more runner.
   e2e-csi-forks:
@@ -280,10 +296,10 @@ jobs:
           SHA: ${{ github.sha }}
         run: ci/publish-image.sh agentfs-git-server:ci ghcr.io/mcurcio/agentfs-git-server "$SHA"
 
-  # Pushes the image e2e-kind, e2e-csi and e2e-csi-forks tested (the same
-  # tar, not a rebuild), from main only.
+  # Pushes the image e2e-kind, e2e-csi, e2e-csi-forks and e2e-mergiraf
+  # tested (the same tar, not a rebuild), from main only.
   publish:
-    needs: [build, e2e-kind, e2e-csi, e2e-csi-forks]
+    needs: [build, e2e-kind, e2e-csi, e2e-csi-forks, e2e-mergiraf]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:

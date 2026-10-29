@@ -7,10 +7,11 @@
 //!
 //! 1. `git ls-remote` lists the volume's branch, inbox and applied refs.
 //! 2. `git fetch` brings the branch head `H`.
-//! 3. The patch is a commit whose parent is `H` or one of its ancestors:
-//!    a given commit with exactly one parent, or one built here on `H`
-//!    from `--put`/`--delete` (with a temporary index), or, for `--skip`,
-//!    an empty commit on `H`.
+//! 3. The patch is a branch: a given tip (any revision) whose commits since
+//!    its merge base with `H` (the patch's base) are a line of
+//!    single-parent commits, or one commit built here on `H` from
+//!    `--put`/`--delete` (with a temporary index), or, for `--skip`, an
+//!    empty commit on `H`.
 //!    A given commit taking a new number that is already queued
 //!    (`inbox/*`) or applied (`applied/*`, or `last_applied` in the status
 //!    ref) is refused early
@@ -22,13 +23,21 @@
 //!    gap (a number below the highest one that the remote has neither as
 //!    inbox nor applied), which is filled create-only. A number the volume
 //!    has applied (the remote's `applied/N`, or `last_applied` in its
-//!    status ref, which reaches the remote even while applied refs are
-//!    held back) is refused: a replacement would only be ignored as stale.
+//!    status ref at or above N with N not in its queue; the status reaches
+//!    the remote even while applied refs are held back) is refused: a
+//!    replacement would only be ignored as stale. A patch the queue set
+//!    aside below the last applied number is still queued, so replaceable.
+//!    With `barrier`, a built or skip patch gets `Agentfs-Barrier: yes`
+//!    and a given tip must carry it.
 //! 5. `git push --force-with-lease=<ref>: <oid>:<ref>` creates the inbox
 //!    ref only if it does not exist yet (`<ref>:<oid>` for a replacement,
 //!    which must still hold what was listed). A submitter that loses a race
 //!    for a number lists again and tries the next one, up to `attempts`
 //!    times.
+//!
+//! [`approve`] (`agentfs patch approve`) writes
+//! `refs/agentfs/<volume>/approved/<n>` = the queued tip, for
+//! `agentfs.patchAccept=approval`.
 //!
 //! Applied refs are pushed before inbox refs are deleted on the remote
 //! (see [`crate::push`]), so the highest number listed never goes down
@@ -38,7 +47,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use super::{applied_prefix, applied_ref, inbox_prefix, inbox_ref, seq_of_ref, status_ref};
+use super::integrate::message_is_barrier;
+use super::{
+    BARRIER_TRAILER, applied_prefix, applied_ref, approved_ref, inbox_prefix, inbox_ref,
+    seq_of_ref, status_ref,
+};
 
 /// The default number of numbers tried before giving up on a race.
 pub const DEFAULT_ATTEMPTS: u32 = 10;
@@ -55,15 +68,16 @@ pub enum SubmitError {
     Spawn(#[source] std::io::Error),
     #[error("the remote has no branch {0}: the volume has not pushed yet")]
     NoBranch(String),
-    #[error("{commit} has {parents} parents; a patch is a commit with exactly one parent")]
-    NotSingleParent { commit: String, parents: usize },
     #[error(
-        "{commit}'s parent {parent} is not on the volume's branch {branch} (head {head}); \
-         rebase the patch onto the branch{shallow}"
+        "{commit} in the patch has {parents} parents; a patch is a line of single-parent commits"
+    )]
+    MergeInBranch { commit: String, parents: usize },
+    #[error(
+        "{commit} shares no history with the volume's branch {branch} (head {head}); rebase it \
+         onto the branch{shallow}"
     )]
     ParentNotInHistory {
         commit: String,
-        parent: String,
         branch: String,
         head: String,
         shallow: &'static str,
@@ -93,6 +107,11 @@ pub enum SubmitError {
     Refused { ref_name: String, message: String },
     #[error("{0}")]
     BadRequest(String),
+    #[error(
+        "{commit} does not carry `Agentfs-Barrier: yes` in its last paragraph; add it with `git \
+         commit --amend --trailer 'Agentfs-Barrier: yes'`"
+    )]
+    NotABarrier { commit: String },
 }
 
 /// The output of one git command.
@@ -149,7 +168,8 @@ impl GitRunner for GitCli {
 /// What the patch is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    /// An existing commit (any revision), with one parent on the branch.
+    /// The tip of a branch (any revision): its commits since the volume's
+    /// branch are the patch.
     Commit(String),
     /// A commit built on the remote branch head.
     Build {
@@ -180,6 +200,30 @@ pub struct SubmitRequest {
     pub attempts: u32,
     /// `git fetch --depth`, for shallow producers.
     pub depth: Option<u32>,
+    /// Make the patch a barrier: a built or skip patch gets the
+    /// `Agentfs-Barrier: yes` trailer; a given tip must already carry it.
+    pub barrier: bool,
+}
+
+/// `agentfs patch approve`: approves queued patch `inbox` as listed (or
+/// as `expect`, which must match).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveRequest {
+    /// A remote name or URL, as `git push` takes it.
+    pub remote: String,
+    pub volume: String,
+    pub inbox: u64,
+    /// The tip the approver means: refused if the queue holds another.
+    pub expect: Option<String>,
+}
+
+/// What was approved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approved {
+    pub inbox: u64,
+    /// `refs/agentfs/<volume>/approved/<n>`.
+    pub ref_name: String,
+    pub tip: String,
 }
 
 /// What was submitted.
@@ -188,7 +232,10 @@ pub struct Submitted {
     pub inbox: u64,
     pub ref_name: String,
     pub oid: String,
-    pub parent: String,
+    /// The patch's base: the merge base of the tip and the remote head.
+    pub base: String,
+    /// The patch's commits, base exclusive, tip inclusive.
+    pub commits: usize,
     /// Numbers lost to other submitters first.
     pub raced: u32,
 }
@@ -259,27 +306,56 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
         .ok_or_else(|| SubmitError::NoBranch(branch_ref.clone()))?;
     // The head and enough history to check the patch's parent.
     fetch_commit(git, &req.remote, &head, &branch_ref, req.depth)?;
-    let (oid, parent) = match &req.source {
-        Source::Commit(rev) => existing_commit(git, req, rev, &head)?,
+    let barrier = |message: &str| match req.barrier {
+        true => format!("{}\n\n{BARRIER_TRAILER}: yes\n", message.trim_end()),
+        false => message.to_owned(),
+    };
+    let (oid, base, commits) = match &req.source {
+        Source::Commit(rev) => {
+            let tip = branch_tip(git, req, rev, &head)?;
+            if req.barrier {
+                let message = check(git, &["show", "-s", "--format=%B", &tip.0], &[])?.stdout;
+                if !message_is_barrier(&message) {
+                    return Err(SubmitError::NotABarrier { commit: tip.0 });
+                }
+            }
+            tip
+        }
         Source::Build {
             puts,
             deletes,
             message,
             author,
-        } => (
-            build_commit(git, &head, puts, deletes, message, author.as_deref())?,
-            head.clone(),
-        ),
+        } => {
+            let message = if message.trim().is_empty() {
+                "agentfs patch"
+            } else {
+                message
+            };
+            (
+                build_commit(
+                    git,
+                    &head,
+                    puts,
+                    deletes,
+                    &barrier(message),
+                    author.as_deref(),
+                )?,
+                head.clone(),
+                1,
+            )
+        }
         Source::Skip(n) => (
             build_commit(
                 git,
                 &head,
                 &[],
                 &[],
-                &format!("agentfs: skip patch {n}"),
+                &barrier(&format!("agentfs: skip patch {n}")),
                 None,
             )?,
             head.clone(),
+            1,
         ),
     };
     // A given commit taking a new number; `--replace N` names its number
@@ -302,9 +378,12 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
         }
         let ref_name = inbox_ref(&req.volume, n);
         // Applied already, even if the remote still lists it: a
-        // replacement would only ever be ignored as stale.
+        // replacement would only ever be ignored as stale. A number at or
+        // below the last applied one that the status still lists as queued
+        // was set aside, and is replaceable (bead agentfs-mia.2).
         if listing.contains_key(&applied_ref(&req.volume, n))
-            || remote_last_applied(git, req, &listing).is_some_and(|last| last >= n)
+            || remote_status(git, &req.remote, &req.volume, &listing)
+                .is_some_and(|status| applied_per_status(&status, n))
         {
             return Err(SubmitError::AlreadyApplied(n));
         }
@@ -320,7 +399,8 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
                 inbox: n,
                 ref_name,
                 oid,
-                parent,
+                base,
+                commits,
                 raced: 0,
             }),
             PushLine::Rejected(message) => Err(SubmitError::Refused { ref_name, message }),
@@ -338,7 +418,8 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
                     inbox: n,
                     ref_name,
                     oid,
-                    parent,
+                    base,
+                    commits,
                     raced,
                 });
             }
@@ -352,7 +433,8 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
                             inbox: n,
                             ref_name,
                             oid,
-                            parent,
+                            base,
+                            commits,
                             raced,
                         });
                     }
@@ -401,18 +483,75 @@ fn ls_remote(
     git: &impl GitRunner,
     req: &SubmitRequest,
 ) -> Result<BTreeMap<String, String>, SubmitError> {
-    let branch_ref = format!("refs/heads/{}", req.branch);
-    let queue = format!("refs/agentfs/{}/*", req.volume);
-    let out = check(
-        git,
-        &["ls-remote", "--refs", &req.remote, &branch_ref, &queue],
-        &[],
-    )?;
-    let prefix = format!("refs/agentfs/{}/", req.volume);
+    list_queue(git, &req.remote, &req.volume, Some(&req.branch))
+}
+
+/// `git ls-remote` of the volume's queue refs (`refs/agentfs/<volume>/*`)
+/// and, when given, its branch.
+fn list_queue(
+    git: &impl GitRunner,
+    remote: &str,
+    volume: &str,
+    branch: Option<&str>,
+) -> Result<BTreeMap<String, String>, SubmitError> {
+    let branch_ref = branch.map(|b| format!("refs/heads/{b}"));
+    let queue = format!("refs/agentfs/{volume}/*");
+    let mut args = vec!["ls-remote", "--refs", remote];
+    if let Some(b) = &branch_ref {
+        args.push(b);
+    }
+    args.push(&queue);
+    let out = check(git, &args, &[])?;
+    let prefix = format!("refs/agentfs/{volume}/");
     Ok(parse_ls_remote(&out.stdout)
         .into_iter()
-        .filter(|(name, _)| *name == branch_ref || name.starts_with(&prefix))
+        .filter(|(name, _)| Some(name) == branch_ref.as_ref() || name.starts_with(&prefix))
         .collect())
+}
+
+/// Approves queued patch `req.inbox` (see [`ApproveRequest`]): its tip as
+/// the remote lists it goes to `refs/agentfs/<volume>/approved/<n>`,
+/// leased on what that ref held when listed. Idempotent when the approval
+/// already names that tip. The volume fetches approvals with its inbox and
+/// lands an awaiting patch under `agentfs.patchAccept=approval` once its
+/// approval names its tip (bead agentfs-mia.2).
+pub fn approve(git: &impl GitRunner, req: &ApproveRequest) -> Result<Approved, SubmitError> {
+    if req.volume.is_empty() || req.volume.contains('/') {
+        return Err(SubmitError::BadRequest(format!(
+            "{:?} is not a volume name",
+            req.volume
+        )));
+    }
+    let listing = list_queue(git, &req.remote, &req.volume, None)?;
+    let inbox = inbox_ref(&req.volume, req.inbox);
+    let tip = listing
+        .get(&inbox)
+        .cloned()
+        .ok_or(SubmitError::NotQueued(req.inbox))?;
+    if let Some(expect) = &req.expect
+        && *expect != tip
+    {
+        return Err(SubmitError::Refused {
+            ref_name: inbox,
+            message: format!("the queued patch is now {tip}"),
+        });
+    }
+    let ref_name = approved_ref(&req.volume, req.inbox);
+    let approved = |ref_name| Approved {
+        inbox: req.inbox,
+        ref_name,
+        tip: tip.clone(),
+    };
+    let lease = listing.get(&ref_name).cloned().unwrap_or_default();
+    if lease == tip {
+        return Ok(approved(ref_name));
+    }
+    // git pushes only objects it has.
+    fetch_commit(git, &req.remote, &tip, &inbox, None)?;
+    match push_leased(git, &req.remote, &tip, &ref_name, &lease)? {
+        PushLine::Ok => Ok(approved(ref_name)),
+        PushLine::Rejected(message) => Err(SubmitError::Refused { ref_name, message }),
+    }
 }
 
 /// [`SubmitError::AlreadySubmitted`] when `oid` is a queued or applied
@@ -434,7 +573,7 @@ fn refuse_submitted(
     };
     let inbox = at(inbox_prefix(&req.volume));
     let applied = at(applied_prefix(&req.volume)).or_else(|| {
-        let last = remote_status(git, req, listing)?;
+        let last = remote_status(git, &req.remote, &req.volume, listing)?;
         let last = last.get("last_applied")?;
         (last.get("patch")?.as_str()? == oid)
             .then(|| last.get("inbox")?.as_u64())
@@ -450,36 +589,41 @@ fn refuse_submitted(
     Ok(())
 }
 
-/// The highest number the volume has applied, as the remote's status ref
-/// says (`last_applied.inbox` in its `status.json`). The status reaches
-/// the remote even while the branch and the applied refs cannot, so it
-/// catches a patch applied whose applied ref is held back. `None` when
-/// there is no status or it cannot be read: best effort.
-fn remote_last_applied(
-    git: &impl GitRunner,
-    req: &SubmitRequest,
-    listing: &BTreeMap<String, String>,
-) -> Option<u64> {
-    remote_status(git, req, listing)?
-        .get("last_applied")?
-        .get("inbox")?
-        .as_u64()
+/// Whether the remote's `status.json` says patch `n` is applied:
+/// `last_applied.inbox` is at least `n` and its queue does not list `n` (a
+/// set-aside patch is still queued). The status reaches the remote even
+/// while the branch and the applied refs cannot, so it catches a patch
+/// applied whose applied ref is held back.
+fn applied_per_status(status: &serde_json::Value, n: u64) -> bool {
+    let last = status
+        .get("last_applied")
+        .and_then(|l| l.get("inbox"))
+        .and_then(serde_json::Value::as_u64);
+    let queued = status
+        .get("queue")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|q| {
+            q.iter()
+                .any(|e| e.get("inbox").and_then(serde_json::Value::as_u64) == Some(n))
+        });
+    last.is_some_and(|last| last >= n) && !queued
 }
 
 /// The remote's `status.json`, from its status ref. `None` when there is
 /// no status or it cannot be read: best effort.
 fn remote_status(
     git: &impl GitRunner,
-    req: &SubmitRequest,
+    remote: &str,
+    volume: &str,
     listing: &BTreeMap<String, String>,
 ) -> Option<serde_json::Value> {
-    let name = status_ref(&req.volume);
+    let name = status_ref(volume);
     let oid = listing.get(&name)?;
     let base = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"];
-    let by_oid = [&base[..], &[req.remote.as_str(), oid.as_str()]].concat();
+    let by_oid = [&base[..], &[remote, oid.as_str()]].concat();
     let fetched = git.run(&by_oid, &[]).is_ok_and(|o| o.success)
         || git
-            .run(&["fetch", "--quiet", "--no-tags", &req.remote, &name], &[])
+            .run(&["fetch", "--quiet", "--no-tags", remote, &name], &[])
             .is_ok_and(|o| o.success);
     if !fetched {
         return None;
@@ -527,50 +671,63 @@ pub fn push_leased(
     }
 }
 
-/// A given commit: one parent, on the branch.
-fn existing_commit(
+/// A given branch tip: `(tip, base, commit count)`. Its base is the merge
+/// base of the tip and `head`; its commits since the base must each have
+/// one parent, and there must be at least one.
+fn branch_tip(
     git: &impl GitRunner,
     req: &SubmitRequest,
     rev: &str,
     head: &str,
-) -> Result<(String, String), SubmitError> {
+) -> Result<(String, String, usize), SubmitError> {
     let spec = format!("{rev}^{{commit}}");
-    let oid = check(git, &["rev-parse", "--verify", "--quiet", &spec], &[])?
+    let tip = check(git, &["rev-parse", "--verify", "--quiet", &spec], &[])?
         .stdout
         .trim()
         .to_owned();
-    let parents = check(git, &["rev-list", "--parents", "-n", "1", &oid], &[])?;
-    let parents: Vec<String> = parents
-        .stdout
-        .split_whitespace()
-        .skip(1)
-        .map(str::to_owned)
-        .collect();
-    let [parent] = parents.as_slice() else {
-        return Err(SubmitError::NotSingleParent {
-            commit: oid,
-            parents: parents.len(),
-        });
+    let args = ["merge-base", tip.as_str(), head];
+    let merge_base = git.run(&args, &[])?;
+    let base = match (merge_base.success, merge_base.code) {
+        (true, _) => merge_base.stdout.trim().to_owned(),
+        (false, Some(1)) => {
+            let shallow = git
+                .run(&["rev-parse", "--is-shallow-repository"], &[])
+                .map(|o| o.stdout.trim() == "true")
+                .unwrap_or(false);
+            return Err(SubmitError::ParentNotInHistory {
+                commit: tip,
+                branch: req.branch.clone(),
+                head: head.to_owned(),
+                shallow: if shallow {
+                    " (this clone is shallow: a larger --depth may find it)"
+                } else {
+                    ""
+                },
+            });
+        }
+        (false, _) => return Err(git_error(&args, &merge_base)),
     };
-    let ancestor = git.run(&["merge-base", "--is-ancestor", parent, head], &[])?;
-    if ancestor.success {
-        return Ok((oid, parent.clone()));
+    let range = format!("{base}..{tip}");
+    let lines = check(git, &["rev-list", "--parents", &range], &[])?;
+    let mut commits = 0;
+    for line in lines.stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let commit = fields.next().unwrap_or_default();
+        let parents = fields.count();
+        if parents != 1 {
+            return Err(SubmitError::MergeInBranch {
+                commit: commit.to_owned(),
+                parents,
+            });
+        }
+        commits += 1;
     }
-    let shallow = git
-        .run(&["rev-parse", "--is-shallow-repository"], &[])
-        .map(|o| o.stdout.trim() == "true")
-        .unwrap_or(false);
-    Err(SubmitError::ParentNotInHistory {
-        commit: oid,
-        parent: parent.clone(),
-        branch: req.branch.clone(),
-        head: head.to_owned(),
-        shallow: if shallow {
-            " (this clone is shallow: a larger --depth may find it)"
-        } else {
-            ""
-        },
-    })
+    if commits == 0 {
+        return Err(SubmitError::BadRequest(
+            "the commit is already on the volume's branch".into(),
+        ));
+    }
+    Ok((tip, base, commits))
 }
 
 /// A commit on `head` with `puts` written and `deletes` removed, built in
@@ -775,6 +932,8 @@ mod tests {
         steal: RefCell<Vec<u64>>,
         /// `status.json` of the remote's status ref, for `git cat-file`.
         status: RefCell<Option<String>>,
+        /// The given tip's message, for `git show -s --format=%B`.
+        message: RefCell<String>,
     }
 
     const HEAD: &str = "1111111111111111111111111111111111111111";
@@ -792,6 +951,7 @@ mod tests {
                 ),
                 steal: RefCell::new(Vec::new()),
                 status: RefCell::new(None),
+                message: RefCell::new("patch\n".into()),
             }
         }
 
@@ -820,7 +980,8 @@ mod tests {
                         .collect();
                     Self::ok(&out)
                 }
-                "fetch" | "merge-base" | "read-tree" | "update-index" => Self::ok(""),
+                "fetch" | "read-tree" | "update-index" => Self::ok(""),
+                "merge-base" => Self::ok(&format!("{HEAD}\n")),
                 "write-tree" => Self::ok(&format!("{OTHER}\n")),
                 "commit-tree" => Self::ok(&format!("{PATCH}\n")),
                 "cat-file" => match self.status.borrow().as_deref() {
@@ -832,14 +993,15 @@ mod tests {
                     }),
                 },
                 "rev-parse" => Self::ok(&format!("{PATCH}\n")),
+                "show" => Self::ok(&self.message.borrow()),
                 "rev-list" => Self::ok(&format!("{PATCH} {HEAD}\n")),
                 "push" => {
                     let spec = args.last().unwrap();
                     let (oid, name) = spec.split_once(':').unwrap();
                     let lease = args[3].strip_prefix("--force-with-lease=").unwrap();
                     let (_, expected) = lease.rsplit_once(':').unwrap();
-                    let n = super::super::seq_of_ref("refs/agentfs/v/inbox/", name).unwrap();
-                    if self.steal.borrow().contains(&n) {
+                    let n = super::super::seq_of_ref("refs/agentfs/v/inbox/", name);
+                    if n.is_some_and(|n| self.steal.borrow().contains(&n)) {
                         self.remote.borrow_mut().insert(name.into(), OTHER.into());
                     }
                     let mut remote = self.remote.borrow_mut();
@@ -869,6 +1031,7 @@ mod tests {
             replace: None,
             attempts: 3,
             depth: None,
+            barrier: false,
         }
     }
 
@@ -883,7 +1046,8 @@ mod tests {
         assert_eq!(done.inbox, 4);
         assert_eq!(done.raced, 2);
         assert_eq!(done.oid, PATCH);
-        assert_eq!(done.parent, HEAD);
+        assert_eq!(done.base, HEAD);
+        assert_eq!(done.commits, 1);
         assert_eq!(
             git.remote.borrow()["refs/agentfs/v/inbox/0000000004"],
             PATCH
@@ -1077,6 +1241,138 @@ mod tests {
                 .unwrap()
                 .inbox,
             1
+        );
+    }
+
+    /// A patch the queue set aside below the last applied number is still
+    /// in the status's queue, so it can be replaced (bead agentfs-mia.2).
+    #[test]
+    fn a_set_aside_patch_is_replaceable() {
+        let git = FakeGit::new(&[
+            ("refs/heads/agentfs/v", HEAD),
+            ("refs/agentfs/v/inbox/0000000002", OTHER),
+            ("refs/agentfs/v/status", OTHER),
+        ]);
+        *git.status.borrow_mut() =
+            Some(r#"{"last_applied": {"inbox": 3}, "queue": [{"inbox": 2, "patch": "x"}]}"#.into());
+        let mut req = request(Source::Commit("HEAD".into()));
+        req.replace = Some(2);
+        assert_eq!(submit(&git, &req).unwrap().inbox, 2);
+        assert_eq!(submit(&git, &request(Source::Skip(2))).unwrap().inbox, 2);
+        // Not queued any more: applied.
+        *git.status.borrow_mut() = Some(r#"{"last_applied": {"inbox": 3}, "queue": []}"#.into());
+        assert!(matches!(
+            submit(&git, &req).unwrap_err(),
+            SubmitError::AlreadyApplied(2)
+        ));
+    }
+
+    /// `--barrier`: a built or skip patch gets the trailer; a given tip
+    /// must carry it.
+    #[test]
+    fn barriers_carry_the_trailer() {
+        let git = FakeGit::new(&[("refs/heads/agentfs/v", HEAD)]);
+        let mut req = request(Source::Build {
+            puts: Vec::new(),
+            deletes: vec!["gone".into()],
+            message: "drop gone".into(),
+            author: None,
+        });
+        req.barrier = true;
+        submit(&git, &req).unwrap();
+        let message = |git: &FakeGit| {
+            let calls = git.calls.borrow();
+            let call = calls.iter().rev().find(|c| c[0] == "commit-tree").unwrap();
+            call[call.iter().position(|a| a == "-m").unwrap() + 1].clone()
+        };
+        assert_eq!(message(&git), "drop gone\n\nAgentfs-Barrier: yes\n");
+        let git = FakeGit::new(&[
+            ("refs/heads/agentfs/v", HEAD),
+            ("refs/agentfs/v/inbox/0000000004", OTHER),
+        ]);
+        let mut skip = request(Source::Skip(4));
+        skip.barrier = true;
+        submit(&git, &skip).unwrap();
+        assert_eq!(
+            message(&git),
+            "agentfs: skip patch 4\n\nAgentfs-Barrier: yes\n"
+        );
+        let git = FakeGit::new(&[("refs/heads/agentfs/v", HEAD)]);
+        let mut req = request(Source::Commit("HEAD".into()));
+        req.barrier = true;
+        assert!(matches!(
+            submit(&git, &req).unwrap_err(),
+            SubmitError::NotABarrier { .. }
+        ));
+        *git.message.borrow_mut() = "patch\n\nAgentfs-Barrier: yes\n".into();
+        assert_eq!(submit(&git, &req).unwrap().inbox, 1);
+    }
+
+    fn approve_request(expect: Option<&str>) -> ApproveRequest {
+        ApproveRequest {
+            remote: "origin".into(),
+            volume: "v".into(),
+            inbox: 2,
+            expect: expect.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn approve_names_the_listed_tip() {
+        let pushes = |git: &FakeGit| git.calls.borrow().iter().filter(|c| c[0] == "push").count();
+        let git = FakeGit::new(&[("refs/heads/agentfs/v", HEAD)]);
+        assert!(matches!(
+            approve(&git, &approve_request(None)).unwrap_err(),
+            SubmitError::NotQueued(2)
+        ));
+        git.remote
+            .borrow_mut()
+            .insert("refs/agentfs/v/inbox/0000000002".into(), PATCH.into());
+        match approve(&git, &approve_request(Some(OTHER))).unwrap_err() {
+            SubmitError::Refused { ref_name, message } => {
+                assert_eq!(ref_name, "refs/agentfs/v/inbox/0000000002");
+                assert_eq!(message, format!("the queued patch is now {PATCH}"));
+            }
+            other => panic!("{other}"),
+        }
+        assert_eq!(pushes(&git), 0);
+        let done = approve(&git, &approve_request(Some(PATCH))).unwrap();
+        assert_eq!(done.ref_name, "refs/agentfs/v/approved/0000000002");
+        assert_eq!(done.tip, PATCH);
+        assert_eq!(
+            git.remote.borrow()["refs/agentfs/v/approved/0000000002"],
+            PATCH
+        );
+        let push = git
+            .calls
+            .borrow()
+            .iter()
+            .find(|c| c[0] == "push")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            push[3],
+            "--force-with-lease=refs/agentfs/v/approved/0000000002:"
+        );
+        // Again: nothing to push.
+        approve(&git, &approve_request(None)).unwrap();
+        assert_eq!(pushes(&git), 1);
+        // A replaced patch: approved again, leased on the old approval.
+        git.remote
+            .borrow_mut()
+            .insert("refs/agentfs/v/inbox/0000000002".into(), OTHER.into());
+        assert_eq!(approve(&git, &approve_request(None)).unwrap().tip, OTHER);
+        let last = git
+            .calls
+            .borrow()
+            .iter()
+            .rev()
+            .find(|c| c[0] == "push")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            last[3],
+            format!("--force-with-lease=refs/agentfs/v/approved/0000000002:{PATCH}")
         );
     }
 

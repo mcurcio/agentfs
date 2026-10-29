@@ -2167,30 +2167,33 @@ fn patches_apply_before_the_mount_serves() {
     queue_patch(&v, 2, &base, "b.txt", "iac");
     queue_patch(&v, 3, &base, "c.txt", "c");
 
-    // Patch 1 is there from the first read; 2 conflicts and blocks 3; the
-    // volume mounts anyway.
+    // Patches 1 and 3 are there from the first read; 2 conflicts and is
+    // held whole (bead agentfs-mia.2); the volume mounts anyway.
     let m = v.mount(&[]);
     assert_eq!(fs::read_to_string(v.mnt().join("a.txt")).unwrap(), "a1");
     assert_eq!(
         fs::read_to_string(v.mnt().join("b.txt")).unwrap(),
         "workload"
     );
-    assert!(!v.mnt().join("c.txt").exists());
+    assert_eq!(fs::read_to_string(v.mnt().join("c.txt")).unwrap(), "c");
     let (author, message) = v.head();
     assert_eq!(author, "Ada");
-    assert!(message.contains("Agentfs-Inbox: 1\n"), "{message}");
+    assert!(message.contains("Agentfs-Inbox: 3\n"), "{message}");
     let log = m.log();
-    assert!(log.contains("patches: blocked at 2 (conflict)"), "{log}");
+    assert!(log.contains("patch 2 held (conflict)"), "{log}");
     assert!(log.contains("alarm: "), "{log}");
     let status = v.ok(&["patch", "status", "--json"]);
     let doc: serde_json::Value = serde_json::from_str(&status).unwrap();
-    assert_eq!(doc["status"]["blocked"]["reason"], "conflict");
-    assert_eq!(doc["status"]["queue"].as_array().unwrap().len(), 2);
+    assert_eq!(doc["status"]["blocked"], serde_json::Value::Null);
+    let queue = doc["status"]["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0]["verdict"]["reason"], "conflict");
     // The workload goes on.
     v.sh("printf more > d.txt");
     v.expect(&tree(&[
         ("a.txt", f("a1")),
         ("b.txt", f("workload")),
+        ("c.txt", f("c")),
         ("d.txt", f("more")),
     ]));
     m.stop();

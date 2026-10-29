@@ -113,6 +113,14 @@ impl StateDir {
         self.meta().join("patch.json")
     }
 
+    /// The patch queue's notify cursor (bead agentfs-mia.5):
+    /// `meta/notify.json`, the last status whose changes were delivered
+    /// ([`crate::patch::notify::NotifyCursor`]). A cache: lost, every
+    /// change is sent again.
+    pub fn notify_state(&self) -> PathBuf {
+        self.meta().join("notify.json")
+    }
+
     /// `meta/fork.json`: the finisher's marks (design §2.2, §11.5).
     pub fn fork_mark(&self) -> PathBuf {
         self.meta().join("fork.json")
@@ -2391,10 +2399,28 @@ impl Committer {
         &self.history
     }
 
+    /// The replica's committer identity (design §9), for work outside the
+    /// committer that signs as it (a daemon's patch judging, bead
+    /// agentfs-mia.5).
+    pub fn committer_identity(&self) -> crate::identity::Identity {
+        self.identities.committer().clone()
+    }
+
     /// The replica's committer signature, now (design §9).
     pub fn committer_signature(&self) -> Result<git2::Signature<'static>, git2::Error> {
         let c = self.identities.committer();
         git2::Signature::now(&c.name, &c.email)
+    }
+
+    /// The author signature for `caller`, now, from the volume's author
+    /// templates (design §9): a checkpoint's author
+    /// ([`crate::checkpoint::cut`]).
+    pub fn author_signature(
+        &self,
+        caller: crate::record::Caller,
+    ) -> Result<git2::Signature<'static>, HistoryError> {
+        let a = self.identities.author(caller)?;
+        Ok(git2::Signature::now(&a.name, &a.email)?)
     }
 
     /// Commits that the patch of `op` is applied when it changes nothing

@@ -1,5 +1,9 @@
 //! The patch queue against real volumes (design §12, §18 test 15): a state
-//! area, a backing tree, the recorder and committer, no FUSE.
+//! area, a backing tree, the recorder and committer, the `git` program
+//! merging, no FUSE.
+//!
+//! The tests that run the queue skip, with a message, when `git` is not
+//! installed, as `crates/agentfs/tests/cli_patch.rs` does.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,11 +11,14 @@ use std::sync::Arc;
 
 use git2::{Oid, Repository, Signature, Time};
 
+use super::accept::{AcceptanceRule, CleanMerge};
+use super::integrate::{GitMergeTree, Integrated, Integrator, PatchBranch};
 use super::queue::{Queue, QueueContext, QueueReport};
 use super::status::{PatchState, read_status};
 use super::*;
 use crate::confined::Dir;
 use crate::events::{Event, Events, MemorySink};
+use crate::git_cli;
 use crate::identity::Context;
 use crate::lfs::Pointer;
 use crate::lfs::fetch::LfsObjects;
@@ -26,6 +33,15 @@ const CALLER: Caller = Caller {
     gid: 10000,
     pid: 1,
 };
+
+/// Whether `git` is installed; says so when it is not.
+fn have_git() -> bool {
+    let found = git_cli::find_git().is_some();
+    if !found {
+        eprintln!("skipping: git is not installed");
+    }
+    found
+}
 
 struct NoLfs;
 
@@ -173,6 +189,7 @@ impl Fixture {
     fn process(&self) -> QueueReport {
         let tree = self.dir();
         let telemetry = Telemetry::noop();
+        let integrator = GitMergeTree::new(self.state.git());
         let mut queue = Queue::new(QueueContext {
             state: &self.state,
             recorder: &self.recorder,
@@ -181,6 +198,8 @@ impl Fixture {
             objects: &NoLfs,
             telemetry: &telemetry,
             caller: CALLER,
+            integrator: &integrator,
+            rule: &CleanMerge,
         });
         queue.process(None).unwrap()
     }
@@ -310,8 +329,13 @@ fn inbox_trailers_only_count_from_patch_commits() {
 }
 
 /// Design §18 test 15: three patches, the second conflicts.
+/// Keep going (bead agentfs-mia.2): 2 conflicts and is held whole; 1 and
+/// 3 land; a rerun retries 2; rebased, it lands below the high-water.
 #[test]
 fn three_patches_the_second_conflicts() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
     let base = f.head();
     let p1 = f.patch(
@@ -329,10 +353,11 @@ fn three_patches_the_second_conflicts() {
     }
 
     let report = f.process();
-    assert_eq!(report.applied.len(), 1);
-    let (n, commit) = report.applied[0];
-    assert_eq!(n, 1);
-    assert_eq!(commit, f.head());
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1, 3]
+    );
+    let commit = report.applied[0].1;
     let c = f.repo().find_commit(commit).unwrap();
     assert_eq!(c.author().name(), Ok("Ada Lovelace"));
     assert_eq!(c.author().email(), Ok("ada@example.com"));
@@ -344,80 +369,90 @@ fn three_patches_the_second_conflicts() {
     assert_eq!(inbox_from_message(message), Some((1, p1)));
     assert!(message.contains("Agentfs-Trigger: patch\n"), "{message}");
     assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.inbox_commits(3), 1);
     assert_eq!(f.reference(&applied_ref("vol", 1)), Some(p1));
     assert_eq!(f.reference(&inbox_ref("vol", 1)), None);
 
-    let blocked = report.blocked.clone().unwrap();
-    assert_eq!(blocked.inbox, 2);
-    assert_eq!(blocked.reason, BlockReason::Conflict);
-    assert_eq!(blocked.paths, ["b.txt"]);
-    assert_eq!(blocked.patch, Some(p2.to_string()));
-    assert_eq!(report.queue_depth, 2);
-    assert_eq!(report.last_applied, 1);
+    assert_eq!(report.blocked, None);
+    assert_eq!(report.set_aside.len(), 1);
+    let (n, verdict) = &report.set_aside[0];
+    assert_eq!(*n, 2);
+    let Verdict::Held {
+        reason,
+        message,
+        paths,
+    } = verdict
+    else {
+        panic!("{verdict:?}");
+    };
+    assert_eq!(*reason, BlockReason::Conflict);
+    assert_eq!(paths, &["b.txt"]);
+    assert!(message.contains("conflicts in b.txt"), "{message}");
+    assert_eq!(report.queue_depth, 1);
+    assert_eq!(report.last_applied, 3);
     assert_eq!(f.reference(&inbox_ref("vol", 2)), Some(p2));
-    assert_eq!(f.reference(&inbox_ref("vol", 3)), Some(p3));
+    assert_eq!(f.reference(&held_ref("vol", 2)), Some(p2));
+    assert_eq!(f.reference(&inbox_ref("vol", 3)), None);
 
-    // The tree has 1's change and not 3's; b.txt is the workload's.
+    // The tree has 1's and 3's changes; b.txt is the workload's.
     assert_eq!(f.read("a.txt").as_deref(), Some("a1\n"));
     assert_eq!(f.read("b.txt").as_deref(), Some("b-from-workload\n"));
-    assert_eq!(f.read("c.txt"), None);
-    assert_eq!(f.at_head("a.txt").as_deref(), Some("a1\n"));
+    assert_eq!(f.read("c.txt").as_deref(), Some("c\n"));
+    assert_eq!(f.at_head("c.txt").as_deref(), Some("c\n"));
 
     let state = PatchState::load(&f.state.patch_state());
-    assert_eq!(state.queue_depth, 2);
-    assert_eq!(state.last_applied, 1);
-    assert_eq!(
-        state.blocked.as_ref().map(|b| b.reason),
-        Some(BlockReason::Conflict)
-    );
+    assert_eq!(state.queue_depth, 1);
+    assert_eq!(state.held, 1);
+    assert_eq!(state.last_applied, 3);
+    assert_eq!(state.blocked, None);
     assert_eq!(
         state.summary(),
-        "last applied 1, 2 queued, blocked at 2 (conflict)"
+        "last applied 3, 1 queued (1 set aside), ok"
     );
 
     let status = read_status(f.repo(), report.status).unwrap();
     assert_eq!(f.reference(&status_ref("vol")), Some(report.status));
-    assert_eq!(status.applied_now, [1]);
-    assert_eq!(status.last_applied.as_ref().unwrap().patch, p1.to_string());
-    assert_eq!(
-        status.last_applied.as_ref().unwrap().commit,
-        commit.to_string()
-    );
-    assert_eq!(
-        status.queue.iter().map(|q| q.inbox).collect::<Vec<_>>(),
-        [2, 3]
-    );
-    assert_eq!(status.blocked, report.blocked);
-    assert_eq!(status.head, Some(commit.to_string()));
+    assert_eq!(status.applied_now, [1, 3]);
+    assert_eq!(status.last_applied.as_ref().unwrap().inbox, 3);
+    assert_eq!(status.last_applied.as_ref().unwrap().patch, p3.to_string());
+    assert_eq!(status.queue.len(), 1);
+    assert_eq!(status.queue[0].inbox, 2);
+    assert_eq!(status.queue[0].verdict.as_ref(), Some(verdict));
+    assert_eq!(status.blocked, None);
+    assert_eq!(status.head, Some(f.head().to_string()));
 
     let events = f.events();
-    let applied = events
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::PatchBlocked { .. })),
+        "{events:?}"
+    );
+    let held = events
         .iter()
-        .find(|e| matches!(e, Event::PatchApplied { .. }))
+        .find(|e| matches!(e, Event::PatchHeld { .. }))
         .unwrap();
-    assert!(!applied.is_alarm());
-    let blocked_event = events
-        .iter()
-        .find(|e| matches!(e, Event::PatchBlocked { .. }))
-        .unwrap();
-    assert!(blocked_event.is_alarm());
+    assert!(held.is_alarm());
     assert!(matches!(
-        blocked_event,
-        Event::PatchBlocked {
+        held,
+        Event::PatchHeld {
             inbox: 2,
+            verdict: "held",
             reason: "conflict",
-            queued: 2,
             ..
         }
     ));
 
-    // A rerun changes nothing and blocks the same way.
+    // A rerun retries 2: still held, nothing else changes, and inbox/2 is
+    // not stale although 3 is applied.
+    let head = f.head();
     let again = f.process();
     assert!(again.applied.is_empty());
-    assert_eq!(again.blocked.map(|b| b.inbox), Some(2));
-    assert_eq!(f.head(), commit);
+    assert!(again.ignored.is_empty(), "{:?}", again.ignored);
+    assert_eq!(again.set_aside.len(), 1);
+    assert_eq!(f.head(), head);
 
-    // Rebased onto the head, 2 applies, and 3 after it.
+    // Rebased onto the head, 2 lands, after 3.
     let p2b = f.patch(
         f.head(),
         &[("b.txt", Some("b-merged\n"))],
@@ -427,30 +462,126 @@ fn three_patches_the_second_conflicts() {
     let report = f.process();
     assert_eq!(
         report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-        [2, 3]
+        [2]
     );
     assert_eq!(report.blocked, None);
+    assert!(report.set_aside.is_empty());
     assert_eq!(report.queue_depth, 0);
+    assert_eq!(report.last_applied, 3);
     assert_eq!(f.read("b.txt").as_deref(), Some("b-merged\n"));
-    assert_eq!(f.read("c.txt").as_deref(), Some("c\n"));
-    assert_eq!(f.at_head("c.txt").as_deref(), Some("c\n"));
     for n in 1..=3 {
         assert_eq!(f.inbox_commits(n), 1, "patch {n}");
         assert_eq!(f.reference(&inbox_ref("vol", n)), None);
     }
+    assert_eq!(f.reference(&held_ref("vol", 2)), None);
     assert_eq!(f.reference(&applied_ref("vol", 2)), Some(p2b));
     let state = PatchState::load(&f.state.patch_state());
     assert_eq!(state.queue_depth, 0);
+    assert_eq!(state.held, 0);
     assert_eq!(state.blocked, None);
     assert_eq!(state.last_applied, 3);
     let status = read_status(f.repo(), report.status).unwrap();
-    assert_eq!(status.blocked, None);
+    assert_eq!(status.last_applied.as_ref().unwrap().inbox, 3);
     assert!(status.queue.is_empty());
+}
+
+/// Without its held mark, a set-aside number below the high-water is
+/// stale: the mark is what keeps it queued (P2).
+#[test]
+fn a_set_aside_number_is_judged_again_only_with_its_mark() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("b.txt", Some("iac\n"))], "edit b");
+    let p2 = f.patch(base, &[("c.txt", Some("c\n"))], "add c");
+    f.change(&[("b.txt", "workload\n")], &[]);
+    f.queue(1, p1);
+    f.queue(2, p2);
+    assert_eq!(f.process().set_aside.len(), 1);
+    f.repo()
+        .find_reference(&held_ref("vol", 1))
+        .unwrap()
+        .delete()
+        .unwrap();
+    let report = f.process();
+    assert!(report.set_aside.is_empty());
+    assert_eq!(report.ignored.len(), 1);
+    assert_eq!(report.ignored[0].why, "stale");
+}
+
+/// Crash (b) on a set-aside number below the high-water, then the
+/// producer skips it: the interrupted write is put back (the branch has
+/// not applied that number, whatever the high-water says), and the skip
+/// lands once (P3).
+#[test]
+fn crash_after_the_tree_write_below_the_high_water() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("b.txt", Some("iac\n"))], "edit b");
+    let p2 = f.patch(base, &[("c.txt", Some("c\n"))], "add c");
+    f.change(&[("b.txt", "workload\n")], &[]);
+    f.queue(1, p1);
+    f.queue(2, p2);
+    let report = f.process();
+    assert_eq!(report.last_applied, 2);
+    // 1, rebased, was being written when the process died.
+    let p1b = f.patch(f.head(), &[("b.txt", Some("merged\n"))], "edit b, rebased");
+    f.queue(1, p1b);
+    note_in_flight(&f, 1, p1b, &["b.txt"]);
+    fs::write(f.root.join("b.txt"), "merged\n").unwrap();
+    // The producer gives up on it.
+    let skip = f.patch(f.head(), &[], "agentfs: skip patch 1");
+    f.queue(1, skip);
+
+    let report = f.process();
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(f.read("b.txt").as_deref(), Some("workload\n"));
+    assert_eq!(f.at_head("b.txt").as_deref(), Some("workload\n"));
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.reference(&held_ref("vol", 1)), None);
+    assert_eq!(PatchState::load(&f.state.patch_state()).in_flight, None);
+}
+
+/// The same crash with the patch still queued: it lands once, and the
+/// tree matches history.
+#[test]
+fn crash_after_the_tree_write_of_a_set_aside_patch_still_queued() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("b.txt", Some("iac\n"))], "edit b");
+    let p2 = f.patch(base, &[("c.txt", Some("c\n"))], "add c");
+    f.change(&[("b.txt", "workload\n")], &[]);
+    f.queue(1, p1);
+    f.queue(2, p2);
+    f.process();
+    let p1b = f.patch(f.head(), &[("b.txt", Some("merged\n"))], "edit b, rebased");
+    f.queue(1, p1b);
+    note_in_flight(&f, 1, p1b, &["b.txt"]);
+    fs::write(f.root.join("b.txt"), "merged\n").unwrap();
+    let report = f.process();
+    assert_eq!(report.applied.len(), 1, "{report:?}");
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.at_head("b.txt").as_deref(), Some("merged\n"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("merged\n"));
 }
 
 /// Crash (a): the commit is made, the refs are not moved.
 #[test]
 fn crash_between_commit_and_ref_move() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p1);
@@ -479,6 +610,9 @@ fn crash_between_commit_and_ref_move() {
 /// Crash (b): the tree is written, nothing is recorded.
 #[test]
 fn crash_after_the_tree_write() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
     let p1 = f.patch(
         f.head(),
@@ -511,6 +645,9 @@ fn crash_after_the_tree_write() {
 /// Crash (c): the record is journaled, not committed.
 #[test]
 fn crash_before_the_commit() {
+    if !have_git() {
+        return;
+    }
     let mut f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p1);
@@ -519,8 +656,14 @@ fn crash_before_the_commit() {
         let repo = f.repo();
         let head = repo.find_commit(f.head()).unwrap();
         let patch = repo.find_commit(p1).unwrap();
-        let mut index = repo.cherrypick_commit(&patch, &head, 0, None).unwrap();
-        let merged = index.write_tree_to(repo).unwrap();
+        let branch = PatchBranch::read(repo, head.id(), p1).unwrap();
+        let Integrated::Clean { tree: merged } = GitMergeTree::new(f.state.git())
+            .integrate(head.id(), &branch)
+            .unwrap()
+        else {
+            panic!("the patch conflicts");
+        };
+        repo.odb().unwrap().refresh().unwrap();
         let plan = restore::plan_tree(repo, head.id(), p1, merged, "edit a".into()).unwrap();
         let tree = f.dir();
         let plan = restore::check(plan, repo, &f.recorder, &NoLfs, &tree, &NotLive, false).unwrap();
@@ -555,6 +698,9 @@ fn crash_before_the_commit() {
 
 #[test]
 fn a_patch_that_changes_nothing_gets_a_marker_commit() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let base = f.head();
     f.change(&[("a.txt", "a1\n")], &[]);
@@ -577,6 +723,9 @@ fn a_patch_that_changes_nothing_gets_a_marker_commit() {
 
 #[test]
 fn a_gap_blocks() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
     f.queue(1, p1);
@@ -593,7 +742,10 @@ fn a_gap_blocks() {
 }
 
 #[test]
-fn merge_commits_root_commits_and_foreign_parents_block() {
+fn merge_commits_root_commits_and_foreign_parents_are_held() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let head = f.head();
     let repo = f.repo();
@@ -619,13 +771,21 @@ fn merge_commits_root_commits_and_foreign_parents_block() {
     for (oid, reason) in cases {
         f.queue(1, oid);
         let report = f.process();
-        assert_eq!(report.blocked.map(|b| b.reason), Some(reason));
+        assert_eq!(report.blocked, None);
+        assert!(
+            matches!(&report.set_aside[..], [(1, Verdict::Held { reason: r, .. })] if *r == reason),
+            "{:?}",
+            report.set_aside
+        );
         assert_eq!(f.head(), head);
     }
 }
 
 #[test]
 fn gitlinks_are_unsupported() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let repo = f.repo();
     let parent = repo.find_commit(f.head()).unwrap();
@@ -638,13 +798,19 @@ fn gitlinks_are_unsupported() {
         .commit(None, &sig, &sig, "submodule", &tree, &[&parent])
         .unwrap();
     f.queue(1, p);
-    let blocked = f.process().blocked.unwrap();
-    assert_eq!(blocked.reason, BlockReason::Unsupported);
-    assert_eq!(blocked.paths, ["sub"]);
+    let report = f.process();
+    let [(1, Verdict::Held { reason, paths, .. })] = &report.set_aside[..] else {
+        panic!("{report:?}");
+    };
+    assert_eq!(*reason, BlockReason::Unsupported);
+    assert_eq!(paths, &["sub"]);
 }
 
 #[test]
 fn unrecorded_changes_block_and_leave_the_tree_alone() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p1);
@@ -660,6 +826,9 @@ fn unrecorded_changes_block_and_leave_the_tree_alone() {
 
 #[test]
 fn stale_entries_are_ignored_and_do_not_block() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
     f.queue(1, p1);
@@ -698,6 +867,9 @@ fn stale_entries_are_ignored_and_do_not_block() {
 
 #[test]
 fn the_scan_cache_is_not_authoritative() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
     f.queue(1, p1);
@@ -742,6 +914,9 @@ fn note_in_flight(f: &Fixture, n: u64, p: Oid, paths: &[&str]) {
 /// tree or history.
 #[test]
 fn crash_after_the_tree_write_then_the_patch_is_skipped() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
     let base = f.head();
     let p1 = f.patch(
@@ -783,6 +958,9 @@ fn crash_after_the_tree_write_then_the_patch_is_skipped() {
 /// recorded as they stand, so the tree still matches history.
 #[test]
 fn an_interrupted_write_that_cannot_be_put_back_is_recorded() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "patch");
     note_in_flight(&f, 1, p1, &["a.txt"]);
@@ -802,6 +980,9 @@ fn an_interrupted_write_that_cannot_be_put_back_is_recorded() {
 /// The same patch still queued: the run applies it as usual.
 #[test]
 fn an_interrupted_write_of_a_patch_still_queued_is_applied() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "patch");
     f.queue(1, p1);
@@ -816,6 +997,9 @@ fn an_interrupted_write_of_a_patch_still_queued_is_applied() {
 /// A queue that cannot run is recorded as blocked, for the gauges.
 #[test]
 fn a_failed_run_is_recorded_as_blocked() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     f.process();
     let before = PatchState::load(&f.state.patch_state());
@@ -825,6 +1009,7 @@ fn a_failed_run_is_recorded_as_blocked() {
     fs::write(f.state.git().join("refs/agentfs/vol/status.lock"), "").unwrap();
     let tree = f.dir();
     let telemetry = Telemetry::noop();
+    let integrator = GitMergeTree::new(f.state.git());
     let mut queue = Queue::new(QueueContext {
         state: &f.state,
         recorder: &f.recorder,
@@ -833,6 +1018,8 @@ fn a_failed_run_is_recorded_as_blocked() {
         objects: &NoLfs,
         telemetry: &telemetry,
         caller: CALLER,
+        integrator: &integrator,
+        rule: &CleanMerge as &dyn AcceptanceRule,
     });
     assert!(queue.process(None).is_err());
     let after = PatchState::load(&f.state.patch_state());
@@ -849,6 +1036,9 @@ fn a_failed_run_is_recorded_as_blocked() {
 /// A stale entry is a warning event.
 #[test]
 fn ignored_entries_raise_a_warning() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
     f.queue(1, p1);
@@ -878,6 +1068,9 @@ fn ignored_entries_raise_a_warning() {
 /// marker commit carrying its inbox number, with nothing merged.
 #[test]
 fn a_patch_commit_queued_twice_applies_once() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p);
@@ -935,6 +1128,9 @@ fn a_patch_commit_queued_twice_applies_once() {
 /// patched file, leaves the file reverted.
 #[test]
 fn a_duplicate_never_reapplies_a_reverted_change() {
+    if !have_git() {
+        return;
+    }
     let mut f = Fixture::new(&[("a.txt", "a0\n")]);
     let p = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p);
@@ -949,4 +1145,222 @@ fn a_duplicate_never_reapplies_a_reverted_change() {
     assert!(report.applied.is_empty());
     assert_eq!(f.read("a.txt").as_deref(), Some("a0\n"));
     assert_eq!(f.at_head("a.txt").as_deref(), Some("a0\n"));
+}
+
+impl Fixture {
+    /// [`Queue::judge`] with the volume open, as a daemon judges it.
+    fn judge(&self) -> super::queue::Judgement {
+        let integrator = GitMergeTree::new(self.state.git());
+        let events: Events = self.sink.clone();
+        super::queue::Queue::judge(&super::queue::JudgeContext {
+            state: &self.state,
+            history: self.committer.history(),
+            integrator: &integrator,
+            rule: &CleanMerge,
+            events: &events,
+            telemetry: &Telemetry::noop(),
+            committer: &crate::identity::Identity {
+                name: "agentfs".into(),
+                email: "agentfs@pod-0".into(),
+            },
+            fetch: None,
+        })
+        .unwrap()
+    }
+
+    /// Every ref but the status ref, with its target.
+    fn refs_but_status(&self) -> Vec<(String, Oid)> {
+        let mut out: Vec<(String, Oid)> = self
+            .repo()
+            .references()
+            .unwrap()
+            .map(|r| r.unwrap())
+            .filter(|r| r.name().ok() != Some(status_ref("vol").as_str()))
+            .map(|r| (r.name().unwrap().to_owned(), r.target().unwrap()))
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+/// Bead agentfs-mia.5: judging lands nothing, writes no ref but the status
+/// and no file of the tree, and every patch that would land is ready,
+/// judged against the same head; the status carries the verdicts.
+#[test]
+fn judging_writes_only_the_status() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("a.txt", Some("a1\n"))], "edit a");
+    let p2 = f.patch(base, &[("b.txt", Some("b-from-iac\n"))], "edit b");
+    let p3 = f.patch(base, &[("a.txt", Some("a-again\n"))], "edit a again");
+    f.change(&[("b.txt", "b-from-workload\n")], &[]);
+    for (n, p) in [(1, p1), (2, p2), (3, p3)] {
+        f.queue(n, p);
+    }
+    let head = f.head();
+    let refs = f.refs_but_status();
+    let cache_before = PatchState::load(&f.state.patch_state());
+
+    let judgement = f.judge();
+    assert_eq!(f.head(), head, "nothing landed");
+    assert_eq!(f.refs_but_status(), refs, "no ref but the status moved");
+    assert_eq!(f.read("a.txt").as_deref(), Some("a0\n"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("b-from-workload\n"));
+    let kinds: Vec<(u64, &str)> = judgement
+        .verdicts
+        .iter()
+        .map(|(n, v)| (*n, v.kind()))
+        .collect();
+    // 3 changes a.txt as 1 does: judged against the same head, it is ready
+    // too (ready is advisory until a landing).
+    assert_eq!(kinds, [(1, "ready"), (2, "held"), (3, "ready")]);
+    assert_eq!(judgement.blocked, None);
+    assert_eq!(
+        f.reference(&status_ref("vol")),
+        Some(judgement.status),
+        "the status ref is written"
+    );
+    let doc = read_status(f.repo(), judgement.status).unwrap();
+    assert_eq!(doc.queue.len(), 3);
+    assert_eq!(doc.queue[0].verdict, Some(Verdict::Ready));
+    assert!(doc.applied_now.is_empty());
+    let cache = PatchState::load(&f.state.patch_state());
+    assert_eq!(cache.queue_depth, 3);
+    assert_eq!(cache.held, 1);
+    assert_eq!(cache.status_oid, Some(judgement.status.to_string()));
+    assert_eq!(cache.scanned_head, cache_before.scanned_head);
+    assert_eq!(cache.last_applied, cache_before.last_applied);
+    assert!(
+        f.events()
+            .iter()
+            .any(|e| matches!(e, Event::PatchHeld { inbox: 2, .. })),
+        "a held patch is alarmed as at a run"
+    );
+
+    // A run lands by the same rules: 1 lands, and 3, ready against the old
+    // head, now conflicts with it.
+    let report = f.process();
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1]
+    );
+    let kinds: Vec<(u64, &str)> = report
+        .set_aside
+        .iter()
+        .map(|(n, v)| (*n, v.kind()))
+        .collect();
+    assert_eq!(kinds, [(2, "held"), (3, "held")]);
+}
+
+/// A notifier that records each notice and fails while told to.
+#[derive(Default)]
+struct Recording {
+    seen: std::sync::Mutex<Vec<notify::Notice>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl notify::Notifier for Arc<Recording> {
+    fn name(&self) -> &'static str {
+        "hook"
+    }
+
+    fn notify(&self, notice: &notify::Notice) -> Result<(), notify::NotifyError> {
+        self.seen.lock().unwrap().push(notice.clone());
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(notify::NotifyError::Hook("exited with 1".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Bead agentfs-mia.5, P1: the cursor moves only after every method
+/// delivered, so a failed notice is sent again at the next run, and once
+/// delivered, nothing more.
+#[test]
+fn a_failed_notice_is_sent_again() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("a.txt", Some("a1\n"))], "edit a");
+    let p2 = f.patch(base, &[("b.txt", Some("b-from-iac\n"))], "edit b");
+    f.change(&[("b.txt", "b-from-workload\n")], &[]);
+    f.queue(1, p1);
+    f.queue(2, p2);
+    let recording = Arc::new(Recording::default());
+    let notifiers: Vec<Box<dyn notify::Notifier>> = vec![Box::new(recording.clone())];
+    let events: Events = f.sink.clone();
+    let deliver = |status: Oid, landed: &[(u64, Oid)]| {
+        notify::deliver(
+            &f.state,
+            f.repo(),
+            status,
+            landed,
+            None,
+            &notifiers,
+            &events,
+        )
+        .unwrap()
+    };
+
+    recording
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let report = f.process();
+    let first = deliver(report.status, &report.applied);
+    assert_eq!(
+        first,
+        notify::Delivery {
+            sent: true,
+            failed: vec!["hook".into()]
+        }
+    );
+    assert!(f.events().iter().any(|e| matches!(
+        e,
+        Event::NotifyFailed { method: "hook", message } if message.contains("exited with 1")
+    )));
+    assert_eq!(
+        notify::NotifyCursor::load(&f.state.notify_state()).delivered_status,
+        None
+    );
+
+    // The next run changes nothing, and sends the same changes again.
+    recording
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let again = f.process();
+    assert!(again.applied.is_empty());
+    assert_eq!(
+        deliver(again.status, &again.applied).failed,
+        Vec::<String>::new()
+    );
+    let seen = recording.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    let changes = |n: &notify::Notice| {
+        n.changes
+            .iter()
+            .map(|c| {
+                (
+                    c.inbox,
+                    c.to.as_ref().map(Verdict::kind),
+                    c.landed.is_some(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        changes(&seen[0]),
+        [(1, None, true), (2, Some("held"), false)]
+    );
+    assert_eq!(changes(&seen[1]), changes(&seen[0]));
+    assert_eq!(seen[1].changes[0].patch, p1.to_string());
+
+    // Delivered: nothing more.
+    let third = f.process();
+    assert!(!deliver(third.status, &third.applied).sent);
+    assert_eq!(recording.seen.lock().unwrap().len(), 2);
 }
