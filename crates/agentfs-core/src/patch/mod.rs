@@ -31,7 +31,9 @@
 //! ([`crate::push::RemotePusher::push_once`], stage `queue`), never in
 //! the branch push.
 
+pub mod accept;
 pub mod fetch;
+pub mod integrate;
 pub mod queue;
 pub mod status;
 pub mod submit;
@@ -70,6 +72,35 @@ pub fn inbox_ref(volume: &str, n: u64) -> String {
 pub fn applied_ref(volume: &str, n: u64) -> String {
     format!("{}{}", applied_prefix(volume), format_seq(n))
 }
+
+/// `refs/agentfs/<volume>/held/` (bead agentfs-mia.2).
+pub fn held_prefix(volume: &str) -> String {
+    format!("refs/agentfs/{volume}/held/")
+}
+
+/// Where patch `n` is marked as set aside (held, waiting, awaiting or not
+/// judged) by this volume's queue: the patch commit it set aside. The mark
+/// keeps `inbox/<n>` from being judged stale once later numbers land; it
+/// is deleted when `n` lands or its inbox ref is withdrawn (bead
+/// agentfs-mia.2). Local only: never pushed.
+pub fn held_ref(volume: &str, n: u64) -> String {
+    format!("{}{}", held_prefix(volume), format_seq(n))
+}
+
+/// `refs/agentfs/<volume>/approved/` (bead agentfs-mia.2).
+pub fn approved_prefix(volume: &str) -> String {
+    format!("refs/agentfs/{volume}/approved/")
+}
+
+/// Where `agentfs patch approve <n>` records its approval on the patch
+/// remote: the tip it approved (bead agentfs-mia.2).
+pub fn approved_ref(volume: &str, n: u64) -> String {
+    format!("{}{}", approved_prefix(volume), format_seq(n))
+}
+
+/// The trailer that makes a patch a barrier, read only from the last
+/// message paragraph of the patch's tip, value `yes` (bead agentfs-mia.2).
+pub const BARRIER_TRAILER: &str = "Agentfs-Barrier";
 
 /// The queue's status ref.
 pub fn status_ref(volume: &str) -> String {
@@ -196,6 +227,41 @@ impl Blocked {
         }
         self.reason.hint().replace("<n>", &self.inbox.to_string())
     }
+}
+
+/// What the queue decided about a patch it did not land (bead
+/// agentfs-mia.2): kept in `status.json` beside each queued entry. A
+/// patch with a verdict is set aside and the queue goes on past it; a
+/// queued entry with none was not reached (the queue stopped before it,
+/// [`Blocked`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Verdict {
+    /// Not landed until it is replaced or skipped, or (for `conflict`) a
+    /// later run merges it cleanly. `reason` is one that
+    /// `BlockReason::holds_whole` (bead agentfs-mia.2) says holds.
+    Held {
+        reason: BlockReason,
+        message: String,
+        #[serde(default)]
+        paths: Vec<String>,
+    },
+    /// Behind earlier set-aside patches: `behind` are their numbers.
+    Waiting { why: WaitReason, behind: Vec<u64> },
+    /// The acceptance rule has not accepted it yet.
+    Awaiting { what: accept::AwaitWhat },
+    /// The acceptance rule could not judge it (an alarm is raised).
+    NotJudged { rule: String, message: String },
+}
+
+/// Why a patch waits (bead agentfs-mia.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    /// It changes a path an earlier set-aside patch changes.
+    SameFiles,
+    /// An earlier set-aside patch is a barrier.
+    Barrier,
 }
 
 /// An inbox entry the queue does not apply and that does not block it.

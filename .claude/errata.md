@@ -277,3 +277,26 @@ Neither stopped the work; each was resolved as below.
    timing" row amended. git2-rs's push progress callbacks cannot return an error, so libgit2
    offers no abort point after the negotiation: the brief's "cancel in the transfer callbacks"
    was not available, and the whole local transfer is waited for, not only its ref update.
+
+## 2026-10-29, merge-queue code architect (agentfs-mia.4 .. mia.8 frozen pages)
+
+1. **Keep-going cannot keep today's stale check word for word (mia.2).** The brief
+   (`.handoff/mia-features.md`) keeps "inbox numbering, the high-water mark and the stale check"
+   unchanged and also orders feature 2, "a conflicting patch is held whole and the rest go on".
+   Today (`patch/queue.rs:191-215`, design §12 "Idempotency") an inbox entry at or below the last
+   applied number that the branch did not apply is `stale`: never applied, reported, ignored. Once
+   held patch `n` is passed and `n+1` lands, the high-water is `n+1` and `inbox/<n>` reads as
+   stale. Resolution written into mia.2's page (a choice, revisable): the queue marks a number it
+   sets aside with a local ref `refs/agentfs/<volume>/held/<n>` before it judges `n+1`; an inbox
+   entry with that mark is judged again, never stale. Every entry without the mark is judged as
+   today; numbering, the high-water (highest `Agentfs-Inbox` trailer), the gap rule and the trailer
+   done-rule are unchanged. Same root, same bead: `recover_in_flight` tests "the branch has applied
+   that number" as `f.inbox <= last_applied` (`queue.rs:669`), which a set-aside number below the
+   high-water breaks; mia.2 changes that test to the trailer scan, which is what its doc comment
+   already says. Needs the main session's confirmation before mia.2 is implemented.
+2. **No CSI profile has a delivery webhook (mia.5).** The brief says notify under CSI goes to "the
+   profile's delivery webhook". No such setting exists: the only webhook is fork delivery's
+   receiver-side `fork deliver --to webhook` (`fork/deliver.rs`), and the CSI driver never
+   delivers (§11.5). mia.5's page adds git-config keys (`agentfs.patchNotifyUrl`,
+   `agentfs.patchNotifyCredentialFile`, `agentfs.patchNotifyTimeout`) that any volume, and so a CSI
+   profile's config, can set; there is no CSI code in mia.5. Confirm the reading before mia.5.

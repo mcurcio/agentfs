@@ -107,6 +107,8 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs/fetch.rs` | LFS objects for restores and `agentfs lfs fetch`: cache first, then the remotes |
 | `lfs/fake.rs` | An in-process LFS server for tests |
 | `patch/mod.rs` | The patch queue for iac (§12) |
+| `patch/accept.rs` | Acceptance rules: whether a cleanly merged patch may land (clean merge, approval, the `patch-accept` hook) |
+| `patch/integrate.rs` | A patch branch, and merging it onto the branch head with the `git` program |
 | `patch/submit.rs` | `agentfs patch submit`: the producer side, driving the producer's own `git` |
 | `patch/fetch.rs` | Fetching the inbox refs from the patch remote, best effort |
 | `patch/queue.rs` | Applying the queue at mount, before the workload sees the tree |
