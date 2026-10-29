@@ -67,7 +67,7 @@ use opentelemetry::KeyValue;
 
 use super::accept::{Acceptance, AcceptanceRule, Candidate};
 use super::fetch::FetchOutcome;
-use super::integrate::{Integrated, Integrator, PatchBranch, Refusal};
+use super::integrate::{IntegrateError, Integrated, Integrator, PatchBranch, Refusal};
 use super::status::{
     AppliedEntry, DuplicateEntry, FetchStatus, InFlight, PatchState, QueueEntry, STATUS_VERSION,
     StatusDoc, write_status_ref,
@@ -89,6 +89,11 @@ use crate::volume::{Committer, OperationSpec, Recorder, StateDir};
 /// Inputs per record when a partial write is recorded.
 const PARTIAL_RECORD_CHUNK: usize = 4096;
 
+/// The rule a merge driver that cannot run is alarmed as
+/// (`PatchRuleFailed`; bead agentfs-mia.3): its verdict's rule is
+/// `merge driver <name>`.
+const MERGE_RULE: &str = "merge";
+
 /// What the queue runs against.
 pub struct QueueContext<'a> {
     pub state: &'a StateDir,
@@ -102,8 +107,8 @@ pub struct QueueContext<'a> {
     pub telemetry: &'a Telemetry,
     /// The applying process: the operations' actor and operator.
     pub caller: Caller,
-    /// How patches are merged onto the head (bead agentfs-mia.3 adds a
-    /// choice).
+    /// How patches are merged onto the head (`agentfs.patchIntegrate`,
+    /// [`super::integrate::integrator`]).
     pub integrator: &'a dyn Integrator,
     /// Whether a cleanly merged patch may land (`agentfs.patchAccept`,
     /// [`super::accept::rule`]).
@@ -150,6 +155,14 @@ enum Judged {
     Aside(Aside),
     /// The run stops at it.
     Stop(Blocked),
+}
+
+/// Why a patch did not merge onto the head.
+enum Unmerged {
+    /// A conflict, or a merge that could not run: [`refused`] decides.
+    Refused(Refusal),
+    /// A merge driver could not run: the patch is not judged.
+    NotJudged { rule: String, message: String },
 }
 
 /// A patch set aside, as later patches of the same run see it.
@@ -497,8 +510,12 @@ impl<'a> Queue<'a> {
                 reason: reason.as_str(),
                 message: message.clone(),
             }),
-            Verdict::NotJudged { message, .. } => {
-                let rule = self.cx.rule.name();
+            Verdict::NotJudged { rule, message } => {
+                let rule = if rule == self.cx.rule.name() {
+                    self.cx.rule.name()
+                } else {
+                    MERGE_RULE
+                };
                 events.emit(Event::PatchHeld {
                     inbox: n,
                     patch: Some(patch),
@@ -644,7 +661,7 @@ impl<'a> Queue<'a> {
         }
         let merged = match self.integrate(head.id(), &branch)? {
             Ok(merged) => merged,
-            Err(refusal) => {
+            Err(Unmerged::Refused(refusal)) => {
                 return Ok(refused(
                     n,
                     patch_oid,
@@ -652,6 +669,13 @@ impl<'a> Queue<'a> {
                     Some(branch.paths.clone()),
                     branch.barrier,
                 ));
+            }
+            Err(Unmerged::NotJudged { rule, message }) => {
+                return Ok(Judged::Aside(Aside {
+                    verdict: Verdict::NotJudged { rule, message },
+                    paths: Some(branch.paths.clone()),
+                    barrier: branch.barrier,
+                }));
             }
         };
         let candidate = Candidate {
@@ -956,36 +980,58 @@ impl<'a> Queue<'a> {
             Ok(branch) => branch,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        Ok(self.integrate(head, &branch)?.map(|tree| (branch, tree)))
+        Ok(match self.integrate(head, &branch)? {
+            Ok(tree) => Ok((branch, tree)),
+            Err(Unmerged::Refused(refusal)) => Err(refusal),
+            Err(Unmerged::NotJudged { message, .. }) => Err(Refusal {
+                reason: BlockReason::Failed,
+                message,
+                paths: Vec::new(),
+            }),
+        })
     }
 
     /// Merges `branch` onto `head`: the merged tree, whose objects this
     /// repository then sees, or why it does not land (a conflict, a merge
-    /// that could not run).
+    /// that could not run, a merge driver that could not run).
     fn integrate(
         &self,
         head: Oid,
         branch: &PatchBranch,
-    ) -> Result<Result<Oid, Refusal>, PatchError> {
+    ) -> Result<Result<Oid, Unmerged>, PatchError> {
         let repo = self.cx.committer.history().repo();
         let tree = match self.cx.integrator.integrate(head, branch) {
             Ok(Integrated::Clean { tree }) => tree,
             Ok(Integrated::Conflict { paths }) => {
-                return Ok(Err(Refusal {
+                return Ok(Err(Unmerged::Refused(Refusal {
                     reason: BlockReason::Conflict,
                     message: format!(
                         "merging onto the branch head {head} conflicts in {}",
                         paths.join(", ")
                     ),
                     paths,
-                }));
+                })));
+            }
+            Err(IntegrateError::DriverNotWorking {
+                driver,
+                path,
+                detail,
+            }) => {
+                let rule = format!("{MERGE_RULE} driver {driver}");
+                let message = IntegrateError::DriverNotWorking {
+                    driver,
+                    path,
+                    detail,
+                }
+                .to_string();
+                return Ok(Err(Unmerged::NotJudged { rule, message }));
             }
             Err(e) => {
-                return Ok(Err(Refusal {
+                return Ok(Err(Unmerged::Refused(Refusal {
                     reason: BlockReason::Failed,
                     message: e.to_string(),
                     paths: Vec::new(),
-                }));
+                })));
             }
         };
         // The objects git wrote, for this repository's object database.

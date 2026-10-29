@@ -23,7 +23,7 @@ use agentfs_core::lfs::fetch::Fetcher;
 use agentfs_core::lock::StateLock;
 use agentfs_core::patch::accept;
 use agentfs_core::patch::fetch::{FetchOutcome, fetch_inbox};
-use agentfs_core::patch::integrate::GitMergeTree;
+use agentfs_core::patch::integrate;
 use agentfs_core::patch::queue::{Queue, QueueContext, QueueReport, record_failure};
 use agentfs_core::patch::status::{PatchState, StatusDoc, read_status};
 use agentfs_core::patch::status_ref;
@@ -395,7 +395,7 @@ fn apply_queue_inner(
     };
     let tree = Dir::open(root).with_context(|| format!("opening {}", root.display()))?;
     let objects = Fetcher::new(state, settings).context("opening the LFS cache")?;
-    let integrator = GitMergeTree::new(state.git());
+    let integrator = integrate::integrator(settings.patch_integrate, &state.git());
     let rule = accept::rule(
         settings.patch_accept,
         &state.git(),
@@ -413,7 +413,7 @@ fn apply_queue_inner(
             gid: current_gid(),
             pid: std::process::id(),
         },
-        integrator: &integrator,
+        integrator: integrator.as_ref(),
         rule: rule.as_ref(),
     });
     let report = queue

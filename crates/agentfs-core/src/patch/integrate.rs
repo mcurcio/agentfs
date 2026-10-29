@@ -23,10 +23,24 @@
 //! repository's `HEAD:.gitattributes`; 2.47 does not). For a
 //! one-commit patch that is the same three-way merge as libgit2's
 //! cherry-pick against its parent, which the queue used before.
-//! Bead agentfs-mia.3 adds the rebase strategy as a second implementation.
+//!
+//! Bead agentfs-mia.3 adds the rebase strategy, [`GitRebase`], and the one
+//! place a volume's `agentfs.patchIntegrate` ([`IntegrateMode`]) becomes an
+//! integrator, [`integrator`]. Both strategies merge with the same
+//! `git merge-tree` run, so both honour the merge drivers the operator
+//! names in `$GIT_DIR/info/attributes` (`merge=<name>`, the built-in
+//! `union`, `text`, `binary`, or a `merge.<name>.driver` of the
+//! repository's config: libgit2 cannot run those, design §17.3). A driver
+//! that cannot run makes the merge not judged
+//! ([`IntegrateError::DriverNotWorking`]), never a conflict: before the
+//! merge, a configured driver whose program is not an executable file
+//! ([`driver_program`]); during it, git's `failure to merge` (exit 128),
+//! which is what git 2.43 and 2.47 say when a driver is killed or exits
+//! above 128. A driver git can start that then exits 126 or 127 (its
+//! shell found no program) reads to git as a conflict, and is one.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use git2::{FileMode, Oid, Repository};
 
@@ -96,8 +110,45 @@ pub enum IntegrateError {
     /// `git` succeeded but its output is not what this build reads.
     #[error("reading the output of `git {args}`: {detail}")]
     BadOutput { args: String, detail: String },
+    /// A merge driver the operator configured could not run (not found,
+    /// not executable, killed): the merge is not judged. `path` is empty
+    /// when the path is not known (the check before the merge, and git's
+    /// `failure to merge`, which names none).
+    #[error("the merge driver {driver}{} could not run: {detail}", for_path(path))]
+    DriverNotWorking {
+        driver: String,
+        path: String,
+        detail: String,
+    },
     #[error(transparent)]
     Git(#[from] git2::Error),
+}
+
+fn for_path(path: &str) -> String {
+    if path.is_empty() {
+        String::new()
+    } else {
+        format!(" for {path}")
+    }
+}
+
+/// `agentfs.patchIntegrate`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IntegrateMode {
+    /// `merge`, the default: [`GitMergeTree`].
+    #[default]
+    Merge,
+    /// `rebase`: [`GitRebase`].
+    Rebase,
+}
+
+/// The one place a mode becomes an integrator, on the state area's git
+/// directory `git_dir`.
+pub fn integrator(mode: IntegrateMode, git_dir: &Path) -> Box<dyn Integrator> {
+    match mode {
+        IntegrateMode::Merge => Box::new(GitMergeTree::new(git_dir)),
+        IntegrateMode::Rebase => Box::new(GitRebase::new(git_dir)),
+    }
 }
 
 /// Merges a patch branch onto a branch head (see the module docs).
@@ -116,6 +167,19 @@ pub trait Integrator {
 /// base (see the module docs).
 #[derive(Debug, Clone)]
 pub struct GitMergeTree {
+    /// The `git` program, looked up in [`git_cli::GIT_PATH`].
+    git: PathBuf,
+    /// The state area's git directory.
+    git_dir: PathBuf,
+}
+
+/// Rebase: each commit of the patch replayed onto the head in order
+/// (`git merge-tree --write-tree --merge-base=<c^> <cur> <c>`, `cur` a
+/// throwaway `git commit-tree` of the previous result, never referenced);
+/// the first commit that conflicts is the conflict (its paths). The result
+/// tree lands as one record, like Merge.
+#[derive(Debug, Clone)]
+pub struct GitRebase {
     /// The `git` program, looked up in [`git_cli::GIT_PATH`].
     git: PathBuf,
     /// The state area's git directory.
@@ -318,89 +382,266 @@ impl GitMergeTree {
             git_dir: git_dir.into(),
         }
     }
-
-    /// The arguments after `git` that merge `patch` onto `head`.
-    fn args(head: Oid, patch: &PatchBranch) -> Vec<String> {
-        let mut args: Vec<String> = GIT_MERGE_TREE_ARGS.iter().map(|a| a.to_string()).collect();
-        args.extend([
-            "-z".to_owned(),
-            "--name-only".to_owned(),
-            "--no-messages".to_owned(),
-            format!("--merge-base={}", patch.base),
-            head.to_string(),
-            patch.tip.to_string(),
-        ]);
-        args
-    }
-
-    /// `git --version` as (major, minor), when it can be read.
-    fn version(&self) -> Option<(u32, u32)> {
-        let out = git_cli::command(&self.git, &self.git_dir)
-            .arg("--version")
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut numbers = text.split_whitespace().nth(2)?.split('.');
-        Some((numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?))
-    }
 }
 
 impl Integrator for GitMergeTree {
-    /// `git <GIT_MERGE_TREE_ARGS> -z --name-only --no-messages
-    /// --merge-base=<base> <head> <tip>`: exit 0 is a clean merge (the
-    /// first NUL-terminated field is the tree), exit 1 a conflict (the
-    /// tree, then the conflicted paths up to an empty field); anything else
-    /// is [`IntegrateError::Failed`], output it cannot read
-    /// [`IntegrateError::BadOutput`]. Refreshing the caller's object
-    /// database is the caller's.
+    /// The drivers checked ([`check_drivers`]), then one [`merge_tree`]
+    /// of the tip onto the head against the patch's base. Refreshing the
+    /// caller's object database is the caller's.
     fn integrate(&self, head: Oid, patch: &PatchBranch) -> Result<Integrated, IntegrateError> {
-        let args = Self::args(head, patch);
+        let drivers = check_drivers(&self.git_dir)?;
+        merge_tree(
+            &self.git,
+            &self.git_dir,
+            &drivers,
+            patch.base,
+            head,
+            patch.tip,
+        )
+    }
+}
+
+impl GitRebase {
+    /// As [`GitMergeTree::new`].
+    pub fn new(git_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            git: git_cli::find_git().unwrap_or_else(|| PathBuf::from("git")),
+            git_dir: git_dir.into(),
+        }
+    }
+
+    /// A throwaway commit of `tree` on `parent`, for the next step's
+    /// `<cur>` (merge-tree merges commits): a fixed identity and date, so
+    /// a run after a crash writes the same object. Nothing references it.
+    fn step_commit(&self, tree: Oid, parent: Oid) -> Result<Oid, IntegrateError> {
+        let args = [
+            "-c".to_owned(),
+            "core.fsync=objects".to_owned(),
+            "commit-tree".to_owned(),
+            tree.to_string(),
+            "-p".to_owned(),
+            parent.to_string(),
+            "-m".to_owned(),
+            "agentfs rebase step".to_owned(),
+        ];
         let out = git_cli::command(&self.git, &self.git_dir)
             .args(&args)
+            .envs([
+                ("GIT_AUTHOR_NAME", "agentfs"),
+                ("GIT_AUTHOR_EMAIL", "agentfs@localhost"),
+                ("GIT_AUTHOR_DATE", "@0 +0000"),
+                ("GIT_COMMITTER_NAME", "agentfs"),
+                ("GIT_COMMITTER_EMAIL", "agentfs@localhost"),
+                ("GIT_COMMITTER_DATE", "@0 +0000"),
+            ])
             .output()
             .map_err(IntegrateError::Spawn)?;
         let shown = args.join(" ");
-        let conflicted = match out.status.code() {
-            Some(0) => false,
-            Some(1) => true,
-            _ => {
-                let mut stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                if let Some((major, minor)) = self.version()
-                    && (major, minor) < MIN_GIT
-                {
-                    stderr.push_str(&format!(
-                        " (this is git {major}.{minor}; merging a patch needs git {}.{} or later)",
-                        MIN_GIT.0, MIN_GIT.1
-                    ));
-                }
-                return Err(IntegrateError::Failed {
-                    args: shown,
-                    status: out.status.to_string(),
-                    stderr,
-                });
-            }
-        };
-        let bad = |detail: String| IntegrateError::BadOutput {
-            args: shown.clone(),
-            detail,
-        };
-        let stdout =
-            String::from_utf8(out.stdout).map_err(|_| bad("the output is not UTF-8".into()))?;
-        let mut fields = stdout.split('\0');
-        let first = fields.next().unwrap_or_default();
-        let tree =
-            Oid::from_str(first.trim()).map_err(|_| bad(format!("{first:?} is not a tree id")))?;
-        if !conflicted {
-            return Ok(Integrated::Clean { tree });
+        if !out.status.success() {
+            return Err(IntegrateError::Failed {
+                args: shown,
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            });
         }
-        let paths: BTreeSet<String> = fields
-            .take_while(|f| !f.is_empty())
-            .map(str::to_owned)
-            .collect();
-        Ok(Integrated::Conflict {
-            paths: paths.into_iter().collect(),
+        let text = String::from_utf8_lossy(&out.stdout);
+        Oid::from_str(text.trim()).map_err(|_| IntegrateError::BadOutput {
+            args: shown,
+            detail: format!("{:?} is not a commit id", text.trim()),
         })
     }
+}
+
+impl Integrator for GitRebase {
+    /// The drivers checked ([`check_drivers`]), then one [`merge_tree`]
+    /// per commit of the patch, oldest first, each against its parent,
+    /// onto the head and then onto a step commit of the previous result:
+    /// the last result, or the first conflict.
+    fn integrate(&self, head: Oid, patch: &PatchBranch) -> Result<Integrated, IntegrateError> {
+        let drivers = check_drivers(&self.git_dir)?;
+        let mut cur = head;
+        let mut parent = patch.base;
+        let mut last = None;
+        for commit in &patch.commits {
+            if let Some(tree) = last {
+                cur = self.step_commit(tree, cur)?;
+            }
+            match merge_tree(&self.git, &self.git_dir, &drivers, parent, cur, *commit)? {
+                Integrated::Clean { tree } => last = Some(tree),
+                conflict => return Ok(conflict),
+            }
+            parent = *commit;
+        }
+        last.map(|tree| Integrated::Clean { tree })
+            .ok_or_else(|| IntegrateError::BadOutput {
+                args: "merge-tree".into(),
+                detail: "the patch has no commits".into(),
+            })
+    }
+}
+
+/// The merge drivers of the repository's config (`merge.<name>.driver`,
+/// the file `$GIT_DIR/config` and what it includes: what git reads in the
+/// environment of [`git_cli::command`]), as (name, command), in config
+/// order. Fails, [`IntegrateError::DriverNotWorking`], at the first whose
+/// program is not an executable file ([`driver_program`]).
+fn check_drivers(git_dir: &Path) -> Result<Vec<(String, String)>, IntegrateError> {
+    let config = git2::Config::open(&git_dir.join("config"))?;
+    let mut drivers = Vec::new();
+    let mut entries = config.entries(Some(r"^merge\..*\.driver$"))?;
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        let (Ok(key), Ok(command)) = (entry.name(), entry.value()) else {
+            continue;
+        };
+        let Some(name) = key
+            .strip_prefix("merge.")
+            .and_then(|k| k.strip_suffix(".driver"))
+        else {
+            continue;
+        };
+        drivers.push((name.to_owned(), command.to_owned()));
+    }
+    for (name, command) in &drivers {
+        if let Err(detail) = driver_program(command, git_dir) {
+            return Err(IntegrateError::DriverNotWorking {
+                driver: name.clone(),
+                path: String::new(),
+                detail,
+            });
+        }
+    }
+    Ok(drivers)
+}
+
+/// The program a driver's command runs: its first word, a path when it
+/// has a `/` (relative ones from `git_dir`, where git runs), else looked
+/// up in [`git_cli::GIT_PATH`]; it must be an executable file. A shell
+/// word that is no file (a builtin, an assignment) does not pass.
+pub fn driver_program(command: &str, git_dir: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(word) = command.split_whitespace().next() else {
+        return Err("its command is empty".into());
+    };
+    let executable = |path: &Path| {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if word.contains('/') {
+        let path = git_dir.join(word);
+        return if executable(&path) {
+            Ok(path)
+        } else {
+            Err(format!("{word} is not an executable file"))
+        };
+    }
+    git_cli::GIT_PATH
+        .split(':')
+        .map(|dir| Path::new(dir).join(word))
+        .find(|path| executable(path))
+        .ok_or_else(|| format!("{word} is not a program in {}", git_cli::GIT_PATH))
+}
+
+/// The arguments after `git` that merge `theirs` onto `ours` against
+/// `base`.
+fn merge_args(base: Oid, ours: Oid, theirs: Oid) -> Vec<String> {
+    let mut args: Vec<String> = GIT_MERGE_TREE_ARGS.iter().map(|a| a.to_string()).collect();
+    args.extend([
+        "-z".to_owned(),
+        "--name-only".to_owned(),
+        "--no-messages".to_owned(),
+        format!("--merge-base={base}"),
+        ours.to_string(),
+        theirs.to_string(),
+    ]);
+    args
+}
+
+/// `git --version` as (major, minor), when it can be read.
+fn git_version(git: &Path, git_dir: &Path) -> Option<(u32, u32)> {
+    let out = git_cli::command(git, git_dir)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut numbers = text.split_whitespace().nth(2)?.split('.');
+    Some((numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?))
+}
+
+/// git's message when a merge driver is killed or exits above 128 (2.43
+/// and 2.47 alike, from `merge-tree`'s die with exit 128; 2.43 first
+/// prints `error: failed to execute internal merge`).
+const FAILURE_TO_MERGE: &str = "fatal: failure to merge";
+
+/// `git <GIT_MERGE_TREE_ARGS> -z --name-only --no-messages
+/// --merge-base=<base> <ours> <theirs>`: exit 0 is a clean merge (the
+/// first NUL-terminated field is the tree), exit 1 a conflict (the tree,
+/// then the conflicted paths up to an empty field); exit 128 with git's
+/// [`FAILURE_TO_MERGE`] while `drivers` is not empty is
+/// [`IntegrateError::DriverNotWorking`] (the drivers named, no path);
+/// anything else is [`IntegrateError::Failed`], output it cannot read
+/// [`IntegrateError::BadOutput`].
+fn merge_tree(
+    git: &Path,
+    git_dir: &Path,
+    drivers: &[(String, String)],
+    base: Oid,
+    ours: Oid,
+    theirs: Oid,
+) -> Result<Integrated, IntegrateError> {
+    let args = merge_args(base, ours, theirs);
+    let out = git_cli::command(git, git_dir)
+        .args(&args)
+        .output()
+        .map_err(IntegrateError::Spawn)?;
+    let shown = args.join(" ");
+    let conflicted = match out.status.code() {
+        Some(0) => false,
+        Some(1) => true,
+        code => {
+            let mut stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            if code == Some(128) && stderr.contains(FAILURE_TO_MERGE) && !drivers.is_empty() {
+                let names: Vec<&str> = drivers.iter().map(|(n, _)| n.as_str()).collect();
+                return Err(IntegrateError::DriverNotWorking {
+                    driver: names.join(", "),
+                    path: String::new(),
+                    detail: stderr,
+                });
+            }
+            if let Some((major, minor)) = git_version(git, git_dir)
+                && (major, minor) < MIN_GIT
+            {
+                stderr.push_str(&format!(
+                    " (this is git {major}.{minor}; merging a patch needs git {}.{} or later)",
+                    MIN_GIT.0, MIN_GIT.1
+                ));
+            }
+            return Err(IntegrateError::Failed {
+                args: shown,
+                status: out.status.to_string(),
+                stderr,
+            });
+        }
+    };
+    let bad = |detail: String| IntegrateError::BadOutput {
+        args: shown.clone(),
+        detail,
+    };
+    let stdout =
+        String::from_utf8(out.stdout).map_err(|_| bad("the output is not UTF-8".into()))?;
+    let mut fields = stdout.split('\0');
+    let first = fields.next().unwrap_or_default();
+    let tree =
+        Oid::from_str(first.trim()).map_err(|_| bad(format!("{first:?} is not a tree id")))?;
+    if !conflicted {
+        return Ok(Integrated::Clean { tree });
+    }
+    let paths: BTreeSet<String> = fields
+        .take_while(|f| !f.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok(Integrated::Conflict {
+        paths: paths.into_iter().collect(),
+    })
 }
 
 #[cfg(test)]
@@ -690,6 +931,211 @@ mod tests {
         );
         assert!(env.contains("GIT_CONFIG_GLOBAL=/dev/null\n"), "{env}");
         assert!(!env.contains("GIT_ATTR_SOURCE"), "{env}");
+    }
+
+    impl Repo {
+        fn rebase(&self) -> GitRebase {
+            GitRebase::new(self.dir.path())
+        }
+
+        /// `merge.<name>.driver = command` and `info/attributes` holding
+        /// `attributes`.
+        fn driver(&self, name: &str, command: &str, attributes: &str) {
+            let mut config = git2::Config::open(&self.dir.path().join("config")).unwrap();
+            config
+                .set_str(&format!("merge.{name}.driver"), command)
+                .unwrap();
+            let info = self.dir.path().join("info");
+            std::fs::create_dir_all(&info).unwrap();
+            std::fs::write(info.join("attributes"), attributes).unwrap();
+        }
+
+        /// A patch whose first commit edits `f` against the head's edit
+        /// and whose second puts `f` back and adds `g`.
+        fn edit_and_revert(&self) -> (Oid, PatchBranch) {
+            let base = self.commit(&[], &[("f", Some("0\n"))], "seed");
+            let head = self.commit(&[base], &[("f", Some("head\n"))], "on the branch");
+            let a = self.commit(&[base], &[("f", Some("patch\n"))], "edit f");
+            let b = self.commit(
+                &[a],
+                &[("f", Some("0\n")), ("g", Some("g\n"))],
+                "revert, add g",
+            );
+            (head, PatchBranch::read(&self.repo, head, b).unwrap())
+        }
+
+        /// A one-commit patch editing `f.txt` against the head's edit.
+        fn both_edit(&self) -> (Oid, PatchBranch) {
+            let base = self.commit(&[], &[("f.txt", Some("0\n"))], "seed");
+            let head = self.commit(&[base], &[("f.txt", Some("head\n"))], "on the branch");
+            let tip = self.commit(&[base], &[("f.txt", Some("patch\n"))], "edit f");
+            (head, PatchBranch::read(&self.repo, head, tip).unwrap())
+        }
+    }
+
+    /// Acceptance 1 in the core: a first commit that conflicts with the
+    /// head and a second that reverts it merge cleanly as one diff, but
+    /// not commit by commit.
+    #[test]
+    fn rebase_replays_commit_by_commit() {
+        if !have_git() {
+            return;
+        }
+        let r = Repo::new();
+        let (head, branch) = r.edit_and_revert();
+        let Integrated::Clean { tree } = r.merge().integrate(head, &branch).unwrap() else {
+            panic!("merge is not clean");
+        };
+        r.repo.odb().unwrap().refresh().unwrap();
+        assert_eq!(r.content(tree, "f").as_deref(), Some("head\n"));
+        assert_eq!(
+            r.rebase().integrate(head, &branch).unwrap(),
+            Integrated::Conflict {
+                paths: vec!["f".into()]
+            }
+        );
+        let by_mode = |mode| {
+            integrator(mode, r.dir.path())
+                .integrate(head, &branch)
+                .unwrap()
+        };
+        assert!(matches!(
+            by_mode(IntegrateMode::Merge),
+            Integrated::Clean { .. }
+        ));
+        assert!(matches!(
+            by_mode(IntegrateMode::Rebase),
+            Integrated::Conflict { .. }
+        ));
+        assert_eq!(IntegrateMode::default(), IntegrateMode::Merge);
+    }
+
+    /// A clean rebase gives the tree a merge gives, every commit replayed
+    /// onto the last (the second commit edits what the first added).
+    #[test]
+    fn a_clean_rebase_replays_every_commit() {
+        if !have_git() {
+            return;
+        }
+        let r = Repo::new();
+        let base = r.commit(&[], &[("f", Some("0\n")), ("g", Some("0\n"))], "seed");
+        let head = r.commit(&[base], &[("g", Some("head\n"))], "on the branch");
+        let a = r.commit(&[base], &[("a", Some("a\n"))], "add a");
+        let b = r.commit(&[a], &[("a", Some("a, again\n"))], "edit a");
+        let c = r.commit(&[b], &[("f", Some("patched\n"))], "edit f");
+        let branch = PatchBranch::read(&r.repo, head, c).unwrap();
+        let Integrated::Clean { tree } = r.rebase().integrate(head, &branch).unwrap() else {
+            panic!("not clean");
+        };
+        assert_eq!(
+            r.merge().integrate(head, &branch).unwrap(),
+            Integrated::Clean { tree }
+        );
+        r.repo.odb().unwrap().refresh().unwrap();
+        assert_eq!(r.content(tree, "a").as_deref(), Some("a, again\n"));
+        assert_eq!(r.content(tree, "f").as_deref(), Some("patched\n"));
+        assert_eq!(r.content(tree, "g").as_deref(), Some("head\n"));
+        // A run after a crash merges to the same tree.
+        assert_eq!(
+            r.rebase().integrate(head, &branch).unwrap(),
+            Integrated::Clean { tree }
+        );
+    }
+
+    /// The operator's drivers run in both strategies; one that cannot
+    /// run is not a conflict but [`IntegrateError::DriverNotWorking`]:
+    /// missing, not executable, or killed (git's own wording, checked
+    /// against the git installed here); one that exits 1 is a conflict.
+    #[test]
+    fn merge_drivers_run_or_are_not_working() {
+        if !have_git() {
+            return;
+        }
+        let scripts = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let path = scripts.path().join(name);
+            std::fs::write(&path, format!("{body}\n")).unwrap();
+            path.display().to_string()
+        };
+        // Run with `sh <script>`: no exec of a file just written (ETXTBSY).
+        let ours = write("ours.sh", "exit 0");
+        let conflict = write("conflict.sh", "exit 1");
+        let killed = write("killed.sh", "kill -9 $$");
+        let noexec = write("noexec", "exit 0");
+        for rebase in [false, true] {
+            let run = |command: &str| {
+                let r = Repo::new();
+                r.driver("d", command, "*.txt merge=d\n");
+                let (head, branch) = r.both_edit();
+                let result = if rebase {
+                    r.rebase().integrate(head, &branch)
+                } else {
+                    r.merge().integrate(head, &branch)
+                };
+                r.repo.odb().unwrap().refresh().unwrap();
+                (r, result)
+            };
+            let (r, clean) = run(&format!("sh {ours} %O %A %B"));
+            let Ok(Integrated::Clean { tree }) = clean else {
+                panic!("{clean:?}");
+            };
+            assert_eq!(r.content(tree, "f.txt").as_deref(), Some("head\n"));
+            assert_eq!(
+                run(&format!("sh {conflict} %O %A %B")).1.unwrap(),
+                Integrated::Conflict {
+                    paths: vec!["f.txt".into()]
+                }
+            );
+            for command in [
+                "agentfs-no-such-driver %O %A %B".to_owned(),
+                format!("{noexec} %O %A %B"),
+                String::new(),
+                format!("sh {killed} %O %A %B"),
+            ] {
+                match run(&command).1 {
+                    Err(e @ IntegrateError::DriverNotWorking { .. }) => {
+                        if let IntegrateError::DriverNotWorking { driver, path, .. } = &e {
+                            assert_eq!(driver, "d");
+                            assert_eq!(path, "");
+                        }
+                        assert!(
+                            e.to_string()
+                                .starts_with("the merge driver d could not run: "),
+                            "{e}"
+                        );
+                    }
+                    other => panic!("{command:?} (rebase {rebase}): {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_driver_program_is_an_executable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = script(dir.path(), "tool", "exit 0");
+        std::fs::write(dir.path().join("plain"), "").unwrap();
+        assert_eq!(
+            driver_program(&format!("{} %O", tool.display()), Path::new("/")),
+            Ok(tool.clone())
+        );
+        assert_eq!(
+            driver_program("./tool %A", dir.path()),
+            Ok(dir.path().join("./tool"))
+        );
+        assert!(
+            driver_program("sh -c 'x'", dir.path())
+                .unwrap()
+                .ends_with("sh")
+        );
+        let err = driver_program("plain %A", dir.path()).unwrap_err();
+        assert!(err.contains("plain is not a program in"), "{err}");
+        let err = driver_program("./plain", dir.path()).unwrap_err();
+        assert_eq!(err, "./plain is not an executable file");
+        assert_eq!(
+            driver_program("  ", dir.path()).unwrap_err(),
+            "its command is empty"
+        );
     }
 
     #[test]

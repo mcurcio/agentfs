@@ -1226,3 +1226,181 @@ fn a_merge_inside_the_branch_is_refused() {
     assert_eq!(s.branch_head(), head);
     assert_eq!(s.read("a.txt"), None);
 }
+
+impl Setup {
+    /// The state area's git config, to set keys in.
+    fn config(&self) -> git2::Config {
+        git2::Config::open(&self.state().join("git/config")).unwrap()
+    }
+
+    /// Writes the operator's `$GIT_DIR/info/attributes`.
+    fn info_attributes(&self, rules: &str) {
+        let info = self.state().join("git/info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("attributes"), rules).unwrap();
+    }
+
+    /// `f.txt` recorded and pushed, a patch from producer `p` editing it
+    /// (and adding `g.txt`), then the workload's own edit of `f.txt`.
+    fn both_edit_f(&self) {
+        self.record("f.txt", "one\n");
+        self.ok(&["push"]);
+        let p = self.producer_on_branch("p");
+        self.commit(&p, &[("f.txt", "one\niac\n"), ("g.txt", "g\n")], "edit f");
+        self.submit_ok(&p, &["HEAD"]);
+        self.record("f.txt", "one\nworkload\n");
+    }
+}
+
+/// Merge rules (bead agentfs-mia.3), acceptance 1: a branch whose first
+/// commit conflicts with the head and whose second commit reverts that
+/// hunk. `agentfs.patchIntegrate=rebase` replays it commit by commit and
+/// holds it at the first; `merge` (the default) merges the whole diff,
+/// which no longer touches the conflicting hunk, and lands it (P1).
+#[test]
+fn rebase_replays_commit_by_commit() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("f.txt", "f\n");
+    s.ok(&["push"]);
+    let p = s.producer_on_branch("p");
+    s.commit(&p, &[("f.txt", "f, by iac\n")], "edit f");
+    s.commit(&p, &[("f.txt", "f\n"), ("g.txt", "g\n")], "revert f, add g");
+    s.submit_ok(&p, &["HEAD"]);
+    s.record("f.txt", "f, by the workload\n");
+    s.config()
+        .set_str("agentfs.patchIntegrate", "rebase")
+        .unwrap();
+
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("patch 1 held (conflict)"), "{err}");
+    assert!(err.contains("conflicts in f.txt"), "{err}");
+    assert_eq!(s.read("g.txt"), None);
+
+    s.config()
+        .set_str("agentfs.patchIntegrate", "merge")
+        .unwrap();
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("f.txt").as_deref(), Some("f, by the workload\n"));
+    assert_eq!(s.read("g.txt").as_deref(), Some("g\n"));
+    assert_eq!(s.inbox_commits(1), 1);
+}
+
+/// Acceptance 2: `merge=union` in the workload's own `.gitattributes`
+/// does not steer the merge (a conflict, P2); the same rule in the
+/// operator's `$GIT_DIR/info/attributes` does: both edits land.
+#[test]
+fn an_operator_merge_driver_resolves() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record(".gitattributes", "*.txt merge=union\n");
+    s.both_edit_f();
+    // Some git versions read a bare repository's attributes from HEAD.
+    s.local().set_head(BRANCH).unwrap();
+
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("patch 1 held (conflict)"), "{err}");
+    assert_eq!(s.read("f.txt").as_deref(), Some("one\nworkload\n"));
+
+    s.info_attributes("*.txt merge=union\n");
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("f.txt").as_deref(), Some("one\nworkload\niac\n"));
+    assert_eq!(s.read("g.txt").as_deref(), Some("g\n"));
+    assert_eq!(s.inbox_commits(1), 1);
+}
+
+/// Acceptance 3: a custom driver of the repository's config
+/// (`merge.ours2.driver`, named in `info/attributes`) runs and resolves
+/// to ours: the head's `f.txt` stays, the rest of the patch lands.
+#[test]
+fn a_custom_driver_runs() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    let ran = s.dir.path().join("ran");
+    // `sh <script>`: the script is read, never executed as a file just
+    // written (ETXTBSY under parallel tests).
+    let driver = s.file(
+        "ours2.sh",
+        &format!("echo \"$@\" >> '{}'\nexit 0\n", ran.display()),
+    );
+    s.config()
+        .set_str("merge.ours2.driver", &format!("sh {driver} %O %A %B"))
+        .unwrap();
+    s.info_attributes("f.txt merge=ours2\n");
+    s.both_edit_f();
+
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("f.txt").as_deref(), Some("one\nworkload\n"));
+    assert_eq!(s.read("g.txt").as_deref(), Some("g\n"));
+    assert!(fs::read_to_string(&ran).unwrap().contains(".merge_file_"));
+    assert_eq!(s.inbox_commits(1), 1);
+}
+
+/// Acceptance 4: a configured driver whose program is missing leaves
+/// every patch not judged, `merge driver <name>`, with `PatchRuleFailed`
+/// (rule `merge`); the run goes on to the next patch rather than stopping
+/// (P3). With the driver fixed, both land.
+#[test]
+fn a_missing_driver_is_not_judged() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.config()
+        .set_str("merge.gone.driver", "agentfs-no-such-driver %O %A %B")
+        .unwrap();
+    s.record("a.txt", "a0\n");
+    s.record("b.txt", "b0\n");
+    s.ok(&["push"]);
+    let p = s.producer("p");
+    let a1 = s.file("a1", "a1\n");
+    s.submit_ok(&p, &["--put", &format!("a.txt={a1}"), "-m", "one"]);
+    let b1 = s.file("b1", "b1\n");
+    s.submit_ok(&p, &["--put", &format!("b.txt={b1}"), "-m", "two"]);
+
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    for n in [1, 2] {
+        assert!(
+            err.contains(&format!(
+                "patch {n} not judged (merge driver gone): the merge driver gone could not \
+                 run: agentfs-no-such-driver is not a program in "
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "the acceptance rule merge could not judge patch {n}"
+            )),
+            "{err}"
+        );
+    }
+    assert!(!err.contains("held (conflict)"), "{err}");
+    let json = s.ok(&["patch", "status", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let verdict = &doc["status"]["queue"][0]["verdict"];
+    assert_eq!(verdict["kind"], "not_judged", "{json}");
+    assert_eq!(verdict["rule"], "merge driver gone", "{json}");
+    assert_eq!(s.read("a.txt").as_deref(), Some("a0\n"));
+    assert!(s.local().refname_to_id(&held(1)).is_ok());
+
+    s.config().set_str("merge.gone.driver", "true").unwrap();
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("a.txt").as_deref(), Some("a1\n"));
+    assert_eq!(s.read("b.txt").as_deref(), Some("b1\n"));
+}

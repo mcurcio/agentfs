@@ -28,6 +28,7 @@ use std::time::Duration;
 use crate::fork::identity::{self as fork_identity, ForkIdentity, ForkLink, PushTarget};
 use crate::identity::Templates;
 use crate::patch::accept::AcceptMode;
+use crate::patch::integrate::IntegrateMode;
 use crate::proxy::ProxySetting;
 use crate::remote_url::{self, Transport};
 
@@ -193,6 +194,7 @@ pub const KEYS: &[&str] = &[
     "agentfs.patchFetchTimeout",
     "agentfs.patchAccept",
     "agentfs.patchAcceptTimeout",
+    "agentfs.patchIntegrate",
     "agentfs.lfsThreshold",
     "agentfs.forkRefs",
     "agentfs.identity.committerName",
@@ -492,6 +494,10 @@ pub struct Settings {
     /// `agentfs.patchAcceptTimeout`: how long the `patch-accept` hook may
     /// run. Default [`DEFAULT_PATCH_ACCEPT_TIMEOUT`]; `0` is refused.
     pub patch_accept_timeout: Duration,
+    /// `agentfs.patchIntegrate`: how a patch is merged onto the head,
+    /// `merge` (the default) or `rebase` (design §12, §17.3; bead
+    /// agentfs-mia.3).
+    pub patch_integrate: IntegrateMode,
     /// Every `include.path`, in order: absolute, readable config fragments
     /// whose keys count as the repository's own (design §4.3).
     pub includes: Vec<PathBuf>,
@@ -1114,6 +1120,7 @@ impl Settings {
             patch_fetch_timeout: patch_fetch_timeout(config)?,
             patch_accept: patch_accept(config)?,
             patch_accept_timeout: patch_accept_timeout(config)?,
+            patch_integrate: patch_integrate(config)?,
             lfs,
             http_proxy: http_proxy.ok().flatten(),
             remotes: split.remotes,
@@ -1606,6 +1613,21 @@ fn patch_accept_timeout(config: &git2::Config) -> Result<Duration, ConfigError> 
     }
 }
 
+/// `agentfs.patchIntegrate`: `merge` (the default) or `rebase`; anything
+/// else is [`ConfigError::BadChoice`].
+fn patch_integrate(config: &git2::Config) -> Result<IntegrateMode, ConfigError> {
+    let key = "agentfs.patchIntegrate";
+    match string(config, key)?.as_deref() {
+        None | Some("merge") => Ok(IntegrateMode::Merge),
+        Some("rebase") => Ok(IntegrateMode::Rebase),
+        Some(other) => Err(ConfigError::BadChoice {
+            key: key.into(),
+            value: other.into(),
+            allowed: "merge, rebase",
+        }),
+    }
+}
+
 /// `agentfs.repackInterval`: default [`DEFAULT_REPACK_INTERVAL`], `0` or
 /// `off` for never, else a duration of at least [`MIN_REPACK_INTERVAL`].
 fn repack_interval(config: &git2::Config) -> Result<Option<Duration>, ConfigError> {
@@ -1835,6 +1857,26 @@ mod tests {
         assert!(matches!(
             load("\tpatchAcceptTimeout = soon\n"),
             Err(ConfigError::BadDuration { .. })
+        ));
+    }
+
+    #[test]
+    fn patch_integrate_mode() {
+        let load = |extra: &str| {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{extra}"));
+            Settings::from_config(&c)
+        };
+        assert_eq!(load("").unwrap().patch_integrate, IntegrateMode::Merge);
+        for (value, mode) in [
+            ("merge", IntegrateMode::Merge),
+            ("rebase", IntegrateMode::Rebase),
+        ] {
+            let s = load(&format!("\tpatchIntegrate = {value}\n")).unwrap();
+            assert_eq!(s.patch_integrate, mode, "{value}");
+        }
+        assert!(matches!(
+            load("\tpatchIntegrate = squash\n"),
+            Err(ConfigError::BadChoice { .. })
         ));
     }
 

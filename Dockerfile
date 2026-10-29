@@ -2,7 +2,7 @@
 #
 # The agentfs image: the `agentfs` binary built with the `https` and `ssh`
 # features and the `agentfs-csi` CSI driver, on Debian trixie with fuse3,
-# git, tini and the CA certificates. It runs as root, deliberately: the
+# git, tini, mergiraf and the CA certificates. It runs as root, deliberately: the
 # phase 1 sidecar must be root and privileged to mount FUSE with
 # Bidirectional propagation (design §17.1, docs/deployment.md "Security
 # trade-offs"). The CSI node plugin runs it as `tini -- agentfs-csi`, root
@@ -49,21 +49,45 @@ RUN find crates -name '*.rs' -exec touch {} + \
  && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh,agentfs/otlp-tls \
  && install -m 0755 target/release/agentfs target/release/agentfs-csi /usr/local/bin/
 
+# mergiraf, a syntax-aware git merge driver an operator may name in a
+# volume's `$GIT_DIR/info/attributes` (design §12, §17.3): its own
+# program, run by `git merge-tree` as `merge.<name>.driver`, never linked
+# (GPL-3.0-only). A pinned release's static (musl) binary and the licence
+# of its tag, both checked by sha256.
+FROM ${RUST_IMAGE} AS mergiraf
+ARG TARGETARCH
+RUN set -eu; version=0.20.0; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) arch=x86_64 sum=fc77469be936b02ab9021b984a3aebc9250a21ae3d264f2ef2198eb8b31b2a7b ;; \
+      arm64) arch=aarch64 sum=0f153dfa85a799c0d05ee7a21834d049b3595e367ed411a56f007bdb5de8c19d ;; \
+      *) echo "no mergiraf release for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    base=https://codeberg.org/mergiraf/mergiraf; \
+    curl -fsSL -o /tmp/mergiraf.tar.gz "$base/releases/download/v$version/mergiraf_$arch-unknown-linux-musl.tar.gz"; \
+    echo "$sum  /tmp/mergiraf.tar.gz" | sha256sum -c -; \
+    mkdir -p /out/bin /out/doc; \
+    tar -xzf /tmp/mergiraf.tar.gz -C /out/bin mergiraf; \
+    curl -fsSL -o /out/doc/LICENSE.txt "$base/raw/tag/v$version/LICENSE.txt"; \
+    echo "e57f1c320b8cf8798a7d2ff83a6f9e06a33a03585f6e065fea97f1d86db84052  /out/doc/LICENSE.txt" | sha256sum -c -; \
+    printf 'mergiraf %s, GPL-3.0-only (LICENSE.txt).\nSource: %s/src/tag/v%s\n' "$version" "$base" "$version" >/out/doc/SOURCE
+
 FROM ${RUNTIME_IMAGE}
 # fuse3: fusermount3 and /etc/fuse.conf (a non-root daemon); libssl3t64:
 # the `https` and `ssh` transports link OpenSSL; ca-certificates: the TLS
 # trust store; git: the daemon repacks the history with it (design §8),
 # and operators follow the runbooks (git log, show) with kubectl exec;
 # tini: PID 1 of the CSI node plugin, reaping the orphans its children
-# leave (design §14.2).
+# leave (design §14.2); mergiraf: see its stage above.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends fuse3 libssl3t64 ca-certificates git tini \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/agentfs /usr/local/bin/agentfs-csi /usr/local/bin/
+COPY --from=mergiraf /out/bin/mergiraf /usr/local/bin/
+COPY --from=mergiraf /out/doc/ /usr/share/doc/mergiraf/
 # Fails the build if a shared library is missing, or a stub (which exits
 # 1) was shipped.
 RUN agentfs --version && agentfs probe --help >/dev/null \
- && agentfs-csi --version && tini --version
+ && agentfs-csi --version && tini --version && mergiraf --version
 
 LABEL org.opencontainers.image.source="https://github.com/mcurcio/agentfs" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
