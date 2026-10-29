@@ -370,6 +370,18 @@ only waits, at most `--stage-wait`, for the service to listen; before
 listening the service fetches the patch inbox (design §12), bounded by
 `agentfs.patchFetchTimeout`, and applies queued patches.
 
+**Patches land only at NodeStage.** Queued patches are written into a
+volume only when its history service starts with no front attached; the
+driver has no call that lands them later ("No live landing yet", design
+§19.1). To hear about patches, set the notify webhook in the profile's
+config: `agentfs.patchNotifyUrl`, with `agentfs.patchNotifyCredentialFile`
+for a bearer token (a file the node plugin can read) and
+`agentfs.patchNotifyTimeout` ([configuration](configuration.md#agentfs)).
+The history service then POSTs a notice of the verdicts that changed
+after each queue run ([the runbook](runbooks/patch-queue.md#7-notifying-the-integrator)).
+The CSI driver itself has no notify code: the keys are the volume's,
+like any other, and no CSI test sends a notice.
+
 ## 8. Recovery
 
 The plugin specifies and tests each of these (§13; design §14.2):
@@ -785,6 +797,21 @@ off every branch ([configuration](configuration.md#agentfs)).
 - **Receiving.** Whatever reads the fork remote gates the change: a PR on
   the fork's branch, or `agentfs patch submit <change>` into the source's
   inbox, which applies a given change commit at most once.
+- **Forks of forks.** A fork class claim whose `dataSource` is a linked
+  fork's claim makes a fork of that fork, on the same node (design §11.5,
+  §12 "Forks of forks"). When it finishes, the release scan's finisher
+  queues its change as the parent fork's next inbox number on the fork
+  remote, with the fork remote's credentials, instead of publishing
+  change and finish refs; the parent's queue lands it at the parent's
+  next NodeStage with no front attached, and the parent's own change
+  carries it up when the parent finishes. CreateVolume refuses a fork of
+  an unlinked fork, of a fork with hidden history (`agentfs.forkRefs =
+  hidden` in the profile when the parent was made) and of a fork of a
+  local-only source. A child that finishes after its parent is published
+  as a top-level fork (`ForkParentFinished`;
+  [the runbook](runbooks/patch-queue.md#9-forks-of-forks)).
+  `ci/e2e-csi-fork-of-fork.sh` runs this on kind against an
+  authenticated fork remote.
 - **Read-only once finished.** A finished fork takes no changes. Staged
   again (a static PV of its directory, while DeleteVolume waits), its
   history service starts, its fronts FUSE-mount it read-only and every

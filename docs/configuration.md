@@ -119,6 +119,28 @@ Operator path rules are not config keys: they are `<state>/git/info/exclude`
 `<state>/git/info/attributes` (`-agentfs` and the other `agentfs.*`
 attributes, §4.2; see [Operator attributes](#operator-attributes)).
 
+The `agentfs.patch*` keys configure the patch queue (design §12). With
+none set, a volume with one remote takes patches from it, lands a patch
+that merges cleanly (`cleanMerge`, by `merge`) and notifies no one. A
+volume whose integrator approves each patch, rebases, and hears every
+verdict change might set:
+
+```ini
+[agentfs]
+	patchAccept = approval
+	patchIntegrate = rebase
+	patchNotifyUrl = http://integrator.example:8080/agentfs
+	patchNotifyCredentialFile = /run/secrets/agentfs/notify-token
+```
+
+Two hooks are files in the state area's git directory, not keys:
+`hooks/patch-notify` gets every notice when it exists, and
+`hooks/patch-accept` judges each cleanly merged patch with `patchAccept =
+command` (missing, every such patch is not judged). Merge drivers are
+`merge=<name>` lines in `info/attributes` and git's own
+`merge.<name>.driver` keys ([the runbook](runbooks/patch-queue.md#6-configuration)).
+Under CSI, the keys go in the profile's config.
+
 ### Remotes modes
 
 A volume's push sections decide how its history leaves the node (design

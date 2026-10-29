@@ -370,3 +370,17 @@ then re-dispatches mia.7.
    the profile for CSI).
 3. **Add the fork identity keys to `OWN_KEYS`** in `fork/create.rs`, as item 3 says.
 - **Code architect, 2026-10-29: mia.7 page re-cut** (bd design of agentfs-mia.7) for the three confirmed items: roll-up through the finisher's `RemotePusher` (new `RemotePusher::list_refs`, `patch::submit::listed_as`, `PublishOutcome::Submitted`, `PublishedMark.inbox`); `CreateError::ParentHistoryHidden`, read from the parent's own state-area identity for CLI and CSI alike (not the profile); fork identity keys in `OWN_KEYS`. Finding: under item 1 the `NoBranch` reason for item 2 is gone; the refusal stands as a revisable choice.
+## 2026-10-29, mia.8 implementer (agentfs-mia.8, merge queue docs)
+None of these stopped the bead; each is reported with it.
+1. **PR 8 is already merged** (at 5ab0a94, 2026-10-29T23:20Z), so ef53bfe (mia.7) and this bead's
+   commit on `docs/merge-queue-design` reach no open PR. They need a new PR from that branch.
+2. **`docs/supported-configurations.md` is on origin/main (PR 9), not on this branch**, and the
+   rails forbid merging main in. Not edited here; the needed changes are in the bead's notes:
+   hook `patch-arrived` becomes `patch-notify`, and its "designed, not built" rows for notify and
+   apply, acceptance rules, merge or rebase, branches as patches, keep-going and barriers become
+   built (live landing stays designed, not built); the queue row's "stopping at the first that
+   fails" becomes keep-going.
+3. Stale text outside this bead's files, left as is: `docs/patches.md:23` ("cherry-picks each
+   patch"), `crates/agentfs-core/src/patch/mod.rs:4` ("a single commit whose parent ..."),
+   `crates/agentfs-core/src/config.rs:915` ("forks of forks are not ...") and `:1246` ("A fork has
+   no patch queue").

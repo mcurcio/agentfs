@@ -24,7 +24,7 @@ These are the owner's priorities. When a choice is unclear, decide by them. Each
 6. **Any remote, or none.** GitHub is one option, not an assumption (§11.1). Several volumes may share one repository (§11.4).
 7. **History is the product.** Never rewrite history or force-push automatically. A divergence is saved and an alarm is raised, never overwritten (§11.3). History rewrites are manual operator procedures (§15).
 8. **Recovery is manual but supported.** Recovery uses `restore`, `revert` and the runbooks. Further undo tooling is added as real use shows the need (§15).
-9. **Merging is an extra.** The core records history. The patch queue applies iac's changes only at mount: in order, stopping at the first failure, with the rest left queued (§12).
+9. **Merging is an extra.** The core records history. The patch queue applies producers' changes only at mount, with nothing attached: in order, holding a patch that cannot land whole and going on, and stopping only at a gap, unrecorded changes or a failure, with the rest left queued (§12). The owner, 2026-10-29: "No live landing yet" (design §19.1).
 10. **Three layers, each an integration point.** The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into". The library is `agentfs-core`, the filesystem is `agentfs-fuse` and the `agentfs` binary, and the adapter is `agentfs-csi`. Put each primitive in the lowest layer that can own it, and give it a good API and docs there (design §19.1, "Three layers"). All are Rust (§17). OpenTelemetry is used for everything observable (§13).
 
 ## Working with the owner

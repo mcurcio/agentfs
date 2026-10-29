@@ -82,7 +82,9 @@ Built beside the phases, and planned:
 - **Enforcing content rules.** agentfs records; it does not reject writes.
 - **Detecting secrets.** agentfs does not scan content (§10).
 - **Pushing remote changes into a running workload.** Remote changes enter only
-  at mount time.
+  at mount time, with nothing attached; an apply while a workload is
+  attached only judges (§12, §19.1 "No live landing yet"). Landing while a
+  workload runs is a later gate (§19.2 item 11).
 - **Showing history to the workload.**
 
 ## 2. Architecture
@@ -2122,7 +2124,10 @@ store) is set, a flagged section must name its own `lfsurl` or
 `lfspushurl`, which it reads before the global keys; without one it is
 invalid, so a fork's LFS objects never reach the source's store. The
 default fork remote, the source's own, is unaffected. A linked fork pushes only to its fork remote (an unlinked one only to its own remotes, "The link" below), at
-its push target, and has no patch queue.
+its push target. A linked fork has a patch queue from the moment it is
+forked: its patch remote is its fork remote section (none for a fork of a
+local-only source, and none for an unlinked fork), which is where its own
+forks roll their changes up ("Forks of forks" below; bead agentfs-mia.7).
 
 **A local-only source's forks** (F8 S3, R4: a no-remote source's fork
 publishes `agentfs/<fork>` into its own history, never applied). A
@@ -2222,8 +2227,13 @@ status` and `fork abandon` have nothing to act on.
 
 **Create** (`fork::create`) reads the source's settings and branch head
 without its lock and with no credentials, and refuses a source with no
-history, one that is a fork (forks of forks are deferred) and one with no
-fork remote. It then writes the fork's state area: its identity, the
+history and one with no fork remote, and a source that is a fork its
+own forks could not roll up into: an unlinked fork
+(`SourceIsUnlinkedFork`: it never finishes), one whose history is hidden
+(`ParentHistoryHidden`) and a fork of a local-only source
+(`ParentHasNoQueue`: it has no queue); the source's own identity decides,
+never an include. A fork of a fork records `agentfs.fork.sourceIsFork =
+true`. It then writes the fork's state area: its identity, the
 source's settings files as includes, the source's `info/exclude` and
 `info/attributes`, every object reachable from base packed into the
 fork's own object store (no alternates, so a fork outlives its source),
@@ -2374,13 +2384,23 @@ spans, metric and events are in §13.
 Producers outside the volume (iac, an operator, CI) change a volume's tree
 through history: they queue patches, and the recorder applies them, in
 order, before anything can see the tree. Runbook:
-[patch-queue.md](runbooks/patch-queue.md).
+[patch-queue.md](runbooks/patch-queue.md). The merge queue (bead
+agentfs-mia, §19.2 item 11) built the rest of this section on that
+queue: patches as branches merged by git, a queue that keeps going past
+a patch it cannot land, acceptance rules, notify and apply, `serve-git`,
+checkpoints and forks of forks. Patches still land only when no workload
+is attached (§19.1 "No live landing yet").
 
-**What a patch is.** A single commit with exactly one parent, the branch
-commit it was written against (the head or any ancestor of it), pushed to `refs/agentfs/<volume>/inbox/<n>` on the volume's
-patch remote. `<n>` is ten zero-padded digits from `0000000001`; any other
+**What a patch is.** A branch: a line of one or more commits, each with
+exactly one parent, on a **base**, the merge base of its tip and the
+branch head (the head or any ancestor of it; bead agentfs-mia.4). A
+one-commit patch is a branch of one whose base is its parent. Its tip is
+pushed to `refs/agentfs/<volume>/inbox/<n>` on the volume's patch
+remote. `<n>` is ten zero-padded digits from `0000000001`; any other
 name under `inbox/` is ignored and reported. A patch may change at most
-4096 paths, only regular files and symlinks.
+4096 paths from base to tip, only regular files and symlinks.
+`patch::PatchBranch::read` is the one reader of that shape, for the
+queue and for `serve-git`'s admission alike.
 
 **Submitting** (`agentfs patch submit`, or plain git; §19.1). The producer
 runs it in its own git repository, and it drives the producer's `git`, so
@@ -2388,9 +2408,12 @@ the repository's remote, credential helpers and SSH setup apply:
 
 1. `git ls-remote` lists the branch, `inbox/*` and `applied/*`;
 2. `git fetch` brings the head (`--depth` for shallow producers);
-3. the patch is a given commit (its parent must be on the branch), or one
-   built on the remote head from `--put PATH=FILE` and `--delete PATH` in a
-   temporary index, with `-m` and `--author`;
+3. the patch is a given tip whose commits since its merge base with the
+   head are a line of single-parent commits (a merge commit among them is
+   refused), or one commit built on the remote head from `--put
+   PATH=FILE` and `--delete PATH` in a temporary index, with `-m` and
+   `--author`; with `--barrier` a built patch carries `Agentfs-Barrier:
+   yes`, and a given tip must;
 4. its number is one past the highest inbox or applied number listed;
 5. `git push --force-with-lease=<ref>: <oid>:<ref>` creates the ref only if
    it does not exist. A submitter that loses the race lists again and tries
@@ -2433,18 +2456,34 @@ apply"). In order:
 
 **Applying a patch.**
 
-- **Merge:** libgit2's cherry-pick of the patch onto the head, a three-way
-  merge against the patch's parent.
+- **Merge:** by the `git` program (§17.3 "Patch merge"; libgit2 cannot
+  run merge drivers), chosen by `agentfs.patchIntegrate` (bead
+  agentfs-mia.3, §19.1 "Merge rules"). `merge`, the default, is `git
+  merge-tree --write-tree --merge-base=<base> <head> <tip>`: the patch's
+  whole diff, a three-way merge against its base (for a one-commit patch,
+  the cherry-pick the queue did before). `rebase` replays the patch's
+  commits one by one, each such a merge onto the last result, and holds
+  the patch as a `conflict` at the first that conflicts. Either way the
+  merge runs in the state area's git directory with `-c
+  core.fsync=objects` (the merged objects are durable before a record
+  names them) and `-c attr.tree=<the empty tree>`, so only the operator's
+  `$GIT_DIR/info/attributes` steers it (principle 3): its `merge=<name>`
+  picks a built-in driver or a `merge.<name>.driver` of the repository's
+  config, such as `mergiraf`, which the image ships. A driver that cannot
+  run leaves the patch **not judged** (rule `merge`), never a conflict.
+  The merge writes objects only; everything after it is the queue's.
 - **Write:** the merged tree is written into the backing tree by the
   restore engine (§15): plan the paths whose head and merged entries
   differ, check them (an unrecorded change or something in the way
   refuses), write them, LFS content from the cache or the remotes (§7).
 - **Record:** one atomic record of an operation of kind `patch` (§3.4, §8),
-  so it becomes one commit, never grouped with workload changes. Its author
-  is the patch's author (name, email, time); its committer is the replica's
-  identity (§9). It carries `Agentfs-Trigger: patch`, `Agentfs-Patch: <patch
-  oid>` and `Agentfs-Inbox: <n>`; its message is the patch's, without a
-  final trailer paragraph.
+  so it becomes one commit, never grouped with workload changes, whatever
+  the patch's length or `agentfs.patchIntegrate`. Its author is the tip's
+  author (name, email, time); its committer is the replica's identity
+  (§9). It carries `Agentfs-Trigger: patch`, `Agentfs-Patch: <tip>` and
+  `Agentfs-Inbox: <n>`; its message is the tip's, without a final trailer
+  paragraph, followed for a branch of several commits by one line per
+  commit, oldest first (`<short oid> <subject>`).
 - **A patch that changes nothing** (its content is already there) gets a
   marker commit with the head's tree and the same trailers (§3.4's
   exceptions).
@@ -2561,9 +2600,84 @@ reason, message, paths), `ignored` and `fetch` (remote, ok, error).
 `agentfs status` prints a `patches:` line from `meta/patch.json`, and
 `agentfs patch status [--json]` the whole status.
 
-**Telemetry** (§13): the gauges `agentfs.patch.queue_depth` and
-`agentfs.patch.blocked`, an `agentfs.patch` span per patch, and the events
-`PatchApplied`, `PatchBlocked`, `PatchIgnored` and `PatchFetchFailed`.
+**Judging and landing.** One home holds the per-patch rules
+(`queue::judge_one`), and two runs use it. `Queue::process` lands: it is
+the run above, at mount or `agentfs patch apply` with nothing attached.
+`Queue::judge` only judges, while a daemon holds the volume (bead
+agentfs-mia.5): it fetches the inbox (unless `--no-fetch`), runs the scan
+and the per-patch rules read only (no commit, no tree write, no ref but
+the status ref), and gives a patch that would land the verdict `ready`,
+which is advisory: it was judged against the head as it was. Nothing
+lands while a workload may be attached (§19.1 "No live landing yet").
+
+**Notify** (§19.1 "Notify and apply"). After every run and every
+judging, the verdicts in the status just written are compared with those
+of the last delivered notice (`meta/notify.json`, a cache), and when any
+changed one notice (schema 1) goes to each configured method: the hook
+`$GIT_DIR/hooks/patch-notify`, when it exists (run without a shell, the
+notice on stdin, through the command runner fork delivery uses), and the
+webhook `agentfs.patchNotifyUrl` (one POST, `Idempotency-Key:
+<volume>:<status commit>`, a bearer token from
+`agentfs.patchNotifyCredentialFile`; under CSI a profile's config sets
+it). Both are bounded by `agentfs.patchNotifyTimeout`. A failure raises
+`NotifyFailed` and the mark stays, so the next queue event sends the same
+changes again: at least once, no timer and no retry loop. A receiver
+dedupes on volume, inbox, patch and verdict.
+
+**Apply.** `agentfs patch apply` asks the control socket first (`apply`,
+protocol v1). A running daemon (`mount`, `run` or `serve-history`, with
+fronts or none) always counts as attached: it judges, writes the status,
+notifies, and answers "workload attached; lands at next mount" (exit 75).
+With no daemon, the command takes the state lock and runs the queue
+(exit 1 when blocked or a patch is set aside, 75 when the lock is held).
+
+**`serve-git`** (§19.1 "serve-git", bead agentfs-mia.9) makes the state
+area's history repository the volume's patch source: a git server over
+smart HTTP (`git http-backend`), for any producer that speaks git. It
+refuses to start while `agentfs.patchRemote` names a remote. Every
+request authenticates as a pusher of `[agentfsPusher "<name>"]`
+(configuration.md), whose rights (`offer`, `approve`, `barrier`,
+`integrator`) say what it may write. A push is **admitted before git
+keeps it**: agentfs's `pre-receive` hook refuses the whole push unless
+every update is allowed and every offered tip reads as a patch against
+the head, so git discards a refused push's objects. On **arrival** the
+`post-receive` hook judges the queue and notifies, never lands: through
+the daemon's `judge` when one runs, else under the state lock taken
+without waiting, else the lock holder's own run judges it. `POST
+/agentfs/apply` (`integrator`) is `agentfs patch apply`.
+
+**Checkpoints and the change line** (§19.1 "Checkpoint", bead
+agentfs-mia.6). `agentfs checkpoint`, or the control socket's
+`checkpoint`, cuts one commit per intent on
+`refs/agentfs/<volume>/change-line`: the head's tree, with the
+previous checkpoint and the tips of the patches landed since as parents.
+It is merged back into the branch by a marker commit, one of [§3.4](#34-commits)'s
+marker exceptions, so the branch's first-parent history and the queue's
+trailer scan are unchanged. A remote with `agentfsPush = changeLine`
+receives the change line instead of the branch; the queue push is
+unchanged.
+
+**Forks of forks** (bead agentfs-mia.7, §11.5). A linked fork's patch
+remote is its fork remote, so it can be forked, and a fork of it (whose
+identity records `agentfs.fork.sourceIsFork`) rolls its change up one
+level: its finisher pushes its history to the fork remote, with that
+remote's credentials (`remote_auth.rs`), lists `refs/agentfs/<parent>/`
+there once, and queues its change create-only as the parent's next inbox
+number (losing a race, it lists again and takes the next). A change the
+parent already queues or applied is not queued again; a parent that has
+finished (its `finish` ref is listed) cannot take it, so the child
+publishes as a top-level fork and raises `ForkParentFinished` (nothing
+is lost, and nothing lands it). The parent's queue lands the change like
+any patch, at its next mount with nothing attached, and the parent's own
+change then carries it up. A fork's applied numbers are its own: the
+trailer scan reads only the history after the fork's base, so a fork
+never inherits its source's numbers.
+
+**Telemetry** (§13): the gauges `agentfs.patch.queue_depth`,
+`agentfs.patch.blocked` and `agentfs.patch.held`, an `agentfs.patch` span
+per patch, the alarms `PatchBlocked`, `PatchHeld`, `PatchRuleFailed`,
+`PatchFetchFailed` and `NotifyFailed`, the warning `PatchIgnored`, and the
+events `PatchApplied` and `PatchDuplicate`.
 
 **The patch remote** is `agentfs.patchRemote`: a remote's name, or `none`.
 By default it is the only remote when exactly one is configured, else
@@ -2597,6 +2711,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
 | `agentfs.patch.queue_depth` | gauge | Patches queued after the last applied one, the blocked one included (§12) |
 | `agentfs.patch.blocked` | gauge | 1 while the patch queue is blocked (§12) |
+| `agentfs.patch.held` | gauge | Patches set aside (held, waiting, awaiting or not judged) at the last run (§12) |
 | `agentfs.state.bytes` | gauge | Size of the state area by part |
 | `agentfs.telemetry.export_failures` | counter, per signal | Telemetry exports (traces, metrics, logs) that failed; counted by the binary, exported once metrics get through |
 | `agentfs.front.round_trip` | histogram, by request | A front's round trip to the history service (`record`, `tracked`, `ping`), in seconds (§14) |
@@ -2685,6 +2800,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `ForkFinished` | A fork wrote its finish commit, with the fork and its change (none when nothing changed); once (§11.5; not an alarm, logged at INFO) |
 | `ForkPublished` | A fork's fork remote holds its change and finish refs at exactly their ids: the fork and the remote; once, when the published mark is written (§11.5; not an alarm, logged at INFO) |
 | `ForkRefused` | A fork's fork remote refuses its publish for good: the fork, the remote, the reason (`another_writer`, `too_large`, `rejected`, `remote_gone`, `unsafe`) and the remote's message; once, when the refusal is recorded; nothing retries it until `agentfs fork finish --retry` ([fork-refused.md](runbooks/fork-refused.md), §11.5) |
+| `ForkParentFinished` | A fork of a fork finished after its parent had, so its change could not roll up into the parent's queue and was published as a top-level fork's, at `refs/agentfs/<fork>/change`: the fork and its parent; once, when the published mark is written. Nothing is lost and nothing lands it ([runbook](runbooks/patch-queue.md#9-forks-of-forks); §12 "Forks of forks") |
 | `ForkAbandoned` | An operator abandoned a fork on record, with the reason (§11.5; not an alarm, logged at INFO) |
 | `HistoryServiceUnavailable` | A front's request to the history service failed (unreachable, timed out, lost or refused) after it last succeeded: raised once per outage; boundaries fail with `EIO` until it is back (§3.5, §14) |
 | `HistoryServiceRestored` | A front's request succeeded again after `HistoryServiceUnavailable` (not an alarm; sinks filter, the CLI prints it) |
@@ -3437,7 +3553,7 @@ operator runbooks ([runbooks](README.md#runbooks)):
 | [history-rewrite.md](runbooks/history-rewrite.md) | Removing a recorded secret from the state area and each remote (§10) |
 | [stuck-pushes.md](runbooks/stuck-pushes.md) | Pushes that keep failing |
 | [crashed-sidecar.md](runbooks/crashed-sidecar.md) | A sidecar whose daemon died: automatic recovery by stacking, when to step in, the pod restart (§17.1) |
-| [patch-queue.md](runbooks/patch-queue.md) | Submitting patches (with agentfs or plain git), a blocked queue, replacing or skipping a patch (§12) |
+| [patch-queue.md](runbooks/patch-queue.md) | Submitting patches (with agentfs, plain git or `serve-git`), a patch set aside (held, waiting, awaiting, not judged), a blocked queue, replacing or skipping a patch, a failed notice (`NotifyFailed`), a fork of a fork whose parent finished first (`ForkParentFinished`) (§12) |
 | [fork-refused.md](runbooks/fork-refused.md) | A fork whose publish is refused for good: each reason, how it shows, retry or abandon (§11.5) |
 | [moving.md](runbooks/moving.md) | Continuing a CSI volume on another node: a new volume started from the old branch (§14.2) |
 | [start-branch-moved.md](runbooks/start-branch-moved.md) | `StartBranchMoved`: taking in or accepting the commits an old branch received after a move (§11.3) |
@@ -4235,8 +4351,8 @@ restartable (§14.2). The controller runs no children.
     Two nodes writing one volume are out of scope by decision (§19.1).
 17. **Forks** (§11.5). A source with a fork-only remote never pushes there
     and keeps its remotes, limits and patch remote; a fork pushes only to
-    its fork remote at `agentfs/<fork>` and has no patch queue (unit tests
-    in `config.rs`). Create reads the source live, without its lock,
+    its fork remote at `agentfs/<fork>`, which is also its patch remote
+    (unit tests in `config.rs`). Create reads the source live, without its lock,
     leaves it byte-identical, writes base's tree as stored without
     following a symlink, and refuses what it cannot fork; finish writes
     the change on base and the finish commit once; publish returns
@@ -4258,7 +4374,15 @@ restartable (§14.2). The controller runs no children.
     finish --retry` in the node plugin publishes it and its PV goes; the
     first change submitted twice applies once, and a later submit is
     refused early
-    (`ci/e2e-csi-forks.sh`). Refused, abandoned and remote-gone publishes,
+    (`ci/e2e-csi-forks.sh`). Forks of forks (bead agentfs-mia.7): a
+    child's change rolls up into its parent's inbox, once, at the next
+    free number, its parent's queue lands it and ignores the source's
+    numbers, a child finished after its parent publishes as a top-level
+    fork, and unlinked, hidden and local-only parents are refused
+    (`fork/tests.rs`); `fork create` of a CLI fork (`cli_fork.rs`); on
+    kind, a grandchild's change rolled up into its parent's queue on an
+    authenticated fork remote and landed at the parent's next pod
+    (`ci/e2e-csi-fork-of-fork.sh`). Refused, abandoned and remote-gone publishes,
     the single refusal decider, settings that fail closed and the
     read-only recorder are tested in `fork/tests.rs`; `fork status`,
     `abandon`, `list` (forged change refs skipped), `finish --retry`, the
@@ -4516,7 +4640,7 @@ runner.
 | Atomic records | A journal record flag: at record time a refused member, or one a path rule skips (`group_member_skipped`), skips the rest of the group (`GroupRefused`), at commit time a refused change drops the whole record; a refused capture counts as done (§3.4, §8) |
 | `agentfs.maxSize` | An operator attribute for any path, refusing larger content (`max_size`) whatever the store, checked on the size on disk and on the frozen copy at record time, not again at commit; a file moved by a directory rename is checked against its new path's limit by the move's reconciliation and removed if over it (§3.1, §4.2, §8) |
 | Repack | `git repack -d -q --geometric=2` with bitmaps off, one thread, bounded window, delta cache and big-file threshold (about 256 MiB), a cleared environment and system and global config ignored, skipped when nothing is loose, killed on stop, on the commit thread every `agentfs.repackInterval` (default 1h, `0`/`off` disables, at least 1m); put off by a second while a push holds its lock; never prunes; failures raise `RepackFailed` (§8, §13) |
-| Patch submission | A patch is a single commit pushed to `inbox/<n>` with a create-only lease (`--force-with-lease=<ref>:`); a race loses and takes `n+1`. `agentfs patch submit` wraps the producer's `git`; plain git works the same (§12, [runbook](runbooks/patch-queue.md)) |
+| Patch submission | A patch is a single commit (a branch since 2026-10-29, "Patches are branches" below) pushed to `inbox/<n>` with a create-only lease (`--force-with-lease=<ref>:`); a race loses and takes `n+1`. `agentfs patch submit` wraps the producer's `git`; plain git works the same (§12, [runbook](runbooks/patch-queue.md)) |
 | Patch application | At mount only, after journal replay and before the service and FUSE start; a cherry-pick through the restore engine's checks, recorded as one atomic operation of kind `patch` with the patch's author and agentfs as committer; the first failure blocks the queue, raises `PatchBlocked`, and the volume mounts anyway (§12) |
 | Patch idempotency | Decided by the branch's trailers (`Agentfs-Inbox`, `Agentfs-Patch`), never by refs or a cache; refs move after the commit, so a crash anywhere re-applies nothing (§12) |
 | Queue push | Only to the patch remote, after every branch push attempt (failed ones included) and apart from it: the status ref, `applied/<n>` once the branch holds the commit, and `inbox/<n>` of every applied number deleted, leased on the oid listed; its failures never count against the branch (§11.3) |
@@ -4604,6 +4728,8 @@ runner.
 | Checkpoint (2026-10-29) | `agentfs checkpoint [-m MESSAGE]`, and the control socket's `checkpoint` (protocol v1) under a daemon, cut one commit on the change line `refs/agentfs/<volume>/change-line`: the branch head's tree after committing what is recorded; first parent the previous change-line tip (a fork's first: its source's tip at create, `agentfs.fork.baseChangeLine`); further parents the `applied/<n>` tips of the patches landed since, by inbox number; author the caller, committer the replica; the caller's message, then `Agentfs-Trigger: checkpoint` and `Agentfs-Branch-Head`. It is merged back by a marker on the branch with parents `[head, checkpoint]` (§3.4's marker exception, like the patch marker; `Agentfs-Checkpoint`, `Agentfs-Seq`), so first-parent scans and the queue are unchanged. Nothing new (the same tree, no patch since): no commit, exit 0. Under a daemon its commit loop cuts it between commits, so the branch keeps one writer; with none, the command takes the state lock (exit 75 when busy). `remote.<name>.agentfsPush = changeLine` pushes the change line to that remote's branch ref instead of the branch, judged (claims, divergence, backlog, LFS) against it; the queue push is unchanged. The owner's words: "one commit per change intent" (approved design page v4; §19.2 item 11 "checkpoint cuts one commit per intent"). Design choices, not his words: the change-line ref moves before the marker, and a tip a crash left unmerged is merged first by the next cut; patches landed since are found by first-parent inbox trailers from the previous checkpoint's `Agentfs-Branch-Head`; a fork records its source's tip only when base reaches it; the branch's history is no longer linear at checkpoint markers (its first parents are). Costs: a change-line remote sees only checkpoints and producers' patch commits, never the per-record history; producers' LFS pointers outside the managed block are not uploaded (§7 unchanged); the CSI release decider still judges a change-line remote against the branch head (`RemotePusher::branch_claim`'s caller), so a CSI volume should not set it yet. Bead agentfs-mia.6 (§19.2 item 11) |
 | serve-git (2026-10-29) | `agentfs serve-git --listen HOST:PORT` serves the state area's history repository as the volume's patch source over git's smart HTTP (`git http-backend`, §17.3). It refuses to start while `agentfs.patchRemote` names a remote (its fetch would prune what pushers write), and takes no lock: git writes the refs. Fetches and pushes see only the branch and `refs/agentfs/<volume>/{inbox,applied,approved}/*` and its `status` (`transfer.hideRefs`). Pushers are `[agentfsPusher "<name>"]` sections (`tokenFile`, multi-valued `right` = `offer`, `approve`, `barrier`, `integrator`); every request authenticates by HTTP Basic (the pusher's name and token) or a bearer token, compared in constant time with the token file read at each request, else 401. `receive-pack` runs agentfs's own hooks (`core.hooksPath`, `meta/serve-git/hooks`): `pre-receive` (`serve-git admit`) refuses the whole push unless every update is allowed (`inbox/<n>` with `offer`, and `barrier` for an `Agentfs-Barrier: yes` tip; `approved/<n>` with `approve`; nothing else, no deletes) and every offered tip reads as a patch against the head, so git discards a refused push's quarantined objects; `post-receive` (`serve-git arrived`) judges and notifies, never lands: the control socket's `judge` (protocol v1) under a daemon, else the state lock taken without waiting, else nothing (the holder's run judges). `POST /agentfs/apply` (`integrator`) is `patch apply`: 409 with the daemon's reply when attached, else the command's run. The owner's words: "agentfs should be a legitimate git server, and its up to the specific use case to wire up the relationship of the various distributed remotes", "git protocol is ideal" (2026-10-28); "No live landing yet" (2026-10-29). Design choices, not his words: HTTP only (no SSH), one volume per process, the rights' names and meanings, judging without a fetch, the hook's identity from the pod flags as environment, the apply route's statuses (200 exit 0, 422 exit 1, 409 exit 75). Costs: no TLS in the binary; under the sidecar the workload can reach the port and is kept out by the tokens alone, which live outside the mount; serve-git serves no LFS endpoint, only git objects. Bead agentfs-mia.9 (§19.2 item 11) |
 | Merge rules (2026-10-29) | `agentfs.patchIntegrate` picks `merge` (the default) or `rebase`, both by the `git` program; merge drivers come only from the operator's `$GIT_DIR/info/attributes` and the repository's config (AGENTS.md principle 3); a driver that cannot run leaves the patch not judged and alarmed (`PatchRuleFailed`, rule `merge`), never a conflict; mergiraf ships in the image as its own program (§17.3). The owner, 2026-10-16, asked "should we use the native git binary?" and liked the answer; 2026-10-28, on the gate page, picked both the git program and mergiraf; and 2026-10-28: "my opinion is that squashes are too blunt, but rebase can be attractive for cleaner history". The rest are design choices, not his words, and the first sits against that opinion: a rebase lands as one commit (its commits are listed in the message and kept by `applied/<n>`), not as a replayed chain, to keep one record per patch; every configured driver is checked before any merge, so one broken driver leaves every patch not judged, whatever its paths; a killed driver is told from other `merge-tree` failures only by git's wording. Bead agentfs-mia.3 (§19.2 item 11) |
+| Patches are branches (2026-10-29) | A patch is a branch: a line of single-parent commits on a base, the merge base of its tip and the head, read by one reader (`patch::PatchBranch::read`) for the queue and `serve-git` alike; merged onto the head by the `git` program (`git merge-tree --write-tree --merge-base`, `core.fsync=objects`, `attr.tree` the empty tree) and landed as one atomic record and one commit carrying `Agentfs-Patch: <tip>`, its message the tip's with the branch's commits listed; `patch submit` takes a tip and refuses a merge commit inside it. Numbering, the stale check, duplicates and crash recovery are today's (§12). The owner's words: "my opinion is that squashes are too blunt, but rebase can be attractive for cleaner history. then again, merge is more explicit about the process and the merge commit might be a useful artifact to note when agentfs did its work" (2026-10-28); "Build incrementally" (2026-10-29). Design choices, not his words: the base is the merge base, not a recorded one; one commit per patch rather than the producer's commits on the branch (they stay reachable at `applied/<n>`), which keeps one record per patch and "held whole" on a crash; a merge commit inside a patch is held (`merge_commit`). Bead agentfs-mia.4 (§19.2 item 11) |
+| Forks of forks (2026-10-29) | A linked fork may be forked, and changes roll up level by level (§11.5, §12 "Forks of forks"): a linked fork's patch remote is its fork remote; a fork of a fork (`agentfs.fork.sourceIsFork`) finishes by queueing its change create-only as its parent's next inbox number there, through the finisher's own `RemotePusher`, with the fork remote's credentials, at most once; a parent that has finished first makes it publish as a top-level fork, raising `ForkParentFinished`; a fork's applied numbers count only after its base, so it never inherits its source's. The owner, 2026-10-28: "Couldn’t branches of branches be rolled up before they are merged into the “main” branch? This is not really a unique concept — it’s just how git normally works." Design choices, not his words, confirmed by the main session from the mia.7 implementer's erratum (`.claude/errata.md`, 2026-10-29): delivery through `RemotePusher` (one credential path, not the `git` program); create refuses a parent with hidden history (`ParentHistoryHidden`), as well as an unlinked parent and a fork of a local-only source, which have no queue to roll into; the fork identity keys join `OWN_KEYS` so the CLI can fork a CLI fork. Cost: a change whose parent finished first is published but lands nowhere until someone delivers it. Bead agentfs-mia.7 (§19.2 item 11) |
 
 ### 19.2 Open questions
 
@@ -4709,8 +4835,8 @@ runner.
    remote is configured, the volume is lost, and that's a choice the
    user is allowed to make.").
 11. **Merge queue (bead agentfs-mia).** Approved by the owner 2026-10-29;
-   being built incrementally on today's queue (§12), one feature per bead;
-   partly built (below). Short record:
+   built incrementally on today's queue (§12), one feature per bead;
+   every feature below is built, and §12 describes them. Short record:
    - *Requirements, his words:* "bring all of those patches back
      together in an automated way" (10-16); "A partial application has
      unknown side effects" (10-16); "Configurable with a sensible
@@ -4732,7 +4858,7 @@ runner.
      intent; notify (a `patch-notify` hook, a webhook under CSI) and
      apply as in §19.1; `agentfs serve-git` with per-pusher rights;
      forks of forks.
-   - *Later gate:* landing patches while a workload runs. Eight design
+   - *Later gate (open):* landing patches while a workload runs. Eight design
      reviews (2026-10-29) found serious flaws each time, chiefly the race
      between a landing and the workload's writes across pods.
    - *Built:* the tracer (a branch lands as one patch, merged by git;
@@ -4747,7 +4873,10 @@ runner.
      "Checkpoint"), and `agentfs serve-git` (the history repository as a
      git server for patch pushes, with per-pusher rights, admitted
      before kept, judged and notified on arrival; mia.9, §19.1
-     "serve-git").
+     "serve-git"), and forks of forks (a fork's change rolls up into its
+     parent fork's queue, level by level; mia.7, §19.1 "Forks of
+     forks"). The tracer is §19.1 "Patches are branches". Their docs
+     are mia.8.
    - *Beads:* agentfs-mia.4 (tracer), mia.2, mia.3, mia.5, mia.6,
      mia.9, mia.7, mia.8.
 

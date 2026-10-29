@@ -3,7 +3,10 @@
 Producers outside a volume (iac, an operator, CI) change its tree through
 history: they queue patches on the volume's remote, and agentfs applies
 them, in order, the next time the volume mounts, before anything can see
-the tree. Design: [§12](../design.md#12-patch-queue-for-iac-phase-3-built),
+the tree. A patch that cannot land is set aside whole while the
+rest go on; integrators are notified of every verdict change; the queue
+can also be served over git ([section 8](#8-serving-the-queue-over-git-serve-git)),
+and forks of forks roll up through it ([section 9](#9-forks-of-forks)). Design: [§12](../design.md#12-patch-queue-for-iac-phase-3-built),
 [§11.3](../design.md#113-limits-and-rejected-pushes). `ci/e2e-patches.sh`
 follows this runbook against a smart-HTTP remote and a real mount.
 
@@ -87,6 +90,8 @@ volume's branch, and a commit already on the branch. Options:
 | `--replace N` | Replace queued patch N (it must still be the commit listed), or fill a gap at N |
 | `--skip N` | Replace queued patch N with an empty patch, or fill a gap at N with one, so the queue moves on |
 | `--barrier` | Make it a barrier: while it is set aside, every later patch waits behind it. A built or `--skip` patch gets the trailer `Agentfs-Barrier: yes`; a given commit must carry it in its last message paragraph (`git commit --amend --trailer 'Agentfs-Barrier: yes'`) |
+| `--depth D` | Fetch only D commits (shallow producers) |
+| `--attempts K` | Numbers to try when other submitters race (default 10) |
 
 A gap is a number below the highest one listed that the remote has
 neither as `inbox/N` nor as `applied/N`; `--replace N` and `--skip N` fill
@@ -96,8 +101,6 @@ even while the applied refs wait for the branch): a replacement would
 never be applied. Submit a new patch instead. A patch the volume set aside
 is still queued (`status.json` lists it), so `--replace N` and `--skip N`
 take it even when later numbers have landed.
-| `--depth D` | Fetch only D commits (shallow producers) |
-| `--attempts K` | Numbers to try when other submitters race (default 10) |
 
 ### With plain git
 
@@ -271,6 +274,17 @@ not-judged patch raises `PatchHeld` (`patch <n> (<oid>) set aside, held
   the message), 75 leaves it awaiting. Any other status, a signal, the
   timeout or a hook that cannot start leaves it **not judged** and raises
   `PatchRuleFailed`: fix the hook; the next run judges it again.
+- **Merge drivers** ([section 6](#6-configuration), "Merge rules"). A
+  merge driver the operator configured that cannot run (its program is
+  not an executable file in git's fixed `PATH`, or it was killed or exited
+  above 128) leaves the patch **not judged** with rule `merge`
+  (`not judged: 4 (merge): the merge driver mergiraf could not run: ...`)
+  and raises `PatchRuleFailed`, never a conflict. Every configured driver
+  is checked before any merge, so one broken driver leaves every queued
+  patch not judged. Install the program, fix `merge.<name>.driver`, or
+  remove the `merge=<name>` line from `$GIT_DIR/info/attributes`, then
+  run `agentfs patch apply` or restart. A driver that runs and exits 1 to
+  128 reports a conflict, which is `held (conflict)`.
 
 A run **stops** (blocks) only at `gap`, `unrecorded` or `failed`: that
 patch and every later one stay queued unjudged, `PatchBlocked` is raised
@@ -343,6 +357,7 @@ Nothing to do by hand.
 | `agentfs.patchFetchTimeout` | `30s` | How long a mount waits for the fetch; `0` or `off` skips it |
 | `agentfs.patchAccept` | `cleanMerge` | The acceptance rule for a cleanly merged patch: `cleanMerge` lands it, `approval` waits for `agentfs patch approve`, `command` asks `$GIT_DIR/hooks/patch-accept` ([section 4](#4-a-patch-set-aside)) |
 | `agentfs.patchAcceptTimeout` | `60s` | How long the hook may run before its process group is killed and the patch is not judged |
+| `agentfs.patchIntegrate` | `merge` | How a patch is merged onto the head: `merge` merges its whole diff against its base; `rebase` replays its commits one by one and holds it as a `conflict` at the first that conflicts. Either way it lands as one commit |
 | `agentfs.patchNotifyUrl` | unset | The notify webhook ([section 7](#7-notifying-the-integrator)) |
 | `agentfs.patchNotifyCredentialFile` | unset | Its bearer token's file |
 | `agentfs.patchNotifyTimeout` | `30s` | How long the `patch-notify` hook and the webhook may take |
@@ -354,6 +369,23 @@ remote even while the branch cannot push (applied refs and deletions wait
 for a branch push that worked); `agentfs push` prints it as
 `<remote>: queue: ...`. Its failures are `PushFailed` with stage `queue`
 and never count against the branch.
+
+**Merge rules.** Merges run with the `git` program (2.40 or later), and
+only the operator's `$GIT_DIR/info/attributes` names merge drivers; the
+volume's own `.gitattributes` never does. A built-in driver needs one
+line (`*.log merge=union`). A program needs a `merge.<name>.driver` in the
+volume's config too (under CSI, the profile's), for example mergiraf,
+which the image ships:
+
+```sh
+git --git-dir "$STATE/git" config merge.mergiraf.name mergiraf
+git --git-dir "$STATE/git" config merge.mergiraf.driver \
+  'mergiraf merge --git %O %A %B -s %S -x %X -y %Y -p %P -l %L'
+printf '*.rs merge=mergiraf\n' >>"$STATE/git/info/attributes"
+```
+
+`ci/e2e-mergiraf.sh` merges two patches to one `.rs` file this way in the
+built image.
 
 ## 7. Notifying the integrator
 
@@ -397,3 +429,72 @@ when every method delivered. Fix the hook or the receiver, then run
 `agentfs patch apply` (or wait for the next mount). Delivery is at least
 once: a receiver dedupes on volume, inbox, patch and verdict. Deleting
 `meta/notify.json` sends every queued patch's verdict again.
+
+## 8. Serving the queue over git (`serve-git`)
+
+`agentfs serve-git` makes the state area's history repository the
+volume's patch source: producers push patches to it with plain git, and
+`agentfs patch submit` and `patch approve` work against its URL unchanged
+(design §12, configuration
+[`[agentfsPusher "<name>"]`](../configuration.md#agentfspusher-name)).
+It refuses to start while `agentfs.patchRemote` names a remote, whose
+fetch would prune what pushers write:
+
+```sh
+git --git-dir "$STATE/git" config agentfs.patchRemote none
+git --git-dir "$STATE/git" config agentfsPusher.iac.tokenFile /run/secrets/agentfs/iac-token
+git --git-dir "$STATE/git" config --add agentfsPusher.iac.right offer
+agentfs --state "$STATE" --root "$BACKING" serve-git --listen 0.0.0.0:8418
+# serve-git: listening on http://0.0.0.0:8418/
+```
+
+A producer then uses `http://iac:<token>@<host>:8418/` as its remote. It
+is plain HTTP: put TLS in front, and keep the token files outside the
+mount. A push is judged whole before git keeps any of it; a refused push
+keeps nothing, and git prints the reason as `remote: agentfs: push
+refused: <why>`:
+
+| Refusal | Cause | Fix |
+|---|---|---|
+| HTTP 401 | No pusher's name and token, or bearer token, matched (a token file that cannot be read or is empty authenticates no one) | Check the URL's user and token against `tokenFile` |
+| `<pusher> may not offer patch <n> (Offer right needed)` | Pushing `inbox/<n>` without `offer`; likewise `approve patch <n>` without `approve`, and `offer barrier patch <n>` for a tip carrying `Agentfs-Barrier: yes` without `barrier` | Add the `right` to the pusher, or push with another pusher |
+| `patch <n>: <reason>: <message>` | The tip does not read as a patch against the head, with the queue's reason (`parent_not_in_history`, `merge_commit`, `unsupported`, `too_large`; [section 4](#4-a-patch-set-aside)) | Rebase or split it and push again |
+| `<ref> is not a ref pushers write` | Anything but `refs/agentfs/<volume>/inbox/<n>` and `approved/<n>`: the branch, `applied/*`, the status, other names | Push only inbox and approval refs |
+| `deleting <ref> is not allowed` | A push that deletes a ref | To withdraw a patch, `--skip N` it |
+| HTTP 403 on `POST /agentfs/apply` | The pusher lacks `integrator` | Add the right |
+
+An admitted push is judged and notified at once, never landed (the
+patches land at the next mount with nothing attached): through the
+running daemon, or, with none, under the state lock; while another
+command holds the lock, that command's own run judges it. `POST
+/agentfs/apply` with the `integrator` right runs `agentfs patch apply`:
+200 when it exited 0, 422 when 1, 409 when 75 or while a daemon holds the
+volume (its JSON reply is the body).
+
+## 9. Forks of forks
+
+A linked fork's patch remote is its fork remote, so a fork can be forked
+(design §11.5, §12 "Forks of forks"). When the child finishes, it queues
+its change as its parent's next inbox number on the fork remote, using
+that remote's credentials; the parent's queue lands it at its next mount
+with nothing attached, and the parent's own change, when it finishes,
+carries it up a level. `agentfs fork status` shows the child
+`published`, and its `meta/fork.json` mark names the inbox number. The
+parent's `patch status` lists the change like any patch, and everything
+in sections 3 and 4 applies to it.
+
+`fork create` refuses to fork an unlinked fork, a fork whose history is
+hidden (`agentfs.fork.pushTarget = hidden`) and a fork of a local-only
+source: none has a queue its forks could roll up into.
+
+**`ForkParentFinished`**: the child finished after its parent had (the
+parent's `refs/agentfs/<parent>/finish` was on the fork remote), so its
+change could not go into the parent's queue. It was published as a
+top-level fork's instead, at `refs/agentfs/<fork>/change` and
+`refs/agentfs/<fork>/finish` on the fork remote. Nothing is lost, but
+nothing lands it either: it is a published change like any top-level
+fork's, which `agentfs fork list` shows and `agentfs fork deliver` hands
+to a receiver (design §11.5 "Delivery"). Its base is a commit of the
+parent's history, not of the source's branch: deliver it where that
+history is reviewed, or leave it. To avoid it, finish children (delete
+their claims) before their parent.
