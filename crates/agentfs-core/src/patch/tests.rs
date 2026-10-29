@@ -1,5 +1,9 @@
 //! The patch queue against real volumes (design §12, §18 test 15): a state
-//! area, a backing tree, the recorder and committer, no FUSE.
+//! area, a backing tree, the recorder and committer, the `git` program
+//! merging, no FUSE.
+//!
+//! The tests that run the queue skip, with a message, when `git` is not
+//! installed, as `crates/agentfs/tests/cli_patch.rs` does.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,11 +11,13 @@ use std::sync::Arc;
 
 use git2::{Oid, Repository, Signature, Time};
 
+use super::integrate::{GitMergeTree, Integrated, Integrator, PatchBranch};
 use super::queue::{Queue, QueueContext, QueueReport};
 use super::status::{PatchState, read_status};
 use super::*;
 use crate::confined::Dir;
 use crate::events::{Event, Events, MemorySink};
+use crate::git_cli;
 use crate::identity::Context;
 use crate::lfs::Pointer;
 use crate::lfs::fetch::LfsObjects;
@@ -26,6 +32,15 @@ const CALLER: Caller = Caller {
     gid: 10000,
     pid: 1,
 };
+
+/// Whether `git` is installed; says so when it is not.
+fn have_git() -> bool {
+    let found = git_cli::find_git().is_some();
+    if !found {
+        eprintln!("skipping: git is not installed");
+    }
+    found
+}
 
 struct NoLfs;
 
@@ -173,6 +188,7 @@ impl Fixture {
     fn process(&self) -> QueueReport {
         let tree = self.dir();
         let telemetry = Telemetry::noop();
+        let integrator = GitMergeTree::new(self.state.git());
         let mut queue = Queue::new(QueueContext {
             state: &self.state,
             recorder: &self.recorder,
@@ -181,6 +197,7 @@ impl Fixture {
             objects: &NoLfs,
             telemetry: &telemetry,
             caller: CALLER,
+            integrator: &integrator,
         });
         queue.process(None).unwrap()
     }
@@ -312,6 +329,9 @@ fn inbox_trailers_only_count_from_patch_commits() {
 /// Design §18 test 15: three patches, the second conflicts.
 #[test]
 fn three_patches_the_second_conflicts() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
     let base = f.head();
     let p1 = f.patch(
@@ -451,6 +471,9 @@ fn three_patches_the_second_conflicts() {
 /// Crash (a): the commit is made, the refs are not moved.
 #[test]
 fn crash_between_commit_and_ref_move() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p1);
@@ -479,6 +502,9 @@ fn crash_between_commit_and_ref_move() {
 /// Crash (b): the tree is written, nothing is recorded.
 #[test]
 fn crash_after_the_tree_write() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
     let p1 = f.patch(
         f.head(),
@@ -511,6 +537,9 @@ fn crash_after_the_tree_write() {
 /// Crash (c): the record is journaled, not committed.
 #[test]
 fn crash_before_the_commit() {
+    if !have_git() {
+        return;
+    }
     let mut f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p1);
@@ -519,8 +548,14 @@ fn crash_before_the_commit() {
         let repo = f.repo();
         let head = repo.find_commit(f.head()).unwrap();
         let patch = repo.find_commit(p1).unwrap();
-        let mut index = repo.cherrypick_commit(&patch, &head, 0, None).unwrap();
-        let merged = index.write_tree_to(repo).unwrap();
+        let branch = PatchBranch::read(repo, head.id(), p1).unwrap();
+        let Integrated::Clean { tree: merged } = GitMergeTree::new(f.state.git())
+            .integrate(head.id(), &branch)
+            .unwrap()
+        else {
+            panic!("the patch conflicts");
+        };
+        repo.odb().unwrap().refresh().unwrap();
         let plan = restore::plan_tree(repo, head.id(), p1, merged, "edit a".into()).unwrap();
         let tree = f.dir();
         let plan = restore::check(plan, repo, &f.recorder, &NoLfs, &tree, &NotLive, false).unwrap();
@@ -555,6 +590,9 @@ fn crash_before_the_commit() {
 
 #[test]
 fn a_patch_that_changes_nothing_gets_a_marker_commit() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let base = f.head();
     f.change(&[("a.txt", "a1\n")], &[]);
@@ -577,6 +615,9 @@ fn a_patch_that_changes_nothing_gets_a_marker_commit() {
 
 #[test]
 fn a_gap_blocks() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
     f.queue(1, p1);
@@ -594,6 +635,9 @@ fn a_gap_blocks() {
 
 #[test]
 fn merge_commits_root_commits_and_foreign_parents_block() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let head = f.head();
     let repo = f.repo();
@@ -626,6 +670,9 @@ fn merge_commits_root_commits_and_foreign_parents_block() {
 
 #[test]
 fn gitlinks_are_unsupported() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let repo = f.repo();
     let parent = repo.find_commit(f.head()).unwrap();
@@ -645,6 +692,9 @@ fn gitlinks_are_unsupported() {
 
 #[test]
 fn unrecorded_changes_block_and_leave_the_tree_alone() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p1);
@@ -660,6 +710,9 @@ fn unrecorded_changes_block_and_leave_the_tree_alone() {
 
 #[test]
 fn stale_entries_are_ignored_and_do_not_block() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
     f.queue(1, p1);
@@ -698,6 +751,9 @@ fn stale_entries_are_ignored_and_do_not_block() {
 
 #[test]
 fn the_scan_cache_is_not_authoritative() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
     f.queue(1, p1);
@@ -742,6 +798,9 @@ fn note_in_flight(f: &Fixture, n: u64, p: Oid, paths: &[&str]) {
 /// tree or history.
 #[test]
 fn crash_after_the_tree_write_then_the_patch_is_skipped() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
     let base = f.head();
     let p1 = f.patch(
@@ -783,6 +842,9 @@ fn crash_after_the_tree_write_then_the_patch_is_skipped() {
 /// recorded as they stand, so the tree still matches history.
 #[test]
 fn an_interrupted_write_that_cannot_be_put_back_is_recorded() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "patch");
     note_in_flight(&f, 1, p1, &["a.txt"]);
@@ -802,6 +864,9 @@ fn an_interrupted_write_that_cannot_be_put_back_is_recorded() {
 /// The same patch still queued: the run applies it as usual.
 #[test]
 fn an_interrupted_write_of_a_patch_still_queued_is_applied() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "patch");
     f.queue(1, p1);
@@ -816,6 +881,9 @@ fn an_interrupted_write_of_a_patch_still_queued_is_applied() {
 /// A queue that cannot run is recorded as blocked, for the gauges.
 #[test]
 fn a_failed_run_is_recorded_as_blocked() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     f.process();
     let before = PatchState::load(&f.state.patch_state());
@@ -825,6 +893,7 @@ fn a_failed_run_is_recorded_as_blocked() {
     fs::write(f.state.git().join("refs/agentfs/vol/status.lock"), "").unwrap();
     let tree = f.dir();
     let telemetry = Telemetry::noop();
+    let integrator = GitMergeTree::new(f.state.git());
     let mut queue = Queue::new(QueueContext {
         state: &f.state,
         recorder: &f.recorder,
@@ -833,6 +902,7 @@ fn a_failed_run_is_recorded_as_blocked() {
         objects: &NoLfs,
         telemetry: &telemetry,
         caller: CALLER,
+        integrator: &integrator,
     });
     assert!(queue.process(None).is_err());
     let after = PatchState::load(&f.state.patch_state());
@@ -849,6 +919,9 @@ fn a_failed_run_is_recorded_as_blocked() {
 /// A stale entry is a warning event.
 #[test]
 fn ignored_entries_raise_a_warning() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p1 = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "1");
     f.queue(1, p1);
@@ -878,6 +951,9 @@ fn ignored_entries_raise_a_warning() {
 /// marker commit carrying its inbox number, with nothing merged.
 #[test]
 fn a_patch_commit_queued_twice_applies_once() {
+    if !have_git() {
+        return;
+    }
     let f = Fixture::new(&[("a.txt", "a0\n")]);
     let p = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p);
@@ -935,6 +1011,9 @@ fn a_patch_commit_queued_twice_applies_once() {
 /// patched file, leaves the file reverted.
 #[test]
 fn a_duplicate_never_reapplies_a_reverted_change() {
+    if !have_git() {
+        return;
+    }
     let mut f = Fixture::new(&[("a.txt", "a0\n")]);
     let p = f.patch(f.head(), &[("a.txt", Some("a1\n"))], "edit a");
     f.queue(1, p);

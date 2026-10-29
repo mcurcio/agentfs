@@ -7,10 +7,11 @@
 //!
 //! 1. `git ls-remote` lists the volume's branch, inbox and applied refs.
 //! 2. `git fetch` brings the branch head `H`.
-//! 3. The patch is a commit whose parent is `H` or one of its ancestors:
-//!    a given commit with exactly one parent, or one built here on `H`
-//!    from `--put`/`--delete` (with a temporary index), or, for `--skip`,
-//!    an empty commit on `H`.
+//! 3. The patch is a branch: a given tip (any revision) whose commits since
+//!    its merge base with `H` (the patch's base) are a line of
+//!    single-parent commits, or one commit built here on `H` from
+//!    `--put`/`--delete` (with a temporary index), or, for `--skip`, an
+//!    empty commit on `H`.
 //!    A given commit taking a new number that is already queued
 //!    (`inbox/*`) or applied (`applied/*`, or `last_applied` in the status
 //!    ref) is refused early
@@ -55,15 +56,16 @@ pub enum SubmitError {
     Spawn(#[source] std::io::Error),
     #[error("the remote has no branch {0}: the volume has not pushed yet")]
     NoBranch(String),
-    #[error("{commit} has {parents} parents; a patch is a commit with exactly one parent")]
-    NotSingleParent { commit: String, parents: usize },
     #[error(
-        "{commit}'s parent {parent} is not on the volume's branch {branch} (head {head}); \
-         rebase the patch onto the branch{shallow}"
+        "{commit} in the patch has {parents} parents; a patch is a line of single-parent commits"
+    )]
+    MergeInBranch { commit: String, parents: usize },
+    #[error(
+        "{commit} shares no history with the volume's branch {branch} (head {head}); rebase it \
+         onto the branch{shallow}"
     )]
     ParentNotInHistory {
         commit: String,
-        parent: String,
         branch: String,
         head: String,
         shallow: &'static str,
@@ -149,7 +151,8 @@ impl GitRunner for GitCli {
 /// What the patch is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    /// An existing commit (any revision), with one parent on the branch.
+    /// The tip of a branch (any revision): its commits since the volume's
+    /// branch are the patch.
     Commit(String),
     /// A commit built on the remote branch head.
     Build {
@@ -188,7 +191,10 @@ pub struct Submitted {
     pub inbox: u64,
     pub ref_name: String,
     pub oid: String,
-    pub parent: String,
+    /// The patch's base: the merge base of the tip and the remote head.
+    pub base: String,
+    /// The patch's commits, base exclusive, tip inclusive.
+    pub commits: usize,
     /// Numbers lost to other submitters first.
     pub raced: u32,
 }
@@ -259,8 +265,8 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
         .ok_or_else(|| SubmitError::NoBranch(branch_ref.clone()))?;
     // The head and enough history to check the patch's parent.
     fetch_commit(git, &req.remote, &head, &branch_ref, req.depth)?;
-    let (oid, parent) = match &req.source {
-        Source::Commit(rev) => existing_commit(git, req, rev, &head)?,
+    let (oid, base, commits) = match &req.source {
+        Source::Commit(rev) => branch_tip(git, req, rev, &head)?,
         Source::Build {
             puts,
             deletes,
@@ -269,6 +275,7 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
         } => (
             build_commit(git, &head, puts, deletes, message, author.as_deref())?,
             head.clone(),
+            1,
         ),
         Source::Skip(n) => (
             build_commit(
@@ -280,6 +287,7 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
                 None,
             )?,
             head.clone(),
+            1,
         ),
     };
     // A given commit taking a new number; `--replace N` names its number
@@ -320,7 +328,8 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
                 inbox: n,
                 ref_name,
                 oid,
-                parent,
+                base,
+                commits,
                 raced: 0,
             }),
             PushLine::Rejected(message) => Err(SubmitError::Refused { ref_name, message }),
@@ -338,7 +347,8 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
                     inbox: n,
                     ref_name,
                     oid,
-                    parent,
+                    base,
+                    commits,
                     raced,
                 });
             }
@@ -352,7 +362,8 @@ pub fn submit(git: &impl GitRunner, req: &SubmitRequest) -> Result<Submitted, Su
                             inbox: n,
                             ref_name,
                             oid,
-                            parent,
+                            base,
+                            commits,
                             raced,
                         });
                     }
@@ -527,50 +538,63 @@ pub fn push_leased(
     }
 }
 
-/// A given commit: one parent, on the branch.
-fn existing_commit(
+/// A given branch tip: `(tip, base, commit count)`. Its base is the merge
+/// base of the tip and `head`; its commits since the base must each have
+/// one parent, and there must be at least one.
+fn branch_tip(
     git: &impl GitRunner,
     req: &SubmitRequest,
     rev: &str,
     head: &str,
-) -> Result<(String, String), SubmitError> {
+) -> Result<(String, String, usize), SubmitError> {
     let spec = format!("{rev}^{{commit}}");
-    let oid = check(git, &["rev-parse", "--verify", "--quiet", &spec], &[])?
+    let tip = check(git, &["rev-parse", "--verify", "--quiet", &spec], &[])?
         .stdout
         .trim()
         .to_owned();
-    let parents = check(git, &["rev-list", "--parents", "-n", "1", &oid], &[])?;
-    let parents: Vec<String> = parents
-        .stdout
-        .split_whitespace()
-        .skip(1)
-        .map(str::to_owned)
-        .collect();
-    let [parent] = parents.as_slice() else {
-        return Err(SubmitError::NotSingleParent {
-            commit: oid,
-            parents: parents.len(),
-        });
+    let args = ["merge-base", tip.as_str(), head];
+    let merge_base = git.run(&args, &[])?;
+    let base = match (merge_base.success, merge_base.code) {
+        (true, _) => merge_base.stdout.trim().to_owned(),
+        (false, Some(1)) => {
+            let shallow = git
+                .run(&["rev-parse", "--is-shallow-repository"], &[])
+                .map(|o| o.stdout.trim() == "true")
+                .unwrap_or(false);
+            return Err(SubmitError::ParentNotInHistory {
+                commit: tip,
+                branch: req.branch.clone(),
+                head: head.to_owned(),
+                shallow: if shallow {
+                    " (this clone is shallow: a larger --depth may find it)"
+                } else {
+                    ""
+                },
+            });
+        }
+        (false, _) => return Err(git_error(&args, &merge_base)),
     };
-    let ancestor = git.run(&["merge-base", "--is-ancestor", parent, head], &[])?;
-    if ancestor.success {
-        return Ok((oid, parent.clone()));
+    let range = format!("{base}..{tip}");
+    let lines = check(git, &["rev-list", "--parents", &range], &[])?;
+    let mut commits = 0;
+    for line in lines.stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let commit = fields.next().unwrap_or_default();
+        let parents = fields.count();
+        if parents != 1 {
+            return Err(SubmitError::MergeInBranch {
+                commit: commit.to_owned(),
+                parents,
+            });
+        }
+        commits += 1;
     }
-    let shallow = git
-        .run(&["rev-parse", "--is-shallow-repository"], &[])
-        .map(|o| o.stdout.trim() == "true")
-        .unwrap_or(false);
-    Err(SubmitError::ParentNotInHistory {
-        commit: oid,
-        parent: parent.clone(),
-        branch: req.branch.clone(),
-        head: head.to_owned(),
-        shallow: if shallow {
-            " (this clone is shallow: a larger --depth may find it)"
-        } else {
-            ""
-        },
-    })
+    if commits == 0 {
+        return Err(SubmitError::BadRequest(
+            "the commit is already on the volume's branch".into(),
+        ));
+    }
+    Ok((tip, base, commits))
 }
 
 /// A commit on `head` with `puts` written and `deletes` removed, built in
@@ -820,7 +844,8 @@ mod tests {
                         .collect();
                     Self::ok(&out)
                 }
-                "fetch" | "merge-base" | "read-tree" | "update-index" => Self::ok(""),
+                "fetch" | "read-tree" | "update-index" => Self::ok(""),
+                "merge-base" => Self::ok(&format!("{HEAD}\n")),
                 "write-tree" => Self::ok(&format!("{OTHER}\n")),
                 "commit-tree" => Self::ok(&format!("{PATCH}\n")),
                 "cat-file" => match self.status.borrow().as_deref() {
@@ -883,7 +908,8 @@ mod tests {
         assert_eq!(done.inbox, 4);
         assert_eq!(done.raced, 2);
         assert_eq!(done.oid, PATCH);
-        assert_eq!(done.parent, HEAD);
+        assert_eq!(done.base, HEAD);
+        assert_eq!(done.commits, 1);
         assert_eq!(
             git.remote.borrow()["refs/agentfs/v/inbox/0000000004"],
             PATCH

@@ -12,15 +12,17 @@
 //!    (a crash between the commit and the ref moves), and reports other
 //!    entries at or below the last applied number as ignored;
 //! 4. applies the rest in order, the next number being the last applied
-//!    plus one (a missing number blocks with `gap`). Each patch must have
-//!    one parent on the branch, change at most [`MAX_PATCH_PATHS`] paths
-//!    and no gitlinks; it is merged onto the head with libgit2's
-//!    cherry-pick (a three-way merge against its parent), written into the
+//!    plus one (a missing number blocks with `gap`). Each patch is a
+//!    branch ([`PatchBranch`]): a line of single-parent commits on a base,
+//!    the merge base of its tip and the head, changing at most
+//!    [`super::MAX_PATCH_PATHS`] paths and no gitlinks. It is merged onto
+//!    the head by the context's [`Integrator`] (`git merge-tree`, a
+//!    three-way merge against the base), written into the
 //!    backing tree with the restore engine ([`crate::restore`]), and
 //!    recorded as one atomic record of a patch operation, so it becomes one
 //!    commit carrying `Agentfs-Inbox: <n>`. A patch that changes nothing
 //!    gets a marker commit with the head's tree;
-//! 5. moves the refs (`applied/<n>` = the patch, `inbox/<n>` deleted) and
+//! 5. moves the refs (`applied/<n>` = the patch's tip, `inbox/<n>` deleted) and
 //!    stops at the first patch it cannot apply;
 //! 6. writes the status ref and `meta/patch.json`.
 //!
@@ -44,17 +46,18 @@
 
 use std::collections::BTreeMap;
 
-use git2::{FileMode, Oid, Repository};
+use git2::{Oid, Repository};
 use opentelemetry::KeyValue;
 
 use super::fetch::FetchOutcome;
+use super::integrate::{Integrated, Integrator, PatchBranch, Refusal};
 use super::status::{
     AppliedEntry, DuplicateEntry, FetchStatus, InFlight, PatchState, QueueEntry, STATUS_VERSION,
     StatusDoc, write_status_ref,
 };
 use super::{
-    BlockReason, Blocked, Ignored, MAX_PATCH_PATHS, PatchError, applied_ref, inbox_from_message,
-    inbox_prefix, inbox_ref, seq_of_ref,
+    BlockReason, Blocked, Ignored, PatchError, applied_ref, inbox_from_message, inbox_prefix,
+    inbox_ref, seq_of_ref,
 };
 use crate::confined::Dir;
 use crate::events::Event;
@@ -63,7 +66,7 @@ use crate::lfs::fetch::LfsObjects;
 use crate::paths::RepoPath;
 use crate::record::{Caller, Operation, OperationKind, PatchAuthor};
 use crate::restore::{self, Applied, NotLive, Plan, RecordMode, RestoreError, Step};
-use crate::telemetry::{Telemetry, spans};
+use crate::telemetry::{ActiveSpan, Telemetry, spans};
 use crate::volume::{Committer, OperationSpec, Recorder, StateDir};
 
 /// Inputs per record when a partial write is recorded.
@@ -82,6 +85,9 @@ pub struct QueueContext<'a> {
     pub telemetry: &'a Telemetry,
     /// The applying process: the operations' actor and operator.
     pub caller: Caller,
+    /// How patches are merged onto the head (bead agentfs-mia.3 adds a
+    /// choice).
+    pub integrator: &'a dyn Integrator,
 }
 
 /// What one [`Queue::process`] did.
@@ -381,7 +387,7 @@ impl<'a> Queue<'a> {
     fn consume_duplicate(&self, n: u64, patch_oid: Oid, m: u64) -> Result<Oid, PatchError> {
         let repo = self.cx.committer.history().repo();
         let summary = match repo.find_commit(patch_oid) {
-            Ok(patch) => summary_of(&patch, n),
+            Ok(patch) => summary_of(&patch, n, &[], repo),
             Err(_) => format!("patch {n}"),
         };
         let op = Operation {
@@ -414,7 +420,7 @@ impl<'a> Queue<'a> {
                 KeyValue::new("agentfs.patch.oid", patch.to_string()),
             ]
         });
-        let step = match self.apply_inner(n, patch) {
+        let step = match self.apply_inner(n, patch, &span) {
             Ok(step) => step,
             Err(e) => Step1::Blocked(blocked(
                 n,
@@ -439,7 +445,7 @@ impl<'a> Queue<'a> {
         step
     }
 
-    fn apply_inner(&self, n: u64, patch_oid: Oid) -> Result<Step1, PatchError> {
+    fn apply_inner(&self, n: u64, patch_oid: Oid, span: &ActiveSpan) -> Result<Step1, PatchError> {
         let QueueContext {
             recorder,
             committer,
@@ -455,33 +461,6 @@ impl<'a> Queue<'a> {
                 n, patch_oid, reason, message, paths,
             )))
         };
-        let Ok(patch) = repo.find_commit(patch_oid) else {
-            return block(
-                BlockReason::Unsupported,
-                format!("{patch_oid} is not a commit"),
-                Vec::new(),
-            );
-        };
-        match patch.parent_count() {
-            1 => {}
-            0 => {
-                return block(
-                    BlockReason::Unsupported,
-                    "the patch is a root commit: it needs the branch commit it was written \
-                     against as its parent"
-                        .into(),
-                    Vec::new(),
-                );
-            }
-            parents => {
-                return block(
-                    BlockReason::MergeCommit,
-                    format!("the patch has {parents} parents; it must have one"),
-                    Vec::new(),
-                );
-            }
-        }
-        let parent = patch.parent_id(0)?;
         let Some(head) = history.head()? else {
             return block(
                 BlockReason::ParentNotInHistory,
@@ -489,52 +468,19 @@ impl<'a> Queue<'a> {
                 Vec::new(),
             );
         };
-        let on_branch = repo.odb()?.exists(parent)
-            && (parent == head.id() || repo.graph_descendant_of(head.id(), parent)?);
-        if !on_branch {
-            return block(
-                BlockReason::ParentNotInHistory,
-                format!(
-                    "the patch's parent {parent} is not the branch head {} or one of its \
-                     ancestors",
-                    head.id()
-                ),
-                Vec::new(),
-            );
-        }
-        if let Some(step) = validate_diff(repo, &patch, parent)? {
-            return Ok(Step1::Blocked(blocked(
-                n, patch_oid, step.0, step.1, step.2,
-            )));
-        }
-        let mut index = repo.cherrypick_commit(&patch, &head, 0, None)?;
-        if index.has_conflicts() {
-            let mut paths = Vec::new();
-            for conflict in index.conflicts()? {
-                let conflict = conflict?;
-                let entry = conflict.our.or(conflict.their).or(conflict.ancestor);
-                if let Some(entry) = entry {
-                    let path = String::from_utf8_lossy(&entry.path).into_owned();
-                    if !paths.contains(&path) {
-                        paths.push(path);
-                    }
-                }
-            }
-            return block(
-                BlockReason::Conflict,
-                format!(
-                    "merging onto the branch head {} conflicts in {}",
-                    head.id(),
-                    paths.join(", ")
-                ),
-                paths,
-            );
-        }
-        let merged = index.write_tree_to(repo)?;
+        let (branch, merged) = match self.merge(head.id(), patch_oid)? {
+            Ok(merged) => merged,
+            Err(refusal) => return block(refusal.reason, refusal.message, refusal.paths),
+        };
+        span.set(KeyValue::new(
+            "agentfs.patch.commits",
+            branch.commits.len() as i64,
+        ));
+        let patch = repo.find_commit(patch_oid)?;
         let spec = OperationSpec {
             kind: OperationKind::Patch,
             source: patch_oid.to_string(),
-            summary: summary_of(&patch, n),
+            summary: summary_of(&patch, n, &branch.commits, repo),
             caller: *caller,
             inbox: Some(n),
             author: Some(author_of(&patch)),
@@ -723,20 +669,54 @@ impl<'a> Queue<'a> {
         if head.id().to_string() != f.head {
             return Err("the branch head moved".into());
         }
-        let patch = repo
-            .find_commit(patch.ok_or("not a commit id")?)
-            .map_err(|e| e.to_string())?;
-        let mut index = repo
-            .cherrypick_commit(&patch, &head, 0, None)
-            .map_err(|e| e.to_string())?;
-        if index.has_conflicts() {
-            return Err("the merge conflicts".into());
-        }
-        let merged = index.write_tree_to(repo).map_err(|e| e.to_string())?;
-        let plan = restore::plan_tree(repo, head.id(), patch.id(), merged, String::new())
+        let patch = patch.ok_or("not a commit id")?;
+        let merged = match self.merge(head.id(), patch).map_err(|e| e.to_string())? {
+            Ok((_, merged)) => merged,
+            Err(refusal) => return Err(refusal.message),
+        };
+        let plan = restore::plan_tree(repo, head.id(), patch, merged, String::new())
             .map_err(|e| e.to_string())?;
         let paths: Vec<RepoPath> = plan.steps.iter().map(|s| s.path.clone()).collect();
         self.write_back(&plan, &paths, &paths)
+    }
+
+    /// Reads patch `tip` as a branch against `head` and merges it there:
+    /// the branch and the merged tree, whose objects this repository then
+    /// sees, or why it does not land (a refusal, a conflict, a merge that
+    /// could not run).
+    fn merge(
+        &self,
+        head: Oid,
+        tip: Oid,
+    ) -> Result<Result<(PatchBranch, Oid), Refusal>, PatchError> {
+        let repo = self.cx.committer.history().repo();
+        let branch = match PatchBranch::read(repo, head, tip) {
+            Ok(branch) => branch,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let tree = match self.cx.integrator.integrate(head, &branch) {
+            Ok(Integrated::Clean { tree }) => tree,
+            Ok(Integrated::Conflict { paths }) => {
+                return Ok(Err(Refusal {
+                    reason: BlockReason::Conflict,
+                    message: format!(
+                        "merging onto the branch head {head} conflicts in {}",
+                        paths.join(", ")
+                    ),
+                    paths,
+                }));
+            }
+            Err(e) => {
+                return Ok(Err(Refusal {
+                    reason: BlockReason::Failed,
+                    message: e.to_string(),
+                    paths: Vec::new(),
+                }));
+            }
+        };
+        // The objects git wrote, for this repository's object database.
+        repo.odb()?.refresh()?;
+        Ok(Ok((branch, tree)))
     }
 
     /// Puts the paths of `plan` that were written or removed back to the
@@ -808,52 +788,11 @@ fn error_paths(e: &RestoreError) -> Vec<String> {
     }
 }
 
-/// Why the diff from `parent` to `patch` is not one the queue applies:
-/// too many paths, a gitlink, or a path agentfs cannot write.
-fn validate_diff(
-    repo: &Repository,
-    patch: &git2::Commit<'_>,
-    parent: Oid,
-) -> Result<Option<(BlockReason, String, Vec<String>)>, PatchError> {
-    let before = repo.find_commit(parent)?.tree()?;
-    let after = patch.tree()?;
-    let diff = repo.diff_tree_to_tree(Some(&before), Some(&after), None)?;
-    let count = diff.deltas().len();
-    if count > MAX_PATCH_PATHS {
-        return Ok(Some((
-            BlockReason::TooLarge,
-            format!("the patch changes {count} paths; at most {MAX_PATCH_PATHS} are applied"),
-            Vec::new(),
-        )));
-    }
-    for delta in diff.deltas() {
-        for file in [delta.old_file(), delta.new_file()] {
-            let Some(path) = file.path_bytes() else {
-                continue;
-            };
-            let path = String::from_utf8_lossy(path).into_owned();
-            if file.mode() == FileMode::Commit {
-                return Ok(Some((
-                    BlockReason::Unsupported,
-                    format!("{path} is a gitlink (submodule); agentfs never records those"),
-                    vec![path],
-                )));
-            }
-            if let Err(e) = RepoPath::new(path.clone()) {
-                return Ok(Some((
-                    BlockReason::Unsupported,
-                    format!("{path:?} is not a path agentfs records: {e}"),
-                    vec![path],
-                )));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// The commit message of a patch's commit: the patch's own, without a
-/// final trailer paragraph (agentfs adds its own trailers).
-pub fn summary_of(patch: &git2::Commit<'_>, n: u64) -> String {
+/// The commit message of a patch's commit: the tip's own, without a final
+/// trailer paragraph (agentfs adds its own trailers); for a patch of more
+/// than one commit (`commits`, oldest first), followed by a blank line and
+/// one line per commit, `<12-hex short oid> <subject>`.
+pub fn summary_of(patch: &git2::Commit<'_>, n: u64, commits: &[Oid], repo: &Repository) -> String {
     let raw = String::from_utf8_lossy(patch.message_raw_bytes()).into_owned();
     let mut paragraphs: Vec<&str> = raw
         .trim_end()
@@ -867,11 +806,27 @@ pub fn summary_of(patch: &git2::Commit<'_>, n: u64) -> String {
         paragraphs.pop();
     }
     let message = paragraphs.join("\n\n").trim().to_owned();
-    if message.is_empty() {
+    let mut message = if message.is_empty() {
         format!("patch {n}")
     } else {
         message
+    };
+    if commits.len() > 1 {
+        message.push('\n');
+        for oid in commits {
+            let subject = repo
+                .find_commit(*oid)
+                .ok()
+                .and_then(|c| {
+                    c.summary_bytes()
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                })
+                .unwrap_or_default();
+            let short = oid.to_string();
+            message.push_str(&format!("\n{} {subject}", &short[..12]));
+        }
     }
+    message
 }
 
 /// `Token: value`, as git reads trailers.

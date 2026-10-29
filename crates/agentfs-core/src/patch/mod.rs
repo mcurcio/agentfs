@@ -177,12 +177,16 @@ impl BlockReason {
                  the gap create-only)"
             }
             Self::ParentNotInHistory => {
-                "the patch must be written against a commit of the volume's branch; rebase it \
-                 and resubmit with --replace <n>"
+                "the patch must build on a commit of the volume's branch; rebase it and \
+                 resubmit with --replace <n>"
             }
-            Self::MergeCommit | Self::Unsupported | Self::TooLarge => {
-                "replace it with a single-parent commit of at most 4096 regular files and \
-                 symlinks (--replace <n>), or skip it (--skip <n>)"
+            Self::MergeCommit => {
+                "replace it with a line of single-parent commits on the volume's branch \
+                 (--replace <n>), or skip it (--skip <n>)"
+            }
+            Self::Unsupported | Self::TooLarge => {
+                "replace it with a patch changing at most 4096 regular files and symlinks \
+                 (--replace <n>), or skip it (--skip <n>)"
             }
             Self::Unrecorded => {
                 "the tree differs from history at the paths named (changes not recorded yet, or \

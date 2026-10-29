@@ -18,22 +18,32 @@ BRANCH=agentfs/$VOL                                # the volume's branch
 
 ## What a patch is
 
-- **One commit with exactly one parent**, the branch commit it was written
-  against: the head, or any ancestor of it (agentfs merges it
-  onto the head as `git cherry-pick` would).
-- At most 4096 changed paths, regular files and symlinks only (no
+- **A branch**: a line of one or more commits, each with exactly one
+  parent, on a **base**, the last commit of the volume's branch it builds
+  on (the merge base of its tip and the branch head: the head, or any
+  ancestor of it). agentfs merges it onto the head with
+  `git merge-tree --write-tree --merge-base=<base>`, a three-way merge
+  against the base, and lands it as **one** commit. A one-commit patch is
+  a branch of one. Only the operator's `$GIT_DIR/info/attributes` steers
+  the merge, never the volume's own `.gitattributes`. The merge needs git
+  2.40 or later in the state area's environment.
+- The producer's commits are not on the volume's branch: they stay
+  reachable at `refs/agentfs/<volume>/applied/<n>`, which names the tip.
+- At most 4096 paths changed from base to tip, regular files and symlinks only (no
   submodules), and only paths agentfs records (no `.git` components).
 - Pushed to `refs/agentfs/<volume>/inbox/<n>` on the volume's **patch
   remote** (below), where `<n>` is ten zero-padded digits from
   `0000000001`. Numbers are applied in order; a missing number blocks
   the ones after it.
 
-The commit agentfs makes for it has the patch's author and message,
-agentfs's committer identity, and the trailers:
+The commit agentfs makes for it has the tip's author and message (for a
+branch of more than one commit, followed by one line per commit, oldest
+first: `<short oid> <subject>`), agentfs's committer identity, and the
+trailers:
 
 ```text
 Agentfs-Trigger: patch
-Agentfs-Patch: <patch commit>
+Agentfs-Patch: <the tip>
 Agentfs-Inbox: <n>
 ```
 
@@ -52,15 +62,18 @@ default `origin`) and a `user.name` and `user.email` for built patches.
 agentfs patch submit --volume "$VOL" --put config/app.yaml=./app.yaml -m "Raise the limit"
 agentfs patch submit --volume "$VOL" --delete old/notes.md -m "Drop old notes"
 
-# Or queue a commit you made (its parent must be on the volume's branch).
+# Or queue a branch you made: its commits since the volume's branch are
+# the patch (no merge commits among them).
 git fetch origin "$BRANCH"
 git switch -c change FETCH_HEAD
-# ... edit, git commit ...
+# ... edit, git commit, as many times as you like ...
 agentfs patch submit --volume "$VOL" HEAD
 ```
 
-It prints `queued patch <n> as refs/agentfs/<volume>/inbox/<n> (<oid>,
-parent <commit>)`. Options:
+It prints `queued patch <n> as refs/agentfs/<volume>/inbox/<n> (<tip>,
+<k> commit(s) on <base>)`. It refuses a branch with a merge commit in it
+(`... in the patch has 2 parents`), one that shares no history with the
+volume's branch, and a commit already on the branch. Options:
 
 | Option | Meaning |
 |---|---|
@@ -93,7 +106,7 @@ git ls-remote "$URL" "refs/heads/$BRANCH" "refs/agentfs/$VOL/inbox/*" "refs/agen
 N=$(git ls-remote "$URL" "refs/agentfs/$VOL/inbox/*" "refs/agentfs/$VOL/applied/*" |
   sed 's#.*/##' | sort | tail -n1)
 NUM=$(printf '%010d' $((10#${N:-0} + 1)))
-# 2. A commit whose parent is on the branch (here: the current HEAD).
+# 2. The tip of a branch of single-parent commits on the branch (here: HEAD).
 OID=$(git rev-parse HEAD)
 # 3. Create the ref only if nobody has it (an empty lease means "must not exist").
 git push "$URL" --force-with-lease="refs/agentfs/$VOL/inbox/$NUM:" "$OID:refs/agentfs/$VOL/inbox/$NUM"
@@ -184,10 +197,10 @@ patches before it applied. Nothing of the blocked patch is written.
 
 | Reason | Cause | Fix |
 |---|---|---|
-| `conflict` | The patch conflicts with changes on the branch since its parent; `paths` lists them | Rebase it onto the current head and `--replace N` |
+| `conflict` | The patch conflicts with changes on the branch since its base; `paths` lists them | Rebase it onto the current head and `--replace N` |
 | `gap` | Number N is missing while later ones are queued | `agentfs patch submit --volume "$VOL" --skip N`, or `--replace N` with the missing patch (both fill N create-only) |
-| `parent_not_in_history` | Its parent is not on the volume's branch | Rebase onto the branch and `--replace N` |
-| `merge_commit` | More than one parent | Squash it and `--replace N` |
+| `parent_not_in_history` | Its history does not meet the volume's branch | Rebase onto the branch and `--replace N` |
+| `merge_commit` | A commit of the branch has more than one parent | Rebase or squash it into a line of single-parent commits and `--replace N` |
 | `unsupported` | A root commit, a submodule, or a path agentfs does not record | Remove the path and `--replace N`, or `--skip N` |
 | `too_large` | More than 4096 paths | Split it: `--replace N` with the first part, then submit the rest |
 | `unrecorded` | The tree differs from history where the patch writes (`paths` lists them): a change not recorded, a pending repair, something untracked in the way | Record the paths with the volume stopped, `agentfs --state "$STATE" --root "$BACKING" record <paths>` (or finish the repair or restore that left them), then restart. The mount only commits what is journaled; it never records other differences by itself |

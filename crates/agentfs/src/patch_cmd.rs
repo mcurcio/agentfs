@@ -22,6 +22,7 @@ use agentfs_core::lfs::fetch::Fetcher;
 use agentfs_core::lock::StateLock;
 use agentfs_core::patch::BlockReason;
 use agentfs_core::patch::fetch::{FetchOutcome, fetch_inbox};
+use agentfs_core::patch::integrate::GitMergeTree;
 use agentfs_core::patch::queue::{Queue, QueueContext, QueueReport, record_failure};
 use agentfs_core::patch::status::{PatchState, StatusDoc, read_status};
 use agentfs_core::patch::status_ref;
@@ -35,9 +36,10 @@ use crate::{Pod, Session, current_gid, current_uid};
 #[derive(Subcommand)]
 pub enum PatchCommand {
     /// Queue a patch for a volume (run in the producer's git repository):
-    /// a given COMMIT whose parent is on the volume's branch, or one built
-    /// on the remote branch head from --put/--delete. Pushed to the next
-    /// free inbox number; a race with another submitter takes the next.
+    /// a branch, given by its tip COMMIT, whose commits since the volume's
+    /// branch are the patch, or one commit built on the remote branch head
+    /// from --put/--delete. Pushed to the next free inbox number; a race
+    /// with another submitter takes the next.
     Submit(SubmitArgs),
     /// Fetch and apply the volume's patch queue now, with the volume
     /// stopped (takes the state-area lock; exit 75 when it is busy). Exit
@@ -59,7 +61,8 @@ pub enum PatchCommand {
 
 #[derive(Args)]
 pub struct SubmitArgs {
-    /// The commit to queue (any revision); omit to build one from
+    /// The tip of the branch to queue (any revision); its commits since the
+    /// volume's branch are the patch. Omit to build one commit from
     /// --put/--delete on the remote branch head.
     commit: Option<String>,
     /// The volume.
@@ -179,8 +182,8 @@ fn submit_cmd(args: SubmitArgs) -> Result<ExitCode> {
     };
     let done = submit::submit(&GitCli::new(&args.repo), &request)?;
     println!(
-        "queued patch {} as {} ({}, parent {})",
-        done.inbox, done.ref_name, done.oid, done.parent
+        "queued patch {} as {} ({}, {} commit(s) on {})",
+        done.inbox, done.ref_name, done.oid, done.commits, done.base
     );
     if done.raced > 0 {
         println!("{} number(s) taken by other submitters first", done.raced);
@@ -311,6 +314,7 @@ fn apply_queue_inner(
     };
     let tree = Dir::open(root).with_context(|| format!("opening {}", root.display()))?;
     let objects = Fetcher::new(state, settings).context("opening the LFS cache")?;
+    let integrator = GitMergeTree::new(state.git());
     let mut queue = Queue::new(QueueContext {
         state,
         recorder,
@@ -323,6 +327,7 @@ fn apply_queue_inner(
             gid: current_gid(),
             pid: std::process::id(),
         },
+        integrator: &integrator,
     });
     let report = queue
         .process(fetched.as_ref())

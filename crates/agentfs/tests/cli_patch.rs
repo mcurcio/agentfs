@@ -194,6 +194,45 @@ impl Setup {
     }
 }
 
+impl Setup {
+    /// Runs git in `dir`, which must succeed; its stdout.
+    fn git_ok(&self, dir: &Path, args: &[&str]) -> String {
+        let out = self.git(dir, args);
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}{}",
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+        text(&out.stdout)
+    }
+
+    /// A producer clone on the volume's branch as the remote has it.
+    fn producer_on_branch(&self, name: &str) -> PathBuf {
+        let p = self.producer(name);
+        self.git_ok(&p, &["checkout", "--quiet", "agentfs/demo"]);
+        p
+    }
+
+    /// Writes `files` in producer `p` and commits them: the new commit.
+    fn commit(&self, p: &Path, files: &[(&str, &str)], message: &str) -> Oid {
+        for (name, content) in files {
+            fs::write(p.join(name), content).unwrap();
+            self.git_ok(p, &["add", name]);
+        }
+        self.git_ok(p, &["commit", "--quiet", "-m", message]);
+        Oid::from_str(self.git_ok(p, &["rev-parse", "HEAD"]).trim()).unwrap()
+    }
+
+    fn branch_head(&self) -> Oid {
+        self.local().refname_to_id(BRANCH).unwrap()
+    }
+
+    fn read(&self, name: &str) -> Option<String> {
+        fs::read_to_string(self.tree().join(name)).ok()
+    }
+}
+
 fn inbox(n: u64) -> String {
     format!("refs/agentfs/demo/inbox/{n:010}")
 }
@@ -329,7 +368,7 @@ fn submit_builds_replaces_skips_and_refuses() {
     let out = s.submit(&p, &["HEAD"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        text(&out.stderr).contains("is not on the volume's branch"),
+        text(&out.stderr).contains("shares no history with the volume's branch"),
         "{}",
         text(&out.stderr)
     );
@@ -585,4 +624,222 @@ fn a_queue_that_cannot_run_reads_as_blocked() {
     let json = s.ok(&["patch", "status", "--json"]);
     let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(doc["cache"]["blocked"]["reason"], "failed");
+}
+
+/// Acceptance 1 (bead agentfs-mia.4): a branch of two commits lands as one
+/// patch commit on a head that moved since the branch was cut.
+#[test]
+fn a_branch_lands_as_one_patch() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("seed.txt", "seed\n");
+    s.ok(&["push"]);
+    let base = s.remote_ref(BRANCH).unwrap();
+    let p = s.producer_on_branch("p");
+    let a = s.commit(&p, &[("a.txt", "a\n")], "add a");
+    let b = s.commit(&p, &[("b.txt", "b\n")], "add b");
+    let out = s.submit_ok(&p, &["HEAD"]);
+    assert!(
+        out.contains(&format!(
+            "queued patch 1 as refs/agentfs/demo/inbox/0000000001 ({b}, 2 commit(s) on {base})"
+        )),
+        "{out}"
+    );
+    // The workload records a change meanwhile.
+    s.record("w.txt", "w\n");
+    let before = s.branch_head();
+
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("a.txt").as_deref(), Some("a\n"));
+    assert_eq!(s.read("b.txt").as_deref(), Some("b\n"));
+    assert_eq!(s.read("w.txt").as_deref(), Some("w\n"));
+    let local = s.local();
+    let landed = local.find_commit(s.branch_head()).unwrap();
+    assert_eq!(landed.parent_count(), 1);
+    assert_eq!(landed.parent_id(0).unwrap(), before);
+    let message = landed.message().unwrap();
+    let trailers = message.trim_end().rsplit("\n\n").next().unwrap();
+    assert!(
+        trailers.contains(&format!("Agentfs-Patch: {b}\n")),
+        "{message}"
+    );
+    assert!(trailers.contains("Agentfs-Inbox: 1"), "{message}");
+    assert!(message.starts_with("add b\n\n"), "{message}");
+    let short = |o: Oid| o.to_string()[..12].to_owned();
+    assert!(
+        message.contains(&format!("\n{} add a\n{} add b\n", short(a), short(b))),
+        "{message}"
+    );
+    assert_eq!(s.inbox_commits(1), 1);
+    assert_eq!(local.refname_to_id(&applied(1)).unwrap(), b);
+    let tree = landed.tree().unwrap();
+    for name in ["a.txt", "b.txt", "w.txt", "seed.txt"] {
+        assert!(tree.get_path(Path::new(name)).is_ok(), "{name}");
+    }
+}
+
+/// Acceptance 2: a branch cut two commits behind the head, touching other
+/// files, merges cleanly against its base.
+#[test]
+fn a_branch_on_an_older_head_merges() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("seed.txt", "one\ntwo\nthree\n");
+    s.ok(&["push"]);
+    let p = s.producer_on_branch("p");
+    s.record("x.txt", "x\n");
+    s.record("y.txt", "y\n");
+    s.ok(&["push"]);
+    s.commit(
+        &p,
+        &[("seed.txt", "one\ntwo\nthree, by iac\n")],
+        "edit seed",
+    );
+    s.commit(&p, &[("c.txt", "c\n")], "add c");
+    s.submit_ok(&p, &["HEAD"]);
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        s.read("seed.txt").as_deref(),
+        Some("one\ntwo\nthree, by iac\n")
+    );
+    assert_eq!(s.read("c.txt").as_deref(), Some("c\n"));
+    assert_eq!(s.read("x.txt").as_deref(), Some("x\n"));
+    assert_eq!(s.read("y.txt").as_deref(), Some("y\n"));
+    assert_eq!(s.inbox_commits(1), 1);
+}
+
+/// Acceptance 3: a branch changing a path the workload changed too
+/// blocks with a conflict naming it; nothing is written and it stays
+/// queued.
+#[test]
+fn a_branch_that_conflicts_blocks() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("seed.txt", "seed\n");
+    s.ok(&["push"]);
+    let p = s.producer_on_branch("p");
+    s.commit(&p, &[("a.txt", "a\n")], "add a");
+    s.commit(&p, &[("seed.txt", "seed, by iac\n")], "edit seed");
+    s.submit_ok(&p, &["HEAD"]);
+    s.record("seed.txt", "seed, by the workload\n");
+    let head = s.branch_head();
+
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("patches: blocked at 1 (conflict)"), "{err}");
+    assert!(err.contains("conflicts in seed.txt"), "{err}");
+    assert_eq!(s.branch_head(), head);
+    assert_eq!(
+        s.read("seed.txt").as_deref(),
+        Some("seed, by the workload\n")
+    );
+    assert_eq!(s.read("a.txt"), None);
+    assert!(s.local().refname_to_id(&inbox(1)).is_ok());
+    let json = s.ok(&["patch", "status", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(doc["status"]["blocked"]["reason"], "conflict");
+    assert_eq!(
+        doc["status"]["blocked"]["paths"],
+        serde_json::json!(["seed.txt"])
+    );
+    assert_eq!(doc["cache"]["queue_depth"], 1);
+}
+
+/// Acceptance 4: the volume's own `.gitattributes` never steers a merge,
+/// even when the state area's HEAD names the volume's branch (some git
+/// versions, ubuntu-24.04's 2.43 among them, read a bare repository's
+/// attributes from `HEAD:.gitattributes`; 2.47 does not, so only those
+/// catch a merge without the `attr.tree` override).
+/// Here it asks for `merge=union`, which would merge both sides' edits.
+#[test]
+fn workload_attributes_do_not_steer_the_merge() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record(".gitattributes", "f.txt merge=union\n");
+    s.record("f.txt", "f\n");
+    s.ok(&["push"]);
+    let p = s.producer_on_branch("p");
+    s.commit(&p, &[("f.txt", "f, by iac\n")], "edit f");
+    s.submit_ok(&p, &["HEAD"]);
+    s.record("f.txt", "f, by the workload\n");
+    s.local().set_head(BRANCH).unwrap();
+
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("patches: blocked at 1 (conflict)"), "{err}");
+    assert_eq!(s.read("f.txt").as_deref(), Some("f, by the workload\n"));
+}
+
+/// Acceptance 5: a merge commit inside the branch is refused by submit,
+/// and blocks the queue as `merge_commit` when pushed with plain git.
+#[test]
+fn a_merge_inside_the_branch_is_refused() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("seed.txt", "seed\n");
+    s.ok(&["push"]);
+    let p = s.producer_on_branch("p");
+    // The remote head itself is no patch.
+    let out = s.submit(&p, &["HEAD"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("already on the volume's branch"),
+        "{}",
+        text(&out.stderr)
+    );
+    s.git_ok(&p, &["checkout", "--quiet", "-b", "side"]);
+    s.commit(&p, &[("side.txt", "side\n")], "side");
+    s.git_ok(&p, &["checkout", "--quiet", "agentfs/demo"]);
+    s.commit(&p, &[("a.txt", "a\n")], "add a");
+    s.git_ok(
+        &p,
+        &["merge", "--quiet", "--no-ff", "-m", "merge side", "side"],
+    );
+    let merge = Oid::from_str(s.git_ok(&p, &["rev-parse", "HEAD"]).trim()).unwrap();
+    s.commit(&p, &[("b.txt", "b\n")], "add b");
+
+    let out = s.submit(&p, &["HEAD"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains(&format!(
+            "{merge} in the patch has 2 parents; a patch is a line of single-parent commits"
+        )),
+        "{err}"
+    );
+    assert_eq!(s.remote_ref(&inbox(1)), None);
+
+    // Pushed with plain git, the queue refuses it.
+    s.git_ok(
+        &p,
+        &["push", "--quiet", "origin", &format!("HEAD:{}", inbox(1))],
+    );
+    let head = s.branch_head();
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("patches: blocked at 1 (merge_commit)"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("{merge} in the patch has 2 parents")),
+        "{err}"
+    );
+    assert_eq!(s.branch_head(), head);
+    assert_eq!(s.read("a.txt"), None);
 }

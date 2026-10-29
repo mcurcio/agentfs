@@ -20,6 +20,7 @@ pub mod file_lock;
 pub mod fork;
 pub mod fsutil;
 pub mod fsync_class;
+pub mod git_cli;
 pub mod gitmodules;
 pub mod history;
 pub mod history_service;
