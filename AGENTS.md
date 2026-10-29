@@ -25,7 +25,7 @@ These are the owner's priorities. When a choice is unclear, decide by them. Each
 7. **History is the product.** Never rewrite history or force-push automatically. A divergence is saved and an alarm is raised, never overwritten (§11.3). History rewrites are manual operator procedures (§15).
 8. **Recovery is manual but supported.** Recovery uses `restore`, `revert` and the runbooks. Further undo tooling is added as real use shows the need (§15).
 9. **Merging is an extra.** The core records history. The patch queue applies iac's changes only at mount: in order, stopping at the first failure, with the rest left queued (§12).
-10. **Rust in two layers.** The core and daemon form the first layer, and the CSI driver is the second (§17). OpenTelemetry is used for everything observable (§13).
+10. **Three layers, each an integration point.** The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into". The library is `agentfs-core`, the filesystem is `agentfs-fuse` and the `agentfs` binary, and the adapter is `agentfs-csi`. Put each primitive in the lowest layer that can own it, and give it a good API and docs there (design §19.1, "Three layers"). All are Rust (§17). OpenTelemetry is used for everything observable (§13).
 
 ## Working with the owner
 

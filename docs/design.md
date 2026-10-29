@@ -4541,6 +4541,8 @@ runner.
 | Zero remotes (2026-10-16, superseded 2026-10-17) | Zero remotes is never an error and needs no declaration: a volume with no push section is local-only, raises no alarm, and `agentfs init` and CSI CreateVolume take it; a remote added later gets all the history, and one removed leaves it local-only again; status and the `agentfs.remotes.mode` gauge say pushed, none valid or local-only (§11.1). A fork of a local-only source publishes `agentfs/<fork>` into the source's own history and is never applied (§11.5). The owner, on the F8 follow-up "init refusing volumes that never declared remotes" (`.handoff/f8-f12-notes.md`, "Answers on the two F8 follow-ups", 2026-10-17): "Remotes can come and go. It's not a error to have zero remotes"; on the restated change ("zero remotes never an error, no declaration"): "Go" (2026-10-17). Superseded 2026-10-17: it was a declared mode (`agentfs.remotes = none`, `agentfs init --local-only`), and a volume declaring nothing was "undeclared", alarmed (`RemotesUndeclared`) and refused by `init` and CreateVolume, from the frame he accepted on 2026-10-16 (R4): "zero remotes is a declared mode; a no-remote source's fork publishes `agentfs/<fork>` in the source's own history, never applied automatically"; his answer to the F8 reframe's question 2 on the fork half ("yes") stands. Built (F8 S3, F8 follow-ups) |
 | Local-only volumes, the details (2026-10-17) | Design choices (F8 S3), not the owner's words: a local-only `agentfs push` prints `local-only: nothing to push` and exits 0; a start class on a local-only profile is `StartError::LocalOnly`; a fork with nowhere to push (no fork remote and no invalid flagged section) is local-only. (The 2026-10-17 F8 follow-ups removed the declaration's details: `none` beside a push section, `init` and CreateVolume refusing an undeclared result.) A fork of a local-only source finds it by `agentfs.fork.sourceState`, written at create (the source must stay at that path until the fork is published); its finish names the fork remote `(source history)`, which no remote section can be called; it receives through the source's control socket (`receive_fork`) when a daemon holds the source's lock, else under the lock, and `fork finish` exits 75 while another command holds it; the fork's LFS objects are copied into the source's cache; a ref another writer holds there is `AnotherWriter` and a source that is gone `RemoteGone`, both refused (§11.5). Amended 2026-10-17 (F8 fixes): a source that gains a remote pushes the refs it received, create-only, after each branch push that worked (`fork::receive::received_refs` finds them by their `finish` ref; one held on the remote at another commit fails the push), and the release decider waits (`ReceivedLacking`) while a remote lacks one, so "a remote added later gets all the history" holds and DeleteVolume never removes a fork's only copy. Refusing to receive once the source has a remote was rejected: forks made while it was local-only could not publish, and what it already received would stay unpushed |
 | The right technology for the job (2026-10-28) | The owner, 2026-10-28: "i never said \"no native libraries\". lets choose the right technology for the job". AGENTS.md's principle 4 read "Native libraries, not shelling out", worded as his priority without a quote; it now carries his words. A library or the `git` program is chosen per need, with its reason in §17.3. Said beside his answer that agentfs may run the `git` program to merge and ship mergiraf as a separate program (merge queue design, bead agentfs-mia.1) |
+| Three layers, each an integration point (2026-10-29) | The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into. So you don’t need to design a be-all-end-all singular technology so long as the necessary primitives exist and have good designs/API/docs". Library: `agentfs-core`. Filesystem: `agentfs-fuse` and the `agentfs` binary. Kubernetes adapter: `agentfs-csi`. A piece goes in the first layer whose question it passes: (1) usable as Rust calls with no mount and no agentfs process; (2) needs the mount or the running agentfs process (a command, the control socket, git over HTTP); (3) exists only because Kubernetes does. A higher layer may use any lower one. He accepted this placement ("Ok") |
+| Integrators decide when patches are applied (2026-10-29) | The owner, 2026-10-29: "Then the question isn’t “quiet moments or not” — it’s how do we provide an API so that an integrator can trigger this action?"; on the result: "I like that flow. Approved". agentfs sets no timing rule for writing queued patches into a running volume. Every layer offers two primitives: *notify* (agentfs tells the integrator a patch arrived; the files are unchanged) and *apply* (the integrator tells agentfs to write the waiting patches now). agentfs still applies by itself at mount, as today (§12). Designed, not built (§19.2 item 11) |
 
 ### 19.2 Open questions
 
@@ -4645,6 +4647,29 @@ runner.
    deleted (§19.1 "Unlinked fork remotes"; the owner: "B. And if no
    remote is configured, the volume is lost, and that's a choice the
    user is allowed to make.").
+11. **Merge queue (bead agentfs-mia).** Designed and approved by the
+   owner 2026-10-29; not built. The design page
+   (https://claude.ai/artifact/BXfv7vPhKtzGwjgcwSv2GU, the owner's
+   review copy) holds the interfaces. Short record:
+   - *Requirements, his words:* "bring all of those patches back
+     together in an automated way" (10-16); "A partial application has
+     unknown side effects" (10-16); "Configurable with a sensible
+     default" (10-29); "agentfs should be a legitimate git server, and
+     its up to the specific use case to wire up the relationship of the
+     various distributed remotes" (10-28); "agentfs should support
+     merging live" (10-28).
+   - *Current choices (revisable):* a patch is a branch; merge (default)
+     or rebase by the `git` program, mergiraf as its own program; a
+     conflicting patch is held whole while the rest go on; a barrier
+     holds everything behind it on its volume; an adapter's *checkpoint*
+     cuts one commit per change intent on a change line merged back
+     into the recorded branch; acceptance is an extension point
+     (default: a clean merge); `agentfs serve-git` makes agentfs a git
+     server; notify and apply as in §19.1.
+   - *Design rules:* each primitive lives in the lowest layer that can
+     own it; one queue model moved by events only, never a timer; a
+     patch is judged on the head it lands on, and nothing is rewritten.
+   - *Beads:* agentfs-mia.4 (tracer), mia.2, mia.3, mia.5 to mia.8.
 
 ## 20. Prior art
 
