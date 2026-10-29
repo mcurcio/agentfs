@@ -18,6 +18,7 @@ Section numbers (§) across these pages refer to [design.md](design.md).
 | [Forked volumes](forks.md) | A sandbox's copy of a volume that publishes one change for review, and delivering that change |
 | [Telemetry](telemetry.md) | Turning on OpenTelemetry export, what is exported, and the example alerts |
 | [Configuration reference](configuration.md) | Every git config key, operator attribute, flag and environment variable (checked against the code in CI) |
+| [Supported configurations](supported-configurations.md) | The dimensions a configuration varies on (integration point, sharing, remotes, knobs), built or designed, and named example configurations to check a design against |
 
 ## Deploying
 

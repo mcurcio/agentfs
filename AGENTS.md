@@ -55,6 +55,7 @@ When you learn something durable, write it to its home in the same commit. Never
 - `docs/design.md` is authoritative. Decisions are in §19.1 and open questions in §19.2. The acceptance tests are in §18.
 - `docs/architecture.md` maps modules to responsibilities, and a test enforces it.
 - `docs/configuration.md` lists every key, attribute, env var and flag. A test enforces that too.
+- `docs/supported-configurations.md` lists the supported configurations: check a design against every example it touches.
 - `docs/reviews/` holds earlier adversarial reviews: read them to avoid repeating fixed mistakes.
 - Read the existing code before changing it. Learn the current state from the repo, not from old conversation transcripts.
 
