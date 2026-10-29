@@ -9,6 +9,7 @@
 - [Forked volumes](forks.md)
 - [Telemetry](telemetry.md)
 - [Configuration reference](configuration.md)
+- [Supported configurations](supported-configurations.md)
 
 # Deploying
 
