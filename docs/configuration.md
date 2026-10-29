@@ -582,6 +582,28 @@ The key file's permissions are not checked (kubelet's mode varies); what
 protects it is that it is outside the mount, which `agentfs mount`
 enforces.
 
+## `[agentfsPusher "<name>"]`
+
+The pushers `agentfs serve-git` accepts (design §19.1 "serve-git"): one
+section per pusher, read at every request, so a change needs no restart.
+A request authenticates as a pusher with HTTP Basic (user `<name>`,
+password its token: `http://<name>:<token>@host:port/`) or
+`Authorization: Bearer <token>`; anything else is answered 401. Fetching
+needs any pusher; what a push may write is the pusher's rights, judged
+whole before git keeps anything:
+
+```ini
+[agentfsPusher "iac"]
+	tokenFile = /run/secrets/agentfs/iac-token
+	right = offer
+	right = approve
+```
+
+| Key | Type | Default | Meaning and validation |
+|---|---|---|---|
+| `tokenFile` | absolute path | none: required | A file whose contents, trimmed, are the pusher's token; read at each request, compared in constant time. An unreadable or empty file authenticates no one. Keep it outside the mount |
+| `right` | `offer`, `approve`, `barrier` or `integrator`; repeatable | none: fetch only | `offer`: create or replace `refs/agentfs/<volume>/inbox/<n>` with a tip that reads as a patch against the branch head (else the push is refused with the queue's reason, such as `parent_not_in_history`). `barrier`: offer a tip carrying `Agentfs-Barrier: yes` (with `offer`). `approve`: create or move `approved/<n>`. `integrator`: `POST /agentfs/apply`, which is `agentfs patch apply` (409 with the daemon's JSON reply while a daemon holds the volume; otherwise `{"ran":{"exit":N,"output":...}}`, 200 for exit 0, 422 for 1, 409 for 75). No right writes the branch, `applied/*` or the status, or deletes a ref |
+
 ## Git LFS
 
 Large files can be stored as Git LFS objects: history holds a small
@@ -803,7 +825,7 @@ variable). `agentfs <command> --help` prints them too.
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | all |
-| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply`, and `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
+| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply` (and `serve-git`'s `POST /agentfs/apply`), and `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
 | `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold |
 
 **Pod flags**, which name where the volume is mounted (design §9; in
@@ -812,7 +834,7 @@ templates' variables, the commit trailers and the telemetry resource:
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
 
 **Command flags:**
 
@@ -831,6 +853,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it. A push to a path or `file://` remote already updating it is waited for up to 10 s more, so shutdown spends at most this + 10 s on pushes; keep this + 10 s + the final commit under the pod's `terminationGracePeriodSeconds` (the CSI driver sets `5s` against its 30 s unstage grace), or a kill can leave a ref lock in a local remote ([stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)) |
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
 | `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
+| `--listen ADDR` | | none: required | `serve-git`: `HOST:PORT` to serve git's smart HTTP on (port `0` picks one); it prints `serve-git: listening on http://HOST:PORT/` once it listens. Plain HTTP: put TLS in front. It refuses to start while `agentfs.patchRemote` names a remote (set it to `none`), and waits up to 10 s for requests in progress when stopped |
 | `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR |
 | `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `mount`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
 | `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | `mount`, `record` with `--history-service`: how long to wait for the service at start |

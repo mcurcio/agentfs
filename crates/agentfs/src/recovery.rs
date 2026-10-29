@@ -130,7 +130,7 @@ impl Ask {
                 None => Err(RestoreError::MissingPath),
             },
             Op::Revert => Ok(Self::revert(r.commit, r.force, r.dry_run)),
-            Op::Push | Op::ReceiveFork | Op::Apply | Op::Checkpoint => {
+            Op::Push | Op::ReceiveFork | Op::Apply | Op::Checkpoint | Op::Judge => {
                 Err(other("not a restore or revert"))
             }
         }
@@ -287,6 +287,7 @@ fn print_reply(command: &str, reply: Reply) -> ExitCode {
         Reply::Pushed(_)
         | Reply::Received { .. }
         | Reply::Attached { .. }
+        | Reply::Judged { .. }
         | Reply::Checkpoint { .. } => {
             eprintln!("{command} failed: the daemon answered another request's reply");
             ExitCode::FAILURE

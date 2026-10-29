@@ -120,7 +120,11 @@ fn client(state: &StateDir, message: Option<String>) -> Option<ExitCode> {
             eprintln!("error: {message}");
             ExitCode::from(EXIT_LOCKED)
         }
-        Reply::Ok(_) | Reply::Pushed(_) | Reply::Received { .. } | Reply::Attached { .. } => {
+        Reply::Ok(_)
+        | Reply::Pushed(_)
+        | Reply::Received { .. }
+        | Reply::Attached { .. }
+        | Reply::Judged { .. } => {
             eprintln!("checkpoint failed: the daemon answered another request's reply");
             ExitCode::FAILURE
         }

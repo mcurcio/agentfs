@@ -110,6 +110,7 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs/fetch.rs` | LFS objects for restores and `agentfs lfs fetch`: cache first, then the remotes |
 | `lfs/fake.rs` | An in-process LFS server for tests |
 | `patch/mod.rs` | The patch queue for iac (§12) |
+| `patch/admit.rs` | `serve-git`'s pushers and their rights, and admitting a push whole before git keeps it |
 | `patch/accept.rs` | Acceptance rules: whether a cleanly merged patch may land (clean merge, approval, the `patch-accept` hook) |
 | `patch/integrate.rs` | A patch branch, and merging it onto the branch head with the `git` program |
 | `patch/submit.rs` | `agentfs patch submit`: the producer side, driving the producer's own `git` |
@@ -145,6 +146,7 @@ missing from these tables or a row names a module that no longer exists;
 | `daemon.rs` | Signals and shutdown for `run` and `mount` |
 | `front.rs` | `mount --history-service`: a front of a history service (§14) |
 | `serve_history.rs` | `agentfs serve-history`: the history service of a volume (§14) |
+| `serve_git.rs` | `agentfs serve-git`: the history repository as a git server for patch pushes (`git http-backend` behind an HTTP server), and its `pre-receive` and `post-receive` hooks |
 | `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount (`recover`, which mounts over it, is in `main.rs`) |
 | `control.rs` | The control socket of a running daemon (`mount`, `run`, `serve-history`), through which `push`, `restore` and `revert` act (§2.2, §2.3, §15) |
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |

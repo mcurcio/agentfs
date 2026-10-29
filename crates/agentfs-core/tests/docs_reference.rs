@@ -42,6 +42,8 @@ fn configuration() -> Vec<Section> {
 fn home(key: &str) -> (&'static str, String) {
     if let Some(k) = key.strip_prefix("remote.<name>.") {
         ("`[remote \"<name>\"]`", k.to_owned())
+    } else if let Some(k) = key.strip_prefix("agentfsPusher.<name>.") {
+        ("`[agentfsPusher \"<name>\"]`", k.to_owned())
     } else if key.starts_with("agentfs.identity.") {
         ("`[agentfs \"identity\"]`", key.to_owned())
     } else if key.starts_with("agentfs.fork.") {

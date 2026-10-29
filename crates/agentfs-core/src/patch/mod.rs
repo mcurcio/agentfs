@@ -38,11 +38,17 @@
 //!   agentfs-mia.5, design §19.1 "Integrators decide when patches are
 //!   applied").
 //!
+//! `agentfs serve-git` makes the state area's history repository the
+//! volume's patch source, a git server pushers push patches to; [`admit`]
+//! is who may push what, judged before git keeps anything (bead
+//! agentfs-mia.9).
+//!
 //! The queue's refs reach the remote with their own push
 //! ([`crate::push::RemotePusher::push_once`], stage `queue`), never in
 //! the branch push.
 
 pub mod accept;
+pub mod admit;
 pub mod fetch;
 pub mod integrate;
 pub mod notify;

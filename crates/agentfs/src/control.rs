@@ -20,7 +20,9 @@
 //!   fork's state area, F8 S3), or `{"v":1,"op":"apply"}` (`agentfs patch
 //!   apply`, bead agentfs-mia.5), or `{"v":1,"op":"checkpoint",
 //!   "message":...}` (`agentfs checkpoint`, `message` optional; bead
-//!   agentfs-mia.6), at most [`MAX_REQUEST`] bytes, read within
+//!   agentfs-mia.6), or `{"v":1,"op":"judge"}` (a push arrived at
+//!   `agentfs serve-git`, bead agentfs-mia.9), at most [`MAX_REQUEST`]
+//!   bytes, read within
 //!   [`READ_TIMEOUT`];
 //! - reply: `{"ok":{...}}` (a restore or revert), `{"pushed":{...}}` (a
 //!   push), `{"received":{"change":...}}` (a fork received into this
@@ -28,7 +30,8 @@
 //!   "verdicts":[[n,{...}],...]}}` (an apply: the queue was judged, not
 //!   applied, since this daemon holds the volume),
 //!   `{"checkpoint":{"change":...,"marker":...}}` (both `null`: nothing
-//!   new),
+//!   new), `{"judged":{"verdicts":[[n,{...}],...]}}` (a judge: the
+//!   queue was judged and the integrator notified, nothing landed),
 //!   `{"refused":{"kind":...,"message":...,"hint":...}}`,
 //!   `{"busy":"..."}` (another restore is running, or this daemon serves
 //!   no restores) or `{"error":"..."}`.
@@ -40,7 +43,9 @@
 //! pushing directly (which the lock refuses with exit 75). `apply` was
 //! added the same way: `agentfs patch apply` falls back on such an answer,
 //! and on a reply it cannot read, to its lock path, which a running daemon
-//! refuses with exit 75. `checkpoint` likewise, for `agentfs checkpoint`.
+//! refuses with exit 75. `checkpoint` likewise, for `agentfs checkpoint`, and
+//! `judge`, for `serve-git`'s arrival hook (an older daemon's answer leaves
+//! the arrival to be judged at the next run).
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
@@ -79,6 +84,10 @@ pub enum Op {
     /// `agentfs checkpoint` (bead agentfs-mia.6): every daemon serves it,
     /// beside the others; its commit loop cuts it.
     Checkpoint,
+    /// A push arrived at `agentfs serve-git` (bead agentfs-mia.9): every
+    /// daemon serves it, beside the others, by judging the queue and
+    /// notifying; nothing lands.
+    Judge,
 }
 
 impl Op {
@@ -164,6 +173,22 @@ impl Request {
             remotes: Vec::new(),
             timeout_ms: None,
             no_fetch: !fetch,
+            message: None,
+        }
+    }
+
+    /// A judge request: what `serve-git`'s arrival hook sends.
+    pub fn judge() -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            op: Op::Judge,
+            path: None,
+            commit: String::new(),
+            force: false,
+            dry_run: false,
+            remotes: Vec::new(),
+            timeout_ms: None,
+            no_fetch: false,
             message: None,
         }
     }
@@ -255,6 +280,10 @@ pub enum Reply {
     Checkpoint {
         change: Option<String>,
         marker: Option<String>,
+    },
+    /// A judge: the patches judged, by inbox number; nothing landed.
+    Judged {
+        verdicts: Vec<(u64, agentfs_core::patch::Verdict)>,
     },
     Refused {
         kind: String,
@@ -648,6 +677,26 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<Reply>(&json).unwrap(), attached);
         assert!(serde_json::from_str::<Reply>(r#"{"applied_live":{}}"#).is_err());
+    }
+
+    /// Bead agentfs-mia.9: `judge` round-trips.
+    #[test]
+    fn judge_requests_round_trip() {
+        let judge = Request::judge();
+        let json = serde_json::to_string(&judge).unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"op":"judge","force":false,"dry_run":false}"#
+        );
+        let bare: Request = serde_json::from_str(r#"{"v":1,"op":"judge"}"#).unwrap();
+        assert_eq!(bare, judge);
+        assert!(!Op::Judge.exclusive());
+        let judged = Reply::Judged {
+            verdicts: vec![(2, agentfs_core::patch::Verdict::Ready)],
+        };
+        let json = serde_json::to_string(&judged).unwrap();
+        assert_eq!(json, r#"{"judged":{"verdicts":[[2,{"kind":"ready"}]]}}"#);
+        assert_eq!(serde_json::from_str::<Reply>(&json).unwrap(), judged);
     }
 
     #[test]

@@ -177,6 +177,11 @@ pub enum ConfigError {
     /// A global setting that makes every remote misconfigured.
     #[error("{0}")]
     Global(String),
+    #[error(
+        "agentfsPusher.{name}.tokenFile must be set: an absolute path to the pusher's token \
+         (serve-git, bead agentfs-mia.9)"
+    )]
+    PusherNeedsToken { name: String },
 }
 
 /// Every git config key agentfs reads, in the order docs/configuration.md
@@ -242,6 +247,8 @@ pub const KEYS: &[&str] = &[
     "remote.<name>.proxy",
     "remote.<name>.agentfsForkRemote",
     "remote.<name>.agentfsPush",
+    "agentfsPusher.<name>.tokenFile",
+    "agentfsPusher.<name>.right",
 ];
 
 /// Notes that `key` was read, for the test that checks [`KEYS`] against
@@ -264,12 +271,17 @@ pub(crate) mod reads {
         static READ: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     }
 
-    /// `remote.X.k` becomes `remote.<name>.k`; anything else is kept.
+    /// `remote.X.k` becomes `remote.<name>.k`, `agentfsPusher.X.k`
+    /// becomes `agentfsPusher.<name>.k`; anything else is kept.
     pub(crate) fn normalise(key: &str) -> String {
-        if let Some(rest) = key.strip_prefix("remote.")
-            && let Some((_, k)) = rest.rsplit_once('.')
-        {
-            return format!("remote.<name>.{k}");
+        for section in ["remote", "agentfsPusher"] {
+            if let Some(rest) = key
+                .strip_prefix(section)
+                .and_then(|rest| rest.strip_prefix('.'))
+                && let Some((_, k)) = rest.rsplit_once('.')
+            {
+                return format!("{section}.<name>.{k}");
+            }
         }
         key.to_owned()
     }
@@ -1593,6 +1605,46 @@ pub(crate) fn string(config: &git2::Config, key: &str) -> Result<Option<String>,
     }
 }
 
+/// Every value of the multi-valued `key`, in order (empty when unset).
+pub(crate) fn strings(config: &git2::Config, key: &str) -> Result<Vec<String>, git2::Error> {
+    note(key);
+    let mut entries = match config.multivar(key, None) {
+        Ok(entries) => entries,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut values = Vec::new();
+    while let Some(entry) = entries.next() {
+        values.push(String::from_utf8_lossy(entry?.value_bytes()).into_owned());
+    }
+    Ok(values)
+}
+
+/// The subsection names `<name>` of every `[<section> "<name>"]` that sets
+/// `key`, sorted. `section` and `key` as git-config spells them; git
+/// compares both without case, the name with case.
+pub(crate) fn subsections(
+    config: &git2::Config,
+    section: &str,
+    key: &str,
+) -> Result<BTreeSet<String>, git2::Error> {
+    note(&format!("{section}.<name>.{key}"));
+    let (section, key) = (section.to_ascii_lowercase(), key.to_ascii_lowercase());
+    let mut names = BTreeSet::new();
+    let mut entries = config.entries(Some(&format!(r"^{section}\..*\.{key}$")))?;
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        let Ok(full) = entry.name() else { continue };
+        if let Some(name) = full
+            .strip_prefix(&format!("{section}."))
+            .and_then(|rest| rest.strip_suffix(&format!(".{key}")))
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
 /// Whether `key` is set in `config`, read without noting it: a check that
 /// a fragment leaves a key alone, not a read of the setting.
 fn is_set(config: &git2::Config, key: &str) -> Result<bool, git2::Error> {
@@ -1732,7 +1784,10 @@ fn positive_duration(
 }
 
 /// `key`: unset, or an absolute path ([`ConfigError::RelativePath`]).
-fn absolute_path(config: &git2::Config, key: &str) -> Result<Option<PathBuf>, ConfigError> {
+pub(crate) fn absolute_path(
+    config: &git2::Config,
+    key: &str,
+) -> Result<Option<PathBuf>, ConfigError> {
     match string(config, key)? {
         None => Ok(None),
         Some(value) if !Path::new(&value).is_absolute() => Err(ConfigError::RelativePath {
@@ -1879,13 +1934,18 @@ mod tests {
                  \tlfspushurl = http://lfs.example/web-push\n\tagentfsLfsCredentials = /run/l\n\
                  \tproxy = http://other.example:8080\n\
                  [remote \"ssh\"]\n\turl = ssh://git@git.example/r.git\n\
-                 \tagentfsSshKey = /run/k\n\tagentfsKnownHosts = /run/h\n",
+                 \tagentfsSshKey = /run/k\n\tagentfsKnownHosts = /run/h\n\
+                 [agentfsPusher \"iac\"]\n\ttokenFile = /run/t\n\tright = offer\n",
                 fragment.display()
             ),
         )
         .unwrap();
         reads::take();
         let settings = Settings::load(dir.path()).unwrap();
+        // serve-git's pushers are read apart from the settings (bead
+        // agentfs-mia.9), from the same file.
+        let pushers = crate::patch::admit::pushers(&git2::Config::open(&path).unwrap()).unwrap();
+        assert_eq!(pushers.len(), 1);
         let read = reads::take();
         // Both remotes were read whole, whether or not this build supports
         // ssh: their keys are read before the transport is validated.

@@ -9,6 +9,9 @@
 //!   "workload attached; lands at next mount" (exit 75). With no daemon it
 //!   fetches and applies the queue with the volume stopped (it takes the
 //!   state-area lock), as a mount does before it serves.
+//! - A push arriving at `agentfs serve-git` judges the queue the same way
+//!   ([`serve_judge`] under a daemon, [`judge`] under the lock; bead
+//!   agentfs-mia.9), notifying without an apply answer.
 //! - Every queue run and every judging tells the integrator what changed
 //!   ([`notify`]: the `patch-notify` hook, the notify webhook).
 //! - `patch status` reads `meta/patch.json` and the status ref without
@@ -264,7 +267,7 @@ fn approve_cmd(args: ApproveArgs) -> Result<ExitCode> {
 /// A verdict as `patch status` and `patch apply` print it: its label
 /// (`held`, `waiting`, `awaiting`, `not judged`) and what follows the
 /// patch's number.
-fn verdict_parts(verdict: &Verdict) -> (&'static str, String) {
+pub(crate) fn verdict_parts(verdict: &Verdict) -> (&'static str, String) {
     match verdict {
         Verdict::Held {
             reason, message, ..
@@ -330,7 +333,11 @@ fn apply_client(state: &StateDir, fetch: bool) -> Option<ExitCode> {
             eprintln!("error: {message}");
             ExitCode::from(EXIT_LOCKED)
         }
-        Reply::Ok(_) | Reply::Pushed(_) | Reply::Received { .. } | Reply::Checkpoint { .. } => {
+        Reply::Ok(_)
+        | Reply::Pushed(_)
+        | Reply::Received { .. }
+        | Reply::Checkpoint { .. }
+        | Reply::Judged { .. } => {
             eprintln!("patch apply failed: the daemon answered another request's reply");
             ExitCode::FAILURE
         }
@@ -348,10 +355,16 @@ pub struct Applier {
 
 impl Applier {
     pub fn new(committer: &Committer, events: Events, telemetry: &Telemetry) -> Self {
+        Self::with_identity(committer.committer_identity(), events, telemetry)
+    }
+
+    /// With no volume open (`serve-git`'s arrival hook under the lock):
+    /// the committer identity rendered from the settings.
+    pub fn with_identity(committer: Identity, events: Events, telemetry: &Telemetry) -> Self {
         Self {
             events,
             telemetry: telemetry.clone(),
-            committer: committer.committer_identity(),
+            committer,
         }
     }
 }
@@ -369,7 +382,10 @@ pub fn serve_apply(state: &StateDir, applier: &Applier, request: &Request) -> Re
     let _one = APPLYING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match judge_attached(state, applier, !request.no_fetch) {
+    let answer = ApplyAnswer::Attached {
+        message: ATTACHED.to_owned(),
+    };
+    match judge_and_tell(state, applier, !request.no_fetch, Some(answer)) {
         Ok(verdicts) => Reply::Attached {
             message: ATTACHED.to_owned(),
             verdicts,
@@ -378,7 +394,33 @@ pub fn serve_apply(state: &StateDir, applier: &Applier, request: &Request) -> Re
     }
 }
 
-fn judge_attached(state: &StateDir, applier: &Applier, fetch: bool) -> Result<Vec<(u64, Verdict)>> {
+/// The control socket's `judge` (bead agentfs-mia.9): [`judge`].
+pub fn serve_judge(state: &StateDir, applier: &Applier) -> Reply {
+    match judge(state, applier) {
+        Ok(verdicts) => Reply::Judged { verdicts },
+        Err(e) => Reply::Error(format!("judging the patch queue: {e:#}")),
+    }
+}
+
+/// A push arrived at `serve-git` (bead agentfs-mia.9): the queue as it is
+/// is judged ([`Queue::judge`], no fetch: serve-git is the patch source)
+/// and the integrator notified, with no apply answer. Nothing lands. Run by
+/// a daemon, or by the arrival hook holding the state-area lock.
+pub(crate) fn judge(state: &StateDir, applier: &Applier) -> Result<Vec<(u64, Verdict)>> {
+    let _one = APPLYING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    judge_and_tell(state, applier, false, None)
+}
+
+/// Fetches (when `fetch`), judges and notifies; `answer` is what the notice
+/// says to an apply call, if one asked.
+fn judge_and_tell(
+    state: &StateDir,
+    applier: &Applier,
+    fetch: bool,
+    answer: Option<ApplyAnswer>,
+) -> Result<Vec<(u64, Verdict)>> {
     let settings = Settings::load(&state.git())
         .with_context(|| format!("reading {}", state.git().display()))?;
     let fetched = fetch_queue(state, &settings, &applier.events, fetch);
@@ -408,9 +450,7 @@ fn judge_attached(state: &StateDir, applier: &Applier, fetch: bool) -> Result<Ve
         &history,
         judgement.status,
         &[],
-        Some(ApplyAnswer::Attached {
-            message: ATTACHED.to_owned(),
-        }),
+        answer,
         &applier.events,
     ));
     Ok(judgement.verdicts)
