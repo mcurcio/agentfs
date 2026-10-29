@@ -41,6 +41,11 @@
 //! pushes; requests are counted in generations, and an attempt serves
 //! every request made before it started.
 //!
+//! **Checkpoint** ([`ServiceHandle::checkpoint`], design §19.2 item 11):
+//! the commit loop serves it between commits, as it repacks, so the
+//! branch keeps one writer: it commits everything recorded (as push now
+//! does), then cuts the checkpoint ([`crate::checkpoint::cut`]).
+//!
 //! Signals are a process concern: the binary decides when to call
 //! [`Service::shutdown`].
 
@@ -52,6 +57,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::checkpoint::{self, CheckpointOutcome, CheckpointRequest};
 use crate::events::{Event, Events};
 use crate::push::{PushOutcome, PushPhase, PushStop, QueuePush, RemotePusher, backoff};
 use crate::repack::{self, RepackOutcome, RepackSchedule};
@@ -206,6 +212,19 @@ pub enum PushNowError {
     UnknownRemote(String),
 }
 
+/// Why [`ServiceHandle::checkpoint`] cut nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CheckpointNowError {
+    #[error("the daemon is stopping; checkpoint again after it restarts")]
+    Stopping,
+    #[error(
+        "the checkpoint did not finish in time; it is still cut when the commit loop gets to it"
+    )]
+    TimedOut,
+    #[error("{0}")]
+    Failed(String),
+}
+
 /// A remote's last finished attempt: the request generation it served.
 #[derive(Debug, Clone)]
 struct PushDone {
@@ -229,6 +248,13 @@ struct SignalState {
     commit_results: VecDeque<(u64, Result<CommitReport, String>)>,
     push_requested: HashMap<String, u64>,
     push_done: HashMap<String, PushDone>,
+    /// The last checkpoint request's id.
+    checkpoint_next: u64,
+    /// Checkpoints the commit loop has still to cut, oldest first.
+    checkpoints: VecDeque<(u64, CheckpointRequest)>,
+    /// Cut checkpoints whose waiters have not read them yet, by request
+    /// id.
+    checkpoint_results: VecDeque<(u64, Result<CheckpointOutcome, String>)>,
 }
 
 /// What a loop woke for.
@@ -410,6 +436,50 @@ impl ServiceHandle {
             }
         }
         Ok(report)
+    }
+
+    /// Cuts a checkpoint (design §19.2 item 11): the commit loop commits
+    /// everything recorded (but an operation still running) after its
+    /// current commit, then runs [`checkpoint::cut`], so the branch keeps
+    /// one writer. Waits for it up to `timeout`; a checkpoint not cut by
+    /// then is still cut when the loop gets to it.
+    pub fn checkpoint(
+        &self,
+        request: CheckpointRequest,
+        timeout: Duration,
+    ) -> Result<CheckpointOutcome, CheckpointNowError> {
+        let deadline = self.clock.now() + timeout;
+        let id = {
+            let mut s = self.signal.lock();
+            if s.closed || s.stop {
+                return Err(CheckpointNowError::Stopping);
+            }
+            s.checkpoint_next += 1;
+            let id = s.checkpoint_next;
+            s.checkpoints.push_back((id, request));
+            id
+        };
+        self.signal.cond.notify_all();
+        let (mut state, done) = self.signal.wait_until(&*self.clock, deadline, |s| {
+            s.checkpoint_results.iter().any(|(served, _)| *served == id)
+        });
+        if !done {
+            return Err(if state.closed || state.stop {
+                CheckpointNowError::Stopping
+            } else {
+                CheckpointNowError::TimedOut
+            });
+        }
+        let at = state
+            .checkpoint_results
+            .iter()
+            .position(|(served, _)| *served == id);
+        match at.and_then(|at| state.checkpoint_results.remove(at)) {
+            Some((_, result)) => result.map_err(CheckpointNowError::Failed),
+            None => Err(CheckpointNowError::Failed(
+                "the checkpoint's result was lost".into(),
+            )),
+        }
     }
 
     /// Refuses new requests and wakes those waiting, which return
@@ -837,14 +907,23 @@ fn commit_loop(
     let mut next_repack = repacker.map(|r| clock.now() + r.schedule.first);
     loop {
         let delay = backoff(window, failures, COMMIT_BACKOFF_CAP);
+        // A commit request's generation; 0 for checkpoints alone.
         let woke = signal.wait(delay, |s| {
-            (s.commit_requested > s.commit_done).then_some(s.commit_requested)
+            if s.commit_requested > s.commit_done {
+                Some(s.commit_requested)
+            } else {
+                (!s.checkpoints.is_empty()).then_some(0)
+            }
         });
         let generation = match woke {
             Woke::Stop => break,
             Woke::Request(generation) => Some(generation),
             Woke::Timeout => None,
         };
+        if generation == Some(0) {
+            serve_checkpoints(committer, signal);
+            continue;
+        }
         if let Some(generation) = generation {
             // Push now (design §2.3): everything recorded, except an
             // operation still running.
@@ -861,6 +940,7 @@ fn commit_loop(
                 s.commit_results
                     .push_back((generation, result.map_err(|e| e.to_string())));
             });
+            serve_checkpoints(committer, signal);
             continue;
         }
         if let (Some(r), Some(at)) = (repacker, next_repack)
@@ -884,6 +964,28 @@ fn commit_loop(
         }
     }
     committer.commit_pending()
+}
+
+/// Cuts every queued checkpoint on the commit thread, each after a commit
+/// of everything recorded (but an operation still running), and posts the
+/// results for their waiters.
+fn serve_checkpoints(committer: &Committer, signal: &Signal) {
+    loop {
+        let Some((id, request)) = signal.lock().checkpoints.pop_front() else {
+            return;
+        };
+        let result = match committer.commit_now() {
+            Ok(_) => checkpoint::cut(committer, &request).map_err(|e| e.to_string()),
+            Err(e) => Err(format!("committing what is recorded: {e}")),
+        };
+        signal.update(|s| {
+            // A waiter that timed out never reads its result.
+            if s.checkpoint_results.len() >= COMMIT_RESULTS_KEPT {
+                s.checkpoint_results.pop_front();
+            }
+            s.checkpoint_results.push_back((id, result));
+        });
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1491,6 +1593,63 @@ mod tests {
         assert_eq!(
             report.final_pushes,
             [("origin".to_owned(), FinalPush::NothingNew)]
+        );
+    }
+
+    /// A checkpoint is cut on the commit thread, after a commit of what
+    /// is recorded: the marker's first parent holds the last record,
+    /// though the commit window would not have committed it yet, and the
+    /// loop commits on top of the marker afterwards.
+    #[test]
+    fn a_checkpoint_is_cut_on_the_commit_thread_after_a_commit() {
+        let remote = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        let (dir, state, rec, service, _clock) = idle_service(remote.path());
+        let handle = service.handle();
+        record(&rec, dir.path(), "a");
+        push_now(&handle, &[]);
+        let committed = local_head(&state).unwrap();
+        record(&rec, dir.path(), "b");
+        let request = CheckpointRequest {
+            message: Some("intent".into()),
+            caller: CALLER,
+        };
+        let outcome = handle
+            .checkpoint(request.clone(), Duration::from_secs(60))
+            .unwrap();
+        let CheckpointOutcome::Cut { change, marker, .. } = outcome else {
+            panic!("nothing cut: {outcome:?}");
+        };
+        let repo = git2::Repository::open_bare(state.git()).unwrap();
+        assert_eq!(local_head(&state), Some(marker));
+        let m = repo.find_commit(marker).unwrap();
+        assert_eq!(m.parent_id(1).unwrap(), change);
+        let parent = m.parent(0).unwrap();
+        assert_eq!(
+            parent.parent_ids().collect::<Vec<_>>(),
+            [committed],
+            "the marker's first parent is not the commit of the last record"
+        );
+        assert!(parent.tree().unwrap().get_name("b").is_some());
+        assert_eq!(
+            handle.checkpoint(request, Duration::from_secs(60)),
+            Ok(CheckpointOutcome::NothingNew)
+        );
+        record(&rec, dir.path(), "c");
+        push_now(&handle, &[]);
+        let next = repo.find_commit(local_head(&state).unwrap()).unwrap();
+        assert_eq!(next.parent_ids().collect::<Vec<_>>(), [marker]);
+        let report = shutdown_watched(service, Duration::from_secs(1));
+        report.final_commit.unwrap();
+        assert_eq!(
+            handle.checkpoint(
+                CheckpointRequest {
+                    message: None,
+                    caller: CALLER,
+                },
+                Duration::from_secs(1)
+            ),
+            Err(CheckpointNowError::Stopping)
         );
     }
 

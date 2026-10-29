@@ -70,6 +70,7 @@ missing from these tables or a row names a module that no longer exists;
 | `known_hosts.rs` | OpenSSH known_hosts parsing and matching, and `@cert-authority` host certificate checks (§11.1) |
 | `watched.rs` | Files re-read when their stat stamp changes: credentials, keys, known_hosts |
 | `repack.rs` | Periodic `git repack --geometric=2` of the history (§8) |
+| `checkpoint.rs` | Checkpoints: one change-line commit per intent (`refs/agentfs/<volume>/change-line`), with the head's tree and the patches landed since as parents, merged back into the branch by a two-parent marker (§19.2 item 11) |
 | `git_cli.rs` | Running the `git` program on a state area's git directory, in an environment of its own: the one home for `repack.rs` and the patch merge (§8, §12, §17.3) |
 | `command.rs` | Running an operator's program without a shell: `PATH` only, its own process group killed at the deadline, input on stdin; the one runner of fork delivery's command method and the `patch-accept` hook (§11.5, §12) |
 | `restore.rs` | Restore and revert: plan from history, check, apply to a tree (§15) |
@@ -149,6 +150,7 @@ missing from these tables or a row names a module that no longer exists;
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
 | `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly (§15) |
 | `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
+| `checkpoint_cmd.rs` | `agentfs checkpoint`: through a running daemon's control socket (its commit loop cuts it), else under the state-area lock (§19.2 item 11) |
 | `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon`, `list` and `deliver` (§11.5) |
 | `start_cmd.rs` | `agentfs start accept --tip`: a started volume's answer to the start-branch alarm (§11.3) |
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it (§7) |

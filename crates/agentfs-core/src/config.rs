@@ -216,6 +216,7 @@ pub const KEYS: &[&str] = &[
     "agentfs.fork.link",
     "agentfs.fork.sourceState",
     "agentfs.fork.remotes",
+    "agentfs.fork.baseChangeLine",
     "agentfs.start.remote",
     "agentfs.start.branch",
     "agentfs.start.commit",
@@ -240,6 +241,7 @@ pub const KEYS: &[&str] = &[
     "remote.<name>.agentfsLfsCredentials",
     "remote.<name>.proxy",
     "remote.<name>.agentfsForkRemote",
+    "remote.<name>.agentfsPush",
 ];
 
 /// Notes that `key` was read, for the test that checks [`KEYS`] against
@@ -346,6 +348,22 @@ pub struct RemoteSettings {
     /// section is only for forks of the volume (design §11.5). It is never
     /// one of the volume's own push remotes.
     pub fork_remote: bool,
+    /// `remote.<name>.agentfsPush` (`branch`, the default, or
+    /// `changeLine`): what this remote's push sends to the volume's branch
+    /// ref there (design §19.2 item 11, [`crate::checkpoint`]).
+    pub push_source: PushSource,
+}
+
+/// What a remote's push sends to the remote's branch ref
+/// (`remote.<name>.agentfsPush`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PushSource {
+    /// The volume's branch: every recorded commit.
+    #[default]
+    Branch,
+    /// The change line (`refs/agentfs/<volume>/change-line`): only the
+    /// checkpoint commits and the patches they merged.
+    ChangeLine,
 }
 
 /// The agentfs keys of a remote section that name files, which the mount
@@ -556,6 +574,12 @@ pub struct Settings {
     /// This volume's start point (agentfs.start.*), read only from the volume's own config, like
     /// the fork identity; `None` when it was not started from another branch.
     pub start: Option<crate::fork::identity::StartPoint>,
+    /// `agentfs.fork.baseChangeLine`: a fork's source's change-line tip at
+    /// create, the first parent of the fork's first checkpoint (design
+    /// §19.2 item 11, [`crate::checkpoint`]); written by fork create only
+    /// when the source had a change line, read only beside a fork
+    /// identity, never from an include.
+    pub fork_base_change_line: Option<git2::Oid>,
 }
 
 /// Which push remotes a volume has (design §11.1); [`Settings::load`] is the
@@ -661,6 +685,16 @@ impl Settings {
             self.remotes.pushed(),
             &self.invalid_remotes,
         )
+    }
+
+    /// The local ref `remote`'s push sends to its branch ref there
+    /// ([`RemoteSettings::push_source`]): the branch, or the change line
+    /// ([`crate::checkpoint::change_line_ref`]).
+    pub fn push_source_ref(&self, remote: &RemoteSettings) -> String {
+        match remote.push_source {
+            PushSource::Branch => self.branch_ref.clone(),
+            PushSource::ChangeLine => crate::checkpoint::change_line_ref(&self.volume),
+        }
     }
 
     /// The fork remote when it is a remote section, not the source's
@@ -778,6 +812,29 @@ fn source_state_of(
             value,
         }),
         Some(value) => Ok(Some(PathBuf::from(value))),
+    }
+}
+
+/// `agentfs.fork.baseChangeLine`: a full commit id, set only beside a
+/// fork identity.
+fn base_change_line_of(
+    config: &git2::Config,
+    fork: Option<&ForkIdentity>,
+) -> Result<Option<git2::Oid>, ConfigError> {
+    let key = crate::checkpoint::BASE_CHANGE_LINE_KEY;
+    match string(config, key)? {
+        None => Ok(None),
+        Some(_) if fork.is_none() => Err(ConfigError::PartialForkIdentity),
+        Some(value) => {
+            let bad = || ConfigError::BadForkBase {
+                key: key.into(),
+                value: value.clone(),
+            };
+            if !is_full_oid(&value) {
+                return Err(bad());
+            }
+            git2::Oid::from_str(&value).map(Some).map_err(|_| bad())
+        }
     }
 }
 
@@ -992,6 +1049,7 @@ pub fn declares_fork(git_dir: &Path) -> Result<bool, git2::Error> {
         fork_identity::LINK_KEY,
         fork_identity::REMOTES_KEY,
         crate::fork::receive::SOURCE_STATE_KEY,
+        crate::checkpoint::BASE_CHANGE_LINE_KEY,
     ] {
         if is_set(&config, key)? {
             return Ok(true);
@@ -1081,6 +1139,7 @@ impl Settings {
             }
         };
         let source_state = source_state_of(config, fork.as_ref())?;
+        let fork_base_change_line = base_change_line_of(config, fork.as_ref())?;
         let split = if unlinked {
             // Its own sections only, and no fork remote: it delivers
             // nothing.
@@ -1158,6 +1217,7 @@ impl Settings {
             fork_remote: split.fork_remote,
             fork_remotes,
             source_state,
+            fork_base_change_line,
             fork_refs,
             fork,
             start,
@@ -1222,6 +1282,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
             fork_identity::LINK_KEY,
             fork_identity::REMOTES_KEY,
             crate::fork::receive::SOURCE_STATE_KEY,
+            crate::checkpoint::BASE_CHANGE_LINE_KEY,
             fork_identity::START_REMOTE_KEY,
             fork_identity::START_BRANCH_KEY,
             fork_identity::START_COMMIT_KEY,
@@ -1331,10 +1392,24 @@ fn remote(
         lfs_credentials: path("agentfsLfsCredentials")?,
         proxy: remote_proxy(config, name, http_proxy)?,
         fork_remote: boolean(config, &key("agentfsForkRemote"))?.unwrap_or(false),
+        push_source: push_source(config, &key("agentfsPush"))?,
         name: name.to_owned(),
     };
     validate_transport(&remote)?;
     Ok(remote)
+}
+
+/// `remote.<name>.agentfsPush`: `branch` (or unset) or `changeLine`.
+fn push_source(config: &git2::Config, key: &str) -> Result<PushSource, ConfigError> {
+    match string(config, key)?.as_deref() {
+        None | Some("branch") => Ok(PushSource::Branch),
+        Some("changeLine") => Ok(PushSource::ChangeLine),
+        Some(other) => Err(ConfigError::BadChoice {
+            key: key.into(),
+            value: other.into(),
+            allowed: "branch, changeLine",
+        }),
+    }
 }
 
 /// A remote's effective proxy (design §11.1): `remote.<name>.proxy` (empty:

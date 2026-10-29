@@ -330,7 +330,7 @@ fn apply_client(state: &StateDir, fetch: bool) -> Option<ExitCode> {
             eprintln!("error: {message}");
             ExitCode::from(EXIT_LOCKED)
         }
-        Reply::Ok(_) | Reply::Pushed(_) | Reply::Received { .. } => {
+        Reply::Ok(_) | Reply::Pushed(_) | Reply::Received { .. } | Reply::Checkpoint { .. } => {
             eprintln!("patch apply failed: the daemon answered another request's reply");
             ExitCode::FAILURE
         }

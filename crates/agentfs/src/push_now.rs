@@ -22,6 +22,10 @@
 //!   daemon always counts as attached, so the queue is judged and the
 //!   integrator notified, and nothing lands until the next mount.
 //!
+//! - **checkpoint**: `agentfs checkpoint` while a daemon holds the volume
+//!   ([`crate::checkpoint_cmd::serve`], bead agentfs-mia.6): the service's
+//!   commit loop cuts it ([`ServiceHandle::checkpoint`]).
+//!
 //! [`client`] is the command's side: it asks the daemon first and returns
 //! `None` when none answers (no socket, or a daemon from before `push`
 //! existed), and the command then pushes directly, taking the lock.
@@ -80,6 +84,7 @@ pub fn handler(
         Op::Push => serve_push(&service, &misconfigured, &request),
         Op::ReceiveFork => crate::fork_cmd::serve_receive(&state, &request),
         Op::Apply => crate::patch_cmd::serve_apply(&state, &applier, &request),
+        Op::Checkpoint => crate::checkpoint_cmd::serve(&service, &request, peer),
         Op::Restore | Op::Revert => match &restores {
             Restores::Serve(daemon) => daemon.serve(request, peer),
             Restores::ServeFronts(daemon) => daemon.serve(request, peer),
@@ -265,7 +270,10 @@ pub fn client(state: &StateDir, remotes: &[String], timeout: Duration) -> Option
             eprintln!("error: {message}");
             ExitCode::from(EXIT_LOCKED)
         }
-        Reply::Ok(_) | Reply::Received { .. } | Reply::Attached { .. } => {
+        Reply::Ok(_)
+        | Reply::Received { .. }
+        | Reply::Attached { .. }
+        | Reply::Checkpoint { .. } => {
             eprintln!("push failed: the daemon answered another request's reply");
             ExitCode::FAILURE
         }

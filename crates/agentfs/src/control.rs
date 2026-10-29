@@ -18,13 +18,17 @@
 //!   `{"v":1,"op":"push","remotes":[...],"timeout_ms":N}` (both
 //!   optional), or `{"v":1,"op":"receive_fork","path":...}` (a finished
 //!   fork's state area, F8 S3), or `{"v":1,"op":"apply"}` (`agentfs patch
-//!   apply`, bead agentfs-mia.5), at most [`MAX_REQUEST`] bytes, read
-//!   within [`READ_TIMEOUT`];
+//!   apply`, bead agentfs-mia.5), or `{"v":1,"op":"checkpoint",
+//!   "message":...}` (`agentfs checkpoint`, `message` optional; bead
+//!   agentfs-mia.6), at most [`MAX_REQUEST`] bytes, read within
+//!   [`READ_TIMEOUT`];
 //! - reply: `{"ok":{...}}` (a restore or revert), `{"pushed":{...}}` (a
 //!   push), `{"received":{"change":...}}` (a fork received into this
 //!   local-only volume's history), `{"attached":{"message":...,
 //!   "verdicts":[[n,{...}],...]}}` (an apply: the queue was judged, not
 //!   applied, since this daemon holds the volume),
+//!   `{"checkpoint":{"change":...,"marker":...}}` (both `null`: nothing
+//!   new),
 //!   `{"refused":{"kind":...,"message":...,"hint":...}}`,
 //!   `{"busy":"..."}` (another restore is running, or this daemon serves
 //!   no restores) or `{"error":"..."}`.
@@ -36,7 +40,7 @@
 //! pushing directly (which the lock refuses with exit 75). `apply` was
 //! added the same way: `agentfs patch apply` falls back on such an answer,
 //! and on a reply it cannot read, to its lock path, which a running daemon
-//! refuses with exit 75.
+//! refuses with exit 75. `checkpoint` likewise, for `agentfs checkpoint`.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
@@ -72,6 +76,9 @@ pub enum Op {
     /// `agentfs patch apply` (bead agentfs-mia.5): every daemon serves it,
     /// beside the others, by judging the queue without landing anything.
     Apply,
+    /// `agentfs checkpoint` (bead agentfs-mia.6): every daemon serves it,
+    /// beside the others; its commit loop cuts it.
+    Checkpoint,
 }
 
 impl Op {
@@ -104,6 +111,9 @@ pub struct Request {
     /// remote (`patch apply --no-fetch`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_fetch: bool,
+    /// Checkpoint: its message (`checkpoint -m`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl Request {
@@ -119,6 +129,7 @@ impl Request {
             remotes,
             timeout_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
             no_fetch: false,
+            message: None,
         }
     }
 
@@ -135,6 +146,7 @@ impl Request {
             remotes: Vec::new(),
             timeout_ms: None,
             no_fetch: false,
+            message: None,
         }
     }
 }
@@ -152,6 +164,23 @@ impl Request {
             remotes: Vec::new(),
             timeout_ms: None,
             no_fetch: !fetch,
+            message: None,
+        }
+    }
+
+    /// A checkpoint request with `message` (the default when `None`).
+    pub fn checkpoint(message: Option<String>) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            op: Op::Checkpoint,
+            path: None,
+            commit: String::new(),
+            force: false,
+            dry_run: false,
+            remotes: Vec::new(),
+            timeout_ms: None,
+            no_fetch: false,
+            message,
         }
     }
 }
@@ -220,6 +249,12 @@ pub enum Reply {
     Attached {
         message: String,
         verdicts: Vec<(u64, agentfs_core::patch::Verdict)>,
+    },
+    /// A checkpoint: its change-line commit and the marker that merged it
+    /// back, or both `None` when there was nothing new.
+    Checkpoint {
+        change: Option<String>,
+        marker: Option<String>,
     },
     Refused {
         kind: String,
@@ -488,6 +523,7 @@ mod tests {
             remotes: Vec::new(),
             timeout_ms: None,
             no_fetch: false,
+            message: None,
         }
     }
 
@@ -612,6 +648,26 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<Reply>(&json).unwrap(), attached);
         assert!(serde_json::from_str::<Reply>(r#"{"applied_live":{}}"#).is_err());
+    }
+
+    #[test]
+    fn checkpoint_requests_round_trip() {
+        let checkpoint = Request::checkpoint(Some("intent".into()));
+        let json = serde_json::to_string(&checkpoint).unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"op":"checkpoint","force":false,"dry_run":false,"message":"intent"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), checkpoint);
+        let bare: Request = serde_json::from_str(r#"{"v":1,"op":"checkpoint"}"#).unwrap();
+        assert_eq!(bare, Request::checkpoint(None));
+        let cut = Reply::Checkpoint {
+            change: Some("c".into()),
+            marker: Some("m".into()),
+        };
+        let json = serde_json::to_string(&cut).unwrap();
+        assert_eq!(json, r#"{"checkpoint":{"change":"c","marker":"m"}}"#);
+        assert_eq!(serde_json::from_str::<Reply>(&json).unwrap(), cut);
     }
 
     /// A push is served while a restore holds the daemon.

@@ -193,7 +193,8 @@ in the fork's own state-area config, beside `agentfs.volume`. Never set
 them by hand, and never in an include: a fragment that sets any of them
 fails with `IncludeSetsIdentity`. `source` and `base` are set together,
 or neither, and `pushTarget`, `link`, `sourceState` and `remotes` only with them
-(`PartialForkIdentity`); a fork's config must not set `agentfs.branch`.
+(`PartialForkIdentity`), and `baseChangeLine` likewise; a fork's config
+must not set `agentfs.branch`.
 A fork's history ref is its push target. A linked fork's only push
 remote is its fork remote (see `agentfsForkRemote`), or, for a fork of a
 local-only source, none: it publishes into the source's history
@@ -205,6 +206,7 @@ no patch queue.
 |---|---|---|---|
 | `agentfs.fork.source` | name | unset: not a fork | The source volume's name, as `agentfs.volume` |
 | `agentfs.fork.base` | full commit id | unset: not a fork | The source branch's head when the fork was created: 40 lowercase hex digits |
+| `agentfs.fork.baseChangeLine` | full commit id | unset: the fork's first checkpoint starts its own change line | The source's change-line tip (`refs/agentfs/<source>/change-line`) when the fork was created, written by fork create only when the source had one and base reaches it: the first parent of the fork's first checkpoint (design §19.2 item 11). Set without a fork identity, it fails the fork (`PartialForkIdentity`); not a full commit id, `BadForkBase` |
 | `agentfs.fork.sourceState` | absolute path | unset: publishes to a fork remote | A linked fork of a local-only source (F8 S3): the source's state area, written at create; the fork publishes into its history there, unless a section sets `agentfsForkRemote`. A relative path fails the fork (`RelativePath`), and so does any value in an unlinked fork (`UnlinkedSourceState`) |
 | `agentfs.fork.link` | `linked` or `unlinked` | `linked` | Whether the fork delivers back to its source (design §11.5 "Fork link"), from `fork create --link` or a fork class's `link` at create (written only for `unlinked`), never changed after. `linked`: its finish publishes the change to its fork remote, or into a local-only source's history; it waits and alarms while it cannot reach it, and never delivers anywhere else. `unlinked`: an independent fork that pushes its history ref only to its own remotes (`agentfs.fork.remotes`; none: local-only) and delivers nothing: `fork finish` refuses it (`Unlinked`), it has no `fork status`, and DeleteVolume treats it as any worktree. Any other value fails the fork (`BadChoice`) |
 | `agentfs.fork.remotes` | absolute path | unset: an unlinked fork is local-only | An unlinked fork's own remotes (design §11.5, §19.1 "Unlinked fork remotes"), from `fork create --remotes FILE` or a fork class's `remotes` profile at create. The file is read alone at every open: its `[remote "<name>"]` sections are the fork's push remotes, with the same keys and modes as any volume's, and its `lfs.url` and `lfs.pushurl` the fork's (the source's are never read); it may hold nothing else (`ForkRemotesKey`, also for `agentfsForkRemote`), must be a readable file (`ForkRemotesUnreadable`) and must not be inside the backing tree or the mount point (`IncludeExposed`). A relative path fails the fork (`RelativePath`), and so does any value in a linked fork (`LinkedForkRemotes`) |
@@ -304,6 +306,7 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `lfspushurl` | as `lfsurl` | `lfsurl` | Where LFS uploads go, unless `lfs.pushurl` or `lfs.url` is set; on an `agentfsForkRemote` section, before them |
 | `agentfsLfsCredentials` | absolute path | none | The credential file (same format as `agentfsCredentials`) for an LFS endpoint on another host or port than the push URL; never sent to any other host |
 | `proxy` | as `http.proxy`, or empty | `http.proxy` | This remote's HTTP proxy, as in git; an empty value means no proxy for this remote. It carries the remote's `https` git traffic and all its LFS requests, never SSH or plain `http://` git traffic (see [Proxies](#proxies)) |
+| `agentfsPush` | `branch` or `changeLine` | `branch` | What this remote's push sends to the volume's branch ref there (`refs/heads/agentfs/<volume>`, or `agentfs.branch`): `branch`, every recorded commit; `changeLine`, the change line (`refs/agentfs/<volume>/change-line`): only the checkpoints `agentfs checkpoint` cuts and the patches they merged (design §19.2 item 11). Claims, divergence, backlog and the LFS upload are judged against what it sends; nothing is pushed there before the first checkpoint. The patch queue's push is unchanged. Any other value misconfigures the remote |
 | `agentfsForkRemote` | boolean | `false` | This section is only for forks of the volume (design §11.5): never one of the volume's own push remotes, never its patch remote, and its limits never apply to the volume's records. With one such section, forks push there; with none, forks push to the volume's patch remote; two or more such sections are all invalid and forks are refused (`NoForkRemote`). While `lfs.url` or `lfs.pushurl` is set (the source's LFS store), such a section must set its own `lfsurl` or `lfspushurl`, which it then uses before the global keys; without one it is invalid (`RemoteMisconfigured`: a fork remote must name its own LFS endpoint), so a fork's LFS objects never reach the source's store |
 
 The remote's name must be a valid agentfs name (as for `agentfs.volume`;
@@ -318,6 +321,7 @@ state file and appears in metrics.
 | `agentfsMaxBlobSize` is not a positive size | `remote.<name>.agentfsMaxBlobSize` |
 | `agentfsMaxPushSize` is not a positive size | `remote.<name>.agentfsMaxPushSize` |
 | `agentfsMaxLfsObjectSize` is not a positive size | `remote.<name>.agentfsMaxLfsObjectSize` |
+| `agentfsPush` is not `branch` or `changeLine` | `remote.<name>.agentfsPush` |
 | `proxy` is not a plain `http://` proxy without a user or password, or `http.proxy` is not | the key; a bad `http.proxy` misconfigures every remote |
 | `lfs.concurrenttransfers` is not 1 to 64 | the key, for every remote |
 | `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`, `agentfsSshAgent`, `agentfsKnownHosts` or `agentfsLfsCredentials` is not an absolute path | the key |
@@ -799,7 +803,7 @@ variable). `agentfs <command> --help` prints them too.
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | all |
-| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: required by `record` and `serve-history`; used by `flush`, `run`, `patch apply`, and `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
+| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply`, and `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
 | `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold |
 
 **Pod flags**, which name where the volume is mounted (design §9; in
@@ -808,7 +812,7 @@ templates' variables, the commit trailers and the telemetry resource:
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `serve-history`, `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `mount`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
 
 **Command flags:**
 
@@ -845,7 +849,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--repo DIR` | | `.` | `patch submit`, `patch approve`: the producer's git repository |
 | `--put PATH=FILE` (repeatable) | | | `patch submit`: write PATH with FILE's content, in a patch built on the remote branch head |
 | `--delete PATH` (repeatable) | | | `patch submit`: remove PATH, in a built patch |
-| `-m`, `--message TEXT` | | empty | `patch submit`: the built patch's commit message |
+| `-m`, `--message TEXT` | | empty; `checkpoint`: `checkpoint` | `patch submit`: the built patch's commit message; `checkpoint`: the checkpoint's message (its author is the caller, its committer the replica) |
 | `--author 'NAME <EMAIL>'` | | git's user | `patch submit`: the built patch's author |
 | `--replace N` | | | `patch submit`: replace queued patch N (it must still be what was listed) |
 | `--skip N` | | | `patch submit`: replace queued patch N with an empty patch, so the queue moves on |

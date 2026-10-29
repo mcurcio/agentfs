@@ -338,6 +338,77 @@ fn create_reads_the_source_live_and_leaves_it_untouched() {
     assert_eq!(fs::read_to_string(fork.tree.join("a.txt")).unwrap(), "a\n");
 }
 
+/// A fork of a source with a change line records its tip
+/// (`agentfs.fork.baseChangeLine`), and the fork's first checkpoint
+/// continues that line (design §19.2 item 11); a source without one gives
+/// a fork whose first checkpoint starts its own.
+#[test]
+fn a_forks_first_checkpoint_continues_its_sources_change_line() {
+    use crate::checkpoint::{CheckpointOutcome, CheckpointRequest, cut};
+    let request = CheckpointRequest {
+        message: Some("intent".into()),
+        caller: CALLER,
+    };
+    let checkpoint = |state: &StateDir, tree: &Path, volume: &str| {
+        let (_, committer, _) = volume::open(
+            state,
+            tree,
+            context(volume),
+            Arc::new(NullSink),
+            &Telemetry::noop(),
+        )
+        .unwrap();
+        cut(&committer, &request).unwrap()
+    };
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let plain = Fork::new();
+    plain.create(&source, "src-0").unwrap();
+    let settings = crate::config::Settings::load(&plain.state.git()).unwrap();
+    assert_eq!(settings.fork_base_change_line, None);
+
+    let CheckpointOutcome::Cut { change: tip, .. } = checkpoint(&source.state, &source.tree, "src")
+    else {
+        panic!("the source cut nothing");
+    };
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+    let settings = crate::config::Settings::load(&fork.state.git()).unwrap();
+    assert_eq!(settings.fork_base_change_line, Some(tip));
+    // Nothing changed in the fork since: nothing new.
+    assert_eq!(
+        checkpoint(&fork.state, &fork.tree, "src-1"),
+        CheckpointOutcome::NothingNew
+    );
+    fork.as_vol().write("b.txt", "b\n");
+    let CheckpointOutcome::Cut { change, .. } = checkpoint(&fork.state, &fork.tree, "src-1") else {
+        panic!("the fork cut nothing");
+    };
+    let repo = Repository::open_bare(fork.state.git()).unwrap();
+    let c = repo.find_commit(change).unwrap();
+    assert_eq!(c.parent_ids().collect::<Vec<_>>(), [tip]);
+    assert_eq!(
+        repo.refname_to_id(&crate::checkpoint::change_line_ref("src-1"))
+            .unwrap(),
+        change
+    );
+
+    // The key is identity: no include may set it.
+    fs::write(
+        &source.fragment,
+        format!(
+            "[remote \"origin\"]\n\turl = {}\n[agentfs \"fork\"]\n\tbaseChangeLine = {tip}\n",
+            source.remote.display()
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        crate::config::Settings::load(&source.state.git()),
+        Err(crate::config::ConfigError::IncludeSetsIdentity { key, .. })
+            if key == crate::checkpoint::BASE_CHANGE_LINE_KEY
+    ));
+}
+
 /// A5: what create refuses, changing nothing.
 #[test]
 fn create_refuses_and_changes_nothing() {

@@ -2412,6 +2412,17 @@ impl Committer {
         git2::Signature::now(&c.name, &c.email)
     }
 
+    /// The author signature for `caller`, now, from the volume's author
+    /// templates (design §9): a checkpoint's author
+    /// ([`crate::checkpoint::cut`]).
+    pub fn author_signature(
+        &self,
+        caller: crate::record::Caller,
+    ) -> Result<git2::Signature<'static>, HistoryError> {
+        let a = self.identities.author(caller)?;
+        Ok(git2::Signature::now(&a.name, &a.email)?)
+    }
+
     /// Commits that the patch of `op` is applied when it changes nothing
     /// ([`History::commit_patch_marker`], design §12).
     pub fn commit_patch_marker(&self, op: &Operation) -> Result<git2::Oid, VolumeError> {

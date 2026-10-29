@@ -1044,6 +1044,7 @@ mod tests {
             ssh_agent: None,
             ssh_key_passphrase: None,
             fork_remote: false,
+            push_source: agentfs_core::config::PushSource::Branch,
         }
     }
 
@@ -1065,6 +1066,7 @@ mod tests {
             ssh_key: Some(key),
             known_hosts: Some(known_hosts),
             fork_remote: false,
+            push_source: agentfs_core::config::PushSource::Branch,
         }
     }
 

@@ -803,14 +803,76 @@ impl History {
     }
 
     /// An empty commit on the branch with the head's tree and `message`
-    /// (§3.4's exceptions: the patch marker and a fork's finish commit),
-    /// objects and refs synced. Fails if the branch does not exist.
+    /// (§3.4's exceptions: the patch marker, the checkpoint marker and a
+    /// fork's finish commit), objects and refs synced. Fails if the branch
+    /// does not exist.
     pub fn commit_marker(
         &self,
         message: &str,
         signature: &Signature<'_>,
     ) -> Result<Oid, HistoryError> {
         self.marker(message, signature, signature, "agentfs: marker commit")
+    }
+
+    /// Merges the checkpoint commit `change` back into the branch (design
+    /// §19.2 item 11, [`crate::checkpoint`]): a marker with parents
+    /// `[head, change]` and the head's tree, its message `message` then
+    /// `Agentfs-Seq` (the head's), `Agentfs-Trigger: checkpoint` and
+    /// `Agentfs-Checkpoint: <change>`. §3.4's marker exception, like the
+    /// patch marker: it writes no file. First-parent scans (the inbox
+    /// trailers, the sequence) pass it as any marker. Objects and refs
+    /// synced; the branch moves only if it is still at the head read.
+    pub fn commit_checkpoint_marker(
+        &self,
+        change: Oid,
+        message: &str,
+        author: &Signature<'_>,
+        committer: &Signature<'_>,
+    ) -> Result<Oid, HistoryError> {
+        use crate::checkpoint::{CHECKPOINT_TRAILER, CHECKPOINT_TRIGGER};
+        let seq = self.head_seq()?.unwrap_or_default();
+        let message = format!(
+            "{}\n\n{SEQ_TRAILER}: {seq}\nAgentfs-Trigger: {CHECKPOINT_TRIGGER}\n\
+             {CHECKPOINT_TRAILER}: {change}\n",
+            message.trim_end()
+        );
+        let change = self.repo.find_commit(change)?;
+        let log = format!("agentfs: checkpoint marker through seq {seq}");
+        self.marker_with(&message, author, committer, &log, Some(&change))
+    }
+
+    /// A commit of `tree` on `parents` at `refname`, outside the branch,
+    /// by `(author, committer)`, moved only from `expected` (`None`:
+    /// created, never replaced); objects and the ref synced. The change
+    /// line's write ([`crate::checkpoint`]).
+    pub(crate) fn commit_ref(
+        &self,
+        refname: &str,
+        expected: Option<Oid>,
+        tree: Oid,
+        parents: &[Oid],
+        message: &str,
+        (author, committer): (&Signature<'_>, &Signature<'_>),
+    ) -> Result<Oid, HistoryError> {
+        let tree = self.repo.find_tree(tree)?;
+        let parents = parents
+            .iter()
+            .map(|p| self.repo.find_commit(*p))
+            .collect::<Result<Vec<_>, _>>()?;
+        let parents: Vec<&git2::Commit<'_>> = parents.iter().collect();
+        let commit = self
+            .repo
+            .commit(None, author, committer, message, &tree, &parents)?;
+        self.sync_object_dirs()?;
+        let log = "agentfs: checkpoint";
+        match expected {
+            Some(old) => self
+                .repo
+                .reference_matching(refname, commit, true, old, log)?,
+            None => self.repo.reference(refname, commit, false, log)?,
+        };
+        self.sync_dirs_of(refname)?;
+        Ok(commit)
     }
 
     fn marker(
@@ -820,13 +882,27 @@ impl History {
         committer: &Signature<'_>,
         log: &str,
     ) -> Result<Oid, HistoryError> {
+        self.marker_with(message, author, committer, log, None)
+    }
+
+    /// [`History::marker`], with `merged` as a second parent.
+    fn marker_with(
+        &self,
+        message: &str,
+        author: &Signature<'_>,
+        committer: &Signature<'_>,
+        log: &str,
+        merged: Option<&git2::Commit<'_>>,
+    ) -> Result<Oid, HistoryError> {
         let head = self.head()?.ok_or_else(|| {
             git2::Error::from_str("the branch does not exist: there is nothing to mark")
         })?;
         let tree = head.tree()?;
+        let mut parents = vec![&head];
+        parents.extend(merged);
         let commit = self
             .repo
-            .commit(None, author, committer, message, &tree, &[&head])?;
+            .commit(None, author, committer, message, &tree, &parents)?;
         self.sync_object_dirs()?;
         self.repo
             .reference_matching(&self.settings.branch_ref, commit, true, head.id(), log)?;
@@ -929,6 +1005,28 @@ pub fn inbox_from_message(message: &str) -> Option<(u64, Oid)> {
         (true, Some(n), Some(patch)) if n > 0 => Some((n, patch)),
         _ => None,
     }
+}
+
+/// The checkpoint commit a checkpoint marker merged back (design §19.2
+/// item 11): read only from the message's last paragraph, which agentfs
+/// writes itself, and only with `Agentfs-Trigger: checkpoint` there, like
+/// [`inbox_from_message`].
+pub fn checkpoint_from_message(message: &str) -> Option<Oid> {
+    use crate::checkpoint::{CHECKPOINT_TRAILER, CHECKPOINT_TRIGGER};
+    let trimmed = message.trim_end_matches('\n');
+    let last = trimmed.rsplit("\n\n").next()?;
+    let trigger_line = format!("Agentfs-Trigger: {CHECKPOINT_TRIGGER}");
+    let prefix = format!("{CHECKPOINT_TRAILER}: ");
+    let mut trigger = false;
+    let mut change = None;
+    for line in last.lines() {
+        if line == trigger_line {
+            trigger = true;
+        } else if let Some(oid) = line.strip_prefix(&prefix) {
+            change = Oid::from_str(oid.trim()).ok();
+        }
+    }
+    change.filter(|_| trigger)
 }
 
 /// The finish record of the fork's finish commit `finish` (design §11.5):

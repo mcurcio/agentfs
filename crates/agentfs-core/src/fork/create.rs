@@ -12,7 +12,10 @@
 //! its source's remotes), the source's settings files as its includes, the objects of base's
 //! history copied in (no alternates, so a fork outlives its source), the
 //! fork's history ref at base, and base's tree written into the fork's
-//! backing tree before anything can mount it. It is idempotent per name:
+//! backing tree before anything can mount it. When the source has a
+//! change line whose tip base reaches (design §19.2 item 11), that tip is
+//! recorded as the fork's `agentfs.fork.baseChangeLine`, the first parent
+//! of the fork's first checkpoint ([`crate::checkpoint`]). It is idempotent per name:
 //! a fork that already exists with the same source is returned as it is,
 //! with the base it was created with.
 
@@ -164,6 +167,16 @@ pub fn create(request: &CreateRequest<'_>) -> Result<ForkIdentity, CreateError> 
     match head {
         None => {
             copy_objects(&source.repo, &fork, identity.base)?;
+            // Base reaches the tip, so its objects came with base's.
+            if let Some(tip) = source.change_line
+                && fork.odb().map_err(HistoryError::from)?.exists(tip)
+            {
+                record_value_once(
+                    request.fork,
+                    crate::checkpoint::BASE_CHANGE_LINE_KEY,
+                    &tip.to_string(),
+                )?;
+            }
             copy_rules(request.source, request.fork)?;
             fork.reference(&history_ref, identity.base, false, "agentfs: fork created")
                 .map_err(HistoryError::from)?;
@@ -214,21 +227,29 @@ struct Source {
     repo: Repository,
     /// Its forks publish into its history ([`ForkRemote::SourceHistory`]).
     local_only: bool,
+    /// Its change-line tip ([`crate::checkpoint::change_line_ref`]), when
+    /// it has one.
+    change_line: Option<Oid>,
 }
 
 /// The absolute `path` at `key` in the fork's own config: the source's
 /// state area ([`super::receive::SOURCE_STATE_KEY`]) or the fork's own
 /// remotes ([`super::identity::REMOTES_KEY`]); an earlier try's is kept.
 fn record_once(fork: &StateDir, key: &str, path: &Path) -> Result<(), CreateError> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| io::Error::other(format!("{key}: {} is not valid UTF-8", path.display())))?;
+    record_value_once(fork, key, value)
+}
+
+/// `value` at `key` in the fork's own config; an earlier try's is kept.
+fn record_value_once(fork: &StateDir, key: &str, value: &str) -> Result<(), CreateError> {
     let mut config = git2::Config::open(&fork.git().join("config")).map_err(HistoryError::from)?;
     match config.get_string(key) {
         Ok(_) => return Ok(()),
         Err(e) if e.code() == git2::ErrorCode::NotFound => {}
         Err(e) => return Err(HistoryError::from(e).into()),
     }
-    let value = path
-        .to_str()
-        .ok_or_else(|| io::Error::other(format!("{key}: {} is not valid UTF-8", path.display())))?;
     config.set_str(key, value).map_err(HistoryError::from)?;
     Ok(())
 }
@@ -256,11 +277,17 @@ fn read_source(state: &StateDir, link: ForkLink) -> Result<Source, CreateError> 
         }
         Err(e) => return Err(unreadable(e)),
     };
+    let change_line = match repo.refname_to_id(&crate::checkpoint::change_line_ref(&volume)) {
+        Ok(tip) => Some(tip),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+        Err(e) => return Err(unreadable(e)),
+    };
     Ok(Source {
         volume,
         base,
         repo,
         local_only,
+        change_line,
     })
 }
 

@@ -48,6 +48,7 @@
 //! [`otel`], design §13); alarms are also printed to stderr. `init` and
 //! `status` export nothing.
 
+mod checkpoint_cmd;
 mod control;
 mod daemon;
 #[cfg(test)]
@@ -198,6 +199,19 @@ enum Command {
         /// Replace this volume's own branch on one remote, leased on OID (runbooks only).
         #[arg(long, value_name = "OID")]
         force_with_lease: Option<String>,
+        #[command(flatten)]
+        pod: Pod,
+    },
+    /// Cut a checkpoint: one commit on the change line
+    /// (refs/agentfs/<volume>/change-line) with the branch head's tree and
+    /// the patches landed since, merged back into the branch. With a daemon
+    /// running, its commit loop cuts it; otherwise takes the state-area lock
+    /// (exit 75 when it is busy) and commits what is recorded first. Exit 0
+    /// also when there is nothing new.
+    Checkpoint {
+        /// The checkpoint's message (default: `checkpoint`).
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
         #[command(flatten)]
         pod: Pod,
     },
@@ -582,6 +596,9 @@ fn real_main() -> Result<ExitCode> {
             let code = push_once(&state, &remotes, &session)?;
             session.finish();
             return Ok(code);
+        }
+        Command::Checkpoint { message, pod } => {
+            return checkpoint_cmd::run(&state, cli.root.as_deref(), cli.wait_lock, &pod, message);
         }
         Command::Run { pod, push_grace } => {
             refuse_finished(&state)?;
