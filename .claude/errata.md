@@ -300,3 +300,21 @@ Neither stopped the work; each was resolved as below.
    delivers (§11.5). mia.5's page adds git-config keys (`agentfs.patchNotifyUrl`,
    `agentfs.patchNotifyCredentialFile`, `agentfs.patchNotifyTimeout`) that any volume, and so a CSI
    profile's config, can set; there is no CSI code in mia.5. Confirm the reading before mia.5.
+
+## 2026-10-29, mia.2 implementer (agentfs-mia.2)
+
+1. **Stopped before any code: the frozen page's precondition is unmet.** mia.2's page opens with
+   "Precondition: erratum 2026-10-29 item 1 ... confirmed by the main session. If not confirmed:
+   STOP." No confirmation is recorded: not in this file (item 1 still ends "Needs the main
+   session's confirmation"), not in the bead (no notes), not in design §19.1/§19.2 item 11, not in
+   the computed task brief. The brief `.handoff/mia-features.md` still lists "the stale check"
+   among the mechanics to keep unchanged, which the page's held marks change (an inbox entry at or
+   below the high-water with a `held/<n>` mark is judged again, not stale), as does the
+   `recover_in_flight` applied test. Note §19.2 item 11's "Unchanged" list (commit 4002628) names
+   numbering, the high-water and crash recovery but not the stale check, so the record and the
+   brief already disagree. To unblock: the main session confirms item 1 (and amends the brief's
+   "keep unchanged" line and §19.1 with the held-mark exemption), then re-dispatches mia.2.
+
+## 2026-10-29, main session: confirmations
+- **Item 1 (mia.2, stale check): confirmed.** "Keep going" needs it. A local `refs/agentfs/<volume>/held/<n>` mark, written before the next number is judged, exempts that number from the stale check; everything without the mark is judged as today. `recover_in_flight`'s applied test becomes the trailer check its doc comment already describes. Numbering, the high-water mark, the gap rule and the trailer rule for "applied" stay unchanged. The brief (.handoff/mia-features.md) is updated to say so.
+- **Item 2 (mia.5, webhook): confirmed.** No CSI delivery webhook exists. Add `agentfs.patchNotifyUrl`, `agentfs.patchNotifyCredentialFile` and `agentfs.patchNotifyTimeout`, settable by any volume and so by a CSI profile's config; no CSI code in mia.5.
