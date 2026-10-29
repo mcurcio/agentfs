@@ -247,6 +247,7 @@ fn exports_over_otlp_http() {
         "agentfs.state.bytes",
         "agentfs.patch.queue_depth",
         "agentfs.patch.blocked",
+        "agentfs.patch.held",
     ] {
         assert!(
             metric_names.contains(name),
@@ -567,7 +568,7 @@ fn queue_patch(git: &std::path::Path, n: u64, parent: git2::Oid, path: &str, con
 }
 
 #[test]
-fn a_blocked_patch_queue_exports_gauges_span_and_alarm() {
+fn a_held_patch_exports_gauges_span_and_alarm() {
     let collector = Collector::start();
     let v = Volume::new();
     let git = v.dir.path().join("state/git");
@@ -593,8 +594,9 @@ fn a_blocked_patch_queue_exports_gauges_span_and_alarm() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(stderr(&out).contains("alarm: "), "{}", stderr(&out));
 
-    assert_eq!(gauge_last(&collector, "agentfs.patch.queue_depth"), Some(2));
-    assert_eq!(gauge_last(&collector, "agentfs.patch.blocked"), Some(1));
+    assert_eq!(gauge_last(&collector, "agentfs.patch.queue_depth"), Some(1));
+    assert_eq!(gauge_last(&collector, "agentfs.patch.held"), Some(1));
+    assert_eq!(gauge_last(&collector, "agentfs.patch.blocked"), Some(0));
 
     let mut patches = Vec::new();
     for body in collector.bodies("/v1/traces") {
@@ -611,7 +613,11 @@ fn a_blocked_patch_queue_exports_gauges_span_and_alarm() {
         .collect();
     assert_eq!(
         outcomes,
-        [Some("applied".to_owned()), Some("blocked".to_owned())]
+        [
+            Some("applied".to_owned()),
+            Some("held".to_owned()),
+            Some("applied".to_owned())
+        ]
     );
     assert_eq!(
         string_attr(&patches[1].attributes, "agentfs.patch.reason").as_deref(),
@@ -627,13 +633,21 @@ fn a_blocked_patch_queue_exports_gauges_span_and_alarm() {
             }
         }
     }
-    let blocked = logs
+    let held = logs
         .iter()
-        .find(|r| r.event_name == "agentfs.patch_blocked")
-        .unwrap_or_else(|| panic!("no patch_blocked log: {logs:?}"));
+        .find(|r| r.event_name == "agentfs.patch_held")
+        .unwrap_or_else(|| panic!("no patch_held log: {logs:?}"));
     assert_eq!(
-        string_attr(&blocked.attributes, "agentfs.patch.reason").as_deref(),
+        string_attr(&held.attributes, "agentfs.patch.reason").as_deref(),
         Some("conflict")
+    );
+    assert_eq!(
+        string_attr(&held.attributes, "agentfs.patch.verdict").as_deref(),
+        Some("held")
+    );
+    assert!(
+        !logs.iter().any(|r| r.event_name == "agentfs.patch_blocked"),
+        "a held patch does not block"
     );
     assert!(
         !logs.iter().any(|r| r.event_name == "agentfs.patch_applied"),

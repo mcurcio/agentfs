@@ -1,9 +1,12 @@
 //! Fetching the volume's patch queue from the patch remote (design §12).
 //!
-//! Only `refs/agentfs/<volume>/inbox/*` is fetched, forced (a producer may
-//! replace a queued patch), with every commit a patch needs, into the same
-//! names in the history repository. Inbox refs the remote no longer has
-//! are deleted locally, so a patch withdrawn on the remote is not applied.
+//! Only `refs/agentfs/<volume>/inbox/*` and `refs/agentfs/<volume>/approved/*`
+//! (`agentfs patch approve`, bead agentfs-mia.2) are fetched, forced (a
+//! producer may replace a queued patch, an approver approve another tip),
+//! with every commit a patch needs, into the same names in the history
+//! repository. Refs of either kind the remote no longer has are deleted
+//! locally, so a patch withdrawn on the remote is not applied and a
+//! withdrawn approval no longer counts.
 //!
 //! The fetch is best effort: it runs on its own thread with its own
 //! repository handle, and the caller waits at most
@@ -23,7 +26,7 @@ use std::time::Duration;
 
 use git2::{AutotagOption, ErrorCode, FetchOptions, FetchPrune, Repository};
 
-use super::inbox_prefix;
+use super::{approved_prefix, inbox_prefix};
 use crate::config::RemoteSettings;
 use crate::events::PushFailureKind;
 use crate::history::init_libgit2;
@@ -40,7 +43,8 @@ pub struct FetchOutcome {
     pub message: Option<String>,
     /// Inbox refs the remote has.
     pub remote_inbox: usize,
-    /// Local inbox refs deleted because the remote no longer has them.
+    /// Local inbox and approved refs deleted because the remote no longer
+    /// has them.
     pub pruned: usize,
 }
 
@@ -115,7 +119,11 @@ fn fetch_now(
         Err(e) => return FetchOutcome::failed(name, PushFailureKind::Local, e.to_string()),
     };
     let prefix = inbox_prefix(volume);
-    let refspec = format!("+{prefix}*:{prefix}*");
+    let approved = approved_prefix(volume);
+    let refspecs = [
+        format!("+{prefix}*:{prefix}*"),
+        format!("+{approved}*:{approved}*"),
+    ];
     let auth = RemoteAuth::new(remote);
     let state = AuthState::new();
     let _scope = auth.ssh_scope(&state);
@@ -135,7 +143,7 @@ fn fetch_now(
             .prune(FetchPrune::Off)
             .update_fetchhead(false)
             .download_tags(AutotagOption::None);
-        git_remote.fetch(&[refspec.as_str()], Some(&mut options), None)
+        git_remote.fetch(&refspecs, Some(&mut options), None)
     };
     if let Err(e) = result {
         let message = scrub(e.message(), url);
@@ -164,18 +172,21 @@ fn fetch_now(
         Ok(heads) => heads
             .iter()
             .map(|h| h.name().to_owned())
-            .filter(|n| n.starts_with(&prefix))
+            .filter(|n| n.starts_with(&prefix) || n.starts_with(&approved))
             .collect(),
         Err(e) => return FetchOutcome::failed(name, PushFailureKind::Local, e.to_string()),
     };
     let mut pruned = 0;
-    let local: Vec<String> = match repo.references_glob(&format!("{prefix}*")) {
-        Ok(refs) => refs
-            .filter_map(Result::ok)
-            .filter_map(|r| r.name().ok().map(str::to_owned))
-            .collect(),
-        Err(e) => return FetchOutcome::failed(name, PushFailureKind::Local, e.to_string()),
-    };
+    let mut local = Vec::new();
+    for glob in [&prefix, &approved] {
+        match repo.references_glob(&format!("{glob}*")) {
+            Ok(refs) => local.extend(
+                refs.filter_map(Result::ok)
+                    .filter_map(|r| r.name().ok().map(str::to_owned)),
+            ),
+            Err(e) => return FetchOutcome::failed(name, PushFailureKind::Local, e.to_string()),
+        }
+    }
     for local in local {
         if !on_remote.contains(&local)
             && let Ok(mut r) = repo.find_reference(&local)
@@ -184,12 +195,13 @@ fn fetch_now(
             pruned += 1;
         }
     }
+    let remote_inbox = on_remote.iter().filter(|n| n.starts_with(&prefix)).count();
     FetchOutcome {
         remote: name.clone(),
         ok: true,
         kind: None,
         message: None,
-        remote_inbox: on_remote.len(),
+        remote_inbox,
         pruned,
     }
 }

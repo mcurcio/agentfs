@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use crate::fork::identity::{self as fork_identity, ForkIdentity, ForkLink, PushTarget};
 use crate::identity::Templates;
+use crate::patch::accept::AcceptMode;
 use crate::proxy::ProxySetting;
 use crate::remote_url::{self, Transport};
 
@@ -190,6 +191,8 @@ pub const KEYS: &[&str] = &[
     "agentfs.repackInterval",
     "agentfs.patchRemote",
     "agentfs.patchFetchTimeout",
+    "agentfs.patchAccept",
+    "agentfs.patchAcceptTimeout",
     "agentfs.lfsThreshold",
     "agentfs.forkRefs",
     "agentfs.identity.committerName",
@@ -482,6 +485,13 @@ pub struct Settings {
     /// `agentfs.patchFetchTimeout`: how long the mount waits for the
     /// patch fetch (design §12). Default 30s.
     pub patch_fetch_timeout: Duration,
+    /// `agentfs.patchAccept`: the acceptance rule that judges each cleanly
+    /// merged patch (design §12; bead agentfs-mia.2). Default
+    /// `cleanMerge`.
+    pub patch_accept: AcceptMode,
+    /// `agentfs.patchAcceptTimeout`: how long the `patch-accept` hook may
+    /// run. Default [`DEFAULT_PATCH_ACCEPT_TIMEOUT`]; `0` is refused.
+    pub patch_accept_timeout: Duration,
     /// Every `include.path`, in order: absolute, readable config fragments
     /// whose keys count as the repository's own (design §4.3).
     pub includes: Vec<PathBuf>,
@@ -1102,6 +1112,8 @@ impl Settings {
                 patch_remote
             },
             patch_fetch_timeout: patch_fetch_timeout(config)?,
+            patch_accept: patch_accept(config)?,
+            patch_accept_timeout: patch_accept_timeout(config)?,
             lfs,
             http_proxy: http_proxy.ok().flatten(),
             remotes: split.remotes,
@@ -1560,6 +1572,40 @@ fn patch_fetch_timeout(config: &git2::Config) -> Result<Duration, ConfigError> {
     }
 }
 
+/// The default `agentfs.patchAcceptTimeout` (design §12).
+pub const DEFAULT_PATCH_ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `agentfs.patchAccept`: `cleanMerge` (the default), `approval` or
+/// `command`; anything else is [`ConfigError::BadChoice`].
+fn patch_accept(config: &git2::Config) -> Result<AcceptMode, ConfigError> {
+    let key = "agentfs.patchAccept";
+    match string(config, key)?.as_deref() {
+        None | Some("cleanMerge") => Ok(AcceptMode::CleanMerge),
+        Some("approval") => Ok(AcceptMode::Approval),
+        Some("command") => Ok(AcceptMode::Command),
+        Some(other) => Err(ConfigError::BadChoice {
+            key: key.into(),
+            value: other.into(),
+            allowed: "cleanMerge, approval, command",
+        }),
+    }
+}
+
+/// `agentfs.patchAcceptTimeout`: default [`DEFAULT_PATCH_ACCEPT_TIMEOUT`],
+/// else a duration above zero.
+fn patch_accept_timeout(config: &git2::Config) -> Result<Duration, ConfigError> {
+    let key = "agentfs.patchAcceptTimeout";
+    match duration(config, key)? {
+        None => Ok(DEFAULT_PATCH_ACCEPT_TIMEOUT),
+        Some(d) if !d.is_zero() => Ok(d),
+        Some(_) => Err(ConfigError::TooShort {
+            key: key.into(),
+            value: string(config, key)?.unwrap_or_default(),
+            min: Duration::from_millis(1),
+        }),
+    }
+}
+
 /// `agentfs.repackInterval`: default [`DEFAULT_REPACK_INTERVAL`], `0` or
 /// `off` for never, else a duration of at least [`MIN_REPACK_INTERVAL`].
 fn repack_interval(config: &git2::Config) -> Result<Option<Duration>, ConfigError> {
@@ -1757,6 +1803,39 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn patch_accept_and_its_timeout() {
+        let load = |extra: &str| {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{extra}"));
+            Settings::from_config(&c)
+        };
+        let s = load("").unwrap();
+        assert_eq!(s.patch_accept, AcceptMode::CleanMerge);
+        assert_eq!(s.patch_accept_timeout, DEFAULT_PATCH_ACCEPT_TIMEOUT);
+        for (value, mode) in [
+            ("cleanMerge", AcceptMode::CleanMerge),
+            ("approval", AcceptMode::Approval),
+            ("command", AcceptMode::Command),
+        ] {
+            let s = load(&format!("\tpatchAccept = {value}\n")).unwrap();
+            assert_eq!(s.patch_accept, mode, "{value}");
+        }
+        assert!(matches!(
+            load("\tpatchAccept = always\n"),
+            Err(ConfigError::BadChoice { .. })
+        ));
+        let s = load("\tpatchAcceptTimeout = 5s\n").unwrap();
+        assert_eq!(s.patch_accept_timeout, Duration::from_secs(5));
+        assert!(matches!(
+            load("\tpatchAcceptTimeout = 0s\n"),
+            Err(ConfigError::TooShort { .. })
+        ));
+        assert!(matches!(
+            load("\tpatchAcceptTimeout = soon\n"),
+            Err(ConfigError::BadDuration { .. })
+        ));
     }
 
     #[test]

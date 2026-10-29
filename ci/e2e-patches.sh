@@ -6,10 +6,10 @@
 # - two producers race `agentfs patch submit` and get inbox 1 and 2;
 # - three more patches, the second of them (4) conflicting with a change the
 #   workload makes through the mount;
-# - a remount applies 1 to 3, blocks at 4 and mounts anyway; the push moves
-#   the remote's refs and the status ref says why;
+# - a remount applies 1 to 3 and 5, holds 4 whole and mounts anyway; the
+#   push moves the remote's refs and the status ref says why;
 # - a crash between the commit and the ref moves applies nothing twice;
-# - `agentfs patch submit --replace 4` with a rebased patch unblocks it.
+# - `agentfs patch submit --replace 4` with a rebased patch lands it.
 #
 # Needs a server from ci/git-http-server.sh and its GIT_* variables, Linux
 # with /dev/fuse, fuse3, git and passwordless sudo.
@@ -137,26 +137,26 @@ wait_for 20 sh -c "[ \"\$(sudo git --git-dir '$STATE/git' show refs/heads/agentf
 wait_pushed
 stop_mount
 
-step "a remount applies 1 to 3, blocks at 4 and mounts anyway"
+step "a remount applies 1 to 3 and 5, holds 4 whole and mounts anyway"
 start_mount
 assert_eq "a1" "$(cat "$MNT/a.txt")" "patch 3 is served from the first read"
 assert_eq "one" "$(cat "$MNT/r1.txt")" "patch 1 is served"
 assert_eq "b-from-workload" "$(cat "$MNT/b.txt")" "the workload's b.txt stays"
-[ ! -e "$MNT/c.txt" ] || fail "patch 5 must wait behind 4"
-pass "patch 5 waits"
-assert_contains "$(cat "$LOG")" "patches: blocked at 4 (conflict)" "the mount says why"
-assert_contains "$(cat "$LOG")" "alarm: patch queue blocked at 4" "the PatchBlocked alarm"
-applied_on_remote() { [ -n "$(remote_ref "$REPO" "$(applied 3)")" ]; }
-wait_for 30 applied_on_remote || fail "applied/3 never reached the remote"
+assert_eq "c" "$(cat "$MNT/c.txt")" "patch 5 goes on past the held 4"
+assert_contains "$(cat "$LOG")" "patch 4 held (conflict)" "the mount says why"
+assert_contains "$(cat "$LOG")" "alarm: patch 4 (" "the PatchHeld alarm"
+applied_on_remote() { [ -n "$(remote_ref "$REPO" "$(applied 5)")" ]; }
+wait_for 30 applied_on_remote || fail "applied/5 never reached the remote"
 wait_pushed
-inbox_left() { [ "$(remote_inbox | wc -l)" = 2 ]; }
-wait_for 30 inbox_left || fail "inbox 1 to 3 never deleted: $(remote_inbox)"
-assert_eq "$(inbox 4) $(inbox 5)" "$(remote_inbox | tr '\n' ' ' | sed 's/ $//')" "inbox 4 and 5 remain"
+inbox_left() { [ "$(remote_inbox | wc -l)" = 1 ]; }
+wait_for 30 inbox_left || fail "inbox 1 to 3 and 5 never deleted: $(remote_inbox)"
+assert_eq "$(inbox 4)" "$(remote_inbox)" "inbox 4 remains"
 assert_eq "$P3" "$(remote_ref "$REPO" "$(applied 3)")" "applied/3 is the patch"
 status=$(remote_status)
+assert_contains "$status" '"kind": "held"' "status.json: 4 is held"
 assert_contains "$status" '"reason": "conflict"' "status.json: conflict"
-assert_contains "$status" '"inbox": 4' "status.json: blocked at 4"
-assert_contains "$(af status)" "patches:   last applied 3, 2 queued, blocked at 4 (conflict)" \
+assert_contains "$status" '"blocked": null' "status.json: not blocked"
+assert_contains "$(af status)" "patches:   last applied 5, 1 queued (1 set aside), ok" \
   "agentfs status shows the queue"
 
 step "a crash between the commit and the ref moves applies nothing twice"
@@ -173,20 +173,20 @@ assert_eq 1 "$(rgit log --format=%H --grep '^Agentfs-Inbox: 3$' refs/heads/agent
 stop_mount
 sgit config --unset agentfs.patchFetchTimeout
 
-step "patch 4, rebased, replaces the blocked one"
+step "patch 4, rebased, replaces the held one"
 git -C "$W/p1" fetch -q origin
 printf 'b-merged\n' >"$W/b2"
 assert_contains "$(submit "$W/p1" --put "b.txt=$W/b2" --replace 4 -m "four, rebased")" \
   "queued patch 4" "replaced"
 start_mount
 assert_eq "b-merged" "$(cat "$MNT/b.txt")" "patch 4 applied"
-assert_eq "c" "$(cat "$MNT/c.txt")" "patch 5 applied"
+assert_eq "c" "$(cat "$MNT/c.txt")" "patch 5 stays applied"
 inbox_empty() { [ -z "$(remote_inbox)" ]; }
 wait_for 30 inbox_empty || fail "the remote inbox never emptied: $(remote_inbox)"
 wait_pushed
-status_clear() { remote_status | grep -q '"blocked": null'; }
-wait_for 30 status_clear || fail "status still blocked: $(remote_status)"
-pass "status not blocked"
+status_clear() { remote_status | grep -q '"queue": \[\]'; }
+wait_for 30 status_clear || fail "status still queues a patch: $(remote_status)"
+pass "status queues nothing"
 for n in 1 2 3 4 5; do
   [ -n "$(remote_ref "$REPO" "$(applied "$n")")" ] || fail "no applied/$n on the remote"
   who=$(rgit log --format='%an|%cn' --grep "^Agentfs-Inbox: $n\$" refs/heads/agentfs/demo)

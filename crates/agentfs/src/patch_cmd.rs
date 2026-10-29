@@ -1,7 +1,8 @@
 //! `agentfs patch` and the mount's patch phase (design §12, §17.1).
 //!
-//! - `patch submit` is the producer side: it runs in the producer's git
-//!   repository and drives its `git` ([`agentfs_core::patch::submit`]).
+//! - `patch submit` and `patch approve` are the producer side: they run in
+//!   the producer's git repository and drive its `git`
+//!   ([`agentfs_core::patch::submit`]).
 //! - `patch apply` fetches and applies the queue with the volume stopped
 //!   (it takes the state-area lock), as a mount does before it serves.
 //! - `patch status` reads `meta/patch.json` and the status ref without
@@ -20,13 +21,14 @@ use agentfs_core::events::{Event, Events};
 use agentfs_core::history::History;
 use agentfs_core::lfs::fetch::Fetcher;
 use agentfs_core::lock::StateLock;
-use agentfs_core::patch::BlockReason;
+use agentfs_core::patch::accept;
 use agentfs_core::patch::fetch::{FetchOutcome, fetch_inbox};
 use agentfs_core::patch::integrate::GitMergeTree;
 use agentfs_core::patch::queue::{Queue, QueueContext, QueueReport, record_failure};
 use agentfs_core::patch::status::{PatchState, StatusDoc, read_status};
 use agentfs_core::patch::status_ref;
-use agentfs_core::patch::submit::{self, GitCli, Source, SubmitRequest};
+use agentfs_core::patch::submit::{self, ApproveRequest, GitCli, Source, SubmitRequest};
+use agentfs_core::patch::{BlockReason, Verdict};
 use agentfs_core::record::Caller;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{Committer, Recorder, StateDir};
@@ -41,9 +43,14 @@ pub enum PatchCommand {
     /// from --put/--delete. Pushed to the next free inbox number; a race
     /// with another submitter takes the next.
     Submit(SubmitArgs),
+    /// Approve queued patch N for a volume whose agentfs.patchAccept is
+    /// `approval` (run in the producer's git repository): its tip as the
+    /// remote lists it goes to refs/agentfs/<volume>/approved/<N>. A
+    /// replaced patch needs approving again.
+    Approve(ApproveArgs),
     /// Fetch and apply the volume's patch queue now, with the volume
     /// stopped (takes the state-area lock; exit 75 when it is busy). Exit
-    /// 1 when the queue is blocked.
+    /// 1 when the queue is blocked or a patch was set aside.
     Apply {
         /// Apply what is already fetched; do not contact the patch remote.
         #[arg(long)]
@@ -101,6 +108,30 @@ pub struct SubmitArgs {
     /// Inbox numbers to try when other submitters race.
     #[arg(long, default_value_t = submit::DEFAULT_ATTEMPTS)]
     attempts: u32,
+    /// Make the patch a barrier: while it is set aside, every later patch
+    /// waits. A built or skip patch gets the `Agentfs-Barrier: yes`
+    /// trailer; a given COMMIT must already carry it.
+    #[arg(long)]
+    barrier: bool,
+}
+
+#[derive(Args)]
+pub struct ApproveArgs {
+    /// The queued patch's inbox number.
+    inbox: u64,
+    /// The volume.
+    #[arg(long, env = "AGENTFS_VOLUME")]
+    volume: String,
+    /// The remote (name or URL) the volume pushes to.
+    #[arg(long, default_value = "origin")]
+    remote: String,
+    /// The producer's git repository.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// The tip you mean (a full commit id): refused if the queue holds
+    /// another.
+    #[arg(long = "patch", value_name = "OID")]
+    patch: Option<String>,
 }
 
 pub fn run(
@@ -111,6 +142,7 @@ pub fn run(
 ) -> Result<ExitCode> {
     match command {
         PatchCommand::Submit(args) => submit_cmd(args),
+        PatchCommand::Approve(args) => approve_cmd(args),
         PatchCommand::Apply { no_fetch, pod } => {
             let Some(root) = root else {
                 bail!("patch apply needs --root (or AGENTFS_ROOT): the backing tree");
@@ -133,11 +165,13 @@ pub fn run(
             // Telemetry is flushed on failure too: the alarm and gauges.
             session.finish();
             let report = report?;
-            Ok(if report.blocked.is_some() {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            })
+            Ok(
+                if report.blocked.is_some() || !report.set_aside.is_empty() {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                },
+            )
         }
         PatchCommand::Status { json } => status_cmd(state, json),
     }
@@ -179,6 +213,7 @@ fn submit_cmd(args: SubmitArgs) -> Result<ExitCode> {
         replace: args.replace,
         attempts: args.attempts,
         depth: args.depth,
+        barrier: args.barrier,
     };
     let done = submit::submit(&GitCli::new(&args.repo), &request)?;
     println!(
@@ -189,6 +224,46 @@ fn submit_cmd(args: SubmitArgs) -> Result<ExitCode> {
         println!("{} number(s) taken by other submitters first", done.raced);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn approve_cmd(args: ApproveArgs) -> Result<ExitCode> {
+    let request = ApproveRequest {
+        remote: args.remote,
+        volume: args.volume,
+        inbox: args.inbox,
+        expect: args.patch,
+    };
+    let done = submit::approve(&GitCli::new(&args.repo), &request)?;
+    println!(
+        "approved patch {} ({}) as {}",
+        done.inbox, done.tip, done.ref_name
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A verdict as `patch status` and `patch apply` print it: its label
+/// (`held`, `waiting`, `awaiting`, `not judged`) and what follows the
+/// patch's number.
+fn verdict_parts(verdict: &Verdict) -> (&'static str, String) {
+    match verdict {
+        Verdict::Held {
+            reason, message, ..
+        } => ("held", format!(" ({reason}): {message}")),
+        Verdict::Waiting { why, behind } => (
+            "waiting",
+            format!(
+                " behind {} ({})",
+                behind
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                why.as_str()
+            ),
+        ),
+        Verdict::Awaiting { what } => ("awaiting", format!(" ({})", what.as_str())),
+        Verdict::NotJudged { rule, message } => ("not judged", format!(" ({rule}): {message}")),
+    }
 }
 
 #[derive(Serialize)]
@@ -232,6 +307,12 @@ fn status_cmd(state: &StateDir, json: bool) -> Result<ExitCode> {
         }
         for q in &status.queue {
             println!("queued:    {} {}", q.inbox, q.patch);
+        }
+        for q in &status.queue {
+            if let Some(verdict) = &q.verdict {
+                let (label, detail) = verdict_parts(verdict);
+                println!("{:<10} {}{detail}", format!("{label}:"), q.inbox);
+            }
         }
         if let Some(b) = &status.blocked {
             println!("blocked:   {} ({}): {}", b.inbox, b.reason, b.message);
@@ -315,6 +396,11 @@ fn apply_queue_inner(
     let tree = Dir::open(root).with_context(|| format!("opening {}", root.display()))?;
     let objects = Fetcher::new(state, settings).context("opening the LFS cache")?;
     let integrator = GitMergeTree::new(state.git());
+    let rule = accept::rule(
+        settings.patch_accept,
+        &state.git(),
+        settings.patch_accept_timeout,
+    );
     let mut queue = Queue::new(QueueContext {
         state,
         recorder,
@@ -328,6 +414,7 @@ fn apply_queue_inner(
             pid: std::process::id(),
         },
         integrator: &integrator,
+        rule: rule.as_ref(),
     });
     let report = queue
         .process(fetched.as_ref())
@@ -352,6 +439,10 @@ fn apply_queue_inner(
             ignored.ref_name, ignored.why
         );
     }
+    for (n, verdict) in &report.set_aside {
+        let (label, detail) = verdict_parts(verdict);
+        eprintln!("patch {n} {label}{detail}");
+    }
     match &report.blocked {
         Some(b) => eprintln!(
             "patches: blocked at {} ({}): {}; {} queued. {}",
@@ -360,6 +451,12 @@ fn apply_queue_inner(
             b.message,
             report.queue_depth,
             b.hint()
+        ),
+        None if !report.set_aside.is_empty() => eprintln!(
+            "patches: through {} applied, {} queued ({} set aside)",
+            report.last_applied,
+            report.queue_depth,
+            report.set_aside.len()
         ),
         None if !report.applied.is_empty() || fetched.is_some() => eprintln!(
             "patches: through {} applied, none queued",

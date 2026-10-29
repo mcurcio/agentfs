@@ -92,10 +92,11 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
 - **e2e patches** ([`ci/e2e-patches.sh`](../ci/e2e-patches.sh)): the patch
   queue against the same smart-HTTP server and a real FUSE mount, following
   the [runbook](runbooks/patch-queue.md): two producers racing
-  `agentfs patch submit` for a number, a conflicting patch that blocks
-  the queue while the volume mounts, the queue push (applied refs, inbox
-  refs deleted, the status ref), a crash between the commit and the ref
-  move, and a replaced patch unblocking it, with the producer as author.
+  `agentfs patch submit` for a number, a conflicting patch held whole
+  while the later ones land and the volume mounts, the queue push (applied
+  refs, inbox refs deleted, the status ref), a crash between the commit
+  and the ref move, and a replaced patch landing, with the producer as
+  author.
 - **e2e ssh remotes** ([`ci/e2e-ssh.sh`](../ci/e2e-ssh.sh)): pushes to a real
   OpenSSH server ([`ci/git-ssh-server.sh`](../ci/git-ssh-server.sh): its own
   sshd on localhost:2222, key-only authentication, a `git-shell` user,

@@ -241,6 +241,10 @@ fn applied(n: u64) -> String {
     format!("refs/agentfs/demo/applied/{n:010}")
 }
 
+fn held(n: u64) -> String {
+    format!("refs/agentfs/demo/held/{n:010}")
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -376,6 +380,9 @@ fn submit_builds_replaces_skips_and_refuses() {
 }
 
 /// Design §18 test 15 at the CLI.
+/// Acceptance 1 (bead agentfs-mia.2): 2 conflicts and is held whole
+/// while 1 and 3 land; a fetch that brings inbox/2 again does not call it
+/// stale; replaced with a rebased patch, it lands after 3.
 #[test]
 fn three_patches_the_second_conflicts() {
     if !have_git() {
@@ -399,44 +406,57 @@ fn three_patches_the_second_conflicts() {
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("patch 1 applied as "), "{err}");
-    assert!(err.contains("patches: blocked at 2 (conflict)"), "{err}");
-    assert!(err.contains("alarm: "), "{err}");
-    assert_eq!(fs::read_to_string(s.tree().join("a.txt")).unwrap(), "a1\n");
-    assert_eq!(
-        fs::read_to_string(s.tree().join("b.txt")).unwrap(),
-        "b-from-workload\n"
+    assert!(err.contains("patch 3 applied as "), "{err}");
+    assert!(err.contains("patch 2 held (conflict): "), "{err}");
+    assert!(
+        err.contains("patches: through 3 applied, 1 queued (1 set aside)"),
+        "{err}"
     );
-    assert!(!s.tree().join("c.txt").exists());
+    assert!(err.contains("alarm: patch 2 ("), "{err}");
+    assert!(!err.contains("blocked"), "{err}");
+    assert_eq!(s.read("a.txt").as_deref(), Some("a1\n"));
+    assert_eq!(s.read("b.txt").as_deref(), Some("b-from-workload\n"));
+    assert_eq!(s.read("c.txt").as_deref(), Some("c\n"));
     assert_eq!(s.inbox_commits(1), 1);
+    assert_eq!(s.inbox_commits(3), 1);
+    let p2 = s.remote_ref(&inbox(2)).unwrap();
+    assert_eq!(s.local().refname_to_id(&held(2)).ok(), Some(p2));
 
     let status = s.ok(&["status"]);
     assert!(
-        status
-            .contains("patches:   last applied 1, 2 queued, blocked at 2 (conflict) (from origin)"),
+        status.contains("patches:   last applied 3, 1 queued (1 set aside), ok (from origin)"),
         "{status}"
     );
     let json = s.ok(&["patch", "status", "--json"]);
     let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(doc["status"]["blocked"]["reason"], "conflict");
-    assert_eq!(doc["status"]["blocked"]["paths"][0], "b.txt");
-    assert_eq!(doc["cache"]["queue_depth"], 2);
+    assert_eq!(doc["status"]["blocked"], serde_json::Value::Null);
+    let queue = doc["status"]["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0]["inbox"], 2);
+    assert_eq!(queue[0]["verdict"]["kind"], "held");
+    assert_eq!(queue[0]["verdict"]["reason"], "conflict");
+    assert_eq!(queue[0]["verdict"]["paths"], serde_json::json!(["b.txt"]));
+    assert_eq!(doc["cache"]["queue_depth"], 1);
+    assert_eq!(doc["cache"]["held"], 1);
     let human = s.ok(&["patch", "status"]);
-    assert!(human.contains("blocked:   2 (conflict)"), "{human}");
+    assert!(human.contains("held:      2 (conflict): "), "{human}");
 
-    // The push carries the branch, then the queue.
+    // The push carries the branch, then the queue; inbox/2 stays.
     let out = s.ok(&["push"]);
     assert!(
         out.contains(
-            "origin: queue: status pushed, 1 applied ref(s) created, 1 inbox ref(s) deleted"
+            "origin: queue: status pushed, 2 applied ref(s) created, 2 inbox ref(s) deleted"
         ),
         "{out}"
     );
-    let local_head = s.local().refname_to_id(BRANCH).unwrap();
+    let local_head = s.branch_head();
     assert_eq!(s.remote_ref(BRANCH), Some(local_head));
-    assert!(s.remote_ref(&applied(1)).is_some());
-    assert_eq!(s.remote_ref(&inbox(1)), None);
-    assert!(s.remote_ref(&inbox(2)).is_some());
-    assert!(s.remote_ref(&inbox(3)).is_some());
+    for n in [1, 3] {
+        assert!(s.remote_ref(&applied(n)).is_some(), "applied {n}");
+        assert_eq!(s.remote_ref(&inbox(n)), None, "inbox {n}");
+    }
+    assert_eq!(s.remote_ref(&inbox(2)), Some(p2));
+    assert_eq!(s.remote_ref(&held(2)), None, "held marks stay local");
     let remote = Repository::open_bare(s.remote()).unwrap();
     let status = remote
         .find_commit(s.remote_ref("refs/agentfs/demo/status").unwrap())
@@ -452,23 +472,32 @@ fn three_patches_the_second_conflicts() {
         )
         .unwrap();
     let doc: serde_json::Value = serde_json::from_slice(blob.content()).unwrap();
-    assert_eq!(doc["blocked"]["inbox"], 2);
-    assert_eq!(doc["blocked"]["reason"], "conflict");
+    assert_eq!(doc["blocked"], serde_json::Value::Null);
+    assert_eq!(doc["queue"][0]["verdict"]["kind"], "held");
+
+    // A fetch brings inbox/2 again: judged again, never stale.
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(!err.contains("stale"), "{err}");
+    assert!(err.contains("patch 2 held (conflict)"), "{err}");
+    assert_eq!(s.branch_head(), local_head);
 
     // A crash between the commit and the ref moves.
     let local = s.local();
-    let p1 = local.refname_to_id(&applied(1)).unwrap();
-    local.find_reference(&applied(1)).unwrap().delete().unwrap();
-    local.reference(&inbox(1), p1, true, "test").unwrap();
+    let p3 = local.refname_to_id(&applied(3)).unwrap();
+    local.find_reference(&applied(3)).unwrap().delete().unwrap();
+    local.reference(&inbox(3), p3, true, "test").unwrap();
     fs::remove_file(s.state().join("meta/patch.json")).unwrap();
     let out = s.agentfs(&["patch", "apply", "--no-fetch"]);
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("were already applied"), "{err}");
-    assert_eq!(s.inbox_commits(1), 1);
-    assert_eq!(s.local().refname_to_id(BRANCH).unwrap(), local_head);
+    assert_eq!(s.inbox_commits(3), 1);
+    assert_eq!(s.branch_head(), local_head);
 
-    // Resolved: 2 rebased onto the pushed head.
+    // Resolved: 2 rebased onto the pushed head. It is below the last
+    // applied number, and replaceable because the status still lists it.
     let b2 = s.file("b2", "b-merged\n");
     s.submit_ok(
         &p,
@@ -483,16 +512,23 @@ fn three_patches_the_second_conflicts() {
     );
     let out = s.agentfs(&["patch", "apply"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(
-        fs::read_to_string(s.tree().join("b.txt")).unwrap(),
-        "b-merged\n"
-    );
-    assert_eq!(fs::read_to_string(s.tree().join("c.txt")).unwrap(), "c\n");
+    assert_eq!(s.read("b.txt").as_deref(), Some("b-merged\n"));
+    assert_eq!(s.read("c.txt").as_deref(), Some("c\n"));
     for n in 1..=3 {
         assert_eq!(s.inbox_commits(n), 1, "patch {n}");
     }
+    // Inbox 2 lands after inbox 3, on top of it.
+    let local = s.local();
+    let head = local.find_commit(s.branch_head()).unwrap();
+    assert!(
+        head.message().unwrap().contains("Agentfs-Inbox: 2\n"),
+        "{:?}",
+        head.message()
+    );
+    assert_eq!(head.parent_id(0).unwrap(), local_head);
+    assert!(s.local().refname_to_id(&held(2)).is_err());
     let out = s.ok(&["push"]);
-    assert!(out.contains("2 inbox ref(s) deleted"), "{out}");
+    assert!(out.contains("1 inbox ref(s) deleted"), "{out}");
     for n in 1..=3 {
         assert_eq!(s.remote_ref(&inbox(n)), None, "inbox {n}");
         assert!(s.remote_ref(&applied(n)).is_some(), "applied {n}");
@@ -506,6 +542,356 @@ fn three_patches_the_second_conflicts() {
     let d = s.file("d", "d\n");
     let out = s.submit_ok(&p, &["--put", &format!("d.txt={d}")]);
     assert!(out.contains("queued patch 4"), "{out}");
+}
+
+/// Five lines, so edits at the first and the last merge cleanly.
+const FIVE: &str = "1\n2\n3\n4\n5\n";
+
+impl Setup {
+    /// Queues, in producer `p`: 1 on a.txt, 2 on f.txt's first line (which
+    /// the workload then changes too, so 2 conflicts), 3 on f.txt's last
+    /// line (clean on its own), 4 on g.txt; `barrier` makes 2 a barrier.
+    fn conflict_and_followers(&self, p: &Path, barrier: bool) {
+        let put = |name: &str, path: &str, content: &str, extra: &[&str]| {
+            let file = self.file(name, content);
+            let mut args = vec!["--put".to_owned(), format!("{path}={file}")];
+            args.extend(extra.iter().map(|a| a.to_string()));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.submit_ok(p, &args);
+        };
+        put("p1", "a.txt", "a1\n", &[]);
+        let two: &[&str] = if barrier { &["--barrier"] } else { &[] };
+        put("p2", "f.txt", "uno\n2\n3\n4\n5\n", two);
+        put("p3", "f.txt", "1\n2\n3\n4\nfive\n", &[]);
+        put("p4", "g.txt", "g1\n", &[]);
+        self.record("f.txt", "one\n2\n3\n4\n5\n");
+    }
+}
+
+/// Acceptance 2: a later patch on the held patch's file waits behind it;
+/// one on another file lands; once 2 is skipped, 3 lands.
+#[test]
+fn a_later_patch_on_the_same_file_waits() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("f.txt", FIVE);
+    s.record("g.txt", "g0\n");
+    s.ok(&["push"]);
+    let p = s.producer("p");
+    s.conflict_and_followers(&p, false);
+
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("patch 2 held (conflict)"), "{err}");
+    assert!(
+        err.contains("patch 3 waiting behind 2 (same_files)"),
+        "{err}"
+    );
+    assert!(err.contains("patch 4 applied as "), "{err}");
+    assert_eq!(s.read("g.txt").as_deref(), Some("g1\n"));
+    assert_eq!(s.read("f.txt").as_deref(), Some("one\n2\n3\n4\n5\n"));
+    let human = s.ok(&["patch", "status"]);
+    assert!(
+        human.contains("waiting:   3 behind 2 (same_files)"),
+        "{human}"
+    );
+    let json = s.ok(&["patch", "status", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        doc["status"]["queue"][1]["verdict"],
+        serde_json::json!({"kind": "waiting", "why": "same_files", "behind": [2]})
+    );
+
+    s.submit_ok(&p, &["--skip", "2"]);
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("f.txt").as_deref(), Some("one\n2\n3\n4\nfive\n"));
+    for n in 1..=4 {
+        assert_eq!(s.inbox_commits(n), 1, "patch {n}");
+    }
+}
+
+/// Acceptance 3: a held barrier holds every later patch, on any file.
+#[test]
+fn a_barrier_holds_everything_behind_it() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("f.txt", FIVE);
+    s.record("g.txt", "g0\n");
+    s.ok(&["push"]);
+    let p = s.producer("p");
+    s.conflict_and_followers(&p, true);
+    let remote = Repository::open_bare(s.remote()).unwrap();
+    let barrier = remote
+        .find_commit(s.remote_ref(&inbox(2)).unwrap())
+        .unwrap();
+    assert!(
+        barrier
+            .message()
+            .unwrap()
+            .ends_with("\n\nAgentfs-Barrier: yes\n"),
+        "{:?}",
+        barrier.message()
+    );
+
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("patch 1 applied as "), "{err}");
+    assert!(err.contains("patch 2 held (conflict)"), "{err}");
+    for n in [3, 4] {
+        assert!(
+            err.contains(&format!("patch {n} waiting behind 2 (barrier)")),
+            "{err}"
+        );
+    }
+    assert_eq!(s.read("g.txt").as_deref(), Some("g0\n"));
+    assert_eq!(s.inbox_commits(4), 0);
+
+    // A given commit must carry the trailer itself.
+    let q = s.producer_on_branch("q");
+    s.commit(&q, &[("h.txt", "h\n")], "add h");
+    let out = s.submit(&q, &["--barrier", "HEAD"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("does not carry `Agentfs-Barrier: yes`"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// Acceptance 4: with `agentfs.patchAccept=approval` a patch awaits its
+/// approval, lands once approved, and a replacement needs approving again.
+#[test]
+fn approval_rule() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    let mut config = git2::Config::open(&s.state().join("git/config")).unwrap();
+    config.set_str("agentfs.patchAccept", "approval").unwrap();
+    s.record("a.txt", "a0\n");
+    s.ok(&["push"]);
+    let p = s.producer("p");
+    let approve = |n: &str, extra: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
+        cmd.args(["patch", "approve", n, "--volume", "demo", "--repo"])
+            .arg(&p)
+            .args(extra);
+        s.hermetic(&mut cmd);
+        cmd.output().unwrap()
+    };
+    let a1 = s.file("a1", "a1\n");
+    s.submit_ok(&p, &["--put", &format!("a.txt={a1}"), "-m", "one"]);
+
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("patch 1 awaiting (approval)"), "{err}");
+    assert!(!err.contains("alarm: "), "awaiting is no alarm: {err}");
+    assert_eq!(s.read("a.txt").as_deref(), Some("a0\n"));
+    let human = s.ok(&["patch", "status"]);
+    assert!(human.contains("awaiting:  1 (approval)"), "{human}");
+
+    // Approving another tip than the queued one is refused.
+    let out = approve("1", &["--patch", &"0".repeat(40)]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("the queued patch is now "),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = approve("1", &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let tip = s.remote_ref(&inbox(1)).unwrap();
+    assert!(
+        text(&out.stdout).contains(&format!(
+            "approved patch 1 ({tip}) as refs/agentfs/demo/approved/0000000001"
+        )),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("a.txt").as_deref(), Some("a1\n"));
+    assert_eq!(s.inbox_commits(1), 1);
+
+    // 2, approved, then replaced: awaiting again (P4).
+    let b1 = s.file("b1", "b1\n");
+    s.submit_ok(&p, &["--put", &format!("b.txt={b1}"), "-m", "two"]);
+    let out = approve("2", &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let b2 = s.file("b2", "b2\n");
+    s.submit_ok(
+        &p,
+        &[
+            "--put",
+            &format!("b.txt={b2}"),
+            "--replace",
+            "2",
+            "-m",
+            "two'",
+        ],
+    );
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("patch 2 awaiting (approval)"), "{err}");
+    assert_eq!(s.read("b.txt"), None);
+    let out = approve("2", &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("b.txt").as_deref(), Some("b2\n"));
+}
+
+/// Acceptance 5: `agentfs.patchAccept=command` runs
+/// `$GIT_DIR/hooks/patch-accept`: 0 lands, 1 holds as refused, 75 awaits;
+/// another status, the timeout and a missing hook leave the patch not
+/// judged and raise `PatchRuleFailed` (P5).
+#[test]
+fn command_rule() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    let git_dir = s.state().join("git");
+    let mut config = git2::Config::open(&git_dir.join("config")).unwrap();
+    config.set_str("agentfs.patchAccept", "command").unwrap();
+    config.set_str("agentfs.patchAcceptTimeout", "1s").unwrap();
+    s.record("a.txt", "a0\n");
+    s.ok(&["push"]);
+    let p = s.producer("p");
+    let a1 = s.file("a1", "a1\n");
+    s.submit_ok(&p, &["--put", &format!("a.txt={a1}"), "-m", "one"]);
+    let apply = || {
+        let out = s.agentfs(&["patch", "apply", "--no-fetch"]);
+        (out.status.code(), text(&out.stderr))
+    };
+    let not_judged = "patch 1 not judged (command): ";
+    let alarm = "the acceptance rule command could not judge patch 1";
+
+    // No hook (this run fetches the inbox).
+    let out = s.agentfs(&["patch", "apply"]);
+    let (code, err) = (out.status.code(), text(&out.stderr));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains(not_judged), "{err}");
+    assert!(err.contains("could not start"), "{err}");
+    assert!(err.contains(alarm), "{err}");
+
+    let work = s.dir.path().join("hook");
+    fs::create_dir_all(&work).unwrap();
+    let hook = git_dir.join("hooks/patch-accept");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncat > '{w}/input.json'\nmode=$(cat '{w}/mode')\ncase \"$mode\" in\n  \
+             sleep) sleep 30 ;;\n  refuse) echo 'not on a Friday' >&2; echo more >&2; exit 1 ;;\n  \
+             *) exit \"$mode\" ;;\nesac\n",
+            w = work.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mode = |m: &str| fs::write(work.join("mode"), m).unwrap();
+
+    mode("2");
+    let (code, err) = apply();
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains(not_judged), "{err}");
+    assert!(err.contains("exited with 2"), "{err}");
+    assert!(err.contains(alarm), "{err}");
+
+    mode("75");
+    let (code, err) = apply();
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("patch 1 awaiting (command)"), "{err}");
+    assert!(!err.contains("alarm: "), "{err}");
+
+    mode("sleep");
+    let started = std::time::Instant::now();
+    let (code, err) = apply();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains(not_judged), "{err}");
+    assert!(err.contains("killed after"), "{err}");
+
+    mode("refuse");
+    let (code, err) = apply();
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("patch 1 held (refused): not on a Friday\n"),
+        "{err}"
+    );
+    let input: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(work.join("input.json")).unwrap()).unwrap();
+    let tip = s.local().refname_to_id(&inbox(1)).unwrap();
+    assert_eq!(input["schema"], 1);
+    assert_eq!(input["volume"], "demo");
+    assert_eq!(input["inbox"], 1);
+    assert_eq!(input["tip"], tip.to_string());
+    assert_eq!(input["head"], s.branch_head().to_string());
+    assert_eq!(input["commits"], serde_json::json!([tip.to_string()]));
+    assert_eq!(input["paths"], serde_json::json!(["a.txt"]));
+    assert_eq!(input["barrier"], false);
+    assert_eq!(s.read("a.txt").as_deref(), Some("a0\n"));
+
+    mode("0");
+    let (code, err) = apply();
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(s.read("a.txt").as_deref(), Some("a1\n"));
+    assert_eq!(s.inbox_commits(1), 1);
+}
+
+/// Acceptance 7: a held patch withdrawn on the remote loses its mark
+/// (`PatchIgnored`, withdrawn), and the patch waiting on it lands.
+#[test]
+fn a_withdrawn_patch_frees_its_waiters() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.record("f.txt", FIVE);
+    s.record("g.txt", "g0\n");
+    s.ok(&["push"]);
+    let p = s.producer("p");
+    s.conflict_and_followers(&p, false);
+    let out = s.agentfs(&["patch", "apply"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(s.local().refname_to_id(&held(2)).is_ok());
+
+    Repository::open_bare(s.remote())
+        .unwrap()
+        .find_reference(&inbox(2))
+        .unwrap()
+        .delete()
+        .unwrap();
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("patch queue: ignoring refs/agentfs/demo/inbox/0000000002 (withdrawn)"),
+        "{err}"
+    );
+    assert!(err.contains("alarm: "), "{err}");
+    assert!(err.contains("patch 3 applied as "), "{err}");
+    assert!(s.local().refname_to_id(&held(2)).is_err());
+    assert_eq!(s.read("f.txt").as_deref(), Some("one\n2\n3\n4\nfive\n"));
+    assert_eq!(s.inbox_commits(2), 0);
+    assert_eq!(s.inbox_commits(3), 1);
 }
 
 #[test]
@@ -714,11 +1100,11 @@ fn a_branch_on_an_older_head_merges() {
     assert_eq!(s.inbox_commits(1), 1);
 }
 
-/// Acceptance 3: a branch changing a path the workload changed too
-/// blocks with a conflict naming it; nothing is written and it stays
-/// queued.
+/// Acceptance 3 (bead agentfs-mia.4, held whole since mia.2): a branch
+/// changing a path the workload changed too is held with a conflict
+/// naming it; nothing is written and it stays queued.
 #[test]
-fn a_branch_that_conflicts_blocks() {
+fn a_branch_that_conflicts_is_held() {
     if !have_git() {
         return;
     }
@@ -735,7 +1121,7 @@ fn a_branch_that_conflicts_blocks() {
     let out = s.agentfs(&["patch", "apply"]);
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
-    assert!(err.contains("patches: blocked at 1 (conflict)"), "{err}");
+    assert!(err.contains("patch 1 held (conflict)"), "{err}");
     assert!(err.contains("conflicts in seed.txt"), "{err}");
     assert_eq!(s.branch_head(), head);
     assert_eq!(
@@ -746,9 +1132,9 @@ fn a_branch_that_conflicts_blocks() {
     assert!(s.local().refname_to_id(&inbox(1)).is_ok());
     let json = s.ok(&["patch", "status", "--json"]);
     let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(doc["status"]["blocked"]["reason"], "conflict");
+    assert_eq!(doc["status"]["queue"][0]["verdict"]["reason"], "conflict");
     assert_eq!(
-        doc["status"]["blocked"]["paths"],
+        doc["status"]["queue"][0]["verdict"]["paths"],
         serde_json::json!(["seed.txt"])
     );
     assert_eq!(doc["cache"]["queue_depth"], 1);
@@ -778,12 +1164,12 @@ fn workload_attributes_do_not_steer_the_merge() {
     let out = s.agentfs(&["patch", "apply"]);
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
-    assert!(err.contains("patches: blocked at 1 (conflict)"), "{err}");
+    assert!(err.contains("patch 1 held (conflict)"), "{err}");
     assert_eq!(s.read("f.txt").as_deref(), Some("f, by the workload\n"));
 }
 
 /// Acceptance 5: a merge commit inside the branch is refused by submit,
-/// and blocks the queue as `merge_commit` when pushed with plain git.
+/// and held as `merge_commit` when pushed with plain git.
 #[test]
 fn a_merge_inside_the_branch_is_refused() {
     if !have_git() {
@@ -832,10 +1218,7 @@ fn a_merge_inside_the_branch_is_refused() {
     let out = s.agentfs(&["patch", "apply"]);
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
-    assert!(
-        err.contains("patches: blocked at 1 (merge_commit)"),
-        "{err}"
-    );
+    assert!(err.contains("patch 1 held (merge_commit)"), "{err}");
     assert!(
         err.contains(&format!("{merge} in the patch has 2 parents")),
         "{err}"

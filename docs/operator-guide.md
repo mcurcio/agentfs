@@ -708,10 +708,13 @@ whole, consistent groups instead.
   `IdentityFallback` and `PushLimited` are logged as warnings, the rest as
   errors. When each is raised and what it carries: the events table in
   [design §13](design.md#13-observability-opentelemetry).
-- **`patches: blocked at N (<reason>)`** at mount: patch N could not be
-  applied; the mount serves without it and the patches after it. The
+- **`patch N held (<reason>)`** at mount: patch N could not be applied
+  and is set aside whole; the mount serves without it, and the patches
+  after it that do not wait on it are applied. **`patches: blocked at N
+  (<reason>)`**: the run stopped at N (a gap, unrecorded changes or a
+  failure); the mount serves without it and the patches after it. Each
   reason and its fix are in
-  [patch-queue.md](runbooks/patch-queue.md#4-a-blocked-queue).
+  [patch-queue.md](runbooks/patch-queue.md#4-a-patch-set-aside).
 - **`patches: the queue could not run`** at mount (and `blocked at 0
   (failed)` in `agentfs status`): the patch phase failed as a whole, so no
   patch was applied; the message says why (the LFS cache, the backing

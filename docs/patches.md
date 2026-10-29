@@ -24,9 +24,14 @@ agentfs --state /data/state --root /data/backing patch apply   # with the volume
   `restore`, and records it as one commit (`Agentfs-Trigger: patch`,
   `Agentfs-Patch`, `Agentfs-Inbox`). A crash at any point applies nothing
   twice: the branch's trailers decide what is applied.
-- The first patch that conflicts (or is otherwise refused) blocks the
-  queue; the mount carries on. Fix it with `patch submit --replace N` or
-  `--skip N` (both also fill a missing number), then restart.
+- A patch that conflicts (or is otherwise refused) is set aside whole and
+  the rest go on; a later patch on its files, or any later patch behind a
+  barrier (`--barrier`), waits. An acceptance rule (`agentfs.patchAccept`:
+  a clean merge by default, `patch approve`, or a hook) decides whether a
+  clean merge lands. A gap, unrecorded changes or a failure stops the
+  queue; the mount carries on either way. Fix it with `patch submit
+  --replace N` or `--skip N` (both also fill a missing number), then
+  restart.
 - The push to the patch remote (`agentfs.patchRemote`) moves
   `applied/<n>`, deletes `inbox/<n>` and updates the status ref
   (`refs/agentfs/<volume>/status`, holding `status.json`).

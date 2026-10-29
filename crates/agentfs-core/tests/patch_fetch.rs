@@ -1,6 +1,6 @@
-//! Fetching the patch queue from a remote (design §12): the inbox refs of
-//! this volume only, forced, with deleted ones pruned; failures and the
-//! time limit are outcomes, never errors.
+//! Fetching the patch queue from a remote (design §12): the inbox and
+//! approved refs of this volume only, forced, with deleted ones pruned;
+//! failures and the time limit are outcomes, never errors.
 
 use std::net::TcpListener;
 use std::path::Path;
@@ -101,6 +101,54 @@ fn mirrors_this_volumes_inbox_and_prunes() {
         local_refs(&state, "refs/agentfs/*"),
         [("refs/agentfs/vol/inbox/0000000001".to_owned(), p3)]
     );
+}
+
+/// Approvals (bead agentfs-mia.2) come with the inbox, forced, and a
+/// withdrawn one is pruned; another volume's never.
+#[test]
+fn mirrors_this_volumes_approvals_and_prunes() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote_dir = dir.path().join("remote.git");
+    let remote = Repository::init_bare(&remote_dir).unwrap();
+    let p1 = commit(&remote, "one");
+    let p2 = commit(&remote, "two");
+    for (name, oid) in [
+        ("refs/agentfs/vol/inbox/0000000001", p1),
+        ("refs/agentfs/vol/approved/0000000001", p1),
+        ("refs/agentfs/other/approved/0000000001", p2),
+    ] {
+        remote.reference(name, oid, true, "t").unwrap();
+    }
+    let url = format!("file://{}", remote_dir.display());
+    let (state, settings) = volume_with_remote(dir.path(), &url);
+    let patch_remote = settings.patch_remote().unwrap();
+    let outcome = fetch_inbox(&state.git(), patch_remote, "vol", Duration::from_secs(30));
+    assert!(outcome.ok, "{outcome:?}");
+    assert_eq!(outcome.remote_inbox, 1);
+    assert_eq!(
+        local_refs(&state, "refs/agentfs/*"),
+        [
+            ("refs/agentfs/vol/approved/0000000001".to_owned(), p1),
+            ("refs/agentfs/vol/inbox/0000000001".to_owned(), p1),
+        ]
+    );
+    // Approved again for another tip: forced; then withdrawn: pruned.
+    remote
+        .reference("refs/agentfs/vol/approved/0000000001", p2, true, "t")
+        .unwrap();
+    fetch_inbox(&state.git(), patch_remote, "vol", Duration::from_secs(30));
+    assert_eq!(
+        local_refs(&state, "refs/agentfs/vol/approved/*"),
+        [("refs/agentfs/vol/approved/0000000001".to_owned(), p2)]
+    );
+    remote
+        .find_reference("refs/agentfs/vol/approved/0000000001")
+        .unwrap()
+        .delete()
+        .unwrap();
+    let outcome = fetch_inbox(&state.git(), patch_remote, "vol", Duration::from_secs(30));
+    assert_eq!(outcome.pruned, 1);
+    assert!(local_refs(&state, "refs/agentfs/vol/approved/*").is_empty());
 }
 
 #[test]

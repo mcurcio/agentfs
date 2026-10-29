@@ -2454,20 +2454,55 @@ volume stopped. `agentfs run` does not. In order:
   **A write that fails part way** is recorded as it stands, as an
   operation without an inbox number, so the tree matches history again.
 
-**The first patch that cannot be applied blocks the queue.** It and every
-later patch stay queued, `PatchBlocked` is raised, and the volume mounts
-anyway. Reasons:
+**A patch that cannot land is set aside whole, and the queue goes on**
+(bead agentfs-mia.2; the owner, 2026-10-16: "Whole seems best, right? A
+partial application has unknown side effects"). Nothing of it is written;
+it stays queued with a verdict in `status.json`, and every run judges it
+again. In order, a patch is:
 
-| Reason | When |
-|---|---|
-| `conflict` | The merge conflicts; the paths are listed |
-| `gap` | The next number is missing while later ones are queued |
-| `parent_not_in_history` | The parent is not the head or one of its ancestors |
-| `merge_commit` | More than one parent |
-| `unsupported` | A root commit, a gitlink, a path agentfs does not record (§5) |
-| `too_large` | More than 4096 paths |
-| `unrecorded` | The tree differs from history where the patch writes (an unrecorded change, a pending repair, something in the way) |
-| `failed` | Writing or recording failed, or an LFS object is missing |
+- **held** for a reason below marked *held* (`PatchHeld` is raised);
+- **waiting** behind an earlier set-aside patch that is a barrier (its
+  tip's last message paragraph has `Agentfs-Barrier: yes`; `patch submit
+  --barrier`), or that changes one of its paths (paths are known only for
+  a patch whose branch could be read);
+- after a clean merge, judged by the **acceptance rule**
+  (`agentfs.patchAccept`; the owner, 2026-10-16: "Not A, because that
+  assumes that a clean merge is an acceptable merge", 2026-10-29:
+  "Configurable with a sensible default"): `cleanMerge` (the default)
+  lands it; `approval` lands it once `refs/agentfs/<volume>/approved/<n>`
+  on the patch remote names its tip (`agentfs patch approve`), else it is
+  **awaiting**; `command` runs `$GIT_DIR/hooks/patch-accept` (exit 0
+  lands, 1 holds it as `refused`, 75 awaiting). A rule that cannot judge
+  (another status, a signal, the timeout, a hook that cannot start) leaves
+  it **not judged** and raises `PatchRuleFailed` and `PatchHeld`; it never
+  lands it.
+
+A run **stops** only at a `gap`, `unrecorded` changes or a failure: that
+patch and the later ones stay queued, unjudged, `PatchBlocked` is raised,
+and the volume mounts anyway. Reasons:
+
+| Reason | When | Effect |
+|---|---|---|
+| `conflict` | The merge conflicts; the paths are listed | held |
+| `gap` | The next number is missing while later ones are queued | stops |
+| `parent_not_in_history` | The parent is not the head or one of its ancestors | held |
+| `merge_commit` | More than one parent | held |
+| `unsupported` | A root commit, a gitlink, a path agentfs does not record (§5) | held |
+| `too_large` | More than 4096 paths | held |
+| `refused` | The acceptance rule refused it | held |
+| `unrecorded` | The tree differs from history where the patch writes (an unrecorded change, a pending repair, something in the way) | stops |
+| `failed` | Writing or recording failed, or an LFS object is missing | stops |
+
+**Held marks.** Before it judges the next number, the queue marks a
+set-aside number `n` with the local ref `refs/agentfs/<volume>/held/<n>`
+(the patch commit; never pushed). The mark exempts `inbox/<n>` from the
+stale rule below, even once later numbers land; it is deleted when `n`
+lands, or when its inbox entry is gone (`PatchIgnored`, `withdrawn`).
+Numbering, the high-water mark (the highest `Agentfs-Inbox` on the
+branch), the gap rule and the trailer rule for "applied" are unchanged: an
+entry above the high-water must be the next number, one past the highest
+applied or judged in the run (main session's confirmation of the
+architect's erratum, 2026-10-29, `.claude/errata.md`).
 
 The producer fixes it by replacing the patch (`--replace N`, rebased onto
 the head) or skipping it (`--skip N`); a `gap` is filled the same way
@@ -2498,9 +2533,11 @@ on exactly one commit per patch:
 | the commit, before the ref moves | the scan finds it; the refs are moved |
 
 An inbox entry at or below the last applied number is bookkeeping when it
-names the applied patch. Otherwise it is `stale`: reported under
-`ignored`, raised as the warning `PatchIgnored`, never applied, and deleted
-on the remote by the next queue push.
+names the applied patch. Otherwise, unless it has a held mark, it is
+`stale`: reported under `ignored`, raised as the warning `PatchIgnored`,
+never applied, and deleted on the remote by the next queue push. An
+interrupted write is "applied" only when the branch's trailers carry its
+number, never because the number is at or below the high-water mark.
 
 **Refs.** `applied/<n>` is the patch commit itself; `inbox/<n>` is deleted
 locally once `applied/<n>` is written, and on the remote by the queue push
@@ -2511,7 +2548,7 @@ on the oid listed).
 `status.json`, rewritten at every run and force-pushed: a snapshot, not
 history. Schema version 1 (fields in the runbook): the volume, branch and
 head, `updated`, `last_applied` (inbox, patch, commit), `applied_now`,
-`duplicate_now` (inbox, patch, applied_as; absent when empty), `queue` (inbox, patch; the blocked one first), `blocked` (inbox, patch,
+`duplicate_now` (inbox, patch, applied_as; absent when empty), `queue` (inbox, patch, and for a set-aside patch its `verdict`: `held`, `waiting`, `awaiting` or `not_judged`), `blocked` (inbox, patch,
 reason, message, paths), `ignored` and `fetch` (remote, ok, error).
 `agentfs status` prints a `patches:` line from `meta/patch.json`, and
 `agentfs patch status [--json]` the whole status.
@@ -2630,6 +2667,8 @@ and logs above; the CLI also prints alarms to stderr.
 | `RepackFailed` | The periodic `git repack` (§8) failed, or refreshing the object database after it; tried again an interval later |
 | `PushSucceeded` | A push attempt succeeded, including one with nothing new (not an alarm; sinks filter) |
 | `PatchBlocked` | A patch could not be applied at mount: the inbox number, the patch, the reason (§12) and the queue depth; inbox 0 with reason `failed` when the queue could not run at all; the volume mounts anyway |
+| `PatchHeld` | A patch was set aside whole, held (the reason) or not judged (the rule), while the queue went on: the inbox number, the patch, the verdict, the reason and the message; raised at every run it stays so (§12) |
+| `PatchRuleFailed` | The acceptance rule could not judge a patch: the inbox number, the rule and why (a hook that did not start, failed, or ran out of `agentfs.patchAcceptTimeout`); the patch is not judged (§12) |
 | `PatchFetchFailed` | Fetching the inbox from the patch remote failed or timed out; the queue runs with what was already fetched (§12) |
 | `PatchIgnored` | An inbox entry the queue never applies: `stale` (at or below the last applied number, with another commit; deleted on the remote by the queue push) or `malformed` (§12); a warning |
 | `PatchApplied` | A patch was applied as a commit (not an alarm; sinks filter) |
@@ -3729,7 +3768,7 @@ one-time migration of Hermes' existing data and the initial import in
 - **`agentfs`, a binary:**
   - `init`, `mount`, `probe`, `status`, `flush`, `record`, `push`, `run`,
     `serve-history` (§14), `restore`, `revert`, `patch` (`submit`,
-    `apply`, `status`), `lfs` (`fetch`, `prune`), `fork` (`create`,
+    `approve`, `apply`, `status`), `lfs` (`fetch`, `prune`), `fork` (`create`,
     `finish`, `status`, `abandon`, `list`, `deliver`, §11.5) and `start`
     (`accept`, §11.3: a started volume accepts a tip of its start branch,
     clearing the start-branch alarm; no lock); a test
@@ -4544,6 +4583,7 @@ runner.
 | Three layers, each an integration point (2026-10-29) | The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into. So you don’t need to design a be-all-end-all singular technology so long as the necessary primitives exist and have good designs/API/docs". Library: `agentfs-core`. Filesystem: `agentfs-fuse` and the `agentfs` binary. Kubernetes adapter: `agentfs-csi`. A piece goes in the first layer whose question it passes: (1) usable as Rust calls with no mount and no agentfs process; (2) needs the mount or the running agentfs process (a command, the control socket, git over HTTP); (3) exists only because Kubernetes does. A higher layer may use any lower one. He accepted this placement ("Ok") |
 | Integrators decide when patches are applied (2026-10-29) | The owner, 2026-10-29: "Then the question isn’t “quiet moments or not” — it’s how do we provide an API so that an integrator can trigger this action?"; on the result: "I like that flow. Approved". agentfs sets no timing rule for writing queued patches into a running volume. Every layer offers two primitives: *notify* (agentfs tells the integrator a patch arrived; the files are unchanged) and *apply* (the integrator tells agentfs to write the waiting patches now). agentfs still applies by itself at mount, as today (§12). Designed, not built (§19.2 item 11) |
 | No live landing yet (2026-10-29) | The owner, 2026-10-29: "No live landing yet", then "Build incrementally". Patches keep landing only when no workload is attached, at mount (§12); an apply call while a workload is attached is answered "lands at next mount" and notifies. Landing while a workload runs is a later gate (§19.2 item 11) |
+| Keep going (2026-10-29) | A patch that cannot land is set aside whole and the queue goes on (§12): held for `conflict`, `merge_commit`, `parent_not_in_history`, `unsupported`, `too_large` and `refused`; waiting behind an earlier set-aside barrier or patch on the same paths; awaiting or not judged by the acceptance rule (`agentfs.patchAccept`: `cleanMerge` by default, `approval`, `command`). A run still stops at `gap`, `unrecorded` and `failed`, which are about the volume, not the patch. The owner, 2026-10-16: "Whole seems best, right? A partial application has unknown side effects"; "Not A, because that assumes that a clean merge is an acceptable merge"; 2026-10-29: "Configurable with a sensible default". A local mark `refs/agentfs/<volume>/held/<n>`, written before the next number is judged, exempts a set-aside number from the stale check, and an interrupted write counts as applied only by its trailer: the main session confirmed the architect's erratum (2026-10-29), since keep-going cannot keep the stale check word for word. Design choices, not the owner's words: which reasons hold and which stop; a barrier holds every later patch and waits only on its own files; a patch whose branch cannot be read makes nothing wait on its files; paths are compared as written; approvals stay on the remote after landing; a withdrawn held number above the high-water opens a gap, as a withdrawn queued number does. Bead agentfs-mia.2 (§19.2 item 11) |
 
 ### 19.2 Open questions
 
@@ -4650,7 +4690,7 @@ runner.
    user is allowed to make.").
 11. **Merge queue (bead agentfs-mia).** Approved by the owner 2026-10-29;
    being built incrementally on today's queue (§12), one feature per bead;
-   not built yet. Short record:
+   partly built (below). Short record:
    - *Requirements, his words:* "bring all of those patches back
      together in an automated way" (10-16); "A partial application has
      unknown side effects" (10-16); "Configurable with a sensible
@@ -4660,8 +4700,10 @@ runner.
      merging live" (10-28), then "No live landing yet" (10-29).
    - *Unchanged:* patches are written into files only when no workload
      is attached, at mount (§12); inbox numbering, the high-water mark
-     and crash recovery stay as they are. The owner: "Build
-     incrementally" (10-29).
+     and crash recovery stay as they are, except that a set-aside number
+     with a local `held/<n>` mark is exempt from the stale check and an
+     interrupted write is "applied" only by its trailer (§19.1 "Keep
+     going"). The owner: "Build incrementally" (10-29).
    - *Features (current choices, revisable):* a patch is a branch,
      merged by the `git` program (merge by default, or rebase; merge
      drivers and mergiraf); a conflicting patch is held whole while the
@@ -4673,6 +4715,9 @@ runner.
    - *Later gate:* landing patches while a workload runs. Eight design
      reviews (2026-10-29) found serious flaws each time, chiefly the race
      between a landing and the workload's writes across pods.
+   - *Built:* the tracer (a branch lands as one patch, merged by git;
+     mia.4) and keep-going with barriers, approvals and acceptance rules
+     (mia.2, §19.1 "Keep going").
    - *Beads:* agentfs-mia.4 (tracer), mia.2, mia.3, mia.5, mia.6,
      mia.9, mia.7, mia.8.
 

@@ -105,6 +105,8 @@ suffix (`512k`, `100m`).
 | `agentfs.repackInterval` | duration, at least `1m`, or `0`/`off` | `1h` | How often the commit loop (`mount`, `run`) repacks the history with `git repack -d --geometric=2`, delta-compressing versions of files changed in place (§8). Needs the `git` CLI; skipped when nothing is loose, and tried again a second later while a push runs; a failure raises `RepackFailed`. git runs with one thread and bounded windows, about 256 MiB, in a cleared environment; commits wait while it runs, and a stop kills it. `0` or `off` never repacks |
 | `agentfs.patchRemote` | remote name, or `none` | the only remote, when exactly one is configured; else none | Where the patch queue (§12) is fetched from at mount, and the only remote that gets the queue push (status ref, `applied/<n>`, deleted `inbox/<n>`). A name that is not a valid remote means none. With none, patches already in the local inbox still apply |
 | `agentfs.patchFetchTimeout` | duration, or `0`/`off` | `30s` | How long a mount (or `agentfs patch apply`) waits for the inbox fetch; on timeout or failure it raises `PatchFetchFailed` and applies what is already fetched. `0` or `off` skips the fetch |
+| `agentfs.patchAccept` | `cleanMerge`, `approval` or `command` | `cleanMerge` | The acceptance rule: whether a patch that merges cleanly onto the head may land (§12). `cleanMerge` lands it. `approval` lands it once `refs/agentfs/<volume>/approved/<n>` on the patch remote names its tip (`agentfs patch approve N`); until then it is set aside, awaiting approval, and a replaced patch needs approving again. `command` runs `$GIT_DIR/hooks/patch-accept` without a shell, in an empty environment but `PATH`, with the candidate as JSON on stdin (schema 1: `volume`, `inbox`, `tip`, `base`, `head`, `merged_tree`, `commits`, `paths`, `barrier`): exit 0 lands it, 1 holds it as `refused` (its first line of stderr is the message), 75 sets it aside awaiting the hook; any other status, a signal, the timeout or a hook that cannot start leaves it not judged and raises `PatchRuleFailed`. A set-aside patch is judged again at every run. Any other value fails the volume (`BadChoice`) |
+| `agentfs.patchAcceptTimeout` | duration above zero | `60s` | How long the `patch-accept` hook may run; at the timeout its process group is killed and the patch is not judged. `0` is refused (`TooShort`) |
 | `agentfs.lfsThreshold` | positive size | unset: no size rule | Content larger than this (strictly `>`) is stored as Git LFS instead of a git blob (§7). Unset, only `agentfs.store=lfs` and `filter=lfs` in `info/attributes` select LFS. Setting it needs an LFS server for every remote (see [Git LFS](#git-lfs)) |
 | `agentfs.forkRefs` | `branch` or `hidden` | `branch` | The push target new forks of this volume get (design §11.5), written into each fork's identity as `agentfs.fork.pushTarget`: `branch` pushes a fork's history to `refs/heads/agentfs/<fork>` on its fork remote, where CI and pull requests can act on it; `hidden` keeps it at `refs/agentfs/<fork>/history`, never under `refs/heads/`. Read only when a fork is created: changing it moves no fork that exists, so forks already pushing branches keep doing so until they finish or are abandoned. Any other value fails the volume (`BadChoice`). Under CSI, set it in the source's profile config |
 
@@ -808,7 +810,7 @@ templates' variables, the commit trailers and the telemetry resource:
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init`: the volume's name; `patch submit`: the volume the patch is for |
+| `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init`: the volume's name; `patch submit`, `patch approve`: the volume the patch is for |
 | `--branch NAME` | | `agentfs/<volume>` | `init`: the history branch; `patch submit`: the volume's branch |
 | `--include FILE` (repeatable) | | keep the existing includes | `init`: exactly these `include.path` entries |
 | `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount` |
@@ -835,8 +837,8 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--all` | | the branch head | `lfs fetch`: every object any commit on the branch references, instead of the head's (or the revisions given) |
 | `--no-fetch` | | | `patch apply`: apply what is already fetched, without contacting the patch remote |
 | `--json` | | | `patch status`: the status document and the local cache as JSON |
-| `--remote NAME\|URL` | | `origin` | `patch submit`: the remote the volume pushes to |
-| `--repo DIR` | | `.` | `patch submit`: the producer's git repository |
+| `--remote NAME\|URL` | | `origin` | `patch submit`, `patch approve`: the remote the volume pushes to |
+| `--repo DIR` | | `.` | `patch submit`, `patch approve`: the producer's git repository |
 | `--put PATH=FILE` (repeatable) | | | `patch submit`: write PATH with FILE's content, in a patch built on the remote branch head |
 | `--delete PATH` (repeatable) | | | `patch submit`: remove PATH, in a built patch |
 | `-m`, `--message TEXT` | | empty | `patch submit`: the built patch's commit message |
@@ -845,6 +847,8 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--skip N` | | | `patch submit`: replace queued patch N with an empty patch, so the queue moves on |
 | `--depth N` | | full history | `patch submit`: fetch only this many commits (shallow producers) |
 | `--attempts N` | | `10` | `patch submit`: inbox numbers to try when other submitters race |
+| `--barrier` | | off | `patch submit`: make the patch a barrier: while it is set aside, every later patch of the volume waits behind it (design §12). A built or `--skip` patch gets the trailer `Agentfs-Barrier: yes`; a given COMMIT must already carry it in its last message paragraph, else it is refused |
+| `--patch OID` | | the tip listed | `patch approve`: the tip you mean, a full commit id; refused when the queued patch N is now another commit |
 | `--source-state DIR` | | none: required | `fork create`: the source volume's state area, read without its lock; its settings must be in included files, which the fork includes too |
 | `--name NAME` | | the source's name | `fork create`: the fork's name before its random suffix (`<name>-<8 hex digits>`) |
 | `--link linked\|unlinked` | | `linked` | `fork create`: whether the fork delivers back to its source (`agentfs.fork.link`, fixed at create); `unlinked` makes an independent fork, which `fork finish` refuses and which has no `fork status` |
@@ -915,7 +919,7 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_ROOT` | `--root` | all commands |
 | `AGENTFS_WAIT_LOCK` | `--wait-lock` | all commands |
 | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags |
-| `AGENTFS_VOLUME` | `--volume` | `init`, `patch submit` |
+| `AGENTFS_VOLUME` | `--volume` | `init`, `patch submit`, `patch approve` |
 | `AGENTFS_PASSTHROUGH` | `--passthrough` | `mount` |
 | `AGENTFS_THREADS` | `--threads` | `mount` |
 | `AGENTFS_ON_STALE_MOUNT` | `--on-stale-mount` | `mount` |

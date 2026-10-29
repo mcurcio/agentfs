@@ -56,6 +56,9 @@ pub struct PatchBranch {
     pub commits: Vec<Oid>,
     /// The paths the diff from `base` to `tip` changes, sorted, each once.
     pub paths: Vec<RepoPath>,
+    /// The tip's last message paragraph has `Agentfs-Barrier: yes`
+    /// ([`is_barrier`]; bead agentfs-mia.2).
+    pub barrier: bool,
 }
 
 /// Why a patch branch is not one the queue lands: the reason, a message
@@ -175,6 +178,7 @@ impl PatchBranch {
                 format!("the patch's tip {tip} is already on the branch"),
             ));
         }
+        let barrier = is_barrier(&tip_commit);
         let mut commits = Vec::new();
         let mut commit = tip_commit;
         while commit.id() != base {
@@ -202,8 +206,36 @@ impl PatchBranch {
             base,
             commits,
             paths,
+            barrier,
         })
     }
+}
+
+/// Whether `commit` makes its patch a barrier ([`message_is_barrier`]).
+pub fn is_barrier(commit: &git2::Commit<'_>) -> bool {
+    message_is_barrier(&String::from_utf8_lossy(commit.message_raw_bytes()))
+}
+
+/// Whether a patch tip's commit message makes it a barrier (design §12,
+/// bead agentfs-mia.2): it has more than one paragraph and the last one
+/// has a line `Agentfs-Barrier: yes` (the key in any case, as git reads
+/// trailer keys).
+pub fn message_is_barrier(message: &str) -> bool {
+    let paragraphs: Vec<&str> = message
+        .trim_end()
+        .split("\n\n")
+        .filter(|p| !p.trim().is_empty())
+        .collect();
+    if paragraphs.len() < 2 {
+        return false;
+    }
+    paragraphs.last().is_some_and(|last| {
+        last.lines().any(|line| {
+            line.split_once(':').is_some_and(|(key, value)| {
+                key.trim().eq_ignore_ascii_case(super::BARRIER_TRAILER) && value.trim() == "yes"
+            })
+        })
+    })
 }
 
 fn refusal(reason: BlockReason, message: String) -> Refusal {
@@ -496,6 +528,21 @@ mod tests {
         assert_eq!(branch.commits, [a, b]);
         let paths: Vec<&str> = branch.paths.iter().map(RepoPath::as_str).collect();
         assert_eq!(paths, ["a", "b", "f"]);
+        assert!(!branch.barrier);
+        let barrier = r.commit(&[b], &[("c", Some("c\n"))], "c\n\nAgentfs-Barrier: yes\n");
+        assert!(PatchBranch::read(&r.repo, head, barrier).unwrap().barrier);
+        // Only in the last paragraph, and not as the subject.
+        for message in [
+            "Agentfs-Barrier: yes\n",
+            "c\n\nAgentfs-Barrier: yes\n\nmore\n",
+            "c\n\nAgentfs-Barrier: no\n",
+        ] {
+            let tip = r.commit(&[b], &[("c", Some("c\n"))], message);
+            assert!(
+                !PatchBranch::read(&r.repo, head, tip).unwrap().barrier,
+                "{message:?}"
+            );
+        }
     }
 
     #[test]

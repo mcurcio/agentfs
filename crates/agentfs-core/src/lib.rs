@@ -11,6 +11,7 @@
 
 pub mod checks;
 pub mod claims;
+pub mod command;
 pub mod config;
 pub mod confined;
 pub mod credentials;

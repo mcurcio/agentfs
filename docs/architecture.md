@@ -71,6 +71,7 @@ missing from these tables or a row names a module that no longer exists;
 | `watched.rs` | Files re-read when their stat stamp changes: credentials, keys, known_hosts |
 | `repack.rs` | Periodic `git repack --geometric=2` of the history (§8) |
 | `git_cli.rs` | Running the `git` program on a state area's git directory, in an environment of its own: the one home for `repack.rs` and the patch merge (§8, §12, §17.3) |
+| `command.rs` | Running an operator's program without a shell: `PATH` only, its own process group killed at the deadline, input on stdin; the one runner of fork delivery's command method and the `patch-accept` hook (§11.5, §12) |
 | `restore.rs` | Restore and revert: plan from history, check, apply to a tree (§15) |
 | `confined.rs` | `openat2`-confined access to the tree for restores (§6, §15) |
 | `operations.rs` | Restores and reverts in progress: their writes become one operation commit (§15) |

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use git2::{Oid, Repository, Signature, Time};
 
+use super::accept::{AcceptanceRule, CleanMerge};
 use super::integrate::{GitMergeTree, Integrated, Integrator, PatchBranch};
 use super::queue::{Queue, QueueContext, QueueReport};
 use super::status::{PatchState, read_status};
@@ -198,6 +199,7 @@ impl Fixture {
             telemetry: &telemetry,
             caller: CALLER,
             integrator: &integrator,
+            rule: &CleanMerge,
         });
         queue.process(None).unwrap()
     }
@@ -327,6 +329,8 @@ fn inbox_trailers_only_count_from_patch_commits() {
 }
 
 /// Design §18 test 15: three patches, the second conflicts.
+/// Keep going (bead agentfs-mia.2): 2 conflicts and is held whole; 1 and
+/// 3 land; a rerun retries 2; rebased, it lands below the high-water.
 #[test]
 fn three_patches_the_second_conflicts() {
     if !have_git() {
@@ -349,10 +353,11 @@ fn three_patches_the_second_conflicts() {
     }
 
     let report = f.process();
-    assert_eq!(report.applied.len(), 1);
-    let (n, commit) = report.applied[0];
-    assert_eq!(n, 1);
-    assert_eq!(commit, f.head());
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1, 3]
+    );
+    let commit = report.applied[0].1;
     let c = f.repo().find_commit(commit).unwrap();
     assert_eq!(c.author().name(), Ok("Ada Lovelace"));
     assert_eq!(c.author().email(), Ok("ada@example.com"));
@@ -364,80 +369,90 @@ fn three_patches_the_second_conflicts() {
     assert_eq!(inbox_from_message(message), Some((1, p1)));
     assert!(message.contains("Agentfs-Trigger: patch\n"), "{message}");
     assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.inbox_commits(3), 1);
     assert_eq!(f.reference(&applied_ref("vol", 1)), Some(p1));
     assert_eq!(f.reference(&inbox_ref("vol", 1)), None);
 
-    let blocked = report.blocked.clone().unwrap();
-    assert_eq!(blocked.inbox, 2);
-    assert_eq!(blocked.reason, BlockReason::Conflict);
-    assert_eq!(blocked.paths, ["b.txt"]);
-    assert_eq!(blocked.patch, Some(p2.to_string()));
-    assert_eq!(report.queue_depth, 2);
-    assert_eq!(report.last_applied, 1);
+    assert_eq!(report.blocked, None);
+    assert_eq!(report.set_aside.len(), 1);
+    let (n, verdict) = &report.set_aside[0];
+    assert_eq!(*n, 2);
+    let Verdict::Held {
+        reason,
+        message,
+        paths,
+    } = verdict
+    else {
+        panic!("{verdict:?}");
+    };
+    assert_eq!(*reason, BlockReason::Conflict);
+    assert_eq!(paths, &["b.txt"]);
+    assert!(message.contains("conflicts in b.txt"), "{message}");
+    assert_eq!(report.queue_depth, 1);
+    assert_eq!(report.last_applied, 3);
     assert_eq!(f.reference(&inbox_ref("vol", 2)), Some(p2));
-    assert_eq!(f.reference(&inbox_ref("vol", 3)), Some(p3));
+    assert_eq!(f.reference(&held_ref("vol", 2)), Some(p2));
+    assert_eq!(f.reference(&inbox_ref("vol", 3)), None);
 
-    // The tree has 1's change and not 3's; b.txt is the workload's.
+    // The tree has 1's and 3's changes; b.txt is the workload's.
     assert_eq!(f.read("a.txt").as_deref(), Some("a1\n"));
     assert_eq!(f.read("b.txt").as_deref(), Some("b-from-workload\n"));
-    assert_eq!(f.read("c.txt"), None);
-    assert_eq!(f.at_head("a.txt").as_deref(), Some("a1\n"));
+    assert_eq!(f.read("c.txt").as_deref(), Some("c\n"));
+    assert_eq!(f.at_head("c.txt").as_deref(), Some("c\n"));
 
     let state = PatchState::load(&f.state.patch_state());
-    assert_eq!(state.queue_depth, 2);
-    assert_eq!(state.last_applied, 1);
-    assert_eq!(
-        state.blocked.as_ref().map(|b| b.reason),
-        Some(BlockReason::Conflict)
-    );
+    assert_eq!(state.queue_depth, 1);
+    assert_eq!(state.held, 1);
+    assert_eq!(state.last_applied, 3);
+    assert_eq!(state.blocked, None);
     assert_eq!(
         state.summary(),
-        "last applied 1, 2 queued, blocked at 2 (conflict)"
+        "last applied 3, 1 queued (1 set aside), ok"
     );
 
     let status = read_status(f.repo(), report.status).unwrap();
     assert_eq!(f.reference(&status_ref("vol")), Some(report.status));
-    assert_eq!(status.applied_now, [1]);
-    assert_eq!(status.last_applied.as_ref().unwrap().patch, p1.to_string());
-    assert_eq!(
-        status.last_applied.as_ref().unwrap().commit,
-        commit.to_string()
-    );
-    assert_eq!(
-        status.queue.iter().map(|q| q.inbox).collect::<Vec<_>>(),
-        [2, 3]
-    );
-    assert_eq!(status.blocked, report.blocked);
-    assert_eq!(status.head, Some(commit.to_string()));
+    assert_eq!(status.applied_now, [1, 3]);
+    assert_eq!(status.last_applied.as_ref().unwrap().inbox, 3);
+    assert_eq!(status.last_applied.as_ref().unwrap().patch, p3.to_string());
+    assert_eq!(status.queue.len(), 1);
+    assert_eq!(status.queue[0].inbox, 2);
+    assert_eq!(status.queue[0].verdict.as_ref(), Some(verdict));
+    assert_eq!(status.blocked, None);
+    assert_eq!(status.head, Some(f.head().to_string()));
 
     let events = f.events();
-    let applied = events
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::PatchBlocked { .. })),
+        "{events:?}"
+    );
+    let held = events
         .iter()
-        .find(|e| matches!(e, Event::PatchApplied { .. }))
+        .find(|e| matches!(e, Event::PatchHeld { .. }))
         .unwrap();
-    assert!(!applied.is_alarm());
-    let blocked_event = events
-        .iter()
-        .find(|e| matches!(e, Event::PatchBlocked { .. }))
-        .unwrap();
-    assert!(blocked_event.is_alarm());
+    assert!(held.is_alarm());
     assert!(matches!(
-        blocked_event,
-        Event::PatchBlocked {
+        held,
+        Event::PatchHeld {
             inbox: 2,
+            verdict: "held",
             reason: "conflict",
-            queued: 2,
             ..
         }
     ));
 
-    // A rerun changes nothing and blocks the same way.
+    // A rerun retries 2: still held, nothing else changes, and inbox/2 is
+    // not stale although 3 is applied.
+    let head = f.head();
     let again = f.process();
     assert!(again.applied.is_empty());
-    assert_eq!(again.blocked.map(|b| b.inbox), Some(2));
-    assert_eq!(f.head(), commit);
+    assert!(again.ignored.is_empty(), "{:?}", again.ignored);
+    assert_eq!(again.set_aside.len(), 1);
+    assert_eq!(f.head(), head);
 
-    // Rebased onto the head, 2 applies, and 3 after it.
+    // Rebased onto the head, 2 lands, after 3.
     let p2b = f.patch(
         f.head(),
         &[("b.txt", Some("b-merged\n"))],
@@ -447,25 +462,118 @@ fn three_patches_the_second_conflicts() {
     let report = f.process();
     assert_eq!(
         report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-        [2, 3]
+        [2]
     );
     assert_eq!(report.blocked, None);
+    assert!(report.set_aside.is_empty());
     assert_eq!(report.queue_depth, 0);
+    assert_eq!(report.last_applied, 3);
     assert_eq!(f.read("b.txt").as_deref(), Some("b-merged\n"));
-    assert_eq!(f.read("c.txt").as_deref(), Some("c\n"));
-    assert_eq!(f.at_head("c.txt").as_deref(), Some("c\n"));
     for n in 1..=3 {
         assert_eq!(f.inbox_commits(n), 1, "patch {n}");
         assert_eq!(f.reference(&inbox_ref("vol", n)), None);
     }
+    assert_eq!(f.reference(&held_ref("vol", 2)), None);
     assert_eq!(f.reference(&applied_ref("vol", 2)), Some(p2b));
     let state = PatchState::load(&f.state.patch_state());
     assert_eq!(state.queue_depth, 0);
+    assert_eq!(state.held, 0);
     assert_eq!(state.blocked, None);
     assert_eq!(state.last_applied, 3);
     let status = read_status(f.repo(), report.status).unwrap();
-    assert_eq!(status.blocked, None);
+    assert_eq!(status.last_applied.as_ref().unwrap().inbox, 3);
     assert!(status.queue.is_empty());
+}
+
+/// Without its held mark, a set-aside number below the high-water is
+/// stale: the mark is what keeps it queued (P2).
+#[test]
+fn a_set_aside_number_is_judged_again_only_with_its_mark() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("b.txt", Some("iac\n"))], "edit b");
+    let p2 = f.patch(base, &[("c.txt", Some("c\n"))], "add c");
+    f.change(&[("b.txt", "workload\n")], &[]);
+    f.queue(1, p1);
+    f.queue(2, p2);
+    assert_eq!(f.process().set_aside.len(), 1);
+    f.repo()
+        .find_reference(&held_ref("vol", 1))
+        .unwrap()
+        .delete()
+        .unwrap();
+    let report = f.process();
+    assert!(report.set_aside.is_empty());
+    assert_eq!(report.ignored.len(), 1);
+    assert_eq!(report.ignored[0].why, "stale");
+}
+
+/// Crash (b) on a set-aside number below the high-water, then the
+/// producer skips it: the interrupted write is put back (the branch has
+/// not applied that number, whatever the high-water says), and the skip
+/// lands once (P3).
+#[test]
+fn crash_after_the_tree_write_below_the_high_water() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("b.txt", Some("iac\n"))], "edit b");
+    let p2 = f.patch(base, &[("c.txt", Some("c\n"))], "add c");
+    f.change(&[("b.txt", "workload\n")], &[]);
+    f.queue(1, p1);
+    f.queue(2, p2);
+    let report = f.process();
+    assert_eq!(report.last_applied, 2);
+    // 1, rebased, was being written when the process died.
+    let p1b = f.patch(f.head(), &[("b.txt", Some("merged\n"))], "edit b, rebased");
+    f.queue(1, p1b);
+    note_in_flight(&f, 1, p1b, &["b.txt"]);
+    fs::write(f.root.join("b.txt"), "merged\n").unwrap();
+    // The producer gives up on it.
+    let skip = f.patch(f.head(), &[], "agentfs: skip patch 1");
+    f.queue(1, skip);
+
+    let report = f.process();
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(f.read("b.txt").as_deref(), Some("workload\n"));
+    assert_eq!(f.at_head("b.txt").as_deref(), Some("workload\n"));
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.reference(&held_ref("vol", 1)), None);
+    assert_eq!(PatchState::load(&f.state.patch_state()).in_flight, None);
+}
+
+/// The same crash with the patch still queued: it lands once, and the
+/// tree matches history.
+#[test]
+fn crash_after_the_tree_write_of_a_set_aside_patch_still_queued() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("b.txt", Some("iac\n"))], "edit b");
+    let p2 = f.patch(base, &[("c.txt", Some("c\n"))], "add c");
+    f.change(&[("b.txt", "workload\n")], &[]);
+    f.queue(1, p1);
+    f.queue(2, p2);
+    f.process();
+    let p1b = f.patch(f.head(), &[("b.txt", Some("merged\n"))], "edit b, rebased");
+    f.queue(1, p1b);
+    note_in_flight(&f, 1, p1b, &["b.txt"]);
+    fs::write(f.root.join("b.txt"), "merged\n").unwrap();
+    let report = f.process();
+    assert_eq!(report.applied.len(), 1, "{report:?}");
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(f.at_head("b.txt").as_deref(), Some("merged\n"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("merged\n"));
 }
 
 /// Crash (a): the commit is made, the refs are not moved.
@@ -634,7 +742,7 @@ fn a_gap_blocks() {
 }
 
 #[test]
-fn merge_commits_root_commits_and_foreign_parents_block() {
+fn merge_commits_root_commits_and_foreign_parents_are_held() {
     if !have_git() {
         return;
     }
@@ -663,7 +771,12 @@ fn merge_commits_root_commits_and_foreign_parents_block() {
     for (oid, reason) in cases {
         f.queue(1, oid);
         let report = f.process();
-        assert_eq!(report.blocked.map(|b| b.reason), Some(reason));
+        assert_eq!(report.blocked, None);
+        assert!(
+            matches!(&report.set_aside[..], [(1, Verdict::Held { reason: r, .. })] if *r == reason),
+            "{:?}",
+            report.set_aside
+        );
         assert_eq!(f.head(), head);
     }
 }
@@ -685,9 +798,12 @@ fn gitlinks_are_unsupported() {
         .commit(None, &sig, &sig, "submodule", &tree, &[&parent])
         .unwrap();
     f.queue(1, p);
-    let blocked = f.process().blocked.unwrap();
-    assert_eq!(blocked.reason, BlockReason::Unsupported);
-    assert_eq!(blocked.paths, ["sub"]);
+    let report = f.process();
+    let [(1, Verdict::Held { reason, paths, .. })] = &report.set_aside[..] else {
+        panic!("{report:?}");
+    };
+    assert_eq!(*reason, BlockReason::Unsupported);
+    assert_eq!(paths, &["sub"]);
 }
 
 #[test]
@@ -903,6 +1019,7 @@ fn a_failed_run_is_recorded_as_blocked() {
         telemetry: &telemetry,
         caller: CALLER,
         integrator: &integrator,
+        rule: &CleanMerge as &dyn AcceptanceRule,
     });
     assert!(queue.process(None).is_err());
     let after = PatchState::load(&f.state.patch_state());

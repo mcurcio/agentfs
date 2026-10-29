@@ -16,9 +16,14 @@
 //!   recorded as one atomic operation: one commit, authored by the patch
 //!   author, committed by agentfs, with `Agentfs-Trigger: patch`,
 //!   `Agentfs-Patch: <oid>` and `Agentfs-Inbox: <n>`;
-//! - the first patch that cannot be applied blocks the queue
-//!   ([`BlockReason`]): it and the later ones stay queued, an alarm is
-//!   raised, and the volume mounts anyway;
+//! - a patch that cannot land is set aside whole with a [`Verdict`] and
+//!   the queue goes on (bead agentfs-mia.2): held, waiting behind an
+//!   earlier set-aside barrier or patch on the same paths, or awaiting or
+//!   not judged by the acceptance rule ([`accept`]); a local
+//!   `held/<n>` mark keeps it queued. Only a gap, unrecorded changes or a
+//!   failure stop the queue ([`BlockReason::holds_whole`]): that patch and
+//!   the later ones stay queued, an alarm is raised, and the volume mounts
+//!   anyway;
 //! - whether a patch is applied is decided by the `Agentfs-Inbox`
 //!   trailers on the branch, so a crash anywhere never applies one twice;
 //!   `applied/<n>` refs and deleting `inbox/<n>` are bookkeeping;
@@ -148,6 +153,8 @@ pub enum BlockReason {
     Unrecorded,
     /// Writing or recording failed, or an LFS object is missing.
     Failed,
+    /// The acceptance rule refused it.
+    Refused,
 }
 
 impl BlockReason {
@@ -161,6 +168,25 @@ impl BlockReason {
             Self::TooLarge => "too_large",
             Self::Unrecorded => "unrecorded",
             Self::Failed => "failed",
+            Self::Refused => "refused",
+        }
+    }
+
+    /// Whether a patch refused for this reason is held whole while the
+    /// queue goes on (conflict, merge_commit, parent_not_in_history,
+    /// unsupported, too_large, refused); false: the run stops at it (gap,
+    /// unrecorded, failed: they are about the volume or the queue, not the
+    /// patch). The owner, 2026-10-16: "Whole seems best, right? A partial
+    /// application has unknown side effects".
+    pub fn holds_whole(self) -> bool {
+        match self {
+            Self::Conflict
+            | Self::MergeCommit
+            | Self::ParentNotInHistory
+            | Self::Unsupported
+            | Self::TooLarge
+            | Self::Refused => true,
+            Self::Gap | Self::Unrecorded | Self::Failed => false,
         }
     }
 
@@ -196,6 +222,10 @@ impl BlockReason {
             Self::Failed => {
                 "see the message; fix the cause (an LFS object the producer did not upload, a \
                  refused path, disk space) and remount, or skip the patch (--skip <n>)"
+            }
+            Self::Refused => {
+                "the acceptance rule (agentfs.patchAccept) refused it: replace it (--replace <n>) \
+                 or skip it (--skip <n>)"
             }
         }
     }
@@ -258,6 +288,27 @@ pub enum Verdict {
     NotJudged { rule: String, message: String },
 }
 
+impl Verdict {
+    /// `held`, `waiting`, `awaiting` or `not_judged`, as in `status.json`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Held { .. } => "held",
+            Self::Waiting { .. } => "waiting",
+            Self::Awaiting { .. } => "awaiting",
+            Self::NotJudged { .. } => "not_judged",
+        }
+    }
+}
+
+impl WaitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SameFiles => "same_files",
+            Self::Barrier => "barrier",
+        }
+    }
+}
+
 /// Why a patch waits (bead agentfs-mia.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -277,7 +328,9 @@ pub struct Ignored {
     pub inbox: Option<u64>,
     pub patch: Option<String>,
     /// `malformed` (not ten digits), `stale` (numbered at or below the
-    /// last applied patch, with another commit than the one applied).
+    /// last applied patch, with another commit than the one applied, and
+    /// not set aside), `withdrawn` (a set-aside patch whose inbox ref is
+    /// gone: its `held/<n>` mark is deleted).
     pub why: String,
 }
 
