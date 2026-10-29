@@ -318,3 +318,54 @@ Neither stopped the work; each was resolved as below.
 ## 2026-10-29, main session: confirmations
 - **Item 1 (mia.2, stale check): confirmed.** "Keep going" needs it. A local `refs/agentfs/<volume>/held/<n>` mark, written before the next number is judged, exempts that number from the stale check; everything without the mark is judged as today. `recover_in_flight`'s applied test becomes the trailer check its doc comment already describes. Numbering, the high-water mark, the gap rule and the trailer rule for "applied" stay unchanged. The brief (.handoff/mia-features.md) is updated to say so.
 - **Item 2 (mia.5, webhook): confirmed.** No CSI delivery webhook exists. Add `agentfs.patchNotifyUrl`, `agentfs.patchNotifyCredentialFile` and `agentfs.patchNotifyTimeout`, settable by any volume and so by a CSI profile's config; no CSI code in mia.5.
+
+## 2026-10-29, mia.7 implementer (agentfs-mia.7, forks of forks)
+
+1. **Stopped before any code: the roll-up's delivery cannot authenticate.** The frozen page has a
+   child fork's finish deliver its change with `InboxDelivery::new(fork_remote, parent,
+   Some(parent_branch), git)` (`fork/deliver.rs`). `InboxDelivery` is `patch::submit::submit` over
+   a `GitRunner`, whose only implementation is `GitCli`: the `git` program, using "the
+   repository's remote configuration, credential helpers and SSH setup" (`patch/submit.rs` module
+   docs), i.e. a producer's own git. The finisher runs in the node plugin or daemon, and every
+   remote operation agentfs itself makes authenticates through libgit2 with the remote's
+   `agentfsCredentials`, `agentfsSshKey`, `agentfsKnownHosts` (`remote_auth.rs`, "shared by the
+   push and the patch-queue fetch and push"). The `git` program reads none of those keys. So the
+   child's submit gets no credential: it fails against any authenticated remote, including the
+   CI git server that acceptance test 5 must use (`ci/git-http-server.sh`, nginx `auth_basic`;
+   the `cifork` profile's fork remote sets `agentfsCredentials`). Only a `file://` or anonymous
+   remote works, which tests 1-4 would pass on while the CSI case, the bead's purpose, is dead.
+   Possible resolution (a choice for the architect, not made here): deliver through the
+   finisher's own `RemotePusher` (libgit2, the remote's credentials and SSH), which already lists
+   remote refs (`list_remote_refs`) and pushes create-only (`push_create_only`): list
+   `refs/agentfs/<parent>/{inbox,applied}/*`, refuse early if the change is already listed (at
+   most once; the parent queue's duplicate rule stays the guarantee), take
+   `submit::next_seq`, push `refs/agentfs/<parent>/inbox/<n>` = change create-only, and on
+   `AnotherWriter` list again and take the next number. That changes the page's frozen
+   `fork/finish.rs` signature line (no `InboxDelivery` there; `deliver.rs` untouched). The other
+   option, a `GitRunner` that hands agentfs's credentials to `git` (`GIT_ASKPASS`, an SSH
+   command with the key and known hosts), adds a second credential path for one caller.
+2. **A parent whose push target is hidden has no branch to submit against.** `submit` lists
+   `refs/heads/<branch>` (`SubmitRequest::branch`, "without refs/heads/"); a fork created with
+   `agentfs.forkRefs = hidden` keeps its history at `refs/agentfs/<fork>/history`, so a child's
+   submit into it fails `NoBranch` on every try. The page does not say whether such a child is
+   refused at create, published as top level, or held refused. The child cannot read its
+   parent's push target from its own settings either (only `sourceIsFork = true` is recorded);
+   it equals the child's own only while the shared include's `forkRefs` is unchanged.
+3. **The CLI cannot create a fork of a fork as the page leaves it.** `fork create` takes the
+   child's includes from `create::settings_files(<parent's state area>)`, which refuses
+   (`SourceSettingsNotIncluded`) any `agentfs.*` key in the source's own config except
+   `OWN_KEYS`; a fork's own config holds `agentfs.fork.source`, `.base`, `.link`, and so on. The
+   CSI path is unaffected (its includes are the profile's config). Fix within the page's files:
+   add the fork identity keys to `OWN_KEYS` in `fork/create.rs`; the page should say so.
+To unblock: the architect re-cuts mia.7's page for item 1 (and decides item 2, and names item 3),
+then re-dispatches mia.7.
+
+### Main session, 2026-10-29: mia.7 items confirmed (engineering choices, not the owner's)
+1. **Deliver through the finisher's `RemotePusher`.** One credential path (principle: every remote
+   operation agentfs makes logs in through `remote_auth.rs`). No `GitRunner` with injected
+   credentials. The architect re-cuts the `fork/finish.rs` line as item 1 proposes.
+2. **A fork of a parent with `agentfs.forkRefs = hidden` is refused when it is created**, with an
+   error naming the reason. Construction-time beats a delivery that fails on every retry. The
+   architect names where create learns the parent's push target (parent state area for the CLI,
+   the profile for CSI).
+3. **Add the fork identity keys to `OWN_KEYS`** in `fork/create.rs`, as item 3 says.
