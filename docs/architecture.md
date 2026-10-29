@@ -113,7 +113,8 @@ missing from these tables or a row names a module that no longer exists;
 | `patch/integrate.rs` | A patch branch, and merging it onto the branch head with the `git` program |
 | `patch/submit.rs` | `agentfs patch submit`: the producer side, driving the producer's own `git` |
 | `patch/fetch.rs` | Fetching the inbox refs from the patch remote, best effort |
-| `patch/queue.rs` | Applying the queue at mount, before the workload sees the tree |
+| `patch/notify.rs` | Telling the integrator of every verdict change: the `patch-notify` hook and the notify webhook, with the delivered cursor in `meta/notify.json` |
+| `patch/queue.rs` | Applying the queue at mount, before the workload sees the tree; judging it read only while a daemon holds the volume |
 | `patch/status.rs` | The status ref iac reads, and the local cache in `meta/patch.json` |
 
 ### `agentfs-fuse`

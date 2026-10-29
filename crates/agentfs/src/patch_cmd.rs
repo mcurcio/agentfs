@@ -3,13 +3,20 @@
 //! - `patch submit` and `patch approve` are the producer side: they run in
 //!   the producer's git repository and drive its `git`
 //!   ([`agentfs_core::patch::submit`]).
-//! - `patch apply` fetches and applies the queue with the volume stopped
-//!   (it takes the state-area lock), as a mount does before it serves.
+//! - `patch apply` asks a running daemon first (the control socket's
+//!   `apply`, bead agentfs-mia.5): a daemon always counts as attached, so
+//!   it only judges the queue ([`Queue::judge`]), notifies, and answers
+//!   "workload attached; lands at next mount" (exit 75). With no daemon it
+//!   fetches and applies the queue with the volume stopped (it takes the
+//!   state-area lock), as a mount does before it serves.
+//! - Every queue run and every judging tells the integrator what changed
+//!   ([`notify`]: the `patch-notify` hook, the notify webhook).
 //! - `patch status` reads `meta/patch.json` and the status ref without
 //!   the lock.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand};
@@ -19,21 +26,28 @@ use agentfs_core::config::Settings;
 use agentfs_core::confined::Dir;
 use agentfs_core::events::{Event, Events};
 use agentfs_core::history::History;
+use agentfs_core::identity::Identity;
 use agentfs_core::lfs::fetch::Fetcher;
 use agentfs_core::lock::StateLock;
 use agentfs_core::patch::accept;
 use agentfs_core::patch::fetch::{FetchOutcome, fetch_inbox};
 use agentfs_core::patch::integrate;
-use agentfs_core::patch::queue::{Queue, QueueContext, QueueReport, record_failure};
+use agentfs_core::patch::notify::{self, ApplyAnswer};
+use agentfs_core::patch::queue::{JudgeContext, Queue, QueueContext, QueueReport, record_failure};
 use agentfs_core::patch::status::{PatchState, StatusDoc, read_status};
 use agentfs_core::patch::status_ref;
 use agentfs_core::patch::submit::{self, ApproveRequest, GitCli, Source, SubmitRequest};
-use agentfs_core::patch::{BlockReason, Verdict};
+use agentfs_core::patch::{BlockReason, PatchError, Verdict};
 use agentfs_core::record::Caller;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{Committer, Recorder, StateDir};
 
-use crate::{Pod, Session, current_gid, current_uid};
+use crate::control::{self, ClientError, Reply, Request};
+use crate::{EXIT_LOCKED, Pod, Session, current_gid, current_uid};
+
+/// What `patch apply` is answered while a daemon holds the volume (design
+/// §19.1 "No live landing yet").
+pub const ATTACHED: &str = "workload attached; lands at next mount";
 
 #[derive(Subcommand)]
 pub enum PatchCommand {
@@ -50,7 +64,9 @@ pub enum PatchCommand {
     Approve(ApproveArgs),
     /// Fetch and apply the volume's patch queue now, with the volume
     /// stopped (takes the state-area lock; exit 75 when it is busy). Exit
-    /// 1 when the queue is blocked or a patch was set aside.
+    /// 1 when the queue is blocked or a patch was set aside. While a daemon
+    /// holds the volume, it judges the queue instead and nothing lands:
+    /// "workload attached; lands at next mount", exit 75.
     Apply {
         /// Apply what is already fetched; do not contact the patch remote.
         #[arg(long)]
@@ -144,15 +160,18 @@ pub fn run(
         PatchCommand::Submit(args) => submit_cmd(args),
         PatchCommand::Approve(args) => approve_cmd(args),
         PatchCommand::Apply { no_fetch, pod } => {
+            crate::refuse_finished(state)?;
+            if let Some(code) = apply_client(state, !no_fetch) {
+                return Ok(code);
+            }
             let Some(root) = root else {
                 bail!("patch apply needs --root (or AGENTFS_ROOT): the backing tree");
             };
-            crate::refuse_finished(state)?;
             let _lock = StateLock::acquire(state, "patch apply", wait_lock)?;
             let session = Session::start(state, &pod)?;
             let (recorder, committer, _) = session.open(state, root, &pod)?;
             let settings = committer.history().settings().clone();
-            let report = apply_queue(
+            let report = run_queue(
                 state,
                 &settings,
                 &recorder,
@@ -161,6 +180,7 @@ pub fn run(
                 session.telemetry(),
                 &session.events,
                 !no_fetch,
+                true,
             );
             // Telemetry is flushed on failure too: the alarm and gauges.
             session.finish();
@@ -263,6 +283,144 @@ fn verdict_parts(verdict: &Verdict) -> (&'static str, String) {
         ),
         Verdict::Awaiting { what } => ("awaiting", format!(" ({})", what.as_str())),
         Verdict::NotJudged { rule, message } => ("not judged", format!(" ({rule}): {message}")),
+        Verdict::Ready => ("ready", String::new()),
+    }
+}
+
+/// `patch apply` through a running daemon: its exit status, or `None`
+/// when no daemon answers (no socket, a reply this build cannot read, or
+/// a daemon from before `apply`), and the command takes the lock path.
+fn apply_client(state: &StateDir, fetch: bool) -> Option<ExitCode> {
+    let reply = match control::call(&state.control_dir(), &Request::apply(fetch)) {
+        Ok(reply) => reply,
+        Err(ClientError::NotRunning | ClientError::Protocol(_)) => return None,
+        Err(ClientError::Io(e)) => {
+            eprintln!(
+                "error: a daemon seems to be running, but its control socket in {} cannot be \
+                 used: {e}",
+                state.control_dir().display()
+            );
+            eprintln!("hint: run as root or as the user the daemon runs as");
+            return Some(ExitCode::FAILURE);
+        }
+    };
+    Some(match reply {
+        Reply::Attached { message, verdicts } => {
+            for (n, verdict) in &verdicts {
+                let (label, detail) = verdict_parts(verdict);
+                eprintln!("patch {n} {label}{detail}");
+            }
+            eprintln!("patches: {message}");
+            ExitCode::from(EXIT_LOCKED)
+        }
+        // A daemon from before `apply`: the lock path, which refuses.
+        Reply::Error(message) if message.contains("unknown variant") => return None,
+        Reply::Error(message) => {
+            eprintln!("patch apply failed: {message}");
+            ExitCode::FAILURE
+        }
+        Reply::Refused { message, hint, .. } => {
+            eprintln!("patch apply refused: {message}");
+            if let Some(hint) = hint {
+                eprintln!("hint: {hint}");
+            }
+            ExitCode::FAILURE
+        }
+        Reply::Busy(message) => {
+            eprintln!("error: {message}");
+            ExitCode::from(EXIT_LOCKED)
+        }
+        Reply::Ok(_) | Reply::Pushed(_) | Reply::Received { .. } => {
+            eprintln!("patch apply failed: the daemon answered another request's reply");
+            ExitCode::FAILURE
+        }
+    })
+}
+
+/// What a daemon judges an apply with (bead agentfs-mia.5): its alarms,
+/// its telemetry and its committer identity, which signs the status.
+#[derive(Clone)]
+pub struct Applier {
+    events: Events,
+    telemetry: Telemetry,
+    committer: Identity,
+}
+
+impl Applier {
+    pub fn new(committer: &Committer, events: Events, telemetry: &Telemetry) -> Self {
+        Self {
+            events,
+            telemetry: telemetry.clone(),
+            committer: committer.committer_identity(),
+        }
+    }
+}
+
+/// One apply judged at a time: they write one status ref and one cursor.
+static APPLYING: Mutex<()> = Mutex::new(());
+
+/// The control socket's `apply` (bead agentfs-mia.5): a running daemon
+/// always counts as attached (a front may attach mid-landing), so the
+/// queue is fetched (unless the request says not to) and judged against
+/// the head as it is, read only, with its own history handle
+/// ([`Queue::judge`]); the status is written and the integrator notified
+/// with `apply.kind = attached`. Nothing lands.
+pub fn serve_apply(state: &StateDir, applier: &Applier, request: &Request) -> Reply {
+    let _one = APPLYING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match judge_attached(state, applier, !request.no_fetch) {
+        Ok(verdicts) => Reply::Attached {
+            message: ATTACHED.to_owned(),
+            verdicts,
+        },
+        Err(e) => Reply::Error(format!("judging the patch queue: {e:#}")),
+    }
+}
+
+fn judge_attached(state: &StateDir, applier: &Applier, fetch: bool) -> Result<Vec<(u64, Verdict)>> {
+    let settings = Settings::load(&state.git())
+        .with_context(|| format!("reading {}", state.git().display()))?;
+    let fetched = fetch_queue(state, &settings, &applier.events, fetch);
+    // Opened after the fetch, so it sees the objects it brought.
+    let history = History::open(&state.git())
+        .with_context(|| format!("opening {}", state.root().display()))?;
+    let settings = history.settings();
+    let integrator = integrate::integrator(settings.patch_integrate, &state.git());
+    let rule = accept::rule(
+        settings.patch_accept,
+        &state.git(),
+        settings.patch_accept_timeout,
+    );
+    let judgement = Queue::judge(&JudgeContext {
+        state,
+        history: &history,
+        integrator: integrator.as_ref(),
+        rule: rule.as_ref(),
+        events: &applier.events,
+        telemetry: &applier.telemetry,
+        committer: &applier.committer,
+        fetch: fetched.as_ref(),
+    })
+    .context("judging patches")?;
+    warn_unnotified(notify::tell(
+        state,
+        &history,
+        judgement.status,
+        &[],
+        Some(ApplyAnswer::Attached {
+            message: ATTACHED.to_owned(),
+        }),
+        &applier.events,
+    ));
+    Ok(judgement.verdicts)
+}
+
+/// A failed notify method is alarmed by [`notify::deliver`]; failing to
+/// read or write the state is a warning: the queue's work stands.
+fn warn_unnotified(result: std::result::Result<notify::Delivery, PatchError>) {
+    if let Err(e) = result {
+        eprintln!("warning: telling the integrator of the patch queue's changes: {e}");
     }
 }
 
@@ -345,7 +503,27 @@ pub fn apply_queue(
     events: &Events,
     fetch: bool,
 ) -> Result<QueueReport> {
-    apply_queue_inner(
+    run_queue(
+        state, settings, recorder, committer, root, telemetry, events, fetch, false,
+    )
+}
+
+/// [`apply_queue`], then the notice of what changed; `answering` when an
+/// apply call ran it (the notice carries `apply.kind = landed`), not a
+/// mount.
+#[allow(clippy::too_many_arguments)]
+fn run_queue(
+    state: &StateDir,
+    settings: &Settings,
+    recorder: &Recorder,
+    committer: &Committer,
+    root: &Path,
+    telemetry: &Telemetry,
+    events: &Events,
+    fetch: bool,
+    answering: bool,
+) -> Result<QueueReport> {
+    let report = apply_queue_inner(
         state, settings, recorder, committer, root, telemetry, events, fetch,
     )
     .inspect_err(|e| {
@@ -358,7 +536,50 @@ pub fn apply_queue(
             message,
             queued: 0,
         });
-    })
+    })?;
+    warn_unnotified(notify::tell(
+        state,
+        committer.history(),
+        report.status,
+        &report.applied,
+        answering.then(|| ApplyAnswer::Landed {
+            landed: report.applied.iter().map(|(n, _)| *n).collect(),
+        }),
+        events,
+    ));
+    Ok(report)
+}
+
+/// Fetches the inbox from the patch remote, best effort, unless `fetch`
+/// is false, there is no patch remote, or `agentfs.patchFetchTimeout` is
+/// 0; a failure is alarmed (`PatchFetchFailed`) and the queue runs with
+/// what it has.
+fn fetch_queue(
+    state: &StateDir,
+    settings: &Settings,
+    events: &Events,
+    fetch: bool,
+) -> Option<FetchOutcome> {
+    let remote = settings.patch_remote()?;
+    if !fetch || settings.patch_fetch_timeout.is_zero() {
+        return None;
+    }
+    let outcome = fetch_inbox(
+        &state.git(),
+        remote,
+        &settings.volume,
+        settings.patch_fetch_timeout,
+    );
+    if !outcome.ok {
+        events.emit(Event::PatchFetchFailed {
+            remote: outcome.remote.clone(),
+            kind: outcome
+                .kind
+                .unwrap_or(agentfs_core::events::PushFailureKind::Unreachable),
+            message: outcome.message.clone().unwrap_or_default(),
+        });
+    }
+    Some(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -372,27 +593,7 @@ fn apply_queue_inner(
     events: &Events,
     fetch: bool,
 ) -> Result<QueueReport> {
-    let fetched: Option<FetchOutcome> = match settings.patch_remote() {
-        Some(remote) if fetch && !settings.patch_fetch_timeout.is_zero() => {
-            let outcome = fetch_inbox(
-                &state.git(),
-                remote,
-                &settings.volume,
-                settings.patch_fetch_timeout,
-            );
-            if !outcome.ok {
-                events.emit(Event::PatchFetchFailed {
-                    remote: outcome.remote.clone(),
-                    kind: outcome
-                        .kind
-                        .unwrap_or(agentfs_core::events::PushFailureKind::Unreachable),
-                    message: outcome.message.clone().unwrap_or_default(),
-                });
-            }
-            Some(outcome)
-        }
-        _ => None,
-    };
+    let fetched = fetch_queue(state, settings, events, fetch);
     let tree = Dir::open(root).with_context(|| format!("opening {}", root.display()))?;
     let objects = Fetcher::new(state, settings).context("opening the LFS cache")?;
     let integrator = integrate::integrator(settings.patch_integrate, &state.git());

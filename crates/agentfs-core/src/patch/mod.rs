@@ -30,7 +30,13 @@
 //! - the queue's state goes to `refs/agentfs/<volume>/status` (a commit
 //!   holding `status.json`, [`status::StatusDoc`]) and is cached in
 //!   `meta/patch.json` ([`status::PatchState`]) for `agentfs status` and
-//!   the telemetry gauges.
+//!   the telemetry gauges;
+//! - every verdict change is told to the integrator ([`notify`]: the
+//!   `patch-notify` hook, the notify webhook), and while a daemon holds
+//!   the volume `agentfs patch apply` only judges
+//!   ([`queue::Queue::judge`]) and answers "lands at next mount" (bead
+//!   agentfs-mia.5, design §19.1 "Integrators decide when patches are
+//!   applied").
 //!
 //! The queue's refs reach the remote with their own push
 //! ([`crate::push::RemotePusher::push_once`], stage `queue`), never in
@@ -39,6 +45,7 @@
 pub mod accept;
 pub mod fetch;
 pub mod integrate;
+pub mod notify;
 pub mod queue;
 pub mod status;
 pub mod submit;
@@ -286,16 +293,21 @@ pub enum Verdict {
     Awaiting { what: accept::AwaitWhat },
     /// The acceptance rule could not judge it (an alarm is raised).
     NotJudged { rule: String, message: String },
+    /// Would land now: lands at the next mount or apply with nothing
+    /// attached. Only [`queue::Queue::judge`] gives it (bead agentfs-mia.5).
+    Ready,
 }
 
 impl Verdict {
-    /// `held`, `waiting`, `awaiting` or `not_judged`, as in `status.json`.
+    /// `held`, `waiting`, `awaiting`, `not_judged` or `ready`, as in
+    /// `status.json`.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Held { .. } => "held",
             Self::Waiting { .. } => "waiting",
             Self::Awaiting { .. } => "awaiting",
             Self::NotJudged { .. } => "not_judged",
+            Self::Ready => "ready",
         }
     }
 }

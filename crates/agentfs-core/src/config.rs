@@ -155,6 +155,12 @@ pub enum ConfigError {
          URL, a file:// URL or a path; design §7)"
     )]
     LfsUrl { key: String, value: String },
+    #[error("{key}: {value:?} is not a webhook agentfs can POST to: {why}")]
+    NotifyUrl {
+        key: String,
+        value: String,
+        why: &'static str,
+    },
     #[error("{key}: https LFS endpoints need agentfs built with the `https` cargo feature")]
     LfsHttpsUnsupported { key: String },
     #[error(
@@ -195,6 +201,9 @@ pub const KEYS: &[&str] = &[
     "agentfs.patchAccept",
     "agentfs.patchAcceptTimeout",
     "agentfs.patchIntegrate",
+    "agentfs.patchNotifyUrl",
+    "agentfs.patchNotifyCredentialFile",
+    "agentfs.patchNotifyTimeout",
     "agentfs.lfsThreshold",
     "agentfs.forkRefs",
     "agentfs.identity.committerName",
@@ -498,6 +507,17 @@ pub struct Settings {
     /// `merge` (the default) or `rebase` (design §12, §17.3; bead
     /// agentfs-mia.3).
     pub patch_integrate: IntegrateMode,
+    /// `agentfs.patchNotifyUrl`: where the patch queue's verdict changes
+    /// are POSTed (bead agentfs-mia.5; [`crate::patch::notify`]); `None`:
+    /// no webhook.
+    pub patch_notify_url: Option<String>,
+    /// `agentfs.patchNotifyCredentialFile`: an absolute path whose
+    /// contents are the webhook's bearer token.
+    pub patch_notify_credential_file: Option<PathBuf>,
+    /// `agentfs.patchNotifyTimeout`: how long the `patch-notify` hook and
+    /// the webhook may take. Default [`DEFAULT_PATCH_NOTIFY_TIMEOUT`];
+    /// `0` is refused.
+    pub patch_notify_timeout: Duration,
     /// Every `include.path`, in order: absolute, readable config fragments
     /// whose keys count as the repository's own (design §4.3).
     pub includes: Vec<PathBuf>,
@@ -1121,6 +1141,16 @@ impl Settings {
             patch_accept: patch_accept(config)?,
             patch_accept_timeout: patch_accept_timeout(config)?,
             patch_integrate: patch_integrate(config)?,
+            patch_notify_url: patch_notify_url(config)?,
+            patch_notify_credential_file: absolute_path(
+                config,
+                "agentfs.patchNotifyCredentialFile",
+            )?,
+            patch_notify_timeout: positive_duration(
+                config,
+                "agentfs.patchNotifyTimeout",
+                DEFAULT_PATCH_NOTIFY_TIMEOUT,
+            )?,
             lfs,
             http_proxy: http_proxy.ok().flatten(),
             remotes: split.remotes,
@@ -1601,9 +1631,22 @@ fn patch_accept(config: &git2::Config) -> Result<AcceptMode, ConfigError> {
 /// `agentfs.patchAcceptTimeout`: default [`DEFAULT_PATCH_ACCEPT_TIMEOUT`],
 /// else a duration above zero.
 fn patch_accept_timeout(config: &git2::Config) -> Result<Duration, ConfigError> {
-    let key = "agentfs.patchAcceptTimeout";
+    positive_duration(
+        config,
+        "agentfs.patchAcceptTimeout",
+        DEFAULT_PATCH_ACCEPT_TIMEOUT,
+    )
+}
+
+/// `key`: `default` when unset, else a duration above zero (`0` is
+/// [`ConfigError::TooShort`]).
+fn positive_duration(
+    config: &git2::Config,
+    key: &str,
+    default: Duration,
+) -> Result<Duration, ConfigError> {
     match duration(config, key)? {
-        None => Ok(DEFAULT_PATCH_ACCEPT_TIMEOUT),
+        None => Ok(default),
         Some(d) if !d.is_zero() => Ok(d),
         Some(_) => Err(ConfigError::TooShort {
             key: key.into(),
@@ -1611,6 +1654,44 @@ fn patch_accept_timeout(config: &git2::Config) -> Result<Duration, ConfigError> 
             min: Duration::from_millis(1),
         }),
     }
+}
+
+/// `key`: unset, or an absolute path ([`ConfigError::RelativePath`]).
+fn absolute_path(config: &git2::Config, key: &str) -> Result<Option<PathBuf>, ConfigError> {
+    match string(config, key)? {
+        None => Ok(None),
+        Some(value) if !Path::new(&value).is_absolute() => Err(ConfigError::RelativePath {
+            key: key.into(),
+            value,
+        }),
+        Some(value) => Ok(Some(PathBuf::from(value))),
+    }
+}
+
+/// The default `agentfs.patchNotifyTimeout` (bead agentfs-mia.5).
+pub const DEFAULT_PATCH_NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `agentfs.patchNotifyUrl`: unset, or an `http://` URL, or an `https://`
+/// one in a build with the `https` feature ([`ConfigError::NotifyUrl`]).
+fn patch_notify_url(config: &git2::Config) -> Result<Option<String>, ConfigError> {
+    let key = "agentfs.patchNotifyUrl";
+    let Some(url) = string(config, key)? else {
+        return Ok(None);
+    };
+    let lower = url.to_ascii_lowercase();
+    let https = lower.starts_with("https://");
+    let why = if !https && !lower.starts_with("http://") {
+        "it is not an http:// or https:// URL"
+    } else if https && !cfg!(feature = "https") {
+        "it is https, and this build has no TLS (the `https` feature)"
+    } else {
+        return Ok(Some(url));
+    };
+    Err(ConfigError::NotifyUrl {
+        key: key.into(),
+        value: url,
+        why,
+    })
 }
 
 /// `agentfs.patchIntegrate`: `merge` (the default) or `rebase`; anything
@@ -1857,6 +1938,51 @@ mod tests {
         assert!(matches!(
             load("\tpatchAcceptTimeout = soon\n"),
             Err(ConfigError::BadDuration { .. })
+        ));
+    }
+
+    #[test]
+    fn patch_notify_keys() {
+        let load = |extra: &str| {
+            let (_d, c) = config_with(&format!("[agentfs]\n\tvolume = v\n{extra}"));
+            Settings::from_config(&c)
+        };
+        let s = load("").unwrap();
+        assert_eq!(s.patch_notify_url, None);
+        assert_eq!(s.patch_notify_credential_file, None);
+        assert_eq!(s.patch_notify_timeout, DEFAULT_PATCH_NOTIFY_TIMEOUT);
+        let s = load(
+            "\tpatchNotifyUrl = http://127.0.0.1:9/hook\n\
+             \tpatchNotifyCredentialFile = /run/token\n\tpatchNotifyTimeout = 5s\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.patch_notify_url.as_deref(),
+            Some("http://127.0.0.1:9/hook")
+        );
+        assert_eq!(
+            s.patch_notify_credential_file,
+            Some(PathBuf::from("/run/token"))
+        );
+        assert_eq!(s.patch_notify_timeout, Duration::from_secs(5));
+        for bad in ["ftp://example.com/", "example.com"] {
+            assert!(
+                matches!(
+                    load(&format!("\tpatchNotifyUrl = {bad}\n")),
+                    Err(ConfigError::NotifyUrl { .. })
+                ),
+                "{bad}"
+            );
+        }
+        let https = load("\tpatchNotifyUrl = https://example.com/\n");
+        assert_eq!(https.is_ok(), cfg!(feature = "https"));
+        assert!(matches!(
+            load("\tpatchNotifyCredentialFile = token\n"),
+            Err(ConfigError::RelativePath { .. })
+        ));
+        assert!(matches!(
+            load("\tpatchNotifyTimeout = 0s\n"),
+            Err(ConfigError::TooShort { .. })
         ));
     }
 

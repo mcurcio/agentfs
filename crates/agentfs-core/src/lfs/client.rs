@@ -1085,6 +1085,90 @@ pub(crate) fn agent(concurrency: usize, proxy: Option<ureq::Proxy>) -> ureq::Age
     ureq::Agent::new_with_config(config.build())
 }
 
+/// What a [`post`] was answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Posted {
+    pub status: u16,
+    /// The `Location` header, if any (a redirect is never followed).
+    pub location: Option<String>,
+    /// Up to 4 KiB of the body.
+    pub body: Vec<u8>,
+}
+
+/// Why a [`post`] got no answer.
+#[derive(Debug, thiserror::Error)]
+pub enum PostError {
+    /// The request could not be built (a bad URL or header).
+    #[error("request to {url} is malformed: {detail}")]
+    Malformed { url: String, detail: String },
+    /// It could not reach the server, or timed out.
+    #[error("POST {url}: {detail}")]
+    Unreachable { url: String, detail: String },
+}
+
+/// One POST of `body` as `application/json` with `headers`, through
+/// [`agent`] (no redirects, never a proxy from the environment, as the LFS
+/// client, design §7), within `timeout`: the one HTTP POST of fork
+/// delivery's webhook ([`crate::fork::deliver`]) and the patch queue's
+/// notify webhook ([`crate::patch::notify`], bead agentfs-mia.5).
+pub fn post(
+    url: &str,
+    body: &[u8],
+    headers: &[(&str, String)],
+    timeout: Duration,
+) -> Result<Posted, PostError> {
+    let mut request = agent(1, None)
+        .post(url)
+        .header("Content-Type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, value);
+    }
+    let response = request
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .send(body);
+    let response = match response {
+        Ok(r) => r,
+        Err(e @ (ureq::Error::BadUri(_) | ureq::Error::Http(_))) => {
+            return Err(PostError::Malformed {
+                url: url.to_owned(),
+                detail: e.to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(PostError::Unreachable {
+                url: url.to_owned(),
+                detail: e.to_string(),
+            });
+        }
+    };
+    let status = response.status().as_u16();
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    Ok(Posted {
+        status,
+        location,
+        body: read_small(response),
+    })
+}
+
+/// [`post`] for a caller that needs only the status code; why it got none
+/// as text.
+pub fn post_json(
+    url: &str,
+    body: &[u8],
+    headers: &[(&str, String)],
+    timeout: Duration,
+) -> Result<u16, String> {
+    post(url, body, headers, timeout)
+        .map(|posted| posted.status)
+        .map_err(|e| e.to_string())
+}
+
 /// How long one object's transfer may take.
 pub fn object_timeout(size: u64) -> Duration {
     REQUEST_TIMEOUT + Duration::from_secs(size / MIN_RATE)

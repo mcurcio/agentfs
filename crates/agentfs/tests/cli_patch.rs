@@ -1404,3 +1404,399 @@ fn a_missing_driver_is_not_judged() {
     assert_eq!(s.read("a.txt").as_deref(), Some("a1\n"));
     assert_eq!(s.read("b.txt").as_deref(), Some("b1\n"));
 }
+
+/// Bead agentfs-mia.5: the notify hook and the apply answers.
+impl Setup {
+    /// Installs `$GIT_DIR/hooks/patch-notify`: it appends each notice (one
+    /// JSON line) to a log and exits with the code in `notify-mode` (0 when
+    /// there is none). The log's path.
+    fn notify_hook(&self) -> PathBuf {
+        let log = self.dir.path().join("notices.jsonl");
+        let mode = self.dir.path().join("notify-mode");
+        let hook = self.state().join("git/hooks/patch-notify");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ncat >> '{log}'\necho >> '{log}'\nexit \"$(cat '{mode}' 2>/dev/null || \
+                 echo 0)\"\n",
+                log = log.display(),
+                mode = mode.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        log
+    }
+
+    fn notify_mode(&self, code: u8) {
+        fs::write(self.dir.path().join("notify-mode"), code.to_string()).unwrap();
+    }
+
+    /// The notices the hook was given, in order.
+    fn notices(&self) -> Vec<serde_json::Value> {
+        fs::read_to_string(self.dir.path().join("notices.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Two patches on a.txt and b.txt; the workload changes b.txt, so the
+    /// second conflicts.
+    fn one_lands_two_conflicts(&self) -> PathBuf {
+        self.record("a.txt", "a0\n");
+        self.record("b.txt", "b0\n");
+        self.ok(&["push"]);
+        let p = self.producer("p");
+        let a1 = self.file("a1", "a1\n");
+        let b1 = self.file("b1", "b-from-iac\n");
+        self.submit_ok(&p, &["--put", &format!("a.txt={a1}"), "-m", "one"]);
+        self.submit_ok(&p, &["--put", &format!("b.txt={b1}"), "-m", "two"]);
+        self.record("b.txt", "b-from-workload\n");
+        p
+    }
+}
+
+/// `(inbox, from kind, to kind, landed)` of a notice's changes.
+fn changes(notice: &serde_json::Value) -> Vec<(u64, String, String, bool)> {
+    let kind = |v: &serde_json::Value| v["kind"].as_str().unwrap_or("none").to_owned();
+    notice["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["inbox"].as_u64().unwrap(),
+                kind(&c["from"]),
+                kind(&c["to"]),
+                c["landed"].is_string(),
+            )
+        })
+        .collect()
+}
+
+fn change(n: u64, from: &str, to: &str, landed: bool) -> (u64, String, String, bool) {
+    (n, from.to_owned(), to.to_owned(), landed)
+}
+
+/// Acceptance 1: one notice per run that changed a verdict, none for a run
+/// that changed nothing.
+#[test]
+fn the_hook_is_told_each_change() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.notify_hook();
+    let p = s.one_lands_two_conflicts();
+
+    let out = s.agentfs(&["patch", "apply"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let notices = s.notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let first = &notices[0];
+    assert_eq!(first["schema"], 1);
+    assert_eq!(first["volume"], "demo");
+    assert_eq!(first["branch"], BRANCH);
+    assert_eq!(first["head"], s.branch_head().to_string());
+    let status = s.local().refname_to_id("refs/agentfs/demo/status").unwrap();
+    assert_eq!(first["status"], status.to_string());
+    assert_eq!(
+        changes(first),
+        [
+            change(1, "none", "none", true),
+            change(2, "none", "held", false)
+        ]
+    );
+    assert_eq!(
+        first["changes"][0]["patch"],
+        s.local().refname_to_id(&applied(1)).unwrap().to_string()
+    );
+    assert_eq!(first["changes"][1]["to"]["reason"], "conflict");
+
+    // Nothing new: no notice.
+    let out = s.agentfs(&["patch", "apply"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(s.notices().len(), 1);
+
+    // 2 replaced by one that merges: it lands, and the notice says so.
+    s.ok(&["push"]);
+    let b2 = s.file("b2", "b-from-workload\nand iac\n");
+    s.submit_ok(
+        &p,
+        &[
+            "--replace",
+            "2",
+            "--put",
+            &format!("b.txt={b2}"),
+            "-m",
+            "two again",
+        ],
+    );
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let notices = s.notices();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert_eq!(changes(&notices[1]), [change(2, "held", "none", true)]);
+    assert_eq!(notices[1]["apply"]["kind"], "landed");
+    assert_eq!(notices[1]["apply"]["landed"], serde_json::json!([2]));
+}
+
+/// Acceptance 2: a hook that fails raises `NotifyFailed`, and the next run
+/// sends the same changes again; once delivered, nothing more.
+#[test]
+fn a_failing_hook_retries_at_the_next_run() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.notify_hook();
+    s.one_lands_two_conflicts();
+    s.notify_mode(1);
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("alarm: telling the integrator of the patch queue's changes failed (hook)"),
+        "{err}"
+    );
+    assert!(err.contains("exited with 1"), "{err}");
+
+    s.notify_mode(0);
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert!(!err.contains("alarm: telling"), "{err}");
+    let notices = s.notices();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert_eq!(changes(&notices[1]), changes(&notices[0]));
+    assert_eq!(
+        changes(&notices[1]),
+        [
+            change(1, "none", "none", true),
+            change(2, "none", "held", false)
+        ]
+    );
+
+    let out = s.agentfs(&["patch", "apply"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(s.notices().len(), 2);
+}
+
+/// A request the webhook listener saw.
+struct Posted {
+    path: String,
+    headers: std::collections::BTreeMap<String, String>,
+    body: serde_json::Value,
+}
+
+/// An HTTP listener on 127.0.0.1: `/ok` answers 200, `/fail` 500.
+fn webhook_listener() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Posted>>>) {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+            let mut headers = std::collections::BTreeMap::new();
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = h.split_once(':') {
+                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_owned());
+                }
+            }
+            let len = headers
+                .get("content-length")
+                .and_then(|l| l.parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0; len];
+            let _ = reader.read_exact(&mut body);
+            let status = if path == "/ok" {
+                "200 OK"
+            } else {
+                "500 Internal Server Error"
+            };
+            log.lock().unwrap().push(Posted {
+                path,
+                headers,
+                body: serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+            });
+            let _ = stream.write_all(
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            );
+        }
+    });
+    (port, seen)
+}
+
+/// Acceptance 3: the webhook gets the notice with `Idempotency-Key:
+/// <volume>:<status>` and the bearer token; a 500 is `NotifyFailed`, and
+/// the next run sends it again.
+#[test]
+fn the_webhook_is_told_each_change() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    let (port, seen) = webhook_listener();
+    let token = s.file("token", "s3cret\n");
+    let mut config = git2::Config::open(&s.state().join("git/config")).unwrap();
+    config
+        .set_str(
+            "agentfs.patchNotifyUrl",
+            &format!("http://127.0.0.1:{port}/fail"),
+        )
+        .unwrap();
+    config
+        .set_str("agentfs.patchNotifyCredentialFile", &token)
+        .unwrap();
+    s.one_lands_two_conflicts();
+
+    let out = s.agentfs(&["patch", "apply"]);
+    let err = text(&out.stderr);
+    assert!(err.contains("failed (webhook)"), "{err}");
+    assert!(err.contains("answered 500"), "{err}");
+    config
+        .set_str(
+            "agentfs.patchNotifyUrl",
+            &format!("http://127.0.0.1:{port}/ok"),
+        )
+        .unwrap();
+    let out = s.agentfs(&["patch", "apply", "--no-fetch"]);
+    let err = text(&out.stderr);
+    assert!(!err.contains("failed (webhook)"), "{err}");
+    let status = s.local().refname_to_id("refs/agentfs/demo/status").unwrap();
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        let ok = &seen[1];
+        assert_eq!(ok.path, "/ok");
+        assert_eq!(
+            ok.headers.get("idempotency-key").map(String::as_str),
+            Some(format!("demo:{status}").as_str())
+        );
+        assert_eq!(
+            ok.headers.get("authorization").map(String::as_str),
+            Some("Bearer s3cret")
+        );
+        assert_eq!(
+            ok.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(ok.body["status"], status.to_string());
+        assert_eq!(changes(&ok.body), changes(&seen[0].body));
+        assert_eq!(changes(&ok.body).len(), 2);
+    }
+    let out = s.agentfs(&["patch", "apply", "--no-fetch"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(seen.lock().unwrap().len(), 2, "nothing new, nothing sent");
+}
+
+/// Acceptance 4: while `agentfs run` holds the volume, `patch apply`
+/// lands nothing: it judges, notifies with `apply.kind = attached`, and
+/// answers "workload attached; lands at next mount" with exit 75. With the
+/// daemon gone, the next apply lands it.
+#[test]
+fn apply_under_a_daemon_answers_attached() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.notify_hook();
+    s.record("a.txt", "a0\n");
+    s.ok(&["push"]);
+    let head = s.branch_head();
+    let p = s.producer("p");
+    let a1 = s.file("a1", "a1\n");
+    s.submit_ok(&p, &["--put", &format!("a.txt={a1}"), "-m", "one"]);
+
+    let mut run = s
+        .agentfs_command(&["run"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let socket = s.state().join("meta/control/agentfs.sock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !socket.exists() {
+        if std::time::Instant::now() > deadline {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("run never listened");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = s.agentfs(&["patch", "apply"]);
+    let _ = run.kill();
+    let _ = run.wait();
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(75), "{err}");
+    assert!(
+        err.contains("patches: workload attached; lands at next mount"),
+        "{err}"
+    );
+    assert!(err.contains("patch 1 ready"), "{err}");
+    assert_eq!(
+        s.read("a.txt").as_deref(),
+        Some("a0\n"),
+        "the tree is unchanged"
+    );
+    assert_eq!(s.branch_head(), head, "nothing landed");
+    assert_eq!(s.inbox_commits(1), 0);
+    let notices = s.notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["apply"]["kind"], "attached");
+    assert_eq!(
+        notices[0]["apply"]["message"],
+        "workload attached; lands at next mount"
+    );
+    assert_eq!(changes(&notices[0]), [change(1, "none", "ready", false)]);
+    let json = s.ok(&["patch", "status", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(doc["status"]["queue"][0]["verdict"]["kind"], "ready");
+
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("a.txt").as_deref(), Some("a1\n"));
+    let notices = s.notices();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert_eq!(changes(&notices[1]), [change(1, "ready", "none", true)]);
+}
+
+/// Acceptance 5: with no daemon, `patch apply` lands as before and the
+/// notice answers the call: `apply.kind = landed`.
+#[test]
+fn apply_with_no_daemon_lands() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.notify_hook();
+    s.record("a.txt", "a0\n");
+    s.ok(&["push"]);
+    let p = s.producer("p");
+    let a1 = s.file("a1", "a1\n");
+    s.submit_ok(&p, &["--put", &format!("a.txt={a1}"), "-m", "one"]);
+    let out = s.agentfs(&["patch", "apply"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(s.read("a.txt").as_deref(), Some("a1\n"));
+    let notices = s.notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["apply"]["kind"], "landed");
+    assert_eq!(notices[0]["apply"]["landed"], serde_json::json!([1]));
+    assert_eq!(changes(&notices[0]), [change(1, "none", "none", true)]);
+}

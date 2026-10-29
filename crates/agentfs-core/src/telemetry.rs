@@ -782,6 +782,7 @@ impl EventSink for TelemetrySink {
             | Event::PatchIgnored { .. }
             | Event::PatchHeld { .. }
             | Event::PatchRuleFailed { .. }
+            | Event::NotifyFailed { .. }
             | Event::PatchFetchFailed { .. }
             | Event::ForkFinished { .. }
             | Event::ForkPublished { .. }
@@ -837,6 +838,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::PatchIgnored { .. } => "agentfs.patch_ignored",
         Event::PatchHeld { .. } => "agentfs.patch_held",
         Event::PatchRuleFailed { .. } => "agentfs.patch_rule_failed",
+        Event::NotifyFailed { .. } => "agentfs.notify_failed",
         Event::PatchFetchFailed { .. } => "agentfs.patch_fetch_failed",
         Event::ForkFinished { .. } => "agentfs.fork_finished",
         Event::ForkPublished { .. } => "agentfs.fork_published",
@@ -1043,6 +1045,10 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
         } => {
             out.push(("agentfs.patch.inbox", AnyValue::Int(*inbox as i64)));
             out.push(("agentfs.patch.rule", AnyValue::from(*rule)));
+            out.push(("agentfs.message", s(message)));
+        }
+        Event::NotifyFailed { method, message } => {
+            out.push(("agentfs.notify.method", AnyValue::from(*method)));
             out.push(("agentfs.message", s(message)));
         }
         Event::PatchFetchFailed {

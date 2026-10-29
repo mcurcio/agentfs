@@ -1146,3 +1146,221 @@ fn a_duplicate_never_reapplies_a_reverted_change() {
     assert_eq!(f.read("a.txt").as_deref(), Some("a0\n"));
     assert_eq!(f.at_head("a.txt").as_deref(), Some("a0\n"));
 }
+
+impl Fixture {
+    /// [`Queue::judge`] with the volume open, as a daemon judges it.
+    fn judge(&self) -> super::queue::Judgement {
+        let integrator = GitMergeTree::new(self.state.git());
+        let events: Events = self.sink.clone();
+        super::queue::Queue::judge(&super::queue::JudgeContext {
+            state: &self.state,
+            history: self.committer.history(),
+            integrator: &integrator,
+            rule: &CleanMerge,
+            events: &events,
+            telemetry: &Telemetry::noop(),
+            committer: &crate::identity::Identity {
+                name: "agentfs".into(),
+                email: "agentfs@pod-0".into(),
+            },
+            fetch: None,
+        })
+        .unwrap()
+    }
+
+    /// Every ref but the status ref, with its target.
+    fn refs_but_status(&self) -> Vec<(String, Oid)> {
+        let mut out: Vec<(String, Oid)> = self
+            .repo()
+            .references()
+            .unwrap()
+            .map(|r| r.unwrap())
+            .filter(|r| r.name().ok() != Some(status_ref("vol").as_str()))
+            .map(|r| (r.name().unwrap().to_owned(), r.target().unwrap()))
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+/// Bead agentfs-mia.5: judging lands nothing, writes no ref but the status
+/// and no file of the tree, and every patch that would land is ready,
+/// judged against the same head; the status carries the verdicts.
+#[test]
+fn judging_writes_only_the_status() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("a.txt", Some("a1\n"))], "edit a");
+    let p2 = f.patch(base, &[("b.txt", Some("b-from-iac\n"))], "edit b");
+    let p3 = f.patch(base, &[("a.txt", Some("a-again\n"))], "edit a again");
+    f.change(&[("b.txt", "b-from-workload\n")], &[]);
+    for (n, p) in [(1, p1), (2, p2), (3, p3)] {
+        f.queue(n, p);
+    }
+    let head = f.head();
+    let refs = f.refs_but_status();
+    let cache_before = PatchState::load(&f.state.patch_state());
+
+    let judgement = f.judge();
+    assert_eq!(f.head(), head, "nothing landed");
+    assert_eq!(f.refs_but_status(), refs, "no ref but the status moved");
+    assert_eq!(f.read("a.txt").as_deref(), Some("a0\n"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("b-from-workload\n"));
+    let kinds: Vec<(u64, &str)> = judgement
+        .verdicts
+        .iter()
+        .map(|(n, v)| (*n, v.kind()))
+        .collect();
+    // 3 changes a.txt as 1 does: judged against the same head, it is ready
+    // too (ready is advisory until a landing).
+    assert_eq!(kinds, [(1, "ready"), (2, "held"), (3, "ready")]);
+    assert_eq!(judgement.blocked, None);
+    assert_eq!(
+        f.reference(&status_ref("vol")),
+        Some(judgement.status),
+        "the status ref is written"
+    );
+    let doc = read_status(f.repo(), judgement.status).unwrap();
+    assert_eq!(doc.queue.len(), 3);
+    assert_eq!(doc.queue[0].verdict, Some(Verdict::Ready));
+    assert!(doc.applied_now.is_empty());
+    let cache = PatchState::load(&f.state.patch_state());
+    assert_eq!(cache.queue_depth, 3);
+    assert_eq!(cache.held, 1);
+    assert_eq!(cache.status_oid, Some(judgement.status.to_string()));
+    assert_eq!(cache.scanned_head, cache_before.scanned_head);
+    assert_eq!(cache.last_applied, cache_before.last_applied);
+    assert!(
+        f.events()
+            .iter()
+            .any(|e| matches!(e, Event::PatchHeld { inbox: 2, .. })),
+        "a held patch is alarmed as at a run"
+    );
+
+    // A run lands by the same rules: 1 lands, and 3, ready against the old
+    // head, now conflicts with it.
+    let report = f.process();
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1]
+    );
+    let kinds: Vec<(u64, &str)> = report
+        .set_aside
+        .iter()
+        .map(|(n, v)| (*n, v.kind()))
+        .collect();
+    assert_eq!(kinds, [(2, "held"), (3, "held")]);
+}
+
+/// A notifier that records each notice and fails while told to.
+#[derive(Default)]
+struct Recording {
+    seen: std::sync::Mutex<Vec<notify::Notice>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl notify::Notifier for Arc<Recording> {
+    fn name(&self) -> &'static str {
+        "hook"
+    }
+
+    fn notify(&self, notice: &notify::Notice) -> Result<(), notify::NotifyError> {
+        self.seen.lock().unwrap().push(notice.clone());
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(notify::NotifyError::Hook("exited with 1".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Bead agentfs-mia.5, P1: the cursor moves only after every method
+/// delivered, so a failed notice is sent again at the next run, and once
+/// delivered, nothing more.
+#[test]
+fn a_failed_notice_is_sent_again() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("a.txt", "a0\n"), ("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("a.txt", Some("a1\n"))], "edit a");
+    let p2 = f.patch(base, &[("b.txt", Some("b-from-iac\n"))], "edit b");
+    f.change(&[("b.txt", "b-from-workload\n")], &[]);
+    f.queue(1, p1);
+    f.queue(2, p2);
+    let recording = Arc::new(Recording::default());
+    let notifiers: Vec<Box<dyn notify::Notifier>> = vec![Box::new(recording.clone())];
+    let events: Events = f.sink.clone();
+    let deliver = |status: Oid, landed: &[(u64, Oid)]| {
+        notify::deliver(
+            &f.state,
+            f.repo(),
+            status,
+            landed,
+            None,
+            &notifiers,
+            &events,
+        )
+        .unwrap()
+    };
+
+    recording
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let report = f.process();
+    let first = deliver(report.status, &report.applied);
+    assert_eq!(
+        first,
+        notify::Delivery {
+            sent: true,
+            failed: vec!["hook".into()]
+        }
+    );
+    assert!(f.events().iter().any(|e| matches!(
+        e,
+        Event::NotifyFailed { method: "hook", message } if message.contains("exited with 1")
+    )));
+    assert_eq!(
+        notify::NotifyCursor::load(&f.state.notify_state()).delivered_status,
+        None
+    );
+
+    // The next run changes nothing, and sends the same changes again.
+    recording
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let again = f.process();
+    assert!(again.applied.is_empty());
+    assert_eq!(
+        deliver(again.status, &again.applied).failed,
+        Vec::<String>::new()
+    );
+    let seen = recording.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    let changes = |n: &notify::Notice| {
+        n.changes
+            .iter()
+            .map(|c| {
+                (
+                    c.inbox,
+                    c.to.as_ref().map(Verdict::kind),
+                    c.landed.is_some(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        changes(&seen[0]),
+        [(1, None, true), (2, Some("held"), false)]
+    );
+    assert_eq!(changes(&seen[1]), changes(&seen[0]));
+    assert_eq!(seen[1].changes[0].patch, p1.to_string());
+
+    // Delivered: nothing more.
+    let third = f.process();
+    assert!(!deliver(third.status, &third.applied).sent);
+    assert_eq!(recording.seen.lock().unwrap().len(), 2);
+}

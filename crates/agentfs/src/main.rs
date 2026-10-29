@@ -1019,6 +1019,7 @@ fn run(
     let settings = committer.history().settings().clone();
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
+    let applier = patch_cmd::Applier::new(&committer, events.clone(), session.telemetry());
     let service = Service::start(committer, pushers, events).context("starting the service")?;
     // `agentfs push` asks it to push now; restores are refused (design
     // §2.3).
@@ -1029,6 +1030,7 @@ fn run(
             service.handle(),
             misconfigured(&settings),
             push_now::Restores::Refuse(push_now::RUN_SERVES_NO_RESTORES),
+            applier,
         ),
     );
     eprintln!(
@@ -1402,6 +1404,7 @@ fn mount(
     let restorer = recorder.clone();
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
+    let applier = patch_cmd::Applier::new(&committer, events.clone(), session.telemetry());
     let service = Service::start(committer, pushers, events).context("starting the service")?;
     let config = MountConfig {
         volume: settings.volume.clone(),
@@ -1442,6 +1445,7 @@ fn mount(
                 view: mounted.view(),
                 commit_window: settings.commit_window,
             }),
+            applier,
         ),
     );
     add_mounted_views(&mountpoint);

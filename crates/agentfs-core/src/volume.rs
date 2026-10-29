@@ -113,6 +113,14 @@ impl StateDir {
         self.meta().join("patch.json")
     }
 
+    /// The patch queue's notify cursor (bead agentfs-mia.5):
+    /// `meta/notify.json`, the last status whose changes were delivered
+    /// ([`crate::patch::notify::NotifyCursor`]). A cache: lost, every
+    /// change is sent again.
+    pub fn notify_state(&self) -> PathBuf {
+        self.meta().join("notify.json")
+    }
+
     /// `meta/fork.json`: the finisher's marks (design §2.2, §11.5).
     pub fn fork_mark(&self) -> PathBuf {
         self.meta().join("fork.json")
@@ -2389,6 +2397,13 @@ pub struct CommitReport {
 impl Committer {
     pub fn history(&self) -> &History {
         &self.history
+    }
+
+    /// The replica's committer identity (design §9), for work outside the
+    /// committer that signs as it (a daemon's patch judging, bead
+    /// agentfs-mia.5).
+    pub fn committer_identity(&self) -> crate::identity::Identity {
+        self.identities.committer().clone()
     }
 
     /// The replica's committer signature, now (design §9).

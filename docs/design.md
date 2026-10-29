@@ -145,6 +145,8 @@ through the mount:
     push/<remote>.lock   flock held while pushing that remote
     repairs              paths a mount could not record, for the next one (§3.5)
     patch.json           the patch queue's last run, a cache (§12)
+    notify.json          the last patch-queue status whose notice was
+                         delivered, a cache (§19.1 "Notify and apply")
     fork.json            a fork's published mark, written by the finisher
                          only after the fork remote confirmed it (§11.5)
     control/agentfs.sock the running daemon's control socket (§2.3, §15);
@@ -2412,7 +2414,11 @@ reused.
 
 **When it runs.** At mount, after journal replay and before the service
 and the FUSE layer start; `agentfs patch apply` does the same with the
-volume stopped. `agentfs run` does not. In order:
+volume stopped. `agentfs run` does not. While a daemon holds the volume,
+`agentfs patch apply` only judges the queue through the control socket,
+and nothing lands until the next mount; every run and every such judging
+notifies the integrator of the verdicts that changed (§19.1 "Notify and
+apply"). In order:
 
 1. commit what is journaled, so the head is the tree's state;
 2. fetch `inbox/*` from the patch remote: forced, this volume's only, local
@@ -2670,6 +2676,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PatchHeld` | A patch was set aside whole, held (the reason) or not judged (the rule), while the queue went on: the inbox number, the patch, the verdict, the reason and the message; raised at every run it stays so (§12) |
 | `PatchRuleFailed` | The acceptance rule could not judge a patch: the inbox number, the rule and why (a hook that did not start, failed, or ran out of `agentfs.patchAcceptTimeout`); the patch is not judged (§12) |
 | `PatchFetchFailed` | Fetching the inbox from the patch remote failed or timed out; the queue runs with what was already fetched (§12) |
+| `NotifyFailed` | Telling the integrator of the patch queue's verdict changes failed: the method (`hook`, the `patch-notify` hook; `webhook`, `agentfs.patchNotifyUrl`) and why; the same changes are sent again at the next queue run or apply (§19.1 "Notify and apply") |
 | `PatchIgnored` | An inbox entry the queue never applies: `stale` (at or below the last applied number, with another commit; deleted on the remote by the queue push) or `malformed` (§12); a warning |
 | `PatchApplied` | A patch was applied as a commit (not an alarm; sinks filter) |
 | `PatchDuplicate` | A queued patch commit was already applied under an earlier inbox number, so it was consumed with a marker commit and not applied again (§12; not an alarm) |
@@ -3823,7 +3830,10 @@ one-time migration of Hermes' existing data and the initial import in
     in direct mode, with no daemon answering; fronts take none;
   - `patch submit` runs on the producer's side, in its git repository,
     through its `git` (§12); `patch apply` fetches and applies the queue
-    with the volume stopped (it takes the lock; exit 1 when blocked);
+    with the volume stopped (it takes the lock; exit 1 when blocked), and
+    while a daemon runs asks it instead, which judges without landing
+    (exit 75, "workload attached; lands at next mount"; §19.1 "Notify and
+    apply");
     `patch status` reads `meta/patch.json` and the status ref, like
     `status`, which prints a `patches:` line. `push` prints a `queue:`
     line for the patch remote (§11.3);
@@ -4582,9 +4592,10 @@ runner.
 | Local-only volumes, the details (2026-10-17) | Design choices (F8 S3), not the owner's words: a local-only `agentfs push` prints `local-only: nothing to push` and exits 0; a start class on a local-only profile is `StartError::LocalOnly`; a fork with nowhere to push (no fork remote and no invalid flagged section) is local-only. (The 2026-10-17 F8 follow-ups removed the declaration's details: `none` beside a push section, `init` and CreateVolume refusing an undeclared result.) A fork of a local-only source finds it by `agentfs.fork.sourceState`, written at create (the source must stay at that path until the fork is published); its finish names the fork remote `(source history)`, which no remote section can be called; it receives through the source's control socket (`receive_fork`) when a daemon holds the source's lock, else under the lock, and `fork finish` exits 75 while another command holds it; the fork's LFS objects are copied into the source's cache; a ref another writer holds there is `AnotherWriter` and a source that is gone `RemoteGone`, both refused (§11.5). Amended 2026-10-17 (F8 fixes): a source that gains a remote pushes the refs it received, create-only, after each branch push that worked (`fork::receive::received_refs` finds them by their `finish` ref; one held on the remote at another commit fails the push), and the release decider waits (`ReceivedLacking`) while a remote lacks one, so "a remote added later gets all the history" holds and DeleteVolume never removes a fork's only copy. Refusing to receive once the source has a remote was rejected: forks made while it was local-only could not publish, and what it already received would stay unpushed |
 | The right technology for the job (2026-10-28) | The owner, 2026-10-28: "i never said \"no native libraries\". lets choose the right technology for the job". AGENTS.md's principle 4 read "Native libraries, not shelling out", worded as his priority without a quote; it now carries his words. A library or the `git` program is chosen per need, with its reason in §17.3. Said beside his answer that agentfs may run the `git` program to merge and ship mergiraf as a separate program (merge queue design, bead agentfs-mia.1) |
 | Three layers, each an integration point (2026-10-29) | The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into. So you don’t need to design a be-all-end-all singular technology so long as the necessary primitives exist and have good designs/API/docs". Library: `agentfs-core`. Filesystem: `agentfs-fuse` and the `agentfs` binary. Kubernetes adapter: `agentfs-csi`. A piece goes in the first layer whose question it passes: (1) usable as Rust calls with no mount and no agentfs process; (2) needs the mount or the running agentfs process (a command, the control socket, git over HTTP); (3) exists only because Kubernetes does. A higher layer may use any lower one. He accepted this placement ("Ok") |
-| Integrators decide when patches are applied (2026-10-29) | The owner, 2026-10-29: "Then the question isn’t “quiet moments or not” — it’s how do we provide an API so that an integrator can trigger this action?"; on the result: "I like that flow. Approved". agentfs sets no timing rule for writing queued patches into a running volume. Every layer offers two primitives: *notify* (agentfs tells the integrator a patch arrived; the files are unchanged) and *apply* (the integrator tells agentfs to write the waiting patches now). agentfs still applies by itself at mount, as today (§12). Designed, not built (§19.2 item 11) |
+| Integrators decide when patches are applied (2026-10-29) | The owner, 2026-10-29: "Then the question isn’t “quiet moments or not” — it’s how do we provide an API so that an integrator can trigger this action?"; on the result: "I like that flow. Approved". agentfs sets no timing rule for writing queued patches into a running volume. Every layer offers two primitives: *notify* (agentfs tells the integrator a patch arrived; the files are unchanged) and *apply* (the integrator tells agentfs to write the waiting patches now). agentfs still applies by itself at mount, as today (§12). Built as "Notify and apply" (bead agentfs-mia.5, §19.2 item 11) |
 | No live landing yet (2026-10-29) | The owner, 2026-10-29: "No live landing yet", then "Build incrementally". Patches keep landing only when no workload is attached, at mount (§12); an apply call while a workload is attached is answered "lands at next mount" and notifies. Landing while a workload runs is a later gate (§19.2 item 11) |
 | Keep going (2026-10-29) | A patch that cannot land is set aside whole and the queue goes on (§12): held for `conflict`, `merge_commit`, `parent_not_in_history`, `unsupported`, `too_large` and `refused`; waiting behind an earlier set-aside barrier or patch on the same paths; awaiting or not judged by the acceptance rule (`agentfs.patchAccept`: `cleanMerge` by default, `approval`, `command`). A run still stops at `gap`, `unrecorded` and `failed`, which are about the volume, not the patch. The owner, 2026-10-16: "Whole seems best, right? A partial application has unknown side effects"; "Not A, because that assumes that a clean merge is an acceptable merge"; 2026-10-29: "Configurable with a sensible default". A local mark `refs/agentfs/<volume>/held/<n>`, written before the next number is judged, exempts a set-aside number from the stale check, and an interrupted write counts as applied only by its trailer: the main session confirmed the architect's erratum (2026-10-29), since keep-going cannot keep the stale check word for word. Design choices, not the owner's words: which reasons hold and which stop; a barrier holds every later patch and waits only on its own files; a patch whose branch cannot be read makes nothing wait on its files; paths are compared as written; approvals stay on the remote after landing; a withdrawn held number above the high-water opens a gap, as a withdrawn queued number does. Bead agentfs-mia.2 (§19.2 item 11) |
+| Notify and apply (2026-10-29) | The two primitives of "Integrators decide when patches are applied", under "No live landing yet". *Notify:* after every queue run (mount, `patch apply`) and every apply under a daemon, the verdicts in the status written are compared with the last delivered notice (`meta/notify.json`, a cache) and, when any changed, one notice (schema 1) goes to the `$GIT_DIR/hooks/patch-notify` hook when it exists (the command runner fork delivery uses) and to the webhook `agentfs.patchNotifyUrl` when set (the one POST fork delivery's webhook uses; `Idempotency-Key: <volume>:<status>`, a bearer token from `agentfs.patchNotifyCredentialFile`, `agentfs.patchNotifyTimeout`); a failure raises `NotifyFailed` and the mark does not move, so the next queue event sends the same changes again: no timer, no retry loop, at least once. *Apply:* `agentfs patch apply` asks the control socket first (`apply`, protocol v1); a running daemon (`mount`, `run`, `serve-history`, fronts or none) always counts as attached, so it judges read only, writes the status, notifies, and answers "workload attached; lands at next mount" (exit 75), with each patch that would land `ready`; with no daemon, the lock path lands as before. Under CSI there is no code: a profile's config sets the webhook keys (main session's erratum confirmation, 2026-10-29: no CSI delivery webhook exists). The owner's words are those two rows'; the rest are design choices, not his words: a daemon with no front attached counts as attached too (a front may attach mid-landing); a ready verdict is a snapshot, judged against the head as it was, with later patches judged against the same head; the hook and the webhook share one timeout; a judging under a daemon also fetches the inbox (unless `--no-fetch`), raises `PatchHeld` as a run does, and signs the status as the daemon's committer. Bead agentfs-mia.5 (§19.2 item 11) |
 | Merge rules (2026-10-29) | `agentfs.patchIntegrate` picks `merge` (the default) or `rebase`, both by the `git` program; merge drivers come only from the operator's `$GIT_DIR/info/attributes` and the repository's config (AGENTS.md principle 3); a driver that cannot run leaves the patch not judged and alarmed (`PatchRuleFailed`, rule `merge`), never a conflict; mergiraf ships in the image as its own program (§17.3). The owner, 2026-10-16, asked "should we use the native git binary?" and liked the answer; 2026-10-28, on the gate page, picked both the git program and mergiraf; and 2026-10-28: "my opinion is that squashes are too blunt, but rebase can be attractive for cleaner history". The rest are design choices, not his words, and the first sits against that opinion: a rebase lands as one commit (its commits are listed in the message and kept by `applied/<n>`), not as a replayed chain, to keep one record per patch; every configured driver is checked before any merge, so one broken driver leaves every patch not judged, whatever its paths; a killed driver is told from other `merge-tree` failures only by git's wording. Bead agentfs-mia.3 (§19.2 item 11) |
 
 ### 19.2 Open questions
@@ -4719,8 +4730,11 @@ runner.
      between a landing and the workload's writes across pods.
    - *Built:* the tracer (a branch lands as one patch, merged by git;
      mia.4), keep-going with barriers, approvals and acceptance rules
-     (mia.2, §19.1 "Keep going"), and merge rules (merge or rebase,
-     merge drivers, mergiraf in the image; mia.3, §19.1 "Merge rules").
+     (mia.2, §19.1 "Keep going"), merge rules (merge or rebase,
+     merge drivers, mergiraf in the image; mia.3, §19.1 "Merge rules"),
+     and notify and apply (the `patch-notify` hook, the notify webhook,
+     `patch apply` judging under a daemon; mia.5, §19.1 "Notify and
+     apply").
    - *Beads:* agentfs-mia.4 (tracer), mia.2, mia.3, mia.5, mia.6,
      mia.9, mia.7, mia.8.
 

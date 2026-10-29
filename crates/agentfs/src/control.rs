@@ -17,11 +17,14 @@
 //!   "force":false,"dry_run":false}` (`path` for restore only), or
 //!   `{"v":1,"op":"push","remotes":[...],"timeout_ms":N}` (both
 //!   optional), or `{"v":1,"op":"receive_fork","path":...}` (a finished
-//!   fork's state area, F8 S3), at most [`MAX_REQUEST`] bytes, read
+//!   fork's state area, F8 S3), or `{"v":1,"op":"apply"}` (`agentfs patch
+//!   apply`, bead agentfs-mia.5), at most [`MAX_REQUEST`] bytes, read
 //!   within [`READ_TIMEOUT`];
 //! - reply: `{"ok":{...}}` (a restore or revert), `{"pushed":{...}}` (a
 //!   push), `{"received":{"change":...}}` (a fork received into this
-//!   local-only volume's history),
+//!   local-only volume's history), `{"attached":{"message":...,
+//!   "verdicts":[[n,{...}],...]}}` (an apply: the queue was judged, not
+//!   applied, since this daemon holds the volume),
 //!   `{"refused":{"kind":...,"message":...,"hint":...}}`,
 //!   `{"busy":"..."}` (another restore is running, or this daemon serves
 //!   no restores) or `{"error":"..."}`.
@@ -30,7 +33,10 @@
 //! beside them and each other. `push` was added to v1 with optional
 //! fields only: a daemon from before it answers `{"error":"malformed
 //! request: unknown variant ..."}`, and `agentfs push` then falls back to
-//! pushing directly (which the lock refuses with exit 75).
+//! pushing directly (which the lock refuses with exit 75). `apply` was
+//! added the same way: `agentfs patch apply` falls back on such an answer,
+//! and on a reply it cannot read, to its lock path, which a running daemon
+//! refuses with exit 75.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
@@ -63,6 +69,9 @@ pub enum Op {
     /// Receive a finished fork into this local-only volume's history (F8
     /// S3): every daemon serves it, beside the others.
     ReceiveFork,
+    /// `agentfs patch apply` (bead agentfs-mia.5): every daemon serves it,
+    /// beside the others, by judging the queue without landing anything.
+    Apply,
 }
 
 impl Op {
@@ -91,6 +100,10 @@ pub struct Request {
     /// Push: how long the daemon waits for the attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Apply: judge what is already fetched; do not contact the patch
+    /// remote (`patch apply --no-fetch`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_fetch: bool,
 }
 
 impl Request {
@@ -105,6 +118,7 @@ impl Request {
             dry_run: false,
             remotes,
             timeout_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+            no_fetch: false,
         }
     }
 
@@ -120,6 +134,24 @@ impl Request {
             dry_run: false,
             remotes: Vec::new(),
             timeout_ms: None,
+            no_fetch: false,
+        }
+    }
+}
+
+impl Request {
+    /// An apply request; `fetch` false judges what is already fetched.
+    pub fn apply(fetch: bool) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            op: Op::Apply,
+            path: None,
+            commit: String::new(),
+            force: false,
+            dry_run: false,
+            remotes: Vec::new(),
+            timeout_ms: None,
+            no_fetch: !fetch,
         }
     }
 }
@@ -182,6 +214,12 @@ pub enum Reply {
     /// this volume's history.
     Received {
         change: String,
+    },
+    /// An apply while this daemon holds the volume: nothing landed; the
+    /// patches judged, by inbox number, and what to tell the caller.
+    Attached {
+        message: String,
+        verdicts: Vec<(u64, agentfs_core::patch::Verdict)>,
     },
     Refused {
         kind: String,
@@ -449,6 +487,7 @@ mod tests {
             dry_run: true,
             remotes: Vec::new(),
             timeout_ms: None,
+            no_fetch: false,
         }
     }
 
@@ -543,6 +582,36 @@ mod tests {
                 .unwrap()
                 .starts_with(r#"{"pushed":{"#)
         );
+    }
+
+    /// Bead agentfs-mia.5: `apply` round-trips, and a reply this build
+    /// cannot read is an error (`agentfs patch apply` falls back on it).
+    #[test]
+    fn apply_requests_round_trip() {
+        let apply = Request::apply(true);
+        let json = serde_json::to_string(&apply).unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"op":"apply","force":false,"dry_run":false}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), apply);
+        let bare: Request = serde_json::from_str(r#"{"v":1,"op":"apply"}"#).unwrap();
+        assert_eq!(bare, apply);
+        let no_fetch = Request::apply(false);
+        let json = serde_json::to_string(&no_fetch).unwrap();
+        assert!(json.contains(r#""no_fetch":true"#), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), no_fetch);
+        let attached = Reply::Attached {
+            message: "workload attached; lands at next mount".into(),
+            verdicts: vec![(1, agentfs_core::patch::Verdict::Ready)],
+        };
+        let json = serde_json::to_string(&attached).unwrap();
+        assert_eq!(
+            json,
+            r#"{"attached":{"message":"workload attached; lands at next mount","verdicts":[[1,{"kind":"ready"}]]}}"#
+        );
+        assert_eq!(serde_json::from_str::<Reply>(&json).unwrap(), attached);
+        assert!(serde_json::from_str::<Reply>(r#"{"applied_live":{}}"#).is_err());
     }
 
     /// A push is served while a restore holds the daemon.

@@ -150,6 +150,23 @@ a rollout). With the volume stopped, `agentfs patch apply` does the same:
 agentfs --state "$STATE" --root "$BACKING" patch apply   # exit 1 when blocked or a patch is set aside, 75 when busy
 ```
 
+While a daemon holds the volume (`mount`, `run` or `serve-history`, with
+fronts or without), `agentfs patch apply` asks it through the control
+socket instead, and **nothing lands**: the daemon fetches the inbox (unless
+`--no-fetch`), judges every queued patch against the head as it is, writes
+the status, [notifies](#7-notifying-the-integrator), and the command exits
+75:
+
+```text
+patch 3 ready
+patch 4 held (conflict): merging onto the branch head 9a0b... conflicts in config/app.yaml
+patches: workload attached; lands at next mount
+```
+
+`ready` patches land at the next mount (a pod restart), or with an apply
+once the daemon is stopped. A daemon from before this answer refuses the
+request, and the command falls back to taking the lock, which exits 75.
+
 The mount first fetches `inbox/*` from the patch remote, waiting at most
 `agentfs.patchFetchTimeout` (default `30s`). If that fails, the alarm
 `PatchFetchFailed` is raised and the patches already fetched apply. The
@@ -224,13 +241,14 @@ A `verdict` is one of:
 | `waiting` | `why` (`same_files` or `barrier`), `behind` | Behind these earlier set-aside patches |
 | `awaiting` | `what` (`approval` or `command`) | The acceptance rule has not accepted it yet |
 | `not_judged` | `rule`, `message` | The acceptance rule could not judge it |
+| `ready` | | Would land now; given only by an apply while a daemon holds the volume ([section 2](#2-when-patches-apply)). Advisory: it was judged against the head as it was, and lands at the next mount or apply with nothing attached |
 
 Telemetry: `agentfs.patch.queue_depth`, `agentfs.patch.blocked` (alert on
 it being 1), `agentfs.patch.held` (patches set aside at the last run), the
 span `agentfs.patch` (outcome `applied`, `held`, `waiting`, `awaiting`,
-`not_judged` or `blocked`), the `PatchBlocked`, `PatchHeld`,
-`PatchRuleFailed` and `PatchFetchFailed` alarms, and the `PatchIgnored`
-warning. Waiting and awaiting raise nothing: the status carries them.
+`not_judged`, `ready` or `blocked`), the `PatchBlocked`, `PatchHeld`,
+`PatchRuleFailed`, `PatchFetchFailed` and `NotifyFailed` alarms, and the
+`PatchIgnored` warning. Waiting and awaiting raise nothing: the status carries them.
 
 ## 4. A patch set aside
 
@@ -325,6 +343,9 @@ Nothing to do by hand.
 | `agentfs.patchFetchTimeout` | `30s` | How long a mount waits for the fetch; `0` or `off` skips it |
 | `agentfs.patchAccept` | `cleanMerge` | The acceptance rule for a cleanly merged patch: `cleanMerge` lands it, `approval` waits for `agentfs patch approve`, `command` asks `$GIT_DIR/hooks/patch-accept` ([section 4](#4-a-patch-set-aside)) |
 | `agentfs.patchAcceptTimeout` | `60s` | How long the hook may run before its process group is killed and the patch is not judged |
+| `agentfs.patchNotifyUrl` | unset | The notify webhook ([section 7](#7-notifying-the-integrator)) |
+| `agentfs.patchNotifyCredentialFile` | unset | Its bearer token's file |
+| `agentfs.patchNotifyTimeout` | `30s` | How long the `patch-notify` hook and the webhook may take |
 
 The queue push (status ref, `applied/<n>`, deleting `inbox/<n>` of applied
 numbers, stale ones included) runs after each branch push attempt to the
@@ -333,3 +354,46 @@ remote even while the branch cannot push (applied refs and deletions wait
 for a branch push that worked); `agentfs push` prints it as
 `<remote>: queue: ...`. Its failures are `PushFailed` with stage `queue`
 and never count against the branch.
+
+## 7. Notifying the integrator
+
+After every queue run (a mount, `agentfs patch apply`) and every apply
+judged under a daemon, agentfs compares the verdicts in the status it wrote
+with those of the last notice it delivered, and if any changed, sends one
+**notice** to each method configured:
+
+- the hook `$GIT_DIR/hooks/patch-notify`, if the file exists: run without a
+  shell, in an empty environment but `PATH`, the notice as JSON on stdin,
+  killed after `agentfs.patchNotifyTimeout`; exit 0 is delivered;
+- the webhook `agentfs.patchNotifyUrl`: a POST of the notice as
+  `application/json`, with `Idempotency-Key: <volume>:<status commit>` and,
+  with `agentfs.patchNotifyCredentialFile`, `Authorization: Bearer
+  <token>`; redirects are not followed; a 2xx is delivered. Under CSI, set
+  the keys in the profile's config.
+
+A notice (schema 1):
+
+```json
+{"schema":1,"volume":"hermes","branch":"refs/heads/agentfs/hermes","head":"9a0b...",
+ "status":"c41e...","changes":[
+   {"inbox":3,"patch":"5d2f...","from":null,"to":null,"landed":"6f1c..."},
+   {"inbox":4,"patch":"8e77...","from":null,"to":{"kind":"held","reason":"conflict","message":"...","paths":["config/app.yaml"]},"landed":null}],
+ "apply":{"kind":"landed","landed":[3]}}
+```
+
+Each change names the patch's number and tip, its verdict before (`from`,
+as last delivered) and now (`to`, a `verdict` of [section 3](#3-check-the-queue));
+`null` means not queued then (or queued but not reached), and `landed` is
+the branch commit when it landed. `apply` is there when the notice answers
+an apply call: `landed` (the numbers it landed) or `attached` (`message`:
+`workload attached; lands at next mount`).
+
+A method that fails (another exit status, a non-2xx answer, a timeout, a
+credential file that cannot be read) raises **`NotifyFailed`**
+(`telling the integrator of the patch queue's changes failed (hook): ...`).
+Nothing retries it on a timer: the next queue run or apply sends the same
+changes again, because the delivered mark in `meta/notify.json` moves only
+when every method delivered. Fix the hook or the receiver, then run
+`agentfs patch apply` (or wait for the next mount). Delivery is at least
+once: a receiver dedupes on volume, inbox, patch and verdict. Deleting
+`meta/notify.json` sends every queued patch's verdict again.

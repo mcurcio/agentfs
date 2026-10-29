@@ -9,7 +9,11 @@
 # - a remount applies 1 to 3 and 5, holds 4 whole and mounts anyway; the
 #   push moves the remote's refs and the status ref says why;
 # - a crash between the commit and the ref moves applies nothing twice;
-# - `agentfs patch submit --replace 4` with a rebased patch lands it.
+# - `agentfs patch submit --replace 4` with a rebased patch lands it;
+# - `agentfs patch apply` under the running mount lands nothing, answers
+#   "workload attached; lands at next mount" (exit 75) and tells the
+#   `patch-notify` hook; the next mount lands it and tells the hook again
+#   (bead agentfs-mia.5).
 #
 # Needs a server from ci/git-http-server.sh and its GIT_* variables, Linux
 # with /dev/fuse, fuse3, git and passwordless sudo.
@@ -192,5 +196,29 @@ for n in 1 2 3 4 5; do
   who=$(rgit log --format='%an|%cn' --grep "^Agentfs-Inbox: $n\$" refs/heads/agentfs/demo)
   assert_eq "Patch Producer|ci-0" "$who" "patch $n: authored by the producer, committed by agentfs"
 done
+
+step "an apply under the running mount lands nothing and notifies"
+NOTICES=$W/notices.jsonl
+sudo mkdir -p "$STATE/git/hooks"
+sudo sh -c "printf '#!/bin/sh\\ncat >>%s\\necho >>%s\\n' '$NOTICES' '$NOTICES' >'$STATE/git/hooks/patch-notify'"
+sudo chmod 755 "$STATE/git/hooks/patch-notify"
+printf 'd\n' >"$W/d1"
+assert_contains "$(submit "$W/p1" --put "d.txt=$W/d1" -m "six")" "queued patch 6" "patch 6"
+code=0
+out=$(af patch apply 2>&1) || code=$?
+assert_eq 75 "$code" "patch apply under a mount exits 75"
+assert_contains "$out" "patches: workload attached; lands at next mount" "the answer"
+assert_contains "$out" "patch 6 ready" "patch 6 would land"
+[ ! -e "$MNT/d.txt" ] || fail "patch 6 was written under the workload"
+assert_eq 1 "$(grep -c . "$NOTICES")" "one notice"
+assert_contains "$(cat "$NOTICES")" '"apply":{"kind":"attached"' "the notice answers the apply"
+assert_contains "$(cat "$NOTICES")" '"to":{"kind":"ready"}' "patch 6 is ready"
+stop_mount
+start_mount
+assert_eq "d" "$(cat "$MNT/d.txt")" "the next mount lands patch 6"
+assert_eq 2 "$(grep -c . "$NOTICES")" "the mount notifies too"
+last=$(tail -n 1 "$NOTICES")
+assert_contains "$last" '"from":{"kind":"ready"},"to":null,"landed":"' "patch 6 landed"
+case "$last" in *'"apply"'*) fail "a mount's notice answers no apply call" ;; esac
 stop_mount
 pass "patch queue end to end"

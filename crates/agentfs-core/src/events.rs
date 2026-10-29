@@ -276,6 +276,14 @@ pub enum Event {
         rule: &'static str,
         message: String,
     },
+    /// Telling the integrator of the patch queue's verdict changes failed
+    /// (bead agentfs-mia.5, [`crate::patch::notify`]): the notice is sent
+    /// again at the next queue run or apply. An alarm.
+    NotifyFailed {
+        /// `hook` or `webhook`.
+        method: &'static str,
+        message: String,
+    },
     /// Fetching the patch queue from its remote failed; the queue ran with
     /// what was already fetched (design §12).
     PatchFetchFailed {
@@ -374,6 +382,7 @@ impl Event {
             Self::PatchIgnored { .. } => "patch_ignored",
             Self::PatchHeld { .. } => "patch_held",
             Self::PatchRuleFailed { .. } => "patch_rule_failed",
+            Self::NotifyFailed { .. } => "notify_failed",
             Self::PatchFetchFailed { .. } => "patch_fetch_failed",
             Self::ForkFinished { .. } => "fork_finished",
             Self::ForkPublished { .. } => "fork_published",
@@ -544,6 +553,11 @@ impl fmt::Display for Event {
             } => write!(
                 f,
                 "the acceptance rule {rule} could not judge patch {inbox}: {message}"
+            ),
+            Self::NotifyFailed { method, message } => write!(
+                f,
+                "telling the integrator of the patch queue's changes failed ({method}): \
+                 {message}; sent again at the next queue run"
             ),
             Self::PatchFetchFailed {
                 remote,

@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::{Finished, RunError, run_with_stdin};
 use crate::config::validate_name;
+use crate::lfs::client::PostError;
 use crate::patch::submit::{
     self, DEFAULT_ATTEMPTS, GitRunner, PushLine, Source, SubmitError, SubmitRequest, check,
     parse_ls_remote,
@@ -662,13 +663,7 @@ impl Delivery for WebhookDelivery {
     fn deliver(&self, change: &PublishedChange) -> Result<Delivered, DeliveryError> {
         let payload = serde_json::to_vec(&DeliveryPayload::new(change, &self.fork_remote))
             .map_err(|e| DeliveryError::BadMethod(e.to_string()))?;
-        // No redirects and never a proxy from the environment, as the LFS
-        // client (design §7).
-        let agent = crate::lfs::client::agent(1, None);
-        let mut request = agent
-            .post(self.url.as_str())
-            .header("Content-Type", "application/json")
-            .header("Idempotency-Key", &change.change);
+        let mut headers = vec![("Idempotency-Key", change.change.clone())];
         if let Some(file) = &self.credential_file {
             let token = std::fs::read_to_string(file).map_err(|e| {
                 DeliveryError::BadMethod(format!(
@@ -676,34 +671,20 @@ impl Delivery for WebhookDelivery {
                     file.display()
                 ))
             })?;
-            request = request.header("Authorization", format!("Bearer {}", token.trim()));
+            headers.push(("Authorization", format!("Bearer {}", token.trim())));
         }
-        let response = request
-            .config()
-            .timeout_global(Some(self.timeout))
-            .build()
-            .send(&payload[..]);
-        let response = match response {
-            Ok(r) => r,
-            Err(e @ (ureq::Error::BadUri(_) | ureq::Error::Http(_))) => {
-                return Err(DeliveryError::BadMethod(format!(
-                    "the webhook request to {} is malformed: {e}",
-                    self.url
-                )));
+        let posted = match crate::lfs::client::post(&self.url, &payload, &headers, self.timeout) {
+            Ok(posted) => posted,
+            Err(e @ PostError::Malformed { .. }) => {
+                return Err(DeliveryError::BadMethod(format!("the webhook {e}")));
             }
-            Err(e) => {
+            Err(e @ PostError::Unreachable { .. }) => {
                 return Err(DeliveryError::ReceiverUnavailable {
-                    detail: format!("POST {}: {e}", self.url),
+                    detail: e.to_string(),
                 });
             }
         };
-        let status = response.status().as_u16();
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let body = crate::lfs::client::read_small(response);
+        let (status, location, body) = (posted.status, posted.location, posted.body);
         let body = String::from_utf8_lossy(&body);
         let detail = format!("POST {} answered {status}: {}", self.url, body.trim());
         match status {
