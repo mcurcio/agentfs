@@ -587,6 +587,7 @@ Hermes' current volume holds its files at the root. agentfs needs them
 under `backing/`, next to `state/`. A one-time Job, with Hermes scaled to
 zero and the same PVC mounted at `/data`:
 
+<!-- ci: hermes-migration -->
 ```sh
 set -eu
 cd /data

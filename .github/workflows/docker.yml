@@ -18,6 +18,8 @@ on:
       - ci/docker/**
       - ci/e2e-hermes.sh
       - ci/hermes/**
+      # The kind scenarios' manifests: hermes.yml.
+      - "!ci/hermes/k8s/**"
       - deploy/examples/hermes/**
       - ci/lib.sh
       - .github/workflows/docker.yml

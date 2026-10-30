@@ -1,0 +1,40 @@
+# The scripted stand-in for the model API (ci/hermes/model/model.py), as
+# the Service `model`: Hermes' config reaches it at http://model:8000/v1.
+# The Hermes image only for its python3, so the node pulls no other image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: hermes-model }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: hermes-model }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: model
+          image: hermes-agent
+          command: [python3, /model/model.py, "8000", /model/scenarios.json]
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 2
+          volumeMounts:
+            - { name: model, mountPath: /model, readOnly: true }
+      volumes:
+        - name: model
+          configMap: { name: hermes-model }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model
+spec:
+  selector: { app.kubernetes.io/name: hermes-model }
+  ports:
+    - port: 8000
+      targetPort: 8000
