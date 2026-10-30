@@ -870,6 +870,37 @@ fn release_and_sweep_backstops() {
     assert_eq!(fx.backlog(), 0);
 }
 
+/// A writer that shared a passthrough backing id (design §17.1): its
+/// mapping may write after RELEASE without the daemon seeing it, so the
+/// node is swept with no handle open and recorded at FORGET.
+#[test]
+fn a_mapping_that_may_write_unseen_is_watched_until_forget() {
+    let fx = Fx::new();
+    fx.put("m", "0");
+    fx.put("plain", "0");
+    fx.history();
+    let id = fx.id("m");
+    let fh = fx.open("m", O_RDWR);
+    fx.ops.mapping_may_write(id);
+    fx.close(fh);
+    let plain = fx.open("plain", O_RDWR);
+    fx.close(plain);
+    // Written through the mapping after the last RELEASE.
+    fs::write(fx.backing().join("m"), "11").unwrap();
+    fs::write(fx.backing().join("plain"), "11").unwrap();
+    assert_eq!(fx.ops.sweep(false).recorded, 1);
+    assert_eq!(fx.history()["m"], file("11"));
+    // Only the watched node: a plain one is recorded by its next boundary.
+    assert_eq!(fx.history()["plain"], file("0"));
+    assert_eq!(fx.ops.sweep(false).recorded, 0, "unchanged since");
+    // Written again; the kernel forgets the node only once no mapping is
+    // left, so FORGET records it.
+    fs::write(fx.backing().join("m"), "222").unwrap();
+    fx.ops.forget(id, u64::MAX);
+    assert_eq!(fx.history()["m"], file("222"));
+    assert_eq!(fx.backlog(), 0);
+}
+
 #[test]
 fn stale_backing_inodes_are_detected() {
     let fx = Fx::new();

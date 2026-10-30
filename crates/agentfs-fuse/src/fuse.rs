@@ -21,7 +21,8 @@
 //!   is live, and writes through it would go unrecorded. One backing id is
 //!   kept per inode while any handle on it is open. The kernel refuses to
 //!   mix the two modes on one inode (`ETXTBSY`, the open failing with
-//!   `EIO`), so an inode with a backing id open keeps it, for a writer too,
+//!   `EIO`), so an inode with a backing id open keeps it, for a writer too
+//!   (whose node is then watched until FORGET, [`Ops::mapping_may_write`]),
 //!   and one with daemon handles open gets no new one. If registering fails
 //!   for an inode (a stacked backing filesystem such as overlayfs,
 //!   `EMFILE`), only that inode goes through the daemon, while it has a
@@ -142,8 +143,6 @@ struct BackingIds {
     daemon_nodes: HashMap<u64, usize>,
     /// Registrations that failed.
     refused: u64,
-    /// Writers that shared an open backing id ([`way`]).
-    shared_writers: u64,
 }
 
 impl BackingIds {
@@ -177,8 +176,9 @@ enum Way {
 /// be recorded. A read-only handle cannot make a writable shared mapping.
 /// The one exception is the kernel's: an inode with a backing id open
 /// fails any open without one (`EIO`), so a writer there shares the id,
-/// and that gap stays for it. An fsync-class file always goes through the
-/// daemon (design §8).
+/// and its node is watched until the kernel forgets it instead
+/// ([`Ops::mapping_may_write`]). An fsync-class file always goes through
+/// the daemon (design §8).
 fn way(daemon_only: bool, write: bool, backing_open: bool, daemon_open: bool) -> Way {
     if daemon_only {
         Way::Daemon
@@ -270,21 +270,9 @@ impl FuseFs {
         ) {
             (Way::Shared, Some(id)) => {
                 if handle.write {
-                    ids.shared_writers += 1;
-                    if ids.shared_writers <= REFUSALS_LOGGED {
-                        eprintln!(
-                            "agentfs: inode {} opened for writing while a passthrough handle is \
-                             open on it: it shares that backing file (the kernel refuses to mix \
-                             the two), so a write through a shared mapping after its last close \
-                             is not recorded (design §17.1){}",
-                            handle.node,
-                            if ids.shared_writers == REFUSALS_LOGGED {
-                                " (further ones are not logged)"
-                            } else {
-                                ""
-                            }
-                        );
-                    }
+                    // Its mapping would not hold the FUSE file: watched
+                    // until FORGET instead.
+                    self.ops.mapping_may_write(handle.node);
                 }
                 ids.by_handle.insert(fh, (handle.node, id.clone()));
                 return Route::Passthrough(id);

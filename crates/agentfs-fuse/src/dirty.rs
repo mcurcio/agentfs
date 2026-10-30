@@ -18,10 +18,10 @@
 //! RELEASE comes once every handle is closed and every mapping made through
 //! a daemon handle is gone; that is every writer's, except a writer sharing
 //! a passthrough backing id, whose mapping does not hold the FUSE file
-//! open (design §3.1, §17.1). It is the only backstop for a same-tick write
-//! through a shared mapping, and for a file without one it follows the
-//! last close at once, so a file written and closed within the window
-//! would be recorded twice. Instead, a racy record pins
+//! open, so its node stays armed until FORGET (design §3.1, §17.1).
+//! RELEASE is the only backstop for a same-tick write through a shared
+//! mapping, and for a file without one it follows the last close at once,
+//! so a file written and closed within the window would be recorded twice. Instead, a racy record pins
 //! its frozen copy ([`FrozenRef`]); a boundary that would record again only
 //! because of the racy rule compares the file's bytes with that copy, and
 //! skips the record if they are equal and the copy is still the last state

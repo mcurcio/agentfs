@@ -1373,8 +1373,10 @@ fn released(m: &Mounted, path: &Path, limit: Duration) -> bool {
 /// auto in CI run 40993499943). So a handle that can write is never given
 /// passthrough (design §17.1): its mapping holds the FUSE file, and
 /// RELEASE waits for munmap in every mode. Should a writer get passthrough
-/// again, the writer here writes only once the daemon has served that
-/// RELEASE, so the write never races it.
+/// of its own again, its mapping would be on the backing file, which the
+/// assertion on `mapped_backing` catches. A writer sharing a reader's
+/// backing id is covered by
+/// `a_writer_sharing_a_readers_passthrough_backing_file_is_recorded`.
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn a_shared_mapping_written_after_the_last_close_is_recorded() {
@@ -1431,10 +1433,6 @@ fn a_shared_mapping_written_after_the_last_close_is_recorded() {
             assert_eq!(got.as_deref(), Some(want), "the writer of {name}");
         };
         said("closed");
-        // With the mapping holding the FUSE file open (no passthrough) no
-        // RELEASE comes before munmap: under passthrough this waits its
-        // whole timeout, and only a writer given passthrough would end it.
-        let release_first = active && released(&m, &backing, Duration::from_secs(10));
         writeln!(stdin, "write").unwrap();
         said("written");
         // Under passthrough the mapping is the backing file's page cache:
@@ -1455,15 +1453,14 @@ fn a_shared_mapping_written_after_the_last_close_is_recorded() {
             "the writer of {name}: {status:?} {rest:?}"
         );
         println!(
-            "agentfs-dyu: {name} ({mode}): RELEASE served before the write: {release_first}; \
-             backing file before msync {before_msync:?}, so the mapping is the {}; then {rest:?}",
+            "agentfs-dyu: {name} ({mode}): backing file before msync {before_msync:?}, so the mapping is the {}; then {rest:?}",
             if mapped_backing {
                 "backing file (passthrough)"
             } else {
                 "FUSE file (through the daemon)"
             }
         );
-        evidence.push((name, new, release_first, mapped_backing));
+        evidence.push((name, new, mapped_backing));
     }
 
     // Shutdown is the event after which nothing more is recorded: every
@@ -1474,7 +1471,7 @@ fn a_shared_mapping_written_after_the_last_close_is_recorded() {
     assert!(status.contains("backlog:   0 record(s)"), "{status}");
     let history = v.history();
     let mut gaps = Vec::new();
-    for (name, new, _, _) in &evidence {
+    for (name, new, _) in &evidence {
         let on_disk = fs::read_to_string(v.backing().join(name)).unwrap();
         assert_eq!(&on_disk, new, "the write never reached the backing file");
         let recorded = history.get(*name);
@@ -1495,7 +1492,7 @@ fn a_shared_mapping_written_after_the_last_close_is_recorded() {
 
     // A writer's mapping is on the FUSE file in every mode: a handle that
     // can write never gets passthrough (design §17.1).
-    for (name, _, _, mapped_backing) in &evidence {
+    for (name, _, mapped_backing) in &evidence {
         assert!(
             !*mapped_backing,
             "{name}: passthrough active {active}, mapping on the backing file"

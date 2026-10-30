@@ -687,13 +687,6 @@ whole, consistent groups instead.
   daemon while it is open; every other file keeps passthrough. The first
   ten are logged. With `--passthrough on` the open fails with `EIO` and the
   mount stops with exit status 1 instead.
-- **`opened for writing while a passthrough handle is open` in the log.**
-  A file was opened for writing while another descriptor had it open
-  read-only with passthrough. The kernel allows only one mode per file, so
-  the writer shares the reader's backing file: its writes and closes are
-  recorded as usual, but a write through a shared memory mapping after its
-  last close is not (design §17.1). The first ten are logged. Where that
-  matters, use `--passthrough off`.
 - **`close` fails with `EIO`.** Recording failed, usually because the state
   area is full or unwritable. A `RecordFailed` alarm says why. The file is
   still changed in the backing tree and stays marked as changed, so its next

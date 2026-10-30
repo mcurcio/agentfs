@@ -913,8 +913,40 @@ impl Ops {
         }
     }
 
+    /// The kernel forgot `n` lookups of `id`. A node whose mapping may
+    /// write unseen ([`Ops::mapping_may_write`]) with no handle open is
+    /// recorded first if it changed: the kernel forgets a node only once
+    /// its inode is evicted, which a live mapping prevents (it pins the
+    /// dentry), so every write through it has landed (design §3.1).
     pub fn forget(&self, id: u64, n: u64) {
+        let watched = self
+            .table()
+            .get(id)
+            .filter(|node| node.mapping_may_write && node.handles.is_empty())
+            .map(|node| node.dirty.last_writer.unwrap_or(NOBODY));
+        if let Some(caller) = watched {
+            let _names = self.read_names();
+            if let Ok(fd) = self.node_fd(id)
+                && self.record_node(id, &fd, Trigger::Release, caller).is_err()
+            {
+                // The sweep re-derives the content from the tree.
+                let paths = self.table().paths(id);
+                self.boundary.queue_repair(paths, caller);
+            }
+        }
         self.table().forget(id, n);
+    }
+
+    /// A handle that can write on node `id` was given a passthrough
+    /// backing id another handle had open (the kernel allows no other
+    /// handle there, design §17.1). A shared mapping it makes holds the
+    /// backing file, not the FUSE file, so RELEASE can come while the
+    /// mapping still writes: the node stays armed and swept until the
+    /// kernel forgets it ([`Ops::forget`]).
+    pub fn mapping_may_write(&self, id: u64) {
+        if let Some(node) = self.table().get_mut(id) {
+            node.mapping_may_write = true;
+        }
     }
 
     pub fn getattr(&self, id: u64, fh: Option<u64>) -> OpResult<FileAttr> {
@@ -1991,12 +2023,15 @@ impl Ops {
             let _names = self.read_names();
             match self.record_node(h.node, &h.fd, Trigger::Release, last_writer) {
                 Ok(_) => {
+                    // Nothing can write it unseen any more but a mapping,
+                    // which RELEASE covers unless the mapping holds a
+                    // passthrough backing file: then the node stays armed
+                    // until FORGET.
                     if let Some(node) = self.table().get_mut(h.node)
                         && node.write_handles == 0
+                        && !node.mapping_may_write
                     {
                         node.dirty.armed = false;
-                        // Nothing can write it unseen any more but a
-                        // mapping, which RELEASE already covered.
                         node.dirty.frozen = None;
                     }
                 }
@@ -2275,7 +2310,9 @@ impl Ops {
             self.boundary.repaired(&done);
         }
         report.still_queued = self.boundary.pending_repairs();
-        let candidates: Vec<(u64, u64, Caller)> = {
+        // A node whose mapping may write unseen is swept with no handle
+        // open too, from its name.
+        let candidates: Vec<(u64, Option<u64>, Caller)> = {
             let table = self.table();
             table
                 .ids()
@@ -2287,19 +2324,29 @@ impl Ops {
                     } else {
                         node.write_handles > 0
                     };
-                    (node.dirty.armed && open && node.group.is_none()).then(|| {
-                        (
-                            id,
-                            node.handles[0],
-                            node.dirty.last_writer.unwrap_or(NOBODY),
-                        )
-                    })
+                    (node.dirty.armed && (open || node.mapping_may_write) && node.group.is_none())
+                        .then(|| {
+                            (
+                                id,
+                                node.handles.first().copied(),
+                                node.dirty.last_writer.unwrap_or(NOBODY),
+                            )
+                        })
                 })
                 .collect()
         };
         for (id, fh, caller) in candidates {
-            let Ok(h) = self.handle(fh) else { continue };
-            if let Ok(true) = self.record_node(id, &h.fd, Trigger::Sweep, caller) {
+            let fd = match fh {
+                Some(fh) => match self.handle(fh) {
+                    Ok(h) => NodeFd::Handle(h),
+                    Err(_) => continue,
+                },
+                None => match self.node_fd(id) {
+                    Ok(fd) => fd,
+                    Err(_) => continue,
+                },
+            };
+            if let Ok(true) = self.record_node(id, &fd, Trigger::Sweep, caller) {
                 report.recorded += 1;
             }
         }

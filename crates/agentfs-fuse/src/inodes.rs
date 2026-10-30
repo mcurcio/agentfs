@@ -69,6 +69,12 @@ pub struct Node {
     /// How many of [`Node::handles`] were opened for writing.
     pub write_handles: u32,
     pub dirty: DirtyState,
+    /// A writer shared a passthrough backing id on this node, so a shared
+    /// mapping it made may write without the daemon seeing it, and without
+    /// holding the FUSE file open, until the kernel forgets the node (the
+    /// mapping pins its dentry): the node stays armed and swept, and is
+    /// recorded once more at FORGET (design §3.1, §17.1).
+    pub mapping_may_write: bool,
     /// The fsync-class group of the open handles, if they are in one
     /// (design §8): such a node is recorded by group captures, never alone.
     pub group: Option<Arc<Group>>,
@@ -87,6 +93,7 @@ impl Node {
             handles: Vec::new(),
             write_handles: 0,
             dirty: DirtyState::default(),
+            mapping_may_write: false,
             group: None,
             children: 0,
         }
