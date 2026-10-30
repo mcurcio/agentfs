@@ -711,13 +711,10 @@ whole, consistent groups instead.
   `CommitFailed`, `RepackFailed`, `ReconcileFailed`, `PushFailed`,
   `Diverged`, `PushLimited`, `RemoteMisconfigured`, `PatchBlocked`,
   `PatchFetchFailed`, `PatchIgnored` (a stale or malformed inbox entry
-  that is never applied), `PatchQueueDeferred` (a start that may have a
-  workload attached held the patch queue: [patch-queue.md](runbooks/patch-queue.md#10-patches-held-after-an-unclean-stop)),
-  `ForkRefused`, `HistoryServiceUnavailable` and
+  that is never applied), `ForkRefused`, `HistoryServiceUnavailable` and
   `IdentityFallback` (a pod's records committed with the service's own
   committer). `PathRefused`, `PatchFetchFailed`, `PatchIgnored`,
-  `PatchQueueDeferred`, `IdentityFallback` and `PushLimited` are logged as
-  warnings, the rest as
+  `IdentityFallback` and `PushLimited` are logged as warnings, the rest as
   errors. When each is raised and what it carries: the events table in
   [design §13](design.md#13-observability-opentelemetry).
 - **`patch N held (<reason>)`** at mount: patch N could not be applied
