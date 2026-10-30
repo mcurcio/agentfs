@@ -185,16 +185,15 @@ impl Notifier for WebhookNotifier {
             headers.push(("Authorization", format!("Bearer {}", token.trim())));
         }
         // Settings refuse a URL with userinfo; a caller building the
-        // notifier itself may not, so a failure never prints it.
+        // notifier itself may not, so a failure never prints it (`post`
+        // scrubs its own errors).
         match crate::lfs::client::post_json(&self.url, &body, &headers, self.timeout) {
             Ok(200..=299) => Ok(()),
             Ok(status) => Err(NotifyError::Webhook(format!(
                 "{} answered {status}",
                 crate::push::redact_url(&self.url)
             ))),
-            Err(e) => Err(NotifyError::Webhook(crate::push::scrub_userinfo(
-                &e, &self.url,
-            ))),
+            Err(e) => Err(NotifyError::Webhook(e)),
         }
     }
 }

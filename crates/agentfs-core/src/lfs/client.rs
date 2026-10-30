@@ -1196,7 +1196,33 @@ pub struct Posted {
     pub body: Vec<u8>,
 }
 
-/// Why a [`post`] got no answer.
+/// Why `url` cannot be a webhook's, or `None` when it can: the one check
+/// of every [`post`] target an operator configures (fork delivery's
+/// webhook, [`crate::fork::deliver`]; the patch queue's notify webhook,
+/// `agentfs.patchNotifyUrl`). It must be `http://`, or `https://` in a
+/// build with the `https` feature, with no user or password, which would
+/// reach logs and alarms: a token goes in the caller's credential file
+/// (bead agentfs-5sg).
+pub fn webhook_url_refused(url: &str) -> Option<&'static str> {
+    let lower = url.to_ascii_lowercase();
+    let https = lower.starts_with("https://");
+    if !https && !lower.starts_with("http://") {
+        Some("it is not an http:// or https:// URL")
+    } else if https && !cfg!(feature = "https") {
+        Some("it is https, and this build has no TLS (the `https` feature)")
+    } else if crate::push::redact_url(url) != url {
+        Some(
+            "it carries a user or password, which would reach logs and alarms: put the token \
+             in the credential file",
+        )
+    } else {
+        None
+    }
+}
+
+/// Why a [`post`] got no answer. The URL is kept with its userinfo as
+/// `***`, and the detail with every copy of it scrubbed, so no caller can
+/// print a password a URL carries.
 #[derive(Debug, thiserror::Error)]
 pub enum PostError {
     /// The request could not be built (a bad URL or header).
@@ -1233,14 +1259,14 @@ pub fn post(
         Ok(r) => r,
         Err(e @ (ureq::Error::BadUri(_) | ureq::Error::Http(_))) => {
             return Err(PostError::Malformed {
-                url: url.to_owned(),
-                detail: e.to_string(),
+                url: crate::push::redact_url(url),
+                detail: crate::push::scrub_userinfo(&e.to_string(), url),
             });
         }
         Err(e) => {
             return Err(PostError::Unreachable {
-                url: url.to_owned(),
-                detail: e.to_string(),
+                url: crate::push::redact_url(url),
+                detail: crate::push::scrub_userinfo(&e.to_string(), url),
             });
         }
     };

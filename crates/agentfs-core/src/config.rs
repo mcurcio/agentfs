@@ -1853,25 +1853,15 @@ fn patch_notify_url(config: &git2::Config) -> Result<Option<String>, ConfigError
     let Some(url) = string(config, key)? else {
         return Ok(None);
     };
-    let lower = url.to_ascii_lowercase();
-    let https = lower.starts_with("https://");
-    // Never echo a password the URL may carry.
-    let redacted = crate::push::redact_url(&url);
-    let why = if !https && !lower.starts_with("http://") {
-        "it is not an http:// or https:// URL"
-    } else if https && !cfg!(feature = "https") {
-        "it is https, and this build has no TLS (the `https` feature)"
-    } else if redacted != url {
-        "it carries a user or password, which would reach logs and alarms: put the token in \
-         agentfs.patchNotifyCredentialFile"
-    } else {
-        return Ok(Some(url));
-    };
-    Err(ConfigError::NotifyUrl {
-        key: key.into(),
-        value: redacted,
-        why,
-    })
+    match crate::lfs::client::webhook_url_refused(&url) {
+        None => Ok(Some(url)),
+        // Never echo a password the URL may carry.
+        Some(why) => Err(ConfigError::NotifyUrl {
+            key: key.into(),
+            value: crate::push::redact_url(&url),
+            why,
+        }),
+    }
 }
 
 /// `agentfs.patchIntegrate`: `merge` (the default) or `rebase`; anything
@@ -2171,7 +2161,7 @@ mod tests {
                 Err(e @ ConfigError::NotifyUrl { .. }) => {
                     let message = e.to_string();
                     assert!(!message.contains("s3cret"), "{message}");
-                    assert!(message.contains("patchNotifyCredentialFile"), "{message}");
+                    assert!(message.contains("credential file"), "{message}");
                 }
                 other => panic!("{bad}: {other:?}"),
             }

@@ -272,15 +272,10 @@ pub fn delivery<'g, G: GitRunner + 'g>(
             credential_file,
             timeout,
         } => {
-            let lower = url.to_ascii_lowercase();
-            let https = lower.starts_with("https://");
-            if !https && !lower.starts_with("http://") {
-                return bad(format!("{url:?} is not an http:// or https:// URL"));
-            }
-            if https && !cfg!(feature = "https") {
-                return bad(format!(
-                    "{url:?} is https, and this build has no TLS (the `https` feature)"
-                ));
+            if let Some(why) = crate::lfs::client::webhook_url_refused(url) {
+                // Never echo a password the URL may carry.
+                let shown = crate::push::redact_url(url);
+                return bad(format!("the webhook URL {shown:?} is refused: {why}"));
             }
             if let Some(f) = credential_file
                 && !f.is_absolute()
@@ -686,15 +681,17 @@ impl Delivery for WebhookDelivery {
         };
         let (status, location, body) = (posted.status, posted.location, posted.body);
         let body = String::from_utf8_lossy(&body);
-        let detail = format!("POST {} answered {status}: {}", self.url, body.trim());
+        // The factory refuses a URL with userinfo; a caller building this
+        // itself may not, so nothing prints it.
+        let shown = crate::push::redact_url(&self.url);
+        let detail = format!("POST {shown} answered {status}: {}", body.trim());
         match status {
             200..=299 => Ok(Delivered::Accepted),
             409 => Ok(Delivered::AlreadyDelivered),
             429 | 500..=599 => Err(DeliveryError::ReceiverUnavailable { detail }),
             300..=399 => Err(DeliveryError::ReceiverRefused {
                 detail: format!(
-                    "POST {} answered {status}, a redirect to {}, which is never followed",
-                    self.url,
+                    "POST {shown} answered {status}, a redirect to {}, which is never followed",
                     location.as_deref().unwrap_or("nowhere")
                 ),
             }),
@@ -813,6 +810,10 @@ mod tests {
         refused(webhook("ftp://example.com/", None));
         refused(webhook("example.com", None));
         refused(webhook("http://example.com/", Some("token")));
+        // A password in the URL would reach logs and alarms; the refusal
+        // never echoes it.
+        let why = refused(webhook("http://u:s3cret@127.0.0.1:1/x", None));
+        assert!(!why.contains("s3cret") && why.contains("password"), "{why}");
         let https = delivery(&webhook("https://example.com/", None), &NoGit, "o");
         assert_eq!(https.is_ok(), cfg!(feature = "https"));
     }

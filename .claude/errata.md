@@ -479,3 +479,8 @@ None stopped a slice; each was resolved as stated and is recorded in design §19
    connectivity check passes, the object is already there), then fetches the advertised inbox
    ref. Reproduced with Apple git 2.50.1 over `file://` (a pack of only the commit and tree to
    `receive-pack --stateless-rpc`). Design §19.1 "serve-git" and the serve_git.rs doc now say so.
+4. **agentfs-5sg's scrub sat in one consumer.** The shared POST helper kept the raw URL in
+   `PostError`, and fork delivery's webhook printed it and accepted a URL with userinfo (its
+   check was a copy of the notify one from before the refusal). Now one check
+   (`lfs::client::webhook_url_refused`) serves both, and `post` redacts its own errors.
+   Entry 5's unaudited `Settings` URL fields remain unaudited.

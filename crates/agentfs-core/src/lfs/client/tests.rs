@@ -941,3 +941,16 @@ fn lfs_requests_go_through_the_remotes_proxy() {
         .unwrap_err();
     assert_eq!(err.kind, PushFailureKind::Unreachable, "{err}");
 }
+
+/// A POST that gets no answer never prints the URL's userinfo, whichever
+/// webhook made it (bead agentfs-5sg, fix round).
+#[test]
+fn a_failed_post_never_prints_the_urls_password() {
+    let closed = ClosedPort::new();
+    let url = format!("http://u:s3cret@127.0.0.1:{}/hook", closed.port());
+    let e = post(&url, b"{}", &[], Duration::from_secs(5)).unwrap_err();
+    assert!(matches!(e, PostError::Unreachable { .. }), "{e}");
+    let shown = e.to_string();
+    assert!(!shown.contains("s3cret"), "{shown}");
+    assert!(shown.contains("http://***@127.0.0.1:"), "{shown}");
+}
