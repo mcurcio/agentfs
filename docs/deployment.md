@@ -171,9 +171,14 @@ containers, so the daemon unmounts once nothing uses the mount, runs a
 final sweep, makes the final commit and pushes it once more, within
 `--push-grace` (5 s; the log shows `final commit:` and a `final push:`
 line per remote). A workload container that mounts the FUSE root itself through
-a `subPath` (Hermes, §9 below) pins the mount until the kubelet tears the
-pod's volumes down, so the daemon detaches lazily and waits its
-`--unmount-grace` (10 s) first. `terminationGracePeriodSeconds: 60`
+a `subPath` (Hermes, §10 below) gets a kubelet bind of the mount that
+stays until the kubelet tears the pod's volumes down, after the sidecar
+has exited. The daemon's unmount succeeds, but the bind keeps the
+filesystem mounted elsewhere, so the daemon waits its `--unmount-grace`
+(10 s) for the session to end, says so (`the filesystem was still
+mounted elsewhere`), and exits; the bind then fails with `ENOTCONN` until
+the kubelet removes it. The stop keeps the attached mark, which the next
+pod's start passes over because it was another pod's (design §12). `terminationGracePeriodSeconds: 60`
 covers both with room to spare; keep it above `--unmount-grace` plus
 `--push-grace` plus a few seconds.
 
@@ -638,17 +643,14 @@ sidecar's startup probe allows for the fetch, which waits at most
 alert on `agentfs.patch.blocked`. See
 [patch-queue.md](runbooks/patch-queue.md).
 
-**With Hermes' data path mounted through `subPath`, the queue never
-lands.** When the sidecar stops, the kubelet still holds the mount
-through the subPath binds it made for Hermes and docker-in-docker, which
-it removes only after every container of the pod has exited. The stop is
-therefore never one with nothing attached (design §12), and the next
-start defers the queue (`PatchQueueDeferred`, reason `unclean_stop`),
-pod restart after pod restart. The read-only fence pod above lands it at
-the next pod restart. This is an open question (design §19.2), and the
-`hermes` workflow's sidecar job fails on it. A restart of the sidecar
-alone under running Hermes defers the queue, as it should (design §12);
-that is tested in the subPath pod only.
+**With Hermes' data path mounted through `subPath`**, the kubelet still
+holds the mount when the sidecar stops, through the subPath binds it made
+for Hermes and docker-in-docker, so the stop keeps the attached mark
+(design §12). The mark names the pod (`AGENTFS_POD_UID`), and the next
+pod lands the queue over it: the old pod's binds cannot reach the new
+pod's `emptyDir`. A restart of the sidecar alone under running Hermes
+defers the queue (`PatchQueueDeferred`, reason `unclean_stop`), as it
+should; the patches land at the next pod restart.
 
 ### How it is tested
 
@@ -695,9 +697,8 @@ next start) and the manifests in [`ci/hermes/k8s`](../ci/hermes/k8s):
   files and pushes them, and reports `.env`, the databases, the logs and
   a nested repository as skipped. Then a clean exit of the sidecar alone:
   Hermes' liveness probe restarts it onto the new mount, it records
-  again, and a queued patch is deferred (`PatchQueueDeferred`). The job
-  then fails at the next pod restart, which defers the patch again (see
-  above). The import also records what Hermes keeps in `skills/` beside
+  again, and a queued patch is deferred (`PatchQueueDeferred`); it lands
+  at the next pod restart. The import also records what Hermes keeps in `skills/` beside
   the skills: the bundled skills it syncs there and its own
   `.usage.json`, `.curator_ledger.jsonl` and `.bundled_manifest`.
 - **fence**: the read-only fence alternative, on a fresh volume; the

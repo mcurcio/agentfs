@@ -19,7 +19,9 @@
 #             only the sidecar under running Hermes: Hermes' liveness
 #             probe restarts it onto the new mount and it records again,
 #             and a queued patch is not applied (PatchQueueDeferred); it
-#             lands at the next pod restart (4).
+#             lands at the next pod restart (4), over the mark the old
+#             pod's stop left while the kubelet's subPath binds held the
+#             mount (design §12 "Only with nothing attached").
 #   fence     the read-only fence alternative of §10 (ci/hermes/k8s/fence):
 #             the emptyDir read-only at /agentfs and
 #             HERMES_HOME=/agentfs/workspace, on a fresh volume; 1-5.
@@ -396,7 +398,7 @@ if [ "$MODE" = sidecar ]; then
   pass "Hermes' liveness probe restarted it onto the new mount, and the pod is Ready"
   k logs "$POD" -c agentfs --previous >"$LOGS/sidecar-stopped.log" 2>&1 || true
   k logs "$POD" -c agentfs >"$LOGS/sidecar-restarted.log" 2>&1
-  grep -E 'signal|unmount|attached|final' "$LOGS/sidecar-stopped.log" || true
+  grep -E 'signal|unmount|attached|elsewhere|final' "$LOGS/sidecar-stopped.log" || true
   grep -E '^(mounted|stacked|patches|alarm)' "$LOGS/sidecar-restarted.log" || true
   assert_contains "$(cat "$LOGS/sidecar-restarted.log")" "patches: not applied at this start" "the restarted sidecar did not apply the queue"
   assert_contains "$(cat "$LOGS/sidecar-restarted.log")" "alarm: patch queue deferred (" "it raised PatchQueueDeferred"
@@ -415,13 +417,13 @@ if [ "$MODE" = sidecar ]; then
   k delete pod "$POD" --wait --timeout=180s
   for _ in $(seq 30); do kill -0 "$follower" 2>/dev/null || break; sleep 1; done
   kill "$follower" 2>/dev/null || true
-  grep -E 'signal|unmount|attached|final' "$LOGS/sidecar-pod-stop.log" || true
+  grep -E 'signal|unmount|attached|elsewhere|final' "$LOGS/sidecar-pod-stop.log" || true
   wait_ready
   [ "$POD" != "$OLD" ] || fail "the pod was not replaced"
   k logs "$POD" -c agentfs >"$LOGS/sidecar-next-pod.log" 2>&1
   grep -E '^(mounted|patches|alarm)' "$LOGS/sidecar-next-pod.log" || true
   if grep -q 'patches: not applied at this start' "$LOGS/sidecar-next-pod.log"; then
-    fail "the pod restart did not land the queue: the stopping sidecar found the mount still held ($(grep -m1 -E 'workload may still be attached' "$LOGS/sidecar-pod-stop.log" || echo 'see its log')), so the new pod deferred it"
+    fail "the pod restart did not land the queue: the new pod deferred it ($(grep -m1 'patches: not applied' "$LOGS/sidecar-next-pod.log"))"
   fi
 elif [ "$MODE" = fence ]; then
   step "4. the queued patch lands at the next pod restart"

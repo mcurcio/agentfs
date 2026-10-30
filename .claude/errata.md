@@ -569,3 +569,16 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    `HERMES_HOME=/agentfs/workspace` alone Hermes' file tools could not write its home. The
    image's `main-wrapper.sh` also sets `HOME=/opt/data` whatever `HERMES_HOME` is. Read from
    upstream code; the fence job sets the variable but does not exercise the file tools.
+
+## 2026-10-30, agentfs-vqr implementer (another pod's attached mark)
+
+1. **agentfs-4f2 item 1 is fixed, not open.** A mount whose mount point is in its pod's own
+   volume records `AGENTFS_POD_UID` in `meta/attached.json`, and a start in a different pod
+   lands the queue over it (design §12, §19.1 "Patches land after a clean stop", amended;
+   §19.2 question 12 closed). The docs' "the sidecar job fails on it" notes are gone.
+2. **deployment.md §3 "Termination" was wrong twice.** It said a `subPath` consumer makes
+   the daemon detach lazily; the unmount is not busy (the kubelet's binds are other mounts
+   of the filesystem) and it is the session that outlives the unmount
+   (`session_abandoned`), which the log reported as "files were still open". It also
+   pointed at Hermes as §9 (it is §10). The log now says "the filesystem was still mounted
+   elsewhere" when the unmount was not busy.
