@@ -444,6 +444,21 @@ mod tests {
         // Replacing an ordinary patch needs only the offer right.
         let other = r.commit(&[r.head()], "a.txt", "a3\n", "three");
         assert_eq!(over(&[Right::Offer], ordinary, other), Ok(()));
+        // An old tip that cannot be read fails closed: it counts as a
+        // barrier.
+        let unreadable = Oid::from_bytes(&[7; 20]).unwrap();
+        assert_eq!(
+            over(&[Right::Offer], unreadable, ordinary),
+            Err(PushRefused::NotAllowed {
+                pusher: "iac".into(),
+                what: "replace barrier patch 1".into(),
+                right: Right::Barrier,
+            })
+        );
+        assert_eq!(
+            over(&[Right::Offer, Right::Barrier], unreadable, ordinary),
+            Ok(())
+        );
     }
 
     #[test]
