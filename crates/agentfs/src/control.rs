@@ -538,6 +538,7 @@ pub fn call(dir: &Path, request: &Request) -> Result<Reply, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
@@ -885,10 +886,32 @@ mod tests {
             Err(ClientError::NotRunning)
         ));
         // A stale socket file (a crashed daemon) is not running either,
-        // and the next server replaces it.
+        // and the next server replaces it. Nothing listens on a crashed
+        // daemon's socket. Dropping a listener alone is not that, while any
+        // thread of this test binary spawns a child: the child shares the
+        // listener from its fork until its exec, and connects succeed
+        // meanwhile. `forked` is that child's copy, held throughout. A
+        // shut-down listener refuses connects at once, whoever holds it
+        // (as in agentfs-core's local_socket tests).
         let stale =
             UnixListener::bind(socket_address(&local_socket::open_dir(&dir).unwrap())).unwrap();
+        let forked = stale.try_clone().unwrap();
+        // SAFETY: `stale` is an open socket for the whole call.
+        assert_eq!(
+            unsafe { libc::shutdown(stale.as_raw_fd(), libc::SHUT_RDWR) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
         drop(stale);
+        // A connect that succeeded would leave `call` waiting for a reply
+        // nobody sends: fail fast here instead.
+        assert_eq!(
+            local_socket::connect(&dir, CONTROL_SOCKET)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionRefused
+        );
         assert!(matches!(
             call(&dir, &request()),
             Err(ClientError::NotRunning)
@@ -899,5 +922,6 @@ mod tests {
             Reply::Error("second".into())
         );
         server.shutdown(Duration::from_secs(1));
+        drop(forked);
     }
 }
