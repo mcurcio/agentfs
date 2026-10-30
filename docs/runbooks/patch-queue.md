@@ -503,8 +503,10 @@ to a receiver (design §11.5 "Delivery"). Its base is a commit of the
 parent's history, not of the source's branch: deliver it where that
 history is reviewed, or leave it. The child also lists its parent again
 after queueing its change, so a parent that finished in that moment
-raises this the same way. The alarm is raised from the child's published
-mark, so a crash cannot lose it (it may be raised twice), and after it
+raises this the same way. The alarm is raised before the child's
+published mark is written, and a crash in between leaves the child
+finished, so its next publish (`agentfs fork finish`, or the CSI release
+scan) raises it again: it may be raised twice, never not at all. After it
 has scrolled away `agentfs fork status` of the child still reads
 `published at N ms as a top-level fork: its parent P had finished, ...`;
 its `--json` carries `parent_finished`.

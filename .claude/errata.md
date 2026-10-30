@@ -465,3 +465,10 @@ None stopped a slice; each was resolved as stated and is recorded in design §19
     path; not fixed here.
 18. **Brief vs. date.** The integrator brief asked for new §19.1 rows dated 2026-10-29; they are
     dated 2026-10-30, the day they were made, as the existing "Kept 2026-10-30" entry is.
+## 2026-10-30, merge-queue follow-up batch, fix round (PR 14 review)
+1. **agentfs-rrm's "raise from the mark" did not reach the CSI path.** Built as a `raised` flag
+   in the published mark, re-raised only by a later publish. Under CSI nothing publishes a fork
+   already published (the release scan skips it, DeleteVolume deletes it), so a crash between
+   the mark and the alarm still lost it, while design §12 and the runbook said "never lost".
+   Fixed by raising before the mark is written (the flag is gone): a crash in between leaves the
+   fork finished, which every publishing path retries. Entry 7 above is superseded.

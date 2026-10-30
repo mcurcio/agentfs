@@ -29,9 +29,10 @@
 //! change create-only as the parent's next inbox number
 //! ([`PublishOutcome::Submitted`]), unless the parent already queued or
 //! applied it (at most once) or the parent has finished, when it publishes
-//! as a top-level fork and raises [`Event::ForkParentFinished`] from the
-//! published mark, which records it, so a crash before the alarm leaves it
-//! to the next publish (bead agentfs-rrm). After its
+//! as a top-level fork and raises [`Event::ForkParentFinished`] before it
+//! writes the published mark, which records the parent: a crash before
+//! the mark leaves the fork finished, so the next publish, by whatever
+//! runs it, raises the alarm again (bead agentfs-rrm). After its
 //! push it lists the parent again, so a parent that finished in between is
 //! seen. It then pushes its own finish ref, which its own forks read as
 //! "finished". The parent's queue lands it like any patch.
@@ -325,17 +326,15 @@ pub struct PublishedMark {
 }
 
 /// The parent fork had finished when its child published
-/// ([`Event::ForkParentFinished`]), recorded with the published mark so
-/// the alarm is raised from the mark, not from the attempt that wrote it.
+/// ([`Event::ForkParentFinished`]), recorded with the published mark,
+/// which is written only after the alarm was raised: a fork whose mark
+/// says published has raised it, and one that crashed before the mark is
+/// still finished, so its next publish raises it again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParentFinishedMark {
     /// The parent fork's name.
     pub parent: String,
-    /// The alarm was raised. Written `false` with the published mark and
-    /// set once it is raised, so a crash in between raises it at the next
-    /// publish (it may then be raised twice, never not at all).
-    pub raised: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -805,7 +804,6 @@ impl Finisher {
                 });
             }
             if let Some(published) = mark.published.as_ref().filter(|p| p.finish == finish) {
-                self.raise_parent_finished(&record.fork, published)?;
                 return Ok(match published.inbox {
                     Some(inbox) => PublishOutcome::Submitted { inbox },
                     None => PublishOutcome::Published,
@@ -824,10 +822,18 @@ impl Finisher {
                         Delivered::Published | Delivered::ParentFinished { .. } => None,
                     };
                     let parent_finished = match &delivered {
-                        Delivered::ParentFinished { parent } => Some(ParentFinishedMark {
-                            parent: parent.clone(),
-                            raised: false,
-                        }),
+                        Delivered::ParentFinished { parent } => {
+                            // Before the mark: a crash in between leaves the
+                            // fork finished, and its next publish raises it
+                            // again (at least once; twice across a crash).
+                            self.events.emit(Event::ForkParentFinished {
+                                fork: record.fork.clone(),
+                                parent: parent.clone(),
+                            });
+                            Some(ParentFinishedMark {
+                                parent: parent.clone(),
+                            })
+                        }
                         Delivered::Published | Delivered::Submitted { .. } => None,
                     };
                     let published = PublishedMark {
@@ -842,7 +848,6 @@ impl Finisher {
                         mark.published = Some(published.clone());
                         mark.refused = None;
                     })?;
-                    self.raise_parent_finished(&record.fork, &published)?;
                     self.published(record);
                     return Ok(match inbox {
                         Some(inbox) => PublishOutcome::Submitted { inbox },
@@ -887,34 +892,6 @@ impl Finisher {
             };
             std::thread::sleep(delay.max(Duration::from_millis(10)));
         }
-    }
-
-    /// Raises [`Event::ForkParentFinished`] from the published mark of
-    /// fork `fork` while the mark says it was not raised yet, then records
-    /// it raised: once after the mark is written, and again only after a
-    /// crash in between (bead agentfs-rrm).
-    fn raise_parent_finished(
-        &self,
-        fork: &str,
-        published: &PublishedMark,
-    ) -> Result<(), FinishError> {
-        let Some(pending) = published.parent_finished.as_ref().filter(|p| !p.raised) else {
-            return Ok(());
-        };
-        self.events.emit(Event::ForkParentFinished {
-            fork: fork.to_owned(),
-            parent: pending.parent.clone(),
-        });
-        update_mark(&self.state, |mark| {
-            if let Some(parent) = mark
-                .published
-                .as_mut()
-                .and_then(|p| p.parent_finished.as_mut())
-            {
-                parent.raised = true;
-            }
-        })?;
-        Ok(())
     }
 
     /// What the published mark, just written, is told by: the

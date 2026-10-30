@@ -822,7 +822,6 @@ mod tests {
         };
         let doc = ForkStatusDoc::new(&status(Some(ParentFinishedMark {
             parent: "src-1".into(),
-            raised: false,
         })));
         assert_eq!(doc.parent_finished.as_deref(), Some("src-1"));
         let json = serde_json::to_value(&doc).unwrap();

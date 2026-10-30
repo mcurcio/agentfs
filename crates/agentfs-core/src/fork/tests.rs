@@ -2265,17 +2265,17 @@ fn a_child_after_its_parent() {
         published.parent_finished,
         Some(finish::ParentFinishedMark {
             parent: "src-1".into(),
-            raised: true,
         })
     );
 }
 
-/// A crash after the published mark is written and before
-/// ForkParentFinished is raised loses nothing: the mark records the
-/// parent finished, and the next publish raises the alarm from it, once
-/// (bead agentfs-rrm).
+/// A crash as ForkParentFinished is raised loses nothing, on any path:
+/// the published mark is written only after the alarm, so the fork stays
+/// finished, not published, and whatever publishes a finished fork next
+/// (`agentfs fork finish`, or under CSI the release scan, which skips a
+/// published fork) raises it again (bead agentfs-rrm).
 #[test]
-fn a_parent_finished_alarm_survives_a_crash_before_it_is_raised() {
+fn a_crash_at_the_parent_finished_alarm_leaves_the_fork_unpublished() {
     let t = Tree3::new();
     {
         let lock = t.parent.lock();
@@ -2286,22 +2286,23 @@ fn a_parent_finished_alarm_survives_a_crash_before_it_is_raised() {
         );
     }
     {
+        // The process dies as the alarm leaves it.
+        let dies: Events = Arc::new(|event: Event| {
+            if matches!(event, Event::ForkParentFinished { .. }) {
+                panic!("killed while raising ForkParentFinished");
+            }
+        });
         let lock = t.child.lock();
-        let mut finisher = t.child.finisher(&lock).unwrap();
-        assert_eq!(
-            finisher.publish(Some(soon())).unwrap(),
-            PublishOutcome::Published
-        );
+        let mut finisher = t.child.finisher_with(&lock, dies).unwrap();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finisher.publish(Some(soon()))
+        }));
+        assert!(crashed.is_err(), "the alarm was not raised");
     }
-    // What a crash between the mark's write and the alarm leaves.
-    let mut mark = finish::status(&t.child.state)
-        .unwrap()
-        .unwrap()
-        .mark
-        .unwrap();
-    let published = mark.published.as_mut().unwrap();
-    published.parent_finished.as_mut().unwrap().raised = false;
-    crate::fsutil::write_json_atomic(&t.child.state.fork_mark(), &mark).unwrap();
+    assert_eq!(
+        finish::status(&t.child.state).unwrap().unwrap().state,
+        ForkState::Finished
+    );
 
     let (events, seen) = recording();
     let lock = t.child.lock();
@@ -2326,14 +2327,14 @@ fn a_parent_finished_alarm_survives_a_crash_before_it_is_raised() {
             parent: "src-1".into(),
         }]
     );
-    let published = finish::status(&t.child.state)
-        .unwrap()
-        .unwrap()
-        .mark
-        .unwrap()
-        .published
-        .unwrap();
-    assert!(published.parent_finished.unwrap().raised);
+    let status = finish::status(&t.child.state).unwrap().unwrap();
+    assert_eq!(status.state, ForkState::Published);
+    assert_eq!(
+        status.mark.unwrap().published.unwrap().parent_finished,
+        Some(finish::ParentFinishedMark {
+            parent: "src-1".into(),
+        })
+    );
 }
 
 /// Test 4: a fork whose own forks could never roll up is refused as a
