@@ -7,6 +7,10 @@ use super::*;
 use crate::config::LfsSettings;
 use crate::lfs::fake::{FakeLfs, State};
 
+#[path = "../../../tests/support/closed_port.rs"]
+mod closed_port;
+use closed_port::ClosedPort;
+
 const REF: &str = "refs/heads/agentfs/vol";
 
 struct Setup {
@@ -196,11 +200,8 @@ fn failures_are_classified() {
         assert!(server.seen().iter().all(|s| !s.path.contains("elsewhere")));
     }
     // Nothing listening.
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-    r.lfs_url = Some(format!("http://127.0.0.1:{closed}/r"));
+    let closed = ClosedPort::new();
+    r.lfs_url = Some(format!("http://127.0.0.1:{}/r", closed.port()));
     let t = transfer_for(&settings(), &r, Direction::Upload).unwrap();
     let err = t.upload(&[p], &s.cache, REF).unwrap_err();
     assert_eq!(err.kind, PushFailureKind::Unreachable, "{err}");
@@ -845,12 +846,9 @@ fn lfs_requests_go_through_the_remotes_proxy() {
     t.download(&p, &third.cache, REF).unwrap();
     assert_eq!(proxy.targets().len(), before);
     // A proxy that is not there: unreachable.
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let closed = ClosedPort::new();
     r.proxy = Some(crate::proxy::ProxySetting {
-        url: format!("http://127.0.0.1:{closed}"),
+        url: format!("http://127.0.0.1:{}", closed.port()),
         key: "http.proxy".into(),
     });
     let t = http(&server, &mut r);

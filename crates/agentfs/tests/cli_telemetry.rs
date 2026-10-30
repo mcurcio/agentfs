@@ -20,6 +20,10 @@ use prost::Message;
 
 mod fork_setup;
 
+#[path = "../../agentfs-core/tests/support/closed_port.rs"]
+mod closed_port;
+use closed_port::ClosedPort;
+
 /// `(path, body)` of each request received.
 type Requests = Mutex<Vec<(String, Vec<u8>)>>;
 
@@ -419,16 +423,12 @@ fn push_exports_its_span() {
 #[test]
 fn a_collector_that_is_down_never_fails_the_command() {
     // A port nothing listens on: connections are refused.
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let closed = ClosedPort::new();
     let v = Volume::new();
     let start = std::time::Instant::now();
     let out = v.record(&[(
         "OTEL_EXPORTER_OTLP_ENDPOINT",
-        &format!("http://127.0.0.1:{port}"),
+        &format!("http://127.0.0.1:{}", closed.port()),
     )]);
     assert!(
         start.elapsed() < Duration::from_secs(20),
@@ -1191,17 +1191,13 @@ fn exports_over_otlp_grpc_with_headers() {
 
 #[test]
 fn a_grpc_collector_that_is_down_never_fails_the_command() {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let closed = ClosedPort::new();
     let v = Volume::new();
     let start = std::time::Instant::now();
     let out = v.record(&[
         (
             "OTEL_EXPORTER_OTLP_ENDPOINT",
-            &format!("http://127.0.0.1:{port}"),
+            &format!("http://127.0.0.1:{}", closed.port()),
         ),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
     ]);

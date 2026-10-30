@@ -62,6 +62,9 @@ tonic-prost-build = { version = "0.14.6", default-features = false }
 # In-memory exporters for the telemetry tests.
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["testing"] }
 tempfile = "3.27.0"
+# A port that refuses connections and that no other test can be handed
+# (tests/support/closed_port.rs).
+socket2 = "0.6.5"
 # The in-process ssh-agent of the transport tests (`ssh` feature): its
 # connection stream.
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
