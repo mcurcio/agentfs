@@ -490,3 +490,10 @@ None stopped a slice; each was resolved as stated and is recorded in design §19
    removed (`std::mem::forget(stopper)`) every existing test stayed green. Now
    `history_service::a_draining_service_refuses_new_connects` and
    `grpc::a_stopping_driver_refuses_connects_while_calls_finish` go red under that probe.
+6. **Deferred: a missing fork base loops instead of being refused** (review finding, P3).
+   Refusing `ForkBaseMissing` in `announce_uncarried` alone would patch one instance of a class:
+   `Finisher::finish_once` already fails on the same corruption (`find_commit(base)`) with an
+   error, not a refusal, and a history push missing the object fails as a retried branch
+   failure. Local state-area corruption has no terminal outcome or alarm of its own anywhere in
+   publishing or the mount-time queue (`queue_at_start` only prints). A class-level outcome
+   (a refused reason or alarm, with a runbook) needs its own bead.
