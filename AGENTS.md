@@ -6,10 +6,11 @@ agentfs is a FUSE filesystem. It records every change a workload makes into git 
 
 ## What agentfs is for
 
-- **Origin.** The owner (mcurcio) runs AI agents on a Kubernetes cluster managed by [mcurcio/iac](https://github.com/mcurcio/iac). The first agent is Hermes (`workloads/hermes` there). Two problems needed solving:
+- **Origin.** agentfs was built to run AI agents on Kubernetes, with infrastructure as code (iac) managing the cluster. The first agent is Hermes. Two problems needed solving:
   - **Configuration.** The agent must edit its own and its sub-agents' configuration (prompts, profiles, skills) at runtime, yet iac also owns that configuration. Overwriting whole files from iac would destroy the agent's changes.
   - **Audit.** Every change the agent makes should be on record, and that record should be out of the agent's sight and reach.
-- **The earlier attempt.** An earlier attempt, ArtifactFS (iac PR 197), stalled on mounting one FUSE volume that both root and non-root processes could use. agentfs was redesigned from first principles. Its design was reviewed adversarially (`docs/reviews/`) before any code was written.
+- **The earlier attempt.** An earlier attempt, ArtifactFS, stalled on mounting one FUSE volume that both root and non-root processes could use. agentfs was redesigned from first principles. Its design was reviewed adversarially (`docs/reviews/`) before any code was written.
+- **No deployment's own details.** Never record a particular deployment's settings, policy or paths (the owner's own Hermes included) in this repo. Describe consumers as their upstream projects ship them.
 - **The goal is general.** agentfs is meant as a general tool for the cluster: any workload whose directory should carry an audit trail and accept versioned patches. Hermes is the first consumer, used to validate the design (design §16), not the design target. Don't specialise the code for it.
 
 ## Principles
@@ -30,7 +31,7 @@ These are the owner's priorities. When a choice is unclear, decide by them. Each
 ## Working with the owner
 
 - **Decisions.** The owner's decisions are recorded, dated, in design §19.1. Don't reopen them without new evidence. Record new ones there in the same commit.
-- **Ask about what is genuinely the owner's call**: policy, security trade-offs, cost. Examples are relaxing iac's `docker_volumes` pin for Hermes, or choosing a licence. Decide the rest with the principles above, and say what you decided.
+- **Ask about what is genuinely the owner's call**: policy, security trade-offs, cost. Examples are what a workload's sandbox may reach, or choosing a licence. Decide the rest with the principles above, and say what you decided.
 - **Large multi-agent runs need an explicit request.** Workflows and fan-outs are expensive. Describe the scale first.
 - **Reports must be honest.** Say what is untested, tested only locally, or cut, with the reason.
 
