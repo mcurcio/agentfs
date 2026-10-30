@@ -4,9 +4,9 @@
 # agentfs services and the git server they push to). Relative paths
 # resolve against examples/docker, the first compose file's directory.
 #
-#   agentfs        the example's recorder, with the Hermes rule files
-#                  (deploy/examples/hermes) as info/exclude and
-#                  info/attributes, as the sidecar mounts them
+#   agentfs-init   the example's init step, which also installs the
+#                  Hermes rule files (deploy/examples/hermes) as
+#                  info/exclude and info/attributes
 #   hermes         upstream's image and command (`gateway run`), started
 #                  as root as upstream ships it, with the FUSE mount at
 #                  its data path /opt/data
@@ -33,10 +33,14 @@ x-hermes-image: &hermes-image
   image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v0.22.5@sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d}
 
 services:
-  agentfs:
+  # The example's init step, plus the Hermes rule files copied into the
+  # state area, as deployment.md §10's migration does. (Bind-mounting
+  # each file over the volume, as the sidecar mounts them, left the volume
+  # busy at `docker compose down -v` on the runner.)
+  agentfs-init:
+    command: ['agentfs init --include /etc/agentfs/config && cp /etc/agentfs/hermes/exclude /etc/agentfs/hermes/attributes /data/state/git/info/ && chown "$$WORKLOAD_USER" /data/backing']
     volumes:
-      - ../../deploy/examples/hermes/exclude:/data/state/git/info/exclude:ro
-      - ../../deploy/examples/hermes/attributes:/data/state/git/info/attributes:ro
+      - ../../deploy/examples/hermes:/etc/agentfs/hermes:ro
 
   # The example's idle workload is not part of this test.
   workload:
