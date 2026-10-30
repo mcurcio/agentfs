@@ -216,8 +216,8 @@ kubectl delete pod <hermes pod>
 - **Limits:** patches apply only at a pod restart (deployment.md
   [Restarts and patches](deployment.md#restarts-and-patches)). A blocked
   queue does not stop the pod; alert on `agentfs.patch.blocked`. Passing
-  the mount into tool containers changes iac's `docker_volumes` pin,
-  which is the owner's call. Check the profile layout against the Hermes
+  the mount into tool containers changes iac's `docker_volumes` pin
+  (approved, design §19.1, 2026-10-30). Check the profile layout against the Hermes
   version you run.
 
 ### Example 4: several pods on one CSI volume

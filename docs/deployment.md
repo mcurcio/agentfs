@@ -572,8 +572,9 @@ Starting from Hermes' own workload:
 - **The docker-in-docker sidecar** that runs Hermes' file and terminal
   tools mounts it the same way, so tool containers see the same files,
   and the `docker_volumes` pin in the iac workload changes to pass the
-  path into tool containers. That is a deliberate policy change, and the
-  owner must approve it.
+  path into tool containers, so a tool's edit to Hermes' configuration
+  reaches the Hermes container. The owner approved this (design §19.1,
+  "Sandboxes edit their own configuration", 2026-10-30).
 - **Root init.** Hermes' start-up runs as root; with `default_permissions`
   and a real backing tree, root reads and writes the mount like any other
   directory, and files keep their owners.

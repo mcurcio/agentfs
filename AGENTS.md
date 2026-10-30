@@ -30,7 +30,7 @@ These are the owner's priorities. When a choice is unclear, decide by them. Each
 ## Working with the owner
 
 - **Decisions.** The owner's decisions are recorded, dated, in design §19.1. Don't reopen them without new evidence. Record new ones there in the same commit.
-- **Ask about what is genuinely the owner's call**: policy, security trade-offs, cost. Examples are relaxing iac's `docker_volumes` pin for Hermes, or choosing a licence. Decide the rest with the principles above, and say what you decided.
+- **Ask about what is genuinely the owner's call**: policy, security trade-offs, cost. Examples are what a workload's sandbox may reach, or choosing a licence. Decide the rest with the principles above, and say what you decided.
 - **Large multi-agent runs need an explicit request.** Workflows and fan-outs are expensive. Describe the scale first.
 - **Reports must be honest.** Say what is untested, tested only locally, or cut, with the reason.
 

@@ -3948,8 +3948,10 @@ target. What it needs:
   - Hermes' file and terminal tools run in containers on a docker-in-docker
     sidecar, so the mount must also reach that sidecar, and tool containers need
     it as a volume.
-  - In the iac workload that is a deliberate policy change to the `docker_volumes`
-    pin, which the owner must approve.
+  - Tool containers must be able to edit Hermes' own configuration, and the
+    Hermes container sees the change. In the iac workload that means adding
+    the mount to the `docker_volumes` pin, which the owner approved
+    (§19.1 "Sandboxes edit their own configuration", 2026-10-30).
 - **Root init.** The Hermes image's start-up runs as root. With a real backing
   tree and `default_permissions`, root reads the mount like any other directory.
 - **Restarts.** iac patches (§12) apply only at mount, which for Hermes means a
@@ -4850,6 +4852,7 @@ runner.
 | LFS reads and signals (2026-10-30) | The LFS client retries a socket read that returns `EINTR` at the HTTP transport, within what is left of its timeout (§7, §17.3 "LFS"), rather than retrying whole LFS requests: a whole-request retry would restart a large upload from its first byte, and the batch and verify requests have no retry at all. A design choice, not the owner's words. Cost: the connector chain is built on ureq's unversioned transport API, so each ureq upgrade must recheck it. Bead agentfs-lh8 |
 | Parent-finished mark (2026-10-30) | A fork of a fork that publishes as a top-level fork because its parent finished raises `ForkParentFinished`, then writes its published mark, which records the parent (§12 "Forks of forks"): at least once, at most twice across a crash. The mark is the confirmation, so a crash before it leaves the fork finished, and every path that publishes a finished fork (`agentfs fork finish`, the CSI release scan, with DeleteVolume waiting) raises it again. A design choice, not the owner's words. The bead's "raise from the mark", built first as a `raised` flag in the mark, was replaced in the fix round: under CSI nothing re-runs a publish for a fork already published (the release scan skips it and DeleteVolume deletes it), so an alarm pending in a published mark could still be lost. Cost: the alarm can precede a mark write that then fails. Left as before: `ForkPublished` and the publish duration are emitted after the mark write, so a crash there loses them (they are not alarms). Bead agentfs-rrm |
 | serve-git credentials and barriers (2026-10-30) | Replacing a barrier patch, whatever with, needs the `barrier` right, and an old tip that cannot be read counts as a barrier (fail closed). `agentfs.patchNotifyUrl` with userinfo (`user:token@`) fails the volume (`NotifyUrl`, the value echoed with its userinfo as `***`): the token goes in `agentfs.patchNotifyCredentialFile`. One check, `lfs::client::webhook_url_refused`, judges every webhook URL an operator configures (scheme, the `https` feature, no userinfo): `agentfs.patchNotifyUrl` and `agentfs fork deliver --to webhook --url` alike. The shared POST helper (`lfs::client::post`) keeps the URL redacted and scrubs it from its error text, so no webhook's failure prints userinfo, even for library callers who build a notifier or delivery themselves (fix round). Design choices, not the owner's words. Bead agentfs-5sg |
+| Sandboxes edit their own configuration (2026-10-30) | The owner, 2026-10-30: "i want sandboxes to be able to edit their own configuration and have it reflected back in the main container". For Hermes (§16), the docker-in-docker sidecar mounts the agentfs mount the way the Hermes container does, and iac's `docker_volumes` pin passes it into tool containers, so a tool's edit lands in the one mount the Hermes container reads and is recorded like any other write. This settles the policy question the 2026-10-12 review left to him (review finding 9). Costs, design notes, not his words: a tool container's shell can now change the agent's prompts, profiles and skills, kept on record but not prevented; nested propagation (FUSE mount → sidecar → tool container) is not tested yet |
 
 ### 19.2 Open questions
 
