@@ -18,6 +18,10 @@ pub const LINK_KEY: &str = "agentfs.fork.link";
 /// path to a config file of `[remote "<name>"]` sections (design §11.5,
 /// §19.1 "Unlinked fork remotes"); unset, the fork is local-only.
 pub const REMOTES_KEY: &str = "agentfs.fork.remotes";
+/// `agentfs.fork.sourceIsFork`: `true` when the source was itself a fork
+/// at create; unset otherwise. Identity: written by create, never by an
+/// include.
+pub const SOURCE_IS_FORK_KEY: &str = "agentfs.fork.sourceIsFork";
 
 /// Whether a fork delivers back to its source, fixed at create (design
 /// §11.5; §19.1 "Fork link", 2026-10-17). The owner: "A fork can be

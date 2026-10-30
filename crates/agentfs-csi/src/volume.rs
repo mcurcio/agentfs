@@ -311,7 +311,9 @@ pub fn create_error(e: CreateError) -> Error {
     match e {
         CreateError::SourceNotFound { .. } => Error::NotFound(message),
         CreateError::SourceHasNoHistory { .. }
-        | CreateError::SourceIsFork { .. }
+        | CreateError::SourceIsUnlinkedFork { .. }
+        | CreateError::ParentHistoryHidden { .. }
+        | CreateError::ParentHasNoQueue { .. }
         | CreateError::NoForkRemote { .. }
         | CreateError::SourceSettingsNotIncluded { .. }
         | CreateError::LfsObjectMissing { .. } => Error::FailedPrecondition(message),

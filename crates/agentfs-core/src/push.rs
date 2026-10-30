@@ -1220,6 +1220,20 @@ impl RemotePusher {
         }))
     }
 
+    /// The refs this remote lists whose full names start with `prefix`
+    /// (e.g. `refs/agentfs/<volume>/`), by name: one listing connection
+    /// with this remote's authentication (remote_auth.rs) and proxy, as
+    /// [`RemotePusher::branch_claim`]; never pushes, never takes the push
+    /// lock, never touches the push state. `Unreachable::message` is
+    /// scrubbed of userinfo.
+    pub fn list_refs(&self, prefix: &str) -> Result<BTreeMap<String, Oid>, Unreachable> {
+        self.list_remote_refs(|name| name.starts_with(prefix))
+            .map_err(|(kind, message)| Unreachable {
+                kind,
+                message: scrub_userinfo(&message, self.remote.push_url()),
+            })
+    }
+
     /// Replaces this worktree's own branch on the remote with the local
     /// head, leased on `lease`: the value the operator saw on the remote
     /// (F8 S2; design §15). Under this remote's push lock, not the state

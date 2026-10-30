@@ -119,6 +119,28 @@ Operator path rules are not config keys: they are `<state>/git/info/exclude`
 `<state>/git/info/attributes` (`-agentfs` and the other `agentfs.*`
 attributes, §4.2; see [Operator attributes](#operator-attributes)).
 
+The `agentfs.patch*` keys configure the patch queue (design §12). With
+none set, a volume with one remote takes patches from it, lands a patch
+that merges cleanly (`cleanMerge`, by `merge`) and notifies no one. A
+volume whose integrator approves each patch, rebases, and hears every
+verdict change might set:
+
+```ini
+[agentfs]
+	patchAccept = approval
+	patchIntegrate = rebase
+	patchNotifyUrl = http://integrator.example:8080/agentfs
+	patchNotifyCredentialFile = /run/secrets/agentfs/notify-token
+```
+
+Two hooks are files in the state area's git directory, not keys:
+`hooks/patch-notify` gets every notice when it exists, and
+`hooks/patch-accept` judges each cleanly merged patch with `patchAccept =
+command` (missing, every such patch is not judged). Merge drivers are
+`merge=<name>` lines in `info/attributes` and git's own
+`merge.<name>.driver` keys ([the runbook](runbooks/patch-queue.md#6-configuration)).
+Under CSI, the keys go in the profile's config.
+
 ### Remotes modes
 
 A volume's push sections decide how its history leaves the node (design
@@ -193,14 +215,16 @@ in the fork's own state-area config, beside `agentfs.volume`. Never set
 them by hand, and never in an include: a fragment that sets any of them
 fails with `IncludeSetsIdentity`. `source` and `base` are set together,
 or neither, and `pushTarget`, `link`, `sourceState` and `remotes` only with them
-(`PartialForkIdentity`), and `baseChangeLine` likewise; a fork's config
+(`PartialForkIdentity`), and `baseChangeLine` and `sourceIsFork` likewise; a fork's config
 must not set `agentfs.branch`.
 A fork's history ref is its push target. A linked fork's only push
 remote is its fork remote (see `agentfsForkRemote`), or, for a fork of a
 local-only source, none: it publishes into the source's history
 ([Remotes modes](#remotes-modes)). An unlinked fork's push remotes are
-the sections of its own remotes file, or none: it is local-only. It has
-no patch queue.
+the sections of its own remotes file, or none: it is local-only, and it
+has no patch queue. A linked fork's patch queue is on its fork remote,
+where its own forks roll their changes up; a fork of a local-only source
+has none.
 
 | Key | Type | Default | Meaning and validation |
 |---|---|---|---|
@@ -210,6 +234,7 @@ no patch queue.
 | `agentfs.fork.sourceState` | absolute path | unset: publishes to a fork remote | A linked fork of a local-only source (F8 S3): the source's state area, written at create; the fork publishes into its history there, unless a section sets `agentfsForkRemote`. A relative path fails the fork (`RelativePath`), and so does any value in an unlinked fork (`UnlinkedSourceState`) |
 | `agentfs.fork.link` | `linked` or `unlinked` | `linked` | Whether the fork delivers back to its source (design §11.5 "Fork link"), from `fork create --link` or a fork class's `link` at create (written only for `unlinked`), never changed after. `linked`: its finish publishes the change to its fork remote, or into a local-only source's history; it waits and alarms while it cannot reach it, and never delivers anywhere else. `unlinked`: an independent fork that pushes its history ref only to its own remotes (`agentfs.fork.remotes`; none: local-only) and delivers nothing: `fork finish` refuses it (`Unlinked`), it has no `fork status`, and DeleteVolume treats it as any worktree. Any other value fails the fork (`BadChoice`) |
 | `agentfs.fork.remotes` | absolute path | unset: an unlinked fork is local-only | An unlinked fork's own remotes (design §11.5, §19.1 "Unlinked fork remotes"), from `fork create --remotes FILE` or a fork class's `remotes` profile at create. The file is read alone at every open: its `[remote "<name>"]` sections are the fork's push remotes, with the same keys and modes as any volume's, and its `lfs.url` and `lfs.pushurl` the fork's (the source's are never read); it may hold nothing else (`ForkRemotesKey`, also for `agentfsForkRemote`), must be a readable file (`ForkRemotesUnreadable`) and must not be inside the backing tree or the mount point (`IncludeExposed`). A relative path fails the fork (`RelativePath`), and so does any value in a linked fork (`LinkedForkRemotes`) |
+| `agentfs.fork.sourceIsFork` | boolean | unset: the source is not a fork | `true` when the fork's source was itself a fork at create (bead agentfs-mia.7), written by fork create: the fork's finish rolls its change up into the source's patch queue on the fork remote, as the source's next inbox number, instead of publishing change and finish refs; once the source has finished, it publishes as a top-level fork and raises `ForkParentFinished`. Set without a fork identity, or by an include, it fails the fork (`PartialForkIdentity`, `IncludeSetsIdentity`) |
 | `agentfs.fork.pushTarget` | `branch` or `hidden` | `branch` | Where the fork's history is kept and pushed, from the source's `agentfs.forkRefs` at create (written only for `hidden`): `branch` is `refs/heads/agentfs/<fork>`, `hidden` is `refs/agentfs/<fork>/history`. Any other value fails the fork (`BadChoice`) |
 
 ### `[agentfs "start"]`

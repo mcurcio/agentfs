@@ -594,6 +594,38 @@ fn arrival_judges_and_notifies_never_lands() {
     );
 }
 
+/// `POST /agentfs/apply` needs the Integrator right: no credentials is a
+/// 401, a pusher with only `offer` a 403 that lands nothing, and one with
+/// the right lands the queue (nothing attached).
+#[test]
+fn apply_needs_the_integrator_right() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new();
+    s.pusher("iac", &["offer"]);
+    s.pusher("ops", &["integrator"]);
+    let head = s.branch_head();
+    let served = s.serve();
+    let url = served.url("iac", "iac-token");
+    let p = s.producer("p");
+    let a1 = s.file("a1", "a1\n");
+    let out = s.submit(&p, &url, &["--put", &format!("a.txt={a1}"), "-m", "one"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(s.local_ref(&inbox(1)).is_some());
+
+    assert_eq!(served.http("POST", "/agentfs/apply", None).0, 401);
+    let (status, body) = served.http("POST", "/agentfs/apply", Some("Bearer iac-token"));
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("iac may not apply the queue"), "{body}");
+    assert_eq!(s.read("a.txt").as_deref(), Some("a0\n"), "nothing landed");
+    assert_eq!(s.branch_head(), head, "nothing landed");
+
+    let (status, body) = served.http("POST", "/agentfs/apply", Some("Bearer ops-token"));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(s.read("a.txt").as_deref(), Some("a1\n"), "{body}");
+}
+
 /// Acceptance 5: serve-git is the patch source, so a patch remote refuses
 /// it, naming the key.
 #[test]

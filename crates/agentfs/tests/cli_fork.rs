@@ -276,6 +276,57 @@ fn a_source_with_settings_in_its_own_config_is_refused() {
     );
 }
 
+/// The `include.path` values of the state area `state`'s own config.
+fn includes_of(s: &Setup, state: &str) -> Vec<String> {
+    let config = git2::Config::open(&s.path(state).join("git/config")).unwrap();
+    let mut out = Vec::new();
+    let mut entries = config.multivar("include.path", None).unwrap();
+    while let Some(entry) = entries.next() {
+        out.push(entry.unwrap().value().unwrap().to_owned());
+    }
+    out
+}
+
+/// Bead agentfs-mia.7, test 7: `fork create` of a CLI fork's state area
+/// makes a fork of a fork, whose identity names the fork, records that its
+/// source is a fork, and reads the parent's includes.
+#[test]
+fn fork_create_of_a_fork() {
+    let s = Setup::new(true);
+    s.record("state", "tree", "a.txt", "a\n");
+    let parent = s.create_fork();
+    s.record("fork", "fork-tree", "b.txt", "b\n");
+    let parent_state = s.path("fork").display().to_string();
+    let out = s.ok(
+        "child",
+        "child-tree",
+        &["fork", "create", "--source-state", &parent_state],
+    );
+    let line = out.lines().next().unwrap();
+    let name = line
+        .strip_prefix("fork ")
+        .and_then(|l| l.split(' ').next())
+        .unwrap_or_else(|| panic!("{line}"));
+    assert!(name.starts_with(&format!("{parent}-")), "{line}");
+    assert!(line.contains(&format!(" of {parent} at ")), "{line}");
+    assert_eq!(
+        s.own_config("child", "agentfs.fork.source").as_deref(),
+        Some(parent.as_str())
+    );
+    assert_eq!(
+        s.own_config("child", "agentfs.fork.sourceIsFork")
+            .as_deref(),
+        Some("true")
+    );
+    assert_eq!(includes_of(&s, "child"), includes_of(&s, "fork"));
+    assert!(!includes_of(&s, "child").is_empty());
+    // The child's tree is the parent's head: the parent's own record too.
+    assert_eq!(
+        fs::read_to_string(s.path("child-tree/b.txt")).unwrap(),
+        "b\n"
+    );
+}
+
 /// `fork status --json` of the fork in `fork`.
 fn status_json(s: &Setup) -> serde_json::Value {
     let out = s.ok("fork", "fork-tree", &["fork", "status", "--json"]);

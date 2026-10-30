@@ -110,8 +110,8 @@ pub enum ConfigError {
     BadForkBase { key: String, value: String },
     #[error(
         "agentfs.fork.source and agentfs.fork.base must be set together, and \
-         agentfs.fork.pushTarget, agentfs.fork.link, agentfs.fork.sourceState and \
-         agentfs.fork.remotes only with them"
+         agentfs.fork.pushTarget, agentfs.fork.link, agentfs.fork.sourceState, \
+         agentfs.fork.remotes and agentfs.fork.sourceIsFork only with them"
     )]
     PartialForkIdentity,
     #[error(
@@ -222,6 +222,7 @@ pub const KEYS: &[&str] = &[
     "agentfs.fork.sourceState",
     "agentfs.fork.remotes",
     "agentfs.fork.baseChangeLine",
+    "agentfs.fork.sourceIsFork",
     "agentfs.start.remote",
     "agentfs.start.branch",
     "agentfs.start.commit",
@@ -592,6 +593,11 @@ pub struct Settings {
     /// when the source had a change line, read only beside a fork
     /// identity, never from an include.
     pub fork_base_change_line: Option<git2::Oid>,
+    /// `agentfs.fork.sourceIsFork = true`: the fork's source was itself a
+    /// fork at create (bead agentfs-mia.7), so its change rolls up into
+    /// the source's patch queue ([`Settings::parent_fork`]). Read only
+    /// beside a fork identity, never from an include.
+    pub source_is_fork: bool,
 }
 
 /// Which push remotes a volume has (design §11.1); [`Settings::load`] is the
@@ -690,8 +696,17 @@ pub enum PatchRemote {
 impl Settings {
     /// The remote the patch queue uses, if any (design §12). A section
     /// with `agentfsForkRemote` is never one: it is not in `remotes`, and
-    /// an invalid one does not count against the automatic choice.
+    /// an invalid one does not count against the automatic choice. A
+    /// linked fork's queue is on its fork remote section, where its own
+    /// history is pushed and where its forks roll their changes up (bead
+    /// agentfs-mia.7); a fork of a local-only source has none.
     pub fn patch_remote(&self) -> Option<&RemoteSettings> {
+        if self.fork.is_some() {
+            return match self.is_unlinked_fork() {
+                true => None,
+                false => self.fork_remote_section(),
+            };
+        }
         resolve_patch_remote(
             &self.patch_remote,
             self.remotes.pushed(),
@@ -721,6 +736,17 @@ impl Settings {
     /// Whether this volume is a fork (design §11.5).
     pub fn is_fork(&self) -> bool {
         self.fork.is_some()
+    }
+
+    /// The source's name when this volume is a fork whose source was
+    /// itself a fork at create (`agentfs.fork.sourceIsFork`, bead
+    /// agentfs-mia.7): its change rolls up into that source's patch queue.
+    /// `None` for any other volume.
+    pub fn parent_fork(&self) -> Option<&str> {
+        self.fork
+            .as_ref()
+            .filter(|_| self.source_is_fork)
+            .map(|f| f.source.as_str())
     }
 
     /// Whether this volume is an unlinked fork (design §11.5,
@@ -847,6 +873,19 @@ fn base_change_line_of(
             }
             git2::Oid::from_str(&value).map(Some).map_err(|_| bad())
         }
+    }
+}
+
+/// `agentfs.fork.sourceIsFork` (bead agentfs-mia.7): a boolean, set only
+/// beside a fork identity.
+fn source_is_fork_of(
+    config: &git2::Config,
+    fork: Option<&ForkIdentity>,
+) -> Result<bool, ConfigError> {
+    match boolean(config, fork_identity::SOURCE_IS_FORK_KEY)? {
+        None => Ok(false),
+        Some(_) if fork.is_none() => Err(ConfigError::PartialForkIdentity),
+        Some(value) => Ok(value),
     }
 }
 
@@ -1062,6 +1101,7 @@ pub fn declares_fork(git_dir: &Path) -> Result<bool, git2::Error> {
         fork_identity::REMOTES_KEY,
         crate::fork::receive::SOURCE_STATE_KEY,
         crate::checkpoint::BASE_CHANGE_LINE_KEY,
+        fork_identity::SOURCE_IS_FORK_KEY,
     ] {
         if is_set(&config, key)? {
             return Ok(true);
@@ -1152,6 +1192,7 @@ impl Settings {
         };
         let source_state = source_state_of(config, fork.as_ref())?;
         let fork_base_change_line = base_change_line_of(config, fork.as_ref())?;
+        let source_is_fork = source_is_fork_of(config, fork.as_ref())?;
         let split = if unlinked {
             // Its own sections only, and no fork remote: it delivers
             // nothing.
@@ -1230,6 +1271,7 @@ impl Settings {
             fork_remotes,
             source_state,
             fork_base_change_line,
+            source_is_fork,
             fork_refs,
             fork,
             start,
@@ -1295,6 +1337,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
             fork_identity::REMOTES_KEY,
             crate::fork::receive::SOURCE_STATE_KEY,
             crate::checkpoint::BASE_CHANGE_LINE_KEY,
+            fork_identity::SOURCE_IS_FORK_KEY,
             fork_identity::START_REMOTE_KEY,
             fork_identity::START_BRANCH_KEY,
             fork_identity::START_COMMIT_KEY,
@@ -3000,9 +3043,10 @@ mod tests {
     }
 
     /// A2: a fork pushes only to its fork remote, at its own branch, and
-    /// has no patch queue.
+    /// its patch queue is on that remote (bead agentfs-mia.7), never on
+    /// the source's patch remote.
     #[test]
-    fn a_fork_has_one_remote_and_no_patch_queue() {
+    fn a_fork_has_one_remote_and_its_queue_on_it() {
         let (_d, c) = config_with(&fork_config(
             "[agentfs]\n\tpatchRemote = origin\n[remote \"origin\"]\n\turl = /o\n\
              [remote \"other\"]\n\turl = /x\n\
@@ -3017,7 +3061,8 @@ mod tests {
         let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["forks"]);
         assert_eq!(s.patch_remote, PatchRemote::Disabled);
-        assert_eq!(s.patch_remote(), None);
+        assert_eq!(s.patch_remote().map(|r| r.name.as_str()), Some("forks"));
+        assert_eq!(s.parent_fork(), None);
         // No flagged section: the source's patch remote (gate answer Q1 b).
         let (_d, c) = config_with(&fork_config("[remote \"origin\"]\n\turl = /o\n"));
         let s = Settings::from_config(&c).unwrap();
@@ -3027,7 +3072,7 @@ mod tests {
             s.fork_remote_section().map(|r| r.name.as_str()),
             Some("origin")
         );
-        assert_eq!(s.patch_remote(), None);
+        assert_eq!(s.patch_remote().map(|r| r.name.as_str()), Some("origin"));
         // Two remotes and no patch remote: no fork remote, nothing pushed.
         let (_d, c) = config_with(&fork_config(
             "[remote \"a\"]\n\turl = /a\n[remote \"b\"]\n\turl = /b\n",
@@ -3035,6 +3080,7 @@ mod tests {
         let s = Settings::from_config(&c).unwrap();
         assert!(s.remotes.pushed().is_empty());
         assert_eq!(s.fork_remote, None);
+        assert_eq!(s.patch_remote(), None);
         // An unflagged invalid section is not the fork's: nothing raised.
         let (_d, c) = config_with(&fork_config(
             "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n\
@@ -3393,5 +3439,43 @@ mod tests {
             Settings::from_config(&c),
             Err(ConfigError::RelativePath { ref key, .. }) if key == "agentfs.fork.sourceState"
         ));
+    }
+
+    /// A fork of a fork (bead agentfs-mia.7): `agentfs.fork.sourceIsFork`
+    /// names the parent, only beside a fork identity, never from an
+    /// include; a fork of a local-only source has no queue.
+    #[test]
+    fn source_is_fork_names_the_parent() {
+        let (_d, c) = config_with(&fork_config(
+            "[agentfs \"fork\"]\n\tsourceIsFork = true\n[remote \"origin\"]\n\turl = /o\n",
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.parent_fork(), Some("src"));
+        let (_d, c) = config_with(&fork_config("[agentfs \"fork\"]\n\tsourceIsFork = false\n"));
+        assert_eq!(Settings::from_config(&c).unwrap().parent_fork(), None);
+        let (_d, c) =
+            config_with("[agentfs]\n\tvolume = v\n[agentfs \"fork\"]\n\tsourceIsFork = true\n");
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::PartialForkIdentity)
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let fragment = dir.path().join("fragment");
+        std::fs::write(&fragment, "[agentfs \"fork\"]\n\tsourceIsFork = true\n").unwrap();
+        let (_d, c) = config_with(&fork_config(&format!(
+            "[include]\n\tpath = {}\n",
+            fragment.display()
+        )));
+        assert!(matches!(
+            Settings::from_config(&c),
+            Err(ConfigError::IncludeSetsIdentity { key, .. })
+                if key == crate::fork::identity::SOURCE_IS_FORK_KEY
+        ));
+        // A fork of a local-only source publishes into its history: no
+        // remote, so no queue.
+        let (_d, c) = config_with(&fork_config("[agentfs \"fork\"]\n\tsourceState = /s\n"));
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.fork_remote, Some(ForkRemote::SourceHistory));
+        assert_eq!(s.patch_remote(), None);
     }
 }
