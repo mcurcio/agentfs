@@ -292,8 +292,10 @@ tests the container image on every push:
 Three more workflows test what ships beside the binary:
 
 - [`.github/workflows/docker.yml`](../.github/workflows/docker.yml), on
-  pushes that touch the image or `examples/docker`: each Docker example
-  in its own job ([docker.md](docker.md)).
+  pushes that touch the image, `examples/docker`, `ci/hermes` or
+  `deploy/examples/hermes`: each Docker example in its own job
+  ([docker.md](docker.md)), and upstream Hermes on the compose example
+  ([deployment.md](deployment.md#how-it-is-tested)).
 - [`.github/workflows/helm.yml`](../.github/workflows/helm.yml), on every
   push: the charts linted and checked against `deploy/`, the CSI chart
   installed on kind and put through `ci/e2e-csi.sh`, and the charts

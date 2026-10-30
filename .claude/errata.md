@@ -497,3 +497,36 @@ None stopped a slice; each was resolved as stated and is recorded in design §19
    failure. Local state-area corruption has no terminal outcome or alarm of its own anywhere in
    publishing or the mount-time queue (`queue_at_start` only prints). A class-level outcome
    (a refused reason or alarm, with a runbook) needs its own bead.
+
+## 2026-10-30, agentfs-4af implementer (Hermes compose suite in CI)
+
+Not blocking; the suite is built and green. Findings about the brief and the docs:
+
+1. **`deploy/examples/hermes/config` cannot be used as-is.** The brief said to use the three
+   rule files as-is. `config` names a placeholder remote (`https://git.example.com/...`) and a
+   credentials path; its one other setting, `agentfs.nested = exclude`, is the default
+   (configuration.md). Overriding the URL with a second include would make
+   `remote.origin.url` multi-valued (git pushes to every value; libgit2 reads the last), and
+   `url.<base>.insteadOf` would rewrite only for libgit2, not for every reader. The suite uses
+   `exclude` and `attributes` as-is and the Docker example's `config/remote` for the remote.
+2. **Hermes keeps its sessions in `state.db`, not `sessions/`.** design §16, deployment.md
+   §10 and the `attributes` comments list `sessions/` as Hermes' session store. In upstream
+   v0.22.5 (image digest `9c5561579f3f…`) sessions live in `state.db` (upstream
+   `website/docs/user-guide/docker.md`, "Filesystem requirements for `state.db`"), and
+   `sessions/` held nothing during the run. The rules still cover both (`*.db`,
+   `sessions/**`); only the prose is out of date. Hermes also writes `response_store.db`,
+   `runs_idempotency.db`, `kanban.db` and a Unix socket `gateway.sock` at the top of its home,
+   all excluded by the allowlist.
+3. **Bind-mounting the rule files into the state volume (as the sidecar does with `subPath`)
+   left the Docker volume busy** at `docker compose down -v` on the runner (docker run
+   41092510458: `unlinkat .../_data/state/git/info/attributes: device or resource busy`). The
+   suite copies them at init instead, as deployment.md §10's migration does. Not investigated
+   further: whether the bind survives on the host through the `/agentfs` mount's `rshared`
+   propagation; it does not affect Kubernetes, where kubelet owns the mounts.
+4. **The brief's topology needed two additions upstream requires.** `hermes chat --oneshot`
+   hides `skill_manage` (upstream `agent/oneshot_footprint.py`), so the suite drives Hermes
+   through its gateway's OpenAI-compatible API (`API_SERVER_ENABLED`, upstream
+   `features/api-server.md`). Hermes' approval check flags a terminal command that redirects
+   into any `.env` path (upstream `tools/approval_detection.py`, "overwrite project env/config
+   via redirection") and then waits for a human, so the tool container writes `auth.json`, not
+   `.env`, as its secret.

@@ -619,6 +619,37 @@ sidecar's startup probe allows for the fetch, which waits at most
 alert on `agentfs.patch.blocked`. See
 [patch-queue.md](runbooks/patch-queue.md).
 
+### How it is tested
+
+The `docker` workflow runs this setup under Docker Compose, not
+Kubernetes: [`ci/e2e-hermes.sh`](../ci/e2e-hermes.sh) with
+[`ci/hermes/compose.yaml`](../ci/hermes/compose.yaml) over the compose
+example and its git server ([docker.md](docker.md)), with this
+section's `exclude` and `attributes` and the example's remote settings
+(the Hermes `config` names a placeholder remote). Hermes is the
+upstream image, pinned by digest and started as shipped (`gateway run`,
+root start-up), with the mount at `/opt/data`; its tool containers run on
+a docker-in-docker service that has the mount too, and
+`terminal.docker_volumes` passes it into them. A scripted stand-in for
+the model API makes every turn deterministic. The job checks that:
+
+- Hermes' root start-up runs on the mount and files keep their owners;
+- a skill Hermes creates with its own skill tool is committed as its user
+  and pushed;
+- a tool container's edit, made through Hermes' terminal tool, reaches
+  the Hermes container and is committed as root and pushed;
+- `.env`, `state.db` (which holds the sessions), `response_store.db`,
+  `logs/`, and an `auth.json` and a log a tool container writes inside
+  `skills/`, are in the tree but never in the history, locally or on the
+  remote;
+- a patch queued with `agentfs patch submit` lands when Hermes and
+  docker-in-docker are stopped and agentfs restarted, and Hermes' next
+  model request carries the patched `SOUL.md`.
+
+Not tested: the Kubernetes pod itself (the sidecar, `subPath`, probes),
+a profile's files, a real model, and tool containers given only part of
+the volume.
+
 ## 11. Limitations
 
 - `linux/amd64` images only.
