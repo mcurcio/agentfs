@@ -269,7 +269,7 @@ if [ "$MODE" = csi ]; then
   echo "volume $VOLUME"
   hermes_check_startup
 else
-  step "deploy the overlay (the Deployment at zero for sidecar)"
+  step "deploy ci/hermes/k8s/$MODE"
   render "$K8S/$MODE" >"$LOGS/$MODE.yaml"
   grep -q 'name: agentfs-example' "$LOGS/$MODE.yaml" || fail "the overlay renders no Deployment"
   kubectl apply -f ci/k8s/namespace.yaml

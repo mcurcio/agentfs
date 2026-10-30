@@ -31,8 +31,8 @@ model_requests() {
 }
 
 # The messages of <role> in the turn whose user message carries <nonce>:
-# the system prompt of its first request, or every tool result of its last
-# (a terminal result's output, when it is JSON with one).
+# the system prompt of its first request, or every tool result of the
+# last that has any (a terminal result's output, when it is JSON with one).
 turn_text() { # nonce role
   model_requests | python3 -c '
 import json, sys
@@ -47,13 +47,17 @@ def text(content):
         pass
     return str(content)
 
+# Hermes sends more requests per turn than the agent loop (a title, after
+# the reply): the last one with messages of the role.
 found = None
 for r in json.load(sys.stdin):
     ms = r["body"].get("messages") or []
     if any(nonce in str(m.get("content")) for m in ms if m.get("role") == "user"):
-        found = ms
         if role == "system":
+            found = ms
             break
+        if any(m.get("role") == role for m in ms):
+            found = ms
 print("\n".join(text(m.get("content")) for m in (found or []) if m.get("role") == role))' "$1" "$2"
 }
 
