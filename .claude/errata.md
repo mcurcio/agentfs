@@ -472,3 +472,5 @@ None stopped a slice; each was resolved as stated and is recorded in design §19
    the mark and the alarm still lost it, while design §12 and the runbook said "never lost".
    Fixed by raising before the mark is written (the flag is gone): a crash in between leaves the
    fork finished, which every publishing path retries. Entry 7 above is superseded.
+2. **Entry 14's follow-up done here.** `tokio::net::UnixListener::bind` is banned; the two test
+   fakes listen through `Listener::into_async` instead of carrying an `#[allow]`.

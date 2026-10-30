@@ -18,6 +18,7 @@ use agentfs_core::history_service::{
 };
 use agentfs_core::identity::Context;
 use agentfs_core::lfs::Store;
+use agentfs_core::listening_socket::Listener;
 use agentfs_core::paths::RepoPath;
 use agentfs_core::pending::PendingId;
 use agentfs_core::record::{Caller, Change, Draft, Origin, Trigger};
@@ -28,7 +29,7 @@ use agentfs_core::volume::{self, Committer, Input, Recorded, Recorder, StateDir,
 use hyper_util::rt::TokioIo;
 use pb::history_client::HistoryClient as RawClient;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -737,7 +738,7 @@ impl FakeServer {
         let (kill, killed) = std::sync::mpsc::channel();
         let listener = {
             let _runtime = runtime.enter();
-            tokio::net::UnixListener::bind(&socket).unwrap()
+            Listener::bind(&socket).unwrap().into_async().unwrap()
         };
         let (reporter, health) = tonic_health::server::health_reporter();
         runtime.block_on(reporter.set_service_status(
@@ -752,7 +753,7 @@ impl FakeServer {
             Server::builder()
                 .add_service(health)
                 .add_service(pb::history_server::HistoryServer::new(fake))
-                .serve_with_incoming(UnixListenerStream::new(listener).map(|io| io.map(FakeConn))),
+                .serve_with_incoming(listener.map(|io| io.map(FakeConn))),
         );
         let thread = std::thread::spawn(move || {
             let _ = killed.recv();
