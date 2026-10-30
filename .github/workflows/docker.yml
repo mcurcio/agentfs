@@ -78,8 +78,8 @@ jobs:
         run: ci/e2e-docker.sh diagnose
 
   # Bead agentfs-4do: restarting only the agentfs container under a running
-  # workload must not land queued patches under it (design §12). Red means
-  # the bug is confirmed; the log shows what the workload saw.
+  # workload must not land queued patches under it (design §12); the log
+  # shows what the workload saw.
   restart-patch:
     name: e2e (docker restart under a workload, queued patch)
     needs: build

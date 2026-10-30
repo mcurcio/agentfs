@@ -728,6 +728,71 @@ async fn reconcile_rebuilds_services_and_fronts_from_the_records() {
     sup.shutdown().await;
 }
 
+/// Whether a service was told a workload is attached (design §12: it
+/// judges the patch queue and does not land it).
+fn told_attached(spec: &ProcessSpec) -> bool {
+    spec.args.iter().any(|a| a == "--workload-attached")
+}
+
+/// The plugin dies with its children, leaving their mounts stale.
+fn plugin_dies(n: &Node, sup: &Supervisor) {
+    let pids: Vec<u32> = n.fake.world().procs.keys().copied().collect();
+    sup.forget();
+    for pid in pids {
+        n.fake.crash(pid);
+    }
+}
+
+/// Bead agentfs-4do: a service started while a pod of the volume is
+/// published (a restart after a crash, a new plugin's reconcile) is told a
+/// workload is attached before any front is back; one started with no pod
+/// published (a stage, a reconcile after the targets went away) is not.
+#[tokio::test]
+async fn a_service_is_told_while_a_pod_of_its_volume_is_published() {
+    let n = Node::new();
+    n.stage("v").await.unwrap();
+    assert!(!told_attached(&n.fake.spawns("service")[0]), "a stage");
+    let target = n.target("a");
+    n.publish("v", &target, false).await.unwrap();
+
+    let first = n.sup.service_pid("v").unwrap();
+    n.fake.crash(first);
+    eventually("the service's restart", || {
+        n.sup.service_pid("v").is_some_and(|p| p != first)
+    })
+    .await;
+    assert!(
+        told_attached(n.fake.spawns("service").last().unwrap()),
+        "a restart"
+    );
+
+    plugin_dies(&n, &n.sup);
+    let sup = n.restart();
+    let report = sup.reconcile().await.unwrap();
+    assert_eq!((report.services, report.recovering), (1, 1));
+    assert!(
+        told_attached(n.fake.spawns("service").last().unwrap()),
+        "a reconcile"
+    );
+    eventually("the recovered front", || {
+        n.fake.stack(&target) == [false, true]
+    })
+    .await;
+
+    // A reboot: the target is no longer mounted, so its record is dropped
+    // before the service starts, and nothing is attached.
+    plugin_dies(&n, &sup);
+    n.fake.world().table.remove(&target);
+    let sup = n.restart();
+    let report = sup.reconcile().await.unwrap();
+    assert_eq!((report.services, report.dropped), (1, 1));
+    assert!(
+        !told_attached(n.fake.spawns("service").last().unwrap()),
+        "after a reboot"
+    );
+    sup.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_service_restart_that_cannot_spawn_is_tried_again() {
     let n = Node::new();

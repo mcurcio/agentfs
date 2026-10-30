@@ -284,6 +284,16 @@ pub enum Event {
         method: &'static str,
         message: String,
     },
+    /// A start did not land the patch queue because a workload may be
+    /// attached ([`crate::patch::attached`], design §12): the queue was
+    /// judged instead, and its patches stay queued for the next start with
+    /// nothing attached. A warning.
+    PatchQueueDeferred {
+        /// [`crate::patch::attached::Deferred::as_str`].
+        reason: &'static str,
+        /// Patches queued.
+        queued: usize,
+    },
     /// Fetching the patch queue from its remote failed; the queue ran with
     /// what was already fetched (design §12).
     PatchFetchFailed {
@@ -400,6 +410,7 @@ impl Event {
             Self::PatchHeld { .. } => "patch_held",
             Self::PatchRuleFailed { .. } => "patch_rule_failed",
             Self::NotifyFailed { .. } => "notify_failed",
+            Self::PatchQueueDeferred { .. } => "patch_queue_deferred",
             Self::PatchFetchFailed { .. } => "patch_fetch_failed",
             Self::ForkFinished { .. } => "fork_finished",
             Self::ForkPublished { .. } => "fork_published",
@@ -577,6 +588,12 @@ impl fmt::Display for Event {
                 f,
                 "telling the integrator of the patch queue's changes failed ({method}): \
                  {message}; sent again at the next queue run"
+            ),
+            Self::PatchQueueDeferred { reason, queued } => write!(
+                f,
+                "patch queue deferred ({reason}): a workload may be attached, so {queued} \
+                 patch(es) stay queued; they land at the next start with nothing attached \
+                 (docs/runbooks/patch-queue.md)"
             ),
             Self::PatchFetchFailed {
                 remote,

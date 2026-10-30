@@ -86,6 +86,7 @@ use agentfs_core::history::History;
 use agentfs_core::identity::Context;
 use agentfs_core::lfs;
 use agentfs_core::lock::{LockError, StateLock};
+use agentfs_core::patch::attached::{self, Deferred};
 use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::push::{self, LeaseOutcome, PushOutcome, RemotePusher, RemoteStatus};
 use agentfs_core::record::{Caller, Trigger};
@@ -186,6 +187,11 @@ enum Command {
         /// How long shutdown waits for fronts' requests in progress.
         #[arg(long, default_value = "10s", value_parser = parse_grace)]
         shutdown_grace: Duration,
+        /// A workload may be attached to the volume (the CSI node plugin
+        /// passes it while a pod of the volume is published): the patch
+        /// queue is judged at start, not applied.
+        #[arg(long)]
+        workload_attached: bool,
     },
     /// Serve the volume's history repository to pushers over git's smart
     /// HTTP as its patch source, until SIGINT or SIGTERM: pushers push
@@ -575,6 +581,7 @@ fn real_main() -> Result<ExitCode> {
             pod,
             push_grace,
             shutdown_grace,
+            workload_attached,
         } => {
             let daemon = Daemon::start()?;
             let Some(root) = cli.root.as_deref() else {
@@ -592,6 +599,7 @@ fn real_main() -> Result<ExitCode> {
                 &pod,
                 push_grace,
                 shutdown_grace,
+                workload_attached,
             );
         }
         Command::ServeGit { listen, pod, hook } => {
@@ -1453,11 +1461,19 @@ fn mount(
     agentfs_core::nested::add_views(workload_views(&mountpoint, args));
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
-    // The patch queue, before anything can see the tree (design §12). A
+    // The patch queue, before anything can see the tree (design §12): it
+    // lands only when the last mount stopped with nothing attached and no
+    // stale mount is below this one; otherwise it is judged and waits. A
     // blocked queue is an alarm; the volume mounts anyway, and so it does
-    // when the queue cannot run at all (apply_queue raised the alarm and
-    // recorded the failure).
-    if let Err(e) = patch_cmd::apply_queue(
+    // when the queue cannot run at all.
+    let deferred = if stacked {
+        Some(Deferred::StaleMount)
+    } else if attached::marked(state) {
+        Some(Deferred::UncleanStop)
+    } else {
+        None
+    };
+    patch_cmd::queue_at_start(
         state,
         &settings,
         &recorder,
@@ -1465,10 +1481,15 @@ fn mount(
         &backing,
         session.telemetry(),
         &events,
-        true,
-    ) {
-        eprintln!("patches: the queue could not run: {e:#}");
-    }
+        deferred,
+    );
+    // From here until a stop with nothing attached, a workload may be.
+    attached::mark(state).with_context(|| {
+        format!(
+            "writing {} (the patch queue's evidence of a clean stop)",
+            state.attached_mark().display()
+        )
+    })?;
     let restorer = recorder.clone();
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
@@ -1492,8 +1513,12 @@ fn mount(
     let mounted = match Mount::start(recorder, config) {
         Ok(mounted) => mounted,
         Err(e) => {
-            // Commits what recovery found; nothing was mounted.
+            // Commits what recovery found; nothing was mounted, so nothing
+            // attached: the mark goes unless a stale mount is below.
             let _ = service.shutdown(args.push_grace);
+            if !stacked {
+                clear_attached(state);
+            }
             session.finish();
             return Err(e.into());
         }
@@ -1569,17 +1594,45 @@ fn mount(
     let report = mounted.shutdown(args.unmount_grace);
     print_unmount(&report, args.unmount_grace);
     // The layers earlier crashes left under a stacked mount.
-    match detach_stale_layers(&mountpoint, STALE_LAYERS) {
-        Ok(0) => {}
-        Ok(n) => eprintln!("detached {n} stale layer(s) at {}", mountpoint.display()),
-        Err(e) => eprintln!(
-            "could not detach the stale layers at {}: {e}",
-            mountpoint.display()
-        ),
+    let stale_left = match detach_stale_layers(&mountpoint, STALE_LAYERS) {
+        Ok(0) => false,
+        Ok(n) => {
+            eprintln!("detached {n} stale layer(s) at {}", mountpoint.display());
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "could not detach the stale layers at {}: {e}",
+                mountpoint.display()
+            );
+            true
+        }
+    };
+    // Nothing attached: the unmount was not busy, no file stayed open and
+    // no stale layer (which a workload may still hold) was below. Else the
+    // mark stays, and the next mount holds the patch queue (design §12).
+    if report.unmount_error.is_none() && !report.lazy && !report.session_abandoned && !stale_left {
+        clear_attached(state);
+    } else {
+        eprintln!(
+            "a workload may still be attached: the next mount holds the patch queue until a \
+             mount stops with nothing attached (docs/runbooks/patch-queue.md)"
+        );
     }
     let code = stop_service(service, args.push_grace);
     session.finish();
     Ok(if failed { ExitCode::FAILURE } else { code })
+}
+
+/// Removes the attached mark (design §12): a mount stopped with nothing
+/// attached. A failure leaves it, and the next mount holds the queue.
+fn clear_attached(state: &StateDir) {
+    if let Err(e) = attached::clear(state) {
+        eprintln!(
+            "warning: removing {}: {e}; the next mount holds the patch queue",
+            state.attached_mark().display()
+        );
+    }
 }
 
 /// Reports what an unmount did and what it could not record.

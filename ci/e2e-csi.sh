@@ -436,8 +436,9 @@ assert_contains "$(plugin_log)" "service for $PV exited" "the plugin restarted t
 step "(h) restart the node plugin: reconcile"
 # Bead agentfs-4do: a patch queued while both pods run (plain git, as
 # docs/runbooks/patch-queue.md "With plain git") must not land under them
-# when the plugin restarts (design §12). Checked after the restart; a
-# landing fails the script at its end, so the rest still runs.
+# when the plugin restarts (design §12): reconcile starts the service with
+# --workload-attached, the pods being published. Checked after the
+# restart; a landing fails the script at its end, so the rest still runs.
 PATCH_FILE=patched-under-pod.txt
 patch_head=$(rgit rev-parse "$BRANCH")
 patch_blob=$(printf landed | rgit hash-object -w --stdin)

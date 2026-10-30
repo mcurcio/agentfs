@@ -3,7 +3,8 @@
 //! after a close was recorded but before FLUSH replied, and while saving
 //! the repair queue of a rename whose record failed. The stale mount is
 //! detached and the next command recovers; nothing journaled is lost and
-//! the repair is made.
+//! the repair is made. And a killed daemon's next mount holds the patch
+//! queue (design §12): a workload may still be attached.
 //!
 //! Built only with the `failpoints` feature, and needs `/dev/fuse` and
 //! root, so every test is `#[ignore]`d; the `crash` CI job runs them
@@ -18,6 +19,8 @@
 
 #[path = "../../agentfs-core/tests/support/crash_oracle.rs"]
 mod crash_oracle;
+#[path = "../../agentfs-core/tests/support/queue_patch.rs"]
+mod queue_patch;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -258,4 +261,81 @@ fn killed_while_saving_the_repair_queue() {
     let repairs = agentfs_core::volume::StateDir::new(v.state()).repairs();
     assert!(!repairs.exists() && !repairs.with_extension("tmp").exists());
     crash_oracle::check_clean(&v.state(), BRANCH).unwrap();
+}
+
+/// Bead agentfs-4do (design §12): a mount killed (`kill -9`) may leave a
+/// workload attached, so the next mount does not land the patch queue; it
+/// says why and the patch stays queued. Once a mount stops with nothing
+/// attached, the next one lands it.
+#[test]
+#[ignore = "needs /dev/fuse and root; run by ci/crash-tests.sh"]
+fn a_killed_mount_holds_the_patch_queue_until_a_clean_stop() {
+    let v = Vol::new();
+    fs::write(v.backing().join("a.txt"), "a0\n").unwrap();
+    v.ok("", &["record", "a.txt"]);
+
+    let mut child = v.mount("");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let out = Command::new("umount")
+        .arg("-l")
+        .arg(v.mnt())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    queue_patch::queue_patch(&v.state().join("git"), "demo", 1, "a.txt", "a1\n");
+
+    let child = v.mount("");
+    assert_eq!(fs::read_to_string(v.mnt().join("a.txt")).unwrap(), "a0\n");
+    v.unmount(child);
+    let log = v.log_text();
+    assert!(
+        log.contains("alarm: patch queue deferred (unclean_stop)"),
+        "{log}"
+    );
+    assert!(!log.contains("patch 1 applied"), "{log}");
+
+    let child = v.mount("");
+    assert_eq!(fs::read_to_string(v.mnt().join("a.txt")).unwrap(), "a1\n");
+    v.unmount(child);
+    assert!(v.log_text().contains("patch 1 applied"), "{}", v.log_text());
+    crash_oracle::check_clean(&v.state(), BRANCH).unwrap();
+}
+
+/// Bead agentfs-4do (design §12): a mount stopped while a workload holds
+/// it (its working directory in the mount, as in a container restarted
+/// under a running workload) is detached lazily, so the next mount does
+/// not land the patch queue.
+#[test]
+#[ignore = "needs /dev/fuse and root; run by ci/crash-tests.sh"]
+fn a_busy_stop_holds_the_patch_queue() {
+    let v = Vol::new();
+    fs::write(v.backing().join("a.txt"), "a0\n").unwrap();
+    v.ok("", &["record", "a.txt"]);
+
+    let child = v.mount("");
+    let mut holder = Command::new("sleep")
+        .arg("60")
+        .current_dir(v.mnt())
+        .spawn()
+        .unwrap();
+    v.unmount(child);
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert!(
+        v.log_text().contains("the mount was busy: detached lazily"),
+        "{}",
+        v.log_text()
+    );
+    queue_patch::queue_patch(&v.state().join("git"), "demo", 1, "a.txt", "a1\n");
+
+    let child = v.mount("");
+    assert_eq!(fs::read_to_string(v.mnt().join("a.txt")).unwrap(), "a0\n");
+    v.unmount(child);
+    let log = v.log_text();
+    assert!(
+        log.contains("alarm: patch queue deferred (unclean_stop)"),
+        "{log}"
+    );
+    assert!(!log.contains("patch 1 applied"), "{log}");
 }

@@ -10,6 +10,9 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[path = "../../agentfs-core/tests/support/queue_patch.rs"]
+mod queue_patch;
+
 use agentfs_core::events::NullSink;
 use agentfs_core::history_service::{
     Address, ClientConfig, FrontHooks, FrontInfo, FrontLease, HistoryClient, ListenerHandle,
@@ -18,6 +21,7 @@ use agentfs_core::paths::RepoPath;
 use agentfs_core::record::Origin;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::StateDir;
+use queue_patch::queue_patch;
 
 struct Volume {
     dir: tempfile::TempDir,
@@ -88,9 +92,15 @@ impl Volume {
     }
 
     fn serve(&self) -> Service {
+        self.serve_with(&[])
+    }
+
+    /// `serve-history` with `extra` flags.
+    fn serve_with(&self, extra: &[&str]) -> Service {
         let log = unique(self.dir.path());
         let child = command(self.state().root(), &self.tree())
             .arg("serve-history")
+            .args(extra)
             .env("AGENTFS_REPLICA", "service-0")
             .stdout(fs::File::create(&log).unwrap())
             .stderr(fs::File::create(log.with_extension("err")).unwrap())
@@ -692,4 +702,31 @@ fn a_file_opened_during_a_live_restore_is_left_alone() {
     assert_eq!(fs::read_to_string(v.tree().join("z")).unwrap(), "two");
     drop(front);
     service.stop();
+}
+
+/// Bead agentfs-4do (design §12): a history service told a workload is
+/// attached (the CSI node plugin, while a pod of the volume is published)
+/// lands no patch: it judges the queue, says why, and the patch stays
+/// queued; the next start with nothing attached lands it.
+#[test]
+fn a_service_told_a_workload_is_attached_lands_no_patch() {
+    let v = Volume::new();
+    fs::write(v.tree().join("a.txt"), "a0\n").unwrap();
+    let out = v.run(["record", "a.txt"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    queue_patch(&v.state().git(), "demo", 1, "a.txt", "a1\n");
+
+    let log = v.serve_with(&["--workload-attached"]).stop();
+    assert!(
+        log.contains("alarm: patch queue deferred (workload_attached)"),
+        "{log}"
+    );
+    assert!(!log.contains("patch 1 applied"), "{log}");
+    assert_eq!(fs::read_to_string(v.tree().join("a.txt")).unwrap(), "a0\n");
+    let out = v.run(["patch", "status"]);
+    assert!(stdout(&out).contains("1 queued"), "{}", stdout(&out));
+
+    let log = v.serve().stop();
+    assert!(log.contains("patch 1 applied"), "{log}");
+    assert_eq!(fs::read_to_string(v.tree().join("a.txt")).unwrap(), "a1\n");
 }

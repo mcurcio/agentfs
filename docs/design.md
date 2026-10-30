@@ -152,6 +152,9 @@ through the mount:
                          delivered, a cache (§19.1 "Notify and apply")
     fork.json            a fork's published mark, written by the finisher
                          only after the fork remote confirmed it (§11.5)
+    attached.json        a mount may have a workload attached: written as
+                         a single-process mount starts, removed when it
+                         stops with nothing attached (§12)
     control/agentfs.sock the running daemon's control socket (§2.3, §15);
                          directory 0700, socket 0600
     stack/mnt            where a mount recovering over a stale one mounts FUSE
@@ -286,9 +289,6 @@ Rules that make this precise:
 - **RELEASE is asynchronous.** Its result never reaches the caller, which is why
   writes through shared memory mappings, or after the last close, are recorded
   late.
-- **Empty directories** are not recorded, because git cannot represent them.
-  `mkdir` alone is not a boundary.
-
 - **A mapping keeps RELEASE back only through the daemon.** A mapping of a
   file opened through the daemon holds the FUSE file, so RELEASE waits for
   `munmap`. A mapping of a passthrough file holds the backing file instead
@@ -298,6 +298,9 @@ Rules that make this precise:
   the kernel forces: an inode with a backing id open takes no other kind of
   handle, so a writer opened there shares it, and a write through its
   shared mapping after its last close is not recorded (it is logged).
+- **Empty directories** are not recorded, because git cannot represent them.
+  `mkdir` alone is not a boundary.
+
 **How the FUSE layer implements this** (`agentfs-fuse`):
 
 - **Dirty detection.** The daemon does not see every write (writes through
@@ -2456,6 +2459,32 @@ and nothing lands until the next mount; every run and every such judging
 notifies the integrator of the verdicts that changed (§19.1 "Notify and
 apply"). In order:
 
+**Only with nothing attached** (§19.1 "Patches land after a clean
+stop"). A start lands the queue only on evidence that no workload is
+attached; otherwise it judges the queue as an apply under a daemon does
+(fetch, verdicts, status, notice; nothing written to the tree), says why,
+and raises `PatchQueueDeferred` when anything is queued. The patches stay
+queued for the next start with nothing attached. The evidence:
+
+- *A single-process mount* writes `meta/attached.json` before the mount
+  can be seen, and removes it only after a stop whose unmount was not busy
+  (no lazy detach), with no file still open after `--unmount-grace` and no
+  stale layer below it. A start that finds the mark defers
+  (`unclean_stop`): the last mount was killed or crashed, or a workload
+  held it as it stopped (a container restarted under a running workload).
+  A mount stacked over a stale one (`--on-stale-mount recover`) defers too
+  (`stale_mount`). A state area never mounted has no mark.
+- *A history service* defers while a front holds a lease
+  (`fronts_running`), and when started with `--workload-attached`
+  (`workload_attached`): the CSI node plugin passes it whenever a pod of
+  the volume is published on the node, decided from its published records
+  before any front is recovered (§14.2), so a plugin restart under running
+  pods never lands the queue, however fast its fronts come back.
+
+`agentfs patch apply` with the volume stopped lands the queue without
+this check: it is the operator's call
+([runbook](runbooks/patch-queue.md#10-patches-held-after-an-unclean-stop)).
+
 1. commit what is journaled, so the head is the tree's state;
 2. fetch `inbox/*` from the patch remote: forced, this volume's only, local
    inbox refs the remote no longer has are pruned. Best effort, within
@@ -2699,7 +2728,8 @@ never inherits its source's numbers.
 **Telemetry** (§13): the gauges `agentfs.patch.queue_depth`,
 `agentfs.patch.blocked` and `agentfs.patch.held`, an `agentfs.patch` span
 per patch, the alarms `PatchBlocked`, `PatchHeld`, `PatchRuleFailed`,
-`PatchFetchFailed` and `NotifyFailed`, the warning `PatchIgnored`, and the
+`PatchFetchFailed` and `NotifyFailed`, the warnings `PatchIgnored` and
+`PatchQueueDeferred`, and the
 events `PatchApplied` and `PatchDuplicate`.
 
 **The patch remote** is `agentfs.patchRemote`: a remote's name, or `none`.
@@ -2789,8 +2819,8 @@ too.
 for a fork's lifecycle (`ForkFinished`, `ForkPublished`, `ForkAbandoned`:
 `Event::is_logged`): the event name
 (`agentfs.path_refused`, `agentfs.push_failed`, ...), WARN for a refused
-path, a failed patch fetch, an ignored patch, an identity fallback and a
-limited push, and ERROR for every other alarm, the event's message as the body and its fields
+path, a failed patch fetch, an ignored patch, a deferred patch queue, an
+identity fallback and a limited push, and ERROR for every other alarm, the event's message as the body and its fields
 (path, reason, remote, kind, heads, ...) as attributes; a push failure
 carries its stage as `agentfs.push.stage`.
 
@@ -2817,6 +2847,7 @@ and logs above; the CLI also prints alarms to stderr.
 | `PatchRuleFailed` | The acceptance rule could not judge a patch: the inbox number, the rule and why (a hook that did not start, failed, or ran out of `agentfs.patchAcceptTimeout`); the patch is not judged (§12) |
 | `PatchFetchFailed` | Fetching the inbox from the patch remote failed or timed out; the queue runs with what was already fetched (§12) |
 | `NotifyFailed` | Telling the integrator of the patch queue's verdict changes failed: the method (`hook`, the `patch-notify` hook; `webhook`, `agentfs.patchNotifyUrl`) and why; the same changes are sent again at the next queue run or apply (§19.1 "Notify and apply") |
+| `PatchQueueDeferred` | A start did not land the patch queue because a workload may be attached: the reason (`unclean_stop`, `stale_mount`, `fronts_running`, `workload_attached`) and the patches queued; raised at each such start while any is queued; the queue was judged instead, and the patches land at the next start with nothing attached (§12 "Only with nothing attached"); a warning |
 | `PatchIgnored` | An inbox entry the queue never applies: `stale` (at or below the last applied number, with another commit; deleted on the remote by the queue push) or `malformed` (§12); a warning |
 | `PatchApplied` | A patch was applied as a commit (not an alarm; sinks filter) |
 | `PatchDuplicate` | A queued patch commit was already applied under an earlier inbox number, so it was consumed with a marker commit and not applied again (§12; not an alarm) |
@@ -3451,10 +3482,12 @@ kubelet retries.
 - *A crashed service* is restarted with the same backoff; it recovers its
   journal (§3.3), and fronts reconnect at their next request.
 - *A plugin restart* stops every child (final commits) and leaves the
-  records. The new plugin reconciles: it starts the staged volumes'
+  records. The new plugin reconciles: it forgets the targets the kubelet
+  removed or that are no longer mounted, starts the staged volumes'
   services, and recovers each recorded target whose mount is still there
-  (live or stale) as for a crashed front; targets the kubelet removed are
-  forgotten. The DaemonSet is `OnDelete`: an upgrade interrupts the node's
+  (live or stale) as for a crashed front. A service started while a target
+  of its volume is published (here, or at a crashed service's restart) is
+  given `--workload-attached`, so it does not land the patch queue (§12). The DaemonSet is `OnDelete`: an upgrade interrupts the node's
   mounts for seconds, so it is rolled node by node.
 - *Order.* Per-volume locks serialise stage, publish, unpublish, unstage
   and restarts; unstage is refused (`FailedPrecondition`) while a target
@@ -4755,6 +4788,7 @@ runner.
 | Three layers, each an integration point (2026-10-29) | The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into. So you don’t need to design a be-all-end-all singular technology so long as the necessary primitives exist and have good designs/API/docs". Library: `agentfs-core`. Filesystem: `agentfs-fuse` and the `agentfs` binary. Kubernetes adapter: `agentfs-csi`. A piece goes in the first layer whose question it passes: (1) usable as Rust calls with no mount and no agentfs process; (2) needs the mount or the running agentfs process (a command, the control socket, git over HTTP); (3) exists only because Kubernetes does. A higher layer may use any lower one. He accepted this placement ("Ok") |
 | Integrators decide when patches are applied (2026-10-29) | The owner, 2026-10-29: "Then the question isn’t “quiet moments or not” — it’s how do we provide an API so that an integrator can trigger this action?"; on the result: "I like that flow. Approved". agentfs sets no timing rule for writing queued patches into a running volume. Every layer offers two primitives: *notify* (agentfs tells the integrator a patch arrived; the files are unchanged) and *apply* (the integrator tells agentfs to write the waiting patches now). agentfs still applies by itself at mount, as today (§12). Built as "Notify and apply" (bead agentfs-mia.5, §19.2 item 11) |
 | No live landing yet (2026-10-29) | The owner, 2026-10-29: "No live landing yet", then "Build incrementally". Patches keep landing only when no workload is attached, at mount (§12); an apply call while a workload is attached is answered "lands at next mount" and notifies. Landing while a workload runs is a later gate (§19.2 item 11) |
+| Patches land after a clean stop (2026-10-30) | Under "No live landing yet", a start lands the queue only on evidence that nothing is attached, else judges it, keeps the patches queued and raises `PatchQueueDeferred` (§12 "Only with nothing attached"). A single-process mount writes `meta/attached.json` before it can be seen and removes it only after a stop whose unmount was not busy, with no file left open and no stale layer below; a start that finds it, or stacks over a stale mount, defers. A history service defers while fronts hold leases or when given `--workload-attached`, which the CSI node plugin passes whenever its published records hold a target of the volume, those records being sorted (gone targets forgotten) before reconcile starts any service. Why: an agentfs-only restart under a running workload landed patches under it (bead agentfs-4do, CI run 40992639848: `docker restart` and SIGKILL of the agentfs container; a CSI node-plugin restart, where reconcile started the service before its fronts were recovered). A design choice, not the owner's words; the rule it serves is his ("No live landing yet", 2026-10-29). Costs: after a crash or a busy stop the patches wait for a further stop with nothing attached and a start after it (the stop that leaves stale layers behind counts as busy too), or for `agentfs patch apply` with the volume stopped; "attached" is open files and working directories in the mount at the unmount, so a workload container that still has the mount but nothing open in it at a clean stop sees the next mount's patches; outside the CSI driver a history service cannot tell a pod whose front crashed and is not back yet, nor does it read the mount's mark |
 | Keep going (2026-10-29) | A patch that cannot land is set aside whole and the queue goes on (§12): held for `conflict`, `merge_commit`, `parent_not_in_history`, `unsupported`, `too_large` and `refused`; waiting behind an earlier set-aside barrier or patch on the same paths; awaiting or not judged by the acceptance rule (`agentfs.patchAccept`: `cleanMerge` by default, `approval`, `command`). A run still stops at `gap`, `unrecorded` and `failed`, which are about the volume, not the patch. The owner, 2026-10-16: "Whole seems best, right? A partial application has unknown side effects"; "Not A, because that assumes that a clean merge is an acceptable merge"; 2026-10-29: "Configurable with a sensible default". A local mark `refs/agentfs/<volume>/held/<n>`, written before the next number is judged, exempts a set-aside number from the stale check, and an interrupted write counts as applied only by its trailer: the main session confirmed the architect's erratum (2026-10-29), since keep-going cannot keep the stale check word for word. Design choices, not the owner's words: which reasons hold and which stop; a barrier holds every later patch and waits only on its own files; a patch whose branch cannot be read makes nothing wait on its files; paths are compared as written; approvals stay on the remote after landing; a withdrawn held number above the high-water opens a gap, as a withdrawn queued number does. Bead agentfs-mia.2 (§19.2 item 11) |
 | Notify and apply (2026-10-29) | The two primitives of "Integrators decide when patches are applied", under "No live landing yet". *Notify:* after every queue run (mount, `patch apply`) and every apply under a daemon, the verdicts in the status written are compared with the last delivered notice (`meta/notify.json`, a cache) and, when any changed, one notice (schema 1) goes to the `$GIT_DIR/hooks/patch-notify` hook when it exists (the command runner fork delivery uses) and to the webhook `agentfs.patchNotifyUrl` when set (the one POST fork delivery's webhook uses; `Idempotency-Key: <volume>:<status>`, a bearer token from `agentfs.patchNotifyCredentialFile`, `agentfs.patchNotifyTimeout`); a failure raises `NotifyFailed` and the mark does not move, so the next queue event sends the same changes again: no timer, no retry loop, at least once. *Apply:* `agentfs patch apply` asks the control socket first (`apply`, protocol v1); a running daemon (`mount`, `run`, `serve-history`, fronts or none) always counts as attached, so it judges read only, writes the status, notifies, and answers "workload attached; lands at next mount" (exit 75), with each patch that would land `ready`; with no daemon, the lock path lands as before. Under CSI there is no code: a profile's config sets the webhook keys (main session's erratum confirmation, 2026-10-29: no CSI delivery webhook exists). The owner's words are those two rows'; the rest are design choices, not his words: a daemon with no front attached counts as attached too (a front may attach mid-landing); a ready verdict is a snapshot, judged against the head as it was, with later patches judged against the same head; the hook and the webhook share one timeout; a judging under a daemon also fetches the inbox (unless `--no-fetch`), raises `PatchHeld` as a run does, and signs the status as the daemon's committer. Bead agentfs-mia.5 (§19.2 item 11) |
 | Checkpoint (2026-10-29) | `agentfs checkpoint [-m MESSAGE]`, and the control socket's `checkpoint` (protocol v1) under a daemon, cut one commit on the change line `refs/agentfs/<volume>/change-line`: the branch head's tree after committing what is recorded; first parent the previous change-line tip (a fork's first: its source's tip at create, `agentfs.fork.baseChangeLine`); further parents the `applied/<n>` tips of the patches landed since, by inbox number; author the caller, committer the replica; the caller's message, then `Agentfs-Trigger: checkpoint` and `Agentfs-Branch-Head`. It is merged back by a marker on the branch with parents `[head, checkpoint]` (§3.4's marker exception, like the patch marker; `Agentfs-Checkpoint`, `Agentfs-Seq`), so first-parent scans and the queue are unchanged. Nothing new (the same tree, no patch since): no commit, exit 0. Under a daemon its commit loop cuts it between commits, so the branch keeps one writer; with none, the command takes the state lock (exit 75 when busy). `remote.<name>.agentfsPush = changeLine` pushes the change line to that remote's branch ref instead of the branch, judged (claims, divergence, backlog, LFS) against it; the queue push is unchanged. The owner's words: "one commit per change intent" (approved design page v4; §19.2 item 11 "checkpoint cuts one commit per intent"). Design choices, not his words: the change-line ref moves before the marker, and a tip a crash left unmerged is merged first by the next cut; patches landed since are found by first-parent inbox trailers from the previous checkpoint's `Agentfs-Branch-Head`; a fork records its source's tip only when base reaches it; the branch's history is no longer linear at checkpoint markers (its first parents are). Costs: a change-line remote sees only checkpoints and producers' patch commits, never the per-record history; producers' LFS pointers outside the managed block are not uploaded (§7 unchanged); the CSI release decider still judges a change-line remote against the branch head (`RemotePusher::branch_claim`'s caller), so a CSI volume should not set it yet. Bead agentfs-mia.6 (§19.2 item 11) |
@@ -4762,6 +4796,7 @@ runner.
 | Merge rules (2026-10-29) | `agentfs.patchIntegrate` picks `merge` (the default) or `rebase`, both by the `git` program; merge drivers come only from the operator's `$GIT_DIR/info/attributes` and the repository's config (AGENTS.md principle 3); a driver that cannot run leaves the patch not judged and alarmed (`PatchRuleFailed`, rule `merge`), never a conflict; mergiraf ships in the image as its own program (§17.3). The owner, 2026-10-16, asked "should we use the native git binary?" and liked the answer; 2026-10-28, on the gate page, picked both the git program and mergiraf; and 2026-10-28: "my opinion is that squashes are too blunt, but rebase can be attractive for cleaner history". The rest are design choices, not his words, and the first sits against that opinion: a rebase lands as one commit (its commits are listed in the message and kept by `applied/<n>`), not as a replayed chain, to keep one record per patch; every configured driver is checked before any merge, so one broken driver leaves every patch not judged, whatever its paths; a killed driver is told from other `merge-tree` failures only by git's wording. Bead agentfs-mia.3 (§19.2 item 11) |
 | Patches are branches (2026-10-29) | A patch is a branch: a line of single-parent commits on a base, the merge base of its tip and the head, read by one reader (`patch::PatchBranch::read`) for the queue and `serve-git` alike; merged onto the head by the `git` program (`git merge-tree --write-tree --merge-base`, `core.fsync=objects`, `attr.tree` the empty tree) and landed as one atomic record and one commit carrying `Agentfs-Patch: <tip>`, its message the tip's with the branch's commits listed; `patch submit` takes a tip and refuses a merge commit inside it. Numbering, the stale check, duplicates and crash recovery are today's (§12). The owner's words: "my opinion is that squashes are too blunt, but rebase can be attractive for cleaner history. then again, merge is more explicit about the process and the merge commit might be a useful artifact to note when agentfs did its work" (2026-10-28); "Build incrementally" (2026-10-29). Design choices, not his words: the base is the merge base, not a recorded one; one commit per patch rather than the producer's commits on the branch (they stay reachable at `applied/<n>`), which keeps one record per patch and "held whole" on a crash; a merge commit inside a patch is held (`merge_commit`). Bead agentfs-mia.4 (§19.2 item 11) |
 | Forks of forks (2026-10-29) | A linked fork may be forked, and changes roll up level by level (§11.5, §12 "Forks of forks"): a linked fork's patch remote is its fork remote; a fork of a fork (`agentfs.fork.sourceIsFork`) finishes by queueing its change create-only as its parent's next inbox number there, through the finisher's own `RemotePusher`, with the fork remote's credentials, at most once; a parent that has finished first makes it publish as a top-level fork, raising `ForkParentFinished`; a fork's applied numbers count only after its base, so it never inherits its source's. The owner, 2026-10-28: "Couldn’t branches of branches be rolled up before they are merged into the “main” branch? This is not really a unique concept — it’s just how git normally works." Design choices, not his words, confirmed by the main session from the mia.7 implementer's erratum (`.claude/errata.md`, 2026-10-29): delivery through `RemotePusher` (one credential path, not the `git` program); create refuses a parent with hidden history (`ParentHistoryHidden`), as well as an unlinked parent and a fork of a local-only source, which have no queue to roll into; the fork identity keys join `OWN_KEYS` so the CLI can fork a CLI fork. Cost: a change whose parent finished first is published but lands nowhere until someone delivers it. Amended 2026-10-29 (fix round, a review finding that a child's change could be stranded unannounced): finishing never runs the queue (the queue's mechanics are unchanged), so a parent publishing with inbox entries it did not land raises `ForkInboxNotCarried`; a child lists its parent again after its push and publishes itself when the parent finished without its change; a rolled-up fork pushes its own `finish` ref so its forks see it finished. Cost: a child's change that reaches its parent after the parent's last mount is announced but not landed; restarting the parent's workload once its children have finished, before it is finished, lands it. Landing the queue at finish was not chosen: it would add a landing point the merge-queue brief keeps fixed, and is the owner's call. Bead agentfs-mia.7 (§19.2 item 11) |
+| Writers never passthrough (2026-10-30) | A handle opened for writing or truncating is never given a passthrough backing id; it goes through the daemon, and so do its inode's later opens while it is open. Read-only opens keep passthrough. The reason: under passthrough a mapping holds the backing file, not the FUSE file, so RELEASE came while a shared writable mapping was live and a write through it after the last close was never recorded (agentfs-dyu; `a_shared_mapping_written_after_the_last_close_is_recorded` red under `on` and `auto`, kernel 7.0, CI run 40993499943). The cost: write I/O no longer bypasses the daemon (each write is a FUSE round trip, as under `off`), and a reader opened while a writer is open goes through the daemon too. Left uncovered: the kernel refuses a daemon handle on an inode with a backing id open, so a writer opened while a read-only passthrough handle is open shares its id and keeps the gap for a write through its mapping after its last close (logged); failing such opens instead was not chosen, as it would surface a failure to a workload with a reader open (§17.1). A design choice (agentfs-dyu), not the owner's words |
 
 ### 19.2 Open questions
 
@@ -4796,7 +4831,6 @@ runner.
    iac. (Asking a running daemon to push now is built: `agentfs push`
    goes through the control socket, §2.3.)
 4. **The FLUSH+RELEASE double record** (§3.1, §3.2). *Decided
-| Writers never passthrough (2026-10-30) | A handle opened for writing or truncating is never given a passthrough backing id; it goes through the daemon, and so do its inode's later opens while it is open. Read-only opens keep passthrough. The reason: under passthrough a mapping holds the backing file, not the FUSE file, so RELEASE came while a shared writable mapping was live and a write through it after the last close was never recorded (agentfs-dyu; `a_shared_mapping_written_after_the_last_close_is_recorded` red under `on` and `auto`, kernel 7.0, CI run 40993499943). The cost: write I/O no longer bypasses the daemon (each write is a FUSE round trip, as under `off`), and a reader opened while a writer is open goes through the daemon too. Left uncovered: the kernel refuses a daemon handle on an inode with a backing id open, so a writer opened while a read-only passthrough handle is open shares its id and keeps the gap for a write through its mapping after its last close (logged); failing such opens instead was not chosen, as it would surface a failure to a workload with a reader open (§17.1). A design choice (agentfs-dyu), not the owner's words |
    (2026-10-13)*: a racy record keeps its frozen copy open, and a
    boundary that would record only because of the racy rule compares the
    file with it, skipping the record when the bytes are equal and the

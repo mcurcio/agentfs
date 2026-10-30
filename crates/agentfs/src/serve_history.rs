@@ -5,8 +5,9 @@
 //! (`mount --history-service`) hand it their records over a Unix socket,
 //! and its commit and push loops do the rest, as `run` does.
 //!
-//! Start order: lock, open (recovery), the patch queue (only when no front
-//! holds a lease: patches write the backing tree, which live fronts serve),
+//! Start order: lock, open (recovery), the patch queue (landed only when no
+//! front holds a lease and `--workload-attached` was not given: patches
+//! write the backing tree, which fronts serve; else judged, design §12),
 //! the commit and push loops, the socket fronts use, then the control
 //! socket (`agentfs push` asks it to push now; `restore` and `revert` it
 //! serves live, writing the backing tree with its fronts' help, design
@@ -31,6 +32,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 
 use agentfs_core::history_service::{Address, FrontLease, HistoryServer};
+use agentfs_core::patch::attached::Deferred;
 use agentfs_core::push;
 use agentfs_core::service::Service;
 use agentfs_core::volume::StateDir;
@@ -52,6 +54,7 @@ pub(crate) fn read_address(state: &StateDir) -> Option<String> {
         .filter(|a| !a.is_empty())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve(
     daemon: Daemon,
     state: &StateDir,
@@ -60,6 +63,7 @@ pub(crate) fn serve(
     pod: &Pod,
     push_grace: Duration,
     shutdown_grace: Duration,
+    workload_attached: bool,
 ) -> Result<ExitCode> {
     let backing = root
         .canonicalize()
@@ -85,27 +89,28 @@ pub(crate) fn serve(
             state.repairs().display()
         );
     }
+    // The patch queue lands only with nothing attached (design §12): no
+    // front holds a lease, and the launcher did not say a workload is
+    // attached (the CSI node plugin says so while a pod of the volume is
+    // published, whether or not its front is back yet).
     let live = FrontLease::live(state).context("reading the front leases")?;
-    if live.is_empty() {
-        if let Err(e) = patch_cmd::apply_queue(
-            state,
-            &settings,
-            &recorder,
-            &committer,
-            &backing,
-            session.telemetry(),
-            &events,
-            true,
-        ) {
-            eprintln!("patches: the queue could not run: {e:#}");
-        }
+    let deferred = if workload_attached {
+        Some(Deferred::WorkloadAttached)
+    } else if !live.is_empty() {
+        Some(Deferred::FrontsRunning)
     } else {
-        eprintln!(
-            "patches: {} front(s) are running, so the queue is not applied; it is applied when \
-             the history service starts with no fronts",
-            live.len()
-        );
-    }
+        None
+    };
+    patch_cmd::queue_at_start(
+        state,
+        &settings,
+        &recorder,
+        &committer,
+        &backing,
+        session.telemetry(),
+        &events,
+        deferred,
+    );
     let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
     let applier = patch_cmd::Applier::new(&committer, events.clone(), session.telemetry());

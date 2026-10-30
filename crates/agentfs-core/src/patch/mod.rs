@@ -36,7 +36,8 @@
 //!   the volume `agentfs patch apply` only judges
 //!   ([`queue::Queue::judge`]) and answers "lands at next mount" (bead
 //!   agentfs-mia.5, design §19.1 "Integrators decide when patches are
-//!   applied").
+//!   applied"); a start that may have a workload attached judges it the
+//!   same way instead of landing it ([`attached`]).
 //!
 //! `agentfs serve-git` makes the state area's history repository the
 //! volume's patch source, a git server pushers push patches to; [`admit`]
@@ -49,6 +50,7 @@
 
 pub mod accept;
 pub mod admit;
+pub mod attached;
 pub mod fetch;
 pub mod integrate;
 pub mod notify;

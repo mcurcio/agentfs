@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Reproduction for bead agentfs-4do: does restarting ONLY the agentfs
-# container, while a workload container keeps running on the mount, apply
-# queued patches under that live workload?
+# Bead agentfs-4do: restarting ONLY the agentfs container, while a
+# workload container keeps running on the mount, must not apply queued
+# patches under that live workload.
 #
-# Patches land only when no workload is attached (design §12, §19.1 "No
-# live landing yet"). This test asserts that behaviour from the workload's
-# side, with examples/docker/docker-run.sh (docs/docker.md):
+# Patches land only when no workload is attached (design §12 "Only with
+# nothing attached", §19.1 "No live landing yet", "Patches land after a
+# clean stop"): the old daemon's busy (lazy) unmount, or its SIGKILL,
+# leaves meta/attached.json, so the new mount judges the queue and holds
+# it. This test asserts that behaviour from the workload's side, with
+# examples/docker/docker-run.sh (docs/docker.md):
 #
 #   - agentfs and a uid 10000 workload container on the mount; the
 #     workload's cwd is in the mount and a process in it holds the target
@@ -20,8 +23,8 @@
 #   - after each, from the still-running workload: the target file must be
 #     unchanged and the patch still queued.
 #
-# A patch that lands under the running workload fails the job (red = bug
-# confirmed). Each variant's evidence is printed: the file as the
+# A patch that lands under the running workload fails the job. Each
+# variant's evidence is printed: the file as the
 # workload sees it, the open descriptor, agentfs's log lines since the
 # restart, `agentfs status`, and the target's last commit.
 #
