@@ -54,6 +54,13 @@ pub enum HistoryError {
     MissingSeq(Oid),
     #[error("caching LFS content: {0}")]
     Lfs(#[source] io::Error),
+    /// The fork's base (`agentfs.fork.base`) is not in its history: the
+    /// history is corrupt, as fork create never leaves it so.
+    #[error(
+        "the fork's base {0} is not in its history, which is corrupt: its inbox numbers \
+         cannot be told from its source's"
+    )]
+    ForkBaseMissing(Oid),
 }
 
 /// Process-wide libgit2 setup, done once before any repository is opened:
@@ -953,7 +960,8 @@ impl History {
     /// patch`, `Agentfs-Patch` and `Agentfs-Inbox` counts. For a fork,
     /// only the first-parent history after the fork's base: its inbox
     /// numbers are its own queue's, never its source's (bead
-    /// agentfs-mia.7).
+    /// agentfs-mia.7). A fork whose base is not in its history is
+    /// [`HistoryError::ForkBaseMissing`] (bead agentfs-rrm).
     pub fn find_inbox_commits(
         &self,
         since: Option<Oid>,
@@ -971,9 +979,13 @@ impl History {
         {
             walk.hide(since)?;
         }
-        if let Some(base) = self.settings.fork.as_ref().map(|f| f.base)
-            && self.repo.odb()?.exists(base)
-        {
+        if let Some(base) = self.settings.fork.as_ref().map(|f| f.base) {
+            // Fork create refuses a base it could not copy, so a missing
+            // one is corruption: counting on would take the source's
+            // numbers as the fork's own.
+            if !self.repo.odb()?.exists(base) {
+                return Err(HistoryError::ForkBaseMissing(base));
+            }
             walk.hide(base)?;
         }
         for oid in walk {

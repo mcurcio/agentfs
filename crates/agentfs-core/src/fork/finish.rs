@@ -29,7 +29,9 @@
 //! change create-only as the parent's next inbox number
 //! ([`PublishOutcome::Submitted`]), unless the parent already queued or
 //! applied it (at most once) or the parent has finished, when it publishes
-//! as a top-level fork and raises [`Event::ForkParentFinished`]. After its
+//! as a top-level fork and raises [`Event::ForkParentFinished`] from the
+//! published mark, which records it, so a crash before the alarm leaves it
+//! to the next publish (bead agentfs-rrm). After its
 //! push it lists the parent again, so a parent that finished in between is
 //! seen. It then pushes its own finish ref, which its own forks read as
 //! "finished". The parent's queue lands it like any patch.
@@ -313,8 +315,27 @@ pub struct PublishedMark {
     /// top-level publish. Optional in the file: marks without it read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbox: Option<u64>,
+    /// A fork of a fork whose parent had finished, so it published as a
+    /// top-level fork; `None` otherwise. Optional in the file: marks
+    /// without it read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_finished: Option<ParentFinishedMark>,
     /// When the remote confirmed it (milliseconds since the Unix epoch).
     pub at_ms: u64,
+}
+
+/// The parent fork had finished when its child published
+/// ([`Event::ForkParentFinished`]), recorded with the published mark so
+/// the alarm is raised from the mark, not from the attempt that wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParentFinishedMark {
+    /// The parent fork's name.
+    pub parent: String,
+    /// The alarm was raised. Written `false` with the published mark and
+    /// set once it is raised, so a crash in between raises it at the next
+    /// publish (it may then be raised twice, never not at all).
+    pub raised: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -784,6 +805,7 @@ impl Finisher {
                 });
             }
             if let Some(published) = mark.published.as_ref().filter(|p| p.finish == finish) {
+                self.raise_parent_finished(&record.fork, published)?;
                 return Ok(match published.inbox {
                     Some(inbox) => PublishOutcome::Submitted { inbox },
                     None => PublishOutcome::Published,
@@ -801,23 +823,26 @@ impl Finisher {
                         Delivered::Submitted { inbox } => Some(*inbox),
                         Delivered::Published | Delivered::ParentFinished { .. } => None,
                     };
+                    let parent_finished = match &delivered {
+                        Delivered::ParentFinished { parent } => Some(ParentFinishedMark {
+                            parent: parent.clone(),
+                            raised: false,
+                        }),
+                        Delivered::Published | Delivered::Submitted { .. } => None,
+                    };
                     let published = PublishedMark {
                         finish: finish.clone(),
                         change: record.change.map(|c| c.to_string()),
                         remote: record.remote.clone(),
                         inbox,
+                        parent_finished,
                         at_ms: now_ms(),
                     };
                     update_mark(&self.state, |mark| {
-                        mark.published = Some(published);
+                        mark.published = Some(published.clone());
                         mark.refused = None;
                     })?;
-                    if let Delivered::ParentFinished { parent } = delivered {
-                        self.events.emit(Event::ForkParentFinished {
-                            fork: record.fork.clone(),
-                            parent,
-                        });
-                    }
+                    self.raise_parent_finished(&record.fork, &published)?;
                     self.published(record);
                     return Ok(match inbox {
                         Some(inbox) => PublishOutcome::Submitted { inbox },
@@ -862,6 +887,34 @@ impl Finisher {
             };
             std::thread::sleep(delay.max(Duration::from_millis(10)));
         }
+    }
+
+    /// Raises [`Event::ForkParentFinished`] from the published mark of
+    /// fork `fork` while the mark says it was not raised yet, then records
+    /// it raised: once after the mark is written, and again only after a
+    /// crash in between (bead agentfs-rrm).
+    fn raise_parent_finished(
+        &self,
+        fork: &str,
+        published: &PublishedMark,
+    ) -> Result<(), FinishError> {
+        let Some(pending) = published.parent_finished.as_ref().filter(|p| !p.raised) else {
+            return Ok(());
+        };
+        self.events.emit(Event::ForkParentFinished {
+            fork: fork.to_owned(),
+            parent: pending.parent.clone(),
+        });
+        update_mark(&self.state, |mark| {
+            if let Some(parent) = mark
+                .published
+                .as_mut()
+                .and_then(|p| p.parent_finished.as_mut())
+            {
+                parent.raised = true;
+            }
+        })?;
+        Ok(())
     }
 
     /// What the published mark, just written, is told by: the

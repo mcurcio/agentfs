@@ -55,6 +55,8 @@ use crate::{Pod, Session, control};
 /// Where an operator reads what to do about a refused publish: one section
 /// per [`RefusedReason`], headed by its name.
 const REFUSED_RUNBOOK: &str = "docs/runbooks/fork-refused.md";
+/// The runbook section for a fork of a fork whose parent finished first.
+const PARENT_FINISHED_RUNBOOK: &str = "docs/runbooks/patch-queue.md#9-forks-of-forks";
 
 /// What to fix for a publish refused for `reason`, and the runbook
 /// section that says how.
@@ -248,6 +250,11 @@ pub struct ForkStatusDoc {
     pub finish: Option<String>,
     pub remote: Option<String>,
     pub published_at_ms: Option<u64>,
+    /// The parent fork that had finished first, so this fork of a fork
+    /// published as a top-level fork (`ForkParentFinished`); omitted
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_finished: Option<String>,
     pub refused: Option<RefusedMark>,
     pub abandoned: Option<AbandonedMark>,
 }
@@ -258,6 +265,9 @@ impl ForkStatusDoc {
         let finish = record.map(|r| r.finish.to_string());
         let mark = status.mark.as_ref();
         let names_finish = |f: &str| finish.as_deref() == Some(f);
+        let published = mark
+            .and_then(|m| m.published.as_ref())
+            .filter(|p| names_finish(&p.finish));
         Self {
             version: 1,
             fork: status.identity.fork.clone(),
@@ -267,10 +277,10 @@ impl ForkStatusDoc {
             change: record.and_then(|r| r.change).map(|c| c.to_string()),
             finish: finish.clone(),
             remote: record.map(|r| r.remote.clone()),
-            published_at_ms: mark
-                .and_then(|m| m.published.as_ref())
-                .filter(|p| names_finish(&p.finish))
-                .map(|p| p.at_ms),
+            published_at_ms: published.map(|p| p.at_ms),
+            parent_finished: published
+                .and_then(|p| p.parent_finished.as_ref())
+                .map(|p| p.parent.clone()),
             refused: mark
                 .and_then(|m| m.refused.clone())
                 .filter(|r| names_finish(&r.finish)),
@@ -578,7 +588,13 @@ fn print_status(doc: &ForkStatusDoc) {
             a.at_ms, a.uid, a.state, a.reason
         )
     } else if let Some(at) = doc.published_at_ms {
-        format!("published at {at} ms")
+        match &doc.parent_finished {
+            Some(parent) => format!(
+                "published at {at} ms as a top-level fork: its parent {parent} had finished, \
+                 so nothing lands the change (see {PARENT_FINISHED_RUNBOOK})"
+            ),
+            None => format!("published at {at} ms"),
+        }
     } else if let Some(r) = &doc.refused {
         format!(
             "refused ({}) at {} ms by {}: {} (see {REFUSED_RUNBOOK}#{})",
@@ -763,5 +779,64 @@ mod tests {
                 "{REFUSED_RUNBOOK} has no section {heading:?}"
             );
         }
+    }
+
+    /// A fork of a fork published because its parent had finished says
+    /// so, from its published mark, and links a runbook section that
+    /// exists; any other publish omits it (bead agentfs-rrm).
+    #[test]
+    fn status_shows_a_parent_that_finished_first() {
+        use agentfs_core::fork::finish::{ForkMark, ParentFinishedMark, PublishedMark};
+        use agentfs_core::fork::identity::PushTarget;
+        let finish = git2::Oid::from_bytes(&[2; 20]).unwrap();
+        let record = FinishRecord {
+            fork: "src-1-1".into(),
+            source: "src-1".into(),
+            base: git2::Oid::from_bytes(&[1; 20]).unwrap(),
+            finish,
+            change: None,
+            remote: "origin".into(),
+            unrecorded: 0,
+        };
+        let status = |parent_finished: Option<ParentFinishedMark>| ForkStatus {
+            identity: ForkIdentity {
+                fork: record.fork.clone(),
+                source: record.source.clone(),
+                base: record.base,
+                push_target: PushTarget::Branch,
+                link: ForkLink::Linked,
+            },
+            state: ForkState::Published,
+            record: Some(record.clone()),
+            mark: Some(ForkMark {
+                published: Some(PublishedMark {
+                    finish: finish.to_string(),
+                    change: None,
+                    remote: "origin".into(),
+                    inbox: None,
+                    parent_finished,
+                    at_ms: 5,
+                }),
+                ..ForkMark::empty()
+            }),
+        };
+        let doc = ForkStatusDoc::new(&status(Some(ParentFinishedMark {
+            parent: "src-1".into(),
+            raised: false,
+        })));
+        assert_eq!(doc.parent_finished.as_deref(), Some("src-1"));
+        let json = serde_json::to_value(&doc).unwrap();
+        assert_eq!(json["parent_finished"], "src-1", "{json}");
+        let plain = ForkStatusDoc::new(&status(None));
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("parent_finished").is_none(), "{json}");
+
+        let runbook = include_str!("../../../docs/runbooks/patch-queue.md");
+        let (_, anchor) = PARENT_FINISHED_RUNBOOK.split_once('#').unwrap();
+        assert_eq!(anchor, "9-forks-of-forks");
+        assert!(
+            runbook.contains("\n## 9. Forks of forks\n"),
+            "{PARENT_FINISHED_RUNBOOK} has no section"
+        );
     }
 }
