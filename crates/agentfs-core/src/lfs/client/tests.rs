@@ -451,6 +451,90 @@ fn uploads_run_concurrently_up_to_the_setting() {
     }
 }
 
+/// Sends `SIGUSR2` to the thread that made it, every 200 µs, until
+/// dropped. The handler does nothing and is installed with `SA_RESTART`,
+/// as signal-hook installs the daemon's: Linux still fails a socket read
+/// that has a receive timeout with `EINTR` (signal(7)), as it does after a
+/// stop and continue with no handler at all. Only this thread is
+/// signalled, so tests running beside it are not.
+struct SignalStorm {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    sender: Option<std::thread::JoinHandle<usize>>,
+}
+
+impl SignalStorm {
+    fn at_this_thread() -> Self {
+        extern "C" fn nothing(_: libc::c_int) {}
+        // SAFETY: a zeroed sigaction is valid; the handler is
+        // async-signal-safe (it does nothing).
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = nothing as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        // SAFETY: pthread_self has no preconditions.
+        let target = unsafe { libc::pthread_self() } as usize;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let sender = std::thread::spawn(move || {
+            let mut sent = 0;
+            while !stop.load(Ordering::SeqCst) {
+                // SAFETY: the target thread outlives this one: Drop joins
+                // it before the target can return.
+                assert_eq!(
+                    unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGUSR2) },
+                    0
+                );
+                sent += 1;
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            sent
+        });
+        Self {
+            done,
+            sender: Some(sender),
+        }
+    }
+}
+
+impl Drop for SignalStorm {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.join();
+        }
+    }
+}
+
+/// A signal is not a failure to reach the server (agentfs-lh8): every
+/// read and write of a transfer survives a storm of them. Concurrency 1
+/// keeps every request on this thread, the one signalled; the server's
+/// delay keeps each read blocked long enough to be interrupted.
+#[test]
+fn transfers_survive_signals() {
+    let s = Setup::new();
+    let objects: Vec<Pointer> = (0..4)
+        .map(|i| s.object(format!("signalled object {i}").as_bytes()))
+        .collect();
+    let server = FakeLfs::start();
+    server.with(|st| st.delay = Duration::from_millis(30));
+    let mut r = remote("/unused");
+    let t = http_with(&server, &mut r, 1);
+    let storm = SignalStorm::at_this_thread();
+    let report = t.upload(&objects, &s.cache, REF);
+    let other = Setup::new();
+    let results = t.download_many(&objects, &other.cache, REF);
+    drop(storm);
+    assert_eq!(report.unwrap().uploaded, 4);
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    assert!(objects.iter().all(|p| other.cache.contains(p)));
+}
+
 #[test]
 fn one_failed_object_leaves_the_others_uploaded() {
     let s = Setup::new();

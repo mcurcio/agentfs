@@ -33,7 +33,8 @@
 //! certificate that fails verification `untrusted_host`; any other refusal
 //! (another status, a per-object error, a redirect) `refused`; and the
 //! cache or configuration `local`. Messages name the endpoint with any
-//! userinfo redacted.
+//! userinfo redacted. A read interrupted by a signal is read again, not a
+//! failure ([`agent`]).
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -1082,7 +1083,107 @@ pub(crate) fn agent(concurrency: usize, proxy: Option<ureq::Proxy>) -> ureq::Age
             .root_certs(ureq::tls::RootCerts::PlatformVerifier)
             .build(),
     );
-    ureq::Agent::new_with_config(config.build())
+    ureq::Agent::with_parts(
+        config.build(),
+        restarting::connector(),
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    )
+}
+
+/// ureq's connectors, with reads interrupted by a signal retried.
+///
+/// ureq 3.4's TCP transport sets a receive timeout on its socket and fails
+/// a read that returns `EINTR`. Linux never restarts such a read after a
+/// signal handler runs, `SA_RESTART` or not, and fails it with `EINTR`
+/// after a stop and continue even with no handler (signal(7)). So any
+/// signal the process takes (the daemon's `SIGTERM` handler, a debugger
+/// attaching, a cgroup freeze) would fail the transfer in flight as
+/// `unreachable`. Retrying the read is std's idiom for
+/// [`io::ErrorKind::Interrupted`] (`read_exact`, `io::copy`): nothing was
+/// read, so nothing is lost. Writes need nothing: `write_all` already
+/// retries, and std's `connect_timeout` too.
+///
+/// The chain is ureq's `DefaultConnector` without the SOCKS warning
+/// (agentfs refuses SOCKS proxies, [`crate::proxy`]) and with the retry
+/// between TCP and TLS, so TLS reads through it as well. The connector
+/// API is ureq's `unversioned` module, outside its semver promise: an
+/// upgrade of ureq rechecks this chain against its `DefaultConnector`.
+mod restarting {
+    use std::io;
+    use std::time::Instant;
+
+    use ureq::Error;
+    use ureq::unversioned::transport::{
+        Buffers, ConnectProxyConnector, ConnectionDetails, Connector, NextTimeout, TcpConnector,
+        Transport,
+    };
+
+    /// CONNECT proxy, TCP, the retry, then TLS with the `https` feature.
+    pub(super) fn connector() -> impl Connector {
+        let chain =
+            ().chain(ConnectProxyConnector::default())
+                .chain(TcpConnector::default())
+                .chain(Restart);
+        #[cfg(feature = "https")]
+        let chain = chain.chain(ureq::unversioned::transport::NativeTlsConnector::default());
+        chain
+    }
+
+    /// Wraps the transport the connectors before it opened.
+    #[derive(Debug)]
+    struct Restart;
+
+    impl<In: Transport> Connector<In> for Restart {
+        type Out = Restarting<In>;
+
+        fn connect(
+            &self,
+            _: &ConnectionDetails,
+            chained: Option<In>,
+        ) -> Result<Option<Self::Out>, Error> {
+            Ok(chained.map(Restarting))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Restarting<T>(T);
+
+    impl<T: Transport> Transport for Restarting<T> {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            self.0.buffers()
+        }
+
+        fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), Error> {
+            self.0.transmit_output(amount, timeout)
+        }
+
+        /// Reads again after `EINTR`, within what is left of `timeout`, so
+        /// signals never stretch a deadline.
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
+            let started = Instant::now();
+            let mut next = timeout;
+            loop {
+                match self.0.await_input(next) {
+                    Err(Error::Io(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+                    result => return result,
+                }
+                if !timeout.after.is_not_happening() {
+                    match timeout.after.checked_sub(started.elapsed()) {
+                        Some(left) if !left.is_zero() => next.after = left.into(),
+                        _ => return Err(Error::Timeout(timeout.reason)),
+                    }
+                }
+            }
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.0.is_open()
+        }
+
+        fn is_tls(&self) -> bool {
+            self.0.is_tls()
+        }
+    }
 }
 
 /// What a [`post`] was answered.
