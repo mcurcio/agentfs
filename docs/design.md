@@ -3942,17 +3942,22 @@ target. What it needs:
 - **What is mounted.** Only agent-authored definitions are recorded, for example
   `skills/` and each profile's `SOUL.md`, `config.yaml`, `profile.yaml` and
   `skills/`. The operator rules exclude Hermes' secrets (`.env`, `auth.json`),
-  databases, sessions, logs, caches and `checkpoints/`.
+  databases (upstream v0.22.5 keeps its sessions in `state.db`), session files,
+  logs, caches and `checkpoints/`.
 - **Two kinds of writer.**
   - The Hermes process writes to the mount directly.
   - Hermes' file and terminal tools run in containers on a docker-in-docker
     sidecar, so the mount must also reach that sidecar, and tool containers need
     it as a volume when the tools should edit Hermes' files. Whether a sandbox
-    may reach its agent's configuration is the deployment's choice.
+    may reach its agent's configuration is the deployment's choice. Without that
+    volume, upstream still binds Hermes' `skills/` read-only and each tool
+    container's home from Hermes' home (deployment.md §10).
 - **Root init.** The Hermes image's start-up runs as root. With a real backing
   tree and `default_permissions`, root reads the mount like any other directory.
 - **Restarts.** A producer's patches (§12) apply only at mount, which for Hermes means a
-  pod restart (or `agentfs patch apply` with the sidecar stopped).
+  pod restart (or `agentfs patch apply` with the sidecar stopped). With Hermes'
+  data path mounted through `subPath`, no pod restart lands them (§19.2 question
+  12).
 
 The rule files are in `deploy/examples/hermes`, and the pod changes, the
 one-time migration of Hermes' existing data and the initial import in
@@ -4998,6 +5003,18 @@ runner.
      are mia.8.
    - *Beads:* agentfs-mia.4 (tracer), mia.2, mia.3, mia.5, mia.6,
      mia.9, mia.7, mia.8.
+12. **Patches under a `subPath` consumer (bead agentfs-4f2, 2026-10-30).**
+   deployment.md §10 mounts the FUSE mount itself at Hermes' `/opt/data`
+   through `subPath`. The kubelet keeps a subPath bind of the mount until
+   every container of the pod has exited, so when the sidecar stops at a
+   pod deletion the mount is still held: the session does not end within
+   `--unmount-grace`, the attached mark stays (§12 "Only with nothing
+   attached"), and the next pod defers the queue (`unclean_stop`). No pod
+   restart lands a patch (CI run 41102851463, job "e2e (Hermes on kind,
+   sidecar)"). The read-only fence pod (the `emptyDir` read-only at
+   `/agentfs`, `HERMES_HOME=/agentfs/workspace`) lands it at the next pod
+   restart (same run, "fence"). Open: recommend the fence pod for Hermes,
+   or change how a stop judges a hold that only the kubelet's binds keep.
 
 ## 20. Prior art
 

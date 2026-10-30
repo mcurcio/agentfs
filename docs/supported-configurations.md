@@ -214,9 +214,14 @@ kubectl delete pod <hermes pod>
   `agentfs.commitWindow`; each applied patch as its own commit, authored
   by the patch's author, with `Agentfs-Trigger: patch`.
 - **Limits:** patches apply only at a pod restart (deployment.md
-  [Restarts and patches](deployment.md#restarts-and-patches)). A blocked
+  [Restarts and patches](deployment.md#restarts-and-patches)), and with
+  `/opt/data` mounted through `subPath` not even then (design §19.2
+  question 12); the read-only fence pod (`HERMES_HOME=/agentfs/workspace`)
+  lands them. A blocked
   queue does not stop the pod; alert on `agentfs.patch.blocked`. Whether
-  tool containers get the mount is the deployment's policy choice. Check
+  tool containers get the mount is the deployment's policy choice; with
+  `terminal.docker_volumes` empty they still write their home into the
+  volume (never recorded). Check
   the profile layout against the Hermes version you run.
 
 ### Example 4: several pods on one CSI volume
