@@ -570,10 +570,11 @@ Starting from Hermes' own workload:
   read-only fence covers: mount the `emptyDir` read-only at `/agentfs`
   and set `HERMES_HOME=/agentfs/workspace`.
 - **The docker-in-docker sidecar** that runs Hermes' file and terminal
-  tools mounts it the same way, so tool containers see the same files,
-  and the `docker_volumes` pin in the iac workload changes to pass the
-  path into tool containers. That is a deliberate policy change, and the
-  owner must approve it.
+  tools mounts it the same way, and Hermes' `terminal.docker_volumes`
+  setting passes the path into tool containers, so they see the same
+  files. Whether a sandbox may edit its agent's configuration is a policy
+  choice for whoever runs Hermes; leave the setting empty to keep tool
+  containers away from it.
 - **Root init.** Hermes' start-up runs as root; with `default_permissions`
   and a real backing tree, root reads and writes the mount like any other
   directory, and files keep their owners.

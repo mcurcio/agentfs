@@ -3947,12 +3947,11 @@ target. What it needs:
   - The Hermes process writes to the mount directly.
   - Hermes' file and terminal tools run in containers on a docker-in-docker
     sidecar, so the mount must also reach that sidecar, and tool containers need
-    it as a volume.
-  - In the iac workload that is a deliberate policy change to the `docker_volumes`
-    pin, which the owner must approve.
+    it as a volume when the tools should edit Hermes' files. Whether a sandbox
+    may reach its agent's configuration is the deployment's choice.
 - **Root init.** The Hermes image's start-up runs as root. With a real backing
   tree and `default_permissions`, root reads the mount like any other directory.
-- **Restarts.** iac patches (§12) apply only at mount, which for Hermes means a
+- **Restarts.** A producer's patches (§12) apply only at mount, which for Hermes means a
   pod restart (or `agentfs patch apply` with the sidecar stopped).
 
 The rule files are in `deploy/examples/hermes`, and the pod changes, the
@@ -5005,7 +5004,7 @@ runner.
 | Project | What it is | Why not use it |
 |---|---|---|
 | gitfs (Presslabs; fork `vtemian/gitfs`) | Python FUSE filesystem over git that commits after idle | Commits after a 5 s idle period; merges while running; history visible in the mount; no LFS. Last commits 2021 and 2025-08-11. Design reference |
-| Cloudflare ArtifactFS | FUSE client for Cloudflare Artifacts | Commits only on `git commit`; single-user mount (`allow_root` impossible through jacobsa/fuse); built for large lazily loaded repositories. PR 197 in iac stalled on it |
+| Cloudflare ArtifactFS | FUSE client for Cloudflare Artifacts | Commits only on `git commit`; single-user mount (`allow_root` impossible through jacobsa/fuse); built for large lazily loaded repositories. An earlier attempt at this problem stalled on it |
 | JuiceFS CSI driver | FUSE filesystem with a CSI driver and mount pods | Reference for §14's recovery problems |
 | Hermes `checkpoint_manager` | Shadow git store outside the project, snapshot before each turn | Evidence that a git directory outside the tree works for undo; snapshots per turn, not per change |
 | Mesa | Hosted versioned filesystem for agents | Hosted private beta |

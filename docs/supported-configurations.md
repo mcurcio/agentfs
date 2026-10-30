@@ -209,16 +209,15 @@ kubectl delete pod <hermes pod>
 ```
 
 - **The workload sees** `/opt/data` as before. Tool containers see the
-  same files.
+  same files when Hermes' `terminal.docker_volumes` passes the mount in.
 - **History:** the agent's edits to recorded paths, grouped by
   `agentfs.commitWindow`; each applied patch as its own commit, authored
   by the patch's author, with `Agentfs-Trigger: patch`.
 - **Limits:** patches apply only at a pod restart (deployment.md
   [Restarts and patches](deployment.md#restarts-and-patches)). A blocked
-  queue does not stop the pod; alert on `agentfs.patch.blocked`. Passing
-  the mount into tool containers changes iac's `docker_volumes` pin,
-  which is the owner's call. Check the profile layout against the Hermes
-  version you run.
+  queue does not stop the pod; alert on `agentfs.patch.blocked`. Whether
+  tool containers get the mount is the deployment's policy choice. Check
+  the profile layout against the Hermes version you run.
 
 ### Example 4: several pods on one CSI volume
 
