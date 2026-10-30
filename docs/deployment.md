@@ -433,8 +433,9 @@ Run `subPath` consumers as non-root, or with `capabilities: {drop:
 
 **Limits:**
 
-- Files opened before a crash with kernel passthrough (`--passthrough
-  auto` as root) keep writing to their backing file after the daemon
+- Files opened for writing before a crash with kernel passthrough
+  (`--passthrough auto` as root; only a writer sharing a reader's
+  backing file, design §17.1) keep writing to their backing file after the daemon
   died, unrecorded, for as long as the workload holds them open; a
   recovered sidecar does not notice those changes until the file is
   changed again through the mount or the sweep sees it. With in-place

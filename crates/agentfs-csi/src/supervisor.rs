@@ -373,7 +373,12 @@ impl Supervisor {
             .map_err(io_error(format!("creating {}", run.display())))?;
         let address = address_file(layout, handle);
         records::remove(&address).map_err(io_error(format!("removing {}", address.display())))?;
-        let spec = launcher::service_spec(layout, handle, &self.cfg.plugin);
+        // A pod of the volume published on this node is attached, whether
+        // or not its front runs yet: the service must not land the patch
+        // queue (design §12). Only no published record at all is evidence
+        // that nothing is; a directory that cannot be listed is not.
+        let attached = records::any(&layout.published_dir(handle)).unwrap_or(true);
+        let spec = launcher::service_spec(layout, handle, &self.cfg.plugin, attached);
         let spawned = self
             .launcher
             .spawn(spec)
@@ -1096,7 +1101,11 @@ impl Supervisor {
     // ----- start and stop -------------------------------------------------
 
     /// At plugin start: starts the services of staged volumes and recovers
-    /// published targets (in the background).
+    /// published targets (in the background). Published records whose
+    /// target is gone are dropped first, so each service starts knowing
+    /// which of its pods are still attached (design §12: a volume with a
+    /// published pod never lands its patch queue, whenever its fronts come
+    /// back).
     pub async fn reconcile(self: &Arc<Self>) -> Result<ReconcileReport, Error> {
         let layout = self.layout().clone();
         let mut report = ReconcileReport::default();
@@ -1106,9 +1115,45 @@ impl Supervisor {
             bad.into_iter()
                 .map(|(p, e)| format!("{}: {e}", p.display())),
         );
-        let mut staged_handles = std::collections::HashSet::new();
+        let staged_handles: std::collections::HashSet<String> =
+            staged.iter().map(|rec| rec.handle.clone()).collect();
+        let mut published = Vec::new();
+        if let Ok(dirs) = fs::read_dir(layout.published_root()) {
+            for dir in dirs.flatten() {
+                let (found, bad) = records::load_all::<PublishedRecord>(&dir.path())
+                    .map_err(io_error("reading the published records"))?;
+                published.extend(found);
+                report.unreadable.extend(
+                    bad.into_iter()
+                        .map(|(p, e)| format!("{}: {e}", p.display())),
+                );
+            }
+        }
+        let mut recover = Vec::new();
+        for rec in published {
+            let key = target_key(&rec.target);
+            let path = layout.published_record(&rec.handle, &key);
+            // Staged, whether or not its service has started yet: a front waits
+            // for its service, so a later start recovers it.
+            let staged = staged_handles.contains(&rec.handle);
+            let state = if exists(&rec.target) {
+                self.mount_state(&rec.target).await.ok()
+            } else {
+                None
+            };
+            match state {
+                Some(MountState::Stale { .. } | MountState::Live { .. }) if staged => {
+                    recover.push(rec);
+                }
+                _ => {
+                    // Gone, or no longer mounted (a reboot): the kubelet
+                    // publishes it again if the pod still wants it.
+                    report.dropped += 1;
+                    let _ = records::remove(&path);
+                }
+            }
+        }
         for rec in staged {
-            staged_handles.insert(rec.handle.clone());
             let _lock = self.lock_volume(&rec.handle).await;
             if self.children().services.contains_key(&rec.handle) {
                 continue;
@@ -1130,53 +1175,21 @@ impl Supervisor {
                 }
             }
         }
-        let mut published = Vec::new();
-        if let Ok(dirs) = fs::read_dir(layout.published_root()) {
-            for dir in dirs.flatten() {
-                let (found, bad) = records::load_all::<PublishedRecord>(&dir.path())
-                    .map_err(io_error("reading the published records"))?;
-                published.extend(found);
-                report.unreadable.extend(
-                    bad.into_iter()
-                        .map(|(p, e)| format!("{}: {e}", p.display())),
-                );
-            }
-        }
-        for rec in published {
-            let key = target_key(&rec.target);
-            let path = layout.published_record(&rec.handle, &key);
-            // Staged, whether or not its service has started yet: a front waits
-            // for its service, so a later start recovers it.
-            let staged = staged_handles.contains(&rec.handle);
-            let state = if exists(&rec.target) {
-                self.mount_state(&rec.target).await.ok()
-            } else {
-                None
-            };
-            match state {
-                Some(MountState::Stale { .. } | MountState::Live { .. }) if staged => {
-                    report.recovering += 1;
-                    eprintln!(
-                        "reconcile: recovering the front for {} at {}",
-                        who(&rec),
-                        rec.target.display()
-                    );
-                    let this = Arc::clone(self);
-                    tokio::spawn(async move {
-                        let lock = this.lock_volume(&rec.handle).await;
-                        if this.children().fronts.contains_key(&rec.target) {
-                            return;
-                        }
-                        this.recover_front(lock, rec, None).await;
-                    });
+        for rec in recover {
+            report.recovering += 1;
+            eprintln!(
+                "reconcile: recovering the front for {} at {}",
+                who(&rec),
+                rec.target.display()
+            );
+            let this = Arc::clone(self);
+            tokio::spawn(async move {
+                let lock = this.lock_volume(&rec.handle).await;
+                if this.children().fronts.contains_key(&rec.target) {
+                    return;
                 }
-                _ => {
-                    // Gone, or no longer mounted (a reboot): the kubelet
-                    // publishes it again if the pod still wants it.
-                    report.dropped += 1;
-                    let _ = records::remove(&path);
-                }
-            }
+                this.recover_front(lock, rec, None).await;
+            });
         }
         Ok(report)
     }

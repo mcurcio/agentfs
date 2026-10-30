@@ -784,6 +784,7 @@ impl EventSink for TelemetrySink {
             | Event::PatchRuleFailed { .. }
             | Event::NotifyFailed { .. }
             | Event::PatchFetchFailed { .. }
+            | Event::PatchQueueDeferred { .. }
             | Event::ForkFinished { .. }
             | Event::ForkPublished { .. }
             | Event::ForkRefused { .. }
@@ -842,6 +843,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::PatchRuleFailed { .. } => "agentfs.patch_rule_failed",
         Event::NotifyFailed { .. } => "agentfs.notify_failed",
         Event::PatchFetchFailed { .. } => "agentfs.patch_fetch_failed",
+        Event::PatchQueueDeferred { .. } => "agentfs.patch_queue_deferred",
         Event::ForkFinished { .. } => "agentfs.fork_finished",
         Event::ForkPublished { .. } => "agentfs.fork_published",
         Event::ForkRefused { .. } => "agentfs.fork_refused",
@@ -1064,6 +1066,10 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
             out.push(("agentfs.kind", AnyValue::from(kind.as_str())));
             out.push(("agentfs.message", s(message)));
         }
+        Event::PatchQueueDeferred { reason, queued } => {
+            out.push(("agentfs.patch.reason", AnyValue::from(*reason)));
+            out.push(("agentfs.patch.queued", AnyValue::Int(*queued as i64)));
+        }
         Event::ForkFinished { fork, change } => {
             out.push(("agentfs.fork", s(fork)));
             if let Some(change) = change {
@@ -1137,6 +1143,7 @@ impl<L: Logger + Send + Sync> AlarmLog for OtelAlarmLog<L> {
             | Event::ForkAbandoned { .. }
             | Event::HistoryServiceRestored { .. } => (Severity::Info, "INFO"),
             Event::PatchFetchFailed { .. }
+            | Event::PatchQueueDeferred { .. }
             | Event::PatchIgnored { .. }
             | Event::IdentityFallback { .. }
             | Event::PushLimited { .. } => (Severity::Warn, "WARN"),

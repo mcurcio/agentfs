@@ -80,8 +80,9 @@ report it with the log.
   daemon is stuck in the kernel, the node may need the mount detached
   (below).
 - **Files open with passthrough at the crash**: with `--passthrough auto`
-  as root, writes through descriptors the workload opened before the
-  crash go straight to the backing file and are not recorded until the
+  as root, writes through descriptors the workload opened for writing
+  while another had the file open read-only (the only writers given
+  passthrough, design §17.1) before the crash go straight to the backing file and are not recorded until the
   file changes again through the mount. If every write must be recorded,
   restart the workload after a crash, or run with `--passthrough off`.
 - **A clean exit while the pod runs** (someone sent the sidecar SIGTERM,

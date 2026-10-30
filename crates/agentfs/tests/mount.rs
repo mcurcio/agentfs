@@ -1,8 +1,10 @@
 //! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7, 11 and 15, plus SQLite
 //! in and out of the fsync class (design §8),
 //! git on the mount, restores through the mount, the daemon's lifecycle, and
-//! `probe`, `--on-stale-mount hold` and `recover` after a crash (design §17.1), and two
-//! front mounts of one backing tree feeding one history service (design §14).
+//! `probe`, `--on-stale-mount hold` and `recover` after a crash (design §17.1), two
+//! front mounts of one backing tree feeding one history service (design §14), and
+//! writes through a shared mapping after the file's last close (design §3.1, bead
+//! agentfs-dyu).
 //!
 //! Every test needs `/dev/fuse` and root, so all are `#[ignore]`d; the
 //! `fuse` CI job runs them through `ci/fuse-tests.sh`:
@@ -1280,6 +1282,329 @@ fn the_startup_line_reports_passthrough() {
         ),
         "on" => assert!(line.contains("passthrough: on,"), "{line}"),
         _ => assert!(line.contains("passthrough: "), "{line}"),
+    }
+}
+
+// ---- bead agentfs-dyu: a shared mapping that outlives its file's last close ----
+
+/// Maps `path` shared and writable, closes the file (its last close: FLUSH,
+/// then RELEASE) and says `closed`. On a `write` line from stdin it writes
+/// `new` through the mapping and says `written`; on `finish`, `msync` mode
+/// msyncs (`MS_SYNC`) and munmaps, `exit` mode exits at once and leaves the
+/// dirty pages to the kernel.
+const MMAP_WRITER: &str = r#"
+import ctypes, mmap, os, sys
+path, new, mode = sys.argv[1], sys.argv[2].encode(), sys.argv[3]
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.restype = ctypes.c_void_p
+libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+libc.msync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+def check(ok, what):
+    if not ok:
+        e = ctypes.get_errno()
+        raise OSError(e, what + ": " + os.strerror(e))
+def say(word):
+    print(word)
+    sys.stdout.flush()
+def expect(word):
+    got = sys.stdin.readline().strip()
+    if got != word:
+        raise SystemExit("expected " + word + ", got " + repr(got))
+n = len(new)
+fd = os.open(path, os.O_RDWR)
+addr = libc.mmap(None, n, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, fd, 0)
+check(addr not in (None, ctypes.c_void_p(-1).value), "mmap")
+os.close(fd)
+say("closed")
+expect("write")
+ctypes.memmove(addr, new, n)
+say("written")
+expect("finish")
+if mode == "msync":
+    check(libc.msync(addr, n, 4) == 0, "msync")  # MS_SYNC
+    check(libc.munmap(addr, n) == 0, "munmap")
+    say("msync, munmap")
+else:
+    say("exiting without msync")
+    os._exit(0)
+"#;
+
+/// Whether process `pid` holds `path` open for writing.
+fn holds_for_writing(pid: rustix::process::Pid, path: &Path) -> bool {
+    let proc = PathBuf::from(format!("/proc/{}", pid.as_raw_nonzero()));
+    let Ok(fds) = fs::read_dir(proc.join("fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        if fs::read_link(fd.path()).ok().as_deref() != Some(path) {
+            return false;
+        }
+        let info = fs::read_to_string(proc.join("fdinfo").join(fd.file_name()));
+        info.ok()
+            .and_then(|i| {
+                let flags = i.lines().find_map(|l| l.strip_prefix("flags:"))?.trim();
+                u32::from_str_radix(flags, 8).ok()
+            })
+            .is_some_and(|flags| flags & 0o3 != 0)
+    })
+}
+
+/// Waits up to `limit` for the daemon to hold `path` open for writing no
+/// more: its RELEASE of the last handle has been served (the handle's
+/// descriptor is closed after RELEASE's record). Whether it did.
+fn released(m: &Mounted, path: &Path, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while holds_for_writing(m.pid(), path) {
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// A write through a shared mapping after the last close is recorded late
+/// but recorded (design §3.1). Under FUSE passthrough the kernel's
+/// `backing_file_mmap` points the mapping at the backing file
+/// (`vma_set_file`), so the mapping does not hold the FUSE file open:
+/// RELEASE was served at the last close, before the write, and the sweep
+/// looks only at open files (agentfs-dyu, red under passthrough on and
+/// auto in CI run 40993499943). So a handle that can write is never given
+/// passthrough (design §17.1): its mapping holds the FUSE file, and
+/// RELEASE waits for munmap in every mode. Should a writer get passthrough
+/// of its own again, its mapping would be on the backing file, which the
+/// assertion on `mapped_backing` catches. A writer sharing a reader's
+/// backing id is covered by
+/// `a_writer_sharing_a_readers_passthrough_backing_file_is_recorded`.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn a_shared_mapping_written_after_the_last_close_is_recorded() {
+    use std::io::{BufRead as _, BufReader};
+
+    let v = Vol::new("mmap_after_close");
+    let m = v.mount(&[]);
+    let startup = m
+        .log()
+        .lines()
+        .find(|l| l.starts_with("mounted "))
+        .unwrap()
+        .to_owned();
+    let active = startup.contains("passthrough: on,");
+    println!(
+        "agentfs-dyu: kernel {}; --passthrough {}; startup: {startup}",
+        text(&Command::new("uname").arg("-r").output().unwrap().stdout).trim(),
+        passthrough()
+    );
+    if passthrough() == "on" {
+        assert!(active, "--passthrough on but not active: {startup}");
+    }
+
+    // Same length as the new content: a mapping cannot grow a file.
+    v.sh("printf 'old-msync-bytes!' > synced && printf 'old-exit-bytes!!' > exited");
+    v.expect(&tree(&[
+        ("exited", f("old-exit-bytes!!")),
+        ("synced", f("old-msync-bytes!")),
+    ]));
+
+    let cases = [
+        ("synced", "old-msync-bytes!", "NEW-MSYNC-BYTES!", "msync"),
+        ("exited", "old-exit-bytes!!", "NEW-EXIT-BYTES!!", "exit"),
+    ];
+    let mut evidence = Vec::new();
+    for (name, old, new, mode) in cases {
+        let backing = fs::canonicalize(v.backing().join(name)).unwrap();
+        // The shell's own RELEASE first.
+        assert!(released(&m, &backing, Duration::from_secs(10)));
+        let mut writer = Command::new("python3")
+            .arg("-c")
+            .arg(MMAP_WRITER)
+            .arg(v.mnt().join(name))
+            .arg(new)
+            .arg(mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = writer.stdin.take().unwrap();
+        let mut stdout = BufReader::new(writer.stdout.take().unwrap()).lines();
+        let mut said = |want: &str| {
+            let got = stdout.next().map(Result::unwrap);
+            assert_eq!(got.as_deref(), Some(want), "the writer of {name}");
+        };
+        said("closed");
+        writeln!(stdin, "write").unwrap();
+        said("written");
+        // Under passthrough the mapping is the backing file's page cache:
+        // the backing file shows the write before any msync. Without it
+        // the write waits in the FUSE inode's pages until written back.
+        let before_msync = fs::read_to_string(&backing).unwrap();
+        let mapped_backing = before_msync == new;
+        assert!(
+            mapped_backing || before_msync == old,
+            "{name}: {before_msync:?}"
+        );
+        writeln!(stdin, "finish").unwrap();
+        drop(stdin);
+        let rest: Vec<String> = stdout.map(Result::unwrap).collect();
+        let status = writer.wait().unwrap();
+        assert!(
+            status.success(),
+            "the writer of {name}: {status:?} {rest:?}"
+        );
+        println!(
+            "agentfs-dyu: {name} ({mode}): backing file before msync {before_msync:?}, so the mapping is the {}; then {rest:?}",
+            if mapped_backing {
+                "backing file (passthrough)"
+            } else {
+                "FUSE file (through the daemon)"
+            }
+        );
+        evidence.push((name, new, mapped_backing));
+    }
+
+    // Shutdown is the event after which nothing more is recorded: every
+    // RELEASE has been served, the final sweep has run and the commit
+    // loop has drained (backlog 0 below).
+    m.stop();
+    let status = v.ok(&["status"]);
+    assert!(status.contains("backlog:   0 record(s)"), "{status}");
+    let history = v.history();
+    let mut gaps = Vec::new();
+    for (name, new, _) in &evidence {
+        let on_disk = fs::read_to_string(v.backing().join(name)).unwrap();
+        assert_eq!(&on_disk, new, "the write never reached the backing file");
+        let recorded = history.get(*name);
+        println!("agentfs-dyu: {name}: backing file {on_disk:?}; history {recorded:?}");
+        if recorded != Some(&f(new)) {
+            gaps.push(*name);
+        }
+    }
+    println!(
+        "agentfs-dyu: RESULT (--passthrough {}, active {active}): {}",
+        passthrough(),
+        if gaps.is_empty() {
+            "every write through a mapping after the last close was recorded".to_owned()
+        } else {
+            format!("NOT RECORDED: {gaps:?}")
+        }
+    );
+
+    // A writer's mapping is on the FUSE file in every mode: a handle that
+    // can write never gets passthrough (design §17.1).
+    for (name, _, mapped_backing) in &evidence {
+        assert!(
+            !*mapped_backing,
+            "{name}: passthrough active {active}, mapping on the backing file"
+        );
+    }
+    assert!(
+        gaps.is_empty(),
+        "writes through a shared mapping after the last close went unrecorded: {gaps:?}"
+    );
+}
+
+/// A writer opened while a read-only passthrough handle is open shares
+/// its backing id: the kernel allows no other kind of handle on the inode
+/// (design §17.1). Its shared mapping then holds the backing file, not the
+/// FUSE file, so RELEASE comes at its last close and the mapping writes
+/// after it. The write is made only once that RELEASE has been served:
+/// with the reader still open, and after the reader closed too. Both must
+/// be recorded. Under `--passthrough off` nothing is shared: the control.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn a_writer_sharing_a_readers_passthrough_backing_file_is_recorded() {
+    use std::io::{BufRead as _, BufReader};
+
+    let v = Vol::new("shared_writer");
+    let m = v.mount(&[]);
+    let active = m
+        .log()
+        .lines()
+        .any(|l| l.starts_with("mounted ") && l.contains("passthrough: on,"));
+    if passthrough() == "on" {
+        assert!(active, "--passthrough on but not active:\n{}", m.log());
+    }
+    // Same length as the new content: a mapping cannot grow a file.
+    v.sh("printf 'old-reader-open!' > open && printf 'old-reader-gone!' > gone");
+    v.expect(&tree(&[
+        ("gone", f("old-reader-gone!")),
+        ("open", f("old-reader-open!")),
+    ]));
+
+    // (name, new content, whether the reader closes before the write)
+    let cases = [
+        ("open", "NEW-READER-OPEN!", false),
+        ("gone", "NEW-READER-GONE!", true),
+    ];
+    for (name, new, reader_first) in cases {
+        let backing = fs::canonicalize(v.backing().join(name)).unwrap();
+        // The shell's own RELEASE first, so the reader gets passthrough.
+        assert!(released(&m, &backing, Duration::from_secs(10)));
+        let mut reader = Some(fs::File::open(v.mnt().join(name)).unwrap());
+        let mut writer = Command::new("python3")
+            .arg("-c")
+            .arg(MMAP_WRITER)
+            .arg(v.mnt().join(name))
+            .arg(new)
+            .arg("msync")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = writer.stdin.take().unwrap();
+        let mut stdout = BufReader::new(writer.stdout.take().unwrap()).lines();
+        let mut said = |want: &str| {
+            let got = stdout.next().map(Result::unwrap);
+            assert_eq!(got.as_deref(), Some(want), "the writer of {name}");
+        };
+        said("closed");
+        if active {
+            // The writer's RELEASE, while its mapping lives.
+            assert!(
+                released(&m, &backing, Duration::from_secs(10)),
+                "{name}: the writer's RELEASE never came"
+            );
+        }
+        if reader_first {
+            drop(reader.take());
+        }
+        writeln!(stdin, "write").unwrap();
+        said("written");
+        // Shared: the mapping is the backing file's page cache, so the
+        // backing file shows the write before any msync.
+        let mapped_backing = fs::read_to_string(&backing).unwrap() == new;
+        assert_eq!(
+            mapped_backing, active,
+            "{name}: passthrough active {active}, mapping on the backing file {mapped_backing}"
+        );
+        drop(reader);
+        writeln!(stdin, "finish").unwrap();
+        drop(stdin);
+        let rest: Vec<String> = stdout.map(Result::unwrap).collect();
+        let status = writer.wait().unwrap();
+        assert!(
+            status.success(),
+            "the writer of {name}: {status:?} {rest:?}"
+        );
+    }
+
+    // Shutdown is the event after which nothing more is recorded.
+    m.stop();
+    let status = v.ok(&["status"]);
+    assert!(status.contains("backlog:   0 record(s)"), "{status}");
+    let history = v.history();
+    for (name, new, _) in cases {
+        assert_eq!(
+            fs::read_to_string(v.backing().join(name)).unwrap(),
+            new,
+            "the write never reached the backing file"
+        );
+        assert_eq!(
+            history.get(name),
+            Some(&f(new)),
+            "{name}: a write through a shared writer's mapping after RELEASE went unrecorded"
+        );
     }
 }
 

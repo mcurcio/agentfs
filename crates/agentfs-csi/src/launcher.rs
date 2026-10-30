@@ -224,9 +224,16 @@ pub const SERVICE_LOCK_WAIT: Duration = Duration::from_secs(30);
 /// It waits up to [`SERVICE_LOCK_WAIT`] for the state lock, which the
 /// release scan's `agentfs push` of the then unstaged worktree, a
 /// finisher or DeleteVolume's listing may hold for a moment as the volume
-/// is staged.
-pub fn service_spec(layout: &Layout, handle: &str, plugin: &PluginIdentity) -> ProcessSpec {
-    let args = vec![
+/// is staged. `workload_attached` (a pod of the volume is published on
+/// the node) adds `--workload-attached`: the service judges the patch
+/// queue and does not land it (design §12).
+pub fn service_spec(
+    layout: &Layout,
+    handle: &str,
+    plugin: &PluginIdentity,
+    workload_attached: bool,
+) -> ProcessSpec {
+    let mut args = vec![
         os("--state"),
         layout.state(handle).into_os_string(),
         os("--root"),
@@ -247,6 +254,9 @@ pub fn service_spec(layout: &Layout, handle: &str, plugin: &PluginIdentity) -> P
         os("--push-grace"),
         os("5s"),
     ];
+    if workload_attached {
+        args.push(os("--workload-attached"));
+    }
     ProcessSpec {
         label: format!("service {handle}"),
         args,
@@ -430,13 +440,17 @@ mod tests {
             pod: "agentfs-csi-node-x".into(),
             node: "n1".into(),
         };
-        let spec = service_spec(&layout(), "v", &plugin);
+        let spec = service_spec(&layout(), "v", &plugin, false);
         assert_eq!(spec.label, "service v");
+        let expected = "--state /b/v/state --root /b/v/backing --wait-lock 30000ms \
+                        serve-history --listen unix:/n/run/v/history.sock --namespace \
+                        agentfs-csi --pod agentfs-csi-node-x --node n1 --shutdown-grace 10s \
+                        --push-grace 5s";
+        assert_eq!(strings(&spec).join(" "), expected);
+        let attached = service_spec(&layout(), "v", &plugin, true);
         assert_eq!(
-            strings(&spec).join(" "),
-            "--state /b/v/state --root /b/v/backing --wait-lock 30000ms serve-history --listen \
-             unix:/n/run/v/history.sock --namespace agentfs-csi --pod agentfs-csi-node-x \
-             --node n1 --shutdown-grace 10s --push-grace 5s"
+            strings(&attached).join(" "),
+            format!("{expected} --workload-attached")
         );
     }
 

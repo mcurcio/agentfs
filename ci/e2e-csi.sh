@@ -26,6 +26,8 @@
 #     committed and pushed after the restart, and writes resume;
 #   - deleting the node plugin pod: the new one reconciles, writer-a
 #     recovers live, writer-b after a container restart;
+#     a patch queued before it must not land under the running pods
+#     (bead agentfs-4do; a landing fails the script at its end);
 #   - an inline (ephemeral) volume and a ReadWriteMany claim are refused;
 #   - a restore and a revert run from the node plugin reach both pods at
 #     once and are pushed;
@@ -432,6 +434,24 @@ wait_remote after-service-crash.txt again
 assert_contains "$(plugin_log)" "service for $PV exited" "the plugin restarted the service"
 
 step "(h) restart the node plugin: reconcile"
+# Bead agentfs-4do: a patch queued while both pods run (plain git, as
+# docs/runbooks/patch-queue.md "With plain git") must not land under them
+# when the plugin restarts (design §12): reconcile starts the service with
+# --workload-attached, the pods being published. Checked after the
+# restart; a landing fails the script at its end, so the rest still runs.
+PATCH_FILE=patched-under-pod.txt
+patch_head=$(rgit rev-parse "$BRANCH")
+patch_blob=$(printf landed | rgit hash-object -w --stdin)
+patch_index=$(mktemp -u)
+GIT_INDEX_FILE=$patch_index rgit read-tree "$patch_head"
+GIT_INDEX_FILE=$patch_index rgit update-index --add --cacheinfo "100644,$patch_blob,$PATCH_FILE"
+patch_tree=$(GIT_INDEX_FILE=$patch_index rgit write-tree)
+rm -f "$patch_index"
+patch_tip=$(GIT_AUTHOR_NAME=producer GIT_AUTHOR_EMAIL=producer@example.com \
+  GIT_COMMITTER_NAME=producer GIT_COMMITTER_EMAIL=producer@example.com \
+  rgit commit-tree "$patch_tree" -p "$patch_head" -m "agentfs-4do: a patch queued under live pods")
+rgit update-ref "refs/agentfs/$VOLUME/inbox/0000000001" "$patch_tip" ""
+pass "queued patch 1 ($patch_tip) adding $PATCH_FILE while writer-a and writer-b run"
 OLD_PLUGIN=$(plugin_pod)
 kd logs -f "$OLD_PLUGIN" -c agentfs-csi >"$LOGS/old-plugin.log" 2>&1 &
 FOLLOWER=$!
@@ -462,6 +482,19 @@ wait_writable writer-b after-restart-b.txt b2 60
 wait_remote after-restart-a.txt a2
 wait_remote after-restart-b.txt b2
 assert_eq writer-b "$(remote_committer after-restart-b.txt)" "writer-b still commits as itself"
+echo "---- agentfs-4do: the new plugin's patch lines"
+grep -E 'patch|front\(s\) are running' "$LOGS/old-plugin.log" | sed 's/^/old plugin: /' || true
+plugin_log | grep -E 'patch|front\(s\) are running' | sed 's/^/new plugin: /' || true
+in_plugin agentfs --state "$STATE" status 2>&1 | grep -E '^patches:' || true
+PATCH_SEEN=$(in_pod writer-a "cat /data/$PATCH_FILE 2>&1" || true)
+echo "---- agentfs-4do: writer-a (running since before the restart) reads /data/$PATCH_FILE: '$PATCH_SEEN'"
+CSI_4DO_BUG=
+if [ "$PATCH_SEEN" = landed ]; then
+  CSI_4DO_BUG="agentfs-4do: patch 1 landed under running pod writer-a when the node plugin restarted"
+  printf '\033[31mBUG:\033[0m %s\n' "$CSI_4DO_BUG"
+else
+  pass "agentfs-4do: patch 1 did not land under the running pods"
+fi
 
 step "(i) inline volumes and ReadWriteMany are refused"
 kubectl apply -k ci/k8s-csi/negative
@@ -526,5 +559,7 @@ while docker exec "$NODE" test -e "$BASE/$PV"; do
   sleep 1
 done
 pass "DeleteVolume removed $BASE/$PV (onDelete: delete)"
+
+[ -z "$CSI_4DO_BUG" ] || fail "$CSI_4DO_BUG"
 
 step "e2e-csi passed"

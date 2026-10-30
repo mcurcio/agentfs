@@ -121,6 +121,13 @@ impl StateDir {
         self.meta().join("notify.json")
     }
 
+    /// `meta/attached.json`: a mount may have a workload attached
+    /// ([`crate::patch::attached`], design §12). Written as a mount
+    /// starts, removed only when it stops with nothing attached.
+    pub fn attached_mark(&self) -> PathBuf {
+        self.meta().join("attached.json")
+    }
+
     /// `meta/fork.json`: the finisher's marks (design §2.2, §11.5).
     pub fn fork_mark(&self) -> PathBuf {
         self.meta().join("fork.json")

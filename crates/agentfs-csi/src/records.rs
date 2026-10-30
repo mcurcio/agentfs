@@ -98,18 +98,30 @@ pub fn remove(path: &Path) -> io::Result<()> {
 /// Records that could not be read, with why.
 pub type Unreadable = Vec<(PathBuf, io::Error)>;
 
-/// Every `*.json` record directly in `dir`, in name order, with the files
-/// that could not be read.
-pub fn load_all<T: DeserializeOwned>(dir: &Path) -> io::Result<(Vec<T>, Unreadable)> {
-    let mut paths = match fs::read_dir(dir) {
-        Ok(entries) => entries
+/// The `*.json` record files directly in `dir`, unsorted; none when `dir`
+/// is missing.
+fn record_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    match fs::read_dir(dir) {
+        Ok(entries) => Ok(entries
             .filter_map(Result::ok)
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect::<Vec<_>>(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
-        Err(e) => return Err(e),
-    };
+            .collect()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `dir` holds any `*.json` record, readable or not. An error
+/// listing it is returned: the caller cannot tell.
+pub fn any(dir: &Path) -> io::Result<bool> {
+    Ok(!record_paths(dir)?.is_empty())
+}
+
+/// Every `*.json` record directly in `dir`, in name order, with the files
+/// that could not be read.
+pub fn load_all<T: DeserializeOwned>(dir: &Path) -> io::Result<(Vec<T>, Unreadable)> {
+    let mut paths = record_paths(dir)?;
     paths.sort();
     let mut good = Vec::new();
     let mut bad = Vec::new();

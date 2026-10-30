@@ -6,7 +6,9 @@ them, in order, the next time the volume mounts, before anything can see
 the tree. A patch that cannot land is set aside whole while the
 rest go on; integrators are notified of every verdict change; the queue
 can also be served over git ([section 8](#8-serving-the-queue-over-git-serve-git)),
-and forks of forks roll up through it ([section 9](#9-forks-of-forks)). Design: [§12](../design.md#12-patch-queue-for-iac-phase-3-built),
+and forks of forks roll up through it ([section 9](#9-forks-of-forks)).
+A start that may have a workload attached holds the queue
+([section 10](#10-patches-held-after-an-unclean-stop)). Design: [§12](../design.md#12-patch-queue-for-iac-phase-3-built),
 [§11.3](../design.md#113-limits-and-rejected-pushes). `ci/e2e-patches.sh`
 follows this runbook against a smart-HTTP remote and a real mount.
 
@@ -167,7 +169,9 @@ patches: workload attached; lands at next mount
 ```
 
 `ready` patches land at the next mount (a pod restart), or with an apply
-once the daemon is stopped. A daemon from before this answer refuses the
+once the daemon is stopped. A mount lands them only when nothing is
+attached: after a crash or a restart of agentfs alone under a running
+workload, it holds them ([section 10](#10-patches-held-after-an-unclean-stop)). A daemon from before this answer refuses the
 request, and the command falls back to taking the lock, which exits 75.
 
 The mount first fetches `inbox/*` from the patch remote, waiting at most
@@ -251,7 +255,7 @@ it being 1), `agentfs.patch.held` (patches set aside at the last run), the
 span `agentfs.patch` (outcome `applied`, `held`, `waiting`, `awaiting`,
 `not_judged`, `ready` or `blocked`), the `PatchBlocked`, `PatchHeld`,
 `PatchRuleFailed`, `PatchFetchFailed` and `NotifyFailed` alarms, and the
-`PatchIgnored` warning. Waiting and awaiting raise nothing: the status carries them.
+`PatchIgnored` and `PatchQueueDeferred` warnings. Waiting and awaiting raise nothing: the status carries them.
 
 ## 4. A patch set aside
 
@@ -524,3 +528,44 @@ each parent mount once after its children finished:
    children's changes; `agentfs patch status` shows them applied.
 3. Finish the parent (delete its claim). Its change carries its
    children's.
+
+## 10. Patches held after an unclean stop
+
+Patches land only at a start with nothing attached (design §12, "Only
+with nothing attached"). A start that cannot show that judges the queue
+instead (verdicts, status and notice as in [section 2](#2-when-patches-apply)),
+lands nothing, and raises the warning `PatchQueueDeferred` while anything
+is queued:
+
+```text
+patches: not applied at this start: the previous mount of this volume did not stop with nothing attached (killed, crashed, a busy unmount or open files), so a workload may still hold it; 1 patch(es) stay queued and land at the next start with nothing attached
+alarm: patch queue deferred (unclean_stop): a workload may be attached, so 1 patch(es) stay queued; they land at the next start with nothing attached (docs/runbooks/patch-queue.md)
+```
+
+| Reason | Why the start may have a workload attached |
+|---|---|
+| `unclean_stop` | The previous mount left `$STATE/meta/attached.json`: it was killed or crashed, or it stopped while a workload held it (its log said `the mount was busy: detached lazily`, `files were still open after ...`, or `a workload may still be attached`). Typical: `docker restart` or a crash of the agentfs container alone, or a sidecar restart inside a running pod |
+| `stale_mount` | The mount stacked over a stale mount a crashed daemon left (`--on-stale-mount recover`). Its own stop keeps the mark too (a workload may still hold the stale layers it detaches), so it takes one more clean stop and start |
+| `fronts_running` | `serve-history` started while fronts hold leases |
+| `workload_attached` | `serve-history` was given `--workload-attached`: the CSI node plugin passes it while a pod of the volume is published on the node (a node-plugin restart, a crashed service's restart) |
+
+To land them, stop the workload, then agentfs, so the mount stops with
+nothing attached and removes the mark; the next start lands the queue:
+
+- **Docker:** `docker stop` the workload containers, then the agentfs
+  container, then start agentfs and the workloads again (`docker compose
+  down` and `up` stop dependents first). A mount that was itself started
+  over a held queue stops cleanly the same way: one clean stop and start
+  is enough.
+- **Kubernetes sidecar:** delete the pod; the new pod's mount lands it.
+- **CSI:** delete the volume's pods on the node, so it is unstaged, then
+  start them again; NodeStage starts the service with no pod published.
+- **By hand:** with the volume stopped and no workload holding the
+  mount point, `agentfs --state "$STATE" --root "$BACKING" patch apply`
+  lands the queue without this check (it is the operator's call). It
+  leaves the mark, so the next mount still judges until one stops
+  cleanly.
+
+Never remove `meta/attached.json` by hand while a workload may hold the
+mount: the next mount would land patches under it.
+

@@ -10,9 +10,11 @@ what to do when something goes wrong. The design behind it is
 - **Linux 5.6 or later.** Every path in the backing tree is resolved with
   `openat2`, so no path can leave the tree or follow a symlink. Older
   kernels fail at mount with "the kernel has no openat2".
-- **Linux 6.9 or later for passthrough** (optional). With it, reads, writes
-  and `mmap` go straight to the backing files without passing through the
-  daemon. Without it everything still works, through the daemon.
+- **Linux 6.9 or later for passthrough** (optional). With it, reads and
+  `mmap` of files opened read-only go straight to the backing files without
+  passing through the daemon; files opened for writing always go through
+  the daemon (design §17.1). Without it everything still works, through the
+  daemon.
 - **`/dev/fuse`.** In a container, give it the device (and, for a mount
   other containers see, a privileged sidecar: see section 11 below).
 - **Run as root** for multi-user volumes. What the daemon does is decided
@@ -145,7 +147,7 @@ it exits 1 and changes nothing
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
-| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | Kernel passthrough: `auto` uses it when the kernel (6.9+) and privileges (`CAP_SYS_ADMIN`, see §1) allow, `on` refuses to mount without it and stops the mount (exit 1) if a file cannot be given a backing file later, `off` never uses it |
+| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | Kernel passthrough for files opened read-only (files opened for writing always go through the daemon): `auto` uses it when the kernel (6.9+) and privileges (`CAP_SYS_ADMIN`, see §1) allow, `on` refuses to mount without it and stops the mount (exit 1) if a file cannot be given a backing file later, `off` never uses it |
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | FUSE request threads |
 | `--no-allow-other` | | | Only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | At shutdown, how long to wait for open files on a busy mount after detaching it |
@@ -702,10 +704,13 @@ whole, consistent groups instead.
   `CommitFailed`, `RepackFailed`, `ReconcileFailed`, `PushFailed`,
   `Diverged`, `PushLimited`, `RemoteMisconfigured`, `PatchBlocked`,
   `PatchFetchFailed`, `PatchIgnored` (a stale or malformed inbox entry
-  that is never applied), `ForkRefused`, `HistoryServiceUnavailable` and
+  that is never applied), `PatchQueueDeferred` (a start that may have a
+  workload attached held the patch queue: [patch-queue.md](runbooks/patch-queue.md#10-patches-held-after-an-unclean-stop)),
+  `ForkRefused`, `HistoryServiceUnavailable` and
   `IdentityFallback` (a pod's records committed with the service's own
   committer). `PathRefused`, `PatchFetchFailed`, `PatchIgnored`,
-  `IdentityFallback` and `PushLimited` are logged as warnings, the rest as
+  `PatchQueueDeferred`, `IdentityFallback` and `PushLimited` are logged as
+  warnings, the rest as
   errors. When each is raised and what it carries: the events table in
   [design §13](design.md#13-observability-opentelemetry).
 - **`patch N held (<reason>)`** at mount: patch N could not be applied

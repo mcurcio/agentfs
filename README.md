@@ -212,7 +212,7 @@ flowchart LR
 
 1. A workload uses the mount like any directory. agentfs passes each call
    through to the backing tree, a real directory, with kernel passthrough
-   for reads and writes where the kernel allows it.
+   for files opened read-only where the kernel allows it.
 2. At each change boundary agentfs freezes the file's content (a reflink,
    else a copy) and journals the change in the state area before the call
    returns.

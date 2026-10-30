@@ -110,6 +110,7 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs/fetch.rs` | LFS objects for restores and `agentfs lfs fetch`: cache first, then the remotes |
 | `lfs/fake.rs` | An in-process LFS server for tests |
 | `patch/mod.rs` | The patch queue for iac (§12) |
+| `patch/attached.rs` | Whether a workload may be attached when a daemon starts, so the queue waits: the mount's attached mark (`meta/attached.json`) and the reasons a start defers the queue |
 | `patch/admit.rs` | `serve-git`'s pushers and their rights, and admitting a push whole before git keeps it |
 | `patch/accept.rs` | Acceptance rules: whether a cleanly merged patch may land (clean merge, approval, the `patch-accept` hook) |
 | `patch/integrate.rs` | A patch branch, and merging it onto the branch head with the `git` program |

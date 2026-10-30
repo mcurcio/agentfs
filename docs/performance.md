@@ -12,7 +12,8 @@ Unless a section says otherwise, the numbers below are from the first
 CI run of the benchmark, on 2026-10-13 (commit `699bbb7`, run
 [38334925092](https://github.com/mcurcio/agentfs/actions/runs/38334925092)):
 GitHub's `ubuntu-24.04` runner, 4 vCPUs (AMD EPYC 7763), 16 GiB, kernel
-6.17, FUSE passthrough on, each filesystem a fresh 20 GiB loop device on
+6.17, FUSE passthrough on (writes too, before 2026-10-30: see
+[Writes through the daemon](#writes-through-the-daemon)), each filesystem a fresh 20 GiB loop device on
 the runner's disk, no remotes configured (so no pushes). They are one
 run on a shared machine; the next two runs, some on a different CPU,
 were up to about 1.7 times slower in `fsync`-bound results and up to four
@@ -213,6 +214,23 @@ boundary (plus 1 % and 10 of slack for the sweep), so a regression to
 the double record fails the job. It also checks that renaming the
 directory of 100,000 created files is one record and leaves every file
 in the history at its new path.
+
+### Writes through the daemon
+
+Since 2026-10-30 a file opened for writing never gets kernel passthrough
+(design §17.1, §19.1 "Writers never passthrough"): under passthrough a
+shared mapping did not hold the FUSE file open, so a write through it
+after the last close went unrecorded. Every `write` to such a file is now
+a FUSE round trip through the daemon, as under `--passthrough off`, and
+a reader opened while it is open is served by the daemon too. Reads of
+files opened read-only keep passthrough. The numbers on this page were
+measured before the change, with writes in passthrough. Not yet
+measured: the cost is expected to be small where the record dominates
+(a 4 KiB write is one round trip of tens of microseconds against a
+boundary of 1.8 ms or more), and largest for workloads that write much
+data without recording it, such as npm into an excluded path, and for
+the time spent writing a large file before its close. The benchmark
+after landing shows it ([Run to run](#run-to-run)).
 
 ### Directory renames
 

@@ -1,8 +1,10 @@
 //! Whether an inode changed since it was last recorded (design §3.1:
 //! "FLUSH records only if the inode changed").
 //!
-//! With kernel passthrough the daemon never sees writes, so change is
-//! detected from the inode itself. An inode is *armed* once something could
+//! The daemon does not see every write (writes through a shared mapping
+//! reach it only at writeback, and a writer sharing a passthrough backing
+//! id not at all: design §17.1), so change is detected from the inode
+//! itself. An inode is *armed* once something could
 //! have changed it: a write-open, a write the daemon served, or a size
 //! change. Only an armed inode is `fstat`ed at FLUSH; its [`Stamp`] (device,
 //! inode, size, mtime, ctime, mode) is compared with the stamp taken just
@@ -13,9 +15,13 @@
 //! closes that gap: when the last record's stamp is within the clock's
 //! granularity of the record time, a write could have followed the freeze
 //! without moving the stamp, so the next FLUSH or RELEASE records regardless.
-//! RELEASE follows the last close at once, and is the only backstop for a
-//! same-tick write through a shared mapping, so a file written and closed
-//! within the window would be recorded twice. Instead, a racy record pins
+//! RELEASE comes once every handle is closed and every mapping made through
+//! a daemon handle is gone; that is every writer's, except a writer sharing
+//! a passthrough backing id, whose mapping does not hold the FUSE file
+//! open, so its node stays armed until FORGET (design §3.1, §17.1).
+//! RELEASE is the only backstop for a same-tick write through a shared
+//! mapping, and for a file without one it follows the last close at once,
+//! so a file written and closed within the window would be recorded twice. Instead, a racy record pins
 //! its frozen copy ([`FrozenRef`]); a boundary that would record again only
 //! because of the racy rule compares the file's bytes with that copy, and
 //! skips the record if they are equal and the copy is still the last state

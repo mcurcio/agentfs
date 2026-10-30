@@ -13,6 +13,7 @@ on:
       - crates/**
       - examples/docker/**
       - ci/e2e-docker.sh
+      - ci/e2e-docker-restart-patch.sh
       - ci/docker/**
       - ci/lib.sh
       - .github/workflows/docker.yml
@@ -72,6 +73,29 @@ jobs:
           uname -a
           docker load -i "$RUNNER_TEMP/agentfs-image.tar"
       - run: ci/e2e-docker.sh ${{ matrix.example }}
+      - name: diagnose
+        if: failure()
+        run: ci/e2e-docker.sh diagnose
+
+  # Bead agentfs-4do: restarting only the agentfs container under a running
+  # workload must not land queued patches under it (design §12); the log
+  # shows what the workload saw.
+  restart-patch:
+    name: e2e (docker restart under a workload, queued patch)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentfs-image-docker
+          path: ${{ runner.temp }}
+      - name: FUSE and the image
+        run: |
+          sudo modprobe fuse
+          docker load -i "$RUNNER_TEMP/agentfs-image.tar"
+      - run: ci/e2e-docker-restart-patch.sh
       - name: diagnose
         if: failure()
         run: ci/e2e-docker.sh diagnose

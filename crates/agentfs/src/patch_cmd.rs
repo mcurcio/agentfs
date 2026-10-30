@@ -33,6 +33,7 @@ use agentfs_core::identity::Identity;
 use agentfs_core::lfs::fetch::Fetcher;
 use agentfs_core::lock::StateLock;
 use agentfs_core::patch::accept;
+use agentfs_core::patch::attached::Deferred;
 use agentfs_core::patch::fetch::{FetchOutcome, fetch_inbox};
 use agentfs_core::patch::integrate;
 use agentfs_core::patch::notify::{self, ApplyAnswer};
@@ -523,6 +524,56 @@ fn status_cmd(state: &StateDir, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The patch phase of a daemon's start (design §12 "When it runs"): with
+/// nothing attached (`deferred` is `None`) the queue lands
+/// ([`apply_queue`]). Otherwise it is judged as an apply under a daemon
+/// is ([`Queue::judge`], fetching the inbox), the integrator is told, and
+/// when anything is queued `PatchQueueDeferred` is raised: those patches
+/// land at the next start with nothing attached. Never fails: the volume
+/// serves anyway.
+#[allow(clippy::too_many_arguments)]
+pub fn queue_at_start(
+    state: &StateDir,
+    settings: &Settings,
+    recorder: &Recorder,
+    committer: &Committer,
+    root: &Path,
+    telemetry: &Telemetry,
+    events: &Events,
+    deferred: Option<Deferred>,
+) {
+    let Some(reason) = deferred else {
+        if let Err(e) = apply_queue(
+            state, settings, recorder, committer, root, telemetry, events, true,
+        ) {
+            eprintln!("patches: the queue could not run: {e:#}");
+        }
+        return;
+    };
+    let applier = Applier::new(committer, events.clone(), telemetry);
+    let judged = {
+        let _one = APPLYING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        judge_and_tell(state, &applier, true, None)
+    };
+    if let Err(e) = &judged {
+        eprintln!("patches: judging the queue: {e:#}");
+    }
+    let queued = PatchState::load(&state.patch_state()).queue_depth as usize;
+    eprintln!(
+        "patches: not applied at this start: {}; {queued} patch(es) stay queued and land at the \
+         next start with nothing attached",
+        reason.describe()
+    );
+    if queued > 0 {
+        events.emit(Event::PatchQueueDeferred {
+            reason: reason.as_str(),
+            queued,
+        });
+    }
+}
+
 /// The patch phase (design §12, §17.1): with the volume open and nothing
 /// serving the tree, fetch the inbox from the patch remote (best effort,
 /// unless `fetch` is false or `agentfs.patchFetchTimeout` is 0) and apply
@@ -533,7 +584,7 @@ fn status_cmd(state: &StateDir, json: bool) -> Result<ExitCode> {
 /// as blocked in `meta/patch.json` and the status ref, so the gauges and
 /// `agentfs status` show it.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_queue(
+fn apply_queue(
     state: &StateDir,
     settings: &Settings,
     recorder: &Recorder,
