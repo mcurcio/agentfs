@@ -485,6 +485,10 @@ fn a_daemon_commits_on_top_of_its_marker() {
             text(&pushed.stdout),
             text(&pushed.stderr)
         );
+        // The push committed, before the daemon's own commit at stop.
+        let head = v.head();
+        assert_ne!(head, marker, "the push committed nothing");
+        assert_eq!(parents(&v.local(), head), [marker]);
         marker
     }));
     let _ = rustix::process::kill_process(
