@@ -113,8 +113,11 @@ ask() { # scenario
 step "start agentfs, the git server, the model server, docker-in-docker and Hermes"
 docker version --format 'docker {{.Server.Version}}'
 docker compose version
-mkdir -p "$EX/mnt"
-dc up -d
+# Hermes and dind bind the mount point itself, which Docker requires to
+# exist when it creates them; the FUSE mount covers it before they start.
+mkdir -p "$EX/mnt/workspace"
+dc build --quiet
+dc up -d --quiet-pull
 wait_healthy agentfs 300
 wait_healthy hermes 600
 
@@ -201,7 +204,7 @@ assert_contains "$out" "queued patch 1" "the patch is queued on the remote"
 dc stop hermes dind
 dc restart agentfs
 wait_healthy agentfs 300
-dc up -d
+dc up -d --quiet-pull
 wait_healthy hermes 600
 assert_contains "$(dc exec -T agentfs agentfs status)" "last applied 1" "agentfs applied patch 1"
 assert_contains "$(in_hermes 'cat /opt/data/SOUL.md')" "$marker" "Hermes' container reads the patched SOUL.md"
