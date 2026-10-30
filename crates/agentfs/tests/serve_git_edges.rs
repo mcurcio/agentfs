@@ -13,12 +13,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agentfs_core::listening_socket::Listener;
 use git2::{Oid, Repository};
 
 const BRANCH: &str = "refs/heads/agentfs/demo";
@@ -254,12 +254,11 @@ impl OldDaemon {
     fn start(state: &Path) -> Self {
         let dir = state.join("meta/control");
         fs::create_dir_all(&dir).unwrap();
-        let listener = UnixListener::bind(dir.join("agentfs.sock")).unwrap();
+        let listener = Listener::bind(dir.join("agentfs.sock")).unwrap();
         let asked = Arc::new(Mutex::new(Vec::new()));
         let log = asked.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
+            while let Ok(Some(mut stream)) = listener.accept() {
                 let mut line = String::new();
                 if BufReader::new(&stream).read_line(&mut line).is_err() {
                     continue;
