@@ -2,7 +2,8 @@ name: docker
 
 # The Docker examples (examples/docker, docs/docker.md): the image built
 # from this commit, then every example run on the runner with docker and
-# docker compose by ci/e2e-docker.sh, one job each, in parallel.
+# docker compose by ci/e2e-docker.sh, one job each, in parallel; and
+# upstream Hermes on the compose example (ci/e2e-hermes.sh, design §16).
 
 on:
   push:
@@ -15,6 +16,9 @@ on:
       - ci/e2e-docker.sh
       - ci/e2e-docker-restart-patch.sh
       - ci/docker/**
+      - ci/e2e-hermes.sh
+      - ci/hermes/**
+      - deploy/examples/hermes/**
       - ci/lib.sh
       - .github/workflows/docker.yml
   pull_request:
@@ -99,3 +103,28 @@ jobs:
       - name: diagnose
         if: failure()
         run: ci/e2e-docker.sh diagnose
+
+  # Bead agentfs-4af: upstream Hermes' published image on the compose
+  # example, with its tool containers on docker-in-docker and a scripted
+  # model server (design §16, deployment.md §10).
+  hermes:
+    name: e2e (docker compose, upstream Hermes)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentfs-image-docker
+          path: ${{ runner.temp }}
+      - name: FUSE and the image
+        run: |
+          sudo modprobe fuse
+          docker load -i "$RUNNER_TEMP/agentfs-image.tar"
+      - run: ci/e2e-hermes.sh
+      - name: diagnose
+        if: failure()
+        run: |
+          ci/e2e-hermes.sh diagnose
+          ci/e2e-docker.sh diagnose

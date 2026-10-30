@@ -1,0 +1,116 @@
+# CI overlay for ci/e2e-hermes.sh: upstream Hermes (NousResearch/
+# hermes-agent, its published image pinned by digest) on an agentfs
+# volume, over examples/docker/compose.yaml and compose.remote.yaml (the
+# agentfs services and the git server they push to). Relative paths
+# resolve against examples/docker, the first compose file's directory.
+#
+#   agentfs        the example's recorder, with the Hermes rule files
+#                  (deploy/examples/hermes) as info/exclude and
+#                  info/attributes, as the sidecar mounts them
+#   hermes         upstream's image and command (`gateway run`), started
+#                  as root as upstream ships it, with the FUSE mount at
+#                  its data path /opt/data
+#   dind           the Docker daemon Hermes' docker terminal backend runs
+#                  tool containers on; it has the mount at /opt/data too,
+#                  so Hermes' `terminal.docker_volumes` passes it into them
+#   model          a scripted stand-in for the model API (model/model.py)
+#   hermes-config  puts ci/hermes/hermes/config.yaml in the volume before
+#                  Hermes' first start, as an operator would
+#   producer       a patch producer (`agentfs patch submit`), run on demand
+#
+# Hermes and dind bind the mount itself (./mnt/workspace), so a new mount
+# reaches them when they restart, never while they run: the test restarts
+# them with agentfs, as a pod restart would (deployment.md §10).
+
+x-mount: &mount
+  type: bind
+  source: ./mnt/workspace
+  target: /opt/data
+  bind:
+    propagation: rslave
+
+x-hermes-image: &hermes-image
+  image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v0.22.5@sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d}
+
+services:
+  agentfs:
+    volumes:
+      - ../../deploy/examples/hermes/exclude:/data/state/git/info/exclude:ro
+      - ../../deploy/examples/hermes/attributes:/data/state/git/info/attributes:ro
+
+  # The example's idle workload is not part of this test.
+  workload:
+    profiles: [example-workload]
+
+  hermes-config:
+    image: ${WORKLOAD_IMAGE:-debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f}
+    user: "10000:10000"
+    command: [sh, -c, "[ -e /opt/data/config.yaml ] || cp /config/config.yaml /opt/data/config.yaml"]
+    volumes:
+      - *mount
+      - ../../ci/hermes/hermes/config.yaml:/config/config.yaml:ro
+    restart: "no"
+    depends_on:
+      agentfs:
+        condition: service_healthy
+
+  model:
+    # The Hermes image only for its python3, so the test pulls no other image.
+    <<: *hermes-image
+    entrypoint: [python3, /model/model.py, "8000", /model/scenarios.json]
+    volumes:
+      - ../../ci/hermes/model:/model:ro
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      start_period: 60s
+      start_interval: 1s
+
+  dind:
+    image: ${DIND_IMAGE:-docker:29.9.2-dind@sha256:9e79b879b177fbd72c34376a3dd3d91747da5db49e1f560f76aea59561471977}
+    privileged: true
+    environment:
+      # Plain TCP on the compose network: a throwaway daemon for the test.
+      DOCKER_TLS_CERTDIR: ""
+    command: [dockerd, --host=tcp://0.0.0.0:2375, --host=unix:///var/run/docker.sock, --tls=false]
+    volumes:
+      - *mount
+    healthcheck:
+      test: [CMD, docker, info]
+      interval: 10s
+      start_period: 60s
+      start_interval: 1s
+    depends_on:
+      agentfs:
+        condition: service_healthy
+
+  hermes:
+    <<: *hermes-image
+    command: [gateway, run]
+    environment:
+      DOCKER_HOST: tcp://dind:2375
+      # The gateway's OpenAI-compatible API, on the container's loopback:
+      # the test drives Hermes through it (upstream api-server.md).
+      API_SERVER_ENABLED: "true"
+      API_SERVER_KEY: agentfs-ci-not-a-secret
+    volumes:
+      - *mount
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8642/health]
+      interval: 10s
+      timeout: 5s
+      start_period: 300s
+      start_interval: 1s
+    depends_on:
+      hermes-config:
+        condition: service_completed_successfully
+      dind:
+        condition: service_healthy
+      model:
+        condition: service_healthy
+
+  producer:
+    image: ${AGENTFS_IMAGE:-ghcr.io/mcurcio/agentfs:latest}
+    profiles: [producer]
+    entrypoint: [sh, -ec]
+    secrets: [origin]
