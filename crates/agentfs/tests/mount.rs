@@ -1507,6 +1507,110 @@ fn a_shared_mapping_written_after_the_last_close_is_recorded() {
     );
 }
 
+/// A writer opened while a read-only passthrough handle is open shares
+/// its backing id: the kernel allows no other kind of handle on the inode
+/// (design §17.1). Its shared mapping then holds the backing file, not the
+/// FUSE file, so RELEASE comes at its last close and the mapping writes
+/// after it. The write is made only once that RELEASE has been served:
+/// with the reader still open, and after the reader closed too. Both must
+/// be recorded. Under `--passthrough off` nothing is shared: the control.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn a_writer_sharing_a_readers_passthrough_backing_file_is_recorded() {
+    use std::io::{BufRead as _, BufReader};
+
+    let v = Vol::new("shared_writer");
+    let m = v.mount(&[]);
+    let active = m
+        .log()
+        .lines()
+        .any(|l| l.starts_with("mounted ") && l.contains("passthrough: on,"));
+    if passthrough() == "on" {
+        assert!(active, "--passthrough on but not active:\n{}", m.log());
+    }
+    // Same length as the new content: a mapping cannot grow a file.
+    v.sh("printf 'old-reader-open!' > open && printf 'old-reader-gone!' > gone");
+    v.expect(&tree(&[
+        ("gone", f("old-reader-gone!")),
+        ("open", f("old-reader-open!")),
+    ]));
+
+    // (name, new content, whether the reader closes before the write)
+    let cases = [
+        ("open", "NEW-READER-OPEN!", false),
+        ("gone", "NEW-READER-GONE!", true),
+    ];
+    for (name, new, reader_first) in cases {
+        let backing = fs::canonicalize(v.backing().join(name)).unwrap();
+        // The shell's own RELEASE first, so the reader gets passthrough.
+        assert!(released(&m, &backing, Duration::from_secs(10)));
+        let mut reader = Some(fs::File::open(v.mnt().join(name)).unwrap());
+        let mut writer = Command::new("python3")
+            .arg("-c")
+            .arg(MMAP_WRITER)
+            .arg(v.mnt().join(name))
+            .arg(new)
+            .arg("msync")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = writer.stdin.take().unwrap();
+        let mut stdout = BufReader::new(writer.stdout.take().unwrap()).lines();
+        let mut said = |want: &str| {
+            let got = stdout.next().map(Result::unwrap);
+            assert_eq!(got.as_deref(), Some(want), "the writer of {name}");
+        };
+        said("closed");
+        if active {
+            // The writer's RELEASE, while its mapping lives.
+            assert!(
+                released(&m, &backing, Duration::from_secs(10)),
+                "{name}: the writer's RELEASE never came"
+            );
+        }
+        if reader_first {
+            drop(reader.take());
+        }
+        writeln!(stdin, "write").unwrap();
+        said("written");
+        // Shared: the mapping is the backing file's page cache, so the
+        // backing file shows the write before any msync.
+        let mapped_backing = fs::read_to_string(&backing).unwrap() == new;
+        assert_eq!(
+            mapped_backing, active,
+            "{name}: passthrough active {active}, mapping on the backing file {mapped_backing}"
+        );
+        drop(reader);
+        writeln!(stdin, "finish").unwrap();
+        drop(stdin);
+        let rest: Vec<String> = stdout.map(Result::unwrap).collect();
+        let status = writer.wait().unwrap();
+        assert!(
+            status.success(),
+            "the writer of {name}: {status:?} {rest:?}"
+        );
+    }
+
+    // Shutdown is the event after which nothing more is recorded.
+    m.stop();
+    let status = v.ok(&["status"]);
+    assert!(status.contains("backlog:   0 record(s)"), "{status}");
+    let history = v.history();
+    for (name, new, _) in cases {
+        assert_eq!(
+            fs::read_to_string(v.backing().join(name)).unwrap(),
+            new,
+            "the write never reached the backing file"
+        );
+        assert_eq!(
+            history.get(name),
+            Some(&f(new)),
+            "{name}: a write through a shared writer's mapping after RELEASE went unrecorded"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn an_unprivileged_daemon() {
