@@ -1364,16 +1364,17 @@ fn released(m: &Mounted, path: &Path, limit: Duration) -> bool {
     true
 }
 
-/// Design §3.1 says RELEASE comes only once every handle and mapping is
-/// gone, so a write through a shared mapping is recorded late but
-/// recorded. Under FUSE passthrough the kernel's `backing_file_mmap` points
-/// the mapping at the backing file (`vma_set_file`), so the mapping may
-/// not hold the FUSE file open: RELEASE can be served at the last close,
-/// before the write, and the sweep looks only at open files. The writer
-/// writes only once the daemon has served that RELEASE, so the write can
-/// never race it. This asserts the correct behaviour: a red run under
-/// passthrough confirms the gap; the `--passthrough off` leg of the CI
-/// matrix is the control.
+/// A write through a shared mapping after the last close is recorded late
+/// but recorded (design §3.1). Under FUSE passthrough the kernel's
+/// `backing_file_mmap` points the mapping at the backing file
+/// (`vma_set_file`), so the mapping does not hold the FUSE file open:
+/// RELEASE was served at the last close, before the write, and the sweep
+/// looks only at open files (agentfs-dyu, red under passthrough on and
+/// auto in CI run 40993499943). So a handle that can write is never given
+/// passthrough (design §17.1): its mapping holds the FUSE file, and
+/// RELEASE waits for munmap in every mode. Should a writer get passthrough
+/// again, the writer here writes only once the daemon has served that
+/// RELEASE, so the write never races it.
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn a_shared_mapping_written_after_the_last_close_is_recorded() {
@@ -1431,7 +1432,8 @@ fn a_shared_mapping_written_after_the_last_close_is_recorded() {
         };
         said("closed");
         // With the mapping holding the FUSE file open (no passthrough) no
-        // RELEASE comes before munmap: nothing to wait for.
+        // RELEASE comes before munmap: under passthrough this waits its
+        // whole timeout, and only a writer given passthrough would end it.
         let release_first = active && released(&m, &backing, Duration::from_secs(10));
         writeln!(stdin, "write").unwrap();
         said("written");
@@ -1491,11 +1493,12 @@ fn a_shared_mapping_written_after_the_last_close_is_recorded() {
         }
     );
 
-    // The mapping went where the mode says.
+    // A writer's mapping is on the FUSE file in every mode: a handle that
+    // can write never gets passthrough (design §17.1).
     for (name, _, _, mapped_backing) in &evidence {
-        assert_eq!(
-            *mapped_backing, active,
-            "{name}: passthrough active {active}, mapping on the backing file {mapped_backing}"
+        assert!(
+            !*mapped_backing,
+            "{name}: passthrough active {active}, mapping on the backing file"
         );
     }
     assert!(

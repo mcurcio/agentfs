@@ -13,18 +13,24 @@
 //! - **Passthrough.** With `--passthrough auto` (the default) or `on`, when
 //!   the kernel offers `FUSE_PASSTHROUGH` (Linux 6.9+) and the daemon may
 //!   register backing files (`CAP_SYS_ADMIN` in the initial user namespace;
-//!   [`crate::privileges`]), regular files are opened with a backing file,
-//!   so reads, writes and mmap go straight to the backing inode without the
-//!   daemon. One backing id is kept per inode while any handle on it is
-//!   open. If registering fails for an inode (a stacked backing filesystem
-//!   such as overlayfs, `EMFILE`), only that inode goes through the daemon,
-//!   while it has a handle open: the kernel refuses to mix the two modes on
-//!   one inode (`ETXTBSY`), so an inode with a backing id open keeps it and
-//!   one with daemon handles open gets no new one. `on` instead fails the
-//!   mount when the kernel or privileges do not allow it, and a later
-//!   registration failure fails that open with `EIO` and stops the mount.
-//! - **Caching.** Entries are cached for 1 s, attributes not at all: with
-//!   passthrough the daemon does not see writes, so only the backing inode
+//!   [`crate::privileges`]), regular files opened read-only are opened with
+//!   a backing file, so their reads and mmap go straight to the backing
+//!   inode without the daemon. A handle that can write never is ([`way`],
+//!   design §17.1): a mapping of a passthrough file holds the backing file,
+//!   not the FUSE file, so RELEASE can come while a shared writable mapping
+//!   is live, and writes through it would go unrecorded. One backing id is
+//!   kept per inode while any handle on it is open. The kernel refuses to
+//!   mix the two modes on one inode (`ETXTBSY`, the open failing with
+//!   `EIO`), so an inode with a backing id open keeps it, for a writer too,
+//!   and one with daemon handles open gets no new one. If registering fails
+//!   for an inode (a stacked backing filesystem such as overlayfs,
+//!   `EMFILE`), only that inode goes through the daemon, while it has a
+//!   handle open. `on` instead fails the mount when the kernel or
+//!   privileges do not allow it, and a later registration failure fails
+//!   that open with `EIO` and stops the mount.
+//! - **Caching.** Entries are cached for 1 s, attributes not at all: the
+//!   daemon does not see every change (a writer sharing a backing id, or
+//!   another front on the same backing tree), so only the backing inode
 //!   knows the size.
 
 use std::collections::HashMap;
@@ -136,12 +142,52 @@ struct BackingIds {
     daemon_nodes: HashMap<u64, usize>,
     /// Registrations that failed.
     refused: u64,
+    /// Writers that shared an open backing id ([`way`]).
+    shared_writers: u64,
 }
 
 impl BackingIds {
     fn track_daemon(&mut self, fh: u64, node: u64) {
         self.daemon_handles.insert(fh, node);
         *self.daemon_nodes.entry(node).or_default() += 1;
+    }
+}
+
+/// Which way one open of a regular file goes while passthrough is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Way {
+    /// Through the daemon; later opens of the inode follow it while this
+    /// handle is open.
+    Daemon,
+    /// Passthrough with the inode's backing id already open.
+    Shared,
+    /// Passthrough with a newly registered backing id.
+    Register,
+}
+
+/// The passthrough rule (design §17.1), for a handle that is an
+/// fsync-class file (`daemon_only`), can write (`write`: opened for
+/// writing or truncating), on an inode that has a backing id open
+/// (`backing_open`) or daemon handles open (`daemon_open`).
+///
+/// A handle that can write never gets passthrough: a mapping of a
+/// passthrough file holds the backing file, not the FUSE file
+/// (`backing_file_mmap`), so RELEASE can come while a shared writable
+/// mapping is live, and what is written through it afterwards would never
+/// be recorded. A read-only handle cannot make a writable shared mapping.
+/// The one exception is the kernel's: an inode with a backing id open
+/// fails any open without one (`EIO`), so a writer there shares the id,
+/// and that gap stays for it. An fsync-class file always goes through the
+/// daemon (design §8).
+fn way(daemon_only: bool, write: bool, backing_open: bool, daemon_open: bool) -> Way {
+    if daemon_only {
+        Way::Daemon
+    } else if backing_open {
+        Way::Shared
+    } else if write || daemon_open {
+        Way::Daemon
+    } else {
+        Way::Register
     }
 }
 
@@ -191,12 +237,11 @@ impl FuseFs {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// How to open handle `fh`: with the node's backing id when passthrough
-    /// is active and `handle` is a regular file (`register` makes a new
-    /// one), else through the daemon. A failed registration sends only this
-    /// node through the daemon while it has a handle open; under
+    /// How to open handle `fh`: by [`way`] when passthrough is active and
+    /// `handle` is a regular file (`register` makes a new backing id), else
+    /// through the daemon. A failed registration sends only this node
+    /// through the daemon while it has a handle open; under
     /// `--passthrough on` it fails the open and stops the mount.
-    /// An fsync-class file always goes through the daemon (design §8).
     fn route(
         &self,
         fh: u64,
@@ -206,26 +251,49 @@ impl FuseFs {
         if *self.status() != PassthroughStatus::Active {
             return Route::Daemon;
         }
-        if handle.daemon_only() {
-            // An fsync-class file (design §8): the daemon must see its
-            // writes. Other handles on the inode follow it, as after a
-            // refused registration.
-            self.ids().track_daemon(fh, handle.node);
-            return Route::Daemon;
-        }
         let regular = rustix::fs::fstat(&handle.fd)
             .is_ok_and(|st| u32::from(st.st_mode) & 0o170000 == 0o100000);
         if !regular {
             return Route::Daemon;
         }
         let mut ids = self.ids();
-        if let Some(id) = ids.by_node.get(&handle.node).and_then(Weak::upgrade) {
-            ids.by_handle.insert(fh, (handle.node, id.clone()));
-            return Route::Passthrough(id);
-        }
-        if ids.daemon_nodes.get(&handle.node).is_some_and(|n| *n > 0) {
-            ids.track_daemon(fh, handle.node);
-            return Route::Daemon;
+        let shared = ids.by_node.get(&handle.node).and_then(Weak::upgrade);
+        let daemon_open = ids.daemon_nodes.get(&handle.node).is_some_and(|n| *n > 0);
+        match (
+            way(
+                handle.daemon_only(),
+                handle.write,
+                shared.is_some(),
+                daemon_open,
+            ),
+            shared,
+        ) {
+            (Way::Shared, Some(id)) => {
+                if handle.write {
+                    ids.shared_writers += 1;
+                    if ids.shared_writers <= REFUSALS_LOGGED {
+                        eprintln!(
+                            "agentfs: inode {} opened for writing while a passthrough handle is \
+                             open on it: it shares that backing file (the kernel refuses to mix \
+                             the two), so a write through a shared mapping after its last close \
+                             is not recorded (design §17.1){}",
+                            handle.node,
+                            if ids.shared_writers == REFUSALS_LOGGED {
+                                " (further ones are not logged)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+                ids.by_handle.insert(fh, (handle.node, id.clone()));
+                return Route::Passthrough(id);
+            }
+            (Way::Register, _) => {}
+            _ => {
+                ids.track_daemon(fh, handle.node);
+                return Route::Daemon;
+            }
         }
         match register(handle) {
             Ok(id) => {
@@ -926,6 +994,70 @@ mod tests {
 
     fn refuse(_: &Handle) -> io::Result<BackingId> {
         Err(io::Error::from_raw_os_error(1))
+    }
+
+    #[test]
+    fn a_handle_that_can_write_never_gets_passthrough_of_its_own() {
+        // (daemon_only, write, backing_open, daemon_open) -> way
+        let table = [
+            ((false, false, false, false), Way::Register),
+            ((false, false, false, true), Way::Daemon),
+            ((false, false, true, false), Way::Shared),
+            // A writer: through the daemon, unless the kernel forbids it
+            // (a backing id already open on the inode).
+            ((false, true, false, false), Way::Daemon),
+            ((false, true, false, true), Way::Daemon),
+            ((false, true, true, false), Way::Shared),
+            // An fsync-class file: always the daemon.
+            ((true, false, false, false), Way::Daemon),
+            ((true, true, false, false), Way::Daemon),
+            ((true, false, true, false), Way::Daemon),
+        ];
+        for ((daemon_only, write, backing_open, daemon_open), want) in table {
+            assert_eq!(
+                way(daemon_only, write, backing_open, daemon_open),
+                want,
+                "daemon_only {daemon_only}, write {write}, backing_open {backing_open}, \
+                 daemon_open {daemon_open}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_writer_goes_through_the_daemon_and_readers_follow_it() {
+        let fx = fx(Passthrough::On);
+        let fd: OwnedFd = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fx.file)
+            .unwrap()
+            .into();
+        let writer = Handle::new(7, fd, true, None, 0);
+        let tried = Cell::new(false);
+        let route = fx.fs.route(1, &writer, |_| {
+            tried.set(true);
+            refuse(&writer)
+        });
+        assert!(matches!(route, Route::Daemon));
+        assert!(!tried.get(), "a writer registered a backing file");
+        // Not a failure, even under `on`.
+        assert!(!fx.failed.is_stopped());
+        assert_eq!(*fx.fs.status(), PassthroughStatus::Active);
+        // A reader of the same inode follows it while it is open.
+        let reader = handle(&fx, 7);
+        let route = fx.fs.route(2, &reader, |_| {
+            tried.set(true);
+            refuse(&reader)
+        });
+        assert!(matches!(route, Route::Daemon));
+        assert!(!tried.get());
+        // Once the writer is closed, a reader tries passthrough again.
+        fx.fs.forget_backing(1);
+        fx.fs.forget_backing(2);
+        let _ = fx.fs.route(3, &reader, |_| {
+            tried.set(true);
+            refuse(&reader)
+        });
+        assert!(tried.get());
     }
 
     #[test]

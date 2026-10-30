@@ -868,7 +868,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init`: the volume's name; `patch submit`, `patch approve`: the volume the patch is for |
 | `--branch NAME` | | `agentfs/<volume>` | `init`: the history branch; `patch submit`: the volume's branch |
 | `--include FILE` (repeatable) | | keep the existing includes | `init`: exactly these `include.path` entries |
-| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount` |
+| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount`: kernel passthrough for files opened read-only; files opened for writing always go through the daemon (design §17.1) |
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | `mount` |
 | `--no-allow-other` | | | `mount`: only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | `mount`: how long shutdown waits for a busy mount |
@@ -1077,7 +1077,7 @@ any other.
 | `--mount-dir DIR` | | `/run/agentfs-csi/mounts` | where fronts mount before the bind onto the kubelet's target |
 | `--profiles-dir DIR` | | `/etc/agentfs-csi/profiles` | the profiles |
 | `--agentfs-bin PATH` | | `/usr/local/bin/agentfs` | the `agentfs` binary the node plugin runs |
-| `--passthrough auto\|on\|off` | | `auto` | the fronts' FUSE passthrough |
+| `--passthrough auto\|on\|off` | | `auto` | the fronts' FUSE passthrough, for files opened read-only (design §17.1) |
 | `--front-threads N` | | `4` | FUSE threads per front |
 | `--stage-wait DURATION` | | `60s` | how long NodeStage waits for the history service before answering `UNAVAILABLE` |
 | `--publish-wait DURATION` | | `60s` | how long NodePublish waits for the front's mount |

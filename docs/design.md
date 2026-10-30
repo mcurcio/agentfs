@@ -93,7 +93,7 @@ Built beside the phases, and planned:
  workload processes
         │  ordinary file calls
         ▼
- ┌──────────────┐   reads/writes go straight to backing files (FUSE passthrough)
+ ┌──────────────┐   reads go straight to backing files (FUSE passthrough)
  │ agentfs FUSE │──────────────────────────────────────────────┐
  │   (front)    │  intercepts namespace ops + change boundaries │
  └──────┬───────┘                                              ▼
@@ -110,8 +110,9 @@ Built beside the phases, and planned:
 The visible directory is a real directory tree on the backing volume.
 
 - **Reads and writes** go straight to the backing files. On Linux 6.9 and later,
-  the kernel's FUSE passthrough means data I/O does not go through the daemon at
-  all. fuser exposes this through `BackingId`.
+  the kernel's FUSE passthrough means the data I/O of a file opened read-only
+  does not go through the daemon at all; a file opened for writing goes through
+  the daemon (§17.1). fuser exposes this through `BackingId`.
 - **Normal behaviour.** Because the files are real:
   - hard links, mmap, `O_APPEND`, sparse files and SQLite behave normally;
   - unlinking or renaming an open file behaves normally;
@@ -272,7 +273,7 @@ so a crash never leaves a stale lock.
 | `setattr` changing size (`truncate`) or the executable bit | new content or mode | yes |
 | `fsync` on a path marked `agentfs.commit=fsync` | its whole group (§8), coalesced | yes, at most once per interval |
 | the trailing timer of an `fsync`-class group | its whole group (§8) | **no**: at most one `agentfs.coalesce` late |
-| RELEASE (all handles and mappings gone) | content, if changed after the last FLUSH or that record's stamp was racy (below) | **no**: backstop for mmap and late writes |
+| RELEASE (all handles gone, and every mapping made through a daemon handle) | content, if changed after the last FLUSH or that record's stamp was racy (below) | **no**: backstop for mmap and late writes |
 | periodic sweep | content of files still open and changed | **no**: backstop for files never closed |
 
 Rules that make this precise:
@@ -288,11 +289,21 @@ Rules that make this precise:
 - **Empty directories** are not recorded, because git cannot represent them.
   `mkdir` alone is not a boundary.
 
+- **A mapping keeps RELEASE back only through the daemon.** A mapping of a
+  file opened through the daemon holds the FUSE file, so RELEASE waits for
+  `munmap`. A mapping of a passthrough file holds the backing file instead
+  (the kernel's `backing_file_mmap`), so RELEASE can come while it is live,
+  and nothing would see a write through it afterwards. A handle that can
+  write is therefore never given passthrough (§17.1), with one exception
+  the kernel forces: an inode with a backing id open takes no other kind of
+  handle, so a writer opened there shares it, and a write through its
+  shared mapping after its last close is not recorded (it is logged).
 **How the FUSE layer implements this** (`agentfs-fuse`):
 
-- **Dirty detection.** With passthrough the daemon never sees writes, so
-  "changed" is read from the inode. An inode is *armed* by a write-open, a
-  write the daemon serves, or a size change; FLUSH `fstat`s only armed
+- **Dirty detection.** The daemon does not see every write (writes through
+  a mapping reach it only at writeback, and a writer sharing a passthrough
+  backing id not at all), so "changed" is read from the inode. An inode is
+  *armed* by a write-open, a write the daemon serves, or a size change; FLUSH `fstat`s only armed
   inodes and records when the stamp (device, inode, size, mtime, ctime,
   mode) differs from the one taken just before the last freeze. Timestamps
   come from a coarse clock, so git's racy-timestamp rule applies: if the
@@ -4059,7 +4070,14 @@ one-time migration of Hermes' existing data and the initial import in
     `FUSE_PASSTHROUGH` (maximum stack depth 1) when the kernel offers it and
     the daemon may register backing files (`CAP_SYS_ADMIN` in the initial
     user namespace: root, not root inside a rootless container), and keeps
-    one backing id per inode while any handle on it is open. If registering
+    one backing id per inode while any handle on it is open. Only a handle
+    that cannot write gets one: an open for writing or truncating goes
+    through the daemon, and so do the inode's later opens while it is open
+    (§3.1, "A mapping keeps RELEASE back only through the daemon"). The
+    exception is the kernel's: it refuses an open without the backing id
+    on an inode that has one open, so a writer there shares it (logged as
+    "opened for writing while a passthrough handle is open"; the first
+    ten). The rule is `way` in `agentfs-fuse`'s `fuse.rs`. If registering
     fails for one inode (a stacked backing filesystem such as overlayfs,
     `EMFILE`), only that inode is served through the daemon while it has a
     handle open; every other inode keeps passthrough, and an inode that
@@ -4179,7 +4197,8 @@ one-time migration of Hermes' existing data and the initial import in
     stays final for the daemon (it never waits for a remount): the pod
     may be terminating, and the kubelet decides whether it comes back.
   - **Limits of in-place recovery.** Descriptors the workload opened
-    with kernel passthrough before the crash keep writing to the backing
+    for writing with kernel passthrough (a writer sharing a reader's
+    backing id, §17.1) before the crash keep writing to the backing
     file, unrecorded, until closed; since the workload keeps running,
     such a descriptor can outlive the crash longer than under a pod
     restart (`--passthrough off` where every write must be recorded). A
@@ -4610,7 +4629,7 @@ runner.
 | Journal compatibility | A newer change kind in an intact journal frame is an error for an older binary, never a torn tail: flush before downgrading (2026-10-13; §3.3) |
 | `.git` paths | An exact `.git` component that is a git directory or gitfile is skipped without an alarm; any other `.git`, look-alikes and invalid names raise `PathRefused` (§5) |
 | Layout | The state area, backing tree and mount point are separate; credentials are never under the backing tree. `mount` refuses otherwise (§17.1) |
-| Passthrough | `auto` by default: used when the kernel and privileges allow, off with the reason reported otherwise, and switched off per inode (not per mount) if registering its backing file fails; `on` fails the mount instead (§17.1) |
+| Passthrough | `auto` by default: used when the kernel and privileges allow, off with the reason reported otherwise, and switched off per inode (not per mount) if registering its backing file fails; `on` fails the mount instead; only for handles that cannot write ("Writers never passthrough", §17.1) |
 | Failed namespace records | `EIO` plus a repair queue the sweep drains from the backing tree's current state, kept in `meta/repairs` across mounts and drained before the next mount serves (§3.5) |
 | Privileges | Decided from the effective capabilities, not the uid: `CAP_SETUID` + `CAP_SETGID` (with the two below) to create new objects as their caller, `CAP_CHOWN` + `CAP_FOWNER` to give the rest to their caller, `CAP_SYS_ADMIN` in the initial user namespace for passthrough (§6, §17.1) |
 | `st_ino` | The FUSE node id, stable while mounted and shared by hard links, not across remounts (§6) |
@@ -4777,6 +4796,7 @@ runner.
    iac. (Asking a running daemon to push now is built: `agentfs push`
    goes through the control socket, §2.3.)
 4. **The FLUSH+RELEASE double record** (§3.1, §3.2). *Decided
+| Writers never passthrough (2026-10-30) | A handle opened for writing or truncating is never given a passthrough backing id; it goes through the daemon, and so do its inode's later opens while it is open. Read-only opens keep passthrough. The reason: under passthrough a mapping holds the backing file, not the FUSE file, so RELEASE came while a shared writable mapping was live and a write through it after the last close was never recorded (agentfs-dyu; `a_shared_mapping_written_after_the_last_close_is_recorded` red under `on` and `auto`, kernel 7.0, CI run 40993499943). The cost: write I/O no longer bypasses the daemon (each write is a FUSE round trip, as under `off`), and a reader opened while a writer is open goes through the daemon too. Left uncovered: the kernel refuses a daemon handle on an inode with a backing id open, so a writer opened while a read-only passthrough handle is open shares its id and keeps the gap for a write through its mapping after its last close (logged); failing such opens instead was not chosen, as it would surface a failure to a workload with a reader open (§17.1). A design choice (agentfs-dyu), not the owner's words |
    (2026-10-13)*: a racy record keeps its frozen copy open, and a
    boundary that would record only because of the racy rule compares the
    file with it, skipping the record when the bytes are equal and the
