@@ -1514,3 +1514,125 @@ async fn a_fork_class_link_reaches_the_fork() {
     assert!(!d.layout.volume_dir("fork-unlinked").exists());
     d.stop().await;
 }
+
+/// A Node whose `NodeGetInfo` waits until released: a call in flight, so
+/// a graceful stop has something to drain.
+struct HeldNode {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[tonic::async_trait]
+impl agentfs_csi::csi::v1::node_server::Node for HeldNode {
+    async fn node_stage_volume(
+        &self,
+        _: tonic::Request<NodeStageVolumeRequest>,
+    ) -> Result<tonic::Response<NodeStageVolumeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("held node"))
+    }
+
+    async fn node_unstage_volume(
+        &self,
+        _: tonic::Request<NodeUnstageVolumeRequest>,
+    ) -> Result<tonic::Response<NodeUnstageVolumeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("held node"))
+    }
+
+    async fn node_publish_volume(
+        &self,
+        _: tonic::Request<NodePublishVolumeRequest>,
+    ) -> Result<tonic::Response<NodePublishVolumeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("held node"))
+    }
+
+    async fn node_unpublish_volume(
+        &self,
+        _: tonic::Request<NodeUnpublishVolumeRequest>,
+    ) -> Result<tonic::Response<NodeUnpublishVolumeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("held node"))
+    }
+
+    async fn node_get_capabilities(
+        &self,
+        _: tonic::Request<NodeGetCapabilitiesRequest>,
+    ) -> Result<tonic::Response<NodeGetCapabilitiesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("held node"))
+    }
+
+    async fn node_get_info(
+        &self,
+        _: tonic::Request<NodeGetInfoRequest>,
+    ) -> Result<tonic::Response<NodeGetInfoResponse>, tonic::Status> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(tonic::Response::new(NodeGetInfoResponse::default()))
+    }
+}
+
+/// Once its shutdown completes, the driver refuses new connects while the
+/// calls in flight finish: tonic keeps its incoming stream through the
+/// drain, so the listener is stopped at the signal (bead agentfs-4lb.10,
+/// fix round).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopping_driver_refuses_connects_while_calls_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout {
+        base: dir.path().join("base"),
+        node_state: dir.path().join("node"),
+        mount_dir: dir.path().join("mounts"),
+        profiles: dir.path().join("profiles"),
+    };
+    let launcher = Arc::new(AgentfsLauncher {
+        bin: "/bin/false".into(),
+    });
+    let release = Arc::new(ReleaseScan::new(
+        Arc::new(layout.clone()),
+        launcher,
+        PluginIdentity::default(),
+        Duration::from_secs(30),
+        Backoff::default(),
+    ));
+    let controller = ControllerService::new(layout.clone(), "node-1".into(), release);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let node = HeldNode {
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+    let socket = dir.path().join("csi.sock");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            server::serve(&socket, IdentityService::new(), controller, node, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        }
+    });
+    let channel = connect(&socket).await;
+    let call = tokio::spawn(async move {
+        NodeClient::new(channel)
+            .node_get_info(NodeGetInfoRequest {})
+            .await
+    });
+    entered.notified().await;
+    stop.send(()).unwrap();
+    // The stop runs on the server's task just after the signal: wait for
+    // it, bounded, while the held call keeps the drain going.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let refused = loop {
+        match UnixStream::connect(&socket).await {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break true,
+            _ if Instant::now() >= deadline => break false,
+            _ => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    assert!(!task.is_finished(), "the drain ended before the check");
+    assert!(refused, "a connect during the drain was not refused");
+    release.notify_one();
+    call.await.unwrap().unwrap();
+    task.await.unwrap();
+    assert!(!socket.exists());
+}

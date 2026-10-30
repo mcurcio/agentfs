@@ -29,7 +29,10 @@
 //! change create-only as the parent's next inbox number
 //! ([`PublishOutcome::Submitted`]), unless the parent already queued or
 //! applied it (at most once) or the parent has finished, when it publishes
-//! as a top-level fork and raises [`Event::ForkParentFinished`]. After its
+//! as a top-level fork and raises [`Event::ForkParentFinished`] before it
+//! writes the published mark, which records the parent: a crash before
+//! the mark leaves the fork finished, so the next publish, by whatever
+//! runs it, raises the alarm again (bead agentfs-rrm). After its
 //! push it lists the parent again, so a parent that finished in between is
 //! seen. It then pushes its own finish ref, which its own forks read as
 //! "finished". The parent's queue lands it like any patch.
@@ -313,8 +316,25 @@ pub struct PublishedMark {
     /// top-level publish. Optional in the file: marks without it read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbox: Option<u64>,
+    /// A fork of a fork whose parent had finished, so it published as a
+    /// top-level fork; `None` otherwise. Optional in the file: marks
+    /// without it read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_finished: Option<ParentFinishedMark>,
     /// When the remote confirmed it (milliseconds since the Unix epoch).
     pub at_ms: u64,
+}
+
+/// The parent fork had finished when its child published
+/// ([`Event::ForkParentFinished`]), recorded with the published mark,
+/// which is written only after the alarm was raised: a fork whose mark
+/// says published has raised it, and one that crashed before the mark is
+/// still finished, so its next publish raises it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParentFinishedMark {
+    /// The parent fork's name.
+    pub parent: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -801,23 +821,33 @@ impl Finisher {
                         Delivered::Submitted { inbox } => Some(*inbox),
                         Delivered::Published | Delivered::ParentFinished { .. } => None,
                     };
+                    let parent_finished = match &delivered {
+                        Delivered::ParentFinished { parent } => {
+                            // Before the mark: a crash in between leaves the
+                            // fork finished, and its next publish raises it
+                            // again (at least once; twice across a crash).
+                            self.events.emit(Event::ForkParentFinished {
+                                fork: record.fork.clone(),
+                                parent: parent.clone(),
+                            });
+                            Some(ParentFinishedMark {
+                                parent: parent.clone(),
+                            })
+                        }
+                        Delivered::Published | Delivered::Submitted { .. } => None,
+                    };
                     let published = PublishedMark {
                         finish: finish.clone(),
                         change: record.change.map(|c| c.to_string()),
                         remote: record.remote.clone(),
                         inbox,
+                        parent_finished,
                         at_ms: now_ms(),
                     };
                     update_mark(&self.state, |mark| {
-                        mark.published = Some(published);
+                        mark.published = Some(published.clone());
                         mark.refused = None;
                     })?;
-                    if let Delivered::ParentFinished { parent } = delivered {
-                        self.events.emit(Event::ForkParentFinished {
-                            fork: record.fork.clone(),
-                            parent,
-                        });
-                    }
                     self.published(record);
                     return Ok(match inbox {
                         Some(inbox) => PublishOutcome::Submitted { inbox },

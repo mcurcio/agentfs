@@ -2049,6 +2049,39 @@ fn a_forks_queue_ignores_its_sources_numbers() {
     assert_eq!(inbox_numbers(&fork.state), [1]);
 }
 
+/// A fork whose base is not in its history is corrupt: counting its
+/// inbox numbers fails rather than counting its source's (bead
+/// agentfs-rrm), as fork create refuses a base it cannot copy.
+#[test]
+fn a_fork_base_missing_from_its_history_is_an_error() {
+    if !have_git() {
+        return;
+    }
+    let source = Vol::new("src");
+    source.change(&[("a.txt", "a\n")]);
+    let repo = source.repo();
+    let patch = patch_commit(&repo, source.head().unwrap(), "p1.txt", "p\n");
+    repo.reference(&crate::patch::inbox_ref("src", 1), patch, true, "test")
+        .unwrap();
+    let report = run_queue(&source.state, &source.tree, false);
+    assert_eq!(report.applied.len(), 1, "{report:?}");
+    let fork = Fork::new();
+    fork.create(&source, "src-1").unwrap();
+    let missing = Oid::from_bytes(&[7; 20]).unwrap();
+    Repository::open_bare(fork.state.git())
+        .unwrap()
+        .config()
+        .unwrap()
+        .set_str("agentfs.fork.base", &missing.to_string())
+        .unwrap();
+    let history = crate::history::History::open(&fork.state.git()).unwrap();
+    let err = history.find_inbox_commits(None).unwrap_err();
+    assert!(
+        matches!(err, crate::history::HistoryError::ForkBaseMissing(oid) if oid == missing),
+        "{err}"
+    );
+}
+
 /// S -> F -> G, G finished with g.txt and published: rolled up into F's
 /// inbox on the fork remote.
 struct Tree3 {
@@ -2226,7 +2259,82 @@ fn a_child_after_its_parent() {
     assert!(t.parent_inbox().is_empty(), "{:?}", t.parent_inbox());
     let status = finish::status(&t.child.state).unwrap().unwrap();
     assert_eq!(status.state, ForkState::Published);
-    assert_eq!(status.mark.unwrap().published.unwrap().inbox, None);
+    let published = status.mark.unwrap().published.unwrap();
+    assert_eq!(published.inbox, None);
+    assert_eq!(
+        published.parent_finished,
+        Some(finish::ParentFinishedMark {
+            parent: "src-1".into(),
+        })
+    );
+}
+
+/// A crash as ForkParentFinished is raised loses nothing, on any path:
+/// the published mark is written only after the alarm, so the fork stays
+/// finished, not published, and whatever publishes a finished fork next
+/// (`agentfs fork finish`, or under CSI the release scan, which skips a
+/// published fork) raises it again (bead agentfs-rrm).
+#[test]
+fn a_crash_at_the_parent_finished_alarm_leaves_the_fork_unpublished() {
+    let t = Tree3::new();
+    {
+        let lock = t.parent.lock();
+        let mut finisher = t.parent.finisher(&lock).unwrap();
+        assert_eq!(
+            finisher.publish(Some(soon())).unwrap(),
+            PublishOutcome::Published
+        );
+    }
+    {
+        // The process dies as the alarm leaves it.
+        let dies: Events = Arc::new(|event: Event| {
+            if matches!(event, Event::ForkParentFinished { .. }) {
+                panic!("killed while raising ForkParentFinished");
+            }
+        });
+        let lock = t.child.lock();
+        let mut finisher = t.child.finisher_with(&lock, dies).unwrap();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finisher.publish(Some(soon()))
+        }));
+        assert!(crashed.is_err(), "the alarm was not raised");
+    }
+    assert_eq!(
+        finish::status(&t.child.state).unwrap().unwrap().state,
+        ForkState::Finished
+    );
+
+    let (events, seen) = recording();
+    let lock = t.child.lock();
+    let mut finisher = t.child.finisher_with(&lock, events).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            finisher.publish(Some(soon())).unwrap(),
+            PublishOutcome::Published
+        );
+    }
+    let raised: Vec<Event> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::ForkParentFinished { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        raised,
+        [Event::ForkParentFinished {
+            fork: "src-1-1".into(),
+            parent: "src-1".into(),
+        }]
+    );
+    let status = finish::status(&t.child.state).unwrap().unwrap();
+    assert_eq!(status.state, ForkState::Published);
+    assert_eq!(
+        status.mark.unwrap().published.unwrap().parent_finished,
+        Some(finish::ParentFinishedMark {
+            parent: "src-1".into(),
+        })
+    );
 }
 
 /// Test 4: a fork whose own forks could never roll up is refused as a

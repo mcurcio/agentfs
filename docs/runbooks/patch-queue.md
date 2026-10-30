@@ -461,7 +461,7 @@ refused: <why>`:
 | Refusal | Cause | Fix |
 |---|---|---|
 | HTTP 401 | No pusher's name and token, or bearer token, matched (a token file that cannot be read or is empty authenticates no one) | Check the URL's user and token against `tokenFile` |
-| `<pusher> may not offer patch <n> (Offer right needed)` | Pushing `inbox/<n>` without `offer`; likewise `approve patch <n>` without `approve`, and `offer barrier patch <n>` for a tip carrying `Agentfs-Barrier: yes` without `barrier` | Add the `right` to the pusher, or push with another pusher |
+| `<pusher> may not offer patch <n> (Offer right needed)` | Pushing `inbox/<n>` without `offer`; likewise `approve patch <n>` without `approve`, `offer barrier patch <n>` for a tip carrying `Agentfs-Barrier: yes` without `barrier`, and `replace barrier patch <n> (Barrier right needed)` for any push over a barrier patch without `barrier` | Add the `right` to the pusher, or push with another pusher |
 | `patch <n>: <reason>: <message>` | The tip does not read as a patch against the head, with the queue's reason (`parent_not_in_history`, `merge_commit`, `unsupported`, `too_large`; [section 4](#4-a-patch-set-aside)) | Rebase or split it and push again |
 | `<ref> is not a ref pushers write` | Anything but `refs/agentfs/<volume>/inbox/<n>` and `approved/<n>`: the branch, `applied/*`, the status, other names | Push only inbox and approval refs |
 | `deleting <ref> is not allowed` | A push that deletes a ref | To withdraw a patch, `--skip N` it |
@@ -503,7 +503,13 @@ to a receiver (design §11.5 "Delivery"). Its base is a commit of the
 parent's history, not of the source's branch: deliver it where that
 history is reviewed, or leave it. The child also lists its parent again
 after queueing its change, so a parent that finished in that moment
-raises this the same way.
+raises this the same way. The alarm is raised before the child's
+published mark is written, and a crash in between leaves the child
+finished, so its next publish (`agentfs fork finish`, or the CSI release
+scan) raises it again: it may be raised twice, never not at all. After it
+has scrolled away `agentfs fork status` of the child still reads
+`published at N ms as a top-level fork: its parent P had finished, ...`;
+its `--json` carries `parent_finished`.
 
 **`ForkInboxNotCarried`**: a fork was published while its inbox on the
 fork remote held entries its history never landed, listed by number. A

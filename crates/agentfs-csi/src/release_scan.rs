@@ -537,6 +537,7 @@ mod tests {
                     change: None,
                     remote: "origin".into(),
                     inbox: None,
+                    parent_finished: None,
                     at_ms: 1,
                 }),
                 ..ForkMark::empty()

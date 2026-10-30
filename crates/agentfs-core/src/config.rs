@@ -1845,26 +1845,23 @@ pub(crate) fn absolute_path(
 pub const DEFAULT_PATCH_NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `agentfs.patchNotifyUrl`: unset, or an `http://` URL, or an `https://`
-/// one in a build with the `https` feature ([`ConfigError::NotifyUrl`]).
+/// one in a build with the `https` feature, with no userinfo: a token
+/// belongs in `agentfs.patchNotifyCredentialFile` ([`ConfigError::NotifyUrl`],
+/// bead agentfs-5sg).
 fn patch_notify_url(config: &git2::Config) -> Result<Option<String>, ConfigError> {
     let key = "agentfs.patchNotifyUrl";
     let Some(url) = string(config, key)? else {
         return Ok(None);
     };
-    let lower = url.to_ascii_lowercase();
-    let https = lower.starts_with("https://");
-    let why = if !https && !lower.starts_with("http://") {
-        "it is not an http:// or https:// URL"
-    } else if https && !cfg!(feature = "https") {
-        "it is https, and this build has no TLS (the `https` feature)"
-    } else {
-        return Ok(Some(url));
-    };
-    Err(ConfigError::NotifyUrl {
-        key: key.into(),
-        value: url,
-        why,
-    })
+    match crate::lfs::client::webhook_url_refused(&url) {
+        None => Ok(Some(url)),
+        // Never echo a password the URL may carry.
+        Some(why) => Err(ConfigError::NotifyUrl {
+            key: key.into(),
+            value: crate::push::redact_url(&url),
+            why,
+        }),
+    }
 }
 
 /// `agentfs.patchIntegrate`: `merge` (the default) or `rebase`; anything
@@ -2154,6 +2151,21 @@ mod tests {
         }
         let https = load("\tpatchNotifyUrl = https://example.com/\n");
         assert_eq!(https.is_ok(), cfg!(feature = "https"));
+        // A token belongs in patchNotifyCredentialFile, never the URL, and
+        // the refusal never echoes it (bead agentfs-5sg).
+        for bad in [
+            "http://iac:s3cret@127.0.0.1:9/hook",
+            "http://s3cret@127.0.0.1:9/",
+        ] {
+            match load(&format!("\tpatchNotifyUrl = {bad}\n")) {
+                Err(e @ ConfigError::NotifyUrl { .. }) => {
+                    let message = e.to_string();
+                    assert!(!message.contains("s3cret"), "{message}");
+                    assert!(message.contains("credential file"), "{message}");
+                }
+                other => panic!("{bad}: {other:?}"),
+            }
+        }
         assert!(matches!(
             load("\tpatchNotifyCredentialFile = token\n"),
             Err(ConfigError::RelativePath { .. })

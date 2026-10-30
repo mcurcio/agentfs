@@ -191,7 +191,10 @@ pub struct GitRebase {
 /// `attr.tree` is the empty tree: some git versions (2.43, for one) read a
 /// bare repository's attributes from `HEAD:.gitattributes` by default,
 /// which is the workload's tree; only `$GIT_DIR/info/attributes` (the operator's,
-/// AGENTS.md principle 3) may steer a merge.
+/// AGENTS.md principle 3) may steer a merge. The command line wins over
+/// the repository's config, so the override holds whatever git's default;
+/// `the_heads_attributes_never_steer_a_merge` checks it on any git by
+/// setting `attr.tree = HEAD` there.
 pub const GIT_MERGE_TREE_ARGS: [&str; 6] = [
     "-c",
     "core.fsync=objects",
@@ -1108,6 +1111,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The workload's own `.gitattributes` never steers a merge, on any
+    /// git: the repository's config sets `attr.tree = HEAD`, so every git
+    /// reads the head's attributes (as 2.43 does by default in a bare
+    /// repository and 2.47 does not), and the head asks for
+    /// `merge=union`, which would merge both edits cleanly. The empty-tree
+    /// override in [`GIT_MERGE_TREE_ARGS`] wins over the config: both
+    /// strategies see the conflict.
+    #[test]
+    fn the_heads_attributes_never_steer_a_merge() {
+        if !have_git() {
+            return;
+        }
+        let r = Repo::new();
+        let mut config = git2::Config::open(&r.dir.path().join("config")).unwrap();
+        config.set_str("attr.tree", "HEAD").unwrap();
+        let base = r.commit(
+            &[],
+            &[
+                ("f.txt", Some("0\n")),
+                (".gitattributes", Some("f.txt merge=union\n")),
+            ],
+            "seed",
+        );
+        let head = r.commit(&[base], &[("f.txt", Some("head\n"))], "on the branch");
+        let tip = r.commit(&[base], &[("f.txt", Some("patch\n"))], "edit f");
+        r.repo
+            .reference("refs/heads/main", head, true, "test")
+            .unwrap();
+        r.repo.set_head("refs/heads/main").unwrap();
+        let branch = PatchBranch::read(&r.repo, head, tip).unwrap();
+        let conflict = Integrated::Conflict {
+            paths: vec!["f.txt".into()],
+        };
+        assert_eq!(r.merge().integrate(head, &branch).unwrap(), conflict);
+        assert_eq!(r.rebase().integrate(head, &branch).unwrap(), conflict);
     }
 
     #[test]

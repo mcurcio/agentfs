@@ -295,15 +295,21 @@ fn patches_become_parents() {
 }
 
 fn wait_until_running(child: &mut Child) {
+    wait_for(child, "running volume");
+}
+
+/// Reads `child`'s stderr until a line starts with `prefix`, then drains
+/// the rest in the background.
+fn wait_for(child: &mut Child, prefix: &str) {
     use std::io::BufRead as _;
     let mut reader = std::io::BufReader::new(child.stderr.take().unwrap());
     let mut seen = String::new();
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).unwrap();
-        assert!(n > 0, "agentfs run exited early: {seen}");
+        assert!(n > 0, "agentfs exited early: {seen}");
         seen.push_str(&line);
-        if line.starts_with("running volume") {
+        if line.starts_with(prefix) {
             std::thread::spawn(move || std::io::copy(&mut reader, &mut std::io::sink()));
             return;
         }
@@ -429,9 +435,84 @@ fn under_a_daemon() {
             .ok(),
         Some(marker)
     );
-    // The next record commits on top of the marker.
+    // After it stops, the CLI's next record commits on top of the marker
+    // (the daemon's own commit loop: `a_daemon_commits_on_top_of_its_marker`).
     v.record("c.txt", "c\n");
     assert_eq!(parents(&repo, v.head()), [marker]);
+}
+
+/// Acceptance 4, the commit loop: a record that reaches a running daemon
+/// after its checkpoint is committed by that daemon on top of the marker.
+/// `run` has no way in for a record while it is up (`agentfs record` takes
+/// the state-area lock, exit 75), so this drives the same commit loop
+/// (`agentfs_core::service`) through `serve-history`, recording with
+/// `record --history-service` and committing with a push through the
+/// control socket.
+#[test]
+fn a_daemon_commits_on_top_of_its_marker() {
+    let v = Volume::new();
+    let origin = v.bare("origin");
+    v.config(&[
+        ("remote.origin.url", &origin),
+        ("agentfs.commitWindow", "1h"),
+        ("agentfs.pushInterval", "1h"),
+    ]);
+    v.record("a.txt", "a\n");
+    let mut child = v
+        .command(&["serve-history", "--push-grace", "1s"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&mut child, "serving history for volume");
+    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (_, marker) = v
+            .checkpoint(&["-m", "under serve-history"])
+            .expect("nothing cut");
+        assert_eq!(v.head(), marker);
+        fs::write(v.tree().join("b.txt"), "b\n").unwrap();
+        let socket = agentfs_core::volume::StateDir::new(v.state()).history_socket();
+        let mut record = v.command(&["record", "--history-service"]);
+        record.arg(&socket).args(["--history-wait", "10s", "b.txt"]);
+        let out = record.output().unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        // Nothing is committed in the window until the push asks for it.
+        assert_eq!(v.head(), marker);
+        let pushed = v.run(&["push", "--timeout", "30s"]);
+        assert!(
+            pushed.status.success(),
+            "{}{}",
+            text(&pushed.stdout),
+            text(&pushed.stderr)
+        );
+        // The push committed, before the daemon's own commit at stop.
+        let head = v.head();
+        assert_ne!(head, marker, "the push committed nothing");
+        assert_eq!(parents(&v.local(), head), [marker]);
+        marker
+    }));
+    let _ = rustix::process::kill_process(
+        rustix::process::Pid::from_child(&child),
+        rustix::process::Signal::TERM,
+    );
+    let status = wait_with_timeout(&mut child, Duration::from_secs(30));
+    let marker = served.unwrap_or_else(|e| std::panic::resume_unwind(e));
+    assert!(status.success(), "{status:?}");
+    let repo = v.local();
+    let head = v.head();
+    assert_ne!(
+        head, marker,
+        "the daemon committed nothing after the marker"
+    );
+    assert_eq!(parents(&repo, head), [marker]);
+    assert!(
+        repo.find_commit(head)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_name("b.txt")
+            .is_some()
+    );
 }
 
 /// Acceptance 5: with one remote set to `agentfsPush = changeLine`, a push

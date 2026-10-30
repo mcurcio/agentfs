@@ -384,3 +384,116 @@ None of these stopped the bead; each is reported with it.
    patch"), `crates/agentfs-core/src/patch/mod.rs:4` ("a single commit whose parent ..."),
    `crates/agentfs-core/src/config.rs:915` ("forks of forks are not ...") and `:1246` ("A fork has
    no patch queue").
+## 2026-10-30, merge-queue follow-up batch (agentfs-5sg, rrm, g09, ew1/4lb.10, lh8, 93v)
+None stopped a slice; each was resolved as stated and is recorded in design §19.1 where lasting.
+1. **agentfs-93v (1), the mia.4 page's probe P3.** The page says "P3: skip the parent-count check
+   in PatchBranch::read -> test 4 (queue half) fails". Acceptance test 4 is
+   `workload_attributes_do_not_steer_the_merge`; the parent-count check is guarded by acceptance
+   test 5, `a_merge_inside_the_branch_is_refused` (`crates/agentfs/tests/cli_patch.rs`, the
+   "Pushed with plain git, the queue refuses it" half). P3 fails test 5.
+2. **agentfs-93v (2), the mia.3 build against its page.** The page has the merge run *without*
+   `--no-messages` and read a driver failure from git's message lines, with exit 126/127 reported
+   as `DriverNotWorking`. The build (`patch/integrate.rs`) keeps `--no-messages`; pre-checks every
+   configured `merge.<name>.driver`'s first word as an executable file (`driver_program`,
+   `check_drivers`); and treats only `merge-tree`'s exit 128 with `failure to merge` (with a
+   driver configured) as `DriverNotWorking`. A driver that starts and exits 126 or 127 is a
+   conflict, because git reads it as one. Lasting: design §12 "Applying a patch" now says so;
+   §17.3 "Patch merge" already gave the reason (git 2.43 and 2.47, checked 2026-10-29).
+3. **agentfs-93v (3), the mia.5 frozen page's `NotifyCursor`.** The page froze
+   `NotifyCursor { delivered_status: Option<String> }`. The build (`patch/notify.rs`) adds
+   `undelivered_landed: Vec<(u64, String)>` (inbox number, branch commit; omitted when empty):
+   patches landed by a run whose notice failed, which a status does not keep, sent with every
+   notice until one is delivered. Lasting: design §12 "Notify" now says so.
+4. **agentfs-5sg, ref hiding.** The bead was right: `transfer.hideRefs` hides names, not
+   objects. Probed with Apple git 2.50.1 over `file://`: protocol v0 refused an unadvertised
+   object, protocol v2 fetched it by id. `serve_git_edges::hidden_refs_hide_names_not_objects`
+   shows the same over serve-git's smart HTTP (Debian trixie git). The docs were corrected
+   rather than v2 refused: forcing v0 closes fetch-by-id only, not the negotiation attacks
+   gitnamespaces(7) "SECURITY" describes, and costs v2's ref-prefix filtering. For the owner, if
+   he wants the stronger guarantee: the real fix is a separate repository, not a protocol switch.
+5. **agentfs-5sg, beyond the bead.** `Settings` derives `Debug`, and a Debug dump printed
+   `patch_notify_url` with its userinfo; refusing userinfo at parse closes that too. Other URL
+   fields of `Settings` were not audited here.
+6. **agentfs-5sg, fail closed.** An `inbox/<n>` old tip that cannot be read counts as a barrier,
+   so only a pusher with `barrier` may replace it (git checks old against the ref, so this should
+   not happen).
+7. **agentfs-rrm, "raise from the mark".** Read literally (raise whenever the mark says the
+   parent finished) it contradicts design §12's alarm table ("once") and the test
+   `a_child_after_its_parent`. Resolved as pending then confirmed (`raised` flag), as for
+   `Diverged` in §11.3: at least once, at most twice across a crash. `ForkPublished` and the
+   publish duration point keep the same crash gap (informational, left out of scope), and
+   nothing re-runs a publish at start for a fork already published.
+8. **agentfs-rrm, scope.** Adding a field to `PublishedMark` breaks a struct literal in
+   `crates/agentfs-csi/src/release_scan.rs` tests; one line (`parent_finished: None`) there.
+9. **agentfs-g09 item 4 is not workable as written.** "Record while `agentfs run` is up": `run`
+   has no way in for a record (`record` takes the state lock, exit 75; `run` serves no restores;
+   `patch apply` under a daemon lands nothing; run's recorder is unused). The same commit loop
+   (`service::commit_loop`, shared by `run` and `serve-history`) is driven through
+   `serve-history` with `record --history-service` (`cli_checkpoint::a_daemon_commits_on_top_of_its_marker`).
+10. **agentfs-g09 item 3, read as a product change, breaks principle 3.** Setting `attr.tree =
+    HEAD` in the volume config would let the workload's `.gitattributes` steer merges. The product
+    was already version independent (`-c attr.tree=<empty tree>` beats any config value), so
+    `attr.tree=HEAD` is set only in the test fixture
+    (`integrate::tests::the_heads_attributes_never_steer_a_merge`).
+11. **agentfs-g09 item 1** guarded code that already existed: test only, red shown by mutation.
+12. **agentfs-ew1 and agentfs-4lb.10 are one fix.** ew1's hang is 4lb.10's mechanism (a closed
+    listener keeps listening through any shared fd; only `shutdown(SHUT_RDWR)` refuses). The
+    shutdown sits in the stop step (`Server::shutdown` calls `Stopper::stop`), not in the accept
+    loop as ew1 says; it also wakes the loop, so the wake-up connect is gone.
+13. **agentfs-4lb.10 says no product path closes a listener and then needs connects refused
+    in-process. Wrong:** tonic 0.14.6 `serve_internal` keeps its incoming stream through the
+    graceful drain, so the history service and agentfs-csi queued connects no one answered,
+    with no fork involved. Fixed by stopping the listener at the shutdown signal.
+14. **agentfs-4lb.10's "one listener type" is not clippy-complete.** `tokio::net::UnixListener::bind`
+    is left off the ban: `ssh_transport/tests.rs` and `tests/history_service.rs` call it, and
+    `disallowed_methods` has no test-only exemption. Follow-up: ban it with a reasoned
+    `#[allow]` on those two lines. agentfs-csi's `tokio-stream` dependency is now unused.
+15. **agentfs-lh8, broader than the bead.** Not only uploads: every ureq read (batch, PUT,
+    verify, GET bodies, the fork webhook POST) failed on `EINTR`; downloads hid it by retrying
+    `Unreachable`. ureq 3.4's `TcpTransport::await_input` sets `SO_RCVTIMEO` and maps
+    `Interrupted` to an I/O error; Linux never restarts such a read after a handler or a stop
+    and continue (signal(7)). Who signalled the one observed failure is not proven (a container
+    stop or freeze, or tokio's SIGCHLD handler in the all-features build are candidates).
+    `lfs::client::tests::transfers_survive_signals` reproduces it. Design gap: nothing said
+    blocking I/O retries `EINTR`; transport errors folded silently into the retried
+    `unreachable` class (§11.3).
+16. **Integrator seam.** The listener ban (12) failed clippy on 5sg's old-daemon fake in
+    `tests/serve_git_edges.rs`; it now binds `Listener`.
+17. **Integrator, environment.** `agentfs-fuse` `creds::tests::as_root_the_caller_owns_what_it_creates`
+    fails in the local `agentfs-dev` container as root (mode 0644, expected 0664: the thread's
+    umask is not 0). It fails the same at e9a17f7 (A/B), and no file of this batch is on its
+    path; not fixed here.
+18. **Brief vs. date.** The integrator brief asked for new §19.1 rows dated 2026-10-29; they are
+    dated 2026-10-30, the day they were made, as the existing "Kept 2026-10-30" entry is.
+## 2026-10-30, merge-queue follow-up batch, fix round (PR 14 review)
+1. **agentfs-rrm's "raise from the mark" did not reach the CSI path.** Built as a `raised` flag
+   in the published mark, re-raised only by a later publish. Under CSI nothing publishes a fork
+   already published (the release scan skips it, DeleteVolume deletes it), so a crash between
+   the mark and the alarm still lost it, while design §12 and the runbook said "never lost".
+   Fixed by raising before the mark is written (the flag is gone): a crash in between leaves the
+   fork finished, which every publishing path retries. Entry 7 above is superseded.
+2. **Entry 14's follow-up done here.** `tokio::net::UnixListener::bind` is banned; the two test
+   fakes listen through `Listener::into_async` instead of carrying an `#[allow]`.
+3. **Entry 4 under-stated the object exposure.** Under protocol v0 too a pusher reads a hidden
+   object whose id it knows: it pushes a commit whose tree names the object (receive-pack's
+   connectivity check passes, the object is already there), then fetches the advertised inbox
+   ref. Reproduced with Apple git 2.50.1 over `file://` (a pack of only the commit and tree to
+   `receive-pack --stateless-rpc`). Design §19.1 "serve-git" and the serve_git.rs doc now say so.
+4. **agentfs-5sg's scrub sat in one consumer.** The shared POST helper kept the raw URL in
+   `PostError`, and fork delivery's webhook printed it and accepted a URL with userinfo (its
+   check was a copy of the notify one from before the refusal). Now one check
+   (`lfs::client::webhook_url_refused`) serves both, and `post` redacts its own errors.
+   Entry 5's unaudited `Settings` URL fields remain unaudited.
+5. **The review's probe of entry 13's fix was ineffective.** It replaced `stopper.stop()` with
+   `let _ = &stopper;`, which still moves the `Stopper` into the shutdown future, and a
+   finished future drops it, and dropping stops. Its conclusion held anyway: with the stop truly
+   removed (`std::mem::forget(stopper)`) every existing test stayed green. Now
+   `history_service::a_draining_service_refuses_new_connects` and
+   `grpc::a_stopping_driver_refuses_connects_while_calls_finish` go red under that probe.
+6. **Deferred: a missing fork base loops instead of being refused** (review finding, P3).
+   Refusing `ForkBaseMissing` in `announce_uncarried` alone would patch one instance of a class:
+   `Finisher::finish_once` already fails on the same corruption (`find_commit(base)`) with an
+   error, not a refusal, and a history push missing the object fails as a retried branch
+   failure. Local state-area corruption has no terminal outcome or alarm of its own anywhere in
+   publishing or the mount-time queue (`queue_at_start` only prints). A class-level outcome
+   (a refused reason or alarm, with a runbook) needs its own bead.

@@ -878,14 +878,13 @@ impl TestAgent {
             .unwrap();
         let socket = dir.join(format!("agent-{}.sock", keys.len()));
         let _ = fs::remove_file(&socket);
-        let listener = {
+        let connections = {
             let _guard = runtime.enter();
-            tokio::net::UnixListener::bind(&socket).unwrap()
+            crate::listening_socket::Listener::bind(&socket)
+                .unwrap()
+                .into_async()
+                .unwrap()
         };
-        let connections = futures::stream::unfold(listener, |listener| async move {
-            let accepted = listener.accept().await.map(|(stream, _)| stream);
-            Some((accepted, listener))
-        });
         runtime.spawn(russh::keys::agent::server::serve(
             Box::pin(connections),
             AllowAll,

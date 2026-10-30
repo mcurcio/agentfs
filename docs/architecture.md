@@ -81,6 +81,7 @@ missing from these tables or a row names a module that no longer exists;
 | `shared_fs.rs` | Which filesystems a state area may live on: refuses NFS below 4.1, `nolock` and `local_lock` other than `none` whenever the lock is taken (§2.3); tells a network filesystem from a node's own disk for agentfs-csi's base path (§14.2) |
 | `mountinfo.rs` | The one parser of `/proc/self/mountinfo`: device, root, mount point, fstype, source and super options of each mount, and the mount holding a path |
 | `local_socket.rs` | Unix sockets in the state area with peer-credential checks, for the control socket and the history service |
+| `listening_socket.rs` | `Listener`, the one way agentfs listens on a Unix socket (control socket, history service, agentfs-csi), shut down (`SHUT_RDWR`) when stopped or dropped so a child process still sharing it cannot take connections no one answers; `clippy.toml` disallows raw listener construction elsewhere (§2.2) |
 | `fsutil.rs` | Small helpers for the state files under `<state>/meta` |
 | `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` (§4.3, §11.1) |
 | `events.rs` | Alarm and event signals, handed to a non-blocking sink (§13) |

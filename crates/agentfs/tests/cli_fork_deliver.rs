@@ -581,6 +581,22 @@ fn webhook_posts_the_payload_keyed_by_the_change() {
     );
 }
 
+/// A webhook URL carrying a password is refused before any request, and
+/// the refusal never prints it: the token belongs in `--credential-file`
+/// (bead agentfs-5sg, fix round).
+#[test]
+fn a_webhook_url_with_a_password_is_refused_unprinted() {
+    let Some(p) = published() else { return };
+    let hook = Receiver::start();
+    let url = format!("http://u:s3cret@127.0.0.1:{}/ok", hook.port);
+    let out = p.deliver(&["--to", "webhook", "--url", &url]);
+    assert!(!out.status.success(), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(!shown.contains("s3cret"), "{shown}");
+    assert!(shown.contains("password"), "{shown}");
+    assert!(hook.seen().is_empty(), "{:?}", hook.seen());
+}
+
 /// C7: the CSI driver never delivers (gate answer "2 a for CSI").
 #[test]
 fn the_csi_driver_never_delivers() {

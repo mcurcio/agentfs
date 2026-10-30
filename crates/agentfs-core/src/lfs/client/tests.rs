@@ -451,6 +451,115 @@ fn uploads_run_concurrently_up_to_the_setting() {
     }
 }
 
+/// Sends `SIGUSR2` to the thread that made it, every 200 µs, until
+/// dropped (or, [`SignalStorm::at_this_thread_for`], for a while). The handler does nothing and is installed with `SA_RESTART`,
+/// as signal-hook installs the daemon's: Linux still fails a socket read
+/// that has a receive timeout with `EINTR` (signal(7)), as it does after a
+/// stop and continue with no handler at all. Only this thread is
+/// signalled, so tests running beside it are not.
+struct SignalStorm {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    sender: Option<std::thread::JoinHandle<usize>>,
+}
+
+impl SignalStorm {
+    fn at_this_thread() -> Self {
+        Self::at_this_thread_for(Duration::MAX)
+    }
+
+    fn at_this_thread_for(limit: Duration) -> Self {
+        extern "C" fn nothing(_: libc::c_int) {}
+        // SAFETY: a zeroed sigaction is valid; the handler is
+        // async-signal-safe (it does nothing).
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = nothing as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        // SAFETY: pthread_self has no preconditions.
+        let target = unsafe { libc::pthread_self() } as usize;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let sender = std::thread::spawn(move || {
+            let mut sent = 0;
+            let started = std::time::Instant::now();
+            while !stop.load(Ordering::SeqCst) && started.elapsed() < limit {
+                // SAFETY: the target thread outlives this one: Drop joins
+                // it before the target can return.
+                assert_eq!(
+                    unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGUSR2) },
+                    0
+                );
+                sent += 1;
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            sent
+        });
+        Self {
+            done,
+            sender: Some(sender),
+        }
+    }
+}
+
+impl Drop for SignalStorm {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.join();
+        }
+    }
+}
+
+/// A signal is not a failure to reach the server (agentfs-lh8): every
+/// read and write of a transfer survives a storm of them. Concurrency 1
+/// keeps every request on this thread, the one signalled; the server's
+/// delay keeps each read blocked long enough to be interrupted.
+#[test]
+fn transfers_survive_signals() {
+    let s = Setup::new();
+    let objects: Vec<Pointer> = (0..4)
+        .map(|i| s.object(format!("signalled object {i}").as_bytes()))
+        .collect();
+    let server = FakeLfs::start();
+    server.with(|st| st.delay = Duration::from_millis(30));
+    let mut r = remote("/unused");
+    let t = http_with(&server, &mut r, 1);
+    let storm = SignalStorm::at_this_thread();
+    let report = t.upload(&objects, &s.cache, REF);
+    let other = Setup::new();
+    let results = t.download_many(&objects, &other.cache, REF);
+    drop(storm);
+    assert_eq!(report.unwrap().uploaded, 4);
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    assert!(objects.iter().all(|p| other.cache.contains(p)));
+}
+
+/// A read retried after a signal stays within what is left of its
+/// timeout (agentfs-lh8): a request to a server that never answers fails
+/// at its deadline while signals keep coming, not only once they stop.
+#[test]
+fn signals_never_stretch_a_deadline() {
+    // Connections complete in the backlog; nothing ever answers.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/hook", silent.local_addr().unwrap());
+    let storm = SignalStorm::at_this_thread_for(Duration::from_secs(6));
+    let started = std::time::Instant::now();
+    let e = post(&url, b"{}", &[], Duration::from_secs(1)).unwrap_err();
+    let took = started.elapsed();
+    drop(storm);
+    assert!(matches!(e, PostError::Unreachable { .. }), "{e}");
+    assert!(
+        took < Duration::from_secs(4),
+        "took {took:?}: signals stretched a 1 s deadline ({e})"
+    );
+}
+
 #[test]
 fn one_failed_object_leaves_the_others_uploaded() {
     let s = Setup::new();
@@ -856,4 +965,17 @@ fn lfs_requests_go_through_the_remotes_proxy() {
         .upload(&[s.object(b"another")], &s.cache, REF)
         .unwrap_err();
     assert_eq!(err.kind, PushFailureKind::Unreachable, "{err}");
+}
+
+/// A POST that gets no answer never prints the URL's userinfo, whichever
+/// webhook made it (bead agentfs-5sg, fix round).
+#[test]
+fn a_failed_post_never_prints_the_urls_password() {
+    let closed = ClosedPort::new();
+    let url = format!("http://u:s3cret@127.0.0.1:{}/hook", closed.port());
+    let e = post(&url, b"{}", &[], Duration::from_secs(5)).unwrap_err();
+    assert!(matches!(e, PostError::Unreachable { .. }), "{e}");
+    let shown = e.to_string();
+    assert!(!shown.contains("s3cret"), "{shown}");
+    assert!(shown.contains("http://***@127.0.0.1:"), "{shown}");
 }

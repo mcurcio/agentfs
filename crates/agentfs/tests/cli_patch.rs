@@ -1144,7 +1144,8 @@ fn a_branch_that_conflicts_is_held() {
 /// even when the state area's HEAD names the volume's branch (some git
 /// versions, ubuntu-24.04's 2.43 among them, read a bare repository's
 /// attributes from `HEAD:.gitattributes`; 2.47 does not, so only those
-/// catch a merge without the `attr.tree` override).
+/// catch a merge without the `attr.tree` override here; the core test
+/// `the_heads_attributes_never_steer_a_merge` catches it on any git).
 /// Here it asks for `merge=union`, which would merge both sides' edits.
 #[test]
 fn workload_attributes_do_not_steer_the_merge() {
