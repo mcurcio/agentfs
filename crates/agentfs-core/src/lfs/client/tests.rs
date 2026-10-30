@@ -452,7 +452,7 @@ fn uploads_run_concurrently_up_to_the_setting() {
 }
 
 /// Sends `SIGUSR2` to the thread that made it, every 200 µs, until
-/// dropped. The handler does nothing and is installed with `SA_RESTART`,
+/// dropped (or, [`SignalStorm::at_this_thread_for`], for a while). The handler does nothing and is installed with `SA_RESTART`,
 /// as signal-hook installs the daemon's: Linux still fails a socket read
 /// that has a receive timeout with `EINTR` (signal(7)), as it does after a
 /// stop and continue with no handler at all. Only this thread is
@@ -464,6 +464,10 @@ struct SignalStorm {
 
 impl SignalStorm {
     fn at_this_thread() -> Self {
+        Self::at_this_thread_for(Duration::MAX)
+    }
+
+    fn at_this_thread_for(limit: Duration) -> Self {
         extern "C" fn nothing(_: libc::c_int) {}
         // SAFETY: a zeroed sigaction is valid; the handler is
         // async-signal-safe (it does nothing).
@@ -483,7 +487,8 @@ impl SignalStorm {
         let stop = done.clone();
         let sender = std::thread::spawn(move || {
             let mut sent = 0;
-            while !stop.load(Ordering::SeqCst) {
+            let started = std::time::Instant::now();
+            while !stop.load(Ordering::SeqCst) && started.elapsed() < limit {
                 // SAFETY: the target thread outlives this one: Drop joins
                 // it before the target can return.
                 assert_eq!(
@@ -533,6 +538,26 @@ fn transfers_survive_signals() {
     assert_eq!(report.unwrap().uploaded, 4);
     assert!(results.iter().all(Result::is_ok), "{results:?}");
     assert!(objects.iter().all(|p| other.cache.contains(p)));
+}
+
+/// A read retried after a signal stays within what is left of its
+/// timeout (agentfs-lh8): a request to a server that never answers fails
+/// at its deadline while signals keep coming, not only once they stop.
+#[test]
+fn signals_never_stretch_a_deadline() {
+    // Connections complete in the backlog; nothing ever answers.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/hook", silent.local_addr().unwrap());
+    let storm = SignalStorm::at_this_thread_for(Duration::from_secs(6));
+    let started = std::time::Instant::now();
+    let e = post(&url, b"{}", &[], Duration::from_secs(1)).unwrap_err();
+    let took = started.elapsed();
+    drop(storm);
+    assert!(matches!(e, PostError::Unreachable { .. }), "{e}");
+    assert!(
+        took < Duration::from_secs(4),
+        "took {took:?}: signals stretched a 1 s deadline ({e})"
+    );
 }
 
 #[test]
