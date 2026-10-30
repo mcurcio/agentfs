@@ -6,8 +6,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use tokio::net::UnixListener;
-use tokio_stream::wrappers::UnixListenerStream;
+use agentfs_core::listening_socket::Listener;
 
 use crate::controller::ControllerService;
 use crate::csi::v1::controller_server::ControllerServer;
@@ -78,14 +77,24 @@ pub async fn serve<N: Node>(
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(io_err("inspecting", e)),
     }
-    let listener = UnixListener::bind(socket).map_err(|e| io_err("binding", e))?;
+    let listener = Listener::bind(socket)
+        .and_then(Listener::into_async)
+        .map_err(|e| io_err("binding", e))?;
+    // Stops the listener once `shutdown` completes: tonic keeps its
+    // incoming stream while calls finish, and a connect then must be
+    // refused, not left unanswered (`agentfs_core::listening_socket`).
+    let stopper = listener.stopper().map_err(|e| io_err("binding", e))?;
+    let shutdown = async move {
+        shutdown.await;
+        let _ = stopper.stop();
+    };
     fs::set_permissions(socket, fs::Permissions::from_mode(0o660))
         .map_err(|e| io_err("setting the mode of", e))?;
     let result = tonic::transport::Server::builder()
         .add_service(IdentityServer::new(identity))
         .add_service(ControllerServer::new(controller))
         .add_service(NodeServer::new(node))
-        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
+        .serve_with_incoming_shutdown(listener, shutdown)
         .await;
     let _ = fs::remove_file(socket);
     result.map_err(ServerError::from)

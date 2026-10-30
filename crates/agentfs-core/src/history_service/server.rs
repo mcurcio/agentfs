@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 use tonic_health::ServingStatus;
@@ -697,13 +697,17 @@ impl HistoryServer {
             in_flight: shared.in_flight.clone(),
         });
         bridge.block_on(health.set_service_status(SERVICE_NAME, ServingStatus::Serving));
-        listener.set_nonblocking(true)?;
         let listener = {
             let _runtime = bridge.handle().enter();
-            tokio::net::UnixListener::from_std(listener)?
+            listener.into_async()?
         };
+        // Stops the listener at the shutdown signal: tonic keeps its
+        // incoming stream while connections drain, and a front's connect
+        // then must be refused, not left unanswered
+        // (`crate::listening_socket`).
+        let stopper = listener.stopper()?;
         let euid = shared.admission.euid;
-        let incoming = UnixListenerStream::new(listener).filter_map(move |accepted| {
+        let incoming = listener.filter_map(move |accepted| {
             let conn = Conn::accept(accepted.ok()?, &registry, euid, HELLO_TIMEOUT)?;
             Some(Ok::<_, std::io::Error>(conn))
         });
@@ -717,8 +721,9 @@ impl HistoryServer {
             tonic::transport::Server::builder()
                 .add_service(health_service)
                 .add_service(history)
-                .serve_with_incoming_shutdown(incoming, async {
+                .serve_with_incoming_shutdown(incoming, async move {
                     let _ = stopped.await;
+                    let _ = stopper.stop();
                 }),
         );
         Ok(Self {

@@ -1,7 +1,7 @@
-# Every advisory file lock goes through agentfs_core::file_lock::FileLock,
-# which unlocks before it closes: a lock released only by closing stays held
-# by a child process between its fork and its exec (design §2.2).
 disallowed-methods = [
+    # Every advisory file lock goes through agentfs_core::file_lock::FileLock,
+    # which unlocks before it closes: a lock released only by closing stays
+    # held by a child process between its fork and its exec (design §2.2).
     { path = "std::fs::File::lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
     { path = "std::fs::File::lock_shared", reason = "take file locks through agentfs_core::file_lock::FileLock" },
     { path = "std::fs::File::try_lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
@@ -15,4 +15,20 @@ disallowed-methods = [
     { path = "rustix::fs::fcntl_lock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
     { path = "nix::fcntl::flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
     { path = "nix::fcntl::Flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+
+    # Every listening Unix socket goes through
+    # agentfs_core::listening_socket::Listener, which shuts the socket down
+    # when it is stopped or dropped: a listener only closed goes on taking
+    # connections no one answers while a child process shares it between its
+    # fork and its exec (design §2.2). Not listed yet:
+    # tokio::net::UnixListener::bind, which two test fakes outside that
+    # module still call.
+    { path = "std::os::unix::net::UnixListener::bind", reason = "listen through agentfs_core::listening_socket::Listener" },
+    { path = "std::os::unix::net::UnixListener::bind_addr", reason = "listen through agentfs_core::listening_socket::Listener" },
+    { path = "tokio::net::UnixListener::from_std", reason = "listen through agentfs_core::listening_socket::Listener::into_async", allow-invalid = true },
+    { path = "tokio::net::UnixSocket::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
+    { path = "socket2::Socket::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
+    { path = "rustix::net::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
+    { path = "libc::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
+    { path = "nix::sys::socket::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
 ]

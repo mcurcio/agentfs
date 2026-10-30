@@ -5,16 +5,19 @@
 //! state-area path never hits the 108-byte `sun_path` limit. A private
 //! socket's directory is `0700` and the socket `0600`, and a server accepts
 //! only peers whose `SO_PEERCRED` uid is root or its own effective uid
-//! ([`allowed`]).
+//! ([`allowed`]). Each listens through a
+//! [`crate::listening_socket::Listener`].
 
 use std::fs::DirBuilder;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use rustix::fs::{AtFlags, Mode, OFlags};
+
+use crate::listening_socket::Listener;
 
 /// Who is on the other end of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +50,7 @@ pub fn socket_address(dir: &OwnedFd, name: &str) -> String {
 
 /// Listens on `name` in `dir`, created and set to `0700`; the socket is
 /// `0600`. See [`bind`].
-pub fn bind_private(dir: &Path, name: &str) -> io::Result<(OwnedFd, UnixListener)> {
+pub fn bind_private(dir: &Path, name: &str) -> io::Result<(OwnedFd, Listener)> {
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     bind(dir, name)
@@ -57,7 +60,7 @@ pub fn bind_private(dir: &Path, name: &str) -> io::Result<(OwnedFd, UnixListener
 /// directory's mode as it is; the socket is `0600`. A stale socket (a
 /// crashed server's) is replaced; a live one fails with
 /// [`io::ErrorKind::AddrInUse`] and is left alone.
-pub fn bind(dir: &Path, name: &str) -> io::Result<(OwnedFd, UnixListener)> {
+pub fn bind(dir: &Path, name: &str) -> io::Result<(OwnedFd, Listener)> {
     let dir_fd = open_dir(dir)?;
     let address = socket_address(&dir_fd, name);
     match UnixStream::connect(&address) {
@@ -81,7 +84,7 @@ pub fn bind(dir: &Path, name: &str) -> io::Result<(OwnedFd, UnixListener)> {
         Ok(()) | Err(rustix::io::Errno::NOENT) => {}
         Err(e) => return Err(e.into()),
     }
-    let listener = UnixListener::bind(&address)?;
+    let listener = Listener::bind(&address)?;
     rustix::fs::chmodat(&dir_fd, name, Mode::from_raw_mode(0o600), AtFlags::empty())?;
     Ok((dir_fd, listener))
 }
@@ -169,7 +172,7 @@ mod tests {
         assert_eq!(mode(&dir.join("s.sock")), 0o600);
 
         let mut client = connect(&dir, "s.sock").unwrap();
-        let (mut server, _) = listener.accept().unwrap();
+        let mut server = listener.accept().unwrap().unwrap();
         client.write_all(b"hi").unwrap();
         let mut buf = [0; 2];
         server.read_exact(&mut buf).unwrap();
@@ -183,18 +186,9 @@ mod tests {
         let (fd, first) = bind_private(&dir, "s").unwrap();
         let err = bind(&dir, "s").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
-        // A crashed server's socket: nothing listens on it. Dropping the
-        // listener alone is not that, while any thread of this test binary
-        // spawns a child: the child shares the listener from its fork until
-        // its exec, and connects succeed meanwhile. A shut-down listener
-        // refuses them at once (as `FileLock` unlocks before it closes).
-        // SAFETY: `first` is an open socket for the whole call.
-        assert_eq!(
-            unsafe { libc::shutdown(first.as_raw_fd(), libc::SHUT_RDWR) },
-            0,
-            "{}",
-            io::Error::last_os_error()
-        );
+        // A crashed server's socket: nothing listens on it. A dropped
+        // listener is shut down, so it refuses connects even while a child
+        // spawned by another thread of this test binary shares it.
         drop(first);
         assert_eq!(
             connect(&dir, "s").unwrap_err().kind(),

@@ -51,13 +51,13 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use agentfs_core::listening_socket::Stopper;
 use agentfs_core::local_socket;
 use agentfs_core::volume::CONTROL_SOCKET;
 
@@ -315,7 +315,9 @@ struct InFlight {
 /// The listening control socket of a running mount.
 pub struct Server {
     dir: OwnedFd,
-    stop: Arc<AtomicBool>,
+    /// Stops the listener the accept loop owns; dropping the server stops
+    /// it too.
+    stopper: Stopper,
     in_flight: Arc<InFlight>,
     accept: Option<JoinHandle<()>>,
 }
@@ -325,21 +327,21 @@ impl Server {
     /// caller holds the state-area lock, so no other daemon owns it).
     pub fn start(dir: &Path, handler: Handler) -> io::Result<Self> {
         let (dir_fd, listener) = local_socket::bind_private(dir, CONTROL_SOCKET)?;
-        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = listener.stopper()?;
         let in_flight = Arc::new(InFlight::default());
         let busy = Arc::new(Mutex::new(()));
         let euid = rustix::process::geteuid().as_raw();
         let accept = {
-            let stop = stop.clone();
             let in_flight = in_flight.clone();
             std::thread::Builder::new()
                 .name("agentfs-control".into())
                 .spawn(move || {
-                    for stream in listener.incoming() {
-                        if stop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let Ok(stream) = stream else { continue };
+                    loop {
+                        let stream = match listener.accept() {
+                            Ok(Some(stream)) => stream,
+                            Ok(None) => break,
+                            Err(_) => continue,
+                        };
                         *in_flight
                             .count
                             .lock()
@@ -368,18 +370,20 @@ impl Server {
         };
         Ok(Self {
             dir: dir_fd,
-            stop,
+            stopper,
             in_flight,
             accept: Some(accept),
         })
     }
 
-    /// Stops accepting, waits up to `grace` for a request in progress,
-    /// and removes the socket. Returns whether nothing was left running.
+    /// Stops the listener, so every later connect is refused (a client
+    /// sees [`ClientError::NotRunning`]) even while the socket file stays
+    /// and a child forked meanwhile shares the listener, then waits up to
+    /// `grace` for a request in progress, and removes the socket. Returns
+    /// whether nothing was left running.
     pub fn shutdown(mut self, grace: Duration) -> bool {
-        self.stop.store(true, Ordering::SeqCst);
-        // Wakes the accept loop, which then sees `stop`.
-        let _ = UnixStream::connect(socket_address(&self.dir));
+        // Wakes the accept loop, which then ends.
+        let _ = self.stopper.stop();
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
@@ -538,9 +542,7 @@ pub fn call(dir: &Path, request: &Request) -> Result<Reply, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
 
     fn request() -> Request {
         Request {
@@ -777,6 +779,105 @@ mod tests {
         assert!(server.shutdown(Duration::from_secs(5)));
     }
 
+    /// The descriptor of the socket listening at `address` in this
+    /// process, duplicated: what a child forked by any thread holds until
+    /// its exec.
+    fn dup_of_listener(address: &str) -> OwnedFd {
+        use std::os::fd::BorrowedFd;
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let Ok(fd) = entry.unwrap().file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            // SAFETY: zeroed is a valid `sockaddr_un`; `len` is its size.
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            // SAFETY: `addr` is writable for `len` bytes; a closed or
+            // non-socket descriptor only makes the call fail.
+            let rc = unsafe { libc::getsockname(fd, (&raw mut addr).cast(), &mut len) };
+            if rc != 0 || i32::from(addr.sun_family) != libc::AF_UNIX {
+                continue;
+            }
+            // SAFETY: `sun_path` is a plain byte array (`c_char` is `i8` or
+            // `u8` by target), zeroed beyond what the kernel wrote.
+            let path = unsafe {
+                std::slice::from_raw_parts(addr.sun_path.as_ptr().cast::<u8>(), addr.sun_path.len())
+            };
+            let path = std::ffi::CStr::from_bytes_until_nul(path).map_or(path, |c| c.to_bytes());
+            if path == address.as_bytes() {
+                // SAFETY: `fd` is open: it was just named by getsockname.
+                return unsafe { BorrowedFd::borrow_raw(fd) }
+                    .try_clone_to_owned()
+                    .unwrap();
+            }
+        }
+        panic!("no socket listens at {address}");
+    }
+
+    /// Bead agentfs-ew1: once shutdown has begun, a connect is refused
+    /// (`NotRunning`) even while a request in flight keeps the socket file
+    /// and a child forked meanwhile still holds the listener.
+    #[test]
+    fn a_stopping_server_refuses_connects_while_a_child_holds_its_listener() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("control");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let handler: Handler = Arc::new(move |request: Request, _| {
+            if request.commit == "slow" {
+                let _ = wait.lock().unwrap().recv();
+            }
+            Reply::Ok(Outcome::default())
+        });
+        let server = Server::start(&dir, handler).unwrap();
+        let forked = dup_of_listener(&socket_address(&server.dir));
+        let slow = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let slow = Request {
+                    commit: "slow".into(),
+                    ..request()
+                };
+                loop {
+                    match call(&dir, &slow) {
+                        Ok(Reply::Busy(_)) => std::thread::sleep(Duration::from_millis(1)),
+                        other => return other,
+                    }
+                }
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(call(&dir, &request()).unwrap(), Reply::Busy(_)) {
+            assert!(Instant::now() < deadline, "never busy");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The slow restore holds the shutdown in its grace wait, with the
+        // socket file still in place.
+        let stopping = std::thread::spawn(move || server.shutdown(Duration::from_secs(30)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match local_socket::connect(&dir, CONTROL_SOCKET) {
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => break,
+                Err(e) => panic!("{e}"),
+                // Accepted before the stop, or queued on `forked`.
+                Ok(_) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a stopped server's socket still takes connections"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dir.join(CONTROL_SOCKET).exists());
+        assert!(matches!(
+            call(&dir, &request()),
+            Err(ClientError::NotRunning)
+        ));
+        release.send(()).unwrap();
+        assert!(matches!(slow.join().unwrap(), Ok(Reply::Ok(_))));
+        assert!(stopping.join().unwrap());
+        drop(forked);
+    }
+
     #[test]
     fn requests_are_checked() {
         let line = format!("{}\n", serde_json::to_string(&request()).unwrap());
@@ -887,23 +988,15 @@ mod tests {
         ));
         // A stale socket file (a crashed daemon) is not running either,
         // and the next server replaces it. Nothing listens on a crashed
-        // daemon's socket. Dropping a listener alone is not that, while any
-        // thread of this test binary spawns a child: the child shares the
-        // listener from its fork until its exec, and connects succeed
-        // meanwhile. `forked` is that child's copy, held throughout. A
-        // shut-down listener refuses connects at once, whoever holds it
-        // (as in agentfs-core's local_socket tests).
-        let stale =
-            UnixListener::bind(socket_address(&local_socket::open_dir(&dir).unwrap())).unwrap();
-        let forked = stale.try_clone().unwrap();
-        // SAFETY: `stale` is an open socket for the whole call.
-        assert_eq!(
-            unsafe { libc::shutdown(stale.as_raw_fd(), libc::SHUT_RDWR) },
-            0,
-            "{}",
-            io::Error::last_os_error()
+        // daemon's socket; a dropped listener is shut down, so it refuses
+        // connects even while a child spawned by another thread of this
+        // test binary shares it.
+        drop(
+            agentfs_core::listening_socket::Listener::bind(socket_address(
+                &local_socket::open_dir(&dir).unwrap(),
+            ))
+            .unwrap(),
         );
-        drop(stale);
         // A connect that succeeded would leave `call` waiting for a reply
         // nobody sends: fail fast here instead.
         assert_eq!(
@@ -922,6 +1015,5 @@ mod tests {
             Reply::Error("second".into())
         );
         server.shutdown(Duration::from_secs(1));
-        drop(forked);
     }
 }
