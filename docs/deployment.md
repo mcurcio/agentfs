@@ -620,10 +620,13 @@ find . -mindepth 1 -maxdepth 1 ! -name backing -exec mv -t backing {} +
 agentfs --state /data/state --root /data/backing init --volume hermes --include /etc/agentfs/config
 cp /etc/agentfs/exclude /data/state/git/info/exclude
 cp /etc/agentfs/attributes /data/state/git/info/attributes
-# The initial import: record every file the rules accept.
+# The initial import: record every file the rules accept. The list is
+# null-separated so any name passes whole, and written first so a failing
+# find stops the script.
 cd /data/backing
-find . -name .git -prune -o \( -type f -o -type l \) -printf '%P\n' |
-  xargs -r agentfs --state /data/state --root /data/backing record
+list=$(mktemp)
+find . -name .git -prune -o \( -type f -o -type l \) -printf '%P\0' >"$list"
+xargs -0 -r -a "$list" agentfs --state /data/state --root /data/backing record
 agentfs --state /data/state push
 ```
 

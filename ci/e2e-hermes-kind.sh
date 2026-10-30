@@ -289,6 +289,10 @@ if [ "$MODE" = sidecar ]; then
   # A nested repository: a skill cloned with git (agentfs.nested = exclude).
   in_hermes "d=$HERMES_DIR/skills/agentfs-cloned && mkdir -p \$d && cd \$d && git init -q &&
     printf 'cloned\n' > SKILL.md && chown -R 10000:10000 \$d"
+  # Names xargs would split or read as quotes: a space, ' and ".
+  in_hermes "d=$HERMES_DIR/skills/agentfs-names && mkdir -p \$d && cd \$d &&
+    printf 'space\n' > 'a space.md' && printf 'single\n' > \"it's.md\" &&
+    printf 'double\n' > 'say \"hi\".md' && chown -R 10000:10000 \$d"
   for path in SOUL.md config.yaml .env state.db response_store.db logs/agent.log \
     skills/agentfs-before/SKILL.md skills/agentfs-cloned/SKILL.md; do
     in_hermes "test -e $HERMES_DIR/$path" || fail "Hermes left no $path before agentfs"
@@ -346,6 +350,10 @@ EOF
     rgit cat-file -e "$BRANCH:$path" || fail "the remote lacks $path"
   done
   pass "the remote has SOUL.md and config.yaml"
+  for name in 'space:a space.md' "single:it's.md" 'double:say "hi".md'; do
+    assert_eq "${name%%:*}" "$(rgit show "$BRANCH:skills/agentfs-names/${name#*:}")" \
+      "the import recorded and pushed skills/agentfs-names/${name#*:}"
+  done
   never_recorded rgit \
     '(^|/)(\.env|auth\.json)$|\.(db|db-wal|db-shm|db-journal)$|(^|/)(sessions|logs)/|^skills/agentfs-cloned/' \
     "a secret, database, log or nested repository of the existing data"
