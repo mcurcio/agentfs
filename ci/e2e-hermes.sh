@@ -206,7 +206,8 @@ assert_contains "$out" "queued patch 1" "the patch is queued on the remote"
 dc stop hermes dind
 dc restart agentfs
 wait_healthy agentfs 300
-dc up -d --quiet-pull
+# Only what was stopped: agentfs-init refuses (exit 75) a mounted volume.
+dc up -d --no-deps dind hermes
 wait_healthy hermes 600
 assert_contains "$(dc exec -T agentfs agentfs status)" "last applied 1" "agentfs applied patch 1"
 assert_contains "$(in_hermes 'cat /opt/data/SOUL.md')" "$marker" "Hermes' container reads the patched SOUL.md"
