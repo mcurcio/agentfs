@@ -162,7 +162,9 @@ wait_content rgit skills/agentfs-sandbox/SKILL.md "$note"
 assert_eq uid-0 "$(author rgit skills/agentfs-sandbox/SKILL.md)" "the tool container's commit is authored by root"
 
 step "3. secrets, sessions, logs and databases are never recorded"
-excluded=(.env state.db sessions/sessions.json logs/agent.log skills/agentfs-sandbox/auth.json skills/agentfs-sandbox/logs/run.log)
+# Hermes keeps its sessions in state.db (upstream docker.md); its
+# sessions/ directory stays empty in this version.
+excluded=(.env state.db response_store.db logs/agent.log skills/agentfs-sandbox/auth.json skills/agentfs-sandbox/logs/run.log)
 for path in "${excluded[@]}"; do
   in_hermes "test -e /opt/data/$path" || fail "$path was never written, so this check proves nothing"
   dc exec -T agentfs test -e "/data/backing/$path" || fail "$path is not in the backing tree"
