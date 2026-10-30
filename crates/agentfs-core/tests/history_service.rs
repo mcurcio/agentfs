@@ -1761,6 +1761,49 @@ fn health_follows_the_service() {
     assert!(stopping.join().unwrap(), "the service stopped in time");
 }
 
+/// A stopping service refuses new connects while it drains: tonic keeps
+/// its incoming stream until the drain ends, so the listener is stopped at
+/// the shutdown signal (bead agentfs-4lb.10, fix round). An open health
+/// watch keeps the drain going.
+#[test]
+fn a_draining_service_refuses_new_connects() {
+    use tonic_health::pb::HealthCheckRequest;
+    use tonic_health::pb::health_check_response::ServingStatus;
+    use tonic_health::pb::health_client::HealthClient;
+
+    let env = env();
+    let mut service = Service::start(&env);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut health = HealthClient::new(raw_channel(&runtime, &env));
+    let mut watch = runtime
+        .block_on(health.watch(HealthCheckRequest {
+            service: SERVICE_NAME.to_owned(),
+        }))
+        .unwrap()
+        .into_inner();
+    let first = runtime.block_on(watch.message()).unwrap().unwrap();
+    assert_eq!(first.status, ServingStatus::Serving as i32);
+    let server = service.server.take().unwrap();
+    let stopping = std::thread::spawn(move || server.shutdown(Duration::from_secs(30)));
+    let next = runtime.block_on(watch.message()).unwrap().unwrap();
+    assert_eq!(next.status, ServingStatus::NotServing as i32);
+    // The stop runs on the server's runtime just after NOT_SERVING: wait
+    // for it, bounded, while the watch keeps the drain going.
+    let socket = env.state.history_socket();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let refused = loop {
+        match std::os::unix::net::UnixStream::connect(&socket) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break true,
+            _ if Instant::now() >= deadline => break false,
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    assert!(!stopping.is_finished(), "the drain ended before the check");
+    assert!(refused, "a connect during the drain was not refused");
+    drop((watch, health));
+    assert!(stopping.join().unwrap(), "the service stopped in time");
+}
+
 #[test]
 fn a_restarted_service_does_not_fail_the_next_boundary() {
     let env = env();

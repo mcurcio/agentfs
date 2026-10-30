@@ -484,3 +484,9 @@ None stopped a slice; each was resolved as stated and is recorded in design §19
    check was a copy of the notify one from before the refusal). Now one check
    (`lfs::client::webhook_url_refused`) serves both, and `post` redacts its own errors.
    Entry 5's unaudited `Settings` URL fields remain unaudited.
+5. **The review's probe of entry 13's fix was ineffective.** It replaced `stopper.stop()` with
+   `let _ = &stopper;`, which still moves the `Stopper` into the shutdown future, and a
+   finished future drops it, and dropping stops. Its conclusion held anyway: with the stop truly
+   removed (`std::mem::forget(stopper)`) every existing test stayed green. Now
+   `history_service::a_draining_service_refuses_new_connects` and
+   `grpc::a_stopping_driver_refuses_connects_while_calls_finish` go red under that probe.
