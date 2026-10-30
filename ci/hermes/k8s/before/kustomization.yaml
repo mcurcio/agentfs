@@ -1,0 +1,14 @@
+# Hermes before agentfs (ci/e2e-hermes-kind.sh sidecar): upstream Hermes
+# with deploy/sidecar's volume (agentfs-data) mounted at /opt/data, as it
+# runs today, so the volume holds Hermes' files at its root for the
+# migration Job of docs/deployment.md §10.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: agentfs-e2e
+
+resources:
+  - deployment.yaml
+
+components:
+  - ../common

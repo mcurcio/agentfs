@@ -1,0 +1,46 @@
+# docs/deployment.md §10, "The pod changes": Hermes (and the
+# docker-in-docker sidecar) keep their data path by mounting the FUSE
+# mount itself at /opt/data (subPath, HostToContainer), with the liveness
+# probe a subPath consumer needs (§3) so a clean exit of the daemon
+# restarts them onto the new mount.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentfs-example
+spec:
+  # ci/e2e-hermes-kind.sh scales it up after the migration Job.
+  replicas: 0
+  template:
+    spec:
+      initContainers:
+        - name: agentfs-init
+          env:
+            - { name: AGENTFS_VOLUME, value: hermes }
+        - name: agentfs
+          env:
+            - { name: OTEL_SDK_DISABLED, value: "true" }
+        - name: hermes-config
+          volumeMounts:
+            - { name: agentfs-mount, mountPath: /opt/data, subPath: workspace, mountPropagation: HostToContainer }
+        - name: dind
+          volumeMounts:
+            - { name: agentfs-mount, mountPath: /opt/data, subPath: workspace, mountPropagation: HostToContainer }
+          livenessProbe:
+            exec:
+              # BusyBox stat: the FUSE magic (fuseblk), not a dead mount or
+              # the bare directory.
+              command: [sh, -c, 'test "$(stat -f -c %t /opt/data)" = 65735546']
+            periodSeconds: 10
+            failureThreshold: 6
+      containers:
+        - name: workload
+          $patch: delete
+        - name: hermes
+          volumeMounts:
+            - { name: agentfs-mount, mountPath: /opt/data, subPath: workspace, mountPropagation: HostToContainer }
+          livenessProbe:
+            exec:
+              # Fails on the dead mount (ENOTCONN) and on a bare directory.
+              command: [sh, -c, 'test "$(stat -f -c %T /opt/data)" = fuseblk']
+            periodSeconds: 10
+            failureThreshold: 6

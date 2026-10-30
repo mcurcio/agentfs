@@ -1,0 +1,67 @@
+# Hermes as upstream ships it (root start-up, `gateway run`), and the
+# docker-in-docker sidecar its docker terminal backend runs tool
+# containers on, as in ci/hermes/compose.yaml. Each scenario adds how
+# hermes-config, dind and hermes mount the volume.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: any
+spec:
+  template:
+    spec:
+      initContainers:
+        # Hermes' CI config in the volume before Hermes' first start, as an
+        # operator would put it there; a no-op once the file exists.
+        # TOOL_SOURCE is where dind sees Hermes' home, which
+        # terminal.docker_volumes passes into tool containers at /opt/data.
+        - name: hermes-config
+          image: hermes-agent
+          command:
+            - sh
+            - -c
+            - '[ -e "$HERMES_DIR/config.yaml" ] || sed "s|- /opt/data:/opt/data|- $TOOL_SOURCE:/opt/data|" /config/config.yaml >"$HERMES_DIR/config.yaml"'
+          env:
+            - { name: HERMES_DIR, value: /opt/data }
+            - { name: TOOL_SOURCE, value: /opt/data }
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - { name: hermes-config, mountPath: /config, readOnly: true }
+        # A native sidecar: Hermes starts once the daemon answers.
+        - name: dind
+          image: dind
+          restartPolicy: Always
+          args: [dockerd, --host=tcp://127.0.0.1:2375, --host=unix:///var/run/docker.sock, --tls=false]
+          env:
+            # Plain TCP on the pod's loopback: a throwaway daemon for the test.
+            - { name: DOCKER_TLS_CERTDIR, value: "" }
+          securityContext:
+            privileged: true
+          startupProbe:
+            exec:
+              command: [docker, info]
+            periodSeconds: 2
+            failureThreshold: 150
+          volumeMounts:
+            - { name: dind-storage, mountPath: /var/lib/docker }
+      containers:
+        - name: hermes
+          image: hermes-agent
+          args: [gateway, run]
+          env:
+            - { name: DOCKER_HOST, value: "tcp://127.0.0.1:2375" }
+            # The gateway's OpenAI-compatible API, on the pod's loopback:
+            # the test drives Hermes through it (upstream api-server.md).
+            - { name: API_SERVER_ENABLED, value: "true" }
+            - { name: API_SERVER_KEY, value: agentfs-ci-not-a-secret }
+          readinessProbe:
+            exec:
+              command: [curl, -fsS, "http://127.0.0.1:8642/health"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+      volumes:
+        - name: hermes-config
+          configMap: { name: hermes-config }
+        - name: dind-storage
+          emptyDir: {}

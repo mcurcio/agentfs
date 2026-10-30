@@ -13,11 +13,47 @@
       }
     }
   ],
+  "before-skill": [
+    {
+      "tool": "skill_manage",
+      "arguments": {
+        "operations": [
+          {
+            "action": "create",
+            "name": "agentfs-before",
+            "content": "---\nname: agentfs-before\ndescription: Use when checking the migration of existing data.\n---\n# agentfs-before\n\nCreated by Hermes' own skill tool before agentfs, in agentfs CI.\n"
+          }
+        ]
+      }
+    }
+  ],
+  "recovered-skill": [
+    {
+      "tool": "skill_manage",
+      "arguments": {
+        "operations": [
+          {
+            "action": "create",
+            "name": "agentfs-recovered",
+            "content": "---\nname: agentfs-recovered\ndescription: Use when checking that recording goes on.\n---\n# agentfs-recovered\n\nCreated by Hermes' own skill tool later in the run, in agentfs CI.\n"
+          }
+        ]
+      }
+    }
+  ],
   "sandbox-edit": [
     {
       "tool": "terminal",
       "arguments": {
         "command": "d=/opt/data/skills/agentfs-sandbox && mkdir -p $d/logs && printf -- '---\\nname: agentfs-sandbox\\ndescription: Use when checking tool container edits.\\n---\\nWritten in tool container %s.\\n' \"$(hostname)\" > $d/SKILL.md && printf '{\"token\": \"not-a-real-secret\"}\\n' > $d/auth.json && printf 'a log line\\n' > $d/logs/run.log && cat $d/SKILL.md"
+      }
+    }
+  ],
+  "sandbox-unmounted": [
+    {
+      "tool": "terminal",
+      "arguments": {
+        "command": "d=/opt/data/skills/agentfs-unmounted && mkdir -p $d && printf -- '---\\nname: agentfs-unmounted\\ndescription: Use when checking tool containers without the mount.\\n---\\nWritten in tool container %s.\\n' \"$(hostname)\" > $d/SKILL.md && printf 'Written in tool container %s.\\n' \"$(hostname)\" > \"$HOME/agentfs-home.txt\" && if touch \"$HOME/.hermes/skills/agentfs-probe\" 2>/dev/null; then echo 'skills: writable'; else echo 'skills: read-only'; fi && cat $d/SKILL.md"
       }
     }
   ],

@@ -1,0 +1,13 @@
+# The read-only fence alternative of docs/deployment.md §10
+# (ci/e2e-hermes-kind.sh fence): the sidecar scenario's pod, but Hermes and
+# docker-in-docker mount the emptyDir read-only at /agentfs, as
+# deploy/sidecar's workload does, and Hermes' home is
+# HERMES_HOME=/agentfs/workspace. A fresh volume: no migration.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../sidecar
+
+patches:
+  - path: deployment-patch.yaml

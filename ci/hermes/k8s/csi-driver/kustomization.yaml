@@ -1,0 +1,21 @@
+# The e2e-csi driver overlay (ci/k8s-csi/driver) with a `hermes` profile
+# for ci/e2e-hermes-kind.sh csi: the Hermes rule files
+# (deploy/examples/hermes) and the `ci` profile's remote settings (the
+# runner's git server, 2 s pushes). Build with --load-restrictor
+# LoadRestrictionsNone.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../../k8s-csi/driver
+
+configMapGenerator:
+  - name: agentfs-csi-profiles
+    namespace: agentfs-csi
+    behavior: merge
+    options:
+      disableNameSuffixHash: true
+    files:
+      - hermes.config=../../../k8s-csi/driver/profiles/ci.config
+      - hermes.exclude=../../../../deploy/examples/hermes/exclude
+      - hermes.attributes=../../../../deploy/examples/hermes/attributes

@@ -544,13 +544,13 @@ lands nothing, and raises the warning `PatchQueueDeferred` while anything
 is queued:
 
 ```text
-patches: not applied at this start: the previous mount of this volume did not stop with nothing attached (killed, crashed, a busy unmount or open files), so a workload may still hold it; 1 patch(es) stay queued and land at the next start with nothing attached
+patches: not applied at this start: the previous mount of this volume did not stop with nothing attached (killed, crashed, busy, or still mounted elsewhere) and was not another pod's, so a workload may still hold it; 1 patch(es) stay queued and land at the next start with nothing attached
 alarm: patch queue deferred (unclean_stop): a workload may be attached, so 1 patch(es) stay queued; they land at the next start with nothing attached (docs/runbooks/patch-queue.md)
 ```
 
 | Reason | Why the start may have a workload attached |
 |---|---|
-| `unclean_stop` | The previous mount left `$STATE/meta/attached.json`: it was killed or crashed, or it stopped while a workload held it (its log said `the mount was busy: detached lazily`, `files were still open after ...`, or `a workload may still be attached`). Typical: `docker restart` or a crash of the agentfs container alone, or a sidecar restart inside a running pod |
+| `unclean_stop` | The previous mount left `$STATE/meta/attached.json`: it was killed or crashed, or it stopped while a workload held it (its log said `the mount was busy: detached lazily`, `files were still open after ...`, `the filesystem was still mounted elsewhere after ...`, or `a workload may still be attached`), and the mark was not another pod's. Typical: `docker restart` or a crash of the agentfs container alone, or a sidecar restart inside a running pod. A sidecar whose mount point is in its pod's own `emptyDir` records the pod's uid in the mark, and a new pod lands the queue over it (its log says `this is another pod`; design §12) |
 | `stale_mount` | The mount stacked over a stale mount a crashed daemon left (`--on-stale-mount recover`). Its own stop keeps the mark too (a workload may still hold the stale layers it detaches), so it takes one more clean stop and start |
 | `fronts_running` | `serve-history` started while fronts hold leases |
 | `workload_attached` | `serve-history` was given `--workload-attached`: the CSI node plugin passes it while a pod of the volume is published on the node (a node-plugin restart, a crashed service's restart) |
@@ -563,7 +563,11 @@ nothing attached and removes the mark; the next start lands the queue:
   down` and `up` stop dependents first). A mount that was itself started
   over a held queue stops cleanly the same way: one clean stop and start
   is enough.
-- **Kubernetes sidecar:** delete the pod; the new pod's mount lands it.
+- **Kubernetes sidecar:** delete the pod; the new pod's mount lands it,
+  even when the old pod's stop kept the mark (a `subPath` bind held the
+  mount), as long as `AGENTFS_POD_UID` is set and the mount point is in
+  the pod's own disk-backed `emptyDir`, as in `deploy/sidecar`. Otherwise
+  it takes one more pod restart after a clean stop.
 - **CSI:** delete the volume's pods on the node, so it is unstaged, then
   start them again; NodeStage starts the service with no pod published.
 - **By hand:** with the volume stopped and no workload holding the

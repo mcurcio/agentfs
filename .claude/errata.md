@@ -530,3 +530,55 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    into any `.env` path (upstream `tools/approval_detection.py`, "overwrite project env/config
    via redirection") and then waits for a human, so the tool container writes `auth.json`, not
    `.env`, as its secret.
+
+## 2026-10-30, agentfs-4f2 implementer (Hermes on every supported configuration)
+
+1. **Product/design bug: no pod restart lands a patch in deployment.md §10's Hermes pod.**
+   Hermes and docker-in-docker mount the FUSE mount at `/opt/data` through `subPath`. The
+   kubelet's subPath binds (`/var/lib/kubelet/pods/<uid>/volume-subpaths/...`) stay until it
+   unmounts the pod's volumes, after every container, the sidecar included, has exited. So
+   when the sidecar stops at a pod deletion the FUSE session cannot end within
+   `--unmount-grace`, `crates/agentfs/src/main.rs:1614` keeps `meta/attached.json` ("a
+   workload may still be attached"), and the next pod's mount defers the queue
+   (`main.rs:1471`, `unclean_stop`, `PatchQueueDeferred`), pod after pod. Evidence: CI run
+   41102851463, job 124224481251 (e2e (Hermes on kind, sidecar)): the old pod's sidecar log
+   at `kubectl delete pod` and the new pod's "patches: not applied at this start". The same
+   run's fence job (emptyDir read-only at `/agentfs`, `HERMES_HOME=/agentfs/workspace`)
+   lands the patch at the next pod restart, and the csi job at the next NodeStage.
+   deployment.md §10 "Restarts and patches" and supported-configurations.md Example 3
+   promised landing at a pod restart. Not fixed: the rule is §19.1 "Patches land after a
+   clean stop" (working directories count as attached), so the choice (recommend the fence
+   pod, or judge a hold only the kubelet's binds keep) is the owner's; design §19.2
+   question 12 records it, the docs now say so, and the sidecar job fails on it.
+2. **The Hermes rule files record Hermes' bookkeeping in `skills/`.** Upstream v0.22.5
+   writes `skills/.usage.json`, `skills/.usage.json.lock`, `skills/.curator_ledger.jsonl`
+   and `skills/.bundled_manifest`, and syncs its bundled skills (about 330 files) into
+   `skills/`; the allowlist records all of them (the migration Job's log in the run above).
+   `.usage.json` changes as skills are used, so it records churn that no one authored.
+   Not changed: what Hermes' rules record is policy (deploy/examples/hermes); noted in
+   deployment.md §10 "How it is tested".
+3. **deployment.md §10 said an empty `terminal.docker_volumes` keeps tool containers away
+   from Hermes' files. Wrong for upstream v0.22.5:** `tools/environments/docker.py` binds
+   `$HERMES_HOME/skills` read-only into every tool container (`_readonly_skill_mount_args`)
+   and, with `container_persistent: true` (the default), the tool container's `/root` and
+   `/workspace` from `$HERMES_HOME/sandboxes/docker/<task>/` (`_mount_args`), resolved by
+   the docker-in-docker daemon, so on the volume. ci/e2e-hermes.sh step 6 checks it. Prose
+   fixed in deployment.md §10, design §16 and supported-configurations.md Example 3.
+4. **The fence alternative needs `HERMES_WRITE_SAFE_ROOT` too.** The image sets it to
+   `/opt/data`, and `agent/file_safety.py` refuses file-tool writes outside it; with
+   `HERMES_HOME=/agentfs/workspace` alone Hermes' file tools could not write its home. The
+   image's `main-wrapper.sh` also sets `HOME=/opt/data` whatever `HERMES_HOME` is. Read from
+   upstream code; the fence job sets the variable but does not exercise the file tools.
+
+## 2026-10-30, agentfs-vqr implementer (another pod's attached mark)
+
+1. **agentfs-4f2 item 1 is fixed, not open.** A mount whose mount point is in its pod's own
+   volume records `AGENTFS_POD_UID` in `meta/attached.json`, and a start in a different pod
+   lands the queue over it (design §12, §19.1 "Patches land after a clean stop", amended;
+   §19.2 question 12 closed). The docs' "the sidecar job fails on it" notes are gone.
+2. **deployment.md §3 "Termination" was wrong twice.** It said a `subPath` consumer makes
+   the daemon detach lazily; the unmount is not busy (the kubelet's binds are other mounts
+   of the filesystem) and it is the session that outlives the unmount
+   (`session_abandoned`), which the log reported as "files were still open". It also
+   pointed at Hermes as §9 (it is §10). The log now says "the filesystem was still mounted
+   elsewhere" when the unmount was not busy.

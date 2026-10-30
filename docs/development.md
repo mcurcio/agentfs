@@ -289,13 +289,18 @@ tests the container image on every push:
 - **publish** (main only, after the three kind tests): pushes the tested image to
   `ghcr.io/mcurcio/agentfs` as `<commit sha>` and `latest`.
 
-Three more workflows test what ships beside the binary:
+Four more workflows test what ships beside the binary:
 
 - [`.github/workflows/docker.yml`](../.github/workflows/docker.yml), on
   pushes that touch the image, `examples/docker`, `ci/hermes` or
   `deploy/examples/hermes`: each Docker example in its own job
   ([docker.md](docker.md)), and upstream Hermes on the compose example
   ([deployment.md](deployment.md#how-it-is-tested)).
+- [`.github/workflows/hermes.yml`](../.github/workflows/hermes.yml), on
+  pushes that touch the image, the Hermes suite, `deploy/sidecar`,
+  `deploy/csi` or `docs/deployment.md`: upstream Hermes on kind, as the
+  sidecar pod, its read-only fence alternative and on a CSI volume, one
+  job each ([deployment.md](deployment.md#how-it-is-tested)).
 - [`.github/workflows/helm.yml`](../.github/workflows/helm.yml), on every
   push: the charts linted and checked against `deploy/`, the CSI chart
   installed on kind and put through `ci/e2e-csi.sh`, and the charts

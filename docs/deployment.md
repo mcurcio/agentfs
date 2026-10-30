@@ -171,9 +171,14 @@ containers, so the daemon unmounts once nothing uses the mount, runs a
 final sweep, makes the final commit and pushes it once more, within
 `--push-grace` (5 s; the log shows `final commit:` and a `final push:`
 line per remote). A workload container that mounts the FUSE root itself through
-a `subPath` (Hermes, §9 below) pins the mount until the kubelet tears the
-pod's volumes down, so the daemon detaches lazily and waits its
-`--unmount-grace` (10 s) first. `terminationGracePeriodSeconds: 60`
+a `subPath` (Hermes, §10 below) gets a kubelet bind of the mount that
+stays until the kubelet tears the pod's volumes down, after the sidecar
+has exited. The daemon's unmount succeeds, but the bind keeps the
+filesystem mounted elsewhere, so the daemon waits its `--unmount-grace`
+(10 s) for the session to end, says so (`the filesystem was still
+mounted elsewhere`), and exits; the bind then fails with `ENOTCONN` until
+the kubelet removes it. The stop keeps the attached mark, which the next
+pod's start passes over because it was another pod's (design §12). `terminationGracePeriodSeconds: 60`
 covers both with room to spare; keep it above `--unmount-grace` plus
 `--push-grace` plus a few seconds.
 
@@ -535,7 +540,8 @@ The rule files are in [`deploy/examples/hermes`](../deploy/examples/hermes):
   (`.env`, `auth.json`), databases (`*.db`, `*.sqlite*` and their
   journals), `sessions/`, `logs/` and `checkpoints/` `-agentfs`
   everywhere: never recorded, even if tracked or re-included by a later
-  exclude change.
+  exclude change. Upstream Hermes v0.22.5 keeps its sessions in
+  `state.db`, not `sessions/`; both are covered.
 - [`config`](../deploy/examples/hermes/config) keeps nested repositories
   out (`nested = exclude`) and names the push remote.
 
@@ -562,19 +568,36 @@ Starting from Hermes' own workload:
       mountPropagation: HostToContainer
   ```
 
-  The e2e test's uid 10000 writer uses exactly this pattern, with the
-  liveness probe a subPath consumer needs (§3, with `/opt/data`) so a
-  clean exit of the daemon restarts it onto the new mount. Hermes'
-  start-up runs as root, which the sealed mount point does not stop
-  (§7); where every write must be recorded, use the alternative the
-  read-only fence covers: mount the `emptyDir` read-only at `/agentfs`
-  and set `HERMES_HOME=/agentfs/workspace`.
+  Give it the liveness probe a subPath consumer needs (§3, with
+  `/opt/data`) so a clean exit of the daemon restarts it onto the new
+  mount. Hermes' start-up runs as root, which the sealed mount point
+  does not stop (§7). **Queued patches do not land in this pod** (see
+  [Restarts and patches](#restarts-and-patches)).
+
+  The alternative, which the read-only fence covers and under which
+  patches land: mount the `emptyDir` read-only at `/agentfs`, as
+  `deploy/sidecar`'s workload does, and set
+  `HERMES_HOME=/agentfs/workspace` and
+  `HERMES_WRITE_SAFE_ROOT=/agentfs/workspace`. The image sets the second
+  to `/opt/data`, and Hermes' file tools refuse writes outside it
+  (upstream `agent/file_safety.py`; the test sets it but does not
+  exercise those tools). The image's entrypoint still sets
+  `HOME=/opt/data`, the image's own directory: what Hermes keeps under
+  `$HOME` stays in the container.
 - **The docker-in-docker sidecar** that runs Hermes' file and terminal
   tools mounts it the same way, and Hermes' `terminal.docker_volumes`
   setting passes the path into tool containers, so they see the same
   files. Whether a sandbox may edit its agent's configuration is a policy
-  choice for whoever runs Hermes; leave the setting empty to keep tool
-  containers away from it.
+  choice for whoever runs Hermes. Leaving the setting empty (upstream's
+  default) keeps the tool containers' writes to that path out of
+  Hermes' files, but not every tool container write off the volume:
+  upstream still binds directories of Hermes' home into each tool
+  container, read-only (`skills/`, `cache/`, `images/`,
+  `attachments/`, `composer-pastes/`), and the tool container's home and
+  `/workspace` (`container_persistent`, default true) read-write from
+  `$HERMES_HOME/sandboxes/`, all resolved by the docker-in-docker
+  daemon, so those writes land in the volume (never recorded under these
+  rules).
 - **Root init.** Hermes' start-up runs as root; with `default_permissions`
   and a real backing tree, root reads and writes the mount like any other
   directory, and files keep their owners.
@@ -587,6 +610,7 @@ Hermes' current volume holds its files at the root. agentfs needs them
 under `backing/`, next to `state/`. A one-time Job, with Hermes scaled to
 zero and the same PVC mounted at `/data`:
 
+<!-- ci: hermes-migration -->
 ```sh
 set -eu
 cd /data
@@ -619,10 +643,20 @@ sidecar's startup probe allows for the fetch, which waits at most
 alert on `agentfs.patch.blocked`. See
 [patch-queue.md](runbooks/patch-queue.md).
 
+**With Hermes' data path mounted through `subPath`**, the kubelet still
+holds the mount when the sidecar stops, through the subPath binds it made
+for Hermes and docker-in-docker, so the stop keeps the attached mark
+(design §12). The mark names the pod (`AGENTFS_POD_UID`), and the next
+pod lands the queue over it: the old pod's binds cannot reach the new
+pod's `emptyDir`. A restart of the sidecar alone under running Hermes
+defers the queue (`PatchQueueDeferred`, reason `unclean_stop`), as it
+should; the patches land at the next pod restart.
+
 ### How it is tested
 
-The `docker` workflow runs this setup under Docker Compose, not
-Kubernetes: [`ci/e2e-hermes.sh`](../ci/e2e-hermes.sh) with
+Upstream Hermes is tested in four configurations, with the checks of
+[`ci/hermes/lib.sh`](../ci/hermes/lib.sh). The `docker` workflow runs
+this setup under Docker Compose: [`ci/e2e-hermes.sh`](../ci/e2e-hermes.sh) with
 [`ci/hermes/compose.yaml`](../ci/hermes/compose.yaml) over the compose
 example and its git server ([docker.md](docker.md)), with this
 section's `exclude` and `attributes` and the example's remote settings
@@ -644,11 +678,39 @@ the model API makes every turn deterministic. The job checks that:
   remote;
 - a patch queued with `agentfs patch submit` lands when Hermes and
   docker-in-docker are stopped and agentfs restarted, and Hermes' next
-  model request carries the patched `SOUL.md`.
+  model request carries the patched `SOUL.md`;
+- with `terminal.docker_volumes` emptied, a tool container's write to
+  `/opt/data` stays in the tool container, reaching neither Hermes nor
+  the history; Hermes' `skills/` is read-only there; a file in the tool
+  container's home lands in Hermes' `sandboxes/` and is never recorded;
+  Hermes' own edits are still recorded.
 
-Not tested: the Kubernetes pod itself (the sidecar, `subPath`, probes),
-a profile's files, a real model, and tool containers given only part of
-the volume.
+The `hermes` workflow runs [`ci/e2e-hermes-kind.sh`](../ci/e2e-hermes-kind.sh)
+on kind, one job per configuration, with the same checks (start-up,
+Hermes' skill, a tool container's edit, exclusions, a queued patch at the
+next start) and the manifests in [`ci/hermes/k8s`](../ci/hermes/k8s):
+
+- **sidecar**: this pod, from `deploy/sidecar` with the Hermes rule
+  files, `subPath` mounts and their liveness probes, docker-in-docker as
+  a native sidecar. First upstream Hermes runs on the plain volume, then
+  the migration Job above runs as written: the import records Hermes'
+  files and pushes them, and reports `.env`, the databases, the logs and
+  a nested repository as skipped. Then a clean exit of the sidecar alone:
+  Hermes' liveness probe restarts it onto the new mount, it records
+  again, and a queued patch is deferred (`PatchQueueDeferred`); it lands
+  at the next pod restart. The import also records what Hermes keeps in `skills/` beside
+  the skills: the bundled skills it syncs there and its own
+  `.usage.json`, `.curator_ledger.jsonl` and `.bundled_manifest`.
+- **fence**: the read-only fence alternative, on a fresh volume; the
+  patch lands at the next pod restart.
+- **csi**: Hermes and docker-in-docker in one pod on a claim of the CSI
+  driver ([csi.md](csi.md)), with a `hermes` profile holding these
+  rules; the patch lands at the next NodeStage.
+
+Not tested: a profile's files, a real model, tool containers given only
+part of the volume, docker-in-docker without the mount, the fence pod
+across a restart of the sidecar alone, and Hermes' file tools under the
+fence's `HERMES_WRITE_SAFE_ROOT`.
 
 ## 11. Limitations
 
