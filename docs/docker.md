@@ -283,6 +283,10 @@ checks that Docker restarts it, that it mounts over the stale mount, and
 that the running workload writes through the new mount without a
 restart.
 
+A further job runs upstream Hermes on the compose example, with the git
+server and docker-in-docker for its tool containers
+([deployment.md §10](deployment.md#how-it-is-tested)).
+
 Not tested: Docker Desktop and rootless Docker, `--privileged` instead
 of the three narrower options, `restore` and `push` through `docker
 exec`, SSH and LFS remotes under Docker, and a clean stop of agentfs while

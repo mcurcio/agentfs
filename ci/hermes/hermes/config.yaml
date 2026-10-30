@@ -1,0 +1,26 @@
+# A minimal Hermes config for ci/e2e-hermes.sh, from upstream's own
+# docs (website/docs/user-guide/configuration.md, docker.md and
+# configuring-models.md in NousResearch/hermes-agent): the scripted model
+# server as a custom OpenAI-compatible provider, and the docker terminal
+# backend on the docker-in-docker service with the mount passed into tool
+# containers. Every other key keeps upstream's default.
+model:
+  provider: custom
+  default: scripted
+  base_url: http://model:8000/v1
+  api_key: no-key-needed
+
+# Upstream: on "generic FUSE mounts, set database.journal_mode: delete
+# explicitly" (docker.md, "Filesystem requirements for state.db").
+database:
+  journal_mode: delete
+
+terminal:
+  backend: docker
+  # A small image instead of upstream's desktop sandbox: the tests only
+  # run shell commands. Pinned like the repo's other test images.
+  docker_image: debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+  # The docker-in-docker service has the mount at the same path, so tool
+  # containers see (and edit) Hermes' own files.
+  docker_volumes:
+    - /opt/data:/opt/data

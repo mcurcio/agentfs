@@ -1,0 +1,25 @@
+{
+  "create-skill": [
+    {
+      "tool": "skill_manage",
+      "arguments": {
+        "operations": [
+          {
+            "action": "create",
+            "name": "agentfs-recorded",
+            "content": "---\nname: agentfs-recorded\ndescription: Use when checking that agentfs records skills.\n---\n# agentfs-recorded\n\nCreated by Hermes' own skill tool in agentfs CI.\n"
+          }
+        ]
+      }
+    }
+  ],
+  "sandbox-edit": [
+    {
+      "tool": "terminal",
+      "arguments": {
+        "command": "d=/opt/data/skills/agentfs-sandbox && mkdir -p $d/logs && printf -- '---\\nname: agentfs-sandbox\\ndescription: Use when checking tool container edits.\\n---\\nWritten in tool container %s.\\n' \"$(hostname)\" > $d/SKILL.md && printf '{\"token\": \"not-a-real-secret\"}\\n' > $d/auth.json && printf 'a log line\\n' > $d/logs/run.log && cat $d/SKILL.md"
+      }
+    }
+  ],
+  "hello": []
+}
