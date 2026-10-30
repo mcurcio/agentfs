@@ -335,9 +335,11 @@ fn serve_git_apply_falls_back_when_an_old_daemon_cannot_apply() {
 }
 
 /// `transfer.hideRefs` hides ref names, not objects: protocol v2's
-/// upload-pack serves any object a client names by id, while v0 refuses
-/// one no advertised ref points at (git-config(1) `transfer.hideRefs`;
-/// gitnamespaces(7) SECURITY). This pins what design §12 says hiding
+/// upload-pack serves any object a client names by id (git-config(1)
+/// `transfer.hideRefs`; gitnamespaces(7) SECURITY). v0's upload-pack
+/// refuses that one request, but v0 hides no objects either: a pusher
+/// can push a patch whose tree names a hidden object and fetch it back
+/// (design §19.1 "serve-git"). This pins what design §12 says hiding
 /// gives (bead agentfs-5sg).
 #[test]
 fn hidden_refs_hide_names_not_objects() {

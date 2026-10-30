@@ -474,3 +474,8 @@ None stopped a slice; each was resolved as stated and is recorded in design §19
    fork finished, which every publishing path retries. Entry 7 above is superseded.
 2. **Entry 14's follow-up done here.** `tokio::net::UnixListener::bind` is banned; the two test
    fakes listen through `Listener::into_async` instead of carrying an `#[allow]`.
+3. **Entry 4 under-stated the object exposure.** Under protocol v0 too a pusher reads a hidden
+   object whose id it knows: it pushes a commit whose tree names the object (receive-pack's
+   connectivity check passes, the object is already there), then fetches the advertised inbox
+   ref. Reproduced with Apple git 2.50.1 over `file://` (a pack of only the commit and tree to
+   `receive-pack --stateless-rpc`). Design §19.1 "serve-git" and the serve_git.rs doc now say so.
