@@ -327,6 +327,65 @@ fn fork_create_of_a_fork() {
     );
 }
 
+/// Bead agentfs-tuf: `agentfs.patchRemote = none` turns a linked fork's
+/// patch queue off, so `patch apply` (the mount's queue run, with the
+/// volume stopped) fetches nothing from its fork remote and lands
+/// nothing; unset, the same queued patch lands.
+#[test]
+fn patch_remote_none_turns_a_forks_queue_off() {
+    if !have_git() {
+        return;
+    }
+    let s = Setup::new(true);
+    s.record("state", "tree", "a.txt", "a\n");
+    let fork = s.create_fork();
+    s.ok("fork", "fork-tree", &["push"]);
+    // A producer's patch on the fork's head, queued on its fork remote.
+    let forks = Repository::open_bare(s.path("forks.git")).unwrap();
+    let head = forks
+        .find_commit(
+            forks
+                .refname_to_id(&format!("refs/heads/agentfs/{fork}"))
+                .unwrap(),
+        )
+        .unwrap();
+    let blob = forks.blob(b"from the producer\n").unwrap();
+    let mut builder = forks.treebuilder(Some(&head.tree().unwrap())).unwrap();
+    builder.insert("p.txt", blob, 0o100644).unwrap();
+    let tree = forks.find_tree(builder.write().unwrap()).unwrap();
+    let ada = git2::Signature::now("Ada Lovelace", "ada@example.com").unwrap();
+    let patch = forks
+        .commit(None, &ada, &ada, "patch p.txt", &tree, &[&head])
+        .unwrap();
+    forks
+        .reference(
+            &format!("refs/agentfs/{fork}/inbox/0000000001"),
+            patch,
+            false,
+            "test",
+        )
+        .unwrap();
+
+    let profile = fs::read_to_string(s.path("profile")).unwrap();
+    fs::write(
+        s.path("profile"),
+        format!("[agentfs]\n\tpatchRemote = none\n{profile}"),
+    )
+    .unwrap();
+    let out = s.ok("fork", "fork-tree", &["patch", "apply"]);
+    assert!(!s.path("fork-tree/p.txt").exists(), "{out}");
+    let status = s.ok("fork", "fork-tree", &["status"]);
+    assert!(status.contains("(no patch remote)"), "{status}");
+
+    fs::write(s.path("profile"), &profile).unwrap();
+    let out = s.ok("fork", "fork-tree", &["patch", "apply"]);
+    assert_eq!(
+        fs::read_to_string(s.path("fork-tree/p.txt")).unwrap(),
+        "from the producer\n",
+        "{out}"
+    );
+}
+
 /// `fork status --json` of the fork in `fork`.
 fn status_json(s: &Setup) -> serde_json::Value {
     let out = s.ok("fork", "fork-tree", &["fork", "status", "--json"]);

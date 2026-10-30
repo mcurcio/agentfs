@@ -103,7 +103,7 @@ suffix (`512k`, `100m`).
 | `agentfs.pushInterval` | duration | `60s` | How often each remote is pushed; also the base of the failure backoff, which doubles up to `max(pushInterval, 15m)` (§11.2) |
 | `agentfs.sweepInterval` | duration, at least `1s` | `30s` | How often the mount records files held open and retries failed records (§3.1, §3.5) |
 | `agentfs.repackInterval` | duration, at least `1m`, or `0`/`off` | `1h` | How often the commit loop (`mount`, `run`) repacks the history with `git repack -d --geometric=2`, delta-compressing versions of files changed in place (§8). Needs the `git` CLI; skipped when nothing is loose, and tried again a second later while a push runs; a failure raises `RepackFailed`. git runs with one thread and bounded windows, about 256 MiB, in a cleared environment; commits wait while it runs, and a stop kills it. `0` or `off` never repacks |
-| `agentfs.patchRemote` | remote name, or `none` | the only remote, when exactly one is configured; else none | Where the patch queue (§12) is fetched from at mount, and the only remote that gets the queue push (status ref, `applied/<n>`, deleted `inbox/<n>`). A name that is not a valid remote means none. With none, patches already in the local inbox still apply |
+| `agentfs.patchRemote` | remote name, or `none` | the only remote, when exactly one is configured; else none | Where the patch queue (§12) is fetched from at mount, and the only remote that gets the queue push (status ref, `applied/<n>`, deleted `inbox/<n>`). A name that is not a valid remote means none. With none, patches already in the local inbox still apply. A linked fork's queue is on its fork remote whatever this names, except that `none` turns it off (design §11.5), and then `fork create` refuses forks of it (`ParentHasNoQueue`) |
 | `agentfs.patchFetchTimeout` | duration, or `0`/`off` | `30s` | How long a mount (or `agentfs patch apply`) waits for the inbox fetch; on timeout or failure it raises `PatchFetchFailed` and applies what is already fetched. `0` or `off` skips the fetch |
 | `agentfs.patchAccept` | `cleanMerge`, `approval` or `command` | `cleanMerge` | The acceptance rule: whether a patch that merges cleanly onto the head may land (§12). `cleanMerge` lands it. `approval` lands it once `refs/agentfs/<volume>/approved/<n>` on the patch remote names its tip (`agentfs patch approve N`); until then it is set aside, awaiting approval, and a replaced patch needs approving again. `command` runs `$GIT_DIR/hooks/patch-accept` without a shell, in an empty environment but `PATH`, with the candidate as JSON on stdin (schema 1: `volume`, `inbox`, `tip`, `base`, `head`, `merged_tree`, `commits`, `paths`, `barrier`): exit 0 lands it, 1 holds it as `refused` (its first line of stderr is the message), 75 sets it aside awaiting the hook; any other status, a signal, the timeout or a hook that cannot start leaves it not judged and raises `PatchRuleFailed`. A set-aside patch is judged again at every run. Any other value fails the volume (`BadChoice`) |
 | `agentfs.patchAcceptTimeout` | duration above zero | `60s` | How long the `patch-accept` hook may run; at the timeout its process group is killed and the patch is not judged. `0` is refused (`TooShort`) |
@@ -224,7 +224,9 @@ local-only source, none: it publishes into the source's history
 the sections of its own remotes file, or none: it is local-only, and it
 has no patch queue. A linked fork's patch queue is on its fork remote,
 where its own forks roll their changes up; a fork of a local-only source
-has none.
+has none, and `agentfs.patchRemote = none` turns it off (any other value
+of that key names one of the source's remotes and changes nothing for
+the fork).
 
 | Key | Type | Default | Meaning and validation |
 |---|---|---|---|

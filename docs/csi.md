@@ -807,8 +807,9 @@ off every branch ([configuration](configuration.md#agentfs)).
   next NodeStage with no front attached, and the parent's own change
   carries it up when the parent finishes. CreateVolume refuses a fork of
   an unlinked fork, of a fork with hidden history (`agentfs.forkRefs =
-  hidden` in the profile when the parent was made) and of a fork of a
-  local-only source. A child that finishes after its parent is published
+  hidden` in the profile when the parent was made), of a fork of a
+  local-only source and of a fork whose profile sets
+  `agentfs.patchRemote = none` (its queue is off). A child that finishes after its parent is published
   as a top-level fork (`ForkParentFinished`). A parent deleted before a
   NodeStage has landed its children's changes publishes without them and
   raises `ForkInboxNotCarried`: after deleting its children's claims,

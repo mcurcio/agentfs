@@ -522,7 +522,9 @@ pub struct Settings {
     /// volume (design §11.1).
     pub invalid_remotes: Vec<InvalidRemote>,
     /// `agentfs.patchRemote`: where the patch queue is fetched from and
-    /// its refs pushed to (design §12).
+    /// its refs pushed to (design §12). Read it through
+    /// [`Settings::patch_remote`]: a linked fork's queue is on its fork
+    /// remote, and only `none` changes that.
     pub patch_remote: PatchRemote,
     /// `agentfs.patchFetchTimeout`: how long the mount waits for the
     /// patch fetch (design §12). Default 30s.
@@ -680,7 +682,8 @@ pub enum ForkRemote {
     SourceHistory,
 }
 
-/// `agentfs.patchRemote` (design §12).
+/// `agentfs.patchRemote` (design §12). A linked fork honours only
+/// `Disabled` ([`Settings::patch_remote`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchRemote {
     /// Unset: the only remote, if exactly one is configured and valid.
@@ -699,10 +702,13 @@ impl Settings {
     /// an invalid one does not count against the automatic choice. A
     /// linked fork's queue is on its fork remote section, where its own
     /// history is pushed and where its forks roll their changes up (bead
-    /// agentfs-mia.7); a fork of a local-only source has none.
+    /// agentfs-mia.7); a fork of a local-only source has none, and
+    /// `agentfs.patchRemote = none` turns it off (bead agentfs-tuf). Any
+    /// other value names one of the source's remotes, never the fork's.
     pub fn patch_remote(&self) -> Option<&RemoteSettings> {
         if self.fork.is_some() {
-            return match self.is_unlinked_fork() {
+            let off = self.is_unlinked_fork() || self.patch_remote == PatchRemote::Disabled;
+            return match off {
                 true => None,
                 false => self.fork_remote_section(),
             };
@@ -1243,12 +1249,7 @@ impl Settings {
                 author_email: string(config, "agentfs.identity.authorEmail")?
                     .unwrap_or(defaults.author_email),
             },
-            // A fork has no patch queue (design §11.5).
-            patch_remote: if fork.is_some() {
-                PatchRemote::Disabled
-            } else {
-                patch_remote
-            },
+            patch_remote,
             patch_fetch_timeout: patch_fetch_timeout(config)?,
             patch_accept: patch_accept(config)?,
             patch_accept_timeout: patch_accept_timeout(config)?,
@@ -3060,9 +3061,31 @@ mod tests {
         assert_eq!(s.branch_ref, "refs/heads/agentfs/f-1");
         let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["forks"]);
-        assert_eq!(s.patch_remote, PatchRemote::Disabled);
+        assert_eq!(s.patch_remote, PatchRemote::Named("origin".into()));
         assert_eq!(s.patch_remote().map(|r| r.name.as_str()), Some("forks"));
         assert_eq!(s.parent_fork(), None);
+        // Unset: the queue stays on the fork remote.
+        let (_d, c) = config_with(&fork_config(
+            "[remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n",
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.patch_remote, PatchRemote::Auto);
+        assert_eq!(s.patch_remote().map(|r| r.name.as_str()), Some("forks"));
+        // An explicit `none` turns the queue off (bead agentfs-tuf); the
+        // fork still pushes to its fork remote.
+        let (_d, c) = config_with(&fork_config(
+            "[agentfs]\n\tpatchRemote = none\n[remote \"origin\"]\n\turl = /o\n\
+             [remote \"forks\"]\n\turl = /f\n\tagentfsForkRemote = true\n",
+        ));
+        let s = Settings::from_config(&c).unwrap();
+        assert_eq!(s.patch_remote, PatchRemote::Disabled);
+        assert_eq!(s.patch_remote(), None);
+        assert_eq!(
+            s.fork_remote_section().map(|r| r.name.as_str()),
+            Some("forks")
+        );
+        let names: Vec<&str> = s.remotes.pushed().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["forks"]);
         // No flagged section: the source's patch remote (gate answer Q1 b).
         let (_d, c) = config_with(&fork_config("[remote \"origin\"]\n\turl = /o\n"));
         let s = Settings::from_config(&c).unwrap();

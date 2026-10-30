@@ -489,8 +489,9 @@ parent's `patch status` lists the change like any patch, and everything
 in sections 3 and 4 applies to it.
 
 `fork create` refuses to fork an unlinked fork, a fork whose history is
-hidden (`agentfs.fork.pushTarget = hidden`) and a fork of a local-only
-source: none has a queue its forks could roll up into.
+hidden (`agentfs.fork.pushTarget = hidden`), a fork of a local-only
+source and a fork whose settings set `agentfs.patchRemote = none`: none
+has a queue its forks could roll up into.
 
 **`ForkParentFinished`**: the child finished after its parent had (the
 parent's `refs/agentfs/<parent>/finish` was on the fork remote), so its

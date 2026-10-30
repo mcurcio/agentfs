@@ -2232,7 +2232,7 @@ fn a_child_after_its_parent() {
 /// Test 4: a fork whose own forks could never roll up is refused as a
 /// source, each with its own error, and nothing is written for the child.
 #[test]
-fn unlinked_hidden_and_local_only_parents_are_refused() {
+fn unlinked_hidden_local_only_and_queueless_parents_are_refused() {
     let source = Vol::new("src");
     source.change(&[("a.txt", "a\n")]);
     let child_of = |parent: &Fork, source: &Vol, name: &str| {
@@ -2275,6 +2275,29 @@ fn unlinked_hidden_and_local_only_parents_are_refused() {
     assert!(matches!(
         child_of(&of_local, &local, "lo-1-1"),
         Err(CreateError::ParentHasNoQueue { volume }) if volume == "lo-1"
+    ));
+
+    // A fork whose queue `agentfs.patchRemote = none` turns off (bead
+    // agentfs-tuf): a child's roll-up would queue where nothing lands.
+    let off = Vol::new("off");
+    off.change(&[("a.txt", "a\n")]);
+    let forks = off.dir.path().join("forks.git");
+    Repository::init_bare(&forks).unwrap();
+    fs::write(
+        &off.fragment,
+        format!(
+            "[agentfs]\n\tpatchRemote = none\n[remote \"origin\"]\n\turl = {}\n\
+             [remote \"forks\"]\n\turl = {}\n\tagentfsForkRemote = true\n",
+            off.remote.display(),
+            forks.display()
+        ),
+    )
+    .unwrap();
+    let of_off = Fork::new();
+    of_off.create(&off, "off-1").unwrap();
+    assert!(matches!(
+        child_of(&of_off, &off, "off-1-1"),
+        Err(CreateError::ParentHasNoQueue { volume }) if volume == "off-1"
     ));
 }
 

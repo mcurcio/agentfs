@@ -5,7 +5,8 @@
 //! [`create`] reads the source's settings and branch head (the base). It
 //! refuses a source that has no fork remote, and a source that is a fork
 //! its own forks could not roll up into (bead agentfs-mia.7): an unlinked
-//! fork, a fork whose history is hidden, or a fork of a local-only source.
+//! fork, a fork whose history is hidden, or a fork with no patch queue (a
+//! fork of a local-only source, or one with `agentfs.patchRemote = none`).
 //! A fork of a fork records `agentfs.fork.sourceIsFork`. It then
 //! makes the fork's state area: the identity in the fork's own config,
 //! with its link (design §11.5), and, for a linked fork of a local-only
@@ -92,8 +93,8 @@ pub enum CreateError {
     )]
     ParentHistoryHidden { volume: String },
     #[error(
-        "volume {volume} is a fork of a local-only source: it has no patch queue for a fork of it \
-         to roll up into"
+        "volume {volume} is a fork with no patch queue (a fork of a local-only source, or \
+         agentfs.patchRemote = none): a fork of it would have nothing to roll up into"
     )]
     ParentHasNoQueue { volume: String },
     #[error(
@@ -278,8 +279,11 @@ fn record_value_once(fork: &StateDir, key: &str, value: &str) -> Result<(), Crea
 /// An unlinked fork needs no fork remote: it never pushes to its
 /// source's remotes. A source that is a fork is read from its own state
 /// area's identity (its push target is never an include's): refused when
-/// it is unlinked, when its history is hidden, or when it is a fork of a
-/// local-only source, in that order (bead agentfs-mia.7).
+/// it is unlinked, when its history is hidden, or when it has a fork
+/// remote but no patch queue ([`Settings::patch_remote`]: a fork of a
+/// local-only source, or `agentfs.patchRemote = none`, bead agentfs-tuf),
+/// in that order (bead agentfs-mia.7). One with no fork remote is
+/// [`CreateError::NoForkRemote`].
 fn read_source(state: &StateDir, link: ForkLink) -> Result<Source, CreateError> {
     let git = state.git();
     let settings = source_settings(state)?;
@@ -291,7 +295,7 @@ fn read_source(state: &StateDir, link: ForkLink) -> Result<Source, CreateError> 
         if fork.push_target == PushTarget::Hidden {
             return Err(CreateError::ParentHistoryHidden { volume });
         }
-        if settings.fork_remote == Some(ForkRemote::SourceHistory) {
+        if settings.fork_remote.is_some() && settings.patch_remote().is_none() {
             return Err(CreateError::ParentHasNoQueue { volume });
         }
     }
