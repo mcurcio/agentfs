@@ -2114,10 +2114,21 @@ fn a_fork_of_a_fork_rolls_up() {
         t.parent_inbox(),
         BTreeMap::from([(crate::patch::inbox_ref("src-1", 1), change)])
     );
-    // A roll-up publishes no change or finish ref of its own.
+    // A roll-up publishes no change ref of its own; its finish ref tells
+    // its own forks it finished.
     let remote = remote_refs(&t.source.remote);
     assert!(!remote.contains_key(&change_ref("src-1-1")), "{remote:?}");
-    assert!(!remote.contains_key(&finish_ref("src-1-1")), "{remote:?}");
+    let child_finish = finish::status(&t.child.state)
+        .unwrap()
+        .unwrap()
+        .record
+        .unwrap()
+        .finish;
+    assert_eq!(
+        remote.get(&finish_ref("src-1-1")),
+        Some(&child_finish),
+        "{remote:?}"
+    );
     let status = finish::status(&t.child.state).unwrap().unwrap();
     assert_eq!(status.state, ForkState::Published);
     assert_eq!(status.mark.unwrap().published.unwrap().inbox, Some(1));
@@ -2141,13 +2152,16 @@ fn a_fork_of_a_fork_rolls_up() {
         "from the grandchild\n"
     );
 
-    // F finishes: its change, published for S, contains G's.
+    // F finishes: its change, published for S, contains G's, and nothing
+    // is left uncarried.
+    let (events, seen) = recording();
     let lock = t.parent.lock();
-    let mut finisher = t.parent.finisher(&lock).unwrap();
+    let mut finisher = t.parent.finisher_with(&lock, events).unwrap();
     assert_eq!(
         finisher.publish(Some(soon())).unwrap(),
         PublishOutcome::Published
     );
+    assert_eq!(not_carried(&seen), Vec::<Event>::new());
     let remote = Repository::open_bare(&t.source.remote).unwrap();
     let parent_change = remote
         .find_commit(remote.refname_to_id(&change_ref("src-1")).unwrap())
@@ -2327,4 +2341,157 @@ fn a_roll_up_takes_the_next_number() {
         Some(&t.child_change())
     );
     assert_eq!(refs.get(&crate::patch::inbox_ref("src-1", 1)), Some(&other));
+}
+
+/// The `ForkInboxNotCarried` events among `seen`.
+fn not_carried(seen: &Arc<Mutex<Vec<Event>>>) -> Vec<Event> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::ForkInboxNotCarried { .. }))
+        .cloned()
+        .collect()
+}
+
+/// Test 7: a child finished, then its parent with no queue run between:
+/// the parent's change does not carry the child's, so the parent raises
+/// ForkInboxNotCarried naming the entry, still publishes, and the entry
+/// stays queued on the fork remote.
+#[test]
+fn a_parent_finished_before_its_queue_ran_says_so() {
+    let t = Tree3::new();
+    {
+        let lock = t.child.lock();
+        let mut finisher = t.child.finisher(&lock).unwrap();
+        assert_eq!(
+            finisher.publish(Some(soon())).unwrap(),
+            PublishOutcome::Submitted { inbox: 1 }
+        );
+    }
+    let (events, seen) = recording();
+    let lock = t.parent.lock();
+    let mut finisher = t.parent.finisher_with(&lock, events).unwrap();
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Published
+    );
+    assert_eq!(
+        not_carried(&seen),
+        [Event::ForkInboxNotCarried {
+            fork: "src-1".into(),
+            remote: "origin".into(),
+            inboxes: vec![1],
+        }]
+    );
+    assert_eq!(
+        t.parent_inbox(),
+        BTreeMap::from([(crate::patch::inbox_ref("src-1", 1), t.child_change())])
+    );
+    // Published once: a second run reads the mark and says nothing more.
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Published
+    );
+    assert_eq!(not_carried(&seen).len(), 1);
+}
+
+/// Test 8: the child's push into its parent's inbox raced the parent's
+/// finish (here: a crash after the push, before the mark, and the parent
+/// finished meanwhile). Listing again, the child sees the parent finished
+/// without its change, so it publishes as a top-level fork and raises
+/// ForkParentFinished; the parent, which saw the entry, raised
+/// ForkInboxNotCarried.
+#[test]
+fn a_child_queued_as_its_parent_finished_publishes_itself() {
+    let t = Tree3::new();
+    let lock = t.child.lock();
+    let mut child = t.child.finisher(&lock).unwrap();
+    assert_eq!(
+        child.publish(Some(soon())).unwrap(),
+        PublishOutcome::Submitted { inbox: 1 }
+    );
+    fs::remove_file(t.child.state.fork_mark()).unwrap();
+    {
+        let (events, seen) = recording();
+        let lock = t.parent.lock();
+        let mut finisher = t.parent.finisher_with(&lock, events).unwrap();
+        assert_eq!(
+            finisher.publish(Some(soon())).unwrap(),
+            PublishOutcome::Published
+        );
+        assert_eq!(not_carried(&seen).len(), 1);
+    }
+    let (events, seen) = recording();
+    drop(child);
+    let mut child = t.child.finisher_with(&lock, events).unwrap();
+    assert_eq!(
+        child.publish(Some(soon())).unwrap(),
+        PublishOutcome::Published
+    );
+    let raised: Vec<Event> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::ForkParentFinished { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        raised,
+        [Event::ForkParentFinished {
+            fork: "src-1-1".into(),
+            parent: "src-1".into(),
+        }]
+    );
+    let remote = remote_refs(&t.source.remote);
+    assert_eq!(
+        remote.get(&change_ref("src-1-1")),
+        Some(&t.child_change()),
+        "{remote:?}"
+    );
+}
+
+/// Test 9: three levels. G rolled up into F; G's fork H finishing after
+/// G sees G's finish ref and publishes as a top-level fork, rather than
+/// queueing into the inbox of a fork that will never run its queue again.
+#[test]
+fn a_fork_of_a_rolled_up_fork_sees_it_finished() {
+    let t = Tree3::new();
+    let grandchild = Fork::new();
+    grandchild
+        .create(&fork_as_source(&t.child, &t.source), "src-1-1-1")
+        .unwrap();
+    grandchild
+        .as_vol()
+        .write("h.txt", "from the great-grandchild\n");
+    {
+        let lock = t.child.lock();
+        let mut finisher = t.child.finisher(&lock).unwrap();
+        assert_eq!(
+            finisher.publish(Some(soon())).unwrap(),
+            PublishOutcome::Submitted { inbox: 1 }
+        );
+    }
+    let (events, seen) = recording();
+    let lock = grandchild.lock();
+    let mut finisher = grandchild.finisher_with(&lock, events).unwrap();
+    assert_eq!(
+        finisher.publish(Some(soon())).unwrap(),
+        PublishOutcome::Published
+    );
+    assert!(
+        seen.lock().unwrap().contains(&Event::ForkParentFinished {
+            fork: "src-1-1-1".into(),
+            parent: "src-1-1".into(),
+        }),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+    let remote = remote_refs(&t.source.remote);
+    assert!(
+        !remote
+            .keys()
+            .any(|name| name.starts_with(&crate::patch::inbox_prefix("src-1-1"))),
+        "{remote:?}"
+    );
+    assert!(remote.contains_key(&change_ref("src-1-1-1")), "{remote:?}");
 }

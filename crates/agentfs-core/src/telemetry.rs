@@ -788,6 +788,7 @@ impl EventSink for TelemetrySink {
             | Event::ForkPublished { .. }
             | Event::ForkRefused { .. }
             | Event::ForkParentFinished { .. }
+            | Event::ForkInboxNotCarried { .. }
             | Event::ForkAbandoned { .. }
             | Event::HistoryServiceUnavailable { .. }
             | Event::HistoryServiceRestored { .. }
@@ -845,6 +846,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::ForkPublished { .. } => "agentfs.fork_published",
         Event::ForkRefused { .. } => "agentfs.fork_refused",
         Event::ForkParentFinished { .. } => "agentfs.fork_parent_finished",
+        Event::ForkInboxNotCarried { .. } => "agentfs.fork_inbox_not_carried",
         Event::ForkAbandoned { .. } => "agentfs.fork_abandoned",
         Event::HistoryServiceUnavailable { .. } => "agentfs.history_service_unavailable",
         Event::HistoryServiceRestored { .. } => "agentfs.history_service_restored",
@@ -1086,6 +1088,23 @@ fn log_attributes(event: &Event) -> Vec<(&'static str, AnyValue)> {
         Event::ForkParentFinished { fork, parent } => {
             out.push(("agentfs.fork", s(fork)));
             out.push(("agentfs.fork.parent", s(parent)));
+        }
+        Event::ForkInboxNotCarried {
+            fork,
+            remote,
+            inboxes,
+        } => {
+            out.push(("agentfs.fork", s(fork)));
+            out.push(("agentfs.remote", s(remote)));
+            out.push((
+                "agentfs.patch.inboxes",
+                AnyValue::ListAny(Box::new(
+                    inboxes
+                        .iter()
+                        .map(|n| AnyValue::from(i64::try_from(*n).unwrap_or(i64::MAX)))
+                        .collect(),
+                )),
+            ));
         }
         Event::ForkAbandoned { fork, reason } => {
             out.push(("agentfs.fork", s(fork)));

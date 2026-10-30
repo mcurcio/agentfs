@@ -802,14 +802,21 @@ off every branch ([configuration](configuration.md#agentfs)).
   §12 "Forks of forks"). When it finishes, the release scan's finisher
   queues its change as the parent fork's next inbox number on the fork
   remote, with the fork remote's credentials, instead of publishing
-  change and finish refs; the parent's queue lands it at the parent's
+  a change ref (it pushes its finish ref, so its own forks see it
+  finished); the parent's queue lands it at the parent's
   next NodeStage with no front attached, and the parent's own change
   carries it up when the parent finishes. CreateVolume refuses a fork of
   an unlinked fork, of a fork with hidden history (`agentfs.forkRefs =
   hidden` in the profile when the parent was made) and of a fork of a
   local-only source. A child that finishes after its parent is published
-  as a top-level fork (`ForkParentFinished`;
-  [the runbook](runbooks/patch-queue.md#9-forks-of-forks)).
+  as a top-level fork (`ForkParentFinished`). A parent deleted before a
+  NodeStage has landed its children's changes publishes without them and
+  raises `ForkInboxNotCarried`: after deleting its children's claims,
+  stop the parent's pod and start one again (a NodeStage with nothing
+  attached lands them), then delete its claim
+  ([the runbook](runbooks/patch-queue.md#9-forks-of-forks)).
+  `agentfs fork list` shows a rolled-up fork's finish ref as skipped (it
+  has no `change` ref: its parent carries it).
   `ci/e2e-csi-fork-of-fork.sh` runs this on kind against an
   authenticated fork remote.
 - **Read-only once finished.** A finished fork takes no changes. Staged

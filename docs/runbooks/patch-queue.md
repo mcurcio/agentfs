@@ -478,7 +478,8 @@ A linked fork's patch remote is its fork remote, so a fork can be forked
 its change as its parent's next inbox number on the fork remote, using
 that remote's credentials; the parent's queue lands it at its next mount
 with nothing attached, and the parent's own change, when it finishes,
-carries it up a level. `agentfs fork status` shows the child
+carries it up a level. Finishing the parent does not run its queue:
+see `ForkInboxNotCarried` below for the order that carries everything. `agentfs fork status` shows the child
 `published`, and its `meta/fork.json` mark names the inbox number. The
 parent's `patch status` lists the change like any patch, and everything
 in sections 3 and 4 applies to it.
@@ -496,5 +497,30 @@ nothing lands it either: it is a published change like any top-level
 fork's, which `agentfs fork list` shows and `agentfs fork deliver` hands
 to a receiver (design §11.5 "Delivery"). Its base is a commit of the
 parent's history, not of the source's branch: deliver it where that
-history is reviewed, or leave it. To avoid it, finish children (delete
-their claims) before their parent.
+history is reviewed, or leave it. The child also lists its parent again
+after queueing its change, so a parent that finished in that moment
+raises this the same way.
+
+**`ForkInboxNotCarried`**: a fork was published while its inbox on the
+fork remote held entries its history never landed, listed by number. A
+finish never runs the queue: only a mount with nothing attached does.
+So a child that finished after its parent's last mount is in the
+parent's inbox but not in the parent's change. The entries stay at
+`refs/agentfs/<fork>/inbox/<n>` on the fork remote, and nothing lands
+them. Each is a commit on a commit of the parent's history: fetch it
+(`git fetch <fork remote> refs/agentfs/<fork>/inbox/<n>`) and apply it
+where the parent's change went, for example as a patch to the source
+once the parent's change has landed there, or leave it.
+
+To avoid both alarms, retire a tree of forks from the leaves up, and let
+each parent mount once after its children finished:
+
+1. Finish the children (delete their claims). Each queues its change in
+   its parent's inbox.
+2. Stop the parent's workload and start it again, so its volume mounts
+   with nothing attached (under CSI: delete its pod, then start one; a
+   NodeStage lands the queue). Outside Kubernetes, mount it, or run
+   `agentfs patch apply` with nothing attached. Its queue lands the
+   children's changes; `agentfs patch status` shows them applied.
+3. Finish the parent (delete its claim). Its change carries its
+   children's.

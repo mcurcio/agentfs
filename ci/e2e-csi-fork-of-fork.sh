@@ -16,7 +16,8 @@
 #      plugin's release scan rolls its change up into the child's queue on
 #      the fork remote (refs/agentfs/<child>/inbox/0000000001 holds g.txt),
 #      logging in with the fork remote's credentials, publishes no change
-#      or finish ref of the grandchild's, and the PV goes;
+#      ref of the grandchild's but its finish ref (its own forks read it as
+#      finished), and the PV goes;
 #   4. the child's next pod sees g.txt: its queue landed the patch when its
 #      history service started with nothing attached, and its applied ref
 #      reaches the fork remote.
@@ -256,8 +257,9 @@ fgit merge-base --is-ancestor "$(fgit rev-parse "$INBOX^")" "refs/heads/agentfs/
   fail "the patch's parent is not on the child's branch"
 pass "the patch's parent is a commit of the child's branch, the base the grandchild forked"
 ref_exists "$FORKS_REMOTE" "refs/agentfs/$GC/change" && fail "the grandchild published a change ref"
-ref_exists "$FORKS_REMOTE" "refs/agentfs/$GC/finish" && fail "the grandchild published a finish ref"
-pass "a rolled-up fork publishes no change or finish ref of its own"
+pass "a rolled-up fork publishes no change ref of its own"
+until_ok 120 "the grandchild's finish ref is on the fork remote" \
+  ref_exists "$FORKS_REMOTE" "refs/agentfs/$GC/finish"
 until_ok 600 "the grandchild's PV is gone once its change is queued" pv_gone "$GC_PV"
 
 step "(4) the child's next pod sees the grandchild's file"

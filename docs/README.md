@@ -40,7 +40,7 @@ that point to it.
 | [Pushes that keep failing](runbooks/stuck-pushes.md) | `PushFailed` again and again, a growing push backlog |
 | [A diverged remote](runbooks/divergence.md) | Someone else moved the volume's branch (`Diverged`) |
 | [Removing a recorded secret](runbooks/history-rewrite.md) | A secret reached history: rewrite it, the one documented force-push |
-| [The patch queue](runbooks/patch-queue.md) | A held patch or a blocked queue (`PatchHeld`, `PatchBlocked`, `PatchRuleFailed`), a notice that failed (`NotifyFailed`), a refused push to `serve-git`, a fork of a fork whose parent finished first (`ForkParentFinished`) |
+| [The patch queue](runbooks/patch-queue.md) | A held patch or a blocked queue (`PatchHeld`, `PatchBlocked`, `PatchRuleFailed`), a notice that failed (`NotifyFailed`), a refused push to `serve-git`, a fork of a fork whose parent finished first (`ForkParentFinished`), a fork that finished with patches its change does not carry (`ForkInboxNotCarried`) |
 | [LFS storage](runbooks/lfs-storage.md) | The LFS cache's size, pruning and fetching objects |
 | [A crashed sidecar](runbooks/crashed-sidecar.md) | The daemon died in a pod |
 | [Upgrading the sidecar](runbooks/upgrading-the-sidecar.md) | Rolling out a new image for the phase 1 sidecar |
