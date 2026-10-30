@@ -20,7 +20,8 @@
 //!   `pre-receive` hook, objects still quarantined): every update must be
 //!   allowed, else nothing is. Pushers write only the queue's inbox and
 //!   approvals: `inbox/<n>` with [`Right::Offer`] (and [`Right::Barrier`]
-//!   for a tip carrying `Agentfs-Barrier: yes`), `approved/<n>` with
+//!   for a tip carrying `Agentfs-Barrier: yes`, or one replacing such a
+//!   tip, since that removes the barrier), `approved/<n>` with
 //!   [`Right::Approve`]. The branch, `applied/*`, the status, deletes and
 //!   every other ref are refused. An offered tip must also read as a patch
 //!   against the branch head ([`PatchBranch::read`]), so nothing the queue
@@ -251,6 +252,10 @@ pub fn admit(
             if patch.barrier {
                 need(Right::Barrier, format!("offer barrier patch {n}"))?;
             }
+            // Replacing a barrier, whatever with, removes it.
+            if !update.old.is_zero() && replaces_barrier(repo, update.old) {
+                need(Right::Barrier, format!("replace barrier patch {n}"))?;
+            }
         } else if let Some(n) = seq_of_ref(&approved, &update.name) {
             need(Right::Approve, format!("approve patch {n}"))?;
         } else {
@@ -260,6 +265,14 @@ pub fn admit(
         }
     }
     Ok(())
+}
+
+/// Whether the tip `old` an update replaces is a barrier. A tip that
+/// cannot be read counts as one, so only a pusher with
+/// [`Right::Barrier`] may replace it.
+fn replaces_barrier(repo: &Repository, old: Oid) -> bool {
+    repo.find_commit(old)
+        .map_or(true, |commit| super::integrate::is_barrier(&commit))
 }
 
 #[cfg(test)]
@@ -393,6 +406,44 @@ mod tests {
             r.admit(&[Right::Offer, Right::Barrier], &[(&inbox, barrier)]),
             Ok(())
         );
+    }
+
+    /// Replacing a barrier with an ordinary patch removes the barrier, so
+    /// it needs the barrier right too (bead agentfs-5sg).
+    #[test]
+    fn replacing_a_barrier_needs_the_barrier_right() {
+        let r = Repo::new();
+        let barrier = r.commit(
+            &[r.head()],
+            "a.txt",
+            "a1\n",
+            "one\n\nAgentfs-Barrier: yes\n",
+        );
+        let ordinary = r.commit(&[r.head()], "a.txt", "a2\n", "two");
+        let inbox = inbox_ref("v", 1);
+        let over = |rights: &[Right], old: Oid, new: Oid| {
+            let update = RefUpdate {
+                old,
+                new,
+                name: inbox.clone(),
+            };
+            admit(&r.repo, "v", BRANCH, &pusher(rights), &[update])
+        };
+        assert_eq!(
+            over(&[Right::Offer], barrier, ordinary),
+            Err(PushRefused::NotAllowed {
+                pusher: "iac".into(),
+                what: "replace barrier patch 1".into(),
+                right: Right::Barrier,
+            })
+        );
+        assert_eq!(
+            over(&[Right::Offer, Right::Barrier], barrier, ordinary),
+            Ok(())
+        );
+        // Replacing an ordinary patch needs only the offer right.
+        let other = r.commit(&[r.head()], "a.txt", "a3\n", "three");
+        assert_eq!(over(&[Right::Offer], ordinary, other), Ok(()));
     }
 
     #[test]

@@ -16,10 +16,15 @@
 //!   `agentfs.patchRemote` names a remote: the queue's fetch would prune
 //!   what pushers wrote. It never takes the state-area lock; git writes
 //!   the refs (with its lock files), as a push to a `file://` remote does.
-//! - **Refs.** Fetches and pushes see only the branch and
+//! - **Refs.** Fetches and pushes are shown only the branch and
 //!   `refs/agentfs/<volume>/{inbox,applied,approved}/*` and its `status`
 //!   (`transfer.hideRefs`); `held/*`, other volumes' refs, `HEAD` and the
-//!   rest stay hidden.
+//!   rest are not listed. That hides names, not objects: protocol v2's
+//!   upload-pack serves any object a client names by id (git-config(1)
+//!   `transfer.hideRefs`, gitnamespaces(7) "SECURITY"). Every client is a
+//!   pusher the operator configured, and the threat is mistakes, not
+//!   malice (design §1.1), so this is kept; data no pusher may read
+//!   belongs in another repository.
 //! - **Pushers.** Every request authenticates as a pusher of the volume's
 //!   config ([`agentfs_core::patch::admit`]): HTTP Basic with the pusher's
 //!   name and token, or a bearer token; otherwise 401. git runs with the

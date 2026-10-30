@@ -184,13 +184,17 @@ impl Notifier for WebhookNotifier {
             })?;
             headers.push(("Authorization", format!("Bearer {}", token.trim())));
         }
+        // Settings refuse a URL with userinfo; a caller building the
+        // notifier itself may not, so a failure never prints it.
         match crate::lfs::client::post_json(&self.url, &body, &headers, self.timeout) {
             Ok(200..=299) => Ok(()),
             Ok(status) => Err(NotifyError::Webhook(format!(
                 "{} answered {status}",
-                self.url
+                crate::push::redact_url(&self.url)
             ))),
-            Err(e) => Err(NotifyError::Webhook(e)),
+            Err(e) => Err(NotifyError::Webhook(crate::push::scrub_userinfo(
+                &e, &self.url,
+            ))),
         }
     }
 }
@@ -554,5 +558,55 @@ mod tests {
         assert_eq!(back, notice);
         let landed = serde_json::to_value(ApplyAnswer::Landed { landed: vec![1] }).unwrap();
         assert_eq!(landed, serde_json::json!({"kind": "landed", "landed": [1]}));
+    }
+
+    /// A URL's userinfo never reaches a failure's message (bead
+    /// agentfs-5sg): neither when the webhook answers non-2xx nor when it
+    /// cannot be reached. Settings refuse such a URL; this covers a
+    /// library caller building the notifier itself.
+    #[test]
+    fn webhook_failures_never_print_userinfo() {
+        use std::io::{Read as _, Write as _};
+        let notice = Notice {
+            schema: NOTICE_SCHEMA,
+            volume: "vol".into(),
+            branch: "refs/heads/agentfs/vol".into(),
+            head: None,
+            status: "s".into(),
+            changes: Vec::new(),
+            apply: None,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 500 Nope\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let answered = WebhookNotifier::new(
+            format!("http://iac:s3cret@127.0.0.1:{port}/hook"),
+            None,
+            Duration::from_secs(10),
+        )
+        .notify(&notice)
+        .unwrap_err()
+        .to_string();
+        server.join().unwrap();
+        assert!(answered.contains("answered 500"), "{answered}");
+        assert!(!answered.contains("s3cret"), "{answered}");
+        // Port 0: nothing can listen there, so no POST is answered.
+        let unreachable = WebhookNotifier::new(
+            "http://iac:s3cret@127.0.0.1:0/hook".to_owned(),
+            None,
+            Duration::from_secs(10),
+        )
+        .notify(&notice)
+        .unwrap_err()
+        .to_string();
+        assert!(!unreachable.contains("s3cret"), "{unreachable}");
+        assert!(unreachable.contains("127.0.0.1"), "{unreachable}");
     }
 }
