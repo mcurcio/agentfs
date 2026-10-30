@@ -511,6 +511,55 @@ fn a_set_aside_number_is_judged_again_only_with_its_mark() {
     assert_eq!(report.ignored[0].why, "stale");
 }
 
+/// A crash after a set-aside number lands (failpoint
+/// `patch.after_commit`), before its refs move and its held mark is
+/// dropped: the next run finds the number applied on the branch, drops
+/// the mark and finishes the bookkeeping; nothing lands twice (bead
+/// agentfs-mia.2).
+#[test]
+fn a_held_mark_for_an_applied_number_is_dropped() {
+    if !have_git() {
+        return;
+    }
+    let f = Fixture::new(&[("b.txt", "b0\n")]);
+    let base = f.head();
+    let p1 = f.patch(base, &[("b.txt", Some("iac\n"))], "edit b");
+    let p2 = f.patch(base, &[("c.txt", Some("c\n"))], "add c");
+    f.change(&[("b.txt", "workload\n")], &[]);
+    f.queue(1, p1);
+    f.queue(2, p2);
+    assert_eq!(f.process().set_aside.len(), 1);
+    let p1b = f.patch(f.head(), &[("b.txt", Some("merged\n"))], "edit b, rebased");
+    f.queue(1, p1b);
+    let report = f.process();
+    assert_eq!(
+        report.applied.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        [1]
+    );
+    let head = f.head();
+    // What the crash left: the commit, but inbox/1 and held/1 unmoved.
+    f.repo()
+        .find_reference(&applied_ref("vol", 1))
+        .unwrap()
+        .delete()
+        .unwrap();
+    f.queue(1, p1b);
+    f.repo()
+        .reference(&held_ref("vol", 1), p1b, true, "test")
+        .unwrap();
+
+    let report = f.process();
+    assert!(report.applied.is_empty(), "{report:?}");
+    assert!(report.set_aside.is_empty(), "{report:?}");
+    assert_eq!(report.already, [1]);
+    assert_eq!(f.head(), head);
+    assert_eq!(f.reference(&held_ref("vol", 1)), None);
+    assert_eq!(f.reference(&inbox_ref("vol", 1)), None);
+    assert_eq!(f.reference(&applied_ref("vol", 1)), Some(p1b));
+    assert_eq!(f.inbox_commits(1), 1);
+    assert_eq!(PatchState::load(&f.state.patch_state()).held, 0);
+}
+
 /// Crash (b) on a set-aside number below the high-water, then the
 /// producer skips it: the interrupted write is put back (the branch has
 /// not applied that number, whatever the high-water says), and the skip
