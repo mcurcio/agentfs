@@ -1,0 +1,15 @@
+# Hermes on an agentfs CSI volume (ci/e2e-hermes-kind.sh csi, docs/csi.md):
+# Hermes and docker-in-docker in one pod, the claim at /opt/data in both.
+# Their namespace allows privileged pods, for dind; Hermes needs none.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: hermes-csi
+
+resources:
+  - namespace.yaml
+  - storageclass.yaml
+  - deployment.yaml
+
+components:
+  - ../common

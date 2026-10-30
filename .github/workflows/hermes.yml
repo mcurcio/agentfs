@@ -1,0 +1,112 @@
+name: hermes
+
+# Upstream Hermes (design §16) on agentfs in kind, one configuration per
+# job, each on its own runner (ci/e2e-hermes-kind.sh): the sidecar pod of
+# docs/deployment.md §10 with the migration of existing data and a
+# sidecar-only restart, its read-only fence alternative, and Hermes on a
+# CSI volume. The Compose suite is docker.yml's hermes job.
+
+on:
+  push:
+    paths: &paths
+      - Dockerfile
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - ci/e2e-hermes-kind.sh
+      - ci/hermes/**
+      - ci/lib.sh
+      - ci/k8s/**
+      - ci/k8s-csi/driver/**
+      - ci/kind/**
+      - ci/install-kind.sh
+      - ci/git-http-server.sh
+      - deploy/examples/hermes/**
+      - deploy/sidecar/**
+      - deploy/csi/**
+      # The migration Job runs the block of §10 as written.
+      - docs/deployment.md
+      - .github/workflows/hermes.yml
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: render the manifests
+        run: |
+          for d in sidecar fence before csi csi-driver; do
+            kubectl kustomize --load-restrictor LoadRestrictionsNone "ci/hermes/k8s/$d" >/dev/null
+          done
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Reads the image workflow's layer cache and writes none, so the two
+      # workflows never race on it.
+      - name: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          tags: agentfs:ci
+          outputs: type=docker,dest=${{ runner.temp }}/agentfs-image.tar
+          cache-from: type=gha,scope=agentfs-image
+          provenance: false
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agentfs-image-hermes
+          path: ${{ runner.temp }}/agentfs-image.tar
+          retention-days: 1
+
+  e2e:
+    name: e2e (Hermes on kind, ${{ matrix.mode }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [sidecar, fence, csi]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentfs-image-hermes
+          path: ${{ runner.temp }}
+      - name: FUSE, nginx and fcgiwrap
+        run: |
+          sudo modprobe fuse
+          ls -l /dev/fuse
+          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+      - name: install kind and kubectl
+        run: |
+          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
+          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+      - name: create the cluster
+        run: |
+          docker load -i "$RUNNER_TEMP/agentfs-image.tar"
+          kind create cluster --name agentfs-hermes --config ci/kind/cluster.yaml \
+            --image "$KIND_NODE_IMAGE" --wait 120s
+          kind load image-archive "$RUNNER_TEMP/agentfs-image.tar" --name agentfs-hermes
+          kubectl get nodes -o wide
+      - name: start git server
+        run: |
+          GIT_SERVER_EXTRA_LISTEN=$(ci/e2e-hermes-kind.sh gateway) \
+            ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
+      - run: ci/e2e-hermes-kind.sh ${{ matrix.mode }}
+      - name: diagnose
+        if: failure()
+        run: ci/e2e-hermes-kind.sh diagnose ${{ matrix.mode }}
+      - name: clean up
+        if: always()
+        run: |
+          kind delete cluster --name agentfs-hermes || true
+          ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"

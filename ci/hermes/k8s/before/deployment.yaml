@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-before
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app.kubernetes.io/name: hermes-before }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: hermes-before }
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: hermes-config
+          volumeMounts:
+            - { name: data, mountPath: /opt/data }
+        - name: dind
+          volumeMounts:
+            - { name: data, mountPath: /opt/data }
+      containers:
+        - name: hermes
+          volumeMounts:
+            - { name: data, mountPath: /opt/data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: agentfs-data

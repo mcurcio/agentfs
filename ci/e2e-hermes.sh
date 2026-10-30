@@ -7,7 +7,8 @@
 # containers on a docker-in-docker service that has the mount too; a
 # scripted model server (ci/hermes/model) stands in for the model API, so
 # every turn is deterministic and needs no key. Hermes is driven through
-# its gateway's OpenAI-compatible API. Each check fails loudly:
+# its gateway's OpenAI-compatible API. The checks are ci/hermes/lib.sh's,
+# shared with the kind suite (ci/e2e-hermes-kind.sh). Each fails loudly:
 #
 #   1. Hermes starts as upstream ships it (root init) on the mount, and
 #      files keep their owners, in Hermes and in the backing tree;
@@ -21,7 +22,13 @@
 #      the volume is restarted with nothing attached, and Hermes reads the
 #      new content: its next model request carries the patched SOUL.md;
 #   5. a tool container's edit, made through Hermes' terminal tool, reaches
-#      the Hermes container and is committed, as root, and pushed.
+#      the Hermes container and is committed, as root, and pushed;
+#   6. with `terminal.docker_volumes` empty (upstream's default), a tool
+#      container's write to /opt/data stays in the tool container, never
+#      in Hermes' files nor the history; upstream still binds Hermes'
+#      skills read-only and the tool container's persistent home from
+#      Hermes' home (sandboxes/, never recorded); Hermes' own edits are
+#      still recorded.
 #
 #   ci/e2e-hermes.sh            run the checks
 #   ci/e2e-hermes.sh diagnose   print Hermes' own logs, the tool containers
@@ -31,6 +38,7 @@
 # module loaded, and a host whose / is a shared mount (GitHub's runners).
 
 . "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/hermes/lib.sh"
 
 EX=examples/docker
 export AGENTFS_IMAGE=${AGENTFS_IMAGE:-agentfs:ci}
@@ -38,16 +46,23 @@ export VOLUME=hermes
 files=(-f "$EX/compose.yaml" -f "$EX/compose.remote.yaml" -f ci/hermes/compose.yaml)
 dc() { docker compose "${files[@]}" "$@"; }
 BRANCH=agentfs/$VOLUME
-SCENARIOS=ci/hermes/model/scenarios.json
-API_KEY=agentfs-ci-not-a-secret
+HERMES_DIR=/opt/data
+BACKING=/data/backing
 
-in_hermes() { dc exec -T hermes sh -c "$1"; }
+hermes_exec() { dc exec -T hermes "$@"; }
+hermes_logs() { dc logs --no-color --no-log-prefix hermes; }
+dind_exec() { dc exec -T dind "$@"; }
+model_exec() { dc exec -T model "$@"; }
+backing_exec() { dc exec -T agentfs "$@"; }
 history() { dc exec -T agentfs git --git-dir /data/state/git "$@"; }
 rgit() { dc exec -T -u www-data git-server git --git-dir /srv/git/history.git "$@"; }
-
-# The requests the model server received, as JSON.
-model_requests() {
-  dc exec -T model python3 -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/requests').read().decode())"
+agentfs_status() { dc exec -T agentfs agentfs status; }
+run_producer() { # marker
+  dc run --rm -T -e MARKER="$1" -e VOLUME="$VOLUME" producer "
+    user=\$(sed -n 's/^username=//p' /run/secrets/origin)
+    password=\$(sed -n 's/^password=//p' /run/secrets/origin)
+    ORIGIN=http://\$user:\$password@git-server:8080/git/history.git
+    $PRODUCER_SUBMIT"
 }
 
 if [ "${1:-}" = diagnose ]; then
@@ -84,32 +99,6 @@ wait_healthy() { # service seconds
   pass "$1 is healthy"
 }
 
-# Waits until history function $1 has <path> on the branch with <content>.
-wait_content() { # git-fn path content [seconds]
-  local deadline=$((SECONDS + ${4:-120}))
-  until [ "$("$1" show "$BRANCH:$2" 2>/dev/null)" = "$3" ]; do
-    [ $SECONDS -lt $deadline ] || fail "$1 never had $2 as Hermes sees it"
-    sleep 1
-  done
-  pass "$1 has $2"
-}
-author() { "$1" log -1 --format=%an "$BRANCH" -- "$2"; } # git-fn path
-
-# Sends Hermes one user turn naming a scenario of the model server; a
-# fresh nonce makes each turn a new request to the gateway. Prints the
-# nonce.
-ask() { # scenario
-  local nonce out
-  nonce="$1-$(date +%s%N)"
-  out=$(dc exec -T hermes curl -sS --max-time 300 http://127.0.0.1:8642/v1/chat/completions \
-    -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
-    -d "{\"model\": \"hermes-agent\", \"messages\": [{\"role\": \"user\", \"content\": \"agentfs-scenario:$1 $nonce\"}]}") ||
-    fail "the request to Hermes failed: $out"
-  echo "$out" >&2
-  assert_contains "$out" "agentfs-scenario $1: done" "Hermes finished the $1 turn" >&2
-  echo "$nonce"
-}
-
 step "start agentfs, the git server, the model server, docker-in-docker and Hermes"
 docker version --format 'docker {{.Server.Version}}'
 docker compose version
@@ -121,86 +110,18 @@ dc up -d --quiet-pull
 wait_healthy agentfs 300
 wait_healthy hermes 600
 
-step "1. Hermes starts as upstream ships it (root init) on the mount"
-assert_contains "$(in_hermes 'grep " /opt/data " /proc/self/mountinfo')" "fuse" "Hermes' /opt/data is the agentfs FUSE mount"
-logs=$(dc logs --no-color --no-log-prefix hermes)
-assert_contains "$logs" "[stage2] Setup complete" "the image's root start-up ran to the end on the mount"
-assert_eq "hermes 640" "$(in_hermes 'stat -c "%U %a" /opt/data/config.yaml')" "start-up chowned and chmodded config.yaml to hermes"
-assert_eq "hermes 600" "$(in_hermes 'stat -c "%U %a" /opt/data/.env')" "start-up created .env as hermes, mode 600"
-assert_eq hermes "$(in_hermes 'stat -c %U /opt/data/SOUL.md')" "start-up seeded SOUL.md as hermes"
-assert_eq hermes "$(in_hermes 'stat -c %U /opt/data/skills')" "start-up created skills/ as hermes"
-assert_eq 10000 "$(dc exec -T agentfs stat -c %u /data/backing/SOUL.md)" "the backing tree keeps SOUL.md's owner"
-soul=$(in_hermes 'cat /opt/data/SOUL.md')
-wait_content history SOUL.md "$soul"
-wait_content rgit SOUL.md "$soul"
-assert_eq uid-10000 "$(author rgit SOUL.md)" "SOUL.md is authored by Hermes' user"
+hermes_check_startup
 
 step "2. a skill Hermes creates with its own skill tool is recorded and pushed"
-skill=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["create-skill"][0]["arguments"]["operations"][0]["content"])' "$SCENARIOS")
-ask create-skill >/dev/null
-assert_eq "$skill" "$(in_hermes 'cat /opt/data/skills/agentfs-recorded/SKILL.md')" "Hermes wrote the skill"
-assert_eq hermes "$(in_hermes 'stat -c %U /opt/data/skills/agentfs-recorded/SKILL.md')" "the skill is Hermes' user's"
-wait_content history skills/agentfs-recorded/SKILL.md "$skill"
-wait_content rgit skills/agentfs-recorded/SKILL.md "$skill"
-assert_eq uid-10000 "$(author rgit skills/agentfs-recorded/SKILL.md)" "the skill's commit is authored by Hermes' user"
+hermes_check_skill create-skill
 
-step "5. a tool container's edit reaches Hermes and is recorded and pushed"
-sandbox_image=$(sed -n 's/^ *docker_image: *//p' ci/hermes/hermes/config.yaml)
-# Pulled ahead, so the terminal tool's first call does not wait on it.
-dc exec -T dind docker pull -q "$sandbox_image"
-ask sandbox-edit >/dev/null
-note=$(in_hermes 'cat /opt/data/skills/agentfs-sandbox/SKILL.md')
-echo "$note"
-tool=$(printf '%s\n' "$note" | sed -n 's/^Written in tool container \(.*\)\.$/\1/p')
-[ -n "$tool" ] || fail "the tool container's note names no container"
-[ "$tool" != "$(in_hermes hostname)" ] || fail "the note was written in the Hermes container"
-assert_contains "$(dc exec -T dind docker ps --no-trunc --format '{{.ID}} {{.Image}}')" "$tool" \
-  "the note was written in a tool container on docker-in-docker ($tool)"
-assert_eq root "$(in_hermes 'stat -c %U /opt/data/skills/agentfs-sandbox/SKILL.md')" "the tool container's file is root's in Hermes too"
-wait_content history skills/agentfs-sandbox/SKILL.md "$note"
-wait_content rgit skills/agentfs-sandbox/SKILL.md "$note"
-assert_eq uid-0 "$(author rgit skills/agentfs-sandbox/SKILL.md)" "the tool container's commit is authored by root"
+hermes_check_tool_edit
 
-step "3. secrets, sessions, logs and databases are never recorded"
-# Hermes keeps its sessions in state.db (upstream docker.md); its
-# sessions/ directory stays empty in this version.
-excluded=(.env state.db response_store.db logs/agent.log skills/agentfs-sandbox/auth.json skills/agentfs-sandbox/logs/run.log)
-for path in "${excluded[@]}"; do
-  in_hermes "test -e /opt/data/$path" || fail "$path was never written, so this check proves nothing"
-  dc exec -T agentfs test -e "/data/backing/$path" || fail "$path is not in the backing tree"
-done
-pass "written during the run: ${excluded[*]}"
-# Everything Hermes and the tool container wrote so far is committed and
-# pushed once the remote's branch is the history's.
-deadline=$((SECONDS + 120))
-until [ "$(rgit rev-parse "$BRANCH" 2>/dev/null)" = "$(history rev-parse "$BRANCH")" ]; do
-  [ $SECONDS -lt $deadline ] || fail "the remote never caught up with the history"
-  sleep 1
-done
-pass "the remote has the history's head"
-unwanted='(^|/)(\.env|auth\.json)$|\.(db|db-wal|db-shm|db-journal)$|\.sqlite|(^|/)(sessions|logs|checkpoints)/'
-for git_fn in history rgit; do
-  paths=$("$git_fn" log --all --format= --name-only | sort -u)
-  echo "$git_fn: $(printf '%s\n' "$paths" | grep -c .) paths ever recorded"
-  if found=$(printf '%s\n' "$paths" | grep -E "$unwanted"); then
-    fail "$git_fn recorded excluded paths: $found"
-  fi
-  pass "$git_fn never recorded a secret, session, log or database"
-done
+hermes_check_exclusions
 
 step "4. a queued patch lands at restart and Hermes reads it"
 marker="Patched by agentfs CI $(date +%s%N)"
-out=$(dc run --rm -T -e MARKER="$marker" producer '
-  user=$(sed -n "s/^username=//p" /run/secrets/origin)
-  password=$(sed -n "s/^password=//p" /run/secrets/origin)
-  git init -q /tmp/producer && cd /tmp/producer
-  git config user.name "Patch Producer" && git config user.email producer@example.com
-  git remote add origin "http://$user:$password@git-server:8080/git/history.git"
-  printf "# A persona from the patch queue\n\n%s\n" "$MARKER" >/tmp/SOUL.md
-  agentfs patch submit --volume hermes --put SOUL.md=/tmp/SOUL.md -m "Set the persona"' 2>&1) ||
-  fail "patch submit failed: $out"
-echo "$out"
-assert_contains "$out" "queued patch 1" "the patch is queued on the remote"
+hermes_queue_patch "$marker" 1
 # A pod restart (deployment.md §10): everything on the mount stops, then
 # the recorder, which lands the queue at mount with nothing attached.
 dc stop hermes dind
@@ -209,18 +130,41 @@ wait_healthy agentfs 300
 # Only what was stopped: agentfs-init refuses (exit 75) a mounted volume.
 dc up -d --no-deps dind hermes
 wait_healthy hermes 600
-assert_contains "$(dc exec -T agentfs agentfs status)" "last applied 1" "agentfs applied patch 1"
-assert_contains "$(in_hermes 'cat /opt/data/SOUL.md')" "$marker" "Hermes' container reads the patched SOUL.md"
-assert_contains "$(history log -1 --format=%B "$BRANCH" -- SOUL.md)" "Agentfs-Trigger: patch" "the patch is its own commit in the history"
-nonce=$(ask hello)
-system=$(model_requests | python3 -c '
-import json, sys
-for r in json.load(sys.stdin):
-    ms = r["body"].get("messages") or []
-    if any(sys.argv[1] in str(m.get("content")) for m in ms if m.get("role") == "user"):
-        print(" ".join(str(m.get("content")) for m in ms if m.get("role") == "system"))
-        break' "$nonce")
-assert_contains "$system" "$marker" "Hermes' next model request carries the patched SOUL.md"
+hermes_check_patch_landed "$marker" 1
+
+step "6. tool containers without the mount (terminal.docker_volumes empty)"
+# The operator's edit, through the mount: upstream's default, an empty
+# list. Hermes reads its config at start.
+in_hermes "sed -i -e 's|^  docker_volumes:\$|  docker_volumes: []|' -e '\\|^    - /opt/data:/opt/data\$|d' $HERMES_DIR/config.yaml"
+assert_contains "$(in_hermes "grep docker_volumes $HERMES_DIR/config.yaml")" "docker_volumes: []" "docker_volumes is empty"
+dc restart hermes
+wait_healthy hermes 600
+nonce=$(hermes_ask sandbox-unmounted)
+result=$(turn_text "$nonce" tool)
+echo "$result"
+tool=$(tool_container "$result")
+mounts=$(dind_exec docker inspect -f '{{range .Mounts}}{{.Source}}:{{.Destination}}:{{.RW}} {{end}}' "$tool")
+echo "tool container $tool mounts: $mounts"
+case " $mounts" in *":/opt/data:"*) fail "the tool container has /opt/data mounted: $mounts" ;; esac
+pass "the tool container has nothing mounted at /opt/data"
+assert_contains "$(dind_exec docker exec "$tool" cat /opt/data/skills/agentfs-unmounted/SKILL.md)" \
+  "Written in tool container $tool." "the write stayed in the tool container's own /opt/data"
+if in_hermes "test -e $HERMES_DIR/skills/agentfs-unmounted"; then fail "the tool container's write reached Hermes"; fi
+if backing_exec test -e "$BACKING/skills/agentfs-unmounted"; then fail "the tool container's write reached the backing tree"; fi
+pass "the tool container's write reached neither Hermes nor the backing tree"
+# Upstream binds Hermes' skills read-only into every tool container, and
+# its persistent home (container_persistent, default true) from
+# $HERMES_HOME/sandboxes: both from the daemon's view of Hermes' home.
+assert_contains "$result" "skills: read-only" "the tool container sees Hermes' skills read-only"
+home=$(in_hermes "find $HERMES_DIR/sandboxes -name agentfs-home.txt")
+[ -n "$home" ] || fail "the tool container's home file is not under Hermes' sandboxes/: $mounts"
+assert_eq "Written in tool container $tool." "$(in_hermes "cat $home")" \
+  "the tool container's home is in Hermes' home (${home#"$HERMES_DIR"/})"
+hermes_check_skill recovered-skill
+wait_pushed
+for git_fn in history rgit; do
+  never_recorded "$git_fn" '^skills/agentfs-unmounted/|^sandboxes/' "the tool container's writes"
+done
 
 step "clean up"
 dc --profile producer down -v

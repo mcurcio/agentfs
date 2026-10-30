@@ -13,7 +13,9 @@
 #     the runner's git server over HTTP with the credential Secret (test 8);
 #   - `kubectl exec ... agentfs restore` through the control socket (test
 #     11);
-#   - deleting the pod makes the final commit and pushes it;
+#   - deleting the pod makes the final commit and pushes it, and the new
+#     pod does not defer the patch queue although the subPath writer's
+#     bind held the old pod's mount as it stopped (design §12);
 #   - after `kill -9` of the daemon, writes fail with ENOTCONN, the kubelet
 #     restarts the sidecar (a write that races the recovery and succeeds
 #     must be recorded), which stacks a new mount over the stale one
@@ -269,6 +271,14 @@ wait_ready
 wait_remote final.txt final
 assert_contains "$(remote_message final.txt)" "Agentfs-Pod: $OLD" "final.txt was committed by the deleted pod"
 assert_contains "$(k logs "$POD" -c agentfs-init)" "volume $VOLUME already initialised" "init accepted the existing state area"
+# The writer's subPath bind kept the old pod's mount until the kubelet tore
+# its volumes down, after the sidecar's stop; a new pod still runs the
+# patch queue (design §12 "Only with nothing attached").
+grep -E 'elsewhere|attached' "$LOGS/graceful.log" || true
+case "$(k logs "$POD" -c agentfs)" in
+*"patches: not applied at this start"*) fail "the new pod deferred the patch queue: $(k logs "$POD" -c agentfs | grep -m1 'patches: not applied')" ;;
+esac
+pass "the new pod did not defer the patch queue"
 
 # Restart counts and the sidecar's pid on the node.
 sidecar_restarts() {

@@ -1,0 +1,39 @@
+# What every kind scenario of ci/e2e-hermes-kind.sh shares (design §16,
+# docs/deployment.md §10): the scripted model server (ci/hermes/model) as
+# the Service `model`, Hermes' CI config (ci/hermes/hermes/config.yaml),
+# Hermes and its docker-in-docker sidecar added to each scenario's
+# Deployment (hermes.yaml; each scenario mounts the volume its own way),
+# and the image pins. Build with --load-restrictor LoadRestrictionsNone:
+# the files live in ci/hermes and deploy/examples/hermes.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - model.yaml
+
+configMapGenerator:
+  - name: hermes-model
+    files:
+      - ../../model/model.py
+      - ../../model/scenarios.json
+  - name: hermes-config
+    files:
+      - ../../hermes/config.yaml
+
+patches:
+  # The Deployments of the scenarios: sidecar and fence (agentfs-example,
+  # deploy/sidecar's), csi (hermes), and Hermes before agentfs.
+  - path: hermes.yaml
+    target:
+      kind: Deployment
+      name: agentfs-example|hermes|hermes-before
+
+images:
+  # The same pins as ci/hermes/compose.yaml (ci/e2e-hermes-kind.sh checks
+  # that they agree): upstream Hermes v0.22.5 and docker 29.9.2-dind.
+  - name: hermes-agent
+    newName: nousresearch/hermes-agent
+    digest: sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d
+  - name: dind
+    newName: docker
+    digest: sha256:9e79b879b177fbd72c34376a3dd3d91747da5db49e1f560f76aea59561471977

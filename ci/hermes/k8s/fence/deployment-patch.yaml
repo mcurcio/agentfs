@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentfs-example
+spec:
+  replicas: 1
+  template:
+    spec:
+      initContainers:
+        # Named in order, so the merge keeps it.
+        - name: agentfs-init
+        - name: agentfs
+        - name: hermes-config
+          env:
+            - { name: HERMES_DIR, value: /agentfs/workspace }
+            - { name: TOOL_SOURCE, value: /agentfs/workspace }
+          volumeMounts:
+            - { mountPath: /opt/data, $patch: delete }
+            - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: HostToContainer, readOnly: true, recursiveReadOnly: Disabled }
+        - name: dind
+          volumeMounts:
+            - { mountPath: /opt/data, $patch: delete }
+            - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: HostToContainer, readOnly: true, recursiveReadOnly: Disabled }
+          # The read-only emptyDir needs no restart onto a new mount.
+          livenessProbe: null
+      containers:
+        - name: hermes
+          env:
+            - { name: HERMES_HOME, value: /agentfs/workspace }
+            # The image sets it to /opt/data: Hermes' file tools refuse
+            # writes outside it (upstream agent/file_safety.py).
+            - { name: HERMES_WRITE_SAFE_ROOT, value: /agentfs/workspace }
+          volumeMounts:
+            - { mountPath: /opt/data, $patch: delete }
+            - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: HostToContainer, readOnly: true, recursiveReadOnly: Disabled }
+          livenessProbe: null

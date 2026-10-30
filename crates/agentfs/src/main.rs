@@ -86,7 +86,7 @@ use agentfs_core::history::History;
 use agentfs_core::identity::Context;
 use agentfs_core::lfs;
 use agentfs_core::lock::{LockError, StateLock};
-use agentfs_core::patch::attached::{self, Deferred};
+use agentfs_core::patch::attached::{self, Deferred, Judgement, PodScope};
 use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::push::{self, LeaseOutcome, PushOutcome, RemotePusher, RemoteStatus};
 use agentfs_core::record::{Caller, Trigger};
@@ -1462,16 +1462,25 @@ fn mount(
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
     // The patch queue, before anything can see the tree (design §12): it
-    // lands only when the last mount stopped with nothing attached and no
-    // stale mount is below this one; otherwise it is judged and waits. A
-    // blocked queue is an alarm; the volume mounts anyway, and so it does
-    // when the queue cannot run at all.
+    // lands only when the last mount stopped with nothing attached, or was
+    // another pod's while this mount point is in this pod's own volume,
+    // and no stale mount is below this one; otherwise it is judged and
+    // waits. A blocked queue is an alarm; the volume mounts anyway, and so
+    // it does when the queue cannot run at all.
+    let scope = PodScope::of(&args.pod.pod_uid, &mountpoint);
     let deferred = if stacked {
         Some(Deferred::StaleMount)
-    } else if attached::marked(state) {
-        Some(Deferred::UncleanStop)
     } else {
-        None
+        let judgement = attached::judge(state, scope.as_ref());
+        if let (Judgement::AnotherPod { uid }, Some(scope)) = (&judgement, &scope) {
+            eprintln!(
+                "patches: the previous mount of this volume (pod {uid}) did not stop with \
+                 nothing attached, but this is another pod ({}) with the mount point in its own \
+                 volume, which nothing attached to that pod's mount can reach: the queue runs",
+                scope.uid()
+            );
+        }
+        judgement.deferred()
     };
     patch_cmd::queue_at_start(
         state,
@@ -1484,7 +1493,7 @@ fn mount(
         deferred,
     );
     // From here until a stop with nothing attached, a workload may be.
-    attached::mark(state).with_context(|| {
+    attached::mark(state, scope.as_ref()).with_context(|| {
         format!(
             "writing {} (the patch queue's evidence of a clean stop)",
             state.attached_mark().display()
@@ -1613,6 +1622,13 @@ fn mount(
     // mark stays, and the next mount holds the patch queue (design §12).
     if report.unmount_error.is_none() && !report.lazy && !report.session_abandoned && !stale_left {
         clear_attached(state);
+    } else if let Some(scope) = &scope {
+        eprintln!(
+            "a workload may still be attached: a restart of agentfs in this pod ({}) holds the \
+             patch queue until a mount stops with nothing attached; the next pod lands it \
+             (docs/runbooks/patch-queue.md)",
+            scope.uid()
+        );
     } else {
         eprintln!(
             "a workload may still be attached: the next mount holds the patch queue until a \
@@ -1644,10 +1660,21 @@ fn print_unmount(report: &UnmountReport, unmount_grace: Duration) {
         eprintln!("the mount was busy: detached lazily");
     }
     if report.session_abandoned {
-        eprintln!(
-            "files were still open after {:?}: their later changes are not recorded",
-            unmount_grace
-        );
+        if report.lazy || report.unmount_error.is_some() {
+            eprintln!(
+                "files were still open after {unmount_grace:?}: their later changes are not \
+                 recorded"
+            );
+        } else {
+            // The unmount was not busy, so what holds the session is
+            // another mount of this filesystem, not this one.
+            eprintln!(
+                "the filesystem was still mounted elsewhere after {unmount_grace:?} (a bind of \
+                 it, such as a kubelet subPath mount, or a copy in another mount namespace): \
+                 the session ends as agentfs exits, and changes through those mounts after \
+                 this are not recorded"
+            );
+        }
     }
     if report.swept > 0 || report.repaired > 0 {
         println!(

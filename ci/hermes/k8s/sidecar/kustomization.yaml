@@ -1,0 +1,38 @@
+# Hermes in the sidecar pod of docs/deployment.md §10 (ci/e2e-hermes-kind.sh
+# sidecar): the CI overlay of deploy/sidecar, as ci/k8s is (its namespace,
+# git server Service, remote config and Secret), with the Hermes rule files
+# (deploy/examples/hermes) as the ConfigMap's exclude and attributes,
+# AGENTFS_VOLUME=hermes, and Hermes and docker-in-docker with the mount at
+# /opt/data through subPath. The Deployment starts at zero replicas: the
+# test migrates the volume first.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: agentfs-e2e
+
+resources:
+  - ../../../k8s/namespace.yaml
+  - ../../../k8s/git-server.yaml
+  - ../../../../deploy/sidecar
+
+components:
+  - ../common
+
+images:
+  - name: ghcr.io/mcurcio/agentfs
+    newName: agentfs
+    newTag: ci
+
+configMapGenerator:
+  # The Hermes `config` names a placeholder remote: ci/k8s's remote
+  # settings instead (the runner's git server, 2 s pushes).
+  - name: agentfs-config
+    behavior: replace
+    files:
+      - config=../../../k8s/config/config
+      - exclude=../../../../deploy/examples/hermes/exclude
+      - attributes=../../../../deploy/examples/hermes/attributes
+
+patches:
+  - path: ../../../k8s/secret-patch.yaml
+  - path: deployment-patch.yaml
