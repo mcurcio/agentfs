@@ -3950,8 +3950,9 @@ target. What it needs:
     sidecar, so the mount must also reach that sidecar, and tool containers need
     it as a volume when the tools should edit Hermes' files. Whether a sandbox
     may reach its agent's configuration is the deployment's choice. Without that
-    volume, upstream still binds Hermes' `skills/` read-only and each tool
-    container's home from Hermes' home (deployment.md §10).
+    volume, upstream still binds parts of Hermes' home into tool containers:
+    `skills/` read-only, and each tool container's home read-write
+    (deployment.md §10).
 - **Root init.** The Hermes image's start-up runs as root. With a real backing
   tree and `default_permissions`, root reads the mount like any other directory.
 - **Restarts.** A producer's patches (§12) apply only at mount, which for Hermes means a

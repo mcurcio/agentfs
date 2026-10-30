@@ -586,11 +586,13 @@ Starting from Hermes' own workload:
   choice for whoever runs Hermes. Leaving the setting empty (upstream's
   default) keeps the tool containers' writes to that path out of
   Hermes' files, but not every tool container write off the volume:
-  upstream still binds Hermes' `skills/` read-only into each tool
-  container, and its home and `/workspace` (`container_persistent`,
-  default true) from `$HERMES_HOME/sandboxes/`, both resolved by the
-  docker-in-docker daemon, so those writes land in the volume (never
-  recorded under these rules).
+  upstream still binds directories of Hermes' home into each tool
+  container, read-only (`skills/`, `cache/`, `images/`,
+  `attachments/`, `composer-pastes/`), and the tool container's home and
+  `/workspace` (`container_persistent`, default true) read-write from
+  `$HERMES_HOME/sandboxes/`, all resolved by the docker-in-docker
+  daemon, so those writes land in the volume (never recorded under these
+  rules).
 - **Root init.** Hermes' start-up runs as root; with `default_permissions`
   and a real backing tree, root reads and writes the mount like any other
   directory, and files keep their owners.
@@ -677,9 +679,9 @@ the model API makes every turn deterministic. The job checks that:
   model request carries the patched `SOUL.md`;
 - with `terminal.docker_volumes` emptied, a tool container's write to
   `/opt/data` stays in the tool container, reaching neither Hermes nor
-  the history; Hermes' `skills/` is read-only there; its home file lands
-  in Hermes' `sandboxes/` and is never recorded; Hermes' own edits are
-  still recorded.
+  the history; Hermes' `skills/` is read-only there; a file in the tool
+  container's home lands in Hermes' `sandboxes/` and is never recorded;
+  Hermes' own edits are still recorded.
 
 The `hermes` workflow runs [`ci/e2e-hermes-kind.sh`](../ci/e2e-hermes-kind.sh)
 on kind, one job per configuration, with the same checks (start-up,
