@@ -95,7 +95,7 @@ pub fn permits(object: Object, who: Who<'_>, want: Want) -> bool {
         return !want.exec || object.is_dir() || object.mode & 0o111 != 0;
     }
     let bits = if object.uid == who.uid {
-        ((object.mode >> 6) | object.mode) & 0o7
+        (object.mode >> 6) & 0o7
     } else if object.gid == who.gid || who.groups.contains(&object.gid) {
         (object.mode >> 3) & 0o7
     } else {

@@ -311,7 +311,7 @@ pub fn preflight_overlay(main: &Path, overlay: &Path) -> Result<PathBuf, Preflig
     // The main mount point may be a stale mount (`--on-stale-mount`),
     // which answers `stat` with ENOTCONN.
     let main = canonical_any(main);
-    if overlay.starts_with(&main) {
+    if overlay.starts_with(&main) || main.starts_with(&overlay) {
         return Err(PreflightError::OverlayNested { main, overlay });
     }
     Ok(overlay)
@@ -678,7 +678,7 @@ pub fn fuser_config(config: &MountConfig, kind: MountKind) -> fuser::Config {
     c.mount_options = [
         Some(MountOption::FSName(format!("agentfs:{}", config.volume))),
         Some(MountOption::Subtype("agentfs".into())),
-        Some(MountOption::DefaultPermissions),
+        (kind == MountKind::Main).then_some(MountOption::DefaultPermissions),
         Some(MountOption::NoDev),
         Some(MountOption::NoSuid),
         Some(if config.read_only {
