@@ -1384,9 +1384,10 @@ struct MountArgs {
 }
 
 /// `--sandbox-overlay` with `--sandbox-owner`: the overlay's mount point,
-/// created if missing and checked as the mount point is and against the
-/// main mount point `mountpoint`, and the view owner, which the daemon
-/// must be able to act as. `None` without the flags.
+/// created if missing and checked as the mount point is ([`mount`] has
+/// checked it against the main mount point, [`preflight_overlay`], before
+/// creating anything), and the view owner, which the daemon must be able
+/// to act as. `None` without the flags.
 ///
 /// With `stacked` the overlay is stacked over the stale overlay mount a
 /// crashed daemon left (`--on-stale-mount recover`); otherwise a stale one
@@ -1395,7 +1396,6 @@ struct MountArgs {
 fn sandbox_overlay(
     state: &StateDir,
     settings: &agentfs_core::config::Settings,
-    mountpoint: &Path,
     args: &MountArgs,
     stacked: bool,
 ) -> Result<Option<OverlayConfig>> {
@@ -1431,7 +1431,6 @@ fn sandbox_overlay(
         }
         overlay
     };
-    let overlay = preflight_overlay(mountpoint, &overlay)?;
     let owner = match agentfs_fuse::overlay::ViewOwner::new(
         ids,
         &agentfs_fuse::privileges::Privileges::current(),
@@ -1648,6 +1647,11 @@ fn mount(
             );
         }
     }
+    // The sandbox overlay's mount point against the main one first, so a
+    // refused setting changes nothing: no mount point created, none sealed.
+    if let Some(at) = &args.sandbox_overlay {
+        preflight_overlay(&args.mountpoint, at)?;
+    }
     let session = Session::start(state, &args.pod)?;
     let settings = History::open(&state.git())
         .with_context(|| format!("opening {}", state.root().display()))?
@@ -1688,7 +1692,7 @@ fn mount(
         Some(at) if overlay_stacked => Some(agentfs_layers(at).unwrap_or(1)),
         _ => None,
     };
-    let overlay = sandbox_overlay(state, &settings, &mountpoint, args, overlay_stacked)?;
+    let overlay = sandbox_overlay(state, &settings, args, overlay_stacked)?;
     // A stale layer below either mount may still be held by a workload.
     let any_stacked = stacked || overlay_stacked;
     agentfs_core::nested::add_views(workload_views(&mountpoint, args));

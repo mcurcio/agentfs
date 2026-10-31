@@ -152,6 +152,13 @@ pub trait TreeOperations: Operations {
     /// every file and directory handle id of every session.
     fn new_handle_id(&self) -> u64;
 
+    /// The kind of `name` in directory `parent`, not following a symlink,
+    /// as [`Operations::lookup`] would find it, but counting nothing: no
+    /// node id is handed out. A decorator asks it before a lookup it may
+    /// have to hide, so a hidden entry leaves no trace in the node ids.
+    /// Errors: `ENOENT` (no such name), as `lookup`.
+    fn kind_at(&self, parent: u64, name: &[u8]) -> OpResult<Kind>;
+
     /// Moves the regular file `name` in directory `from` (outside the
     /// backing tree, on its filesystem) to `newname` in tree directory
     /// `newparent`, as one `renameat2(2)` with `flags` (`0` or

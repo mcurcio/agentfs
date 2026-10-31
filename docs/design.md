@@ -74,7 +74,19 @@ boundary for names.**
     directory whose remaining entries are hidden (`overlay_refusals`),
     and d_ino gaps: node ids are handed out in sequence to every entry
     a listing reads, hidden ones included, so the inode numbers of shown
-    entries skip one per hidden entry (not tested).
+    entries skip one per hidden entry (not tested). Lookups, removes and
+    renames take no id for an entry hidden for its kind: they ask its
+    kind first, and look up only what is shown
+    (`a5_hidden_entries_take_no_node_ids`).
+  - Existence leaks at names a sandbox may place. Where a name is hidden
+    only for what is there (a file the attributes never record at a name
+    a directory may take, a nested repository or a special file at a
+    recordable name), `mkdir`, `create` and `rename` onto it answer
+    `EACCES`, while the same call at an absent name succeeds. Refusing
+    the absent name too would refuse legitimate directories and files.
+    So a sandbox can confirm that something unrecorded exists at a name
+    it guesses, never its content or kind
+    (`a5_hidden_entries_at_placeable_names_are_refused_under_the_names_ordering`).
   - Locks are not shared between the two mounts: each kernel keeps its
     own POSIX and BSD locks (§17.1), so a lock taken through one mount
     is not seen through the other (not tested).
@@ -345,8 +357,11 @@ both (`overlay_open_files_hold_off_a_restore`).
 
 **The visibility gate** (`agentfs-core`'s `visibility.rs`) is the one
 judge, a pure decision over the volume's rules. It never asks whether a
-name exists, so a hidden name answers the same whether or not it does,
-and a rules error hides or refuses, never shows (`a1` to `a14` there).
+name exists, so its answer for a name is the same whether or not
+something is there, and a rules error hides or refuses, never shows
+(`a1` to `a14` there). The overlay keeps that for names hidden whatever
+their kind; a name hidden only for what is there leaks its existence
+where a sandbox may place it (§1.1, its limits).
 
 - **Show.** An existing file or symlink is shown when its path is
   recordable; a directory when the rules could record something beneath
@@ -426,14 +441,17 @@ an event every other session's kernel must hear (`invalidate.rs`). A
 change it served, after it succeeded; the `Invalidator` queues it, and
 one worker thread sends the entry and inode invalidations to every other
 session (never the one the change came through, whose kernel already
-knows). Restore and revert, made outside every session, invalidate every
-session. Sending is asynchronous, from the worker, never from a FUSE
-request thread: the kernel may wait on a request of the session it
-invalidates, and two sessions' requests invalidating each other would
-wait on each other forever. The cost: the other session's kernel hears
-the change a moment after the call returned, not before
-(`a_change_reaches_every_other_session_and_never_its_own`,
-`overlay_and_main_mount_rename_at_once`). A failing session's
+knows): `a_change_reaches_every_other_session_and_never_its_own`, and
+through both real mounts, a save by temp file and rename is seen through
+the other mount well before its cached entry expires
+(`overlay_and_main_mount_see_each_others_saves_at_once`). Restore and
+revert, made outside every session, invalidate every session. Sending is
+asynchronous, from the worker, never from a FUSE request thread: the
+kernel may wait on a request of the session it invalidates, and two
+sessions' requests invalidating each other would wait on each other
+forever (`overlay_and_main_mount_rename_at_once` renames through both at
+once). The cost: the other session's kernel hears the change a moment
+after the call returned, not before. A failing session's
 invalidations never stop the others' (`a_failing_cache_never_stops_the_others`),
 and their errors are logged once per kind.
 
@@ -462,7 +480,9 @@ and their errors are logged once per kind.
   tree rules (`agentfs.respectTreeRules`, whose rule files a sandbox
   could edit), an overlay mount point that is the main one or nested with
   it, the two mount points in one parent directory (a container given
-  that directory would reach both), a tmp layer on another filesystem
+  that directory would reach both; these two are checked before either
+  mount point is created or sealed, so a refused one is left as it was:
+  `a_refused_overlay_mount_point_is_left_as_it_was`), a tmp layer on another filesystem
   than the backing tree, a front (`--history-service`), and a view owner
   the daemon cannot act as
   (`the_overlay_is_refused_on_a_front_and_with_tree_rules`,

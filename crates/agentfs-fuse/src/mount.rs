@@ -355,9 +355,11 @@ fn canonical_any(path: &Path) -> PathBuf {
         return c;
     }
     match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
-            canonical_any(parent).join(name)
+        // A relative name resolves against the working directory.
+        (Some(parent), Some(name)) if parent.as_os_str().is_empty() => {
+            canonical_any(Path::new(".")).join(name)
         }
+        (Some(parent), Some(name)) => canonical_any(parent).join(name),
         _ => path.to_path_buf(),
     }
 }
@@ -400,14 +402,17 @@ pub fn preflight(
 /// be the other or inside it, and they may not share a parent directory
 /// (a container given it would reach both). Run [`preflight`] on `overlay`
 /// as well, for the state area, the backing tree and the remotes' files.
-/// Returns the canonical overlay mount point.
+/// Returns the canonical overlay mount point. It needs nothing created
+/// first, so it can refuse a setting before anything changes.
 pub fn preflight_overlay(main: &Path, overlay: &Path) -> Result<PathBuf, PreflightError> {
     // A stale overlay mount (`--on-stale-mount recover`) answers `stat`
-    // with ENOTCONN: it is resolved through its parent.
-    let overlay = if rustix::fs::stat(overlay).err() == Some(rustix::io::Errno::NOTCONN) {
-        canonical_any(overlay)
-    } else {
-        canonical_dir(OVERLAY, overlay)?
+    // with ENOTCONN, and a mount point not yet created with ENOENT: each
+    // is resolved through its parent.
+    let overlay = match rustix::fs::stat(overlay) {
+        Err(e) if e == rustix::io::Errno::NOTCONN || e == rustix::io::Errno::NOENT => {
+            canonical_any(overlay)
+        }
+        _ => canonical_dir(OVERLAY, overlay)?,
     };
     // The main mount point may be a stale mount (`--on-stale-mount`),
     // which answers `stat` with ENOTCONN.
@@ -2116,10 +2121,20 @@ mod tests {
             preflight_overlay(&main, &l.p("sandbox/../sandbox/overlay")).unwrap(),
             l.p("sandbox/overlay").canonicalize().unwrap()
         );
+        // A mount point not yet created is judged through its parent, so
+        // a refused one is never created.
+        assert!(matches!(
+            preflight_overlay(&main, &l.p("mnt/missing")).unwrap_err(),
+            PreflightError::OverlayNested { .. }
+        ));
         assert!(matches!(
             preflight_overlay(&main, &l.p("missing")).unwrap_err(),
-            PreflightError::Missing { .. }
+            PreflightError::OverlaySharesParent { .. }
         ));
+        assert_eq!(
+            preflight_overlay(&main, &l.p("sandbox/missing")).unwrap(),
+            l.p("sandbox").canonicalize().unwrap().join("missing")
+        );
     }
 
     #[test]

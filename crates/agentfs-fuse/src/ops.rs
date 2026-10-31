@@ -843,12 +843,25 @@ impl Ops {
     // ---- lookups and attributes ----
 
     pub fn lookup(&self, parent: u64, name: &[u8]) -> OpResult<Entry> {
-        check_name(name)?;
         let _names = self.read_names();
-        let dir = self.open_dir_node(parent)?;
-        let st =
-            rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
+        let st = self.stat_child(parent, name)?;
         Ok(self.entry(parent, name, &st))
+    }
+
+    /// The kind of `name` in `parent`, not following a symlink. Nothing
+    /// is counted: no node id is handed out or kept.
+    pub fn kind_at(&self, parent: u64, name: &[u8]) -> OpResult<Kind> {
+        let _names = self.read_names();
+        let st = self.stat_child(parent, name)?;
+        Ok(Kind::from_mode(mode_of(&st)))
+    }
+
+    /// `name` in `parent`, statted without following a symlink. The
+    /// caller holds the names lock.
+    fn stat_child(&self, parent: u64, name: &[u8]) -> OpResult<Stat> {
+        check_name(name)?;
+        let dir = self.open_dir_node(parent)?;
+        rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()
     }
 
     /// Counts a kernel lookup of `name` in `parent`, now `st`.
@@ -2672,6 +2685,10 @@ impl crate::session::TreeOperations for Ops {
 
     fn new_handle_id(&self) -> u64 {
         self.next_fh.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn kind_at(&self, parent: u64, name: &[u8]) -> OpResult<Kind> {
+        Ops::kind_at(self, parent, name)
     }
 
     fn move_in(

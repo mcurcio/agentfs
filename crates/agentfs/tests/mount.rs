@@ -3759,6 +3759,62 @@ fn overlay_and_main_mount_rename_at_once() {
     m.stop();
 }
 
+/// A file saved through one mount by a temp file and a rename is seen
+/// through the other at once, though that mount's kernel had just cached
+/// its entry: every change invalidates every other session's kernel cache
+/// (design §2.4). A cached entry lives for one second (fuse.rs'
+/// `ENTRY_TTL`), so seeing the new file well inside that second, counted
+/// from before the entry was cached, proves the invalidation and not the
+/// expiry. A round whose own save outlasted half of it judges nothing and
+/// is run again.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_and_main_mount_see_each_others_saves_at_once() {
+    let (v, overlay) = sandbox_vol("overlay_and_main_mount_see_each_others_saves_at_once");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let main = v.mnt();
+    // (the mount whose kernel caches the entry, the mount saved through,
+    // the file); a temp file at the overlay's root is a tmp file.
+    for (cached, saved, name) in [
+        (&main, &overlay, "config.yaml"),
+        (&overlay, &main, "skills/a.md"),
+    ] {
+        let seen = (1..=5).find_map(|round| {
+            let before = Instant::now();
+            // Looked up and read: the kernel now caches the entry.
+            let _ = fs::read_to_string(cached.join(name));
+            let content = format!("{name} {round}");
+            let tmp = saved.join(format!("{name}.tmp"));
+            fs::write(&tmp, &content).unwrap();
+            fs::rename(&tmp, saved.join(name)).unwrap();
+            if before.elapsed() > Duration::from_millis(500) {
+                // The next round starts with this one's entry expired.
+                std::thread::sleep(Duration::from_millis(1100));
+                return None;
+            }
+            loop {
+                if fs::read_to_string(cached.join(name)).is_ok_and(|c| c == content) {
+                    return Some(true);
+                }
+                if before.elapsed() > Duration::from_millis(900) {
+                    return Some(false);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        assert_eq!(
+            seen,
+            Some(true),
+            "{name} saved through {} was not seen through {} before its cached entry \
+             expired (None: every save was too slow to judge); log:\n{}",
+            saved.display(),
+            cached.display(),
+            m.log()
+        );
+    }
+    m.stop();
+}
+
 /// A path held open for writing through the overlay holds off a restore as
 /// one held through the main mount does, and the restore's settle records
 /// the overlay's unclosed write first: one set of open files, one sweep.

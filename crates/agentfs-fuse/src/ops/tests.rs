@@ -2530,7 +2530,10 @@ fn an_existing_file_is_opened_by_create_only_with_access() {
         std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
         (group, None, std::process::id())
     };
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o070)).unwrap();
+    // The owner may read and write: as non-root, Ops opens the file as
+    // this process, its owner. The caller is not the owner, so only the
+    // group bits can let it in.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o670)).unwrap();
     let caller = Caller {
         uid: me.wrapping_add(12345),
         gid: me.wrapping_add(12345),

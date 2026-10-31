@@ -498,6 +498,15 @@ impl TreeOperations for FakeOps {
         1000 + self.next.fetch_add(1, Ordering::Relaxed)
     }
 
+    fn kind_at(&self, parent: u64, name: &[u8]) -> OpResult<Kind> {
+        self.record("kind_at", name, None);
+        let id = self
+            .children
+            .get(&(parent, name.to_vec()))
+            .ok_or(Errno::ENOENT)?;
+        Ok(kind_of(self.attrs[id].kind))
+    }
+
     /// Asks `check` about the scripted entry at the new name, then takes
     /// the file out of the store, as the real move would.
     fn move_in(
@@ -661,7 +670,7 @@ fn a5_hidden_names_answer_the_same_whether_or_not_they_exist() {
         .fake
         .calls()
         .into_iter()
-        .filter(|c| ["lookup", "unlink", "create", "mkdir"].contains(&c.method))
+        .filter(|c| ["lookup", "kind_at", "unlink", "create", "mkdir"].contains(&c.method))
         .collect();
     assert!(
         asked.is_empty(),
@@ -1065,15 +1074,105 @@ fn rules_errors_answer_eio_through_the_overlay() {
 }
 
 #[test]
-fn a_lookup_that_finds_a_hidden_kind_gives_its_lookup_back() {
+fn a_lookup_of_a_hidden_kind_asks_its_kind_only() {
     // A FIFO at a recordable name: may_show says yes, its kind says no.
     let b =
         fixture_b(FakeOps::examples().node(8, 5, "fifo", FileType::NamedPipe, 0o644, OWNER.uid));
     assert_eq!(b.overlay.lookup(5, b"fifo").unwrap_err(), Errno::ENOENT);
-    assert_eq!(b.fake.calls_to("forget").len(), 1);
-    // A shown one keeps it.
+    assert_eq!(b.fake.calls_to("kind_at").len(), 1);
+    assert!(b.fake.calls_to("lookup").is_empty());
+    // A shown one is looked up and keeps its lookup.
     assert_eq!(b.overlay.lookup(5, b"a.md").unwrap().id, 6);
-    assert_eq!(b.fake.calls_to("forget").len(), 1);
+    assert_eq!(b.fake.calls_to("lookup").len(), 1);
+    assert!(b.fake.calls_to("forget").is_empty());
+}
+
+/// No operation looks up an entry hidden for its kind: the operations
+/// are asked only its kind, which counts no lookup.
+#[test]
+fn a5_no_operation_looks_up_an_entry_hidden_for_its_kind() {
+    let b = hidden_kinds();
+    let actor = Actor::of_process(REQUEST);
+    for name in ["pipe", "x.sec", "repo"] {
+        let n = name.as_bytes();
+        let _ = b.overlay.lookup(5, n);
+        let _ = b.overlay.unlink(5, n, actor);
+        let _ = b.overlay.rmdir(5, n, actor);
+        let _ = b.overlay.rename(5, n, 5, b"b.md", 0, actor);
+        let _ = b.overlay.rename(5, n, 5, b"a.md", RENAME_EXCHANGE, actor);
+        let _ = b.overlay.rename(5, b"a.md", 5, n, 0, actor);
+        let _ = b.overlay.rename(5, b"a.md", 5, n, RENAME_EXCHANGE, actor);
+        let _ = b.overlay.create(5, n, 0o644, O_WRONLY, actor);
+        let _ = b.overlay.mkdir(5, n, 0o755, actor);
+        let looked: Vec<Call> = b
+            .fake
+            .calls_to("lookup")
+            .into_iter()
+            .filter(|c| c.name == n)
+            .collect();
+        assert!(looked.is_empty(), "{name} was looked up: {looked:?}");
+    }
+}
+
+/// A name hidden for what is there answers as an absent name does, down
+/// to the node ids: nothing hidden is given one, so the ids a sandbox
+/// sees next are the same whether or not the name exists.
+#[test]
+fn a5_hidden_entries_take_no_node_ids() {
+    let a = fixture_a_with(
+        &["skills/a.md", "skills/x.sec"],
+        &["skills/repo/.git"],
+        "/skills/*.sec -agentfs\n",
+    );
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        a.backing("skills/pipe"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o666),
+        0,
+    )
+    .unwrap();
+    let skills = a.overlay.lookup(ROOT, b"skills").unwrap().id;
+    // Held, so a rename's look at it reuses its id.
+    a.overlay.lookup(skills, b"a.md").unwrap();
+    let actor = Actor::of_process(REQUEST);
+    for name in ["x.sec", "pipe", "repo", "y.sec"] {
+        let n = name.as_bytes();
+        let before = a.ops.new_node_id();
+        assert_eq!(
+            a.overlay.lookup(skills, n).unwrap_err(),
+            Errno::ENOENT,
+            "lookup {name}"
+        );
+        assert_eq!(
+            a.overlay.unlink(skills, n, actor).unwrap_err(),
+            Errno::ENOENT,
+            "unlink {name}"
+        );
+        assert_eq!(
+            a.overlay.rmdir(skills, n, actor).unwrap_err(),
+            Errno::ENOENT,
+            "rmdir {name}"
+        );
+        assert_eq!(
+            a.overlay
+                .rename(skills, n, skills, b"b.md", 0, actor)
+                .unwrap_err(),
+            Errno::ENOENT,
+            "rename {name}"
+        );
+        let _ = a
+            .overlay
+            .rename(skills, b"a.md", skills, n, RENAME_EXCHANGE, actor);
+        if name != "y.sec" {
+            let _ = a.overlay.rename(skills, b"a.md", skills, n, 0, actor);
+        }
+        assert_eq!(
+            a.ops.new_node_id(),
+            before + 1,
+            "{name}: a node id was handed out in between"
+        );
+    }
 }
 
 #[test]
@@ -1367,6 +1466,12 @@ struct A {
 }
 
 fn fixture_a(files: &[&str], dirs: &[&str]) -> A {
+    fixture_a_with(files, dirs, "")
+}
+
+/// [`fixture_a`] with `attributes` as the git directory's
+/// `info/attributes`.
+fn fixture_a_with(files: &[&str], dirs: &[&str], attributes: &str) -> A {
     let dir = tempfile::tempdir().unwrap();
     let backing = dir.path().join("backing");
     std::fs::create_dir_all(&backing).unwrap();
@@ -1383,6 +1488,7 @@ fn fixture_a(files: &[&str], dirs: &[&str]) -> A {
     let info = state.git().join("info");
     std::fs::create_dir_all(&info).unwrap();
     std::fs::write(info.join("exclude"), EXCLUDE).unwrap();
+    std::fs::write(info.join("attributes"), attributes).unwrap();
     let (recorder, _committer, _) = volume::open(
         &state,
         &backing,

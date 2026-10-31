@@ -14,7 +14,7 @@
 //!
 //! | Operation | Answer |
 //! |---|---|
-//! | `lookup` | parent not shown: `ENOENT`; owner may not search parent: `EACCES`; a name the tmp layer holds: its file (the upper layer wins, as in overlayfs); `may_show` hidden or the name not a repository path: `ENOENT` (`EIO` on a rules error) without asking the operations; else looked up, and a result not shown for its kind is forgotten again and answered `ENOENT` (`EIO`) |
+//! | `lookup` | parent not shown: `ENOENT`; owner may not search parent: `EACCES`; a name the tmp layer holds: its file (the upper layer wins, as in overlayfs); `may_show` hidden or the name not a repository path: `ENOENT` (`EIO` on a rules error) without asking the operations; its kind, asked without a lookup ([`TreeOperations::kind_at`]), hidden: `ENOENT` (`EIO`); else looked up, and a result replaced since by one not shown for its kind is forgotten again and answered `ENOENT` (`EIO`). No entry found hidden for its kind is looked up, here or by any other operation, so none is given a node id |
 //! | `getattr`, `readlink`, `access` | node not shown: `ENOENT`; through an open handle: passed on. `access` checks the mask as the owner (`EACCES`) |
 //! | `getxattr` | node not shown: `ENOENT`; a name outside `user.*`: `ENODATA`; owner may not read the node: `EACCES` |
 //! | `listxattr` | node not shown: `ENOENT`; the `user.*` names only, sized for that list |
@@ -646,20 +646,44 @@ impl<O: TreeOperations> Overlay<O> {
         }
     }
 
+    /// The kind of the entry `name` in `parent`, if there is one, asked
+    /// without the operations counting a lookup
+    /// ([`TreeOperations::kind_at`]). Only for a name the gate may show.
+    /// Every lookup the overlay makes is preceded by this and the gate's
+    /// answer for the kind, so an entry hidden for its kind is never
+    /// given a node id: it leaves no gap in the ids a sandbox sees, and
+    /// answers as an absent name does.
+    fn kind_at(&self, parent: u64, name: &[u8]) -> OpResult<Option<ExistingKind>> {
+        match self.inner.kind_at(parent, name) {
+            Ok(kind) => Ok(Some(kind_to_gate(kind))),
+            Err(e) if e == Errno::ENOENT => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The existing entry `name` in `parent`, its kernel lookup given back
-    /// at once. Only for a name the gate may show.
+    /// at once. Only for a name shown for the kind [`Self::kind_at`]
+    /// found.
     fn peek(&self, parent: u64, name: &[u8]) -> OpResult<Entry> {
         let entry = self.inner.lookup(parent, name)?;
         self.inner.forget(entry.id, 1);
         Ok(entry)
     }
 
-    /// The existing entry `name` in `parent`, if there is one ([`Self::peek`]).
-    fn existing(&self, parent: u64, name: &[u8]) -> OpResult<Option<Entry>> {
-        match self.peek(parent, name) {
-            Ok(entry) => Ok(Some(entry)),
-            Err(e) if e == Errno::ENOENT => Ok(None),
-            Err(e) => Err(e),
+    /// The existing entry at `path`, `name` in `parent`, if there is one
+    /// and it is shown for its kind ([`Self::peek`]). One hidden for its
+    /// kind is answered as none, never looked up: the operations' check
+    /// refuses it under the names ordering ([`Judge`]).
+    fn shown_existing(&self, parent: u64, name: &[u8], path: &RepoPath) -> OpResult<Option<Entry>> {
+        match self.kind_at(parent, name)? {
+            Some(kind) if self.gate.show(path, kind) == Visibility::Shown => {
+                match self.peek(parent, name) {
+                    Ok(entry) => Ok(Some(entry)),
+                    Err(e) if e == Errno::ENOENT => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+            _ => Ok(None),
         }
     }
 
@@ -698,8 +722,8 @@ impl<O: TreeOperations> Overlay<O> {
         // tree is never asked about a name the gate hides (existence-blind).
         // Only a directory can be shown at a name skipped for a file.
         if self.gate.may_show(&path) == Visibility::Shown
-            && let Some(entry) = self.existing(parent, name)?
-            && self.gate.show(&path, existing_kind(entry.attr.kind)) == Visibility::Shown
+            && let Some(kind) = self.kind_at(parent, name)?
+            && self.gate.show(&path, kind) == Visibility::Shown
         {
             return Err(if exclusive {
                 Errno::EEXIST
@@ -717,7 +741,12 @@ impl<O: TreeOperations> Overlay<O> {
         if let Visibility::Hidden(h) = self.gate.may_show(&path) {
             return Err(self.refuse_hidden_change(h));
         }
+        let kind = self.kind_at(parent, name)?.ok_or(Errno::ENOENT)?;
+        if let Visibility::Hidden(h) = self.gate.show(&path, kind) {
+            return Err(self.refuse_hidden_change(h));
+        }
         let entry = self.peek(parent, name)?;
+        // Replaced since its kind was asked.
         if let Visibility::Hidden(h) = self.gate.show(&path, existing_kind(entry.attr.kind)) {
             return Err(self.refuse_hidden_change(h));
         }
@@ -749,8 +778,8 @@ impl<O: TreeOperations> Overlay<O> {
             Placement::TmpLayer => {
                 // As for a create: a shown directory there is not shadowed.
                 if self.gate.may_show(&to) == Visibility::Shown
-                    && let Some(entry) = self.existing(newparent, newname)?
-                    && self.gate.show(&to, existing_kind(entry.attr.kind)) == Visibility::Shown
+                    && let Some(kind) = self.kind_at(newparent, newname)?
+                    && self.gate.show(&to, kind) == Visibility::Shown
                 {
                     return Err(Errno::EISDIR);
                 }
@@ -759,7 +788,7 @@ impl<O: TreeOperations> Overlay<O> {
                     .unwrap_or(Err(Errno::ENOENT))
             }
             Placement::Tree => {
-                if let Some(dst) = self.existing(newparent, newname)? {
+                if let Some(dst) = self.shown_existing(newparent, newname, &to)? {
                     self.require_unlink(&to_dir.attr, &dst.attr)?;
                 }
                 let owner = self.owner.caller(caller.pid);
@@ -844,7 +873,13 @@ impl<O: TreeOperations> Operations for Overlay<O> {
         if let Visibility::Hidden(h) = self.gate.may_show(&path) {
             return Err(hidden_errno(h));
         }
+        // Its kind first, counting nothing ([`Self::kind_at`]).
+        let kind = self.kind_at(parent, name)?.ok_or(Errno::ENOENT)?;
+        if let Visibility::Hidden(h) = self.gate.show(&path, kind) {
+            return Err(hidden_errno(h));
+        }
         let entry = self.inner.lookup(parent, name)?;
+        // Replaced since its kind was asked: its lookup given back.
         if let Visibility::Hidden(h) = self.gate.show(&path, existing_kind(entry.attr.kind)) {
             self.inner.forget(entry.id, 1);
             return Err(hidden_errno(h));
@@ -1010,24 +1045,21 @@ impl<O: TreeOperations> Operations for Overlay<O> {
             return Err(self.refuse_hidden_change(h));
         }
         let to = self.new_path(&to_dir, newname)?;
+        // Each end's kind is asked before it is looked up, so an end
+        // hidden for its kind is never given a node id ([`Self::kind_at`]).
+        let src_kind = self.kind_at(parent, name)?.ok_or(Errno::ENOENT)?;
+        self.admit(self.gate.place_move(Source::Tree(&from, src_kind), &to))?;
         let src = self.peek(parent, name)?;
-        self.admit(
-            self.gate
-                .place_move(Source::Tree(&from, existing_kind(src.attr.kind)), &to),
-        )?;
         // The target may be shown now: its name is recordable. Whether
         // what is there is shown for its kind is judged under the names
         // ordering ([`Judge`]): a target hidden for its kind is never
         // replaced.
         let dst = if flags & RENAME_EXCHANGE != 0 {
-            let dst = self.peek(newparent, newname)?;
-            self.admit(
-                self.gate
-                    .place_move(Source::Tree(&to, existing_kind(dst.attr.kind)), &from),
-            )?;
-            Some(dst)
+            let dst_kind = self.kind_at(newparent, newname)?.ok_or(Errno::ENOENT)?;
+            self.admit(self.gate.place_move(Source::Tree(&to, dst_kind), &from))?;
+            Some(self.peek(newparent, newname)?)
         } else {
-            self.existing(newparent, newname)?
+            self.shown_existing(newparent, newname, &to)?
         };
         self.require_unlink(&from_dir.attr, &src.attr)?;
         match &dst {
