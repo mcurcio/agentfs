@@ -13,6 +13,7 @@ use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Committer, StateDir};
 
 use super::*;
+use crate::creds::Supplementary;
 
 const C: Caller = Caller {
     uid: 1000,
@@ -140,7 +141,7 @@ impl Fx {
     fn mkdir(&self, path: &str) -> u64 {
         let (parent, name) = self.split(path);
         self.ops
-            .mkdir(parent, name.as_bytes(), 0o755, C)
+            .mkdir(parent, name.as_bytes(), 0o755, Actor::of_process(C))
             .unwrap()
             .id
     }
@@ -149,34 +150,48 @@ impl Fx {
         let (parent, name) = self.split(path);
         let (entry, fh, _) = self
             .ops
-            .create(parent, name.as_bytes(), 0o100644, O_WRONLY | 0o100, C)
+            .create(
+                parent,
+                name.as_bytes(),
+                0o100644,
+                O_WRONLY | 0o100,
+                Actor::of_process(C),
+            )
             .unwrap();
         (entry.id, fh)
     }
 
     fn open(&self, path: &str, flags: i32) -> u64 {
         let id = self.id(path);
-        self.ops.open(id, flags, C).unwrap().0
+        self.ops.open(id, flags, Actor::of_process(C)).unwrap().0
     }
 
     /// create, write, close (flush and release).
     fn put(&self, path: &str, content: &str) {
         let (_, fh) = self.create(path);
-        self.ops.write(fh, 0, content.as_bytes(), C).unwrap();
-        self.ops.flush(fh, C).unwrap();
+        self.ops
+            .write(fh, 0, content.as_bytes(), Actor::of_process(C))
+            .unwrap();
+        self.ops.flush(fh, Actor::of_process(C)).unwrap();
         self.ops.release(fh).unwrap();
     }
 
     fn close(&self, fh: u64) {
-        self.ops.flush(fh, C).unwrap();
+        self.ops.flush(fh, Actor::of_process(C)).unwrap();
         self.ops.release(fh).unwrap();
     }
 
     fn rename(&self, from: &str, to: &str, flags: u32) -> OpResult<()> {
         let (p1, n1) = self.split(from);
         let (p2, n2) = self.split(to);
-        self.ops
-            .rename(p1, n1.as_bytes(), p2, n2.as_bytes(), flags, C)
+        self.ops.rename(
+            p1,
+            n1.as_bytes(),
+            p2,
+            n2.as_bytes(),
+            flags,
+            Actor::of_process(C),
+        )
     }
 
     fn refused(&self) -> Vec<String> {
@@ -202,11 +217,11 @@ fn map(items: &[(&str, Item)]) -> BTreeMap<String, Item> {
 fn create_write_close_records_once() {
     let fx = Fx::new();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", C).unwrap();
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     assert_eq!(fx.backlog(), 1);
     // A second close with nothing new records nothing.
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     assert_eq!(fx.backlog(), 1);
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.backlog(), 1, "release: unchanged since the flush");
@@ -236,7 +251,7 @@ fn append_truncate_and_o_trunc() {
     let fx = Fx::new();
     fx.put("f", "one");
     let fh = fx.open("f", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 3, b"two", C).unwrap();
+    fx.ops.write(fh, 3, b"two", Actor::of_process(C)).unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("f", file("onetwo"))]));
 
@@ -246,7 +261,7 @@ fn append_truncate_and_o_trunc() {
         size: Some(3),
         ..SetAttr::default()
     };
-    fx.ops.setattr(id, &set, C).unwrap();
+    fx.ops.setattr(id, &set, Actor::of_process(C)).unwrap();
     assert_eq!(fx.history(), map(&[("f", file("one"))]));
 
     // ftruncate on an open handle.
@@ -256,7 +271,7 @@ fn append_truncate_and_o_trunc() {
         fh: Some(fh),
         ..SetAttr::default()
     };
-    fx.ops.setattr(id, &set, C).unwrap();
+    fx.ops.setattr(id, &set, Actor::of_process(C)).unwrap();
     assert_eq!(fx.backlog(), 1);
     fx.close(fh);
     assert_eq!(fx.backlog(), 1, "nothing changed after the truncate");
@@ -264,7 +279,7 @@ fn append_truncate_and_o_trunc() {
 
     // `>` on an existing file: O_TRUNC at open, one record at close.
     let fh = fx.open("f", O_WRONLY | O_TRUNC);
-    fx.ops.write(fh, 0, b"new", C).unwrap();
+    fx.ops.write(fh, 0, b"new", Actor::of_process(C)).unwrap();
     fx.close(fh);
     assert_eq!(fx.backlog(), 1);
     assert_eq!(fx.history(), map(&[("f", file("new"))]));
@@ -281,7 +296,9 @@ fn same_size_rewrites_are_caught_by_the_racy_rule() {
     fx.put("f", "aaa");
     for content in ["bbb", "ccc", "ddd"] {
         let fh = fx.open("f", O_WRONLY);
-        fx.ops.write(fh, 0, content.as_bytes(), C).unwrap();
+        fx.ops
+            .write(fh, 0, content.as_bytes(), Actor::of_process(C))
+            .unwrap();
         fx.close(fh);
         assert_eq!(fx.history(), map(&[("f", file(content))]), "{content}");
     }
@@ -320,8 +337,8 @@ fn write_behind(fx: &Fx, path: &str, content: &str) {
 fn a_racy_close_is_not_recorded_again_at_release() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", C).unwrap();
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     assert_eq!(fx.backlog(), 1, "flush records the close");
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.backlog(), 1, "release proves the bytes recorded");
@@ -340,8 +357,8 @@ fn a_proven_racy_skip_clears_racy_once_the_window_passed() {
         chunk: RENAME_CHUNK,
     });
     let (id, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", C).unwrap();
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     assert_eq!(fx.backlog(), 1);
     let racy = |fx: &Fx| {
         let table = fx.ops.table();
@@ -350,7 +367,7 @@ fn a_proven_racy_skip_clears_racy_once_the_window_passed() {
     };
     assert_eq!(racy(&fx), (true, true), "recorded within the window");
     std::thread::sleep(std::time::Duration::from_nanos(3 * TICK as u64));
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     assert_eq!(fx.backlog(), 1, "proven unchanged: skipped");
     assert_eq!(racy(&fx), (false, false), "and no longer racy");
     fx.ops.release(fh).unwrap();
@@ -365,8 +382,8 @@ fn a_proven_racy_skip_clears_racy_once_the_window_passed() {
 fn a_same_tick_write_after_a_racy_close_is_recorded_at_release() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", C).unwrap();
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     let before = fs::metadata(fx.backing().join("a")).unwrap();
     write_behind(&fx, "a", "jello");
     let after = fs::metadata(fx.backing().join("a")).unwrap();
@@ -382,12 +399,12 @@ fn a_same_tick_write_after_a_racy_close_is_recorded_at_release() {
 fn a_same_tick_write_is_recorded_at_the_next_close() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", C).unwrap();
-    fx.ops.flush(fh, C).unwrap();
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     assert_eq!(fx.backlog(), 1, "an unchanged racy close records nothing");
     write_behind(&fx, "a", "jello");
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     assert_eq!(fx.backlog(), 2);
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.backlog(), 2);
@@ -403,8 +420,8 @@ fn a_same_tick_write_is_recorded_at_the_next_close() {
 fn release_records_when_the_pinned_copy_is_no_longer_last() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", C).unwrap();
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     fx.ops.boundary().queue_repair([b"a".to_vec()], C);
     fx.ops.sweep(false);
     assert_eq!(fx.backlog(), 3, "the repair, then the open file again");
@@ -418,15 +435,15 @@ fn release_records_when_the_pinned_copy_is_no_longer_last() {
 fn a_commit_between_close_and_release_does_not_lose_the_pin() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", C).unwrap();
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     assert_eq!(fx.history(), map(&[("a", file("hello"))]));
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.backlog(), 0, "nothing recorded again");
     // And a same-tick write after a commit is still caught.
     let fh = fx.open("a", O_WRONLY);
-    fx.ops.write(fh, 0, b"hallo", C).unwrap();
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.write(fh, 0, b"hallo", Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     fx.history();
     write_behind(&fx, "a", "jallo");
     fx.ops.release(fh).unwrap();
@@ -443,14 +460,22 @@ fn exec_bit_and_other_metadata() {
         mode: Some(mode),
         ..SetAttr::default()
     };
-    fx.ops.setattr(id, &chmod(0o755), C).unwrap();
+    fx.ops
+        .setattr(id, &chmod(0o755), Actor::of_process(C))
+        .unwrap();
     assert_eq!(fx.history(), map(&[("s", Item::Exec("#!/bin/sh".into()))]));
     // Other bits: passed through, not recorded.
-    fx.ops.setattr(id, &chmod(0o700), C).unwrap();
+    fx.ops
+        .setattr(id, &chmod(0o700), Actor::of_process(C))
+        .unwrap();
     assert_eq!(fx.backlog(), 0);
-    fx.ops.setattr(id, &chmod(0o600), C).unwrap();
+    fx.ops
+        .setattr(id, &chmod(0o600), Actor::of_process(C))
+        .unwrap();
     assert_eq!(fx.history(), map(&[("s", file("#!/bin/sh"))]));
-    fx.ops.setattr(id, &chmod(0o400), C).unwrap();
+    fx.ops
+        .setattr(id, &chmod(0o400), Actor::of_process(C))
+        .unwrap();
     assert_eq!(fx.backlog(), 0);
     let mode = fs::metadata(fx.backing().join("s"))
         .unwrap()
@@ -465,14 +490,14 @@ fn exec_bit_and_other_metadata() {
         gid: Some(me.gid()),
         ..SetAttr::default()
     };
-    fx.ops.setattr(id, &set, C).unwrap();
+    fx.ops.setattr(id, &set, Actor::of_process(C)).unwrap();
     let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
     let set = SetAttr {
         mtime: Some(TimeOrNow::SpecificTime(when)),
         atime: Some(TimeOrNow::Now),
         ..SetAttr::default()
     };
-    let attr = fx.ops.setattr(id, &set, C).unwrap();
+    let attr = fx.ops.setattr(id, &set, Actor::of_process(C)).unwrap();
     assert_eq!(attr.mtime, when);
     assert_eq!(
         fs::metadata(fx.backing().join("s")).unwrap().mtime(),
@@ -506,7 +531,7 @@ fn directory_renames_move_every_file() {
     fx.put("d/x", "x");
     fx.put("d/e/y", "y");
     let (p, _) = fx.split("d/e/y");
-    fx.ops.symlink(p, b"l", b"y", C).unwrap();
+    fx.ops.symlink(p, b"l", b"y", Actor::of_process(C)).unwrap();
     fx.rename("d", "moved", 0).unwrap();
     assert_eq!(
         fx.history(),
@@ -518,7 +543,7 @@ fn directory_renames_move_every_file() {
     );
     // Paths of open nodes follow the rename.
     let fh = fx.open("moved/x", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 1, b"2", C).unwrap();
+    fx.ops.write(fh, 1, b"2", Actor::of_process(C)).unwrap();
     fx.close(fh);
     assert_eq!(fx.history()["moved/x"], file("x2"));
 }
@@ -574,7 +599,7 @@ fn a_write_in_flight_across_a_directory_rename_lands_at_the_new_path() {
     fx.put("d/x", "1");
     fx.history();
     let fh = fx.open("d/x", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 1, b"2", C).unwrap();
+    fx.ops.write(fh, 1, b"2", Actor::of_process(C)).unwrap();
     fx.rename("d", "m", 0).unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("m/x", file("12"))]));
@@ -638,7 +663,7 @@ fn rename_flags() {
     );
     // A rename between two names of one inode changes nothing.
     let id = fx.id("a");
-    fx.ops.link(id, ROOT, b"a2", C).unwrap();
+    fx.ops.link(id, ROOT, b"a2", Actor::of_process(C)).unwrap();
     fx.history();
     fx.rename("a", "a2", 0).unwrap();
     assert!(fx.backing().join("a").exists());
@@ -655,14 +680,17 @@ fn unlink_and_rm_r() {
     fx.history();
     // rm -r: depth first.
     let e = fx.id("d/e");
-    fx.ops.unlink(e, b"f", C).unwrap();
+    fx.ops.unlink(e, b"f", Actor::of_process(C)).unwrap();
     let d = fx.id("d");
-    fx.ops.rmdir(d, b"e", C).unwrap();
-    fx.ops.rmdir(ROOT, b"d", C).unwrap();
+    fx.ops.rmdir(d, b"e", Actor::of_process(C)).unwrap();
+    fx.ops.rmdir(ROOT, b"d", Actor::of_process(C)).unwrap();
     assert_eq!(fx.history(), map(&[("keep", file("k"))]));
-    fx.ops.unlink(ROOT, b"keep", C).unwrap();
+    fx.ops.unlink(ROOT, b"keep", Actor::of_process(C)).unwrap();
     assert_eq!(fx.history(), map(&[]));
-    assert_eq!(fx.ops.unlink(ROOT, b"keep", C), Err(Errno::ENOENT));
+    assert_eq!(
+        fx.ops.unlink(ROOT, b"keep", Actor::of_process(C)),
+        Err(Errno::ENOENT)
+    );
 }
 
 #[test]
@@ -670,12 +698,12 @@ fn hard_links() {
     let fx = Fx::new();
     fx.put("a", "1");
     let id = fx.id("a");
-    let entry = fx.ops.link(id, ROOT, b"b", C).unwrap();
+    let entry = fx.ops.link(id, ROOT, b"b", Actor::of_process(C)).unwrap();
     assert_eq!(entry.id, id, "one inode, one node, one st_ino");
     assert_eq!(fx.history(), map(&[("a", file("1")), ("b", file("1"))]));
     // A write through one name is recorded at both.
     let fh = fx.open("b", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 1, b"2", C).unwrap();
+    fx.ops.write(fh, 1, b"2", Actor::of_process(C)).unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("a", file("12")), ("b", file("12"))]));
 }
@@ -683,7 +711,10 @@ fn hard_links() {
 #[test]
 fn symlinks() {
     let fx = Fx::new();
-    let entry = fx.ops.symlink(ROOT, b"l", b"some/target", C).unwrap();
+    let entry = fx
+        .ops
+        .symlink(ROOT, b"l", b"some/target", Actor::of_process(C))
+        .unwrap();
     assert_eq!(entry.attr.kind, FileType::Symlink);
     assert_eq!(fx.ops.readlink(entry.id).unwrap(), b"some/target");
     assert_eq!(
@@ -695,7 +726,11 @@ fn symlinks() {
         mode: Some(0o700),
         ..SetAttr::default()
     };
-    assert!(fx.ops.setattr(entry.id, &set, C).is_err());
+    assert!(
+        fx.ops
+            .setattr(entry.id, &set, Actor::of_process(C))
+            .is_err()
+    );
 }
 
 #[test]
@@ -705,8 +740,8 @@ fn unlink_of_an_open_file() {
     fx.history();
     // exec 3>>f; rm f; echo y >&3; exec 3>&-
     let fh = fx.open("f", O_WRONLY | O_APPEND);
-    fx.ops.unlink(ROOT, b"f", C).unwrap();
-    fx.ops.write(fh, 1, b"y", C).unwrap();
+    fx.ops.unlink(ROOT, b"f", Actor::of_process(C)).unwrap();
+    fx.ops.write(fh, 1, b"y", Actor::of_process(C)).unwrap();
     // Still answerable through the handle.
     let id = fx.ops.handle(fh).unwrap().node;
     assert_eq!(fx.ops.getattr(id, Some(fh)).unwrap().size, 2);
@@ -723,7 +758,7 @@ fn rename_over_an_open_file() {
     let fh = fx.open("f", O_WRONLY | O_APPEND);
     fx.rename("new", "f", 0).unwrap();
     // The replaced inode has no name: its late write is not recorded.
-    fx.ops.write(fh, 3, b"!", C).unwrap();
+    fx.ops.write(fh, 3, b"!", Actor::of_process(C)).unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("f", file("fresh"))]));
 }
@@ -733,11 +768,13 @@ fn log_rotation_with_the_writer_open() {
     let fx = Fx::new();
     fx.put("app.log", "a\n");
     let fh = fx.open("app.log", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 2, b"b\n", C).unwrap();
+    fx.ops.write(fh, 2, b"b\n", Actor::of_process(C)).unwrap();
     fx.rename("app.log", "app.log.1", 0).unwrap();
     fx.put("app.log", "new\n");
     // The writer still holds the rotated file.
-    fx.ops.write(fh, 4, b"late\n", C).unwrap();
+    fx.ops
+        .write(fh, 4, b"late\n", Actor::of_process(C))
+        .unwrap();
     fx.close(fh);
     assert_eq!(
         fx.history(),
@@ -761,7 +798,7 @@ fn git_internals_are_never_recorded() {
     fx.put("sub/.git/config", "[core]\n\trepositoryformatversion = 0\n");
     fx.rename(".git/HEAD", ".git/HEAD2", 0).unwrap();
     let git = fx.id(".git");
-    fx.ops.unlink(git, b"HEAD2", C).unwrap();
+    fx.ops.unlink(git, b"HEAD2", Actor::of_process(C)).unwrap();
     assert_eq!(fx.history(), map(&[("README", file("r"))]));
     assert!(fx.refused().is_empty(), "{:?}", fx.refused());
 
@@ -777,15 +814,17 @@ fn non_utf8_names_are_refused_but_work() {
     let fx = Fx::new();
     let (entry, fh, _) = fx
         .ops
-        .create(ROOT, b"bad\xff", 0o100644, O_WRONLY, C)
+        .create(ROOT, b"bad\xff", 0o100644, O_WRONLY, Actor::of_process(C))
         .unwrap();
-    fx.ops.write(fh, 0, b"data", C).unwrap();
+    fx.ops.write(fh, 0, b"data", Actor::of_process(C)).unwrap();
     fx.close(fh);
     assert_eq!(fx.refused().len(), 1, "{:?}", fx.refused());
     assert_eq!(fx.history(), map(&[]));
     assert_eq!(fx.ops.getattr(entry.id, None).unwrap().size, 4);
     // A symlink whose target is not UTF-8 is refused too.
-    fx.ops.symlink(ROOT, b"l", b"\xfe", C).unwrap();
+    fx.ops
+        .symlink(ROOT, b"l", b"\xfe", Actor::of_process(C))
+        .unwrap();
     assert_eq!(fx.refused().len(), 2);
 }
 
@@ -807,9 +846,9 @@ fn record_failures_return_eio_and_are_repaired() {
     };
 
     let fh = fx.open("keep", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 1, b"2", C).unwrap();
+    fx.ops.write(fh, 1, b"2", Actor::of_process(C)).unwrap();
     lock(0o500);
-    assert_eq!(fx.ops.flush(fh, C), Err(Errno::EIO));
+    assert_eq!(fx.ops.flush(fh, Actor::of_process(C)), Err(Errno::EIO));
     assert!(
         fx.sink
             .snapshot()
@@ -818,18 +857,23 @@ fn record_failures_return_eio_and_are_repaired() {
     );
     lock(0o700);
     // Still dirty: the next close records it.
-    fx.ops.flush(fh, C).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.history()["keep"], file("k2"));
 
     // A namespace operation that already happened is repaired by the sweep.
-    fx.ops.unlink(ROOT, b"gone", C).unwrap_or(());
+    fx.ops
+        .unlink(ROOT, b"gone", Actor::of_process(C))
+        .unwrap_or(());
     fx.put("gone", "again");
     fx.history();
     // Make the pending directory unreadable: the journal syncs it before
     // every write, so even a removal fails to journal.
     fs::set_permissions(&pending, fs::Permissions::from_mode(0o000)).unwrap();
-    assert_eq!(fx.ops.unlink(ROOT, b"gone", C), Err(Errno::EIO));
+    assert_eq!(
+        fx.ops.unlink(ROOT, b"gone", Actor::of_process(C)),
+        Err(Errno::EIO)
+    );
     assert!(!fx.backing().join("gone").exists(), "the unlink happened");
     assert_eq!(fx.ops.boundary().pending_repairs(), 1);
     fs::set_permissions(&pending, fs::Permissions::from_mode(0o700)).unwrap();
@@ -846,7 +890,7 @@ fn release_and_sweep_backstops() {
     // A write that no close follows (a shared mapping, say): recorded
     // at RELEASE.
     let fh = fx.open("m", O_RDWR);
-    fx.ops.write(fh, 0, b"12", C).unwrap();
+    fx.ops.write(fh, 0, b"12", Actor::of_process(C)).unwrap();
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.history()["m"], file("12"));
     let triggers = fx.committer.history().head().unwrap().unwrap();
@@ -861,7 +905,7 @@ fn release_and_sweep_backstops() {
 
     // A file held open and changed: recorded by the sweep.
     let fh = fx.open("m", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 2, b"345", C).unwrap();
+    fx.ops.write(fh, 2, b"345", Actor::of_process(C)).unwrap();
     let report = fx.ops.sweep(false);
     assert_eq!(report.recorded, 1);
     assert_eq!(fx.history()["m"], file("12345"));
@@ -912,7 +956,10 @@ fn stale_backing_inodes_are_detected() {
     fs::remove_file(fx.backing().join("f")).unwrap();
     fs::write(fx.backing().join("f"), "other").unwrap();
     assert_eq!(fx.ops.getattr(id, None), Err(estale()));
-    assert_eq!(fx.ops.open(id, O_RDONLY, C).map(|_| ()), Err(estale()));
+    assert_eq!(
+        fx.ops.open(id, O_RDONLY, Actor::of_process(C)).map(|_| ()),
+        Err(estale())
+    );
 }
 
 #[test]
@@ -927,7 +974,7 @@ fn names_another_process_moved_away_are_dropped_at_lookup() {
     // The old name is gone from the node: it opens, and records, by the
     // new one.
     let fh = fx.open("new", O_WRONLY | O_TRUNC);
-    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
     fx.close(fh);
     assert_eq!(fx.history().get("new"), Some(&file("2")));
     // A real hard link keeps both names.
@@ -935,7 +982,7 @@ fn names_another_process_moved_away_are_dropped_at_lookup() {
     assert_eq!(fx.id("link"), id);
     assert_eq!(fx.id("new"), id);
     let fh = fx.open("new", O_WRONLY | O_TRUNC);
-    fx.ops.write(fh, 0, b"3", C).unwrap();
+    fx.ops.write(fh, 0, b"3", Actor::of_process(C)).unwrap();
     fx.close(fh);
     let history = fx.history();
     assert_eq!(history.get("new"), Some(&file("3")), "{history:?}");
@@ -950,7 +997,7 @@ fn an_open_file_another_process_renamed_is_recorded_at_its_new_name() {
     fx.put("old", "1");
     let fh = fx.open("old", O_WRONLY | O_TRUNC);
     fs::rename(fx.backing().join("old"), fx.backing().join("new")).unwrap();
-    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
     fx.close(fh);
     let history = fx.history();
     assert_eq!(history.get("old"), Some(&file("1")), "{history:?}");
@@ -960,7 +1007,7 @@ fn an_open_file_another_process_renamed_is_recorded_at_its_new_name() {
     fx.put("d/f", "1");
     let fh = fx.open("d/f", O_WRONLY | O_TRUNC);
     fs::rename(fx.backing().join("d"), fx.backing().join("e")).unwrap();
-    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
     fx.close(fh);
     let history = fx.history();
     assert_eq!(history.get("d/f"), Some(&file("1")), "{history:?}");
@@ -969,7 +1016,7 @@ fn an_open_file_another_process_renamed_is_recorded_at_its_new_name() {
     fx.put("s", "1");
     let fh = fx.open("s", O_WRONLY | O_TRUNC);
     fs::rename(fx.backing().join("s"), fx.backing().join("t")).unwrap();
-    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
     assert_eq!(fx.ops.sweep(false).recorded, 1);
     let history = fx.history();
     assert_eq!(history.get("s"), Some(&file("1")), "{history:?}");
@@ -985,7 +1032,7 @@ fn an_open_file_another_process_removed_is_recorded_nowhere() {
     fx.put("x", "1");
     let fh = fx.open("x", O_WRONLY | O_TRUNC);
     fs::remove_file(fx.backing().join("x")).unwrap();
-    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("x", file("1"))]));
     // Removed, and the name reused for another file.
@@ -993,7 +1040,7 @@ fn an_open_file_another_process_removed_is_recorded_nowhere() {
     let fh = fx.open("y", O_WRONLY | O_TRUNC);
     fs::remove_file(fx.backing().join("y")).unwrap();
     fs::write(fx.backing().join("y"), "other").unwrap();
-    fx.ops.write(fh, 0, b"2", C).unwrap();
+    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
     fx.close(fh);
     assert_eq!(fx.history().get("y"), Some(&file("1")));
 }
@@ -1008,7 +1055,7 @@ fn symlinked_components_never_escape() {
     // Swap the directory for a symlink to outside the tree.
     fs::rename(fx.backing().join("d"), fx.backing().join("d.real")).unwrap();
     std::os::unix::fs::symlink(fx.dir.path(), fx.backing().join("d")).unwrap();
-    assert!(fx.ops.open(f, O_RDONLY, C).is_err());
+    assert!(fx.ops.open(f, O_RDONLY, Actor::of_process(C)).is_err());
     // And a lookup through it sees a symlink, not a directory.
     let d = fx.ops.lookup(ROOT, b"d").unwrap();
     assert_eq!(d.attr.kind, FileType::Symlink);
@@ -1075,7 +1122,10 @@ fn xattrs_pass_through() {
     fx.ops.removexattr(id, b"user.agentfs-test").unwrap();
     assert!(fx.ops.getxattr(id, b"user.agentfs-test", 64).is_err());
     assert_eq!(fx.backlog(), 0);
-    let l = fx.ops.symlink(ROOT, b"l", b"f", C).unwrap();
+    let l = fx
+        .ops
+        .symlink(ROOT, b"l", b"f", Actor::of_process(C))
+        .unwrap();
     assert!(fx.ops.getxattr(l.id, b"user.x", 0).is_err());
 }
 
@@ -1084,10 +1134,16 @@ fn created_objects_keep_the_requested_mode() {
     let fx = Fx::new();
     // The mode is exact even with a umask that would clear group write.
     let (parent, _) = fx.split("x");
-    let (entry, fh, _) = fx.ops.create(parent, b"g", 0o100664, O_WRONLY, C).unwrap();
+    let (entry, fh, _) = fx
+        .ops
+        .create(parent, b"g", 0o100664, O_WRONLY, Actor::of_process(C))
+        .unwrap();
     fx.close(fh);
     assert_eq!(u32::from(entry.attr.perm), 0o664);
-    let d = fx.ops.mkdir(ROOT, b"dir", 0o775, C).unwrap();
+    let d = fx
+        .ops
+        .mkdir(ROOT, b"dir", 0o775, Actor::of_process(C))
+        .unwrap();
     assert_eq!(
         fs::metadata(fx.backing().join("dir"))
             .unwrap()
@@ -1114,8 +1170,12 @@ fn created_objects_keep_the_requested_mode() {
 #[test]
 fn mknod_regular_files_are_recorded_fifos_are_not() {
     let fx = Fx::new();
-    fx.ops.mknod(ROOT, b"reg", 0o100644, 0, C).unwrap();
-    fx.ops.mknod(ROOT, b"fifo", 0o010644, 0, C).unwrap();
+    fx.ops
+        .mknod(ROOT, b"reg", 0o100644, 0, Actor::of_process(C))
+        .unwrap();
+    fx.ops
+        .mknod(ROOT, b"fifo", 0o010644, 0, Actor::of_process(C))
+        .unwrap();
     assert_eq!(fx.history(), map(&[("reg", file(""))]));
     // Opening a FIFO's attributes still works.
     let fifo = fx.id("fifo");
@@ -1174,7 +1234,7 @@ fn final_sweep_covers_read_only_handles_of_armed_inodes() {
     fx.history();
     let w = fx.open("f", O_WRONLY | O_APPEND);
     let r = fx.open("f", O_RDONLY);
-    fx.ops.write(w, 1, b"2", C).unwrap();
+    fx.ops.write(w, 1, b"2", Actor::of_process(C)).unwrap();
     // The writer's handle goes without a flush; the reader stays open.
     let id = fx.ops.handle(w).unwrap().node;
     {
@@ -1229,9 +1289,13 @@ fn a_new_objects_name_swapped_for_a_symlink_or_link_is_never_followed() {
     }
     assert_eq!(mode_of_path(&outside), 0o600);
     // The real thing still works.
-    fx.ops.mkdir(ROOT, b"d", 0o1777, C).unwrap();
+    fx.ops
+        .mkdir(ROOT, b"d", 0o1777, Actor::of_process(C))
+        .unwrap();
     assert_eq!(mode_of_path(&fx.backing().join("d")), 0o1777);
-    fx.ops.mknod(ROOT, b"n", 0o100640, 0, C).unwrap();
+    fx.ops
+        .mknod(ROOT, b"n", 0o100640, 0, Actor::of_process(C))
+        .unwrap();
     assert_eq!(mode_of_path(&fx.backing().join("n")), 0o640);
 }
 
@@ -1262,8 +1326,8 @@ fn mkdir_and_mknod_race_a_symlink_swap_without_following_it() {
     };
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(2) {
-        let _ = ops.mkdir(ROOT, b"x", 0o1777, C);
-        let _ = ops.mknod(ROOT, b"y", 0o104777, 0, C);
+        let _ = ops.mkdir(ROOT, b"x", 0o1777, Actor::of_process(C));
+        let _ = ops.mknod(ROOT, b"y", 0o104777, 0, Actor::of_process(C));
         assert_eq!(
             mode_of_path(&outside),
             0o600,
@@ -1287,8 +1351,10 @@ fn getattr_never_fails_while_an_ancestor_is_renamed() {
         let stop = stop.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                ops.rename(ROOT, b"d", ROOT, b"d2", 0, C).unwrap();
-                ops.rename(ROOT, b"d2", ROOT, b"d", 0, C).unwrap();
+                ops.rename(ROOT, b"d", ROOT, b"d2", 0, Actor::of_process(C))
+                    .unwrap();
+                ops.rename(ROOT, b"d2", ROOT, b"d", 0, Actor::of_process(C))
+                    .unwrap();
             }
         })
     };
@@ -1326,7 +1392,7 @@ fn create_over_an_existing_file_does_not_take_it_over() {
     };
     let (_, fh, _) = fx
         .ops
-        .create(ROOT, b"victim", 0o666, O_WRONLY, owner)
+        .create(ROOT, b"victim", 0o666, O_WRONLY, Actor::of_process(owner))
         .unwrap();
     assert_eq!(mode_of_path(&victim), 0o600, "mode rewritten");
     // Not marked new: closing it unchanged records nothing.
@@ -1336,7 +1402,13 @@ fn create_over_an_existing_file_does_not_take_it_over() {
     let excl = 0o200;
     assert_eq!(
         fx.ops
-            .create(ROOT, b"victim", 0o666, O_WRONLY | excl, owner)
+            .create(
+                ROOT,
+                b"victim",
+                0o666,
+                O_WRONLY | excl,
+                Actor::of_process(owner)
+            )
             .err(),
         Some(Errno::EEXIST)
     );
@@ -1347,7 +1419,9 @@ fn create_over_an_existing_file_does_not_take_it_over() {
         pid: 2,
     };
     assert_eq!(
-        fx.ops.create(ROOT, b"victim", 0o666, O_RDWR, other).err(),
+        fx.ops
+            .create(ROOT, b"victim", 0o666, O_RDWR, Actor::of_process(other))
+            .err(),
         Some(Errno::EACCES)
     );
     // A FIFO in the way is not opened (that would block).
@@ -1360,7 +1434,9 @@ fn create_over_an_existing_file_does_not_take_it_over() {
     )
     .unwrap();
     assert_eq!(
-        fx.ops.create(ROOT, b"fifo", 0o666, O_RDONLY, C).err(),
+        fx.ops
+            .create(ROOT, b"fifo", 0o666, O_RDONLY, Actor::of_process(C))
+            .err(),
         Some(Errno::EEXIST)
     );
 }
@@ -1379,7 +1455,9 @@ fn a_dot_git_that_is_no_repository_raises_path_refused_once() {
     fx.put("plain/.git", "hello\n");
     assert_eq!(fx.refused(), ["notes/.git/report.txt", "plain/.git"]);
     // Removing such paths raises nothing.
-    fx.ops.unlink(fx.id("plain"), b".git", C).unwrap();
+    fx.ops
+        .unlink(fx.id("plain"), b".git", Actor::of_process(C))
+        .unwrap();
     assert_eq!(fx.refused().len(), 2);
 }
 
@@ -1536,8 +1614,10 @@ fn records_by_a_restore_actor_belong_to_the_operation() {
         .unwrap();
     // A write (close), a chmod +x (setattr) and an unlink by the actor.
     let fh = fx.open("a", O_WRONLY | O_TRUNC);
-    fx.ops.write(fh, 0, b"restored", actor).unwrap();
-    fx.ops.flush(fh, actor).unwrap();
+    fx.ops
+        .write(fh, 0, b"restored", Actor::of_process(actor))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(actor)).unwrap();
     fx.ops.release(fh).unwrap();
     let id = fx.id("a");
     fx.ops
@@ -1547,10 +1627,10 @@ fn records_by_a_restore_actor_belong_to_the_operation() {
                 mode: Some(0o100755),
                 ..SetAttr::default()
             },
-            actor,
+            Actor::of_process(actor),
         )
         .unwrap();
-    fx.ops.unlink(ROOT, b"b", actor).unwrap();
+    fx.ops.unlink(ROOT, b"b", Actor::of_process(actor)).unwrap();
     // Someone else, meanwhile.
     fx.put("c", "3");
     let last = guard.finish();
@@ -1625,8 +1705,8 @@ fn fsync_class_files_are_captured_whole_at_fsync_at_most_once_per_interval() {
     let fx = Fx::with_attributes(SQLITE);
     let (_, db) = fx.create("s.db");
     let (_, wal) = fx.create("s.db-wal");
-    fx.ops.write(db, 0, b"db1", C).unwrap();
-    fx.ops.write(wal, 0, b"wal1", C).unwrap();
+    fx.ops.write(db, 0, b"db1", Actor::of_process(C)).unwrap();
+    fx.ops.write(wal, 0, b"wal1", Actor::of_process(C)).unwrap();
     // Nothing is recorded per file.
     assert_eq!(fx.backlog(), 0);
     fx.ops.fsync(wal, false).unwrap();
@@ -1639,7 +1719,7 @@ fn fsync_class_files_are_captured_whole_at_fsync_at_most_once_per_interval() {
         map(&[("s.db", file("db1")), ("s.db-wal", file("wal1"))])
     );
     // A second fsync within the interval records nothing...
-    fx.ops.write(db, 0, b"db2", C).unwrap();
+    fx.ops.write(db, 0, b"db2", Actor::of_process(C)).unwrap();
     fx.ops.fsync(db, true).unwrap();
     assert_eq!(fx.backlog(), 0);
     // ...nor does the timer before the interval has passed...
@@ -1674,7 +1754,9 @@ fn close_captures_and_shm_is_never_recorded() {
         map(&[("s.db", file("v1")), ("s.db-journal", file("hot"))])
     );
     // An unlink of a member is captured with the group, not alone.
-    fx.ops.unlink(ROOT, b"s.db-journal", C).unwrap();
+    fx.ops
+        .unlink(ROOT, b"s.db-journal", Actor::of_process(C))
+        .unwrap();
     assert_eq!(fx.backlog(), 0);
     assert_eq!(fx.later(6), 1);
     assert_eq!(fx.history(), map(&[("s.db", file("v1"))]));
@@ -1689,16 +1771,22 @@ fn class_handles_never_use_passthrough() {
     fx.put("s.db", "v1");
     fx.put("a.txt", "x");
     let id = fx.id("s.db");
-    let (_, h) = fx.ops.open(id, O_RDONLY, C).unwrap();
+    let (_, h) = fx.ops.open(id, O_RDONLY, Actor::of_process(C)).unwrap();
     assert!(h.daemon_only());
     let id = fx.id("a.txt");
-    let (_, h) = fx.ops.open(id, O_RDONLY, C).unwrap();
+    let (_, h) = fx.ops.open(id, O_RDONLY, Actor::of_process(C)).unwrap();
     assert!(!h.daemon_only());
     // Without the class, nothing is daemon-only.
     let fx = Fx::new();
     fx.put("s.db", "v1");
     let id = fx.id("s.db");
-    assert!(!fx.ops.open(id, O_RDONLY, C).unwrap().1.daemon_only());
+    assert!(
+        !fx.ops
+            .open(id, O_RDONLY, Actor::of_process(C))
+            .unwrap()
+            .1
+            .daemon_only()
+    );
 }
 
 #[test]
@@ -1706,14 +1794,14 @@ fn a_capture_holds_writes_to_every_member() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let fx = Fx::with_attributes(SQLITE);
     let (_, db) = fx.create("s.db");
-    fx.ops.write(db, 0, b"1", C).unwrap();
+    fx.ops.write(db, 0, b"1", Actor::of_process(C)).unwrap();
     let (_, wal) = fx.create("s.db-wal");
     let group = fx.ops.groups().dirty().pop().unwrap();
     let frozen = group.gate().freeze();
     let done = AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| {
-            fx.ops.write(wal, 0, b"w", C).unwrap();
+            fx.ops.write(wal, 0, b"w", Actor::of_process(C)).unwrap();
             done.store(true, Ordering::SeqCst);
         });
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1749,7 +1837,9 @@ fn the_last_release_and_unmount_capture_what_changed() {
     let fx = Fx::with_attributes(SQLITE);
     // A write no close follows (a mapping, say): captured at release.
     let (_, db) = fx.create("s.db");
-    fx.ops.write(db, 0, b"mapped", C).unwrap();
+    fx.ops
+        .write(db, 0, b"mapped", Actor::of_process(C))
+        .unwrap();
     fx.ops.release(db).unwrap();
     assert_eq!(fx.journal().last().unwrap().draft.trigger, Trigger::Release);
     assert_eq!(fx.history()["s.db"], file("mapped"));
@@ -1762,7 +1852,7 @@ fn the_last_release_and_unmount_capture_what_changed() {
                 size: Some(3),
                 ..SetAttr::default()
             },
-            C,
+            Actor::of_process(C),
         )
         .unwrap();
     assert_eq!(fx.backlog(), 0);
@@ -1776,8 +1866,10 @@ fn a_member_over_max_size_refuses_the_whole_group() {
     let fx = Fx::with_attributes(&format!("{SQLITE}*.db-wal agentfs.maxSize=4\n"));
     let (_, db) = fx.create("s.db");
     let (_, wal) = fx.create("s.db-wal");
-    fx.ops.write(db, 0, b"db", C).unwrap();
-    fx.ops.write(wal, 0, b"0123456789", C).unwrap();
+    fx.ops.write(db, 0, b"db", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(wal, 0, b"0123456789", Actor::of_process(C))
+        .unwrap();
     // A refusal is not a failure: the last close succeeds, nothing is
     // recorded, and the group is clean.
     fx.close(db);
@@ -1817,15 +1909,22 @@ fn a_restore_actor_s_changes_are_captured_whole_at_the_operation_s_end() {
         .unwrap();
     // The actor removes the journal and rewrites the database, as a
     // restore does, one member at a time.
-    fx.ops.unlink(ROOT, b"s.db-journal", actor).unwrap();
+    fx.ops
+        .unlink(ROOT, b"s.db-journal", Actor::of_process(actor))
+        .unwrap();
     let id = fx.id("s.db");
-    let (fh, _) = fx.ops.open(id, O_WRONLY | O_TRUNC, actor).unwrap();
-    fx.ops.write(fh, 0, b"v0", actor).unwrap();
+    let (fh, _) = fx
+        .ops
+        .open(id, O_WRONLY | O_TRUNC, Actor::of_process(actor))
+        .unwrap();
+    fx.ops
+        .write(fh, 0, b"v0", Actor::of_process(actor))
+        .unwrap();
     // No trigger records the half-restored group: not the timer, not an
     // fsync, not the actor's close or release.
     assert_eq!(fx.later(600), 0);
     fx.ops.fsync(workload, false).unwrap();
-    fx.ops.flush(fh, actor).unwrap();
+    fx.ops.flush(fh, Actor::of_process(actor)).unwrap();
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.journal().len(), records);
     // The operation's end records it whole, as part of the operation.
@@ -1852,17 +1951,23 @@ fn closing_one_member_while_another_is_open_does_not_capture() {
     // the close must not capture, or the rate is unbounded.
     let fx = Fx::with_attributes(SQLITE);
     let (_, db) = fx.create("s.db");
-    fx.ops.write(db, 0, b"db0", C).unwrap();
+    fx.ops.write(db, 0, b"db0", Actor::of_process(C)).unwrap();
     fx.ops.fsync(db, false).unwrap();
     assert_eq!(fx.journal().len(), 1, "the first fsync captures");
     for i in 1..=5 {
         let (_, journal) = fx.create("s.db-journal");
-        fx.ops.write(journal, 0, b"hot", C).unwrap();
+        fx.ops
+            .write(journal, 0, b"hot", Actor::of_process(C))
+            .unwrap();
         fx.ops.fsync(journal, false).unwrap();
         fx.close(journal);
-        fx.ops.write(db, 0, format!("db{i}").as_bytes(), C).unwrap();
+        fx.ops
+            .write(db, 0, format!("db{i}").as_bytes(), Actor::of_process(C))
+            .unwrap();
         fx.ops.fsync(db, false).unwrap();
-        fx.ops.unlink(ROOT, b"s.db-journal", C).unwrap();
+        fx.ops
+            .unlink(ROOT, b"s.db-journal", Actor::of_process(C))
+            .unwrap();
     }
     // Five transactions inside one interval: still one capture.
     assert_eq!(fx.journal().len(), 1);
@@ -1874,7 +1979,7 @@ fn closing_one_member_while_another_is_open_does_not_capture() {
     assert_eq!(fx.later(6), 1);
     assert_eq!(fx.history(), map(&[("s.db", file("db5"))]));
     // ...and the last handle's close what changed after it.
-    fx.ops.write(db, 0, b"db6", C).unwrap();
+    fx.ops.write(db, 0, b"db6", Actor::of_process(C)).unwrap();
     fx.close(db);
     assert_eq!(fx.journal().last().unwrap().draft.trigger, Trigger::Close);
     assert_eq!(fx.history(), map(&[("s.db", file("db6"))]));
@@ -1888,7 +1993,7 @@ fn a_failed_fsync_capture_returns_ok_and_leaves_the_group_changed() {
     }
     let fx = Fx::with_attributes(SQLITE);
     let (_, db) = fx.create("s.db");
-    fx.ops.write(db, 0, b"db1", C).unwrap();
+    fx.ops.write(db, 0, b"db1", Actor::of_process(C)).unwrap();
     let pending = fx.state().pending();
     let mode = fs::metadata(&pending).unwrap().permissions();
     fs::set_permissions(&pending, fs::Permissions::from_mode(0o500)).unwrap();
@@ -1915,18 +2020,18 @@ fn a_database_whose_directory_moved_is_captured_at_its_new_path() {
     let fx = Fx::with_attributes(SQLITE);
     fx.mkdir("d");
     let (_, db) = fx.create("d/s.db");
-    fx.ops.write(db, 0, b"v1", C).unwrap();
+    fx.ops.write(db, 0, b"v1", Actor::of_process(C)).unwrap();
     fx.rename("d", "e", 0).unwrap();
     // Writes through the handle opened before the rename change the group
     // at the new path.
-    fx.ops.write(db, 0, b"v2", C).unwrap();
+    fx.ops.write(db, 0, b"v2", Actor::of_process(C)).unwrap();
     assert_eq!(fx.later(6), 1);
     assert_eq!(fx.history(), map(&[("e/s.db", file("v2"))]));
-    fx.ops.write(db, 0, b"v3", C).unwrap();
+    fx.ops.write(db, 0, b"v3", Actor::of_process(C)).unwrap();
     assert_eq!(fx.later(12), 1);
     assert_eq!(fx.history(), map(&[("e/s.db", file("v3"))]));
     // The handle counts in its new group: its close is the last one.
-    fx.ops.write(db, 0, b"v4", C).unwrap();
+    fx.ops.write(db, 0, b"v4", Actor::of_process(C)).unwrap();
     fx.close(db);
     assert_eq!(fx.history(), map(&[("e/s.db", file("v4"))]));
     assert!(fx.ops.groups().dirty().is_empty());
@@ -1949,8 +2054,10 @@ fn a_member_the_rules_leave_out_refuses_the_whole_group() {
     );
     let (_, db) = fx.create("s.db");
     let (_, wal) = fx.create("s.db-wal");
-    fx.ops.write(db, 0, b"db", C).unwrap();
-    fx.ops.write(wal, 0, b"frames", C).unwrap();
+    fx.ops.write(db, 0, b"db", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(wal, 0, b"frames", Actor::of_process(C))
+        .unwrap();
     fx.close(db);
     fx.close(wal);
     // Without its WAL the database could be torn: nothing is recorded,
@@ -1958,37 +2065,11 @@ fn a_member_the_rules_leave_out_refuses_the_whole_group() {
     assert_eq!(fx.backlog(), 0);
     assert_eq!(fx.refused(), ["s.db-wal"]);
     // A database with no WAL is recorded.
-    fx.ops.unlink(ROOT, b"s.db-wal", C).unwrap();
+    fx.ops
+        .unlink(ROOT, b"s.db-wal", Actor::of_process(C))
+        .unwrap();
     assert_eq!(fx.later(6), 1);
     assert_eq!(fx.history(), map(&[("s.db", file("db"))]));
-}
-
-#[test]
-fn may_open_counts_the_callers_supplementary_groups() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("f");
-    fs::write(&path, "x").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
-    let st = rustix::fs::stat(&path).unwrap();
-    let stranger = Caller {
-        uid: st.st_uid + 1,
-        gid: st.st_gid + 1,
-        pid: 1,
-    };
-    assert!(!may_open(&st, stranger, &[], 2, false));
-    assert!(!may_open(&st, stranger, &[st.st_gid + 7], 0, false));
-    assert!(may_open(
-        &st,
-        stranger,
-        &[st.st_gid + 7, st.st_gid],
-        2,
-        true
-    ));
-    let member = Caller {
-        gid: st.st_gid,
-        ..stranger
-    };
-    assert!(may_open(&st, member, &[], 1, false));
 }
 
 #[test]
@@ -2014,4 +2095,482 @@ fn cached_at_names_every_entry_on_the_way_and_the_known_node() {
         ]
     );
     assert_eq!(fx.ops.cached_at(b""), vec![Cached::Node(ROOT)]);
+}
+
+// ---- moving a file into the tree from outside it (sandbox overlay) ----
+
+/// A [`crate::session::NameCheck`] for `move_in` that answers `answer` and
+/// keeps what it was shown.
+struct MoveCheck {
+    answer: OpResult<()>,
+    seen: std::sync::Mutex<Vec<(String, Option<Kind>)>>,
+}
+
+impl MoveCheck {
+    fn answering(answer: OpResult<()>) -> Self {
+        Self {
+            answer,
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<(String, Option<Kind>)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl crate::session::NameCheck for MoveCheck {
+    fn create(&self, _at: crate::session::Found<'_>, _kind: Kind) -> OpResult<()> {
+        unreachable!("move_in asks only move_in")
+    }
+
+    fn link(&self, _at: crate::session::Found<'_>) -> OpResult<()> {
+        unreachable!("move_in asks only move_in")
+    }
+
+    fn remove(&self, _at: crate::session::Found<'_>) -> OpResult<()> {
+        unreachable!("move_in asks only move_in")
+    }
+
+    fn rename(
+        &self,
+        _from: crate::session::Found<'_>,
+        _to: crate::session::Found<'_>,
+        _flags: u32,
+    ) -> OpResult<()> {
+        unreachable!("move_in asks only move_in")
+    }
+
+    fn move_in(&self, to: crate::session::Found<'_>) -> OpResult<()> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((String::from_utf8(to.path.to_vec()).unwrap(), to.kind));
+        self.answer
+    }
+}
+
+impl Fx {
+    /// A directory outside the tree, on its filesystem, holding `name`
+    /// with `content`: a descriptor of it.
+    fn outside(&self, name: &str, content: &str) -> OwnedFd {
+        let store = self.dir.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join(name), content).unwrap();
+        rustix::fs::open(&store, OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).unwrap()
+    }
+
+    fn outside_names(&self) -> Vec<String> {
+        fs::read_dir(self.dir.path().join("store"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    /// Moves `name` from `store` to `to` under the root as node `node`.
+    fn move_in(
+        &self,
+        store: &OwnedFd,
+        name: &str,
+        to: &str,
+        flags: u32,
+        moved: crate::session::Moved,
+        check: &MoveCheck,
+    ) -> OpResult<Entry> {
+        use crate::session::TreeOperations;
+        self.ops.move_in(
+            store.as_fd(),
+            name.as_bytes(),
+            ROOT,
+            to.as_bytes(),
+            flags,
+            moved,
+            check,
+            C,
+        )
+    }
+}
+
+fn unopened(node: u64) -> crate::session::Moved {
+    crate::session::Moved {
+        node,
+        lookups: 1,
+        handles: Vec::new(),
+        mapping_may_write: false,
+    }
+}
+
+#[test]
+fn move_in_records_the_new_path_only() {
+    use crate::session::TreeOperations;
+    let fx = Fx::new();
+    fx.put("config.yaml", "old");
+    let before = fx.journal().len();
+    let store = fx.outside("17", "new");
+    let node = fx.ops.new_node_id();
+    let check = MoveCheck::answering(Ok(()));
+    let entry = fx
+        .move_in(&store, "17", "config.yaml", 0, unopened(node), &check)
+        .unwrap();
+    assert_eq!(entry.id, node);
+    assert_eq!(entry.attr.ino.0, node);
+    assert_eq!(check.seen(), [("config.yaml".to_owned(), Some(Kind::File))]);
+    // One record, a rename of the new path only.
+    let records = fx.journal();
+    assert_eq!(records.len(), before + 1, "{records:#?}");
+    let record = records.last().unwrap();
+    assert_eq!(record.draft.trigger, Trigger::Rename);
+    let paths: Vec<&str> = record
+        .draft
+        .changes
+        .iter()
+        .flat_map(|c| c.paths())
+        .map(|p| p.as_str())
+        .collect();
+    assert_eq!(paths, ["config.yaml"]);
+    assert_eq!(fx.history(), map(&[("config.yaml", file("new"))]));
+    assert!(fx.outside_names().is_empty());
+    assert_eq!(fx.ops.lookup(ROOT, b"config.yaml").unwrap().id, node);
+    // Only a plain or no-replace move of a regular file, at a good name.
+    for (flags, to) in [
+        (RenameFlags::EXCHANGE.bits(), "x"),
+        (RenameFlags::WHITEOUT.bits(), "x"),
+        (0, "a/b"),
+    ] {
+        let store = fx.outside("18", "z");
+        assert_eq!(
+            fx.move_in(&store, "18", to, flags, unopened(node + 1), &check)
+                .unwrap_err(),
+            Errno::EINVAL,
+            "{flags} {to}"
+        );
+    }
+    fs::create_dir_all(fx.dir.path().join("store/dir")).unwrap();
+    assert_eq!(
+        fx.move_in(&store, "dir", "d", 0, unopened(node + 1), &check)
+            .unwrap_err(),
+        Errno::EINVAL
+    );
+    assert!(!fx.backing().join("d").exists());
+}
+
+#[test]
+fn move_in_keeps_the_node_id_and_takes_over_handles() {
+    use crate::session::TreeOperations;
+    let fx = Fx::new();
+    fx.put("other", "o");
+    let store = fx.outside("17", "v1");
+    let node = fx.ops.new_node_id();
+    assert_ne!(fx.id("other"), node);
+    let fd = rustix::fs::openat(&store, "17", OFlags::RDWR, Mode::empty()).unwrap();
+    let fh = fx.ops.new_handle_id();
+    assert!(fx.ops.new_handle_id() > fh, "from one sequence");
+    let handle = Arc::new(Handle::new(node, fd, true, None, 0));
+    let moved = crate::session::Moved {
+        node,
+        lookups: 2,
+        handles: vec![(fh, handle)],
+        mapping_may_write: false,
+    };
+    let check = MoveCheck::answering(Ok(()));
+    fx.move_in(&store, "17", "config.yaml", 0, moved, &check)
+        .unwrap();
+    assert_eq!(fx.history().get("config.yaml"), Some(&file("v1")));
+    // The handle the kernel holds writes on, and its close records the
+    // new content at the new path.
+    let before = fx.journal().len();
+    fx.ops
+        .write(fh, 0, b"v2 longer", Actor::of_process(C))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    let records = fx.journal();
+    assert_eq!(records.len(), before + 1, "{records:#?}");
+    assert_eq!(records.last().unwrap().draft.trigger, Trigger::Close);
+    assert_eq!(
+        fx.history(),
+        map(&[("config.yaml", file("v2 longer")), ("other", file("o"))])
+    );
+    assert_eq!(fx.ops.getattr(node, Some(fh)).unwrap().ino.0, node);
+    assert_eq!(fx.ops.open_handles(), 1);
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.ops.open_handles(), 0);
+    // The kernel's two lookups keep the node until it forgets them.
+    fx.ops.forget(node, 1);
+    assert_eq!(fx.ops.getattr(node, None).unwrap().size, 9);
+    fx.ops.forget(node, 1);
+    assert_eq!(fx.ops.lookup(ROOT, b"config.yaml").unwrap().id, node);
+}
+
+#[test]
+fn move_in_refused_by_the_check_moves_nothing() {
+    use crate::session::TreeOperations;
+    let fx = Fx::new();
+    fx.put("config.yaml", "old");
+    let before = fx.journal().len();
+    let store = fx.outside("17", "new");
+    let node = fx.ops.new_node_id();
+    let refuse = MoveCheck::answering(Err(Errno::EACCES));
+    assert_eq!(
+        fx.move_in(&store, "17", "new.yaml", 0, unopened(node), &refuse)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(refuse.seen(), [("new.yaml".to_owned(), None)]);
+    assert_eq!(fx.outside_names(), ["17"]);
+    assert!(!fx.backing().join("new.yaml").exists());
+    // The name is taken, and the move may not replace it.
+    let check = MoveCheck::answering(Ok(()));
+    assert_eq!(
+        fx.move_in(
+            &store,
+            "17",
+            "config.yaml",
+            RenameFlags::NOREPLACE.bits(),
+            unopened(node),
+            &check
+        )
+        .unwrap_err(),
+        Errno::EEXIST
+    );
+    assert_eq!(fx.outside_names(), ["17"]);
+    assert_eq!(
+        fs::read_to_string(fx.backing().join("config.yaml")).unwrap(),
+        "old"
+    );
+    assert_eq!(fx.journal().len(), before);
+    assert_eq!(
+        fx.ops.lookup(ROOT, b"config.yaml").unwrap().id,
+        fx.id("config.yaml")
+    );
+    assert_ne!(fx.id("config.yaml"), node);
+}
+
+// ---- a request's check, under the names ordering (sandbox overlay slice 4) ----
+
+/// A [`NameCheck`] that refuses everything, after asserting the
+/// operations hold the names ordering, and records what it was shown.
+struct Refuses<'a> {
+    ops: &'a Ops,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl Refuses<'_> {
+    fn saw(&self, what: String) -> OpResult<()> {
+        assert!(
+            self.ops.names.try_write().is_err(),
+            "{what}: checked without the names ordering held"
+        );
+        self.seen.lock().unwrap().push(what);
+        Err(Errno::EACCES)
+    }
+}
+
+fn found(at: Found<'_>) -> String {
+    format!("{}={:?}", String::from_utf8_lossy(at.path), at.kind)
+}
+
+impl crate::session::NameCheck for Refuses<'_> {
+    fn create(&self, at: Found<'_>, kind: Kind) -> OpResult<()> {
+        self.saw(format!("create {} {kind:?}", found(at)))
+    }
+    fn link(&self, at: Found<'_>) -> OpResult<()> {
+        self.saw(format!("link {}", found(at)))
+    }
+    fn remove(&self, at: Found<'_>) -> OpResult<()> {
+        self.saw(format!("remove {}", found(at)))
+    }
+    fn rename(&self, from: Found<'_>, to: Found<'_>, flags: u32) -> OpResult<()> {
+        self.saw(format!("rename {} {} {flags}", found(from), found(to)))
+    }
+    fn move_in(&self, to: Found<'_>) -> OpResult<()> {
+        self.saw(format!("move_in {}", found(to)))
+    }
+}
+
+/// Every file and directory under `root`, with its kind and content.
+fn snapshot(root: &std::path::Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for e in fs::read_dir(&dir).unwrap() {
+            let e = e.unwrap();
+            let path = e.path();
+            let rel = path.strip_prefix(root).unwrap().display().to_string();
+            let t = e.file_type().unwrap();
+            let what = if t.is_dir() {
+                dirs.push(path.clone());
+                "dir".to_owned()
+            } else if t.is_file() {
+                fs::read_to_string(&path).unwrap()
+            } else {
+                format!("{t:?}")
+            };
+            out.insert(rel, what);
+        }
+    }
+    out
+}
+
+/// Each name operation asks the request's check while it holds the names
+/// ordering, after statting the name, with what it found; a refusal is
+/// the answer and nothing changes.
+#[test]
+fn a_check_decides_under_the_names_ordering_and_a_refusal_changes_nothing() {
+    let fx = Fx::new();
+    fx.put("a", "1");
+    fx.put("b", "2");
+    fs::create_dir(fx.backing().join("d")).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        fx.backing().join("pipe"),
+        rustix::fs::FileType::Fifo,
+        Mode::from_raw_mode(0o644),
+        0,
+    )
+    .unwrap();
+    let before = snapshot(&fx.backing());
+    let history = fx.history();
+    let backlog = fx.backlog();
+    let check = Refuses {
+        ops: &fx.ops,
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    let actor = Actor {
+        caller: C,
+        groups: Supplementary::OfProcess,
+        check: Some(&check),
+    };
+    let a = fx.id("a");
+    let eacces = Some(Errno::EACCES);
+    assert_eq!(
+        fx.ops.create(ROOT, b"new", 0o644, O_WRONLY, actor).err(),
+        eacces
+    );
+    assert_eq!(
+        fx.ops.create(ROOT, b"pipe", 0o644, O_WRONLY, actor).err(),
+        eacces
+    );
+    assert_eq!(fx.ops.mknod(ROOT, b"n", 0o100644, 0, actor).err(), eacces);
+    assert_eq!(fx.ops.mknod(ROOT, b"f", 0o010644, 0, actor).err(), eacces);
+    assert_eq!(fx.ops.mkdir(ROOT, b"e", 0o755, actor).err(), eacces);
+    assert_eq!(fx.ops.symlink(ROOT, b"s", b"a", actor).err(), eacces);
+    assert_eq!(fx.ops.link(a, ROOT, b"l", actor).err(), eacces);
+    assert_eq!(fx.ops.unlink(ROOT, b"a", actor).err(), eacces);
+    assert_eq!(fx.ops.rmdir(ROOT, b"d", actor).err(), eacces);
+    assert_eq!(
+        fx.ops.rename(ROOT, b"a", ROOT, b"b", 0, actor).err(),
+        eacces
+    );
+    assert_eq!(
+        fx.ops.rename(ROOT, b"a", ROOT, b"c", 0, actor).err(),
+        eacces
+    );
+    assert_eq!(
+        fx.ops.rename(ROOT, b"d", ROOT, b"pipe", 0, actor).err(),
+        eacces
+    );
+    assert_eq!(
+        *check.seen.lock().unwrap(),
+        [
+            "create new=None File",
+            "create pipe=Some(Other) File",
+            "create n=None File",
+            "create f=None Other",
+            "create e=None Dir",
+            "create s=None Symlink",
+            "link l=None",
+            "remove a=Some(File)",
+            "remove d=Some(Dir)",
+            "rename a=Some(File) b=Some(File) 0",
+            "rename a=Some(File) c=None 0",
+            "rename d=Some(Dir) pipe=Some(Other) 0",
+        ]
+    );
+    assert_eq!(snapshot(&fx.backing()), before);
+    assert_eq!(fx.backlog(), backlog, "nothing recorded");
+    assert_eq!(fx.history(), history);
+    // Without a check, the main mount's requests go on as before.
+    fx.ops
+        .rename(ROOT, b"a", ROOT, b"c", 0, Actor::of_process(C))
+        .unwrap();
+}
+
+/// The access check of an existing file opened by `create` counts the
+/// supplementary groups only of a request that acts as its own process.
+#[test]
+fn an_existing_file_is_opened_by_create_only_with_access() {
+    let fx = Fx::new();
+    let path = fx.backing().join("shared");
+    fs::write(&path, "x").unwrap();
+    // A process in group `group` that neither owns the file nor has the
+    // file's group as its own: as root, a child given that group; else
+    // this process, through one of its supplementary groups.
+    let me = rustix::process::geteuid().as_raw();
+    let (group, mut child, pid) = if me == 0 {
+        let child = std::process::Command::new("setpriv")
+            .args(["--groups=4242", "--", "sleep", "60"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Its groups are set before it runs sleep.
+        while !creds::caller_groups(pid).contains(&4242) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::os::unix::fs::chown(&path, Some(54321), Some(4242)).unwrap();
+        (4242, Some(child), pid)
+    } else {
+        let primary = rustix::process::getegid().as_raw();
+        let Some(group) = creds::caller_groups(std::process::id())
+            .into_iter()
+            .find(|g| *g != primary)
+        else {
+            eprintln!("skipped: needs root or a supplementary group");
+            return;
+        };
+        std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
+        (group, None, std::process::id())
+    };
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o070)).unwrap();
+    let caller = Caller {
+        uid: me.wrapping_add(12345),
+        gid: me.wrapping_add(12345),
+        pid,
+    };
+    assert_ne!(caller.gid, group);
+    let (_, fh, _) = fx
+        .ops
+        .create(ROOT, b"shared", 0o644, O_RDWR, Actor::of_process(caller))
+        .unwrap();
+    fx.ops.release(fh).unwrap();
+    let substituted = Actor {
+        caller,
+        groups: Supplementary::None,
+        check: None,
+    };
+    assert_eq!(
+        fx.ops
+            .create(ROOT, b"shared", 0o644, O_RDWR, substituted)
+            .err(),
+        Some(Errno::EACCES)
+    );
+    if let Some(child) = &mut child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// An open to execute is an open to read: the kernel's `__FMODE_EXEC` is
+/// not an open flag, and `openat2(2)` would refuse it.
+#[test]
+fn an_open_to_execute_opens_the_file() {
+    let fx = Fx::new();
+    fx.put("run.sh", "#!/bin/sh\n");
+    let id = fx.id("run.sh");
+    let (fh, handle) = fx
+        .ops
+        .open(id, O_RDONLY | FMODE_EXEC, Actor::of_process(C))
+        .unwrap();
+    assert!(!handle.write);
+    assert_eq!(fx.ops.read(fh, 0, 64).unwrap(), b"#!/bin/sh\n");
+    fx.ops.release(fh).unwrap();
 }

@@ -45,10 +45,22 @@
 //! stale mount point, and [`detach_stale_layers`] clears the layers crashes
 //! leave under it.
 //!
-//! [`Mount::shutdown`] unmounts (lazily if the mount is busy), waits a grace
-//! period for the session to end, stops the sweep and runs a final one.
+//! With [`MountConfig::overlay`] the daemon serves a second FUSE session,
+//! the sandbox overlay ([`crate::overlay`]), at its own mount point over
+//! the same [`Ops`]: one inode table, one name ordering, one set of open
+//! files, one recorder, one sweep. Its options are the main mount's minus
+//! `default_permissions` ([`fuser_config`], [`MountKind`]): the overlay
+//! checks every access itself, as the view owner. [`preflight_overlay`]
+//! refuses an overlay mount point that is the main one or nested with it;
+//! [`Mount::start`] refuses the overlay with `--on-stale-mount recover`,
+//! on a front, and on a volume whose rules read tree rule files.
+//!
+//! [`Mount::shutdown`] unmounts (lazily if the mount is busy; the overlay
+//! first), waits a grace period for the sessions to end, stops the sweep
+//! and runs a final one.
 
 use std::io;
+use std::os::fd::AsFd;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,7 +75,10 @@ use fuser::{MountOption, SessionACL};
 
 use crate::backing::Backing;
 use crate::fuse::{FuseFs, Passthrough, PassthroughStatus};
-use crate::ops::{Cached, Ops, OpsConfig};
+use crate::invalidate::{Coherent, Invalidator};
+use crate::ops::{Ops, OpsConfig};
+use crate::overlay::tmp::TmpLayer;
+use crate::overlay::{Overlay, ViewOwner};
 use crate::privileges::Privileges;
 use crate::sweep::{Capturer, Sweeper};
 
@@ -91,6 +106,101 @@ pub struct MountConfig {
     /// `EROFS`, through any bind of the mount (a finished fork, design
     /// §11.5).
     pub read_only: bool,
+    /// Also serve the sandbox overlay ([`crate::overlay`]) over the same
+    /// operations, at its own mount point; `None` serves the main mount
+    /// only.
+    pub overlay: Option<OverlayConfig>,
+    /// How long [`Mount::shutdown`] waits for the sessions to end after
+    /// unmounting.
+    pub unmount_grace: Duration,
+}
+
+/// Which of a daemon's FUSE sessions a mount is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountKind {
+    /// The volume's whole tree.
+    Main,
+    /// The sandbox overlay: the visibility gate and the view owner in front
+    /// of the same operations ([`crate::overlay`]).
+    SandboxOverlay,
+}
+
+/// What an agentfs mount's source names (sandbox overlay slice 4): its
+/// volume and which of its daemon's sessions it is, so `agentfs probe`,
+/// the hold and recover paths and the workload views never take one
+/// session's mount point for the other's.
+///
+/// Rendered as `agentfs:<volume>` for the main mount (unchanged) and
+/// `agentfs:<volume>:sandbox-overlay` for the sandbox overlay. A volume
+/// name never holds `:` ([`agentfs_core::config::validate_name`]), so the
+/// two never parse as each other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountSource {
+    pub volume: String,
+    pub kind: MountKind,
+}
+
+impl MountSource {
+    pub fn new(volume: &str, kind: MountKind) -> Self {
+        Self {
+            volume: volume.to_owned(),
+            kind,
+        }
+    }
+
+    /// The source string a mount of this kind is made with (fuser's
+    /// `fsname`).
+    pub fn render(&self) -> String {
+        match self.kind {
+            MountKind::Main => format!("{SOURCE_PREFIX}{}", self.volume),
+            MountKind::SandboxOverlay => {
+                format!("{SOURCE_PREFIX}{}{OVERLAY_SUFFIX}", self.volume)
+            }
+        }
+    }
+
+    /// The source of an agentfs mount as mountinfo lists it; `None` for
+    /// anything else.
+    pub fn parse(source: &str) -> Option<Self> {
+        let rest = source.strip_prefix(SOURCE_PREFIX)?;
+        let (volume, kind) = match rest.strip_suffix(OVERLAY_SUFFIX) {
+            Some(volume) => (volume, MountKind::SandboxOverlay),
+            None => (rest, MountKind::Main),
+        };
+        (!volume.is_empty() && !volume.contains(':')).then(|| Self::new(volume, kind))
+    }
+}
+
+/// What every agentfs mount's source starts with.
+const SOURCE_PREFIX: &str = "agentfs:";
+/// What the sandbox overlay's source ends with.
+const OVERLAY_SUFFIX: &str = ":sandbox-overlay";
+
+impl MountKind {
+    /// What a mount point of this kind is called in messages: "the mount
+    /// point" or "the sandbox overlay's mount point".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Main => MOUNTPOINT,
+            Self::SandboxOverlay => OVERLAY,
+        }
+    }
+}
+
+/// The sandbox overlay's mount point and view owner
+/// (`--sandbox-overlay`, `--sandbox-owner`).
+#[derive(Debug, Clone)]
+pub struct OverlayConfig {
+    pub mountpoint: PathBuf,
+    pub owner: ViewOwner,
+    /// Stack the overlay over the stale overlay mount a crashed daemon
+    /// left at its mount point (`--on-stale-mount recover`, design §17.1),
+    /// as [`MountConfig::stack_over`] does for the main mount; `None`
+    /// mounts normally. Its source is not the main mount's.
+    pub stack_over: Option<StackOver>,
+    /// The tmp layer's store ([`agentfs_core::volume::StateDir::tmp_layer`]),
+    /// on the backing tree's filesystem.
+    pub tmp_layer: PathBuf,
 }
 
 /// How a mount is stacked over a stale one: FUSE is mounted at `source`, a
@@ -190,11 +300,36 @@ pub enum PreflightError {
         outer: &'static str,
         outer_path: PathBuf,
     },
+    /// The sandbox overlay's mount point is the main mount point, or one is
+    /// inside the other: one mount would hide or reach into the other.
+    #[error(
+        "the sandbox overlay's mount point {} and the mount point {} are the same directory \
+         or one is inside the other; give each its own directory",
+        overlay.display(),
+        main.display()
+    )]
+    OverlayNested { main: PathBuf, overlay: PathBuf },
+    /// The two mount points are in the same directory: a container given
+    /// that directory would reach both.
+    #[error(
+        "the sandbox overlay's mount point {} and the mount point {} are both in {}: a \
+         container given that directory would reach both; give the sandbox overlay a \
+         directory of its own",
+        overlay.display(),
+        main.display(),
+        parent.display()
+    )]
+    OverlaySharesParent {
+        main: PathBuf,
+        overlay: PathBuf,
+        parent: PathBuf,
+    },
 }
 
 const STATE: &str = "the state area";
 const BACKING: &str = "the backing tree";
 const MOUNTPOINT: &str = "the mount point";
+const OVERLAY: &str = "the sandbox overlay's mount point";
 
 fn canonical_dir(what: &'static str, path: &Path) -> Result<PathBuf, PreflightError> {
     let canonical = path
@@ -231,8 +366,8 @@ fn canonical_any(path: &Path) -> PathBuf {
 fn why(inner: &'static str, outer: &'static str) -> &'static str {
     match (inner, outer) {
         (STATE, BACKING) => "history, journal and credentials would be visible through the mount",
-        (_, MOUNTPOINT) => "the daemon would reach it through its own mount",
-        (MOUNTPOINT, _) => "the mount would recurse into itself or hide its own files",
+        (_, MOUNTPOINT | OVERLAY) => "the daemon would reach it through its own mount",
+        (MOUNTPOINT | OVERLAY, _) => "the mount would recurse into itself or hide its own files",
         _ => "the state area and the backing tree must be separate",
     }
 }
@@ -242,32 +377,69 @@ fn why(inner: &'static str, outer: &'static str) -> &'static str {
 /// §18 test 5), and every remote section's credentials, SSH key and
 /// known_hosts file out of the backing tree and the mount point, invalid
 /// sections included (design §17.1). Returns the canonical backing tree and
-/// mount point.
+/// mount point. `kind` names the mount point in errors
+/// ([`MountKind::label`]).
 pub fn preflight(
     state: &StateDir,
     settings: &Settings,
     backing: &Path,
     mountpoint: &Path,
+    kind: MountKind,
 ) -> Result<(PathBuf, PathBuf), PreflightError> {
     if let Err(e) = rustix::fs::stat(mountpoint)
         && e == rustix::io::Errno::NOTCONN
     {
         return Err(PreflightError::StaleMount(mountpoint.to_path_buf()));
     }
-    let mountpoint = canonical_dir(MOUNTPOINT, mountpoint)?;
-    check_layout(state, settings, backing, mountpoint)
+    let mountpoint = canonical_dir(kind.label(), mountpoint)?;
+    check_layout(state, settings, backing, mountpoint, kind.label())
+}
+
+/// Checks the sandbox overlay's mount point `overlay` against the main
+/// mount point `main` (canonical, as [`preflight`] returns it): neither may
+/// be the other or inside it, and they may not share a parent directory
+/// (a container given it would reach both). Run [`preflight`] on `overlay`
+/// as well, for the state area, the backing tree and the remotes' files.
+/// Returns the canonical overlay mount point.
+pub fn preflight_overlay(main: &Path, overlay: &Path) -> Result<PathBuf, PreflightError> {
+    // A stale overlay mount (`--on-stale-mount recover`) answers `stat`
+    // with ENOTCONN: it is resolved through its parent.
+    let overlay = if rustix::fs::stat(overlay).err() == Some(rustix::io::Errno::NOTCONN) {
+        canonical_any(overlay)
+    } else {
+        canonical_dir(OVERLAY, overlay)?
+    };
+    // The main mount point may be a stale mount (`--on-stale-mount`),
+    // which answers `stat` with ENOTCONN.
+    let main = canonical_any(main);
+    if overlay.starts_with(&main) || main.starts_with(&overlay) {
+        return Err(PreflightError::OverlayNested { main, overlay });
+    }
+    if let (Some(a), Some(b)) = (main.parent(), overlay.parent())
+        && a == b
+    {
+        return Err(PreflightError::OverlaySharesParent {
+            parent: a.to_path_buf(),
+            main,
+            overlay,
+        });
+    }
+    Ok(overlay)
 }
 
 /// [`preflight`] for a mount stacked over the stale agentfs mount at
 /// `mountpoint` (`--on-stale-mount recover`, design §17.1): the same
 /// checks, with the mount point resolved through its parent, since a
 /// stale mount answers every `stat` with `ENOTCONN`. Refuses anything but
-/// a stale agentfs mount of this volume (source `agentfs:<volume>`) there.
+/// a stale agentfs mount of this volume and of kind `kind` there (source
+/// [`MountSource::render`]): the other kind's stale mount is another mount
+/// point's.
 pub fn preflight_stacked(
     state: &StateDir,
     settings: &Settings,
     backing: &Path,
     mountpoint: &Path,
+    kind: MountKind,
 ) -> Result<(PathBuf, PathBuf), PreflightError> {
     let (Some(parent), Some(name)) = (mountpoint.parent(), mountpoint.file_name()) else {
         return Err(PreflightError::NotStale(mountpoint.to_path_buf()));
@@ -277,17 +449,25 @@ pub fn preflight_stacked(
     } else {
         parent
     };
-    let resolved = canonical_dir(MOUNTPOINT, parent)?.join(name);
+    let resolved = canonical_dir(kind.label(), parent)?.join(name);
     match mount_state(&resolved) {
-        Ok(MountState::Stale { source }) => same_volume(&resolved, source, &settings.volume)?,
+        Ok(MountState::Stale { source }) => {
+            same_volume(&resolved, source, &settings.volume, kind)?;
+        }
         _ => return Err(PreflightError::NotStale(resolved)),
     }
-    check_layout(state, settings, backing, resolved)
+    check_layout(state, settings, backing, resolved, kind.label())
 }
 
-/// Refuses a stale mount at `path` whose source is not `agentfs:<volume>`.
-fn same_volume(path: &Path, source: String, volume: &str) -> Result<(), PreflightError> {
-    let expected = format!("agentfs:{volume}");
+/// Refuses a stale mount at `path` whose source is not this volume's mount
+/// of kind `kind`.
+fn same_volume(
+    path: &Path,
+    source: String,
+    volume: &str,
+    kind: MountKind,
+) -> Result<(), PreflightError> {
+    let expected = MountSource::new(volume, kind).render();
     if source == expected {
         return Ok(());
     }
@@ -304,14 +484,11 @@ fn check_layout(
     settings: &Settings,
     backing: &Path,
     mountpoint: PathBuf,
+    label: &'static str,
 ) -> Result<(PathBuf, PathBuf), PreflightError> {
     let state = canonical_dir(STATE, state.root())?;
     let backing = canonical_dir(BACKING, backing)?;
-    let dirs = [
-        (STATE, &state),
-        (BACKING, &backing),
-        (MOUNTPOINT, &mountpoint),
-    ];
+    let dirs = [(STATE, &state), (BACKING, &backing), (label, &mountpoint)];
     for (i, (a, pa)) in dirs.iter().enumerate() {
         for (b, pb) in &dirs[i + 1..] {
             if pa == pb {
@@ -347,7 +524,7 @@ fn check_layout(
         )
     {
         let path = canonical_any(path);
-        for (outer, outer_path) in [(BACKING, &backing), (MOUNTPOINT, &mountpoint)] {
+        for (outer, outer_path) in [(BACKING, &backing), (label, &mountpoint)] {
             if path.starts_with(outer_path) {
                 return Err(PreflightError::CredentialsExposed {
                     remote: remote.clone(),
@@ -368,7 +545,7 @@ fn check_layout(
     );
     for (key, include) in fragments {
         let path = canonical_any(include);
-        for (outer, outer_path) in [(BACKING, &backing), (MOUNTPOINT, &mountpoint)] {
+        for (outer, outer_path) in [(BACKING, &backing), (label, &mountpoint)] {
             if path.starts_with(outer_path) {
                 return Err(PreflightError::IncludeExposed {
                     key,
@@ -559,6 +736,26 @@ pub enum MountError {
     /// Stacking over the stale mount failed (design §17.1).
     #[error("stacking over the stale mount at {}", path.display())]
     Stack { path: PathBuf, source: io::Error },
+    /// The volume cannot have the sandbox overlay's visibility gate.
+    #[error(transparent)]
+    Gate(#[from] agentfs_core::visibility::GateError),
+    /// The sandbox overlay is not served together with this.
+    #[error("the sandbox overlay (--sandbox-overlay) cannot be served with {0} yet")]
+    OverlayUnsupported(&'static str),
+    /// The sandbox overlay's tmp layer cannot be opened.
+    #[error(transparent)]
+    TmpLayer(#[from] crate::overlay::tmp::TmpLayerError),
+    /// The sandbox overlay failed after the main mount was served; the
+    /// main mount was stopped as at a stop ([`Mount::shutdown`]), which
+    /// `report` says.
+    #[error(
+        "the sandbox overlay could not be mounted after the mount point was: {source}; the \
+         mount point was unmounted as at a stop"
+    )]
+    Overlay {
+        source: Box<MountError>,
+        report: Box<UnmountReport>,
+    },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -568,8 +765,8 @@ pub enum MountError {
 pub struct UnmountReport {
     /// The mount was busy, so it was detached lazily.
     pub lazy: bool,
-    /// Unmounting failed; the message.
-    pub unmount_error: Option<String>,
+    /// Each unmount that failed: `"PATH: error"`.
+    pub unmount_errors: Vec<String>,
     /// The session was still serving open files when the grace period
     /// ended; it is left to process exit.
     pub session_abandoned: bool,
@@ -585,6 +782,9 @@ pub struct UnmountReport {
     /// Where they are saved for the next mount; `None` if they could not
     /// be saved (or no store is configured).
     pub repairs_saved: Option<PathBuf>,
+    /// Wiping the sandbox overlay's tmp layer failed; the message (the
+    /// next start wipes it).
+    pub tmp_wipe_error: Option<String>,
 }
 
 /// What [`Mount::start`] repaired from the queue a previous mount left.
@@ -605,21 +805,28 @@ pub fn thread_count(requested: usize) -> usize {
         .clamp(2, 16)
 }
 
-/// fuser's configuration for `config`.
-pub fn fuser_config(config: &MountConfig) -> fuser::Config {
+/// fuser's configuration for `config`'s session of kind `kind`. The
+/// sandbox overlay's has no `default_permissions`: the overlay checks
+/// every access itself, as the view owner ([`crate::overlay`]).
+pub fn fuser_config(config: &MountConfig, kind: MountKind) -> fuser::Config {
     let mut c = fuser::Config::default();
-    c.mount_options = vec![
-        MountOption::FSName(format!("agentfs:{}", config.volume)),
-        MountOption::Subtype("agentfs".into()),
-        MountOption::DefaultPermissions,
-        MountOption::NoDev,
-        MountOption::NoSuid,
-        if config.read_only {
+    c.mount_options = [
+        Some(MountOption::FSName(
+            MountSource::new(&config.volume, kind).render(),
+        )),
+        Some(MountOption::Subtype("agentfs".into())),
+        (kind == MountKind::Main).then_some(MountOption::DefaultPermissions),
+        Some(MountOption::NoDev),
+        Some(MountOption::NoSuid),
+        Some(if config.read_only {
             MountOption::RO
         } else {
             MountOption::RW
-        },
-    ];
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     c.acl = if config.allow_other {
         SessionACL::All
     } else {
@@ -646,26 +853,148 @@ fn raise_nofile() {
     }
 }
 
-/// A mounted volume.
+/// The sandbox overlay's visibility gate for a volume whose recorder is a
+/// front (`is_front`) with path rules `rules`, when `overlay` is
+/// configured: refused on a front, which does not serve it yet, and on a
+/// volume whose rules read tree rule files ([`MountError::Gate`]).
+fn overlay_gate(
+    overlay: Option<&OverlayConfig>,
+    is_front: bool,
+    rules: &Arc<agentfs_core::rules::Rules>,
+) -> Result<Option<agentfs_core::visibility::Gate>, MountError> {
+    if overlay.is_none() {
+        return Ok(None);
+    }
+    if is_front {
+        return Err(MountError::OverlayUnsupported(
+            "a front (--history-service)",
+        ));
+    }
+    Ok(Some(agentfs_core::visibility::Gate::new(rules.clone())?))
+}
+
+/// The sandbox overlay's session, beside the main one.
+struct OverlaySession {
+    mountpoint: PathBuf,
+    /// Set when its FUSE session ends.
+    ended: Arc<Stop>,
+    /// Its own passthrough status: each session negotiates INIT.
+    status: Arc<Mutex<PassthroughStatus>>,
+}
+
+/// Which session ended first, once one has.
+type FirstEnded = Arc<Mutex<Option<MountKind>>>;
+
+/// Runs `session` (of kind `kind`) until it ends, then notes it in `first`
+/// if no session ended before it, and sets `ended` and `either`.
+fn watch_session(
+    session: fuser::BackgroundSession,
+    kind: MountKind,
+    ended: Arc<Stop>,
+    either: Arc<Stop>,
+    first: FirstEnded,
+) -> io::Result<()> {
+    let name = match kind {
+        MountKind::Main => "agentfs-session",
+        MountKind::SandboxOverlay => "agentfs-overlay",
+    };
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            if let Err(e) = session.join() {
+                eprintln!("agentfs: the FUSE session ended with an error: {e}");
+            }
+            first
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(kind);
+            ended.stop();
+            either.stop();
+        })?;
+    Ok(())
+}
+
+/// The sink a session of kind `kind` reports its changes to.
+fn sink(invalidator: &Arc<Invalidator>, kind: MountKind) -> crate::invalidate::ChangeSink {
+    let invalidator = invalidator.clone();
+    Arc::new(move |cached| invalidator.changed(kind, cached))
+}
+
+/// Mounts the sandbox overlay's session `fs` at `overlay`'s mount point,
+/// stacked over its stale mount when [`OverlayConfig::stack_over`] says so
+/// (as [`Mount::start`] stacks the main mount).
+fn spawn_overlay<FS: fuser::Filesystem + Send + 'static>(
+    fs: FS,
+    overlay: &OverlayConfig,
+    options: &fuser::Config,
+) -> Result<fuser::BackgroundSession, MountError> {
+    let stack_error = |source| MountError::Stack {
+        path: overlay.mountpoint.clone(),
+        source,
+    };
+    let at = match &overlay.stack_over {
+        Some(stack) => {
+            prepare_stack_source(&stack.source).map_err(stack_error)?;
+            stack.source.clone()
+        }
+        None => overlay.mountpoint.clone(),
+    };
+    let session = fuser::spawn_mount(fs, &at, options).map_err(|source| MountError::Mount {
+        path: at.clone(),
+        source,
+    })?;
+    if overlay.stack_over.is_some()
+        && let Err(source) = stack(&at, &overlay.mountpoint)
+    {
+        let _ = session.umount_and_join();
+        return Err(stack_error(source));
+    }
+    Ok(session)
+}
+
+/// A mounted volume: the main mount, and the sandbox overlay when
+/// configured, over one [`Ops`].
 pub struct Mount {
     ops: Arc<Ops>,
     mountpoint: PathBuf,
     status: Arc<Mutex<PassthroughStatus>>,
+    /// Set when either session ends.
     ended: Arc<Stop>,
+    /// Set when the main session ends.
+    main_ended: Arc<Stop>,
+    overlay: Option<OverlaySession>,
+    /// The sandbox overlay's tmp layer, wiped at stop.
+    tmp: Option<Arc<TmpLayer>>,
     failed: Arc<Stop>,
     sweeper: Option<Sweeper>,
     capturer: Option<Capturer>,
     threads: usize,
     startup: StartupRepairs,
-    /// Sends the kernel cache invalidations of [`MountHooks`].
-    notifier: fuser::Notifier,
+    /// Sends kernel cache invalidations to every session: the changes one
+    /// session served, to the others; those of [`MountHooks`], to all.
+    invalidator: Arc<Invalidator>,
+    /// Which session ended first.
+    first_ended: FirstEnded,
+    unmount_grace: Duration,
 }
 
 impl Mount {
     /// Mounts `config.backing` at `config.mountpoint`, recording through
     /// `recorder`, and starts the sweep. Returns once the kernel has
     /// finished INIT. Run [`preflight`] first.
+    ///
+    /// With [`MountConfig::overlay`], the sandbox overlay is mounted at its
+    /// own mount point too, over the same [`Ops`]; if it cannot be, the
+    /// main mount is unmounted again and the start fails. Run
+    /// [`preflight_overlay`] first.
     pub fn start(recorder: Recorder, config: MountConfig) -> Result<Self, MountError> {
+        // Everything the overlay needs is checked before anything mounts.
+        let gate = overlay_gate(
+            config.overlay.as_ref(),
+            recorder.is_front(),
+            recorder.rules(),
+        )?;
+        let overlay = config.overlay.clone().zip(gate);
         if !Path::new("/dev/fuse").exists() {
             return Err(MountError::NoFuse);
         }
@@ -680,6 +1009,15 @@ impl Mount {
             source,
         })?;
         let ops = Arc::new(Ops::new(backing, recorder, OpsConfig::default())?);
+        // The tmp layer is opened (and wiped) before any session mounts.
+        let tmp = match &overlay {
+            Some((overlay, _)) => Some(Arc::new(TmpLayer::open(
+                &overlay.tmp_layer,
+                ops.backing().root().as_fd(),
+                overlay.owner,
+            )?)),
+            None => None,
+        };
         // Paths a previous mount could not record are repaired from the
         // backing tree before any request is served.
         let mut startup = StartupRepairs::default();
@@ -693,14 +1031,20 @@ impl Mount {
         }
         let status = Arc::new(Mutex::new(PassthroughStatus::Off("not negotiated".into())));
         let failed = Arc::new(Stop::default());
+        // Changes made through one session reach the other's kernel cache
+        // through one worker thread, never a request thread.
+        let invalidator = Invalidator::start()?;
         let fs = FuseFs::new(
-            ops.clone(),
+            Arc::new(Coherent::new(
+                ops.clone(),
+                sink(&invalidator, MountKind::Main),
+            )),
             config.passthrough,
             status.clone(),
             failed.clone(),
         );
-        let fuser_config = fuser_config(&config);
-        let threads = fuser_config.n_threads.unwrap_or(1);
+        let main_options = fuser_config(&config, MountKind::Main);
+        let threads = main_options.n_threads.unwrap_or(1);
         // Stacked over a stale mount: FUSE goes to a private directory
         // first, since the stale mount point answers ENOTCONN.
         let at = match &config.stack_over {
@@ -715,7 +1059,7 @@ impl Mount {
         };
         // Session::new mounts and completes INIT before it returns.
         let session =
-            fuser::spawn_mount(fs, &at, &fuser_config).map_err(|source| MountError::Mount {
+            fuser::spawn_mount(fs, &at, &main_options).map_err(|source| MountError::Mount {
                 path: at.clone(),
                 source,
             })?;
@@ -730,37 +1074,107 @@ impl Mount {
                 source,
             });
         }
-        let notifier = session.notifier();
+        invalidator.attach(MountKind::Main, Box::new(session.notifier()));
         let ended = Arc::new(Stop::default());
-        {
-            let ended = ended.clone();
-            std::thread::Builder::new()
-                .name("agentfs-session".into())
-                .spawn(move || {
-                    if let Err(e) = session.join() {
-                        eprintln!("agentfs: the FUSE session ended with an error: {e}");
-                    }
-                    ended.stop();
-                })?;
-        }
+        let main_ended = Arc::new(Stop::default());
+        let first_ended = FirstEnded::default();
+        watch_session(
+            session,
+            MountKind::Main,
+            main_ended.clone(),
+            ended.clone(),
+            first_ended.clone(),
+        )?;
         let sweeper = Sweeper::start(ops.clone(), config.sweep_interval)?;
         let capturer = if ops.boundary().recorder().has_fsync_class() {
             Some(Capturer::start(ops.clone())?)
         } else {
             None
         };
-        Ok(Self {
+        let mut mount = Self {
             ops,
-            mountpoint: config.mountpoint,
+            mountpoint: config.mountpoint.clone(),
             status,
             ended,
+            main_ended,
+            overlay: None,
+            tmp: tmp.clone(),
             failed,
             sweeper: Some(sweeper),
             capturer,
             threads,
             startup,
-            notifier,
-        })
+            invalidator,
+            first_ended,
+            unmount_grace: config.unmount_grace,
+        };
+        // From here the main mount is served: a failure of the overlay
+        // stops it as a stop does (the final sweep, the repair queue), so
+        // the start leaves nothing mounted and nothing unrecorded.
+        let Some(((overlay, gate), tmp)) = overlay.zip(tmp) else {
+            return Ok(mount);
+        };
+        match mount.start_overlay(&config, overlay, gate, tmp) {
+            Ok(()) => Ok(mount),
+            Err(source) => {
+                let report = mount.shutdown();
+                Err(MountError::Overlay {
+                    source: Box::new(source),
+                    report: Box::new(report),
+                })
+            }
+        }
+    }
+
+    /// Mounts the sandbox overlay's session beside the main one: the gate
+    /// and the view owner in front of the same operations, its own
+    /// passthrough status (each session negotiates INIT), the shared stop
+    /// for a failed passthrough.
+    fn start_overlay(
+        &mut self,
+        config: &MountConfig,
+        overlay: OverlayConfig,
+        gate: agentfs_core::visibility::Gate,
+        tmp: Arc<TmpLayer>,
+    ) -> Result<(), MountError> {
+        agentfs_core::failpoints::hit("mount.before_overlay")?;
+        let telemetry = self.ops.boundary().recorder().telemetry().clone();
+        let refused: crate::overlay::RefusalCounter =
+            Arc::new(move |reason| telemetry.overlay_refused(reason));
+        let status = Arc::new(Mutex::new(PassthroughStatus::Off("not negotiated".into())));
+        let fs = FuseFs::new(
+            Arc::new(Coherent::new(
+                Arc::new(Overlay::new(
+                    self.ops.clone(),
+                    gate,
+                    overlay.owner,
+                    tmp,
+                    refused,
+                )),
+                sink(&self.invalidator, MountKind::SandboxOverlay),
+            )),
+            config.passthrough,
+            status.clone(),
+            self.failed.clone(),
+        );
+        let options = fuser_config(config, MountKind::SandboxOverlay);
+        let session = spawn_overlay(fs, &overlay, &options)?;
+        self.invalidator
+            .attach(MountKind::SandboxOverlay, Box::new(session.notifier()));
+        let ended = Arc::new(Stop::default());
+        watch_session(
+            session,
+            MountKind::SandboxOverlay,
+            ended.clone(),
+            self.ended.clone(),
+            self.first_ended.clone(),
+        )?;
+        self.overlay = Some(OverlaySession {
+            mountpoint: overlay.mountpoint,
+            ended,
+            status,
+        });
+        Ok(())
     }
 
     /// Whether passthrough is in use.
@@ -771,10 +1185,29 @@ impl Mount {
             .clone()
     }
 
-    /// Set when the FUSE session ends: after [`Mount::shutdown`]'s unmount,
-    /// or when something else unmounted it.
+    /// The sandbox overlay's passthrough status, when it is served.
+    pub fn overlay_passthrough(&self) -> Option<PassthroughStatus> {
+        self.overlay.as_ref().map(|o| {
+            o.status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
+    /// Set when a FUSE session ends (the main mount's or the sandbox
+    /// overlay's): after [`Mount::shutdown`]'s unmount, or when something
+    /// else unmounted it.
     pub fn ended(&self) -> Arc<Stop> {
         self.ended.clone()
+    }
+
+    /// The session that ended first, once one has ([`Mount::ended`]).
+    pub fn ended_session(&self) -> Option<MountKind> {
+        *self
+            .first_ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Set when `--passthrough on` could not be honoured after INIT: the
@@ -796,6 +1229,11 @@ impl Mount {
         &self.mountpoint
     }
 
+    /// The sandbox overlay's mount point, when it is served.
+    pub fn overlay_mountpoint(&self) -> Option<&Path> {
+        self.overlay.as_ref().map(|o| o.mountpoint.as_path())
+    }
+
     /// What a restore through the mount needs of it (design §15).
     pub fn view(&self) -> MountView {
         MountView {
@@ -809,23 +1247,41 @@ impl Mount {
     pub fn hooks(&self) -> MountHooks {
         MountHooks {
             ops: self.ops.clone(),
-            notifier: self.notifier.clone(),
+            invalidator: self.invalidator.clone(),
         }
     }
 
-    /// Unmounts (lazily if busy), waits up to `grace` for the session to
-    /// end, stops the sweep and runs a final one over every file still
-    /// open, plus the repair queue, then captures every changed
-    /// fsync-class group.
-    pub fn shutdown(mut self, grace: Duration) -> UnmountReport {
+    /// Unmounts the sandbox overlay, then the main mount (each lazily if
+    /// busy), waits up to [`MountConfig::unmount_grace`] for both sessions
+    /// to end, stops the invalidator, stops the sweep and runs a final one
+    /// over every file still open, plus the repair queue, then captures
+    /// every changed fsync-class group, and last wipes the sandbox
+    /// overlay's tmp layer.
+    pub fn shutdown(mut self) -> UnmountReport {
+        let grace = self.unmount_grace;
         let mut report = UnmountReport::default();
-        if !self.ended.is_stopped() {
-            match unmount(&self.mountpoint) {
-                Ok(lazy) => report.lazy = lazy,
-                Err(e) => report.unmount_error = Some(e.to_string()),
+        let sessions = self
+            .overlay
+            .iter()
+            .map(|o| (o.mountpoint.as_path(), &o.ended))
+            .chain([(self.mountpoint.as_path(), &self.main_ended)]);
+        let mut waits = Vec::new();
+        for (mountpoint, ended) in sessions {
+            if !ended.is_stopped() {
+                match unmount(mountpoint) {
+                    Ok(lazy) => report.lazy |= lazy,
+                    Err(e) => report
+                        .unmount_errors
+                        .push(format!("{}: {e}", mountpoint.display())),
+                }
             }
+            waits.push(ended.clone());
         }
-        report.session_abandoned = !self.ended.wait(grace);
+        let deadline = std::time::Instant::now() + grace;
+        report.session_abandoned = !waits
+            .iter()
+            .all(|ended| ended.wait(deadline.saturating_duration_since(std::time::Instant::now())));
+        self.invalidator.stop();
         if let Some(sweeper) = self.sweeper.take() {
             sweeper.stop();
         }
@@ -844,6 +1300,11 @@ impl Mount {
                 .boundary()
                 .repair_store()
                 .and_then(|(store, error)| error.is_none().then_some(store));
+        }
+        if let Some(tmp) = &self.tmp
+            && let Err(e) = tmp.wipe()
+        {
+            report.tmp_wipe_error = Some(format!("{e}"));
         }
         report
     }
@@ -895,7 +1356,7 @@ impl agentfs_core::restore::Liveness for MountView {
 ///   may wait on a request to finish an invalidation.
 pub struct MountHooks {
     ops: Arc<Ops>,
-    notifier: fuser::Notifier,
+    invalidator: Arc<Invalidator>,
 }
 
 impl agentfs_core::history_service::FrontHooks for MountHooks {
@@ -911,22 +1372,14 @@ impl agentfs_core::history_service::FrontHooks for MountHooks {
             .collect()
     }
 
+    /// Every session's kernel drops what it caches along each path (node
+    /// ids are the same in every session).
     fn invalidate(&self, paths: &[agentfs_core::paths::RepoPath]) -> Result<(), String> {
-        use std::os::unix::ffi::OsStrExt;
         let mut first = None;
         for path in paths {
-            for cached in self.ops.cached_at(path.as_str().as_bytes()) {
-                // An inode or entry the kernel no longer holds is not an
-                // error (fuser maps ENOENT to Ok).
-                let sent = match &cached {
-                    Cached::Node(id) => self.notifier.inval_inode(fuser::INodeNo(*id), 0, 0),
-                    Cached::Entry(parent, name) => self
-                        .notifier
-                        .inval_entry(fuser::INodeNo(*parent), std::ffi::OsStr::from_bytes(name)),
-                };
-                if let Err(e) = sent {
-                    first.get_or_insert_with(|| format!("invalidating {path}: {e}"));
-                }
+            let cached = self.ops.cached_at(path.as_str().as_bytes());
+            if let Err(e) = self.invalidator.invalidate(&cached) {
+                first.get_or_insert_with(|| format!("invalidating {path} in {e}"));
             }
         }
         first.map_or(Ok(()), Err)
@@ -1009,6 +1462,7 @@ mod tests {
                 settings,
                 &self.p(backing),
                 &self.p(mnt),
+                MountKind::Main,
             )
             .map(|_| ())
         }
@@ -1362,6 +1816,7 @@ mod tests {
             &settings(vec![]),
             &l.p("file"),
             &l.p("mnt"),
+            MountKind::Main,
         )
         .unwrap_err();
         assert!(matches!(err, PreflightError::NotADirectory { .. }), "{err}");
@@ -1370,9 +1825,52 @@ mod tests {
             &settings(vec![]),
             &l.p("backing"),
             &l.p("nope"),
+            MountKind::Main,
         )
         .unwrap_err();
         assert!(matches!(err, PreflightError::Missing { .. }), "{err}");
+        assert!(err.to_string().starts_with("the mount point "), "{err}");
+    }
+
+    /// Each mount point is named as what it is.
+    #[test]
+    fn the_overlay_is_preflighted_under_its_own_label() {
+        let l = Layout::new();
+        let err = preflight(
+            &StateDir::new(l.p("state")),
+            &settings(vec![]),
+            &l.p("backing"),
+            &l.p("nope"),
+            MountKind::SandboxOverlay,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the sandbox overlay's mount point {} does not exist or cannot be reached",
+                l.p("nope").display()
+            )
+        );
+        // Nested in the backing tree.
+        fs::create_dir_all(l.p("backing/sandbox")).unwrap();
+        let err = preflight(
+            &StateDir::new(l.p("state")),
+            &settings(vec![]),
+            &l.p("backing"),
+            &l.p("backing/sandbox"),
+            MountKind::SandboxOverlay,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("the sandbox overlay's mount point "),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .ends_with("the mount would recurse into itself or hide its own files"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1393,14 +1891,70 @@ mod tests {
     #[test]
     fn stacking_refuses_another_volume() {
         let p = Path::new("/mnt");
-        same_volume(p, "agentfs:vol".into(), "vol").unwrap();
-        let err = same_volume(p, "agentfs:other".into(), "vol").unwrap_err();
+        same_volume(p, "agentfs:vol".into(), "vol", MountKind::Main).unwrap();
+        let err = same_volume(p, "agentfs:other".into(), "vol", MountKind::Main).unwrap_err();
         assert!(matches!(err, PreflightError::OtherVolume { .. }), "{err}");
         let msg = err.to_string();
         assert!(
             msg.contains("agentfs:other") && msg.contains("agentfs:vol"),
             "{msg}"
         );
+        // The other kind of this volume's mount is another mount point's.
+        same_volume(
+            p,
+            "agentfs:vol:sandbox-overlay".into(),
+            "vol",
+            MountKind::SandboxOverlay,
+        )
+        .unwrap();
+        let err = same_volume(
+            p,
+            "agentfs:vol:sandbox-overlay".into(),
+            "vol",
+            MountKind::Main,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, PreflightError::OtherVolume { expected, .. } if expected == "agentfs:vol"),
+            "{err}"
+        );
+        let err =
+            same_volume(p, "agentfs:vol".into(), "vol", MountKind::SandboxOverlay).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                PreflightError::OtherVolume { expected, .. }
+                    if expected == "agentfs:vol:sandbox-overlay"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mount_sources_round_trip() {
+        for kind in [MountKind::Main, MountKind::SandboxOverlay] {
+            let source = MountSource::new("vol", kind);
+            assert_eq!(MountSource::parse(&source.render()), Some(source));
+        }
+        assert_eq!(
+            MountSource::new("vol", MountKind::Main).render(),
+            "agentfs:vol"
+        );
+        assert_eq!(
+            MountSource::new("vol", MountKind::SandboxOverlay).render(),
+            "agentfs:vol:sandbox-overlay"
+        );
+        for other in [
+            "agentfs:v:x",
+            "agentfs:",
+            "agentfs::sandbox-overlay",
+            "agentfs:a:b:sandbox-overlay",
+            "vol",
+            "fuse:vol",
+            "",
+        ] {
+            assert_eq!(MountSource::parse(other), None, "{other}");
+        }
     }
 
     #[test]
@@ -1411,6 +1965,7 @@ mod tests {
             &settings(vec![]),
             &l.p("backing"),
             &l.p("mnt"),
+            MountKind::Main,
         )
         .unwrap_err();
         assert!(matches!(err, PreflightError::NotStale(_)), "{err}");
@@ -1430,17 +1985,27 @@ mod tests {
             repair_store: None,
             stack_over: None,
             read_only: false,
+            overlay: None,
+            unmount_grace: Duration::from_secs(1),
         };
-        let c = fuser_config(&config);
+        let c = fuser_config(&config, MountKind::Main);
         assert!(c.mount_options.contains(&MountOption::RW));
         config.read_only = true;
-        let ro = fuser_config(&config);
+        let ro = fuser_config(&config, MountKind::Main);
         assert!(ro.mount_options.contains(&MountOption::RO));
         assert!(!ro.mount_options.contains(&MountOption::RW));
         config.read_only = false;
         assert!(
             c.mount_options
                 .contains(&MountOption::FSName("agentfs:vol".into()))
+        );
+        let overlay = fuser_config(&config, MountKind::SandboxOverlay);
+        assert!(
+            overlay
+                .mount_options
+                .contains(&MountOption::FSName("agentfs:vol:sandbox-overlay".into())),
+            "{:?}",
+            overlay.mount_options
         );
         assert!(c.mount_options.contains(&MountOption::DefaultPermissions));
         assert!(!c.mount_options.contains(&MountOption::AutoUnmount));
@@ -1450,8 +2015,156 @@ mod tests {
         assert!((2..=16).contains(&n), "{n}");
         config.allow_other = false;
         config.threads = 3;
-        let c = fuser_config(&config);
+        let c = fuser_config(&config, MountKind::Main);
         assert_eq!(c.acl, SessionACL::Owner);
         assert_eq!(c.n_threads, Some(3));
+    }
+
+    #[test]
+    fn the_sandbox_overlay_mounts_without_default_permissions_only() {
+        let config = MountConfig {
+            volume: "vol".into(),
+            backing: "/b".into(),
+            mountpoint: "/m".into(),
+            passthrough: Passthrough::Auto,
+            allow_other: true,
+            threads: 3,
+            sweep_interval: Duration::from_secs(30),
+            repair_store: None,
+            stack_over: None,
+            read_only: false,
+            overlay: None,
+            unmount_grace: Duration::from_secs(1),
+        };
+        let main = fuser_config(&config, MountKind::Main);
+        let overlay = fuser_config(&config, MountKind::SandboxOverlay);
+        assert!(
+            main.mount_options
+                .contains(&MountOption::DefaultPermissions)
+        );
+        assert!(
+            !overlay
+                .mount_options
+                .contains(&MountOption::DefaultPermissions)
+        );
+        // The same options, but for the permissions and the source.
+        let without: Vec<_> = main
+            .mount_options
+            .iter()
+            .filter(|o| **o != MountOption::DefaultPermissions)
+            .map(|o| match o {
+                MountOption::FSName(_) => MountOption::FSName("agentfs:vol:sandbox-overlay".into()),
+                o => o.clone(),
+            })
+            .collect();
+        assert_eq!(overlay.mount_options, without);
+        assert_eq!(overlay.acl, main.acl);
+        assert_eq!(overlay.n_threads, main.n_threads);
+        assert_eq!(overlay.clone_fd, main.clone_fd);
+    }
+
+    #[test]
+    fn the_overlay_mount_point_is_its_own_directory() {
+        let l = Layout::new();
+        fs::create_dir_all(l.p("mnt/inner")).unwrap();
+        fs::create_dir_all(l.p("sandbox/overlay/inner")).unwrap();
+        let main = l.p("mnt").canonicalize().unwrap();
+        for overlay in ["mnt", "mnt/inner", "mnt/../mnt/inner"] {
+            let err = preflight_overlay(&main, &l.p(overlay)).unwrap_err();
+            assert!(
+                matches!(err, PreflightError::OverlayNested { .. }),
+                "{overlay}: {err}"
+            );
+        }
+        // The main mount point inside the overlay's.
+        let err =
+            preflight_overlay(&l.p("sandbox/overlay/inner"), &l.p("sandbox/overlay")).unwrap_err();
+        assert!(matches!(err, PreflightError::OverlayNested { .. }), "{err}");
+        let overlay = l.p("sandbox/overlay").canonicalize().unwrap();
+        let inner = overlay.join("inner");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the sandbox overlay's mount point {} and the mount point {} are the same \
+                 directory or one is inside the other; give each its own directory",
+                overlay.display(),
+                inner.display()
+            )
+        );
+        // Two mount points in one directory: a container given it would
+        // reach both.
+        fs::create_dir_all(l.p("sandbox-two")).unwrap();
+        let err = preflight_overlay(&main, &l.p("sandbox-two")).unwrap_err();
+        let parent = main.parent().unwrap();
+        assert!(
+            matches!(err, PreflightError::OverlaySharesParent { .. }),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the sandbox overlay's mount point {} and the mount point {} are both in {}: a \
+                 container given that directory would reach both; give the sandbox overlay a \
+                 directory of its own",
+                parent.join("sandbox-two").display(),
+                main.display(),
+                parent.display()
+            )
+        );
+        // Siblings pass, and the overlay's path comes back canonical.
+        assert_eq!(
+            preflight_overlay(&main, &l.p("sandbox/../sandbox/overlay")).unwrap(),
+            l.p("sandbox/overlay").canonicalize().unwrap()
+        );
+        assert!(matches!(
+            preflight_overlay(&main, &l.p("missing")).unwrap_err(),
+            PreflightError::Missing { .. }
+        ));
+    }
+
+    #[test]
+    fn the_overlay_is_refused_on_a_front_and_with_tree_rules() {
+        use agentfs_core::rules::{RuleOptions, Rules};
+        use agentfs_core::visibility::GateError;
+
+        use crate::overlay::OwnerIds;
+
+        let l = Layout::new();
+        let rules = |respect_tree_rules| {
+            Arc::new(Rules::new(
+                l.p("backing"),
+                RuleOptions {
+                    respect_tree_rules,
+                    ..RuleOptions::default()
+                },
+                b"",
+                b"",
+            ))
+        };
+        let ids = OwnerIds {
+            uid: 10000,
+            gid: 10000,
+        };
+        let overlay = OverlayConfig {
+            mountpoint: l.p("sandbox/overlay"),
+            owner: ViewOwner::new(ids, &Privileges::default(), ids.uid).unwrap(),
+            stack_over: None,
+            tmp_layer: l.p("state/tmp-layer"),
+        };
+        // Without the overlay there is nothing to refuse.
+        assert!(overlay_gate(None, true, &rules(true)).unwrap().is_none());
+        assert!(
+            overlay_gate(Some(&overlay), false, &rules(false))
+                .unwrap()
+                .is_some()
+        );
+        let err = overlay_gate(Some(&overlay), true, &rules(false)).unwrap_err();
+        assert!(matches!(err, MountError::OverlayUnsupported(_)), "{err}");
+        assert!(err.to_string().contains("--history-service"), "{err}");
+        let err = overlay_gate(Some(&overlay), false, &rules(true)).unwrap_err();
+        assert!(
+            matches!(err, MountError::Gate(GateError::TreeRules)),
+            "{err}"
+        );
     }
 }

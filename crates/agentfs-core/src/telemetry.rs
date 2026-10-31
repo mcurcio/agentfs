@@ -49,6 +49,46 @@ use crate::push::{self, RemoteBacklog};
 use crate::record::Trigger;
 use crate::volume::StateDir;
 
+/// Why the sandbox overlay refused a change: the `reason` attribute of
+/// `agentfs.sandbox_overlay.refusals` (design §13; sandbox overlay slice
+/// 4). Reads of hidden names are not counted: a hidden name answers like a
+/// missing one, and missing names are looked up all the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayRefusal {
+    /// A name the rules skip for that kind (a directory they could record
+    /// nothing beneath; a recorded file moved to a skipped name).
+    NotRecordable,
+    /// A kind the overlay never makes or moves: a symlink, hard link or
+    /// special file.
+    Kind,
+    /// A directory move, answered `EXDEV`.
+    CrossDevice,
+    /// The source, or an entry at the target, is hidden.
+    Hidden,
+    /// The rules could not decide: refused, failing closed (`EIO`).
+    RulesError,
+    /// An ownership, set-id or sticky-bit change.
+    Ownership,
+    /// An extended-attribute change.
+    Xattr,
+}
+
+impl OverlayRefusal {
+    /// The attribute value: `not_recordable`, `kind`, `cross_device`,
+    /// `hidden`, `rules_error`, `ownership` or `xattr`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRecordable => "not_recordable",
+            Self::Kind => "kind",
+            Self::CrossDevice => "cross_device",
+            Self::Hidden => "hidden",
+            Self::RulesError => "rules_error",
+            Self::Ownership => "ownership",
+            Self::Xattr => "xattr",
+        }
+    }
+}
+
 /// Metric names (design §13).
 pub mod names {
     pub const RECORD_DURATION: &str = "agentfs.record.duration";
@@ -77,6 +117,7 @@ pub mod names {
     pub const HISTORY_SERVICE_RESYNCS: &str = "agentfs.history_service.resyncs";
     pub const FUSE_CREATE_AS_CALLER_FALLBACKS: &str = "agentfs.fuse.create_as_caller_fallbacks";
     pub const FUSE_RACY_RECHECKS: &str = "agentfs.fuse.racy_rechecks";
+    pub const SANDBOX_OVERLAY_REFUSALS: &str = "agentfs.sandbox_overlay.refusals";
     pub const RECONCILE_RECORDS: &str = "agentfs.reconcile.records";
     pub const RECONCILE_FAILURES: &str = "agentfs.reconcile.failures";
     pub const NESTED_GITDIR_HEURISTIC: &str = "agentfs.nested.gitdir_heuristic";
@@ -152,6 +193,7 @@ struct Inner {
     resyncs: Counter<u64>,
     create_as_caller_fallbacks: Counter<u64>,
     racy_rechecks: Counter<u64>,
+    overlay_refusals: Counter<u64>,
     fork_publish_duration: Histogram<f64>,
 }
 
@@ -276,6 +318,13 @@ impl Telemetry {
                 "Boundaries that would have recorded a file again only because its last record \
                  was racy, by outcome: skipped (its bytes were the frozen copy still last \
                  journaled at its path) or recorded (design §3.1)",
+            ),
+            overlay_refusals: counter(
+                names::SANDBOX_OVERLAY_REFUSALS,
+                "{refusal}",
+                "Changes the sandbox overlay refused, by reason: not_recordable, kind, \
+                 cross_device, hidden, rules_error, ownership or xattr (reads of hidden names \
+                 are not counted)",
             ),
             fork_publish_duration: meter
                 .f64_histogram(names::FORK_PUBLISH_DURATION)
@@ -551,6 +600,16 @@ impl Telemetry {
     pub fn create_as_caller_fallback(&self) {
         if let Some(inner) = &self.inner {
             inner.create_as_caller_fallbacks.add(1, &[]);
+        }
+    }
+
+    /// Counts one change the sandbox overlay refused, by `reason`
+    /// (`agentfs.sandbox_overlay.refusals`; sandbox overlay slice 4).
+    pub fn overlay_refused(&self, reason: OverlayRefusal) {
+        if let Some(inner) = &self.inner {
+            inner
+                .overlay_refusals
+                .add(1, &[KeyValue::new("reason", reason.as_str())]);
         }
     }
 
@@ -1490,6 +1549,37 @@ mod tests {
             Some(1)
         );
         assert_eq!(memory.take(), alarms(), "every event is forwarded in order");
+    }
+
+    #[test]
+    fn overlay_refusals_are_counted_by_reason() {
+        let h = Harness::new();
+        let all = [
+            OverlayRefusal::NotRecordable,
+            OverlayRefusal::Kind,
+            OverlayRefusal::CrossDevice,
+            OverlayRefusal::Hidden,
+            OverlayRefusal::RulesError,
+            OverlayRefusal::Ownership,
+            OverlayRefusal::Xattr,
+        ];
+        for reason in all {
+            h.telemetry.overlay_refused(reason);
+        }
+        h.telemetry.overlay_refused(OverlayRefusal::Kind);
+        let name = names::SANDBOX_OVERLAY_REFUSALS;
+        for (reason, n) in [
+            ("not_recordable", 1),
+            ("kind", 2),
+            ("cross_device", 1),
+            ("hidden", 1),
+            ("rules_error", 1),
+            ("ownership", 1),
+            ("xattr", 1),
+        ] {
+            assert_eq!(h.sum(name, &[("reason", reason)]), Some(n), "{reason}");
+        }
+        Telemetry::noop().overlay_refused(OverlayRefusal::Xattr);
     }
 
     #[test]

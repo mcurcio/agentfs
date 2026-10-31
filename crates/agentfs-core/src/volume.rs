@@ -150,6 +150,20 @@ impl StateDir {
         self.meta().join("stack").join("mnt")
     }
 
+    /// [`StateDir::stack_source`] for the sandbox overlay's mount point
+    /// (design §2.2, §17.1).
+    pub fn overlay_stack_source(&self) -> PathBuf {
+        self.meta().join("stack").join("overlay")
+    }
+
+    /// The sandbox overlay's tmp layer: the store of the files a sandbox
+    /// creates under names the rules skip (design §2.2, §1.1; sandbox
+    /// overlay slice 3), `<state>/tmp-layer`. Wiped at every start and
+    /// stop; counted in [`StateDir::usage`] as part `tmp_layer`.
+    pub fn tmp_layer(&self) -> PathBuf {
+        self.root.join("tmp-layer")
+    }
+
     /// The control socket in [`StateDir::control_dir`].
     pub fn control_socket(&self) -> PathBuf {
         self.control_dir().join(CONTROL_SOCKET)
@@ -207,8 +221,8 @@ impl StateDir {
     }
 
     /// The apparent size in bytes (the sum of regular files' lengths) of
-    /// each part of the state area: `git`, `journal`, `pending`, `lfs` and
-    /// `meta` (design §13). Symlinks are not followed; a missing part, and
+    /// each part of the state area: `git`, `journal`, `pending`, `lfs`,
+    /// `meta` and `tmp_layer` (design §13). Symlinks are not followed; a missing part, and
     /// files that vanish while it is walked, count 0.
     pub fn usage(&self) -> Vec<(&'static str, u64)> {
         [
@@ -217,6 +231,7 @@ impl StateDir {
             ("pending", self.pending()),
             ("lfs", self.lfs()),
             ("meta", self.meta()),
+            ("tmp_layer", self.tmp_layer()),
         ]
         .into_iter()
         .map(|(part, dir)| (part, apparent_size(&dir)))
@@ -2234,6 +2249,13 @@ impl Recorder {
     /// class.
     pub fn fsync_class(&self, path: &RepoPath) -> Option<FsyncClass> {
         self.rules.fsync_class(path)
+    }
+
+    /// The volume's path rules, read when it was opened (design §4.1):
+    /// the sandbox overlay's visibility gate judges by them
+    /// ([`crate::visibility::Gate`]).
+    pub fn rules(&self) -> &Arc<Rules> {
+        &self.rules
     }
 
     /// Whether any path can be in the fsync class on this volume.
@@ -5735,8 +5757,9 @@ mod tests {
             )
             .unwrap();
             let usage: std::collections::HashMap<_, _> = state.usage().into_iter().collect();
-            assert_eq!(usage.len(), 5);
+            assert_eq!(usage.len(), 6);
             assert_eq!(usage["pending"], 5);
+            assert_eq!(usage["tmp_layer"], 0, "no tmp layer yet");
             assert!(usage["journal"] > 0, "{usage:?}");
             assert!(usage["git"] > 0, "{usage:?}");
             assert_eq!(usage["lfs"], 0, "no lfs directory yet");
@@ -5745,6 +5768,16 @@ mod tests {
                 Some(5)
             );
             assert_eq!(h.gauge_u64(names::STATE_BYTES, &[("part", "lfs")]), Some(0));
+            assert_eq!(
+                h.gauge_u64(names::STATE_BYTES, &[("part", "tmp_layer")]),
+                Some(0)
+            );
+            // The sandbox overlay's tmp files count where they live.
+            std::fs::create_dir_all(state.tmp_layer()).unwrap();
+            std::fs::write(state.tmp_layer().join("7"), "1234567").unwrap();
+            let usage: std::collections::HashMap<_, _> = state.usage().into_iter().collect();
+            assert_eq!(usage["tmp_layer"], 7);
+            assert_eq!(state.tmp_layer(), state.root().join("tmp-layer"));
 
             com.commit_pending().unwrap();
             let usage: std::collections::HashMap<_, _> = state.usage().into_iter().collect();

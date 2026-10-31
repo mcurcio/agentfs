@@ -1,0 +1,7 @@
+# deploy/examples/helm-sidecar with the sandbox overlay, compared with
+# `kubectl kustomize deploy/examples/sidecar-sandbox-overlay` by
+# ci/helm-equivalence.sh.
+agentfs:
+  sandboxOverlay:
+    enabled: true
+    owner: "10000:10000"

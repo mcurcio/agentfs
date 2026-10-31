@@ -46,10 +46,46 @@ exists to:
 the mount. agentfs does not try to resist a workload that is actively trying to
 defeat it.
 
-Forks are the exception (decided 2026-10-15, §19.1 "Fork content"; §11.5):
+Forks are the first exception (decided 2026-10-15, §19.1 "Fork content"; §11.5):
 what a sandbox writes into a fork is treated as potentially
 hostile in everything agentfs itself does with it, while agentfs limits
 nothing that users' own CI may do with what a fork publishes.
+
+The sandbox overlay is the second (decided 2026-10-30, §19.1 "The
+sandbox overlay (2026-10-30)"; §2.4): **the sandbox overlay is a
+boundary for names.**
+
+- **What it covers.** Through the overlay a sandbox can name, create,
+  replace or move only recordable files, plus its own tmp files. It
+  cannot make a symlink, hard link or special file, move a directory,
+  change ownership, or change a rule (tests: `a8_refusals`,
+  `a5_hidden_names_answer_the_same_whether_or_not_they_exist`,
+  `recorded_files_never_move_out`, `overlay_refusals`,
+  `the_overlay_is_refused_on_a_front_and_with_tree_rules`).
+- **Its limits.**
+  - A file a sandbox already holds open stays writable after the main
+    container moves it out of view, and those writes go unrecorded. Not
+    tested: `a6_a_node_moved_out_of_view_is_gone_from_the_overlay`
+    checks only that later lookups and opens of the node fail.
+  - A planted repository layout hides that directory, from the overlay
+    and from recording (`judge_answers`, `a11_directories`).
+  - Volume-wide facts leak: free space (`statfs` is passed on; not
+    tested), link counts (not tested), "directory not empty" for a
+    directory whose remaining entries are hidden (`overlay_refusals`),
+    and d_ino gaps: node ids are handed out in sequence to every entry
+    a listing reads, hidden ones included, so the inode numbers of shown
+    entries skip one per hidden entry (not tested).
+  - Locks are not shared between the two mounts: each kernel keeps its
+    own POSIX and BSD locks (§17.1), so a lock taken through one mount
+    is not seen through the other (not tested).
+  - Mode-bit permission checks run outside the names lock: the overlay
+    checks the view owner's access against attributes it read before
+    the operation takes the names ordering, so a `chmod` through the
+    main mount in between is not seen by that one operation (not
+    tested). The name checks run under the lock (§2.4).
+- **Capability assumptions.** Sandboxes lack `CAP_SYS_ADMIN` and
+  `CAP_DAC_READ_SEARCH`. Stopping a privileged container from reaching
+  the disk by other means is not planned.
 
 ### 1.2 What "every change" means
 
@@ -75,6 +111,7 @@ Built beside the phases, and planned:
 | Docker examples, `docker run` and Compose ([docker.md](docker.md)) | Built, tested in the `docker` workflow |
 | Helm charts: the CSI driver and the sidecar library ([helm.md](helm.md)) | Built, tested in the `helm` workflow, published to `oci://ghcr.io/mcurcio/charts` |
 | Example Prometheus alert rules with runbooks (§13, `deploy/alerts`) | Built, tested in the `alerts` workflow |
+| The sandbox overlay: a second mount point of a volume that shows sandboxes only recordable files (§2.4) | Built for single-process mounts (the sidecar, `agentfs mount`), tested with FUSE mounts in the `ci` workflow; not on fronts or CSI volumes |
 | Local-only volumes: zero remotes, never an error and with nothing declared (§11.1); a local-only source's forks publish into its own history (§11.5) | Built (F8 S3, F8 follow-ups), tested through the CLI and the CSI driver in process |
 
 ### 1.4 Not goals
@@ -142,6 +179,10 @@ through the mount:
     incomplete/<oid>     resumable downloads (0600), each under its own flock
     lock                 flock: shared by restores and fetches, exclusive
                          while `agentfs lfs prune` deletes
+  tmp-layer/ the sandbox overlay's tmp files (§2.4): one file per tmp
+             name, named by its node id and owned by the view owner, in a
+             0700 directory on the backing tree's filesystem; wiped at
+             start and at stop
   meta/      the daemon's own bookkeeping
     lock                 flock held by the one process using the state area (§2.3)
     push/<remote>.json   each remote's push state (§11.2)
@@ -161,6 +202,8 @@ through the mount:
                          directory 0700, socket 0600
     stack/mnt            where a mount recovering over a stale one mounts FUSE
                          before stacking it over the mount point (§17.1)
+    stack/overlay        the same for the sandbox overlay's mount point
+                         (`--sandbox-overlay`, §17.1)
     history/history.sock the history service's socket for fronts (§14);
                          directory 0700, socket 0600
     history/address      the address it serves, for `agentfs status`
@@ -278,6 +321,213 @@ so a crash never leaves a stale lock.
   volume is staged on a node. The controller takes the lock only briefly,
   to create or delete a volume; DeleteVolume of a staged volume fails with
   `FailedPrecondition`.
+
+### 2.4 The sandbox overlay
+
+The sandbox overlay (`mount --sandbox-overlay PATH --sandbox-owner
+UID:GID`) is a second mount point of a volume that shows only the names
+the operator's rules would record if they were new (*recordable* names).
+A container that starts other containers (for example a Docker daemon) is
+given only this mount point, so the sandboxes it starts see and change
+only recordable files, and what they change is recorded and seen through
+the main mount at once. It is a boundary for names (§1.1), decided
+2026-10-30 (§19.1 "The sandbox overlay (2026-10-30)").
+
+**One daemon, two entry points, one `Ops`.** The volume's own daemon
+serves both mount points, as two FUSE sessions over one `Ops`
+(`agentfs-fuse`'s `session.rs`): one inode table, one names ordering, one
+set of open files, one recorder and one sweep. The overlay's session is a
+decorator (`overlay.rs`) in front of that `Ops`; `Ops` never knows it is
+there. A change through the overlay is recorded like any other, with the
+view owner as its caller (`overlay_edit_is_recorded_and_seen_through_the_main_mount`).
+Restore and revert check the files open through either mount and settle
+both (`overlay_open_files_hold_off_a_restore`).
+
+**The visibility gate** (`agentfs-core`'s `visibility.rs`) is the one
+judge, a pure decision over the volume's rules. It never asks whether a
+name exists, so a hidden name answers the same whether or not it does,
+and a rules error hides or refuses, never shows (`a1` to `a14` there).
+
+- **Show.** An existing file or symlink is shown when its path is
+  recordable; a directory when the rules could record something beneath
+  it; a special file never. An fsync-class group (§8) is shown whole or
+  not at all, and `-shm` files never.
+- **Place new.** A recordable file name goes to the shared tree; a file
+  name the rules skip goes to the tmp layer; a directory goes to the tree
+  when the rules could record beneath it, else it is refused. Symlinks,
+  hard links and special files are always refused.
+- **Place move.** A directory never moves (`EXDEV`: `mv` and similar
+  tools copy what they can see and delete it). A symlink never moves. A
+  shown tree file moves only to a recordable name: moving a recorded file
+  out to a skipped name is refused (copying it still works). A tmp file
+  moves into the tree under a recordable name, and stays in the tmp layer
+  otherwise.
+
+**The tmp layer** (`overlay/tmp.rs`) holds the files a sandbox creates
+under names the rules skip, so the save-by-temp-file-and-rename pattern
+works without recording temp names.
+
+- It is the overlay's upper layer, as in overlayfs: a tmp name hides a
+  hidden tree entry of the same name (`tmp_files_are_private_and_shadow_hidden_names`).
+- Writes are routed by name, not by layer: a recordable name is always
+  the tree's, a skipped file name always the tmp layer's.
+- The store is `<state>/tmp-layer/` (§2.2), on the backing tree's
+  filesystem, so a rename into the tree is one atomic `renameat2(2)`; a
+  store on another filesystem is refused at start
+  (`open_refuses_another_filesystem`). Tmp names live only in memory.
+- Renaming a tmp file onto a recordable name moves it into the tree with
+  its node id and open handles; it is recorded at the new path only, and
+  no tmp name reaches history
+  (`a_tmp_file_renamed_onto_a_recordable_name_is_recorded_there`,
+  `overlay_tmp_save_by_rename_as_a_non_root_user`,
+  `overlay_tmp_editor_patterns`).
+- The main mount, history and restores never see a tmp file
+  (`overlay_tmp_files_never_reach_the_main_mount_or_history`).
+- It is wiped at start and at stop; a crash leaves it for the next start
+  (`open_and_wipe_discard_everything`). A wipe that fails at stop is a
+  warning line, and the next start wipes it.
+
+**The view owner** (`--sandbox-owner UID:GID`) is the one user every
+operation through the overlay is checked and done as, whoever the caller
+is, like NFS's `all_squash` with `anonuid` and `anongid`. It has no
+supplementary groups: the sandbox process's own groups never count
+(`overlay_ignores_the_sandbox_process_groups`,
+`a_substituted_identity_has_no_supplementary_groups`). So a root and a
+non-root sandbox can both save a file wherever the view owner may write
+(`a7_the_view_owner_acts_for_every_caller`). The overlay's session has no
+`default_permissions`: the overlay checks every access itself against
+the stored mode bits, as the view owner
+(`the_sandbox_overlay_mounts_without_default_permissions_only`),
+including the read check on `user.*` extended attributes
+(`b8_extended_attributes_are_read_as_the_owner`) and the execute bit for
+an open to execute
+(`b9_an_exec_open_needs_the_owners_execute_bit`,
+`overlay_exec_needs_the_owners_execute_bit`). The daemon must run as that
+uid or as root (`a9_owner_ids_parse_and_the_daemon_must_be_able_to_act_as_them`).
+`getattr` reports the real stored owners.
+
+**Name checks run under the names ordering.** The overlay hands every
+operation it passes on a name check (`NameCheck`, the `Judge`) that `Ops`
+calls while it holds the names ordering, after it has resolved and
+statted the names the operation changes and before it changes the
+backing tree: the pattern of Linux security modules, whose
+`security_inode_*` hooks the VFS calls under the directory locks. The
+kind the gate judges is the kind that is there when the change is made,
+and a hidden entry at a placeable name is refused, never replaced or
+opened (`a_check_decides_under_the_names_ordering_and_a_refusal_changes_nothing`,
+`a5_hidden_entries_at_placeable_names_are_refused_under_the_names_ordering`,
+`b6_a_hidden_kind_at_a_recordable_name_is_never_replaced_nor_opened`).
+The mode-bit checks still run before the lock (§1.1).
+
+**Coherence by events.** Each session's kernel caches names for 1 s and
+the pages of files open through it, so a change through one session is
+an event every other session's kernel must hear (`invalidate.rs`). A
+`Coherent` decorator in front of each session's operations reports each
+change it served, after it succeeded; the `Invalidator` queues it, and
+one worker thread sends the entry and inode invalidations to every other
+session (never the one the change came through, whose kernel already
+knows). Restore and revert, made outside every session, invalidate every
+session. Sending is asynchronous, from the worker, never from a FUSE
+request thread: the kernel may wait on a request of the session it
+invalidates, and two sessions' requests invalidating each other would
+wait on each other forever. The cost: the other session's kernel hears
+the change a moment after the call returned, not before
+(`a_change_reaches_every_other_session_and_never_its_own`,
+`overlay_and_main_mount_rename_at_once`). A failing session's
+invalidations never stop the others' (`a_failing_cache_never_stops_the_others`),
+and their errors are logged once per kind.
+
+**Lifecycle.**
+
+- **Mount source.** The overlay's mount source is
+  `agentfs:<volume>:sandbox-overlay` (the main mount's stays
+  `agentfs:<volume>`), so probes, recovery and the workload views tell
+  the two apart (`mount_sources_round_trip`,
+  `the_sandbox_overlay_is_not_a_view`).
+- **Seal, hold and recover** cover both mount points (§17.1):
+  `--seal-mountpoint` seals the overlay's too
+  (`seal_mountpoint_seals_the_overlay_too`); after a crash `hold`
+  detaches each stale one and `recover` stacks over each, the overlay's
+  through `<state>/meta/stack/overlay`
+  (`overlay_recovers_from_a_crashed_daemon`).
+- **Probe.** `agentfs probe --sandbox-overlay PATH` expects the overlay's
+  mount; a mount of the other kind is exit 1, either way round
+  (`overlay_probe_tells_the_mounts_apart`).
+- **Order.** The overlay is mounted after the main mount. If it then
+  fails, the main mount is unmounted as at a stop (its final sweep
+  included), and the error says so
+  (`overlay_failing_after_the_mount_point_stops_cleanly`).
+- **Boot refusals** (each exits 1 before anything is mounted; the
+  messages are in [the runbook](runbooks/sandbox-overlay.md#boot-refusals)):
+  tree rules (`agentfs.respectTreeRules`, whose rule files a sandbox
+  could edit), an overlay mount point that is the main one or nested with
+  it, the two mount points in one parent directory (a container given
+  that directory would reach both), a tmp layer on another filesystem
+  than the backing tree, a front (`--history-service`), and a view owner
+  the daemon cannot act as
+  (`the_overlay_is_refused_on_a_front_and_with_tree_rules`,
+  `the_overlay_mount_point_is_its_own_directory`,
+  `the_sandbox_overlay_inside_the_mount_point_is_refused`,
+  `the_sandbox_overlay_beside_the_mount_point_is_refused`,
+  `the_sandbox_overlay_is_not_served_on_a_front`,
+  `open_refuses_another_filesystem`).
+- **Either session ending stops both.** An unmount of either mount point
+  from outside stops the daemon, which unmounts the other, commits and
+  pushes; the log names the overlay when it was the one unmounted
+  (`an_external_unmount_of_the_overlay_stops_both`).
+
+**Errors.** What a sandbox sees through the overlay (the full table, per
+operation, is the module documentation of `overlay.rs`):
+
+| Case | Answer | Test |
+|---|---|---|
+| Lookup or `getattr` of a hidden name, whether or not it exists | `ENOENT`; absent from listings | `a5_hidden_names_answer_the_same_whether_or_not_they_exist`, `a4_listing_shows_only_shown_names`, `overlay_shows_only_recordable_names` |
+| The rules could not decide | `EIO`, hidden or refused | `rules_errors_answer_eio_through_the_overlay` |
+| Create of a skipped file name, `O_EXCL` included | a new tmp file, never `EEXIST` from a hidden tree entry | `tmp_files_are_private_and_shadow_hidden_names` |
+| `mkdir` of a directory the rules could record nothing beneath | `EACCES` | `a8_refusals` |
+| Create, `mkdir` or rename onto a recordable name holding a hidden kind (a special file, a nested repository) | `EACCES` | `b6_a_hidden_kind_at_a_recordable_name_is_never_replaced_nor_opened` |
+| `symlink`, `link`, `mknod` of anything but a regular file | `EACCES`, whatever exists | `a8_refusals`, `overlay_refusals` |
+| Rename of a recorded file to a skipped name | `EACCES` | `recorded_files_never_move_out` |
+| Rename or exchange of a directory | `EXDEV` | `rename_exchange_needs_both_ends_shown_in_the_tree`, `overlay_refusals` |
+| `RENAME_EXCHANGE` with a tmp end | `EACCES` | `recorded_files_never_move_out` |
+| `RENAME_WHITEOUT` | `EINVAL` | `a8_refusals` |
+| `rmdir` of a directory holding tmp files | `ENOTEMPTY` | `rmdir_of_a_directory_holding_tmp_files_is_not_empty` |
+| `copy_file_range` between a tmp file and a tree file | `EXDEV` (programs fall back to read and write) | `copy_file_range_across_layers_is_cross_device` |
+| `chown`, `chgrp`, set-id or sticky bits | `EPERM` | `setattr_through_the_overlay`, `overlay_refusals` |
+| `setxattr`, `removexattr` | `ENOTSUP` | `a8_refusals` |
+| `getxattr` outside `user.*` | `ENODATA` | `b8_extended_attributes_are_read_as_the_owner` |
+| The view owner lacks the access (read, write, search, execute) | `EACCES` | `a7_the_view_owner_acts_for_every_caller`, `b9_an_exec_open_needs_the_owners_execute_bit` |
+
+Each refused change is counted once in
+`agentfs.sandbox_overlay.refusals` by `reason` (§13;
+`b10_each_refused_change_is_counted_once`); reads of hidden names are
+not counted.
+
+**Executing files.** The kernel sets `__FMODE_EXEC` in the open flags of
+a file it opens to execute, and FUSE passes it on; `openat2(2)` refuses
+it with `EINVAL`, so executing a file through an agentfs mount, the main
+one included, failed. `Ops::open` drops it like the other flags that are
+not open flags (`an_open_to_execute_opens_the_file`; through both mount
+points, `overlay_exec_needs_the_owners_execute_bit`).
+
+**Costs.**
+
+- Sandboxes lose abilities through the overlay: hard links, creating
+  symlinks, directory moves (`EXDEV`), WAL databases (their `-shm` file is
+  never recordable; not tested), and `git init` and `git clone` (a
+  `.git` directory is never a repository path; not tested).
+- The d_ino leak: shown entries' inode numbers skip one per hidden entry
+  (§1.1; not tested).
+- A tmp file whose directory the main container removes stays in the
+  store, orphaned and still reachable through the handles open on it,
+  until the next wipe at stop or start (not tested).
+- Tmp files can fill the state area's disk: nothing limits their size,
+  and they count in `agentfs.state.bytes{part="tmp_layer"}` (§13).
+- Locks are not shared between the two mounts, and mode-bit checks run
+  outside the names lock (§1.1).
+- Front hosting is not built: the overlay is served only by a
+  single-process `mount`, never on a front, so not on CSI volumes
+  (§19.2 item 13).
 
 ## 3. Recording
 
@@ -2823,7 +3073,7 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.patch.queue_depth` | gauge | Patches queued after the last applied one, the blocked one included (§12) |
 | `agentfs.patch.blocked` | gauge | 1 while the patch queue is blocked (§12) |
 | `agentfs.patch.held` | gauge | Patches set aside (held, waiting, awaiting or not judged) at the last run (§12) |
-| `agentfs.state.bytes` | gauge | Size of the state area by part |
+| `agentfs.state.bytes` | gauge | Size of the state area by part; part `tmp_layer` is the sandbox overlay's tmp files (§2.4) |
 | `agentfs.telemetry.export_failures` | counter, per signal | Telemetry exports (traces, metrics, logs) that failed; counted by the binary, exported once metrics get through |
 | `agentfs.front.round_trip` | histogram, by request | A front's round trip to the history service (`record`, `tracked`, `ping`), in seconds (§14) |
 | `agentfs.front.service_failures` | counter, by stage | A front's failed requests to the history service: `connect`, `timeout`, `request` (connection lost or malformed reply), `refused`, `service` (§3.5, §14) |
@@ -2835,12 +3085,14 @@ API only; the binary picks the SDK and the exporter.
 | `agentfs.reconcile.records` | counter | Records made reconciling moved directories (§3.1) |
 | `agentfs.reconcile.failures` | counter | Moved directories given up on after 5 failed reconciliations over at least 30 s (`reconcile_failed`, §3.1) |
 | `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree, found by trying their suffixes (§5); set `--workload-mount` (CSI: `workloadMounts`) |
+| `agentfs.sandbox_overlay.refusals` | counter, by `reason` | Changes the sandbox overlay refused (§2.4), each counted once: `not_recordable` (a name the rules skip for that kind: a directory they could record nothing beneath, a recorded file moved to a skipped name), `kind` (a symlink, hard link or special file), `cross_device` (a directory move, `EXDEV`), `hidden` (the source, or an entry at the target, is hidden), `rules_error` (the rules could not decide: `EIO`), `ownership` (an owner, group, set-id or sticky-bit change), `xattr` (an extended-attribute change). Reads of hidden names are not counted |
 | `agentfs.fork.publish.duration` | histogram, per remote | Seconds from a fork's finish commit to its fork remote holding the change and finish refs (§11.5): one point per fork, when the published mark is written |
 
 Metric attributes are short and low-cardinality: `trigger`, `remote`,
-`reason` (a refusal label or a push failure kind), `stage` (`record` or
+`reason` (a refusal label, a push failure kind or a sandbox overlay
+refusal), `stage` (`record` or
 `commit` for refused paths, `git`, `lfs` or `queue` for push failures) and `part`
-(`git`, `journal`, `pending`, `lfs`, `meta`). Paths never become metric
+(`git`, `journal`, `pending`, `lfs`, `meta`, `tmp_layer`). Paths never become metric
 attributes. Span and log attributes are namespaced `agentfs.*`.
 
 `agentfs.state.bytes` is the apparent size (the sum of file lengths) of each
@@ -4040,7 +4292,9 @@ one-time migration of Hermes' existing data and the initial import in
     (exit 0), a stale one whose daemon died (1, or 0 with
     `--allow-stale`), nothing, or another filesystem (1), from
     `/proc/self/mountinfo` and a `statfs`; no lock, no state area. It is
-    the sidecar's startup and readiness probe;
+    the sidecar's startup and readiness probe. With `--sandbox-overlay`
+    it expects the sandbox overlay's mount (§2.4), and a mount of the
+    other kind is exit 1, either way round;
   - `push` pushes once to every remote (or those named with `--remote`) and
     exits 1 unless all succeeded; with a daemon running it asks the daemon
     over the control socket instead, waiting up to `--timeout` (§2.3);
@@ -4153,6 +4407,20 @@ one-time migration of Hermes' existing data and the initial import in
     read-only bind "floor" under the FUSE mount (it would outlive the
     pod on the node, and probes would have to tell it from a foreign
     mount).
+  - **The sandbox overlay's mount point** (`--sandbox-overlay PATH`,
+    §2.4) is a second FUSE session of the same daemon, with fsname
+    `agentfs:<volume>:sandbox-overlay` and the main mount's options
+    except `default_permissions` (the overlay checks every access
+    itself). Its mount point gets the same preflight under its own
+    label, the not-empty warning, the seal, and `hold` and `recover`
+    (stacking through `<state>/meta/stack/overlay`); it must be neither
+    the mount point nor nested with it, nor in the same parent
+    directory. It is mounted last, after the main mount, so a probe of
+    it (`agentfs probe --sandbox-overlay`) gates on both mounts. A
+    failure mounting it unmounts the main mount as at a stop. An unmount
+    of either from outside stops the daemon and both mounts. It is not
+    one of the workload views of §5 (`--workload-mount`): its own mount
+    source keeps it out.
   - **Kernel options.** fuser, multi-threaded (`--threads`, default the CPU
     count between 2 and 16) with a cloned `/dev/fuse` descriptor per thread;
     `default_permissions`, `allow_other` (unless `--no-allow-other`),
@@ -4867,6 +5135,7 @@ runner.
 | LFS reads and signals (2026-10-30) | The LFS client retries a socket read that returns `EINTR` at the HTTP transport, within what is left of its timeout (§7, §17.3 "LFS"), rather than retrying whole LFS requests: a whole-request retry would restart a large upload from its first byte, and the batch and verify requests have no retry at all. A design choice, not the owner's words. Cost: the connector chain is built on ureq's unversioned transport API, so each ureq upgrade must recheck it. Bead agentfs-lh8 |
 | Parent-finished mark (2026-10-30) | A fork of a fork that publishes as a top-level fork because its parent finished raises `ForkParentFinished`, then writes its published mark, which records the parent (§12 "Forks of forks"): at least once, at most twice across a crash. The mark is the confirmation, so a crash before it leaves the fork finished, and every path that publishes a finished fork (`agentfs fork finish`, the CSI release scan, with DeleteVolume waiting) raises it again. A design choice, not the owner's words. The bead's "raise from the mark", built first as a `raised` flag in the mark, was replaced in the fix round: under CSI nothing re-runs a publish for a fork already published (the release scan skips it and DeleteVolume deletes it), so an alarm pending in a published mark could still be lost. Cost: the alarm can precede a mark write that then fails. Left as before: `ForkPublished` and the publish duration are emitted after the mark write, so a crash there loses them (they are not alarms). Bead agentfs-rrm |
 | serve-git credentials and barriers (2026-10-30) | Replacing a barrier patch, whatever with, needs the `barrier` right, and an old tip that cannot be read counts as a barrier (fail closed). `agentfs.patchNotifyUrl` with userinfo (`user:token@`) fails the volume (`NotifyUrl`, the value echoed with its userinfo as `***`): the token goes in `agentfs.patchNotifyCredentialFile`. One check, `lfs::client::webhook_url_refused`, judges every webhook URL an operator configures (scheme, the `https` feature, no userinfo): `agentfs.patchNotifyUrl` and `agentfs fork deliver --to webhook --url` alike. The shared POST helper (`lfs::client::post`) keeps the URL redacted and scrubs it from its error text, so no webhook's failure prints userinfo, even for library callers who build a notifier or delivery themselves (fix round). Design choices, not the owner's words. Bead agentfs-5sg |
+| The sandbox overlay (2026-10-30) | The owner's requirements, 2026-10-30: "the sandbox agent should only get write access to the agentfs overlay files"; "-- and potentially should only be able to see the agentfs overlay files at all" (his word "potentially" is kept: hiding is the current choice); and "i want sandboxes to be able to edit their own configuration and have it reflected back in the main container". His picture: "like a real Linux overlay filesystem ... editing a file that matches the agentfs includes makes it recorded, whereas editing a file that doesn't match the includes would mean the file is created on the underlying tmp disk". His answers at the design gate (current choices, revisable): *Q1, where a sandbox's save temp file lives:* in the tmp layer, and moving a recorded file out to a non-matching name is refused (copying it still works). *Q2, whether the overlay is a security boundary:* "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see", recorded as a boundary for names, the second stated exception of §1.1. *Q3, who serves it:* the volume's own daemon, as a second entry point over the same operations; hosting it on a front is cut. Built (§2.4). Design choices, not his words: the view owner (one user every operation is checked and done as, like NFS `all_squash`); `EXDEV` for directory moves; refusing hard links and symlinks; tmp names kept only in memory; the mount source `agentfs:<volume>:sandbox-overlay` and `probe --sandbox-overlay`; the refusal metric `agentfs.sandbox_overlay.refusals`. Open questions: §19.2 item 13 |
 
 ### 19.2 Open questions
 
@@ -5027,6 +5296,20 @@ runner.
    (2026-10-30)*: the owner chose to judge the mark by pod (§19.1
    "Patches land after a clean stop"); a new pod lands the queue over the
    old pod's mark, and a restart of the sidecar alone still defers it.
+13. **The sandbox overlay's open questions (2026-10-30, §2.4).**
+   - *Locks across the two mounts:* each kernel keeps its own POSIX and
+     BSD locks, so a lock taken through the main mount is not seen
+     through the overlay (§1.1). Sharing them would mean serving locks
+     in the daemon (`getlk`, `setlk`, `flock`) for both sessions. Open.
+   - *Whether d_ino gaps matter:* shown entries' inode numbers skip one
+     per hidden entry, which tells a sandbox how many hidden entries a
+     directory holds, not their names (§1.1). Giving node ids only to
+     shown entries would close it. Open.
+   - *A front serving the overlay:* the overlay is served only by a
+     single-process `mount`, so not on CSI volumes, where every pod's
+     mount is a front (§14). Hosting it on a front was cut on
+     2026-10-30 (§19.1 "The sandbox overlay (2026-10-30)") and waits for
+     a consumer that needs it. Open.
 
 ## 20. Prior art
 

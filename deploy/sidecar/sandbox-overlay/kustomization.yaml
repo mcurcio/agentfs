@@ -1,0 +1,57 @@
+# The sandbox overlay (design §2.4, docs/deployment.md §12) for the
+# sidecar of deploy/sidecar: a second mount point of the volume, served by
+# the same daemon, that shows only the files the operator's rules would
+# record. Give it to a container that starts other containers (for example
+# a Docker daemon), and never the main mount:
+#
+#   volumeMounts:
+#     - name: agentfs-sandbox
+#       mountPath: /agentfs-sandbox
+#       mountPropagation: HostToContainer
+#
+# and have it bind paths under /agentfs-sandbox/overlay into its
+# sandboxes. Use it as a component of a kustomization that has
+# deploy/sidecar as a resource (deploy/examples/sidecar-sandbox-overlay).
+#
+# JSON patches, so every addition goes at the end of its list and the
+# init containers keep their order; the `test` fails the build if the
+# recorder is no longer the second init container.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - target:
+      kind: Deployment
+      name: agentfs-example
+    patch: |-
+      - op: test
+        path: /spec/template/spec/initContainers/1/name
+        value: agentfs
+      # The overlay's mount point: a subdirectory of an emptyDir of its
+      # own. It must not share a parent directory with /agentfs/workspace
+      # (refused at start): a container given that directory would reach
+      # both.
+      - op: add
+        path: /spec/template/spec/initContainers/1/env/-
+        value: { name: AGENTFS_SANDBOX_OVERLAY, value: /agentfs-sandbox/overlay }
+      # The view owner: every operation through the overlay is checked and
+      # done as this uid:gid, whoever the sandbox runs as. Set it to the
+      # user that owns the files sandboxes should edit (here the example
+      # workload's).
+      - op: add
+        path: /spec/template/spec/initContainers/1/env/-
+        value: { name: AGENTFS_SANDBOX_OWNER, value: "10000:10000" }
+      - op: add
+        path: /spec/template/spec/initContainers/1/volumeMounts/-
+        value: { name: agentfs-sandbox, mountPath: /agentfs-sandbox, mountPropagation: Bidirectional }
+      # The overlay is mounted after the main mount, so probing it gates
+      # on both.
+      - op: replace
+        path: /spec/template/spec/initContainers/1/startupProbe/exec/command
+        value: [agentfs, probe, --allow-stale, --sandbox-overlay, /agentfs-sandbox/overlay]
+      - op: replace
+        path: /spec/template/spec/initContainers/1/readinessProbe/exec/command
+        value: [agentfs, probe, --sandbox-overlay, /agentfs-sandbox/overlay]
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value: { name: agentfs-sandbox, emptyDir: {} }
