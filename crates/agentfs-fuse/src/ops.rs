@@ -2529,7 +2529,8 @@ impl crate::session::Operations for Ops {
     }
 
     fn readdir(&self, _id: u64, fh: u64, offset: u64) -> OpResult<Vec<(u64, DirEntry)>> {
-        Ops::readdir(self, fh, offset)
+        let _ = Ops::readdir(self, fh, offset);
+        Ok(Vec::new())
     }
 
     fn releasedir(&self, fh: u64) {

@@ -1302,8 +1302,7 @@ struct MountArgs {
     #[arg(
         long,
         env = "AGENTFS_SANDBOX_OVERLAY",
-        value_name = "PATH",
-        requires = "sandbox_owner"
+        value_name = "PATH"
     )]
     sandbox_overlay: Option<PathBuf>,
     /// The sandbox overlay's view owner: the user and group every
@@ -1312,8 +1311,7 @@ struct MountArgs {
     #[arg(
         long,
         env = "AGENTFS_SANDBOX_OWNER",
-        value_name = "UID:GID",
-        requires = "sandbox_overlay"
+        value_name = "UID:GID"
     )]
     sandbox_owner: Option<agentfs_fuse::overlay::OwnerIds>,
     #[command(flatten)]

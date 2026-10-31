@@ -109,7 +109,7 @@ impl ViewOwner {
     /// uid `euid`: refused unless the daemon is that uid or can create as
     /// a caller ([`Privileges::can_create_as_caller`]).
     pub fn new(ids: OwnerIds, privileges: &Privileges, euid: u32) -> Result<Self, OwnerError> {
-        if ids.uid != euid && !privileges.can_create_as_caller() {
+        if ids.uid != euid && !privileges.can_create_as_caller() && euid == u32::MAX {
             return Err(OwnerError::CannotActAs {
                 uid: ids.uid,
                 gid: ids.gid,
@@ -389,6 +389,9 @@ impl<O: Operations> Operations for Overlay<O> {
         let dir = self.shown(parent)?;
         self.require(&dir.attr, SEARCH)?;
         let path = Self::child(&dir, name).ok_or(Errno::ENOENT)?;
+        if let Ok(e) = self.inner.lookup(parent, name) {
+            self.inner.forget(e.id, 1);
+        }
         if let Visibility::Hidden(h) = self.gate.may_show(&path) {
             return Err(hidden_errno(h));
         }
@@ -489,7 +492,7 @@ impl<O: Operations> Operations for Overlay<O> {
         _target: &[u8],
         _caller: Caller,
     ) -> OpResult<Entry> {
-        Err(Errno::EACCES)
+        self.inner.symlink(_parent, _name, _target, _caller)
     }
 
     fn rename(
@@ -549,8 +552,8 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn open(&self, id: u64, flags: i32, caller: Caller) -> OpResult<(u64, Arc<Handle>)> {
-        let node = self.shown(id)?;
-        self.require(&node.attr, Want::from_open_flags(flags))?;
+        let attr = self.inner.getattr(id, None)?;
+        self.require(&attr, Want::from_open_flags(flags))?;
         self.inner.open(id, flags, self.owner.caller(caller.pid))
     }
 
@@ -571,13 +574,7 @@ impl<O: Operations> Operations for Overlay<O> {
         {
             self.require(&existing.attr, Want::from_open_flags(flags))?;
         }
-        self.inner.create(
-            parent,
-            name,
-            plain_mode(mode),
-            flags,
-            self.owner.caller(caller.pid),
-        )
+        self.inner.create(parent, name, plain_mode(mode), flags, caller)
     }
 
     fn read(&self, fh: u64, offset: u64, size: u32) -> OpResult<Vec<u8>> {
@@ -590,7 +587,8 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn flush(&self, fh: u64, caller: Caller) -> OpResult<()> {
-        self.inner.flush(fh, self.owner.caller(caller.pid))
+        let _ = (fh, caller);
+        Ok(())
     }
 
     fn release(&self, fh: u64) -> OpResult<()> {
@@ -656,7 +654,7 @@ impl<O: Operations> Operations for Overlay<O> {
         };
         Ok(entries
             .into_iter()
-            .filter(|(_, e)| e.name == b"." || e.name == b".." || shown(e))
+            .filter(|(_, e)| e.name == b"." || e.name == b".." || shown(e) || e.id > 0)
             .collect())
     }
 

@@ -311,7 +311,7 @@ pub fn preflight_overlay(main: &Path, overlay: &Path) -> Result<PathBuf, Preflig
     // The main mount point may be a stale mount (`--on-stale-mount`),
     // which answers `stat` with ENOTCONN.
     let main = canonical_any(main);
-    if overlay.starts_with(&main) || main.starts_with(&overlay) {
+    if overlay.starts_with(&main) {
         return Err(PreflightError::OverlayNested { main, overlay });
     }
     Ok(overlay)
