@@ -8,12 +8,21 @@
 //! bind mount of the mount or of a directory in it, as `/proc/self/mountinfo`
 //! lists them), and the paths an operator names with `--workload-mount`
 //! (a container's `mountPath`, which only the pod spec knows).
+//!
+//! The sandbox overlay ([`crate::overlay`]) is never a workload view, even
+//! where it shares the mount's device: no `.git` name can be created or
+//! shown through it (a [`agentfs_core::paths::RepoPath`] is never `.git`,
+//! and nested repositories are hidden), so no `gitdir:` target is ever
+//! written through it. Its mounts are told apart by their source
+//! ([`crate::mount::MountSource`]).
 
 use std::io;
 use std::path::Path;
 
 use agentfs_core::mountinfo::{self, MountEntry};
 use agentfs_core::nested::View;
+
+use crate::mount::{MountKind, MountSource};
 
 /// One `--workload-mount` value: `PATH`, where a workload sees the whole
 /// tree, or `PATH=DIR`, where it sees the tree's directory `DIR` (a
@@ -28,7 +37,8 @@ pub fn parse_workload_mount(value: &str) -> Result<View, String> {
 }
 
 /// The views of the mount at `mountpoint` that `/proc/self/mountinfo`
-/// shows: every mount of the same device, at the tree directory it shows.
+/// shows: every mount of the same device, at the tree directory it shows,
+/// except the sandbox overlay's.
 pub fn mounted_views(mountpoint: &Path) -> io::Result<Vec<View>> {
     let entries = mountinfo::read()?;
     let mountpoint = mountpoint.canonicalize()?;
@@ -44,6 +54,9 @@ fn views_in(entries: &[MountEntry], mountpoint: &Path) -> Vec<View> {
     entries
         .iter()
         .filter(|e| e.device == this.device)
+        .filter(|e| {
+            MountSource::parse(&e.source).is_none_or(|s| s.kind != MountKind::SandboxOverlay)
+        })
         .filter_map(|e| View::new(e.mountpoint.to_str()?, e.root.to_str()?))
         .fold(Vec::new(), |mut views, view| {
             if !views.contains(&view) {
@@ -63,6 +76,7 @@ mod tests {
 41 22 0:44 /proj /src rw shared:9 - fuse.agentfs agentfs:v rw
 42 22 0:44 / /with\\040space rw - fuse.agentfs agentfs:v rw
 43 22 0:50 / /other rw - fuse.agentfs agentfs:w rw
+44 22 0:44 / /sandbox rw - fuse.agentfs agentfs:v:sandbox-overlay rw
 garbage line
 ";
 
@@ -79,6 +93,18 @@ garbage line
             ]
         );
         assert!(views_in(&entries, Path::new("/nowhere")).is_empty());
+    }
+
+    /// The sandbox overlay is not a workload view, even on the same
+    /// device.
+    #[test]
+    fn the_sandbox_overlay_is_not_a_view() {
+        let entries = mountinfo::parse(MOUNTINFO);
+        let views = views_in(&entries, Path::new("/agentfs/workspace"));
+        assert!(
+            !views.contains(&View::new("/sandbox", "").unwrap()),
+            "{views:?}"
+        );
     }
 
     #[test]

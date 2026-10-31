@@ -93,9 +93,10 @@ use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::service::{FinalPush, Service};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
+use agentfs_fuse::mount::MountSource;
 use agentfs_fuse::{
-    Mount, MountConfig, MountState, OverlayConfig, Passthrough, StackOver, UnmountReport,
-    agentfs_layers, detach_stale_layers, mount_state, preflight, preflight_overlay,
+    Mount, MountConfig, MountError, MountKind, MountState, OverlayConfig, Passthrough, StackOver,
+    UnmountReport, agentfs_layers, detach_stale_layers, mount_state, preflight, preflight_overlay,
     preflight_stacked,
 };
 
@@ -303,6 +304,10 @@ enum Command {
         /// crash).
         #[arg(long)]
         allow_stale: bool,
+        /// Expect the sandbox overlay's mount, not the main mount: either
+        /// kind's mount is exit 1 where the other is expected.
+        #[arg(long)]
+        sandbox_overlay: bool,
     },
     /// The patch queue (design §12): submit a patch for a volume, apply
     /// the queue now, or show it.
@@ -693,7 +698,15 @@ fn real_main() -> Result<ExitCode> {
         Command::Probe {
             mountpoint,
             allow_stale,
-        } => return Ok(probe(&mountpoint, allow_stale)),
+            sandbox_overlay,
+        } => {
+            let kind = if sandbox_overlay {
+                MountKind::SandboxOverlay
+            } else {
+                MountKind::Main
+            };
+            return Ok(probe(&mountpoint, allow_stale, kind));
+        }
         Command::Patch { command } => {
             return patch_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
         }
@@ -1214,6 +1227,19 @@ fn list(names: &[String]) -> String {
     }
 }
 
+/// Why a mount stops: [`describe_wake`], naming the sandbox overlay when
+/// its session was the one unmounted from outside (`ended`, the session
+/// that ended first, at `overlay`).
+fn describe_mount_wake(wake: Wake, ended: Option<MountKind>, overlay: Option<&Path>) -> String {
+    match (wake, ended, overlay) {
+        (Wake::Unmounted, Some(MountKind::SandboxOverlay), Some(at)) => format!(
+            "the sandbox overlay at {} was unmounted from outside; stopping both mount points",
+            at.display()
+        ),
+        _ => describe_wake(wake),
+    }
+}
+
 fn describe_wake(wake: Wake) -> String {
     match wake {
         Wake::Signal(signal) => format!("signal {signal}"),
@@ -1376,10 +1402,11 @@ fn sandbox_overlay(
     let (Some(at), Some(ids)) = (&args.sandbox_overlay, args.sandbox_owner) else {
         return Ok(None);
     };
+    let kind = MountKind::SandboxOverlay;
     let overlay = if stacked {
-        preflight_stacked(state, settings, &args.backing, at)?.1
+        preflight_stacked(state, settings, &args.backing, at, kind)?.1
     } else {
-        create_mountpoint(at)?;
+        create_mountpoint(at, kind)?;
         if let Err(e) = rustix::fs::stat(at)
             && e == rustix::io::Errno::NOTCONN
         {
@@ -1390,7 +1417,7 @@ fn sandbox_overlay(
                 p = at.display()
             );
         }
-        let (_, overlay) = preflight(state, settings, &args.backing, at)?;
+        let (_, overlay) = preflight(state, settings, &args.backing, at, kind)?;
         if std::fs::read_dir(&overlay).is_ok_and(|mut d| d.next().is_some()) {
             eprintln!(
                 "warning: the sandbox overlay's mount point {} is not empty: the files in it \
@@ -1423,10 +1450,19 @@ fn sandbox_overlay(
     }))
 }
 
-/// The startup line's note of the sandbox overlay, if served.
+/// The startup line's note of the sandbox overlay, if served: its mount
+/// point, view owner and passthrough status (each session negotiates its
+/// own).
 fn describe_overlay(mounted: &Mount, args: &MountArgs) -> String {
-    match (mounted.overlay_mountpoint(), args.sandbox_owner) {
-        (Some(at), Some(owner)) => format!(", sandbox overlay at {} as {owner}", at.display()),
+    match (
+        mounted.overlay_mountpoint(),
+        args.sandbox_owner,
+        mounted.overlay_passthrough(),
+    ) {
+        (Some(at), Some(owner), Some(passthrough)) => format!(
+            ", sandbox overlay at {} as {owner}, passthrough {passthrough}",
+            at.display()
+        ),
         _ => String::new(),
     }
 }
@@ -1483,17 +1519,35 @@ fn parse_passthrough(value: &str) -> Result<Passthrough, String> {
     value.parse()
 }
 
-/// `agentfs probe`: one line, exit 0 for a live agentfs mount (or a stale
-/// one with `allow_stale`), else 1.
-fn probe(mountpoint: &Path, allow_stale: bool) -> ExitCode {
+/// `agentfs probe`: one line, exit 0 for a live agentfs mount of kind
+/// `kind` (or a stale one with `allow_stale`), else 1. A mount of the
+/// other kind says so.
+fn probe(mountpoint: &Path, allow_stale: bool, kind: MountKind) -> ExitCode {
     match mount_state(mountpoint) {
         Ok(state) => {
-            println!("{}", describe_state(&state));
-            let ok = match state {
-                MountState::Live { .. } => true,
-                MountState::Stale { .. } => allow_stale,
-                MountState::NotMounted | MountState::Foreign { .. } => false,
+            let found = match &state {
+                MountState::Live { source } | MountState::Stale { source } => {
+                    Some(source_kind(source))
+                }
+                MountState::NotMounted | MountState::Foreign { .. } => None,
             };
+            let wrong = found.is_some_and(|found| found != kind);
+            let line = describe_state(&state);
+            if wrong {
+                let expected = match kind {
+                    MountKind::Main => "a main mount",
+                    MountKind::SandboxOverlay => "a sandbox overlay",
+                };
+                println!("{line}, not {expected}");
+            } else {
+                println!("{line}");
+            }
+            let ok = !wrong
+                && match state {
+                    MountState::Live { .. } => true,
+                    MountState::Stale { .. } => allow_stale,
+                    MountState::NotMounted | MountState::Foreign { .. } => false,
+                };
             if ok {
                 ExitCode::SUCCESS
             } else {
@@ -1507,25 +1561,42 @@ fn probe(mountpoint: &Path, allow_stale: bool) -> ExitCode {
     }
 }
 
+/// Which kind of mount an agentfs mount's source names; a source that
+/// names none is a main mount's (as every source was before the sandbox
+/// overlay).
+fn source_kind(source: &str) -> MountKind {
+    MountSource::parse(source).map_or(MountKind::Main, |s| s.kind)
+}
+
+/// What an agentfs mount of `source` is called: "agentfs mount" or
+/// "agentfs sandbox overlay".
+fn mount_noun(source: &str) -> &'static str {
+    match source_kind(source) {
+        MountKind::Main => "agentfs mount",
+        MountKind::SandboxOverlay => "agentfs sandbox overlay",
+    }
+}
+
 fn describe_state(state: &MountState) -> String {
     match state {
-        MountState::Live { source } => format!("live agentfs mount ({source})"),
-        MountState::Stale { .. } => "stale agentfs mount (daemon gone)".to_owned(),
+        MountState::Live { source } => format!("live {} ({source})", mount_noun(source)),
+        MountState::Stale { source } => format!("stale {} (daemon gone)", mount_noun(source)),
         MountState::NotMounted => "not mounted".to_owned(),
         MountState::Foreign { fstype } => format!("not an agentfs mount ({fstype})"),
     }
 }
 
-/// Creates a missing mount point (one level: its parent must exist), so a
-/// sidecar can mount into a subdirectory of a fresh emptyDir.
-fn create_mountpoint(mountpoint: &Path) -> Result<()> {
+/// Creates a missing mount point of kind `kind` (one level: its parent
+/// must exist), so a sidecar can mount into a subdirectory of a fresh
+/// emptyDir.
+fn create_mountpoint(mountpoint: &Path, kind: MountKind) -> Result<()> {
     match std::fs::symlink_metadata(mountpoint) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             std::fs::DirBuilder::new()
                 .mode(0o755)
                 .create(mountpoint)
-                .with_context(|| format!("creating the mount point {}", mountpoint.display()))?;
-            eprintln!("created the mount point {}", mountpoint.display());
+                .with_context(|| format!("creating {} {}", kind.label(), mountpoint.display()))?;
+            eprintln!("created {} {}", kind.label(), mountpoint.display());
             Ok(())
         }
         // Anything else (it exists, or is stale) is preflight's to judge.
@@ -1583,13 +1654,24 @@ fn mount(
         .settings()
         .clone();
     let (backing, mountpoint, stale_layers) = if stacked {
-        let (backing, mountpoint) =
-            preflight_stacked(state, &settings, &args.backing, &args.mountpoint)?;
+        let (backing, mountpoint) = preflight_stacked(
+            state,
+            &settings,
+            &args.backing,
+            &args.mountpoint,
+            MountKind::Main,
+        )?;
         let layers = agentfs_layers(&mountpoint).unwrap_or(1);
         (backing, mountpoint, Some(layers))
     } else {
-        create_mountpoint(&args.mountpoint)?;
-        let (backing, mountpoint) = preflight(state, &settings, &args.backing, &args.mountpoint)?;
+        create_mountpoint(&args.mountpoint, MountKind::Main)?;
+        let (backing, mountpoint) = preflight(
+            state,
+            &settings,
+            &args.backing,
+            &args.mountpoint,
+            MountKind::Main,
+        )?;
         if std::fs::read_dir(&mountpoint).is_ok_and(|mut d| d.next().is_some()) {
             eprintln!(
                 "warning: {} is not empty: the files in it are hidden by the mount and not \
@@ -1670,10 +1752,16 @@ fn mount(
         // A finished fork never gets here (`refuse_finished`).
         read_only: false,
         overlay,
+        unmount_grace: args.unmount_grace,
     };
     let mounted = match Mount::start(recorder, config) {
         Ok(mounted) => mounted,
         Err(e) => {
+            // The overlay failed after the mount point was served: the
+            // mount point was stopped as at a stop; report it as one.
+            if let MountError::Overlay { report, .. } = &e {
+                print_unmount(report, args.unmount_grace);
+            }
             // Commits what recovery found; nothing was mounted, so nothing
             // attached: the mark goes unless a stale mount is below.
             let _ = service.shutdown(args.push_grace);
@@ -1745,10 +1833,11 @@ fn mount(
     if failed {
         eprintln!("passthrough: {}", mounted.passthrough());
     }
+    let overlay_at = mounted.overlay_mountpoint().map(Path::to_path_buf);
     eprintln!(
         "{}: unmounting (waiting up to {:?} for open files, then {:?} for the final push; signal \
          again to exit now)",
-        describe_wake(wake),
+        describe_mount_wake(wake, mounted.ended_session(), overlay_at.as_deref()),
         args.unmount_grace,
         args.push_grace
     );
@@ -1760,8 +1849,7 @@ fn mount(
     {
         eprintln!("a restore was still running at shutdown; it stops with the unmount");
     }
-    let overlay_at = mounted.overlay_mountpoint().map(Path::to_path_buf);
-    let report = mounted.shutdown(args.unmount_grace);
+    let report = mounted.shutdown();
     print_unmount(&report, args.unmount_grace);
     // The layers earlier crashes left under a stacked mount (the overlay's
     // too).
@@ -1772,7 +1860,8 @@ fn mount(
     // Nothing attached: the unmount was not busy, no file stayed open and
     // no stale layer (which a workload may still hold) was below. Else the
     // mark stays, and the next mount holds the patch queue (design §12).
-    if report.unmount_error.is_none() && !report.lazy && !report.session_abandoned && !stale_left {
+    if report.unmount_errors.is_empty() && !report.lazy && !report.session_abandoned && !stale_left
+    {
         clear_attached(state);
     } else if let Some(scope) = &scope {
         eprintln!(
@@ -1805,14 +1894,14 @@ fn clear_attached(state: &StateDir) {
 
 /// Reports what an unmount did and what it could not record.
 fn print_unmount(report: &UnmountReport, unmount_grace: Duration) {
-    if let Some(error) = &report.unmount_error {
+    for error in &report.unmount_errors {
         eprintln!("unmount failed: {error}");
     }
     if report.lazy {
         eprintln!("the mount was busy: detached lazily");
     }
     if report.session_abandoned {
-        if report.lazy || report.unmount_error.is_some() {
+        if report.lazy || !report.unmount_errors.is_empty() {
             eprintln!(
                 "files were still open after {unmount_grace:?}: their later changes are not \
                  recorded"

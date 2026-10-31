@@ -3088,9 +3088,11 @@ fn mount_sandbox(v: &Vol, overlay: &Path) -> (Mounted, Unmounts) {
         "the overlay is not mounted; log:\n{}",
         m.log()
     );
+    // The startup line names the overlay, its view owner and its own
+    // passthrough status.
     assert!(
         m.log().contains(&format!(
-            "sandbox overlay at {} as 10000:10000",
+            "sandbox overlay at {} as 10000:10000, passthrough ",
             overlay.display()
         )),
         "{}",
@@ -3694,4 +3696,279 @@ fn seal_mountpoint_seals_the_overlay_too() {
         "Permission denied",
     );
     assert!(!overlay.join("f").exists());
+}
+
+// ---- the sandbox overlay: coherence and lifecycle (slice 4) ----
+
+/// Renames through the main mount and through the overlay at once, in one
+/// directory, each changing what the other session's kernel caches: the
+/// invalidations go through one worker thread, never a request thread,
+/// so neither session waits on the other.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_and_main_mount_rename_at_once() {
+    let (v, overlay) = sandbox_vol("overlay_and_main_mount_rename_at_once");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    fs::write(v.mnt().join("skills/m1"), "m").unwrap();
+    fs::write(overlay.join("skills/o1"), "o").unwrap();
+    const ROUNDS: usize = 1000;
+    let (done, results) = std::sync::mpsc::channel();
+    for (dir, a, b) in [
+        (v.mnt().join("skills"), "m1", "m2"),
+        (overlay.join("skills"), "o1", "o2"),
+    ] {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let renamed = (0..ROUNDS).try_for_each(|_| {
+                fs::rename(dir.join(a), dir.join(b))?;
+                fs::rename(dir.join(b), dir.join(a))
+            });
+            let _ = done.send((a, renamed));
+        });
+    }
+    for _ in 0..2 {
+        let (who, renamed) = results
+            .recv_timeout(Duration::from_secs(120))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the renames never finished (a deadlock?); log:\n{}",
+                    m.log()
+                )
+            });
+        renamed.unwrap_or_else(|e| panic!("{who}: {e}"));
+    }
+    // Each session sees the other's last rename.
+    assert_eq!(fs::read_to_string(overlay.join("skills/m1")).unwrap(), "m");
+    assert_eq!(fs::read_to_string(v.mnt().join("skills/o1")).unwrap(), "o");
+    assert!(!overlay.join("skills/m2").exists());
+    assert!(!v.mnt().join("skills/o2").exists());
+    wait_for(&v, &m, "skills/m1", "m");
+    wait_for(&v, &m, "skills/o1", "o");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let history = v.history();
+        if !history.contains_key("skills/m2") && !history.contains_key("skills/o2") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "history kept a renamed-away name: {history:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    m.stop();
+}
+
+/// A path held open for writing through the overlay holds off a restore as
+/// one held through the main mount does, and the restore's settle records
+/// the overlay's unclosed write first: one set of open files, one sweep.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_open_files_hold_off_a_restore() {
+    let (v, overlay) = sandbox_vol("overlay_open_files_hold_off_a_restore");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let sandbox = v.p("sandbox");
+    succeeds(&v.p(""), None, "printf v2 > mnt/config.yaml");
+    wait_for(&v, &m, "config.yaml", "v2");
+    let c2 = v.head_id();
+    succeeds(&v.p(""), None, "printf v3 > mnt/config.yaml");
+    wait_for(&v, &m, "config.yaml", "v3");
+
+    let hold = |script: &str| {
+        let mut holder = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&sandbox)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        holder
+    };
+    // Held open for writing, unchanged.
+    let mut holder = hold("exec 3>>overlay/config.yaml; echo ready; exec sleep 60");
+    let out = v.agentfs(&["restore", "config.yaml", &c2]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("open for writing through the mount: config.yaml"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read_to_string(overlay.join("config.yaml")).unwrap(),
+        "v3"
+    );
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    // Written and still open: the settle records it before the restore.
+    let mut holder = hold("exec 3>overlay/config.yaml; printf v4 >&3; echo ready; exec sleep 60");
+    v.ok(&["restore", "--force", "config.yaml", &c2]);
+    let (_, message) = commit_setting(&v, "config.yaml", "v4");
+    assert!(message.contains("Agentfs-Uid: 10000\n"), "{message}");
+    wait_for(&v, &m, "config.yaml", "v2");
+    let _ = holder.kill();
+    let _ = holder.wait();
+    // Both sessions show the restored file.
+    assert_eq!(
+        fs::read_to_string(overlay.join("config.yaml")).unwrap(),
+        "v2"
+    );
+    assert_eq!(
+        fs::read_to_string(v.mnt().join("config.yaml")).unwrap(),
+        "v2"
+    );
+    m.stop();
+}
+
+/// The overlay acts as the view owner with no supplementary groups: a
+/// directory whose group may not write but others may is writable through
+/// it, whatever groups the sandbox process has.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_ignores_the_sandbox_process_groups() {
+    let (v, overlay) = sandbox_vol("overlay_ignores_the_sandbox_process_groups");
+    let dir = v.backing().join("skills/g");
+    fs::create_dir(&dir).unwrap();
+    std::os::unix::fs::chown(&dir, Some(0), Some(50)).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o707)).unwrap();
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let out = Command::new("setpriv")
+        .args([
+            "--reuid=20000",
+            "--regid=20000",
+            "--groups=50",
+            "--",
+            "sh",
+            "-c",
+        ])
+        .arg("printf n > overlay/skills/g/new")
+        .current_dir(v.p("sandbox"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    let made = fs::metadata(dir.join("new")).unwrap();
+    assert_eq!((made.uid(), made.gid()), (UID, UID));
+    wait_for(&v, &m, "skills/g/new", "n");
+    m.stop();
+}
+
+/// An open to execute needs the view owner's execute bit, not just any.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_exec_needs_the_owners_execute_bit() {
+    let (v, overlay) = sandbox_vol("overlay_exec_needs_the_owners_execute_bit");
+    for (name, mode) in [("owner-only.sh", 0o744), ("anyone.sh", 0o755)] {
+        let path = v.backing().join("skills").join(name);
+        fs::write(&path, "#!/bin/sh\necho ran\n").unwrap();
+        std::os::unix::fs::chown(&path, Some(0), Some(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let sandbox = v.p("sandbox");
+    // Through the main mount, the kernel checks the mode itself.
+    assert_eq!(
+        succeeds(&v.p(""), Some(20000), "./mnt/skills/anyone.sh"),
+        "ran\n"
+    );
+    fails_with(
+        &sandbox,
+        Some(20000),
+        "./overlay/skills/owner-only.sh",
+        "Permission denied",
+    );
+    assert_eq!(
+        succeeds(&sandbox, Some(20000), "./overlay/skills/anyone.sh"),
+        "ran\n"
+    );
+    // Other may not run it there.
+    fails_with(
+        &v.p(""),
+        Some(20000),
+        "./mnt/skills/owner-only.sh",
+        "Permission denied",
+    );
+    m.stop();
+}
+
+/// `agentfs probe` tells the main mount and the sandbox overlay apart, both
+/// ways.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_probe_tells_the_mounts_apart() {
+    let (v, overlay) = sandbox_vol("overlay_probe_tells_the_mounts_apart");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let mnt = v.mnt();
+    let probe = |args: &[&str], at: &Path| {
+        let mut all = vec!["probe"];
+        all.extend_from_slice(args);
+        all.push(at.to_str().unwrap());
+        let out = v.agentfs(&all);
+        (out.status.code(), text(&out.stdout))
+    };
+    assert_eq!(
+        probe(&[], &mnt),
+        (Some(0), "live agentfs mount (agentfs:demo)\n".to_owned())
+    );
+    assert_eq!(
+        probe(&["--sandbox-overlay"], &overlay),
+        (
+            Some(0),
+            "live agentfs sandbox overlay (agentfs:demo:sandbox-overlay)\n".to_owned()
+        )
+    );
+    assert_eq!(
+        probe(&[], &overlay),
+        (
+            Some(1),
+            "live agentfs sandbox overlay (agentfs:demo:sandbox-overlay), not a main mount\n"
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        probe(&["--sandbox-overlay", "--allow-stale"], &mnt),
+        (
+            Some(1),
+            "live agentfs mount (agentfs:demo), not a sandbox overlay\n".to_owned()
+        )
+    );
+    m.stop();
+}
+
+/// An unmount of the overlay from outside stops the daemon, and both mount
+/// points with it; the log names the overlay.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn an_external_unmount_of_the_overlay_stops_both() {
+    let (v, overlay) = sandbox_vol("an_external_unmount_of_the_overlay_stops_both");
+    let (mut m, _unmounts) = mount_sandbox(&v, &overlay);
+    assert!(
+        Command::new("umount")
+            .arg(&overlay)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = m.wait_exit(Duration::from_secs(30));
+    let log = m.log();
+    assert!(status.success(), "{log}");
+    assert!(
+        log.contains(&format!(
+            "the sandbox overlay at {} was unmounted from outside; stopping both mount points",
+            overlay.display()
+        )),
+        "{log}"
+    );
+    assert!(!is_mounted(&v.mnt()), "{log}");
+    assert!(!is_mounted(&overlay), "{log}");
 }

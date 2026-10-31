@@ -77,7 +77,15 @@ impl OverlayRefusal {
     /// The attribute value: `not_recordable`, `kind`, `cross_device`,
     /// `hidden`, `rules_error`, `ownership` or `xattr`.
     pub fn as_str(self) -> &'static str {
-        todo!("sandbox overlay slice 4")
+        match self {
+            Self::NotRecordable => "not_recordable",
+            Self::Kind => "kind",
+            Self::CrossDevice => "cross_device",
+            Self::Hidden => "hidden",
+            Self::RulesError => "rules_error",
+            Self::Ownership => "ownership",
+            Self::Xattr => "xattr",
+        }
     }
 }
 
@@ -185,6 +193,7 @@ struct Inner {
     resyncs: Counter<u64>,
     create_as_caller_fallbacks: Counter<u64>,
     racy_rechecks: Counter<u64>,
+    overlay_refusals: Counter<u64>,
     fork_publish_duration: Histogram<f64>,
 }
 
@@ -309,6 +318,13 @@ impl Telemetry {
                 "Boundaries that would have recorded a file again only because its last record \
                  was racy, by outcome: skipped (its bytes were the frozen copy still last \
                  journaled at its path) or recorded (design §3.1)",
+            ),
+            overlay_refusals: counter(
+                names::SANDBOX_OVERLAY_REFUSALS,
+                "{refusal}",
+                "Changes the sandbox overlay refused, by reason: not_recordable, kind, \
+                 cross_device, hidden, rules_error, ownership or xattr (reads of hidden names \
+                 are not counted)",
             ),
             fork_publish_duration: meter
                 .f64_histogram(names::FORK_PUBLISH_DURATION)
@@ -590,8 +606,11 @@ impl Telemetry {
     /// Counts one change the sandbox overlay refused, by `reason`
     /// (`agentfs.sandbox_overlay.refusals`; sandbox overlay slice 4).
     pub fn overlay_refused(&self, reason: OverlayRefusal) {
-        let _ = reason;
-        todo!("sandbox overlay slice 4")
+        if let Some(inner) = &self.inner {
+            inner
+                .overlay_refusals
+                .add(1, &[KeyValue::new("reason", reason.as_str())]);
+        }
     }
 
     /// Counts a record made by reconciling a moved tree (design §3.1).
@@ -1530,6 +1549,37 @@ mod tests {
             Some(1)
         );
         assert_eq!(memory.take(), alarms(), "every event is forwarded in order");
+    }
+
+    #[test]
+    fn overlay_refusals_are_counted_by_reason() {
+        let h = Harness::new();
+        let all = [
+            OverlayRefusal::NotRecordable,
+            OverlayRefusal::Kind,
+            OverlayRefusal::CrossDevice,
+            OverlayRefusal::Hidden,
+            OverlayRefusal::RulesError,
+            OverlayRefusal::Ownership,
+            OverlayRefusal::Xattr,
+        ];
+        for reason in all {
+            h.telemetry.overlay_refused(reason);
+        }
+        h.telemetry.overlay_refused(OverlayRefusal::Kind);
+        let name = names::SANDBOX_OVERLAY_REFUSALS;
+        for (reason, n) in [
+            ("not_recordable", 1),
+            ("kind", 2),
+            ("cross_device", 1),
+            ("hidden", 1),
+            ("rules_error", 1),
+            ("ownership", 1),
+            ("xattr", 1),
+        ] {
+            assert_eq!(h.sum(name, &[("reason", reason)]), Some(n), "{reason}");
+        }
+        Telemetry::noop().overlay_refused(OverlayRefusal::Xattr);
     }
 
     #[test]

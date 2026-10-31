@@ -69,6 +69,8 @@ pub const POINTS: &[&str] = &[
     "patch.after_commit",
     "queue.after_status",
     "repack.running",
+    // Mounting (design §17.1).
+    "mount.before_overlay",
 ];
 
 /// Passes failpoint `name`: `Ok(())` unless a test build was told to act

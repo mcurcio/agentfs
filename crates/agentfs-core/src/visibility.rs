@@ -160,14 +160,12 @@ impl Gate {
     /// Whether any entry at `path` could be shown, whatever its kind:
     /// [`Visibility::Hidden`] means every kind is hidden, so a caller can
     /// answer for the name without looking at the tree.
+    ///
+    /// A rules error from either predicate answers
+    /// [`Hidden::RulesError`], even when the other would show the name:
+    /// no path through an error is shown.
     pub fn may_show(&self, path: &RepoPath) -> Visibility {
-        let file = self.file(path);
-        let dir = self.dir(path);
-        match (file, dir) {
-            (Ok(true), _) | (_, Ok(true)) => Visibility::Shown,
-            (Err(_), _) | (_, Err(_)) => Visibility::Hidden(Hidden::RulesError),
-            (Ok(false), Ok(false)) => Visibility::Hidden(Hidden::NotRecordable),
-        }
+        either_kind(self.file(path), self.dir(path))
     }
 
     /// Whether the existing entry at `path`, of kind `kind`, is shown.
@@ -260,6 +258,17 @@ fn visibility(recordable: Result<bool, RulesError>) -> Visibility {
         Ok(true) => Visibility::Shown,
         Ok(false) => Visibility::Hidden(Hidden::NotRecordable),
         Err(_) => Visibility::Hidden(Hidden::RulesError),
+    }
+}
+
+/// Whether a name could be shown as a file (`file`) or as a directory
+/// (`dir`): shown when either could be, hidden when neither, and a rules
+/// error, failing closed, whenever either predicate errs.
+fn either_kind<E>(file: Result<bool, E>, dir: Result<bool, E>) -> Visibility {
+    match (file, dir) {
+        (Err(_), _) | (_, Err(_)) => Visibility::Hidden(Hidden::RulesError),
+        (Ok(true), _) | (_, Ok(true)) => Visibility::Shown,
+        (Ok(false), Ok(false)) => Visibility::Hidden(Hidden::NotRecordable),
     }
 }
 
@@ -602,6 +611,21 @@ mod tests {
             g.place_move(Source::Tree(&p("config.yaml"), ExistingKind::File), &x),
             Placement::Refused(Denial::RulesError)
         );
+    }
+
+    /// I1 for `may_show`: an error from either predicate is a rules
+    /// error, even when the other predicate would show the name.
+    #[test]
+    fn may_show_fails_closed_when_either_predicate_errs() {
+        let ok = |b: bool| Ok::<bool, ()>(b);
+        assert_eq!(either_kind(ok(true), ok(false)), SHOWN);
+        assert_eq!(either_kind(ok(false), ok(true)), SHOWN);
+        assert_eq!(either_kind(ok(false), ok(false)), HIDDEN);
+        assert_eq!(either_kind(Err(()), ok(true)), RULES_ERROR);
+        assert_eq!(either_kind(ok(true), Err(())), RULES_ERROR);
+        assert_eq!(either_kind(Err(()), ok(false)), RULES_ERROR);
+        assert_eq!(either_kind(ok(false), Err(())), RULES_ERROR);
+        assert_eq!(either_kind::<()>(Err(()), Err(())), RULES_ERROR);
     }
 
     #[test]

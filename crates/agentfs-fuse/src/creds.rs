@@ -62,14 +62,14 @@ pub struct AsCaller {
 
 impl AsCaller {
     /// Switches the current thread's filesystem identity to `caller`'s,
-    /// with the supplementary groups of its process (none if they cannot
-    /// be read). Fails, with nothing changed, if the thread cannot.
-    pub fn enter(caller: Caller) -> io::Result<Self> {
-        let groups = rustix::process::getgroups()?;
-        let theirs: Vec<Gid> = caller_groups(caller.pid)
+    /// with the supplementary groups `groups` says ([`groups_of`]). Fails,
+    /// with nothing changed, if the thread cannot.
+    pub fn enter(caller: Caller, groups: Supplementary) -> io::Result<Self> {
+        let theirs: Vec<Gid> = groups_of(caller, groups)
             .into_iter()
             .map(Gid::from_raw)
             .collect();
+        let groups = rustix::process::getgroups()?;
         // Needs CAP_SETGID: without it, nothing has changed yet.
         rustix::thread::set_thread_groups(&theirs)?;
         // From here on, dropping `saved` switches everything back.
@@ -113,7 +113,8 @@ impl Drop for AsCaller {
     }
 }
 
-/// Runs `create` as `caller` when `enabled`, else (or if the thread cannot
+/// Runs `create` as `caller` (with the supplementary groups `groups`
+/// says) when `enabled`, else (or if the thread cannot
 /// switch, or the caller is refused with `EACCES` or `EPERM`) as the
 /// daemon. Returns the result and whether it was made as the caller.
 ///
@@ -125,9 +126,10 @@ impl Drop for AsCaller {
 pub fn create_as<T>(
     enabled: bool,
     caller: Caller,
+    groups: Supplementary,
     mut create: impl FnMut() -> rustix::io::Result<T>,
 ) -> (rustix::io::Result<T>, bool) {
-    if enabled && let Ok(guard) = AsCaller::enter(caller) {
+    if enabled && let Ok(guard) = AsCaller::enter(caller, groups) {
         let made = create();
         drop(guard);
         match made {
@@ -154,6 +156,16 @@ fn own_fs_context() -> bool {
         own.set(Some(ok));
         ok
     })
+}
+
+/// The supplementary groups `caller` acts with: its process's
+/// ([`caller_groups`]) for [`Supplementary::OfProcess`], none for
+/// [`Supplementary::None`].
+pub fn groups_of(caller: Caller, groups: Supplementary) -> Vec<u32> {
+    match groups {
+        Supplementary::OfProcess => caller_groups(caller.pid),
+        Supplementary::None => Vec::new(),
+    }
 }
 
 /// The supplementary groups of process `pid` (`Groups:` in its status);
@@ -247,6 +259,20 @@ mod tests {
         assert_eq!(mine_sorted, expected_sorted);
     }
 
+    #[test]
+    fn a_substituted_identity_has_no_supplementary_groups() {
+        let me = Caller {
+            uid: 1,
+            gid: 1,
+            pid: std::process::id(),
+        };
+        assert!(groups_of(me, Supplementary::None).is_empty());
+        assert_eq!(
+            groups_of(me, Supplementary::OfProcess),
+            caller_groups(me.pid)
+        );
+    }
+
     /// Without the privilege, nothing changes and the daemon creates.
     #[test]
     fn without_the_privilege_the_daemon_creates() {
@@ -261,14 +287,17 @@ mod tests {
             gid: me + 1,
             pid: std::process::id(),
         };
-        let (made, as_caller) =
-            std::thread::spawn(move || create_as(true, other, || fs_create(&path)))
-                .join()
-                .unwrap();
+        let (made, as_caller) = std::thread::spawn(move || {
+            create_as(true, other, Supplementary::OfProcess, || fs_create(&path))
+        })
+        .join()
+        .unwrap();
         made.unwrap();
         assert!(!as_caller);
         assert_eq!(fs::metadata(dir.path().join("f")).unwrap().uid(), me);
-        let (made, as_caller) = create_as(false, other, || fs_create(&dir.path().join("g")));
+        let (made, as_caller) = create_as(false, other, Supplementary::OfProcess, || {
+            fs_create(&dir.path().join("g"))
+        });
         made.unwrap();
         assert!(!as_caller);
     }
@@ -292,7 +321,7 @@ mod tests {
         let r = root.clone();
         std::thread::spawn(move || {
             let path = r.join("f");
-            let (made, as_caller) = create_as(true, caller, || {
+            let (made, as_caller) = create_as(true, caller, Supplementary::OfProcess, || {
                 rustix::fs::open(
                     &path,
                     rustix::fs::OFlags::CREATE
@@ -316,7 +345,9 @@ mod tests {
                 std::os::unix::fs::PermissionsExt::from_mode(0o700),
             )
             .unwrap();
-            let (made, as_caller) = create_as(true, caller, || fs_create(&private.join("g")));
+            let (made, as_caller) = create_as(true, caller, Supplementary::OfProcess, || {
+                fs_create(&private.join("g"))
+            });
             made.unwrap();
             assert!(!as_caller, "fell back after EACCES");
             assert_eq!(fs::metadata(private.join("g")).unwrap().uid(), 0);
