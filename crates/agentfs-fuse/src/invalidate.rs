@@ -1,5 +1,5 @@
 //! Kernel cache invalidations across a daemon's FUSE sessions (design
-//! §17.1; sandbox overlay slice 4).
+//! §2.4, §17.1).
 //!
 //! The main mount and the sandbox overlay are two FUSE sessions over one
 //! [`crate::ops::Ops`], and node ids are the same in both. Each kernel

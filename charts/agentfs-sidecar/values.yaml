@@ -65,6 +65,23 @@ onStaleMount: recover
 # cannot write where nothing records it (design §17.1).
 sealMountpoint: true
 
+sandboxOverlay:
+  # -- Also serve the sandbox overlay (design §2.4, docs/deployment.md
+  # §12): a second mount point of the volume, at `<mountPath>/overlay`,
+  # that shows only the files the operator's rules would record. Give it
+  # to a container that starts other containers, with
+  # `agentfs-sidecar.sandboxOverlayMount`, never the main mount.
+  enabled: false
+  # -- The emptyDir holding the overlay's mount point.
+  volumeName: agentfs-sandbox
+  # -- Where the sidecar mounts that emptyDir; it must not be `/agentfs`
+  # or inside it (the two mount points may not share a parent).
+  mountPath: /agentfs-sandbox
+  # -- The view owner, `UID:GID` (required when enabled): every operation
+  # through the overlay is checked and done as this user, whoever the
+  # sandbox runs as.
+  owner: ""
+
 # -- More environment of the sidecar: OpenTelemetry (docs/telemetry.md).
 env:
   - name: OTEL_EXPORTER_OTLP_ENDPOINT

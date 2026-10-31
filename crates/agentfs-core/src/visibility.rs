@@ -1,5 +1,6 @@
 //! The visibility gate of the sandbox overlay: which names the overlay
-//! shows, and where a name it creates or moves may go (design §1.1, §4).
+//! shows, and where a name it creates or moves may go (design §1.1, §2.4,
+//! §4).
 //!
 //! The sandbox overlay is a second mount point of a volume that shows only
 //! the paths the operator's rules would record if they were new

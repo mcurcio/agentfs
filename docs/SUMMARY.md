@@ -36,6 +36,7 @@
 - [A fork's publish is refused](runbooks/fork-refused.md)
 - [A moved directory could not be reconciled](runbooks/reconcile-failed.md)
 - [Worktree paths found by the heuristic](runbooks/worktree-heuristic.md)
+- [The sandbox overlay](runbooks/sandbox-overlay.md)
 
 # How it works
 

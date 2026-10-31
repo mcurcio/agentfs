@@ -91,6 +91,9 @@ audit trail can use it.
   ([operator guide](docs/operator-guide.md#12-recovery-and-undo)).
 - **Forked volumes.** A sandbox works on a copy of a volume and publishes
   one reviewable change ([forks](docs/forks.md)).
+- **The sandbox overlay.** A second mount point that shows sandboxes
+  only the recordable files; their edits reach the main mount at once
+  ([design §2.4](docs/design.md#24-the-sandbox-overlay)).
 - **Several pods, one volume.** A history service with one front per pod
   on one node, each pod committing as itself
   ([operator guide](docs/operator-guide.md#16-several-mounts-of-one-volume-history-service)).

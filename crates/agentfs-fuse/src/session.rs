@@ -1,4 +1,4 @@
-//! What one FUSE session serves (design §2.1, §17.1).
+//! What one FUSE session serves (design §2.1, §2.4, §17.1).
 //!
 //! [`crate::fuse::FuseFs`] maps each kernel request onto an
 //! [`Operations`]. Two implementations exist:
