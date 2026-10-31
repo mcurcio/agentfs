@@ -320,7 +320,8 @@ fn check_name(name: &[u8]) -> OpResult<()> {
     Ok(())
 }
 
-fn timespec(t: Option<TimeOrNow>) -> Timespec {
+/// A `setattr` time as `utimensat(2)` takes it: omitted, now, or exact.
+pub(crate) fn timespec(t: Option<TimeOrNow>) -> Timespec {
     match t {
         None => Timespec {
             tv_sec: 0,
@@ -350,6 +351,51 @@ fn timespec(t: Option<TimeOrNow>) -> Timespec {
             }
         },
     }
+}
+
+/// `pread(2)` of up to `size` bytes at `offset`, short only at the end of
+/// the file.
+pub(crate) fn read_at(fd: &impl AsFd, offset: u64, size: u32) -> OpResult<Vec<u8>> {
+    let mut buf = vec![0u8; size as usize];
+    let mut done = 0;
+    while done < buf.len() {
+        let n = rustix::io::pread(fd, &mut buf[done..], offset + done as u64).eno()?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+    }
+    buf.truncate(done);
+    Ok(buf)
+}
+
+/// `pwrite(2)` of all of `data` at `offset`; how many bytes were written.
+pub(crate) fn write_at(fd: &impl AsFd, offset: u64, data: &[u8]) -> OpResult<u32> {
+    let mut done = 0;
+    loop {
+        if done >= data.len() {
+            return Ok(u32::try_from(done).unwrap_or(u32::MAX));
+        }
+        match rustix::io::pwrite(fd, &data[done..], offset + done as u64).eno() {
+            Ok(0) => return Err(Errno::EIO),
+            Ok(n) => done += n,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `lseek(2)` with the kernel's `whence` (`SEEK_SET` 0 to `SEEK_HOLE` 4).
+pub(crate) fn seek(fd: &impl AsFd, offset: i64, whence: i32) -> OpResult<i64> {
+    let pos = match whence {
+        0 => rustix::fs::SeekFrom::Start(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
+        1 => rustix::fs::SeekFrom::Current(offset),
+        2 => rustix::fs::SeekFrom::End(offset),
+        3 => rustix::fs::SeekFrom::Data(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
+        4 => rustix::fs::SeekFrom::Hole(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
+        _ => return Err(Errno::EINVAL),
+    };
+    let at = rustix::fs::seek(fd, pos).eno()?;
+    i64::try_from(at).map_err(|_| Errno::EINVAL)
 }
 
 impl Ops {
@@ -1776,18 +1822,7 @@ impl Ops {
     }
 
     pub fn read(&self, fh: u64, offset: u64, size: u32) -> OpResult<Vec<u8>> {
-        let h = self.handle(fh)?;
-        let mut buf = vec![0u8; size as usize];
-        let mut done = 0;
-        while done < buf.len() {
-            let n = rustix::io::pread(&h.fd, &mut buf[done..], offset + done as u64).eno()?;
-            if n == 0 {
-                break;
-            }
-            done += n;
-        }
-        buf.truncate(done);
-        Ok(buf)
+        read_at(&self.handle(fh)?.fd, offset, size)
     }
 
     pub fn write(&self, fh: u64, offset: u64, data: &[u8], caller: Caller) -> OpResult<u32> {
@@ -1797,17 +1832,7 @@ impl Ops {
         }
         let group = self.handle_group(&h);
         let hold = group.as_ref().map(|g| g.hold());
-        let mut done = 0;
-        let result = loop {
-            if done >= data.len() {
-                break Ok(u32::try_from(done).unwrap_or(u32::MAX));
-            }
-            match rustix::io::pwrite(&h.fd, &data[done..], offset + done as u64).eno() {
-                Ok(0) => break Err(Errno::EIO),
-                Ok(n) => done += n,
-                Err(e) => break Err(e),
-            }
-        };
+        let result = write_at(&h.fd, offset, data);
         if let Some(hold) = &hold {
             hold.changed(caller);
         }
@@ -2078,17 +2103,7 @@ impl Ops {
     }
 
     pub fn lseek(&self, fh: u64, offset: i64, whence: i32) -> OpResult<i64> {
-        let h = self.handle(fh)?;
-        let pos = match whence {
-            0 => rustix::fs::SeekFrom::Start(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
-            1 => rustix::fs::SeekFrom::Current(offset),
-            2 => rustix::fs::SeekFrom::End(offset),
-            3 => rustix::fs::SeekFrom::Data(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
-            4 => rustix::fs::SeekFrom::Hole(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
-            _ => return Err(Errno::EINVAL),
-        };
-        let at = rustix::fs::seek(&h.fd, pos).eno()?;
-        i64::try_from(at).map_err(|_| Errno::EINVAL)
+        seek(&self.handle(fh)?.fd, offset, whence)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2559,11 +2574,11 @@ impl crate::session::Operations for Ops {
 
 impl crate::session::TreeOperations for Ops {
     fn new_node_id(&self) -> u64 {
-        todo!("sandbox overlay slice 3")
+        self.table().new_id()
     }
 
     fn new_handle_id(&self) -> u64 {
-        todo!("sandbox overlay slice 3")
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
     }
 
     fn move_in(
@@ -2577,8 +2592,99 @@ impl crate::session::TreeOperations for Ops {
         check: &dyn crate::session::NameCheck,
         caller: Caller,
     ) -> OpResult<Entry> {
-        let _ = (from, name, newparent, newname, flags, moved, check, caller);
-        todo!("sandbox overlay slice 3")
+        check_name(newname)?;
+        let flags = match RenameFlags::from_bits(flags) {
+            Some(f) if f.is_empty() || f == RenameFlags::NOREPLACE => f,
+            _ => return Err(Errno::EINVAL),
+        };
+        let names = self.write_names();
+        let ddir = self.open_dir_node(newparent)?;
+        let dst_path = join(&self.path_of(newparent)?, newname);
+        let dst =
+            rustix::fs::statat(&ddir, OsStr::from_bytes(newname), AtFlags::SYMLINK_NOFOLLOW).ok();
+        let src =
+            rustix::fs::statat(from, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
+        if Kind::from_mode(mode_of(&src)) != Kind::File {
+            return Err(Errno::EINVAL);
+        }
+        // Decided under the names ordering, on what is there now: an error
+        // is the answer, and nothing has moved.
+        check.move_in(crate::session::Found {
+            path: &dst_path,
+            kind: dst.as_ref().map(|st| Kind::from_mode(mode_of(st))),
+        })?;
+        rustix::fs::renameat_with(
+            from,
+            OsStr::from_bytes(name),
+            &ddir,
+            OsStr::from_bytes(newname),
+            flags,
+        )
+        .eno()?;
+        let st = rustix::fs::statat(&ddir, OsStr::from_bytes(newname), AtFlags::SYMLINK_NOFOLLOW)
+            .unwrap_or(src);
+        let (dev, ino) = dev_ino(&src);
+        // The kernel keeps the node id and handle ids it knows the file by.
+        let write = moved.handles.iter().any(|(_, h)| h.write);
+        {
+            let mut handles = self.handles();
+            for (fh, handle) in &moved.handles {
+                handles.insert(*fh, handle.clone());
+            }
+        }
+        {
+            let mut table = self.table();
+            table.adopt(
+                moved.node,
+                newparent,
+                newname,
+                dev,
+                ino,
+                Kind::File,
+                moved.lookups,
+            );
+            if let Some(node) = table.get_mut(moved.node) {
+                node.mapping_may_write = moved.mapping_may_write;
+                for (fh, handle) in &moved.handles {
+                    node.handles.push(*fh);
+                    if handle.write {
+                        node.write_handles += 1;
+                    }
+                }
+                // As `add_handle` arms a node opened for writing: later
+                // writes through the handles are recorded at their flush or
+                // release.
+                if write {
+                    node.dirty.arm(caller);
+                    if node.dirty.baseline.is_none() {
+                        node.dirty.baseline = Some(stamp(&st));
+                    }
+                }
+            }
+            table.maybe_drop(moved.node);
+        }
+        // Adopted handles find their fsync-class group at the new path.
+        self.renames.fetch_add(1, Ordering::AcqRel);
+        drop(names);
+
+        let _names = self.read_names();
+        if self
+            .record_tree(
+                Trigger::Rename,
+                caller,
+                vec![],
+                std::slice::from_ref(&dst_path),
+                None,
+            )
+            .is_err()
+        {
+            self.boundary.queue_repair([dst_path], caller);
+            return Err(Errno::EIO);
+        }
+        Ok(Entry {
+            id: moved.node,
+            attr: attr(moved.node, &st),
+        })
     }
 }
 

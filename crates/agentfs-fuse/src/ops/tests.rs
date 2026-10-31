@@ -1987,3 +1987,249 @@ fn cached_at_names_every_entry_on_the_way_and_the_known_node() {
     );
     assert_eq!(fx.ops.cached_at(b""), vec![Cached::Node(ROOT)]);
 }
+
+// ---- moving a file into the tree from outside it (sandbox overlay) ----
+
+/// A [`crate::session::NameCheck`] for `move_in` that answers `answer` and
+/// keeps what it was shown.
+struct MoveCheck {
+    answer: OpResult<()>,
+    seen: std::sync::Mutex<Vec<(String, Option<Kind>)>>,
+}
+
+impl MoveCheck {
+    fn answering(answer: OpResult<()>) -> Self {
+        Self {
+            answer,
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<(String, Option<Kind>)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl crate::session::NameCheck for MoveCheck {
+    fn create(&self, _at: crate::session::Found<'_>, _kind: Kind) -> OpResult<()> {
+        unreachable!("move_in asks only move_in")
+    }
+
+    fn link(&self, _at: crate::session::Found<'_>) -> OpResult<()> {
+        unreachable!("move_in asks only move_in")
+    }
+
+    fn remove(&self, _at: crate::session::Found<'_>) -> OpResult<()> {
+        unreachable!("move_in asks only move_in")
+    }
+
+    fn rename(
+        &self,
+        _from: crate::session::Found<'_>,
+        _to: crate::session::Found<'_>,
+        _flags: u32,
+    ) -> OpResult<()> {
+        unreachable!("move_in asks only move_in")
+    }
+
+    fn move_in(&self, to: crate::session::Found<'_>) -> OpResult<()> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((String::from_utf8(to.path.to_vec()).unwrap(), to.kind));
+        self.answer
+    }
+}
+
+impl Fx {
+    /// A directory outside the tree, on its filesystem, holding `name`
+    /// with `content`: a descriptor of it.
+    fn outside(&self, name: &str, content: &str) -> OwnedFd {
+        let store = self.dir.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join(name), content).unwrap();
+        rustix::fs::open(&store, OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).unwrap()
+    }
+
+    fn outside_names(&self) -> Vec<String> {
+        fs::read_dir(self.dir.path().join("store"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    /// Moves `name` from `store` to `to` under the root as node `node`.
+    fn move_in(
+        &self,
+        store: &OwnedFd,
+        name: &str,
+        to: &str,
+        flags: u32,
+        moved: crate::session::Moved,
+        check: &MoveCheck,
+    ) -> OpResult<Entry> {
+        use crate::session::TreeOperations;
+        self.ops.move_in(
+            store.as_fd(),
+            name.as_bytes(),
+            ROOT,
+            to.as_bytes(),
+            flags,
+            moved,
+            check,
+            C,
+        )
+    }
+}
+
+fn unopened(node: u64) -> crate::session::Moved {
+    crate::session::Moved {
+        node,
+        lookups: 1,
+        handles: Vec::new(),
+        mapping_may_write: false,
+    }
+}
+
+#[test]
+fn move_in_records_the_new_path_only() {
+    use crate::session::TreeOperations;
+    let fx = Fx::new();
+    fx.put("config.yaml", "old");
+    let before = fx.journal().len();
+    let store = fx.outside("17", "new");
+    let node = fx.ops.new_node_id();
+    let check = MoveCheck::answering(Ok(()));
+    let entry = fx
+        .move_in(&store, "17", "config.yaml", 0, unopened(node), &check)
+        .unwrap();
+    assert_eq!(entry.id, node);
+    assert_eq!(entry.attr.ino.0, node);
+    assert_eq!(check.seen(), [("config.yaml".to_owned(), Some(Kind::File))]);
+    // One record, a rename of the new path only.
+    let records = fx.journal();
+    assert_eq!(records.len(), before + 1, "{records:#?}");
+    let record = records.last().unwrap();
+    assert_eq!(record.draft.trigger, Trigger::Rename);
+    let paths: Vec<&str> = record
+        .draft
+        .changes
+        .iter()
+        .flat_map(|c| c.paths())
+        .map(|p| p.as_str())
+        .collect();
+    assert_eq!(paths, ["config.yaml"]);
+    assert_eq!(fx.history(), map(&[("config.yaml", file("new"))]));
+    assert!(fx.outside_names().is_empty());
+    assert_eq!(fx.ops.lookup(ROOT, b"config.yaml").unwrap().id, node);
+    // Only a plain or no-replace move of a regular file, at a good name.
+    for (flags, to) in [
+        (RenameFlags::EXCHANGE.bits(), "x"),
+        (RenameFlags::WHITEOUT.bits(), "x"),
+        (0, "a/b"),
+    ] {
+        let store = fx.outside("18", "z");
+        assert_eq!(
+            fx.move_in(&store, "18", to, flags, unopened(node + 1), &check)
+                .unwrap_err(),
+            Errno::EINVAL,
+            "{flags} {to}"
+        );
+    }
+    fs::create_dir_all(fx.dir.path().join("store/dir")).unwrap();
+    assert_eq!(
+        fx.move_in(&store, "dir", "d", 0, unopened(node + 1), &check)
+            .unwrap_err(),
+        Errno::EINVAL
+    );
+    assert!(!fx.backing().join("d").exists());
+}
+
+#[test]
+fn move_in_keeps_the_node_id_and_takes_over_handles() {
+    use crate::session::TreeOperations;
+    let fx = Fx::new();
+    fx.put("other", "o");
+    let store = fx.outside("17", "v1");
+    let node = fx.ops.new_node_id();
+    assert_ne!(fx.id("other"), node);
+    let fd = rustix::fs::openat(&store, "17", OFlags::RDWR, Mode::empty()).unwrap();
+    let fh = fx.ops.new_handle_id();
+    assert!(fx.ops.new_handle_id() > fh, "from one sequence");
+    let handle = Arc::new(Handle::new(node, fd, true, None, 0));
+    let moved = crate::session::Moved {
+        node,
+        lookups: 2,
+        handles: vec![(fh, handle)],
+        mapping_may_write: false,
+    };
+    let check = MoveCheck::answering(Ok(()));
+    fx.move_in(&store, "17", "config.yaml", 0, moved, &check)
+        .unwrap();
+    assert_eq!(fx.history().get("config.yaml"), Some(&file("v1")));
+    // The handle the kernel holds writes on, and its close records the
+    // new content at the new path.
+    let before = fx.journal().len();
+    fx.ops.write(fh, 0, b"v2 longer", C).unwrap();
+    fx.ops.flush(fh, C).unwrap();
+    let records = fx.journal();
+    assert_eq!(records.len(), before + 1, "{records:#?}");
+    assert_eq!(records.last().unwrap().draft.trigger, Trigger::Close);
+    assert_eq!(
+        fx.history(),
+        map(&[("config.yaml", file("v2 longer")), ("other", file("o"))])
+    );
+    assert_eq!(fx.ops.getattr(node, Some(fh)).unwrap().ino.0, node);
+    assert_eq!(fx.ops.open_handles(), 1);
+    fx.ops.release(fh).unwrap();
+    assert_eq!(fx.ops.open_handles(), 0);
+    // The kernel's two lookups keep the node until it forgets them.
+    fx.ops.forget(node, 1);
+    assert_eq!(fx.ops.getattr(node, None).unwrap().size, 9);
+    fx.ops.forget(node, 1);
+    assert_eq!(fx.ops.lookup(ROOT, b"config.yaml").unwrap().id, node);
+}
+
+#[test]
+fn move_in_refused_by_the_check_moves_nothing() {
+    use crate::session::TreeOperations;
+    let fx = Fx::new();
+    fx.put("config.yaml", "old");
+    let before = fx.journal().len();
+    let store = fx.outside("17", "new");
+    let node = fx.ops.new_node_id();
+    let refuse = MoveCheck::answering(Err(Errno::EACCES));
+    assert_eq!(
+        fx.move_in(&store, "17", "new.yaml", 0, unopened(node), &refuse)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(refuse.seen(), [("new.yaml".to_owned(), None)]);
+    assert_eq!(fx.outside_names(), ["17"]);
+    assert!(!fx.backing().join("new.yaml").exists());
+    // The name is taken, and the move may not replace it.
+    let check = MoveCheck::answering(Ok(()));
+    assert_eq!(
+        fx.move_in(
+            &store,
+            "17",
+            "config.yaml",
+            RenameFlags::NOREPLACE.bits(),
+            unopened(node),
+            &check
+        )
+        .unwrap_err(),
+        Errno::EEXIST
+    );
+    assert_eq!(fx.outside_names(), ["17"]);
+    assert_eq!(
+        fs::read_to_string(fx.backing().join("config.yaml")).unwrap(),
+        "old"
+    );
+    assert_eq!(fx.journal().len(), before);
+    assert_eq!(
+        fx.ops.lookup(ROOT, b"config.yaml").unwrap().id,
+        fx.id("config.yaml")
+    );
+    assert_ne!(fx.id("config.yaml"), node);
+}

@@ -5,8 +5,10 @@
 //! proves complete mediation and listings over real rules.
 
 use std::collections::HashMap;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use agentfs_core::events::MemorySink;
@@ -17,9 +19,11 @@ use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, StateDir};
 use fuser::INodeNo;
 
+use super::tmp::TmpLayer;
 use super::*;
 use crate::backing::Backing;
 use crate::ops::{Ops, OpsConfig};
+use crate::session::Moved;
 
 /// The worked examples' allowlist, plus a skipped pattern.
 const EXCLUDE: &str = "/*\n!/config.yaml\n!/skills/\n*.key\n";
@@ -39,6 +43,7 @@ const REQUEST: Caller = Caller {
 
 const O_RDONLY: i32 = 0;
 const O_WRONLY: i32 = 1;
+const O_RDWR: i32 = 2;
 
 fn owner() -> ViewOwner {
     ViewOwner::new(OWNER, &Privileges::default(), OWNER.uid).unwrap()
@@ -80,6 +85,8 @@ struct FakeOps {
     attrs: HashMap<u64, FileAttr>,
     paths: HashMap<u64, Vec<u8>>,
     children: HashMap<(u64, Vec<u8>), u64>,
+    /// The last node and handle id handed out (fresh ones start at 1000).
+    next: AtomicU64,
 }
 
 impl FakeOps {
@@ -407,8 +414,66 @@ impl Operations for FakeOps {
     }
 }
 
+impl TreeOperations for FakeOps {
+    fn new_node_id(&self) -> u64 {
+        1000 + self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn new_handle_id(&self) -> u64 {
+        1000 + self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Asks `check` about the scripted entry at the new name, then takes
+    /// the file out of the store, as the real move would.
+    fn move_in(
+        &self,
+        from: BorrowedFd<'_>,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        _flags: u32,
+        moved: Moved,
+        check: &dyn NameCheck,
+        caller: Caller,
+    ) -> OpResult<Entry> {
+        self.record("move_in", newname, Some(caller));
+        let path = join(&self.paths[&newparent], newname);
+        let kind =
+            self.children
+                .get(&(newparent, newname.to_vec()))
+                .map(|id| match self.attrs[id].kind {
+                    FileType::RegularFile => Kind::File,
+                    FileType::Directory => Kind::Dir,
+                    FileType::Symlink => Kind::Symlink,
+                    _ => Kind::Other,
+                });
+        check.move_in(Found { path: &path, kind })?;
+        rustix::fs::unlinkat(
+            from,
+            std::ffi::OsStr::from_bytes(name),
+            rustix::fs::AtFlags::empty(),
+        )
+        .unwrap();
+        Ok(Entry {
+            id: moved.node,
+            attr: attr(moved.node, FileType::RegularFile, 0o644, OWNER.uid),
+        })
+    }
+}
+
+/// This process's own ids as a view owner: the tmp layer's files are made
+/// as the daemon is.
+fn me() -> ViewOwner {
+    let ids = OwnerIds {
+        uid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getegid().as_raw(),
+    };
+    ViewOwner::new(ids, &Privileges::default(), ids.uid).unwrap()
+}
+
 /// Fixture B: the overlay over [`FakeOps`], with the examples' rules over
-/// an empty tree (`_tree` keeps it for nested-repository probes).
+/// an empty tree (`_tree` keeps it for nested-repository probes) and a tmp
+/// layer beside it whose files are this process's.
 struct B {
     _tree: tempfile::TempDir,
     fake: Arc<FakeOps>,
@@ -434,9 +499,11 @@ fn fixture_b_with(fake: FakeOps, attributes: &str, dirs: &[&str]) -> B {
     );
     let gate = Gate::new(Arc::new(rules)).unwrap();
     let fake = Arc::new(fake);
+    let root = std::fs::File::open(tree.path()).unwrap();
+    let tmp = TmpLayer::open(&tree.path().join("tmp-layer"), root.as_fd(), me()).unwrap();
     B {
         _tree: tree,
-        overlay: Overlay::new(fake.clone(), gate, owner()),
+        overlay: Overlay::new(fake.clone(), gate, owner(), Arc::new(tmp)),
         fake,
     }
 }
@@ -454,7 +521,7 @@ fn a4_listing_shows_only_shown_names() {
     let fh = b.overlay.opendir(ROOT).unwrap();
     let listed = b.overlay.readdir(ROOT, fh, 0).unwrap();
     assert_eq!(names(&listed), [".", "..", "config.yaml", "skills"]);
-    // Offsets are the operations' own, so paging resumes where it left off.
+    // Paging resumes where it left off.
     let rest = b.overlay.readdir(ROOT, fh, listed[2].0).unwrap();
     assert_eq!(names(&rest), ["skills"]);
 }
@@ -475,17 +542,15 @@ fn a5_hidden_names_answer_the_same_whether_or_not_they_exist() {
             "{name}"
         );
         assert_eq!(
-            b.overlay
-                .create(ROOT, n, 0o644, O_WRONLY, REQUEST)
-                .unwrap_err(),
-            Errno::EACCES,
-            "{name}"
-        );
-        assert_eq!(
             b.overlay.mkdir(ROOT, n, 0o755, REQUEST).unwrap_err(),
             Errno::EACCES,
             "{name}"
         );
+        // A file at a skipped name is a tmp file, whether or not the tree
+        // holds one there.
+        b.overlay
+            .create(ROOT, n, 0o644, O_WRONLY | O_EXCL, REQUEST)
+            .unwrap();
     }
     let asked: Vec<Call> = b
         .fake
@@ -695,12 +760,17 @@ fn mknod_of_a_regular_file_is_a_create_as_the_owner() {
     let calls = b.fake.calls_to("mknod");
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].caller, Some(owner().caller(REQUEST.pid)));
-    // A skipped name would go to the tmp layer, not built yet.
+    // A skipped name goes to the tmp layer, never the operations.
+    let tmp = b
+        .overlay
+        .mknod(ROOT, b"notes.txt", s_ifreg | 0o4644, 0, REQUEST)
+        .unwrap();
+    assert_eq!(tmp.attr.perm, 0o644);
     assert_eq!(
         b.overlay
             .mknod(ROOT, b"notes.txt", s_ifreg | 0o644, 0, REQUEST)
             .unwrap_err(),
-        Errno::EACCES
+        Errno::EEXIST
     );
     assert_eq!(b.fake.calls_to("mknod").len(), 2);
 }
@@ -969,13 +1039,10 @@ fn a8_refusals() {
         Some(owner().caller(REQUEST.pid))
     );
 
-    // A skipped name would go to the tmp layer, which is not built yet.
-    assert_eq!(
-        b.overlay
-            .create(ROOT, b"notes.txt", 0o644, O_WRONLY, REQUEST)
-            .unwrap_err(),
-        Errno::EACCES
-    );
+    // A skipped name goes to the tmp layer, never the operations.
+    b.overlay
+        .create(ROOT, b"notes.txt", 0o644, O_WRONLY, REQUEST)
+        .unwrap();
     assert!(b.fake.calls_to("create").is_empty());
 }
 
@@ -1119,8 +1186,10 @@ fn fixture_a(files: &[&str], dirs: &[&str]) -> A {
         gid: rustix::process::getegid().as_raw(),
     };
     let owner = ViewOwner::new(ids, &Privileges::default(), ids.uid).unwrap();
+    let tmp =
+        Arc::new(TmpLayer::open(&state.tmp_layer(), ops.backing().root().as_fd(), owner).unwrap());
     A {
-        overlay: Overlay::new(ops.clone(), gate, owner),
+        overlay: Overlay::new(ops.clone(), gate, owner, tmp),
         ops,
         dir,
     }
@@ -1190,4 +1259,548 @@ fn a14_a_close_through_the_overlay_records_before_it_returns() {
     assert_eq!(record.draft.caller.uid, owner_uid);
     assert_eq!(record.draft.caller.pid, REQUEST.pid);
     a.overlay.release(fh).unwrap();
+}
+
+// ---- the tmp layer (sandbox overlay slice 3) ----
+
+impl A {
+    fn journal(&self) -> Vec<agentfs_core::record::Record> {
+        agentfs_core::journal::read_records(&StateDir::new(self.dir.path().join("state")).journal())
+            .unwrap()
+            .0
+    }
+
+    fn backing(&self, rel: &str) -> std::path::PathBuf {
+        self.dir.path().join("backing").join(rel)
+    }
+
+    /// The names in the tmp layer's store.
+    fn stored(&self) -> Vec<String> {
+        std::fs::read_dir(self.dir.path().join("state/tmp-layer"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    /// Every path any record names.
+    fn recorded_paths(&self) -> Vec<String> {
+        self.journal()
+            .iter()
+            .flat_map(|r| r.draft.changes.iter().flat_map(|c| c.paths()))
+            .map(|p| p.as_str().to_owned())
+            .collect()
+    }
+
+    /// The main mount's names in directory `id`, sorted.
+    fn main_listing(&self, id: u64) -> Vec<String> {
+        let fh = self.ops.opendir(id).unwrap();
+        let mut all = names(&self.ops.readdir(fh, 0).unwrap());
+        self.ops.releasedir(fh);
+        all.sort();
+        all
+    }
+
+    /// Creates `name` in `parent` through the overlay with `content`, and
+    /// closes it.
+    fn put(&self, parent: u64, name: &str, content: &str) -> u64 {
+        let (entry, fh, _) = self
+            .overlay
+            .create(parent, name.as_bytes(), 0o644, O_WRONLY | O_EXCL, REQUEST)
+            .unwrap();
+        self.overlay
+            .write(fh, 0, content.as_bytes(), REQUEST)
+            .unwrap();
+        self.overlay.flush(fh, REQUEST).unwrap();
+        self.overlay.release(fh).unwrap();
+        entry.id
+    }
+
+    fn read(&self, id: u64) -> String {
+        let (fh, _) = self.overlay.open(id, O_RDONLY, REQUEST).unwrap();
+        let bytes = self.overlay.read(fh, 0, 100).unwrap();
+        self.overlay.release(fh).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+}
+
+#[test]
+fn tmp_files_are_private_and_shadow_hidden_names() {
+    let a = fixture_a(&["config.yaml", "secrets.db"], &["skills"]);
+    let records = a.journal().len();
+    // A hidden tree name: the tmp file is created over it, exclusively.
+    let (entry, fh, _) = a
+        .overlay
+        .create(ROOT, b"secrets.db", 0o644, O_RDWR | O_EXCL, REQUEST)
+        .unwrap();
+    a.overlay.write(fh, 0, b"tmp", REQUEST).unwrap();
+    a.overlay.fsync(fh, false).unwrap();
+    a.overlay.flush(fh, REQUEST).unwrap();
+    a.overlay.release(fh).unwrap();
+    a.put(ROOT, "new.txt", "n");
+    let skill_dir = a.overlay.lookup(ROOT, b"skills").unwrap().id;
+    a.put(skill_dir, "x.key", "k");
+
+    // The overlay sees its tmp file: the upper layer wins.
+    let found = a.overlay.lookup(ROOT, b"secrets.db").unwrap();
+    assert_eq!(found.id, entry.id);
+    assert_eq!(a.overlay.getattr(entry.id, None).unwrap().size, 3);
+    assert_eq!(a.read(entry.id), "tmp");
+    assert_eq!(a.overlay.access(entry.id, 6), Ok(()));
+    assert!(a.overlay.paths(entry.id).is_empty());
+    assert_eq!(a.overlay.readlink(entry.id).unwrap_err(), Errno::EINVAL);
+    assert_eq!(
+        a.overlay.getxattr(entry.id, b"user.x", 0).unwrap_err(),
+        Errno::ENODATA
+    );
+    assert_eq!(a.overlay.listxattr(entry.id, 0), Ok(Xattr::Size(0)));
+    // Nothing reached the tree, the main mount or history.
+    assert_eq!(
+        std::fs::read_to_string(a.backing("secrets.db")).unwrap(),
+        "secrets.db"
+    );
+    assert!(!a.backing("new.txt").exists());
+    assert!(!a.backing("skills/x.key").exists());
+    assert_eq!(
+        a.main_listing(ROOT),
+        [".", "..", "config.yaml", "secrets.db", "skills"]
+    );
+    assert_eq!(a.journal().len(), records, "nothing recorded");
+    assert_eq!(a.stored().len(), 3);
+
+    // Unlinking removes only the tmp file: the tree's is hidden again.
+    a.overlay.unlink(ROOT, b"secrets.db", REQUEST).unwrap();
+    assert_eq!(
+        a.overlay.lookup(ROOT, b"secrets.db").unwrap_err(),
+        Errno::ENOENT
+    );
+    assert_eq!(
+        std::fs::read_to_string(a.backing("secrets.db")).unwrap(),
+        "secrets.db"
+    );
+    assert_eq!(a.stored().len(), 2);
+    assert_eq!(a.journal().len(), records);
+}
+
+#[test]
+fn a_tmp_file_renamed_onto_a_recordable_name_is_recorded_there() {
+    let a = fixture_a(&["config.yaml"], &[]);
+    let tmp = a.put(ROOT, "config.yaml.tmp", "new");
+    let before = a.journal().len();
+    a.overlay
+        .rename(ROOT, b"config.yaml.tmp", ROOT, b"config.yaml", 0, REQUEST)
+        .unwrap();
+    let records = a.journal();
+    assert_eq!(records.len(), before + 1, "{records:#?}");
+    let record = records.last().unwrap();
+    assert_eq!(record.draft.trigger, Trigger::Rename);
+    assert_eq!(record.draft.caller.pid, REQUEST.pid);
+    assert_eq!(record.draft.caller.uid, rustix::process::geteuid().as_raw());
+    let paths: Vec<&str> = record
+        .draft
+        .changes
+        .iter()
+        .flat_map(|c| c.paths())
+        .map(|p| p.as_str())
+        .collect();
+    assert_eq!(paths, ["config.yaml"]);
+    assert!(
+        a.recorded_paths().iter().all(|p| !p.contains("tmp")),
+        "{:?}",
+        a.recorded_paths()
+    );
+    // The layer gave it up; the tree has it, under the same node id.
+    assert!(a.stored().is_empty());
+    assert_eq!(
+        a.overlay.lookup(ROOT, b"config.yaml.tmp").unwrap_err(),
+        Errno::ENOENT
+    );
+    assert_eq!(a.overlay.lookup(ROOT, b"config.yaml").unwrap().id, tmp);
+    assert_eq!(a.ops.lookup(ROOT, b"config.yaml").unwrap().id, tmp);
+    assert_eq!(
+        std::fs::read_to_string(a.backing("config.yaml")).unwrap(),
+        "new"
+    );
+    assert_eq!(a.overlay.paths(tmp), [b"config.yaml".to_vec()]);
+}
+
+#[test]
+fn a_handle_open_across_the_move_writes_into_the_tree() {
+    let a = fixture_a(&["config.yaml"], &[]);
+    let (entry, fh, _) = a
+        .overlay
+        .create(ROOT, b"config.yaml.tmp", 0o644, O_WRONLY | O_EXCL, REQUEST)
+        .unwrap();
+    a.overlay.write(fh, 0, b"v1", REQUEST).unwrap();
+    a.overlay
+        .rename(ROOT, b"config.yaml.tmp", ROOT, b"config.yaml", 0, REQUEST)
+        .unwrap();
+    a.overlay.write(fh, 2, b"+v2", REQUEST).unwrap();
+    let before = a.journal().len();
+    a.overlay.flush(fh, REQUEST).unwrap();
+    let records = a.journal();
+    assert_eq!(records.len(), before + 1, "the close records");
+    assert_eq!(records.last().unwrap().draft.trigger, Trigger::Close);
+    a.overlay.release(fh).unwrap();
+    assert_eq!(a.ops.open_handles(), 0);
+    assert_eq!(a.read(entry.id), "v1+v2");
+}
+
+#[test]
+fn recorded_files_never_move_out() {
+    let a = fixture_a(&["config.yaml", "skills/a.md"], &[]);
+    let skills = a.overlay.lookup(ROOT, b"skills").unwrap().id;
+    // A tree file to a skipped name: refused, a directory: cross-device.
+    assert_eq!(
+        a.overlay
+            .rename(ROOT, b"config.yaml", ROOT, b"config.bak", 0, REQUEST)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(
+        a.overlay
+            .rename(ROOT, b"skills", ROOT, b"skills2", 0, REQUEST)
+            .unwrap_err(),
+        Errno::EXDEV
+    );
+    // The judge answers the same under the names ordering.
+    let judge = Judge::new(a.overlay.gate.clone());
+    let file = |path: &'static [u8]| Found {
+        path,
+        kind: Some(Kind::File),
+    };
+    let free = |path: &'static [u8]| Found { path, kind: None };
+    assert_eq!(
+        judge.rename(file(b"config.yaml"), free(b"config.bak"), 0),
+        Err(Errno::EACCES)
+    );
+    assert!(a.backing("config.yaml").is_file());
+    assert!(!a.backing("config.bak").exists());
+
+    // A tmp file to another skipped name stays in the layer.
+    let tmp = a.put(ROOT, "a.tmp", "t");
+    a.overlay
+        .rename(ROOT, b"a.tmp", skills, b"b.key", 0, REQUEST)
+        .unwrap();
+    assert_eq!(a.overlay.lookup(skills, b"b.key").unwrap().id, tmp);
+    assert!(!a.backing("skills/b.key").exists());
+    assert_eq!(a.stored().len(), 1);
+    // An exchange with a tmp end is refused, either way round.
+    let exchange = RenameFlags::EXCHANGE.bits();
+    assert_eq!(
+        a.overlay
+            .rename(skills, b"b.key", ROOT, b"config.yaml", exchange, REQUEST)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(
+        a.overlay
+            .rename(ROOT, b"config.yaml", skills, b"b.key", exchange, REQUEST)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    // No-replace holds in both layers.
+    let noreplace = RenameFlags::NOREPLACE.bits();
+    a.put(ROOT, "c.tmp", "c");
+    assert_eq!(
+        a.overlay
+            .rename(ROOT, b"c.tmp", skills, b"b.key", noreplace, REQUEST)
+            .unwrap_err(),
+        Errno::EEXIST
+    );
+    assert_eq!(
+        a.overlay
+            .rename(ROOT, b"c.tmp", ROOT, b"config.yaml", noreplace, REQUEST)
+            .unwrap_err(),
+        Errno::EEXIST
+    );
+    assert_eq!(a.stored().len(), 2, "nothing moved");
+    assert_eq!(
+        std::fs::read_to_string(a.backing("config.yaml")).unwrap(),
+        "config.yaml"
+    );
+    // Without it, a tmp file replaces another.
+    a.overlay
+        .rename(ROOT, b"c.tmp", skills, b"b.key", 0, REQUEST)
+        .unwrap();
+    assert_eq!(a.stored().len(), 1);
+}
+
+#[test]
+fn judge_answers() {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tree.path().join("skills/repo/.git")).unwrap();
+    let rules = Rules::new(
+        tree.path(),
+        RuleOptions::default(),
+        EXCLUDE.as_bytes(),
+        b"/skills/*.sec -agentfs\n",
+    );
+    let judge = Judge::new(Gate::new(Arc::new(rules)).unwrap());
+    let at = |path: &'static str, kind: Option<Kind>| Found {
+        path: path.as_bytes(),
+        kind,
+    };
+    let (file, dir) = (Some(Kind::File), Some(Kind::Dir));
+    let other = Some(Kind::Other);
+    let bad: &[u8] = b"skills/x\xff.md";
+    let not_utf8 = Found {
+        path: bad,
+        kind: None,
+    };
+
+    // create
+    assert_eq!(judge.create(at("skills/n.md", None), Kind::File), Ok(()));
+    assert_eq!(judge.create(at("skills/n.md", file), Kind::File), Ok(()));
+    assert_eq!(judge.create(at("skills/e", None), Kind::Dir), Ok(()));
+    assert_eq!(
+        judge.create(at("notes.txt", None), Kind::File),
+        Err(Errno::EACCES),
+        "a skipped file is the tmp layer's, never the tree's"
+    );
+    assert_eq!(
+        judge.create(at("notes", None), Kind::Dir),
+        Err(Errno::EACCES)
+    );
+    for kind in [Kind::Symlink, Kind::Other] {
+        assert_eq!(judge.create(at("skills/l", None), kind), Err(Errno::EACCES));
+    }
+    assert_eq!(judge.create(not_utf8, Kind::File), Err(Errno::EACCES));
+    // An entry hidden for its kind is never created over.
+    assert_eq!(
+        judge.create(at("skills/pipe", other), Kind::File),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        judge.create(at("skills/x.sec", file), Kind::Dir),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        judge.create(at("skills/repo", dir), Kind::File),
+        Err(Errno::EACCES)
+    );
+
+    // link
+    assert_eq!(judge.link(at("skills/n.md", None)), Err(Errno::EACCES));
+
+    // remove
+    assert_eq!(judge.remove(at("skills/a.md", file)), Ok(()));
+    assert_eq!(judge.remove(at("skills/d", dir)), Ok(()));
+    assert_eq!(judge.remove(at("skills/a.md", None)), Err(Errno::ENOENT));
+    assert_eq!(judge.remove(at("secrets.db", file)), Err(Errno::ENOENT));
+    assert_eq!(judge.remove(at("skills/pipe", other)), Err(Errno::ENOENT));
+    assert_eq!(judge.remove(not_utf8), Err(Errno::ENOENT));
+
+    // rename
+    let exchange = RenameFlags::EXCHANGE.bits();
+    let whiteout = RenameFlags::WHITEOUT.bits();
+    assert_eq!(
+        judge.rename(at("skills/a.md", file), at("config.yaml", None), 0),
+        Ok(())
+    );
+    assert_eq!(
+        judge.rename(at("skills/a.md", file), at("config.yaml", file), 0),
+        Ok(())
+    );
+    assert_eq!(
+        judge.rename(at("skills/a.md", file), at("config.yaml", None), whiteout),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        judge.rename(at("skills/a.md", file), at("notes.txt", None), 0),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        judge.rename(at("skills/d", dir), at("skills/e", None), 0),
+        Err(Errno::EXDEV)
+    );
+    assert_eq!(
+        judge.rename(at("secrets.db", file), at("config.yaml", None), 0),
+        Err(Errno::ENOENT)
+    );
+    assert_eq!(
+        judge.rename(at("skills/a.md", None), at("config.yaml", None), 0),
+        Err(Errno::ENOENT)
+    );
+    assert_eq!(
+        judge.rename(at("skills/a.md", file), at("skills/pipe", other), 0),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        judge.rename(at("skills/a.md", file), at("config.yaml", file), exchange),
+        Ok(())
+    );
+    assert_eq!(
+        judge.rename(at("skills/a.md", file), at("config.yaml", None), exchange),
+        Err(Errno::ENOENT)
+    );
+    assert_eq!(
+        judge.rename(at("skills/a.md", file), at("skills/d", dir), exchange),
+        Err(Errno::EXDEV)
+    );
+
+    // move_in
+    assert_eq!(judge.move_in(at("config.yaml", None)), Ok(()));
+    assert_eq!(judge.move_in(at("config.yaml", file)), Ok(()));
+    assert_eq!(judge.move_in(at("notes.txt", None)), Err(Errno::EACCES));
+    assert_eq!(judge.move_in(at("skills/pipe", other)), Err(Errno::EACCES));
+    assert_eq!(judge.move_in(at("skills/repo", dir)), Err(Errno::EACCES));
+    assert_eq!(judge.move_in(not_utf8), Err(Errno::EACCES));
+
+    // A rules error is EIO.
+    let long = format!("skills/{}", "d".repeat(300));
+    let long: &'static str = Box::leak(long.into_boxed_str());
+    assert_eq!(judge.move_in(at(long, dir)), Err(Errno::EIO));
+    assert_eq!(judge.remove(at(long, dir)), Err(Errno::EIO));
+}
+
+#[test]
+fn rmdir_of_a_directory_holding_tmp_files_is_not_empty() {
+    let a = fixture_a(&[], &["skills/d"]);
+    let skills = a.overlay.lookup(ROOT, b"skills").unwrap().id;
+    let d = a.overlay.lookup(skills, b"d").unwrap().id;
+    a.put(d, "x.key", "k");
+    assert_eq!(
+        a.overlay.rmdir(skills, b"d", REQUEST).unwrap_err(),
+        Errno::ENOTEMPTY
+    );
+    assert!(a.backing("skills/d").is_dir());
+    assert_eq!(a.stored().len(), 1);
+    a.overlay.unlink(d, b"x.key", REQUEST).unwrap();
+    a.overlay.rmdir(skills, b"d", REQUEST).unwrap();
+    assert!(!a.backing("skills/d").exists());
+}
+
+#[test]
+fn a_skipped_file_name_over_a_shown_directory() {
+    // `skills` is skipped as a file, shown as a directory.
+    let b = fixture_b(FakeOps::examples());
+    assert_eq!(
+        b.overlay
+            .create(ROOT, b"skills", 0o644, O_WRONLY | O_EXCL, REQUEST)
+            .unwrap_err(),
+        Errno::EEXIST
+    );
+    assert_eq!(
+        b.overlay
+            .create(ROOT, b"skills", 0o644, O_WRONLY, REQUEST)
+            .unwrap_err(),
+        Errno::EISDIR
+    );
+    assert_eq!(
+        b.overlay
+            .mknod(ROOT, b"skills", 0o100644, 0, REQUEST)
+            .unwrap_err(),
+        Errno::EEXIST
+    );
+    // Nothing there: a tmp file.
+    b.overlay
+        .create(ROOT, b"notes.txt", 0o644, O_WRONLY, REQUEST)
+        .unwrap();
+    // A directory over a tmp file's name.
+    assert_eq!(
+        b.overlay
+            .mkdir(ROOT, b"notes.txt", 0o755, REQUEST)
+            .unwrap_err(),
+        Errno::EEXIST
+    );
+    // Without O_EXCL the tmp file is opened again; with it, it exists.
+    // (Here the layer's files are this process's, not the owner's, who
+    // may only read them.)
+    b.overlay
+        .create(ROOT, b"notes.txt", 0o644, O_RDONLY, REQUEST)
+        .unwrap();
+    assert_eq!(
+        b.overlay
+            .create(ROOT, b"notes.txt", 0o644, O_WRONLY | O_EXCL, REQUEST)
+            .unwrap_err(),
+        Errno::EEXIST
+    );
+    for method in ["create", "mknod", "mkdir"] {
+        assert!(b.fake.calls_to(method).is_empty(), "{method}");
+    }
+}
+
+#[test]
+fn a_tmp_file_moves_into_the_tree_only_as_the_judge_allows() {
+    let b = fixture_b(FakeOps::examples());
+    b.overlay
+        .create(ROOT, b"c.tmp", 0o644, O_WRONLY | O_EXCL, REQUEST)
+        .unwrap();
+    // Onto a recordable name: the operations move it, as the owner,
+    // asking the judge.
+    b.overlay
+        .rename(ROOT, b"c.tmp", ROOT, b"config.yaml", 0, REQUEST)
+        .unwrap();
+    let calls = b.fake.calls_to("move_in");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, b"config.yaml");
+    assert_eq!(calls[0].caller, Some(owner().caller(REQUEST.pid)));
+    assert!(!b.overlay.tmp.holds(ROOT, b"c.tmp"));
+    assert!(b.fake.calls_to("rename").is_empty());
+}
+
+#[test]
+fn tmp_files_count_in_listings_with_dense_offsets() {
+    let a = fixture_a(
+        &["config.yaml", "secrets.db", "a.key", "skills/a.md"],
+        &["notes"],
+    );
+    a.put(ROOT, "secrets.db", "tmp");
+    a.put(ROOT, "new.txt", "n");
+    let fh = a.overlay.opendir(ROOT).unwrap();
+    let listed = a.overlay.readdir(ROOT, fh, 0).unwrap();
+    let offsets: Vec<u64> = listed.iter().map(|(o, _)| *o).collect();
+    assert_eq!(offsets, (1..=listed.len() as u64).collect::<Vec<_>>());
+    assert_eq!(&names(&listed)[..2], [".", ".."]);
+    let mut got = names(&listed);
+    got.sort();
+    assert_eq!(
+        got,
+        [".", "..", "config.yaml", "new.txt", "secrets.db", "skills"]
+    );
+    // Paging from any offset resumes at the next entry.
+    for (i, (offset, _)) in listed.iter().enumerate() {
+        let rest = a.overlay.readdir(ROOT, fh, *offset).unwrap();
+        assert_eq!(names(&rest), names(&listed[i + 1..]));
+    }
+    a.overlay.releasedir(fh);
+    assert_eq!(a.overlay.readdir(ROOT, fh, 0).unwrap_err(), Errno::EBADF);
+}
+
+#[test]
+fn copy_file_range_across_layers_is_cross_device() {
+    let a = fixture_a(&["config.yaml"], &[]);
+    let (_, tmp_in, _) = a
+        .overlay
+        .create(ROOT, b"in.tmp", 0o644, O_RDWR | O_EXCL, REQUEST)
+        .unwrap();
+    a.overlay.write(tmp_in, 0, b"copied", REQUEST).unwrap();
+    let (_, tmp_out, _) = a
+        .overlay
+        .create(ROOT, b"out.tmp", 0o644, O_RDWR | O_EXCL, REQUEST)
+        .unwrap();
+    let id = a.overlay.lookup(ROOT, b"config.yaml").unwrap().id;
+    let (tree, _) = a.overlay.open(id, O_RDWR, REQUEST).unwrap();
+    for (from, to) in [(tmp_in, tree), (tree, tmp_out)] {
+        assert_eq!(
+            a.overlay
+                .copy_file_range(from, 0, to, 0, 6, REQUEST)
+                .unwrap_err(),
+            Errno::EXDEV
+        );
+    }
+    assert_eq!(
+        a.overlay
+            .copy_file_range(tmp_in, 0, tmp_out, 0, 6, REQUEST)
+            .unwrap(),
+        6
+    );
+    assert_eq!(a.overlay.read(tmp_out, 0, 10).unwrap(), b"copied");
+    assert_eq!(
+        std::fs::read_to_string(a.backing("config.yaml")).unwrap(),
+        "config.yaml"
+    );
+    for fh in [tmp_in, tmp_out, tree] {
+        a.overlay.release(fh).unwrap();
+    }
 }

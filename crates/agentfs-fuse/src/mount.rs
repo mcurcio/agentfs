@@ -60,6 +60,7 @@
 //! and runs a final one.
 
 use std::io;
+use std::os::fd::AsFd;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -75,6 +76,7 @@ use fuser::{MountOption, SessionACL};
 use crate::backing::Backing;
 use crate::fuse::{FuseFs, Passthrough, PassthroughStatus};
 use crate::ops::{Cached, Ops, OpsConfig};
+use crate::overlay::tmp::TmpLayer;
 use crate::overlay::{Overlay, ViewOwner};
 use crate::privileges::Privileges;
 use crate::sweep::{Capturer, Sweeper};
@@ -167,6 +169,9 @@ pub struct OverlayConfig {
     /// as [`MountConfig::stack_over`] does for the main mount; `None`
     /// mounts normally. Its source is not the main mount's.
     pub stack_over: Option<StackOver>,
+    /// The tmp layer's store ([`agentfs_core::volume::StateDir::tmp_layer`]),
+    /// on the backing tree's filesystem.
+    pub tmp_layer: PathBuf,
 }
 
 /// How a mount is stacked over a stale one: FUSE is mounted at `source`, a
@@ -673,6 +678,9 @@ pub enum MountError {
     /// The sandbox overlay is not served together with this.
     #[error("the sandbox overlay (--sandbox-overlay) cannot be served with {0} yet")]
     OverlayUnsupported(&'static str),
+    /// The sandbox overlay's tmp layer cannot be opened.
+    #[error(transparent)]
+    TmpLayer(#[from] crate::overlay::tmp::TmpLayerError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -699,6 +707,9 @@ pub struct UnmountReport {
     /// Where they are saved for the next mount; `None` if they could not
     /// be saved (or no store is configured).
     pub repairs_saved: Option<PathBuf>,
+    /// Wiping the sandbox overlay's tmp layer failed; the message (the
+    /// next start wipes it).
+    pub tmp_wipe_error: Option<String>,
 }
 
 /// What [`Mount::start`] repaired from the queue a previous mount left.
@@ -854,6 +865,8 @@ pub struct Mount {
     /// Set when the main session ends.
     main_ended: Arc<Stop>,
     overlay: Option<OverlaySession>,
+    /// The sandbox overlay's tmp layer, wiped at stop.
+    tmp: Option<Arc<TmpLayer>>,
     failed: Arc<Stop>,
     sweeper: Option<Sweeper>,
     capturer: Option<Capturer>,
@@ -894,6 +907,15 @@ impl Mount {
             source,
         })?;
         let ops = Arc::new(Ops::new(backing, recorder, OpsConfig::default())?);
+        // The tmp layer is opened (and wiped) before any session mounts.
+        let tmp = match &overlay {
+            Some((overlay, _)) => Some(Arc::new(TmpLayer::open(
+                &overlay.tmp_layer,
+                ops.backing().root().as_fd(),
+                overlay.owner,
+            )?)),
+            None => None,
+        };
         // Paths a previous mount could not record are repaired from the
         // backing tree before any request is served.
         let mut startup = StartupRepairs::default();
@@ -948,10 +970,10 @@ impl Mount {
         // negotiates INIT), the shared stop for a failed passthrough. If it
         // cannot be mounted, the main mount is taken down again (its
         // stacked layer too), so the start leaves nothing mounted.
-        let overlay = match overlay {
-            Some((overlay, gate)) => {
+        let overlay = match overlay.zip(tmp.clone()) {
+            Some(((overlay, gate), tmp)) => {
                 let fs = FuseFs::new(
-                    Arc::new(Overlay::new(ops.clone(), gate, overlay.owner)),
+                    Arc::new(Overlay::new(ops.clone(), gate, overlay.owner, tmp)),
                     config.passthrough,
                     Arc::new(Mutex::new(PassthroughStatus::Off("not negotiated".into()))),
                     failed.clone(),
@@ -1011,6 +1033,7 @@ impl Mount {
             ended,
             main_ended,
             overlay,
+            tmp,
             failed,
             sweeper: Some(sweeper),
             capturer,
@@ -1079,7 +1102,8 @@ impl Mount {
     /// Unmounts the sandbox overlay, then the main mount (each lazily if
     /// busy), waits up to `grace` for both sessions to end, stops the
     /// sweep and runs a final one over every file still open, plus the
-    /// repair queue, then captures every changed fsync-class group.
+    /// repair queue, then captures every changed fsync-class group, and
+    /// last wipes the sandbox overlay's tmp layer.
     pub fn shutdown(mut self, grace: Duration) -> UnmountReport {
         let mut report = UnmountReport::default();
         let sessions = self
@@ -1123,6 +1147,11 @@ impl Mount {
                 .boundary()
                 .repair_store()
                 .and_then(|(store, error)| error.is_none().then_some(store));
+        }
+        if let Some(tmp) = &self.tmp
+            && let Err(e) = tmp.wipe()
+        {
+            report.tmp_wipe_error = Some(format!("{e}"));
         }
         report
     }
@@ -1829,6 +1858,7 @@ mod tests {
             mountpoint: l.p("sandbox/overlay"),
             owner: ViewOwner::new(ids, &Privileges::default(), ids.uid).unwrap(),
             stack_over: None,
+            tmp_layer: l.p("state/tmp-layer"),
         };
         // Without the overlay there is nothing to refuse.
         assert!(overlay_gate(None, true, &rules(true)).unwrap().is_none());

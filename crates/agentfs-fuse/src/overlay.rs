@@ -14,24 +14,32 @@
 //!
 //! | Operation | Answer |
 //! |---|---|
-//! | `lookup` | parent not shown: `ENOENT`; owner may not search parent: `EACCES`; `may_show` hidden or the name not a repository path: `ENOENT` (`EIO` on a rules error) without asking the operations; else looked up, and a result not shown for its kind is forgotten again and answered `ENOENT` (`EIO`) |
+//! | `lookup` | parent not shown: `ENOENT`; owner may not search parent: `EACCES`; a name the tmp layer holds: its file (the upper layer wins, as in overlayfs); `may_show` hidden or the name not a repository path: `ENOENT` (`EIO` on a rules error) without asking the operations; else looked up, and a result not shown for its kind is forgotten again and answered `ENOENT` (`EIO`) |
 //! | `getattr`, `readlink`, `getxattr`, `listxattr`, `access` | node not shown: `ENOENT`; through an open handle: passed on. `access` checks the mask as the owner (`EACCES`) |
-//! | `opendir` / `readdir` | not shown: `ENOENT`; owner may not read: `EACCES`; entries not shown for their kind are left out (rules errors too); `.` and `..` stay |
+//! | `opendir` / `readdir` | not shown: `ENOENT`; owner may not read: `EACCES`; the overlay's own snapshot, with offsets 1 to n and no gaps: `.` and `..`, the tree's entries shown for their kind whose names the tmp layer does not hold, then the tmp layer's files |
 //! | `open` | not shown: `ENOENT`; owner lacks the access the flags ask: `EACCES` |
-//! | `create`, `mknod` of a regular file | parent shown, owner may write and search it; `place_new(File)`: tree: passed on; tmp layer: `EACCES` until the tmp layer is built (slice 3); refused: `EACCES` (`EIO` on a rules error). A placed name that holds an entry hidden for its kind (a special file, a skipped file under a name placeable as a directory, a nested repository) is refused the same way, so the operations never touch a hidden entry and it never answers `EEXIST`. An existing file opened without `O_EXCL` needs the owner's access to it |
-//! | `mkdir` | as `create`, with `place_new(Directory)` |
+//! | `create`, `mknod` of a regular file | parent shown, owner may write and search it; a name the tmp layer holds: `EEXIST` with `O_EXCL` (and for `mknod`), else its file opened as `open` does; `place_new(File)`: tree: passed on; tmp layer: a shown directory there is `EEXIST` (`EISDIR` for `create` without `O_EXCL`), else a new tmp file; refused: `EACCES` (`EIO` on a rules error). A placed name in the tree that holds an entry hidden for its kind (a special file, a nested repository) is refused the same way, so the operations never touch a hidden entry and it never answers `EEXIST`. An existing file opened without `O_EXCL` needs the owner's access to it |
+//! | `mkdir` | a name the tmp layer holds: `EEXIST`; else as `create`, with `place_new(Directory)` |
 //! | `symlink`, `link`, `mknod` of anything else | `EACCES`, whatever exists |
-//! | `unlink`, `rmdir` | name hidden for the kind found: `ENOENT`; owner may not write and search the parent, or the sticky rule refuses: `EACCES` |
-//! | `rename` | `RENAME_WHITEOUT`: `EINVAL`; source hidden: `ENOENT`; `place_move`: cross-device: `EXDEV`; refused: `EACCES` (`EIO`); an existing target hidden for its kind: `EACCES` (`EIO`), never replaced; tree: passed on, after the owner's checks on both parents. `RENAME_EXCHANGE` needs both ends to place in the tree |
+//! | `unlink`, `rmdir` | a tmp file: removed from the layer once the owner may write and search the parent (`EACCES`); name hidden for the kind found: `ENOENT`; owner may not write and search the parent, or the sticky rule refuses: `EACCES`; `rmdir` of a directory holding tmp files: `ENOTEMPTY` |
+//! | `rename` | `RENAME_WHITEOUT`: `EINVAL`; source hidden: `ENOENT`; `place_move`: cross-device: `EXDEV`; refused: `EACCES` (`EIO`); an existing target hidden for its kind: `EACCES` (`EIO`), never replaced; tree: passed on, after the owner's checks on both parents. `RENAME_EXCHANGE` needs both ends to place in the tree. A tmp source: `RENAME_EXCHANGE` is `EACCES`; to a skipped name it stays in the layer; to a recordable name it moves into the tree ([`TreeOperations::move_in`], judged by [`Judge`] under the names ordering) |
 //! | `setattr` | not shown: `ENOENT`; a uid or gid: `EPERM`; a mode with set-id or sticky bits, or a mode change by an owner who does not own the object: `EPERM`; a size without a handle the owner may not write: `EACCES`; times as for `utimensat(2)` |
 //! | `setxattr`, `removexattr` | `ENOTSUP` |
-//! | `read`, `write`, `flush`, `release`, `fsync`, `fallocate`, `lseek`, `copy_file_range`, `releasedir`, `statfs`, `forget`, `mapping_may_write`, `paths` | passed on: handles were gated when opened |
+//! | `read`, `write`, `flush`, `release`, `fsync`, `fallocate`, `lseek`, `statfs`, `forget`, `mapping_may_write`, `paths` | passed on: handles were gated when opened |
+//! | `copy_file_range` | between two tmp files: in the layer; between a tmp file and a tree file: `EXDEV` (programs fall back to reading and writing); else passed on |
+//!
+//! A tmp file ([`tmp`]) answers for itself: its attributes (`getattr`,
+//! `access`, `setattr` after the same checks, `open` after the owner's
+//! access check), `readlink` `EINVAL`, no extended attributes, no paths in
+//! the tree, and its handles' reads and writes (a `flush` records
+//! nothing).
 //!
 //! Every operation that the decorator passes on gets
 //! [`ViewOwner::caller`] of the request's process, never the request's own
 //! uid and gid.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use agentfs_core::paths::RepoPath;
 use agentfs_core::record::Caller;
@@ -43,10 +51,10 @@ use rustix::fs::{OFlags, RenameFlags};
 
 use crate::access::{self, Object, Want, Who};
 use crate::backing::join;
-use crate::inodes::ROOT;
+use crate::inodes::{Kind, ROOT};
 use crate::ops::{DirEntry, Entry, Handle, OpResult, SetAttr, Xattr};
 use crate::privileges::Privileges;
-use crate::session::{Actor, Found, NameCheck, Operations};
+use crate::session::{Actor, Found, NameCheck, Operations, TreeOperations};
 
 pub mod tmp;
 
@@ -183,9 +191,10 @@ pub fn hidden_errno(hidden: Hidden) -> Errno {
 }
 
 /// Whether a placement lets the operation go on to the operations, and
-/// otherwise its errno: tree goes on; tmp layer is `EACCES` until the tmp
-/// layer is built (slice 3); cross-device is `EXDEV`; a refusal is `EACCES`, `ENOENT`
-/// for a hidden source, `EIO` for a rules error.
+/// otherwise its errno: tree goes on; cross-device is `EXDEV`; a refusal
+/// is `EACCES`, `ENOENT` for a hidden source, `EIO` for a rules error. The
+/// overlay routes tmp placements to the layer; one that reaches admit is
+/// refused (`EACCES`).
 pub fn admit(placement: Placement) -> OpResult<()> {
     match placement {
         Placement::Tree => Ok(()),
@@ -206,6 +215,26 @@ fn existing_kind(kind: FileType) -> ExistingKind {
         FileType::NamedPipe | FileType::CharDevice | FileType::BlockDevice | FileType::Socket => {
             ExistingKind::Special
         }
+    }
+}
+
+/// What an existing entry of the inode table's kind `kind` is to the gate.
+fn kind_to_gate(kind: Kind) -> ExistingKind {
+    match kind {
+        Kind::File => ExistingKind::File,
+        Kind::Dir => ExistingKind::Directory,
+        Kind::Symlink => ExistingKind::Symlink,
+        Kind::Other => ExistingKind::Special,
+    }
+}
+
+/// `EACCES` (`EIO` on a rules error) unless an existing entry at `path`,
+/// of kind `kind`, is shown for its kind.
+fn refuse_hidden_kind(gate: &Gate, path: &RepoPath, kind: ExistingKind) -> OpResult<()> {
+    match gate.show(path, kind) {
+        Visibility::Shown => Ok(()),
+        Visibility::Hidden(Hidden::NotRecordable) => Err(Errno::EACCES),
+        Visibility::Hidden(Hidden::RulesError) => Err(Errno::EIO),
     }
 }
 
@@ -233,6 +262,7 @@ fn plain_mode(mode: u32) -> u32 {
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const O_EXCL: i32 = OFlags::EXCL.bits() as i32;
+const RENAME_EXCHANGE: u32 = RenameFlags::EXCHANGE.bits();
 
 const READ: Want = Want {
     read: true,
@@ -283,30 +313,70 @@ impl Judge {
     }
 }
 
+impl Judge {
+    /// `EACCES` (`EIO`) when the entry found at `at`, if any, is hidden for
+    /// its kind.
+    fn existing_shown(&self, path: &RepoPath, at: Found<'_>) -> OpResult<()> {
+        match at.kind {
+            Some(kind) => refuse_hidden_kind(&self.gate, path, kind_to_gate(kind)),
+            None => Ok(()),
+        }
+    }
+}
+
 impl NameCheck for Judge {
-    fn create(&self, at: Found<'_>, kind: crate::inodes::Kind) -> OpResult<()> {
-        let _ = (&self.gate, at, kind);
-        todo!("sandbox overlay slice 3")
+    fn create(&self, at: Found<'_>, kind: Kind) -> OpResult<()> {
+        let path = repo_path(at.path).ok_or(Errno::EACCES)?;
+        let new = match kind {
+            Kind::File => NewKind::File,
+            Kind::Dir => NewKind::Directory,
+            Kind::Symlink | Kind::Other => return Err(Errno::EACCES),
+        };
+        admit(self.gate.place_new(&path, new))?;
+        self.existing_shown(&path, at)
     }
 
-    fn link(&self, at: Found<'_>) -> OpResult<()> {
-        let _ = at;
-        todo!("sandbox overlay slice 3")
+    fn link(&self, _at: Found<'_>) -> OpResult<()> {
+        Err(Errno::EACCES)
     }
 
     fn remove(&self, at: Found<'_>) -> OpResult<()> {
-        let _ = at;
-        todo!("sandbox overlay slice 3")
+        let path = repo_path(at.path).ok_or(Errno::ENOENT)?;
+        let kind = at.kind.ok_or(Errno::ENOENT)?;
+        match self.gate.show(&path, kind_to_gate(kind)) {
+            Visibility::Shown => Ok(()),
+            Visibility::Hidden(h) => Err(hidden_errno(h)),
+        }
     }
 
     fn rename(&self, from: Found<'_>, to: Found<'_>, flags: u32) -> OpResult<()> {
-        let _ = (from, to, flags);
-        todo!("sandbox overlay slice 3")
+        if flags & RenameFlags::WHITEOUT.bits() != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let from_path = repo_path(from.path).ok_or(Errno::ENOENT)?;
+        let from_kind = from.kind.ok_or(Errno::ENOENT)?;
+        let to_path = repo_path(to.path).ok_or(Errno::EACCES)?;
+        admit(
+            self.gate
+                .place_move(Source::Tree(&from_path, kind_to_gate(from_kind)), &to_path),
+        )?;
+        if flags & RENAME_EXCHANGE != 0 {
+            let to_kind = to.kind.ok_or(Errno::ENOENT)?;
+            admit(
+                self.gate
+                    .place_move(Source::Tree(&to_path, kind_to_gate(to_kind)), &from_path),
+            )
+        } else {
+            self.existing_shown(&to_path, to)
+        }
     }
 
     fn move_in(&self, to: Found<'_>) -> OpResult<()> {
-        let _ = to;
-        todo!("sandbox overlay slice 3")
+        let path = repo_path(to.path).ok_or(Errno::EACCES)?;
+        // Where a tmp-layer file moved to `path` goes: only the tree is
+        // admitted (a skipped name is the layer's, never the tree's).
+        admit(self.gate.place_move(Source::TmpLayer(&path), &path))?;
+        self.existing_shown(&path, to)
     }
 }
 
@@ -316,17 +386,49 @@ struct Shown {
     attr: FileAttr,
 }
 
+/// Where a new regular file goes.
+enum NewFile {
+    /// The tree, with the entry already there, if any.
+    Tree(Option<Entry>),
+    Tmp,
+}
+
+/// One directory listing the overlay serves: (offset of the next entry,
+/// entry).
+type Listing = Arc<Vec<(u64, DirEntry)>>;
+
 /// The sandbox overlay: [`Operations`] behind the visibility gate, done as
-/// the view owner.
-pub struct Overlay<O: Operations> {
+/// the view owner, with the tmp layer above the tree.
+pub struct Overlay<O: TreeOperations> {
     inner: Arc<O>,
     gate: Gate,
     owner: ViewOwner,
+    tmp: Arc<tmp::TmpLayer>,
+    judge: Judge,
+    /// The overlay's own directory snapshots, by handle id.
+    dirs: Mutex<HashMap<u64, Listing>>,
 }
 
-impl<O: Operations> Overlay<O> {
-    pub fn new(inner: Arc<O>, gate: Gate, owner: ViewOwner) -> Self {
-        Self { inner, gate, owner }
+impl<O: TreeOperations> Overlay<O> {
+    pub fn new(inner: Arc<O>, gate: Gate, owner: ViewOwner, tmp: Arc<tmp::TmpLayer>) -> Self {
+        Self {
+            inner,
+            judge: Judge::new(gate.clone()),
+            gate,
+            owner,
+            tmp,
+            dirs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn dirs(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Listing>> {
+        self.dirs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The tmp layer's attributes of node `id`; `None` when it is not a
+    /// tmp file.
+    fn tmp_attr(&self, id: u64) -> Option<OpResult<FileAttr>> {
+        self.tmp.getattr(id, None)
     }
 
     /// Node `id` if it is shown: the root, or a node one of whose current
@@ -411,32 +513,69 @@ impl<O: Operations> Overlay<O> {
     /// refused name, so the operations never create over, open or replace
     /// what the overlay does not show.
     fn refuse_hidden(&self, path: &RepoPath, entry: &Entry) -> OpResult<()> {
-        match self.gate.show(path, existing_kind(entry.attr.kind)) {
-            Visibility::Shown => Ok(()),
-            Visibility::Hidden(Hidden::NotRecordable) => Err(Errno::EACCES),
-            Visibility::Hidden(Hidden::RulesError) => Err(Errno::EIO),
-        }
+        refuse_hidden_kind(&self.gate, path, existing_kind(entry.attr.kind))
     }
 
-    /// `name` in shown directory `parent` for a new object of kind `kind`:
-    /// the owner may write and search the directory, the gate places the
-    /// name in the tree (decided before the operations are asked anything
-    /// about the name), and an entry already there is shown for its kind.
-    /// Returns that entry, if any.
-    fn place_new(&self, parent: u64, name: &[u8], kind: NewKind) -> OpResult<Option<Entry>> {
+    /// Shown directory `parent`, in which the owner may write and search
+    /// (to add a name).
+    fn writable_dir(&self, parent: u64) -> OpResult<Shown> {
         let dir = self.shown(parent)?;
         self.require(&dir.attr, WRITE_SEARCH)?;
+        Ok(dir)
+    }
+
+    /// `name` in shown, writable directory `parent` for a new object of
+    /// kind `kind`: the gate places the name in the tree (decided before
+    /// the operations are asked anything about the name), and an entry
+    /// already there is shown for its kind. Returns that entry, if any.
+    fn place_new(&self, parent: u64, name: &[u8], kind: NewKind) -> OpResult<Option<Entry>> {
+        let dir = self.writable_dir(parent)?;
         let path = Self::child(&dir, name).ok_or(Errno::EACCES)?;
         admit(self.gate.place_new(&path, kind))?;
+        self.existing_shown(parent, name, &path)
+    }
+
+    /// The entry at `name` in `parent` (repository path `path`, which the
+    /// gate places in the tree), if any, refused if hidden for its kind.
+    fn existing_shown(&self, parent: u64, name: &[u8], path: &RepoPath) -> OpResult<Option<Entry>> {
         let existing = self.existing(parent, name)?;
         if let Some(entry) = &existing {
-            self.refuse_hidden(&path, entry)?;
+            self.refuse_hidden(path, entry)?;
         }
         Ok(existing)
     }
 
-    /// `unlink` and `rmdir`.
-    fn remove(&self, parent: u64, name: &[u8]) -> OpResult<()> {
+    /// Where a new regular file `name` in `parent` goes, for `create`
+    /// (`exclusive` with `O_EXCL`) and `mknod` (always exclusive). The
+    /// caller has checked the tmp layer does not hold the name.
+    fn place_file(&self, parent: u64, name: &[u8], exclusive: bool) -> OpResult<NewFile> {
+        let dir = self.writable_dir(parent)?;
+        let path = Self::child(&dir, name).ok_or(Errno::EACCES)?;
+        match self.gate.place_new(&path, NewKind::File) {
+            Placement::TmpLayer => {}
+            placement => {
+                admit(placement)?;
+                return self.existing_shown(parent, name, &path).map(NewFile::Tree);
+            }
+        }
+        // A tmp file shadows whatever the tree hides at its name, and the
+        // tree is never asked about a name the gate hides (existence-blind).
+        // Only a directory can be shown at a name skipped for a file.
+        if self.gate.may_show(&path) == Visibility::Shown
+            && let Some(entry) = self.existing(parent, name)?
+            && self.gate.show(&path, existing_kind(entry.attr.kind)) == Visibility::Shown
+        {
+            return Err(if exclusive {
+                Errno::EEXIST
+            } else {
+                Errno::EISDIR
+            });
+        }
+        Ok(NewFile::Tmp)
+    }
+
+    /// `unlink` and `rmdir` of a tree entry: the entry.
+    fn remove(&self, parent: u64, name: &[u8]) -> OpResult<Entry> {
         let dir = self.shown(parent)?;
         let path = Self::child(&dir, name).ok_or(Errno::ENOENT)?;
         if let Visibility::Hidden(h) = self.gate.may_show(&path) {
@@ -446,7 +585,65 @@ impl<O: Operations> Overlay<O> {
         if let Visibility::Hidden(h) = self.gate.show(&path, existing_kind(entry.attr.kind)) {
             return Err(hidden_errno(h));
         }
-        self.require_unlink(&dir.attr, &entry.attr)
+        self.require_unlink(&dir.attr, &entry.attr)?;
+        Ok(entry)
+    }
+
+    /// `rename` of tmp file `name` in `parent`: within the layer to a
+    /// skipped name, into the tree to a recordable one.
+    #[allow(clippy::too_many_arguments)]
+    fn rename_tmp(
+        &self,
+        parent: u64,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+        caller: Caller,
+    ) -> OpResult<()> {
+        if flags & RENAME_EXCHANGE != 0 {
+            return Err(Errno::EACCES);
+        }
+        let from_dir = self.writable_dir(parent)?;
+        let to_dir = self.writable_dir(newparent)?;
+        let from = Self::child(&from_dir, name).ok_or(Errno::ENOENT)?;
+        let to = Self::child(&to_dir, newname).ok_or(Errno::EACCES)?;
+        match self.gate.place_move(Source::TmpLayer(&from), &to) {
+            Placement::TmpLayer => {
+                // As for a create: a shown directory there is not shadowed.
+                if self.gate.may_show(&to) == Visibility::Shown
+                    && let Some(entry) = self.existing(newparent, newname)?
+                    && self.gate.show(&to, existing_kind(entry.attr.kind)) == Visibility::Shown
+                {
+                    return Err(Errno::EISDIR);
+                }
+                self.tmp
+                    .rename(parent, name, newparent, newname, flags)
+                    .unwrap_or(Err(Errno::ENOENT))
+            }
+            Placement::Tree => {
+                if let Some(dst) = self.existing(newparent, newname)? {
+                    self.require_unlink(&to_dir.attr, &dst.attr)?;
+                }
+                let owner = self.owner.caller(caller.pid);
+                self.tmp
+                    .move_out(parent, name, |m| {
+                        self.inner.move_in(
+                            m.store,
+                            m.name,
+                            newparent,
+                            newname,
+                            flags,
+                            m.moved,
+                            &self.judge,
+                            owner,
+                        )
+                    })
+                    .unwrap_or(Err(Errno::ENOENT))
+                    .map(|_| ())
+            }
+            placement => admit(placement),
+        }
     }
 
     /// The checks of `setattr` on an object with attributes `attr`
@@ -477,10 +674,14 @@ impl<O: Operations> Overlay<O> {
     }
 }
 
-impl<O: Operations> Operations for Overlay<O> {
+impl<O: TreeOperations> Operations for Overlay<O> {
     fn lookup(&self, parent: u64, name: &[u8]) -> OpResult<Entry> {
         let dir = self.shown(parent)?;
         self.require(&dir.attr, SEARCH)?;
+        // The upper layer wins, as in overlayfs.
+        if let Some(found) = self.tmp.lookup(parent, name) {
+            return found;
+        }
         let path = Self::child(&dir, name).ok_or(Errno::ENOENT)?;
         if let Visibility::Hidden(h) = self.gate.may_show(&path) {
             return Err(hidden_errno(h));
@@ -494,10 +695,15 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn forget(&self, id: u64, n: u64) {
-        self.inner.forget(id, n);
+        if self.tmp.forget(id, n).is_none() {
+            self.inner.forget(id, n);
+        }
     }
 
     fn getattr(&self, id: u64, fh: Option<u64>) -> OpResult<FileAttr> {
+        if let Some(attr) = self.tmp.getattr(id, fh) {
+            return attr;
+        }
         match fh {
             Some(_) => self.inner.getattr(id, fh),
             None => Ok(self.shown(id)?.attr),
@@ -505,6 +711,10 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn setattr(&self, id: u64, set: &SetAttr, caller: Caller) -> OpResult<FileAttr> {
+        if let Some(attr) = self.tmp.getattr(id, set.fh) {
+            self.may_setattr(&attr?, set)?;
+            return self.tmp.setattr(id, set).unwrap_or(Err(Errno::ENOENT));
+        }
         // Through an open handle, gated when it was opened; else the node
         // must be shown.
         let attr = match set.fh {
@@ -516,16 +726,26 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn readlink(&self, id: u64) -> OpResult<Vec<u8>> {
+        if let Some(attr) = self.tmp_attr(id) {
+            attr?;
+            return Err(Errno::EINVAL);
+        }
         self.shown(id)?;
         self.inner.readlink(id)
     }
 
     fn access(&self, id: u64, mask: i32) -> OpResult<()> {
-        let node = self.shown(id)?;
-        self.require(&node.attr, Want::from_mask(mask))
+        let attr = match self.tmp_attr(id) {
+            Some(attr) => attr?,
+            None => self.shown(id)?.attr,
+        };
+        self.require(&attr, Want::from_mask(mask))
     }
 
     fn paths(&self, id: u64) -> Vec<Vec<u8>> {
+        if self.tmp_attr(id).is_some() {
+            return Vec::new();
+        }
         self.inner.paths(id)
     }
 
@@ -538,11 +758,18 @@ impl<O: Operations> Operations for Overlay<O> {
         caller: Caller,
     ) -> OpResult<Entry> {
         // Only a regular file: devices, FIFOs and sockets are never placed.
-        let kind = match mode & S_IFMT {
-            0 | S_IFREG => NewKind::File,
-            _ => return Err(Errno::EACCES),
-        };
-        self.place_new(parent, name, kind)?;
+        if !matches!(mode & S_IFMT, 0 | S_IFREG) {
+            return Err(Errno::EACCES);
+        }
+        if self.tmp.holds(parent, name) {
+            self.writable_dir(parent)?;
+            return Err(Errno::EEXIST);
+        }
+        if let NewFile::Tmp = self.place_file(parent, name, true)? {
+            return self
+                .tmp
+                .mknod(parent, name, plain_mode(mode), self.inner.new_node_id());
+        }
         self.inner.mknod(
             parent,
             name,
@@ -553,6 +780,10 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn mkdir(&self, parent: u64, name: &[u8], mode: u32, caller: Caller) -> OpResult<Entry> {
+        if self.tmp.holds(parent, name) {
+            self.writable_dir(parent)?;
+            return Err(Errno::EEXIST);
+        }
         self.place_new(parent, name, NewKind::Directory)?;
         self.inner.mkdir(
             parent,
@@ -563,13 +794,23 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn unlink(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
+        if self.tmp.holds(parent, name) {
+            self.writable_dir(parent)?;
+            if let Some(unlinked) = self.tmp.unlink(parent, name) {
+                return unlinked;
+            }
+        }
         self.remove(parent, name)?;
         self.inner
             .unlink(parent, name, self.owner.caller(caller.pid))
     }
 
     fn rmdir(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
-        self.remove(parent, name)?;
+        let dir = self.remove(parent, name)?;
+        // Empty in the tree, but not through the overlay.
+        if !self.tmp.entries(dir.id).is_empty() {
+            return Err(Errno::ENOTEMPTY);
+        }
         self.inner
             .rmdir(parent, name, self.owner.caller(caller.pid))
     }
@@ -597,6 +838,9 @@ impl<O: Operations> Operations for Overlay<O> {
         if flags & RenameFlags::WHITEOUT.bits() != 0 {
             return Err(Errno::EINVAL);
         }
+        if self.tmp.holds(parent, name) {
+            return self.rename_tmp(parent, name, newparent, newname, flags, caller);
+        }
         let from_dir = self.shown(parent)?;
         let to_dir = self.shown(newparent)?;
         let from = Self::child(&from_dir, name).ok_or(Errno::ENOENT)?;
@@ -610,7 +854,7 @@ impl<O: Operations> Operations for Overlay<O> {
                 .place_move(Source::Tree(&from, existing_kind(src.attr.kind)), &to),
         )?;
         // The target may be shown now: its name is recordable.
-        let dst = if flags & RenameFlags::EXCHANGE.bits() != 0 {
+        let dst = if flags & RENAME_EXCHANGE != 0 {
             let dst = self.peek(newparent, newname)?;
             admit(
                 self.gate
@@ -647,6 +891,12 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn open(&self, id: u64, flags: i32, caller: Caller) -> OpResult<(u64, Arc<Handle>)> {
+        if let Some(attr) = self.tmp_attr(id) {
+            self.require(&attr?, Want::from_open_flags(flags))?;
+            if let Some(opened) = self.tmp.open_node(id, flags, self.inner.new_handle_id()) {
+                return opened;
+            }
+        }
         let node = self.shown(id)?;
         self.require(&node.attr, Want::from_open_flags(flags))?;
         self.inner.open(id, flags, self.owner.caller(caller.pid))
@@ -660,7 +910,49 @@ impl<O: Operations> Operations for Overlay<O> {
         flags: i32,
         caller: Caller,
     ) -> OpResult<(Entry, u64, Arc<Handle>)> {
-        let existing = self.place_new(parent, name, NewKind::File)?;
+        if self.tmp.holds(parent, name) {
+            self.writable_dir(parent)?;
+            if flags & O_EXCL != 0 {
+                return Err(Errno::EEXIST);
+            }
+            // Opened as `open` opens it, its lookup counted for the reply.
+            if let Some(found) = self.tmp.lookup(parent, name) {
+                let entry = found?;
+                let opened = self
+                    .require(&entry.attr, Want::from_open_flags(flags))
+                    .and_then(|()| {
+                        self.tmp
+                            .open_node(entry.id, flags, self.inner.new_handle_id())
+                            .unwrap_or(Err(Errno::ENOENT))
+                    });
+                return match opened {
+                    Ok((fh, handle)) => {
+                        let attr = self
+                            .tmp
+                            .getattr(entry.id, Some(fh))
+                            .unwrap_or(Ok(entry.attr))?;
+                        Ok((Entry { id: entry.id, attr }, fh, handle))
+                    }
+                    Err(e) => {
+                        self.forget(entry.id, 1);
+                        Err(e)
+                    }
+                };
+            }
+        }
+        let existing = match self.place_file(parent, name, flags & O_EXCL != 0)? {
+            NewFile::Tree(existing) => existing,
+            NewFile::Tmp => {
+                return self.tmp.create(
+                    parent,
+                    name,
+                    plain_mode(mode),
+                    flags,
+                    self.inner.new_node_id(),
+                    self.inner.new_handle_id(),
+                );
+            }
+        };
         // Without O_EXCL an existing file is opened: the owner needs the
         // access the flags ask of it.
         if flags & O_EXCL == 0
@@ -679,23 +971,38 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn read(&self, fh: u64, offset: u64, size: u32) -> OpResult<Vec<u8>> {
+        if let Some(read) = self.tmp.read(fh, offset, size) {
+            return read;
+        }
         self.inner.read(fh, offset, size)
     }
 
     fn write(&self, fh: u64, offset: u64, data: &[u8], caller: Caller) -> OpResult<u32> {
+        if let Some(written) = self.tmp.write(fh, offset, data) {
+            return written;
+        }
         self.inner
             .write(fh, offset, data, self.owner.caller(caller.pid))
     }
 
     fn flush(&self, fh: u64, caller: Caller) -> OpResult<()> {
+        if let Some(flushed) = self.tmp.flush(fh) {
+            return flushed;
+        }
         self.inner.flush(fh, self.owner.caller(caller.pid))
     }
 
     fn release(&self, fh: u64) -> OpResult<()> {
+        if let Some(released) = self.tmp.release(fh) {
+            return released;
+        }
         self.inner.release(fh)
     }
 
     fn fsync(&self, fh: u64, datasync: bool) -> OpResult<()> {
+        if let Some(synced) = self.tmp.fsync(fh, datasync) {
+            return synced;
+        }
         self.inner.fsync(fh, datasync)
     }
 
@@ -707,11 +1014,17 @@ impl<O: Operations> Operations for Overlay<O> {
         mode: i32,
         caller: Caller,
     ) -> OpResult<()> {
+        if let Some(done) = self.tmp.fallocate(fh, offset, length, mode) {
+            return done;
+        }
         self.inner
             .fallocate(fh, offset, length, mode, self.owner.caller(caller.pid))
     }
 
     fn lseek(&self, fh: u64, offset: i64, whence: i32) -> OpResult<i64> {
+        if let Some(at) = self.tmp.lseek(fh, offset, whence) {
+            return at;
+        }
         self.inner.lseek(fh, offset, whence)
     }
 
@@ -724,6 +1037,12 @@ impl<O: Operations> Operations for Overlay<O> {
         len: u64,
         caller: Caller,
     ) -> OpResult<u32> {
+        if let Some(copied) = self
+            .tmp
+            .copy_file_range(fh_in, offset_in, fh_out, offset_out, len)
+        {
+            return copied;
+        }
         self.inner.copy_file_range(
             fh_in,
             offset_in,
@@ -735,31 +1054,66 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn mapping_may_write(&self, id: u64) {
-        self.inner.mapping_may_write(id);
+        if self.tmp.mapping_may_write(id).is_none() {
+            self.inner.mapping_may_write(id);
+        }
     }
 
     fn opendir(&self, id: u64) -> OpResult<u64> {
         let node = self.shown(id)?;
         self.require(&node.attr, READ)?;
-        self.inner.opendir(id)
-    }
-
-    fn readdir(&self, id: u64, fh: u64, offset: u64) -> OpResult<Vec<(u64, DirEntry)>> {
-        let dir = self.shown(id)?;
-        let entries = self.inner.readdir(id, fh, offset)?;
+        // The tree's snapshot, read whole and released at once.
+        let tree_fh = self.inner.opendir(id)?;
+        let mut tree = Vec::new();
+        let mut offset = 0;
+        let read = loop {
+            match self.inner.readdir(id, tree_fh, offset) {
+                Ok(page) if page.is_empty() => break Ok(()),
+                Ok(page) => {
+                    offset = page.last().map_or(offset, |(next, _)| *next);
+                    tree.extend(page.into_iter().map(|(_, e)| e));
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        self.inner.releasedir(tree_fh);
+        read?;
+        let (mut dots, rest): (Vec<DirEntry>, Vec<DirEntry>) = tree
+            .into_iter()
+            .partition(|e| e.name == b"." || e.name == b"..");
+        // `.` first, then `..`.
+        dots.sort_by(|a, b| a.name.cmp(&b.name));
+        let held = self.tmp.entries(id);
         let shown = |e: &DirEntry| {
-            Self::child(&dir, &e.name).is_some_and(|path| {
+            Self::child(&node, &e.name).is_some_and(|path| {
                 self.gate.show(&path, existing_kind(e.kind)) == Visibility::Shown
             })
         };
-        Ok(entries
+        let listing: Vec<(u64, DirEntry)> = dots
             .into_iter()
-            .filter(|(_, e)| e.name == b"." || e.name == b".." || shown(e))
-            .collect())
+            .chain(
+                rest.into_iter()
+                    .filter(|e| shown(e) && !held.iter().any(|t| t.name == e.name)),
+            )
+            .chain(held.iter().cloned())
+            .enumerate()
+            .map(|(i, e)| (i as u64 + 1, e))
+            .collect();
+        let fh = self.inner.new_handle_id();
+        self.dirs().insert(fh, Arc::new(listing));
+        Ok(fh)
+    }
+
+    /// The overlay's snapshot from `offset` on: each entry's offset is its
+    /// 1-based index in the snapshot, so there are no gaps.
+    fn readdir(&self, _id: u64, fh: u64, offset: u64) -> OpResult<Vec<(u64, DirEntry)>> {
+        let listing = self.dirs().get(&fh).cloned().ok_or(Errno::EBADF)?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        Ok(listing.iter().skip(start).cloned().collect())
     }
 
     fn releasedir(&self, fh: u64) {
-        self.inner.releasedir(fh);
+        self.dirs().remove(&fh);
     }
 
     fn statfs(&self) -> OpResult<rustix::fs::StatVfs> {
@@ -771,11 +1125,23 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn getxattr(&self, id: u64, name: &[u8], size: u32) -> OpResult<Xattr> {
+        if let Some(attr) = self.tmp_attr(id) {
+            attr?;
+            return Err(Errno::ENODATA);
+        }
         self.shown(id)?;
         self.inner.getxattr(id, name, size)
     }
 
     fn listxattr(&self, id: u64, size: u32) -> OpResult<Xattr> {
+        if let Some(attr) = self.tmp_attr(id) {
+            attr?;
+            return Ok(if size == 0 {
+                Xattr::Size(0)
+            } else {
+                Xattr::Data(Vec::new())
+            });
+        }
         self.shown(id)?;
         self.inner.listxattr(id, size)
     }

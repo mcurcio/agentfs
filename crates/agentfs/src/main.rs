@@ -1419,6 +1419,7 @@ fn sandbox_overlay(
         stack_over: stacked.then(|| StackOver {
             source: state.overlay_stack_source(),
         }),
+        tmp_layer: state.tmp_layer(),
     }))
 }
 
@@ -1835,6 +1836,11 @@ fn print_unmount(report: &UnmountReport, unmount_grace: Duration) {
     }
     if report.captured > 0 {
         println!("unmount: {} database group(s) captured", report.captured);
+    }
+    if let Some(e) = &report.tmp_wipe_error {
+        eprintln!(
+            "warning: the sandbox overlay's tmp layer was not wiped: {e} (the next start wipes it)"
+        );
     }
     if report.unrepaired > 0 {
         match &report.repairs_saved {

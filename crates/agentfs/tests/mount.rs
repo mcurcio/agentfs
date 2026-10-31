@@ -3101,6 +3101,11 @@ fn mount_sandbox(v: &Vol, overlay: &Path) -> (Mounted, Unmounts) {
 
 /// The message of the newest commit that set `path` to `content`.
 fn commit_that_set(v: &Vol, path: &str, content: &str) -> String {
+    commit_setting(v, path, content).1
+}
+
+/// The id and message of the newest commit that set `path` to `content`.
+fn commit_setting(v: &Vol, path: &str, content: &str) -> (String, String) {
     let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
     let blob_at = |commit: &git2::Commit<'_>| {
         commit
@@ -3121,7 +3126,10 @@ fn commit_that_set(v: &Vol, path: &str, content: &str) -> String {
         let set = blob_at(&commit).as_deref() == Some(content.as_bytes());
         let before = parent.as_ref().and_then(blob_at);
         if set && before.as_deref() != Some(content.as_bytes()) {
-            return commit.message().unwrap_or("").to_owned();
+            return (
+                commit.id().to_string(),
+                commit.message().unwrap_or("").to_owned(),
+            );
         }
         commit = parent.unwrap_or_else(|| panic!("no commit set {path} to {content:?}"));
     }
@@ -3140,8 +3148,13 @@ impl Drop for Unmounts {
 
 /// Runs `script` with `sh` in `dir`, as `uid` (and gid) if given.
 fn sh_at(dir: &Path, uid: Option<u32>, script: &str) -> Output {
+    run_at(dir, uid, "sh", script)
+}
+
+/// Runs `script` with `program -c` in `dir`, as `uid` (and gid) if given.
+fn run_at(dir: &Path, uid: Option<u32>, program: &str, script: &str) -> Output {
     let mut cmd = match uid {
-        None => Command::new("sh"),
+        None => Command::new(program),
         Some(uid) => {
             let mut c = Command::new("setpriv");
             c.args([
@@ -3149,12 +3162,57 @@ fn sh_at(dir: &Path, uid: Option<u32>, script: &str) -> Output {
                 format!("--regid={uid}"),
                 "--clear-groups".into(),
                 "--".into(),
-                "sh".into(),
+                program.into(),
             ]);
             c
         }
     };
     cmd.arg("-c").arg(script).current_dir(dir).output().unwrap()
+}
+
+/// Every path in every commit of the branch.
+fn every_history_path(v: &Vol) -> std::collections::BTreeSet<String> {
+    let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    let mut paths = std::collections::BTreeSet::new();
+    let mut walk = repo.revwalk().unwrap();
+    walk.push_ref("refs/heads/agentfs/demo").unwrap();
+    for id in walk {
+        let commit = repo.find_commit(id.unwrap()).unwrap();
+        commit
+            .tree()
+            .unwrap()
+            .walk(git2::TreeWalkMode::PreOrder, |root, e| {
+                paths.insert(format!("{root}{}", e.name().unwrap()));
+                git2::TreeWalkResult::Ok
+            })
+            .unwrap();
+    }
+    paths
+}
+
+/// Waits until history has `path` with `content`.
+fn wait_for(v: &Vol, m: &Mounted, path: &str, content: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let history = v.history();
+        if history.get(path) == Some(&f(content)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{path} never became {content:?} in history: {history:#?}\nlog:\n{}",
+            m.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The entries of the tmp layer's store.
+fn tmp_store(v: &Vol) -> Vec<PathBuf> {
+    fs::read_dir(v.state().join("tmp-layer"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect()
 }
 
 /// `script` fails, saying `why`.
@@ -3203,16 +3261,222 @@ fn overlay_shows_only_recordable_names() {
     fails_with(&sandbox, None, "cat overlay/nothing.db", NO_SUCH);
     fails_with(&sandbox, None, "stat overlay/skills/d/k.key", NO_SUCH);
 
-    const DENIED: &str = "Permission denied";
-    fails_with(&sandbox, None, "printf x > overlay/secrets.db", DENIED);
-    fails_with(&sandbox, None, "printf x > overlay/new.db", DENIED);
+    // A skipped file name is a private tmp file, over the hidden one too.
+    succeeds(&sandbox, None, "printf x > overlay/secrets.db");
+    succeeds(&sandbox, None, "printf y > overlay/new.db");
+    assert_eq!(succeeds(&sandbox, None, "cat overlay/secrets.db"), "x");
+    assert_eq!(
+        succeeds(&sandbox, None, "ls -A overlay"),
+        "config.yaml\nnew.db\nsecrets.db\nskills\n"
+    );
     assert_eq!(
         fs::read_to_string(v.backing().join("secrets.db")).unwrap(),
         "s"
     );
     assert!(!v.backing().join("new.db").exists());
+    assert_eq!(
+        succeeds(&top, None, "ls -A mnt"),
+        "config.yaml\nnotes\nsecrets.db\nskills\n"
+    );
+    // A hidden directory holds none: it is not there to hold one.
+    const DENIED: &str = "Permission denied";
+    fails_with(
+        &sandbox,
+        None,
+        "printf x > overlay/notes/x",
+        "Directory nonexistent",
+    );
+    fails_with(&sandbox, None, "mkdir overlay/notes", DENIED);
+    assert!(!v.backing().join("notes/x").exists());
     m.stop();
     assert!(!is_mounted(&overlay));
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_tmp_files_never_reach_the_main_mount_or_history() {
+    let (v, overlay) = sandbox_vol("overlay_tmp_files_never_reach_the_main_mount_or_history");
+    // A crash left a tmp file behind: the start wipes it.
+    fs::create_dir_all(v.state().join("tmp-layer")).unwrap();
+    fs::write(v.state().join("tmp-layer/99"), "left").unwrap();
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    assert!(tmp_store(&v).is_empty(), "{:?}", tmp_store(&v));
+    let sandbox = v.p("sandbox");
+    let top = v.p("");
+
+    // As a sandbox user: over a hidden file, at skipped names, and into a
+    // hidden directory.
+    assert_eq!(
+        succeeds(
+            &sandbox,
+            Some(20000),
+            "printf tmp > overlay/secrets.db && printf k > overlay/skills/d/new.key && \
+             printf n > overlay/scratch.txt && printf gone > overlay/gone.txt && \
+             rm overlay/gone.txt && cat overlay/secrets.db"
+        ),
+        "tmp"
+    );
+    fails_with(
+        &sandbox,
+        Some(20000),
+        "printf x > overlay/notes/x",
+        "Directory nonexistent",
+    );
+    // A recorded change through the overlay, so history is live.
+    succeeds(&sandbox, Some(20000), "printf v2 > overlay/config.yaml");
+    wait_for(&v, &m, "config.yaml", "v2");
+
+    // The tree, the main mount and history never see a tmp file.
+    assert_eq!(
+        fs::read_to_string(v.backing().join("secrets.db")).unwrap(),
+        "s"
+    );
+    for gone in ["skills/d/new.key", "scratch.txt", "gone.txt", "notes/x"] {
+        assert!(!v.backing().join(gone).exists(), "{gone}");
+    }
+    assert_eq!(
+        succeeds(&top, None, "ls -A mnt"),
+        "config.yaml\nnotes\nsecrets.db\nskills\n"
+    );
+    assert_eq!(succeeds(&top, None, "ls -A mnt/skills/d"), "b.md\nk.key\n");
+    let history = every_history_path(&v);
+    for path in &history {
+        assert!(
+            !(path == "secrets.db"
+                || path.ends_with(".key")
+                || path.contains("scratch")
+                || path.contains("gone")
+                || path.starts_with("notes")),
+            "{path} reached history: {history:#?}"
+        );
+    }
+    // They live in the store, the view owner's.
+    let store = tmp_store(&v);
+    assert_eq!(store.len(), 3, "{store:?}");
+    for file in &store {
+        assert_eq!(fs::metadata(file).unwrap().uid(), UID, "{}", file.display());
+    }
+    let meta = fs::metadata(v.state().join("tmp-layer")).unwrap();
+    assert_eq!((meta.uid(), meta.mode() & 0o7777), (UID, 0o700));
+
+    // Wiped at stop.
+    m.stop();
+    assert!(tmp_store(&v).is_empty(), "{:?}", tmp_store(&v));
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_tmp_save_by_rename_as_a_non_root_user() {
+    let (v, overlay) = sandbox_vol("overlay_tmp_save_by_rename_as_a_non_root_user");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let sandbox = v.p("sandbox");
+    let top = v.p("");
+
+    succeeds(
+        &sandbox,
+        Some(20000),
+        "printf new > overlay/config.yaml.tmp && sync overlay/config.yaml.tmp",
+    );
+    // While the tmp file exists, the main mount never lists it.
+    assert_eq!(
+        succeeds(&top, None, "ls -A mnt"),
+        "config.yaml\nnotes\nsecrets.db\nskills\n"
+    );
+    succeeds(
+        &sandbox,
+        Some(20000),
+        "mv overlay/config.yaml.tmp overlay/config.yaml",
+    );
+    // At once, through the main mount; recorded as a rename, as the owner.
+    assert_eq!(succeeds(&top, None, "cat mnt/config.yaml"), "new");
+    assert_eq!(
+        fs::read_to_string(v.backing().join("config.yaml")).unwrap(),
+        "new"
+    );
+    wait_for(&v, &m, "config.yaml", "new");
+    let message = commit_that_set(&v, "config.yaml", "new");
+    assert!(message.contains("Agentfs-Trigger: rename\n"), "{message}");
+    assert!(message.contains("Agentfs-Uid: 10000\n"), "{message}");
+    let history = every_history_path(&v);
+    assert!(history.iter().all(|p| !p.contains(".tmp")), "{history:#?}");
+    assert_eq!(
+        succeeds(&sandbox, None, "ls -A overlay"),
+        "config.yaml\nskills\n"
+    );
+    assert!(tmp_store(&v).is_empty(), "{:?}", tmp_store(&v));
+    assert_eq!(
+        fs::metadata(v.backing().join("config.yaml")).unwrap().uid(),
+        UID
+    );
+    m.stop();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_tmp_editor_patterns() {
+    let (v, overlay) = sandbox_vol("overlay_tmp_editor_patterns");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let sandbox = v.p("sandbox");
+    let top = v.p("");
+    let python = |script: &str| {
+        let out = run_at(&sandbox.join("overlay"), Some(20000), "python3", script);
+        assert!(
+            out.status.success(),
+            "{script}: {}{}",
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+    };
+    succeeds(&sandbox, Some(20000), "printf v2 > overlay/config.yaml");
+    wait_for(&v, &m, "config.yaml", "v2");
+    let before = v.head_id();
+
+    // (i) An exclusive tmp file, synced, renamed over the target with the
+    // descriptor still open, written again, closed.
+    python(
+        "import os\n\
+         fd = os.open('config.yaml.tmp', os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)\n\
+         os.write(fd, b'part1')\n\
+         os.fsync(fd)\n\
+         os.replace('config.yaml.tmp', 'config.yaml')\n\
+         os.write(fd, b'+part2')\n\
+         os.close(fd)\n",
+    );
+    wait_for(&v, &m, "config.yaml", "part1+part2");
+    assert_eq!(succeeds(&top, None, "cat mnt/config.yaml"), "part1+part2");
+
+    // (ii) An exclusive create over a hidden file is the sandbox's own.
+    python(
+        "import os\n\
+         fd = os.open('secrets.db', os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)\n\
+         os.write(fd, b't')\n\
+         os.close(fd)\n",
+    );
+    assert_eq!(succeeds(&top, None, "cat mnt/secrets.db"), "s");
+    assert_eq!(
+        succeeds(&sandbox, Some(20000), "cat overlay/secrets.db"),
+        "t"
+    );
+
+    // (iii) A restore through the daemon leaves tmp files alone, and the
+    // main mount never lists the store.
+    let out = v.ok(&["restore", "config.yaml", &before]);
+    assert!(out.contains("  write config.yaml\n"), "{out}");
+    assert_eq!(succeeds(&top, None, "cat mnt/config.yaml"), "v2");
+    assert_eq!(
+        succeeds(&sandbox, Some(20000), "cat overlay/secrets.db"),
+        "t"
+    );
+    assert_eq!(
+        succeeds(&top, None, "ls -A mnt"),
+        "config.yaml\nnotes\nsecrets.db\nskills\n"
+    );
+    assert!(
+        every_history_path(&v).iter().all(|p| !p.contains(".tmp")),
+        "{:#?}",
+        every_history_path(&v)
+    );
+    m.stop();
 }
 
 #[test]
