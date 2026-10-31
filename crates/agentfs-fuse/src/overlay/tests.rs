@@ -112,8 +112,22 @@ impl FakeOps {
     /// skills/, skills/a.md and skills/d/.
     fn examples() -> Self {
         Self::new()
-            .node(2, ROOT, "config.yaml", FileType::RegularFile, 0o644, OWNER.uid)
-            .node(3, ROOT, "secrets.db", FileType::RegularFile, 0o644, OWNER.uid)
+            .node(
+                2,
+                ROOT,
+                "config.yaml",
+                FileType::RegularFile,
+                0o644,
+                OWNER.uid,
+            )
+            .node(
+                3,
+                ROOT,
+                "secrets.db",
+                FileType::RegularFile,
+                0o644,
+                OWNER.uid,
+            )
             .node(4, ROOT, "notes", FileType::Directory, 0o755, OWNER.uid)
             .node(5, ROOT, "skills", FileType::Directory, 0o755, OWNER.uid)
             .node(6, 5, "a.md", FileType::RegularFile, 0o644, OWNER.uid)
@@ -217,7 +231,13 @@ impl Operations for FakeOps {
         Ok(())
     }
 
-    fn symlink(&self, _parent: u64, name: &[u8], _target: &[u8], caller: Caller) -> OpResult<Entry> {
+    fn symlink(
+        &self,
+        _parent: u64,
+        name: &[u8],
+        _target: &[u8],
+        caller: Caller,
+    ) -> OpResult<Entry> {
         self.record("symlink", name, Some(caller));
         Ok(self.entry(2))
     }
@@ -396,12 +416,7 @@ struct B {
 
 fn fixture_b(fake: FakeOps) -> B {
     let tree = tempfile::tempdir().unwrap();
-    let rules = Rules::new(
-        tree.path(),
-        RuleOptions::default(),
-        EXCLUDE.as_bytes(),
-        b"",
-    );
+    let rules = Rules::new(tree.path(), RuleOptions::default(), EXCLUDE.as_bytes(), b"");
     let gate = Gate::new(Arc::new(rules)).unwrap();
     let fake = Arc::new(fake);
     B {
@@ -434,7 +449,11 @@ fn a5_hidden_names_answer_the_same_whether_or_not_they_exist() {
     let b = fixture_b(FakeOps::examples());
     for name in ["secrets.db", "nothing.db"] {
         let n = name.as_bytes();
-        assert_eq!(b.overlay.lookup(ROOT, n).unwrap_err(), Errno::ENOENT, "{name}");
+        assert_eq!(
+            b.overlay.lookup(ROOT, n).unwrap_err(),
+            Errno::ENOENT,
+            "{name}"
+        );
         assert_eq!(
             b.overlay.unlink(ROOT, n, REQUEST).unwrap_err(),
             Errno::ENOENT,
@@ -468,14 +487,8 @@ fn a5_hidden_names_answer_the_same_whether_or_not_they_exist() {
 #[test]
 fn a_lookup_that_finds_a_hidden_kind_gives_its_lookup_back() {
     // A FIFO at a recordable name: may_show says yes, its kind says no.
-    let b = fixture_b(FakeOps::examples().node(
-        8,
-        5,
-        "fifo",
-        FileType::NamedPipe,
-        0o644,
-        OWNER.uid,
-    ));
+    let b =
+        fixture_b(FakeOps::examples().node(8, 5, "fifo", FileType::NamedPipe, 0o644, OWNER.uid));
     assert_eq!(b.overlay.lookup(5, b"fifo").unwrap_err(), Errno::ENOENT);
     assert_eq!(b.fake.calls_to("forget").len(), 1);
     // A shown one keeps it.
@@ -509,14 +522,8 @@ fn a7_the_view_owner_acts_for_every_caller() {
     }
 
     // A file the owner may only read: no write, whoever asks.
-    let b = fixture_b(FakeOps::examples().node(
-        8,
-        5,
-        "theirs.md",
-        FileType::RegularFile,
-        0o644,
-        OTHER,
-    ));
+    let b =
+        fixture_b(FakeOps::examples().node(8, 5, "theirs.md", FileType::RegularFile, 0o644, OTHER));
     let id = b.overlay.lookup(5, b"theirs.md").unwrap().id;
     let root = Caller {
         uid: 0,
@@ -593,9 +600,7 @@ fn a8_refusals() {
     assert_eq!(b.fake.calls_to("setattr").len(), 1);
 
     assert_eq!(
-        b.overlay
-            .setxattr(2, b"user.x", b"1", 0)
-            .unwrap_err(),
+        b.overlay.setxattr(2, b"user.x", b"1", 0).unwrap_err(),
         Errno::ENOTSUP
     );
     assert_eq!(
@@ -604,9 +609,7 @@ fn a8_refusals() {
     );
 
     assert_eq!(
-        b.overlay
-            .rename(5, b"d", 5, b"e", 0, REQUEST)
-            .unwrap_err(),
+        b.overlay.rename(5, b"d", 5, b"e", 0, REQUEST).unwrap_err(),
         Errno::EXDEV
     );
     assert_eq!(
@@ -665,7 +668,10 @@ fn a9_owner_ids_parse_and_the_daemon_must_be_able_to_act_as_them() {
             euid: 1000
         }
     ));
-    assert!(err.to_string().contains("--sandbox-owner 10000:10000"), "{err}");
+    assert!(
+        err.to_string().contains("--sandbox-owner 10000:10000"),
+        "{err}"
+    );
     let owner = ViewOwner::new(OWNER, &Privileges::default(), OWNER.uid).unwrap();
     assert_eq!((owner.uid(), owner.gid()), (OWNER.uid, OWNER.gid));
     let all = Privileges {
@@ -697,14 +703,8 @@ fn errnos_for_hidden_names_and_placements() {
 
 #[test]
 fn times_follow_utimensat() {
-    let b = fixture_b(FakeOps::examples().node(
-        8,
-        5,
-        "theirs.md",
-        FileType::RegularFile,
-        0o666,
-        OTHER,
-    ));
+    let b =
+        fixture_b(FakeOps::examples().node(8, 5, "theirs.md", FileType::RegularFile, 0o666, OTHER));
     let now = SetAttr {
         atime: Some(TimeOrNow::Now),
         mtime: Some(TimeOrNow::Now),

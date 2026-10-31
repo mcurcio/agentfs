@@ -461,8 +461,12 @@ impl<O: Operations> Operations for Overlay<O> {
 
     fn mkdir(&self, parent: u64, name: &[u8], mode: u32, caller: Caller) -> OpResult<Entry> {
         self.place_new(parent, name, NewKind::Directory)?;
-        self.inner
-            .mkdir(parent, name, plain_mode(mode), self.owner.caller(caller.pid))
+        self.inner.mkdir(
+            parent,
+            name,
+            plain_mode(mode),
+            self.owner.caller(caller.pid),
+        )
     }
 
     fn unlink(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
@@ -473,7 +477,8 @@ impl<O: Operations> Operations for Overlay<O> {
 
     fn rmdir(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
         self.remove(parent, name)?;
-        self.inner.rmdir(parent, name, self.owner.caller(caller.pid))
+        self.inner
+            .rmdir(parent, name, self.owner.caller(caller.pid))
     }
 
     /// Never offered: the gate places no symlink ([`NewKind::Symlink`]).
@@ -644,15 +649,14 @@ impl<O: Operations> Operations for Overlay<O> {
     fn readdir(&self, id: u64, fh: u64, offset: u64) -> OpResult<Vec<(u64, DirEntry)>> {
         let dir = self.shown(id)?;
         let entries = self.inner.readdir(id, fh, offset)?;
+        let shown = |e: &DirEntry| {
+            Self::child(&dir, &e.name).is_some_and(|path| {
+                self.gate.show(&path, existing_kind(e.kind)) == Visibility::Shown
+            })
+        };
         Ok(entries
             .into_iter()
-            .filter(|(_, e)| {
-                e.name == b"." || e.name == b".." || {
-                    Self::child(&dir, &e.name).is_some_and(|path| {
-                        self.gate.show(&path, existing_kind(e.kind)) == Visibility::Shown
-                    })
-                }
-            })
+            .filter(|(_, e)| e.name == b"." || e.name == b".." || shown(e))
             .collect())
     }
 

@@ -200,7 +200,11 @@ mod tests {
         assert!(permits(file(0o640, 1000, 50), member, R));
         assert!(!permits(file(0o640, 1000, 50), member, W));
         // F_OK asks for nothing.
-        assert!(permits(file(0o000, 1000, 50), who(2000, 60), Want::default()));
+        assert!(permits(
+            file(0o000, 1000, 50),
+            who(2000, 60),
+            Want::default()
+        ));
     }
 
     #[test]

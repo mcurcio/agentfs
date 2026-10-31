@@ -3083,7 +3083,11 @@ fn mount_sandbox(v: &Vol, overlay: &Path) -> (Mounted, Unmounts) {
         "--sandbox-owner",
         "10000:10000",
     ]);
-    assert!(is_mounted(overlay), "the overlay is not mounted; log:\n{}", m.log());
+    assert!(
+        is_mounted(overlay),
+        "the overlay is not mounted; log:\n{}",
+        m.log()
+    );
     assert!(
         m.log().contains(&format!(
             "sandbox overlay at {} as 10000:10000",
@@ -3156,7 +3160,10 @@ fn overlay_shows_only_recordable_names() {
     let top = v.p("");
     let sandbox = v.p("sandbox");
 
-    assert_eq!(succeeds(&sandbox, None, "ls -A overlay"), "config.yaml\nskills\n");
+    assert_eq!(
+        succeeds(&sandbox, None, "ls -A overlay"),
+        "config.yaml\nskills\n"
+    );
     assert_eq!(
         succeeds(&top, None, "ls -A mnt"),
         "config.yaml\nnotes\nsecrets.db\nskills\n"
@@ -3171,7 +3178,10 @@ fn overlay_shows_only_recordable_names() {
     const DENIED: &str = "Permission denied";
     fails_with(&sandbox, None, "printf x > overlay/secrets.db", DENIED);
     fails_with(&sandbox, None, "printf x > overlay/new.db", DENIED);
-    assert_eq!(fs::read_to_string(v.backing().join("secrets.db")).unwrap(), "s");
+    assert_eq!(
+        fs::read_to_string(v.backing().join("secrets.db")).unwrap(),
+        "s"
+    );
     assert!(!v.backing().join("new.db").exists());
     m.stop();
     assert!(!is_mounted(&overlay));
@@ -3245,7 +3255,10 @@ fn overlay_refusals() {
     );
     assert_eq!(errno.trim(), "18");
     let out = sh_at(&sandbox, None, "mv overlay/skills/d overlay/skills/e");
-    assert!(!out.status.success(), "mv of a directory with a hidden file succeeded");
+    assert!(
+        !out.status.success(),
+        "mv of a directory with a hidden file succeeded"
+    );
     succeeds(&sandbox, None, "test -f overlay/skills/e/b.md");
     assert!(v.backing().join("skills/d/k.key").is_file());
 

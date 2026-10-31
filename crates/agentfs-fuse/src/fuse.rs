@@ -53,8 +53,8 @@ use fuser::{
 use agentfs_core::service::Stop;
 
 use crate::ops::{Handle, Ops, SetAttr, Xattr};
-use crate::session::Operations;
 use crate::privileges::Privileges;
+use crate::session::Operations;
 
 const ENTRY_TTL: Duration = Duration::from_secs(1);
 const ATTR_TTL: Duration = Duration::ZERO;

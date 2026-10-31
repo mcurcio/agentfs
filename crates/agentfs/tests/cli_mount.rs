@@ -326,18 +326,16 @@ fn the_sandbox_overlay_flags_come_in_pairs() {
     let state = l.p("state");
     let pairs = [
         ("--sandbox-overlay", l.p("overlay"), "--sandbox-owner"),
-        ("--sandbox-owner", PathBuf::from("10000:10000"), "--sandbox-overlay"),
+        (
+            "--sandbox-owner",
+            PathBuf::from("10000:10000"),
+            "--sandbox-overlay",
+        ),
     ];
     for (flag, value, missing) in pairs {
         let out = run(
             &state,
-            &[
-                "mount",
-                s(&l.p("backing")),
-                s(&l.p("mnt")),
-                flag,
-                s(&value),
-            ],
+            &["mount", s(&l.p("backing")), s(&l.p("mnt")), flag, s(&value)],
         );
         assert_eq!(out.status.code(), Some(2), "{flag}: {}", stderr(&out));
         assert!(stderr(&out).contains(missing), "{flag}: {}", stderr(&out));

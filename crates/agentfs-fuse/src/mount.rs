@@ -782,7 +782,9 @@ impl Mount {
                     return Err(MountError::OverlayUnsupported("--on-stale-mount recover"));
                 }
                 if recorder.is_front() {
-                    return Err(MountError::OverlayUnsupported("a front (--history-service)"));
+                    return Err(MountError::OverlayUnsupported(
+                        "a front (--history-service)",
+                    ));
                 }
                 let gate = agentfs_core::visibility::Gate::new(recorder.rules().clone())?;
                 Some((overlay.clone(), gate))
@@ -819,8 +821,8 @@ impl Mount {
             status.clone(),
             failed.clone(),
         );
-        let fuser_config = fuser_config(&config, MountKind::Main);
-        let threads = fuser_config.n_threads.unwrap_or(1);
+        let main_options = fuser_config(&config, MountKind::Main);
+        let threads = main_options.n_threads.unwrap_or(1);
         // Stacked over a stale mount: FUSE goes to a private directory
         // first, since the stale mount point answers ENOTCONN.
         let at = match &config.stack_over {
@@ -835,7 +837,7 @@ impl Mount {
         };
         // Session::new mounts and completes INIT before it returns.
         let session =
-            fuser::spawn_mount(fs, &at, &fuser_config).map_err(|source| MountError::Mount {
+            fuser::spawn_mount(fs, &at, &main_options).map_err(|source| MountError::Mount {
                 path: at.clone(),
                 source,
             })?;
@@ -877,7 +879,12 @@ impl Mount {
         let notifier = session.notifier();
         let ended = Arc::new(Stop::default());
         let main_ended = Arc::new(Stop::default());
-        watch_session(session, "agentfs-session", main_ended.clone(), ended.clone())?;
+        watch_session(
+            session,
+            "agentfs-session",
+            main_ended.clone(),
+            ended.clone(),
+        )?;
         let overlay = match overlay {
             Some((mountpoint, overlay_session)) => {
                 let overlay_ended = Arc::new(Stop::default());
@@ -998,9 +1005,9 @@ impl Mount {
             waits.push(ended.clone());
         }
         let deadline = std::time::Instant::now() + grace;
-        report.session_abandoned = !waits.iter().all(|ended| {
-            ended.wait(deadline.saturating_duration_since(std::time::Instant::now()))
-        });
+        report.session_abandoned = !waits
+            .iter()
+            .all(|ended| ended.wait(deadline.saturating_duration_since(std::time::Instant::now())));
         if let Some(sweeper) = self.sweeper.take() {
             sweeper.stop();
         }
@@ -1648,7 +1655,10 @@ mod tests {
         };
         let main = fuser_config(&config, MountKind::Main);
         let overlay = fuser_config(&config, MountKind::SandboxOverlay);
-        assert!(main.mount_options.contains(&MountOption::DefaultPermissions));
+        assert!(
+            main.mount_options
+                .contains(&MountOption::DefaultPermissions)
+        );
         assert!(
             !overlay
                 .mount_options
