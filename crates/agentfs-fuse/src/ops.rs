@@ -320,6 +320,11 @@ fn check_name(name: &[u8]) -> OpResult<()> {
     Ok(())
 }
 
+/// `__FMODE_EXEC` (`FMODE_EXEC`, 0x20, in `include/linux/fs.h`; reserved
+/// in `include/uapi/asm-generic/fcntl.h`): the kernel sets it in the open
+/// flags of a file it opens to execute, and FUSE passes it on.
+pub(crate) const FMODE_EXEC: i32 = 0o40;
+
 /// A `setattr` time as `utimensat(2)` takes it: omitted, now, or exact.
 pub(crate) fn timespec(t: Option<TimeOrNow>) -> Timespec {
     match t {
@@ -1657,6 +1662,9 @@ impl Ops {
         let mut oflags = OFlags::from_bits_retain(flags as u32)
             & !(OFlags::CREATE | OFlags::EXCL | OFlags::NOCTTY | OFlags::NOATIME);
         oflags.remove(OFlags::PATH);
+        // Not an open flag: `openat2(2)` refuses it (EINVAL), so a file
+        // could never be executed through the mount.
+        oflags.remove(OFlags::from_bits_retain(FMODE_EXEC as u32));
         let acc = flags & 0o3;
         let truncate = oflags.contains(OFlags::TRUNC);
         let write = acc != 0 || truncate;

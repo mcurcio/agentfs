@@ -2233,3 +2233,16 @@ fn move_in_refused_by_the_check_moves_nothing() {
     );
     assert_ne!(fx.id("config.yaml"), node);
 }
+
+/// An open to execute is an open to read: the kernel's `__FMODE_EXEC` is
+/// not an open flag, and `openat2(2)` would refuse it.
+#[test]
+fn an_open_to_execute_opens_the_file() {
+    let fx = Fx::new();
+    fx.put("run.sh", "#!/bin/sh\n");
+    let id = fx.id("run.sh");
+    let (fh, handle) = fx.ops.open(id, O_RDONLY | FMODE_EXEC, C).unwrap();
+    assert!(!handle.write);
+    assert_eq!(fx.ops.read(fh, 0, 64).unwrap(), b"#!/bin/sh\n");
+    fx.ops.release(fh).unwrap();
+}
