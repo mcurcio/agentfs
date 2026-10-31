@@ -1964,34 +1964,6 @@ fn a_member_the_rules_leave_out_refuses_the_whole_group() {
 }
 
 #[test]
-fn may_open_counts_the_callers_supplementary_groups() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("f");
-    fs::write(&path, "x").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
-    let st = rustix::fs::stat(&path).unwrap();
-    let stranger = Caller {
-        uid: st.st_uid + 1,
-        gid: st.st_gid + 1,
-        pid: 1,
-    };
-    assert!(!may_open(&st, stranger, &[], 2, false));
-    assert!(!may_open(&st, stranger, &[st.st_gid + 7], 0, false));
-    assert!(may_open(
-        &st,
-        stranger,
-        &[st.st_gid + 7, st.st_gid],
-        2,
-        true
-    ));
-    let member = Caller {
-        gid: st.st_gid,
-        ..stranger
-    };
-    assert!(may_open(&st, member, &[], 1, false));
-}
-
-#[test]
 fn cached_at_names_every_entry_on_the_way_and_the_known_node() {
     let fx = Fx::new();
     let dir = fx.mkdir("d");

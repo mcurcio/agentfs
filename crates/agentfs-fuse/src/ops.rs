@@ -72,6 +72,7 @@ use agentfs_core::volume::{MoveOutcome, Recorded, Recorder, VolumeError};
 use fuser::{Errno, FileAttr, FileType, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
 
+use crate::access::{self, Object, Want, Who};
 use crate::backing::{self, Backing, attr, join, proc_path};
 use crate::boundary::{Boundary, Change, REPAIR_TRIGGER, State};
 use crate::creds;
@@ -317,26 +318,6 @@ fn check_name(name: &[u8]) -> OpResult<()> {
         return Err(Errno::EINVAL);
     }
     Ok(())
-}
-
-/// Whether `caller` may open the file `st` with access mode `acc`
-/// (`O_RDONLY`, `O_WRONLY`, `O_RDWR`), and `truncate`, by its mode bits;
-/// `groups` are the caller's supplementary groups. Root (uid 0) always may.
-fn may_open(st: &Stat, caller: Caller, groups: &[u32], acc: i32, truncate: bool) -> bool {
-    if caller.uid == 0 {
-        return true;
-    }
-    let mode = mode_of(st);
-    let bits = if st.st_uid == caller.uid {
-        (mode >> 6) & 0o7
-    } else if st.st_gid == caller.gid || groups.contains(&st.st_gid) {
-        (mode >> 3) & 0o7
-    } else {
-        mode & 0o7
-    };
-    let read = acc != 1;
-    let write = acc != 0 || truncate;
-    (!read || bits & 0o4 != 0) && (!write || bits & 0o2 != 0)
 }
 
 fn timespec(t: Option<TimeOrNow>) -> Timespec {
@@ -1752,8 +1733,12 @@ impl Ops {
                 // this file: check that as the kernel would, from the
                 // mode bits and the caller's groups.
                 let groups = creds::caller_groups(caller.pid);
-                let truncate = requested.contains(OFlags::TRUNC);
-                if !may_open(&st, caller, &groups, flags & 0o3, truncate) {
+                let who = Who {
+                    uid: caller.uid,
+                    gid: caller.gid,
+                    groups: &groups,
+                };
+                if !access::permits(Object::from_stat(&st), who, Want::from_open_flags(flags)) {
                     return Err(Errno::EACCES);
                 }
                 let fd =
@@ -2395,6 +2380,180 @@ impl Ops {
     /// How many handles are open (for tests and the shutdown report).
     pub fn open_handles(&self) -> usize {
         self.handles().len()
+    }
+}
+
+/// What the main mount serves: each method is the inherent method of the
+/// same name ([`crate::session`]). `access` always allows: the main mount's
+/// kernel checks modes itself (`default_permissions`), so it never asks.
+impl crate::session::Operations for Ops {
+    fn lookup(&self, parent: u64, name: &[u8]) -> OpResult<Entry> {
+        Ops::lookup(self, parent, name)
+    }
+
+    fn forget(&self, id: u64, n: u64) {
+        Ops::forget(self, id, n);
+    }
+
+    fn getattr(&self, id: u64, fh: Option<u64>) -> OpResult<FileAttr> {
+        Ops::getattr(self, id, fh)
+    }
+
+    fn setattr(&self, id: u64, set: &SetAttr, caller: Caller) -> OpResult<FileAttr> {
+        Ops::setattr(self, id, set, caller)
+    }
+
+    fn readlink(&self, id: u64) -> OpResult<Vec<u8>> {
+        Ops::readlink(self, id)
+    }
+
+    fn access(&self, _id: u64, _mask: i32) -> OpResult<()> {
+        Ok(())
+    }
+
+    fn paths(&self, id: u64) -> Vec<Vec<u8>> {
+        self.table().paths(id)
+    }
+
+    fn mknod(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: u32,
+        rdev: u32,
+        caller: Caller,
+    ) -> OpResult<Entry> {
+        Ops::mknod(self, parent, name, mode, rdev, caller)
+    }
+
+    fn mkdir(&self, parent: u64, name: &[u8], mode: u32, caller: Caller) -> OpResult<Entry> {
+        Ops::mkdir(self, parent, name, mode, caller)
+    }
+
+    fn unlink(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
+        Ops::unlink(self, parent, name, caller)
+    }
+
+    fn rmdir(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
+        Ops::rmdir(self, parent, name, caller)
+    }
+
+    fn symlink(&self, parent: u64, name: &[u8], target: &[u8], caller: Caller) -> OpResult<Entry> {
+        Ops::symlink(self, parent, name, target, caller)
+    }
+
+    fn rename(
+        &self,
+        parent: u64,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+        caller: Caller,
+    ) -> OpResult<()> {
+        Ops::rename(self, parent, name, newparent, newname, flags, caller)
+    }
+
+    fn link(&self, id: u64, newparent: u64, newname: &[u8], caller: Caller) -> OpResult<Entry> {
+        Ops::link(self, id, newparent, newname, caller)
+    }
+
+    fn open(&self, id: u64, flags: i32, caller: Caller) -> OpResult<(u64, Arc<Handle>)> {
+        Ops::open(self, id, flags, caller)
+    }
+
+    fn create(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: u32,
+        flags: i32,
+        caller: Caller,
+    ) -> OpResult<(Entry, u64, Arc<Handle>)> {
+        Ops::create(self, parent, name, mode, flags, caller)
+    }
+
+    fn read(&self, fh: u64, offset: u64, size: u32) -> OpResult<Vec<u8>> {
+        Ops::read(self, fh, offset, size)
+    }
+
+    fn write(&self, fh: u64, offset: u64, data: &[u8], caller: Caller) -> OpResult<u32> {
+        Ops::write(self, fh, offset, data, caller)
+    }
+
+    fn flush(&self, fh: u64, caller: Caller) -> OpResult<()> {
+        Ops::flush(self, fh, caller)
+    }
+
+    fn release(&self, fh: u64) -> OpResult<()> {
+        Ops::release(self, fh)
+    }
+
+    fn fsync(&self, fh: u64, datasync: bool) -> OpResult<()> {
+        Ops::fsync(self, fh, datasync)
+    }
+
+    fn fallocate(
+        &self,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        caller: Caller,
+    ) -> OpResult<()> {
+        Ops::fallocate(self, fh, offset, length, mode, caller)
+    }
+
+    fn lseek(&self, fh: u64, offset: i64, whence: i32) -> OpResult<i64> {
+        Ops::lseek(self, fh, offset, whence)
+    }
+
+    fn copy_file_range(
+        &self,
+        fh_in: u64,
+        offset_in: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        caller: Caller,
+    ) -> OpResult<u32> {
+        Ops::copy_file_range(self, fh_in, offset_in, fh_out, offset_out, len, caller)
+    }
+
+    fn mapping_may_write(&self, id: u64) {
+        Ops::mapping_may_write(self, id);
+    }
+
+    fn opendir(&self, id: u64) -> OpResult<u64> {
+        Ops::opendir(self, id)
+    }
+
+    fn readdir(&self, _id: u64, fh: u64, offset: u64) -> OpResult<Vec<(u64, DirEntry)>> {
+        Ops::readdir(self, fh, offset)
+    }
+
+    fn releasedir(&self, fh: u64) {
+        Ops::releasedir(self, fh);
+    }
+
+    fn statfs(&self) -> OpResult<rustix::fs::StatVfs> {
+        Ops::statfs(self)
+    }
+
+    fn setxattr(&self, id: u64, name: &[u8], value: &[u8], flags: i32) -> OpResult<()> {
+        Ops::setxattr(self, id, name, value, flags)
+    }
+
+    fn getxattr(&self, id: u64, name: &[u8], size: u32) -> OpResult<Xattr> {
+        Ops::getxattr(self, id, name, size)
+    }
+
+    fn listxattr(&self, id: u64, size: u32) -> OpResult<Xattr> {
+        Ops::listxattr(self, id, size)
+    }
+
+    fn removexattr(&self, id: u64, name: &[u8]) -> OpResult<()> {
+        Ops::removexattr(self, id, name)
     }
 }
 

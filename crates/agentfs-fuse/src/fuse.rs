@@ -1,8 +1,8 @@
-//! The kernel adapter: [`fuser::Filesystem`] over [`Ops`] (design §2.1,
-//! §17.1).
+//! The kernel adapter: [`fuser::Filesystem`] over an [`Operations`]
+//! ([`Ops`], or the sandbox overlay in front of it; design §2.1, §17.1).
 //!
-//! Each request is handed to [`Ops`] with its caller, and the result mapped
-//! to the reply. What this layer decides itself:
+//! Each request is handed to the session's [`Operations`] with its caller,
+//! and the result mapped to the reply. What this layer decides itself:
 //!
 //! - **INIT.** It asks for `FUSE_ATOMIC_O_TRUNC` (a shell `>` is one open
 //!   with `O_TRUNC`, recorded once at close) and `FUSE_PARALLEL_DIROPS`.
@@ -53,6 +53,7 @@ use fuser::{
 use agentfs_core::service::Stop;
 
 use crate::ops::{Handle, Ops, SetAttr, Xattr};
+use crate::session::Operations;
 use crate::privileges::Privileges;
 
 const ENTRY_TTL: Duration = Duration::from_secs(1);
@@ -199,9 +200,11 @@ enum Route {
     Fatal,
 }
 
-/// The filesystem fuser runs.
-pub struct FuseFs {
-    ops: Arc<Ops>,
+/// The filesystem fuser runs: one session's kernel requests mapped onto an
+/// [`Operations`] ([`Ops`] for the main mount, [`crate::overlay::Overlay`]
+/// for the sandbox overlay).
+pub struct FuseFs<O: Operations = Ops> {
+    ops: Arc<O>,
     mode: Passthrough,
     status: Arc<Mutex<PassthroughStatus>>,
     /// Set when `--passthrough on` fails after INIT: the mount stops.
@@ -209,9 +212,9 @@ pub struct FuseFs {
     ids: Mutex<BackingIds>,
 }
 
-impl FuseFs {
+impl<O: Operations> FuseFs<O> {
     pub fn new(
-        ops: Arc<Ops>,
+        ops: Arc<O>,
         mode: Passthrough,
         status: Arc<Mutex<PassthroughStatus>>,
         failed: Arc<Stop>,
@@ -357,7 +360,7 @@ fn bytes(name: &OsStr) -> &[u8] {
     name.as_bytes()
 }
 
-impl Filesystem for FuseFs {
+impl<O: Operations> Filesystem for FuseFs<O> {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         let caps = config.capabilities();
         for flag in [
@@ -714,12 +717,12 @@ impl Filesystem for FuseFs {
     fn readdir(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        match self.ops.readdir(fh.0, offset) {
+        match self.ops.readdir(ino.0, fh.0, offset) {
             Ok(entries) => {
                 for (next, entry) in entries {
                     if reply.add(
@@ -815,9 +818,13 @@ impl Filesystem for FuseFs {
         }
     }
 
-    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
-        // Not called with default_permissions; the kernel checks modes.
-        reply.ok();
+    fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        // Called only on a session without default_permissions (the
+        // sandbox overlay's); the main mount's kernel checks modes.
+        match self.ops.access(ino.0, mask.bits()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn fallocate(

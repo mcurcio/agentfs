@@ -286,26 +286,7 @@ impl Vol {
 
     /// Runs a shell command in the mount as `uid` (and gid) if given.
     fn sh_as(&self, uid: Option<u32>, script: &str, must_succeed: bool) -> String {
-        let mut cmd = match uid {
-            None => Command::new("sh"),
-            Some(uid) => {
-                let mut c = Command::new("setpriv");
-                c.args([
-                    format!("--reuid={uid}"),
-                    format!("--regid={uid}"),
-                    "--clear-groups".into(),
-                    "--".into(),
-                    "sh".into(),
-                ]);
-                c
-            }
-        };
-        let out = cmd
-            .arg("-c")
-            .arg(script)
-            .current_dir(self.mnt())
-            .output()
-            .unwrap();
+        let out = sh_at(&self.mnt(), uid, script);
         if must_succeed {
             assert!(
                 out.status.success(),
@@ -3054,4 +3035,221 @@ fn identity_templates_through_mount() {
     );
     front.stop();
     service.stop();
+}
+
+// ---- the sandbox overlay (design §1.1) ----
+
+/// The worked examples' allowlist, plus a skipped pattern.
+const SANDBOX_EXCLUDE: &str = "/*\n!/config.yaml\n!/skills/\n*.key\n";
+
+/// A volume for the sandbox overlay: the allowlist in `info/exclude`, a
+/// backing tree owned by uid 10000 holding recordable and skipped files,
+/// and the overlay's mount point `sandbox/overlay`, in a directory of its
+/// own beside `mnt`.
+fn sandbox_vol(name: &'static str) -> (Vol, PathBuf) {
+    let v = Vol::new(name);
+    let exclude = v.state().join("git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, SANDBOX_EXCLUDE).unwrap();
+    for (path, content) in [
+        ("config.yaml", "v1"),
+        ("skills/a.md", "a"),
+        ("skills/d/b.md", "b"),
+        ("skills/d/k.key", "k"),
+        ("secrets.db", "s"),
+        ("notes/n.txt", "n"),
+    ] {
+        let path = v.backing().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let out = Command::new("chown")
+        .args(["-R", "10000:10000"])
+        .arg(v.backing())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let sandbox = v.p("sandbox");
+    fs::create_dir_all(&sandbox).unwrap();
+    fs::set_permissions(&sandbox, fs::Permissions::from_mode(0o755)).unwrap();
+    (v, sandbox.join("overlay"))
+}
+
+/// Mounts `v` with the sandbox overlay at `overlay`, owned by 10000:10000.
+fn mount_sandbox(v: &Vol, overlay: &Path) -> (Mounted, Unmounts) {
+    let m = v.mount(&[
+        "--sandbox-overlay",
+        overlay.to_str().unwrap(),
+        "--sandbox-owner",
+        "10000:10000",
+    ]);
+    assert!(is_mounted(overlay), "the overlay is not mounted; log:\n{}", m.log());
+    assert!(
+        m.log().contains(&format!(
+            "sandbox overlay at {} as 10000:10000",
+            overlay.display()
+        )),
+        "{}",
+        m.log()
+    );
+    (m, Unmounts(overlay.to_path_buf()))
+}
+
+/// Detaches a mount point a failed test leaves behind.
+struct Unmounts(PathBuf);
+
+impl Drop for Unmounts {
+    fn drop(&mut self) {
+        if is_mounted(&self.0) {
+            let _ = Command::new("umount").arg("-l").arg(&self.0).status();
+        }
+    }
+}
+
+/// Runs `script` with `sh` in `dir`, as `uid` (and gid) if given.
+fn sh_at(dir: &Path, uid: Option<u32>, script: &str) -> Output {
+    let mut cmd = match uid {
+        None => Command::new("sh"),
+        Some(uid) => {
+            let mut c = Command::new("setpriv");
+            c.args([
+                format!("--reuid={uid}"),
+                format!("--regid={uid}"),
+                "--clear-groups".into(),
+                "--".into(),
+                "sh".into(),
+            ]);
+            c
+        }
+    };
+    cmd.arg("-c").arg(script).current_dir(dir).output().unwrap()
+}
+
+/// `script` fails, saying `why`.
+fn fails_with(dir: &Path, uid: Option<u32>, script: &str, why: &str) {
+    let out = sh_at(dir, uid, script);
+    assert!(!out.status.success(), "`{script}` succeeded");
+    assert!(
+        text(&out.stderr).contains(why),
+        "`{script}`: wanted {why:?}, got {}",
+        text(&out.stderr)
+    );
+}
+
+/// `script` succeeds; its stdout.
+fn succeeds(dir: &Path, uid: Option<u32>, script: &str) -> String {
+    let out = sh_at(dir, uid, script);
+    assert!(
+        out.status.success(),
+        "`{script}` failed: {}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    text(&out.stdout)
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_shows_only_recordable_names() {
+    let (v, overlay) = sandbox_vol("overlay_shows_only_recordable_names");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let top = v.p("");
+    let sandbox = v.p("sandbox");
+
+    assert_eq!(succeeds(&sandbox, None, "ls -A overlay"), "config.yaml\nskills\n");
+    assert_eq!(
+        succeeds(&top, None, "ls -A mnt"),
+        "config.yaml\nnotes\nsecrets.db\nskills\n"
+    );
+    assert_eq!(succeeds(&sandbox, None, "ls -A overlay/skills/d"), "b.md\n");
+
+    const NO_SUCH: &str = "No such file or directory";
+    fails_with(&sandbox, None, "cat overlay/secrets.db", NO_SUCH);
+    fails_with(&sandbox, None, "cat overlay/nothing.db", NO_SUCH);
+    fails_with(&sandbox, None, "stat overlay/skills/d/k.key", NO_SUCH);
+
+    const DENIED: &str = "Permission denied";
+    fails_with(&sandbox, None, "printf x > overlay/secrets.db", DENIED);
+    fails_with(&sandbox, None, "printf x > overlay/new.db", DENIED);
+    assert_eq!(fs::read_to_string(v.backing().join("secrets.db")).unwrap(), "s");
+    assert!(!v.backing().join("new.db").exists());
+    m.stop();
+    assert!(!is_mounted(&overlay));
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_edit_is_recorded_and_seen_through_the_main_mount() {
+    let (v, overlay) = sandbox_vol("overlay_edit_is_recorded_and_seen_through_the_main_mount");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let sandbox = v.p("sandbox");
+
+    // Neither root nor the owner: done as the owner.
+    succeeds(&sandbox, Some(20000), "printf v2 > overlay/config.yaml");
+    assert_eq!(succeeds(&v.p(""), None, "cat mnt/config.yaml"), "v2");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let history = loop {
+        let history = v.history();
+        if history.get("config.yaml") == Some(&f("v2")) {
+            break history;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "config.yaml never became v2 in history: {history:#?}\nlog:\n{}",
+            m.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    for path in history.keys() {
+        assert!(
+            !(path == "secrets.db" || path.starts_with("notes/") || path.ends_with(".key")),
+            "{path} reached history: {history:#?}"
+        );
+    }
+    assert_eq!(
+        fs::metadata(v.backing().join("config.yaml")).unwrap().uid(),
+        UID
+    );
+    m.stop();
+}
+
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_refusals() {
+    let (v, overlay) = sandbox_vol("overlay_refusals");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let sandbox = v.p("sandbox");
+
+    const DENIED: &str = "Permission denied";
+    fails_with(&sandbox, None, "ln -s config.yaml overlay/skills/l", DENIED);
+    fails_with(
+        &sandbox,
+        None,
+        "ln overlay/config.yaml overlay/skills/c.yaml",
+        DENIED,
+    );
+    fails_with(&sandbox, None, "mkfifo overlay/skills/f", DENIED);
+    fails_with(
+        &sandbox,
+        None,
+        "chown 0 overlay/config.yaml",
+        "Operation not permitted",
+    );
+
+    // A directory never moves: tools copy what they see and delete it.
+    let errno = succeeds(
+        &sandbox,
+        None,
+        "python3 -c 'import os\ntry:\n    os.rename(\"overlay/skills/d\", \"overlay/skills/e\")\n    print(0)\nexcept OSError as e:\n    print(e.errno)'",
+    );
+    assert_eq!(errno.trim(), "18");
+    let out = sh_at(&sandbox, None, "mv overlay/skills/d overlay/skills/e");
+    assert!(!out.status.success(), "mv of a directory with a hidden file succeeded");
+    succeeds(&sandbox, None, "test -f overlay/skills/e/b.md");
+    assert!(v.backing().join("skills/d/k.key").is_file());
+
+    m.stop();
+    assert!(!is_mounted(&overlay));
+    assert!(!is_mounted(&v.mnt()));
 }

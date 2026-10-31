@@ -94,8 +94,9 @@ use agentfs_core::service::{FinalPush, Service};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
 use agentfs_fuse::{
-    Mount, MountConfig, MountState, Passthrough, StackOver, UnmountReport, agentfs_layers,
-    detach_stale_layers, mount_state, preflight, preflight_stacked,
+    Mount, MountConfig, MountState, OverlayConfig, Passthrough, StackOver, UnmountReport,
+    agentfs_layers, detach_stale_layers, mount_state, preflight, preflight_overlay,
+    preflight_stacked,
 };
 
 /// Most stale layers a stop (or a hold) detaches at the mount point: one
@@ -1294,8 +1295,67 @@ struct MountArgs {
         value_parser = agentfs_fuse::views::parse_workload_mount
     )]
     workload_mounts: Vec<agentfs_core::nested::View>,
+    /// Also serve the sandbox overlay at PATH: a second mount point of the
+    /// volume that shows only the names the operator's rules would record,
+    /// and does every operation as --sandbox-owner. Must not be the mount
+    /// point or nested with it.
+    #[arg(
+        long,
+        env = "AGENTFS_SANDBOX_OVERLAY",
+        value_name = "PATH",
+        requires = "sandbox_owner"
+    )]
+    sandbox_overlay: Option<PathBuf>,
+    /// The sandbox overlay's view owner: the user and group every
+    /// operation through it is checked and done as, whoever the caller is.
+    /// The daemon must be that user or root.
+    #[arg(
+        long,
+        env = "AGENTFS_SANDBOX_OWNER",
+        value_name = "UID:GID",
+        requires = "sandbox_overlay"
+    )]
+    sandbox_owner: Option<agentfs_fuse::overlay::OwnerIds>,
     #[command(flatten)]
     history: HistoryArgs,
+}
+
+/// `--sandbox-overlay` with `--sandbox-owner`: the overlay's mount point,
+/// created if missing and checked as the mount point is and against the
+/// main mount point `mountpoint`, and the view owner, which the daemon
+/// must be able to act as. `None` without the flags.
+fn sandbox_overlay(
+    state: &StateDir,
+    settings: &agentfs_core::config::Settings,
+    mountpoint: &Path,
+    args: &MountArgs,
+) -> Result<Option<OverlayConfig>> {
+    let (Some(at), Some(ids)) = (&args.sandbox_overlay, args.sandbox_owner) else {
+        return Ok(None);
+    };
+    create_mountpoint(at)?;
+    let (_, overlay) = preflight(state, settings, &args.backing, at)?;
+    let overlay = preflight_overlay(mountpoint, &overlay)?;
+    let owner = match agentfs_fuse::overlay::ViewOwner::new(
+        ids,
+        &agentfs_fuse::privileges::Privileges::current(),
+        rustix::process::geteuid().as_raw(),
+    ) {
+        Ok(owner) => owner,
+        Err(e) => bail!("{e}"),
+    };
+    Ok(Some(OverlayConfig {
+        mountpoint: overlay,
+        owner,
+    }))
+}
+
+/// The startup line's note of the sandbox overlay, if served.
+fn describe_overlay(mounted: &Mount, args: &MountArgs) -> String {
+    match (mounted.overlay_mountpoint(), args.sandbox_owner) {
+        (Some(at), Some(owner)) => format!(", sandbox overlay at {} as {owner}", at.display()),
+        _ => String::new(),
+    }
 }
 
 /// Where workloads see the tree before it is mounted (design §5): the mount
@@ -1458,6 +1518,7 @@ fn mount(
         }
         (backing, mountpoint, None)
     };
+    let overlay = sandbox_overlay(state, &settings, &mountpoint, args)?;
     agentfs_core::nested::add_views(workload_views(&mountpoint, args));
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
@@ -1518,6 +1579,7 @@ fn mount(
         }),
         // A finished fork never gets here (`refuse_finished`).
         read_only: false,
+        overlay,
     };
     let mounted = match Mount::start(recorder, config) {
         Ok(mounted) => mounted,
@@ -1570,14 +1632,15 @@ fn mount(
     }
     eprintln!(
         "mounted {} at {} (volume {}, passthrough: {}, threads {}, {} uncommitted record(s) \
-         recovered, remotes: {}); stop with SIGINT or SIGTERM",
+         recovered, remotes: {}{}); stop with SIGINT or SIGTERM",
         backing.display(),
         mountpoint.display(),
         settings.volume,
         mounted.passthrough(),
         mounted.threads(),
         recovery.uncommitted,
-        list(&names)
+        list(&names),
+        describe_overlay(&mounted, args)
     );
 
     let wake = daemon.wait();

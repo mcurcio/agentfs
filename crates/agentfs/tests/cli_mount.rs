@@ -319,3 +319,61 @@ fn seal_mountpoint_needs_root() {
     let mode = std::fs::metadata(l.p("mnt")).unwrap().permissions().mode();
     assert_ne!(mode & 0o777, 0, "the mount point was sealed");
 }
+
+#[test]
+fn the_sandbox_overlay_flags_come_in_pairs() {
+    let l = Layout::new();
+    let state = l.p("state");
+    let pairs = [
+        ("--sandbox-overlay", l.p("overlay"), "--sandbox-owner"),
+        ("--sandbox-owner", PathBuf::from("10000:10000"), "--sandbox-overlay"),
+    ];
+    for (flag, value, missing) in pairs {
+        let out = run(
+            &state,
+            &[
+                "mount",
+                s(&l.p("backing")),
+                s(&l.p("mnt")),
+                flag,
+                s(&value),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2), "{flag}: {}", stderr(&out));
+        assert!(stderr(&out).contains(missing), "{flag}: {}", stderr(&out));
+    }
+    let out = run(
+        &state,
+        &[
+            "mount",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+            "--sandbox-overlay",
+            s(&l.p("overlay")),
+            "--sandbox-owner",
+            "10000",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("UID:GID"), "{}", stderr(&out));
+}
+
+#[test]
+fn the_sandbox_overlay_inside_the_mount_point_is_refused() {
+    let l = Layout::new();
+    let state = l.p("state");
+    l.init(&state);
+    let out = run(
+        &state,
+        &[
+            "mount",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+            "--sandbox-overlay",
+            s(&l.p("mnt/overlay")),
+            "--sandbox-owner",
+            "10000:10000",
+        ],
+    );
+    refused(&out, "one is inside the other");
+}

@@ -42,7 +42,7 @@ pub mod views;
 
 pub use fuse::{Passthrough, PassthroughStatus};
 pub use mount::{
-    Mount, MountConfig, MountError, MountHooks, MountState, MountView, PreflightError, StackOver,
-    StartupRepairs, UnmountReport, agentfs_layers, detach, detach_stale_layers, mount_state,
-    preflight, preflight_stacked,
+    Mount, MountConfig, MountError, MountHooks, MountKind, MountState, MountView, OverlayConfig,
+    PreflightError, StackOver, StartupRepairs, UnmountReport, agentfs_layers, detach,
+    detach_stale_layers, mount_state, preflight, preflight_overlay, preflight_stacked,
 };

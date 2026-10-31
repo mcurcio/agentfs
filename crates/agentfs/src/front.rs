@@ -209,6 +209,9 @@ pub(crate) fn mount_front(
             agentfs_core::volume::refuse_finished(state),
             Err(agentfs_core::volume::VolumeError::ForkFinished { .. })
         ),
+        // Mount::start refuses the overlay on a front (not served there
+        // yet), so the flag is never silently dropped.
+        overlay: crate::sandbox_overlay(state, &settings, &mountpoint, args)?,
     };
     let mounted = Mount::start(front.recorder.clone(), config)?;
     crate::add_mounted_views(&mountpoint);
