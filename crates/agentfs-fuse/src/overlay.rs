@@ -256,6 +256,11 @@ const WRITE_SEARCH: Want = Want {
     exec: true,
 };
 
+/// Counts one change the overlay refused (sandbox overlay slice 4): the
+/// mount wires it to [`agentfs_core::telemetry::Telemetry::overlay_refused`];
+/// tests record.
+pub type RefusalCounter = Arc<dyn Fn(agentfs_core::telemetry::OverlayRefusal) + Send + Sync>;
+
 /// The overlay's [`NameCheck`] (sandbox overlay slice 3): the visibility
 /// gate's answer for a name change the operations are about to make, from
 /// what they found under the names ordering, as the overlay answers it
