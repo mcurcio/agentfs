@@ -161,6 +161,8 @@ through the mount:
                          directory 0700, socket 0600
     stack/mnt            where a mount recovering over a stale one mounts FUSE
                          before stacking it over the mount point (§17.1)
+    stack/overlay        the same for the sandbox overlay's mount point
+                         (`--sandbox-overlay`, §17.1)
     history/history.sock the history service's socket for fronts (§14);
                          directory 0700, socket 0600
     history/address      the address it serves, for `agentfs status`

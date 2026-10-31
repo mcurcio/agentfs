@@ -125,6 +125,11 @@ pub enum MountKind {
 pub struct OverlayConfig {
     pub mountpoint: PathBuf,
     pub owner: ViewOwner,
+    /// Stack the overlay over the stale overlay mount a crashed daemon
+    /// left at its mount point (`--on-stale-mount recover`, design §17.1),
+    /// as [`MountConfig::stack_over`] does for the main mount; `None`
+    /// mounts normally. Its source is not the main mount's.
+    pub stack_over: Option<StackOver>,
 }
 
 /// How a mount is stacked over a stale one: FUSE is mounted at `source`, a
@@ -227,7 +232,8 @@ pub enum PreflightError {
     /// The sandbox overlay's mount point is the main mount point, or one is
     /// inside the other: one mount would hide or reach into the other.
     #[error(
-        "the sandbox overlay's mount point {} and the mount point {} are the same directory          or one is inside the other; give each its own directory",
+        "the sandbox overlay's mount point {} and the mount point {} are the same directory \
+         or one is inside the other; give each its own directory",
         overlay.display(),
         main.display()
     )]
@@ -307,7 +313,13 @@ pub fn preflight(
 /// the state area, the backing tree and the remotes' files. Returns the
 /// canonical overlay mount point.
 pub fn preflight_overlay(main: &Path, overlay: &Path) -> Result<PathBuf, PreflightError> {
-    let overlay = canonical_dir(OVERLAY, overlay)?;
+    // A stale overlay mount (`--on-stale-mount recover`) answers `stat`
+    // with ENOTCONN: it is resolved through its parent.
+    let overlay = if rustix::fs::stat(overlay).err() == Some(rustix::io::Errno::NOTCONN) {
+        canonical_any(overlay)
+    } else {
+        canonical_dir(OVERLAY, overlay)?
+    };
     // The main mount point may be a stale mount (`--on-stale-mount`),
     // which answers `stat` with ENOTCONN.
     let main = canonical_any(main);
@@ -716,6 +728,26 @@ fn raise_nofile() {
     }
 }
 
+/// The sandbox overlay's visibility gate for a volume whose recorder is a
+/// front (`is_front`) with path rules `rules`, when `overlay` is
+/// configured: refused on a front, which does not serve it yet, and on a
+/// volume whose rules read tree rule files ([`MountError::Gate`]).
+fn overlay_gate(
+    overlay: Option<&OverlayConfig>,
+    is_front: bool,
+    rules: &Arc<agentfs_core::rules::Rules>,
+) -> Result<Option<agentfs_core::visibility::Gate>, MountError> {
+    if overlay.is_none() {
+        return Ok(None);
+    }
+    if is_front {
+        return Err(MountError::OverlayUnsupported(
+            "a front (--history-service)",
+        ));
+    }
+    Ok(Some(agentfs_core::visibility::Gate::new(rules.clone())?))
+}
+
 /// The sandbox overlay's session, beside the main one.
 struct OverlaySession {
     mountpoint: PathBuf,
@@ -740,6 +772,38 @@ fn watch_session(
             either.stop();
         })?;
     Ok(())
+}
+
+/// Mounts the sandbox overlay's session `fs` at `overlay`'s mount point,
+/// stacked over its stale mount when [`OverlayConfig::stack_over`] says so
+/// (as [`Mount::start`] stacks the main mount).
+fn spawn_overlay<FS: fuser::Filesystem + Send + 'static>(
+    fs: FS,
+    overlay: &OverlayConfig,
+    options: &fuser::Config,
+) -> Result<fuser::BackgroundSession, MountError> {
+    let stack_error = |source| MountError::Stack {
+        path: overlay.mountpoint.clone(),
+        source,
+    };
+    let at = match &overlay.stack_over {
+        Some(stack) => {
+            prepare_stack_source(&stack.source).map_err(stack_error)?;
+            stack.source.clone()
+        }
+        None => overlay.mountpoint.clone(),
+    };
+    let session = fuser::spawn_mount(fs, &at, options).map_err(|source| MountError::Mount {
+        path: at.clone(),
+        source,
+    })?;
+    if overlay.stack_over.is_some()
+        && let Err(source) = stack(&at, &overlay.mountpoint)
+    {
+        let _ = session.umount_and_join();
+        return Err(stack_error(source));
+    }
+    Ok(session)
 }
 
 /// A mounted volume: the main mount, and the sandbox overlay when
@@ -772,25 +836,16 @@ impl Mount {
     /// main mount is unmounted again and the start fails. Run
     /// [`preflight_overlay`] first.
     pub fn start(recorder: Recorder, config: MountConfig) -> Result<Self, MountError> {
+        // Everything the overlay needs is checked before anything mounts.
+        let gate = overlay_gate(
+            config.overlay.as_ref(),
+            recorder.is_front(),
+            recorder.rules(),
+        )?;
+        let overlay = config.overlay.clone().zip(gate);
         if !Path::new("/dev/fuse").exists() {
             return Err(MountError::NoFuse);
         }
-        // Everything the overlay needs is checked before anything mounts.
-        let overlay = match &config.overlay {
-            Some(overlay) => {
-                if config.stack_over.is_some() {
-                    return Err(MountError::OverlayUnsupported("--on-stale-mount recover"));
-                }
-                if recorder.is_front() {
-                    return Err(MountError::OverlayUnsupported(
-                        "a front (--history-service)",
-                    ));
-                }
-                let gate = agentfs_core::visibility::Gate::new(recorder.rules().clone())?;
-                Some((overlay.clone(), gate))
-            }
-            None => None,
-        };
         if config.passthrough == Passthrough::On
             && let Some(refusal) = Privileges::current().passthrough_refusal()
         {
@@ -853,7 +908,9 @@ impl Mount {
             });
         }
         // The overlay's session: its own passthrough status (each session
-        // negotiates INIT), the shared stop for a failed passthrough.
+        // negotiates INIT), the shared stop for a failed passthrough. If it
+        // cannot be mounted, the main mount is taken down again (its
+        // stacked layer too), so the start leaves nothing mounted.
         let overlay = match overlay {
             Some((overlay, gate)) => {
                 let fs = FuseFs::new(
@@ -863,14 +920,17 @@ impl Mount {
                     failed.clone(),
                 );
                 let overlay_config = fuser_config(&config, MountKind::SandboxOverlay);
-                match fuser::spawn_mount(fs, &overlay.mountpoint, &overlay_config) {
+                match spawn_overlay(fs, &overlay, &overlay_config) {
                     Ok(overlay_session) => Some((overlay.mountpoint, overlay_session)),
-                    Err(source) => {
+                    Err(e) => {
+                        if config.stack_over.is_some() {
+                            let _ = rustix::mount::unmount(
+                                &config.mountpoint,
+                                rustix::mount::UnmountFlags::DETACH,
+                            );
+                        }
                         let _ = session.umount_and_join();
-                        return Err(MountError::Mount {
-                            path: overlay.mountpoint,
-                            source,
-                        });
+                        return Err(e);
                     }
                 }
             }
@@ -1703,5 +1763,50 @@ mod tests {
             preflight_overlay(&main, &l.p("missing")).unwrap_err(),
             PreflightError::Missing { .. }
         ));
+    }
+
+    #[test]
+    fn the_overlay_is_refused_on_a_front_and_with_tree_rules() {
+        use agentfs_core::rules::{RuleOptions, Rules};
+        use agentfs_core::visibility::GateError;
+
+        use crate::overlay::OwnerIds;
+
+        let l = Layout::new();
+        let rules = |respect_tree_rules| {
+            Arc::new(Rules::new(
+                l.p("backing"),
+                RuleOptions {
+                    respect_tree_rules,
+                    ..RuleOptions::default()
+                },
+                b"",
+                b"",
+            ))
+        };
+        let ids = OwnerIds {
+            uid: 10000,
+            gid: 10000,
+        };
+        let overlay = OverlayConfig {
+            mountpoint: l.p("sandbox/overlay"),
+            owner: ViewOwner::new(ids, &Privileges::default(), ids.uid).unwrap(),
+            stack_over: None,
+        };
+        // Without the overlay there is nothing to refuse.
+        assert!(overlay_gate(None, true, &rules(true)).unwrap().is_none());
+        assert!(
+            overlay_gate(Some(&overlay), false, &rules(false))
+                .unwrap()
+                .is_some()
+        );
+        let err = overlay_gate(Some(&overlay), true, &rules(false)).unwrap_err();
+        assert!(matches!(err, MountError::OverlayUnsupported(_)), "{err}");
+        assert!(err.to_string().contains("--history-service"), "{err}");
+        let err = overlay_gate(Some(&overlay), false, &rules(true)).unwrap_err();
+        assert!(
+            matches!(err, MountError::Gate(GateError::TreeRules)),
+            "{err}"
+        );
     }
 }

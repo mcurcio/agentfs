@@ -375,3 +375,29 @@ fn the_sandbox_overlay_inside_the_mount_point_is_refused() {
     );
     refused(&out, "one is inside the other");
 }
+
+#[test]
+fn the_sandbox_overlay_is_not_served_on_a_front() {
+    let l = Layout::new();
+    let state = l.p("state");
+    let out = run(
+        &state,
+        &[
+            "mount",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+            "--sandbox-overlay",
+            s(&l.p("overlay")),
+            "--sandbox-owner",
+            "10000:10000",
+            "--history-service",
+            "unix:/nonexistent.sock",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--history-service"),
+        "{}",
+        stderr(&out)
+    );
+}

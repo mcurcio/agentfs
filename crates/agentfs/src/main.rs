@@ -704,33 +704,45 @@ fn real_main() -> Result<ExitCode> {
         Command::Start { command } => return start_cmd::run(command, &state),
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
-            // A restarted sidecar whose daemon died (design §17.1).
-            let stale = match mount_state(&args.mountpoint) {
-                Ok(MountState::Stale { source }) => Some(source),
-                _ => None,
-            };
-            let mut stacked = false;
-            if let Some(source) = &stale {
+            // A restarted sidecar whose daemon died (design §17.1): the
+            // mount point, the sandbox overlay's, or both, are stale.
+            let stale = stale_source(&args.mountpoint);
+            let overlay_stale = args.sandbox_overlay.as_deref().and_then(stale_source);
+            let held: Vec<(&Path, &str)> = [
+                (args.mountpoint.as_path(), stale.as_deref()),
+                (
+                    args.sandbox_overlay.as_deref().unwrap_or(Path::new("")),
+                    overlay_stale.as_deref(),
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(path, source)| Some((path, source?)))
+            .collect();
+            let (mut stacked, mut overlay_stacked) = (false, false);
+            if !held.is_empty() {
                 match args.on_stale_mount {
                     // Mount nothing and take no lock.
-                    OnStaleMount::Hold => return Ok(hold::hold(daemon, &args.mountpoint, source)),
+                    OnStaleMount::Hold => return Ok(hold::hold(daemon, &held)),
                     OnStaleMount::Recover => {
                         if let Some(refusal) = recover_refusal(&args) {
-                            eprintln!(
-                                "error: --on-stale-mount recover: {refusal}; {} is a stale \
-                                 agentfs mount ({source}) and is left as it is",
-                                args.mountpoint.display()
-                            );
-                            eprintln!(
-                                "hint: use --on-stale-mount hold (and restart the pod), or \
-                                 detach it: umount -l {}",
-                                args.mountpoint.display()
-                            );
+                            for (path, source) in &held {
+                                eprintln!(
+                                    "error: --on-stale-mount recover: {refusal}; {} is a stale \
+                                     agentfs mount ({source}) and is left as it is",
+                                    path.display()
+                                );
+                                eprintln!(
+                                    "hint: use --on-stale-mount hold (and restart the pod), or \
+                                     detach it: umount -l {}",
+                                    path.display()
+                                );
+                            }
                             return Ok(ExitCode::FAILURE);
                         }
-                        stacked = true;
+                        stacked = stale.is_some();
+                        overlay_stacked = overlay_stale.is_some();
                     }
-                    // preflight reports it, with the command that clears it.
+                    // preflight reports each, with the command that clears it.
                     OnStaleMount::Refuse => {}
                 }
             }
@@ -744,10 +756,33 @@ fn real_main() -> Result<ExitCode> {
             refuse_finished(&state)?;
             // The dead daemon's lock went with it.
             let _lock = StateLock::acquire(&state, "mount", cli.wait_lock)?;
-            return mount(daemon, &state, cli.root.as_deref(), &args, stacked);
+            return mount(
+                daemon,
+                &state,
+                cli.root.as_deref(),
+                &args,
+                stacked,
+                overlay_stacked,
+            );
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Detaches the stale layers earlier crashes left at `at`, under a mount
+/// stacked over them; whether any was there (or could not be checked).
+fn detach_layers_left(at: &Path) -> bool {
+    match detach_stale_layers(at, STALE_LAYERS) {
+        Ok(0) => false,
+        Ok(n) => {
+            eprintln!("detached {n} stale layer(s) at {}", at.display());
+            true
+        }
+        Err(e) => {
+            eprintln!("could not detach the stale layers at {}: {e}", at.display());
+            true
+        }
+    }
 }
 
 /// A finished fork is read-only (design §11.5): `mount`, `run`, `record`,
@@ -1277,10 +1312,11 @@ struct MountArgs {
         value_enum
     )]
     on_stale_mount: OnStaleMount,
-    /// Seal the bare mount point before mounting: owned by root, mode 0000,
-    /// so a non-root workload that reaches it while no daemon is mounted
-    /// (a `subPath` bound while the sidecar restarts) gets EACCES instead
-    /// of writing where nothing records it. Needs root (design §17.1).
+    /// Seal the bare mount point, and the sandbox overlay's, before
+    /// mounting: owned by root, mode 0000, so a non-root workload that
+    /// reaches it while no daemon is mounted (a `subPath` bound while the
+    /// sidecar restarts) gets EACCES instead of writing where nothing
+    /// records it. Needs root (design §17.1).
     #[arg(long, env = "AGENTFS_SEAL_MOUNTPOINT")]
     seal_mountpoint: bool,
     /// Where a workload sees the mount when not at MOUNTPOINT (a container's
@@ -1303,7 +1339,8 @@ struct MountArgs {
         long,
         env = "AGENTFS_SANDBOX_OVERLAY",
         value_name = "PATH",
-        requires = "sandbox_owner"
+        requires = "sandbox_owner",
+        conflicts_with = "history_service"
     )]
     sandbox_overlay: Option<PathBuf>,
     /// The sandbox overlay's view owner: the user and group every
@@ -1324,17 +1361,49 @@ struct MountArgs {
 /// created if missing and checked as the mount point is and against the
 /// main mount point `mountpoint`, and the view owner, which the daemon
 /// must be able to act as. `None` without the flags.
+///
+/// With `stacked` the overlay is stacked over the stale overlay mount a
+/// crashed daemon left (`--on-stale-mount recover`); otherwise a stale one
+/// is refused, and the bare mount point is checked for files and sealed
+/// (`--seal-mountpoint`) as the main mount point is.
 fn sandbox_overlay(
     state: &StateDir,
     settings: &agentfs_core::config::Settings,
     mountpoint: &Path,
     args: &MountArgs,
+    stacked: bool,
 ) -> Result<Option<OverlayConfig>> {
     let (Some(at), Some(ids)) = (&args.sandbox_overlay, args.sandbox_owner) else {
         return Ok(None);
     };
-    create_mountpoint(at)?;
-    let (_, overlay) = preflight(state, settings, &args.backing, at)?;
+    let overlay = if stacked {
+        preflight_stacked(state, settings, &args.backing, at)?.1
+    } else {
+        create_mountpoint(at)?;
+        if let Err(e) = rustix::fs::stat(at)
+            && e == rustix::io::Errno::NOTCONN
+        {
+            bail!(
+                "the sandbox overlay's mount point {p} is a stale FUSE mount (transport endpoint \
+                 is not connected), probably left by a daemon that died; start with \
+                 --on-stale-mount recover or hold, or unmount it first: umount -l {p}",
+                p = at.display()
+            );
+        }
+        let (_, overlay) = preflight(state, settings, &args.backing, at)?;
+        if std::fs::read_dir(&overlay).is_ok_and(|mut d| d.next().is_some()) {
+            eprintln!(
+                "warning: the sandbox overlay's mount point {} is not empty: the files in it \
+                 are hidden by the mount and not recorded (a sandbox wrote there while no \
+                 daemon was mounted?)",
+                overlay.display()
+            );
+        }
+        if args.seal_mountpoint {
+            seal_mountpoint(&overlay)?;
+        }
+        overlay
+    };
     let overlay = preflight_overlay(mountpoint, &overlay)?;
     let owner = match agentfs_fuse::overlay::ViewOwner::new(
         ids,
@@ -1347,6 +1416,9 @@ fn sandbox_overlay(
     Ok(Some(OverlayConfig {
         mountpoint: overlay,
         owner,
+        stack_over: stacked.then(|| StackOver {
+            source: state.overlay_stack_source(),
+        }),
     }))
 }
 
@@ -1375,6 +1447,14 @@ fn add_mounted_views(mountpoint: &Path) {
     match agentfs_fuse::views::mounted_views(mountpoint) {
         Ok(views) => agentfs_core::nested::add_views(views),
         Err(e) => eprintln!("warning: reading the mount's bind mounts: {e}"),
+    }
+}
+
+/// The source of the stale agentfs mount at `path`, if it is one.
+fn stale_source(path: &Path) -> Option<String> {
+    match mount_state(path) {
+        Ok(MountState::Stale { source }) => Some(source),
+        _ => None,
     }
 }
 
@@ -1472,13 +1552,16 @@ fn seal_mountpoint(mountpoint: &Path) -> Result<()> {
 }
 
 /// `agentfs mount`: the FUSE filesystem, the commit loop and the push loops
-/// in one process, until SIGINT, SIGTERM or an unmount.
+/// in one process, until SIGINT, SIGTERM or an unmount. `stacked` and
+/// `overlay_stacked` stack the mount and the sandbox overlay over the stale
+/// mounts a crashed daemon left (`--on-stale-mount recover`).
 fn mount(
     daemon: Daemon,
     state: &StateDir,
     root: Option<&Path>,
     args: &MountArgs,
     stacked: bool,
+    overlay_stacked: bool,
 ) -> Result<ExitCode> {
     if let Some(root) = root {
         let same = match (root.canonicalize(), args.backing.canonicalize()) {
@@ -1518,7 +1601,13 @@ fn mount(
         }
         (backing, mountpoint, None)
     };
-    let overlay = sandbox_overlay(state, &settings, &mountpoint, args)?;
+    let overlay_layers = match &args.sandbox_overlay {
+        Some(at) if overlay_stacked => Some(agentfs_layers(at).unwrap_or(1)),
+        _ => None,
+    };
+    let overlay = sandbox_overlay(state, &settings, &mountpoint, args, overlay_stacked)?;
+    // A stale layer below either mount may still be held by a workload.
+    let any_stacked = stacked || overlay_stacked;
     agentfs_core::nested::add_views(workload_views(&mountpoint, args));
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
@@ -1529,7 +1618,7 @@ fn mount(
     // waits. A blocked queue is an alarm; the volume mounts anyway, and so
     // it does when the queue cannot run at all.
     let scope = PodScope::of(&args.pod.pod_uid, &mountpoint);
-    let deferred = if stacked {
+    let deferred = if any_stacked {
         Some(Deferred::StaleMount)
     } else {
         let judgement = attached::judge(state, scope.as_ref());
@@ -1587,7 +1676,7 @@ fn mount(
             // Commits what recovery found; nothing was mounted, so nothing
             // attached: the mark goes unless a stale mount is below.
             let _ = service.shutdown(args.push_grace);
-            if !stacked {
+            if !any_stacked {
                 clear_attached(state);
             }
             session.finish();
@@ -1630,6 +1719,13 @@ fn mount(
             mountpoint.display()
         );
     }
+    if let (Some(layers), Some(at)) = (overlay_layers, mounted.overlay_mountpoint()) {
+        eprintln!(
+            "stacked the sandbox overlay over a stale mount left by a crashed daemon at {} \
+             ({layers} stale layer(s) below): the sandboxes' copies of it now reach this daemon",
+            at.display()
+        );
+    }
     eprintln!(
         "mounted {} at {} (volume {}, passthrough: {}, threads {}, {} uncommitted record(s) \
          recovered, remotes: {}{}); stop with SIGINT or SIGTERM",
@@ -1663,23 +1759,15 @@ fn mount(
     {
         eprintln!("a restore was still running at shutdown; it stops with the unmount");
     }
+    let overlay_at = mounted.overlay_mountpoint().map(Path::to_path_buf);
     let report = mounted.shutdown(args.unmount_grace);
     print_unmount(&report, args.unmount_grace);
-    // The layers earlier crashes left under a stacked mount.
-    let stale_left = match detach_stale_layers(&mountpoint, STALE_LAYERS) {
-        Ok(0) => false,
-        Ok(n) => {
-            eprintln!("detached {n} stale layer(s) at {}", mountpoint.display());
-            true
-        }
-        Err(e) => {
-            eprintln!(
-                "could not detach the stale layers at {}: {e}",
-                mountpoint.display()
-            );
-            true
-        }
-    };
+    // The layers earlier crashes left under a stacked mount (the overlay's
+    // too).
+    let mut stale_left = false;
+    for at in std::iter::once(&mountpoint).chain(overlay_at.as_ref()) {
+        stale_left |= detach_layers_left(at);
+    }
     // Nothing attached: the unmount was not busy, no file stayed open and
     // no stale layer (which a workload may still hold) was below. Else the
     // mark stays, and the next mount holds the patch queue (design §12).

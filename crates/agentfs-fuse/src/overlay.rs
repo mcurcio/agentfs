@@ -18,11 +18,11 @@
 //! | `getattr`, `readlink`, `getxattr`, `listxattr`, `access` | node not shown: `ENOENT`; through an open handle: passed on. `access` checks the mask as the owner (`EACCES`) |
 //! | `opendir` / `readdir` | not shown: `ENOENT`; owner may not read: `EACCES`; entries not shown for their kind are left out (rules errors too); `.` and `..` stay |
 //! | `open` | not shown: `ENOENT`; owner lacks the access the flags ask: `EACCES` |
-//! | `create`, `mknod` of a regular file | parent shown, owner may write and search it; `place_new(File)`: tree: passed on; tmp layer: `EACCES` until the tmp layer is built (slice 3); refused: `EACCES` (`EIO` on a rules error). Decided before the operations run, so a hidden name never answers `EEXIST`. An existing file opened without `O_EXCL` needs the owner's access to it |
+//! | `create`, `mknod` of a regular file | parent shown, owner may write and search it; `place_new(File)`: tree: passed on; tmp layer: `EACCES` until the tmp layer is built (slice 3); refused: `EACCES` (`EIO` on a rules error). A placed name that holds an entry hidden for its kind (a special file, a skipped file under a name placeable as a directory, a nested repository) is refused the same way, so the operations never touch a hidden entry and it never answers `EEXIST`. An existing file opened without `O_EXCL` needs the owner's access to it |
 //! | `mkdir` | as `create`, with `place_new(Directory)` |
 //! | `symlink`, `link`, `mknod` of anything else | `EACCES`, whatever exists |
 //! | `unlink`, `rmdir` | name hidden for the kind found: `ENOENT`; owner may not write and search the parent, or the sticky rule refuses: `EACCES` |
-//! | `rename` | `RENAME_WHITEOUT`: `EINVAL`; source hidden: `ENOENT`; `place_move`: cross-device: `EXDEV`; refused: `EACCES` (`EIO`); tree: passed on, after the owner's checks on both parents. `RENAME_EXCHANGE` needs both ends to place in the tree |
+//! | `rename` | `RENAME_WHITEOUT`: `EINVAL`; source hidden: `ENOENT`; `place_move`: cross-device: `EXDEV`; refused: `EACCES` (`EIO`); an existing target hidden for its kind: `EACCES` (`EIO`), never replaced; tree: passed on, after the owner's checks on both parents. `RENAME_EXCHANGE` needs both ends to place in the tree |
 //! | `setattr` | not shown: `ENOENT`; a uid or gid: `EPERM`; a mode with set-id or sticky bits, or a mode change by an owner who does not own the object: `EPERM`; a size without a handle the owner may not write: `EACCES`; times as for `utimensat(2)` |
 //! | `setxattr`, `removexattr` | `ENOTSUP` |
 //! | `read`, `write`, `flush`, `release`, `fsync`, `fallocate`, `lseek`, `copy_file_range`, `releasedir`, `statfs`, `forget`, `mapping_may_write`, `paths` | passed on: handles were gated when opened |
@@ -331,15 +331,42 @@ impl<O: Operations> Overlay<O> {
         Ok(entry)
     }
 
+    /// The existing entry `name` in `parent`, if there is one ([`Self::peek`]).
+    fn existing(&self, parent: u64, name: &[u8]) -> OpResult<Option<Entry>> {
+        match self.peek(parent, name) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(e) if e == Errno::ENOENT => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `EACCES` (`EIO` on a rules error) when `entry`, at a name the gate
+    /// places in the tree, is hidden for its kind: it is answered as a
+    /// refused name, so the operations never create over, open or replace
+    /// what the overlay does not show.
+    fn refuse_hidden(&self, path: &RepoPath, entry: &Entry) -> OpResult<()> {
+        match self.gate.show(path, existing_kind(entry.attr.kind)) {
+            Visibility::Shown => Ok(()),
+            Visibility::Hidden(Hidden::NotRecordable) => Err(Errno::EACCES),
+            Visibility::Hidden(Hidden::RulesError) => Err(Errno::EIO),
+        }
+    }
+
     /// `name` in shown directory `parent` for a new object of kind `kind`:
-    /// the owner may write and search the directory and the gate places
-    /// the name in the tree. Decided before the operations are asked
-    /// anything about the name.
-    fn place_new(&self, parent: u64, name: &[u8], kind: NewKind) -> OpResult<()> {
+    /// the owner may write and search the directory, the gate places the
+    /// name in the tree (decided before the operations are asked anything
+    /// about the name), and an entry already there is shown for its kind.
+    /// Returns that entry, if any.
+    fn place_new(&self, parent: u64, name: &[u8], kind: NewKind) -> OpResult<Option<Entry>> {
         let dir = self.shown(parent)?;
         self.require(&dir.attr, WRITE_SEARCH)?;
         let path = Self::child(&dir, name).ok_or(Errno::EACCES)?;
-        admit(self.gate.place_new(&path, kind))
+        admit(self.gate.place_new(&path, kind))?;
+        let existing = self.existing(parent, name)?;
+        if let Some(entry) = &existing {
+            self.refuse_hidden(&path, entry)?;
+        }
+        Ok(existing)
     }
 
     /// `unlink` and `rmdir`.
@@ -525,7 +552,12 @@ impl<O: Operations> Operations for Overlay<O> {
             )?;
             Some(dst)
         } else {
-            self.peek(newparent, newname).ok()
+            // A target hidden for its kind is never replaced.
+            let dst = self.existing(newparent, newname)?;
+            if let Some(dst) = &dst {
+                self.refuse_hidden(&to, dst)?;
+            }
+            dst
         };
         self.require_unlink(&from_dir.attr, &src.attr)?;
         match &dst {
@@ -562,11 +594,11 @@ impl<O: Operations> Operations for Overlay<O> {
         flags: i32,
         caller: Caller,
     ) -> OpResult<(Entry, u64, Arc<Handle>)> {
-        self.place_new(parent, name, NewKind::File)?;
+        let existing = self.place_new(parent, name, NewKind::File)?;
         // Without O_EXCL an existing file is opened: the owner needs the
         // access the flags ask of it.
         if flags & O_EXCL == 0
-            && let Ok(existing) = self.peek(parent, name)
+            && let Some(existing) = existing
             && existing.attr.kind == FileType::RegularFile
         {
             self.require(&existing.attr, Want::from_open_flags(flags))?;

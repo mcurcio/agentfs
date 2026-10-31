@@ -11,6 +11,7 @@ use std::time::UNIX_EPOCH;
 
 use agentfs_core::events::MemorySink;
 use agentfs_core::identity::Context;
+use agentfs_core::record::Trigger;
 use agentfs_core::rules::{RuleOptions, Rules};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, StateDir};
@@ -415,8 +416,22 @@ struct B {
 }
 
 fn fixture_b(fake: FakeOps) -> B {
+    fixture_b_with(fake, "", &[])
+}
+
+/// Fixture B with `attributes` in `info/attributes` and the directories
+/// `dirs` in the tree (for nested-repository probes).
+fn fixture_b_with(fake: FakeOps, attributes: &str, dirs: &[&str]) -> B {
     let tree = tempfile::tempdir().unwrap();
-    let rules = Rules::new(tree.path(), RuleOptions::default(), EXCLUDE.as_bytes(), b"");
+    for d in dirs {
+        std::fs::create_dir_all(tree.path().join(d)).unwrap();
+    }
+    let rules = Rules::new(
+        tree.path(),
+        RuleOptions::default(),
+        EXCLUDE.as_bytes(),
+        attributes.as_bytes(),
+    );
     let gate = Gate::new(Arc::new(rules)).unwrap();
     let fake = Arc::new(fake);
     B {
@@ -482,6 +497,325 @@ fn a5_hidden_names_answer_the_same_whether_or_not_they_exist() {
         asked.is_empty(),
         "the operations were asked about a hidden name: {asked:?}"
     );
+}
+
+/// The examples, plus entries the gate hides for their kind at names it
+/// places: a FIFO at a recordable name (`skills/pipe`), a file the
+/// attributes never record at a name placeable as a directory
+/// (`skills/x.sec`, under `/skills/*.sec -agentfs`) and a nested
+/// repository at a file-recordable name (`skills/repo`).
+fn hidden_kinds() -> B {
+    fixture_b_with(
+        FakeOps::examples()
+            .node(8, 5, "pipe", FileType::NamedPipe, 0o666, OWNER.uid)
+            .node(9, 5, "x.sec", FileType::RegularFile, 0o666, OWNER.uid)
+            .node(10, 5, "repo", FileType::Directory, 0o777, OWNER.uid),
+        "/skills/*.sec -agentfs\n",
+        &["skills/repo/.git"],
+    )
+}
+
+#[test]
+fn a5_hidden_entries_at_placeable_names_are_refused_and_never_touched() {
+    let b = hidden_kinds();
+    let s_ifreg = 0o100000;
+    // Each answers as a refused name: never EEXIST, EISDIR or a replace.
+    for name in ["pipe", "x.sec", "repo"] {
+        let n = name.as_bytes();
+        assert_eq!(
+            b.overlay.mkdir(5, n, 0o755, REQUEST).unwrap_err(),
+            Errno::EACCES,
+            "mkdir {name}"
+        );
+        assert_eq!(
+            b.overlay.rename(5, b"a.md", 5, n, 0, REQUEST).unwrap_err(),
+            Errno::EACCES,
+            "rename onto {name}"
+        );
+    }
+    for name in ["pipe", "repo"] {
+        let n = name.as_bytes();
+        assert_eq!(
+            b.overlay
+                .create(5, n, 0o644, O_WRONLY, REQUEST)
+                .unwrap_err(),
+            Errno::EACCES,
+            "create {name}"
+        );
+        assert_eq!(
+            b.overlay
+                .mknod(5, n, s_ifreg | 0o644, 0, REQUEST)
+                .unwrap_err(),
+            Errno::EACCES,
+            "mknod {name}"
+        );
+    }
+    for method in ["mkdir", "rename", "create", "mknod"] {
+        assert!(b.fake.calls_to(method).is_empty(), "{method}");
+    }
+    // The same names with nothing behind them go on.
+    let b = fixture_b_with(
+        FakeOps::examples(),
+        "/skills/*.sec -agentfs\n",
+        &["skills/repo/.git"],
+    );
+    b.overlay.mkdir(5, b"y.sec", 0o755, REQUEST).unwrap();
+    b.overlay
+        .rename(5, b"a.md", 5, b"pipe", 0, REQUEST)
+        .unwrap();
+    b.overlay
+        .create(5, b"pipe", 0o644, O_WRONLY, REQUEST)
+        .unwrap();
+    b.overlay
+        .mknod(5, b"pipe2", s_ifreg | 0o644, 0, REQUEST)
+        .unwrap();
+}
+
+#[test]
+fn rename_exchange_needs_both_ends_shown_in_the_tree() {
+    let b = hidden_kinds();
+    let exchange = RenameFlags::EXCHANGE.bits();
+    // A hidden kind at the other end: refused, so it never moves.
+    assert_ne!(
+        b.overlay.rename(5, b"a.md", 5, b"pipe", exchange, REQUEST),
+        Ok(())
+    );
+    // A directory at the other end never moves.
+    assert_eq!(
+        b.overlay
+            .rename(ROOT, b"config.yaml", 5, b"d", exchange, REQUEST)
+            .unwrap_err(),
+        Errno::EXDEV
+    );
+    // Nothing to exchange with.
+    assert_eq!(
+        b.overlay
+            .rename(5, b"a.md", 5, b"b.md", exchange, REQUEST)
+            .unwrap_err(),
+        Errno::ENOENT
+    );
+    assert!(b.fake.calls_to("rename").is_empty());
+    b.overlay
+        .rename(5, b"a.md", ROOT, b"config.yaml", exchange, REQUEST)
+        .unwrap();
+    assert_eq!(b.fake.calls_to("rename").len(), 1);
+}
+
+#[test]
+fn rename_onto_an_entry_follows_the_sticky_rule() {
+    // A sticky directory of another user's, holding their file.
+    let b = fixture_b(
+        FakeOps::examples()
+            .node(8, 5, "shared", FileType::Directory, 0o1777, OTHER)
+            .node(9, 8, "theirs.md", FileType::RegularFile, 0o666, OTHER),
+    );
+    assert_eq!(
+        b.overlay
+            .rename(5, b"a.md", 8, b"theirs.md", 0, REQUEST)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(
+        b.overlay.unlink(8, b"theirs.md", REQUEST).unwrap_err(),
+        Errno::EACCES
+    );
+    assert!(b.fake.calls_to("rename").is_empty());
+    assert!(b.fake.calls_to("unlink").is_empty());
+    // A new name there is the owner's to add.
+    b.overlay
+        .rename(5, b"a.md", 8, b"mine.md", 0, REQUEST)
+        .unwrap();
+    assert_eq!(b.fake.calls_to("rename").len(), 1);
+}
+
+#[test]
+fn create_checks_an_existing_file_only_when_it_opens_it() {
+    let b = fixture_b(
+        FakeOps::examples()
+            .node(8, 5, "theirs.md", FileType::RegularFile, 0o644, OTHER)
+            .node(9, 5, "dir", FileType::Directory, 0o755, OTHER),
+    );
+    // O_EXCL opens nothing: the operations answer for the existing file.
+    b.overlay
+        .create(5, b"theirs.md", 0o644, O_WRONLY | O_EXCL, REQUEST)
+        .unwrap();
+    // A directory is not opened as a file: the operations answer.
+    b.overlay
+        .create(5, b"dir", 0o644, O_WRONLY, REQUEST)
+        .unwrap();
+    assert_eq!(b.fake.calls_to("create").len(), 2);
+}
+
+#[test]
+fn setattr_through_the_overlay() {
+    let b =
+        fixture_b(FakeOps::examples().node(8, 5, "theirs.md", FileType::RegularFile, 0o644, OTHER));
+    let chgrp = SetAttr {
+        gid: Some(0),
+        ..SetAttr::default()
+    };
+    assert_eq!(
+        b.overlay.setattr(2, &chgrp, REQUEST).unwrap_err(),
+        Errno::EPERM
+    );
+    // A size without a handle needs the owner's write access.
+    let truncate = SetAttr {
+        size: Some(0),
+        ..SetAttr::default()
+    };
+    assert_eq!(
+        b.overlay.setattr(8, &truncate, REQUEST).unwrap_err(),
+        Errno::EACCES
+    );
+    assert!(b.fake.calls_to("setattr").is_empty());
+    b.overlay.setattr(6, &truncate, REQUEST).unwrap();
+    assert_eq!(b.fake.calls_to("setattr").len(), 1);
+    // Through a handle, gated when it was opened: a hidden node too, and
+    // no write check (ftruncate on a descriptor opened to write).
+    let through = SetAttr {
+        size: Some(0),
+        fh: Some(1),
+        ..SetAttr::default()
+    };
+    assert_eq!(b.overlay.getattr(3, None).unwrap_err(), Errno::ENOENT);
+    b.overlay.setattr(3, &through, REQUEST).unwrap();
+    b.overlay.setattr(8, &through, REQUEST).unwrap();
+    assert_eq!(b.fake.calls_to("setattr").len(), 3);
+}
+
+#[test]
+fn mknod_of_a_regular_file_is_a_create_as_the_owner() {
+    let b = fixture_b(FakeOps::examples());
+    let s_ifreg = 0o100000;
+    b.overlay
+        .mknod(5, b"new.md", s_ifreg | 0o4644, 0, REQUEST)
+        .unwrap();
+    // A type of 0 is a regular file too.
+    b.overlay.mknod(5, b"new2.md", 0o644, 0, REQUEST).unwrap();
+    let calls = b.fake.calls_to("mknod");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].caller, Some(owner().caller(REQUEST.pid)));
+    // A skipped name would go to the tmp layer, not built yet.
+    assert_eq!(
+        b.overlay
+            .mknod(ROOT, b"notes.txt", s_ifreg | 0o644, 0, REQUEST)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(b.fake.calls_to("mknod").len(), 2);
+}
+
+#[test]
+fn rmdir_through_the_overlay() {
+    let b = fixture_b(FakeOps::examples());
+    assert_eq!(
+        b.overlay.rmdir(ROOT, b"notes", REQUEST).unwrap_err(),
+        Errno::ENOENT
+    );
+    assert_eq!(
+        b.overlay.rmdir(ROOT, b"nothing", REQUEST).unwrap_err(),
+        Errno::ENOENT
+    );
+    assert!(b.fake.calls_to("rmdir").is_empty());
+    b.overlay.rmdir(5, b"d", REQUEST).unwrap();
+    assert_eq!(
+        b.fake.calls_to("rmdir")[0].caller,
+        Some(owner().caller(REQUEST.pid))
+    );
+}
+
+#[test]
+fn lookup_needs_the_owner_to_search_the_parent() {
+    let b = fixture_b(
+        FakeOps::examples()
+            .node(8, 5, "private", FileType::Directory, 0o700, OTHER)
+            .node(9, 8, "x.md", FileType::RegularFile, 0o644, OTHER),
+    );
+    assert_eq!(b.overlay.lookup(8, b"x.md").unwrap_err(), Errno::EACCES);
+    assert!(b.fake.calls_to("lookup").is_empty());
+}
+
+#[test]
+fn names_that_are_not_utf8_are_hidden() {
+    let b = fixture_b(FakeOps::examples());
+    let bad: &[u8] = b"x\xff.md";
+    assert_eq!(b.overlay.lookup(5, bad).unwrap_err(), Errno::ENOENT);
+    assert_eq!(
+        b.overlay
+            .create(5, bad, 0o644, O_WRONLY, REQUEST)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(
+        b.overlay
+            .rename(5, bad, 5, b"b.md", 0, REQUEST)
+            .unwrap_err(),
+        Errno::ENOENT
+    );
+    assert_eq!(
+        b.overlay
+            .rename(5, b"a.md", 5, bad, 0, REQUEST)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    assert!(b.fake.calls_to("lookup").is_empty());
+    assert!(b.fake.calls_to("create").is_empty());
+    assert!(b.fake.calls_to("rename").is_empty());
+    // A node whose only path is not UTF-8 is hidden too.
+    let b = fixture_b(FakeOps::examples().node(
+        8,
+        5,
+        "y\u{fffd}.md",
+        FileType::RegularFile,
+        0o644,
+        OWNER.uid,
+    ));
+    let mut fake = FakeOps::examples();
+    fake.attrs
+        .insert(8, attr(8, FileType::RegularFile, 0o644, OWNER.uid));
+    fake.paths.insert(8, b"skills/y\xff.md".to_vec());
+    let raw = fixture_b(fake);
+    assert_eq!(raw.overlay.getattr(8, None).unwrap_err(), Errno::ENOENT);
+    // Its UTF-8 twin is shown.
+    b.overlay.getattr(8, None).unwrap();
+}
+
+#[test]
+fn rules_errors_answer_eio_through_the_overlay() {
+    // Longer than any file name the host allows: probing `<long>/.git`
+    // for a nested repository fails with ENAMETOOLONG.
+    // (`skills` exists in the tree, so the probe reaches the long name.)
+    let long = "d".repeat(300);
+    let b = fixture_b_with(
+        FakeOps::examples()
+            .node(8, ROOT, &long, FileType::Directory, 0o755, OWNER.uid)
+            .node(9, 8, "x", FileType::RegularFile, 0o644, OWNER.uid)
+            .node(10, 5, &long, FileType::Directory, 0o755, OWNER.uid),
+        "",
+        &["skills"],
+    );
+    // Every path of the node fails to decide: EIO, not ENOENT.
+    assert_eq!(b.overlay.getattr(9, None).unwrap_err(), Errno::EIO);
+    assert_eq!(
+        b.overlay.lookup(8, b"x").unwrap_err(),
+        Errno::EIO,
+        "its parent"
+    );
+    // `skills/<long>` is recordable as a file, so it may be shown, but
+    // as the directory it is the rules cannot decide.
+    assert_eq!(b.overlay.getattr(10, None).unwrap_err(), Errno::EIO);
+    assert_eq!(
+        b.overlay.lookup(5, long.as_bytes()).unwrap_err(),
+        Errno::EIO
+    );
+    assert_eq!(b.fake.calls_to("forget").len(), 1);
+    assert_eq!(
+        b.overlay
+            .mkdir(5, format!("{long}x").as_bytes(), 0o755, REQUEST)
+            .unwrap_err(),
+        Errno::EIO
+    );
+    assert!(b.fake.calls_to("mkdir").is_empty());
 }
 
 #[test]
@@ -832,4 +1166,28 @@ fn a6_a_node_moved_out_of_view_is_gone_from_the_overlay() {
         Errno::ENOENT
     );
     assert_eq!(a.overlay.access(id, 4).unwrap_err(), Errno::ENOENT);
+}
+
+#[test]
+fn a14_a_close_through_the_overlay_records_before_it_returns() {
+    let a = fixture_a(&["config.yaml"], &[]);
+    let journal = || {
+        agentfs_core::journal::read_records(&StateDir::new(a.dir.path().join("state")).journal())
+            .unwrap()
+            .0
+    };
+    let before = journal().len();
+    let id = a.overlay.lookup(ROOT, b"config.yaml").unwrap().id;
+    let (fh, _handle) = a.overlay.open(id, O_WRONLY, REQUEST).unwrap();
+    a.overlay.write(fh, 0, b"v2", REQUEST).unwrap();
+    a.overlay.flush(fh, REQUEST).unwrap();
+    // The close's own record, not a later release's or sweep's.
+    let records = journal();
+    assert_eq!(records.len(), before + 1, "{records:#?}");
+    let record = records.last().unwrap();
+    assert_eq!(record.draft.trigger, Trigger::Close);
+    let owner_uid = rustix::process::geteuid().as_raw();
+    assert_eq!(record.draft.caller.uid, owner_uid);
+    assert_eq!(record.draft.caller.pid, REQUEST.pid);
+    a.overlay.release(fh).unwrap();
 }

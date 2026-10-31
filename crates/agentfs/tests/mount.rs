@@ -3099,6 +3099,34 @@ fn mount_sandbox(v: &Vol, overlay: &Path) -> (Mounted, Unmounts) {
     (m, Unmounts(overlay.to_path_buf()))
 }
 
+/// The message of the newest commit that set `path` to `content`.
+fn commit_that_set(v: &Vol, path: &str, content: &str) -> String {
+    let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    let blob_at = |commit: &git2::Commit<'_>| {
+        commit
+            .tree()
+            .unwrap()
+            .get_path(Path::new(path))
+            .ok()
+            .and_then(|e| repo.find_blob(e.id()).ok())
+            .map(|b| b.content().to_vec())
+    };
+    let mut commit = repo
+        .find_reference("refs/heads/agentfs/demo")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    loop {
+        let parent = commit.parent(0).ok();
+        let set = blob_at(&commit).as_deref() == Some(content.as_bytes());
+        let before = parent.as_ref().and_then(&blob_at);
+        if set && before.as_deref() != Some(content.as_bytes()) {
+            return commit.message().unwrap_or("").to_owned();
+        }
+        commit = parent.unwrap_or_else(|| panic!("no commit set {path} to {content:?}"));
+    }
+}
+
 /// Detaches a mount point a failed test leaves behind.
 struct Unmounts(PathBuf);
 
@@ -3196,8 +3224,9 @@ fn overlay_edit_is_recorded_and_seen_through_the_main_mount() {
 
     // Neither root nor the owner: done as the owner.
     succeeds(&sandbox, Some(20000), "printf v2 > overlay/config.yaml");
-    assert_eq!(succeeds(&v.p(""), None, "cat mnt/config.yaml"), "v2");
 
+    // Nothing touches the file through the main mount until the change is
+    // committed: a close there would record it too.
     let deadline = Instant::now() + Duration::from_secs(15);
     let history = loop {
         let history = v.history();
@@ -3211,6 +3240,13 @@ fn overlay_edit_is_recorded_and_seen_through_the_main_mount() {
         );
         std::thread::sleep(Duration::from_millis(100));
     };
+    // Recorded at the overlay's close, as the owner: not later, by a
+    // release or the sweep of a node the close left changed.
+    let message = commit_that_set(&v, "config.yaml", "v2");
+    assert!(message.contains("Agentfs-Trigger: close\n"), "{message}");
+    assert!(message.contains("Agentfs-Uid: 10000\n"), "{message}");
+    assert!(!message.contains("Agentfs-Uid: 20000"), "{message}");
+    assert_eq!(succeeds(&v.p(""), None, "cat mnt/config.yaml"), "v2");
     for path in history.keys() {
         assert!(
             !(path == "secrets.db" || path.starts_with("notes/") || path.ends_with(".key")),
@@ -3265,4 +3301,133 @@ fn overlay_refusals() {
     m.stop();
     assert!(!is_mounted(&overlay));
     assert!(!is_mounted(&v.mnt()));
+}
+
+/// A daemon serving the sandbox overlay killed with -9 leaves both mount
+/// points stale (design §17.1). Refuse names the overlay's; a hold detaches
+/// it; recover stacks over both, and its stop detaches the stale layers.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn overlay_recovers_from_a_crashed_daemon() {
+    let (v, overlay) = sandbox_vol("overlay_recovers_from_a_crashed_daemon");
+    let overlay_s = overlay.to_str().unwrap().to_owned();
+    let mnt = v.mnt();
+    let sandbox = v.p("sandbox");
+    let flags = [
+        "--sandbox-overlay",
+        overlay_s.as_str(),
+        "--sandbox-owner",
+        "10000:10000",
+    ];
+    let with = |mode: &'static str| [&["--on-stale-mount", mode][..], &flags[..]].concat();
+
+    let (mut first, _unmounts) = mount_sandbox(&v, &overlay);
+    crash(&mut first);
+    assert_eq!(
+        rustix::fs::stat(&overlay).unwrap_err(),
+        rustix::io::Errno::NOTCONN
+    );
+
+    // Refuse, with only the overlay's mount point stale: it is named.
+    let out = Command::new("umount").arg("-l").arg(&mnt).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = v
+        .mount_command(&with("refuse"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "the sandbox overlay's mount point {overlay_s} is a stale FUSE mount"
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!is_mounted(&mnt));
+
+    // Hold: mounts nothing, then detaches the overlay's stale mount.
+    let child = v.mount_command(&with("hold")).spawn().unwrap();
+    let mut held = Mounted {
+        child: Some(child),
+        mnt: mnt.clone(),
+        log: v.log_path(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !held.log().contains("Holding until SIGTERM") {
+        assert!(
+            Instant::now() < deadline,
+            "never held; log:\n{}",
+            held.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!is_mounted(&mnt));
+    held.signal(rustix::process::Signal::TERM);
+    assert_eq!(held.wait_exit(Duration::from_secs(20)).code(), Some(1));
+    assert!(
+        held.log()
+            .contains(&format!("detached stale mount {overlay_s} (1 layer(s))")),
+        "{}",
+        held.log()
+    );
+    assert_eq!(layers(&overlay), 0, "{}", held.log());
+
+    // Recover: both mount points stale, both stacked over, both served.
+    let (mut second, _unmounts) = mount_sandbox(&v, &overlay);
+    crash(&mut second);
+    let third = v.mount(&with("recover"));
+    let log = third.log();
+    assert!(
+        log.contains(&format!(
+            "stacked the sandbox overlay over a stale mount left by a crashed daemon at \
+             {overlay_s} (1 stale layer(s) below)"
+        )),
+        "{log}"
+    );
+    assert_eq!(layers(&overlay), 2);
+    assert_eq!(
+        succeeds(&sandbox, None, "ls -A overlay"),
+        "config.yaml\nskills\n"
+    );
+    succeeds(&sandbox, Some(20000), "printf v3 > overlay/config.yaml");
+    assert_eq!(succeeds(&v.p(""), None, "cat mnt/config.yaml"), "v3");
+    let log = third.stop();
+    assert!(
+        log.contains(&format!("detached 1 stale layer(s) at {overlay_s}")),
+        "{log}"
+    );
+    assert_eq!(layers(&overlay), 0, "{log}");
+    assert_eq!(layers(&mnt), 0, "{log}");
+}
+
+/// `--seal-mountpoint` seals the sandbox overlay's bare mount point too
+/// (design §17.1): a sandbox that binds it while no daemon is mounted
+/// cannot write there unrecorded.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn seal_mountpoint_seals_the_overlay_too() {
+    let (v, overlay) = sandbox_vol("seal_mountpoint_seals_the_overlay_too");
+    let overlay_s = overlay.to_str().unwrap().to_owned();
+    let m = v.mount(&[
+        "--seal-mountpoint",
+        "--sandbox-overlay",
+        &overlay_s,
+        "--sandbox-owner",
+        "10000:10000",
+    ]);
+    let _unmounts = Unmounts(overlay.clone());
+    assert!(is_mounted(&overlay), "{}", m.log());
+    m.stop();
+    assert!(!is_mounted(&overlay));
+    let meta = fs::metadata(&overlay).unwrap();
+    assert_eq!((meta.uid(), meta.mode() & 0o7777), (0, 0));
+    fails_with(
+        &v.p("sandbox"),
+        Some(20000),
+        "printf x > overlay/f",
+        "Permission denied",
+    );
+    assert!(!overlay.join("f").exists());
 }

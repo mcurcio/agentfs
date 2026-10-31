@@ -150,6 +150,12 @@ impl StateDir {
         self.meta().join("stack").join("mnt")
     }
 
+    /// [`StateDir::stack_source`] for the sandbox overlay's mount point
+    /// (design §2.2, §17.1).
+    pub fn overlay_stack_source(&self) -> PathBuf {
+        self.meta().join("stack").join("overlay")
+    }
+
     /// The control socket in [`StateDir::control_dir`].
     pub fn control_socket(&self) -> PathBuf {
         self.control_dir().join(CONTROL_SOCKET)
