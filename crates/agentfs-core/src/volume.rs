@@ -2236,6 +2236,13 @@ impl Recorder {
         self.rules.fsync_class(path)
     }
 
+    /// The volume's path rules, read when it was opened (design §4.1):
+    /// the sandbox overlay's visibility gate judges by them
+    /// ([`crate::visibility::Gate`]).
+    pub fn rules(&self) -> &Arc<Rules> {
+        &self.rules
+    }
+
     /// Whether any path can be in the fsync class on this volume.
     pub fn has_fsync_class(&self) -> bool {
         self.rules.has_fsync_class()

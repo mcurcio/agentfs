@@ -59,5 +59,6 @@ pub(crate) mod ssh_transport;
 pub mod stamps;
 pub mod telemetry;
 pub mod tracked;
+pub mod visibility;
 pub mod volume;
 pub(crate) mod watched;
