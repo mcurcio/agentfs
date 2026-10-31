@@ -53,9 +53,28 @@ agentfs run
   (`agentfs.remotes.mode{mode}`, 1, with `mode` one of `pushed`,
   `none_valid`, `local_only`;
   [configuration](configuration.md#remotes-modes)), the patch queue,
-  the state area's size, the history service and its fronts, and fork
-  publishing: the table in
+  the state area's size (part `tmp_layer` is the sandbox overlay's tmp
+  files), the history service and its fronts, fork publishing, and the
+  sandbox overlay's refusals: the table in
   [design §13](design.md#13-observability-opentelemetry).
+- **Sandbox overlay refusals:** `agentfs.sandbox_overlay.refusals{reason}`
+  counts each change a sandbox made through the overlay that was refused
+  ([design §2.4](design.md#24-the-sandbox-overlay)), once, with `reason`
+  one of:
+  - `not_recordable`: a name the rules skip for that kind (a directory
+    they could record nothing beneath, a recorded file moved to a
+    skipped name);
+  - `kind`: a symlink, hard link or special file;
+  - `cross_device`: a directory move, answered `EXDEV`;
+  - `hidden`: the source, or an entry at the target, is hidden;
+  - `rules_error`: the rules could not decide (`EIO`);
+  - `ownership`: an owner, group, set-id or sticky-bit change;
+  - `xattr`: an extended-attribute change.
+
+  Reads of hidden names are not counted: a hidden name answers like a
+  missing one. A steady count usually means a sandbox's tool works in a
+  way the overlay does not offer
+  ([runbook](runbooks/sandbox-overlay.md#a-sandbox-cannot-save)).
 - **Spans:** `agentfs.record`, `agentfs.commit`, `agentfs.push`,
   `agentfs.patch`, `agentfs.fork.finish` and `agentfs.fork.publish`,
   carrying journal sequence numbers, commit ids and outcomes.

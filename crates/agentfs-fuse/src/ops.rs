@@ -72,6 +72,7 @@ use agentfs_core::volume::{MoveOutcome, Recorded, Recorder, VolumeError};
 use fuser::{Errno, FileAttr, FileType, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
 
+use crate::access::{self, Object, Want, Who};
 use crate::backing::{self, Backing, attr, join, proc_path};
 use crate::boundary::{Boundary, Change, REPAIR_TRIGGER, State};
 use crate::creds;
@@ -80,6 +81,7 @@ use crate::groups::{Group, Groups};
 use crate::inodes::{InodeTable, Kind, ROOT};
 use crate::names::is_git_dir_name;
 use crate::privileges::Privileges;
+use crate::session::{Actor, Found};
 
 pub type OpResult<T> = Result<T, Errno>;
 
@@ -319,27 +321,23 @@ fn check_name(name: &[u8]) -> OpResult<()> {
     Ok(())
 }
 
-/// Whether `caller` may open the file `st` with access mode `acc`
-/// (`O_RDONLY`, `O_WRONLY`, `O_RDWR`), and `truncate`, by its mode bits;
-/// `groups` are the caller's supplementary groups. Root (uid 0) always may.
-fn may_open(st: &Stat, caller: Caller, groups: &[u32], acc: i32, truncate: bool) -> bool {
-    if caller.uid == 0 {
-        return true;
+/// `__FMODE_EXEC` (`FMODE_EXEC`, 0x20, in `include/linux/fs.h`; reserved
+/// in `include/uapi/asm-generic/fcntl.h`): the kernel sets it in the open
+/// flags of a file it opens to execute, and FUSE passes it on.
+pub(crate) const FMODE_EXEC: i32 = 0o40;
+
+/// The kind of entry `name` in `dir`, not following a symlink; `None` when
+/// the name is free.
+fn kind_at(dir: &impl AsFd, name: &[u8]) -> OpResult<Option<Kind>> {
+    match rustix::fs::statat(dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => Ok(Some(Kind::from_mode(mode_of(&st)))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(e) => Err(errno(e)),
     }
-    let mode = mode_of(st);
-    let bits = if st.st_uid == caller.uid {
-        (mode >> 6) & 0o7
-    } else if st.st_gid == caller.gid || groups.contains(&st.st_gid) {
-        (mode >> 3) & 0o7
-    } else {
-        mode & 0o7
-    };
-    let read = acc != 1;
-    let write = acc != 0 || truncate;
-    (!read || bits & 0o4 != 0) && (!write || bits & 0o2 != 0)
 }
 
-fn timespec(t: Option<TimeOrNow>) -> Timespec {
+/// A `setattr` time as `utimensat(2)` takes it: omitted, now, or exact.
+pub(crate) fn timespec(t: Option<TimeOrNow>) -> Timespec {
     match t {
         None => Timespec {
             tv_sec: 0,
@@ -369,6 +367,51 @@ fn timespec(t: Option<TimeOrNow>) -> Timespec {
             }
         },
     }
+}
+
+/// `pread(2)` of up to `size` bytes at `offset`, short only at the end of
+/// the file.
+pub(crate) fn read_at(fd: &impl AsFd, offset: u64, size: u32) -> OpResult<Vec<u8>> {
+    let mut buf = vec![0u8; size as usize];
+    let mut done = 0;
+    while done < buf.len() {
+        let n = rustix::io::pread(fd, &mut buf[done..], offset + done as u64).eno()?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+    }
+    buf.truncate(done);
+    Ok(buf)
+}
+
+/// `pwrite(2)` of all of `data` at `offset`; how many bytes were written.
+pub(crate) fn write_at(fd: &impl AsFd, offset: u64, data: &[u8]) -> OpResult<u32> {
+    let mut done = 0;
+    loop {
+        if done >= data.len() {
+            return Ok(u32::try_from(done).unwrap_or(u32::MAX));
+        }
+        match rustix::io::pwrite(fd, &data[done..], offset + done as u64).eno() {
+            Ok(0) => return Err(Errno::EIO),
+            Ok(n) => done += n,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `lseek(2)` with the kernel's `whence` (`SEEK_SET` 0 to `SEEK_HOLE` 4).
+pub(crate) fn seek(fd: &impl AsFd, offset: i64, whence: i32) -> OpResult<i64> {
+    let pos = match whence {
+        0 => rustix::fs::SeekFrom::Start(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
+        1 => rustix::fs::SeekFrom::Current(offset),
+        2 => rustix::fs::SeekFrom::End(offset),
+        3 => rustix::fs::SeekFrom::Data(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
+        4 => rustix::fs::SeekFrom::Hole(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
+        _ => return Err(Errno::EINVAL),
+    };
+    let at = rustix::fs::seek(fd, pos).eno()?;
+    i64::try_from(at).map_err(|_| Errno::EINVAL)
 }
 
 impl Ops {
@@ -412,10 +455,11 @@ impl Ops {
     /// (`agentfs.fuse.create_as_caller_fallbacks`, design §6).
     fn create_as<T>(
         &self,
-        caller: Caller,
+        actor: Actor<'_>,
         create: impl FnMut() -> rustix::io::Result<T>,
     ) -> (rustix::io::Result<T>, bool) {
-        let (made, as_caller) = creds::create_as(self.create_as_caller, caller, create);
+        let (made, as_caller) =
+            creds::create_as(self.create_as_caller, actor.caller, actor.groups, create);
         if self.create_as_caller && !as_caller && made.is_ok() {
             self.boundary
                 .recorder()
@@ -799,12 +843,25 @@ impl Ops {
     // ---- lookups and attributes ----
 
     pub fn lookup(&self, parent: u64, name: &[u8]) -> OpResult<Entry> {
-        check_name(name)?;
         let _names = self.read_names();
-        let dir = self.open_dir_node(parent)?;
-        let st =
-            rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
+        let st = self.stat_child(parent, name)?;
         Ok(self.entry(parent, name, &st))
+    }
+
+    /// The kind of `name` in `parent`, not following a symlink. Nothing
+    /// is counted: no node id is handed out or kept.
+    pub fn kind_at(&self, parent: u64, name: &[u8]) -> OpResult<Kind> {
+        let _names = self.read_names();
+        let st = self.stat_child(parent, name)?;
+        Ok(Kind::from_mode(mode_of(&st)))
+    }
+
+    /// `name` in `parent`, statted without following a symlink. The
+    /// caller holds the names lock.
+    fn stat_child(&self, parent: u64, name: &[u8]) -> OpResult<Stat> {
+        check_name(name)?;
+        let dir = self.open_dir_node(parent)?;
+        rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()
     }
 
     /// Counts a kernel lookup of `name` in `parent`, now `st`.
@@ -961,7 +1018,8 @@ impl Ops {
         Ok(attr(id, &st))
     }
 
-    pub fn setattr(&self, id: u64, set: &SetAttr, caller: Caller) -> OpResult<FileAttr> {
+    pub fn setattr(&self, id: u64, set: &SetAttr, actor: Actor<'_>) -> OpResult<FileAttr> {
+        let caller = actor.caller;
         let names = self.read_names();
         let kind = self.kind_of(id)?;
         let fd = match set.fh.and_then(|fh| self.handle(fh).ok()) {
@@ -1183,17 +1241,43 @@ impl Ops {
         Ok(fd)
     }
 
+    /// Asks `actor`'s check, if it carries one, about a new entry of kind
+    /// `kind` at `name` in directory `dir` (node `parent`), from what is
+    /// there now ([`NameCheck::create`]). The caller holds `names`.
+    fn check_create(
+        &self,
+        actor: Actor<'_>,
+        dir: &OwnedFd,
+        parent: u64,
+        name: &[u8],
+        kind: Kind,
+    ) -> OpResult<()> {
+        let Some(check) = actor.check else {
+            return Ok(());
+        };
+        let path = join(&self.path_of(parent)?, name);
+        check.create(
+            Found {
+                path: &path,
+                kind: kind_at(dir, name)?,
+            },
+            kind,
+        )
+    }
+
     /// Undoes the lookup count of an entry the kernel never received.
     fn unlookup(&self, id: u64) {
         self.table().forget(id, 1);
     }
 
-    pub fn mkdir(&self, parent: u64, name: &[u8], mode: u32, caller: Caller) -> OpResult<Entry> {
+    pub fn mkdir(&self, parent: u64, name: &[u8], mode: u32, actor: Actor<'_>) -> OpResult<Entry> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
-        let (made, as_caller) = self.create_as(caller, || {
+        self.check_create(actor, &dir, parent, name, Kind::Dir)?;
+        let (made, as_caller) = self.create_as(actor, || {
             rustix::fs::mkdirat(
                 &dir,
                 OsStr::from_bytes(name),
@@ -1213,18 +1297,20 @@ impl Ops {
         name: &[u8],
         mode: u32,
         rdev: u32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<Entry> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
         let kind = Kind::from_mode(mode);
+        self.check_create(actor, &dir, parent, name, kind)?;
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
         // A device node needs CAP_MKNOD, which the caller lacks: refused
         // as the caller, it is made by the daemon.
-        let (made, as_caller) = self.create_as(caller, || {
+        let (made, as_caller) = self.create_as(actor, || {
             rustix::fs::mknodat(
                 &dir,
                 OsStr::from_bytes(name),
@@ -1265,15 +1351,17 @@ impl Ops {
         parent: u64,
         name: &[u8],
         target: &[u8],
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<Entry> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
+        self.check_create(actor, &dir, parent, name, Kind::Symlink)?;
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
-        let (made, as_caller) = self.create_as(caller, || {
+        let (made, as_caller) = self.create_as(actor, || {
             rustix::fs::symlinkat(OsStr::from_bytes(target), &dir, OsStr::from_bytes(name))
         });
         made.eno()?;
@@ -1306,7 +1394,8 @@ impl Ops {
         Ok(entry)
     }
 
-    pub fn link(&self, id: u64, parent: u64, name: &[u8], caller: Caller) -> OpResult<Entry> {
+    pub fn link(&self, id: u64, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<Entry> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let (sparent, sname) = self
@@ -1322,6 +1411,13 @@ impl Ops {
             return Err(estale());
         }
         let dir = self.open_dir_node(parent)?;
+        if let Some(check) = actor.check {
+            let path = join(&self.path_of(parent)?, name);
+            check.link(Found {
+                path: &path,
+                kind: kind_at(&dir, name)?,
+            })?;
+        }
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
         rustix::fs::linkat(
@@ -1364,15 +1460,16 @@ impl Ops {
 
     // ---- removing and renaming ----
 
-    pub fn unlink(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
-        self.remove(parent, name, false, caller)
+    pub fn unlink(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        self.remove(parent, name, false, actor)
     }
 
-    pub fn rmdir(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
-        self.remove(parent, name, true, caller)
+    pub fn rmdir(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        self.remove(parent, name, true, actor)
     }
 
-    fn remove(&self, parent: u64, name: &[u8], dir: bool, caller: Caller) -> OpResult<()> {
+    fn remove(&self, parent: u64, name: &[u8], dir: bool, actor: Actor<'_>) -> OpResult<()> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let pdir = self.open_dir_node(parent)?;
@@ -1382,6 +1479,12 @@ impl Ops {
         } else {
             AtFlags::empty()
         };
+        if let Some(check) = actor.check {
+            check.remove(Found {
+                path: &path,
+                kind: kind_at(&pdir, name)?,
+            })?;
+        }
         // Removing a member changes its group: held while it happens.
         let group = self.group_at(&path);
         let hold = group.as_ref().map(|g| g.hold());
@@ -1407,8 +1510,9 @@ impl Ops {
         newparent: u64,
         newname: &[u8],
         flags: u32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<()> {
+        let caller = actor.caller;
         check_name(name)?;
         check_name(newname)?;
         let flags = RenameFlags::from_bits(flags).ok_or(Errno::EINVAL)?;
@@ -1425,6 +1529,19 @@ impl Ops {
             rustix::fs::statat(&ddir, OsStr::from_bytes(newname), AtFlags::SYMLINK_NOFOLLOW).ok();
         let src_path = join(&self.path_of(parent)?, name);
         let dst_path = join(&self.path_of(newparent)?, newname);
+        if let Some(check) = actor.check {
+            check.rename(
+                Found {
+                    path: &src_path,
+                    kind: Some(Kind::from_mode(mode_of(&src))),
+                },
+                Found {
+                    path: &dst_path,
+                    kind: dst.as_ref().map(|d| Kind::from_mode(mode_of(d))),
+                },
+                flags.bits(),
+            )?;
+        }
         rustix::fs::renameat_with(
             &sdir,
             OsStr::from_bytes(name),
@@ -1626,10 +1743,14 @@ impl Ops {
 
     /// Opens node `id`. Returns the handle id and the handle (the fuser
     /// layer registers its descriptor for passthrough).
-    pub fn open(&self, id: u64, flags: i32, caller: Caller) -> OpResult<(u64, Arc<Handle>)> {
+    pub fn open(&self, id: u64, flags: i32, actor: Actor<'_>) -> OpResult<(u64, Arc<Handle>)> {
+        let caller = actor.caller;
         let mut oflags = OFlags::from_bits_retain(flags as u32)
             & !(OFlags::CREATE | OFlags::EXCL | OFlags::NOCTTY | OFlags::NOATIME);
         oflags.remove(OFlags::PATH);
+        // Not an open flag: `openat2(2)` refuses it (EINVAL), so a file
+        // could never be executed through the mount.
+        oflags.remove(OFlags::from_bits_retain(FMODE_EXEC as u32));
         let acc = flags & 0o3;
         let truncate = oflags.contains(OFlags::TRUNC);
         let write = acc != 0 || truncate;
@@ -1709,8 +1830,9 @@ impl Ops {
         name: &[u8],
         mode: u32,
         flags: i32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<(Entry, u64, Arc<Handle>)> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
@@ -1720,10 +1842,11 @@ impl Ops {
             & !(OFlags::NOCTTY | OFlags::NOATIME | OFlags::CREATE | OFlags::EXCL))
             | OFlags::NOFOLLOW
             | OFlags::CLOEXEC;
+        self.check_create(actor, &dir, parent, name, Kind::File)?;
         // Creating or truncating a member changes its group: held.
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
-        let (created, as_caller) = self.create_as(caller, || {
+        let (created, as_caller) = self.create_as(actor, || {
             rustix::fs::openat(
                 &dir,
                 OsStr::from_bytes(name),
@@ -1751,9 +1874,13 @@ impl Ops {
                 // The kernel checked permission to create, not to open
                 // this file: check that as the kernel would, from the
                 // mode bits and the caller's groups.
-                let groups = creds::caller_groups(caller.pid);
-                let truncate = requested.contains(OFlags::TRUNC);
-                if !may_open(&st, caller, &groups, flags & 0o3, truncate) {
+                let groups = creds::groups_of(actor.caller, actor.groups);
+                let who = Who {
+                    uid: caller.uid,
+                    gid: caller.gid,
+                    groups: &groups,
+                };
+                if !access::permits(Object::from_stat(&st), who, Want::from_open_flags(flags)) {
                     return Err(Errno::EACCES);
                 }
                 let fd =
@@ -1791,38 +1918,18 @@ impl Ops {
     }
 
     pub fn read(&self, fh: u64, offset: u64, size: u32) -> OpResult<Vec<u8>> {
-        let h = self.handle(fh)?;
-        let mut buf = vec![0u8; size as usize];
-        let mut done = 0;
-        while done < buf.len() {
-            let n = rustix::io::pread(&h.fd, &mut buf[done..], offset + done as u64).eno()?;
-            if n == 0 {
-                break;
-            }
-            done += n;
-        }
-        buf.truncate(done);
-        Ok(buf)
+        read_at(&self.handle(fh)?.fd, offset, size)
     }
 
-    pub fn write(&self, fh: u64, offset: u64, data: &[u8], caller: Caller) -> OpResult<u32> {
+    pub fn write(&self, fh: u64, offset: u64, data: &[u8], actor: Actor<'_>) -> OpResult<u32> {
+        let caller = actor.caller;
         let h = self.handle(fh)?;
         if let Some(node) = self.table().get_mut(h.node) {
             node.dirty.arm(caller);
         }
         let group = self.handle_group(&h);
         let hold = group.as_ref().map(|g| g.hold());
-        let mut done = 0;
-        let result = loop {
-            if done >= data.len() {
-                break Ok(u32::try_from(done).unwrap_or(u32::MAX));
-            }
-            match rustix::io::pwrite(&h.fd, &data[done..], offset + done as u64).eno() {
-                Ok(0) => break Err(Errno::EIO),
-                Ok(n) => done += n,
-                Err(e) => break Err(e),
-            }
-        };
+        let result = write_at(&h.fd, offset, data);
         if let Some(hold) = &hold {
             hold.changed(caller);
         }
@@ -1832,7 +1939,8 @@ impl Ops {
     /// `close` of a descriptor: records the inode if it changed since its
     /// last record (design §3.1). `EIO` if recording fails; the inode stays
     /// dirty, so the next boundary records it.
-    pub fn flush(&self, fh: u64, caller: Caller) -> OpResult<()> {
+    pub fn flush(&self, fh: u64, actor: Actor<'_>) -> OpResult<()> {
+        let caller = actor.caller;
         let h = self.handle(fh)?;
         let _names = self.read_names();
         if let Some(group) = self.handle_group(&h) {
@@ -2071,8 +2179,9 @@ impl Ops {
         offset: u64,
         length: u64,
         mode: i32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<()> {
+        let caller = actor.caller;
         let h = self.handle(fh)?;
         if let Some(node) = self.table().get_mut(h.node) {
             node.dirty.arm(caller);
@@ -2093,17 +2202,7 @@ impl Ops {
     }
 
     pub fn lseek(&self, fh: u64, offset: i64, whence: i32) -> OpResult<i64> {
-        let h = self.handle(fh)?;
-        let pos = match whence {
-            0 => rustix::fs::SeekFrom::Start(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
-            1 => rustix::fs::SeekFrom::Current(offset),
-            2 => rustix::fs::SeekFrom::End(offset),
-            3 => rustix::fs::SeekFrom::Data(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
-            4 => rustix::fs::SeekFrom::Hole(u64::try_from(offset).map_err(|_| Errno::EINVAL)?),
-            _ => return Err(Errno::EINVAL),
-        };
-        let at = rustix::fs::seek(&h.fd, pos).eno()?;
-        i64::try_from(at).map_err(|_| Errno::EINVAL)
+        seek(&self.handle(fh)?.fd, offset, whence)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2114,8 +2213,9 @@ impl Ops {
         fh_out: u64,
         offset_out: u64,
         len: u64,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<u32> {
+        let caller = actor.caller;
         let input = self.handle(fh_in)?;
         let output = self.handle(fh_out)?;
         if let Some(node) = self.table().get_mut(output.node) {
@@ -2395,6 +2495,306 @@ impl Ops {
     /// How many handles are open (for tests and the shutdown report).
     pub fn open_handles(&self) -> usize {
         self.handles().len()
+    }
+}
+
+/// What the main mount serves: each method is the inherent method of the
+/// same name ([`crate::session`]). `access` always allows: the main mount's
+/// kernel checks modes itself (`default_permissions`), so it never asks.
+impl crate::session::Operations for Ops {
+    fn lookup(&self, parent: u64, name: &[u8]) -> OpResult<Entry> {
+        Ops::lookup(self, parent, name)
+    }
+
+    fn forget(&self, id: u64, n: u64) {
+        Ops::forget(self, id, n);
+    }
+
+    fn getattr(&self, id: u64, fh: Option<u64>) -> OpResult<FileAttr> {
+        Ops::getattr(self, id, fh)
+    }
+
+    fn setattr(&self, id: u64, set: &SetAttr, actor: Actor<'_>) -> OpResult<FileAttr> {
+        Ops::setattr(self, id, set, actor)
+    }
+
+    fn readlink(&self, id: u64) -> OpResult<Vec<u8>> {
+        Ops::readlink(self, id)
+    }
+
+    fn access(&self, _id: u64, _mask: i32) -> OpResult<()> {
+        Ok(())
+    }
+
+    fn paths(&self, id: u64) -> Vec<Vec<u8>> {
+        self.table().paths(id)
+    }
+
+    fn mknod(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: u32,
+        rdev: u32,
+        actor: Actor<'_>,
+    ) -> OpResult<Entry> {
+        Ops::mknod(self, parent, name, mode, rdev, actor)
+    }
+
+    fn mkdir(&self, parent: u64, name: &[u8], mode: u32, actor: Actor<'_>) -> OpResult<Entry> {
+        Ops::mkdir(self, parent, name, mode, actor)
+    }
+
+    fn unlink(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        Ops::unlink(self, parent, name, actor)
+    }
+
+    fn rmdir(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        Ops::rmdir(self, parent, name, actor)
+    }
+
+    fn symlink(
+        &self,
+        parent: u64,
+        name: &[u8],
+        target: &[u8],
+        actor: Actor<'_>,
+    ) -> OpResult<Entry> {
+        Ops::symlink(self, parent, name, target, actor)
+    }
+
+    fn rename(
+        &self,
+        parent: u64,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+        actor: Actor<'_>,
+    ) -> OpResult<()> {
+        Ops::rename(self, parent, name, newparent, newname, flags, actor)
+    }
+
+    fn link(&self, id: u64, newparent: u64, newname: &[u8], actor: Actor<'_>) -> OpResult<Entry> {
+        Ops::link(self, id, newparent, newname, actor)
+    }
+
+    fn open(&self, id: u64, flags: i32, actor: Actor<'_>) -> OpResult<(u64, Arc<Handle>)> {
+        Ops::open(self, id, flags, actor)
+    }
+
+    fn create(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: u32,
+        flags: i32,
+        actor: Actor<'_>,
+    ) -> OpResult<(Entry, u64, Arc<Handle>)> {
+        Ops::create(self, parent, name, mode, flags, actor)
+    }
+
+    fn read(&self, fh: u64, offset: u64, size: u32) -> OpResult<Vec<u8>> {
+        Ops::read(self, fh, offset, size)
+    }
+
+    fn write(&self, fh: u64, offset: u64, data: &[u8], actor: Actor<'_>) -> OpResult<u32> {
+        Ops::write(self, fh, offset, data, actor)
+    }
+
+    fn flush(&self, fh: u64, actor: Actor<'_>) -> OpResult<()> {
+        Ops::flush(self, fh, actor)
+    }
+
+    fn release(&self, fh: u64) -> OpResult<()> {
+        Ops::release(self, fh)
+    }
+
+    fn fsync(&self, fh: u64, datasync: bool) -> OpResult<()> {
+        Ops::fsync(self, fh, datasync)
+    }
+
+    fn fallocate(
+        &self,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        actor: Actor<'_>,
+    ) -> OpResult<()> {
+        Ops::fallocate(self, fh, offset, length, mode, actor)
+    }
+
+    fn lseek(&self, fh: u64, offset: i64, whence: i32) -> OpResult<i64> {
+        Ops::lseek(self, fh, offset, whence)
+    }
+
+    fn copy_file_range(
+        &self,
+        fh_in: u64,
+        offset_in: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        actor: Actor<'_>,
+    ) -> OpResult<u32> {
+        Ops::copy_file_range(self, fh_in, offset_in, fh_out, offset_out, len, actor)
+    }
+
+    fn mapping_may_write(&self, id: u64) {
+        Ops::mapping_may_write(self, id);
+    }
+
+    fn opendir(&self, id: u64) -> OpResult<u64> {
+        Ops::opendir(self, id)
+    }
+
+    fn readdir(&self, _id: u64, fh: u64, offset: u64) -> OpResult<Vec<(u64, DirEntry)>> {
+        Ops::readdir(self, fh, offset)
+    }
+
+    fn releasedir(&self, fh: u64) {
+        Ops::releasedir(self, fh);
+    }
+
+    fn statfs(&self) -> OpResult<rustix::fs::StatVfs> {
+        Ops::statfs(self)
+    }
+
+    fn setxattr(&self, id: u64, name: &[u8], value: &[u8], flags: i32) -> OpResult<()> {
+        Ops::setxattr(self, id, name, value, flags)
+    }
+
+    fn getxattr(&self, id: u64, name: &[u8], size: u32) -> OpResult<Xattr> {
+        Ops::getxattr(self, id, name, size)
+    }
+
+    fn listxattr(&self, id: u64, size: u32) -> OpResult<Xattr> {
+        Ops::listxattr(self, id, size)
+    }
+
+    fn removexattr(&self, id: u64, name: &[u8]) -> OpResult<()> {
+        Ops::removexattr(self, id, name)
+    }
+}
+
+impl crate::session::TreeOperations for Ops {
+    fn new_node_id(&self) -> u64 {
+        self.table().new_id()
+    }
+
+    fn new_handle_id(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn kind_at(&self, parent: u64, name: &[u8]) -> OpResult<Kind> {
+        Ops::kind_at(self, parent, name)
+    }
+
+    fn move_in(
+        &self,
+        from: BorrowedFd<'_>,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+        moved: crate::session::Moved,
+        check: &dyn crate::session::NameCheck,
+        caller: Caller,
+    ) -> OpResult<Entry> {
+        check_name(newname)?;
+        let flags = match RenameFlags::from_bits(flags) {
+            Some(f) if f.is_empty() || f == RenameFlags::NOREPLACE => f,
+            _ => return Err(Errno::EINVAL),
+        };
+        let names = self.write_names();
+        let ddir = self.open_dir_node(newparent)?;
+        let dst_path = join(&self.path_of(newparent)?, newname);
+        let dst =
+            rustix::fs::statat(&ddir, OsStr::from_bytes(newname), AtFlags::SYMLINK_NOFOLLOW).ok();
+        let src =
+            rustix::fs::statat(from, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
+        if Kind::from_mode(mode_of(&src)) != Kind::File {
+            return Err(Errno::EINVAL);
+        }
+        // Decided under the names ordering, on what is there now: an error
+        // is the answer, and nothing has moved.
+        check.move_in(crate::session::Found {
+            path: &dst_path,
+            kind: dst.as_ref().map(|st| Kind::from_mode(mode_of(st))),
+        })?;
+        rustix::fs::renameat_with(
+            from,
+            OsStr::from_bytes(name),
+            &ddir,
+            OsStr::from_bytes(newname),
+            flags,
+        )
+        .eno()?;
+        let st = rustix::fs::statat(&ddir, OsStr::from_bytes(newname), AtFlags::SYMLINK_NOFOLLOW)
+            .unwrap_or(src);
+        let (dev, ino) = dev_ino(&src);
+        // The kernel keeps the node id and handle ids it knows the file by.
+        let write = moved.handles.iter().any(|(_, h)| h.write);
+        {
+            let mut handles = self.handles();
+            for (fh, handle) in &moved.handles {
+                handles.insert(*fh, handle.clone());
+            }
+        }
+        {
+            let mut table = self.table();
+            table.adopt(
+                moved.node,
+                newparent,
+                newname,
+                dev,
+                ino,
+                Kind::File,
+                moved.lookups,
+            );
+            if let Some(node) = table.get_mut(moved.node) {
+                node.mapping_may_write = moved.mapping_may_write;
+                for (fh, handle) in &moved.handles {
+                    node.handles.push(*fh);
+                    if handle.write {
+                        node.write_handles += 1;
+                    }
+                }
+                // As `add_handle` arms a node opened for writing: later
+                // writes through the handles are recorded at their flush or
+                // release.
+                if write {
+                    node.dirty.arm(caller);
+                    if node.dirty.baseline.is_none() {
+                        node.dirty.baseline = Some(stamp(&st));
+                    }
+                }
+            }
+            table.maybe_drop(moved.node);
+        }
+        // Adopted handles find their fsync-class group at the new path.
+        self.renames.fetch_add(1, Ordering::AcqRel);
+        drop(names);
+
+        let _names = self.read_names();
+        if self
+            .record_tree(
+                Trigger::Rename,
+                caller,
+                vec![],
+                std::slice::from_ref(&dst_path),
+                None,
+            )
+            .is_err()
+        {
+            self.boundary.queue_repair([dst_path], caller);
+            return Err(Errno::EIO);
+        }
+        Ok(Entry {
+            id: moved.node,
+            attr: attr(moved.node, &st),
+        })
     }
 }
 

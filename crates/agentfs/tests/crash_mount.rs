@@ -339,3 +339,70 @@ fn a_busy_stop_holds_the_patch_queue() {
     );
     assert!(!log.contains("patch 1 applied"), "{log}");
 }
+
+/// The sandbox overlay fails after the mount point was mounted (its
+/// failpoint, between the two): the mount point is stopped as at a stop,
+/// so nothing stays mounted, the daemon exits non-zero naming the overlay,
+/// and the next mount serves both.
+#[test]
+#[ignore = "needs /dev/fuse and root; run by ci/crash-tests.sh"]
+fn overlay_failing_after_the_mount_point_stops_cleanly() {
+    let v = Vol::new();
+    fs::write(v.backing().join("a.txt"), "a\n").unwrap();
+    let sandbox = v.dir.path().join("sandbox");
+    fs::create_dir_all(&sandbox).unwrap();
+    fs::set_permissions(&sandbox, fs::Permissions::from_mode(0o755)).unwrap();
+    let overlay = sandbox.join("overlay");
+    let mount = |spec: &str| {
+        let mut cmd = v.command(spec);
+        cmd.args(["mount", "--unmount-grace", "3s", "--sandbox-overlay"])
+            .arg(&overlay)
+            .args(["--sandbox-owner", "0:0"])
+            .arg(v.backing())
+            .arg(v.mnt());
+        cmd
+    };
+    let out = mount("mount.before_overlay=error")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = text(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("agentfs failpoint mount.before_overlay triggered (error)"),
+        "{err}"
+    );
+    assert!(
+        err.contains("the sandbox overlay could not be mounted after the mount point was: ")
+            && err.contains("; the mount point was unmounted as at a stop"),
+        "{err}"
+    );
+    assert!(!is_mounted(&v.mnt()), "{err}");
+    assert!(!is_mounted(&overlay), "{err}");
+
+    // The next mount serves both, and stops cleanly.
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(v.log())
+        .unwrap();
+    let child = mount("")
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !(is_mounted(&v.mnt()) && is_mounted(&overlay)) {
+        assert!(
+            Instant::now() < deadline,
+            "never mounted:\n{}",
+            v.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(fs::read_to_string(v.mnt().join("a.txt")).unwrap(), "a\n");
+    v.unmount(child);
+    assert!(!is_mounted(&v.mnt()) && !is_mounted(&overlay));
+    crash_oracle::check_clean(&v.state(), BRANCH).unwrap();
+}

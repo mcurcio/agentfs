@@ -743,3 +743,71 @@ fence's `HERMES_WRITE_SAFE_ROOT`.
   volume started from its branch ([runbooks/moving.md](runbooks/moving.md)).
 - The image is not bit-reproducible (Debian packages are not pinned),
   and is not yet signed or shipped with an SBOM.
+
+## 12. The sandbox overlay
+
+A workload that starts sandboxes through a container that starts other
+containers (for example a Docker daemon) can give them the sandbox
+overlay instead of the mount: a second mount point of the same volume
+that shows only the files the operator's rules would record, records
+what sandboxes change there, and keeps their other files in a private
+tmp layer ([design §2.4](design.md#24-the-sandbox-overlay); its limits
+are in [§1.1](design.md#11-threat-model)). The kustomize Component
+[`deploy/sidecar/sandbox-overlay`](../deploy/sidecar/sandbox-overlay)
+adds it to the example sidecar
+([`deploy/examples/sidecar-sandbox-overlay`](../deploy/examples/sidecar-sandbox-overlay)
+uses it), and the sidecar library chart's `sandboxOverlay` values do the
+same ([helm.md](helm.md#4-the-sidecar-helpers)).
+
+```
+volumes
+├── agentfs-mount    emptyDir   /agentfs; the mount is /agentfs/workspace
+└── agentfs-sandbox  emptyDir   /agentfs-sandbox; the overlay is /agentfs-sandbox/overlay
+```
+
+- **A second `emptyDir`.** The sidecar mounts another `emptyDir`,
+  `agentfs-sandbox`, at a directory of its own (`/agentfs-sandbox`) with
+  `Bidirectional` propagation, and serves the overlay in its
+  subdirectory `overlay`. The two mount points must not share a parent
+  directory: `agentfs mount` refuses that, because a container given that
+  directory would reach both.
+- **Settings.** Set `AGENTFS_SANDBOX_OVERLAY=/agentfs-sandbox/overlay`
+  and `AGENTFS_SANDBOX_OWNER=<uid>:<gid>`, the view owner every operation
+  through the overlay is checked and done as. Pick the user that owns the
+  files sandboxes should edit, usually the workload's own.
+- **Probes.** The startup probe runs `agentfs probe --allow-stale
+  --sandbox-overlay /agentfs-sandbox/overlay` and the readiness probe
+  `agentfs probe --sandbox-overlay /agentfs-sandbox/overlay`. The overlay
+  is mounted after the main mount, so these gate on both.
+- **The container that starts other containers** mounts only the
+  `agentfs-sandbox` `emptyDir`, with `mountPropagation: HostToContainer`,
+  never `agentfs-mount`, and binds paths under
+  `/agentfs-sandbox/overlay` into the sandboxes it starts:
+
+  ```yaml
+  volumeMounts:
+    - name: agentfs-sandbox
+      mountPath: /agentfs-sandbox
+      mountPropagation: HostToContainer
+  ```
+
+  Not tested: the Component and the chart option are checked as
+  rendered manifests only ([helm.md](helm.md#5-deploy-and-the-charts)); no CI job runs
+  a container runtime against the overlay in a pod.
+- **After a sidecar recovery.** A container runtime binds a path into a
+  sandbox with private propagation by default, so a sandbox started
+  before the sidecar recovered from a crash keeps the dead mount
+  (`ENOTCONN`) and never sees the new one. Restart such sandboxes, or bind
+  with `rslave` propagation (Docker: `--mount
+  type=bind,src=...,dst=...,bind-propagation=rslave`) so the recovered
+  mount reaches them. Not tested.
+- **Either mount ending stops both.** An unmount of either mount point
+  from outside stops the daemon; the kubelet restarts the sidecar into
+  fresh mounts ([runbook](runbooks/sandbox-overlay.md#the-overlay-was-unmounted-from-outside-and-both-mounts-stopped)).
+- **Sidecar only.** The overlay is served by a single-process `agentfs
+  mount`. It is not offered on CSI volumes or on fronts
+  (`--history-service`), which refuse it at start
+  ([design §19.2](design.md#192-open-questions) item 13).
+
+Failure modes and their fixes:
+[runbooks/sandbox-overlay.md](runbooks/sandbox-overlay.md).

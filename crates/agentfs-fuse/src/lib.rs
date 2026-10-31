@@ -8,6 +8,9 @@
 //!   behaviour is unit-tested against a real directory and state area.
 //! - [`fuse`] maps fuser's [`fuser::Filesystem`] onto it and negotiates
 //!   kernel passthrough.
+//! - [`session`] is what one FUSE session serves; [`overlay`] puts the
+//!   visibility gate and the view owner in front of `Ops` for the sandbox
+//!   overlay's session.
 //! - [`groups`] holds writes to fsync-class databases while they are
 //!   captured and schedules the captures (design §8).
 //! - [`sweep`] runs the periodic backstop and retries failed records, and
@@ -20,6 +23,7 @@
 // identities on some targets.
 #![allow(clippy::useless_conversion)]
 
+pub mod access;
 pub mod backing;
 pub mod boundary;
 pub mod creds;
@@ -27,16 +31,19 @@ pub mod dirty;
 pub mod fuse;
 pub mod groups;
 pub mod inodes;
+pub mod invalidate;
 pub mod mount;
 pub mod names;
 pub mod ops;
+pub mod overlay;
 pub mod privileges;
+pub mod session;
 pub mod sweep;
 pub mod views;
 
 pub use fuse::{Passthrough, PassthroughStatus};
 pub use mount::{
-    Mount, MountConfig, MountError, MountHooks, MountState, MountView, PreflightError, StackOver,
-    StartupRepairs, UnmountReport, agentfs_layers, detach, detach_stale_layers, mount_state,
-    preflight, preflight_stacked,
+    Mount, MountConfig, MountError, MountHooks, MountKind, MountState, MountView, OverlayConfig,
+    PreflightError, StackOver, StartupRepairs, UnmountReport, agentfs_layers, detach,
+    detach_stale_layers, mount_state, preflight, preflight_overlay, preflight_stacked,
 };

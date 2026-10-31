@@ -241,6 +241,7 @@ fn probe_without_a_mount() {
     for args in [
         &["probe", s(&l.p("mnt"))][..],
         &["probe", "--allow-stale", s(&l.p("mnt"))],
+        &["probe", "--sandbox-overlay", s(&l.p("mnt"))],
     ] {
         let out = run(&state, args);
         assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
@@ -318,4 +319,173 @@ fn seal_mountpoint_needs_root() {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = std::fs::metadata(l.p("mnt")).unwrap().permissions().mode();
     assert_ne!(mode & 0o777, 0, "the mount point was sealed");
+}
+
+#[test]
+fn the_sandbox_overlay_flags_come_in_pairs() {
+    let l = Layout::new();
+    let state = l.p("state");
+    let pairs = [
+        ("--sandbox-overlay", l.p("overlay"), "--sandbox-owner"),
+        (
+            "--sandbox-owner",
+            PathBuf::from("10000:10000"),
+            "--sandbox-overlay",
+        ),
+    ];
+    for (flag, value, missing) in pairs {
+        let out = run(
+            &state,
+            &["mount", s(&l.p("backing")), s(&l.p("mnt")), flag, s(&value)],
+        );
+        assert_eq!(out.status.code(), Some(2), "{flag}: {}", stderr(&out));
+        assert!(stderr(&out).contains(missing), "{flag}: {}", stderr(&out));
+    }
+    let out = run(
+        &state,
+        &[
+            "mount",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+            "--sandbox-overlay",
+            s(&l.p("overlay")),
+            "--sandbox-owner",
+            "10000",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("UID:GID"), "{}", stderr(&out));
+}
+
+#[test]
+fn the_sandbox_overlay_inside_the_mount_point_is_refused() {
+    let l = Layout::new();
+    let state = l.p("state");
+    l.init(&state);
+    let out = run(
+        &state,
+        &[
+            "mount",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+            "--sandbox-overlay",
+            s(&l.p("mnt/overlay")),
+            "--sandbox-owner",
+            "10000:10000",
+        ],
+    );
+    refused(&out, "one is inside the other");
+}
+
+/// Two mount points in one directory: a container given that directory
+/// would reach both.
+#[test]
+fn the_sandbox_overlay_beside_the_mount_point_is_refused() {
+    let l = Layout::new();
+    let state = l.p("state");
+    l.init(&state);
+    let out = run(
+        &state,
+        &[
+            "mount",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+            "--sandbox-overlay",
+            s(&l.p("overlay")),
+            "--sandbox-owner",
+            "10000:10000",
+        ],
+    );
+    refused(&out, "are both in");
+    refused(&out, "give the sandbox overlay a directory of its own");
+}
+
+/// A refused overlay mount point changes nothing: with `--seal-mountpoint`,
+/// the main mount point's parent given as the overlay's keeps its owner
+/// and mode, and the missing main mount point is not created.
+#[test]
+fn a_refused_overlay_mount_point_is_left_as_it_was() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let l = Layout::new();
+    let state = l.p("state");
+    l.init(&state);
+    let work = l.p("work");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let before = std::fs::metadata(&work).unwrap();
+    let out = run(
+        &state,
+        &[
+            "mount",
+            "--seal-mountpoint",
+            s(&l.p("backing")),
+            s(&l.p("work/mnt")),
+            "--sandbox-overlay",
+            s(&work),
+            "--sandbox-owner",
+            "10000:10000",
+        ],
+    );
+    refused(&out, "one is inside the other");
+    let after = std::fs::metadata(&work).unwrap();
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode()),
+        (before.uid(), before.gid(), before.mode())
+    );
+    assert!(
+        !l.p("work/mnt").exists(),
+        "the main mount point was created"
+    );
+}
+
+/// The overlay's mount point is named as what it is.
+#[test]
+fn a_missing_overlay_parent_names_the_sandbox_overlay() {
+    let l = Layout::new();
+    let state = l.p("state");
+    l.init(&state);
+    let out = run(
+        &state,
+        &[
+            "mount",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+            "--sandbox-overlay",
+            s(&l.p("a/b")),
+            "--sandbox-owner",
+            "10000:10000",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("creating the sandbox overlay's mount point"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn the_sandbox_overlay_is_not_served_on_a_front() {
+    let l = Layout::new();
+    let state = l.p("state");
+    let out = run(
+        &state,
+        &[
+            "mount",
+            s(&l.p("backing")),
+            s(&l.p("mnt")),
+            "--sandbox-overlay",
+            s(&l.p("overlay")),
+            "--sandbox-owner",
+            "10000:10000",
+            "--history-service",
+            "unix:/nonexistent.sock",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--history-service"),
+        "{}",
+        stderr(&out)
+    );
 }

@@ -39,6 +39,7 @@ missing from these tables or a row names a module that no longer exists;
 | `tracked.rs` | The tracked set, git's index in agentfs: branch head plus durable records (§4), a tree so a directory move is O(1) (§3.1) |
 | `reconcile.rs` | Directory moves: the duties that reconcile a moved tree before its move is committed (§3.1) |
 | `rules.rs` | Path rules: recorded or skipped, and why, from `info/exclude`, `info/attributes` and optionally tree rules (§4, §5) |
+| `visibility.rs` | The sandbox overlay's visibility gate: which names it shows and where a new or moved name goes, decided from the rules alone (§1.1, §4) |
 | `nested.rs` | Detects nested git repositories, including ones being created (§5) |
 | `non_empty.rs` | A list with at least one element by construction (`config::Remotes::Pushed`) |
 | `probe.rs` | Bounded, non-blocking reads of small workload files (`.gitignore`, `.git` files) during the synchronous step |
@@ -128,6 +129,11 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root and overview |
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |
+| `session.rs` | What one FUSE session serves: the `Operations` trait that `fuse.rs` calls, implemented by `Ops` and by the overlay |
+| `overlay.rs` | The sandbox overlay's session: the visibility gate and the view owner in front of the shared `Ops` (§1.1, §6) |
+| `overlay/tmp.rs` | The sandbox overlay's tmp layer: files a sandbox creates under names the rules skip, private to the overlay, in a store of the state area, moved into the tree by rename (§1.1) |
+| `invalidate.rs` | Kernel cache coherence across a daemon's FUSE sessions: each session reports the changes it served (`Coherent`), and a worker thread sends them to the other sessions' kernels (`Invalidator`, §17.1) |
+| `access.rs` | Mode-bit permission checks, as the kernel's `generic_permission` decides them (§6) |
 | `boundary.rs` | Recording a change boundary: builds the inputs and calls the recorder, or a front's client (§3.1, §3.2, §3.5) |
 | `creds.rs` | Creating as the caller: a worker thread's filesystem uid, gid and groups switched for one system call (§6) |
 | `dirty.rs` | Whether an inode changed since it was last recorded, so clean closes record nothing |

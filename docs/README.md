@@ -25,7 +25,7 @@ Section numbers (§) across these pages refer to [design.md](design.md).
 | Page | For |
 |---|---|
 | [Docker](docker.md) | The agentfs container and workload containers, with `docker run` and Compose |
-| [Kubernetes sidecar](deployment.md) | The container image and the privileged native sidecar, with the alert rules |
+| [Kubernetes sidecar](deployment.md) | The container image and the privileged native sidecar, with the alert rules and the sandbox overlay |
 | [CSI driver](csi.md) | Volumes as claims for unprivileged pods, several pods per volume on one node, forks |
 | [Helm charts](helm.md) | The CSI driver chart and the sidecar library chart |
 
@@ -52,6 +52,7 @@ that point to it.
 | [A fork's publish is refused](runbooks/fork-refused.md) | `ForkRefused`, by reason |
 | [A moved directory could not be reconciled](runbooks/reconcile-failed.md) | `ReconcileFailed` |
 | [Worktree paths found by the heuristic](runbooks/worktree-heuristic.md) | `agentfs.nested.gitdir_heuristic` counting |
+| [The sandbox overlay](runbooks/sandbox-overlay.md) | The overlay refuses to start, a sandbox cannot save, tmp files gone, both mounts stopped, sandboxes still on a dead mount (`agentfs.sandbox_overlay.refusals`) |
 
 ## How it works
 

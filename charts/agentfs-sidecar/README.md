@@ -21,7 +21,8 @@ dependencies:
 |---|---|
 | `agentfs-sidecar.initContainers` | the init container and the recorder (a native sidecar), for `initContainers` |
 | `agentfs-sidecar.workspaceMount` | the workload container's mount of `/agentfs` (read-only; the workspace is `/agentfs/workspace`) |
-| `agentfs-sidecar.volumes` | the pod's volumes: the claim, the shared emptyDir, the ConfigMap and the Secret |
+| `agentfs-sidecar.sandboxOverlayMount` | with `sandboxOverlay.enabled`, the mount of the sandbox overlay's emptyDir for a container that starts other containers (the overlay is `<mountPath>/overlay`; docs/deployment.md §12) |
+| `agentfs-sidecar.volumes` | the pod's volumes: the claim, the shared emptyDir, the ConfigMap and the Secret, and the sandbox overlay's emptyDir when enabled |
 | `agentfs-sidecar.podAnnotations` | a checksum of the settings, so changing them rolls the pod |
 | `agentfs-sidecar.configMap`, `.secret`, `.claim` | the ConfigMap, the credentials Secret and the claim |
 
@@ -50,5 +51,9 @@ Each takes this library's values, e.g.
 | labels | object | `{}` | Labels of the ConfigMap, Secret and claim the helpers render. |
 | onStaleMount | string | `"recover"` | What the sidecar does on a stale mount after a crash: `recover` mounts over it, `hold` waits for a pod restart (design §17.1). |
 | resources | object | `{"limits":{"memory":"512Mi"},"requests":{"cpu":"50m","memory":"64Mi"}}` | The sidecar's resources. An OOM kill is a crash: size the limit for the volume. |
+| sandboxOverlay.enabled | bool | `false` | Also serve the sandbox overlay (design §2.4, docs/deployment.md §12): a second mount point of the volume, at `<mountPath>/overlay`, that shows only the files the operator's rules would record. Give it to a container that starts other containers, with `agentfs-sidecar.sandboxOverlayMount`, never the main mount. |
+| sandboxOverlay.mountPath | string | `"/agentfs-sandbox"` | Where the sidecar mounts that emptyDir; it must not be `/agentfs` or inside it (the two mount points may not share a parent). |
+| sandboxOverlay.owner | string | `""` | The view owner, `UID:GID` (required when enabled): every operation through the overlay is checked and done as this user, whoever the sandbox runs as. |
+| sandboxOverlay.volumeName | string | `"agentfs-sandbox"` | The emptyDir holding the overlay's mount point. |
 | sealMountpoint | bool | `true` | Seal the bare mount point (root's, mode 0000) so a non-root workload cannot write where nothing records it (design §17.1). |
 | volume | string | `""` | The agentfs volume name (required); the history branch is `agentfs/<volume>` (design §4.3). |

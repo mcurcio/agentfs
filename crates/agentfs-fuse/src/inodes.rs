@@ -142,6 +142,40 @@ impl InodeTable {
         id
     }
 
+    /// A node id never handed out before, mapped to no backing inode (yet):
+    /// for a file the kernel knows before the table does (the sandbox
+    /// overlay's tmp layer), taken over later by [`InodeTable::adopt`].
+    pub fn new_id(&mut self) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        id
+    }
+
+    /// Makes backing inode (`dev`, `ino`), of kind `kind`, node `id` (from
+    /// [`InodeTable::new_id`]), named `name` in `parent`, with `lookups`
+    /// kernel lookups: a file the kernel already knows by `id` that has
+    /// just moved into the tree. An earlier mapping of (`dev`, `ino`) is
+    /// dropped (its file is gone: the inode number was reused), and any
+    /// other node holding the name loses it. The caller drops the node
+    /// ([`InodeTable::maybe_drop`]) once it has added its handles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt(
+        &mut self,
+        id: u64,
+        parent: u64,
+        name: &[u8],
+        dev: u64,
+        ino: u64,
+        kind: Kind,
+        lookups: u64,
+    ) {
+        self.ids.insert((dev, ino), id);
+        let mut node = Node::new(dev, ino, kind);
+        node.nlookup = lookups;
+        self.nodes.insert(id, node);
+        self.add_link(parent, name, id);
+    }
+
     /// The kernel learned `name` in `parent` names backing inode (`dev`,
     /// `ino`) of kind `kind` (a lookup, create, mkdir, mknod, symlink or
     /// link reply). Counts one kernel lookup and returns the node id.
@@ -492,6 +526,31 @@ mod tests {
         assert_eq!(Kind::from_mode(0o040755), Kind::Dir);
         assert_eq!(Kind::from_mode(0o120777), Kind::Symlink);
         assert_eq!(Kind::from_mode(0o010644), Kind::Other);
+    }
+
+    #[test]
+    fn adopt_takes_over_the_inode_and_the_name() {
+        let mut t = table();
+        let fresh = t.new_id();
+        assert!(t.get(fresh).is_none(), "mapped to nothing");
+        let next = t.lookup(ROOT, b"other", 1, 150, Kind::File);
+        assert!(next > fresh, "never handed out again");
+        // An unlinked file whose inode number is reused by the newcomer,
+        // and a file at the name it takes.
+        let gone = t.lookup(ROOT, b"gone", 1, 101, Kind::File);
+        t.remove_link(ROOT, b"gone");
+        let old = t.lookup(ROOT, b"c", 1, 102, Kind::File);
+        t.adopt(fresh, ROOT, b"c", 1, 101, Kind::File, 2);
+        assert_eq!(t.child(ROOT, b"c"), Some(fresh));
+        assert!(paths(&t, old).is_empty(), "the replaced file lost its name");
+        assert_eq!(paths(&t, fresh), ["c"]);
+        assert_eq!(t.lookup(ROOT, b"c", 1, 101, Kind::File), fresh);
+        assert_ne!(gone, fresh);
+        // Two lookups from the adoption, one from the lookup just made.
+        t.forget(fresh, 2);
+        assert!(t.get(fresh).is_some());
+        t.forget(fresh, 1);
+        assert!(t.get(fresh).is_none());
     }
 
     #[test]

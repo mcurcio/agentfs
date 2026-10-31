@@ -61,6 +61,7 @@ sharing-one-volume world.
 | One process, one mount | `agentfs mount BACKING MOUNTPOINT`; one workload process | Every change boundary recorded before the call returns (§3.1, §3.2) | **built** |
 | Several processes, one mount | Several processes or containers use one FUSE mount: one pod's containers (deployment.md §10, Hermes and its tool containers), or several Docker workload containers on one host mount ([docker.md](docker.md#2-the-layout)) | One kernel and one daemon. Grouped commits carry one `Agentfs-Uid` and `Agentfs-Pid` line per writer (§9) | **built** |
 | Several pods, one volume, one node | CSI only: one front per pod (`mount --history-service`), one history service per volume (`serve-history`) | Files shared with the backing filesystem's semantics: two pods writing one file is last writer wins; POSIX locks are not shared between pods, so a SQLite database is written from one pod ([csi.md](csi.md#6-using-a-volume)). A commit never holds two pods' changes; each pod has its own committer (§9, §14) | **built** (§14.1, §14.2) |
+| One daemon, two mount points: the main mount and the sandbox overlay | `agentfs mount --sandbox-overlay PATH --sandbox-owner UID:GID` (example 12) | One set of names, one set of open files, one recorder. The overlay shows only recordable files and keeps other new files in a private tmp layer; each kernel caches its own names, invalidated by events from the other; POSIX and BSD locks are not shared between the two mounts (§1.1, §2.4) | **built** (single-process `mount` only); on a front or a CSI volume **not built** (open, §19.2 item 13) |
 | Several pods through the sidecar | | The sidecar is one pod per volume ([deployment.md](deployment.md#11-limitations)) | use the CSI driver |
 | Several nodes, one volume | `ReadWriteMany`, `ReadOnlyMany` | Refused: the claim stays Pending. Pods on other nodes read the history from a remote | **not supported** (§19.1, 2026-10-15) |
 | A volume moving between nodes | | A worktree stays on its node for good. Continuing elsewhere is a new volume started from the old branch (example 10) | **not supported** as a move (§14.2, [moving.md](runbooks/moving.md)) |
@@ -498,12 +499,59 @@ large files kept out of git.
   each remote needs an LFS server
   ([configuration](configuration.md#remote-name)).
 
+### Example 12: a sidecar with the sandbox overlay
+
+**For:** a workload that starts sandboxes through a container that
+starts other containers (for example a Docker daemon), where the
+sandboxes should see and change only the files that are recorded, and
+their changes should reach the workload at once.
+
+| Dimension | Value |
+|---|---|
+| Integration point | filesystem, packaged as the sidecar, with the sandbox overlay |
+| Sharing | one pod; one daemon serving two mount points (section 1.2) |
+| Remotes | any |
+| Knobs | `--sandbox-overlay`, `--sandbox-owner`; the operator's rules decide what the overlay shows |
+
+```sh
+kubectl apply -k deploy/examples/sidecar-sandbox-overlay
+# or, with the sidecar library chart: sandboxOverlay.enabled=true, sandboxOverlay.owner=<uid>:<gid>
+```
+
+The container that starts other containers mounts only the
+`agentfs-sandbox` `emptyDir`, and binds paths under
+`/agentfs-sandbox/overlay` into its sandboxes
+([deployment.md](deployment.md#12-the-sandbox-overlay)).
+
+- **The workload sees** the whole tree through the main mount, as in
+  example 2, and every change a sandbox makes to a recorded file as
+  soon as the call returns.
+- **A sandbox sees** only the recordable files and the directories that
+  could hold them; everything else answers "no such file". A file it
+  creates under a name the rules skip is a tmp file only sandboxes see,
+  never recorded, gone when the sidecar stops; renaming it onto a
+  recordable name records it there (§2.4). Every operation is done as
+  the view owner, whatever user the sandbox runs as.
+- **History:** as example 2. Changes through the overlay are recorded
+  with the view owner as `Agentfs-Uid`. No tmp name reaches history.
+- **Restores and reverts** (example 9) check and settle the files open
+  through either mount point.
+- **Limits:** the boundary is for names only (§1.1): a file a sandbox
+  holds open stays writable after it leaves view; volume-wide facts
+  leak; locks are not shared between the mounts. Sandboxes lose hard
+  links, creating symlinks, directory moves (`EXDEV`), WAL databases,
+  and `git init` and `git clone` through the overlay. It is not offered
+  under the CSI driver (example 4) or on fronts. Tested with FUSE mounts
+  in CI; the Component and the chart option only as rendered manifests.
+
 ## 3. How to use this page
 
 - **Check a design against every example it touches**, not only the one
   it was written for. A change to how patches apply touches examples 3,
   5, 8 and 11; a change to the front protocol touches example 4 and
-  every restore through the history service in example 9.
+  every restore through the history service in example 9; a change to
+  the sandbox overlay touches examples 2, 9 and 12, and example 4 when
+  it is offered on fronts.
 - **Say which world the design lives in.** File semantics (locks,
   renames, caches) belong to section 1.2. Merging, order and gating
   belong to section 1.3. A design that needs both, such as landing a
