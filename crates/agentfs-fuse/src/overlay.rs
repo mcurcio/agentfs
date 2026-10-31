@@ -388,8 +388,16 @@ impl<O: Operations> Operations for Overlay<O> {
     fn lookup(&self, parent: u64, name: &[u8]) -> OpResult<Entry> {
         let dir = self.shown(parent)?;
         self.require(&dir.attr, SEARCH)?;
-        let _ = Self::child(&dir, name).ok_or(Errno::ENOENT)?;
-        self.inner.lookup(parent, name)
+        let path = Self::child(&dir, name).ok_or(Errno::ENOENT)?;
+        if let Visibility::Hidden(h) = self.gate.may_show(&path) {
+            return Err(hidden_errno(h));
+        }
+        let entry = self.inner.lookup(parent, name)?;
+        if let Visibility::Hidden(h) = self.gate.show(&path, existing_kind(entry.attr.kind)) {
+            self.inner.forget(entry.id, 1);
+            return Err(hidden_errno(h));
+        }
+        Ok(entry)
     }
 
     fn forget(&self, id: u64, n: u64) {
@@ -481,7 +489,7 @@ impl<O: Operations> Operations for Overlay<O> {
         _target: &[u8],
         _caller: Caller,
     ) -> OpResult<Entry> {
-        self.inner.symlink(_parent, _name, _target, _caller)
+        Err(Errno::EACCES)
     }
 
     fn rename(
@@ -542,10 +550,7 @@ impl<O: Operations> Operations for Overlay<O> {
 
     fn open(&self, id: u64, flags: i32, caller: Caller) -> OpResult<(u64, Arc<Handle>)> {
         let node = self.shown(id)?;
-        let who = Who { uid: caller.uid, gid: caller.gid, groups: &[] };
-        if !access::permits(Object::from_attr(&node.attr), who, Want::from_open_flags(flags)) {
-            return Err(Errno::EACCES);
-        }
+        self.require(&node.attr, Want::from_open_flags(flags))?;
         self.inner.open(id, flags, self.owner.caller(caller.pid))
     }
 
