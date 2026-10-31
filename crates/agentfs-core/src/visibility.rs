@@ -41,8 +41,9 @@
 
 use std::sync::Arc;
 
+use crate::fsync_class;
 use crate::paths::RepoPath;
-use crate::rules::Rules;
+use crate::rules::{Decision, Rules, RulesError};
 
 /// What an existing entry is, as a lookup or a listing sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,28 +151,47 @@ impl Gate {
     /// The gate over the volume's `rules`. Refuses a volume whose rules
     /// read tree rule files ([`GateError::TreeRules`]).
     pub fn new(rules: Arc<Rules>) -> Result<Self, GateError> {
-        let _ = rules;
-        todo!("sandbox overlay slice 1")
+        if rules.options().respect_tree_rules {
+            return Err(GateError::TreeRules);
+        }
+        Ok(Self { rules })
     }
 
     /// Whether any entry at `path` could be shown, whatever its kind:
     /// [`Visibility::Hidden`] means every kind is hidden, so a caller can
     /// answer for the name without looking at the tree.
     pub fn may_show(&self, path: &RepoPath) -> Visibility {
-        let _ = (&self.rules, path);
-        todo!("sandbox overlay slice 1")
+        let file = self.file(path);
+        let dir = self.dir(path);
+        match (file, dir) {
+            (Ok(true), _) | (_, Ok(true)) => Visibility::Shown,
+            (Err(_), _) | (_, Err(_)) => Visibility::Hidden(Hidden::RulesError),
+            (Ok(false), Ok(false)) => Visibility::Hidden(Hidden::NotRecordable),
+        }
     }
 
     /// Whether the existing entry at `path`, of kind `kind`, is shown.
     pub fn show(&self, path: &RepoPath, kind: ExistingKind) -> Visibility {
-        let _ = (path, kind);
-        todo!("sandbox overlay slice 1")
+        match kind {
+            ExistingKind::File | ExistingKind::Symlink => visibility(self.file(path)),
+            ExistingKind::Directory => visibility(self.dir(path)),
+            ExistingKind::Special => Visibility::Hidden(Hidden::NotRecordable),
+        }
     }
 
     /// Where a new entry of kind `kind` at `path` goes.
     pub fn place_new(&self, path: &RepoPath, kind: NewKind) -> Placement {
-        let _ = (path, kind);
-        todo!("sandbox overlay slice 1")
+        match kind {
+            NewKind::File => file_placement(self.file(path)),
+            NewKind::Directory => match self.dir(path) {
+                Ok(true) => Placement::Tree,
+                Ok(false) => Placement::Refused(Denial::NotRecordable),
+                Err(_) => Placement::Refused(Denial::RulesError),
+            },
+            NewKind::Symlink | NewKind::Hardlink | NewKind::Special => {
+                Placement::Refused(Denial::Kind)
+            }
+        }
     }
 
     /// Where a rename of `from` to `to` goes. A tree source that is not
@@ -179,7 +199,414 @@ impl Gate {
     /// that its caller checked. An exchange is two moves, each of which
     /// must place in the tree.
     pub fn place_move(&self, from: Source<'_>, to: &RepoPath) -> Placement {
-        let _ = (from, to);
-        todo!("sandbox overlay slice 1")
+        let (path, kind) = match from {
+            Source::TmpLayer(_) => return file_placement(self.file(to)),
+            Source::Tree(path, kind) => (path, kind),
+        };
+        match self.show(path, kind) {
+            Visibility::Shown => {}
+            Visibility::Hidden(Hidden::NotRecordable) => {
+                return Placement::Refused(Denial::SourceHidden);
+            }
+            Visibility::Hidden(Hidden::RulesError) => {
+                return Placement::Refused(Denial::RulesError);
+            }
+        }
+        match kind {
+            ExistingKind::Directory => Placement::CrossDevice,
+            ExistingKind::Symlink => Placement::Refused(Denial::Kind),
+            ExistingKind::File => match self.file(to) {
+                Ok(true) => Placement::Tree,
+                Ok(false) => Placement::Refused(Denial::NotRecordable),
+                Err(_) => Placement::Refused(Denial::RulesError),
+            },
+            // Never shown, so refused above; kept closed if that changes.
+            ExistingKind::Special => Placement::Refused(Denial::SourceHidden),
+        }
+    }
+
+    /// Whether a file at `path` would be recorded if it were new, and, in
+    /// an fsync-class group, whether every member of its group would be.
+    /// The tracked flag is always false: the gate never asks the tracked
+    /// set.
+    fn file(&self, path: &RepoPath) -> Result<bool, RulesError> {
+        if self.rules.decide(path, false)? != Decision::Record {
+            return Ok(false);
+        }
+        let Some(class) = self.rules.fsync_class(path) else {
+            return Ok(true);
+        };
+        let Some(group) = fsync_class::group_members(path, &class, |q| self.rules.fsync_class(q))
+        else {
+            return Ok(true);
+        };
+        for member in &group.members {
+            if self.rules.decide(member, false)? != Decision::Record {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether the rules could record something beneath directory `path`.
+    fn dir(&self, path: &RepoPath) -> Result<bool, RulesError> {
+        Ok(!self.rules.excludes_dir(path)?)
+    }
+}
+
+/// An existing name's visibility from a predicate: failing closed.
+fn visibility(recordable: Result<bool, RulesError>) -> Visibility {
+    match recordable {
+        Ok(true) => Visibility::Shown,
+        Ok(false) => Visibility::Hidden(Hidden::NotRecordable),
+        Err(_) => Visibility::Hidden(Hidden::RulesError),
+    }
+}
+
+/// Where a new file, or a file moved out of the tmp layer, goes.
+fn file_placement(recordable: Result<bool, RulesError>) -> Placement {
+    match recordable {
+        Ok(true) => Placement::Tree,
+        Ok(false) => Placement::TmpLayer,
+        Err(_) => Placement::Refused(Denial::RulesError),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::*;
+    use crate::rules::RuleOptions;
+
+    /// The allowlist the worked examples use.
+    const E: &str = "/*\n!/config.yaml\n!/skills/\n";
+
+    fn p(s: &str) -> RepoPath {
+        RepoPath::new(s).unwrap()
+    }
+
+    struct Fixture {
+        dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                dir: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        fn tree(&self) -> &Path {
+            self.dir.path()
+        }
+
+        fn file(&self, rel: &str) -> &Self {
+            let path = self.tree().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "x").unwrap();
+            self
+        }
+
+        fn mkdir(&self, rel: &str) -> &Self {
+            fs::create_dir_all(self.tree().join(rel)).unwrap();
+            self
+        }
+
+        fn rules(&self, exclude: &str, attributes: &str) -> Rules {
+            Rules::new(
+                self.tree(),
+                RuleOptions::default(),
+                exclude.as_bytes(),
+                attributes.as_bytes(),
+            )
+        }
+
+        fn gate(&self, exclude: &str, attributes: &str) -> Gate {
+            Gate::new(Arc::new(self.rules(exclude, attributes))).unwrap()
+        }
+    }
+
+    const SHOWN: Visibility = Visibility::Shown;
+    const HIDDEN: Visibility = Visibility::Hidden(Hidden::NotRecordable);
+    const RULES_ERROR: Visibility = Visibility::Hidden(Hidden::RulesError);
+
+    #[test]
+    fn a1_skipped_file_is_hidden_whether_or_not_it_exists() {
+        let f = Fixture::new();
+        let g = f.gate(E, "");
+        let secrets = p("secrets.db");
+        assert_eq!(g.show(&secrets, ExistingKind::File), HIDDEN);
+        assert_eq!(g.may_show(&secrets), HIDDEN);
+        f.file("secrets.db");
+        assert_eq!(g.show(&secrets, ExistingKind::File), HIDDEN);
+        assert_eq!(g.may_show(&secrets), HIDDEN);
+    }
+
+    #[test]
+    fn a2_new_skipped_file_goes_to_the_tmp_layer() {
+        let g = Fixture::new().gate(E, "");
+        assert_eq!(
+            g.place_new(&p("notes.txt"), NewKind::File),
+            Placement::TmpLayer
+        );
+    }
+
+    #[test]
+    fn a3_save_by_temp_file_and_rename() {
+        let g = Fixture::new().gate(E, "");
+        assert_eq!(
+            g.place_new(&p("config.yaml.tmp"), NewKind::File),
+            Placement::TmpLayer
+        );
+        assert_eq!(
+            g.place_move(Source::TmpLayer(&p("config.yaml.tmp")), &p("config.yaml")),
+            Placement::Tree
+        );
+        assert_eq!(
+            g.place_move(Source::TmpLayer(&p("a.tmp")), &p("b.tmp")),
+            Placement::TmpLayer
+        );
+    }
+
+    #[test]
+    fn a4_recordable_file_is_shown_and_placed_in_the_tree() {
+        let g = Fixture::new().gate(E, "");
+        assert_eq!(g.show(&p("config.yaml"), ExistingKind::File), SHOWN);
+        assert_eq!(g.may_show(&p("config.yaml")), SHOWN);
+        assert_eq!(
+            g.place_new(&p("config.yaml"), NewKind::File),
+            Placement::Tree
+        );
+    }
+
+    #[test]
+    fn a5_tree_file_never_moves_to_a_skipped_name() {
+        let g = Fixture::new().gate(E, "");
+        assert_eq!(
+            g.place_move(
+                Source::Tree(&p("config.yaml"), ExistingKind::File),
+                &p("config.bak")
+            ),
+            Placement::Refused(Denial::NotRecordable)
+        );
+        assert_eq!(
+            g.place_move(
+                Source::Tree(&p("config.yaml"), ExistingKind::File),
+                &p("skills/config.yaml")
+            ),
+            Placement::Tree
+        );
+    }
+
+    #[test]
+    fn a6_directory_moves_are_cross_device_whatever_the_target() {
+        let g = Fixture::new().gate(E, "");
+        let from = p("skills/a");
+        for to in ["skills/b", "hidden/b"] {
+            assert_eq!(
+                g.place_move(Source::Tree(&from, ExistingKind::Directory), &p(to)),
+                Placement::CrossDevice,
+                "{to}"
+            );
+        }
+    }
+
+    #[test]
+    fn a7_tree_rules_are_refused_and_rules_stay_fixed() {
+        let f = Fixture::new();
+        let respect = Rules::new(
+            f.tree(),
+            RuleOptions {
+                respect_tree_rules: true,
+                ..RuleOptions::default()
+            },
+            E.as_bytes(),
+            b"",
+        );
+        assert!(matches!(
+            Gate::new(Arc::new(respect)),
+            Err(GateError::TreeRules)
+        ));
+
+        let git_dir = tempfile::tempdir().unwrap();
+        let info = git_dir.path().join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("exclude"), E).unwrap();
+        let rules = Rules::load(git_dir.path(), f.tree(), RuleOptions::default()).unwrap();
+        let g = Gate::new(Arc::new(rules)).unwrap();
+        let answers = |g: &Gate| {
+            (
+                g.show(&p("notes.txt"), ExistingKind::File),
+                g.show(&p("config.yaml"), ExistingKind::File),
+                g.place_new(&p("notes.txt"), NewKind::File),
+                g.place_new(&p("cache"), NewKind::Directory),
+            )
+        };
+        let before = answers(&g);
+        assert_eq!(
+            before,
+            (
+                HIDDEN,
+                SHOWN,
+                Placement::TmpLayer,
+                Placement::Refused(Denial::NotRecordable)
+            )
+        );
+        fs::write(info.join("exclude"), "").unwrap();
+        assert_eq!(answers(&g), before);
+    }
+
+    #[test]
+    fn a8_symlinks_are_shown_but_never_placed() {
+        let g = Fixture::new().gate(E, "");
+        assert_eq!(g.show(&p("skills/link"), ExistingKind::Symlink), SHOWN);
+        assert_eq!(g.show(&p("link"), ExistingKind::Symlink), HIDDEN);
+        assert_eq!(
+            g.place_new(&p("skills/l2"), NewKind::Symlink),
+            Placement::Refused(Denial::Kind)
+        );
+        assert_eq!(
+            g.place_move(
+                Source::Tree(&p("skills/link"), ExistingKind::Symlink),
+                &p("skills/l3")
+            ),
+            Placement::Refused(Denial::Kind)
+        );
+    }
+
+    #[test]
+    fn a9_hard_links_and_special_files_are_refused() {
+        let g = Fixture::new().gate(E, "");
+        for path in ["skills/c.yaml", "hidden.yaml", "config.yaml"] {
+            assert_eq!(
+                g.place_new(&p(path), NewKind::Hardlink),
+                Placement::Refused(Denial::Kind),
+                "{path}"
+            );
+            assert_eq!(
+                g.place_new(&p(path), NewKind::Special),
+                Placement::Refused(Denial::Kind),
+                "{path}"
+            );
+        }
+        assert_eq!(g.show(&p("skills/fifo"), ExistingKind::Special), HIDDEN);
+        assert_eq!(
+            g.place_move(
+                Source::Tree(&p("skills/fifo"), ExistingKind::Special),
+                &p("skills/f2")
+            ),
+            Placement::Refused(Denial::SourceHidden)
+        );
+    }
+
+    #[test]
+    fn a10_tracking_is_ignored() {
+        let g = Fixture::new().gate("/*\n!/config.yaml\n", "");
+        assert_eq!(g.show(&p("old.txt"), ExistingKind::File), HIDDEN);
+        assert_eq!(
+            g.rules.decide(&p("old.txt"), true).unwrap(),
+            Decision::Record
+        );
+        assert_eq!(
+            g.place_move(
+                Source::Tree(&p("old.txt"), ExistingKind::File),
+                &p("config.yaml")
+            ),
+            Placement::Refused(Denial::SourceHidden)
+        );
+    }
+
+    #[test]
+    fn a11_directories() {
+        let f = Fixture::new();
+        f.mkdir("skills/repo/.git");
+        let g = f.gate(E, "");
+        assert_eq!(g.show(&p("skills"), ExistingKind::Directory), SHOWN);
+        assert_eq!(g.may_show(&p("skills")), SHOWN);
+        assert_eq!(g.show(&p("secrets"), ExistingKind::Directory), HIDDEN);
+        assert_eq!(g.may_show(&p("secrets")), HIDDEN);
+        assert_eq!(
+            g.place_new(&p("skills/new"), NewKind::Directory),
+            Placement::Tree
+        );
+        assert_eq!(
+            g.place_new(&p("cache"), NewKind::Directory),
+            Placement::Refused(Denial::NotRecordable)
+        );
+        assert_eq!(g.show(&p("skills/repo"), ExistingKind::Directory), HIDDEN);
+        assert_eq!(g.show(&p("skills/repo/x"), ExistingKind::File), HIDDEN);
+    }
+
+    #[test]
+    fn a12_never_record_groups_and_shared_memory() {
+        let f = Fixture::new();
+        let g = f.gate(E, "/skills/*.key -agentfs\n");
+        assert_eq!(g.show(&p("skills/a.key"), ExistingKind::File), HIDDEN);
+        assert_eq!(
+            g.place_new(&p("skills/a.key"), NewKind::File),
+            Placement::TmpLayer
+        );
+
+        let group = "/skills/db agentfs.commit=fsync agentfs.group=g\n\
+                     /skills/db-wal agentfs.commit=fsync agentfs.group=g\n";
+        let split = f.gate(&format!("{E}/skills/db-wal\n"), group);
+        assert_eq!(split.show(&p("skills/db"), ExistingKind::File), HIDDEN);
+        assert_eq!(
+            split.place_new(&p("skills/db"), NewKind::File),
+            Placement::TmpLayer
+        );
+        let whole = f.gate(E, group);
+        assert_eq!(whole.show(&p("skills/db"), ExistingKind::File), SHOWN);
+        assert_eq!(whole.show(&p("skills/db-wal"), ExistingKind::File), SHOWN);
+        assert_eq!(whole.show(&p("skills/db-shm"), ExistingKind::File), HIDDEN);
+    }
+
+    #[test]
+    fn a13_rules_errors_fail_closed() {
+        let f = Fixture::new();
+        let g = f.gate(E, "");
+        // Longer than any file name the host allows, so probing `D/.git`
+        // for a nested repository fails with ENAMETOOLONG, which is not
+        // "absent".
+        let long = "d".repeat(300);
+        let x = p(&format!("{long}/x"));
+        assert!(g.rules.nested_ancestor(&x).is_err());
+
+        assert_eq!(g.show(&x, ExistingKind::File), RULES_ERROR);
+        assert_eq!(g.show(&x, ExistingKind::Symlink), RULES_ERROR);
+        assert_eq!(g.show(&x, ExistingKind::Directory), RULES_ERROR);
+        assert_eq!(g.may_show(&x), RULES_ERROR);
+        assert_eq!(
+            g.place_new(&x, NewKind::File),
+            Placement::Refused(Denial::RulesError)
+        );
+        assert_eq!(
+            g.place_new(&x, NewKind::Directory),
+            Placement::Refused(Denial::RulesError)
+        );
+        assert_eq!(
+            g.place_move(Source::TmpLayer(&p("a.tmp")), &x),
+            Placement::Refused(Denial::RulesError)
+        );
+        assert_eq!(
+            g.place_move(Source::Tree(&x, ExistingKind::File), &p("config.yaml")),
+            Placement::Refused(Denial::RulesError)
+        );
+        assert_eq!(
+            g.place_move(Source::Tree(&x, ExistingKind::Directory), &p("skills/b")),
+            Placement::Refused(Denial::RulesError)
+        );
+        assert_eq!(
+            g.place_move(Source::Tree(&p("config.yaml"), ExistingKind::File), &x),
+            Placement::Refused(Denial::RulesError)
+        );
+    }
+
+    #[test]
+    fn a14_gate_is_send_and_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<Gate>();
     }
 }
