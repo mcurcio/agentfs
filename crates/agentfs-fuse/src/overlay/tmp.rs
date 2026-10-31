@@ -334,14 +334,19 @@ impl TmpLayer {
         }
         let mode = mode & 0o777;
         let file = store_name(node);
-        let (made, _) = creds::create_as(self.switch, self.owner.caller(0), || {
-            rustix::fs::openat(
-                &self.store,
-                file.as_str(),
-                oflags | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from_raw_mode(mode),
-            )
-        });
+        let (made, _) = creds::create_as(
+            self.switch,
+            self.owner.caller(0),
+            creds::Supplementary::None,
+            || {
+                rustix::fs::openat(
+                    &self.store,
+                    file.as_str(),
+                    oflags | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::from_raw_mode(mode),
+                )
+            },
+        );
         let fd = made.map_err(eno)?;
         let owned = |fd: &OwnedFd| -> OpResult<rustix::fs::Stat> {
             let st = rustix::fs::fstat(fd).map_err(eno)?;

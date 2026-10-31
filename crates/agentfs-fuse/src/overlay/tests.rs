@@ -78,6 +78,34 @@ struct Call {
     caller: Option<Caller>,
 }
 
+/// The extended attribute names of every [`FakeOps`] node.
+const FAKE_XATTRS: &[u8] = b"user.a\0trusted.b\0security.c\0user.d\0";
+
+/// A [`Found`] that owns its path.
+struct Owned {
+    path: Vec<u8>,
+    kind: Option<Kind>,
+}
+
+impl Owned {
+    fn as_found(&self) -> Found<'_> {
+        Found {
+            path: &self.path,
+            kind: self.kind,
+        }
+    }
+}
+
+/// The inode table's kind of fuser kind `kind`.
+fn kind_of(kind: FileType) -> Kind {
+    match kind {
+        FileType::RegularFile => Kind::File,
+        FileType::Directory => Kind::Dir,
+        FileType::Symlink => Kind::Symlink,
+        _ => Kind::Other,
+    }
+}
+
 /// An [`Operations`] with scripted nodes that records every call.
 #[derive(Default)]
 struct FakeOps {
@@ -168,6 +196,26 @@ impl FakeOps {
         }
     }
 
+    /// What the fake finds at `name` in `parent`, as the operations hand
+    /// it to a check.
+    fn found(&self, parent: u64, name: &[u8]) -> Owned {
+        Owned {
+            path: join(self.paths.get(&parent).map_or(&[][..], Vec::as_slice), name),
+            kind: self
+                .children
+                .get(&(parent, name.to_vec()))
+                .map(|id| kind_of(self.attrs[id].kind)),
+        }
+    }
+
+    /// Asks `actor`'s check about a new entry, as the operations do.
+    fn check_create(&self, actor: Actor<'_>, parent: u64, name: &[u8], kind: Kind) -> OpResult<()> {
+        match actor.check {
+            Some(check) => check.create(self.found(parent, name).as_found(), kind),
+            None => Ok(()),
+        }
+    }
+
     fn handle(id: u64) -> Arc<Handle> {
         let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
         Arc::new(Handle::new(id, fd, false, None, 0))
@@ -193,8 +241,8 @@ impl Operations for FakeOps {
         self.attrs.get(&id).copied().ok_or(Errno::ENOENT)
     }
 
-    fn setattr(&self, id: u64, _set: &SetAttr, caller: Caller) -> OpResult<FileAttr> {
-        self.record("setattr", b"", Some(caller));
+    fn setattr(&self, id: u64, _set: &SetAttr, actor: Actor<'_>) -> OpResult<FileAttr> {
+        self.record("setattr", b"", Some(actor.caller));
         self.attrs.get(&id).copied().ok_or(Errno::ENOENT)
     }
 
@@ -214,74 +262,94 @@ impl Operations for FakeOps {
 
     fn mknod(
         &self,
-        _parent: u64,
+        parent: u64,
         name: &[u8],
-        _mode: u32,
+        mode: u32,
         _rdev: u32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<Entry> {
-        self.record("mknod", name, Some(caller));
+        self.record("mknod", name, Some(actor.caller));
+        self.check_create(actor, parent, name, Kind::from_mode(mode))?;
         Ok(self.entry(2))
     }
 
-    fn mkdir(&self, _parent: u64, name: &[u8], _mode: u32, caller: Caller) -> OpResult<Entry> {
-        self.record("mkdir", name, Some(caller));
+    fn mkdir(&self, parent: u64, name: &[u8], _mode: u32, actor: Actor<'_>) -> OpResult<Entry> {
+        self.record("mkdir", name, Some(actor.caller));
+        self.check_create(actor, parent, name, Kind::Dir)?;
         Ok(self.entry(5))
     }
 
-    fn unlink(&self, _parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
-        self.record("unlink", name, Some(caller));
+    fn unlink(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        self.record("unlink", name, Some(actor.caller));
+        if let Some(check) = actor.check {
+            check.remove(self.found(parent, name).as_found())?;
+        }
         Ok(())
     }
 
-    fn rmdir(&self, _parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
-        self.record("rmdir", name, Some(caller));
+    fn rmdir(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        self.record("rmdir", name, Some(actor.caller));
+        if let Some(check) = actor.check {
+            check.remove(self.found(parent, name).as_found())?;
+        }
         Ok(())
     }
 
     fn symlink(
         &self,
-        _parent: u64,
+        parent: u64,
         name: &[u8],
         _target: &[u8],
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<Entry> {
-        self.record("symlink", name, Some(caller));
+        self.record("symlink", name, Some(actor.caller));
+        self.check_create(actor, parent, name, Kind::Symlink)?;
         Ok(self.entry(2))
     }
 
     fn rename(
         &self,
-        _parent: u64,
+        parent: u64,
         name: &[u8],
-        _newparent: u64,
-        _newname: &[u8],
-        _flags: u32,
-        caller: Caller,
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+        actor: Actor<'_>,
     ) -> OpResult<()> {
-        self.record("rename", name, Some(caller));
+        self.record("rename", name, Some(actor.caller));
+        if let Some(check) = actor.check {
+            check.rename(
+                self.found(parent, name).as_found(),
+                self.found(newparent, newname).as_found(),
+                flags,
+            )?;
+        }
         Ok(())
     }
 
-    fn link(&self, _id: u64, _newparent: u64, newname: &[u8], caller: Caller) -> OpResult<Entry> {
-        self.record("link", newname, Some(caller));
+    fn link(&self, _id: u64, newparent: u64, newname: &[u8], actor: Actor<'_>) -> OpResult<Entry> {
+        self.record("link", newname, Some(actor.caller));
+        if let Some(check) = actor.check {
+            check.link(self.found(newparent, newname).as_found())?;
+        }
         Ok(self.entry(2))
     }
 
-    fn open(&self, id: u64, _flags: i32, caller: Caller) -> OpResult<(u64, Arc<Handle>)> {
-        self.record("open", b"", Some(caller));
+    fn open(&self, id: u64, _flags: i32, actor: Actor<'_>) -> OpResult<(u64, Arc<Handle>)> {
+        self.record("open", b"", Some(actor.caller));
         Ok((1, Self::handle(id)))
     }
 
     fn create(
         &self,
-        _parent: u64,
+        parent: u64,
         name: &[u8],
         _mode: u32,
         _flags: i32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<(Entry, u64, Arc<Handle>)> {
-        self.record("create", name, Some(caller));
+        self.record("create", name, Some(actor.caller));
+        self.check_create(actor, parent, name, Kind::File)?;
         Ok((self.entry(2), 1, Self::handle(2)))
     }
 
@@ -290,13 +358,13 @@ impl Operations for FakeOps {
         Ok(Vec::new())
     }
 
-    fn write(&self, _fh: u64, _offset: u64, data: &[u8], caller: Caller) -> OpResult<u32> {
-        self.record("write", b"", Some(caller));
+    fn write(&self, _fh: u64, _offset: u64, data: &[u8], actor: Actor<'_>) -> OpResult<u32> {
+        self.record("write", b"", Some(actor.caller));
         Ok(u32::try_from(data.len()).unwrap())
     }
 
-    fn flush(&self, _fh: u64, caller: Caller) -> OpResult<()> {
-        self.record("flush", b"", Some(caller));
+    fn flush(&self, _fh: u64, actor: Actor<'_>) -> OpResult<()> {
+        self.record("flush", b"", Some(actor.caller));
         Ok(())
     }
 
@@ -316,9 +384,9 @@ impl Operations for FakeOps {
         _offset: u64,
         _length: u64,
         _mode: i32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<()> {
-        self.record("fallocate", b"", Some(caller));
+        self.record("fallocate", b"", Some(actor.caller));
         Ok(())
     }
 
@@ -334,9 +402,9 @@ impl Operations for FakeOps {
         _fh_out: u64,
         _offset_out: u64,
         len: u64,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<u32> {
-        self.record("copy_file_range", b"", Some(caller));
+        self.record("copy_file_range", b"", Some(actor.caller));
         Ok(u32::try_from(len).unwrap_or(u32::MAX))
     }
 
@@ -403,9 +471,16 @@ impl Operations for FakeOps {
         Ok(Xattr::Size(0))
     }
 
-    fn listxattr(&self, _id: u64, _size: u32) -> OpResult<Xattr> {
+    /// Every node has `user.a`, `trusted.b`, `security.c` and `user.d`.
+    fn listxattr(&self, _id: u64, size: u32) -> OpResult<Xattr> {
         self.record("listxattr", b"", None);
-        Ok(Xattr::Size(0))
+        let list = FAKE_XATTRS.to_vec();
+        let len = u32::try_from(list.len()).unwrap();
+        match size {
+            0 => Ok(Xattr::Size(len)),
+            n if n < len => Err(Errno::ERANGE),
+            _ => Ok(Xattr::Data(list)),
+        }
     }
 
     fn removexattr(&self, _id: u64, name: &[u8]) -> OpResult<()> {
@@ -438,15 +513,10 @@ impl TreeOperations for FakeOps {
     ) -> OpResult<Entry> {
         self.record("move_in", newname, Some(caller));
         let path = join(&self.paths[&newparent], newname);
-        let kind =
-            self.children
-                .get(&(newparent, newname.to_vec()))
-                .map(|id| match self.attrs[id].kind {
-                    FileType::RegularFile => Kind::File,
-                    FileType::Directory => Kind::Dir,
-                    FileType::Symlink => Kind::Symlink,
-                    _ => Kind::Other,
-                });
+        let kind = self
+            .children
+            .get(&(newparent, newname.to_vec()))
+            .map(|id| kind_of(self.attrs[id].kind));
         check.move_in(Found { path: &path, kind })?;
         rustix::fs::unlinkat(
             from,
@@ -478,6 +548,23 @@ struct B {
     _tree: tempfile::TempDir,
     fake: Arc<FakeOps>,
     overlay: Overlay<FakeOps>,
+    refused: Refusals,
+}
+
+/// The refusals a [`RefusalCounter`] counted, in order.
+#[derive(Clone, Default)]
+struct Refusals(Arc<Mutex<Vec<OverlayRefusal>>>);
+
+impl Refusals {
+    fn counter(&self) -> RefusalCounter {
+        let seen = self.0.clone();
+        Arc::new(move |reason| seen.lock().unwrap().push(reason))
+    }
+
+    /// What was counted since the last take.
+    fn take(&self) -> Vec<OverlayRefusal> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
 }
 
 fn fixture_b(fake: FakeOps) -> B {
@@ -501,10 +588,18 @@ fn fixture_b_with(fake: FakeOps, attributes: &str, dirs: &[&str]) -> B {
     let fake = Arc::new(fake);
     let root = std::fs::File::open(tree.path()).unwrap();
     let tmp = TmpLayer::open(&tree.path().join("tmp-layer"), root.as_fd(), me()).unwrap();
+    let refused = Refusals::default();
     B {
         _tree: tree,
-        overlay: Overlay::new(fake.clone(), gate, owner(), Arc::new(tmp)),
+        overlay: Overlay::new(
+            fake.clone(),
+            gate,
+            owner(),
+            Arc::new(tmp),
+            refused.counter(),
+        ),
         fake,
+        refused,
     }
 }
 
@@ -537,19 +632,29 @@ fn a5_hidden_names_answer_the_same_whether_or_not_they_exist() {
             "{name}"
         );
         assert_eq!(
-            b.overlay.unlink(ROOT, n, REQUEST).unwrap_err(),
+            b.overlay
+                .unlink(ROOT, n, Actor::of_process(REQUEST))
+                .unwrap_err(),
             Errno::ENOENT,
             "{name}"
         );
         assert_eq!(
-            b.overlay.mkdir(ROOT, n, 0o755, REQUEST).unwrap_err(),
+            b.overlay
+                .mkdir(ROOT, n, 0o755, Actor::of_process(REQUEST))
+                .unwrap_err(),
             Errno::EACCES,
             "{name}"
         );
         // A file at a skipped name is a tmp file, whether or not the tree
         // holds one there.
         b.overlay
-            .create(ROOT, n, 0o644, O_WRONLY | O_EXCL, REQUEST)
+            .create(
+                ROOT,
+                n,
+                0o644,
+                O_WRONLY | O_EXCL,
+                Actor::of_process(REQUEST),
+            )
             .unwrap();
     }
     let asked: Vec<Call> = b
@@ -581,19 +686,23 @@ fn hidden_kinds() -> B {
 }
 
 #[test]
-fn a5_hidden_entries_at_placeable_names_are_refused_and_never_touched() {
+fn a5_hidden_entries_at_placeable_names_are_refused_under_the_names_ordering() {
     let b = hidden_kinds();
     let s_ifreg = 0o100000;
     // Each answers as a refused name: never EEXIST, EISDIR or a replace.
     for name in ["pipe", "x.sec", "repo"] {
         let n = name.as_bytes();
         assert_eq!(
-            b.overlay.mkdir(5, n, 0o755, REQUEST).unwrap_err(),
+            b.overlay
+                .mkdir(5, n, 0o755, Actor::of_process(REQUEST))
+                .unwrap_err(),
             Errno::EACCES,
             "mkdir {name}"
         );
         assert_eq!(
-            b.overlay.rename(5, b"a.md", 5, n, 0, REQUEST).unwrap_err(),
+            b.overlay
+                .rename(5, b"a.md", 5, n, 0, Actor::of_process(REQUEST))
+                .unwrap_err(),
             Errno::EACCES,
             "rename onto {name}"
         );
@@ -602,37 +711,39 @@ fn a5_hidden_entries_at_placeable_names_are_refused_and_never_touched() {
         let n = name.as_bytes();
         assert_eq!(
             b.overlay
-                .create(5, n, 0o644, O_WRONLY, REQUEST)
+                .create(5, n, 0o644, O_WRONLY, Actor::of_process(REQUEST))
                 .unwrap_err(),
             Errno::EACCES,
             "create {name}"
         );
         assert_eq!(
             b.overlay
-                .mknod(5, n, s_ifreg | 0o644, 0, REQUEST)
+                .mknod(5, n, s_ifreg | 0o644, 0, Actor::of_process(REQUEST))
                 .unwrap_err(),
             Errno::EACCES,
             "mknod {name}"
         );
     }
-    for method in ["mkdir", "rename", "create", "mknod"] {
-        assert!(b.fake.calls_to(method).is_empty(), "{method}");
-    }
+    // Decided under the names ordering, on what the operations found
+    // there: every refusal is the Judge's, counted once as hidden.
+    assert_eq!(b.refused.take().len(), 10);
     // The same names with nothing behind them go on.
     let b = fixture_b_with(
         FakeOps::examples(),
         "/skills/*.sec -agentfs\n",
         &["skills/repo/.git"],
     );
-    b.overlay.mkdir(5, b"y.sec", 0o755, REQUEST).unwrap();
     b.overlay
-        .rename(5, b"a.md", 5, b"pipe", 0, REQUEST)
+        .mkdir(5, b"y.sec", 0o755, Actor::of_process(REQUEST))
         .unwrap();
     b.overlay
-        .create(5, b"pipe", 0o644, O_WRONLY, REQUEST)
+        .rename(5, b"a.md", 5, b"pipe", 0, Actor::of_process(REQUEST))
         .unwrap();
     b.overlay
-        .mknod(5, b"pipe2", s_ifreg | 0o644, 0, REQUEST)
+        .create(5, b"pipe", 0o644, O_WRONLY, Actor::of_process(REQUEST))
+        .unwrap();
+    b.overlay
+        .mknod(5, b"pipe2", s_ifreg | 0o644, 0, Actor::of_process(REQUEST))
         .unwrap();
 }
 
@@ -642,26 +753,41 @@ fn rename_exchange_needs_both_ends_shown_in_the_tree() {
     let exchange = RenameFlags::EXCHANGE.bits();
     // A hidden kind at the other end: refused, so it never moves.
     assert_ne!(
-        b.overlay.rename(5, b"a.md", 5, b"pipe", exchange, REQUEST),
+        b.overlay
+            .rename(5, b"a.md", 5, b"pipe", exchange, Actor::of_process(REQUEST)),
         Ok(())
     );
     // A directory at the other end never moves.
     assert_eq!(
         b.overlay
-            .rename(ROOT, b"config.yaml", 5, b"d", exchange, REQUEST)
+            .rename(
+                ROOT,
+                b"config.yaml",
+                5,
+                b"d",
+                exchange,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EXDEV
     );
     // Nothing to exchange with.
     assert_eq!(
         b.overlay
-            .rename(5, b"a.md", 5, b"b.md", exchange, REQUEST)
+            .rename(5, b"a.md", 5, b"b.md", exchange, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::ENOENT
     );
     assert!(b.fake.calls_to("rename").is_empty());
     b.overlay
-        .rename(5, b"a.md", ROOT, b"config.yaml", exchange, REQUEST)
+        .rename(
+            5,
+            b"a.md",
+            ROOT,
+            b"config.yaml",
+            exchange,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     assert_eq!(b.fake.calls_to("rename").len(), 1);
 }
@@ -676,19 +802,21 @@ fn rename_onto_an_entry_follows_the_sticky_rule() {
     );
     assert_eq!(
         b.overlay
-            .rename(5, b"a.md", 8, b"theirs.md", 0, REQUEST)
+            .rename(5, b"a.md", 8, b"theirs.md", 0, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
-        b.overlay.unlink(8, b"theirs.md", REQUEST).unwrap_err(),
+        b.overlay
+            .unlink(8, b"theirs.md", Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::EACCES
     );
     assert!(b.fake.calls_to("rename").is_empty());
     assert!(b.fake.calls_to("unlink").is_empty());
     // A new name there is the owner's to add.
     b.overlay
-        .rename(5, b"a.md", 8, b"mine.md", 0, REQUEST)
+        .rename(5, b"a.md", 8, b"mine.md", 0, Actor::of_process(REQUEST))
         .unwrap();
     assert_eq!(b.fake.calls_to("rename").len(), 1);
 }
@@ -702,11 +830,17 @@ fn create_checks_an_existing_file_only_when_it_opens_it() {
     );
     // O_EXCL opens nothing: the operations answer for the existing file.
     b.overlay
-        .create(5, b"theirs.md", 0o644, O_WRONLY | O_EXCL, REQUEST)
+        .create(
+            5,
+            b"theirs.md",
+            0o644,
+            O_WRONLY | O_EXCL,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     // A directory is not opened as a file: the operations answer.
     b.overlay
-        .create(5, b"dir", 0o644, O_WRONLY, REQUEST)
+        .create(5, b"dir", 0o644, O_WRONLY, Actor::of_process(REQUEST))
         .unwrap();
     assert_eq!(b.fake.calls_to("create").len(), 2);
 }
@@ -720,7 +854,9 @@ fn setattr_through_the_overlay() {
         ..SetAttr::default()
     };
     assert_eq!(
-        b.overlay.setattr(2, &chgrp, REQUEST).unwrap_err(),
+        b.overlay
+            .setattr(2, &chgrp, Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::EPERM
     );
     // A size without a handle needs the owner's write access.
@@ -729,11 +865,15 @@ fn setattr_through_the_overlay() {
         ..SetAttr::default()
     };
     assert_eq!(
-        b.overlay.setattr(8, &truncate, REQUEST).unwrap_err(),
+        b.overlay
+            .setattr(8, &truncate, Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::EACCES
     );
     assert!(b.fake.calls_to("setattr").is_empty());
-    b.overlay.setattr(6, &truncate, REQUEST).unwrap();
+    b.overlay
+        .setattr(6, &truncate, Actor::of_process(REQUEST))
+        .unwrap();
     assert_eq!(b.fake.calls_to("setattr").len(), 1);
     // Through a handle, gated when it was opened: a hidden node too, and
     // no write check (ftruncate on a descriptor opened to write).
@@ -743,8 +883,12 @@ fn setattr_through_the_overlay() {
         ..SetAttr::default()
     };
     assert_eq!(b.overlay.getattr(3, None).unwrap_err(), Errno::ENOENT);
-    b.overlay.setattr(3, &through, REQUEST).unwrap();
-    b.overlay.setattr(8, &through, REQUEST).unwrap();
+    b.overlay
+        .setattr(3, &through, Actor::of_process(REQUEST))
+        .unwrap();
+    b.overlay
+        .setattr(8, &through, Actor::of_process(REQUEST))
+        .unwrap();
     assert_eq!(b.fake.calls_to("setattr").len(), 3);
 }
 
@@ -753,22 +897,42 @@ fn mknod_of_a_regular_file_is_a_create_as_the_owner() {
     let b = fixture_b(FakeOps::examples());
     let s_ifreg = 0o100000;
     b.overlay
-        .mknod(5, b"new.md", s_ifreg | 0o4644, 0, REQUEST)
+        .mknod(
+            5,
+            b"new.md",
+            s_ifreg | 0o4644,
+            0,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     // A type of 0 is a regular file too.
-    b.overlay.mknod(5, b"new2.md", 0o644, 0, REQUEST).unwrap();
+    b.overlay
+        .mknod(5, b"new2.md", 0o644, 0, Actor::of_process(REQUEST))
+        .unwrap();
     let calls = b.fake.calls_to("mknod");
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].caller, Some(owner().caller(REQUEST.pid)));
     // A skipped name goes to the tmp layer, never the operations.
     let tmp = b
         .overlay
-        .mknod(ROOT, b"notes.txt", s_ifreg | 0o4644, 0, REQUEST)
+        .mknod(
+            ROOT,
+            b"notes.txt",
+            s_ifreg | 0o4644,
+            0,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     assert_eq!(tmp.attr.perm, 0o644);
     assert_eq!(
         b.overlay
-            .mknod(ROOT, b"notes.txt", s_ifreg | 0o644, 0, REQUEST)
+            .mknod(
+                ROOT,
+                b"notes.txt",
+                s_ifreg | 0o644,
+                0,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EEXIST
     );
@@ -779,15 +943,21 @@ fn mknod_of_a_regular_file_is_a_create_as_the_owner() {
 fn rmdir_through_the_overlay() {
     let b = fixture_b(FakeOps::examples());
     assert_eq!(
-        b.overlay.rmdir(ROOT, b"notes", REQUEST).unwrap_err(),
+        b.overlay
+            .rmdir(ROOT, b"notes", Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::ENOENT
     );
     assert_eq!(
-        b.overlay.rmdir(ROOT, b"nothing", REQUEST).unwrap_err(),
+        b.overlay
+            .rmdir(ROOT, b"nothing", Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::ENOENT
     );
     assert!(b.fake.calls_to("rmdir").is_empty());
-    b.overlay.rmdir(5, b"d", REQUEST).unwrap();
+    b.overlay
+        .rmdir(5, b"d", Actor::of_process(REQUEST))
+        .unwrap();
     assert_eq!(
         b.fake.calls_to("rmdir")[0].caller,
         Some(owner().caller(REQUEST.pid))
@@ -812,19 +982,19 @@ fn names_that_are_not_utf8_are_hidden() {
     assert_eq!(b.overlay.lookup(5, bad).unwrap_err(), Errno::ENOENT);
     assert_eq!(
         b.overlay
-            .create(5, bad, 0o644, O_WRONLY, REQUEST)
+            .create(5, bad, 0o644, O_WRONLY, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
         b.overlay
-            .rename(5, bad, 5, b"b.md", 0, REQUEST)
+            .rename(5, bad, 5, b"b.md", 0, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::ENOENT
     );
     assert_eq!(
         b.overlay
-            .rename(5, b"a.md", 5, bad, 0, REQUEST)
+            .rename(5, b"a.md", 5, bad, 0, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::EACCES
     );
@@ -871,17 +1041,23 @@ fn rules_errors_answer_eio_through_the_overlay() {
         Errno::EIO,
         "its parent"
     );
-    // `skills/<long>` is recordable as a file, so it may be shown, but
-    // as the directory it is the rules cannot decide.
+    // `skills/<long>` is recordable as a file, but as a directory the
+    // rules cannot decide: `may_show` fails closed, so the name is
+    // answered without asking the operations.
     assert_eq!(b.overlay.getattr(10, None).unwrap_err(), Errno::EIO);
     assert_eq!(
         b.overlay.lookup(5, long.as_bytes()).unwrap_err(),
         Errno::EIO
     );
-    assert_eq!(b.fake.calls_to("forget").len(), 1);
+    assert!(b.fake.calls_to("lookup").is_empty());
     assert_eq!(
         b.overlay
-            .mkdir(5, format!("{long}x").as_bytes(), 0o755, REQUEST)
+            .mkdir(
+                5,
+                format!("{long}x").as_bytes(),
+                0o755,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EIO
     );
@@ -904,7 +1080,7 @@ fn a_lookup_that_finds_a_hidden_kind_gives_its_lookup_back() {
 fn a7_the_view_owner_acts_for_every_caller() {
     let b = fixture_b(FakeOps::examples());
     b.overlay
-        .create(5, b"new.md", 0o644, O_WRONLY, REQUEST)
+        .create(5, b"new.md", 0o644, O_WRONLY, Actor::of_process(REQUEST))
         .unwrap();
     assert_eq!(
         b.fake.calls_to("create")[0].caller,
@@ -915,8 +1091,10 @@ fn a7_the_view_owner_acts_for_every_caller() {
         })
     );
     // Handle operations get the owner too.
-    b.overlay.write(1, 0, b"x", REQUEST).unwrap();
-    b.overlay.flush(1, REQUEST).unwrap();
+    b.overlay
+        .write(1, 0, b"x", Actor::of_process(REQUEST))
+        .unwrap();
+    b.overlay.flush(1, Actor::of_process(REQUEST)).unwrap();
     for method in ["write", "flush"] {
         assert_eq!(
             b.fake.calls_to(method)[0].caller,
@@ -936,22 +1114,29 @@ fn a7_the_view_owner_acts_for_every_caller() {
     };
     for caller in [REQUEST, root] {
         assert_eq!(
-            b.overlay.open(id, O_WRONLY, caller).unwrap_err(),
+            b.overlay
+                .open(id, O_WRONLY, Actor::of_process(caller))
+                .unwrap_err(),
             Errno::EACCES
         );
     }
     assert!(b.fake.calls_to("open").is_empty());
-    b.overlay.open(id, O_RDONLY, REQUEST).unwrap();
+    b.overlay
+        .open(id, O_RDONLY, Actor::of_process(REQUEST))
+        .unwrap();
     assert_eq!(b.fake.calls_to("open").len(), 1);
-    // Nor through access(2), nor a create that would open it to write.
+    // Nor through access(2). A create that would open it is passed on
+    // as the owner with no supplementary groups: the operations check the
+    // owner's access to what they find there, under the names ordering
+    // (ops::tests::an_existing_file_is_opened_by_create_only_with_access).
     assert_eq!(b.overlay.access(id, 2).unwrap_err(), Errno::EACCES);
+    b.overlay
+        .create(5, b"theirs.md", 0o644, O_WRONLY, Actor::of_process(REQUEST))
+        .unwrap();
     assert_eq!(
-        b.overlay
-            .create(5, b"theirs.md", 0o644, O_WRONLY, REQUEST)
-            .unwrap_err(),
-        Errno::EACCES
+        b.fake.calls_to("create")[0].caller,
+        Some(owner().caller(REQUEST.pid))
     );
-    assert!(b.fake.calls_to("create").is_empty());
 }
 
 #[test]
@@ -960,17 +1145,19 @@ fn a8_refusals() {
     let s_ififo = 0o010000;
     assert_eq!(
         b.overlay
-            .symlink(5, b"l", b"config.yaml", REQUEST)
+            .symlink(5, b"l", b"config.yaml", Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
-        b.overlay.link(2, 5, b"c.yaml", REQUEST).unwrap_err(),
+        b.overlay
+            .link(2, 5, b"c.yaml", Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
         b.overlay
-            .mknod(5, b"f", s_ififo | 0o644, 0, REQUEST)
+            .mknod(5, b"f", s_ififo | 0o644, 0, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::EACCES
     );
@@ -983,7 +1170,9 @@ fn a8_refusals() {
         ..SetAttr::default()
     };
     assert_eq!(
-        b.overlay.setattr(2, &chown, REQUEST).unwrap_err(),
+        b.overlay
+            .setattr(2, &chown, Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::EPERM
     );
     let setuid = SetAttr {
@@ -991,7 +1180,9 @@ fn a8_refusals() {
         ..SetAttr::default()
     };
     assert_eq!(
-        b.overlay.setattr(2, &setuid, REQUEST).unwrap_err(),
+        b.overlay
+            .setattr(2, &setuid, Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::EPERM
     );
     assert!(b.fake.calls_to("setattr").is_empty());
@@ -1000,7 +1191,9 @@ fn a8_refusals() {
         mode: Some(0o755),
         ..SetAttr::default()
     };
-    b.overlay.setattr(2, &chmod, REQUEST).unwrap();
+    b.overlay
+        .setattr(2, &chmod, Actor::of_process(REQUEST))
+        .unwrap();
     assert_eq!(b.fake.calls_to("setattr").len(), 1);
 
     assert_eq!(
@@ -1013,26 +1206,42 @@ fn a8_refusals() {
     );
 
     assert_eq!(
-        b.overlay.rename(5, b"d", 5, b"e", 0, REQUEST).unwrap_err(),
+        b.overlay
+            .rename(5, b"d", 5, b"e", 0, Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::EXDEV
     );
     assert_eq!(
         b.overlay
-            .rename(ROOT, b"config.yaml", ROOT, b"config.bak", 0, REQUEST)
+            .rename(
+                ROOT,
+                b"config.yaml",
+                ROOT,
+                b"config.bak",
+                0,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EACCES
     );
     let whiteout = RenameFlags::WHITEOUT.bits();
     assert_eq!(
         b.overlay
-            .rename(5, b"a.md", 5, b"b.md", whiteout, REQUEST)
+            .rename(5, b"a.md", 5, b"b.md", whiteout, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::EINVAL
     );
     assert!(b.fake.calls_to("rename").is_empty());
     // A file moved to a recordable name goes on, as the owner.
     b.overlay
-        .rename(ROOT, b"config.yaml", 5, b"config.yaml", 0, REQUEST)
+        .rename(
+            ROOT,
+            b"config.yaml",
+            5,
+            b"config.yaml",
+            0,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     assert_eq!(
         b.fake.calls_to("rename")[0].caller,
@@ -1041,7 +1250,13 @@ fn a8_refusals() {
 
     // A skipped name goes to the tmp layer, never the operations.
     b.overlay
-        .create(ROOT, b"notes.txt", 0o644, O_WRONLY, REQUEST)
+        .create(
+            ROOT,
+            b"notes.txt",
+            0o644,
+            O_WRONLY,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     assert!(b.fake.calls_to("create").is_empty());
 }
@@ -1112,13 +1327,17 @@ fn times_follow_utimensat() {
         ..SetAttr::default()
     };
     // Not the owner's, but writable: touching is allowed.
-    b.overlay.setattr(8, &now, REQUEST).unwrap();
+    b.overlay
+        .setattr(8, &now, Actor::of_process(REQUEST))
+        .unwrap();
     let explicit = SetAttr {
         mtime: Some(TimeOrNow::SpecificTime(UNIX_EPOCH)),
         ..SetAttr::default()
     };
     assert_eq!(
-        b.overlay.setattr(8, &explicit, REQUEST).unwrap_err(),
+        b.overlay
+            .setattr(8, &explicit, Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::EPERM
     );
     // A mode change needs the owner to own the object.
@@ -1127,11 +1346,15 @@ fn times_follow_utimensat() {
         ..SetAttr::default()
     };
     assert_eq!(
-        b.overlay.setattr(8, &chmod, REQUEST).unwrap_err(),
+        b.overlay
+            .setattr(8, &chmod, Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::EPERM
     );
     // On the owner's own file, explicit times are fine.
-    b.overlay.setattr(6, &explicit, REQUEST).unwrap();
+    b.overlay
+        .setattr(6, &explicit, Actor::of_process(REQUEST))
+        .unwrap();
 }
 
 /// Fixture A: a real [`Ops`] on a temporary directory, with the overlay
@@ -1140,6 +1363,7 @@ struct A {
     dir: tempfile::TempDir,
     ops: Arc<Ops>,
     overlay: Overlay<Ops>,
+    refused: Refusals,
 }
 
 fn fixture_a(files: &[&str], dirs: &[&str]) -> A {
@@ -1188,10 +1412,12 @@ fn fixture_a(files: &[&str], dirs: &[&str]) -> A {
     let owner = ViewOwner::new(ids, &Privileges::default(), ids.uid).unwrap();
     let tmp =
         Arc::new(TmpLayer::open(&state.tmp_layer(), ops.backing().root().as_fd(), owner).unwrap());
+    let refused = Refusals::default();
     A {
-        overlay: Overlay::new(ops.clone(), gate, owner, tmp),
+        overlay: Overlay::new(ops.clone(), gate, owner, tmp, refused.counter()),
         ops,
         dir,
+        refused,
     }
 }
 
@@ -1227,11 +1453,20 @@ fn a6_a_node_moved_out_of_view_is_gone_from_the_overlay() {
         pid: 1,
     };
     a.ops
-        .rename(ROOT, b"config.yaml", ROOT, b"secrets2.db", 0, main)
+        .rename(
+            ROOT,
+            b"config.yaml",
+            ROOT,
+            b"secrets2.db",
+            0,
+            Actor::of_process(main),
+        )
         .unwrap();
     assert_eq!(a.overlay.getattr(id, None).unwrap_err(), Errno::ENOENT);
     assert_eq!(
-        a.overlay.open(id, O_RDONLY, REQUEST).unwrap_err(),
+        a.overlay
+            .open(id, O_RDONLY, Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::ENOENT
     );
     assert_eq!(a.overlay.access(id, 4).unwrap_err(), Errno::ENOENT);
@@ -1247,9 +1482,14 @@ fn a14_a_close_through_the_overlay_records_before_it_returns() {
     };
     let before = journal().len();
     let id = a.overlay.lookup(ROOT, b"config.yaml").unwrap().id;
-    let (fh, _handle) = a.overlay.open(id, O_WRONLY, REQUEST).unwrap();
-    a.overlay.write(fh, 0, b"v2", REQUEST).unwrap();
-    a.overlay.flush(fh, REQUEST).unwrap();
+    let (fh, _handle) = a
+        .overlay
+        .open(id, O_WRONLY, Actor::of_process(REQUEST))
+        .unwrap();
+    a.overlay
+        .write(fh, 0, b"v2", Actor::of_process(REQUEST))
+        .unwrap();
+    a.overlay.flush(fh, Actor::of_process(REQUEST)).unwrap();
     // The close's own record, not a later release's or sweep's.
     let records = journal();
     assert_eq!(records.len(), before + 1, "{records:#?}");
@@ -1305,18 +1545,27 @@ impl A {
     fn put(&self, parent: u64, name: &str, content: &str) -> u64 {
         let (entry, fh, _) = self
             .overlay
-            .create(parent, name.as_bytes(), 0o644, O_WRONLY | O_EXCL, REQUEST)
+            .create(
+                parent,
+                name.as_bytes(),
+                0o644,
+                O_WRONLY | O_EXCL,
+                Actor::of_process(REQUEST),
+            )
             .unwrap();
         self.overlay
-            .write(fh, 0, content.as_bytes(), REQUEST)
+            .write(fh, 0, content.as_bytes(), Actor::of_process(REQUEST))
             .unwrap();
-        self.overlay.flush(fh, REQUEST).unwrap();
+        self.overlay.flush(fh, Actor::of_process(REQUEST)).unwrap();
         self.overlay.release(fh).unwrap();
         entry.id
     }
 
     fn read(&self, id: u64) -> String {
-        let (fh, _) = self.overlay.open(id, O_RDONLY, REQUEST).unwrap();
+        let (fh, _) = self
+            .overlay
+            .open(id, O_RDONLY, Actor::of_process(REQUEST))
+            .unwrap();
         let bytes = self.overlay.read(fh, 0, 100).unwrap();
         self.overlay.release(fh).unwrap();
         String::from_utf8(bytes).unwrap()
@@ -1330,11 +1579,19 @@ fn tmp_files_are_private_and_shadow_hidden_names() {
     // A hidden tree name: the tmp file is created over it, exclusively.
     let (entry, fh, _) = a
         .overlay
-        .create(ROOT, b"secrets.db", 0o644, O_RDWR | O_EXCL, REQUEST)
+        .create(
+            ROOT,
+            b"secrets.db",
+            0o644,
+            O_RDWR | O_EXCL,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
-    a.overlay.write(fh, 0, b"tmp", REQUEST).unwrap();
+    a.overlay
+        .write(fh, 0, b"tmp", Actor::of_process(REQUEST))
+        .unwrap();
     a.overlay.fsync(fh, false).unwrap();
-    a.overlay.flush(fh, REQUEST).unwrap();
+    a.overlay.flush(fh, Actor::of_process(REQUEST)).unwrap();
     a.overlay.release(fh).unwrap();
     a.put(ROOT, "new.txt", "n");
     let skill_dir = a.overlay.lookup(ROOT, b"skills").unwrap().id;
@@ -1368,7 +1625,9 @@ fn tmp_files_are_private_and_shadow_hidden_names() {
     assert_eq!(a.stored().len(), 3);
 
     // Unlinking removes only the tmp file: the tree's is hidden again.
-    a.overlay.unlink(ROOT, b"secrets.db", REQUEST).unwrap();
+    a.overlay
+        .unlink(ROOT, b"secrets.db", Actor::of_process(REQUEST))
+        .unwrap();
     assert_eq!(
         a.overlay.lookup(ROOT, b"secrets.db").unwrap_err(),
         Errno::ENOENT
@@ -1387,7 +1646,14 @@ fn a_tmp_file_renamed_onto_a_recordable_name_is_recorded_there() {
     let tmp = a.put(ROOT, "config.yaml.tmp", "new");
     let before = a.journal().len();
     a.overlay
-        .rename(ROOT, b"config.yaml.tmp", ROOT, b"config.yaml", 0, REQUEST)
+        .rename(
+            ROOT,
+            b"config.yaml.tmp",
+            ROOT,
+            b"config.yaml",
+            0,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     let records = a.journal();
     assert_eq!(records.len(), before + 1, "{records:#?}");
@@ -1428,15 +1694,32 @@ fn a_handle_open_across_the_move_writes_into_the_tree() {
     let a = fixture_a(&["config.yaml"], &[]);
     let (entry, fh, _) = a
         .overlay
-        .create(ROOT, b"config.yaml.tmp", 0o644, O_WRONLY | O_EXCL, REQUEST)
+        .create(
+            ROOT,
+            b"config.yaml.tmp",
+            0o644,
+            O_WRONLY | O_EXCL,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
-    a.overlay.write(fh, 0, b"v1", REQUEST).unwrap();
     a.overlay
-        .rename(ROOT, b"config.yaml.tmp", ROOT, b"config.yaml", 0, REQUEST)
+        .write(fh, 0, b"v1", Actor::of_process(REQUEST))
         .unwrap();
-    a.overlay.write(fh, 2, b"+v2", REQUEST).unwrap();
+    a.overlay
+        .rename(
+            ROOT,
+            b"config.yaml.tmp",
+            ROOT,
+            b"config.yaml",
+            0,
+            Actor::of_process(REQUEST),
+        )
+        .unwrap();
+    a.overlay
+        .write(fh, 2, b"+v2", Actor::of_process(REQUEST))
+        .unwrap();
     let before = a.journal().len();
-    a.overlay.flush(fh, REQUEST).unwrap();
+    a.overlay.flush(fh, Actor::of_process(REQUEST)).unwrap();
     let records = a.journal();
     assert_eq!(records.len(), before + 1, "the close records");
     assert_eq!(records.last().unwrap().draft.trigger, Trigger::Close);
@@ -1452,18 +1735,32 @@ fn recorded_files_never_move_out() {
     // A tree file to a skipped name: refused, a directory: cross-device.
     assert_eq!(
         a.overlay
-            .rename(ROOT, b"config.yaml", ROOT, b"config.bak", 0, REQUEST)
+            .rename(
+                ROOT,
+                b"config.yaml",
+                ROOT,
+                b"config.bak",
+                0,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
         a.overlay
-            .rename(ROOT, b"skills", ROOT, b"skills2", 0, REQUEST)
+            .rename(
+                ROOT,
+                b"skills",
+                ROOT,
+                b"skills2",
+                0,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EXDEV
     );
     // The judge answers the same under the names ordering.
-    let judge = Judge::new(a.overlay.gate.clone());
+    let judge = Judge::new(a.overlay.gate.clone(), Refusals::default().counter());
     let file = |path: &'static [u8]| Found {
         path,
         kind: Some(Kind::File),
@@ -1479,7 +1776,14 @@ fn recorded_files_never_move_out() {
     // A tmp file to another skipped name stays in the layer.
     let tmp = a.put(ROOT, "a.tmp", "t");
     a.overlay
-        .rename(ROOT, b"a.tmp", skills, b"b.key", 0, REQUEST)
+        .rename(
+            ROOT,
+            b"a.tmp",
+            skills,
+            b"b.key",
+            0,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     assert_eq!(a.overlay.lookup(skills, b"b.key").unwrap().id, tmp);
     assert!(!a.backing("skills/b.key").exists());
@@ -1488,13 +1792,27 @@ fn recorded_files_never_move_out() {
     let exchange = RenameFlags::EXCHANGE.bits();
     assert_eq!(
         a.overlay
-            .rename(skills, b"b.key", ROOT, b"config.yaml", exchange, REQUEST)
+            .rename(
+                skills,
+                b"b.key",
+                ROOT,
+                b"config.yaml",
+                exchange,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
         a.overlay
-            .rename(ROOT, b"config.yaml", skills, b"b.key", exchange, REQUEST)
+            .rename(
+                ROOT,
+                b"config.yaml",
+                skills,
+                b"b.key",
+                exchange,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EACCES
     );
@@ -1503,13 +1821,27 @@ fn recorded_files_never_move_out() {
     a.put(ROOT, "c.tmp", "c");
     assert_eq!(
         a.overlay
-            .rename(ROOT, b"c.tmp", skills, b"b.key", noreplace, REQUEST)
+            .rename(
+                ROOT,
+                b"c.tmp",
+                skills,
+                b"b.key",
+                noreplace,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EEXIST
     );
     assert_eq!(
         a.overlay
-            .rename(ROOT, b"c.tmp", ROOT, b"config.yaml", noreplace, REQUEST)
+            .rename(
+                ROOT,
+                b"c.tmp",
+                ROOT,
+                b"config.yaml",
+                noreplace,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EEXIST
     );
@@ -1520,7 +1852,14 @@ fn recorded_files_never_move_out() {
     );
     // Without it, a tmp file replaces another.
     a.overlay
-        .rename(ROOT, b"c.tmp", skills, b"b.key", 0, REQUEST)
+        .rename(
+            ROOT,
+            b"c.tmp",
+            skills,
+            b"b.key",
+            0,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     assert_eq!(a.stored().len(), 1);
 }
@@ -1535,7 +1874,10 @@ fn judge_answers() {
         EXCLUDE.as_bytes(),
         b"/skills/*.sec -agentfs\n",
     );
-    let judge = Judge::new(Gate::new(Arc::new(rules)).unwrap());
+    let judge = Judge::new(
+        Gate::new(Arc::new(rules)).unwrap(),
+        Refusals::default().counter(),
+    );
     let at = |path: &'static str, kind: Option<Kind>| Found {
         path: path.as_bytes(),
         kind,
@@ -1660,13 +2002,19 @@ fn rmdir_of_a_directory_holding_tmp_files_is_not_empty() {
     let d = a.overlay.lookup(skills, b"d").unwrap().id;
     a.put(d, "x.key", "k");
     assert_eq!(
-        a.overlay.rmdir(skills, b"d", REQUEST).unwrap_err(),
+        a.overlay
+            .rmdir(skills, b"d", Actor::of_process(REQUEST))
+            .unwrap_err(),
         Errno::ENOTEMPTY
     );
     assert!(a.backing("skills/d").is_dir());
     assert_eq!(a.stored().len(), 1);
-    a.overlay.unlink(d, b"x.key", REQUEST).unwrap();
-    a.overlay.rmdir(skills, b"d", REQUEST).unwrap();
+    a.overlay
+        .unlink(d, b"x.key", Actor::of_process(REQUEST))
+        .unwrap();
+    a.overlay
+        .rmdir(skills, b"d", Actor::of_process(REQUEST))
+        .unwrap();
     assert!(!a.backing("skills/d").exists());
 }
 
@@ -1676,30 +2024,42 @@ fn a_skipped_file_name_over_a_shown_directory() {
     let b = fixture_b(FakeOps::examples());
     assert_eq!(
         b.overlay
-            .create(ROOT, b"skills", 0o644, O_WRONLY | O_EXCL, REQUEST)
+            .create(
+                ROOT,
+                b"skills",
+                0o644,
+                O_WRONLY | O_EXCL,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EEXIST
     );
     assert_eq!(
         b.overlay
-            .create(ROOT, b"skills", 0o644, O_WRONLY, REQUEST)
+            .create(ROOT, b"skills", 0o644, O_WRONLY, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::EISDIR
     );
     assert_eq!(
         b.overlay
-            .mknod(ROOT, b"skills", 0o100644, 0, REQUEST)
+            .mknod(ROOT, b"skills", 0o100644, 0, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::EEXIST
     );
     // Nothing there: a tmp file.
     b.overlay
-        .create(ROOT, b"notes.txt", 0o644, O_WRONLY, REQUEST)
+        .create(
+            ROOT,
+            b"notes.txt",
+            0o644,
+            O_WRONLY,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     // A directory over a tmp file's name.
     assert_eq!(
         b.overlay
-            .mkdir(ROOT, b"notes.txt", 0o755, REQUEST)
+            .mkdir(ROOT, b"notes.txt", 0o755, Actor::of_process(REQUEST))
             .unwrap_err(),
         Errno::EEXIST
     );
@@ -1707,11 +2067,23 @@ fn a_skipped_file_name_over_a_shown_directory() {
     // (Here the layer's files are this process's, not the owner's, who
     // may only read them.)
     b.overlay
-        .create(ROOT, b"notes.txt", 0o644, O_RDONLY, REQUEST)
+        .create(
+            ROOT,
+            b"notes.txt",
+            0o644,
+            O_RDONLY,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     assert_eq!(
         b.overlay
-            .create(ROOT, b"notes.txt", 0o644, O_WRONLY | O_EXCL, REQUEST)
+            .create(
+                ROOT,
+                b"notes.txt",
+                0o644,
+                O_WRONLY | O_EXCL,
+                Actor::of_process(REQUEST)
+            )
             .unwrap_err(),
         Errno::EEXIST
     );
@@ -1724,12 +2096,25 @@ fn a_skipped_file_name_over_a_shown_directory() {
 fn a_tmp_file_moves_into_the_tree_only_as_the_judge_allows() {
     let b = fixture_b(FakeOps::examples());
     b.overlay
-        .create(ROOT, b"c.tmp", 0o644, O_WRONLY | O_EXCL, REQUEST)
+        .create(
+            ROOT,
+            b"c.tmp",
+            0o644,
+            O_WRONLY | O_EXCL,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     // Onto a recordable name: the operations move it, as the owner,
     // asking the judge.
     b.overlay
-        .rename(ROOT, b"c.tmp", ROOT, b"config.yaml", 0, REQUEST)
+        .rename(
+            ROOT,
+            b"c.tmp",
+            ROOT,
+            b"config.yaml",
+            0,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     let calls = b.fake.calls_to("move_in");
     assert_eq!(calls.len(), 1);
@@ -1772,26 +2157,43 @@ fn copy_file_range_across_layers_is_cross_device() {
     let a = fixture_a(&["config.yaml"], &[]);
     let (_, tmp_in, _) = a
         .overlay
-        .create(ROOT, b"in.tmp", 0o644, O_RDWR | O_EXCL, REQUEST)
+        .create(
+            ROOT,
+            b"in.tmp",
+            0o644,
+            O_RDWR | O_EXCL,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
-    a.overlay.write(tmp_in, 0, b"copied", REQUEST).unwrap();
+    a.overlay
+        .write(tmp_in, 0, b"copied", Actor::of_process(REQUEST))
+        .unwrap();
     let (_, tmp_out, _) = a
         .overlay
-        .create(ROOT, b"out.tmp", 0o644, O_RDWR | O_EXCL, REQUEST)
+        .create(
+            ROOT,
+            b"out.tmp",
+            0o644,
+            O_RDWR | O_EXCL,
+            Actor::of_process(REQUEST),
+        )
         .unwrap();
     let id = a.overlay.lookup(ROOT, b"config.yaml").unwrap().id;
-    let (tree, _) = a.overlay.open(id, O_RDWR, REQUEST).unwrap();
+    let (tree, _) = a
+        .overlay
+        .open(id, O_RDWR, Actor::of_process(REQUEST))
+        .unwrap();
     for (from, to) in [(tmp_in, tree), (tree, tmp_out)] {
         assert_eq!(
             a.overlay
-                .copy_file_range(from, 0, to, 0, 6, REQUEST)
+                .copy_file_range(from, 0, to, 0, 6, Actor::of_process(REQUEST))
                 .unwrap_err(),
             Errno::EXDEV
         );
     }
     assert_eq!(
         a.overlay
-            .copy_file_range(tmp_in, 0, tmp_out, 0, 6, REQUEST)
+            .copy_file_range(tmp_in, 0, tmp_out, 0, 6, Actor::of_process(REQUEST))
             .unwrap(),
         6
     );
@@ -1803,4 +2205,233 @@ fn copy_file_range_across_layers_is_cross_device() {
     for fh in [tmp_in, tmp_out, tree] {
         a.overlay.release(fh).unwrap();
     }
+}
+
+// ---- sandbox overlay slice 4: decisions under the names ordering, the
+// view owner's access, refusal counts ----
+
+/// A FIFO at a recordable name is hidden for its kind: an overlay rename
+/// never replaces it and an overlay create never opens it, decided by the
+/// operations' check under the names ordering on what is there then.
+#[test]
+fn b6_a_hidden_kind_at_a_recordable_name_is_never_replaced_nor_opened() {
+    let a = fixture_a(&["skills/a.md"], &[]);
+    let pipe = a.dir.path().join("backing/skills/p");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &pipe,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o666),
+        0,
+    )
+    .unwrap();
+    let skills = a.overlay.lookup(ROOT, b"skills").unwrap().id;
+    let actor = Actor::of_process(REQUEST);
+    assert_eq!(
+        a.overlay
+            .rename(skills, b"a.md", skills, b"p", 0, actor)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(
+        a.overlay
+            .create(skills, b"p", 0o644, O_WRONLY, actor)
+            .unwrap_err(),
+        Errno::EACCES
+    );
+    let st = rustix::fs::lstat(&pipe).unwrap();
+    assert_eq!(
+        rustix::fs::FileType::from_raw_mode(st.st_mode),
+        rustix::fs::FileType::Fifo
+    );
+    assert!(a.dir.path().join("backing/skills/a.md").is_file());
+    assert_eq!(
+        a.refused.take(),
+        [OverlayRefusal::Hidden, OverlayRefusal::Hidden]
+    );
+}
+
+/// Only `user.*` attributes exist through the overlay, and reading one
+/// needs the owner's read access.
+#[test]
+fn b8_extended_attributes_are_read_as_the_owner() {
+    let b = fixture_b(
+        FakeOps::examples()
+            .node(8, 5, "theirs.md", FileType::RegularFile, 0o600, OTHER)
+            .node(9, 5, "open.md", FileType::RegularFile, 0o644, OTHER),
+    );
+    assert_eq!(
+        b.overlay.getxattr(8, b"user.a", 0).unwrap_err(),
+        Errno::EACCES
+    );
+    assert_eq!(
+        b.overlay.getxattr(9, b"trusted.b", 0).unwrap_err(),
+        Errno::ENODATA
+    );
+    assert_eq!(
+        b.overlay.getxattr(9, b"security.c", 64).unwrap_err(),
+        Errno::ENODATA
+    );
+    assert!(b.fake.calls_to("getxattr").is_empty());
+    b.overlay.getxattr(9, b"user.a", 0).unwrap();
+    assert_eq!(b.fake.calls_to("getxattr").len(), 1);
+    // Listed: the user.* names only, sized for that list.
+    let listed = b"user.a\0user.d\0".to_vec();
+    assert_eq!(
+        b.overlay.listxattr(9, 0),
+        Ok(Xattr::Size(u32::try_from(listed.len()).unwrap()))
+    );
+    assert_eq!(b.overlay.listxattr(9, 64), Ok(Xattr::Data(listed)));
+    assert_eq!(b.overlay.listxattr(9, 5).unwrap_err(), Errno::ERANGE);
+    // A hidden node has none.
+    assert_eq!(b.overlay.listxattr(3, 0).unwrap_err(), Errno::ENOENT);
+    assert!(b.refused.take().is_empty(), "reads are not counted");
+}
+
+/// An open to execute wants the owner's execute access.
+#[test]
+fn b9_an_exec_open_needs_the_owners_execute_bit() {
+    let b = fixture_b(
+        FakeOps::examples()
+            .node(8, 5, "owner-only.sh", FileType::RegularFile, 0o744, OTHER)
+            .node(9, 5, "anyone.sh", FileType::RegularFile, 0o755, OTHER),
+    );
+    let actor = Actor::of_process(REQUEST);
+    let exec = O_RDONLY | 0o40;
+    assert_eq!(b.overlay.open(8, exec, actor).unwrap_err(), Errno::EACCES);
+    assert!(b.fake.calls_to("open").is_empty());
+    // Read, not execute: allowed.
+    b.overlay.open(8, O_RDONLY, actor).unwrap();
+    b.overlay.open(9, exec, actor).unwrap();
+    assert_eq!(b.fake.calls_to("open").len(), 2);
+}
+
+/// Each refused change is counted once, with its reason: the overlay's
+/// own refusals before it calls the operations, the Judge's under the
+/// names ordering. Reads of hidden names are not counted.
+#[test]
+fn b10_each_refused_change_is_counted_once() {
+    let long = "d".repeat(300);
+    let b = fixture_b_with(
+        FakeOps::examples().node(9, 5, "p", FileType::NamedPipe, 0o644, OWNER.uid),
+        "",
+        &["skills"],
+    );
+    let actor = Actor::of_process(REQUEST);
+    let s_ififo = 0o010000;
+    // Reads of hidden names.
+    let _ = b.overlay.lookup(ROOT, b"secrets.db");
+    let _ = b.overlay.getattr(3, None);
+    let _ = b.overlay.open(3, O_RDONLY, actor);
+    assert!(b.refused.take().is_empty());
+
+    let cases: Vec<(&str, Errno, OverlayRefusal, OpResult<()>)> = vec![
+        (
+            "symlink",
+            Errno::EACCES,
+            OverlayRefusal::Kind,
+            b.overlay.symlink(5, b"s", b"a.md", actor).map(drop),
+        ),
+        (
+            "link",
+            Errno::EACCES,
+            OverlayRefusal::Kind,
+            b.overlay.link(6, 5, b"l", actor).map(drop),
+        ),
+        (
+            "mknod fifo",
+            Errno::EACCES,
+            OverlayRefusal::Kind,
+            b.overlay
+                .mknod(5, b"f", s_ififo | 0o644, 0, actor)
+                .map(drop),
+        ),
+        (
+            "mkdir of a skipped directory",
+            Errno::EACCES,
+            OverlayRefusal::NotRecordable,
+            b.overlay.mkdir(ROOT, b"notes2", 0o755, actor).map(drop),
+        ),
+        (
+            "a directory move",
+            Errno::EXDEV,
+            OverlayRefusal::CrossDevice,
+            b.overlay.rename(5, b"d", 5, b"e", 0, actor),
+        ),
+        (
+            "a recorded file moved to a skipped name",
+            Errno::EACCES,
+            OverlayRefusal::NotRecordable,
+            b.overlay
+                .rename(ROOT, b"config.yaml", ROOT, b"other.txt", 0, actor),
+        ),
+        (
+            "unlink of a hidden name",
+            Errno::ENOENT,
+            OverlayRefusal::Hidden,
+            b.overlay.unlink(ROOT, b"secrets.db", actor),
+        ),
+        (
+            "a rename onto a FIFO (the Judge)",
+            Errno::EACCES,
+            OverlayRefusal::Hidden,
+            b.overlay.rename(5, b"a.md", 5, b"p", 0, actor),
+        ),
+        (
+            "chown",
+            Errno::EPERM,
+            OverlayRefusal::Ownership,
+            b.overlay
+                .setattr(
+                    2,
+                    &SetAttr {
+                        uid: Some(0),
+                        ..SetAttr::default()
+                    },
+                    actor,
+                )
+                .map(drop),
+        ),
+        (
+            "setuid",
+            Errno::EPERM,
+            OverlayRefusal::Ownership,
+            b.overlay
+                .setattr(
+                    2,
+                    &SetAttr {
+                        mode: Some(0o4755),
+                        ..SetAttr::default()
+                    },
+                    actor,
+                )
+                .map(drop),
+        ),
+        (
+            "setxattr",
+            Errno::ENOTSUP,
+            OverlayRefusal::Xattr,
+            b.overlay.setxattr(2, b"user.x", b"1", 0),
+        ),
+        (
+            "removexattr",
+            Errno::ENOTSUP,
+            OverlayRefusal::Xattr,
+            b.overlay.removexattr(2, b"user.x"),
+        ),
+        (
+            "a rules error",
+            Errno::EIO,
+            OverlayRefusal::RulesError,
+            b.overlay
+                .mkdir(5, format!("{long}x").as_bytes(), 0o755, actor)
+                .map(drop),
+        ),
+    ];
+    let counted = b.refused.take();
+    let expected: Vec<OverlayRefusal> = cases.iter().map(|c| c.2).collect();
+    for (what, errno, _, result) in &cases {
+        assert_eq!(result.as_ref().unwrap_err(), errno, "{what}");
+    }
+    assert_eq!(counted, expected);
 }

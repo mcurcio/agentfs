@@ -81,6 +81,7 @@ use crate::groups::{Group, Groups};
 use crate::inodes::{InodeTable, Kind, ROOT};
 use crate::names::is_git_dir_name;
 use crate::privileges::Privileges;
+use crate::session::{Actor, Found};
 
 pub type OpResult<T> = Result<T, Errno>;
 
@@ -321,6 +322,21 @@ fn check_name(name: &[u8]) -> OpResult<()> {
 }
 
 /// A `setattr` time as `utimensat(2)` takes it: omitted, now, or exact.
+/// `__FMODE_EXEC` (`FMODE_EXEC`, 0x20, in `include/linux/fs.h`; reserved
+/// in `include/uapi/asm-generic/fcntl.h`): the kernel sets it in the open
+/// flags of a file it opens to execute, and FUSE passes it on.
+pub(crate) const FMODE_EXEC: i32 = 0o40;
+
+/// The kind of entry `name` in `dir`, not following a symlink; `None` when
+/// the name is free.
+fn kind_at(dir: &impl AsFd, name: &[u8]) -> OpResult<Option<Kind>> {
+    match rustix::fs::statat(dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => Ok(Some(Kind::from_mode(mode_of(&st)))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(e) => Err(errno(e)),
+    }
+}
+
 pub(crate) fn timespec(t: Option<TimeOrNow>) -> Timespec {
     match t {
         None => Timespec {
@@ -439,10 +455,11 @@ impl Ops {
     /// (`agentfs.fuse.create_as_caller_fallbacks`, design §6).
     fn create_as<T>(
         &self,
-        caller: Caller,
+        actor: Actor<'_>,
         create: impl FnMut() -> rustix::io::Result<T>,
     ) -> (rustix::io::Result<T>, bool) {
-        let (made, as_caller) = creds::create_as(self.create_as_caller, caller, create);
+        let (made, as_caller) =
+            creds::create_as(self.create_as_caller, actor.caller, actor.groups, create);
         if self.create_as_caller && !as_caller && made.is_ok() {
             self.boundary
                 .recorder()
@@ -988,7 +1005,8 @@ impl Ops {
         Ok(attr(id, &st))
     }
 
-    pub fn setattr(&self, id: u64, set: &SetAttr, caller: Caller) -> OpResult<FileAttr> {
+    pub fn setattr(&self, id: u64, set: &SetAttr, actor: Actor<'_>) -> OpResult<FileAttr> {
+        let caller = actor.caller;
         let names = self.read_names();
         let kind = self.kind_of(id)?;
         let fd = match set.fh.and_then(|fh| self.handle(fh).ok()) {
@@ -1210,17 +1228,43 @@ impl Ops {
         Ok(fd)
     }
 
+    /// Asks `actor`'s check, if it carries one, about a new entry of kind
+    /// `kind` at `name` in directory `dir` (node `parent`), from what is
+    /// there now ([`NameCheck::create`]). The caller holds `names`.
+    fn check_create(
+        &self,
+        actor: Actor<'_>,
+        dir: &OwnedFd,
+        parent: u64,
+        name: &[u8],
+        kind: Kind,
+    ) -> OpResult<()> {
+        let Some(check) = actor.check else {
+            return Ok(());
+        };
+        let path = join(&self.path_of(parent)?, name);
+        check.create(
+            Found {
+                path: &path,
+                kind: kind_at(dir, name)?,
+            },
+            kind,
+        )
+    }
+
     /// Undoes the lookup count of an entry the kernel never received.
     fn unlookup(&self, id: u64) {
         self.table().forget(id, 1);
     }
 
-    pub fn mkdir(&self, parent: u64, name: &[u8], mode: u32, caller: Caller) -> OpResult<Entry> {
+    pub fn mkdir(&self, parent: u64, name: &[u8], mode: u32, actor: Actor<'_>) -> OpResult<Entry> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
-        let (made, as_caller) = self.create_as(caller, || {
+        self.check_create(actor, &dir, parent, name, Kind::Dir)?;
+        let (made, as_caller) = self.create_as(actor, || {
             rustix::fs::mkdirat(
                 &dir,
                 OsStr::from_bytes(name),
@@ -1240,18 +1284,20 @@ impl Ops {
         name: &[u8],
         mode: u32,
         rdev: u32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<Entry> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
         let kind = Kind::from_mode(mode);
+        self.check_create(actor, &dir, parent, name, kind)?;
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
         // A device node needs CAP_MKNOD, which the caller lacks: refused
         // as the caller, it is made by the daemon.
-        let (made, as_caller) = self.create_as(caller, || {
+        let (made, as_caller) = self.create_as(actor, || {
             rustix::fs::mknodat(
                 &dir,
                 OsStr::from_bytes(name),
@@ -1292,15 +1338,17 @@ impl Ops {
         parent: u64,
         name: &[u8],
         target: &[u8],
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<Entry> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
+        self.check_create(actor, &dir, parent, name, Kind::Symlink)?;
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
-        let (made, as_caller) = self.create_as(caller, || {
+        let (made, as_caller) = self.create_as(actor, || {
             rustix::fs::symlinkat(OsStr::from_bytes(target), &dir, OsStr::from_bytes(name))
         });
         made.eno()?;
@@ -1333,7 +1381,8 @@ impl Ops {
         Ok(entry)
     }
 
-    pub fn link(&self, id: u64, parent: u64, name: &[u8], caller: Caller) -> OpResult<Entry> {
+    pub fn link(&self, id: u64, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<Entry> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let (sparent, sname) = self
@@ -1349,6 +1398,13 @@ impl Ops {
             return Err(estale());
         }
         let dir = self.open_dir_node(parent)?;
+        if let Some(check) = actor.check {
+            let path = join(&self.path_of(parent)?, name);
+            check.link(Found {
+                path: &path,
+                kind: kind_at(&dir, name)?,
+            })?;
+        }
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
         rustix::fs::linkat(
@@ -1391,15 +1447,16 @@ impl Ops {
 
     // ---- removing and renaming ----
 
-    pub fn unlink(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
-        self.remove(parent, name, false, caller)
+    pub fn unlink(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        self.remove(parent, name, false, actor)
     }
 
-    pub fn rmdir(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
-        self.remove(parent, name, true, caller)
+    pub fn rmdir(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        self.remove(parent, name, true, actor)
     }
 
-    fn remove(&self, parent: u64, name: &[u8], dir: bool, caller: Caller) -> OpResult<()> {
+    fn remove(&self, parent: u64, name: &[u8], dir: bool, actor: Actor<'_>) -> OpResult<()> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let pdir = self.open_dir_node(parent)?;
@@ -1409,6 +1466,12 @@ impl Ops {
         } else {
             AtFlags::empty()
         };
+        if let Some(check) = actor.check {
+            check.remove(Found {
+                path: &path,
+                kind: kind_at(&pdir, name)?,
+            })?;
+        }
         // Removing a member changes its group: held while it happens.
         let group = self.group_at(&path);
         let hold = group.as_ref().map(|g| g.hold());
@@ -1434,8 +1497,9 @@ impl Ops {
         newparent: u64,
         newname: &[u8],
         flags: u32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<()> {
+        let caller = actor.caller;
         check_name(name)?;
         check_name(newname)?;
         let flags = RenameFlags::from_bits(flags).ok_or(Errno::EINVAL)?;
@@ -1452,6 +1516,19 @@ impl Ops {
             rustix::fs::statat(&ddir, OsStr::from_bytes(newname), AtFlags::SYMLINK_NOFOLLOW).ok();
         let src_path = join(&self.path_of(parent)?, name);
         let dst_path = join(&self.path_of(newparent)?, newname);
+        if let Some(check) = actor.check {
+            check.rename(
+                Found {
+                    path: &src_path,
+                    kind: Some(Kind::from_mode(mode_of(&src))),
+                },
+                Found {
+                    path: &dst_path,
+                    kind: dst.as_ref().map(|d| Kind::from_mode(mode_of(d))),
+                },
+                flags.bits(),
+            )?;
+        }
         rustix::fs::renameat_with(
             &sdir,
             OsStr::from_bytes(name),
@@ -1653,10 +1730,14 @@ impl Ops {
 
     /// Opens node `id`. Returns the handle id and the handle (the fuser
     /// layer registers its descriptor for passthrough).
-    pub fn open(&self, id: u64, flags: i32, caller: Caller) -> OpResult<(u64, Arc<Handle>)> {
+    pub fn open(&self, id: u64, flags: i32, actor: Actor<'_>) -> OpResult<(u64, Arc<Handle>)> {
+        let caller = actor.caller;
         let mut oflags = OFlags::from_bits_retain(flags as u32)
             & !(OFlags::CREATE | OFlags::EXCL | OFlags::NOCTTY | OFlags::NOATIME);
         oflags.remove(OFlags::PATH);
+        // Not an open flag: `openat2(2)` refuses it (EINVAL), so a file
+        // could never be executed through the mount.
+        oflags.remove(OFlags::from_bits_retain(FMODE_EXEC as u32));
         let acc = flags & 0o3;
         let truncate = oflags.contains(OFlags::TRUNC);
         let write = acc != 0 || truncate;
@@ -1736,8 +1817,9 @@ impl Ops {
         name: &[u8],
         mode: u32,
         flags: i32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<(Entry, u64, Arc<Handle>)> {
+        let caller = actor.caller;
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
@@ -1747,10 +1829,11 @@ impl Ops {
             & !(OFlags::NOCTTY | OFlags::NOATIME | OFlags::CREATE | OFlags::EXCL))
             | OFlags::NOFOLLOW
             | OFlags::CLOEXEC;
+        self.check_create(actor, &dir, parent, name, Kind::File)?;
         // Creating or truncating a member changes its group: held.
         let group = self.group_at(&join(&self.path_of(parent)?, name));
         let hold = group.as_ref().map(|g| g.hold());
-        let (created, as_caller) = self.create_as(caller, || {
+        let (created, as_caller) = self.create_as(actor, || {
             rustix::fs::openat(
                 &dir,
                 OsStr::from_bytes(name),
@@ -1778,7 +1861,7 @@ impl Ops {
                 // The kernel checked permission to create, not to open
                 // this file: check that as the kernel would, from the
                 // mode bits and the caller's groups.
-                let groups = creds::caller_groups(caller.pid);
+                let groups = creds::groups_of(actor.caller, actor.groups);
                 let who = Who {
                     uid: caller.uid,
                     gid: caller.gid,
@@ -1825,7 +1908,8 @@ impl Ops {
         read_at(&self.handle(fh)?.fd, offset, size)
     }
 
-    pub fn write(&self, fh: u64, offset: u64, data: &[u8], caller: Caller) -> OpResult<u32> {
+    pub fn write(&self, fh: u64, offset: u64, data: &[u8], actor: Actor<'_>) -> OpResult<u32> {
+        let caller = actor.caller;
         let h = self.handle(fh)?;
         if let Some(node) = self.table().get_mut(h.node) {
             node.dirty.arm(caller);
@@ -1842,7 +1926,8 @@ impl Ops {
     /// `close` of a descriptor: records the inode if it changed since its
     /// last record (design §3.1). `EIO` if recording fails; the inode stays
     /// dirty, so the next boundary records it.
-    pub fn flush(&self, fh: u64, caller: Caller) -> OpResult<()> {
+    pub fn flush(&self, fh: u64, actor: Actor<'_>) -> OpResult<()> {
+        let caller = actor.caller;
         let h = self.handle(fh)?;
         let _names = self.read_names();
         if let Some(group) = self.handle_group(&h) {
@@ -2081,8 +2166,9 @@ impl Ops {
         offset: u64,
         length: u64,
         mode: i32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<()> {
+        let caller = actor.caller;
         let h = self.handle(fh)?;
         if let Some(node) = self.table().get_mut(h.node) {
             node.dirty.arm(caller);
@@ -2114,8 +2200,9 @@ impl Ops {
         fh_out: u64,
         offset_out: u64,
         len: u64,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<u32> {
+        let caller = actor.caller;
         let input = self.handle(fh_in)?;
         let output = self.handle(fh_out)?;
         if let Some(node) = self.table().get_mut(output.node) {
@@ -2414,8 +2501,8 @@ impl crate::session::Operations for Ops {
         Ops::getattr(self, id, fh)
     }
 
-    fn setattr(&self, id: u64, set: &SetAttr, caller: Caller) -> OpResult<FileAttr> {
-        Ops::setattr(self, id, set, caller)
+    fn setattr(&self, id: u64, set: &SetAttr, actor: Actor<'_>) -> OpResult<FileAttr> {
+        Ops::setattr(self, id, set, actor)
     }
 
     fn readlink(&self, id: u64) -> OpResult<Vec<u8>> {
@@ -2436,25 +2523,31 @@ impl crate::session::Operations for Ops {
         name: &[u8],
         mode: u32,
         rdev: u32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<Entry> {
-        Ops::mknod(self, parent, name, mode, rdev, caller)
+        Ops::mknod(self, parent, name, mode, rdev, actor)
     }
 
-    fn mkdir(&self, parent: u64, name: &[u8], mode: u32, caller: Caller) -> OpResult<Entry> {
-        Ops::mkdir(self, parent, name, mode, caller)
+    fn mkdir(&self, parent: u64, name: &[u8], mode: u32, actor: Actor<'_>) -> OpResult<Entry> {
+        Ops::mkdir(self, parent, name, mode, actor)
     }
 
-    fn unlink(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
-        Ops::unlink(self, parent, name, caller)
+    fn unlink(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        Ops::unlink(self, parent, name, actor)
     }
 
-    fn rmdir(&self, parent: u64, name: &[u8], caller: Caller) -> OpResult<()> {
-        Ops::rmdir(self, parent, name, caller)
+    fn rmdir(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
+        Ops::rmdir(self, parent, name, actor)
     }
 
-    fn symlink(&self, parent: u64, name: &[u8], target: &[u8], caller: Caller) -> OpResult<Entry> {
-        Ops::symlink(self, parent, name, target, caller)
+    fn symlink(
+        &self,
+        parent: u64,
+        name: &[u8],
+        target: &[u8],
+        actor: Actor<'_>,
+    ) -> OpResult<Entry> {
+        Ops::symlink(self, parent, name, target, actor)
     }
 
     fn rename(
@@ -2464,17 +2557,17 @@ impl crate::session::Operations for Ops {
         newparent: u64,
         newname: &[u8],
         flags: u32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<()> {
-        Ops::rename(self, parent, name, newparent, newname, flags, caller)
+        Ops::rename(self, parent, name, newparent, newname, flags, actor)
     }
 
-    fn link(&self, id: u64, newparent: u64, newname: &[u8], caller: Caller) -> OpResult<Entry> {
-        Ops::link(self, id, newparent, newname, caller)
+    fn link(&self, id: u64, newparent: u64, newname: &[u8], actor: Actor<'_>) -> OpResult<Entry> {
+        Ops::link(self, id, newparent, newname, actor)
     }
 
-    fn open(&self, id: u64, flags: i32, caller: Caller) -> OpResult<(u64, Arc<Handle>)> {
-        Ops::open(self, id, flags, caller)
+    fn open(&self, id: u64, flags: i32, actor: Actor<'_>) -> OpResult<(u64, Arc<Handle>)> {
+        Ops::open(self, id, flags, actor)
     }
 
     fn create(
@@ -2483,21 +2576,21 @@ impl crate::session::Operations for Ops {
         name: &[u8],
         mode: u32,
         flags: i32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<(Entry, u64, Arc<Handle>)> {
-        Ops::create(self, parent, name, mode, flags, caller)
+        Ops::create(self, parent, name, mode, flags, actor)
     }
 
     fn read(&self, fh: u64, offset: u64, size: u32) -> OpResult<Vec<u8>> {
         Ops::read(self, fh, offset, size)
     }
 
-    fn write(&self, fh: u64, offset: u64, data: &[u8], caller: Caller) -> OpResult<u32> {
-        Ops::write(self, fh, offset, data, caller)
+    fn write(&self, fh: u64, offset: u64, data: &[u8], actor: Actor<'_>) -> OpResult<u32> {
+        Ops::write(self, fh, offset, data, actor)
     }
 
-    fn flush(&self, fh: u64, caller: Caller) -> OpResult<()> {
-        Ops::flush(self, fh, caller)
+    fn flush(&self, fh: u64, actor: Actor<'_>) -> OpResult<()> {
+        Ops::flush(self, fh, actor)
     }
 
     fn release(&self, fh: u64) -> OpResult<()> {
@@ -2514,9 +2607,9 @@ impl crate::session::Operations for Ops {
         offset: u64,
         length: u64,
         mode: i32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<()> {
-        Ops::fallocate(self, fh, offset, length, mode, caller)
+        Ops::fallocate(self, fh, offset, length, mode, actor)
     }
 
     fn lseek(&self, fh: u64, offset: i64, whence: i32) -> OpResult<i64> {
@@ -2530,9 +2623,9 @@ impl crate::session::Operations for Ops {
         fh_out: u64,
         offset_out: u64,
         len: u64,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<u32> {
-        Ops::copy_file_range(self, fh_in, offset_in, fh_out, offset_out, len, caller)
+        Ops::copy_file_range(self, fh_in, offset_in, fh_out, offset_out, len, actor)
     }
 
     fn mapping_may_write(&self, id: u64) {

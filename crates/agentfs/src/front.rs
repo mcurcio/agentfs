@@ -27,7 +27,7 @@ use agentfs_core::history_service::{
 };
 use agentfs_core::record::Origin;
 use agentfs_core::volume::{self, Recorder, StateDir};
-use agentfs_fuse::{Mount, MountConfig, preflight};
+use agentfs_fuse::{Mount, MountConfig, MountKind, preflight};
 
 use crate::daemon::{Daemon, Wake};
 use crate::{HistoryArgs, MountArgs, Pod, Session};
@@ -174,8 +174,14 @@ pub(crate) fn mount_front(
         .with_context(|| format!("opening {}", state.root().display()))?
         .settings()
         .clone();
-    crate::create_mountpoint(&args.mountpoint)?;
-    let (backing, mountpoint) = preflight(state, &settings, &args.backing, &args.mountpoint)?;
+    crate::create_mountpoint(&args.mountpoint, MountKind::Main)?;
+    let (backing, mountpoint) = preflight(
+        state,
+        &settings,
+        &args.backing,
+        &args.mountpoint,
+        MountKind::Main,
+    )?;
     if args.seal_mountpoint {
         crate::seal_mountpoint(&mountpoint)?;
     }
@@ -212,6 +218,7 @@ pub(crate) fn mount_front(
         // Not served on a front yet: `--sandbox-overlay` conflicts with
         // `--history-service`, and Mount::start refuses it there too.
         overlay: None,
+        unmount_grace: args.unmount_grace,
     };
     let mounted = Mount::start(front.recorder.clone(), config)?;
     crate::add_mounted_views(&mountpoint);
@@ -250,7 +257,7 @@ pub(crate) fn mount_front(
     );
     // No more calls: an invalidation must not race the unmount.
     listener.stop();
-    let report = mounted.shutdown(args.unmount_grace);
+    let report = mounted.shutdown();
     crate::print_unmount(&report, args.unmount_grace);
     drop(front);
     session.finish();
