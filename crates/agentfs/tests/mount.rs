@@ -3119,7 +3119,7 @@ fn commit_that_set(v: &Vol, path: &str, content: &str) -> String {
     loop {
         let parent = commit.parent(0).ok();
         let set = blob_at(&commit).as_deref() == Some(content.as_bytes());
-        let before = parent.as_ref().and_then(&blob_at);
+        let before = parent.as_ref().and_then(blob_at);
         if set && before.as_deref() != Some(content.as_bytes()) {
             return commit.message().unwrap_or("").to_owned();
         }
