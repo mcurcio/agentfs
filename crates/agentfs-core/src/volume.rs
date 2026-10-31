@@ -156,6 +156,14 @@ impl StateDir {
         self.meta().join("stack").join("overlay")
     }
 
+    /// The sandbox overlay's tmp layer: the store of the files a sandbox
+    /// creates under names the rules skip (design §2.2, §1.1; sandbox
+    /// overlay slice 3), `<state>/tmp-layer`. Wiped at every start and
+    /// stop; counted in [`StateDir::usage`] as part `tmp_layer`.
+    pub fn tmp_layer(&self) -> PathBuf {
+        todo!("sandbox overlay slice 3")
+    }
+
     /// The control socket in [`StateDir::control_dir`].
     pub fn control_socket(&self) -> PathBuf {
         self.control_dir().join(CONTROL_SOCKET)

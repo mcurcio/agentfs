@@ -46,7 +46,9 @@ use crate::backing::join;
 use crate::inodes::ROOT;
 use crate::ops::{DirEntry, Entry, Handle, OpResult, SetAttr, Xattr};
 use crate::privileges::Privileges;
-use crate::session::Operations;
+use crate::session::{Actor, Found, NameCheck, Operations};
+
+pub mod tmp;
 
 /// `--sandbox-owner UID:GID`, parsed: numeric ids, not yet checked
 /// against the daemon's privileges.
@@ -138,6 +140,16 @@ impl ViewOwner {
             gid: self.gid,
             pid,
         }
+    }
+
+    /// Who a request from process `pid` acts as through the operations
+    /// (sandbox overlay slice 4): the owner's uid and gid with no
+    /// supplementary groups ([`crate::creds::Supplementary::None`]), the
+    /// request's pid, and `check`. The only way the overlay makes an
+    /// [`Actor`].
+    pub fn actor<'a>(&self, pid: u32, check: &'a dyn NameCheck) -> Actor<'a> {
+        let _ = (pid, check);
+        todo!("sandbox overlay slice 4")
     }
 
     /// Whether the owner gets `want` on `object` ([`crate::access::permits`]
@@ -243,6 +255,55 @@ const WRITE_SEARCH: Want = Want {
     write: true,
     exec: true,
 };
+
+/// The overlay's [`NameCheck`] (sandbox overlay slice 3): the visibility
+/// gate's answer for a name change the operations are about to make, from
+/// what they found under the names ordering, as the overlay answers it
+/// ([`admit`], [`hidden_errno`]). Pure: no I/O, no lock.
+///
+/// | Check | Answer |
+/// |---|---|
+/// | `create` | a path that is not a repository path: `EACCES`; a file: `place_new(File)` must be tree; a directory: `place_new(Directory)` must be tree; anything else: `EACCES`; then an entry found there must be shown for its kind (`EACCES`, `EIO` on a rules error) |
+/// | `link` | `EACCES` |
+/// | `remove` | the entry found must be shown for its kind (`ENOENT`, `EIO`); none: `ENOENT` |
+/// | `rename` | `RENAME_WHITEOUT`: `EINVAL`; `place_move(Tree(from, kind), to)` admitted; with `RENAME_EXCHANGE`, the entry at `to` must exist and `place_move(Tree(to, kind), from)` be admitted too; otherwise an entry found at `to` must be shown for its kind (`EACCES`, `EIO`) |
+/// | `move_in` | `to` must place a tmp-layer file in the tree (`EACCES`, `EIO`); an entry found there must be shown for its kind (`EACCES`, `EIO`) |
+pub struct Judge {
+    gate: Gate,
+}
+
+impl Judge {
+    pub fn new(gate: Gate) -> Self {
+        Self { gate }
+    }
+}
+
+impl NameCheck for Judge {
+    fn create(&self, at: Found<'_>, kind: crate::inodes::Kind) -> OpResult<()> {
+        let _ = (&self.gate, at, kind);
+        todo!("sandbox overlay slice 3")
+    }
+
+    fn link(&self, at: Found<'_>) -> OpResult<()> {
+        let _ = at;
+        todo!("sandbox overlay slice 3")
+    }
+
+    fn remove(&self, at: Found<'_>) -> OpResult<()> {
+        let _ = at;
+        todo!("sandbox overlay slice 3")
+    }
+
+    fn rename(&self, from: Found<'_>, to: Found<'_>, flags: u32) -> OpResult<()> {
+        let _ = (from, to, flags);
+        todo!("sandbox overlay slice 3")
+    }
+
+    fn move_in(&self, to: Found<'_>) -> OpResult<()> {
+        let _ = to;
+        todo!("sandbox overlay slice 3")
+    }
+}
 
 /// A shown node: one of its paths that is shown, and its attributes.
 struct Shown {

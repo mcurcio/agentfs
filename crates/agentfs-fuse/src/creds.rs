@@ -37,6 +37,19 @@ thread_local! {
     static OWN_FS: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
+/// Whose supplementary groups an identity has while it acts (sandbox
+/// overlay slice 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Supplementary {
+    /// Those of the request's process ([`caller_groups`] of its pid): what
+    /// the kernel would use.
+    OfProcess,
+    /// None: an identity the daemon substitutes for the request's (the
+    /// sandbox overlay's view owner), whatever groups the requesting
+    /// process has.
+    None,
+}
+
 /// The current thread acting as a caller; switched back on drop.
 #[must_use = "the thread acts as the caller only while this lives"]
 pub struct AsCaller {

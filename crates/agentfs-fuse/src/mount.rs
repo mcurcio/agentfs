@@ -119,6 +119,43 @@ pub enum MountKind {
     SandboxOverlay,
 }
 
+/// What an agentfs mount's source names (sandbox overlay slice 4): its
+/// volume and which of its daemon's sessions it is, so `agentfs probe`,
+/// the hold and recover paths and the workload views never take one
+/// session's mount point for the other's.
+///
+/// Rendered as `agentfs:<volume>` for the main mount (unchanged) and
+/// `agentfs:<volume>:sandbox-overlay` for the sandbox overlay. A volume
+/// name never holds `:` ([`agentfs_core::config::validate_name`]), so the
+/// two never parse as each other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountSource {
+    pub volume: String,
+    pub kind: MountKind,
+}
+
+impl MountSource {
+    pub fn new(volume: &str, kind: MountKind) -> Self {
+        Self {
+            volume: volume.to_owned(),
+            kind,
+        }
+    }
+
+    /// The source string a mount of this kind is made with (fuser's
+    /// `fsname`).
+    pub fn render(&self) -> String {
+        todo!("sandbox overlay slice 4")
+    }
+
+    /// The source of an agentfs mount as mountinfo lists it; `None` for
+    /// anything else.
+    pub fn parse(source: &str) -> Option<Self> {
+        let _ = source;
+        todo!("sandbox overlay slice 4")
+    }
+}
+
 /// The sandbox overlay's mount point and view owner
 /// (`--sandbox-overlay`, `--sandbox-owner`).
 #[derive(Debug, Clone)]

@@ -18,11 +18,14 @@
 //! Each method has `Ops`'s inherent method of the same name as its
 //! reference behaviour: same arguments, same result, same errors.
 
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
 use agentfs_core::record::Caller;
 use fuser::FileAttr;
 
+use crate::creds::Supplementary;
+use crate::inodes::Kind;
 use crate::ops::{DirEntry, Entry, Handle, OpResult, SetAttr, Xattr};
 
 /// Every operation a FUSE session hands its filesystem. Node ids are
@@ -131,4 +134,138 @@ pub trait Operations: Send + Sync + 'static {
     fn getxattr(&self, id: u64, name: &[u8], size: u32) -> OpResult<Xattr>;
     fn listxattr(&self, id: u64, size: u32) -> OpResult<Xattr>;
     fn removexattr(&self, id: u64, name: &[u8]) -> OpResult<()>;
+}
+
+/// What a decorator in front of the shared operations needs of them
+/// beyond a session's requests (sandbox overlay slice 3): ids from the
+/// operations' own sequences, and a move into the tree from outside it.
+/// Implemented by [`crate::ops::Ops`]; [`crate::overlay::Overlay`] is
+/// generic over it.
+pub trait TreeOperations: Operations {
+    /// A node id never handed out before, from the same sequence as every
+    /// node id of every session. The file it names becomes known to the
+    /// operations only through [`TreeOperations::move_in`].
+    fn new_node_id(&self) -> u64;
+
+    /// A handle id never handed out before, from the same sequence as
+    /// every file and directory handle id of every session.
+    fn new_handle_id(&self) -> u64;
+
+    /// Moves the regular file `name` in directory `from` (outside the
+    /// backing tree, on its filesystem) to `newname` in tree directory
+    /// `newparent`, as one `renameat2(2)` with `flags` (`0` or
+    /// `RENAME_NOREPLACE`; anything else is `EINVAL`), and records the new
+    /// path's content ([`agentfs_core::record::Trigger::Rename`], as
+    /// `caller`) before it returns.
+    ///
+    /// Under the names ordering, after resolving `newparent`'s path and
+    /// statting `newname`, it asks `check` ([`NameCheck::move_in`]); an
+    /// error is the answer and nothing has moved. Then the file is moved,
+    /// and the operations take it over as node [`Moved::node`] (the kernel
+    /// keeps that id: its dentry moved with the rename) with
+    /// [`Moved::lookups`] kernel lookups and its open [`Moved::handles`],
+    /// under the ids the kernel knows them by, armed so that later writes
+    /// through them are recorded at their flush or release as any tree
+    /// file's. Returns the node at its new name.
+    ///
+    /// Errors: `EINVAL` (bad name or flags), `ENOENT` (`newparent` gone),
+    /// `EEXIST` (`RENAME_NOREPLACE` and the name is taken), whatever the
+    /// check answers, the rename's own error (nothing moved), and `EIO`
+    /// when the record fails (the file has moved; its path is queued for
+    /// repair, as [`Operations::rename`] does).
+    #[allow(clippy::too_many_arguments)]
+    fn move_in(
+        &self,
+        from: BorrowedFd<'_>,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+        moved: Moved,
+        check: &dyn NameCheck,
+        caller: Caller,
+    ) -> OpResult<Entry>;
+}
+
+/// A file a decorator hands over to the operations with
+/// [`TreeOperations::move_in`]: what the kernel knows it by.
+#[derive(Debug)]
+pub struct Moved {
+    /// Its node id ([`TreeOperations::new_node_id`]).
+    pub node: u64,
+    /// The kernel's lookups of the node not yet forgotten.
+    pub lookups: u64,
+    /// Its open handles, by the ids the kernel knows them by
+    /// ([`TreeOperations::new_handle_id`]).
+    pub handles: Vec<(u64, Arc<Handle>)>,
+    /// A writer shared a passthrough backing id on it
+    /// ([`Operations::mapping_may_write`]).
+    pub mapping_may_write: bool,
+}
+
+/// What the operations found at one name while they hold the names
+/// ordering: its path in the backing tree and the kind of the entry there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Found<'a> {
+    /// The path from the backing tree's root (the root is the empty path).
+    pub path: &'a [u8],
+    /// The kind of the entry at it, not following a symlink; `None` when
+    /// the name is free.
+    pub kind: Option<Kind>,
+}
+
+/// A check a request carries into the operations: called while they hold
+/// the names ordering, after they have resolved the names an operation
+/// changes and statted them, and before they change the backing tree (the
+/// pattern of Linux security modules, whose `security_inode_*` hooks the
+/// VFS calls under the directory locks). An error is the operation's
+/// answer, and nothing has changed. The operations never know what the
+/// check is for.
+///
+/// A check must not block and must not take a lock that is held while the
+/// operations are called (it runs under the names ordering).
+pub trait NameCheck: Sync {
+    /// A new entry of kind `kind` at `at` (`create`, `mknod`, `mkdir`,
+    /// `symlink`).
+    fn create(&self, at: Found<'_>, kind: Kind) -> OpResult<()>;
+    /// A hard link to an existing file at `at`.
+    fn link(&self, at: Found<'_>) -> OpResult<()>;
+    /// Removing the entry at `at` (`unlink`, `rmdir`).
+    fn remove(&self, at: Found<'_>) -> OpResult<()>;
+    /// Renaming `from` to `to`; `flags` as `renameat2(2)`'s.
+    fn rename(&self, from: Found<'_>, to: Found<'_>, flags: u32) -> OpResult<()>;
+    /// Moving a file from outside the tree to `to`
+    /// ([`TreeOperations::move_in`]).
+    fn move_in(&self, to: Found<'_>) -> OpResult<()>;
+}
+
+/// Who a request acts as (sandbox overlay slice 4): the caller its changes
+/// are recorded as, the supplementary groups its effects are checked and
+/// done with, and the check it carries into the operations, if any.
+///
+/// The main mount's requests act as the request's own process
+/// ([`Actor::of_process`]); the sandbox overlay's as its view owner with
+/// no supplementary groups and its name check
+/// ([`crate::overlay::ViewOwner::actor`]).
+#[derive(Clone, Copy)]
+pub struct Actor<'a> {
+    pub caller: Caller,
+    pub groups: Supplementary,
+    pub check: Option<&'a dyn NameCheck>,
+}
+
+impl Actor<'_> {
+    /// `caller` as the kernel reported it: its process's supplementary
+    /// groups, no check.
+    pub const fn of_process(caller: Caller) -> Actor<'static> {
+        let _ = caller;
+        panic!("sandbox overlay slice 4")
+    }
+}
+
+impl std::fmt::Debug for Actor<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = f;
+        todo!("sandbox overlay slice 4")
+    }
 }

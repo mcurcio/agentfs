@@ -31,6 +31,7 @@ pub mod dirty;
 pub mod fuse;
 pub mod groups;
 pub mod inodes;
+pub mod invalidate;
 pub mod mount;
 pub mod names;
 pub mod ops;

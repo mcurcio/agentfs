@@ -131,6 +131,8 @@ missing from these tables or a row names a module that no longer exists;
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |
 | `session.rs` | What one FUSE session serves: the `Operations` trait that `fuse.rs` calls, implemented by `Ops` and by the overlay |
 | `overlay.rs` | The sandbox overlay's session: the visibility gate and the view owner in front of the shared `Ops` (§1.1, §6) |
+| `overlay/tmp.rs` | The sandbox overlay's tmp layer: files a sandbox creates under names the rules skip, private to the overlay, in a store of the state area, moved into the tree by rename (§1.1) |
+| `invalidate.rs` | Kernel cache invalidations across a daemon's FUSE sessions: a change through one session is sent to the others, from a worker thread (§17.1) |
 | `access.rs` | Mode-bit permission checks, as the kernel's `generic_permission` decides them (§6) |
 | `boundary.rs` | Recording a change boundary: builds the inputs and calls the recorder, or a front's client (§3.1, §3.2, §3.5) |
 | `creds.rs` | Creating as the caller: a worker thread's filesystem uid, gid and groups switched for one system call (§6) |

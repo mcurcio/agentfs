@@ -49,6 +49,38 @@ use crate::push::{self, RemoteBacklog};
 use crate::record::Trigger;
 use crate::volume::StateDir;
 
+/// Why the sandbox overlay refused a change: the `reason` attribute of
+/// `agentfs.sandbox_overlay.refusals` (design §13; sandbox overlay slice
+/// 4). Reads of hidden names are not counted: a hidden name answers like a
+/// missing one, and missing names are looked up all the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayRefusal {
+    /// A name the rules skip for that kind (a directory they could record
+    /// nothing beneath; a recorded file moved to a skipped name).
+    NotRecordable,
+    /// A kind the overlay never makes or moves: a symlink, hard link or
+    /// special file.
+    Kind,
+    /// A directory move, answered `EXDEV`.
+    CrossDevice,
+    /// The source, or an entry at the target, is hidden.
+    Hidden,
+    /// The rules could not decide: refused, failing closed (`EIO`).
+    RulesError,
+    /// An ownership, set-id or sticky-bit change.
+    Ownership,
+    /// An extended-attribute change.
+    Xattr,
+}
+
+impl OverlayRefusal {
+    /// The attribute value: `not_recordable`, `kind`, `cross_device`,
+    /// `hidden`, `rules_error`, `ownership` or `xattr`.
+    pub fn as_str(self) -> &'static str {
+        todo!("sandbox overlay slice 4")
+    }
+}
+
 /// Metric names (design §13).
 pub mod names {
     pub const RECORD_DURATION: &str = "agentfs.record.duration";
@@ -77,6 +109,7 @@ pub mod names {
     pub const HISTORY_SERVICE_RESYNCS: &str = "agentfs.history_service.resyncs";
     pub const FUSE_CREATE_AS_CALLER_FALLBACKS: &str = "agentfs.fuse.create_as_caller_fallbacks";
     pub const FUSE_RACY_RECHECKS: &str = "agentfs.fuse.racy_rechecks";
+    pub const SANDBOX_OVERLAY_REFUSALS: &str = "agentfs.sandbox_overlay.refusals";
     pub const RECONCILE_RECORDS: &str = "agentfs.reconcile.records";
     pub const RECONCILE_FAILURES: &str = "agentfs.reconcile.failures";
     pub const NESTED_GITDIR_HEURISTIC: &str = "agentfs.nested.gitdir_heuristic";
@@ -552,6 +585,13 @@ impl Telemetry {
         if let Some(inner) = &self.inner {
             inner.create_as_caller_fallbacks.add(1, &[]);
         }
+    }
+
+    /// Counts one change the sandbox overlay refused, by `reason`
+    /// (`agentfs.sandbox_overlay.refusals`; sandbox overlay slice 4).
+    pub fn overlay_refused(&self, reason: OverlayRefusal) {
+        let _ = reason;
+        todo!("sandbox overlay slice 4")
     }
 
     /// Counts a record made by reconciling a moved tree (design §3.1).

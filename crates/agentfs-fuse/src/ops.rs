@@ -2557,5 +2557,30 @@ impl crate::session::Operations for Ops {
     }
 }
 
+impl crate::session::TreeOperations for Ops {
+    fn new_node_id(&self) -> u64 {
+        todo!("sandbox overlay slice 3")
+    }
+
+    fn new_handle_id(&self) -> u64 {
+        todo!("sandbox overlay slice 3")
+    }
+
+    fn move_in(
+        &self,
+        from: BorrowedFd<'_>,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+        moved: crate::session::Moved,
+        check: &dyn crate::session::NameCheck,
+        caller: Caller,
+    ) -> OpResult<Entry> {
+        let _ = (from, name, newparent, newname, flags, moved, check, caller);
+        todo!("sandbox overlay slice 3")
+    }
+}
+
 #[cfg(test)]
 mod tests;
