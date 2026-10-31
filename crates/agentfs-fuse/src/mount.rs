@@ -678,7 +678,7 @@ pub fn fuser_config(config: &MountConfig, kind: MountKind) -> fuser::Config {
     c.mount_options = [
         Some(MountOption::FSName(format!("agentfs:{}", config.volume))),
         Some(MountOption::Subtype("agentfs".into())),
-        (kind == MountKind::Main).then_some(MountOption::DefaultPermissions),
+        Some(MountOption::DefaultPermissions),
         Some(MountOption::NoDev),
         Some(MountOption::NoSuid),
         Some(if config.read_only {

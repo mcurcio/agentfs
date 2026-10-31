@@ -492,7 +492,7 @@ impl<O: Operations> Operations for Overlay<O> {
         _target: &[u8],
         _caller: Caller,
     ) -> OpResult<Entry> {
-        self.inner.symlink(_parent, _name, _target, _caller)
+        Err(Errno::EACCES)
     }
 
     fn rename(
@@ -515,10 +515,10 @@ impl<O: Operations> Operations for Overlay<O> {
         }
         let to = Self::child(&to_dir, newname).ok_or(Errno::EACCES)?;
         let src = self.peek(parent, name)?;
-        admit(
-            self.gate
-                .place_move(Source::Tree(&from, existing_kind(src.attr.kind)), &to),
-        )?;
+        match self.gate.place_move(Source::Tree(&from, existing_kind(src.attr.kind)), &to) {
+            Placement::CrossDevice => {}
+            p => admit(p)?,
+        }
         // The target may be shown now: its name is recordable.
         let dst = if flags & RenameFlags::EXCHANGE.bits() != 0 {
             let dst = self.peek(newparent, newname)?;
@@ -587,8 +587,7 @@ impl<O: Operations> Operations for Overlay<O> {
     }
 
     fn flush(&self, fh: u64, caller: Caller) -> OpResult<()> {
-        let _ = (fh, caller);
-        Ok(())
+        self.inner.flush(fh, self.owner.caller(caller.pid))
     }
 
     fn release(&self, fh: u64) -> OpResult<()> {
