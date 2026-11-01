@@ -70,6 +70,7 @@ mod reference_tests;
 mod serve_git;
 mod serve_history;
 mod start_cmd;
+mod volume_plugin;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};

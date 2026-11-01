@@ -3,8 +3,10 @@
 //! Records hold absolute state ("this path now has this content"), never
 //! deltas, so applying a record twice gives the same tree (design §3.3).
 
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +67,129 @@ pub struct Caller {
     pub uid: u32,
     pub gid: u32,
     pub pid: u32,
+}
+
+/// How a change came into the volume (design §2.4, §9): `main`, one
+/// sandbox session, or agentfs itself. Every journal record names exactly
+/// one (`Draft::writer`, provenance slice 1), and every commit names its records' one entry
+/// point in an `Agentfs-Entry` trailer ([`crate::history::ENTRY_TRAILER`]).
+///
+/// Rendered `main`, `sandbox/<id>` or `agentfs` by [`fmt::Display`] and
+/// parsed back by [`std::str::FromStr`]; journaled, sent on the wire and
+/// written to repair queues as that string. Required wherever it appears:
+/// a record, wire draft or trailer without one is refused, never read as
+/// `main`.
+///
+/// Never derived from a uid, pid, cgroup or time. A FUSE session is built
+/// with its entry point and stamps every request it serves with it; a late
+/// record takes the [`Writer`] held on the inode or group; agentfs-core
+/// stamps [`EntryPoint::Agentfs`] on what it does itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum EntryPoint {
+    /// The volume's main mount point.
+    Main,
+    /// One sandbox session: one container's mount of the volume (design
+    /// §2.4).
+    Sandbox(SandboxId),
+    /// agentfs itself: an operator operation's records (restore, revert,
+    /// patch apply), `agentfs record`, marker commits, and late records
+    /// whose writer is unknown.
+    Agentfs,
+}
+
+impl fmt::Display for EntryPoint {
+    /// `main`, `sandbox/<id>` or `agentfs`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = f;
+        todo!("provenance slice 1")
+    }
+}
+
+impl std::str::FromStr for EntryPoint {
+    type Err = EntryError;
+
+    /// The inverse of [`fmt::Display`]: exactly `main`, `agentfs`, or
+    /// `sandbox/` followed by a valid [`SandboxId`]. Anything else,
+    /// including the empty string, is an error.
+    fn from_str(s: &str) -> Result<Self, EntryError> {
+        let _ = s;
+        todo!("provenance slice 1")
+    }
+}
+
+impl TryFrom<String> for EntryPoint {
+    type Error = EntryError;
+
+    /// [`std::str::FromStr`], for serde.
+    fn try_from(s: String) -> Result<Self, EntryError> {
+        let _ = s;
+        todo!("provenance slice 1")
+    }
+}
+
+impl From<EntryPoint> for String {
+    /// [`fmt::Display`], for serde.
+    fn from(entry: EntryPoint) -> String {
+        let _ = entry;
+        todo!("provenance slice 1")
+    }
+}
+
+/// A sandbox session's id: the container runtime's mount ID (design
+/// §2.4), never reused within a volume. 1 to [`SandboxId::MAX_LEN`] ASCII
+/// letters, digits, `_`, `.` or `-`, starting with a letter or digit, so
+/// it is one path component, one mount-source suffix and one trailer value
+/// as it is. Cheap to clone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SandboxId(Arc<str>);
+
+impl SandboxId {
+    /// The longest id: a Docker mount ID is 64 hex digits.
+    pub const MAX_LEN: usize = 64;
+
+    /// `id` if it follows the grammar above, else
+    /// [`EntryError::BadSandboxId`].
+    pub fn new(id: &str) -> Result<Self, EntryError> {
+        let _ = id;
+        todo!("provenance slice 1")
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a string is not an [`EntryPoint`] or a [`SandboxId`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EntryError {
+    #[error("{0:?} is not an entry point: expected main, sandbox/<id> or agentfs")]
+    Unknown(String),
+    #[error(
+        "{0:?} is not a sandbox id: 1 to 64 ASCII letters, digits, '_', '.' or '-', starting \
+         with a letter or digit"
+    )]
+    BadSandboxId(String),
+}
+
+/// Who made a change (design §9): the process as FUSE reported it, which
+/// is evidence only (the author's uid), and the entry point it came
+/// through, which a commit is cut by. Held whole wherever a writer is
+/// kept for a later record: an inode's dirty state, an fsync-class
+/// group's state, a repair queue entry, a move's reconcile duty.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Writer {
+    pub caller: Caller,
+    pub entry: EntryPoint,
+}
+
+impl Writer {
+    /// A change agentfs makes itself, as `caller` (an operation's
+    /// operator, the `agentfs record` process, or no one).
+    pub fn agentfs(caller: Caller) -> Self {
+        let _ = caller;
+        todo!("provenance slice 1")
+    }
 }
 
 /// One path's new absolute state.

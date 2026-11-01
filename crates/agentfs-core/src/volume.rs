@@ -2958,6 +2958,26 @@ fn in_backing(tree: &Path, path: &RepoPath, symlink: bool) -> Option<Option<std:
     Some(last)
 }
 
+/// What one commit never mixes (design §9): the operator operation, the
+/// pod that recorded it (`origin`) and the entry point. Two records may
+/// share a commit only if their keys are equal. [`split_key`] is the one
+/// home of that rule: [`group_by_window`] and [`merge_moves`] compare keys
+/// and nothing else (provenance slice 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(dead_code, reason = "stub: provenance slice 1 wires it in")]
+struct SplitKey<'r> {
+    operation: Option<u64>,
+    origin: Option<&'r Origin>,
+    entry: &'r crate::record::EntryPoint,
+}
+
+/// `record`'s [`SplitKey`].
+#[expect(dead_code, reason = "stub: provenance slice 1 wires it in")]
+fn split_key(record: &Record) -> SplitKey<'_> {
+    let _ = record;
+    todo!("provenance slice 1")
+}
+
 /// Splits records into runs where each record is within `window_ms` of the
 /// run's first record. Records of an operator operation (design §15) form
 /// runs of their own, however long the operation takes; workload records

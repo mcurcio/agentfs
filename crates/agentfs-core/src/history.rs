@@ -28,6 +28,11 @@ use crate::pending::PendingStore;
 use crate::record::{Change, Operation, OperationKind, PatchAuthor, Record};
 
 pub const SEQ_TRAILER: &str = "Agentfs-Seq";
+/// The trailer naming the one entry point whose changes a commit holds
+/// ([`crate::record::EntryPoint`], design §9): exactly one on every commit
+/// agentfs writes on the branch, `agentfs` on markers. Wired in by
+/// provenance slice 1.
+pub const ENTRY_TRAILER: &str = "Agentfs-Entry";
 /// The inbox number of the patch a commit applies (design §12).
 pub const INBOX_TRAILER: &str = "Agentfs-Inbox";
 

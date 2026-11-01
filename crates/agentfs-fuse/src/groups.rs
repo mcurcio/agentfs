@@ -136,6 +136,16 @@ impl Hold<'_> {
     }
 }
 
+/// A hold or change refused because the group holds unrecorded changes
+/// from another entry point than the writer's (design §8, §9; provenance
+/// slice 1): the operation captures the group first, as `pending`, with
+/// trigger `cut`, then asks again. No record ever holds two entry points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Foreign {
+    /// The writer whose changes the group holds.
+    pub pending: agentfs_core::record::Writer,
+}
+
 /// When a group changed and was captured.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupState {
