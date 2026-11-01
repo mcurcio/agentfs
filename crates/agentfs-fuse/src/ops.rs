@@ -35,6 +35,15 @@
 //! group, only the operation records it, whole, at its end
 //! ([`Ops::capture_operation`]).
 //!
+//! **The cut** (design §8, §9): no capture holds changes from two entry
+//! points. An operation that changes a member takes the group's hold as
+//! its writer ([`Group::hold`]) before its system call and marks the group
+//! changed inside the hold. When the group holds another entry point's
+//! unrecorded changes ([`crate::groups::Foreign`]), the operation lets go
+//! of everything, captures the group as that writer with trigger `cut`
+//! (waiting first for a running operator operation that defers it), and
+//! starts over ([`Ops::again`]).
+//!
 //! **Permissions** (design §6) are checked by the kernel
 //! (`default_permissions`) before a request arrives; the daemon then acts
 //! with its own privileges. When it also has `CAP_SETUID` and `CAP_SETGID`
@@ -57,6 +66,7 @@
 //! records, so a record is never made against paths a concurrent rename has
 //! already changed.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
@@ -67,7 +77,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Instant;
 
-use agentfs_core::record::{Caller, Origin, Trigger};
+use agentfs_core::record::{Caller, EntryPoint, Origin, Trigger, Writer};
 use agentfs_core::volume::{MoveOutcome, Recorded, Recorder, VolumeError};
 use fuser::{Errno, FileAttr, FileType, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
@@ -77,7 +87,7 @@ use crate::backing::{self, Backing, attr, join, proc_path};
 use crate::boundary::{Boundary, Change, REPAIR_TRIGGER, State};
 use crate::creds;
 use crate::dirty::{FrozenRef, Stamp, now_ns, same_bytes, timestamp_granularity_ns};
-use crate::groups::{Group, Groups};
+use crate::groups::{Foreign, Group, Groups, Hold};
 use crate::inodes::{InodeTable, Kind, ROOT};
 use crate::names::is_git_dir_name;
 use crate::privileges::Privileges;
@@ -85,12 +95,20 @@ use crate::session::{Actor, Found};
 
 pub type OpResult<T> = Result<T, Errno>;
 
-/// The caller of late records whose writer is unknown.
-const NOBODY: Caller = Caller {
-    uid: 0,
-    gid: 0,
-    pid: 0,
+/// The writer of late records whose writer is unknown: agentfs itself.
+const NOBODY: Writer = Writer {
+    caller: Caller {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    },
+    entry: EntryPoint::Agentfs,
 };
+
+/// An operation that met a [`Foreign`] group and must start over once the
+/// group is cut ([`Ops::hold`], [`Ops::again`]).
+#[derive(Default)]
+struct Retry(RefCell<Option<(Arc<Group>, Writer)>>);
 
 /// A directory rename records at most this many files per record; a larger
 /// tree is recorded as several consecutive records (each holds one open
@@ -536,17 +554,18 @@ impl Ops {
     }
 
     /// Records `changes` as one record, except changes at fsync-class paths
-    /// (design §8): those mark their group changed instead, to be captured
-    /// whole later (by an operator operation's actor, at the operation's
-    /// end: [`Ops::capture_operation`]). The caller holds `names` for
-    /// reading and no group hold.
+    /// (design §8): those are their group's, which the operation marked
+    /// changed inside its hold ([`Ops::hold`]), to be captured whole later
+    /// (by an operator operation's actor, at the operation's end:
+    /// [`Ops::capture_operation`]). The caller holds `names` for reading
+    /// and no group hold.
     fn record(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         changes: Vec<Change>,
     ) -> Result<bool, VolumeError> {
-        self.record_as(trigger, caller, changes, None)
+        self.record_as(trigger, writer, changes, None)
     }
 
     /// [`Ops::record`] as the pod `origin`, when given: an inherited repair
@@ -554,33 +573,98 @@ impl Ops {
     fn record_as(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         changes: Vec<Change>,
         origin: Option<&Origin>,
     ) -> Result<bool, VolumeError> {
         if !self.boundary.recorder().has_fsync_class() {
-            return self.boundary.record_as(trigger, caller, changes, origin);
+            return self.boundary.record_as(trigger, writer, changes, origin);
         }
         let changes: Vec<Change> = changes
             .into_iter()
-            .filter(|c| match self.group_at(&c.path) {
-                Some(g) => {
-                    g.changed(caller);
-                    false
-                }
-                None => true,
-            })
+            .filter(|c| self.group_at(&c.path).is_none())
             .collect();
         if changes.is_empty() {
             return Ok(false);
         }
-        self.boundary.record_as(trigger, caller, changes, origin)
+        self.boundary.record_as(trigger, writer, changes, origin)
+    }
+
+    /// Takes `group`'s hold for `writer` (design §8, §9), if there is a
+    /// group. When the group holds another entry point's unrecorded
+    /// changes, notes the cut in `retry` and fails: the operation returns,
+    /// letting go of `names` and every hold, and [`Ops::again`] cuts the
+    /// group and starts it over (the errno never reaches the kernel).
+    fn hold<'g>(
+        &self,
+        group: Option<&'g Arc<Group>>,
+        writer: &Writer,
+        retry: &Retry,
+    ) -> OpResult<Option<Hold<'g>>> {
+        let Some(group) = group else {
+            return Ok(None);
+        };
+        match group.hold(writer) {
+            Ok(hold) => Ok(Some(hold)),
+            Err(Foreign { pending }) => {
+                *retry.0.borrow_mut() = Some((group.clone(), pending));
+                Err(Errno::EAGAIN)
+            }
+        }
+    }
+
+    /// Runs `op` until it ends without meeting a [`Foreign`] group: after
+    /// each such meeting, with no lock held, captures the group as its
+    /// pending writer with trigger `cut`, holding `names` for reading; if
+    /// a running operator operation defers it, lets go of `names` and waits
+    /// for the operation's end capture ([`Group::wait_undeferred`]). A cut
+    /// that fails fails the operation with `EIO`: the change it would have
+    /// mixed in is never made.
+    fn again<T>(&self, mut op: impl FnMut(&Retry) -> OpResult<T>) -> OpResult<T> {
+        loop {
+            let retry = Retry::default();
+            let result = op(&retry);
+            let Some((group, pending)) = retry.0.into_inner() else {
+                return result;
+            };
+            {
+                let _names = self.read_names();
+                self.capture(&group, Trigger::Cut, Some(pending), When::Changed)
+                    .map_err(|_| Errno::EIO)?;
+            }
+            group.wait_undeferred();
+        }
+    }
+
+    /// Marks `group` changed by `writer` after the change was made, for a
+    /// member found only by walking the tree once it was renamed (a
+    /// directory's member, a repair). A group holding another entry
+    /// point's changes is cut first; one a running operator operation
+    /// defers, or whose cut fails, is left to its pending writer's record.
+    /// The caller holds `names` for reading and no hold.
+    fn mark_late(&self, group: &Group, writer: &Writer) {
+        loop {
+            match group.hold(writer) {
+                Ok(hold) => {
+                    hold.changed();
+                    return;
+                }
+                Err(Foreign { pending }) => {
+                    match self.capture(group, Trigger::Cut, Some(pending), When::Changed) {
+                        Ok(false) if group.deferred().is_some() => return,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            }
+        }
     }
 
     /// Captures `group` (design §8) if `when` says it is due: freezes its
     /// gate, so no member changes meanwhile, and records every member's
     /// current state (content, or removal) as one all-or-nothing record.
-    /// `caller` defaults to whoever changed the group last. Returns whether
+    /// The record's writer is `writer`, else whoever changed the group
+    /// last, else [`NOBODY`]. Returns whether
     /// anything was journaled. A member that cannot be read (anything but
     /// a missing file) fails the capture, leaving the group changed. The
     /// caller holds `names` for reading, so no member is renamed meanwhile
@@ -590,7 +674,7 @@ impl Ops {
         &self,
         group: &Group,
         trigger: Trigger,
-        caller: Option<Caller>,
+        writer: Option<Writer>,
         when: When,
     ) -> Result<bool, VolumeError> {
         let _one = group.capturing();
@@ -612,9 +696,9 @@ impl Ops {
         let frozen = group.gate().freeze();
         let (generation, last) = {
             let s = group.state();
-            (s.generation, s.caller)
+            (s.generation, s.writer.clone())
         };
-        let caller = caller.or(last).unwrap_or(NOBODY);
+        let writer = writer.or(last).unwrap_or(NOBODY);
         let mut fds = Vec::new();
         let mut changes = Vec::with_capacity(group.members().len());
         let mut result = Ok(false);
@@ -629,13 +713,11 @@ impl Ops {
             }
         }
         if result.is_ok() {
-            result = self.boundary.record_group(trigger, caller, changes);
+            result = self.boundary.record_group(trigger, writer, changes);
         }
         drop(fds);
         drop(frozen);
-        group
-            .state()
-            .captured(generation, Instant::now(), result.is_ok());
+        group.captured(generation, result.is_ok(), matches!(when, When::Operation));
         result
     }
 
@@ -739,7 +821,8 @@ impl Ops {
         let mut failed = None;
         for (group, actor) in self.groups.in_operation() {
             let _names = self.read_names();
-            match self.capture(&group, Trigger::Restore, Some(actor), When::Operation) {
+            let writer = Writer::agentfs(actor);
+            match self.capture(&group, Trigger::Restore, Some(writer), When::Operation) {
                 Ok(true) => n += 1,
                 Ok(false) => {}
                 Err(e) => {
@@ -980,15 +1063,17 @@ impl Ops {
             .table()
             .get(id)
             .filter(|node| node.mapping_may_write && node.handles.is_empty())
-            .map(|node| node.dirty.last_writer.unwrap_or(NOBODY));
-        if let Some(caller) = watched {
+            .map(|node| node.dirty.last_writer.clone().unwrap_or(NOBODY));
+        if let Some(writer) = watched {
             let _names = self.read_names();
             if let Ok(fd) = self.node_fd(id)
-                && self.record_node(id, &fd, Trigger::Release, caller).is_err()
+                && self
+                    .record_node(id, &fd, Trigger::Release, writer.clone())
+                    .is_err()
             {
                 // The sweep re-derives the content from the tree.
                 let paths = self.table().paths(id);
-                self.boundary.queue_repair(paths, caller);
+                self.boundary.queue_repair(paths, writer);
             }
         }
         self.table().forget(id, n);
@@ -1019,7 +1104,17 @@ impl Ops {
     }
 
     pub fn setattr(&self, id: u64, set: &SetAttr, actor: Actor<'_>) -> OpResult<FileAttr> {
-        let caller = actor.caller;
+        self.again(|retry| self.setattr_once(id, set, actor, retry))
+    }
+
+    fn setattr_once(
+        &self,
+        id: u64,
+        set: &SetAttr,
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<FileAttr> {
+        let writer = actor.writer();
         let names = self.read_names();
         let kind = self.kind_of(id)?;
         let fd = match set.fh.and_then(|fh| self.handle(fh).ok()) {
@@ -1027,7 +1122,7 @@ impl Ops {
             None => self.node_fd(id)?,
         };
         // A size or mode change to an fsync-class file changes its group:
-        // held until the change is made; [`Ops::record`] marks the group.
+        // held until the change is made and marked.
         let group = if kind == Kind::File && (set.size.is_some() || set.mode.is_some()) {
             match &fd {
                 NodeFd::Handle(h) if h.daemon_only() => self.handle_group(h),
@@ -1036,7 +1131,7 @@ impl Ops {
         } else {
             None
         };
-        let hold = group.as_ref().map(|g| g.hold());
+        let hold = self.hold(group.as_ref(), &writer, retry)?;
         let before = rustix::fs::fstat(&fd).eno()?;
         if set.uid.is_some() || set.gid.is_some() {
             rustix::fs::chownat(
@@ -1077,16 +1172,21 @@ impl Ops {
                 }
             }
             if let Some(node) = self.table().get_mut(id) {
-                node.dirty.arm(caller);
+                node.dirty.arm(writer.clone());
             }
         }
         if set.atime.is_some() || set.mtime.is_some() {
             self.utimens(id, &fd, kind, set)?;
         }
         let after = rustix::fs::fstat(&fd).eno()?;
-        drop(hold);
         let record = kind == Kind::File
             && (set.size.is_some() || executable(mode_of(&before)) != executable(mode_of(&after)));
+        if let Some(hold) = &hold
+            && record
+        {
+            hold.changed();
+        }
+        drop(hold);
         if record {
             let paths = self.table().paths(id);
             let changes = paths
@@ -1100,7 +1200,7 @@ impl Ops {
                 })
                 .collect();
             let now = now_ns();
-            match self.record(Trigger::Setattr, caller, changes) {
+            match self.record(Trigger::Setattr, writer.clone(), changes) {
                 Ok(_) => {
                     if let Some(node) = self.table().get_mut(id) {
                         node.dirty
@@ -1109,7 +1209,7 @@ impl Ops {
                     }
                 }
                 Err(_) => {
-                    self.boundary.queue_repair(paths, caller);
+                    self.boundary.queue_repair(paths, writer);
                     return Err(Errno::EIO);
                 }
             }
@@ -1299,7 +1399,20 @@ impl Ops {
         rdev: u32,
         actor: Actor<'_>,
     ) -> OpResult<Entry> {
+        self.again(|retry| self.mknod_once(parent, name, mode, rdev, actor, retry))
+    }
+
+    fn mknod_once(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: u32,
+        rdev: u32,
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<Entry> {
         let caller = actor.caller;
+        let writer = actor.writer();
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
@@ -1307,7 +1420,7 @@ impl Ops {
         let kind = Kind::from_mode(mode);
         self.check_create(actor, &dir, parent, name, kind)?;
         let group = self.group_at(&join(&self.path_of(parent)?, name));
-        let hold = group.as_ref().map(|g| g.hold());
+        let hold = self.hold(group.as_ref(), &writer, retry)?;
         // A device node needs CAP_MKNOD, which the caller lacks: refused
         // as the caller, it is made by the daemon.
         let (made, as_caller) = self.create_as(actor, || {
@@ -1320,6 +1433,9 @@ impl Ops {
             )
         });
         made.eno()?;
+        if let Some(hold) = &hold {
+            hold.changed();
+        }
         drop(hold);
         self.own_new(&dir, name, None, &pst, caller, mode, kind, as_caller)?;
         let st =
@@ -1337,8 +1453,11 @@ impl Ops {
                     executable: executable(mode_of(&st)),
                 },
             };
-            if self.record(Trigger::Close, caller, vec![change]).is_err() {
-                self.boundary.queue_repair([path], caller);
+            if self
+                .record(Trigger::Close, writer.clone(), vec![change])
+                .is_err()
+            {
+                self.boundary.queue_repair([path], writer);
                 self.unlookup(entry.id);
                 return Err(Errno::EIO);
             }
@@ -1353,18 +1472,33 @@ impl Ops {
         target: &[u8],
         actor: Actor<'_>,
     ) -> OpResult<Entry> {
+        self.again(|retry| self.symlink_once(parent, name, target, actor, retry))
+    }
+
+    fn symlink_once(
+        &self,
+        parent: u64,
+        name: &[u8],
+        target: &[u8],
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<Entry> {
         let caller = actor.caller;
+        let writer = actor.writer();
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
         let pst = rustix::fs::fstat(&dir).eno()?;
         self.check_create(actor, &dir, parent, name, Kind::Symlink)?;
         let group = self.group_at(&join(&self.path_of(parent)?, name));
-        let hold = group.as_ref().map(|g| g.hold());
+        let hold = self.hold(group.as_ref(), &writer, retry)?;
         let (made, as_caller) = self.create_as(actor, || {
             rustix::fs::symlinkat(OsStr::from_bytes(target), &dir, OsStr::from_bytes(name))
         });
         made.eno()?;
+        if let Some(hold) = &hold {
+            hold.changed();
+        }
         drop(hold);
         self.own_new(
             &dir,
@@ -1386,8 +1520,11 @@ impl Ops {
                 target: target.to_vec(),
             },
         };
-        if self.record(Trigger::Symlink, caller, vec![change]).is_err() {
-            self.boundary.queue_repair([path], caller);
+        if self
+            .record(Trigger::Symlink, writer.clone(), vec![change])
+            .is_err()
+        {
+            self.boundary.queue_repair([path], writer);
             self.unlookup(entry.id);
             return Err(Errno::EIO);
         }
@@ -1395,7 +1532,18 @@ impl Ops {
     }
 
     pub fn link(&self, id: u64, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<Entry> {
-        let caller = actor.caller;
+        self.again(|retry| self.link_once(id, parent, name, actor, retry))
+    }
+
+    fn link_once(
+        &self,
+        id: u64,
+        parent: u64,
+        name: &[u8],
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<Entry> {
+        let writer = actor.writer();
         check_name(name)?;
         let _names = self.read_names();
         let (sparent, sname) = self
@@ -1419,7 +1567,7 @@ impl Ops {
             })?;
         }
         let group = self.group_at(&join(&self.path_of(parent)?, name));
-        let hold = group.as_ref().map(|g| g.hold());
+        let hold = self.hold(group.as_ref(), &writer, retry)?;
         rustix::fs::linkat(
             &sdir,
             OsStr::from_bytes(&sname),
@@ -1428,6 +1576,9 @@ impl Ops {
             AtFlags::empty(),
         )
         .eno()?;
+        if let Some(hold) = &hold {
+            hold.changed();
+        }
         drop(hold);
         let st =
             rustix::fs::statat(&dir, OsStr::from_bytes(name), AtFlags::SYMLINK_NOFOLLOW).eno()?;
@@ -1450,8 +1601,11 @@ impl Ops {
             path: path.clone(),
             state,
         };
-        if self.record(Trigger::Link, caller, vec![change]).is_err() {
-            self.boundary.queue_repair([path], caller);
+        if self
+            .record(Trigger::Link, writer.clone(), vec![change])
+            .is_err()
+        {
+            self.boundary.queue_repair([path], writer);
             self.unlookup(entry.id);
             return Err(Errno::EIO);
         }
@@ -1469,7 +1623,18 @@ impl Ops {
     }
 
     fn remove(&self, parent: u64, name: &[u8], dir: bool, actor: Actor<'_>) -> OpResult<()> {
-        let caller = actor.caller;
+        self.again(|retry| self.remove_once(parent, name, dir, actor, retry))
+    }
+
+    fn remove_once(
+        &self,
+        parent: u64,
+        name: &[u8],
+        dir: bool,
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<()> {
+        let writer = actor.writer();
         check_name(name)?;
         let _names = self.read_names();
         let pdir = self.open_dir_node(parent)?;
@@ -1487,16 +1652,19 @@ impl Ops {
         }
         // Removing a member changes its group: held while it happens.
         let group = self.group_at(&path);
-        let hold = group.as_ref().map(|g| g.hold());
+        let hold = self.hold(group.as_ref(), &writer, retry)?;
         rustix::fs::unlinkat(&pdir, OsStr::from_bytes(name), flags).eno()?;
+        if let Some(hold) = &hold {
+            hold.changed();
+        }
         drop(hold);
         self.table().remove_link(parent, name);
         let trigger = if dir { Trigger::Rmdir } else { Trigger::Unlink };
         if self
-            .record(trigger, caller, vec![Change::removed(path.clone())])
+            .record(trigger, writer.clone(), vec![Change::removed(path.clone())])
             .is_err()
         {
-            self.boundary.queue_repair([path], caller);
+            self.boundary.queue_repair([path], writer);
             return Err(Errno::EIO);
         }
         Ok(())
@@ -1512,7 +1680,21 @@ impl Ops {
         flags: u32,
         actor: Actor<'_>,
     ) -> OpResult<()> {
-        let caller = actor.caller;
+        self.again(|retry| self.rename_once(parent, name, newparent, newname, flags, actor, retry))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rename_once(
+        &self,
+        parent: u64,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<()> {
+        let writer = actor.writer();
         check_name(name)?;
         check_name(newname)?;
         let flags = RenameFlags::from_bits(flags).ok_or(Errno::EINVAL)?;
@@ -1542,6 +1724,16 @@ impl Ops {
                 flags.bits(),
             )?;
         }
+        // Renaming a member changes its group, at either name: held while
+        // it happens. `names` is held for writing, so no capture runs: a
+        // hold waits at most for a write in progress through another entry
+        // point, which never waits for `names`.
+        let src_group = self.group_at(&src_path);
+        let dst_group = self
+            .group_at(&dst_path)
+            .filter(|d| src_group.as_ref().is_none_or(|s| !Arc::ptr_eq(s, d)));
+        let src_hold = self.hold(src_group.as_ref(), &writer, retry)?;
+        let dst_hold = self.hold(dst_group.as_ref(), &writer, retry)?;
         rustix::fs::renameat_with(
             &sdir,
             OsStr::from_bytes(name),
@@ -1550,6 +1742,10 @@ impl Ops {
             flags,
         )
         .eno()?;
+        for hold in [&src_hold, &dst_hold].into_iter().flatten() {
+            hold.changed();
+        }
+        drop((src_hold, dst_hold));
         // Renaming one name of an inode over another of its names changes
         // nothing (POSIX).
         if dst.as_ref().is_some_and(|d| dev_ino(d) == dev_ino(&src)) {
@@ -1566,13 +1762,13 @@ impl Ops {
             // directory: the names stay locked until it is durable.
             match self
                 .boundary
-                .record_move(Trigger::Rename, caller, &src_path, &dst_path)
+                .record_move(Trigger::Rename, writer.clone(), &src_path, &dst_path)
             {
                 Ok(MoveOutcome::Journaled(_) | MoveOutcome::Nothing) => return Ok(()),
                 Ok(MoveOutcome::Unsupported) => {}
                 Err(_) => {
                     drop(names);
-                    self.boundary.queue_repair([src_path, dst_path], caller);
+                    self.boundary.queue_repair([src_path, dst_path], writer);
                     return Err(Errno::EIO);
                 }
             }
@@ -1594,10 +1790,10 @@ impl Ops {
             (vec![src_path.clone()], vec![dst_path.clone()])
         };
         if self
-            .record_tree(Trigger::Rename, caller, removed, &roots, None)
+            .record_tree(Trigger::Rename, writer.clone(), removed, &roots, None)
             .is_err()
         {
-            self.boundary.queue_repair([src_path, dst_path], caller);
+            self.boundary.queue_repair([src_path, dst_path], writer);
             return Err(Errno::EIO);
         }
         Ok(())
@@ -1610,11 +1806,14 @@ impl Ops {
     /// symlink's target, every file and symlink under a directory (never
     /// inside a `.git` directory), or a removal if the path is gone. Large
     /// trees are recorded in several records of [`OpsConfig::chunk`] files,
-    /// the first carrying the removals.
+    /// the first carrying the removals. A path in an fsync-class group is
+    /// its group's: the group is marked changed by `writer`
+    /// ([`Ops::mark_late`]) instead. The caller holds `names` for reading
+    /// and no hold.
     fn record_tree(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         removed: Vec<Vec<u8>>,
         roots: &[Vec<u8>],
         origin: Option<&Origin>,
@@ -1633,12 +1832,19 @@ impl Ops {
                 Err(_) => leaves.push(root.clone()),
             }
         }
+        if self.boundary.recorder().has_fsync_class() {
+            for path in removed.iter().chain(&leaves) {
+                if let Some(group) = self.group_at(path) {
+                    self.mark_late(&group, &writer);
+                }
+            }
+        }
         let mut first: Vec<Change> = removed.into_iter().map(Change::removed).collect();
         let chunk = self.config.chunk.max(1);
         let mut chunks = leaves.chunks(chunk).peekable();
         if chunks.peek().is_none() {
             return self
-                .record_as(trigger, caller, first, origin)
+                .record_as(trigger, writer, first, origin)
                 .map(|_| ())
                 .map_err(|_| ());
         }
@@ -1650,7 +1856,7 @@ impl Ops {
                     changes.push(change);
                 }
             }
-            self.record_as(trigger, caller, changes, origin)
+            self.record_as(trigger, writer.clone(), changes, origin)
                 .map_err(|_| ())?;
             drop(fds);
         }
@@ -1744,7 +1950,17 @@ impl Ops {
     /// Opens node `id`. Returns the handle id and the handle (the fuser
     /// layer registers its descriptor for passthrough).
     pub fn open(&self, id: u64, flags: i32, actor: Actor<'_>) -> OpResult<(u64, Arc<Handle>)> {
-        let caller = actor.caller;
+        self.again(|retry| self.open_once(id, flags, actor, retry))
+    }
+
+    fn open_once(
+        &self,
+        id: u64,
+        flags: i32,
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<(u64, Arc<Handle>)> {
+        let writer = actor.writer();
         let mut oflags = OFlags::from_bits_retain(flags as u32)
             & !(OFlags::CREATE | OFlags::EXCL | OFlags::NOCTTY | OFlags::NOATIME);
         oflags.remove(OFlags::PATH);
@@ -1757,10 +1973,10 @@ impl Ops {
         let _names = self.read_names();
         let group = self.node_group(id);
         // Truncating a member changes its group: held, like a write.
-        let hold = group.as_ref().filter(|_| truncate).map(|g| g.hold());
+        let hold = self.hold(group.as_ref().filter(|_| truncate), &writer, retry)?;
         let fd = self.open_node(id, oflags)?;
         if let Some(hold) = &hold {
-            hold.changed(caller);
+            hold.changed();
         }
         drop(hold);
         let st = if write {
@@ -1768,7 +1984,7 @@ impl Ops {
         } else {
             None
         };
-        Ok(self.add_handle(id, fd, write, truncate, false, st.as_ref(), caller, group))
+        Ok(self.add_handle(id, fd, write, truncate, false, st.as_ref(), writer, group))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1780,7 +1996,7 @@ impl Ops {
         truncate: bool,
         created: bool,
         st: Option<&Stat>,
-        caller: Caller,
+        writer: Writer,
         group: Option<Arc<Group>>,
     ) -> (u64, Arc<Handle>) {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
@@ -1802,7 +2018,7 @@ impl Ops {
                 node.handles.push(fh);
                 node.group = group.clone();
                 if write || created {
-                    node.dirty.arm(caller);
+                    node.dirty.arm(writer);
                     if truncate || created {
                         node.dirty.force = true;
                     } else if node.dirty.baseline.is_none() {
@@ -1832,7 +2048,20 @@ impl Ops {
         flags: i32,
         actor: Actor<'_>,
     ) -> OpResult<(Entry, u64, Arc<Handle>)> {
+        self.again(|retry| self.create_once(parent, name, mode, flags, actor, retry))
+    }
+
+    fn create_once(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: u32,
+        flags: i32,
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<(Entry, u64, Arc<Handle>)> {
         let caller = actor.caller;
+        let writer = actor.writer();
         check_name(name)?;
         let _names = self.read_names();
         let dir = self.open_dir_node(parent)?;
@@ -1845,7 +2074,7 @@ impl Ops {
         self.check_create(actor, &dir, parent, name, Kind::File)?;
         // Creating or truncating a member changes its group: held.
         let group = self.group_at(&join(&self.path_of(parent)?, name));
-        let hold = group.as_ref().map(|g| g.hold());
+        let hold = self.hold(group.as_ref(), &writer, retry)?;
         let (created, as_caller) = self.create_as(actor, || {
             rustix::fs::openat(
                 &dir,
@@ -1909,11 +2138,11 @@ impl Ops {
         if let Some(hold) = &hold
             && (new || truncate)
         {
-            hold.changed(caller);
+            hold.changed();
         }
         drop(hold);
         let (fh, handle) =
-            self.add_handle(entry.id, fd, write, truncate, new, Some(&st), caller, group);
+            self.add_handle(entry.id, fd, write, truncate, new, Some(&st), writer, group);
         Ok((entry, fh, handle))
     }
 
@@ -1922,16 +2151,27 @@ impl Ops {
     }
 
     pub fn write(&self, fh: u64, offset: u64, data: &[u8], actor: Actor<'_>) -> OpResult<u32> {
-        let caller = actor.caller;
+        self.again(|retry| self.write_once(fh, offset, data, actor, retry))
+    }
+
+    fn write_once(
+        &self,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<u32> {
+        let writer = actor.writer();
         let h = self.handle(fh)?;
         if let Some(node) = self.table().get_mut(h.node) {
-            node.dirty.arm(caller);
+            node.dirty.arm(writer.clone());
         }
         let group = self.handle_group(&h);
-        let hold = group.as_ref().map(|g| g.hold());
+        let hold = self.hold(group.as_ref(), &writer, retry)?;
         let result = write_at(&h.fd, offset, data);
         if let Some(hold) = &hold {
-            hold.changed(caller);
+            hold.changed();
         }
         result
     }
@@ -1940,7 +2180,7 @@ impl Ops {
     /// last record (design §3.1). `EIO` if recording fails; the inode stays
     /// dirty, so the next boundary records it.
     pub fn flush(&self, fh: u64, actor: Actor<'_>) -> OpResult<()> {
-        let caller = actor.caller;
+        let writer = actor.writer();
         let h = self.handle(fh)?;
         let _names = self.read_names();
         if let Some(group) = self.handle_group(&h) {
@@ -1952,12 +2192,14 @@ impl Ops {
             if group.state().handles > 1 {
                 return Ok(());
             }
+            // As whoever changed it: a close through another entry point
+            // never claims another's changes.
             return self
-                .capture(&group, Trigger::Close, Some(caller), When::Changed)
+                .capture(&group, Trigger::Close, None, When::Changed)
                 .map(|_| ())
                 .map_err(|_| Errno::EIO);
         }
-        self.record_node(h.node, &h.fd, Trigger::Close, caller)?;
+        self.record_node(h.node, &h.fd, Trigger::Close, writer)?;
         // Recorded, not yet answered (design §18 test 3).
         agentfs_core::failpoints::hit("fuse.after_record").map_err(|_| Errno::EIO)
     }
@@ -1969,7 +2211,7 @@ impl Ops {
         id: u64,
         fd: &impl AsFd,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
     ) -> OpResult<bool> {
         // fsync-class nodes are recorded by group captures only.
         if !self
@@ -2035,7 +2277,7 @@ impl Ops {
             Recorded::default()
         } else {
             self.boundary
-                .record(trigger, caller, changes)
+                .record(trigger, writer, changes)
                 .map_err(|_| Errno::EIO)?
         };
         let racy = now - current.changed_ns() < self.config.granularity_ns;
@@ -2113,7 +2355,7 @@ impl Ops {
                 node.write_handles = node.write_handles.saturating_sub(1);
             }
             (
-                node.dirty.last_writer.unwrap_or(NOBODY),
+                node.dirty.last_writer.clone().unwrap_or(NOBODY),
                 // An fsync-class handle never records its node alone.
                 group.is_none() && node.write_handles == 0 && node.dirty.armed,
             )
@@ -2129,7 +2371,7 @@ impl Ops {
         let mut result = Ok(());
         if check {
             let _names = self.read_names();
-            match self.record_node(h.node, &h.fd, Trigger::Release, last_writer) {
+            match self.record_node(h.node, &h.fd, Trigger::Release, last_writer.clone()) {
                 Ok(_) => {
                     // Nothing can write it unseen any more but a mapping,
                     // which RELEASE covers unless the mapping holds a
@@ -2181,13 +2423,25 @@ impl Ops {
         mode: i32,
         actor: Actor<'_>,
     ) -> OpResult<()> {
-        let caller = actor.caller;
+        self.again(|retry| self.fallocate_once(fh, offset, length, mode, actor, retry))
+    }
+
+    fn fallocate_once(
+        &self,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<()> {
+        let writer = actor.writer();
         let h = self.handle(fh)?;
         if let Some(node) = self.table().get_mut(h.node) {
-            node.dirty.arm(caller);
+            node.dirty.arm(writer.clone());
         }
         let group = self.handle_group(&h);
-        let hold = group.as_ref().map(|g| g.hold());
+        let hold = self.hold(group.as_ref(), &writer, retry)?;
         let result = rustix::fs::fallocate(
             &h.fd,
             rustix::fs::FallocateFlags::from_bits_retain(mode as u32),
@@ -2196,7 +2450,7 @@ impl Ops {
         )
         .eno();
         if let Some(hold) = &hold {
-            hold.changed(caller);
+            hold.changed();
         }
         result
     }
@@ -2215,17 +2469,33 @@ impl Ops {
         len: u64,
         actor: Actor<'_>,
     ) -> OpResult<u32> {
-        let caller = actor.caller;
+        self.again(|retry| {
+            self.copy_file_range_once(fh_in, offset_in, fh_out, offset_out, len, actor, retry)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range_once(
+        &self,
+        fh_in: u64,
+        offset_in: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        actor: Actor<'_>,
+        retry: &Retry,
+    ) -> OpResult<u32> {
+        let writer = actor.writer();
         let input = self.handle(fh_in)?;
         let output = self.handle(fh_out)?;
         if let Some(node) = self.table().get_mut(output.node) {
-            node.dirty.arm(caller);
+            node.dirty.arm(writer.clone());
         }
         let mut off_in = offset_in;
         let mut off_out = offset_out;
         let len = usize::try_from(len.min(u64::from(u32::MAX))).unwrap_or(usize::MAX);
         let group = self.handle_group(&output);
-        let hold = group.as_ref().map(|g| g.hold());
+        let hold = self.hold(group.as_ref(), &writer, retry)?;
         let n = rustix::fs::copy_file_range(
             &input.fd,
             Some(&mut off_in),
@@ -2235,7 +2505,7 @@ impl Ops {
         )
         .eno();
         if let Some(hold) = &hold {
-            hold.changed(caller);
+            hold.changed();
         }
         Ok(u32::try_from(n?).unwrap_or(u32::MAX))
     }
@@ -2395,7 +2665,7 @@ impl Ops {
             if self
                 .record_tree(
                     REPAIR_TRIGGER,
-                    repair.caller,
+                    repair.writer.clone(),
                     removed,
                     roots,
                     repair.origin.as_ref(),
@@ -2412,7 +2682,7 @@ impl Ops {
         report.still_queued = self.boundary.pending_repairs();
         // A node whose mapping may write unseen is swept with no handle
         // open too, from its name.
-        let candidates: Vec<(u64, Option<u64>, Caller)> = {
+        let candidates: Vec<(u64, Option<u64>, Writer)> = {
             let table = self.table();
             table
                 .ids()
@@ -2429,13 +2699,13 @@ impl Ops {
                             (
                                 id,
                                 node.handles.first().copied(),
-                                node.dirty.last_writer.unwrap_or(NOBODY),
+                                node.dirty.last_writer.clone().unwrap_or(NOBODY),
                             )
                         })
                 })
                 .collect()
         };
-        for (id, fh, caller) in candidates {
+        for (id, fh, writer) in candidates {
             let fd = match fh {
                 Some(fh) => match self.handle(fh) {
                     Ok(h) => NodeFd::Handle(h),
@@ -2446,7 +2716,7 @@ impl Ops {
                     Err(_) => continue,
                 },
             };
-            if let Ok(true) = self.record_node(id, &fd, Trigger::Sweep, caller) {
+            if let Ok(true) = self.record_node(id, &fd, Trigger::Sweep, writer) {
                 report.recorded += 1;
             }
         }
@@ -2700,7 +2970,32 @@ impl crate::session::TreeOperations for Ops {
         flags: u32,
         moved: crate::session::Moved,
         check: &dyn crate::session::NameCheck,
-        caller: Caller,
+        writer: &Writer,
+    ) -> OpResult<Entry> {
+        // Taken by the attempt that moves it: one that meets a foreign
+        // group starts over before.
+        let moved = RefCell::new(Some(moved));
+        self.again(|retry| {
+            self.move_in_once(
+                from, name, newparent, newname, flags, &moved, check, writer, retry,
+            )
+        })
+    }
+}
+
+impl Ops {
+    #[allow(clippy::too_many_arguments)]
+    fn move_in_once(
+        &self,
+        from: BorrowedFd<'_>,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+        flags: u32,
+        moved: &RefCell<Option<crate::session::Moved>>,
+        check: &dyn crate::session::NameCheck,
+        writer: &Writer,
+        retry: &Retry,
     ) -> OpResult<Entry> {
         check_name(newname)?;
         let flags = match RenameFlags::from_bits(flags) {
@@ -2723,6 +3018,12 @@ impl crate::session::TreeOperations for Ops {
             path: &dst_path,
             kind: dst.as_ref().map(|st| Kind::from_mode(mode_of(st))),
         })?;
+        // Moving a file over a member changes its group: held.
+        let group = self.group_at(&dst_path);
+        let hold = self.hold(group.as_ref(), writer, retry)?;
+        let Some(moved) = moved.borrow_mut().take() else {
+            return Err(Errno::EIO);
+        };
         rustix::fs::renameat_with(
             from,
             OsStr::from_bytes(name),
@@ -2731,6 +3032,10 @@ impl crate::session::TreeOperations for Ops {
             flags,
         )
         .eno()?;
+        if let Some(hold) = &hold {
+            hold.changed();
+        }
+        drop(hold);
         let st = rustix::fs::statat(&ddir, OsStr::from_bytes(newname), AtFlags::SYMLINK_NOFOLLOW)
             .unwrap_or(src);
         let (dev, ino) = dev_ino(&src);
@@ -2765,7 +3070,7 @@ impl crate::session::TreeOperations for Ops {
                 // writes through the handles are recorded at their flush or
                 // release.
                 if write {
-                    node.dirty.arm(caller);
+                    node.dirty.arm(writer.clone());
                     if node.dirty.baseline.is_none() {
                         node.dirty.baseline = Some(stamp(&st));
                     }
@@ -2781,14 +3086,14 @@ impl crate::session::TreeOperations for Ops {
         if self
             .record_tree(
                 Trigger::Rename,
-                caller,
+                writer.clone(),
                 vec![],
                 std::slice::from_ref(&dst_path),
                 None,
             )
             .is_err()
         {
-            self.boundary.queue_repair([dst_path], caller);
+            self.boundary.queue_repair([dst_path], writer.clone());
             return Err(Errno::EIO);
         }
         Ok(Entry {

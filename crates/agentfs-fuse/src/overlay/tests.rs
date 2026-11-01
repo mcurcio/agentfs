@@ -13,7 +13,7 @@ use std::time::UNIX_EPOCH;
 
 use agentfs_core::events::MemorySink;
 use agentfs_core::identity::Context;
-use agentfs_core::record::Trigger;
+use agentfs_core::record::{EntryPoint, SandboxId, Trigger, Writer};
 use agentfs_core::rules::{RuleOptions, Rules};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, StateDir};
@@ -35,6 +35,12 @@ const OWNER: OwnerIds = OwnerIds {
 const OTHER: u32 = 20000;
 
 /// A request from a sandbox process that is neither root nor the owner.
+/// The main mount's entry point, as its session stamps it.
+static MAIN: EntryPoint = EntryPoint::Main;
+/// The overlay session's entry point, as its session stamps it.
+static SANDBOX: std::sync::LazyLock<EntryPoint> =
+    std::sync::LazyLock::new(|| EntryPoint::Sandbox(SandboxId::new("test").unwrap()));
+
 const REQUEST: Caller = Caller {
     uid: OTHER,
     gid: OTHER,
@@ -518,9 +524,9 @@ impl TreeOperations for FakeOps {
         _flags: u32,
         moved: Moved,
         check: &dyn NameCheck,
-        caller: Caller,
+        writer: &Writer,
     ) -> OpResult<Entry> {
-        self.record("move_in", newname, Some(caller));
+        self.record("move_in", newname, Some(writer.caller));
         let path = join(&self.paths[&newparent], newname);
         let kind = self
             .children
@@ -642,14 +648,14 @@ fn a5_hidden_names_answer_the_same_whether_or_not_they_exist() {
         );
         assert_eq!(
             b.overlay
-                .unlink(ROOT, n, Actor::of_process(REQUEST))
+                .unlink(ROOT, n, Actor::of_process(REQUEST, &SANDBOX))
                 .unwrap_err(),
             Errno::ENOENT,
             "{name}"
         );
         assert_eq!(
             b.overlay
-                .mkdir(ROOT, n, 0o755, Actor::of_process(REQUEST))
+                .mkdir(ROOT, n, 0o755, Actor::of_process(REQUEST, &SANDBOX))
                 .unwrap_err(),
             Errno::EACCES,
             "{name}"
@@ -662,7 +668,7 @@ fn a5_hidden_names_answer_the_same_whether_or_not_they_exist() {
                 n,
                 0o644,
                 O_WRONLY | O_EXCL,
-                Actor::of_process(REQUEST),
+                Actor::of_process(REQUEST, &SANDBOX),
             )
             .unwrap();
     }
@@ -703,14 +709,14 @@ fn a5_hidden_entries_at_placeable_names_are_refused_under_the_names_ordering() {
         let n = name.as_bytes();
         assert_eq!(
             b.overlay
-                .mkdir(5, n, 0o755, Actor::of_process(REQUEST))
+                .mkdir(5, n, 0o755, Actor::of_process(REQUEST, &SANDBOX))
                 .unwrap_err(),
             Errno::EACCES,
             "mkdir {name}"
         );
         assert_eq!(
             b.overlay
-                .rename(5, b"a.md", 5, n, 0, Actor::of_process(REQUEST))
+                .rename(5, b"a.md", 5, n, 0, Actor::of_process(REQUEST, &SANDBOX))
                 .unwrap_err(),
             Errno::EACCES,
             "rename onto {name}"
@@ -720,14 +726,20 @@ fn a5_hidden_entries_at_placeable_names_are_refused_under_the_names_ordering() {
         let n = name.as_bytes();
         assert_eq!(
             b.overlay
-                .create(5, n, 0o644, O_WRONLY, Actor::of_process(REQUEST))
+                .create(5, n, 0o644, O_WRONLY, Actor::of_process(REQUEST, &SANDBOX))
                 .unwrap_err(),
             Errno::EACCES,
             "create {name}"
         );
         assert_eq!(
             b.overlay
-                .mknod(5, n, s_ifreg | 0o644, 0, Actor::of_process(REQUEST))
+                .mknod(
+                    5,
+                    n,
+                    s_ifreg | 0o644,
+                    0,
+                    Actor::of_process(REQUEST, &SANDBOX)
+                )
                 .unwrap_err(),
             Errno::EACCES,
             "mknod {name}"
@@ -743,16 +755,35 @@ fn a5_hidden_entries_at_placeable_names_are_refused_under_the_names_ordering() {
         &["skills/repo/.git"],
     );
     b.overlay
-        .mkdir(5, b"y.sec", 0o755, Actor::of_process(REQUEST))
+        .mkdir(5, b"y.sec", 0o755, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     b.overlay
-        .rename(5, b"a.md", 5, b"pipe", 0, Actor::of_process(REQUEST))
+        .rename(
+            5,
+            b"a.md",
+            5,
+            b"pipe",
+            0,
+            Actor::of_process(REQUEST, &SANDBOX),
+        )
         .unwrap();
     b.overlay
-        .create(5, b"pipe", 0o644, O_WRONLY, Actor::of_process(REQUEST))
+        .create(
+            5,
+            b"pipe",
+            0o644,
+            O_WRONLY,
+            Actor::of_process(REQUEST, &SANDBOX),
+        )
         .unwrap();
     b.overlay
-        .mknod(5, b"pipe2", s_ifreg | 0o644, 0, Actor::of_process(REQUEST))
+        .mknod(
+            5,
+            b"pipe2",
+            s_ifreg | 0o644,
+            0,
+            Actor::of_process(REQUEST, &SANDBOX),
+        )
         .unwrap();
 }
 
@@ -762,8 +793,14 @@ fn rename_exchange_needs_both_ends_shown_in_the_tree() {
     let exchange = RenameFlags::EXCHANGE.bits();
     // A hidden kind at the other end: refused, so it never moves.
     assert_ne!(
-        b.overlay
-            .rename(5, b"a.md", 5, b"pipe", exchange, Actor::of_process(REQUEST)),
+        b.overlay.rename(
+            5,
+            b"a.md",
+            5,
+            b"pipe",
+            exchange,
+            Actor::of_process(REQUEST, &SANDBOX)
+        ),
         Ok(())
     );
     // A directory at the other end never moves.
@@ -775,7 +812,7 @@ fn rename_exchange_needs_both_ends_shown_in_the_tree() {
                 5,
                 b"d",
                 exchange,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EXDEV
@@ -783,7 +820,14 @@ fn rename_exchange_needs_both_ends_shown_in_the_tree() {
     // Nothing to exchange with.
     assert_eq!(
         b.overlay
-            .rename(5, b"a.md", 5, b"b.md", exchange, Actor::of_process(REQUEST))
+            .rename(
+                5,
+                b"a.md",
+                5,
+                b"b.md",
+                exchange,
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap_err(),
         Errno::ENOENT
     );
@@ -795,7 +839,7 @@ fn rename_exchange_needs_both_ends_shown_in_the_tree() {
             ROOT,
             b"config.yaml",
             exchange,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     assert_eq!(b.fake.calls_to("rename").len(), 1);
@@ -811,13 +855,20 @@ fn rename_onto_an_entry_follows_the_sticky_rule() {
     );
     assert_eq!(
         b.overlay
-            .rename(5, b"a.md", 8, b"theirs.md", 0, Actor::of_process(REQUEST))
+            .rename(
+                5,
+                b"a.md",
+                8,
+                b"theirs.md",
+                0,
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
         b.overlay
-            .unlink(8, b"theirs.md", Actor::of_process(REQUEST))
+            .unlink(8, b"theirs.md", Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EACCES
     );
@@ -825,7 +876,14 @@ fn rename_onto_an_entry_follows_the_sticky_rule() {
     assert!(b.fake.calls_to("unlink").is_empty());
     // A new name there is the owner's to add.
     b.overlay
-        .rename(5, b"a.md", 8, b"mine.md", 0, Actor::of_process(REQUEST))
+        .rename(
+            5,
+            b"a.md",
+            8,
+            b"mine.md",
+            0,
+            Actor::of_process(REQUEST, &SANDBOX),
+        )
         .unwrap();
     assert_eq!(b.fake.calls_to("rename").len(), 1);
 }
@@ -844,12 +902,18 @@ fn create_checks_an_existing_file_only_when_it_opens_it() {
             b"theirs.md",
             0o644,
             O_WRONLY | O_EXCL,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     // A directory is not opened as a file: the operations answer.
     b.overlay
-        .create(5, b"dir", 0o644, O_WRONLY, Actor::of_process(REQUEST))
+        .create(
+            5,
+            b"dir",
+            0o644,
+            O_WRONLY,
+            Actor::of_process(REQUEST, &SANDBOX),
+        )
         .unwrap();
     assert_eq!(b.fake.calls_to("create").len(), 2);
 }
@@ -864,7 +928,7 @@ fn setattr_through_the_overlay() {
     };
     assert_eq!(
         b.overlay
-            .setattr(2, &chgrp, Actor::of_process(REQUEST))
+            .setattr(2, &chgrp, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EPERM
     );
@@ -875,13 +939,13 @@ fn setattr_through_the_overlay() {
     };
     assert_eq!(
         b.overlay
-            .setattr(8, &truncate, Actor::of_process(REQUEST))
+            .setattr(8, &truncate, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EACCES
     );
     assert!(b.fake.calls_to("setattr").is_empty());
     b.overlay
-        .setattr(6, &truncate, Actor::of_process(REQUEST))
+        .setattr(6, &truncate, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     assert_eq!(b.fake.calls_to("setattr").len(), 1);
     // Through a handle, gated when it was opened: a hidden node too, and
@@ -893,10 +957,10 @@ fn setattr_through_the_overlay() {
     };
     assert_eq!(b.overlay.getattr(3, None).unwrap_err(), Errno::ENOENT);
     b.overlay
-        .setattr(3, &through, Actor::of_process(REQUEST))
+        .setattr(3, &through, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     b.overlay
-        .setattr(8, &through, Actor::of_process(REQUEST))
+        .setattr(8, &through, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     assert_eq!(b.fake.calls_to("setattr").len(), 3);
 }
@@ -911,12 +975,18 @@ fn mknod_of_a_regular_file_is_a_create_as_the_owner() {
             b"new.md",
             s_ifreg | 0o4644,
             0,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     // A type of 0 is a regular file too.
     b.overlay
-        .mknod(5, b"new2.md", 0o644, 0, Actor::of_process(REQUEST))
+        .mknod(
+            5,
+            b"new2.md",
+            0o644,
+            0,
+            Actor::of_process(REQUEST, &SANDBOX),
+        )
         .unwrap();
     let calls = b.fake.calls_to("mknod");
     assert_eq!(calls.len(), 2);
@@ -929,7 +999,7 @@ fn mknod_of_a_regular_file_is_a_create_as_the_owner() {
             b"notes.txt",
             s_ifreg | 0o4644,
             0,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     assert_eq!(tmp.attr.perm, 0o644);
@@ -940,7 +1010,7 @@ fn mknod_of_a_regular_file_is_a_create_as_the_owner() {
                 b"notes.txt",
                 s_ifreg | 0o644,
                 0,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EEXIST
@@ -953,19 +1023,19 @@ fn rmdir_through_the_overlay() {
     let b = fixture_b(FakeOps::examples());
     assert_eq!(
         b.overlay
-            .rmdir(ROOT, b"notes", Actor::of_process(REQUEST))
+            .rmdir(ROOT, b"notes", Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::ENOENT
     );
     assert_eq!(
         b.overlay
-            .rmdir(ROOT, b"nothing", Actor::of_process(REQUEST))
+            .rmdir(ROOT, b"nothing", Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::ENOENT
     );
     assert!(b.fake.calls_to("rmdir").is_empty());
     b.overlay
-        .rmdir(5, b"d", Actor::of_process(REQUEST))
+        .rmdir(5, b"d", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     assert_eq!(
         b.fake.calls_to("rmdir")[0].caller,
@@ -991,19 +1061,25 @@ fn names_that_are_not_utf8_are_hidden() {
     assert_eq!(b.overlay.lookup(5, bad).unwrap_err(), Errno::ENOENT);
     assert_eq!(
         b.overlay
-            .create(5, bad, 0o644, O_WRONLY, Actor::of_process(REQUEST))
+            .create(
+                5,
+                bad,
+                0o644,
+                O_WRONLY,
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
         b.overlay
-            .rename(5, bad, 5, b"b.md", 0, Actor::of_process(REQUEST))
+            .rename(5, bad, 5, b"b.md", 0, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::ENOENT
     );
     assert_eq!(
         b.overlay
-            .rename(5, b"a.md", 5, bad, 0, Actor::of_process(REQUEST))
+            .rename(5, b"a.md", 5, bad, 0, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EACCES
     );
@@ -1065,7 +1141,7 @@ fn rules_errors_answer_eio_through_the_overlay() {
                 5,
                 format!("{long}x").as_bytes(),
                 0o755,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EIO
@@ -1092,7 +1168,7 @@ fn a_lookup_of_a_hidden_kind_asks_its_kind_only() {
 #[test]
 fn a5_no_operation_looks_up_an_entry_hidden_for_its_kind() {
     let b = hidden_kinds();
-    let actor = Actor::of_process(REQUEST);
+    let actor = Actor::of_process(REQUEST, &SANDBOX);
     for name in ["pipe", "x.sec", "repo"] {
         let n = name.as_bytes();
         let _ = b.overlay.lookup(5, n);
@@ -1135,7 +1211,7 @@ fn a5_hidden_entries_take_no_node_ids() {
     let skills = a.overlay.lookup(ROOT, b"skills").unwrap().id;
     // Held, so a rename's look at it reuses its id.
     a.overlay.lookup(skills, b"a.md").unwrap();
-    let actor = Actor::of_process(REQUEST);
+    let actor = Actor::of_process(REQUEST, &SANDBOX);
     for name in ["x.sec", "pipe", "repo", "y.sec"] {
         let n = name.as_bytes();
         let before = a.ops.new_node_id();
@@ -1179,7 +1255,13 @@ fn a5_hidden_entries_take_no_node_ids() {
 fn a7_the_view_owner_acts_for_every_caller() {
     let b = fixture_b(FakeOps::examples());
     b.overlay
-        .create(5, b"new.md", 0o644, O_WRONLY, Actor::of_process(REQUEST))
+        .create(
+            5,
+            b"new.md",
+            0o644,
+            O_WRONLY,
+            Actor::of_process(REQUEST, &SANDBOX),
+        )
         .unwrap();
     assert_eq!(
         b.fake.calls_to("create")[0].caller,
@@ -1191,9 +1273,11 @@ fn a7_the_view_owner_acts_for_every_caller() {
     );
     // Handle operations get the owner too.
     b.overlay
-        .write(1, 0, b"x", Actor::of_process(REQUEST))
+        .write(1, 0, b"x", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
-    b.overlay.flush(1, Actor::of_process(REQUEST)).unwrap();
+    b.overlay
+        .flush(1, Actor::of_process(REQUEST, &SANDBOX))
+        .unwrap();
     for method in ["write", "flush"] {
         assert_eq!(
             b.fake.calls_to(method)[0].caller,
@@ -1214,14 +1298,14 @@ fn a7_the_view_owner_acts_for_every_caller() {
     for caller in [REQUEST, root] {
         assert_eq!(
             b.overlay
-                .open(id, O_WRONLY, Actor::of_process(caller))
+                .open(id, O_WRONLY, Actor::of_process(caller, &SANDBOX))
                 .unwrap_err(),
             Errno::EACCES
         );
     }
     assert!(b.fake.calls_to("open").is_empty());
     b.overlay
-        .open(id, O_RDONLY, Actor::of_process(REQUEST))
+        .open(id, O_RDONLY, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     assert_eq!(b.fake.calls_to("open").len(), 1);
     // Nor through access(2). A create that would open it is passed on
@@ -1230,7 +1314,13 @@ fn a7_the_view_owner_acts_for_every_caller() {
     // (ops::tests::an_existing_file_is_opened_by_create_only_with_access).
     assert_eq!(b.overlay.access(id, 2).unwrap_err(), Errno::EACCES);
     b.overlay
-        .create(5, b"theirs.md", 0o644, O_WRONLY, Actor::of_process(REQUEST))
+        .create(
+            5,
+            b"theirs.md",
+            0o644,
+            O_WRONLY,
+            Actor::of_process(REQUEST, &SANDBOX),
+        )
         .unwrap();
     assert_eq!(
         b.fake.calls_to("create")[0].caller,
@@ -1244,19 +1334,30 @@ fn a8_refusals() {
     let s_ififo = 0o010000;
     assert_eq!(
         b.overlay
-            .symlink(5, b"l", b"config.yaml", Actor::of_process(REQUEST))
+            .symlink(
+                5,
+                b"l",
+                b"config.yaml",
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
         b.overlay
-            .link(2, 5, b"c.yaml", Actor::of_process(REQUEST))
+            .link(2, 5, b"c.yaml", Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EACCES
     );
     assert_eq!(
         b.overlay
-            .mknod(5, b"f", s_ififo | 0o644, 0, Actor::of_process(REQUEST))
+            .mknod(
+                5,
+                b"f",
+                s_ififo | 0o644,
+                0,
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap_err(),
         Errno::EACCES
     );
@@ -1270,7 +1371,7 @@ fn a8_refusals() {
     };
     assert_eq!(
         b.overlay
-            .setattr(2, &chown, Actor::of_process(REQUEST))
+            .setattr(2, &chown, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EPERM
     );
@@ -1280,7 +1381,7 @@ fn a8_refusals() {
     };
     assert_eq!(
         b.overlay
-            .setattr(2, &setuid, Actor::of_process(REQUEST))
+            .setattr(2, &setuid, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EPERM
     );
@@ -1291,7 +1392,7 @@ fn a8_refusals() {
         ..SetAttr::default()
     };
     b.overlay
-        .setattr(2, &chmod, Actor::of_process(REQUEST))
+        .setattr(2, &chmod, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     assert_eq!(b.fake.calls_to("setattr").len(), 1);
 
@@ -1306,7 +1407,7 @@ fn a8_refusals() {
 
     assert_eq!(
         b.overlay
-            .rename(5, b"d", 5, b"e", 0, Actor::of_process(REQUEST))
+            .rename(5, b"d", 5, b"e", 0, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EXDEV
     );
@@ -1318,7 +1419,7 @@ fn a8_refusals() {
                 ROOT,
                 b"config.bak",
                 0,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EACCES
@@ -1326,7 +1427,14 @@ fn a8_refusals() {
     let whiteout = RenameFlags::WHITEOUT.bits();
     assert_eq!(
         b.overlay
-            .rename(5, b"a.md", 5, b"b.md", whiteout, Actor::of_process(REQUEST))
+            .rename(
+                5,
+                b"a.md",
+                5,
+                b"b.md",
+                whiteout,
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap_err(),
         Errno::EINVAL
     );
@@ -1339,7 +1447,7 @@ fn a8_refusals() {
             5,
             b"config.yaml",
             0,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     assert_eq!(
@@ -1354,7 +1462,7 @@ fn a8_refusals() {
             b"notes.txt",
             0o644,
             O_WRONLY,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     assert!(b.fake.calls_to("create").is_empty());
@@ -1427,7 +1535,7 @@ fn times_follow_utimensat() {
     };
     // Not the owner's, but writable: touching is allowed.
     b.overlay
-        .setattr(8, &now, Actor::of_process(REQUEST))
+        .setattr(8, &now, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     let explicit = SetAttr {
         mtime: Some(TimeOrNow::SpecificTime(UNIX_EPOCH)),
@@ -1435,7 +1543,7 @@ fn times_follow_utimensat() {
     };
     assert_eq!(
         b.overlay
-            .setattr(8, &explicit, Actor::of_process(REQUEST))
+            .setattr(8, &explicit, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EPERM
     );
@@ -1446,13 +1554,13 @@ fn times_follow_utimensat() {
     };
     assert_eq!(
         b.overlay
-            .setattr(8, &chmod, Actor::of_process(REQUEST))
+            .setattr(8, &chmod, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::EPERM
     );
     // On the owner's own file, explicit times are fine.
     b.overlay
-        .setattr(6, &explicit, Actor::of_process(REQUEST))
+        .setattr(6, &explicit, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
 }
 
@@ -1565,13 +1673,13 @@ fn a6_a_node_moved_out_of_view_is_gone_from_the_overlay() {
             ROOT,
             b"secrets2.db",
             0,
-            Actor::of_process(main),
+            Actor::of_process(main, &MAIN),
         )
         .unwrap();
     assert_eq!(a.overlay.getattr(id, None).unwrap_err(), Errno::ENOENT);
     assert_eq!(
         a.overlay
-            .open(id, O_RDONLY, Actor::of_process(REQUEST))
+            .open(id, O_RDONLY, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::ENOENT
     );
@@ -1590,20 +1698,24 @@ fn a14_a_close_through_the_overlay_records_before_it_returns() {
     let id = a.overlay.lookup(ROOT, b"config.yaml").unwrap().id;
     let (fh, _handle) = a
         .overlay
-        .open(id, O_WRONLY, Actor::of_process(REQUEST))
+        .open(id, O_WRONLY, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     a.overlay
-        .write(fh, 0, b"v2", Actor::of_process(REQUEST))
+        .write(fh, 0, b"v2", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
-    a.overlay.flush(fh, Actor::of_process(REQUEST)).unwrap();
+    a.overlay
+        .flush(fh, Actor::of_process(REQUEST, &SANDBOX))
+        .unwrap();
     // The close's own record, not a later release's or sweep's.
     let records = journal();
     assert_eq!(records.len(), before + 1, "{records:#?}");
     let record = records.last().unwrap();
     assert_eq!(record.draft.trigger, Trigger::Close);
     let owner_uid = rustix::process::geteuid().as_raw();
-    assert_eq!(record.draft.caller.uid, owner_uid);
-    assert_eq!(record.draft.caller.pid, REQUEST.pid);
+    assert_eq!(record.draft.writer.caller.uid, owner_uid);
+    assert_eq!(record.draft.writer.caller.pid, REQUEST.pid);
+    // Through the overlay's session.
+    assert_eq!(record.draft.writer.entry, *SANDBOX);
     a.overlay.release(fh).unwrap();
 }
 
@@ -1656,13 +1768,20 @@ impl A {
                 name.as_bytes(),
                 0o644,
                 O_WRONLY | O_EXCL,
-                Actor::of_process(REQUEST),
+                Actor::of_process(REQUEST, &SANDBOX),
             )
             .unwrap();
         self.overlay
-            .write(fh, 0, content.as_bytes(), Actor::of_process(REQUEST))
+            .write(
+                fh,
+                0,
+                content.as_bytes(),
+                Actor::of_process(REQUEST, &SANDBOX),
+            )
             .unwrap();
-        self.overlay.flush(fh, Actor::of_process(REQUEST)).unwrap();
+        self.overlay
+            .flush(fh, Actor::of_process(REQUEST, &SANDBOX))
+            .unwrap();
         self.overlay.release(fh).unwrap();
         entry.id
     }
@@ -1670,7 +1789,7 @@ impl A {
     fn read(&self, id: u64) -> String {
         let (fh, _) = self
             .overlay
-            .open(id, O_RDONLY, Actor::of_process(REQUEST))
+            .open(id, O_RDONLY, Actor::of_process(REQUEST, &SANDBOX))
             .unwrap();
         let bytes = self.overlay.read(fh, 0, 100).unwrap();
         self.overlay.release(fh).unwrap();
@@ -1690,14 +1809,16 @@ fn tmp_files_are_private_and_shadow_hidden_names() {
             b"secrets.db",
             0o644,
             O_RDWR | O_EXCL,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     a.overlay
-        .write(fh, 0, b"tmp", Actor::of_process(REQUEST))
+        .write(fh, 0, b"tmp", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     a.overlay.fsync(fh, false).unwrap();
-    a.overlay.flush(fh, Actor::of_process(REQUEST)).unwrap();
+    a.overlay
+        .flush(fh, Actor::of_process(REQUEST, &SANDBOX))
+        .unwrap();
     a.overlay.release(fh).unwrap();
     a.put(ROOT, "new.txt", "n");
     let skill_dir = a.overlay.lookup(ROOT, b"skills").unwrap().id;
@@ -1732,7 +1853,7 @@ fn tmp_files_are_private_and_shadow_hidden_names() {
 
     // Unlinking removes only the tmp file: the tree's is hidden again.
     a.overlay
-        .unlink(ROOT, b"secrets.db", Actor::of_process(REQUEST))
+        .unlink(ROOT, b"secrets.db", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     assert_eq!(
         a.overlay.lookup(ROOT, b"secrets.db").unwrap_err(),
@@ -1758,15 +1879,19 @@ fn a_tmp_file_renamed_onto_a_recordable_name_is_recorded_there() {
             ROOT,
             b"config.yaml",
             0,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     let records = a.journal();
     assert_eq!(records.len(), before + 1, "{records:#?}");
     let record = records.last().unwrap();
     assert_eq!(record.draft.trigger, Trigger::Rename);
-    assert_eq!(record.draft.caller.pid, REQUEST.pid);
-    assert_eq!(record.draft.caller.uid, rustix::process::geteuid().as_raw());
+    assert_eq!(record.draft.writer.caller.pid, REQUEST.pid);
+    assert_eq!(
+        record.draft.writer.caller.uid,
+        rustix::process::geteuid().as_raw()
+    );
+    assert_eq!(record.draft.writer.entry, *SANDBOX);
     let paths: Vec<&str> = record
         .draft
         .changes
@@ -1805,11 +1930,11 @@ fn a_handle_open_across_the_move_writes_into_the_tree() {
             b"config.yaml.tmp",
             0o644,
             O_WRONLY | O_EXCL,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     a.overlay
-        .write(fh, 0, b"v1", Actor::of_process(REQUEST))
+        .write(fh, 0, b"v1", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     a.overlay
         .rename(
@@ -1818,14 +1943,16 @@ fn a_handle_open_across_the_move_writes_into_the_tree() {
             ROOT,
             b"config.yaml",
             0,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     a.overlay
-        .write(fh, 2, b"+v2", Actor::of_process(REQUEST))
+        .write(fh, 2, b"+v2", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     let before = a.journal().len();
-    a.overlay.flush(fh, Actor::of_process(REQUEST)).unwrap();
+    a.overlay
+        .flush(fh, Actor::of_process(REQUEST, &SANDBOX))
+        .unwrap();
     let records = a.journal();
     assert_eq!(records.len(), before + 1, "the close records");
     assert_eq!(records.last().unwrap().draft.trigger, Trigger::Close);
@@ -1847,7 +1974,7 @@ fn recorded_files_never_move_out() {
                 ROOT,
                 b"config.bak",
                 0,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EACCES
@@ -1860,7 +1987,7 @@ fn recorded_files_never_move_out() {
                 ROOT,
                 b"skills2",
                 0,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EXDEV
@@ -1888,7 +2015,7 @@ fn recorded_files_never_move_out() {
             skills,
             b"b.key",
             0,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     assert_eq!(a.overlay.lookup(skills, b"b.key").unwrap().id, tmp);
@@ -1904,7 +2031,7 @@ fn recorded_files_never_move_out() {
                 ROOT,
                 b"config.yaml",
                 exchange,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EACCES
@@ -1917,7 +2044,7 @@ fn recorded_files_never_move_out() {
                 skills,
                 b"b.key",
                 exchange,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EACCES
@@ -1933,7 +2060,7 @@ fn recorded_files_never_move_out() {
                 skills,
                 b"b.key",
                 noreplace,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EEXIST
@@ -1946,7 +2073,7 @@ fn recorded_files_never_move_out() {
                 ROOT,
                 b"config.yaml",
                 noreplace,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EEXIST
@@ -1964,7 +2091,7 @@ fn recorded_files_never_move_out() {
             skills,
             b"b.key",
             0,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     assert_eq!(a.stored().len(), 1);
@@ -2109,17 +2236,17 @@ fn rmdir_of_a_directory_holding_tmp_files_is_not_empty() {
     a.put(d, "x.key", "k");
     assert_eq!(
         a.overlay
-            .rmdir(skills, b"d", Actor::of_process(REQUEST))
+            .rmdir(skills, b"d", Actor::of_process(REQUEST, &SANDBOX))
             .unwrap_err(),
         Errno::ENOTEMPTY
     );
     assert!(a.backing("skills/d").is_dir());
     assert_eq!(a.stored().len(), 1);
     a.overlay
-        .unlink(d, b"x.key", Actor::of_process(REQUEST))
+        .unlink(d, b"x.key", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     a.overlay
-        .rmdir(skills, b"d", Actor::of_process(REQUEST))
+        .rmdir(skills, b"d", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     assert!(!a.backing("skills/d").exists());
 }
@@ -2135,20 +2262,32 @@ fn a_skipped_file_name_over_a_shown_directory() {
                 b"skills",
                 0o644,
                 O_WRONLY | O_EXCL,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EEXIST
     );
     assert_eq!(
         b.overlay
-            .create(ROOT, b"skills", 0o644, O_WRONLY, Actor::of_process(REQUEST))
+            .create(
+                ROOT,
+                b"skills",
+                0o644,
+                O_WRONLY,
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap_err(),
         Errno::EISDIR
     );
     assert_eq!(
         b.overlay
-            .mknod(ROOT, b"skills", 0o100644, 0, Actor::of_process(REQUEST))
+            .mknod(
+                ROOT,
+                b"skills",
+                0o100644,
+                0,
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap_err(),
         Errno::EEXIST
     );
@@ -2159,13 +2298,18 @@ fn a_skipped_file_name_over_a_shown_directory() {
             b"notes.txt",
             0o644,
             O_WRONLY,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     // A directory over a tmp file's name.
     assert_eq!(
         b.overlay
-            .mkdir(ROOT, b"notes.txt", 0o755, Actor::of_process(REQUEST))
+            .mkdir(
+                ROOT,
+                b"notes.txt",
+                0o755,
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap_err(),
         Errno::EEXIST
     );
@@ -2178,7 +2322,7 @@ fn a_skipped_file_name_over_a_shown_directory() {
             b"notes.txt",
             0o644,
             O_RDONLY,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     assert_eq!(
@@ -2188,7 +2332,7 @@ fn a_skipped_file_name_over_a_shown_directory() {
                 b"notes.txt",
                 0o644,
                 O_WRONLY | O_EXCL,
-                Actor::of_process(REQUEST)
+                Actor::of_process(REQUEST, &SANDBOX)
             )
             .unwrap_err(),
         Errno::EEXIST
@@ -2207,7 +2351,7 @@ fn a_tmp_file_moves_into_the_tree_only_as_the_judge_allows() {
             b"c.tmp",
             0o644,
             O_WRONLY | O_EXCL,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     // Onto a recordable name: the operations move it, as the owner,
@@ -2219,7 +2363,7 @@ fn a_tmp_file_moves_into_the_tree_only_as_the_judge_allows() {
             ROOT,
             b"config.yaml",
             0,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     let calls = b.fake.calls_to("move_in");
@@ -2268,11 +2412,11 @@ fn copy_file_range_across_layers_is_cross_device() {
             b"in.tmp",
             0o644,
             O_RDWR | O_EXCL,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     a.overlay
-        .write(tmp_in, 0, b"copied", Actor::of_process(REQUEST))
+        .write(tmp_in, 0, b"copied", Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     let (_, tmp_out, _) = a
         .overlay
@@ -2281,25 +2425,32 @@ fn copy_file_range_across_layers_is_cross_device() {
             b"out.tmp",
             0o644,
             O_RDWR | O_EXCL,
-            Actor::of_process(REQUEST),
+            Actor::of_process(REQUEST, &SANDBOX),
         )
         .unwrap();
     let id = a.overlay.lookup(ROOT, b"config.yaml").unwrap().id;
     let (tree, _) = a
         .overlay
-        .open(id, O_RDWR, Actor::of_process(REQUEST))
+        .open(id, O_RDWR, Actor::of_process(REQUEST, &SANDBOX))
         .unwrap();
     for (from, to) in [(tmp_in, tree), (tree, tmp_out)] {
         assert_eq!(
             a.overlay
-                .copy_file_range(from, 0, to, 0, 6, Actor::of_process(REQUEST))
+                .copy_file_range(from, 0, to, 0, 6, Actor::of_process(REQUEST, &SANDBOX))
                 .unwrap_err(),
             Errno::EXDEV
         );
     }
     assert_eq!(
         a.overlay
-            .copy_file_range(tmp_in, 0, tmp_out, 0, 6, Actor::of_process(REQUEST))
+            .copy_file_range(
+                tmp_in,
+                0,
+                tmp_out,
+                0,
+                6,
+                Actor::of_process(REQUEST, &SANDBOX)
+            )
             .unwrap(),
         6
     );
@@ -2332,7 +2483,7 @@ fn b6_a_hidden_kind_at_a_recordable_name_is_never_replaced_nor_opened() {
     )
     .unwrap();
     let skills = a.overlay.lookup(ROOT, b"skills").unwrap().id;
-    let actor = Actor::of_process(REQUEST);
+    let actor = Actor::of_process(REQUEST, &SANDBOX);
     assert_eq!(
         a.overlay
             .rename(skills, b"a.md", skills, b"p", 0, actor)
@@ -2402,7 +2553,7 @@ fn b9_an_exec_open_needs_the_owners_execute_bit() {
             .node(8, 5, "owner-only.sh", FileType::RegularFile, 0o744, OTHER)
             .node(9, 5, "anyone.sh", FileType::RegularFile, 0o755, OTHER),
     );
-    let actor = Actor::of_process(REQUEST);
+    let actor = Actor::of_process(REQUEST, &SANDBOX);
     let exec = O_RDONLY | 0o40;
     assert_eq!(b.overlay.open(8, exec, actor).unwrap_err(), Errno::EACCES);
     assert!(b.fake.calls_to("open").is_empty());
@@ -2423,7 +2574,7 @@ fn b10_each_refused_change_is_counted_once() {
         "",
         &["skills"],
     );
-    let actor = Actor::of_process(REQUEST);
+    let actor = Actor::of_process(REQUEST, &SANDBOX);
     let s_ififo = 0o010000;
     // Reads of hidden names.
     let _ = b.overlay.lookup(ROOT, b"secrets.db");

@@ -81,6 +81,13 @@ impl Volume {
         String::from_utf8(out.stdout).unwrap()
     }
 
+    /// The branch head's message.
+    fn head_message(&self) -> String {
+        let history = History::open(&self.state().join("git")).unwrap();
+        let head = history.head().unwrap().expect("a commit");
+        head.message().unwrap().to_owned()
+    }
+
     /// Paths in the branch head's tree.
     fn head_paths(&self) -> Vec<String> {
         let history = History::open(&self.state().join("git")).unwrap();
@@ -122,6 +129,13 @@ fn excluded_paths_are_reported_and_not_recorded() {
     );
     assert!(stdout.contains("1 record(s) into 1 commit(s)"), "{stdout}");
     assert_eq!(v.head_paths(), ["a.txt"]);
+    // Recorded by agentfs itself, through no mount (design §9).
+    let message = v.head_message();
+    assert_eq!(
+        agentfs_core::history::entry_from_message(&message),
+        Some(agentfs_core::record::EntryPoint::Agentfs),
+        "{message}"
+    );
 }
 
 #[test]

@@ -638,11 +638,11 @@ async fn delete_volume_retains_or_deletes() {
     journal
         .record(agentfs_core::record::Draft {
             trigger: agentfs_core::record::Trigger::Unlink,
-            caller: agentfs_core::record::Caller {
+            writer: agentfs_core::record::Writer::agentfs(agentfs_core::record::Caller {
                 uid: 0,
                 gid: 0,
                 pid: 1,
-            },
+            }),
             time_ms: 0,
             changes: vec![agentfs_core::record::Change::Remove {
                 path: agentfs_core::paths::RepoPath::new("f").unwrap(),

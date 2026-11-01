@@ -39,7 +39,9 @@ use std::sync::Mutex;
 use agentfs_core::fsync_class::GroupMembers;
 use agentfs_core::nested;
 use agentfs_core::paths::PathError;
-use agentfs_core::record::{Caller, Origin, SavedRepairs, Trigger, read_repairs, repairs_tmp};
+use agentfs_core::record::{
+    EntryPoint, Origin, SavedRepairs, Trigger, Writer, read_repairs, repairs_tmp,
+};
 use agentfs_core::volume::{Input, MoveOutcome, Recorded, Recorder, VolumeError};
 
 use crate::names::{Class, classify};
@@ -85,7 +87,7 @@ pub struct Boundary {
 }
 
 /// Paths whose record failed after the backing tree changed, with the
-/// caller that changed them and a generation, so a repair made from an
+/// writer that changed them and a generation, so a repair made from an
 /// older entry never drops a newer one.
 #[derive(Default)]
 struct Repairs {
@@ -103,7 +105,7 @@ struct Repairs {
 /// One queued path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
-    caller: Caller,
+    writer: Writer,
     generation: u64,
     /// The pod that failed to record it, if not this process's own: a
     /// predecessor in the slot.
@@ -127,7 +129,7 @@ const GIT_DIRS_MAX: usize = 4096;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repair {
     pub path: Vec<u8>,
-    pub caller: Caller,
+    pub writer: Writer,
     /// The pod it is committed as, if not this process's own.
     pub origin: Option<Origin>,
     generation: u64,
@@ -161,13 +163,13 @@ impl Boundary {
         let mut repairs = self.lock();
         repairs.store = Some(store);
         let n = entries.len();
-        for (path, caller, origin) in entries {
+        for (path, writer, origin) in entries {
             let generation = repairs.next;
             repairs.next += 1;
             // This pod's own entries (a restart in the same pod) are its own.
             let origin = origin.filter(|o| Some(o) != repairs.own.as_ref());
             repairs.queue.entry(path).or_insert(Entry {
-                caller,
+                writer,
                 generation,
                 origin,
             });
@@ -196,14 +198,14 @@ impl Boundary {
     pub fn record(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         changes: Vec<Change>,
     ) -> Result<Recorded, VolumeError> {
         let inputs = self.inputs(changes);
         if inputs.is_empty() {
             return Ok(Recorded::default());
         }
-        self.recorder.record(trigger, caller, inputs)
+        self.recorder.record(trigger, writer, inputs)
     }
 
     /// Records `changes` like [`Boundary::record`], as the pod `origin`
@@ -211,12 +213,12 @@ impl Boundary {
     pub fn record_as(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         changes: Vec<Change>,
         origin: Option<&Origin>,
     ) -> Result<bool, VolumeError> {
         let Some(origin) = origin else {
-            return Ok(self.record(trigger, caller, changes)?.seq.is_some());
+            return Ok(self.record(trigger, writer, changes)?.seq.is_some());
         };
         let inputs = self.inputs(changes);
         if inputs.is_empty() {
@@ -224,7 +226,7 @@ impl Boundary {
         }
         Ok(self
             .recorder
-            .record_as(trigger, caller, inputs, Some(origin.clone()))?
+            .record_as(trigger, writer, inputs, Some(origin.clone()))?
             .seq
             .is_some())
     }
@@ -238,7 +240,7 @@ impl Boundary {
     pub fn record_move(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         from: &[u8],
         to: &[u8],
     ) -> Result<MoveOutcome, VolumeError> {
@@ -248,7 +250,7 @@ impl Boundary {
         };
         let outcome = self
             .recorder
-            .record_move(trigger, caller, from_path, to_path)?;
+            .record_move(trigger, writer, from_path, to_path)?;
         if outcome != MoveOutcome::Unsupported {
             self.reroot_repairs(from, to);
         }
@@ -288,7 +290,7 @@ impl Boundary {
     pub fn record_group(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         changes: Vec<Change>,
     ) -> Result<bool, VolumeError> {
         let inputs = self.inputs(changes);
@@ -297,7 +299,7 @@ impl Boundary {
         }
         Ok(self
             .recorder
-            .record_group(trigger, caller, inputs)?
+            .record_group(trigger, writer, inputs)?
             .seq
             .is_some())
     }
@@ -400,7 +402,7 @@ impl Boundary {
 
     /// Queues `paths` for the sweep to re-derive and record (design §3.5),
     /// and saves the queue.
-    pub fn queue_repair(&self, paths: impl IntoIterator<Item = Vec<u8>>, caller: Caller) {
+    pub fn queue_repair(&self, paths: impl IntoIterator<Item = Vec<u8>>, writer: Writer) {
         let mut repairs = self.lock();
         for path in paths {
             let generation = repairs.next;
@@ -408,7 +410,7 @@ impl Boundary {
             repairs.queue.insert(
                 path,
                 Entry {
-                    caller,
+                    writer: writer.clone(),
                     generation,
                     origin: None,
                 },
@@ -425,7 +427,7 @@ impl Boundary {
             .iter()
             .map(|(path, e)| Repair {
                 path: path.clone(),
-                caller: e.caller,
+                writer: e.writer.clone(),
                 origin: e.origin.clone(),
                 generation: e.generation,
             })
@@ -523,13 +525,16 @@ fn write_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
 
 /// One line per path, `uid gid pid <path in hex>`, after an
 /// `@origin <JSON>` line naming the pod its entries are committed as
-/// (`@origin -`: the loading process's own). Each entry of this process
-/// is written with `own`, so the next holder of the slot commits it as
-/// this pod's. Older builds skip the `@origin` lines (they are not four
-/// fields), and so commit every entry as their own, as before.
+/// (`@origin -`: the loading process's own) and an `@entry <entry point>`
+/// line naming the entry point they came through, each written before the
+/// first entry whose value differs from the line before. Each entry of
+/// this process is written with `own`, so the next holder of the slot
+/// commits it as this pod's. Older builds skip the header lines (they are
+/// not four fields).
 fn format_repairs(queue: &BTreeMap<Vec<u8>, Entry>, own: Option<&Origin>) -> Vec<u8> {
     let mut out = String::new();
     let mut current: Option<&Origin> = None;
+    let mut entry: Option<&EntryPoint> = None;
     for (path, e) in queue {
         let origin = e.origin.as_ref().or(own);
         if origin != current {
@@ -542,7 +547,11 @@ fn format_repairs(queue: &BTreeMap<Vec<u8>, Entry>, own: Option<&Origin>) -> Vec
             }
             current = origin;
         }
-        let c = e.caller;
+        if entry != Some(&e.writer.entry) {
+            out.push_str(&format!("@entry {}\n", e.writer.entry));
+            entry = Some(&e.writer.entry);
+        }
+        let c = e.writer.caller;
         let hex: String = path.iter().map(|b| format!("{b:02x}")).collect();
         out.push_str(&format!("{} {} {} {hex}\n", c.uid, c.gid, c.pid));
     }
@@ -555,11 +564,18 @@ pub const REPAIR_TRIGGER: Trigger = Trigger::Sweep;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentfs_core::record::parse_repairs;
+    use agentfs_core::record::{Caller, SandboxId, parse_repairs};
 
-    fn entry(caller: Caller, generation: u64, origin: Option<Origin>) -> Entry {
-        Entry {
+    fn main(caller: Caller) -> Writer {
+        Writer {
             caller,
+            entry: EntryPoint::Main,
+        }
+    }
+
+    fn entry(writer: Writer, generation: u64, origin: Option<Origin>) -> Entry {
+        Entry {
+            writer,
             generation,
             origin,
         }
@@ -582,20 +598,40 @@ mod tests {
             gid: 100,
             pid: 7,
         };
+        let sandbox = Writer {
+            caller: c,
+            entry: EntryPoint::Sandbox(SandboxId::new("s1").unwrap()),
+        };
         let mut q = BTreeMap::new();
-        q.insert(b"big.log".to_vec(), entry(c, 0, None));
+        q.insert(b"big.log".to_vec(), entry(main(c), 0, None));
+        q.insert(b"c".to_vec(), entry(main(c), 1, None));
+        q.insert(b"d".to_vec(), entry(sandbox.clone(), 2, None));
         q.insert(
             b"dir/with space/\xff".to_vec(),
-            entry(NOBODY_CALLER, 1, None),
+            entry(Writer::agentfs(NOBODY_CALLER), 3, None),
         );
         let text = format_repairs(&q, None);
-        assert!(!String::from_utf8_lossy(&text).contains("@origin {"));
+        let lines = String::from_utf8_lossy(&text).into_owned();
+        assert!(!lines.contains("@origin {"));
+        // One `@entry` line where the entry point changes.
+        assert_eq!(
+            lines.matches("@entry ").collect::<Vec<_>>().len(),
+            3,
+            "{lines}"
+        );
+        assert!(lines.contains("@entry sandbox/s1\n"), "{lines}");
         let parsed = parse_repairs(&text);
         assert_eq!(
             parsed,
             vec![
-                (b"big.log".to_vec(), c, None),
-                (b"dir/with space/\xff".to_vec(), NOBODY_CALLER, None),
+                (b"big.log".to_vec(), main(c), None),
+                (b"c".to_vec(), main(c), None),
+                (b"d".to_vec(), sandbox, None),
+                (
+                    b"dir/with space/\xff".to_vec(),
+                    Writer::agentfs(NOBODY_CALLER),
+                    None
+                ),
             ]
         );
         assert!(parse_repairs(b"garbage\n1 2 3 zz\n1 2 3 abc\n").is_empty());
@@ -610,35 +646,37 @@ mod tests {
         };
         let mut q = BTreeMap::new();
         // Inherited from pod-a; queued by this front (pod-b) itself.
-        q.insert(b"a1".to_vec(), entry(c, 0, Some(pod("pod-a"))));
-        q.insert(b"a2".to_vec(), entry(c, 1, Some(pod("pod-a"))));
-        q.insert(b"b1".to_vec(), entry(c, 2, None));
+        q.insert(b"a1".to_vec(), entry(main(c), 0, Some(pod("pod-a"))));
+        q.insert(b"a2".to_vec(), entry(main(c), 1, Some(pod("pod-a"))));
+        q.insert(b"b1".to_vec(), entry(main(c), 2, None));
         let text = format_repairs(&q, Some(&pod("pod-b")));
         let lines = String::from_utf8(text.clone()).unwrap();
         assert_eq!(lines.matches("@origin ").count(), 2, "{lines}");
         assert_eq!(
             parse_repairs(&text),
             vec![
-                (b"a1".to_vec(), c, Some(pod("pod-a"))),
-                (b"a2".to_vec(), c, Some(pod("pod-a"))),
-                (b"b1".to_vec(), c, Some(pod("pod-b"))),
+                (b"a1".to_vec(), main(c), Some(pod("pod-a"))),
+                (b"a2".to_vec(), main(c), Some(pod("pod-a"))),
+                (b"b1".to_vec(), main(c), Some(pod("pod-b"))),
             ]
         );
         // Single-process mode (no own pod) after an inherited entry.
         let text = format_repairs(&q, None);
         let parsed = parse_repairs(&text);
-        assert_eq!(parsed[2], (b"b1".to_vec(), c, None));
+        assert_eq!(parsed[2], (b"b1".to_vec(), main(c), None));
         assert!(String::from_utf8(text).unwrap().contains("@origin -\n"));
         // A malformed origin line counts as none; older files have none.
+        // A line with no `@entry` before it is agentfs's: its writer is
+        // unknown, never `main`.
         assert_eq!(
             parse_repairs(b"@origin {nope\n1 2 3 61\n"),
             vec![(
                 b"a".to_vec(),
-                Caller {
+                Writer::agentfs(Caller {
                     uid: 1,
                     gid: 2,
                     pid: 3
-                },
+                }),
                 None
             )]
         );
@@ -653,7 +691,7 @@ mod tests {
             gid: 2,
             pid: 3,
         };
-        q.insert(b"a".to_vec(), entry(c, 0, Some(pod("pod-a"))));
+        q.insert(b"a".to_vec(), entry(main(c), 0, Some(pod("pod-a"))));
         let text = String::from_utf8(format_repairs(&q, None)).unwrap();
         let four_fields: Vec<&str> = text
             .lines()

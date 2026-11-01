@@ -49,7 +49,7 @@ use agentfs_core::events::{Events, NullSink};
 use agentfs_core::identity::Context;
 use agentfs_core::paths::RepoPath;
 use agentfs_core::pending::{FreezeMethod, PendingStore};
-use agentfs_core::record::{Caller, Trigger};
+use agentfs_core::record::{Caller, EntryPoint, Trigger, Writer};
 use agentfs_core::service::Service;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, Recorder, StateDir};
@@ -58,6 +58,10 @@ const CALLER: Caller = Caller {
     uid: 1000,
     gid: 1000,
     pid: 1,
+};
+const WRITER: Writer = Writer {
+    caller: CALLER,
+    entry: EntryPoint::Main,
 };
 
 /// About this much is frozen per size-scaled case.
@@ -299,7 +303,7 @@ impl Bench {
             let input = self.write_input(&rel);
             let start = Instant::now();
             self.recorder
-                .record(Trigger::Close, CALLER, vec![input])
+                .record(Trigger::Close, WRITER, vec![input])
                 .map_err(|e| format!("record: {e}"))?;
             samples.push(start.elapsed());
         }
@@ -338,7 +342,7 @@ impl Bench {
                             let input = this.write_input(&rel);
                             let start = Instant::now();
                             this.recorder
-                                .record(Trigger::Close, CALLER, vec![input])
+                                .record(Trigger::Close, WRITER, vec![input])
                                 .map_err(|e| format!("record: {e}"))?;
                             samples.push(start.elapsed());
                         }
@@ -377,7 +381,7 @@ impl Bench {
             std::fs::write(&path, b"to be removed").map_err(|e| e.to_string())?;
             let input = self.write_input(&rel);
             self.recorder
-                .record(Trigger::Close, CALLER, vec![input])
+                .record(Trigger::Close, WRITER, vec![input])
                 .map_err(|e| format!("record: {e}"))?;
         }
         self.catch_up()?;
@@ -391,7 +395,7 @@ impl Bench {
             let start = Instant::now();
             let recorded = self
                 .recorder
-                .record(Trigger::Unlink, CALLER, vec![input])
+                .record(Trigger::Unlink, WRITER, vec![input])
                 .map_err(|e| format!("record: {e}"))?;
             samples.push(start.elapsed());
             if recorded.seq.is_none() {

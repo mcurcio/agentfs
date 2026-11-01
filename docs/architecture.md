@@ -130,6 +130,7 @@ missing from these tables or a row names a module that no longer exists;
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |
 | `session.rs` | What one FUSE session serves: the `Operations` trait that `fuse.rs` calls, implemented by `Ops` and by the overlay |
+| `sessions.rs` | Sandbox sessions: one container's mount of the volume each, opened and closed at runtime over the shared `Ops`, each stamping its requests `sandbox/<id>` (§2.4; interface only until provenance slice 2) |
 | `overlay.rs` | The sandbox overlay's session: the visibility gate and the view owner in front of the shared `Ops` (§1.1, §6) |
 | `overlay/tmp.rs` | The sandbox overlay's tmp layer: files a sandbox creates under names the rules skip, private to the overlay, in a store of the state area, moved into the tree by rename (§1.1) |
 | `invalidate.rs` | Kernel cache coherence across a daemon's FUSE sessions: each session reports the changes it served (`Coherent`), and a worker thread sends them to the other sessions' kernels (`Invalidator`, §17.1) |
@@ -155,6 +156,7 @@ missing from these tables or a row names a module that no longer exists;
 | `front.rs` | `mount --history-service`: a front of a history service (§14) |
 | `serve_history.rs` | `agentfs serve-history`: the history service of a volume (§14) |
 | `serve_git.rs` | `agentfs serve-git`: the history repository as a git server for patch pushes (`git http-backend` behind an HTTP server), and its `pre-receive` and `post-receive` hooks |
+| `volume_plugin.rs` | The Docker volume plugin endpoint that opens and closes sandbox sessions (§2.4; interface only until provenance slice 2) |
 | `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount (`recover`, which mounts over it, is in `main.rs`) |
 | `control.rs` | The control socket of a running daemon (`mount`, `run`, `serve-history`), through which `push`, `restore` and `revert` act (§2.2, §2.3, §15) |
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |

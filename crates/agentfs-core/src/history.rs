@@ -25,9 +25,13 @@ use crate::identity::{Context, IdentityError, IdentityRenderer};
 use crate::lfs::{ObjectCache, Store, attributes};
 use crate::paths::{RepoPath, SpecialFile};
 use crate::pending::PendingStore;
-use crate::record::{Change, Operation, OperationKind, PatchAuthor, Record};
+use crate::record::{Change, EntryPoint, Operation, OperationKind, PatchAuthor, Record};
 
 pub const SEQ_TRAILER: &str = "Agentfs-Seq";
+/// The trailer naming the one entry point whose changes a commit holds
+/// ([`crate::record::EntryPoint`], design §9): exactly one on every commit
+/// agentfs writes on the branch, `agentfs` on markers.
+pub const ENTRY_TRAILER: &str = "Agentfs-Entry";
 /// The inbox number of the patch a commit applies (design §12).
 pub const INBOX_TRAILER: &str = "Agentfs-Inbox";
 
@@ -367,7 +371,7 @@ impl History {
         {
             Some(author) => author,
             None => {
-                let author = identities.author(first.draft.caller)?;
+                let author = identities.author(first.draft.writer.caller)?;
                 Signature::new(&author.name, &author.email, &time(last.draft.time_ms))?
             }
         };
@@ -892,7 +896,10 @@ impl History {
         self.marker_with(message, author, committer, log, None)
     }
 
-    /// [`History::marker`], with `merged` as a second parent.
+    /// [`History::marker`], with `merged` as a second parent. The one
+    /// place every marker (patch, checkpoint, finish) gets its
+    /// `Agentfs-Entry: agentfs` trailer, appended to `message`'s last
+    /// paragraph: agentfs makes the marker itself (design §9).
     fn marker_with(
         &self,
         message: &str,
@@ -907,9 +914,14 @@ impl History {
         let tree = head.tree()?;
         let mut parents = vec![&head];
         parents.extend(merged);
+        let mut message = message.to_owned();
+        if !message.ends_with('\n') {
+            message.push('\n');
+        }
+        message.push_str(&format!("{ENTRY_TRAILER}: {}\n", EntryPoint::Agentfs));
         let commit = self
             .repo
-            .commit(None, author, committer, message, &tree, &parents)?;
+            .commit(None, author, committer, &message, &tree, &parents)?;
         self.sync_object_dirs()?;
         self.repo
             .reference_matching(&self.settings.branch_ref, commit, true, head.id(), log)?;
@@ -1025,6 +1037,22 @@ pub fn inbox_from_message(message: &str) -> Option<(u64, Oid)> {
         (true, Some(n), Some(patch)) if n > 0 => Some((n, patch)),
         _ => None,
     }
+}
+
+/// The entry point whose changes a commit holds (design §9): read only
+/// from the message's last paragraph, which agentfs writes itself, like
+/// [`inbox_from_message`]. `None` unless that paragraph has exactly one
+/// [`ENTRY_TRAILER`] line and it parses.
+pub fn entry_from_message(message: &str) -> Option<EntryPoint> {
+    let trimmed = message.trim_end_matches('\n');
+    let last = trimmed.rsplit("\n\n").next()?;
+    let prefix = format!("{ENTRY_TRAILER}: ");
+    let mut entries = last.lines().filter_map(|line| line.strip_prefix(&prefix));
+    let entry = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    entry.parse().ok()
 }
 
 /// The checkpoint commit a checkpoint marker merged back (design §19.2
@@ -1234,6 +1262,11 @@ fn message(records: &[Record], context: &Context) -> String {
     for trigger in triggers {
         out.push_str(&format!("Agentfs-Trigger: {trigger}\n"));
     }
+    // A group has one entry point by construction (`split_key`).
+    out.push_str(&format!(
+        "{ENTRY_TRAILER}: {}\n",
+        records[0].draft.writer.entry
+    ));
     if let Some(op) = operation {
         out.push_str(&format!("{}: {}\n", op.kind.trailer(), op.source));
         if let Some(n) = op.inbox {
@@ -1241,14 +1274,14 @@ fn message(records: &[Record], context: &Context) -> String {
         }
     }
     push_context_trailers(&mut out, context);
-    let uids: BTreeSet<u32> = records.iter().map(|r| r.draft.caller.uid).collect();
+    let uids: BTreeSet<u32> = records.iter().map(|r| r.draft.writer.caller.uid).collect();
     for uid in uids {
         out.push_str(&format!("Agentfs-Uid: {uid}\n"));
     }
     // Pid 0 is unknown (a caller outside the pid namespace): not named.
     let pids: BTreeSet<u32> = records
         .iter()
-        .map(|r| r.draft.caller.pid)
+        .map(|r| r.draft.writer.caller.pid)
         .filter(|&pid| pid != 0)
         .collect();
     for pid in pids {
@@ -1300,7 +1333,7 @@ mod tests {
     use super::*;
     use crate::identity::Templates;
     use crate::lfs::Pointer;
-    use crate::record::{Caller, Draft, Trigger};
+    use crate::record::{Caller, Draft, Trigger, Writer};
 
     #[test]
     fn libgit2_home_directory_is_cleared() {
@@ -1403,10 +1436,13 @@ mod tests {
                 seq: self.seq,
                 draft: Draft {
                     trigger,
-                    caller: Caller {
-                        uid: 10000,
-                        gid: 10000,
-                        pid: 42,
+                    writer: Writer {
+                        caller: Caller {
+                            uid: 10000,
+                            gid: 10000,
+                            pid: 42,
+                        },
+                        entry: EntryPoint::Main,
                     },
                     time_ms: 1_700_000_000_000,
                     changes,
@@ -1624,6 +1660,113 @@ mod tests {
             "{msg}"
         );
         assert_eq!(seq_from_message(msg), Some(1));
+    }
+
+    #[test]
+    fn the_message_names_the_groups_one_entry_point() {
+        let mut f = Fixture::new();
+        let sandbox = EntryPoint::Sandbox(crate::record::SandboxId::new("s1").unwrap());
+        let mut r1 = f.record(Trigger::Close, vec![f.write("a", b"1", false)]);
+        let mut r2 = f.record(Trigger::Rename, vec![f.write("b", b"2", false)]);
+        r1.draft.writer.entry = sandbox.clone();
+        r2.draft.writer.entry = sandbox.clone();
+        let msg = message(&[r1, r2], &f.context);
+        let entries: Vec<&str> = msg
+            .lines()
+            .filter(|l| l.starts_with("Agentfs-Entry:"))
+            .collect();
+        assert_eq!(entries, ["Agentfs-Entry: sandbox/s1"], "{msg}");
+        // Right after the trigger lines.
+        assert!(
+            msg.contains(
+                "Agentfs-Trigger: close\nAgentfs-Trigger: rename\nAgentfs-Entry: sandbox/s1\n"
+            ),
+            "{msg}"
+        );
+        assert_eq!(entry_from_message(&msg), Some(sandbox));
+    }
+
+    #[test]
+    fn every_commit_on_the_branch_has_one_entry_trailer_and_markers_say_agentfs() {
+        let mut f = Fixture::new();
+        let r = f.record(Trigger::Close, vec![f.write("a", b"1", false)]);
+        f.commit(&[r]);
+        let head = f.history.head().unwrap().unwrap();
+        assert_eq!(
+            entry_from_message(head.message().unwrap()),
+            Some(EntryPoint::Main)
+        );
+        let sig = Signature::now("op", "op@example.com").unwrap();
+        let ends_with_agentfs = |f: &Fixture, oid: Oid| {
+            let commit = f.history.repo().find_commit(oid).unwrap();
+            let msg = commit.message().unwrap().to_owned();
+            assert!(msg.ends_with("\nAgentfs-Entry: agentfs\n"), "{msg}");
+            assert_eq!(msg.matches("Agentfs-Entry:").count(), 1, "{msg}");
+            assert_eq!(entry_from_message(&msg), Some(EntryPoint::Agentfs));
+        };
+        // A plain marker (a fork's finish), even with no final newline.
+        let marker = f
+            .history
+            .commit_marker("finish\n\nAgentfs-Seq: 0\nAgentfs-Trigger: finish", &sig)
+            .unwrap();
+        ends_with_agentfs(&f, marker);
+        // The patch marker.
+        let op = Operation {
+            id: 1,
+            kind: OperationKind::Patch,
+            source: marker.to_string(),
+            summary: "patch 1".into(),
+            caller: Caller {
+                uid: 1,
+                gid: 1,
+                pid: 1,
+            },
+            inbox: Some(1),
+            author: None,
+        };
+        let patch = f
+            .history
+            .commit_patch_marker(&op, &f.identities, &f.context)
+            .unwrap();
+        ends_with_agentfs(&f, patch);
+        // The checkpoint marker.
+        let tree = f.history.head().unwrap().unwrap().tree_id();
+        let change = f
+            .history
+            .commit_detached("refs/agentfs/test-change", tree, patch, "change\n", &sig)
+            .unwrap();
+        let checkpoint = f
+            .history
+            .commit_checkpoint_marker(change, "checkpoint", &sig, &sig)
+            .unwrap();
+        ends_with_agentfs(&f, checkpoint);
+    }
+
+    #[test]
+    fn entry_from_message_reads_one_trailer_of_the_last_paragraph() {
+        assert_eq!(
+            entry_from_message("s\n\nAgentfs-Seq: 1\nAgentfs-Entry: main\n"),
+            Some(EntryPoint::Main)
+        );
+        assert_eq!(
+            entry_from_message("s\n\nAgentfs-Entry: sandbox/ab-1\n"),
+            Some(EntryPoint::Sandbox(
+                crate::record::SandboxId::new("ab-1").unwrap()
+            ))
+        );
+        // None, two, one outside the last paragraph, or one that does not
+        // parse.
+        assert_eq!(entry_from_message("s\n\nAgentfs-Seq: 1\n"), None);
+        assert_eq!(
+            entry_from_message("s\n\nAgentfs-Entry: main\nAgentfs-Entry: main\n"),
+            None
+        );
+        assert_eq!(
+            entry_from_message("s\n\nAgentfs-Entry: main\n\nAgentfs-Seq: 1\n"),
+            None
+        );
+        assert_eq!(entry_from_message("s\n\nAgentfs-Entry: other\n"), None);
+        assert_eq!(entry_from_message(""), None);
     }
 
     #[test]

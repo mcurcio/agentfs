@@ -2446,13 +2446,17 @@ mod tests {
     use crate::events::{MemorySink, NullSink};
     use crate::identity::Context;
     use crate::paths::RepoPath;
-    use crate::record::{Caller, Trigger};
+    use crate::record::{Caller, EntryPoint, Trigger, Writer};
     use crate::volume::{self, Committer, Input, Recorder};
 
     const CALLER: Caller = Caller {
         uid: 1,
         gid: 1,
         pid: 1,
+    };
+    const WRITER: Writer = Writer {
+        caller: CALLER,
+        entry: EntryPoint::Main,
     };
 
     /// A volume in a temporary directory, with remotes added to its config.
@@ -2516,7 +2520,7 @@ mod tests {
             self.rec
                 .record(
                     Trigger::Close,
-                    CALLER,
+                    WRITER,
                     vec![Input::Write {
                         path: RepoPath::new(format!("f{}", self.n)).unwrap(),
                         backing,
@@ -2535,7 +2539,7 @@ mod tests {
             self.rec
                 .record(
                     Trigger::Close,
-                    CALLER,
+                    WRITER,
                     vec![Input::Write {
                         path: RepoPath::new(name).unwrap(),
                         backing,

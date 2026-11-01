@@ -28,9 +28,17 @@
 //!   open (SQLite's `-journal` in DELETE mode, every transaction) leaves
 //!   the change to the two rules above, so the rate stays bounded.
 //!
+//! **One entry point at a time** (design §8, §9): a group's holders at any
+//! instant share one entry point, and [`Group::hold`] refuses a writer
+//! through another entry point while the group holds unrecorded changes
+//! ([`Foreign`]): the operation captures the group first, as the pending
+//! writer, with trigger `cut`, then starts over. No capture ever holds two
+//! entry points.
+//!
 //! **Operator operations** (a restore or revert through the mount, design
 //! §15): a change made by an operation's actor marks the group
-//! ([`GroupState::actor`]). While the operation runs, no trigger but the
+//! ([`GroupState::actor`]), as agentfs's own change
+//! ([`Writer::agentfs`]). While the operation runs, no trigger but the
 //! operation's own capture ([`Groups::in_operation`]) records the group, so
 //! history never holds a group half restored.
 //!
@@ -44,7 +52,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use agentfs_core::fsync_class::{GroupKey, GroupMembers};
-use agentfs_core::record::Caller;
+use agentfs_core::record::{Caller, EntryPoint, Writer};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -67,17 +75,25 @@ pub struct Gate {
 #[derive(Default)]
 struct GateState {
     holders: usize,
+    /// The entry point every current holder writes through.
+    entry: Option<EntryPoint>,
     freezers_waiting: usize,
     frozen: bool,
 }
 
 impl Gate {
-    fn hold(&self) -> HoldGuard<'_> {
+    /// Waits while the gate is frozen, a freezer waits, or holders through
+    /// another entry point than `entry` hold it.
+    fn hold(&self, entry: &EntryPoint) -> HoldGuard<'_> {
         let mut s = lock(&self.state);
-        while s.frozen || s.freezers_waiting > 0 {
+        while s.frozen
+            || s.freezers_waiting > 0
+            || (s.holders > 0 && s.entry.as_ref().is_some_and(|e| e != entry))
+        {
             s = self.cv.wait(s).unwrap_or_else(PoisonError::into_inner);
         }
         s.holders += 1;
+        s.entry = Some(entry.clone());
         HoldGuard { gate: self }
     }
 
@@ -104,6 +120,7 @@ impl Drop for HoldGuard<'_> {
         let mut s = lock(&self.gate.state);
         s.holders -= 1;
         if s.holders == 0 {
+            s.entry = None;
             self.gate.cv.notify_all();
         }
     }
@@ -125,15 +142,30 @@ impl Drop for Frozen<'_> {
 /// drops. Mark the group changed with [`Hold::changed`] before dropping it.
 pub struct Hold<'a> {
     group: &'a Group,
+    /// Who the hold's changes are recorded as.
+    writer: Writer,
+    /// The writer is an operator operation's actor.
+    actor: Option<Caller>,
     _guard: HoldGuard<'a>,
 }
 
 impl Hold<'_> {
-    /// Marks the group changed by `caller`, inside the hold, so a capture
-    /// that starts after the hold ends sees both the change and the mark.
-    pub fn changed(&self, caller: Caller) {
-        self.group.changed(caller);
+    /// Marks the group changed by the hold's writer, inside the hold, so a
+    /// capture that starts after the hold ends sees both the change and
+    /// the mark.
+    pub fn changed(&self) {
+        self.group.changed(&self.writer, self.actor);
     }
+}
+
+/// A hold or change refused because the group holds unrecorded changes
+/// from another entry point than the writer's (design §8, §9; provenance
+/// slice 1): the operation captures the group first, as `pending`, with
+/// trigger `cut`, then asks again. No record ever holds two entry points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Foreign {
+    /// The writer whose changes the group holds.
+    pub pending: agentfs_core::record::Writer,
 }
 
 /// When a group changed and was captured.
@@ -146,8 +178,9 @@ pub struct GroupState {
     pub generation: u64,
     /// When the last capture was attempted.
     pub last_attempt: Option<Instant>,
-    /// Who changed the group last.
-    pub caller: Option<Caller>,
+    /// Who changed the group last: every change since the last capture
+    /// came through its entry point ([`Group::hold`]).
+    pub writer: Option<Writer>,
     /// Handles open on members.
     pub handles: usize,
     /// The operator operation's actor that changed the group (design §15):
@@ -178,10 +211,10 @@ impl GroupState {
         Some(from + coalesce)
     }
 
-    fn changed(&mut self, now: Instant, caller: Caller) {
+    fn changed(&mut self, now: Instant, writer: &Writer) {
         self.dirty_since.get_or_insert(now);
         self.generation += 1;
-        self.caller = Some(caller);
+        self.writer = Some(writer.clone());
     }
 
     /// A capture that froze the group at `generation` ended at `now`;
@@ -217,6 +250,9 @@ pub struct Group {
     coalesce: Duration,
     gate: Gate,
     state: Mutex<GroupState>,
+    /// Signalled when a capture ends an operator operation's deferral
+    /// ([`Group::wait_undeferred`]).
+    undeferred: Condvar,
     /// One capture at a time.
     capturing: Mutex<()>,
     kick: Arc<Kick>,
@@ -249,26 +285,48 @@ impl Group {
         &self.gate
     }
 
-    /// Starts a write to a member: waits while the group is being
-    /// captured.
-    pub fn hold(&self) -> Hold<'_> {
-        Hold {
-            group: self,
-            _guard: self.gate.hold(),
+    /// Starts a change to a member by `writer`: waits while the group is
+    /// being captured or held through another entry point. Then refuses
+    /// with [`Foreign`] if the group holds unrecorded changes through
+    /// another entry point: capture it as [`Foreign::pending`] first. A
+    /// change by an operator operation's actor ([`IsActor`]) is held as
+    /// [`Writer::agentfs`] of its caller, the rule
+    /// [`agentfs_core::volume::Recorder::record`] applies to its records.
+    pub fn hold(&self, writer: &Writer) -> Result<Hold<'_>, Foreign> {
+        let actor = (self.is_actor)(writer.caller.pid).then_some(writer.caller);
+        let writer = match actor {
+            Some(caller) => Writer::agentfs(caller),
+            None => writer.clone(),
+        };
+        let guard = self.gate.hold(&writer.entry);
+        // Holding: no capture can clean the group, and every other holder
+        // shares the entry point, so this answer stands until it drops.
+        {
+            let s = self.state();
+            if s.is_dirty()
+                && let Some(pending) = &s.writer
+                && pending.entry != writer.entry
+            {
+                return Err(Foreign {
+                    pending: pending.clone(),
+                });
+            }
         }
+        Ok(Hold {
+            group: self,
+            writer,
+            actor,
+            _guard: guard,
+        })
     }
 
-    /// Marks the group changed by `caller`. Prefer [`Hold::changed`]; this
-    /// is for changes made with no hold (a rename, which `names` orders
-    /// against captures).
-    pub fn changed(&self, caller: Caller) {
-        let actor = (self.is_actor)(caller.pid);
+    fn changed(&self, writer: &Writer, actor: Option<Caller>) {
         let was_clean = {
             let mut s = self.state();
             let was_clean = !s.is_dirty();
-            s.changed(Instant::now(), caller);
-            if actor {
-                s.actor = Some(caller);
+            s.changed(Instant::now(), writer);
+            if actor.is_some() {
+                s.actor = actor;
             }
             was_clean
         };
@@ -288,6 +346,37 @@ impl Group {
     pub fn deferred(&self) -> Option<Caller> {
         let actor = self.state().actor?;
         (self.is_actor)(actor.pid).then_some(actor)
+    }
+
+    /// Blocks until no running operator operation defers the group
+    /// ([`Group::deferred`]): woken by the operation's end capture
+    /// ([`Group::captured`]), an event, never a poll. Call it holding
+    /// neither `names` nor any hold.
+    pub fn wait_undeferred(&self) {
+        let mut s = self.state();
+        while s.actor.is_some_and(|actor| (self.is_actor)(actor.pid)) {
+            s = self
+                .undeferred
+                .wait(s)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// A capture that froze the group at `generation` ended; `done` if it
+    /// was recorded (or refused) ([`GroupState::captured`]). The capture at
+    /// an operator operation's end (`operation_end`) ends the operation's
+    /// claim on the group whatever its outcome: a group it left changed is
+    /// the timer's, as once the operation ends. Wakes
+    /// [`Group::wait_undeferred`].
+    pub fn captured(&self, generation: u64, done: bool, operation_end: bool) {
+        {
+            let mut s = self.state();
+            s.captured(generation, Instant::now(), done);
+            if operation_end {
+                s.actor = None;
+            }
+        }
+        self.undeferred.notify_all();
     }
 
     /// Serializes captures of this group.
@@ -348,6 +437,7 @@ impl Groups {
                     coalesce: members.coalesce,
                     gate: Gate::default(),
                     state: Mutex::new(GroupState::default()),
+                    undeferred: Condvar::new(),
                     capturing: Mutex::new(()),
                     kick: self.kick.clone(),
                     is_actor: self.is_actor.clone(),
@@ -465,6 +555,10 @@ mod tests {
         gid: 1,
         pid: 1,
     };
+    const W: Writer = Writer {
+        caller: C,
+        entry: EntryPoint::Main,
+    };
     const S: Duration = Duration::from_secs(1);
 
     fn members(stem: &str) -> GroupMembers {
@@ -488,19 +582,19 @@ mod tests {
         let mut s = GroupState::default();
         assert!(!s.fsync_due(t0, 5 * S));
         assert_eq!(s.due_at(5 * S), None);
-        s.changed(t0, C);
+        s.changed(t0, &W);
         // Never attempted: an fsync captures at once, the timer later.
         assert!(s.fsync_due(t0, 5 * S));
         assert_eq!(s.due_at(5 * S), Some(t0 + 5 * S));
         // Later changes do not push the timer back.
-        s.changed(t0 + 3 * S, C);
+        s.changed(t0 + 3 * S, &W);
         assert_eq!(s.due_at(5 * S), Some(t0 + 5 * S));
         let generation = s.generation;
         s.captured(generation, t0 + 3 * S, true);
         assert!(!s.is_dirty());
         // A change right after a capture: fsync waits out the interval,
         // and so does the timer.
-        s.changed(t0 + 4 * S, C);
+        s.changed(t0 + 4 * S, &W);
         assert!(!s.fsync_due(t0 + 7 * S, 5 * S));
         assert!(s.fsync_due(t0 + 8 * S, 5 * S));
         assert_eq!(s.due_at(5 * S), Some(t0 + 9 * S));
@@ -511,7 +605,7 @@ mod tests {
         assert_eq!(s.due_at(5 * S), Some(t0 + 15 * S));
         // A change during a capture keeps it dirty.
         let generation = s.generation;
-        s.changed(t0 + 11 * S, C);
+        s.changed(t0 + 11 * S, &W);
         s.captured(generation, t0 + 12 * S, true);
         assert!(s.is_dirty());
     }
@@ -524,7 +618,7 @@ mod tests {
         assert_eq!(a.members(), [b"a.db".to_vec(), b"a.db-wal".to_vec()]);
         let b = groups.get(members("b.db"));
         assert_eq!(groups.len(), 2);
-        b.changed(C);
+        b.hold(&W).unwrap().changed();
         drop((a, b));
         groups.prune();
         // b is dirty, so it stays.
@@ -539,7 +633,7 @@ mod tests {
     fn a_freeze_waits_for_holds_and_keeps_new_ones_out() {
         let groups = Groups::default();
         let g = groups.get(members("a.db"));
-        let hold = g.hold();
+        let hold = g.hold(&W).unwrap();
         let frozen = Arc::new(AtomicBool::new(false));
         let freezer = {
             let g = g.clone();
@@ -557,13 +651,13 @@ mod tests {
             !frozen.load(Ordering::SeqCst),
             "the hold keeps the freeze out"
         );
-        hold.changed(C);
+        hold.changed();
         drop(hold);
         // Wait for the freeze to begin; a new hold then waits for its end.
         while !frozen.load(Ordering::SeqCst) {
             thread::yield_now();
         }
-        let hold = g.hold();
+        let hold = g.hold(&W).unwrap();
         assert!(
             !frozen.load(Ordering::SeqCst),
             "the freeze kept the hold out"
@@ -571,6 +665,53 @@ mod tests {
         drop(hold);
         freezer.join().unwrap();
         assert!(g.state().is_dirty());
+    }
+
+    #[test]
+    fn a_dirty_group_refuses_another_entry_point_until_captured() {
+        use agentfs_core::record::SandboxId;
+        let groups = Groups::default();
+        let g = groups.get(members("a.db"));
+        let sandbox = Writer {
+            caller: C,
+            entry: EntryPoint::Sandbox(SandboxId::new("x").unwrap()),
+        };
+        g.hold(&W).unwrap().changed();
+        assert_eq!(g.hold(&sandbox).err(), Some(Foreign { pending: W }));
+        // The same entry point holds it as before.
+        g.hold(&W).unwrap().changed();
+        let generation = g.state().generation;
+        g.captured(generation, true, false);
+        g.hold(&sandbox).unwrap().changed();
+        assert_eq!(g.state().writer, Some(sandbox.clone()));
+        assert_eq!(g.hold(&W).err(), Some(Foreign { pending: sandbox }));
+    }
+
+    #[test]
+    fn holders_share_one_entry_point() {
+        use agentfs_core::record::SandboxId;
+        let groups = Groups::default();
+        let g = groups.get(members("a.db"));
+        let sandbox = Writer {
+            caller: C,
+            entry: EntryPoint::Sandbox(SandboxId::new("x").unwrap()),
+        };
+        let main = g.hold(&W).unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+        let other = {
+            let g = g.clone();
+            let entered = entered.clone();
+            thread::spawn(move || {
+                // Clean group: no cut, only a wait for main's hold.
+                let hold = g.hold(&sandbox).map(|_| ());
+                entered.store(true, Ordering::SeqCst);
+                hold
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(!entered.load(Ordering::SeqCst), "main's hold keeps it out");
+        drop(main);
+        assert_eq!(other.join().unwrap(), Ok(()));
     }
 
     #[test]
@@ -582,10 +723,10 @@ mod tests {
             thread::spawn(move || groups.wait(None))
         };
         thread::sleep(Duration::from_millis(20));
-        g.changed(C);
+        g.hold(&W).unwrap().changed();
         assert!(waiter.join().unwrap());
         // Already dirty: no kick, so the deadline ends the wait.
-        g.changed(C);
+        g.hold(&W).unwrap().changed();
         assert!(groups.wait(Some(Instant::now() + Duration::from_millis(10))));
         groups.stop();
         assert!(!groups.wait(None));
@@ -603,8 +744,10 @@ mod tests {
         let a = groups.get(members("a.db"));
         let b = groups.get(members("b.db"));
         let actor = Caller { pid: 7, ..C };
-        a.changed(actor);
-        b.changed(C);
+        a.hold(&Writer { caller: actor, ..W }).unwrap().changed();
+        // The actor's change is agentfs's own.
+        assert_eq!(a.state().writer, Some(Writer::agentfs(actor)));
+        b.hold(&W).unwrap().changed();
         assert_eq!(a.deferred(), Some(actor));
         assert_eq!(b.deferred(), None);
         let far = Instant::now() + 60 * S;

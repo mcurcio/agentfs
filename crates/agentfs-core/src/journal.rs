@@ -323,8 +323,8 @@ fn decode_all(bytes: &[u8], path: &Path) -> io::Result<(Vec<Record>, usize)> {
                 io::ErrorKind::InvalidData,
                 format!(
                     "{}: record at byte {offset} is intact but cannot be read ({e}); it was \
-                     probably written by a newer agentfs: run that version again and \
-                     `agentfs flush` before downgrading",
+                     probably written by another agentfs version (a newer one, or one from \
+                     before entry points): run that version again and `agentfs flush` first",
                     path.display()
                 ),
             )
@@ -408,15 +408,18 @@ mod tests {
 
     use super::*;
     use crate::paths::RepoPath;
-    use crate::record::{Caller, Change, Trigger};
+    use crate::record::{Caller, Change, EntryPoint, Trigger, Writer};
 
     fn draft(path: &str) -> Draft {
         Draft {
             trigger: Trigger::Unlink,
-            caller: Caller {
-                uid: 1,
-                gid: 1,
-                pid: 1,
+            writer: Writer {
+                caller: Caller {
+                    uid: 1,
+                    gid: 1,
+                    pid: 1,
+                },
+                entry: EntryPoint::Main,
             },
             time_ms: 0,
             changes: vec![Change::Remove {
@@ -656,7 +659,7 @@ mod tests {
         j.record(draft("a")).unwrap();
         drop(j);
         // A change kind from a newer version, framed whole.
-        let payload = br#"{"seq":9,"trigger":"close","caller":{"uid":1,"gid":2,"pid":3},"time_ms":5,"changes":[{"op":"teleport","path":"a"}]}"#;
+        let payload = br#"{"seq":9,"trigger":"close","caller":{"uid":1,"gid":2,"pid":3},"entry":"main","time_ms":5,"changes":[{"op":"teleport","path":"a"}]}"#;
         let mut frame = Vec::new();
         frame.extend_from_slice(&MAGIC);
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -674,9 +677,30 @@ mod tests {
     }
 
     #[test]
+    fn a_record_from_before_entry_points_is_refused_with_the_flush_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        // A record as an agentfs from before entry points framed it.
+        let payload = br#"{"seq":7,"trigger":"close","caller":{"uid":1,"gid":2,"pid":3},"time_ms":5,"changes":[{"op":"remove","path":"a"}]}"#;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC);
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+        frame.extend_from_slice(payload);
+        fs::write(&path, &frame).unwrap();
+        let e = Journal::open(&path, 0, no_hook()).map(|_| ()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let message = e.to_string();
+        assert!(message.contains("entry"), "{message}");
+        assert!(message.contains("before entry points"), "{message}");
+        assert!(message.contains("`agentfs flush` first"), "{message}");
+        assert_eq!(fs::read(&path).unwrap(), frame, "never truncated");
+    }
+
+    #[test]
     fn records_from_before_operations_still_decode() {
         // A frame as journals written before `operation` existed hold it.
-        let payload = br#"{"seq":7,"trigger":"close","caller":{"uid":1,"gid":2,"pid":3},"time_ms":5,"changes":[{"op":"remove","path":"a"}]}"#;
+        let payload = br#"{"seq":7,"trigger":"close","caller":{"uid":1,"gid":2,"pid":3},"entry":"sandbox/a1","time_ms":5,"changes":[{"op":"remove","path":"a"}]}"#;
         let mut frame = Vec::new();
         frame.extend_from_slice(&MAGIC);
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());

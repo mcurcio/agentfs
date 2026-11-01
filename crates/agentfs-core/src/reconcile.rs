@@ -44,7 +44,7 @@ use rustix::fs::{Mode, OFlags};
 
 use crate::confined;
 use crate::paths::{RepoPath, is_dotgit};
-use crate::record::{Caller, Origin};
+use crate::record::{Origin, Writer};
 
 /// How far before a move a file's change makes reconciliation compare
 /// its stamp with the last one journaled: well past any request timeout
@@ -75,8 +75,9 @@ pub struct Duty {
     pub seq: u64,
     pub from: RepoPath,
     pub to: RepoPath,
-    /// Who made the move: the author of the reconciling records.
-    pub caller: Caller,
+    /// Who made the move: the writer of the reconciling records, so they
+    /// share the move's split key (author and entry point).
+    pub writer: Writer,
     /// The front that made it, journaled with the reconciling records too.
     pub origin: Option<Origin>,
     /// When it was journaled, ms since the epoch.
@@ -283,6 +284,7 @@ fn lstat_in(dir: &OwnedFd, name: &str) -> io::Result<Metadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::Caller;
 
     fn p(s: &str) -> RepoPath {
         RepoPath::new(s).unwrap()
@@ -293,11 +295,11 @@ mod tests {
             seq,
             from: p("a"),
             to: p("b"),
-            caller: Caller {
+            writer: Writer::agentfs(Caller {
                 uid: 1,
                 gid: 1,
                 pid: 1,
-            },
+            }),
             origin: None,
             at_ms: 0,
         }

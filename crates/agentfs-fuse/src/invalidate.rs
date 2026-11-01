@@ -548,7 +548,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::UNIX_EPOCH;
 
-    use agentfs_core::record::Caller;
+    use agentfs_core::record::{Caller, EntryPoint};
     use fuser::{Errno, FileType, INodeNo};
 
     use super::*;
@@ -558,7 +558,8 @@ mod tests {
         gid: 1000,
         pid: 42,
     };
-    const A: Actor<'static> = Actor::of_process(C);
+    static MAIN: EntryPoint = EntryPoint::Main;
+    const A: Actor<'static> = Actor::of_process(C, &MAIN);
     const O_RDONLY: i32 = 0;
     const O_WRONLY: i32 = 1;
 

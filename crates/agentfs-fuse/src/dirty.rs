@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use agentfs_core::paths::RepoPath;
 use agentfs_core::pending::PendingId;
-use agentfs_core::record::Caller;
+use agentfs_core::record::Writer;
 use rustix::fs::Stat;
 
 /// The parts of `stat` that change when content or the executable bit do.
@@ -104,10 +104,11 @@ pub struct DirtyState {
     /// Something may have changed the inode since it was last recorded, so
     /// boundaries must look at it. Unarmed inodes cost no `fstat`.
     pub armed: bool,
-    /// The last process that opened the inode for writing or wrote to it:
-    /// the author of late records (RELEASE, sweep), whose requests carry no
-    /// useful caller.
-    pub last_writer: Option<Caller>,
+    /// The last process that opened the inode for writing or wrote to it,
+    /// and the entry point it came through: the writer of late records
+    /// (RELEASE, FORGET, sweep, repair), whose requests carry no useful
+    /// caller.
+    pub last_writer: Option<Writer>,
     /// The frozen copy of the last record, pinned open while that record
     /// is racy (design §3.1).
     pub frozen: Option<FrozenRef>,
@@ -135,7 +136,7 @@ impl Eq for FrozenRef {}
 impl DirtyState {
     /// Something may change the inode from now on (a write-open, a write,
     /// a size change).
-    pub fn arm(&mut self, writer: Caller) {
+    pub fn arm(&mut self, writer: Writer) {
         self.armed = true;
         self.last_writer = Some(writer);
     }
@@ -216,10 +217,15 @@ pub fn now_ns() -> i128 {
 mod tests {
     use super::*;
 
-    const W: Caller = Caller {
-        uid: 1,
-        gid: 1,
-        pid: 1,
+    use agentfs_core::record::{Caller, EntryPoint};
+
+    const W: Writer = Writer {
+        caller: Caller {
+            uid: 1,
+            gid: 1,
+            pid: 1,
+        },
+        entry: EntryPoint::Main,
     };
 
     fn stamp(size: i64, mtime_ns: i128) -> Stamp {

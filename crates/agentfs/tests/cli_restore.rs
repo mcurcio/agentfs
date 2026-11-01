@@ -219,6 +219,8 @@ fn restore_files_directories_symlinks_and_modes() {
     let message = v.message(head);
     assert!(message.starts_with("restore a.txt from "), "{message}");
     assert!(message.contains("Agentfs-Trigger: restore\n"), "{message}");
+    assert!(message.contains("Agentfs-Entry: agentfs\n"), "{message}");
+    assert_eq!(message.matches("Agentfs-Entry:").count(), 1, "{message}");
     assert!(
         message.contains(&format!("Agentfs-Restore: {c1}\n")),
         "{message}"
@@ -323,6 +325,7 @@ fn revert_adds_modifies_and_deletes() {
         "{message}"
     );
     assert!(message.contains("Agentfs-Trigger: restore\n"), "{message}");
+    assert!(message.contains("Agentfs-Entry: agentfs\n"), "{message}");
 
     // Undoing the revert: revert the revert.
     let r = v.head().to_string();

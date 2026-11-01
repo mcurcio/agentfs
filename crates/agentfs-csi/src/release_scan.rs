@@ -778,17 +778,17 @@ mod tests {
     fn journal_a_record(layout: &Layout, handle: &str) {
         use agentfs_core::journal::Journal;
         use agentfs_core::paths::RepoPath;
-        use agentfs_core::record::{Caller, Change, Draft, Trigger};
+        use agentfs_core::record::{Caller, Change, Draft, Trigger, Writer};
         let state = StateDir::new(layout.state(handle));
         let (journal, _) = Journal::open(state.journal(), 1, Box::new(|| Ok(()))).unwrap();
         journal
             .record(Draft {
                 trigger: Trigger::Unlink,
-                caller: Caller {
+                writer: Writer::agentfs(Caller {
                     uid: 0,
                     gid: 0,
                     pid: 1,
-                },
+                }),
                 time_ms: 0,
                 changes: vec![Change::Remove {
                     path: RepoPath::new("gone").unwrap(),

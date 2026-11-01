@@ -38,6 +38,7 @@ pub mod ops;
 pub mod overlay;
 pub mod privileges;
 pub mod session;
+pub mod sessions;
 pub mod sweep;
 pub mod views;
 

@@ -21,7 +21,7 @@
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
-use agentfs_core::record::Caller;
+use agentfs_core::record::{Caller, EntryPoint, Writer};
 use fuser::FileAttr;
 
 use crate::creds::Supplementary;
@@ -164,7 +164,7 @@ pub trait TreeOperations: Operations {
     /// `newparent`, as one `renameat2(2)` with `flags` (`0` or
     /// `RENAME_NOREPLACE`; anything else is `EINVAL`), and records the new
     /// path's content ([`agentfs_core::record::Trigger::Rename`], as
-    /// `caller`) before it returns.
+    /// `writer`) before it returns.
     ///
     /// Under the names ordering, after resolving `newparent`'s path and
     /// statting `newname`, it asks `check` ([`NameCheck::move_in`]); an
@@ -191,7 +191,7 @@ pub trait TreeOperations: Operations {
         flags: u32,
         moved: Moved,
         check: &dyn NameCheck,
-        caller: Caller,
+        writer: &Writer,
     ) -> OpResult<Entry>;
 }
 
@@ -248,28 +248,41 @@ pub trait NameCheck: Sync {
 }
 
 /// Who a request acts as (sandbox overlay slice 4): the caller its changes
-/// are recorded as, the supplementary groups its effects are checked and
-/// done with, and the check it carries into the operations, if any.
+/// are recorded as, the entry point it came through (design §9: the FUSE
+/// session that served it), the supplementary groups its effects are
+/// checked and done with, and the check it carries into the operations, if
+/// any.
 ///
 /// The main mount's requests act as the request's own process
 /// ([`Actor::of_process`]); the sandbox overlay's as its view owner with
 /// no supplementary groups and its name check
-/// ([`crate::overlay::ViewOwner::actor`]).
+/// ([`crate::overlay::ViewOwner::actor`]). Either way the entry point is
+/// the session's, fixed when it was built.
 #[derive(Clone, Copy)]
 pub struct Actor<'a> {
     pub caller: Caller,
+    pub entry: &'a EntryPoint,
     pub groups: Supplementary,
     pub check: Option<&'a dyn NameCheck>,
 }
 
-impl Actor<'_> {
-    /// `caller` as the kernel reported it: its process's supplementary
-    /// groups, no check.
-    pub const fn of_process(caller: Caller) -> Actor<'static> {
+impl<'a> Actor<'a> {
+    /// `caller` as the kernel reported it, through `entry`: its process's
+    /// supplementary groups, no check.
+    pub const fn of_process(caller: Caller, entry: &'a EntryPoint) -> Actor<'a> {
         Actor {
             caller,
+            entry,
             groups: Supplementary::OfProcess,
             check: None,
+        }
+    }
+
+    /// Who the request's changes are recorded as.
+    pub fn writer(&self) -> Writer {
+        Writer {
+            caller: self.caller,
+            entry: self.entry.clone(),
         }
     }
 }
@@ -278,6 +291,7 @@ impl std::fmt::Debug for Actor<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Actor")
             .field("caller", &self.caller)
+            .field("entry", self.entry)
             .field("groups", &self.groups)
             .field("check", &self.check.is_some())
             .finish()

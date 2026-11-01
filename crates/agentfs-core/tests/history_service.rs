@@ -21,7 +21,7 @@ use agentfs_core::lfs::Store;
 use agentfs_core::listening_socket::Listener;
 use agentfs_core::paths::RepoPath;
 use agentfs_core::pending::PendingId;
-use agentfs_core::record::{Caller, Change, Draft, Origin, Trigger};
+use agentfs_core::record::{Caller, Change, Draft, EntryPoint, Origin, Trigger, Writer};
 use agentfs_core::rules::SkipReason;
 use agentfs_core::stamps::FreezeStamp;
 use agentfs_core::telemetry::Telemetry;
@@ -37,6 +37,10 @@ const CALLER: Caller = Caller {
     uid: 1000,
     gid: 1000,
     pid: 1,
+};
+const WRITER: Writer = Writer {
+    caller: CALLER,
+    entry: EntryPoint::Main,
 };
 
 struct Env {
@@ -246,7 +250,7 @@ fn close(
     content: &str,
 ) -> Result<Option<u64>, VolumeError> {
     front
-        .record(Trigger::Close, CALLER, vec![write(env, name, content)])
+        .record(Trigger::Close, WRITER, vec![write(env, name, content)])
         .map(|r| r.seq)
 }
 
@@ -294,7 +298,7 @@ fn concurrent_fronts_commit_with_their_own_committers() {
                             let input = write(env, "shared", &content);
                             let seq = front
                                 .recorder
-                                .record(Trigger::Close, CALLER, vec![input])
+                                .record(Trigger::Close, WRITER, vec![input])
                                 .unwrap()
                                 .seq
                                 .unwrap();
@@ -360,7 +364,7 @@ fn a_write_whose_path_another_front_removed_meanwhile_is_skipped() {
         .recorder
         .record(
             Trigger::Close,
-            CALLER,
+            WRITER,
             vec![Input::Write {
                 path: RepoPath::new("log").unwrap(),
                 backing: elsewhere.clone(),
@@ -379,7 +383,7 @@ fn a_write_whose_path_another_front_removed_meanwhile_is_skipped() {
         .recorder
         .record(
             Trigger::Close,
-            CALLER,
+            WRITER,
             vec![Input::Write {
                 path: RepoPath::new("d/f").unwrap(),
                 backing: elsewhere,
@@ -402,7 +406,7 @@ fn fronts_ask_the_service_whether_ignored_paths_are_tracked() {
         let service = Service::start(&env);
         let local = &service.recorder;
         local
-            .record(Trigger::Close, CALLER, vec![write(&env, "kept.log", "0")])
+            .record(Trigger::Close, WRITER, vec![write(&env, "kept.log", "0")])
             .unwrap();
         service.committer.commit_pending().unwrap();
     }
@@ -412,7 +416,7 @@ fn fronts_ask_the_service_whether_ignored_paths_are_tracked() {
 
     let new = a
         .recorder
-        .record(Trigger::Close, CALLER, vec![write(&env, "new.log", "1")])
+        .record(Trigger::Close, WRITER, vec![write(&env, "new.log", "1")])
         .unwrap();
     assert_eq!(new.seq, None);
     assert_eq!(new.skipped.len(), 1);
@@ -420,7 +424,7 @@ fn fronts_ask_the_service_whether_ignored_paths_are_tracked() {
 
     let kept = a
         .recorder
-        .record(Trigger::Close, CALLER, vec![write(&env, "kept.log", "2")])
+        .record(Trigger::Close, WRITER, vec![write(&env, "kept.log", "2")])
         .unwrap();
     assert!(kept.seq.is_some(), "{kept:?}");
     assert!(
@@ -441,7 +445,7 @@ fn fronts_ask_the_service_whether_ignored_paths_are_tracked() {
         .recorder
         .record(
             Trigger::Unlink,
-            CALLER,
+            WRITER,
             vec![Input::Remove {
                 path: RepoPath::new("never").unwrap(),
             }],
@@ -825,7 +829,7 @@ fn hello_of(front: &FrontInfo, version: u32) -> pb::HelloRequest {
 fn empty_draft() -> Draft {
     Draft {
         trigger: Trigger::Close,
-        caller: CALLER,
+        writer: WRITER,
         time_ms: 1,
         changes: Vec::new(),
         operation: None,
@@ -1022,7 +1026,8 @@ fn a_service_of_another_protocol_is_refused() {
     let _server = FakeServer::start(
         &env,
         Fake {
-            protocol_version: 3,
+            // The previous version, before `draft.entry`.
+            protocol_version: 2,
             ..Fake::new(&env, OnRecord::Answer)
         },
     );
@@ -1035,7 +1040,7 @@ fn a_service_of_another_protocol_is_refused() {
         Arc::new(NullSink),
     ) {
         Err(ClientError::Refused { reason, .. }) => {
-            assert!(reason.contains("protocol version 3"), "{reason}");
+            assert!(reason.contains("protocol version 2"), "{reason}");
         }
         other => panic!("{other:?}"),
     }
@@ -1281,7 +1286,7 @@ fn send_frozen(
     let path = RepoPath::new(path).unwrap();
     let draft = Draft {
         trigger: Trigger::Close,
-        caller: CALLER,
+        writer: WRITER,
         time_ms: 1,
         changes: vec![Change::Write {
             path: path.clone(),
@@ -1368,7 +1373,7 @@ fn nfs_silly_renames_are_never_recorded_through_a_front() {
     let name = ".nfs0000000000a1b2c300000001";
     let recorded = a
         .recorder
-        .record(Trigger::Close, CALLER, vec![write(&env, name, "x")])
+        .record(Trigger::Close, WRITER, vec![write(&env, name, "x")])
         .unwrap();
     assert_eq!(recorded.seq, None, "{recorded:?}");
     assert_eq!(recorded.skipped[0].reason, SkipReason::NfsSillyRename);
@@ -1394,7 +1399,7 @@ fn a_write_of_a_file_renamed_over_meanwhile_is_skipped() {
     close(&env, &b.recorder, "f", "new").unwrap().unwrap();
     let late = a
         .recorder
-        .record(Trigger::Close, CALLER, vec![write_from("f", &held)])
+        .record(Trigger::Close, WRITER, vec![write_from("f", &held)])
         .unwrap();
     assert_eq!(late.seq, None, "{late:?}");
     assert_eq!(late.skipped[0].reason, SkipReason::Gone);
@@ -1411,7 +1416,7 @@ fn the_services_own_writes_supersede_older_front_writes() {
     let a = front(&env, "pod-a");
     service
         .recorder
-        .record(Trigger::Restore, CALLER, vec![write(&env, "f", "restored")])
+        .record(Trigger::Restore, WRITER, vec![write(&env, "f", "restored")])
         .unwrap();
     let restored = stamp_of(&env, "f");
     let before = FreezeStamp {
@@ -1437,7 +1442,7 @@ fn atomic_groups_are_never_superseded() {
     close(&env, &b.recorder, "g", "new").unwrap().unwrap();
     let group = a
         .recorder
-        .record_group(Trigger::Fsync, CALLER, vec![write_from("g", &stale)])
+        .record_group(Trigger::Fsync, WRITER, vec![write_from("g", &stale)])
         .unwrap();
     assert!(group.seq.is_some(), "a group is recorded whole: {group:?}");
     drop(service);
@@ -1503,7 +1508,7 @@ fn a_late_removal_of_a_path_made_again_ends_on_the_trees_state() {
         .recorder
         .record(
             Trigger::Unlink,
-            CALLER,
+            WRITER,
             vec![Input::Remove {
                 path: RepoPath::new("lock.json").unwrap(),
             }],
@@ -1519,7 +1524,7 @@ fn a_late_removal_of_a_path_made_again_ends_on_the_trees_state() {
         .recorder
         .record(
             Trigger::Symlink,
-            CALLER,
+            WRITER,
             vec![Input::Symlink {
                 path: RepoPath::new("link").unwrap(),
                 target: "old-target".into(),
@@ -1535,7 +1540,7 @@ fn a_late_removal_of_a_path_made_again_ends_on_the_trees_state() {
     b.recorder
         .record(
             Trigger::Unlink,
-            CALLER,
+            WRITER,
             vec![Input::Remove {
                 path: RepoPath::new("lock.json").unwrap(),
             }],
@@ -1629,7 +1634,7 @@ fn racing_in_place_writes_leave_head_on_the_trees_last_state() {
         let backing = env.tree.join("shared");
         std::fs::write(&backing, "x".repeat(n)).unwrap();
         recorder
-            .record(Trigger::Close, CALLER, vec![write_from("shared", &backing)])
+            .record(Trigger::Close, WRITER, vec![write_from("shared", &backing)])
             .unwrap();
     });
 }
@@ -1642,7 +1647,7 @@ fn racing_same_size_writes_leave_head_on_the_trees_last_state() {
         let backing = env.tree.join("shared");
         std::fs::write(&backing, format!("{n:08}")).unwrap();
         recorder
-            .record(Trigger::Close, CALLER, vec![write_from("shared", &backing)])
+            .record(Trigger::Close, WRITER, vec![write_from("shared", &backing)])
             .unwrap();
     });
 }
@@ -1664,7 +1669,7 @@ fn racing_renames_over_a_path_leave_head_on_the_trees_last_state() {
         let delay = splitmix(n as u64) % 30_000;
         std::thread::sleep(Duration::from_micros(delay));
         recorder
-            .record(Trigger::Rename, CALLER, vec![write_from("shared", &held)])
+            .record(Trigger::Rename, WRITER, vec![write_from("shared", &held)])
             .unwrap();
         std::fs::remove_file(&held).unwrap();
     });
@@ -1679,7 +1684,7 @@ fn an_inherited_repair_commits_as_the_pod_that_failed_it() {
     b.recorder
         .record_as(
             Trigger::Sweep,
-            CALLER,
+            WRITER,
             vec![write(&env, "inherited", "1")],
             Some(pod("pod-a")),
         )
@@ -1689,7 +1694,7 @@ fn an_inherited_repair_commits_as_the_pod_that_failed_it() {
     b.recorder
         .record_as(
             Trigger::Close,
-            CALLER,
+            WRITER,
             vec![write(&env, "own", "2")],
             Some(pod("pod-a")),
         )
@@ -1699,7 +1704,7 @@ fn an_inherited_repair_commits_as_the_pod_that_failed_it() {
     b.recorder
         .record_as(
             Trigger::Sweep,
-            CALLER,
+            WRITER,
             vec![write(&env, "own-sweep", "3")],
             Some(pod("pod-b")),
         )
@@ -1881,7 +1886,7 @@ fn the_service_says_whether_a_fronts_copy_is_still_last() {
     assert!(client.supports("still_last"));
     let recorded = a
         .recorder
-        .record(Trigger::Close, CALLER, vec![write(&env, "f", "one")])
+        .record(Trigger::Close, WRITER, vec![write(&env, "f", "one")])
         .unwrap();
     let [(path, copy)] = recorded.written.as_slice() else {
         panic!("one write: {recorded:?}");
@@ -1899,7 +1904,7 @@ fn the_service_says_whether_a_fronts_copy_is_still_last() {
     // Nor after a removal of a parent's subtree.
     let recorded = a
         .recorder
-        .record(Trigger::Close, CALLER, vec![write(&env, "d/f", "x")])
+        .record(Trigger::Close, WRITER, vec![write(&env, "d/f", "x")])
         .unwrap();
     let (path, copy) = recorded.written[0].clone();
     assert!(a.recorder.still_last(&path, copy));
@@ -1907,7 +1912,7 @@ fn the_service_says_whether_a_fronts_copy_is_still_last() {
     b.recorder
         .record(
             Trigger::Unlink,
-            CALLER,
+            WRITER,
             vec![Input::Remove {
                 path: RepoPath::new("d").unwrap(),
             }],
@@ -1948,7 +1953,7 @@ fn time_records(
                             let input = write(env, &format!("{prefix}/{t}/{i}"), content);
                             let start = Instant::now();
                             recorder
-                                .record(Trigger::Close, CALLER, vec![input])
+                                .record(Trigger::Close, WRITER, vec![input])
                                 .unwrap();
                             start.elapsed()
                         })
@@ -2268,7 +2273,7 @@ fn a_fronts_directory_move_is_one_record_reconciled_by_the_service() {
         .recorder
         .record_move(
             Trigger::Rename,
-            CALLER,
+            WRITER,
             RepoPath::new("d").unwrap(),
             RepoPath::new("m").unwrap(),
         )

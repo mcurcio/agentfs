@@ -42,7 +42,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
-use agentfs_core::record::Caller;
+use agentfs_core::record::{Caller, EntryPoint};
 use fuser::{
     AccessFlags, BackingId, BsdFileFlags, CopyFileRangeFlags, Errno, FileHandle, Filesystem,
     FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags,
@@ -205,6 +205,10 @@ enum Route {
 /// for the sandbox overlay).
 pub struct FuseFs<O: Operations = Ops> {
     ops: Arc<O>,
+    /// The entry point every request of this session came through (design
+    /// §9): `main` or one sandbox session, never `agentfs` (only
+    /// [`crate::mount`] builds sessions).
+    entry: EntryPoint,
     mode: Passthrough,
     status: Arc<Mutex<PassthroughStatus>>,
     /// Set when `--passthrough on` fails after INIT: the mount stops.
@@ -215,12 +219,14 @@ pub struct FuseFs<O: Operations = Ops> {
 impl<O: Operations> FuseFs<O> {
     pub fn new(
         ops: Arc<O>,
+        entry: EntryPoint,
         mode: Passthrough,
         status: Arc<Mutex<PassthroughStatus>>,
         failed: Arc<Stop>,
     ) -> Self {
         Self {
             ops,
+            entry,
             mode,
             status,
             failed,
@@ -450,7 +456,7 @@ impl<O: Operations> Filesystem for FuseFs<O> {
         };
         match self
             .ops
-            .setattr(ino.0, &set, Actor::of_process(caller(req)))
+            .setattr(ino.0, &set, Actor::of_process(caller(req), &self.entry))
         {
             Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(e) => reply.error(e),
@@ -479,7 +485,7 @@ impl<O: Operations> Filesystem for FuseFs<O> {
             bytes(name),
             mode,
             rdev,
-            Actor::of_process(caller(req)),
+            Actor::of_process(caller(req), &self.entry),
         ) {
             Ok(e) => reply.entry_with_ttls(&ATTR_TTL, &ENTRY_TTL, &e.attr, Generation(0)),
             Err(e) => reply.error(e),
@@ -495,30 +501,34 @@ impl<O: Operations> Filesystem for FuseFs<O> {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        match self
-            .ops
-            .mkdir(parent.0, bytes(name), mode, Actor::of_process(caller(req)))
-        {
+        match self.ops.mkdir(
+            parent.0,
+            bytes(name),
+            mode,
+            Actor::of_process(caller(req), &self.entry),
+        ) {
             Ok(e) => reply.entry_with_ttls(&ATTR_TTL, &ENTRY_TTL, &e.attr, Generation(0)),
             Err(e) => reply.error(e),
         }
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self
-            .ops
-            .unlink(parent.0, bytes(name), Actor::of_process(caller(req)))
-        {
+        match self.ops.unlink(
+            parent.0,
+            bytes(name),
+            Actor::of_process(caller(req), &self.entry),
+        ) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self
-            .ops
-            .rmdir(parent.0, bytes(name), Actor::of_process(caller(req)))
-        {
+        match self.ops.rmdir(
+            parent.0,
+            bytes(name),
+            Actor::of_process(caller(req), &self.entry),
+        ) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -536,7 +546,7 @@ impl<O: Operations> Filesystem for FuseFs<O> {
             parent.0,
             bytes(link_name),
             target.as_os_str().as_bytes(),
-            Actor::of_process(caller(req)),
+            Actor::of_process(caller(req), &self.entry),
         ) {
             Ok(e) => reply.entry_with_ttls(&ATTR_TTL, &ENTRY_TTL, &e.attr, Generation(0)),
             Err(e) => reply.error(e),
@@ -559,7 +569,7 @@ impl<O: Operations> Filesystem for FuseFs<O> {
             newparent.0,
             bytes(newname),
             flags.bits(),
-            Actor::of_process(caller(req)),
+            Actor::of_process(caller(req), &self.entry),
         ) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -578,7 +588,7 @@ impl<O: Operations> Filesystem for FuseFs<O> {
             ino.0,
             newparent.0,
             bytes(newname),
-            Actor::of_process(caller(req)),
+            Actor::of_process(caller(req), &self.entry),
         ) {
             Ok(e) => reply.entry_with_ttls(&ATTR_TTL, &ENTRY_TTL, &e.attr, Generation(0)),
             Err(e) => reply.error(e),
@@ -588,7 +598,7 @@ impl<O: Operations> Filesystem for FuseFs<O> {
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         match self
             .ops
-            .open(ino.0, flags.0, Actor::of_process(caller(req)))
+            .open(ino.0, flags.0, Actor::of_process(caller(req), &self.entry))
         {
             Ok((fh, handle)) => match self.route(fh, &handle, |h| reply.open_backing(&h.fd)) {
                 Route::Passthrough(id) => {
@@ -619,7 +629,7 @@ impl<O: Operations> Filesystem for FuseFs<O> {
             bytes(name),
             mode,
             flags,
-            Actor::of_process(caller(req)),
+            Actor::of_process(caller(req), &self.entry),
         ) {
             Ok((entry, fh, handle)) => {
                 match self.route(fh, &handle, |h| reply.open_backing(&h.fd)) {
@@ -678,10 +688,12 @@ impl<O: Operations> Filesystem for FuseFs<O> {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self
-            .ops
-            .write(fh.0, offset, data, Actor::of_process(caller(req)))
-        {
+        match self.ops.write(
+            fh.0,
+            offset,
+            data,
+            Actor::of_process(caller(req), &self.entry),
+        ) {
             Ok(n) => reply.written(n),
             Err(e) => reply.error(e),
         }
@@ -695,7 +707,10 @@ impl<O: Operations> Filesystem for FuseFs<O> {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.ops.flush(fh.0, Actor::of_process(caller(req))) {
+        match self
+            .ops
+            .flush(fh.0, Actor::of_process(caller(req), &self.entry))
+        {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -863,10 +878,13 @@ impl<O: Operations> Filesystem for FuseFs<O> {
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        match self
-            .ops
-            .fallocate(fh.0, offset, length, mode, Actor::of_process(caller(req)))
-        {
+        match self.ops.fallocate(
+            fh.0,
+            offset,
+            length,
+            mode,
+            Actor::of_process(caller(req), &self.entry),
+        ) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -906,7 +924,7 @@ impl<O: Operations> Filesystem for FuseFs<O> {
             fh_out.0,
             offset_out,
             len,
-            Actor::of_process(caller(req)),
+            Actor::of_process(caller(req), &self.entry),
         ) {
             Ok(n) => reply.written(n),
             Err(e) => reply.error(e),
@@ -1009,7 +1027,13 @@ mod tests {
         let failed = Arc::new(Stop::default());
         Fx {
             _dir: dir,
-            fs: FuseFs::new(Arc::new(ops), mode, status, failed.clone()),
+            fs: FuseFs::new(
+                Arc::new(ops),
+                EntryPoint::Main,
+                mode,
+                status,
+                failed.clone(),
+            ),
             failed,
             file,
         }
