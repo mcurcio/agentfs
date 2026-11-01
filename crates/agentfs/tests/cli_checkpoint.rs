@@ -350,10 +350,13 @@ fn journal(v: &Volume, name: &str) {
     .unwrap();
     rec.record(
         agentfs_core::record::Trigger::Close,
-        agentfs_core::record::Caller {
-            uid: 1,
-            gid: 1,
-            pid: 1,
+        agentfs_core::record::Writer {
+            caller: agentfs_core::record::Caller {
+                uid: 1,
+                gid: 1,
+                pid: 1,
+            },
+            entry: agentfs_core::record::EntryPoint::Main,
         },
         vec![agentfs_core::volume::Input::Write {
             path: agentfs_core::paths::RepoPath::new(name).unwrap(),

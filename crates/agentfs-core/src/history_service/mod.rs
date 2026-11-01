@@ -42,9 +42,10 @@ use crate::paths::RepoPath;
 use crate::record::Origin;
 use crate::stamps::FreezeStamp;
 
-/// 2 = gRPC, package `agentfs.history.v2`; 1 was length-prefixed JSON
-/// frames.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// 3 = `draft.entry` required (design §9), so a front of another version
+/// is refused at `Hello`, never at its first write; 2 = gRPC, package
+/// `agentfs.history.v2`; 1 was length-prefixed JSON frames.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The largest message either side accepts: the journal's bound on one
 /// record. Overrides tonic's 4 MiB default on both ends.

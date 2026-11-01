@@ -1260,6 +1260,8 @@ pub fn record_applied(
         .collect();
     let mut problems = Vec::new();
     let trigger = crate::record::Trigger::Restore;
+    // The operation's own: `Recorder::record` stamps it agentfs anyway.
+    let writer = crate::record::Writer::agentfs(caller);
     let chunk = match mode {
         RecordMode::Chunked(n) => n.max(1),
         RecordMode::Atomic => usize::MAX,
@@ -1290,7 +1292,7 @@ pub fn record_applied(
         }
         // Whole or not at all.
         if problems.is_empty() {
-            let recorded = recorder.record_group(trigger, caller, inputs);
+            let recorded = recorder.record_group(trigger, writer.clone(), inputs);
             note_recorded(recorded, applied, &mut problems);
         }
         drop(fds);
@@ -1315,7 +1317,7 @@ pub fn record_applied(
                 Err(problem) => problems.push(problem),
             }
         }
-        let recorded = recorder.record(trigger, caller, inputs);
+        let recorded = recorder.record(trigger, writer.clone(), inputs);
         note_recorded(recorded, applied, &mut problems);
         drop(fds);
     }
@@ -1335,7 +1337,7 @@ pub fn record_applied(
         }
         // Whole or not at all.
         if !unreadable {
-            let recorded = recorder.record_group(trigger, caller, inputs);
+            let recorded = recorder.record_group(trigger, writer.clone(), inputs);
             note_recorded(recorded, applied, &mut problems);
         }
         drop(fds);

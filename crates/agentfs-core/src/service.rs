@@ -1006,7 +1006,7 @@ mod tests {
     use crate::identity::Context;
     use crate::paths::RepoPath;
     use crate::push;
-    use crate::record::{Caller, Trigger};
+    use crate::record::{Caller, EntryPoint, Trigger, Writer};
     use crate::telemetry::Telemetry;
     use crate::volume::{self, Input, Recorder, StateDir};
 
@@ -1014,6 +1014,10 @@ mod tests {
         uid: 1,
         gid: 1,
         pid: 1,
+    };
+    const WRITER: Writer = Writer {
+        caller: CALLER,
+        entry: EntryPoint::Main,
     };
 
     fn setup(config: &[(&str, &str)]) -> (tempfile::TempDir, StateDir) {
@@ -1061,7 +1065,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![Input::Write {
                     path: RepoPath::new(name).unwrap(),
                     backing,
@@ -2246,7 +2250,10 @@ mod tests {
         fs::write(&backing, name).unwrap();
         rec.record(
             Trigger::Close,
-            caller,
+            Writer {
+                caller,
+                entry: EntryPoint::Main,
+            },
             vec![Input::Write {
                 path: RepoPath::new(name).unwrap(),
                 backing,

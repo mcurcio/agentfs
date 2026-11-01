@@ -227,7 +227,7 @@ mod tests {
     use crate::history::{checkpoint_from_message, inbox_from_message, seq_from_message};
     use crate::identity::Context;
     use crate::paths::RepoPath;
-    use crate::record::{Operation, OperationKind, Trigger};
+    use crate::record::{EntryPoint, Operation, OperationKind, Trigger, Writer};
     use crate::telemetry::Telemetry;
     use crate::volume::{self, Input, Recorder, StateDir};
 
@@ -235,6 +235,10 @@ mod tests {
         uid: 7,
         gid: 7,
         pid: 7,
+    };
+    const WRITER: Writer = Writer {
+        caller: CALLER,
+        entry: EntryPoint::Main,
     };
 
     struct Fixture {
@@ -265,7 +269,7 @@ mod tests {
             self.rec
                 .record(
                     Trigger::Close,
-                    CALLER,
+                    WRITER,
                     vec![Input::Write {
                         path: RepoPath::new(name).unwrap(),
                         backing,

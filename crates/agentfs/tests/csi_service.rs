@@ -368,7 +368,7 @@ async fn the_release_scan_commits_the_journal_and_pushes_to_a_remote_added_later
     use agentfs_core::events::NullSink;
     use agentfs_core::identity::Context;
     use agentfs_core::paths::RepoPath;
-    use agentfs_core::record::{Caller, Trigger};
+    use agentfs_core::record::{Caller, Trigger, Writer};
     use agentfs_core::telemetry::Telemetry;
     use agentfs_core::volume::{self, Input, StateDir};
 
@@ -410,11 +410,11 @@ async fn the_release_scan_commits_the_journal_and_pushes_to_a_remote_added_later
         recorder
             .record(
                 Trigger::Symlink,
-                Caller {
+                Writer::agentfs(Caller {
                     uid: 0,
                     gid: 0,
                     pid: 1,
-                },
+                }),
                 vec![Input::Symlink {
                     path: RepoPath::new("link").unwrap(),
                     target: "promised".into(),

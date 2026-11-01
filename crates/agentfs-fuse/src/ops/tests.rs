@@ -14,6 +14,18 @@ use agentfs_core::volume::{self, Committer, StateDir};
 
 use super::*;
 use crate::creds::Supplementary;
+use agentfs_core::record::SandboxId;
+
+/// The main mount's entry point, as its session stamps it.
+static MAIN: EntryPoint = EntryPoint::Main;
+
+/// `caller` through the main mount.
+fn main(caller: Caller) -> Writer {
+    Writer {
+        caller,
+        entry: EntryPoint::Main,
+    }
+}
 
 const C: Caller = Caller {
     uid: 1000,
@@ -141,7 +153,7 @@ impl Fx {
     fn mkdir(&self, path: &str) -> u64 {
         let (parent, name) = self.split(path);
         self.ops
-            .mkdir(parent, name.as_bytes(), 0o755, Actor::of_process(C))
+            .mkdir(parent, name.as_bytes(), 0o755, Actor::of_process(C, &MAIN))
             .unwrap()
             .id
     }
@@ -155,7 +167,7 @@ impl Fx {
                 name.as_bytes(),
                 0o100644,
                 O_WRONLY | 0o100,
-                Actor::of_process(C),
+                Actor::of_process(C, &MAIN),
             )
             .unwrap();
         (entry.id, fh)
@@ -163,21 +175,24 @@ impl Fx {
 
     fn open(&self, path: &str, flags: i32) -> u64 {
         let id = self.id(path);
-        self.ops.open(id, flags, Actor::of_process(C)).unwrap().0
+        self.ops
+            .open(id, flags, Actor::of_process(C, &MAIN))
+            .unwrap()
+            .0
     }
 
     /// create, write, close (flush and release).
     fn put(&self, path: &str, content: &str) {
         let (_, fh) = self.create(path);
         self.ops
-            .write(fh, 0, content.as_bytes(), Actor::of_process(C))
+            .write(fh, 0, content.as_bytes(), Actor::of_process(C, &MAIN))
             .unwrap();
-        self.ops.flush(fh, Actor::of_process(C)).unwrap();
+        self.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
         self.ops.release(fh).unwrap();
     }
 
     fn close(&self, fh: u64) {
-        self.ops.flush(fh, Actor::of_process(C)).unwrap();
+        self.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
         self.ops.release(fh).unwrap();
     }
 
@@ -190,7 +205,7 @@ impl Fx {
             p2,
             n2.as_bytes(),
             flags,
-            Actor::of_process(C),
+            Actor::of_process(C, &MAIN),
         )
     }
 
@@ -217,11 +232,13 @@ fn map(items: &[(&str, Item)]) -> BTreeMap<String, Item> {
 fn create_write_close_records_once() {
     let fx = Fx::new();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"hello", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     assert_eq!(fx.backlog(), 1);
     // A second close with nothing new records nothing.
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     assert_eq!(fx.backlog(), 1);
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.backlog(), 1, "release: unchanged since the flush");
@@ -251,7 +268,9 @@ fn append_truncate_and_o_trunc() {
     let fx = Fx::new();
     fx.put("f", "one");
     let fh = fx.open("f", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 3, b"two", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 3, b"two", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("f", file("onetwo"))]));
 
@@ -261,7 +280,9 @@ fn append_truncate_and_o_trunc() {
         size: Some(3),
         ..SetAttr::default()
     };
-    fx.ops.setattr(id, &set, Actor::of_process(C)).unwrap();
+    fx.ops
+        .setattr(id, &set, Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(fx.history(), map(&[("f", file("one"))]));
 
     // ftruncate on an open handle.
@@ -271,7 +292,9 @@ fn append_truncate_and_o_trunc() {
         fh: Some(fh),
         ..SetAttr::default()
     };
-    fx.ops.setattr(id, &set, Actor::of_process(C)).unwrap();
+    fx.ops
+        .setattr(id, &set, Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(fx.backlog(), 1);
     fx.close(fh);
     assert_eq!(fx.backlog(), 1, "nothing changed after the truncate");
@@ -279,7 +302,9 @@ fn append_truncate_and_o_trunc() {
 
     // `>` on an existing file: O_TRUNC at open, one record at close.
     let fh = fx.open("f", O_WRONLY | O_TRUNC);
-    fx.ops.write(fh, 0, b"new", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"new", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     assert_eq!(fx.backlog(), 1);
     assert_eq!(fx.history(), map(&[("f", file("new"))]));
@@ -297,7 +322,7 @@ fn same_size_rewrites_are_caught_by_the_racy_rule() {
     for content in ["bbb", "ccc", "ddd"] {
         let fh = fx.open("f", O_WRONLY);
         fx.ops
-            .write(fh, 0, content.as_bytes(), Actor::of_process(C))
+            .write(fh, 0, content.as_bytes(), Actor::of_process(C, &MAIN))
             .unwrap();
         fx.close(fh);
         assert_eq!(fx.history(), map(&[("f", file(content))]), "{content}");
@@ -337,8 +362,10 @@ fn write_behind(fx: &Fx, path: &str, content: &str) {
 fn a_racy_close_is_not_recorded_again_at_release() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"hello", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     assert_eq!(fx.backlog(), 1, "flush records the close");
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.backlog(), 1, "release proves the bytes recorded");
@@ -357,8 +384,10 @@ fn a_proven_racy_skip_clears_racy_once_the_window_passed() {
         chunk: RENAME_CHUNK,
     });
     let (id, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"hello", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     assert_eq!(fx.backlog(), 1);
     let racy = |fx: &Fx| {
         let table = fx.ops.table();
@@ -367,7 +396,7 @@ fn a_proven_racy_skip_clears_racy_once_the_window_passed() {
     };
     assert_eq!(racy(&fx), (true, true), "recorded within the window");
     std::thread::sleep(std::time::Duration::from_nanos(3 * TICK as u64));
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     assert_eq!(fx.backlog(), 1, "proven unchanged: skipped");
     assert_eq!(racy(&fx), (false, false), "and no longer racy");
     fx.ops.release(fh).unwrap();
@@ -382,8 +411,10 @@ fn a_proven_racy_skip_clears_racy_once_the_window_passed() {
 fn a_same_tick_write_after_a_racy_close_is_recorded_at_release() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"hello", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     let before = fs::metadata(fx.backing().join("a")).unwrap();
     write_behind(&fx, "a", "jello");
     let after = fs::metadata(fx.backing().join("a")).unwrap();
@@ -399,12 +430,14 @@ fn a_same_tick_write_after_a_racy_close_is_recorded_at_release() {
 fn a_same_tick_write_is_recorded_at_the_next_close() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"hello", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     assert_eq!(fx.backlog(), 1, "an unchanged racy close records nothing");
     write_behind(&fx, "a", "jello");
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     assert_eq!(fx.backlog(), 2);
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.backlog(), 2);
@@ -420,9 +453,11 @@ fn a_same_tick_write_is_recorded_at_the_next_close() {
 fn release_records_when_the_pinned_copy_is_no_longer_last() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
-    fx.ops.boundary().queue_repair([b"a".to_vec()], C);
+    fx.ops
+        .write(fh, 0, b"hello", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
+    fx.ops.boundary().queue_repair([b"a".to_vec()], main(C));
     fx.ops.sweep(false);
     assert_eq!(fx.backlog(), 3, "the repair, then the open file again");
     fx.ops.release(fh).unwrap();
@@ -435,15 +470,19 @@ fn release_records_when_the_pinned_copy_is_no_longer_last() {
 fn a_commit_between_close_and_release_does_not_lose_the_pin() {
     let fx = coarse_clock();
     let (_, fh) = fx.create("a");
-    fx.ops.write(fh, 0, b"hello", Actor::of_process(C)).unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"hello", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     assert_eq!(fx.history(), map(&[("a", file("hello"))]));
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.backlog(), 0, "nothing recorded again");
     // And a same-tick write after a commit is still caught.
     let fh = fx.open("a", O_WRONLY);
-    fx.ops.write(fh, 0, b"hallo", Actor::of_process(C)).unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"hallo", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     fx.history();
     write_behind(&fx, "a", "jallo");
     fx.ops.release(fh).unwrap();
@@ -461,20 +500,20 @@ fn exec_bit_and_other_metadata() {
         ..SetAttr::default()
     };
     fx.ops
-        .setattr(id, &chmod(0o755), Actor::of_process(C))
+        .setattr(id, &chmod(0o755), Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(fx.history(), map(&[("s", Item::Exec("#!/bin/sh".into()))]));
     // Other bits: passed through, not recorded.
     fx.ops
-        .setattr(id, &chmod(0o700), Actor::of_process(C))
+        .setattr(id, &chmod(0o700), Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(fx.backlog(), 0);
     fx.ops
-        .setattr(id, &chmod(0o600), Actor::of_process(C))
+        .setattr(id, &chmod(0o600), Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(fx.history(), map(&[("s", file("#!/bin/sh"))]));
     fx.ops
-        .setattr(id, &chmod(0o400), Actor::of_process(C))
+        .setattr(id, &chmod(0o400), Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(fx.backlog(), 0);
     let mode = fs::metadata(fx.backing().join("s"))
@@ -490,14 +529,19 @@ fn exec_bit_and_other_metadata() {
         gid: Some(me.gid()),
         ..SetAttr::default()
     };
-    fx.ops.setattr(id, &set, Actor::of_process(C)).unwrap();
+    fx.ops
+        .setattr(id, &set, Actor::of_process(C, &MAIN))
+        .unwrap();
     let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
     let set = SetAttr {
         mtime: Some(TimeOrNow::SpecificTime(when)),
         atime: Some(TimeOrNow::Now),
         ..SetAttr::default()
     };
-    let attr = fx.ops.setattr(id, &set, Actor::of_process(C)).unwrap();
+    let attr = fx
+        .ops
+        .setattr(id, &set, Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(attr.mtime, when);
     assert_eq!(
         fs::metadata(fx.backing().join("s")).unwrap().mtime(),
@@ -531,7 +575,9 @@ fn directory_renames_move_every_file() {
     fx.put("d/x", "x");
     fx.put("d/e/y", "y");
     let (p, _) = fx.split("d/e/y");
-    fx.ops.symlink(p, b"l", b"y", Actor::of_process(C)).unwrap();
+    fx.ops
+        .symlink(p, b"l", b"y", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.rename("d", "moved", 0).unwrap();
     assert_eq!(
         fx.history(),
@@ -543,7 +589,9 @@ fn directory_renames_move_every_file() {
     );
     // Paths of open nodes follow the rename.
     let fh = fx.open("moved/x", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 1, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 1, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     assert_eq!(fx.history()["moved/x"], file("x2"));
 }
@@ -599,7 +647,9 @@ fn a_write_in_flight_across_a_directory_rename_lands_at_the_new_path() {
     fx.put("d/x", "1");
     fx.history();
     let fh = fx.open("d/x", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 1, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 1, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.rename("d", "m", 0).unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("m/x", file("12"))]));
@@ -663,7 +713,9 @@ fn rename_flags() {
     );
     // A rename between two names of one inode changes nothing.
     let id = fx.id("a");
-    fx.ops.link(id, ROOT, b"a2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .link(id, ROOT, b"a2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.history();
     fx.rename("a", "a2", 0).unwrap();
     assert!(fx.backing().join("a").exists());
@@ -680,15 +732,19 @@ fn unlink_and_rm_r() {
     fx.history();
     // rm -r: depth first.
     let e = fx.id("d/e");
-    fx.ops.unlink(e, b"f", Actor::of_process(C)).unwrap();
+    fx.ops.unlink(e, b"f", Actor::of_process(C, &MAIN)).unwrap();
     let d = fx.id("d");
-    fx.ops.rmdir(d, b"e", Actor::of_process(C)).unwrap();
-    fx.ops.rmdir(ROOT, b"d", Actor::of_process(C)).unwrap();
+    fx.ops.rmdir(d, b"e", Actor::of_process(C, &MAIN)).unwrap();
+    fx.ops
+        .rmdir(ROOT, b"d", Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(fx.history(), map(&[("keep", file("k"))]));
-    fx.ops.unlink(ROOT, b"keep", Actor::of_process(C)).unwrap();
+    fx.ops
+        .unlink(ROOT, b"keep", Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(fx.history(), map(&[]));
     assert_eq!(
-        fx.ops.unlink(ROOT, b"keep", Actor::of_process(C)),
+        fx.ops.unlink(ROOT, b"keep", Actor::of_process(C, &MAIN)),
         Err(Errno::ENOENT)
     );
 }
@@ -698,12 +754,17 @@ fn hard_links() {
     let fx = Fx::new();
     fx.put("a", "1");
     let id = fx.id("a");
-    let entry = fx.ops.link(id, ROOT, b"b", Actor::of_process(C)).unwrap();
+    let entry = fx
+        .ops
+        .link(id, ROOT, b"b", Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(entry.id, id, "one inode, one node, one st_ino");
     assert_eq!(fx.history(), map(&[("a", file("1")), ("b", file("1"))]));
     // A write through one name is recorded at both.
     let fh = fx.open("b", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 1, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 1, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("a", file("12")), ("b", file("12"))]));
 }
@@ -713,7 +774,7 @@ fn symlinks() {
     let fx = Fx::new();
     let entry = fx
         .ops
-        .symlink(ROOT, b"l", b"some/target", Actor::of_process(C))
+        .symlink(ROOT, b"l", b"some/target", Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(entry.attr.kind, FileType::Symlink);
     assert_eq!(fx.ops.readlink(entry.id).unwrap(), b"some/target");
@@ -728,7 +789,7 @@ fn symlinks() {
     };
     assert!(
         fx.ops
-            .setattr(entry.id, &set, Actor::of_process(C))
+            .setattr(entry.id, &set, Actor::of_process(C, &MAIN))
             .is_err()
     );
 }
@@ -740,8 +801,12 @@ fn unlink_of_an_open_file() {
     fx.history();
     // exec 3>>f; rm f; echo y >&3; exec 3>&-
     let fh = fx.open("f", O_WRONLY | O_APPEND);
-    fx.ops.unlink(ROOT, b"f", Actor::of_process(C)).unwrap();
-    fx.ops.write(fh, 1, b"y", Actor::of_process(C)).unwrap();
+    fx.ops
+        .unlink(ROOT, b"f", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops
+        .write(fh, 1, b"y", Actor::of_process(C, &MAIN))
+        .unwrap();
     // Still answerable through the handle.
     let id = fx.ops.handle(fh).unwrap().node;
     assert_eq!(fx.ops.getattr(id, Some(fh)).unwrap().size, 2);
@@ -758,7 +823,9 @@ fn rename_over_an_open_file() {
     let fh = fx.open("f", O_WRONLY | O_APPEND);
     fx.rename("new", "f", 0).unwrap();
     // The replaced inode has no name: its late write is not recorded.
-    fx.ops.write(fh, 3, b"!", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 3, b"!", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("f", file("fresh"))]));
 }
@@ -768,12 +835,14 @@ fn log_rotation_with_the_writer_open() {
     let fx = Fx::new();
     fx.put("app.log", "a\n");
     let fh = fx.open("app.log", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 2, b"b\n", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 2, b"b\n", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.rename("app.log", "app.log.1", 0).unwrap();
     fx.put("app.log", "new\n");
     // The writer still holds the rotated file.
     fx.ops
-        .write(fh, 4, b"late\n", Actor::of_process(C))
+        .write(fh, 4, b"late\n", Actor::of_process(C, &MAIN))
         .unwrap();
     fx.close(fh);
     assert_eq!(
@@ -798,7 +867,9 @@ fn git_internals_are_never_recorded() {
     fx.put("sub/.git/config", "[core]\n\trepositoryformatversion = 0\n");
     fx.rename(".git/HEAD", ".git/HEAD2", 0).unwrap();
     let git = fx.id(".git");
-    fx.ops.unlink(git, b"HEAD2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .unlink(git, b"HEAD2", Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(fx.history(), map(&[("README", file("r"))]));
     assert!(fx.refused().is_empty(), "{:?}", fx.refused());
 
@@ -814,16 +885,24 @@ fn non_utf8_names_are_refused_but_work() {
     let fx = Fx::new();
     let (entry, fh, _) = fx
         .ops
-        .create(ROOT, b"bad\xff", 0o100644, O_WRONLY, Actor::of_process(C))
+        .create(
+            ROOT,
+            b"bad\xff",
+            0o100644,
+            O_WRONLY,
+            Actor::of_process(C, &MAIN),
+        )
         .unwrap();
-    fx.ops.write(fh, 0, b"data", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"data", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     assert_eq!(fx.refused().len(), 1, "{:?}", fx.refused());
     assert_eq!(fx.history(), map(&[]));
     assert_eq!(fx.ops.getattr(entry.id, None).unwrap().size, 4);
     // A symlink whose target is not UTF-8 is refused too.
     fx.ops
-        .symlink(ROOT, b"l", b"\xfe", Actor::of_process(C))
+        .symlink(ROOT, b"l", b"\xfe", Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(fx.refused().len(), 2);
 }
@@ -846,9 +925,14 @@ fn record_failures_return_eio_and_are_repaired() {
     };
 
     let fh = fx.open("keep", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 1, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 1, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     lock(0o500);
-    assert_eq!(fx.ops.flush(fh, Actor::of_process(C)), Err(Errno::EIO));
+    assert_eq!(
+        fx.ops.flush(fh, Actor::of_process(C, &MAIN)),
+        Err(Errno::EIO)
+    );
     assert!(
         fx.sink
             .snapshot()
@@ -857,13 +941,13 @@ fn record_failures_return_eio_and_are_repaired() {
     );
     lock(0o700);
     // Still dirty: the next close records it.
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.history()["keep"], file("k2"));
 
     // A namespace operation that already happened is repaired by the sweep.
     fx.ops
-        .unlink(ROOT, b"gone", Actor::of_process(C))
+        .unlink(ROOT, b"gone", Actor::of_process(C, &MAIN))
         .unwrap_or(());
     fx.put("gone", "again");
     fx.history();
@@ -871,7 +955,7 @@ fn record_failures_return_eio_and_are_repaired() {
     // every write, so even a removal fails to journal.
     fs::set_permissions(&pending, fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(
-        fx.ops.unlink(ROOT, b"gone", Actor::of_process(C)),
+        fx.ops.unlink(ROOT, b"gone", Actor::of_process(C, &MAIN)),
         Err(Errno::EIO)
     );
     assert!(!fx.backing().join("gone").exists(), "the unlink happened");
@@ -890,7 +974,9 @@ fn release_and_sweep_backstops() {
     // A write that no close follows (a shared mapping, say): recorded
     // at RELEASE.
     let fh = fx.open("m", O_RDWR);
-    fx.ops.write(fh, 0, b"12", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"12", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.history()["m"], file("12"));
     let triggers = fx.committer.history().head().unwrap().unwrap();
@@ -905,7 +991,9 @@ fn release_and_sweep_backstops() {
 
     // A file held open and changed: recorded by the sweep.
     let fh = fx.open("m", O_WRONLY | O_APPEND);
-    fx.ops.write(fh, 2, b"345", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 2, b"345", Actor::of_process(C, &MAIN))
+        .unwrap();
     let report = fx.ops.sweep(false);
     assert_eq!(report.recorded, 1);
     assert_eq!(fx.history()["m"], file("12345"));
@@ -957,7 +1045,9 @@ fn stale_backing_inodes_are_detected() {
     fs::write(fx.backing().join("f"), "other").unwrap();
     assert_eq!(fx.ops.getattr(id, None), Err(estale()));
     assert_eq!(
-        fx.ops.open(id, O_RDONLY, Actor::of_process(C)).map(|_| ()),
+        fx.ops
+            .open(id, O_RDONLY, Actor::of_process(C, &MAIN))
+            .map(|_| ()),
         Err(estale())
     );
 }
@@ -974,7 +1064,9 @@ fn names_another_process_moved_away_are_dropped_at_lookup() {
     // The old name is gone from the node: it opens, and records, by the
     // new one.
     let fh = fx.open("new", O_WRONLY | O_TRUNC);
-    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     assert_eq!(fx.history().get("new"), Some(&file("2")));
     // A real hard link keeps both names.
@@ -982,7 +1074,9 @@ fn names_another_process_moved_away_are_dropped_at_lookup() {
     assert_eq!(fx.id("link"), id);
     assert_eq!(fx.id("new"), id);
     let fh = fx.open("new", O_WRONLY | O_TRUNC);
-    fx.ops.write(fh, 0, b"3", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"3", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     let history = fx.history();
     assert_eq!(history.get("new"), Some(&file("3")), "{history:?}");
@@ -997,7 +1091,9 @@ fn an_open_file_another_process_renamed_is_recorded_at_its_new_name() {
     fx.put("old", "1");
     let fh = fx.open("old", O_WRONLY | O_TRUNC);
     fs::rename(fx.backing().join("old"), fx.backing().join("new")).unwrap();
-    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     let history = fx.history();
     assert_eq!(history.get("old"), Some(&file("1")), "{history:?}");
@@ -1007,7 +1103,9 @@ fn an_open_file_another_process_renamed_is_recorded_at_its_new_name() {
     fx.put("d/f", "1");
     let fh = fx.open("d/f", O_WRONLY | O_TRUNC);
     fs::rename(fx.backing().join("d"), fx.backing().join("e")).unwrap();
-    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     let history = fx.history();
     assert_eq!(history.get("d/f"), Some(&file("1")), "{history:?}");
@@ -1016,7 +1114,9 @@ fn an_open_file_another_process_renamed_is_recorded_at_its_new_name() {
     fx.put("s", "1");
     let fh = fx.open("s", O_WRONLY | O_TRUNC);
     fs::rename(fx.backing().join("s"), fx.backing().join("t")).unwrap();
-    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(fx.ops.sweep(false).recorded, 1);
     let history = fx.history();
     assert_eq!(history.get("s"), Some(&file("1")), "{history:?}");
@@ -1032,7 +1132,9 @@ fn an_open_file_another_process_removed_is_recorded_nowhere() {
     fx.put("x", "1");
     let fh = fx.open("x", O_WRONLY | O_TRUNC);
     fs::remove_file(fx.backing().join("x")).unwrap();
-    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     assert_eq!(fx.history(), map(&[("x", file("1"))]));
     // Removed, and the name reused for another file.
@@ -1040,7 +1142,9 @@ fn an_open_file_another_process_removed_is_recorded_nowhere() {
     let fh = fx.open("y", O_WRONLY | O_TRUNC);
     fs::remove_file(fx.backing().join("y")).unwrap();
     fs::write(fx.backing().join("y"), "other").unwrap();
-    fx.ops.write(fh, 0, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(fh, 0, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(fh);
     assert_eq!(fx.history().get("y"), Some(&file("1")));
 }
@@ -1055,7 +1159,11 @@ fn symlinked_components_never_escape() {
     // Swap the directory for a symlink to outside the tree.
     fs::rename(fx.backing().join("d"), fx.backing().join("d.real")).unwrap();
     std::os::unix::fs::symlink(fx.dir.path(), fx.backing().join("d")).unwrap();
-    assert!(fx.ops.open(f, O_RDONLY, Actor::of_process(C)).is_err());
+    assert!(
+        fx.ops
+            .open(f, O_RDONLY, Actor::of_process(C, &MAIN))
+            .is_err()
+    );
     // And a lookup through it sees a symlink, not a directory.
     let d = fx.ops.lookup(ROOT, b"d").unwrap();
     assert_eq!(d.attr.kind, FileType::Symlink);
@@ -1124,7 +1232,7 @@ fn xattrs_pass_through() {
     assert_eq!(fx.backlog(), 0);
     let l = fx
         .ops
-        .symlink(ROOT, b"l", b"f", Actor::of_process(C))
+        .symlink(ROOT, b"l", b"f", Actor::of_process(C, &MAIN))
         .unwrap();
     assert!(fx.ops.getxattr(l.id, b"user.x", 0).is_err());
 }
@@ -1136,13 +1244,19 @@ fn created_objects_keep_the_requested_mode() {
     let (parent, _) = fx.split("x");
     let (entry, fh, _) = fx
         .ops
-        .create(parent, b"g", 0o100664, O_WRONLY, Actor::of_process(C))
+        .create(
+            parent,
+            b"g",
+            0o100664,
+            O_WRONLY,
+            Actor::of_process(C, &MAIN),
+        )
         .unwrap();
     fx.close(fh);
     assert_eq!(u32::from(entry.attr.perm), 0o664);
     let d = fx
         .ops
-        .mkdir(ROOT, b"dir", 0o775, Actor::of_process(C))
+        .mkdir(ROOT, b"dir", 0o775, Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(
         fs::metadata(fx.backing().join("dir"))
@@ -1171,10 +1285,10 @@ fn created_objects_keep_the_requested_mode() {
 fn mknod_regular_files_are_recorded_fifos_are_not() {
     let fx = Fx::new();
     fx.ops
-        .mknod(ROOT, b"reg", 0o100644, 0, Actor::of_process(C))
+        .mknod(ROOT, b"reg", 0o100644, 0, Actor::of_process(C, &MAIN))
         .unwrap();
     fx.ops
-        .mknod(ROOT, b"fifo", 0o010644, 0, Actor::of_process(C))
+        .mknod(ROOT, b"fifo", 0o010644, 0, Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(fx.history(), map(&[("reg", file(""))]));
     // Opening a FIFO's attributes still works.
@@ -1234,7 +1348,9 @@ fn final_sweep_covers_read_only_handles_of_armed_inodes() {
     fx.history();
     let w = fx.open("f", O_WRONLY | O_APPEND);
     let r = fx.open("f", O_RDONLY);
-    fx.ops.write(w, 1, b"2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(w, 1, b"2", Actor::of_process(C, &MAIN))
+        .unwrap();
     // The writer's handle goes without a flush; the reader stays open.
     let id = fx.ops.handle(w).unwrap().node;
     {
@@ -1290,11 +1406,11 @@ fn a_new_objects_name_swapped_for_a_symlink_or_link_is_never_followed() {
     assert_eq!(mode_of_path(&outside), 0o600);
     // The real thing still works.
     fx.ops
-        .mkdir(ROOT, b"d", 0o1777, Actor::of_process(C))
+        .mkdir(ROOT, b"d", 0o1777, Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(mode_of_path(&fx.backing().join("d")), 0o1777);
     fx.ops
-        .mknod(ROOT, b"n", 0o100640, 0, Actor::of_process(C))
+        .mknod(ROOT, b"n", 0o100640, 0, Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(mode_of_path(&fx.backing().join("n")), 0o640);
 }
@@ -1326,8 +1442,8 @@ fn mkdir_and_mknod_race_a_symlink_swap_without_following_it() {
     };
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(2) {
-        let _ = ops.mkdir(ROOT, b"x", 0o1777, Actor::of_process(C));
-        let _ = ops.mknod(ROOT, b"y", 0o104777, 0, Actor::of_process(C));
+        let _ = ops.mkdir(ROOT, b"x", 0o1777, Actor::of_process(C, &MAIN));
+        let _ = ops.mknod(ROOT, b"y", 0o104777, 0, Actor::of_process(C, &MAIN));
         assert_eq!(
             mode_of_path(&outside),
             0o600,
@@ -1351,9 +1467,9 @@ fn getattr_never_fails_while_an_ancestor_is_renamed() {
         let stop = stop.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                ops.rename(ROOT, b"d", ROOT, b"d2", 0, Actor::of_process(C))
+                ops.rename(ROOT, b"d", ROOT, b"d2", 0, Actor::of_process(C, &MAIN))
                     .unwrap();
-                ops.rename(ROOT, b"d2", ROOT, b"d", 0, Actor::of_process(C))
+                ops.rename(ROOT, b"d2", ROOT, b"d", 0, Actor::of_process(C, &MAIN))
                     .unwrap();
             }
         })
@@ -1392,7 +1508,13 @@ fn create_over_an_existing_file_does_not_take_it_over() {
     };
     let (_, fh, _) = fx
         .ops
-        .create(ROOT, b"victim", 0o666, O_WRONLY, Actor::of_process(owner))
+        .create(
+            ROOT,
+            b"victim",
+            0o666,
+            O_WRONLY,
+            Actor::of_process(owner, &MAIN),
+        )
         .unwrap();
     assert_eq!(mode_of_path(&victim), 0o600, "mode rewritten");
     // Not marked new: closing it unchanged records nothing.
@@ -1407,7 +1529,7 @@ fn create_over_an_existing_file_does_not_take_it_over() {
                 b"victim",
                 0o666,
                 O_WRONLY | excl,
-                Actor::of_process(owner)
+                Actor::of_process(owner, &MAIN)
             )
             .err(),
         Some(Errno::EEXIST)
@@ -1420,7 +1542,13 @@ fn create_over_an_existing_file_does_not_take_it_over() {
     };
     assert_eq!(
         fx.ops
-            .create(ROOT, b"victim", 0o666, O_RDWR, Actor::of_process(other))
+            .create(
+                ROOT,
+                b"victim",
+                0o666,
+                O_RDWR,
+                Actor::of_process(other, &MAIN)
+            )
             .err(),
         Some(Errno::EACCES)
     );
@@ -1435,7 +1563,7 @@ fn create_over_an_existing_file_does_not_take_it_over() {
     .unwrap();
     assert_eq!(
         fx.ops
-            .create(ROOT, b"fifo", 0o666, O_RDONLY, Actor::of_process(C))
+            .create(ROOT, b"fifo", 0o666, O_RDONLY, Actor::of_process(C, &MAIN))
             .err(),
         Some(Errno::EEXIST)
     );
@@ -1456,7 +1584,7 @@ fn a_dot_git_that_is_no_repository_raises_path_refused_once() {
     assert_eq!(fx.refused(), ["notes/.git/report.txt", "plain/.git"]);
     // Removing such paths raises nothing.
     fx.ops
-        .unlink(fx.id("plain"), b".git", Actor::of_process(C))
+        .unlink(fx.id("plain"), b".git", Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(fx.refused().len(), 2);
 }
@@ -1472,7 +1600,9 @@ fn the_repair_queue_survives_the_process() {
     // An unlink whose record failed: the file is gone from the tree, the
     // path is queued, and the process then ends without repairing it.
     fs::remove_file(fx.backing().join("big.log")).unwrap();
-    fx.ops.boundary().queue_repair([b"big.log".to_vec()], C);
+    fx.ops
+        .boundary()
+        .queue_repair([b"big.log".to_vec()], main(C));
     assert!(store.exists());
     let Fx { dir, ops, .. } = fx;
     drop(ops);
@@ -1551,10 +1681,10 @@ fn an_inherited_repair_keeps_the_pod_that_failed_it() {
 #[test]
 fn a_repair_never_drops_a_path_queued_again_meanwhile() {
     let fx = Fx::new();
-    fx.ops.boundary().queue_repair([b"a".to_vec()], C);
+    fx.ops.boundary().queue_repair([b"a".to_vec()], main(C));
     let listed = fx.ops.boundary().repairs();
     // Queued again (a newer failure) before the older repair finishes.
-    fx.ops.boundary().queue_repair([b"a".to_vec()], C);
+    fx.ops.boundary().queue_repair([b"a".to_vec()], main(C));
     fx.ops.boundary().repaired(&listed);
     assert_eq!(fx.ops.boundary().pending_repairs(), 1);
     let listed = fx.ops.boundary().repairs();
@@ -1615,9 +1745,9 @@ fn records_by_a_restore_actor_belong_to_the_operation() {
     // A write (close), a chmod +x (setattr) and an unlink by the actor.
     let fh = fx.open("a", O_WRONLY | O_TRUNC);
     fx.ops
-        .write(fh, 0, b"restored", Actor::of_process(actor))
+        .write(fh, 0, b"restored", Actor::of_process(actor, &MAIN))
         .unwrap();
-    fx.ops.flush(fh, Actor::of_process(actor)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(actor, &MAIN)).unwrap();
     fx.ops.release(fh).unwrap();
     let id = fx.id("a");
     fx.ops
@@ -1627,10 +1757,12 @@ fn records_by_a_restore_actor_belong_to_the_operation() {
                 mode: Some(0o100755),
                 ..SetAttr::default()
             },
-            Actor::of_process(actor),
+            Actor::of_process(actor, &MAIN),
         )
         .unwrap();
-    fx.ops.unlink(ROOT, b"b", Actor::of_process(actor)).unwrap();
+    fx.ops
+        .unlink(ROOT, b"b", Actor::of_process(actor, &MAIN))
+        .unwrap();
     // Someone else, meanwhile.
     fx.put("c", "3");
     let last = guard.finish();
@@ -1644,14 +1776,15 @@ fn records_by_a_restore_actor_belong_to_the_operation() {
     assert_eq!(ours.len(), 3, "{journal:#?}");
     for r in &ours {
         assert_eq!(r.draft.trigger, Trigger::Restore);
-        assert_eq!(r.draft.caller, operator);
+        // An operation's records are agentfs's own.
+        assert_eq!(r.draft.writer, Writer::agentfs(operator));
     }
     assert_eq!(last, Some(ours[2].seq));
     let theirs = journal
         .iter()
         .find(|r| r.draft.operation.is_none())
         .unwrap();
-    assert_eq!(theirs.draft.caller, C);
+    assert_eq!(theirs.draft.writer, main(C));
     assert_eq!(
         fx.history(),
         map(&[("a", Item::Exec("restored".into())), ("c", file("3"))])
@@ -1705,8 +1838,12 @@ fn fsync_class_files_are_captured_whole_at_fsync_at_most_once_per_interval() {
     let fx = Fx::with_attributes(SQLITE);
     let (_, db) = fx.create("s.db");
     let (_, wal) = fx.create("s.db-wal");
-    fx.ops.write(db, 0, b"db1", Actor::of_process(C)).unwrap();
-    fx.ops.write(wal, 0, b"wal1", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"db1", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops
+        .write(wal, 0, b"wal1", Actor::of_process(C, &MAIN))
+        .unwrap();
     // Nothing is recorded per file.
     assert_eq!(fx.backlog(), 0);
     fx.ops.fsync(wal, false).unwrap();
@@ -1719,7 +1856,9 @@ fn fsync_class_files_are_captured_whole_at_fsync_at_most_once_per_interval() {
         map(&[("s.db", file("db1")), ("s.db-wal", file("wal1"))])
     );
     // A second fsync within the interval records nothing...
-    fx.ops.write(db, 0, b"db2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"db2", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.ops.fsync(db, true).unwrap();
     assert_eq!(fx.backlog(), 0);
     // ...nor does the timer before the interval has passed...
@@ -1755,7 +1894,7 @@ fn close_captures_and_shm_is_never_recorded() {
     );
     // An unlink of a member is captured with the group, not alone.
     fx.ops
-        .unlink(ROOT, b"s.db-journal", Actor::of_process(C))
+        .unlink(ROOT, b"s.db-journal", Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(fx.backlog(), 0);
     assert_eq!(fx.later(6), 1);
@@ -1771,10 +1910,16 @@ fn class_handles_never_use_passthrough() {
     fx.put("s.db", "v1");
     fx.put("a.txt", "x");
     let id = fx.id("s.db");
-    let (_, h) = fx.ops.open(id, O_RDONLY, Actor::of_process(C)).unwrap();
+    let (_, h) = fx
+        .ops
+        .open(id, O_RDONLY, Actor::of_process(C, &MAIN))
+        .unwrap();
     assert!(h.daemon_only());
     let id = fx.id("a.txt");
-    let (_, h) = fx.ops.open(id, O_RDONLY, Actor::of_process(C)).unwrap();
+    let (_, h) = fx
+        .ops
+        .open(id, O_RDONLY, Actor::of_process(C, &MAIN))
+        .unwrap();
     assert!(!h.daemon_only());
     // Without the class, nothing is daemon-only.
     let fx = Fx::new();
@@ -1782,7 +1927,7 @@ fn class_handles_never_use_passthrough() {
     let id = fx.id("s.db");
     assert!(
         !fx.ops
-            .open(id, O_RDONLY, Actor::of_process(C))
+            .open(id, O_RDONLY, Actor::of_process(C, &MAIN))
             .unwrap()
             .1
             .daemon_only()
@@ -1794,14 +1939,18 @@ fn a_capture_holds_writes_to_every_member() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let fx = Fx::with_attributes(SQLITE);
     let (_, db) = fx.create("s.db");
-    fx.ops.write(db, 0, b"1", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"1", Actor::of_process(C, &MAIN))
+        .unwrap();
     let (_, wal) = fx.create("s.db-wal");
     let group = fx.ops.groups().dirty().pop().unwrap();
     let frozen = group.gate().freeze();
     let done = AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| {
-            fx.ops.write(wal, 0, b"w", Actor::of_process(C)).unwrap();
+            fx.ops
+                .write(wal, 0, b"w", Actor::of_process(C, &MAIN))
+                .unwrap();
             done.store(true, Ordering::SeqCst);
         });
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1817,6 +1966,94 @@ fn a_capture_holds_writes_to_every_member() {
     assert_eq!(
         fx.history(),
         map(&[("s.db", file("1")), ("s.db-wal", file("w"))])
+    );
+}
+
+/// A sandbox session's entry point, `sandbox/x`.
+static SANDBOX_X: std::sync::LazyLock<EntryPoint> =
+    std::sync::LazyLock::new(|| EntryPoint::Sandbox(SandboxId::new("x").unwrap()));
+
+/// Late records (design §9) are the writer's held on the inode or group,
+/// entry point included: never `agentfs`, never `main`.
+#[test]
+fn late_records_keep_their_entry_point() {
+    let sandbox = Actor::of_process(C, &SANDBOX_X);
+    let fx = Fx::new();
+    fx.put("m", "0");
+    fx.history();
+    let id = fx.id("m");
+    // (a) Written, then released with no flush record.
+    let (fh, _) = fx.ops.open(id, O_RDWR, sandbox).unwrap();
+    fx.ops.write(fh, 0, b"12", sandbox).unwrap();
+    fx.ops.release(fh).unwrap();
+    let last = fx.journal().pop().unwrap();
+    assert_eq!(last.draft.trigger, Trigger::Release);
+    assert_eq!(last.draft.writer.entry, *SANDBOX_X);
+    // (b) Swept while open.
+    let (fh, _) = fx.ops.open(id, O_WRONLY | O_APPEND, sandbox).unwrap();
+    fx.ops.write(fh, 2, b"345", sandbox).unwrap();
+    assert_eq!(fx.ops.sweep(false).recorded, 1);
+    let last = fx.journal().pop().unwrap();
+    assert_eq!(last.draft.trigger, Trigger::Sweep);
+    assert_eq!(last.draft.writer.entry, *SANDBOX_X);
+    fx.ops.release(fh).unwrap();
+
+    // (c) An fsync-class member left for the interval timer.
+    let fx = Fx::with_attributes(SQLITE);
+    let (_, db, _) = fx
+        .ops
+        .create(ROOT, b"s.db", 0o644, O_RDWR, sandbox)
+        .unwrap();
+    fx.ops.write(db, 0, b"db1", sandbox).unwrap();
+    assert_eq!(fx.backlog(), 0);
+    assert_eq!(fx.later(6), 1);
+    let last = fx.journal().pop().unwrap();
+    assert_eq!(last.draft.trigger, Trigger::Interval);
+    assert_eq!(last.draft.writer.entry, *SANDBOX_X);
+    fx.ops.release(db).unwrap();
+}
+
+/// No capture holds two entry points (design §8, §9): a change through
+/// another entry point cuts the group first, as the writer it holds.
+#[test]
+fn a_foreign_entry_cuts_a_dirty_group_first() {
+    let fx = Fx::with_attributes(SQLITE);
+    let main = Actor::of_process(C, &MAIN);
+    let sandbox = Actor::of_process(Caller { pid: 9, ..C }, &SANDBOX_X);
+    let (_, db, _) = fx.ops.create(ROOT, b"s.db", 0o644, O_RDWR, main).unwrap();
+    fx.ops.write(db, 0, b"main", main).unwrap();
+    assert_eq!(fx.backlog(), 0, "left for the group's capture");
+    // The sandbox writes another member of the dirty group.
+    let (_, wal, _) = fx
+        .ops
+        .create(ROOT, b"s.db-wal", 0o644, O_RDWR, sandbox)
+        .unwrap();
+    fx.ops.write(wal, 0, b"sandbox", sandbox).unwrap();
+    let journal = fx.journal();
+    assert_eq!(journal.len(), 1, "{journal:#?}");
+    let cut = &journal[0];
+    assert_eq!(cut.draft.trigger, Trigger::Cut);
+    assert_eq!(cut.draft.writer, main.writer());
+    assert!(cut.draft.atomic);
+    // Main's state alone: the sandbox's member did not exist yet.
+    let paths: Vec<&str> = cut
+        .draft
+        .changes
+        .iter()
+        .map(|c| c.path().as_str())
+        .collect();
+    assert_eq!(paths, ["s.db"], "{cut:#?}");
+    // Then the sandbox's own record.
+    assert_eq!(fx.later(6), 1);
+    let journal = fx.journal();
+    assert_eq!(journal.len(), 2, "{journal:#?}");
+    assert_eq!(journal[1].draft.writer, sandbox.writer());
+    assert_eq!(journal[1].draft.trigger, Trigger::Interval);
+    fx.ops.release(db).unwrap();
+    fx.ops.release(wal).unwrap();
+    assert_eq!(
+        fx.history(),
+        map(&[("s.db", file("main")), ("s.db-wal", file("sandbox"))])
     );
 }
 
@@ -1838,7 +2075,7 @@ fn the_last_release_and_unmount_capture_what_changed() {
     // A write no close follows (a mapping, say): captured at release.
     let (_, db) = fx.create("s.db");
     fx.ops
-        .write(db, 0, b"mapped", Actor::of_process(C))
+        .write(db, 0, b"mapped", Actor::of_process(C, &MAIN))
         .unwrap();
     fx.ops.release(db).unwrap();
     assert_eq!(fx.journal().last().unwrap().draft.trigger, Trigger::Release);
@@ -1852,7 +2089,7 @@ fn the_last_release_and_unmount_capture_what_changed() {
                 size: Some(3),
                 ..SetAttr::default()
             },
-            Actor::of_process(C),
+            Actor::of_process(C, &MAIN),
         )
         .unwrap();
     assert_eq!(fx.backlog(), 0);
@@ -1866,9 +2103,11 @@ fn a_member_over_max_size_refuses_the_whole_group() {
     let fx = Fx::with_attributes(&format!("{SQLITE}*.db-wal agentfs.maxSize=4\n"));
     let (_, db) = fx.create("s.db");
     let (_, wal) = fx.create("s.db-wal");
-    fx.ops.write(db, 0, b"db", Actor::of_process(C)).unwrap();
     fx.ops
-        .write(wal, 0, b"0123456789", Actor::of_process(C))
+        .write(db, 0, b"db", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops
+        .write(wal, 0, b"0123456789", Actor::of_process(C, &MAIN))
         .unwrap();
     // A refusal is not a failure: the last close succeeds, nothing is
     // recorded, and the group is clean.
@@ -1910,21 +2149,21 @@ fn a_restore_actor_s_changes_are_captured_whole_at_the_operation_s_end() {
     // The actor removes the journal and rewrites the database, as a
     // restore does, one member at a time.
     fx.ops
-        .unlink(ROOT, b"s.db-journal", Actor::of_process(actor))
+        .unlink(ROOT, b"s.db-journal", Actor::of_process(actor, &MAIN))
         .unwrap();
     let id = fx.id("s.db");
     let (fh, _) = fx
         .ops
-        .open(id, O_WRONLY | O_TRUNC, Actor::of_process(actor))
+        .open(id, O_WRONLY | O_TRUNC, Actor::of_process(actor, &MAIN))
         .unwrap();
     fx.ops
-        .write(fh, 0, b"v0", Actor::of_process(actor))
+        .write(fh, 0, b"v0", Actor::of_process(actor, &MAIN))
         .unwrap();
     // No trigger records the half-restored group: not the timer, not an
     // fsync, not the actor's close or release.
     assert_eq!(fx.later(600), 0);
     fx.ops.fsync(workload, false).unwrap();
-    fx.ops.flush(fh, Actor::of_process(actor)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(actor, &MAIN)).unwrap();
     fx.ops.release(fh).unwrap();
     assert_eq!(fx.journal().len(), records);
     // The operation's end records it whole, as part of the operation.
@@ -1934,7 +2173,7 @@ fn a_restore_actor_s_changes_are_captured_whole_at_the_operation_s_end() {
     assert_eq!(journal.len(), records + 1);
     let last = journal.last().unwrap();
     assert_eq!(last.draft.trigger, Trigger::Restore);
-    assert_eq!(last.draft.caller, operator);
+    assert_eq!(last.draft.writer, Writer::agentfs(operator));
     assert!(last.draft.atomic);
     assert!(last.draft.operation.is_some());
     assert_eq!(fx.history(), map(&[("s.db", file("v0"))]));
@@ -1951,22 +2190,29 @@ fn closing_one_member_while_another_is_open_does_not_capture() {
     // the close must not capture, or the rate is unbounded.
     let fx = Fx::with_attributes(SQLITE);
     let (_, db) = fx.create("s.db");
-    fx.ops.write(db, 0, b"db0", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"db0", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.ops.fsync(db, false).unwrap();
     assert_eq!(fx.journal().len(), 1, "the first fsync captures");
     for i in 1..=5 {
         let (_, journal) = fx.create("s.db-journal");
         fx.ops
-            .write(journal, 0, b"hot", Actor::of_process(C))
+            .write(journal, 0, b"hot", Actor::of_process(C, &MAIN))
             .unwrap();
         fx.ops.fsync(journal, false).unwrap();
         fx.close(journal);
         fx.ops
-            .write(db, 0, format!("db{i}").as_bytes(), Actor::of_process(C))
+            .write(
+                db,
+                0,
+                format!("db{i}").as_bytes(),
+                Actor::of_process(C, &MAIN),
+            )
             .unwrap();
         fx.ops.fsync(db, false).unwrap();
         fx.ops
-            .unlink(ROOT, b"s.db-journal", Actor::of_process(C))
+            .unlink(ROOT, b"s.db-journal", Actor::of_process(C, &MAIN))
             .unwrap();
     }
     // Five transactions inside one interval: still one capture.
@@ -1979,7 +2225,9 @@ fn closing_one_member_while_another_is_open_does_not_capture() {
     assert_eq!(fx.later(6), 1);
     assert_eq!(fx.history(), map(&[("s.db", file("db5"))]));
     // ...and the last handle's close what changed after it.
-    fx.ops.write(db, 0, b"db6", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"db6", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(db);
     assert_eq!(fx.journal().last().unwrap().draft.trigger, Trigger::Close);
     assert_eq!(fx.history(), map(&[("s.db", file("db6"))]));
@@ -1993,7 +2241,9 @@ fn a_failed_fsync_capture_returns_ok_and_leaves_the_group_changed() {
     }
     let fx = Fx::with_attributes(SQLITE);
     let (_, db) = fx.create("s.db");
-    fx.ops.write(db, 0, b"db1", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"db1", Actor::of_process(C, &MAIN))
+        .unwrap();
     let pending = fx.state().pending();
     let mode = fs::metadata(&pending).unwrap().permissions();
     fs::set_permissions(&pending, fs::Permissions::from_mode(0o500)).unwrap();
@@ -2020,18 +2270,26 @@ fn a_database_whose_directory_moved_is_captured_at_its_new_path() {
     let fx = Fx::with_attributes(SQLITE);
     fx.mkdir("d");
     let (_, db) = fx.create("d/s.db");
-    fx.ops.write(db, 0, b"v1", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"v1", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.rename("d", "e", 0).unwrap();
     // Writes through the handle opened before the rename change the group
     // at the new path.
-    fx.ops.write(db, 0, b"v2", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"v2", Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(fx.later(6), 1);
     assert_eq!(fx.history(), map(&[("e/s.db", file("v2"))]));
-    fx.ops.write(db, 0, b"v3", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"v3", Actor::of_process(C, &MAIN))
+        .unwrap();
     assert_eq!(fx.later(12), 1);
     assert_eq!(fx.history(), map(&[("e/s.db", file("v3"))]));
     // The handle counts in its new group: its close is the last one.
-    fx.ops.write(db, 0, b"v4", Actor::of_process(C)).unwrap();
+    fx.ops
+        .write(db, 0, b"v4", Actor::of_process(C, &MAIN))
+        .unwrap();
     fx.close(db);
     assert_eq!(fx.history(), map(&[("e/s.db", file("v4"))]));
     assert!(fx.ops.groups().dirty().is_empty());
@@ -2054,9 +2312,11 @@ fn a_member_the_rules_leave_out_refuses_the_whole_group() {
     );
     let (_, db) = fx.create("s.db");
     let (_, wal) = fx.create("s.db-wal");
-    fx.ops.write(db, 0, b"db", Actor::of_process(C)).unwrap();
     fx.ops
-        .write(wal, 0, b"frames", Actor::of_process(C))
+        .write(db, 0, b"db", Actor::of_process(C, &MAIN))
+        .unwrap();
+    fx.ops
+        .write(wal, 0, b"frames", Actor::of_process(C, &MAIN))
         .unwrap();
     fx.close(db);
     fx.close(wal);
@@ -2066,7 +2326,7 @@ fn a_member_the_rules_leave_out_refuses_the_whole_group() {
     assert_eq!(fx.refused(), ["s.db-wal"]);
     // A database with no WAL is recorded.
     fx.ops
-        .unlink(ROOT, b"s.db-wal", Actor::of_process(C))
+        .unlink(ROOT, b"s.db-wal", Actor::of_process(C, &MAIN))
         .unwrap();
     assert_eq!(fx.later(6), 1);
     assert_eq!(fx.history(), map(&[("s.db", file("db"))]));
@@ -2186,7 +2446,7 @@ impl Fx {
             flags,
             moved,
             check,
-            C,
+            &main(C),
         )
     }
 }
@@ -2280,9 +2540,9 @@ fn move_in_keeps_the_node_id_and_takes_over_handles() {
     // new content at the new path.
     let before = fx.journal().len();
     fx.ops
-        .write(fh, 0, b"v2 longer", Actor::of_process(C))
+        .write(fh, 0, b"v2 longer", Actor::of_process(C, &MAIN))
         .unwrap();
-    fx.ops.flush(fh, Actor::of_process(C)).unwrap();
+    fx.ops.flush(fh, Actor::of_process(C, &MAIN)).unwrap();
     let records = fx.journal();
     assert_eq!(records.len(), before + 1, "{records:#?}");
     assert_eq!(records.last().unwrap().draft.trigger, Trigger::Close);
@@ -2437,6 +2697,7 @@ fn a_check_decides_under_the_names_ordering_and_a_refusal_changes_nothing() {
     };
     let actor = Actor {
         caller: C,
+        entry: &MAIN,
         groups: Supplementary::OfProcess,
         check: Some(&check),
     };
@@ -2491,7 +2752,7 @@ fn a_check_decides_under_the_names_ordering_and_a_refusal_changes_nothing() {
     assert_eq!(fx.history(), history);
     // Without a check, the main mount's requests go on as before.
     fx.ops
-        .rename(ROOT, b"a", ROOT, b"c", 0, Actor::of_process(C))
+        .rename(ROOT, b"a", ROOT, b"c", 0, Actor::of_process(C, &MAIN))
         .unwrap();
 }
 
@@ -2542,11 +2803,18 @@ fn an_existing_file_is_opened_by_create_only_with_access() {
     assert_ne!(caller.gid, group);
     let (_, fh, _) = fx
         .ops
-        .create(ROOT, b"shared", 0o644, O_RDWR, Actor::of_process(caller))
+        .create(
+            ROOT,
+            b"shared",
+            0o644,
+            O_RDWR,
+            Actor::of_process(caller, &MAIN),
+        )
         .unwrap();
     fx.ops.release(fh).unwrap();
     let substituted = Actor {
         caller,
+        entry: &MAIN,
         groups: Supplementary::None,
         check: None,
     };
@@ -2571,7 +2839,7 @@ fn an_open_to_execute_opens_the_file() {
     let id = fx.id("run.sh");
     let (fh, handle) = fx
         .ops
-        .open(id, O_RDONLY | FMODE_EXEC, Actor::of_process(C))
+        .open(id, O_RDONLY | FMODE_EXEC, Actor::of_process(C, &MAIN))
         .unwrap();
     assert!(!handle.write);
     assert_eq!(fx.ops.read(fh, 0, 64).unwrap(), b"#!/bin/sh\n");

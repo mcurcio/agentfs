@@ -47,7 +47,7 @@ use crate::paths::{PathError, RepoPath};
 use crate::pending::{PendingId, PendingStore};
 use crate::reconcile::{self, Duties, Duty};
 use crate::record::{
-    Caller, Change, Draft, Operation, OperationKind, Origin, PatchAuthor, Record, Trigger,
+    Caller, Change, Draft, Operation, OperationKind, Origin, PatchAuthor, Record, Trigger, Writer,
 };
 use crate::rules::{Decision, Rules, RulesError, SkipReason};
 use crate::stamps::{FreezeStamp, LastWrites, StampBook, Verdict};
@@ -785,7 +785,7 @@ pub fn open(
                     seq: record.seq,
                     from: from.clone(),
                     to: to.clone(),
-                    caller: record.draft.caller,
+                    writer: record.draft.writer.clone(),
                     origin: record.draft.origin.clone(),
                     at_ms: record.draft.time_ms,
                 });
@@ -1062,10 +1062,10 @@ impl Recorder {
     pub fn record(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         inputs: Vec<Input>,
     ) -> Result<Recorded, VolumeError> {
-        self.record_with(trigger, caller, inputs, false, None)
+        self.record_with(trigger, writer, inputs, false, None)
     }
 
     /// Records an fsync-class group (design §8) as one all-or-nothing
@@ -1078,10 +1078,10 @@ impl Recorder {
     pub fn record_group(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         inputs: Vec<Input>,
     ) -> Result<Recorded, VolumeError> {
-        self.record_with(trigger, caller, inputs, true, None)
+        self.record_with(trigger, writer, inputs, true, None)
     }
 
     /// Records like [`Recorder::record`], for the pod `origin` rather than
@@ -1093,17 +1093,17 @@ impl Recorder {
     pub fn record_as(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         inputs: Vec<Input>,
         origin: Option<Origin>,
     ) -> Result<Recorded, VolumeError> {
-        self.record_with(trigger, caller, inputs, false, origin)
+        self.record_with(trigger, writer, inputs, false, origin)
     }
 
     fn record_with(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         inputs: Vec<Input>,
         atomic: bool,
         origin: Option<Origin>,
@@ -1111,24 +1111,27 @@ impl Recorder {
         self.refuse_if_finished()?;
         let start = Instant::now();
         // A record by an operation's actor is part of that operation (design
-        // §15): trigger `restore`, made by the operator who asked for it.
-        let actor = caller.pid;
+        // §15): trigger `restore`, made by the operator who asked for it,
+        // through agentfs. The one place agentfs-core stamps
+        // [`EntryPoint::Agentfs`] on restores, reverts and patch applies.
+        let actor = writer.caller.pid;
         let operation = self.operations.of_actor(actor);
-        let (trigger, caller) = match &operation {
-            Some(op) => (op.kind.trigger(), op.caller),
-            None => (trigger, caller),
+        let (trigger, writer) = match &operation {
+            Some(op) => (op.kind.trigger(), Writer::agentfs(op.caller)),
+            None => (trigger, writer),
         };
         let in_operation = operation.is_some();
         let span = self.telemetry.span(spans::RECORD, || {
             vec![
                 KeyValue::new("agentfs.trigger", trigger.as_str()),
                 KeyValue::new("agentfs.inputs", inputs.len() as i64),
-                KeyValue::new("agentfs.caller.uid", i64::from(caller.uid)),
-                KeyValue::new("process.pid", i64::from(caller.pid)),
+                KeyValue::new("agentfs.caller.uid", i64::from(writer.caller.uid)),
+                KeyValue::new("process.pid", i64::from(writer.caller.pid)),
+                KeyValue::new("agentfs.entry", writer.entry.to_string()),
             ]
         });
         let paths: Vec<RepoPath> = inputs.iter().map(|i| i.path().clone()).collect();
-        let result = self.record_inner(trigger, caller, inputs, operation, atomic, origin);
+        let result = self.record_inner(trigger, writer, inputs, operation, atomic, origin);
         match &result {
             Ok(recorded) => {
                 if let Some(seq) = recorded.seq {
@@ -1160,7 +1163,7 @@ impl Recorder {
     fn record_inner(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         inputs: Vec<Input>,
         operation: Option<Operation>,
         atomic: bool,
@@ -1316,7 +1319,7 @@ impl Recorder {
             }
             let draft = Draft {
                 trigger,
-                caller,
+                writer,
                 time_ms: now_ms(),
                 changes: changes.clone(),
                 operation,
@@ -1509,12 +1512,12 @@ impl Recorder {
         stamps: &[PathStamp],
     ) -> Result<Recorded, VolumeError> {
         self.refuse_if_finished()?;
-        let caller = draft.caller;
+        let writer = draft.writer.clone();
         let mut resync = Vec::new();
         let recorded = self.sequence_inner(origin, slot, draft, stamps, &mut resync)?;
         if recorded.seq.is_some() {
             for path in resync {
-                self.resync(&path, caller);
+                self.resync(&path, writer.clone());
             }
         }
         Ok(recorded)
@@ -1704,7 +1707,7 @@ impl Recorder {
                     seq: 0,
                     from: from.clone(),
                     to: to.clone(),
-                    caller: draft.caller,
+                    writer: draft.writer.clone(),
                     origin: Some(origin.clone()),
                     at_ms: draft.time_ms,
                 }),
@@ -1758,19 +1761,19 @@ impl Recorder {
     }
 
     /// Records `path` as the backing tree has it now, as the service's own
-    /// `sweep` record by `caller` (design §14.1): after a front's change
+    /// `sweep` record by `writer` (design §14.1): after a front's change
     /// that cannot be ordered against the tree ([`Recorder::sequence`]).
     /// A file is frozen again, a symlink read again; a path that is
     /// neither now records nothing (its removal is another front's to
     /// record). Takes the path's claim; content equal to what was just
     /// journaled leaves the tree, and so history, unchanged. A failure
     /// leaves the path to its next change, with a warning.
-    fn resync(&self, path: &RepoPath, caller: Caller) {
+    fn resync(&self, path: &RepoPath, writer: Writer) {
         // Read confined when recorded (design §6 "Confinement"): the
         // workload may change the tree at any moment.
         let input = Input::Tree { path: path.clone() };
         self.telemetry.resynced();
-        if let Err(e) = self.record_inner(Trigger::Sweep, caller, vec![input], None, false, None) {
+        if let Err(e) = self.record_inner(Trigger::Sweep, writer, vec![input], None, false, None) {
             eprintln!(
                 "history service: recording {path} as the backing tree has it, after fronts' \
                  changes that could not be ordered, failed: {e}; its next change records it"
@@ -1882,14 +1885,14 @@ impl Recorder {
     pub fn record_move(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         from: RepoPath,
         to: RepoPath,
     ) -> Result<MoveOutcome, VolumeError> {
         self.refuse_if_finished()?;
         let start = Instant::now();
         let paths = vec![from.clone(), to.clone()];
-        let result = self.record_move_inner(trigger, caller, from, to);
+        let result = self.record_move_inner(trigger, writer, from, to);
         if let Err(e) = &result {
             self.events.emit(Event::RecordFailed {
                 trigger,
@@ -1904,13 +1907,13 @@ impl Recorder {
     fn record_move_inner(
         &self,
         trigger: Trigger,
-        caller: Caller,
+        writer: Writer,
         from: RepoPath,
         to: RepoPath,
     ) -> Result<MoveOutcome, VolumeError> {
         let draft = |from: RepoPath, to: RepoPath| Draft {
             trigger,
-            caller,
+            writer: writer.clone(),
             time_ms: now_ms(),
             changes: vec![Change::Move { from, to }],
             operation: None,
@@ -1941,7 +1944,7 @@ impl Recorder {
                     seq,
                     from,
                     to,
-                    caller,
+                    writer,
                     origin: None,
                     at_ms,
                 });
@@ -2052,7 +2055,7 @@ impl Recorder {
             let chunk = std::mem::replace(&mut inputs, rest);
             let recorded = self.record_inner(
                 Trigger::Rename,
-                duty.caller,
+                duty.writer.clone(),
                 chunk,
                 None,
                 false,
@@ -2665,7 +2668,7 @@ impl Committer {
                     break;
                 }
             };
-            // A group never mixes origins (`group_by_window`).
+            // A group never mixes origins (`split_key`).
             let (identities, context) = self.identity_for(group[0].draft.origin.as_ref());
             match self.history.commit(
                 &checked,
@@ -2964,7 +2967,6 @@ fn in_backing(tree: &Path, path: &RepoPath, symlink: bool) -> Option<Option<std:
 /// home of that rule: [`group_by_window`] and [`merge_moves`] compare keys
 /// and nothing else (provenance slice 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(dead_code, reason = "stub: provenance slice 1 wires it in")]
 struct SplitKey<'r> {
     operation: Option<u64>,
     origin: Option<&'r Origin>,
@@ -2972,29 +2974,30 @@ struct SplitKey<'r> {
 }
 
 /// `record`'s [`SplitKey`].
-#[expect(dead_code, reason = "stub: provenance slice 1 wires it in")]
 fn split_key(record: &Record) -> SplitKey<'_> {
-    let _ = record;
-    todo!("provenance slice 1")
+    SplitKey {
+        operation: record.draft.operation.as_ref().map(|o| o.id),
+        origin: record.draft.origin.as_ref(),
+        entry: &record.draft.writer.entry,
+    }
 }
 
 /// Splits records into runs where each record is within `window_ms` of the
-/// run's first record. Records of an operator operation (design §15) form
-/// runs of their own, however long the operation takes; workload records
-/// interleaved with them (a live restore) split them, since commits
-/// follow the journal's order. Records from different fronts of a history
-/// service (design §14) never share a run either: a run is one origin's,
-/// so its commit carries that pod's committer.
+/// run's first record. A run never mixes [`split_key`]s: records of an
+/// operator operation (design §15) form runs of their own, however long
+/// the operation takes, and workload records interleaved with them (a
+/// live restore) split them, since commits follow the journal's order;
+/// records from different fronts of a history service (design §14) or
+/// different entry points (design §9) never share a run either, so a
+/// commit carries one pod's committer and one `Agentfs-Entry`.
 fn group_by_window(records: &[Record], window_ms: u64) -> Vec<&[Record]> {
-    let op = |r: &Record| r.draft.operation.as_ref().map(|o| o.id);
     let mut groups = Vec::new();
     let mut start = 0;
     for i in 1..records.len() {
         let first = &records[start];
-        let split = if op(&records[i]) != op(first) || records[i].draft.origin != first.draft.origin
-        {
+        let split = if split_key(&records[i]) != split_key(first) {
             true
-        } else if op(first).is_some() {
+        } else if first.draft.operation.is_some() {
             false
         } else {
             records[i].draft.time_ms.saturating_sub(first.draft.time_ms) > window_ms
@@ -3011,8 +3014,9 @@ fn group_by_window(records: &[Record], window_ms: u64) -> Vec<&[Record]> {
 }
 
 /// Joins each group holding a move with the groups after it, up to the
-/// last record reconciling the move (`through`), while they are the same
-/// origin's and none is an operation's. `groups` split `records` in order.
+/// last record reconciling the move (`through`), while they have the
+/// move's [`split_key`] and none is an operation's. `groups` split
+/// `records` in order.
 fn merge_moves<'r>(
     records: &'r [Record],
     groups: Vec<&'r [Record]>,
@@ -3025,9 +3029,8 @@ fn merge_moves<'r>(
         if end > start {
             let first = &records[start];
             let joins = reach.is_some_and(|r| records[end - 1].seq < r)
-                && first.draft.operation.is_none()
-                && group[0].draft.operation.is_none()
-                && group[0].draft.origin == first.draft.origin;
+                && split_key(first) == split_key(&group[0])
+                && first.draft.operation.is_none();
             if !joins {
                 out.push(&records[start..end]);
                 start = end;
@@ -3072,12 +3075,17 @@ mod tests {
     use super::*;
     use crate::events::{MemorySink, NullSink};
     use crate::lfs::Pointer;
+    use crate::record::EntryPoint;
     use crate::rules::RuleSource;
 
     const CALLER: Caller = Caller {
         uid: 10000,
         gid: 10000,
         pid: 1,
+    };
+    const WRITER: Writer = Writer {
+        caller: CALLER,
+        entry: EntryPoint::Main,
     };
 
     fn context() -> Context {
@@ -3165,9 +3173,9 @@ mod tests {
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         assert_eq!(recovery.committed_through, None);
 
-        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+        rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "a", "1")])
             .unwrap();
-        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "d/b", "2")])
+        rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "d/b", "2")])
             .unwrap();
         assert_eq!(com.backlog(), 2);
 
@@ -3185,7 +3193,7 @@ mod tests {
         let (rec, com, _) =
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let input = write(dir.path(), "a", "at close");
-        rec.record(Trigger::Close, CALLER, vec![input]).unwrap();
+        rec.record(Trigger::Close, WRITER, vec![input]).unwrap();
         fs::write(dir.path().join("a"), "changed later").unwrap();
 
         com.commit_pending().unwrap();
@@ -3201,10 +3209,10 @@ mod tests {
         {
             let (rec, com, _) =
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
-            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+            rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             com.commit_pending().unwrap();
-            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "b", "2")])
+            rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "b", "2")])
                 .unwrap();
             // Crash: the second record is durable but never committed.
         }
@@ -3217,7 +3225,7 @@ mod tests {
         assert_eq!(tree_paths(&com), ["a", "b"]);
         // New records continue after the recovered ones.
         let seq = rec
-            .record(Trigger::Close, CALLER, vec![write(dir.path(), "c", "3")])
+            .record(Trigger::Close, WRITER, vec![write(dir.path(), "c", "3")])
             .unwrap()
             .seq;
         assert_eq!(seq, Some(2));
@@ -3229,7 +3237,7 @@ mod tests {
         {
             let (rec, com, _) =
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
-            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+            rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             // Commit without letting the committer truncate: simulates a crash
             // between the ref update and journal truncation.
@@ -3270,10 +3278,10 @@ mod tests {
         );
         let (rec, com, _) =
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
-        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+        rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "a", "1")])
             .unwrap();
         com.commit_pending().unwrap();
-        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "b", "2")])
+        rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "b", "2")])
             .unwrap();
         // A copy frozen for a record that is not journaled yet: open would
         // prune it, inspect must not.
@@ -3302,7 +3310,7 @@ mod tests {
         .unwrap();
         let err = rec.record(
             Trigger::Close,
-            CALLER,
+            WRITER,
             vec![
                 write(dir.path(), "a", "1"),
                 Input::Write {
@@ -3340,7 +3348,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "a", "1"),
                     Input::Symlink {
@@ -3389,7 +3397,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Rename,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "ok.txt", "fine"),
                     write(dir.path(), ".gitattributes", &attrs),
@@ -3419,7 +3427,7 @@ mod tests {
         assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
         // A refused path is not tracked: removing it records nothing.
         let recorded = rec
-            .record(Trigger::Unlink, CALLER, vec![remove(".gitattributes")])
+            .record(Trigger::Unlink, WRITER, vec![remove(".gitattributes")])
             .unwrap();
         assert_eq!(recorded.seq, None);
     }
@@ -3444,7 +3452,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), ".gitattributes", &attrs),
                     write(dir.path(), "ok", "1"),
@@ -3511,7 +3519,7 @@ mod tests {
                 open(&state, &tree, context(), memory.clone(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "big.bin", "0123456789ab"),
                     write(dir.path(), "ok.bin", "012345678"),
@@ -3586,7 +3594,7 @@ mod tests {
         let (rec, com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
         rec.record(
             Trigger::Close,
-            CALLER,
+            WRITER,
             vec![
                 write(dir.path(), "ten.bin", "0123456789"),
                 write(dir.path(), "eleven.bin", "0123456789a"),
@@ -3654,7 +3662,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "large", &"l".repeat(300)),
                     write(dir.path(), "keep", &"k".repeat(300)),
@@ -3687,7 +3695,7 @@ mod tests {
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "large", &"l".repeat(300)),
                     write(dir.path(), "small", &"s".repeat(220)),
@@ -3735,7 +3743,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), ".gitattributes/x", "hi\n"),
                     write(dir.path(), "big.bin", "0123456789abcdef"),
@@ -3773,7 +3781,7 @@ mod tests {
         let user = format!("{}\n", "#".repeat(150));
         rec.record(
             Trigger::Close,
-            CALLER,
+            WRITER,
             vec![
                 write(dir.path(), ".gitattributes", &user),
                 write(dir.path(), "other.bin", "fedcba9876543210"),
@@ -3796,7 +3804,7 @@ mod tests {
         assert_eq!(blob(&com, "other.bin"), b"fedcba9876543210");
         rec.record(
             Trigger::Close,
-            CALLER,
+            WRITER,
             vec![write(dir.path(), "small.txt", "ok")],
         )
         .unwrap();
@@ -3824,7 +3832,7 @@ mod tests {
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "a.bin", "abc")],
             )
             .unwrap();
@@ -3843,7 +3851,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "a.bin", "abcde")],
             )
             .unwrap();
@@ -3883,7 +3891,7 @@ mod tests {
             unreachable!()
         };
         fs::set_permissions(backing, fs::Permissions::from_mode(0o000)).unwrap();
-        let recorded = rec.record(Trigger::Close, CALLER, vec![input]).unwrap();
+        let recorded = rec.record(Trigger::Close, WRITER, vec![input]).unwrap();
         assert_eq!(recorded.seq, None);
         assert_eq!(
             recorded.skipped[0].reason,
@@ -3935,7 +3943,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "ok", "1"),
                     write(dir.path(), "big", "0123456789"),
@@ -3969,7 +3977,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "big/a", "0123456789"),
                     write(dir.path(), "big/b", "abc"),
@@ -4054,7 +4062,7 @@ mod tests {
         let recorded = rec
             .record_group(
                 Trigger::Interval,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "s.db", "db"),
                     write(dir.path(), "s.db-wal", "0123456789"),
@@ -4093,7 +4101,7 @@ mod tests {
         let seq = rec
             .record_group(
                 Trigger::Interval,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "s.db", "db"),
                     write(dir.path(), "s.db-wal", "wal"),
@@ -4108,7 +4116,7 @@ mod tests {
         com.commit_pending().unwrap();
         assert_eq!(tree_paths(&com), ["s.db", "s.db-wal"]);
         // An ordinary record is not atomic.
-        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "x", "1")])
+        rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "x", "1")])
             .unwrap();
         assert!(!com.journal.uncommitted()[0].draft.atomic);
     }
@@ -4120,12 +4128,12 @@ mod tests {
         {
             let (rec, com, _) =
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
-            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "keep", "1")])
+            rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "keep", "1")])
                 .unwrap();
             com.commit_pending().unwrap();
             rec.record_group(
                 Trigger::Fsync,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "s.db", "0123456789"),
                     write(dir.path(), "s.db-wal", "12"),
@@ -4168,10 +4176,10 @@ mod tests {
         {
             let (rec, com, _) =
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
-            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+            rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             com.commit_pending().unwrap();
-            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "b", "2")])
+            rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "b", "2")])
                 .unwrap();
         }
         let git = state.git();
@@ -4205,12 +4213,12 @@ mod tests {
         {
             let (rec, com, _) =
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
-            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "keep", "1")])
+            rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "keep", "1")])
                 .unwrap();
             com.commit_pending().unwrap();
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![
                     write(dir.path(), "big", "0123456789"),
                     write(dir.path(), "small", "12"),
@@ -4256,7 +4264,7 @@ mod tests {
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "big", "0123456789")],
             )
             .unwrap();
@@ -4273,7 +4281,7 @@ mod tests {
         assert_eq!(com.backlog(), 0);
         // Sequence numbers continue after the consumed record.
         let seq = rec
-            .record(Trigger::Close, CALLER, vec![write(dir.path(), "s", "1")])
+            .record(Trigger::Close, WRITER, vec![write(dir.path(), "s", "1")])
             .unwrap()
             .seq;
         assert_eq!(seq, Some(1));
@@ -4300,7 +4308,7 @@ mod tests {
         rec.journal_for_tests()
             .record(Draft {
                 trigger: Trigger::Close,
-                caller: CALLER,
+                writer: WRITER,
                 time_ms,
                 changes: vec![change.clone()],
                 operation: None,
@@ -4374,7 +4382,12 @@ mod tests {
         let (dir, state) = setup();
         let (rec, com, _) =
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
-        let actor = Caller { pid: 77, ..CALLER };
+        // Through a sandbox: an operation's records are agentfs's all the
+        // same (design §9).
+        let actor = Writer {
+            caller: Caller { pid: 77, ..CALLER },
+            entry: EntryPoint::Sandbox(crate::record::SandboxId::new("x").unwrap()),
+        };
         let guard = begin(&rec, &[77]);
         assert!(matches!(
             rec.begin_operation(
@@ -4387,32 +4400,41 @@ mod tests {
             Err(VolumeError::ActorBusy(_))
         ));
         let a = rec
-            .record(Trigger::Close, actor, vec![write(dir.path(), "a", "1")])
+            .record(
+                Trigger::Close,
+                actor.clone(),
+                vec![write(dir.path(), "a", "1")],
+            )
             .unwrap()
             .seq
             .unwrap();
         let other = rec
-            .record(Trigger::Close, CALLER, vec![write(dir.path(), "b", "2")])
+            .record(Trigger::Close, WRITER, vec![write(dir.path(), "b", "2")])
             .unwrap()
             .seq
             .unwrap();
         assert_eq!(guard.last_seq(), Some(a));
         let records = com.journal.uncommitted();
         assert_eq!(records[0].draft.trigger, Trigger::Restore);
-        assert_eq!(records[0].draft.caller, OPERATOR);
+        assert_eq!(records[0].draft.writer, Writer::agentfs(OPERATOR));
         assert_eq!(
             records[0].draft.operation.as_ref().map(|o| o.id),
             Some(guard.operation().id)
         );
         assert_eq!(records[1].seq, other);
         assert_eq!(records[1].draft.trigger, Trigger::Close);
-        assert_eq!(records[1].draft.caller, CALLER);
+        assert_eq!(records[1].draft.writer, WRITER);
         assert_eq!(records[1].draft.operation, None);
         assert_eq!(guard.finish(), Some(a));
         // After the operation, the actor is an ordinary caller again.
-        rec.record(Trigger::Close, actor, vec![write(dir.path(), "c", "3")])
-            .unwrap();
+        rec.record(
+            Trigger::Close,
+            actor.clone(),
+            vec![write(dir.path(), "c", "3")],
+        )
+        .unwrap();
         assert_eq!(com.journal.uncommitted()[2].draft.operation, None);
+        assert_eq!(com.journal.uncommitted()[2].draft.writer, actor);
     }
 
     #[test]
@@ -4422,11 +4444,18 @@ mod tests {
         let (rec, com, _) =
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let t = 1_700_000_000_000;
-        let actor = Caller { pid: 77, ..CALLER };
+        let actor = Writer {
+            caller: Caller { pid: 77, ..CALLER },
+            ..WRITER
+        };
         record_at(&rec, dir.path(), "before", t);
         let guard = begin(&rec, &[77]);
-        rec.record(Trigger::Close, actor, vec![write(dir.path(), "a", "1")])
-            .unwrap();
+        rec.record(
+            Trigger::Close,
+            actor.clone(),
+            vec![write(dir.path(), "a", "1")],
+        )
+        .unwrap();
         rec.record(Trigger::Unlink, actor, vec![remove("before")])
             .unwrap();
         // Held while the operation runs, however long it takes.
@@ -4448,7 +4477,8 @@ mod tests {
         for line in [
             "write   a\n",
             "remove  before\n",
-            "Agentfs-Trigger: restore\nAgentfs-Restore: 0123456789abcdef0123456789abcdef01234567\n",
+            "Agentfs-Trigger: restore\nAgentfs-Entry: agentfs\n\
+             Agentfs-Restore: 0123456789abcdef0123456789abcdef01234567\n",
             "Agentfs-Uid: 0\n",
             "Agentfs-Pid: 4242\n",
         ] {
@@ -4490,7 +4520,7 @@ mod tests {
                 seq: i as u64,
                 draft: Draft {
                     trigger: Trigger::Close,
-                    caller: CALLER,
+                    writer: WRITER,
                     time_ms: time,
                     changes: vec![],
                     operation,
@@ -4549,7 +4579,7 @@ mod tests {
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         rec.record(
             Trigger::Close,
-            CALLER,
+            WRITER,
             vec![write(dir.path(), "y.log", "1")],
         )
         .unwrap();
@@ -4568,7 +4598,7 @@ mod tests {
         let (rec, com, _) =
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         assert_eq!(rec.last_seq(), None);
-        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+        rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "a", "1")])
             .unwrap();
         let seq = rec.last_seq().unwrap();
         let start = Instant::now();
@@ -4731,7 +4761,7 @@ mod tests {
             seq,
             draft: Draft {
                 trigger: Trigger::Close,
-                caller: CALLER,
+                writer: WRITER,
                 time_ms,
                 changes: vec![],
                 operation: None,
@@ -4770,7 +4800,7 @@ mod tests {
             seq,
             draft: Draft {
                 trigger: Trigger::Close,
-                caller: CALLER,
+                writer: WRITER,
                 time_ms,
                 changes: vec![],
                 operation: None,
@@ -4794,6 +4824,92 @@ mod tests {
         assert_eq!(groups, [vec![0, 1], vec![2], vec![3], vec![4, 5]]);
     }
 
+    fn sandbox(id: &str) -> EntryPoint {
+        EntryPoint::Sandbox(crate::record::SandboxId::new(id).unwrap())
+    }
+
+    #[test]
+    fn group_by_window_splits_on_the_entry_point() {
+        let rec = |seq, time_ms, entry: EntryPoint| Record {
+            seq,
+            draft: Draft {
+                trigger: Trigger::Close,
+                writer: Writer {
+                    caller: CALLER,
+                    entry,
+                },
+                time_ms,
+                changes: vec![],
+                operation: None,
+                atomic: false,
+                origin: None,
+            },
+        };
+        // All within one window: only the entry point splits them.
+        let records = [
+            rec(0, 0, EntryPoint::Main),
+            rec(1, 40, sandbox("s1")),
+            rec(2, 50, sandbox("s1")),
+            rec(3, 60, sandbox("s2")),
+            rec(4, 70, EntryPoint::Agentfs),
+            rec(5, 80, EntryPoint::Main),
+            rec(6, 90, EntryPoint::Main),
+        ];
+        let groups: Vec<Vec<u64>> = group_by_window(&records, 200)
+            .into_iter()
+            .map(|g| g.iter().map(|r| r.seq).collect())
+            .collect();
+        assert_eq!(groups, [vec![0], vec![1, 2], vec![3], vec![4], vec![5, 6]]);
+    }
+
+    #[test]
+    fn merge_moves_never_joins_two_entry_points() {
+        let rec = |seq, entry: EntryPoint, moves: bool| Record {
+            seq,
+            draft: Draft {
+                trigger: Trigger::Rename,
+                writer: Writer {
+                    caller: CALLER,
+                    entry,
+                },
+                time_ms: seq * 1000,
+                changes: vec![if moves {
+                    Change::Move {
+                        from: path("a"),
+                        to: path("b"),
+                    }
+                } else {
+                    Change::Remove { path: path("x") }
+                }],
+                operation: None,
+                atomic: false,
+                origin: None,
+            },
+        };
+        // A sandbox's move, reconciled through seq 4; a main record lands
+        // in between.
+        let records = vec![
+            rec(1, sandbox("s1"), true),
+            rec(2, sandbox("s1"), false),
+            rec(3, EntryPoint::Main, false),
+            rec(4, sandbox("s1"), false),
+        ];
+        let groups: Vec<Vec<u64>> = merge_moves(&records, group_by_window(&records, 0), |s| {
+            (s == 1).then_some(4)
+        })
+        .iter()
+        .map(|g| g.iter().map(|r| r.seq).collect())
+        .collect();
+        assert_eq!(groups, [vec![1, 2], vec![3], vec![4]]);
+        for group in &groups {
+            let entries: std::collections::BTreeSet<String> = group
+                .iter()
+                .map(|seq| records[*seq as usize - 1].draft.writer.entry.to_string())
+                .collect();
+            assert_eq!(entries.len(), 1, "{group:?} mixes {entries:?}");
+        }
+    }
+
     /// The time [`journal_from`] stamps on every record.
     const FRONT_TIME_MS: u64 = 1_700_000_000_000;
 
@@ -4809,7 +4925,7 @@ mod tests {
         rec.journal_for_tests()
             .record(Draft {
                 trigger: Trigger::Close,
-                caller: CALLER,
+                writer: WRITER,
                 time_ms: FRONT_TIME_MS,
                 changes: vec![Change::Write {
                     path,
@@ -4853,7 +4969,7 @@ mod tests {
         journal_from(&rec, dir.path(), &pod("pod-a"), "a1", "1");
         journal_from(&rec, dir.path(), &pod("pod-b"), "b1", "2");
         journal_from(&rec, dir.path(), &pod("pod-a"), "a2", "3");
-        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "own", "4")])
+        rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "own", "4")])
             .unwrap();
         let report = com.commit_pending().unwrap();
         assert_eq!((report.records, report.commits), (4, 4));
@@ -4967,7 +5083,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "a.log", "x")],
             )
             .unwrap();
@@ -4995,14 +5111,14 @@ mod tests {
         exclude(&state, "ignored/\n");
         let (rec, com, _) =
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
-        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "src", "1")])
+        rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "src", "1")])
             .unwrap();
         com.commit_pending().unwrap();
 
         let recorded = rec
             .record(
                 Trigger::Rename,
-                CALLER,
+                WRITER,
                 vec![remove("src"), write(dir.path(), "ignored/dst", "1")],
             )
             .unwrap();
@@ -5020,17 +5136,17 @@ mod tests {
         let (rec, com, _) =
             open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
         let recorded = rec
-            .record(Trigger::Unlink, CALLER, vec![remove("never")])
+            .record(Trigger::Unlink, WRITER, vec![remove("never")])
             .unwrap();
         assert_eq!(recorded.seq, None);
         assert_eq!(recorded.skipped, [skipped("never", SkipReason::Untracked)]);
         assert_eq!(com.backlog(), 0);
 
-        rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "d/a", "1")])
+        rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "d/a", "1")])
             .unwrap();
         // Tracked as soon as it is durable, before any commit.
         let recorded = rec
-            .record(Trigger::Rmdir, CALLER, vec![remove("d")])
+            .record(Trigger::Rmdir, WRITER, vec![remove("d")])
             .unwrap();
         assert_eq!(recorded.seq, Some(1));
         assert!(recorded.skipped.is_empty());
@@ -5049,7 +5165,7 @@ mod tests {
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "a.log", "1")],
             )
             .unwrap();
@@ -5062,7 +5178,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "a.log", "2")],
             )
             .unwrap();
@@ -5072,7 +5188,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "b.log", "3")],
             )
             .unwrap();
@@ -5089,7 +5205,7 @@ mod tests {
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "a.log", "1")],
             )
             .unwrap();
@@ -5101,7 +5217,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "a.log", "new")],
             )
             .unwrap();
@@ -5123,7 +5239,7 @@ mod tests {
             let recorded = rec
                 .record(
                     Trigger::Close,
-                    CALLER,
+                    WRITER,
                     vec![write(dir.path(), "sub/file", "1")],
                 )
                 .unwrap();
@@ -5142,7 +5258,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "sub/file", "1")],
             )
             .unwrap();
@@ -5177,7 +5293,7 @@ mod tests {
             std::thread::spawn(move || {
                 rec.record(
                     Trigger::Close,
-                    CALLER,
+                    WRITER,
                     vec![Input::Write {
                         path: RepoPath::new("out.bin").unwrap(),
                         backing: fifo,
@@ -5194,7 +5310,7 @@ mod tests {
         let remover = {
             let rec = rec.clone();
             std::thread::spawn(move || {
-                let r = rec.record(Trigger::Unlink, CALLER, vec![remove("out.bin")]);
+                let r = rec.record(Trigger::Unlink, WRITER, vec![remove("out.bin")]);
                 tx.send(()).unwrap();
                 r
             })
@@ -5240,7 +5356,7 @@ mod tests {
         let mut out = Vec::new();
         let close = |out: &mut Vec<Recorded>, rel: &str, content: &str| {
             let input = write_in_tree(tree, rel, content);
-            out.push(rec.record(Trigger::Close, CALLER, vec![input]).unwrap());
+            out.push(rec.record(Trigger::Close, WRITER, vec![input]).unwrap());
         };
         if template {
             close(
@@ -5266,7 +5382,7 @@ mod tests {
             fs::rename(tree.join(&lock), tree.join("store").join(name)).unwrap();
             let input = write_in_tree(tree, &format!("store/{name}"), content);
             out.push(
-                rec.record(Trigger::Rename, CALLER, vec![remove(&lock), input])
+                rec.record(Trigger::Rename, WRITER, vec![remove(&lock), input])
                     .unwrap(),
             );
         }
@@ -5284,7 +5400,7 @@ mod tests {
     /// Records `rel` (written in the tree first) as a close.
     fn close_in_tree(rec: &Recorder, tree: &Path, rel: &str, content: &str) -> Recorded {
         let input = write_in_tree(tree, rel, content);
-        rec.record(Trigger::Close, CALLER, vec![input]).unwrap()
+        rec.record(Trigger::Close, WRITER, vec![input]).unwrap()
     }
 
     /// Turns `dir` into a bare git directory: what `git init --bare` with a
@@ -5336,7 +5452,7 @@ mod tests {
         assert_eq!(report.git_dir_dropped, 0);
         assert_eq!(tree_paths(&com), ["proj/src.rs", "store/notes"]);
         assert_eq!(blob(&com, "store/notes"), b"2");
-        rec.record(Trigger::Unlink, CALLER, vec![remove("store/notes")])
+        rec.record(Trigger::Unlink, WRITER, vec![remove("store/notes")])
             .unwrap();
         com.commit_pending().unwrap();
         assert_eq!(tree_paths(&com), ["proj/src.rs"]);
@@ -5393,7 +5509,7 @@ mod tests {
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "secret", "1")],
             )
             .unwrap();
@@ -5409,7 +5525,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "secret", "2")],
             )
             .unwrap();
@@ -5424,7 +5540,7 @@ mod tests {
         assert_eq!(fs::read_dir(state.pending()).unwrap().count(), 0);
 
         let recorded = rec
-            .record(Trigger::Unlink, CALLER, vec![remove("secret")])
+            .record(Trigger::Unlink, WRITER, vec![remove("secret")])
             .unwrap();
         assert_eq!(recorded.seq, Some(1));
         assert!(recorded.skipped.is_empty());
@@ -5441,7 +5557,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Symlink,
-                CALLER,
+                WRITER,
                 vec![Input::Symlink {
                     path: RepoPath::new("latest.log").unwrap(),
                     target: "run-1.txt".into(),
@@ -5469,7 +5585,7 @@ mod tests {
             let recorded = rec
                 .record(
                     Trigger::Close,
-                    CALLER,
+                    WRITER,
                     vec![write(dir.path(), "a.tmp", "1")],
                 )
                 .unwrap();
@@ -5483,7 +5599,7 @@ mod tests {
         let recorded = rec
             .record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "b.tmp", "1")],
             )
             .unwrap();
@@ -5518,12 +5634,12 @@ mod tests {
             let h = Harness::new();
             let (rec, _com) = open_traced(&state, dir.path(), &h);
             let seq = rec
-                .record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+                .record(Trigger::Close, WRITER, vec![write(dir.path(), "a", "1")])
                 .unwrap()
                 .seq
                 .unwrap();
             let skipped = rec
-                .record(Trigger::Unlink, CALLER, vec![remove("never-tracked")])
+                .record(Trigger::Unlink, WRITER, vec![remove("never-tracked")])
                 .unwrap();
             assert_eq!(skipped.seq, None);
 
@@ -5568,13 +5684,13 @@ mod tests {
                 let h = Harness::new();
                 let (rec, com) = open_traced(&state, dir.path(), &h);
                 for name in ["a", "b"] {
-                    rec.record(Trigger::Close, CALLER, vec![write(dir.path(), name, "1")])
+                    rec.record(Trigger::Close, WRITER, vec![write(dir.path(), name, "1")])
                         .unwrap();
                 }
                 assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(2));
                 com.commit_pending().unwrap();
                 assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(0));
-                rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "c", "1")])
+                rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "c", "1")])
                     .unwrap();
                 // Crash before committing.
             }
@@ -5602,7 +5718,7 @@ mod tests {
             let seqs: Vec<u64> = ["a", "b"]
                 .into_iter()
                 .map(|name| {
-                    rec.record(Trigger::Close, CALLER, vec![write(dir.path(), name, "1")])
+                    rec.record(Trigger::Close, WRITER, vec![write(dir.path(), name, "1")])
                         .unwrap()
                         .seq
                         .unwrap()
@@ -5637,7 +5753,7 @@ mod tests {
             assert_eq!(span_attr(&commits[0], "agentfs.commit.empty"), None);
 
             // The same content again leaves the tree unchanged: no commit.
-            rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "a", "1")])
+            rec.record(Trigger::Close, WRITER, vec![write(dir.path(), "a", "1")])
                 .unwrap();
             let report = com.commit_pending().unwrap();
             assert_eq!((report.records, report.commits), (1, 0));
@@ -5669,7 +5785,7 @@ mod tests {
                 backing: dir.path().join("missing"),
                 executable: false,
             };
-            rec.record(Trigger::Close, CALLER, vec![missing])
+            rec.record(Trigger::Close, WRITER, vec![missing])
                 .unwrap_err();
             assert!(matches!(&memory.take()[..], [Event::RecordFailed { .. }]));
             assert_eq!(
@@ -5714,7 +5830,7 @@ mod tests {
                 let (rec, com) = open_traced(&state, dir.path(), &h);
                 rec.record(
                     Trigger::Symlink,
-                    CALLER,
+                    WRITER,
                     vec![Input::Symlink {
                         path: RepoPath::new(".gitmodules").unwrap(),
                         target: "elsewhere".into(),
@@ -5730,7 +5846,7 @@ mod tests {
                 );
                 rec.record(
                     Trigger::Close,
-                    CALLER,
+                    WRITER,
                     vec![write(dir.path(), "big", "0123456789")],
                 )
                 .unwrap();
@@ -5772,7 +5888,7 @@ mod tests {
             h.telemetry.observe_volume(&state, &settings);
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "a", "12345")],
             )
             .unwrap();
@@ -5831,7 +5947,7 @@ mod tests {
     fn front_draft(changes: Vec<Change>, atomic: bool) -> Draft {
         Draft {
             trigger: Trigger::Close,
-            caller: CALLER,
+            writer: WRITER,
             time_ms: now_ms(),
             changes,
             operation: None,
@@ -5873,7 +5989,7 @@ mod tests {
                 open(&state, dir.path(), context(), null(), &Telemetry::noop()).unwrap();
             rec.record(
                 Trigger::Close,
-                CALLER,
+                WRITER,
                 vec![write(dir.path(), "kept.log", "0")],
             )
             .unwrap();
@@ -6019,7 +6135,7 @@ mod tests {
         fs::remove_dir_all(tree.join("m")).unwrap();
         fs::rename(tree.join("d"), tree.join("m")).unwrap();
         let outcome = rec
-            .record_move(Trigger::Rename, CALLER, path("d"), path("m"))
+            .record_move(Trigger::Rename, WRITER, path("d"), path("m"))
             .unwrap();
         assert!(matches!(outcome, MoveOutcome::Journaled(_)));
         assert_eq!(com.backlog(), 1);
@@ -6044,7 +6160,7 @@ mod tests {
         fs::write(tree.join("d/a"), "22").unwrap();
         fs::write(tree.join("d/new"), "n").unwrap();
         fs::rename(tree.join("d"), tree.join("m")).unwrap();
-        rec.record_move(Trigger::Rename, CALLER, path("d"), path("m"))
+        rec.record_move(Trigger::Rename, WRITER, path("d"), path("m"))
             .unwrap();
         let report = com.commit_pending().unwrap();
         assert_eq!(report.commits, 1, "the move and its reconciliation");
@@ -6062,7 +6178,7 @@ mod tests {
         close_in_tree(&rec, &tree, "d/a", "a");
         com.commit_pending().unwrap();
         fs::rename(tree.join("d"), tree.join("m")).unwrap();
-        rec.record_move(Trigger::Rename, CALLER, path("d"), path("m"))
+        rec.record_move(Trigger::Rename, WRITER, path("d"), path("m"))
             .unwrap();
         fs::write(tree.join("m/late"), "l").unwrap();
         drop((rec, com));
@@ -6084,7 +6200,7 @@ mod tests {
         let outcome = rec
             .record_move(
                 Trigger::Rename,
-                CALLER,
+                WRITER,
                 path("node_modules/x"),
                 path("node_modules/y"),
             )
@@ -6093,7 +6209,7 @@ mod tests {
         assert_eq!(com.backlog(), 0);
         // Out of the ignored tree: recorded by reconciling the move.
         fs::rename(tree.join("node_modules/y"), tree.join("y")).unwrap();
-        rec.record_move(Trigger::Rename, CALLER, path("node_modules/y"), path("y"))
+        rec.record_move(Trigger::Rename, WRITER, path("node_modules/y"), path("y"))
             .unwrap();
         com.commit_pending().unwrap();
         assert_eq!(tree_paths(&com), ["y/f"]);
@@ -6106,7 +6222,7 @@ mod tests {
         com.commit_pending().unwrap();
         make_head(&tree, "r.git");
         fs::rename(tree.join("d"), tree.join("r.git/d")).unwrap();
-        rec.record_move(Trigger::Rename, CALLER, path("d"), path("r.git/d"))
+        rec.record_move(Trigger::Rename, WRITER, path("d"), path("r.git/d"))
             .unwrap();
         com.commit_pending().unwrap();
         assert!(tree_paths(&com).is_empty(), "{:?}", tree_paths(&com));
@@ -6170,7 +6286,7 @@ mod tests {
         let rec = rec.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(rec.record(Trigger::Rename, CALLER, inputs));
+            let _ = tx.send(rec.record(Trigger::Rename, WRITER, inputs));
         });
         rx.recv_timeout(Duration::from_secs(20))
             .expect("recording blocked")
@@ -6243,7 +6359,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, tree.join("d/out")).unwrap();
         fs::write(tree.join("d/new"), "n").unwrap();
         fs::rename(tree.join("d"), tree.join("m")).unwrap();
-        rec.record_move(Trigger::Rename, CALLER, path("d"), path("m"))
+        rec.record_move(Trigger::Rename, WRITER, path("d"), path("m"))
             .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -6277,15 +6393,15 @@ mod tests {
         com.commit_pending().unwrap();
         sink.take();
         fs::rename(tree.join("d"), tree.join(".gitmodules")).unwrap();
-        rec.record_move(Trigger::Rename, CALLER, path("d"), path(".gitmodules"))
+        rec.record_move(Trigger::Rename, WRITER, path("d"), path(".gitmodules"))
             .unwrap();
         fs::create_dir_all(tree.join("x")).unwrap();
         fs::rename(tree.join("a"), tree.join("x/.gitattributes")).unwrap();
-        rec.record_move(Trigger::Rename, CALLER, path("a"), path("x/.gitattributes"))
+        rec.record_move(Trigger::Rename, WRITER, path("a"), path("x/.gitattributes"))
             .unwrap();
         fs::create_dir_all(tree.join("assets")).unwrap();
         fs::rename(tree.join("big"), tree.join("assets/big")).unwrap();
-        rec.record_move(Trigger::Rename, CALLER, path("big"), path("assets/big"))
+        rec.record_move(Trigger::Rename, WRITER, path("big"), path("assets/big"))
             .unwrap();
         com.commit_pending().unwrap();
         assert_eq!(tree_paths(&com), ["assets/big/small"]);
@@ -6329,7 +6445,7 @@ mod tests {
             seq,
             draft: Draft {
                 trigger: Trigger::Rename,
-                caller: CALLER,
+                writer: WRITER,
                 time_ms: seq * 1000,
                 changes: vec![if moves {
                     Change::Move {

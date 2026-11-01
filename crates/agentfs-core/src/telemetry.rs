@@ -128,6 +128,10 @@ pub mod names {
 
 /// Span names (design §13).
 pub mod spans {
+    /// Attributes: `agentfs.trigger`, `agentfs.inputs`,
+    /// `agentfs.caller.uid`, `process.pid`, `agentfs.entry` (the writer's
+    /// entry point; a span attribute only, never a metric's: sandbox ids
+    /// are unbounded), and `agentfs.seq` or `agentfs.skipped`.
     pub const RECORD: &str = "agentfs.record";
     pub const COMMIT: &str = "agentfs.commit";
     pub const PUSH: &str = "agentfs.push";

@@ -38,6 +38,10 @@ pub enum Trigger {
     Restore,
     /// A patch from the queue, applied at mount (design §12).
     Patch,
+    /// An fsync-class group captured because a change through another
+    /// entry point was about to touch it (design §8, §9): no record holds
+    /// two entry points.
+    Cut,
 }
 
 impl Trigger {
@@ -56,6 +60,7 @@ impl Trigger {
             Self::Interval => "interval",
             Self::Restore => "restore",
             Self::Patch => "patch",
+            Self::Cut => "cut",
         }
     }
 }
@@ -101,8 +106,11 @@ pub enum EntryPoint {
 impl fmt::Display for EntryPoint {
     /// `main`, `sandbox/<id>` or `agentfs`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!("provenance slice 1")
+        match self {
+            Self::Main => f.write_str("main"),
+            Self::Sandbox(id) => write!(f, "sandbox/{}", id.as_str()),
+            Self::Agentfs => f.write_str("agentfs"),
+        }
     }
 }
 
@@ -113,8 +121,14 @@ impl std::str::FromStr for EntryPoint {
     /// `sandbox/` followed by a valid [`SandboxId`]. Anything else,
     /// including the empty string, is an error.
     fn from_str(s: &str) -> Result<Self, EntryError> {
-        let _ = s;
-        todo!("provenance slice 1")
+        match s {
+            "main" => Ok(Self::Main),
+            "agentfs" => Ok(Self::Agentfs),
+            _ => match s.strip_prefix("sandbox/") {
+                Some(id) => SandboxId::new(id).map(Self::Sandbox),
+                None => Err(EntryError::Unknown(s.to_owned())),
+            },
+        }
     }
 }
 
@@ -123,16 +137,14 @@ impl TryFrom<String> for EntryPoint {
 
     /// [`std::str::FromStr`], for serde.
     fn try_from(s: String) -> Result<Self, EntryError> {
-        let _ = s;
-        todo!("provenance slice 1")
+        s.parse()
     }
 }
 
 impl From<EntryPoint> for String {
     /// [`fmt::Display`], for serde.
     fn from(entry: EntryPoint) -> String {
-        let _ = entry;
-        todo!("provenance slice 1")
+        entry.to_string()
     }
 }
 
@@ -151,8 +163,17 @@ impl SandboxId {
     /// `id` if it follows the grammar above, else
     /// [`EntryError::BadSandboxId`].
     pub fn new(id: &str) -> Result<Self, EntryError> {
-        let _ = id;
-        todo!("provenance slice 1")
+        let bytes = id.as_bytes();
+        let valid = (1..=Self::MAX_LEN).contains(&bytes.len())
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if valid {
+            Ok(Self(Arc::from(id)))
+        } else {
+            Err(EntryError::BadSandboxId(id.to_owned()))
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -187,8 +208,10 @@ impl Writer {
     /// A change agentfs makes itself, as `caller` (an operation's
     /// operator, the `agentfs record` process, or no one).
     pub fn agentfs(caller: Caller) -> Self {
-        let _ = caller;
-        todo!("provenance slice 1")
+        Self {
+            caller,
+            entry: EntryPoint::Agentfs,
+        }
     }
 }
 
@@ -367,7 +390,11 @@ impl Origin {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
     pub trigger: Trigger,
-    pub caller: Caller,
+    /// Who made it: the caller and the entry point (journaled as the keys
+    /// `caller` and `entry`, both required; design §9). A journal from
+    /// before entry points is refused, never read as `main`.
+    #[serde(flatten)]
+    pub writer: Writer,
     /// Milliseconds since the Unix epoch.
     pub time_ms: u64,
     /// Applied together: a rename is a removal plus a write.
@@ -406,9 +433,9 @@ impl Record {
 }
 
 /// A saved repair queue's entry (design §3.5): a path the FUSE layer
-/// could not record, the caller that changed it, and the pod it is
+/// could not record, the writer that changed it, and the pod it is
 /// committed as (`None`: the loading process's own).
-pub type QueuedRepair = (Vec<u8>, Caller, Option<Origin>);
+pub type QueuedRepair = (Vec<u8>, Writer, Option<Origin>);
 
 /// What a repair queue saved at a store holds ([`read_repairs`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -451,13 +478,17 @@ pub fn read_repairs(store: &Path) -> io::Result<SavedRepairs> {
 }
 
 /// The entries of a saved repair queue, the FUSE layer's format: lines
-/// `<uid> <gid> <pid> <path in hex>`, each after an `@origin <JSON>` line
-/// naming the pod its entries are committed as (`@origin -`: none). Each
-/// entry keeps the origin it was saved under; malformed lines are skipped
-/// (a malformed `@origin` line counts as `@origin -`).
+/// `<uid> <gid> <pid> <path in hex>`, after an `@origin <JSON>` line
+/// naming the pod its entries are committed as (`@origin -`: none) and an
+/// `@entry <entry point>` line naming the entry point they came through.
+/// Each header applies to the entry lines after it until the next of its
+/// kind. Malformed lines are skipped (a malformed `@origin` line counts as
+/// `@origin -`); an entry with no valid `@entry` before it reads as
+/// [`EntryPoint::Agentfs`] (writer unknown), never as `main`.
 pub fn parse_repairs(bytes: &[u8]) -> Vec<QueuedRepair> {
     let text = String::from_utf8_lossy(bytes);
     let mut origin: Option<Origin> = None;
+    let mut entry = EntryPoint::Agentfs;
     let mut out = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("@origin ") {
@@ -467,8 +498,16 @@ pub fn parse_repairs(bytes: &[u8]) -> Vec<QueuedRepair> {
             };
             continue;
         }
+        if let Some(rest) = line.strip_prefix("@entry ") {
+            entry = rest.parse().unwrap_or(EntryPoint::Agentfs);
+            continue;
+        }
         if let Some((path, caller)) = parse_repair_entry(line) {
-            out.push((path, caller, origin.clone()));
+            let writer = Writer {
+                caller,
+                entry: entry.clone(),
+            };
+            out.push((path, writer, origin.clone()));
         }
     }
     out
@@ -549,10 +588,13 @@ mod tests {
     fn atomic_is_journaled_only_when_set() {
         let mut draft = Draft {
             trigger: Trigger::Interval,
-            caller: Caller {
-                uid: 1,
-                gid: 1,
-                pid: 1,
+            writer: Writer {
+                caller: Caller {
+                    uid: 1,
+                    gid: 1,
+                    pid: 1,
+                },
+                entry: EntryPoint::Main,
             },
             time_ms: 5,
             changes: vec![],
@@ -584,10 +626,13 @@ mod tests {
     fn the_origin_is_journaled_only_when_set() {
         let mut draft = Draft {
             trigger: Trigger::Close,
-            caller: Caller {
-                uid: 1,
-                gid: 1,
-                pid: 1,
+            writer: Writer {
+                caller: Caller {
+                    uid: 1,
+                    gid: 1,
+                    pid: 1,
+                },
+                entry: EntryPoint::Main,
             },
             time_ms: 5,
             changes: vec![],
@@ -595,11 +640,11 @@ mod tests {
             atomic: false,
             origin: None,
         };
-        // Single-process journals are byte for byte what they were.
+        // Single-process journals carry no origin.
         let single = serde_json::to_string(&draft).unwrap();
         assert_eq!(
             single,
-            r#"{"trigger":"close","caller":{"uid":1,"gid":1,"pid":1},"time_ms":5,"changes":[]}"#
+            r#"{"trigger":"close","caller":{"uid":1,"gid":1,"pid":1},"entry":"main","time_ms":5,"changes":[]}"#
         );
         assert_eq!(serde_json::from_str::<Draft>(&single).unwrap(), draft);
         draft.origin = Some(origin());
@@ -622,6 +667,124 @@ mod tests {
         let bare = serde_json::to_string(&draft).unwrap();
         assert!(bare.ends_with(r#","origin":{"replica":"r"}}"#), "{bare}");
         assert_eq!(serde_json::from_str::<Draft>(&bare).unwrap(), draft);
+    }
+
+    #[test]
+    fn entry_points_round_trip_through_their_string() {
+        let id = "a".repeat(SandboxId::MAX_LEN);
+        for text in [
+            "main",
+            "agentfs",
+            "sandbox/1",
+            "sandbox/A.b_c-9",
+            &format!("sandbox/{id}"),
+        ] {
+            let entry: EntryPoint = text.parse().unwrap();
+            assert_eq!(entry.to_string(), text);
+            assert_eq!(String::from(entry.clone()), text);
+            assert_eq!(EntryPoint::try_from(text.to_owned()).unwrap(), entry);
+            let json = serde_json::to_string(&entry).unwrap();
+            assert_eq!(json, format!("\"{text}\""));
+            assert_eq!(serde_json::from_str::<EntryPoint>(&json).unwrap(), entry);
+        }
+        assert_eq!(
+            "sandbox/x".parse::<EntryPoint>().unwrap(),
+            EntryPoint::Sandbox(SandboxId::new("x").unwrap())
+        );
+        assert_eq!(SandboxId::new("x").unwrap().as_str(), "x");
+    }
+
+    #[test]
+    fn entry_points_and_sandbox_ids_outside_the_grammar_are_refused() {
+        for text in [
+            "",
+            "Main",
+            "sandbox",
+            "sandbox:x",
+            "agentfs ",
+            " main",
+            "x/main",
+        ] {
+            assert_eq!(
+                text.parse::<EntryPoint>(),
+                Err(EntryError::Unknown(text.to_owned())),
+                "{text:?}"
+            );
+        }
+        let long = "a".repeat(SandboxId::MAX_LEN + 1);
+        for id in [
+            "",
+            "-x",
+            ".x",
+            "_x",
+            "a/b",
+            "a:b",
+            "a b",
+            "é",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                SandboxId::new(id),
+                Err(EntryError::BadSandboxId(id.to_owned())),
+                "{id:?}"
+            );
+            assert_eq!(
+                format!("sandbox/{id}").parse::<EntryPoint>(),
+                Err(EntryError::BadSandboxId(id.to_owned())),
+                "{id:?}"
+            );
+        }
+        assert!(serde_json::from_str::<EntryPoint>(r#""""#).is_err());
+    }
+
+    #[test]
+    fn a_draft_without_an_entry_point_does_not_parse() {
+        let old =
+            r#"{"trigger":"close","caller":{"uid":1,"gid":1,"pid":1},"time_ms":5,"changes":[]}"#;
+        assert!(serde_json::from_str::<Draft>(old).is_err());
+        let empty = r#"{"trigger":"close","caller":{"uid":1,"gid":1,"pid":1},"entry":"","time_ms":5,"changes":[]}"#;
+        assert!(serde_json::from_str::<Draft>(empty).is_err());
+        let no_caller = r#"{"trigger":"close","entry":"main","time_ms":5,"changes":[]}"#;
+        assert!(serde_json::from_str::<Draft>(no_caller).is_err());
+        let cut = r#"{"trigger":"cut","caller":{"uid":1,"gid":1,"pid":1},"entry":"sandbox/s","time_ms":5,"changes":[]}"#;
+        let draft = serde_json::from_str::<Draft>(cut).unwrap();
+        assert_eq!(draft.trigger, Trigger::Cut);
+        assert_eq!(Trigger::Cut.as_str(), "cut");
+        assert_eq!(serde_json::to_string(&draft).unwrap(), cut);
+    }
+
+    #[test]
+    fn repair_lines_take_the_entry_point_before_them_and_agentfs_without_one() {
+        let saved = format!(
+            "1 2 3 61\n@entry main\n4 5 6 62\n@origin {}\n@entry sandbox/s1\n7 8 9 63\n\
+             @entry bogus\n1 1 1 64\n@entry agentfs\n2 2 2 65\n",
+            serde_json::to_string(&origin()).unwrap()
+        );
+        let entries = parse_repairs(saved.as_bytes());
+        let got: Vec<(Vec<u8>, String, bool)> = entries
+            .iter()
+            .map(|(path, writer, origin)| {
+                (path.clone(), writer.entry.to_string(), origin.is_some())
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (b"a".to_vec(), "agentfs".to_owned(), false),
+                (b"b".to_vec(), "main".to_owned(), false),
+                (b"c".to_vec(), "sandbox/s1".to_owned(), true),
+                (b"d".to_vec(), "agentfs".to_owned(), true),
+                (b"e".to_vec(), "agentfs".to_owned(), true),
+            ]
+        );
+        assert_eq!(
+            entries[1].1.caller,
+            Caller {
+                uid: 4,
+                gid: 5,
+                pid: 6
+            }
+        );
     }
 
     #[test]

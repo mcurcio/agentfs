@@ -1747,6 +1747,9 @@ fn restore_through_the_mount() {
     assert_eq!(author, "uid-0");
     assert!(message.starts_with("restore f from "), "{message}");
     assert!(message.contains("Agentfs-Trigger: restore\n"), "{message}");
+    // Made by agentfs, whatever mount the restored file is reached through.
+    assert!(message.contains("Agentfs-Entry: agentfs\n"), "{message}");
+    assert_eq!(message.matches("Agentfs-Entry:").count(), 1, "{message}");
     assert!(
         message.contains(&format!("Agentfs-Restore: {c1}\n")),
         "{message}"
@@ -3522,6 +3525,97 @@ fn overlay_edit_is_recorded_and_seen_through_the_main_mount() {
     assert_eq!(
         fs::metadata(v.backing().join("config.yaml")).unwrap().uid(),
         UID
+    );
+    m.stop();
+}
+
+/// The paths commit `id` changes against its first parent.
+fn paths_changed(v: &Vol, id: &str) -> Vec<String> {
+    let repo = git2::Repository::open_bare(v.state().join("git")).unwrap();
+    let commit = repo.find_commit(git2::Oid::from_str(id).unwrap()).unwrap();
+    let parent = commit.parent(0).ok().map(|p| p.tree().unwrap());
+    let diff = repo
+        .diff_tree_to_tree(parent.as_ref(), Some(&commit.tree().unwrap()), None)
+        .unwrap();
+    let mut paths: Vec<String> = diff
+        .deltas()
+        .filter_map(|d| d.new_file().path().map(|p| p.display().to_string()))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// No commit holds two entry points (design §9): an edit through the main
+/// mount and one through the overlay, well inside one commit window, are
+/// two commits, each naming its own entry point.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn main_and_overlay_edits_in_one_window_are_two_commits() {
+    let (v, overlay) = sandbox_vol("main_and_overlay_edits_in_one_window_are_two_commits");
+    // One window for both, whatever the timing.
+    v.config("agentfs.commitWindow", "10m");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    succeeds(
+        &v.p(""),
+        None,
+        "printf a > mnt/skills/a.md && sleep 0.04 && printf b > sandbox/overlay/skills/b.md",
+    );
+    // Unmounting commits what is pending.
+    m.stop();
+    let history = v.history();
+    assert_eq!(history.get("skills/a.md"), Some(&f("a")), "{history:#?}");
+    assert_eq!(history.get("skills/b.md"), Some(&f("b")), "{history:#?}");
+    let (main_id, main) = commit_setting(&v, "skills/a.md", "a");
+    let (sandbox_id, sandbox) = commit_setting(&v, "skills/b.md", "b");
+    assert_ne!(main_id, sandbox_id, "one commit: {main}");
+    assert_eq!(paths_changed(&v, &main_id), ["skills/a.md"], "{main}");
+    assert_eq!(paths_changed(&v, &sandbox_id), ["skills/b.md"], "{sandbox}");
+    assert_eq!(main.matches("Agentfs-Entry:").count(), 1, "{main}");
+    assert!(main.contains("\nAgentfs-Entry: main\n"), "{main}");
+    assert_eq!(sandbox.matches("Agentfs-Entry:").count(), 1, "{sandbox}");
+    let entry = sandbox
+        .lines()
+        .find_map(|l| l.strip_prefix("Agentfs-Entry: sandbox/"))
+        .unwrap_or_else(|| panic!("no sandbox entry: {sandbox}"));
+    assert_eq!(entry.len(), 32, "{sandbox}");
+    assert!(
+        entry
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{sandbox}"
+    );
+}
+
+/// A second session reads the first one's edit at once (design §2.4): the
+/// main mount replacing a file the overlay has just looked up and read.
+#[test]
+#[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
+fn the_overlay_sees_a_main_edit_at_once() {
+    let (v, overlay) = sandbox_vol("the_overlay_sees_a_main_edit_at_once");
+    let (m, _unmounts) = mount_sandbox(&v, &overlay);
+    let top = v.p("");
+    // Looked up and read: the overlay's kernel caches the name.
+    assert_eq!(succeeds(&top, None, "cat sandbox/overlay/skills/a.md"), "a");
+    // Replaced through the main mount by a new file, then read through the
+    // overlay at once, within the name's cache time.
+    assert_eq!(
+        succeeds(
+            &top,
+            None,
+            "printf replaced > mnt/skills/a.new && mv mnt/skills/a.new mnt/skills/a.md && \
+             cat sandbox/overlay/skills/a.md"
+        ),
+        "replaced"
+    );
+    // And a file main creates is there at once.
+    succeeds(&top, None, "test ! -e sandbox/overlay/skills/c.md");
+    assert_eq!(
+        succeeds(
+            &top,
+            None,
+            "printf c > mnt/skills/c.md && cat sandbox/overlay/skills/c.md"
+        ),
+        "c"
     );
     m.stop();
 }

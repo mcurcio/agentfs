@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use agentfs_core::paths::RepoPath;
-use agentfs_core::record::Caller;
+use agentfs_core::record::{Caller, EntryPoint};
 use agentfs_core::telemetry::OverlayRefusal;
 use agentfs_core::visibility::{
     Denial, ExistingKind, Gate, Hidden, NewKind, Placement, Source, Visibility,
@@ -161,11 +161,18 @@ impl ViewOwner {
     /// Who a request from process `pid` acts as through the operations
     /// (sandbox overlay slice 4): the owner's uid and gid with no
     /// supplementary groups ([`crate::creds::Supplementary::None`]), the
-    /// request's pid, and `check`. The only way the overlay makes an
+    /// request's pid, the entry point the request came through (the
+    /// session's), and `check`. The only way the overlay makes an
     /// [`Actor`].
-    pub fn actor<'a>(&self, pid: u32, check: &'a dyn NameCheck) -> Actor<'a> {
+    pub fn actor<'a>(
+        &self,
+        pid: u32,
+        entry: &'a EntryPoint,
+        check: &'a dyn NameCheck,
+    ) -> Actor<'a> {
         Actor {
             caller: self.caller(pid),
+            entry,
             groups: Supplementary::None,
             check: Some(check),
         }
@@ -537,8 +544,10 @@ impl<O: TreeOperations> Overlay<O> {
 
     /// Who a request from process `pid` acts as through the operations:
     /// the view owner, with no supplementary groups and the [`Judge`].
-    fn as_owner(&self, pid: u32) -> Actor<'_> {
-        self.owner.actor(pid, &self.judge)
+    /// The view owner acting for `actor`'s request: its entry point kept,
+    /// its caller, groups and check replaced.
+    fn as_owner<'a>(&'a self, actor: Actor<'a>) -> Actor<'a> {
+        self.owner.actor(actor.caller.pid, actor.entry, &self.judge)
     }
 
     /// Counts one change refused here, before the operations are called.
@@ -764,7 +773,7 @@ impl<O: TreeOperations> Overlay<O> {
         newparent: u64,
         newname: &[u8],
         flags: u32,
-        caller: Caller,
+        actor: Actor<'_>,
     ) -> OpResult<()> {
         if flags & RENAME_EXCHANGE != 0 {
             self.count(OverlayRefusal::Kind);
@@ -791,7 +800,7 @@ impl<O: TreeOperations> Overlay<O> {
                 if let Some(dst) = self.shown_existing(newparent, newname, &to)? {
                     self.require_unlink(&to_dir.attr, &dst.attr)?;
                 }
-                let owner = self.owner.caller(caller.pid);
+                let owner = self.as_owner(actor).writer();
                 self.tmp
                     .move_out(parent, name, |m| {
                         self.inner.move_in(
@@ -802,7 +811,7 @@ impl<O: TreeOperations> Overlay<O> {
                             flags,
                             m.moved,
                             &self.judge,
-                            owner,
+                            &owner,
                         )
                     })
                     .unwrap_or(Err(Errno::ENOENT))
@@ -915,7 +924,7 @@ impl<O: TreeOperations> Operations for Overlay<O> {
             None => self.shown(id)?.attr,
         };
         self.may_setattr(&attr, set)?;
-        self.inner.setattr(id, set, self.as_owner(actor.caller.pid))
+        self.inner.setattr(id, set, self.as_owner(actor))
     }
 
     fn readlink(&self, id: u64) -> OpResult<Vec<u8>> {
@@ -971,7 +980,7 @@ impl<O: TreeOperations> Operations for Overlay<O> {
             name,
             S_IFREG | (plain_mode(mode) & !S_IFMT),
             rdev,
-            self.as_owner(actor.caller.pid),
+            self.as_owner(actor),
         )
     }
 
@@ -981,12 +990,8 @@ impl<O: TreeOperations> Operations for Overlay<O> {
             return Err(Errno::EEXIST);
         }
         self.place_new(parent, name, NewKind::Directory)?;
-        self.inner.mkdir(
-            parent,
-            name,
-            plain_mode(mode),
-            self.as_owner(actor.caller.pid),
-        )
+        self.inner
+            .mkdir(parent, name, plain_mode(mode), self.as_owner(actor))
     }
 
     fn unlink(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
@@ -997,8 +1002,7 @@ impl<O: TreeOperations> Operations for Overlay<O> {
             }
         }
         self.remove(parent, name)?;
-        self.inner
-            .unlink(parent, name, self.as_owner(actor.caller.pid))
+        self.inner.unlink(parent, name, self.as_owner(actor))
     }
 
     fn rmdir(&self, parent: u64, name: &[u8], actor: Actor<'_>) -> OpResult<()> {
@@ -1007,8 +1011,7 @@ impl<O: TreeOperations> Operations for Overlay<O> {
         if !self.tmp.entries(dir.id).is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
-        self.inner
-            .rmdir(parent, name, self.as_owner(actor.caller.pid))
+        self.inner.rmdir(parent, name, self.as_owner(actor))
     }
 
     /// Never offered: the gate places no symlink ([`NewKind::Symlink`]).
@@ -1036,7 +1039,7 @@ impl<O: TreeOperations> Operations for Overlay<O> {
             return Err(Errno::EINVAL);
         }
         if self.tmp.holds(parent, name) {
-            return self.rename_tmp(parent, name, newparent, newname, flags, actor.caller);
+            return self.rename_tmp(parent, name, newparent, newname, flags, actor);
         }
         let from_dir = self.shown(parent)?;
         let to_dir = self.shown(newparent)?;
@@ -1072,7 +1075,7 @@ impl<O: TreeOperations> Operations for Overlay<O> {
             newparent,
             newname,
             flags,
-            self.as_owner(actor.caller.pid),
+            self.as_owner(actor),
         )
     }
 
@@ -1099,7 +1102,7 @@ impl<O: TreeOperations> Operations for Overlay<O> {
         }
         let node = self.shown(id)?;
         self.require(&node.attr, want)?;
-        self.inner.open(id, flags, self.as_owner(actor.caller.pid))
+        self.inner.open(id, flags, self.as_owner(actor))
     }
 
     fn create(
@@ -1157,13 +1160,8 @@ impl<O: TreeOperations> Operations for Overlay<O> {
         // the owner has the access the flags ask of it (with no
         // supplementary groups), and the Judge that what is there is shown
         // for its kind, under the names ordering.
-        self.inner.create(
-            parent,
-            name,
-            plain_mode(mode),
-            flags,
-            self.as_owner(actor.caller.pid),
-        )
+        self.inner
+            .create(parent, name, plain_mode(mode), flags, self.as_owner(actor))
     }
 
     fn read(&self, fh: u64, offset: u64, size: u32) -> OpResult<Vec<u8>> {
@@ -1177,15 +1175,14 @@ impl<O: TreeOperations> Operations for Overlay<O> {
         if let Some(written) = self.tmp.write(fh, offset, data) {
             return written;
         }
-        self.inner
-            .write(fh, offset, data, self.as_owner(actor.caller.pid))
+        self.inner.write(fh, offset, data, self.as_owner(actor))
     }
 
     fn flush(&self, fh: u64, actor: Actor<'_>) -> OpResult<()> {
         if let Some(flushed) = self.tmp.flush(fh) {
             return flushed;
         }
-        self.inner.flush(fh, self.as_owner(actor.caller.pid))
+        self.inner.flush(fh, self.as_owner(actor))
     }
 
     fn release(&self, fh: u64) -> OpResult<()> {
@@ -1214,7 +1211,7 @@ impl<O: TreeOperations> Operations for Overlay<O> {
             return done;
         }
         self.inner
-            .fallocate(fh, offset, length, mode, self.as_owner(actor.caller.pid))
+            .fallocate(fh, offset, length, mode, self.as_owner(actor))
     }
 
     fn lseek(&self, fh: u64, offset: i64, whence: i32) -> OpResult<i64> {
@@ -1245,7 +1242,7 @@ impl<O: TreeOperations> Operations for Overlay<O> {
             fh_out,
             offset_out,
             len,
-            self.as_owner(actor.caller.pid),
+            self.as_owner(actor),
         )
     }
 

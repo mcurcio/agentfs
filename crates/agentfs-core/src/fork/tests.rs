@@ -23,7 +23,7 @@ use crate::events::{Event, Events, NullSink, PushFailureKind};
 use crate::identity::Context;
 use crate::lock::StateLock;
 use crate::paths::RepoPath;
-use crate::record::{Caller, OperationKind, Origin, Trigger};
+use crate::record::{Caller, EntryPoint, OperationKind, Origin, Trigger, Writer};
 use crate::restore::{self, Applied, RecordMode};
 use crate::telemetry::Telemetry;
 use crate::volume::{self, StateDir};
@@ -32,6 +32,10 @@ const CALLER: Caller = Caller {
     uid: 10000,
     gid: 10000,
     pid: 1,
+};
+const WRITER: Writer = Writer {
+    caller: CALLER,
+    entry: EntryPoint::Main,
 };
 
 fn context(volume: &str) -> Context {
@@ -1223,24 +1227,24 @@ fn a_finished_fork_records_nothing() {
     let input = || vec![volume::Input::Tree { path: path.clone() }];
     assert!(finished(
         &recorder
-            .record(Trigger::Close, CALLER, input())
+            .record(Trigger::Close, WRITER, input())
             .unwrap_err()
     ));
     assert!(finished(
         &recorder
-            .record_group(Trigger::Close, CALLER, input())
+            .record_group(Trigger::Close, WRITER, input())
             .unwrap_err()
     ));
     assert!(finished(
         &recorder
-            .record_as(Trigger::Sweep, CALLER, input(), None)
+            .record_as(Trigger::Sweep, WRITER, input(), None)
             .unwrap_err()
     ));
     assert!(finished(
         &recorder
             .record_move(
                 Trigger::Rename,
-                CALLER,
+                WRITER,
                 RepoPath::new("b.txt").unwrap(),
                 RepoPath::new("d.txt").unwrap()
             )

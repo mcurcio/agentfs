@@ -90,7 +90,7 @@ use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::patch::attached::{self, Deferred, Judgement, PodScope};
 use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::push::{self, LeaseOutcome, PushOutcome, RemotePusher, RemoteStatus};
-use agentfs_core::record::{Caller, Trigger};
+use agentfs_core::record::{Caller, SandboxId, Trigger, Writer};
 use agentfs_core::service::{FinalPush, Service};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
@@ -1447,7 +1447,21 @@ fn sandbox_overlay(
             source: state.overlay_stack_source(),
         }),
         tmp_layer: state.tmp_layer(),
+        id: boot_sandbox_id()?,
     }))
+}
+
+/// The static overlay session's sandbox id: 32 lowercase hex digits from
+/// `/dev/urandom`, new at every start, so each daemon run's overlay edits
+/// are their own lineage (design §9).
+fn boot_sandbox_id() -> Result<SandboxId> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom for the sandbox overlay's id")?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(SandboxId::new(&hex)?)
 }
 
 /// The startup line's note of the sandbox overlay, if served: its mount
@@ -2023,11 +2037,12 @@ impl Session {
 /// Records the current state of each of `paths` under `root`, printing
 /// what was recorded and skipped.
 fn record_paths(recorder: &volume::Recorder, root: &Path, paths: &[String]) -> Result<()> {
-    let caller = Caller {
+    // Recorded by agentfs itself, not through a mount (design §9).
+    let writer = Writer::agentfs(Caller {
         uid: current_uid(),
         gid: current_gid(),
         pid: std::process::id(),
-    };
+    });
     let mut groups_done = std::collections::HashSet::new();
     for path in paths {
         // A path in the fsync class records its whole group as one
@@ -2048,7 +2063,7 @@ fn record_paths(recorder: &volume::Recorder, root: &Path, paths: &[String]) -> R
                 }
             }
             let names: Vec<&str> = group.members.iter().map(RepoPath::as_str).collect();
-            let recorded = recorder.record_group(Trigger::Close, caller, inputs)?;
+            let recorded = recorder.record_group(Trigger::Close, writer.clone(), inputs)?;
             if let Some(seq) = recorded.seq {
                 println!("recorded group {} as seq {seq}", names.join(", "));
             }
@@ -2073,7 +2088,7 @@ fn record_paths(recorder: &volume::Recorder, root: &Path, paths: &[String]) -> R
             Input::Symlink { .. } => Trigger::Symlink,
             Input::Write { .. } | Input::Tree { .. } => Trigger::Close,
         };
-        let recorded = recorder.record(trigger, caller, vec![input])?;
+        let recorded = recorder.record(trigger, writer.clone(), vec![input])?;
         if let Some(seq) = recorded.seq {
             println!("recorded {path} as seq {seq}");
         }

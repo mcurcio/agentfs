@@ -69,6 +69,7 @@ use std::time::Duration;
 
 use agentfs_core::config::Settings;
 use agentfs_core::mountinfo::{self, MountEntry};
+use agentfs_core::record::{EntryPoint, SandboxId};
 use agentfs_core::service::Stop;
 use agentfs_core::volume::{Recorder, StateDir};
 use fuser::{MountOption, SessionACL};
@@ -201,6 +202,9 @@ pub struct OverlayConfig {
     /// The tmp layer's store ([`agentfs_core::volume::StateDir::tmp_layer`]),
     /// on the backing tree's filesystem.
     pub tmp_layer: PathBuf,
+    /// The overlay session's sandbox id: every request it serves is
+    /// recorded through `sandbox/<id>` (design §9).
+    pub id: SandboxId,
 }
 
 /// How a mount is stacked over a stale one: FUSE is mounted at `source`, a
@@ -1044,6 +1048,7 @@ impl Mount {
                 ops.clone(),
                 sink(&invalidator, MountKind::Main),
             )),
+            EntryPoint::Main,
             config.passthrough,
             status.clone(),
             failed.clone(),
@@ -1158,6 +1163,7 @@ impl Mount {
                 )),
                 sink(&self.invalidator, MountKind::SandboxOverlay),
             )),
+            EntryPoint::Sandbox(overlay.id.clone()),
             config.passthrough,
             status.clone(),
             self.failed.clone(),
@@ -2165,6 +2171,7 @@ mod tests {
             owner: ViewOwner::new(ids, &Privileges::default(), ids.uid).unwrap(),
             stack_over: None,
             tmp_layer: l.p("state/tmp-layer"),
+            id: SandboxId::new("test").unwrap(),
         };
         // Without the overlay there is nothing to refuse.
         assert!(overlay_gate(None, true, &rules(true)).unwrap().is_none());

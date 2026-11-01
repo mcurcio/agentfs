@@ -18,7 +18,8 @@ use crate::nested::{NestedKind, View};
 use crate::paths::RepoPath;
 use crate::pending::PendingId;
 use crate::record::{
-    Caller, Change, Draft, Operation, OperationKind, Origin, PatchAuthor, Trigger,
+    Caller, Change, Draft, EntryPoint, Operation, OperationKind, Origin, PatchAuthor, Trigger,
+    Writer,
 };
 use crate::rules::{RuleSource, SkipReason};
 use crate::stamps::FreezeStamp;
@@ -252,6 +253,7 @@ fn trigger_to_wire(t: Trigger) -> pb::Trigger {
         Trigger::Interval => pb::Trigger::Interval,
         Trigger::Restore => pb::Trigger::Restore,
         Trigger::Patch => pb::Trigger::Patch,
+        Trigger::Cut => pb::Trigger::Cut,
     }
 }
 
@@ -276,6 +278,7 @@ fn trigger_from_wire(value: i32) -> Result<Trigger, WireError> {
             pb::Trigger::Interval => Trigger::Interval,
             pb::Trigger::Restore => Trigger::Restore,
             pb::Trigger::Patch => Trigger::Patch,
+            pb::Trigger::Cut => Trigger::Cut,
         },
     )
 }
@@ -463,12 +466,13 @@ impl From<&Draft> for pb::Draft {
     fn from(d: &Draft) -> Self {
         Self {
             trigger: trigger_to_wire(d.trigger).into(),
-            caller: Some((&d.caller).into()),
+            caller: Some((&d.writer.caller).into()),
             time_ms: d.time_ms,
             changes: d.changes.iter().map(Into::into).collect(),
             operation: d.operation.as_ref().map(Into::into),
             atomic: d.atomic,
             origin: d.origin.as_ref().map(Into::into),
+            entry: d.writer.entry.to_string(),
         }
     }
 }
@@ -479,7 +483,10 @@ impl TryFrom<pb::Draft> for Draft {
     fn try_from(d: pb::Draft) -> Result<Self, WireError> {
         Ok(Self {
             trigger: trigger_from_wire(d.trigger)?,
-            caller: required("draft.caller", d.caller)?.into(),
+            writer: Writer {
+                caller: required("draft.caller", d.caller)?.into(),
+                entry: entry_from_wire(&d.entry)?,
+            },
             time_ms: d.time_ms,
             changes: d
                 .changes
@@ -491,6 +498,21 @@ impl TryFrom<pb::Draft> for Draft {
             origin: d.origin.map(Origin::try_from).transpose()?,
         })
     }
+}
+
+/// A draft's entry point: required, never defaulted (design §9).
+fn entry_from_wire(entry: &str) -> Result<EntryPoint, WireError> {
+    if entry.is_empty() {
+        return Err(WireError::Missing {
+            field: "draft.entry",
+        });
+    }
+    entry
+        .parse()
+        .map_err(|e: crate::record::EntryError| WireError::Invalid {
+            field: "draft.entry",
+            message: e.to_string(),
+        })
 }
 
 // ---- what the service skipped ----
@@ -675,7 +697,10 @@ mod tests {
     fn draft(changes: Vec<Change>) -> Draft {
         Draft {
             trigger: Trigger::Close,
-            caller: CALLER,
+            writer: Writer {
+                caller: CALLER,
+                entry: EntryPoint::Sandbox(crate::record::SandboxId::new("s1").unwrap()),
+            },
             time_ms: 9,
             changes,
             operation: None,
@@ -980,6 +1005,28 @@ mod tests {
                 field: "draft.caller"
             }
         );
+        // The entry point is required, never read as `main`.
+        let bad = pb::Draft {
+            entry: String::new(),
+            ..good.clone()
+        };
+        assert_eq!(
+            Draft::try_from(bad).unwrap_err(),
+            WireError::Missing {
+                field: "draft.entry"
+            }
+        );
+        let bad = pb::Draft {
+            entry: "sandbox/-x".into(),
+            ..good.clone()
+        };
+        assert!(matches!(
+            Draft::try_from(bad),
+            Err(WireError::Invalid {
+                field: "draft.entry",
+                ..
+            })
+        ));
         let mut bad = good.clone();
         bad.changes[0] = pb::Change { op: None };
         assert_eq!(

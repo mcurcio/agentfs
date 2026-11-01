@@ -103,6 +103,9 @@ message Draft {
   Operation operation = 5;
   bool atomic = 6;
   Origin origin = 7;
+  // The entry point the change came through: `main`, `sandbox/<id>` or
+  // `agentfs` (design §9). Required: empty is refused.
+  string entry = 8;
 }
 
 enum Trigger {
@@ -120,6 +123,7 @@ enum Trigger {
   TRIGGER_INTERVAL = 11;
   TRIGGER_RESTORE = 12;
   TRIGGER_PATCH = 13;
+  TRIGGER_CUT = 14;
 }
 
 message Caller {
