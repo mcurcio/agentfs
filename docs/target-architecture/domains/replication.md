@@ -1,9 +1,9 @@
 # Domain: Replication
 
 **Layer:** System › **Domain (Replication)** › Feature.
-**Status:** draft 3, proposed, against [system.md](../system.md) revision 5, which binds it. It describes the target; Rust sketches show surfaces only.
+**Status:** draft 4, proposed, against [system.md](../system.md) revision 7, which binds it. It describes the target; Rust sketches show surfaces only.
 **Binding from the system:** §3.3 `Replication`, `PushError`, `HistoryObjects`; §3.4 `Committed`, `ForkDropped`, `PushSettled`; I3, I4, I8, I10, I13, I14, I16; §6 (zero remotes is normal); §8 (history kept within a major; drain, then upgrade).
-**What you are asked:** nothing in this domain. Former QR1 and QR2 are adopted as design choices (§7); system Q1 belongs to Landing.
+**What you are asked:** nothing in this domain. Former QR1 and QR2 are adopted as design choices (§7).
 
 ## 1. What Replication owns, its language, and what it is not
 
@@ -79,7 +79,7 @@ stateDiagram-v2
 
 ## 3. Public contract
 
-The trait is system §3.3's; `FetchError` is defined here (E6).
+The trait and both error enums are system §3.3's (`FetchError` since revision 7, from E6).
 
 ```rust
 // ── Commands and queries ────────────────────────────────────────
@@ -112,7 +112,7 @@ pub enum PushError {                     // system §3.3
     NotPermitted,                        // the actor lacks the Operator role
     LocalIo(IoKind),                     // a pending divergence name could not be saved, so nothing was pushed
 }
-pub enum FetchError {                    // E6
+pub enum FetchError {                    // system §3.3
     Unreachable(IoKind),
     CredentialRefused,
     UntrustedHost,
@@ -319,9 +319,7 @@ All run the real binary against real servers: a bare repository by path and `fil
 
 ## 10. Escalations to the system document
 
-| # | Where (revision 5; E1–E5 adopted in revision 4) | Recommended change |
-|---|---|---|
-| E6 | §3.3 `fetch` and `fetch_lfs` return `FetchError`, which the system never defines, though Volume and Landing's commit-source edge match on it | add §3's `FetchError` beside `PushError`, with `Received(HistoryError)` so `OtherMajor` reaches the caller |
+None open. E1–E5 were adopted in revision 4; E6 in revision 7: §3.3 defines `FetchError` beside `PushError`, with `Received(HistoryError)` so `OtherMajor` reaches the caller.
 
 ## New terms
 
@@ -338,4 +336,4 @@ Ref names for lines, divergence saves, fetched tips and the major's place in the
 
 **NOT RUN:** no code was built or tested. Behaviour facts, ref-update atomicity and compare-and-swap per transport are from origin/main `docs/design.md` §11 and the behaviour catalogue, not re-tested.
 
-*History: draft 1 (2026-11-02); draft 2, conformed to system revision 4; draft 3, conformed to revision 5 (majors, sync merges on fork lines, QR1 and QR2 adopted).*
+*History: draft 1 (2026-11-02); draft 2, conformed to system revision 4; draft 3, conformed to revision 5; draft 4, revision 7 (E6 adopted).*

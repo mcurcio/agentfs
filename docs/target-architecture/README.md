@@ -8,7 +8,7 @@ The set is one system document and twelve domain documents. The system document 
 
 | Document | Status |
 |---|---|
-| [The system](system.md) | approved by the owner on 2026-11-02 (revision 3); revision 4 resolves the gaps the domain documents found, each change listed in its change log |
+| [The system](system.md) | approved by the owner on 2026-11-02 (revision 3); now revision 7, each change listed in its change log |
 | The twelve domain documents | proposed |
 
 ## Reading order
@@ -35,5 +35,5 @@ The set is one system document and twelve domain documents. The system document 
 
 - Requirements credited to the owner are quoted and dated; everything else is a design choice and says so.
 - Questions for the owner are marked Q (system) or with a domain letter (QL, QJ, QH, ...), each with a recommendation and its cost.
-- Each domain page ends with its escalations to the system document and how revision 4 resolved them.
+- Each domain page ends with its escalations to the system document and which revision resolved each.
 - Sketches are Rust and show surfaces only. Nothing here was compiled or run.

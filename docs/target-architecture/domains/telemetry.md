@@ -1,7 +1,7 @@
 # agentfs target architecture: the Telemetry domain
 
 **Layer:** System › **Domain: Telemetry** › Feature.
-**Status:** draft 3, proposed, under [system.md](../system.md) revision 5, which binds this page. It describes the target, not today's code. Sketches are Rust and show surfaces only.
+**Status:** draft 4, proposed, under [system.md](../system.md) revision 7, which binds this page. It describes the target, not today's code. Sketches are Rust and show surfaces only.
 **What you are asked:** nothing; former QT1 (§4) and QT2 (§7) are adopted as design choices.
 
 ## 1. What Telemetry owns, its language, and what it is not
@@ -95,12 +95,12 @@ pub enum Event {                    // closed: a new event cannot skip the catal
     Diagnostic(Diagnostic),         // failures that are replies, not published events
 }
 pub enum Diagnostic {               // each inner type is defined by its own domain
-    Journal(JournalDiagnostic),     // NotDurable{kind}, Backpressure, Refused{reason}
+    Journal(JournalDiagnostic),     // NotDurable{kind}, Backpressure, Refused{reason}, TransactionAbandoned{why} (A13)
     Trees(TreesDiagnostic),         // NoSpace, Io{kind}, EscapesRoot
     Forks(ForksDiagnostic),         // SpaceLimit{fork}
     History(HistoryDiagnostic),     // CommitFailed{tree, reason}, PathRefused{reason}, OtherMajor{theirs}
     Views(ViewsDiagnostic),         // MountFailed{kind}, ChangeRefused{reason}, OtherFamily{theirs}
-    Clients(ClientsDiagnostic),     // OtherFamily{theirs}: a launcher of another major.minor
+    Clients(ClientsDiagnostic),     // Refused{reason}. A launcher of another family never reaches Clients: the rpc edge refuses it
     Volume(VolumeDiagnostic),       // FormatsOf{family}: a state area of another family
     Rules(RulesDiagnostic),         // RuleSetLoaded{version}, VerdictError
     Landing(LandingDiagnostic),     // MergeFailed{reason}, ResolverFailed{resolver}, RecoveryRolledForward{id}
@@ -142,7 +142,7 @@ pub enum Subject {                          // identities live here and in attri
 }
 pub struct MetricSpec { id: MetricId, labels: &'static [LabelKey] }
 pub trait LabelValue: sealed::Bounded {}    // only closed enums: SourceKind, Room, StateKind, ResolverKind, reason codes
-pub trait AttrValue: sealed::Shown {}       // ids, positions, commit ids; never Frozen, content or credentials
+pub trait AttrValue: sealed::Shown {}       // ids, positions, commit ids; never Captured, content or credentials
 pub enum TraceKey {                         // the trace id is a hash of this key and the state area
     Landing(LandingId),
     Commit { tree: TreeRef, commit: CommitId },
@@ -156,7 +156,7 @@ pub enum TraceKey {                         // the trace id is a hash of this ke
 | `LandingHeld` | condition, per held run (commits waiting behind it raise none) | `LandingChanged{Held}` | `LandingChanged{Waiting, Landed, Withdrawn}` | Landing |
 | `SyncDeferred` | incident: the conflict raises `LandingHeld` once, when the fork's own commit is held | `LandingChanged{Deferred}` | — | Landing |
 | `LandingRefused` | incident | `LandingChanged{Refused}` | — | Landing |
-| `VersionMismatch` | incident, both versions shown | `OtherFamily`, `OtherMajor`, `FormatsOf` | — | the refusing domain |
+| `VersionMismatch` | incident, both versions shown | `OtherFamily`, `OtherMajor`, `FormatsOf` | — | Views (`OtherFamily`); History; Volume |
 | `StreamLow` / `StreamFull` | condition, per stream | `StreamRoom{Low}` / `{Full}` | `StreamRoom{Plenty}` (or `Low` clears `Full`); `StreamDeleted` | Journal |
 | `StartLineMoved` | condition, per volume | `StartLineChanged{Moved}` | `StartLineChanged{InStep}` | Volume |
 | `CommitsFailing` | condition, per tree | `CommitFailed{tree}` | `Committed{tree}` | History |
@@ -164,7 +164,7 @@ pub enum TraceKey {                         // the trace id is a hash of this ke
 | `ComponentUnresponsive` | condition, per component | `LivenessChanged{Unresponsive, Gone}` | `LivenessChanged{Live}` | Health |
 | `RecordFailed`, `NoSpace`, `ForkSpaceLimit`, `ViewLagged`, `RulesError`, `MountFailed`, `ResolverFailed` | incident | its diagnostic, or `Lagged` | — | the emitting domain |
 
-**Landing metrics** carry `source` (`fork_run`, `sync`, …) and `state` (`deferred` included); `landing.merged{resolver}` counts which resolver merged, measuring the chain's reach. An agent-merged landing is also logged at warn with its commit, for review (E5).
+**Landing metrics** carry `source` (`fork_run`, `sync`, …) and `state` (`deferred` included); `landing.merged{resolver}` counts which resolver merged, read from `Landed{merged_by}` (E5), measuring the chain's reach. An agent-merged landing is also logged at warn with its commit, for review.
 
 ## 4. Invariants and how each is enforced
 
@@ -176,7 +176,7 @@ pub enum TraceKey {                         // the trace id is a hash of this ke
 | T2 | Nothing depends on Telemetry | no publisher port, no query; `cargo deny` bans domain crates from depending on it; the port is always bound, export `Off` a value, so no caller can tell | build time + boot time |
 | T3 | Every event kind has exactly one catalogue entry | `Event` is closed; the catalogue is one exhaustive `match` with `clippy::wildcard_enum_match_arm` denied in this crate | compile time |
 | T4 | No identity or path is ever a metric label (1,000 sandboxes cannot multiply series) | labels take only `LabelValue`, a sealed trait implemented by closed enums; `ClientId`, `ForkId`, `LandingId`, `RelPath`, `CommitId` do not implement it | compile time |
-| T5 | No file content and no credential reaches any signal (R7) | attributes take only `AttrValue`, sealed; `Frozen`, `ContentRef`, `CommitContent` and Replication's credential type do not implement it | compile time |
+| T5 | No file content and no credential reaches any signal (R7) | attributes take only `AttrValue`, sealed; `Captured`, `ContentRef`, `CommitContent` and Replication's credential type do not implement it | compile time |
 | T6 | Telemetry infers nothing. Each condition alarm is raised and cleared only by events of its fact's judge, never by silence or elapsed time | `AlarmDef` names one producing domain for both events, tested over the catalogue; clippy `disallowed_methods` bans every timer and sleep API | construction + test + build time |
 | T7 | The alarm board holds only subjects that still exist | each condition alarm also clears on its subject's end event from the same judge (`Landed`, `Withdrawn`, `StreamDeleted`, `PushSettled{Removed}`, `LivenessChanged{Gone}`); a held run ends only by Landing's event (E6) | test |
 | T8 | One landing is one trace in every process, sampled alike; a sync's trace links to the trace of the landing whose record it carries | `TraceKey::Landing` hashes to the trace id; the sampler decides from the trace id alone (ratio on the id), so every process agrees without talking | construction |
@@ -254,7 +254,7 @@ Linking `Committed`, `ViewCaughtUp` and a sync's `from` to landing 9 needs the l
 |---|---|
 | A fork's run | one trace across every process; a conflict raises one `LandingHeld` (attributes: the held commit, the run's `through`), cleared by a clean re-judging, `resolve` or `Withdrawn` |
 | A sync | its own trace, linked to the landing it carries; `Deferred` is only `SyncDeferred` (the conflict is held once, at the fork's commit) |
-| Transactions | a sealed transaction is one fork commit: at most one `LandingHeld`; its files are attributes, not subjects |
+| Transactions | a sealed transaction is one fork commit: at most one `LandingHeld`; its files are attributes, not subjects. An abandoned one (A13) is counted, never alarmed |
 | 1,000 sandboxes | metric series do not grow with sandboxes (T4); `Recorded` updates counters only; per-view `ViewCaughtUp` feeds one histogram; span volume is cut by sampling, which agrees across processes (T8) |
 | A process crashes or hangs | its queue and board are lost and rebuilt from re-published state; a lost or stuck process is Health's to judge (`ComponentUnresponsive`, raised in Health's process), never inferred here from silence |
 | Disk full | Telemetry writes nothing to disk; `NoSpace`, `NotDurable` and `StreamFull` arrive as diagnostics and alarms; stderr may fail and is ignored |
@@ -283,12 +283,12 @@ All run the real binary with the real `otel` adapter against a local OTLP receiv
 
 | Test | Proves | Failure class ruled out |
 |---|---|---|
-| compile-fail: a `ClientId` or `RelPath` as a label; a `Frozen` or credential as an attribute; a catalogue match with a wildcard | T3, T4, T5 | series explosion; content or secret leaks; a new event silently untracked |
+| compile-fail: a `ClientId` or `RelPath` as a label; a `Captured` or credential as an attribute; a catalogue match with a wildcard | T3, T4, T5 | series explosion; content or secret leaks; a new event silently untracked |
 | the receiver accepts and never answers; 1,000 sandboxes save: record latency as with export `Off`; series count as with 1 sandbox | T1, T4 | a slow collector slowing file calls; labels filling the backend |
 | receiver down at boot, up, down again: commands succeed; one stderr line per transition; `telemetry.dropped` and `telemetry.export_failures` exported after recovery | T1, export link | a telemetry failure stopping a command; a stderr flood; silent loss |
 | the tracer bullet (system §9): one trace per landing across all three processes (Waiting, Writing, Landed, the resolver, the commit link, two `ViewCaughtUp`); step 2's sync as its own trace, caught up in the sandbox's view | T8 | a landing or a sync that cannot be followed end to end |
 | F7 conflicts, F8 waits, F's next commit merges: one `LandingHeld`, raised and cleared. A main save conflicts with F's copy, then F commits it: `SyncDeferred`, then one `LandingHeld` | T6, T7 | a conflict alarmed twice, or per waiting commit |
-| a view host and a launcher of another minor connect; a state area of another family opens: one `VersionMismatch` each, both versions shown | R16 | a version refusal the operator cannot see |
+| a view host of another minor connects; a state area of another family opens: one `VersionMismatch` each, both versions shown | R16 | a version refusal the operator cannot see |
 | stall commits until `StreamLow`, then resume: the alarm raises and clears; hours of fake idle time raise nothing | T6 | alarms from silence or elapsed time |
 | hold a landing, restart the history service: `LandingHeld` is active again before `ServiceReady`; after the tracer bullet ends, the board is empty | T7, T9 | alarms lost on restart; a board that grows forever |
 | a test over the catalogue: both events of every condition alarm come from one domain | T6 | one domain's alarm judged from another's signals |
@@ -304,10 +304,7 @@ All run the real binary with the real `otel` adapter against a local OTLP receiv
 
 ## 10. Escalations to the system document
 
-| # | Gap (revision 5) | Recommended fix |
-|---|---|---|
-| E5 | `LandingChanged{Landed}` does not say which resolver merged; inferring it from the writer breaks I9 | `Landed` carries the resolver used (`ResolverKind`, or none): Landing's state inside §3.4's event |
-| E6 | §3.6 lets a fork "drop with it held"; §5 and I5 resolve or withdraw a held run before `ForkLandingsClosed`. A drop with no Landing event leaves `LandingHeld` raised forever (T7) | one path: dropping withdraws the held run, publishing `Withdrawn` |
+None open. Revision 7 adopted E5 (`Landed{merged_by}` in Landing) and resolved E6 in the system's favour: a fork never drops with a held run (I5), so `resolve` or `withdraw` always clears `LandingHeld` first.
 
 ## For the code architects (parked)
 
@@ -320,4 +317,4 @@ The board without contention (sharded or lock-free); the queue; the recent-landi
 - Alarm gauges set by each subsystem (`patch.blocked`, `push.diverged`) move onto the board, raised and cleared by the judge's events. Record and commit spans, today joined by sequence numbers, join a landing trace; mergiraf's merges, uncounted today, count as `Structure`.
 - Cost: every alarm and metric name is regenerated from the catalogue, so dashboards and alert rules change in one release, with no aliases.
 
-*History: draft 1 (2026-11-02); draft 2, conformed to system revision 4, which adopted E1–E4; draft 3, to revision 5: runs, syncs, `Deferred`, resolvers, version mismatches; QT1 and QT2 adopted.*
+*History: draft 1 (2026-11-02); draft 2, conformed to system revision 4, which adopted E1–E4; draft 3, to revision 5; draft 4, to revision 7: E5, E6, A13.*

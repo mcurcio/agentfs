@@ -1,7 +1,7 @@
 # Domain: Clients
 
 **Layer:** System › **Domain (Clients)** › Feature.
-**Status:** draft 4, proposed, against [system.md](../system.md) revision 6, which binds it. It describes the target, not today's code; Rust sketches show surfaces only.
+**Status:** draft 4, proposed, against [system.md](../system.md) revision 7, which binds it. It describes the target, not today's code; Rust sketches show surfaces only.
 **Binding from the system:** §3.2, §3.3 `Clients`, §3.4 events, §3.7 (the agent resolver), §8 (versions), I2, I9, I12, I13, I14, I16.
 
 ## 1. What Clients owns, its language, and what it is not

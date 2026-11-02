@@ -1,6 +1,6 @@
 # Domain: Rules
 
-**Layer:** System › **Domain (this page)** › Feature. Binding parent: [../system.md](../system.md) revision 6 (revision 3 approved 2026-11-02).
+**Layer:** System › **Domain (this page)** › Feature. Binding parent: [../system.md](../system.md) revision 7 (revision 3 approved 2026-11-02).
 **Status:** draft 4, proposed. Describes the target, not today's code. Sketches are Rust and show surfaces only.
 **What you are asked:** nothing; the two earlier questions are now design choices (§1, §2). "Profile" on this page always means a **view profile**; the CSI settings bundle keeps the bare word.
 
@@ -315,9 +315,9 @@ Built in, not settable: `-shm` files, NFS silly-rename names (`.nfs` and 24 hex 
 3. **A move is two judgements:** a removal at the source and a placement at the target. A sandbox moving a recorded file to a scratch name lands as a removal in main; today the overlay refuses that move.
 4. **Group kinds list their member suffixes.** A database whose sidecar files a kind does not list is captured without them.
 5. **Sandboxes see symlinks read-only** and cannot create them, as today.
-6. **Skips are judged at commit.** A main write the rules would skip is journaled first and dropped by History, because only History knows whether a path is tracked (system cost 9).
+6. **Skips are judged at commit.** A main write the rules would skip is journaled first and dropped by History, because only History knows whether a path is tracked.
 
-Open at this layer: none. System Q1 (a held commit and other forks' landings) does not touch Rules.
+Open at this layer: none.
 
 ## 10. Escalations to the system document
 

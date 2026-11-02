@@ -1,7 +1,7 @@
 # Domain: Volume
 
 **Layer:** System › **Domain (Volume)** › Feature.
-**Status:** draft 4, proposed, against [system.md](../system.md) revision 6, which binds this page. It describes the target, not today's code. Sketches are Rust and show surfaces only.
+**Status:** draft 5, proposed, against [system.md](../system.md) revision 7, which binds this page. It describes the target, not today's code. Sketches are Rust and show surfaces only.
 **Binding from the system:** §3.3 `Volume`, `VolumeError`; §3.4 (its events, in and out); I9, I10, I13, I15, I16; §7 (held work does not hold release); §8 (drain, then upgrade).
 **What you are asked:** nothing. Former VQ1 and VQ2 are adopted as design choices (§7).
 **Since your answers (2026-11-02):** an **upgrade drain** (R16) also waits until no fork is left; another family's release gets `FormatsOf` until that family drains the area.
@@ -89,15 +89,15 @@ stateDiagram-v2
 
 ## 3. Public contract
 
-The trait and `VolumeError` are §3.3's; `drain_for_upgrade` is escalation E1. This page gives the values their shape.
+The trait and `VolumeError` are §3.3's (`drain_for_upgrade` since revision 7, from E1). This page gives the values their shape.
 
 ```rust
-// ── the trait: system §3.3, plus E1 ───────────────────
+// ── the trait: system §3.3 ────────────────────────────
 pub trait Volume {
     fn create(&mut self, spec: VolumeSpec, by: &LaunchCap) -> Result<(), VolumeError>;   // may: Main; a new state area
     fn stage(&mut self, by: &LaunchCap) -> Result<VolumeState, VolumeError>;             // may: Main; boot, Released → Staged, or cancels a Stop drain
     fn unstage(&mut self, by: &LaunchCap) -> Result<VolumeState, VolumeError>;           // may: Main; Staged → Draining(Stop); idempotent
-    fn drain_for_upgrade(&mut self, by: &ActorCap) -> Result<VolumeState, VolumeError>;  // E1. Operator; → Draining(Upgrade); idempotent
+    fn drain_for_upgrade(&mut self, by: &ActorCap) -> Result<VolumeState, VolumeError>;  // Operator; → Draining(Upgrade); idempotent
     fn accept_start(&mut self, tip: CommitId, by: &ActorCap) -> Result<(), VolumeError>; // Operator role; writes nothing in History
     fn start_line(&self) -> StartLine;
     fn release_verdict(&self) -> ReleaseVerdict;   // asks every judge now; never a stored copy
@@ -162,7 +162,7 @@ pub enum StartLine {
 | `Attached`, `AttachmentEnded`, `LastDetached` | Clients | none | re-judge |
 | `LandingChanged` | Landing | none | re-judge |
 | `Committed` | History | none | re-judge |
-| `ForkDropped` (E1) | Forks | none | re-judge (`Upgrade` only) |
+| `ForkDropped` | Forks | none | re-judge (`Upgrade` only) |
 | `PushSettled{remote}` (including `Removed`) | Replication | from the start remote: re-judge the start line | re-judge |
 
 **Who calls Volume, and whom it calls.** Every call out is a query; Volume never commands another domain.
@@ -313,13 +313,9 @@ Each runs the real binary against real state areas and `file://` remotes; the de
 5. **Acceptances stay on the volume:** a row, not today's pushed ref, so another node cannot see it.
 6. **The surface grows Volume** by three commands, three events and seven queries on other domains.
 
-## 10. Escalations to the system document (revision 6)
+## 10. Escalations to the system document
 
-| # | Gap | Proposed |
-|---|---|---|
-| E1 | §3.3 says an upgrade's drain "also needs no fork left", but nothing tells Volume a drain is for an upgrade (`unstage` is a launcher's), and Volume does not consume `ForkDropped` | `drain_for_upgrade(&mut self, by: &ActorCap)` (Operator; a method, not a flag on `unstage`); Volume consumes `ForkDropped` (§3.4); §8's upgrade row names it |
-
-Earlier E1–E5 were adopted in revision 4; E2 (settings kept across upgrades) in revision 6.
+None open. E1 was adopted in revision 7: `drain_for_upgrade` (Operator; a method, not a flag on `unstage`), Volume consumes `ForkDropped` (§3.4), §8's upgrade row names it, and `on_release` is in §8's kept settings. Earlier E1–E5 were adopted in revision 4; E2 in revision 6.
 
 **New terms** are defined in §1's table. Each could be an existing one: blocker (today's "wait" reasons), disposition (`onDelete`'s outcome), start line and accept (start branch, `start accept`), upgrade drain (system §8's "drain"); in motion has none.
 
@@ -335,4 +331,4 @@ The outbox relay's dedup key; how "room reserved at create" is held; whether `se
 
 **NOT RUN:** no code built or tested; CSI behaviour is from `docs/csi.md` and `docs/design.md` §14.2 on origin/main.
 
-*History: draft 1 (2026-11-02); draft 2 for system revision 4; draft 3 for revision 5: upgrade drain, `FormatsOf`, VQ1–VQ2 adopted.*
+*History: draft 1 (2026-11-02); draft 2 for system revision 4; draft 3 for revision 5; draft 4 for revision 6; draft 5 for revision 7 (E1 adopted).*

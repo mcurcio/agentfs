@@ -1,7 +1,7 @@
 # Trees: the real filesystem
 
 **Layer:** System › **Domain (Trees)** › Feature.
-**Status:** draft 3, proposed, under [system.md](../system.md) revision 5. It describes the target, not today's code. Sketches are Rust and show surfaces only.
+**Status:** draft 4, proposed, under [system.md](../system.md) revision 7. It describes the target, not today's code. Sketches are Rust and show surfaces only.
 **Binding:** system.md §3 (contracts), §3.5 (the landing process, syncs and trims), §4 (I1 to I16), §8 (versions).
 
 **Your requirements this domain serves (verbatim, dated).** Everything else here is a design choice.
@@ -29,7 +29,7 @@ Trees is the content truth (R3). It holds every byte a client can see, and it is
 | the **source tree** (main's real directory) and every **layer** (a fork's directory over its parent) | lineage, which fork exists, its kind or its space limit (Forks) |
 | **confinement**: every path is reached beneath its root, no symlink followed | which names a view shows (Rules, Views) |
 | **copy-up**: a fork's first write of a path copies it into the fork's layer | the path base's meaning or lifetime as a merge base (Forks) |
-| **byte copies** (`freeze`): an immutable, durable copy of a file's current bytes | records, `Seq`, writers (Journal) |
+| **byte copies** (`capture`): an immutable, durable copy of a file's current bytes | records, `Seq`, writers (Journal) |
 | **rename into place** under a gate, in main (a run) or a fork (a sync, a restore), idempotent; **trim** of a fork copy | the gate itself: which files it covers, when it rises, who waits on it (Landing, Views) |
 | **fill**: a pinned fork's checkout into a real tree | commit objects (History hands Trees a `CommitContent`) |
 | the **staging area**: where copied and merged bytes wait, on the tree's filesystem; a fork's staging, syncs included, sits under that fork's quota | any event, timer or policy of its own |
@@ -45,7 +45,7 @@ Trees is the content truth (R3). It holds every byte a client can see, and it is
 | whiteout | a mark in a layer: "this name is gone here" | a fork's deletes | overlayfs whiteout |
 | node | one real inode by device, inode and generation, never its path | idempotent replace; `expect` | node id |
 | staged file | a file in the staging area: written, synced, never changed again | atomic rename; durability before `Writing` | `pending/` |
-| `Frozen` | one staged copy per path, or per database-group member. Not A9's "freeze", Landing's gate (E5) | copies have one holder | none |
+| `Captured` | one staged copy per path, or per database-group member; never A9's "freeze", which is Landing's gate (E5) | copies have one holder | none |
 
 ## 2. The model
 
@@ -70,7 +70,7 @@ flowchart TB
 | `Roots` | value, built once at open | the state area | source, layers and staging share one device: every move is one atomic rename |
 | `Layer` | aggregate | `ForkId` | its state is its directory's name; an editable layer's files are never partial |
 | `Staged` | entity, move-only | `StagedId` plus its node | durable and immutable from construction on |
-| `Frozen` | value | its members | one member, or every member of a database group, never part of a group |
+| `Captured` | value | its members | one member, or every member of a database group, never part of a group |
 | `Targets` | value | the gate it was built from | one tree, the gate's; every path is one of the gate's files |
 | `Resolved` | value | none | the topmost layer that answers for a path |
 
@@ -101,12 +101,12 @@ pub trait Trees {
     fn fill(&self, f: ForkId, from: CommitContent) -> Result<(), TreeError>;   // pinned fork: a checkout, whole or absent
     fn resolve(&self, t: TreeRef, p: &RelPath) -> Result<Resolved, TreeError>;
     fn handle(&self, b: &Binding) -> TreeHandle;                               // own tree to write, ancestors to read (Views)
-    fn copy_up(&self, f: ForkId, p: &RelPath) -> Result<Frozen, TreeError>;   // the copied bytes, frozen: the base
-    fn freeze(&self, t: TreeRef, p: &RelPath) -> Result<Frozen, TreeError>;   // reflink, else copy
+    fn copy_up(&self, f: ForkId, p: &RelPath) -> Result<Captured, TreeError>; // the copied bytes, captured: the base
+    fn capture(&self, t: TreeRef, p: &RelPath) -> Result<Captured, TreeError>; // reflink, else copy
     fn stage(&self, t: TreeRef, bytes: MergedBytes) -> Result<Staged, TreeError>; // a merge result, synced; a fork's under its quota
     fn replace(&self, g: &Gated, targets: Targets) -> Result<(), TreeError>;  // rename into place, main or a fork; idempotent
     fn trim(&self, g: &Gated, f: ForkId, p: &RelPath, expect: NodeId) -> Result<(), TreeError>; // only if p still holds expect
-    fn discard(&self, s: Frozen);                                              // its one holder releases it
+    fn discard(&self, s: Captured);                                            // its one holder releases it
 }
 pub enum TreeError { EscapesRoot, Symlink, NoSpace, Moved { path: RelPath }, Io(IoKind) }
 pub struct TreeFacts { reflink: bool, layer_quotas: bool }
@@ -131,8 +131,8 @@ pub struct NodeId { dev: u64, ino: u64, generation: u32 }
 /// Only the fs adapter constructs one, and only after its sync returned.
 pub struct Staged { id: StagedId, node: NodeId, len: u64, executable: bool }
 
-/// What freeze and copy_up return: never hashed (hashing happens at commit).
-pub struct Frozen {
+/// What capture and copy_up return: never hashed (hashing happens at commit).
+pub struct Captured {
     members: NonEmpty<(RelPath, Staged)>, // one file, or every member of its database group
 }
 
@@ -159,10 +159,10 @@ pub enum Expect { Node(NodeId), Absent }
 | Caller | Calls | Why |
 |---|---|---|
 | Forks | `facts`, `create_layer`, `drop_layer`, `fill`, `copy_up`, `discard` | a fork's layer and quota, its pinned checkout, its first write of a path; releasing a replaced base |
-| Landing | `resolve`, `freeze`, `stage`, `replace`, `trim`, `discard` | read what a merge reads; land a run into main or a sync into a fork; trim; reconcile |
-| Views | `resolve`, `handle`, `freeze` | serve the client; copy bytes at a change boundary before `record` |
+| Landing | `resolve`, `capture`, `stage`, `replace`, `trim`, `discard` | read what a merge reads; land a run into main or a sync into a fork; trim; reconcile |
+| Views | `resolve`, `handle`, `capture` | serve the client; copy bytes at a change boundary before `record` |
 | Journal | `discard` | releasing a payload at truncation |
-| Trees asks Rules | `group(p)` → the database group | copy-up and freeze take a group whole |
+| Trees asks Rules | `group(p)` → the database group | copy-up and capture take a group whole |
 
 | Capability Trees requires | From | It makes impossible |
 |---|---|---|
@@ -180,10 +180,10 @@ pub enum Expect { Node(NodeId), Absent }
 | T4 | `replace` and `trim` write only the gate's files, in its one tree, over what the merge read: a sync never touches main, a run no fork | A9; system I3, I4, I6 | `Targets` and `trim` take `&Gated`, checked at construction; `expect` before each rename, else `Moved` | construction time + test |
 | T5 | A replace re-run after a crash gives the state of one run | system I3 (roll forward) | each target is judged done by identity: the name holds the staged node | test |
 | T6 | A layer never holds a partial file: copy-up writes to staging, syncs, then renames into the layer | R3 | copy-up's only write into a layer is a `Put(Staged)` | construction time + test |
-| T7 | A database group is copied up and frozen whole, or not at all | R13 | `Frozen.members` comes from Rules' group; copy-up renames members only after all are staged | construction time + test |
+| T7 | A database group is copied up and captured whole, or not at all | R13 | `Captured.members` comes from Rules' group; copy-up renames members only after all are staged | construction time + test |
 | T8 | A pinned tree is visible only complete, and nothing writes it | A6 | `Filling` is a temporary name; a pinned layer has no writable handle | construction time |
 | T9 | A sandbox fork cannot fill the disk main writes to | system I6 | a per-layer quota set at `create_layer`; the fork's staging (syncs included) and journal payloads sit under it | boot time (`facts`, else sandbox forks refused) |
-| T10 | Every frozen or staged file has one holder, and only it discards it | system I14 | `Frozen` and `Staged` are move-only; `discard` consumes one | construction time |
+| T10 | Every captured or staged file has one holder, and only it discards it | system I14 | `Captured` and `Staged` are move-only; `discard` consumes one | construction time |
 | T11 | The layer layout is read only by its own release family | R16; system I16 | no mark of its own: the state area's family stamp covers it, checked by `store` at boot before Trees opens | boot time |
 
 ## 5. Ports and adapters
@@ -228,7 +228,7 @@ sequenceDiagram
   T->>T: resolve p in F's lowers; stage a copy of each member (reflink, else copy), sync
   T->>T: stage a second copy of each member: the base, never written again
   T->>T: rename each member's first copy into F's layer (parents made as needed)
-  T-->>F: Frozen (the base copies)
+  T-->>F: Captured (the base copies)
   F-->>V: Ok: the write goes to F's layer
 ```
 
@@ -277,7 +277,7 @@ Trees owns no policy a caller can choose: facts detected at open, and two adopte
 |---|---|---|---|
 | One device for source, layers and staging | yes | `open_roots` | refused at boot |
 | Beneath-only path resolution | the kernel supports it | `open_roots` | refused at boot |
-| Freeze method | reflink, else copy | detected at open, never configured | copy: costs time and space per file (named degradation) |
+| Capture method | reflink, else copy | detected at open, never configured | copy: costs time and space per file (named degradation) |
 | Per-layer quota support | yes or no | detected at open, reported by `facts` | sandbox forks refused (system I6) |
 | A layer's space limit | bytes | Forks owns the value and passes it to `create_layer`; Trees enforces it | not applicable |
 | Layer layout family | the state area's major and minor | `store` at boot (I16) | `FormatsOf(family)`: refused until that family's release drains it |
@@ -313,11 +313,7 @@ No open questions here.
 
 ## 10. Escalations to the system document
 
-Revision 4 adopted E1 to E4.
-
-| # | Gap (revision 5) | Proposal |
-|---|---|---|
-| E5 | "freeze" means two things: A9's (Landing's gate, `WriteOpen::Frozen`) and Trees' `freeze`/`Frozen` (an immutable byte copy). Your word should keep one meaning | rename Trees' `freeze` → `capture`, `Frozen` → `Captured` in §3.3 and the pages using them; "freeze" stays the gate's. No model change |
+None open. Revision 4 adopted E1 to E4; revision 7 adopted E5: Trees' `freeze`/`Frozen` became `capture`/`Captured`, so your word "freeze" (A9) means only Landing's gate.
 
 
 ## For the code architects (parked)
@@ -329,8 +325,8 @@ Revision 4 adopted E1 to E4.
 - **Confinement** (`agentfs-core` `confined.rs` and `agentfs-fuse` `backing.rs`, which the module itself calls a duplicate): one confined `fs` adapter. Cost: the two callers move at once.
 - **The tmp layer** (`overlay/tmp.rs`) becomes the fork layer: it holds every file a sandbox writes, persists until the fork drops, and now receives main's changes by sync renames. Recordable names stop going to the shared tree.
 - **The names ordering** (an in-process lock in `agentfs-fuse`) leaves Trees, which relies on single kernel calls; a view host's inode-table ordering stays in Views.
-- **Freeze into `pending/`** (design §3.2) becomes `freeze` into the staging area; restore's in-place rewrite (design §15) becomes a staged rename. Cost: restored files get new inodes, as landed ones do.
+- **Freeze into `pending/`** (design §3.2) becomes `capture` into the staging area; restore's in-place rewrite (design §15) becomes a staged rename. Cost: restored files get new inodes, as landed ones do.
 
 **NOT RUN:** no code was run; reflink, project quotas, beneath-only resolution and rename atomicity come from design.md and kernel documentation.
 
-*History: draft 1; draft 2, system revision 4; draft 3, revision 5 (syncs into forks, freezes only touched files, versioned layout, TQ1 and TQ2 adopted).*
+*History: draft 1; draft 2, system revision 4; draft 3, revision 5 (syncs, local freezes, versioned layout); draft 4, revision 7 (E5 adopted).*

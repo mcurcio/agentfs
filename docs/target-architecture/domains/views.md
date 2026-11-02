@@ -1,7 +1,7 @@
 # Domain: Views
 
 **Layer:** System › **Domain: Views** › Feature.
-**Status:** draft 4, proposed, under [system.md](../system.md) revision 6, which binds it. It describes the target, not today's code. Sketches are Rust and show surfaces only.
+**Status:** draft 5, proposed, under [system.md](../system.md) revision 7, which binds it. It describes the target, not today's code. Sketches are Rust and show surfaces only.
 **What you are asked:** nothing: this domain has no open question.
 
 **Your words this domain serves** (system §1): R3 "a virtual filesystem overlay for each client (including main) that is backed by a _real_ filesystem source-of-truth"; R7 "Agentfs is the gatekeeper that exposes only what we want sandboxes to see"; R13 "a default usage … can operate per-file"; R18 "both clients would see the others changes"; A1 main is a view like any sandbox; A5 "It depends on the config!"; A6 a pinned fork is an acceptable snapshot; A9 "freezing only the files that a landing touches sounds reasonable. and hopefully our new per-client + view system makes locking/freezing files easier"; A11 file watchers: "we can take the "no guarantee" path for now" (2026-11-02). Everything else here is a design choice.
@@ -19,7 +19,7 @@ A view is one client's filesystem: the mount point a program uses, served by a v
 | enforcing the client's consistency setting | choosing it (the grant, in Clients) |
 | forwarding file locks to the real files | merging, history, liveness (Landing, History, Health) |
 | publishing `ViewCaughtUp` | waiting for any other view |
-| the program's transaction edge: how a program in a sandbox declares `begin`, `seal` and `abandon` (R13) | transaction state (Journal) |
+| the program's transaction edge: how a program in a sandbox declares `begin`, `seal` and `abandon` (R13); its closing unsealed (the program died) abandons (A13) | transaction state (Journal) |
 
 | Term | Meaning here |
 |---|---|
@@ -93,7 +93,7 @@ stateDiagram-v2
 
 ## 3. Public contract
 
-Views adds no crossing to system §3 (revision 6); its write-opens and `resume` name no tree (§10).
+Views adds no crossing to system §3 (revision 7); its write-opens and `resume` name no tree (§10).
 
 ```rust
 // ── Offered: to launchers only (system §3.3) ──
@@ -115,7 +115,7 @@ pub struct ViewCaughtUp { view: ViewId, tree: TreeRef, through: Seq } // once pe
 
 | Views calls | Through | For |
 |---|---|---|
-| Trees | `resolve`, `handle(binding)`, `freeze` | every file call, in its own tree or read-through; freezing at a change boundary |
+| Trees | `resolve`, `handle(binding)`, `capture` | every file call, in its own tree or read-through; capturing at a change boundary |
 | Forks | `copy_up(p)`, over its session (the session's `ForkWriteCap`) | the first write of a path an ancestor holds |
 | Journal | `Recorder::record`, `begin`, `seal`, `abandon`, over its session; `feed(t, after)` | records at change boundaries; transactions; the feed of each tree read |
 | Landing | `open_for_writing` (never blocks), `released`, `resume`, over its session; `gates()` with `covers` and `fell` | write-opens; the last release; after a restart; the view's own wait on a gate |
@@ -245,7 +245,7 @@ Attributes are never cached and file pages never outlive their handle, so conten
 | 1,000 sandbox views | each host follows main's feed once and drops only names its kernel holds; a slow host goes Behind alone |
 | History service crash or patch upgrade | data on open handles flows; every other call waits. After the launcher's `rebound`: `resume(write handles)`, feeds from each applied position, Behind if truncated |
 | View host crash | its mounts go stale; Clients ends the attachments, Landing ends their write-opens and reconciles what they left unrecorded. A new open at the same point stacks over a stale mount under `recover`; a sandbox's restarted host gets a new fork |
-| A host frozen, not dead | its kernel serves found names it holds; opens and lookups wait on it; nobody else waits; Health judges it |
+| A host hung, not dead | its kernel serves found names it holds; opens and lookups wait on it; nobody else waits; Health judges it |
 | Patch upgrade of a view host | a restart: its clients' open files fail and the mount is stacked over; a sandbox restarts on a new fork. No live mount hand-over (design choice, system §8) |
 | Minor or major upgrade | drained first: every client detaches. A host of another family gets `OtherFamily` at open or rebind |
 
@@ -254,7 +254,7 @@ Attributes are never cached and file pages never outlive their handle, so conten
 | Policy | Values | Current choice | Why |
 |---|---|---|---|
 | What the kernel may cache | per consistency setting (§6 table) | as tabled | the setting's promise holds with the cache emptied at any moment |
-| Backstop lifetime for cached names | a duration handed to the kernel | placeholder; set at the code-architect gate | only bounds a frozen host's stale names; nothing waits on it (a listed I10 timer) |
+| Backstop lifetime for cached names | a duration handed to the kernel | placeholder; set at the code-architect gate | only bounds a hung host's stale names; nothing waits on it (a listed I10 timer) |
 | Kernel passthrough | read-only opens outside database groups | on where the kernel supports it | reads skip the host; writes stay visible to recording |
 | Stale mount point | `refuse` · `recover` (stack over it) | `recover` | a host restart reuses its mount point |
 | File watchers | no guarantee · guaranteed | no guarantee (A11) | a guarantee needs a per-view mechanism FUSE may lack |
@@ -276,7 +276,7 @@ All run against a real mount over real directories, with a real history service.
 | Hidden names, existing or not, a landing adding a hidden name, a broken rules file | anything shown that the profile hides (I8) |
 | Paths, links and descriptors aimed at the state area from inside a view | history or credentials reachable (I8) |
 | Renames through two views of one tree at once | deadlock from dropping caches inside a file call |
-| One host frozen (`SIGSTOP`) while others save and land | one view stalling the rest (I9) |
+| One host hung (`SIGSTOP`) while others save and land | one view stalling the rest (I9) |
 | Kill the history service mid-write and mid-landing | errors on open handles; double records; a gate rising before resume (I12) |
 | Locks: main views conflict; a sandbox's lock leaves main free; a dead host's locks drop | locks invisible across views; a sandbox blocking main |
 | Snapshot: `EROFS`; content fixed while main changes; `advance` moves it | a snapshot drifting or writable |
@@ -306,7 +306,7 @@ None open. E1 was adopted in revision 6: `open_for_writing(p)` and `resume(paths
 | applied position | the last `Seq` per tree a view has applied | resume and `ViewCaughtUp` | `Agentfs-Seq` |
 | follower | the per-host, per-tree reader of a feed that drops names | V6, scale | today's invalidator |
 | shown name | a name Rules showed for the view's profile | V3 | the visibility gate |
-| backstop lifetime | how long a kernel may keep a name agentfs failed to drop | a frozen host | entry timeout (1 s today) |
+| backstop lifetime | how long a kernel may keep a name agentfs failed to drop | a hung host | entry timeout (1 s today) |
 
 ## For the code architects (parked)
 Node table and hard links; own renames; lookup counts across `rebound`; which errno each `Refusal` maps to; the transaction edge's shape (a control path in the view, or a small library); open-file-description lock mapping from FUSE lock owners; how a host shares one follower across views of one tree; the race between a `Frozen` answer and the gate's fall (ask again after `GateFell`, never assume the mark); whether a dropped name fires a watcher on some kernels (free if it does, never promised).
@@ -321,4 +321,4 @@ Node table and hard links; own renames; lookup counts across `rebound`; which er
 
 **NOT RUN:** FUSE lock forwarding, watchers across mounts, passthrough with name nodes, and copy-up during a parent's rename were not tested. Only `docs/design.md` on origin/main was read; no code.
 
-*History: draft 1 (2026-11-02); draft 2, system revision 4; draft 3, revision 5 (local freezes, syncs on the fork's feed, watchers and upgrades answered); draft 4, revision 6 (E1 adopted).*
+*History: draft 1 (2026-11-02); draft 2, system revision 4; draft 3, revision 5; draft 4, revision 6; draft 5, revision 7 (A13).*
