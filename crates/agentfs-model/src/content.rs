@@ -4,9 +4,10 @@
 //! Every write puts one fresh token into one slot of one file. A token's
 //! name carries its writer (`<writer>.<n>`, plus `~t<T>` when staged in
 //! transaction T), so a commit's diff says whose changes it carries.
-//! Slots are kept on separate lines with separator lines between them, so
-//! git's line merge sees two slots as two hunks: a change to different
-//! slots merges, a change to the same slot conflicts.
+//! Each slot is one line. [`Layout::Separated`] puts separator lines
+//! between slots, so git's line merge sees two slots as two hunks;
+//! [`Layout::Adjacent`] puts them on consecutive lines, so changes to
+//! neighbouring slots form one git hunk.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,6 +18,24 @@ pub const PATHS: [&str; 4] = ["a", "b", "c", "d"];
 /// An unwritten slot.
 pub const EMPTY: &str = "-";
 const SEPARATOR: &str = "--";
+
+/// How a file's slots sit on its lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// Two separator lines after each slot: every slot is its own hunk.
+    Separated,
+    /// Slots on consecutive lines: neighbouring slots share a hunk.
+    Adjacent,
+}
+
+impl Layout {
+    fn gap(self) -> usize {
+        match self {
+            Layout::Separated => 2,
+            Layout::Adjacent => 0,
+        }
+    }
+}
 
 /// One file's content.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,14 +66,18 @@ impl Content {
     }
 
     /// The 1-based line slot `i` renders on.
-    pub fn line_of(i: usize) -> usize {
-        3 * i + 1
+    pub fn line_of(i: usize, layout: Layout) -> usize {
+        (1 + layout.gap()) * i + 1
     }
 
-    pub fn render(&self) -> String {
+    pub fn render(&self, layout: Layout) -> String {
         let mut s = String::new();
         for (i, t) in self.0.iter().enumerate() {
-            s.push_str(&format!("s{i}: {t}\n{SEPARATOR}\n{SEPARATOR}\n"));
+            s.push_str(&format!("s{i}: {t}\n"));
+            for _ in 0..layout.gap() {
+                s.push_str(SEPARATOR);
+                s.push('\n');
+            }
         }
         s
     }
@@ -118,7 +141,9 @@ mod tests {
     #[test]
     fn content_round_trips() {
         let c = Content::empty().with(2, "m1.1");
-        assert_eq!(Content::parse(&c.render()), Some(c));
+        for layout in [Layout::Separated, Layout::Adjacent] {
+            assert_eq!(Content::parse(&c.render(layout)), Some(c.clone()));
+        }
     }
 
     #[test]
@@ -133,11 +158,13 @@ mod tests {
     #[test]
     fn slots_render_on_their_lines() {
         let c = Content::empty().with(2, "m1.1");
-        let line = c
-            .render()
-            .lines()
-            .nth(Content::line_of(2) - 1)
-            .map(str::to_string);
-        assert_eq!(line.as_deref(), Some("s2: m1.1"));
+        for layout in [Layout::Separated, Layout::Adjacent] {
+            let line = c
+                .render(layout)
+                .lines()
+                .nth(Content::line_of(2, layout) - 1)
+                .map(str::to_string);
+            assert_eq!(line.as_deref(), Some("s2: m1.1"), "{layout:?}");
+        }
     }
 }

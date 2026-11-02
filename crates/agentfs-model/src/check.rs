@@ -3,7 +3,8 @@
 //! violation found. Reads over git objects are cached in the [`World`]:
 //! commits, their ancestry and blobs never change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use crate::content::{Content, PATHS, SLOTS, line_token, writer_of};
 use crate::git::{git, try_git};
@@ -11,46 +12,11 @@ use crate::world::{
     CollisionScope, Direction, HistoryPolicy, Step, Tree, TxnEnd, TxnOutcome, World,
 };
 
-/// Which checks run: all by default. `Squashed` breaks three (coherence
-/// finding 2), so its random runs relax exactly those and keep every other
-/// invariant: `real_collisions`, that each collision is between lines that
-/// never saw each other; `no_stale_revert`, that no line is replaced by
-/// one its writer saw; `flag_in_tree`, that a lost line is flagged by a
-/// collision in its own tree or one upstream (relaxed: in any tree, as
-/// when a squashed fork commit carries a collision the fork decided and
-/// git can no longer tell the parent).
-#[derive(Clone, Copy, Debug)]
-pub struct Checks {
-    pub real_collisions: bool,
-    pub no_stale_revert: bool,
-    pub flag_in_tree: bool,
-}
-
-impl Default for Checks {
-    fn default() -> Self {
-        Self {
-            real_collisions: true,
-            no_stale_revert: true,
-            flag_in_tree: true,
-        }
-    }
-}
-
-impl Checks {
-    /// Every check but the three `Squashed` breaks (finding 2).
-    pub fn squashed() -> Self {
-        Self {
-            real_collisions: false,
-            no_stale_revert: false,
-            flag_in_tree: false,
-        }
-    }
-}
-
 /// Every invariant that holds after any step.
-pub fn check(w: &mut World, checks: Checks) -> Result<(), String> {
-    no_silent_loss(w, checks)?;
-    incoming_wins(w, checks)?;
+pub fn check(w: &mut World) -> Result<(), String> {
+    no_silent_loss(w)?;
+    incoming_wins(w)?;
+    syncs_deliver(w)?;
     transactions_end_as_told(w)?;
     let discards = w.grepped.0 != w.discarded.len();
     if w.refs_checked != Some(w.ref_moves) || discards {
@@ -77,9 +43,7 @@ pub fn check_converged(w: &World) -> Result<(), String> {
             let (mine, main) = (w.read(t, p), w.read(Tree::Main, p));
             if mine != main {
                 return Err(format!(
-                    "{t:?}:{p} never converged: {:?} vs main's {:?}",
-                    mine.render(),
-                    main.render()
+                    "{t:?}:{p} never converged: {mine:?} vs main's {main:?}"
                 ));
             }
         }
@@ -87,16 +51,23 @@ pub fn check_converged(w: &World) -> Result<(), String> {
     Ok(())
 }
 
-/// A collision in `t` or a tree upstream of it (any tree, without
-/// `flag_in_tree`) names `token`, or a later token written over it
-/// knowingly, as lost: a loss decided upstream reaches `t` as a plain
-/// update.
-fn flagged(w: &World, checks: Checks, t: Tree, token: &str) -> bool {
-    let up = w.upstream(t);
+/// A collision in `trees` names `token`, or a later token written over it
+/// knowingly, as lost on slot `slot` of `path`.
+fn lost_in(w: &World, trees: &[Tree], path: &str, slot: usize, token: &str) -> bool {
     w.collisions.iter().any(|c| {
-        (!checks.flag_in_tree || up.contains(&c.tree))
-            && c.lost.iter().any(|l| w.lineage.descends(l, token))
+        trees.contains(&c.tree)
+            && c.path == path
+            && c.slots
+                .iter()
+                .zip(&c.lost)
+                .any(|(s, l)| *s == slot && w.lineage.descends(l, token))
     })
+}
+
+/// [`lost_in`] `t` or a tree upstream of it: a loss decided upstream
+/// reaches `t` as a plain update.
+fn flagged(w: &World, t: Tree, path: &str, slot: usize, token: &str) -> bool {
+    lost_in(w, &w.upstream(t), path, slot, token)
 }
 
 /// Main never silently loses a change, nor does any tree, and no stale
@@ -104,10 +75,10 @@ fn flagged(w: &World, checks: Checks, t: Tree, token: &str) -> bool {
 /// token a to token b only if b's writer saw a, or a recorded collision in
 /// that tree or one upstream of it names a as lost; never if a's writer
 /// saw b (b is stale: it was already superseded by a); (b) every token
-/// that entered a tree (written there, or carried in by a landing, won or
-/// lost) is still there or overwritten by one that saw it, or such a
-/// collision names it.
-fn no_silent_loss(w: &mut World, checks: Checks) -> Result<(), String> {
+/// that entered a tree (written there, or carried in by a landing, a sync
+/// or a transaction, won or lost) is still there or overwritten by one that
+/// saw it, or such a collision names it.
+fn no_silent_loss(w: &mut World) -> Result<(), String> {
     let mut now: BTreeMap<Tree, BTreeMap<String, Content>> = BTreeMap::new();
     for t in w.live_trees() {
         now.insert(
@@ -125,12 +96,12 @@ fn no_silent_loss(w: &mut World, checks: Checks) -> Result<(), String> {
         for (p, c) in files {
             for i in 0..SLOTS {
                 let (a, b) = (before[p].slot(i), c.slot(i));
-                if checks.no_stale_revert && a != b && w.lineage.descends(a, b) {
+                if a != b && w.lineage.descends(a, b) {
                     return Err(format!(
                         "stale revert in {t:?}:{p}[{i}]: {a} became {b}, which {a}'s writer had already seen"
                     ));
                 }
-                if a != b && !w.lineage.descends(b, a) && !flagged(w, checks, *t, a) {
+                if a != b && !w.lineage.descends(b, a) && !flagged(w, *t, p, i, a) {
                     return Err(format!(
                         "silent loss in {t:?}:{p}[{i}]: {a} became {b}, whose writer never saw it, and no collision names it"
                     ));
@@ -143,7 +114,7 @@ fn no_silent_loss(w: &mut World, checks: Checks) -> Result<(), String> {
             continue;
         };
         let s = files[&e.path].slot(e.slot);
-        if !w.lineage.descends(s, &e.token) && !flagged(w, checks, *t, &e.token) {
+        if !w.lineage.descends(s, &e.token) && !flagged(w, *t, &e.path, e.slot, &e.token) {
             return Err(format!(
                 "{} entered {t:?}:{}[{}] and is gone ({s} there), with no collision naming it",
                 e.token, e.path, e.slot
@@ -160,9 +131,11 @@ fn no_silent_loss(w: &mut World, checks: Checks) -> Result<(), String> {
 /// under `File`), each named in `won`; the lost and winning lines are
 /// concurrent (neither's writer saw the other); the lost tokens were the
 /// tree's and stay reachable under the collision's ref; the result's
-/// parents are the tree's previous head and the incoming commit (a sync,
-/// or a landing under `FullLineage`), or the previous head alone.
-fn incoming_wins(w: &mut World, checks: Checks) -> Result<(), String> {
+/// stored parents are the tree's previous head and the incoming commit (a
+/// sync, a transaction, or a landing under `FullLineage`), or under
+/// `Squashed` the previous head alone, with the incoming commit as the
+/// graft's second parent.
+fn incoming_wins(w: &mut World) -> Result<(), String> {
     for c in &w.collisions[w.collisions_checked..] {
         let (r, win, lose) = (
             w.file(&c.result, &c.path),
@@ -173,7 +146,7 @@ fn incoming_wins(w: &mut World, checks: Checks) -> Result<(), String> {
             && c.slots.len() == c.lost.len()
             && c.slots.iter().zip(&c.won).all(|(i, t)| r.slot(*i) == t);
         let ok = match w.policies.collision {
-            CollisionScope::Hunk => c.slots.iter().all(|i| r.slot(*i) == win.slot(*i)),
+            CollisionScope::Line => c.slots.iter().all(|i| r.slot(*i) == win.slot(*i)),
             CollisionScope::File => r == win,
         };
         if !ok || !named || c.slots.is_empty() {
@@ -183,10 +156,10 @@ fn incoming_wins(w: &mut World, checks: Checks) -> Result<(), String> {
             |(l, x): (&String, &String)| !w.lineage.descends(l, x) && !w.lineage.descends(x, l);
         let mut pairs = c.lost.iter().zip(&c.won);
         let real = match w.policies.collision {
-            CollisionScope::Hunk => pairs.all(concurrent),
+            CollisionScope::Line => pairs.all(concurrent),
             CollisionScope::File => pairs.any(concurrent),
         };
-        if checks.real_collisions && !real {
+        if !real {
             return Err(format!(
                 "{c:?}: not a collision: one side's writer saw the other's line"
             ));
@@ -198,30 +171,73 @@ fn incoming_wins(w: &mut World, checks: Checks) -> Result<(), String> {
         if at != c.loser {
             return Err(format!("{c:?}: its ref names {at}"));
         }
-        let parents = git(w.repo(), &["rev-list", "--parents", "-n1", &c.result]);
-        let parents: Vec<&str> = parents.split(' ').skip(1).collect();
+        let (stored, lineage) = (
+            parents(w.repo(), &c.result, false),
+            parents(w.repo(), &c.result, true),
+        );
+        let both = [c.loser.clone(), c.winner.clone()];
         let ok = match (c.direction, w.policies.history) {
             // A fast-forward: the fork's commit itself, made on the tree's
             // head.
             (Direction::Landing, HistoryPolicy::FullLineage) if c.result == c.winner => {
-                parents.first() == Some(&c.loser.as_str())
+                stored.first() == Some(&c.loser)
             }
-            (Direction::Landing, HistoryPolicy::Squashed) => parents == [c.loser.as_str()],
-            _ => parents == [c.loser.as_str(), c.winner.as_str()],
+            (Direction::Landing, HistoryPolicy::Squashed) => {
+                stored == [c.loser.clone()] && lineage == both
+            }
+            _ => stored == both,
         };
         if !ok {
-            return Err(format!("{c:?}: result's parents are {parents:?}"));
+            return Err(format!(
+                "{c:?}: result's parents are {stored:?}, in lineage {lineage:?}"
+            ));
         }
     }
     w.collisions_checked = w.collisions.len();
     Ok(())
 }
 
+/// A commit's parents, as stored or in lineage (with grafts).
+fn parents(repo: &Path, c: &str, lineage: bool) -> Vec<String> {
+    let mut args = vec!["rev-list", "--parents", "-n1", c];
+    if !lineage {
+        args.insert(0, "--no-replace-objects");
+    }
+    git(repo, &args)
+        .split(' ')
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Rule 1 and rule 3 per sync, the moment it is taken: the fork now holds
+/// every line of the parent's version it carried, except a line the fork
+/// holds newer (its writer saw the parent's) or one the fork already lost
+/// in a collision recorded in the fork (it took that decision before and
+/// moved on: rule 3, never brought back).
+fn syncs_deliver(w: &mut World) -> Result<(), String> {
+    for (t, up, result) in &w.syncs[w.syncs_checked..] {
+        for p in PATHS {
+            let (u, r) = (w.file(up, p), w.file(result, p));
+            for i in 0..SLOTS {
+                let (u, r) = (u.slot(i), r.slot(i));
+                if r != u && !w.lineage.descends(r, u) && !lost_in(w, &[*t], p, i, u) {
+                    return Err(format!(
+                        "a sync of {up:.7} into {t:?} left {p}[{i}] at {r}, not the parent's {u}"
+                    ));
+                }
+            }
+        }
+    }
+    w.syncs_checked = w.syncs.len();
+    Ok(())
+}
+
 /// Rule 5, as the program was told: a committed transaction's every
 /// staged edit is in the fork's commit that carries it (or overwritten by
 /// a later edit of its own); that commit then entered the fork, so
-/// `no_silent_loss` holds it from there. A rejected or rolled-back one's
-/// every staged token is discarded (`discarded_leave_no_trace` holds that);
+/// `no_silent_loss` holds it from there. A rolled-back one's every staged
+/// token is discarded (`discarded_leave_no_trace` holds that);
 /// an empty one staged nothing.
 fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
     for e in &w.ended[w.ended_checked..] {
@@ -237,9 +253,7 @@ fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
                     })
             }),
             (TxnEnd::Commit(TxnOutcome::Empty), None) => e.staged.is_empty(),
-            (TxnEnd::Commit(TxnOutcome::Rejected) | TxnEnd::Rollback, None) => {
-                e.staged.iter().all(|s| w.discarded.contains(&s.token))
-            }
+            (TxnEnd::Rollback, None) => e.staged.iter().all(|s| w.discarded.contains(&s.token)),
             _ => false,
         };
         if !ok {
@@ -270,6 +284,7 @@ fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let mut args = vec![
+        "--no-replace-objects".to_string(),
         "log".to_string(),
         "--no-walk=unsorted".into(),
         "--diff-merges=first-parent".into(),
@@ -345,7 +360,7 @@ fn added(diff: &str) -> Vec<(String, usize, String)> {
     out
 }
 
-/// A rolled-back or rejected transaction leaves no content in any tree,
+/// A rolled-back transaction leaves no content in any tree,
 /// and no commit reachable from any ref. Each commit is grepped once,
 /// until a new discard adds tokens.
 fn discarded_leave_no_trace(w: &mut World, all: &[String]) -> Result<(), String> {
@@ -390,50 +405,75 @@ fn discarded_leave_no_trace(w: &mut World, all: &[String]) -> Result<(), String>
     }
 }
 
-/// Rule 7: under `FullLineage` a tree's ancestry reaches every commit that
-/// landed in it; under `Squashed` none, and main's ancestry holds only
-/// main's own commits.
+/// Rule 7: a tree's lineage reaches every commit that landed in it; its
+/// stored history does too under `FullLineage`, and under `Squashed` none,
+/// main's holding only main's own commits. Read by ancestry alone (`git
+/// rev-list <head>`, never a `from..to` range, whose walk stops early by
+/// commit date).
 fn history_setting(w: &mut World) -> Result<(), String> {
     let full = w.policies.history == HistoryPolicy::FullLineage;
     let repo = w.repo().to_path_buf();
-    for (t, c) in w.landings.clone() {
-        if !w.alive(t) {
+    let mut heads: Vec<String> = w
+        .landings
+        .iter()
+        .filter(|(t, _)| w.alive(*t))
+        .map(|(t, _)| w.head(*t))
+        .collect();
+    heads.push(w.main_head.clone());
+    for head in heads {
+        w.reach
+            .entry(head.clone())
+            .or_insert_with(|| (reach(&repo, &head, false), reach(&repo, &head, true)));
+    }
+    for (t, c) in &w.landings {
+        if !w.alive(*t) {
             continue;
         }
-        let head = w.head(t);
-        let reach = w.reach.entry(head.clone()).or_insert_with(|| {
-            git(&repo, &["rev-list", &head])
-                .lines()
-                .map(str::to_string)
-                .collect()
-        });
-        if reach.contains(&c) != full {
+        let (history, lineage) = &w.reach[&w.head(*t)];
+        if history.contains(c) != full {
             return Err(format!(
-                "{t:?}'s ancestry reaches landed {c}: {}, under {:?}",
+                "{t:?}'s history reaches landed {c}: {}, under {:?}",
                 !full, w.policies.history
             ));
         }
-    }
-    if !full && w.main_checked.as_deref() != Some(w.main_head.as_str()) {
-        let range = match &w.main_checked {
-            Some(prev) => format!("{prev}..{}", w.main_head),
-            None => w.main_head.clone(),
-        };
-        let trees = git(
-            &repo,
-            &[
-                "log",
-                &range,
-                "--format=%H %(trailers:key=Agentfs-Tree,valueonly)",
-            ],
-        );
-        if let Some(l) = trees
-            .lines()
-            .find(|l| !l.is_empty() && !l.ends_with(" main"))
-        {
-            return Err(format!("Squashed: main's ancestry reaches {l}"));
+        if !lineage.contains(c) {
+            return Err(format!("{t:?}'s lineage lost landed {c}"));
         }
-        w.main_checked = Some(w.main_head.clone());
     }
+    if full {
+        return Ok(());
+    }
+    let new: Vec<String> = w.reach[&w.main_head]
+        .0
+        .iter()
+        .filter(|c| !w.main_history.contains(*c))
+        .cloned()
+        .collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec![
+        "--no-replace-objects",
+        "log",
+        "--no-walk=unsorted",
+        "--format=%H %(trailers:key=Agentfs-Tree,valueonly)",
+    ];
+    args.extend(new.iter().map(String::as_str));
+    if let Some(l) = git(&repo, &args)
+        .lines()
+        .find(|l| !l.is_empty() && !l.ends_with(" main"))
+    {
+        return Err(format!("Squashed: main's history reaches {l}"));
+    }
+    w.main_history.extend(new);
     Ok(())
+}
+
+/// Every commit `head` reaches, as stored or in lineage (with grafts).
+fn reach(repo: &Path, head: &str, lineage: bool) -> BTreeSet<String> {
+    let mut args = vec!["rev-list", head];
+    if !lineage {
+        args.insert(0, "--no-replace-objects");
+    }
+    git(repo, &args).lines().map(str::to_string).collect()
 }

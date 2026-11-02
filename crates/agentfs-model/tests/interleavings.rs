@@ -13,8 +13,8 @@
 //! panic too reports its seed and the event log. The generator is a
 //! SplitMix64 written here: fixed seeds replay exactly.
 
-use agentfs_model::check::{Checks, check, check_converged};
-use agentfs_model::content::PATHS;
+use agentfs_model::check::{check, check_converged};
+use agentfs_model::content::{Layout, PATHS};
 use agentfs_model::git::with_reversed_dates;
 use agentfs_model::world::{
     Client, CollisionScope, Direction, ForkId, HistoryPolicy, Life, MergeRule, Policies, Step,
@@ -53,8 +53,8 @@ struct Tally {
     fast_forwards: usize,
     landing_collisions: usize,
     sync_collisions: usize,
+    transaction_collisions: usize,
     committed: usize,
-    rejected: usize,
     empty: usize,
     rolled_back: usize,
     forks: usize,
@@ -106,34 +106,22 @@ fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
     Ok(())
 }
 
-fn drain(
-    w: &mut World,
-    checks: Checks,
-    tally: &mut Tally,
-    at: usize,
-) -> Result<(), (usize, String)> {
+fn drain(w: &mut World, tally: &mut Tally, at: usize) -> Result<(), (usize, String)> {
     for _ in 0..100_000 {
         let Some(s) = w.pending().into_iter().next() else {
             return check_converged(w).map_err(|e| (at, e));
         };
         take(w, &s, tally).map_err(|e| (at, e))?;
-        check(w, checks).map_err(|e| (at, e))?;
+        check(w).map_err(|e| (at, e))?;
     }
     Err((at, "the queues never drained".into()))
 }
 
 /// One seed: [`run`] under `catch_unwind`. `Ok` carries the run's
 /// [`World::fingerprint`]; `Err` the seed, step, violation and log.
-fn run_seed(
-    seed: u64,
-    policies: Policies,
-    checks: Checks,
-    tally: &mut Tally,
-) -> Result<String, String> {
+fn run_seed(seed: u64, policies: Policies, tally: &mut Tally) -> Result<String, String> {
     let mut w = World::new(policies);
-    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run(&mut w, seed, checks, tally)
-    }));
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut w, seed, tally)));
     let (step, e) = match out {
         Ok(Ok(())) => return Ok(w.fingerprint()),
         Ok(Err(e)) => e,
@@ -152,7 +140,7 @@ fn run_seed(
     ))
 }
 
-fn run(w: &mut World, seed: u64, checks: Checks, tally: &mut Tally) -> Result<(), (usize, String)> {
+fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     let mut rng = Rng(seed);
     for step in 0..STEPS {
         let p = PATHS[rng.below(PATHS.len())];
@@ -187,7 +175,15 @@ fn run(w: &mut World, seed: u64, checks: Checks, tally: &mut Tally) -> Result<()
                 }
             }
             8 => {
-                if let Some(f) = rng.pick(&in_txn(w)) {
+                // Mostly commit a transaction that staged something, so
+                // commits meet concurrent lines.
+                if let Some(f) = rng.pick(&in_txn(w))
+                    && (w.forks[&f]
+                        .txn
+                        .as_ref()
+                        .is_some_and(|t| !t.staged.is_empty())
+                        || rng.below(4) == 0)
+                {
                     w.commit_txn(f).expect("open");
                 }
             }
@@ -212,7 +208,7 @@ fn run(w: &mut World, seed: u64, checks: Checks, tally: &mut Tally) -> Result<()
                 }
             }
         }
-        check(w, checks).map_err(|e| (step, e))?;
+        check(w).map_err(|e| (step, e))?;
     }
     // Writes stop: every open transaction commits or rolls back; the
     // queues drain; every fork equals main.
@@ -224,13 +220,13 @@ fn run(w: &mut World, seed: u64, checks: Checks, tally: &mut Tally) -> Result<()
             tally.rolled_back += 1;
         }
     }
-    check(w, checks).map_err(|e| (STEPS, e))?;
-    drain(w, checks, tally, STEPS)?;
+    check(w).map_err(|e| (STEPS, e))?;
+    drain(w, tally, STEPS)?;
     // Every program exits: every fork drops.
     for f in live_clients(w) {
         w.end_client(f);
     }
-    drain(w, checks, tally, STEPS + 1)?;
+    drain(w, tally, STEPS + 1)?;
     if let Some(f) = w.forks.values().find(|f| f.life != Life::Dropped) {
         return Err((STEPS + 1, format!("f{} never dropped", f.id)));
     }
@@ -239,12 +235,12 @@ fn run(w: &mut World, seed: u64, checks: Checks, tally: &mut Tally) -> Result<()
         match c.direction {
             Direction::Landing => tally.landing_collisions += 1,
             Direction::Sync => tally.sync_collisions += 1,
+            Direction::Transaction => tally.transaction_collisions += 1,
         }
     }
     for e in &w.ended {
         match e.how {
             TxnEnd::Commit(TxnOutcome::Committed) => tally.committed += 1,
-            TxnEnd::Commit(TxnOutcome::Rejected) => tally.rejected += 1,
             TxnEnd::Commit(TxnOutcome::Empty) => tally.empty += 1,
             TxnEnd::Rollback => {}
         }
@@ -252,18 +248,15 @@ fn run(w: &mut World, seed: u64, checks: Checks, tally: &mut Tally) -> Result<()
     Ok(())
 }
 
-fn run_all(policies: Policies, checks: Checks) {
+fn run_all(policies: Policies) {
     let mut tally = Tally::default();
     let mut failures = Vec::new();
     for seed in seeds() {
-        if let Err(e) = run_seed(seed, policies, checks, &mut tally) {
+        if let Err(e) = run_seed(seed, policies, &mut tally) {
             failures.push(e);
         }
     }
-    eprintln!(
-        "{policies:?} {checks:?}, {} seeds: {tally:?}",
-        seeds().len()
-    );
+    eprintln!("{policies:?}, {} seeds: {tally:?}", seeds().len());
     assert!(
         failures.is_empty(),
         "{} of {} seeds failed:\n\n{}",
@@ -273,52 +266,49 @@ fn run_all(policies: Policies, checks: Checks) {
     );
 }
 
-/// The model's choices: full lineage, per hunk, per-line merges. Every
+/// The model's choices: full lineage, per line, per-line merges. Every
 /// invariant.
 #[test]
 fn random_interleavings_full_lineage() {
-    run_all(
-        Policies::new(HistoryPolicy::FullLineage, CollisionScope::Hunk),
-        Checks::default(),
-    );
+    run_all(Policies::new(
+        HistoryPolicy::FullLineage,
+        CollisionScope::Line,
+    ));
+}
+
+/// `Squashed`, every invariant: main's stored history holds only main's
+/// commits, and the graft beside it keeps the lineage rules 2 and 3 read.
+#[test]
+fn random_interleavings_squashed() {
+    run_all(Policies::new(HistoryPolicy::Squashed, CollisionScope::Line));
+}
+
+/// The per-line rule does not depend on slots being separate git hunks:
+/// the same runs with every slot on a neighbouring line.
+#[test]
+fn random_interleavings_adjacent_lines() {
+    run_all(Policies {
+        layout: Layout::Adjacent,
+        ..Policies::new(HistoryPolicy::FullLineage, CollisionScope::Line)
+    });
 }
 
 /// Rule 2, "no clock is read anywhere", on the random runs: seeds 1..=8
-/// run again with every commit dated before its parents decide exactly the
-/// same trees and collisions ([`World::fingerprint`]). An order taken from
-/// commit dates would differ.
+/// under each history setting run again with every commit dated before its
+/// parents decide exactly the same trees and collisions
+/// ([`World::fingerprint`]). An order taken from commit dates would differ.
 #[test]
 fn random_interleavings_commit_dates_decide_nothing() {
-    let policies = Policies::default();
-    for seed in seeds().into_iter().take(8) {
-        let mut tally = Tally::default();
-        let pinned = run_seed(seed, policies, Checks::default(), &mut tally);
-        let reversed =
-            with_reversed_dates(|| run_seed(seed, policies, Checks::default(), &mut tally));
-        assert_eq!(pinned, reversed, "seed {seed}");
-        assert!(pinned.is_ok(), "seed {seed}: {pinned:?}");
+    for history in [HistoryPolicy::FullLineage, HistoryPolicy::Squashed] {
+        let policies = Policies::new(history, CollisionScope::Line);
+        for seed in seeds().into_iter().take(8) {
+            let mut tally = Tally::default();
+            let pinned = run_seed(seed, policies, &mut tally);
+            let reversed = with_reversed_dates(|| run_seed(seed, policies, &mut tally));
+            assert_eq!(pinned, reversed, "{history:?} seed {seed}");
+            assert!(pinned.is_ok(), "{history:?} seed {seed}: {pinned:?}");
+        }
     }
-}
-
-/// `Squashed`, every invariant but the three finding 2 breaks.
-#[test]
-fn random_interleavings_squashed() {
-    run_all(
-        Policies::new(HistoryPolicy::Squashed, CollisionScope::Hunk),
-        Checks::squashed(),
-    );
-}
-
-/// Coherence finding 2: under `Squashed` main's ancestry forgets which
-/// fork commit a landing carried, so a sync brings a fork's own landed
-/// line back as concurrent with its newer line, and reverts it.
-#[test]
-#[ignore = "coherence finding 2: Squashed (rule 7) loses the ancestry rule 2 needs: a fork's own landed edit reverts its newer one"]
-fn random_interleavings_squashed_every_check() {
-    run_all(
-        Policies::new(HistoryPolicy::Squashed, CollisionScope::Hunk),
-        Checks::default(),
-    );
 }
 
 /// Coherence finding 1: git's own merge base, under the crossing merges
@@ -326,13 +316,10 @@ fn random_interleavings_squashed_every_check() {
 #[test]
 #[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings lets a stale line revert a newer one"]
 fn random_interleavings_git_merge_base() {
-    run_all(
-        Policies {
-            merge: MergeRule::GitMergeBase,
-            ..Policies::new(HistoryPolicy::FullLineage, CollisionScope::Hunk)
-        },
-        Checks::default(),
-    );
+    run_all(Policies {
+        merge: MergeRule::GitMergeBase,
+        ..Policies::new(HistoryPolicy::FullLineage, CollisionScope::Line)
+    });
 }
 
 /// Coherence finding 3: per file, an incoming file reverts the tree's
@@ -340,8 +327,8 @@ fn random_interleavings_git_merge_base() {
 #[test]
 #[ignore = "coherence finding 3: per file, the incoming file reverts the tree's newer clean lines"]
 fn random_interleavings_per_file_full_lineage() {
-    run_all(
-        Policies::new(HistoryPolicy::FullLineage, CollisionScope::File),
-        Checks::default(),
-    );
+    run_all(Policies::new(
+        HistoryPolicy::FullLineage,
+        CollisionScope::File,
+    ));
 }
