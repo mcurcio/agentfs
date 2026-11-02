@@ -3,7 +3,7 @@
 //! A test marked `#[ignore = "coherence finding N: ..."]` asserts what the
 //! rules intend but do not deliver; run it with `--ignored`.
 
-use agentfs_model::check::{check, check_converged};
+use agentfs_model::check::{check, check_converged, step_checked};
 use agentfs_model::content::Layout;
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::world::{
@@ -24,10 +24,17 @@ fn ok(w: &mut World) {
     }
 }
 
+/// One step ([`step_checked`]), then every invariant.
+fn take(w: &mut World, s: &Step) {
+    if let Err(e) = step_checked(w, s) {
+        panic!("{e}\nlog:\n  {}", w.log.join("\n  "));
+    }
+    ok(w);
+}
+
 /// One queued step, then every invariant.
 fn next(w: &mut World, t: Tree) {
-    w.step(&Step::Next(t));
-    ok(w);
+    take(w, &Step::Next(t));
 }
 
 /// Every step until none is left, checking after each; then convergence.
@@ -35,8 +42,7 @@ fn drain(w: &mut World) {
     ok(w);
     while let Some(s) = w.pending().into_iter().next() {
         w.note_step(&s);
-        w.step(&s);
-        ok(w);
+        take(w, &s);
     }
     if let Err(e) = check_converged(w) {
         panic!("{e}\nlog:\n  {}", w.log.join("\n  "));

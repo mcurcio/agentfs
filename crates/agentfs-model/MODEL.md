@@ -51,18 +51,20 @@ Checked after every step, in every scenario and random run (`check.rs`), under b
 | No tree silently loses a change: every line that reached a tree is still there, or replaced by a line written over it, or named lost by a collision in that tree or one upstream. | `no_silent_loss` |
 | No stale line reverts a newer one. | `no_silent_loss` |
 | No flip-flop: a line, once replaced in a tree, never shows there again. | `no_flicker` |
-| The parent's version wins every collision, decided only at the parent's queue: the tree keeps its own line, the two lines really collided, the losing commit stays reachable. (A sync has no way to record one.) | `parent_wins` |
+| The parent's version wins every collision, decided only at the parent's queue: read from git, the result is that tree's own landing (or transaction) commit and the losing commit was made in a sandbox below it; the tree keeps its own line, the two lines really collided, the losing commit stays reachable. | `parent_wins` |
+| A sync records no collision, and carries the parent's head as it was at that moment (read before the step, not from the model's record). | `step_checked` |
 | Every sync delivers the parent's decided version: the sandbox holds the parent's line on every slot except its own lines the parent's queue has not taken yet. | `syncs_deliver` |
 | Nothing is held: every save and commit returns at once; every queue step takes its queue's first entry (with the saves a squash carries) and leaves the rest in order. | `interleavings.rs` `take` |
 | A transaction ends as the program was told: committed lines are in the sandbox, each overwritten one is named in the answer and by a collision; rolled-back ones leave nothing in any tree or history. | `transactions_end_as_told`, `discarded_leave_no_trace` |
 | Every change traces back to one writer. | `one_writer` |
 | Trees converge when writes stop: every sandbox equals main. | `check_converged` |
-| The history setting holds, read by ancestry alone. | `history_setting` |
+| The history setting holds, read by ancestry alone; under Squashed, across the CI seeds, runs of saves really land as one changeset. | `history_setting`, `interleavings.rs` `run_all` |
 | No clock is read: the same calls with every commit dated before its parents decide the same trees. | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` |
 
 The checks' record of who saw what is kept apart from git: a line saw the line its writer read on that
 slot, and everything that line saw. The random runs replay seeds 1 to 64 in CI (full lineage, squashed, and
-every slot on a neighbouring line); run more with `AGENTFS_MODEL_SEEDS=500`, or one with
+every slot on a neighbouring line). Half the time a write goes to the line a sandbox wrote last, so runs
+often build "a sandbox edits over its own undecided line while main writes it" (finding 8). Run more with `AGENTFS_MODEL_SEEDS=500`, or one with
 `AGENTFS_MODEL_SEED=<n>`.
 
 ## Coherence findings
@@ -72,14 +74,15 @@ An open finding has a test marked `#[ignore = "coherence finding N"]`; run them 
 1. **git's own merge cannot tell decided from undecided (open, for git's merge).** A sync built by git's
    three-way merge, keeping the sandbox's side of a conflict: once a sandbox and main have each merged the
    other, git finds two merge bases and keeps a sandbox line main already decided against.
-   `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base` (24 of 64 seeds).
+   `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base` (36 of 64 seeds).
 2. **Resolved: Squashed hid what a sync needs.** Without the graft (rule 7), a sync cannot tell that main's
    queue has taken a sandbox's line, so the sandbox keeps it forever. Costs: a clone needs `refs/replace/`
    too; the system design's squash shape (`domains/history.md`) is a merge, not the model's single-parent
    commit, though the same graft serves it. `random_interleavings_squashed`.
 3. **Per file reverts newer lines (open, for per file).** Main's whole file wins, so the sandbox's clean
    line in it is dropped; the sandbox then takes main's older line over its newer one.
-   `finding_3_per_file_keeps_clean_lines`, `random_interleavings_per_file_full_lineage` (2 of 64 seeds).
+   `finding_3_per_file_keeps_clean_lines` (every time); `random_interleavings_per_file_full_lineage` only rarely
+   builds it (0 of 64 seeds, 3 of 500).
 4. **Resolved: the flicker.** Under "the incoming change wins" a sandbox showed x, then main's m, then x.
    The parent rule removes it, and `no_flicker` asserts it in every run.
 5. **git reads commit dates when it walks a range.** `git rev-list A --not B` stops early by date, so the
@@ -103,7 +106,12 @@ An open finding has a test marked `#[ignore = "coherence finding N"]`; run them 
 - A transaction can end split: a line lost to main, its other lines applied (per line, main wins). The
   program is told at its commit only of lines its own sandbox overwrote; a later loss at main's queue is a
   recorded collision, not part of the commit's answer.
-- Until main's queue decides, a sandbox shows its own line, not main's concurrent one.
+- Until main's queue decides, a sandbox shows its own line, not main's concurrent one, and keeps building
+  on it. Once a sync has brought in main's concurrent line (kept out of view), the outcome is already fixed:
+  the sandbox's line will lose, and so will every edit it stacks on that line before main's queue decides
+  (each was made on the out-of-date copy). They stay in history and a collision names them (under Squashed,
+  one collision names the last), but none reaches main.
+  `r3_an_edit_over_an_undecided_line_still_collides`.
 - Under Squashed, main's history gains an empty commit for a landing whose lines all lost.
 
 ## Left out

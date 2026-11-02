@@ -14,7 +14,7 @@
 //! panic too reports its seed and the event log. The generator is a
 //! SplitMix64 written here: fixed seeds replay exactly.
 
-use agentfs_model::check::{check, check_converged};
+use agentfs_model::check::{check, check_converged, step_checked};
 use agentfs_model::content::{Layout, PATHS};
 use agentfs_model::git::with_reversed_dates;
 use agentfs_model::world::{
@@ -90,7 +90,7 @@ fn in_txn(w: &World) -> Vec<ForkId> {
         .collect()
 }
 
-/// One step, asserting it took its queue's head (and, under `Squashed`,
+/// One step ([`step_checked`]), asserting it took its queue's head (and, under `Squashed`,
 /// the entries it says it carried with it), and left the rest in order.
 fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
     w.note_step(s);
@@ -98,7 +98,7 @@ fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
         Step::Next(t) => w.queue(*t),
         Step::Drop(_) => Vec::new(),
     };
-    let taken = w.step(s);
+    let taken = step_checked(w, s)?;
     tally.steps += 1;
     if let Step::Next(t) = s
         && w.alive(*t)
@@ -153,9 +153,15 @@ fn run_seed(seed: u64, policies: Policies, tally: &mut Tally) -> Result<String, 
 
 fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     let mut rng = Rng(seed);
+    // The line a fork wrote last. Main and forks write it again half the
+    // time, so runs often build "a fork edits over its own undecided line
+    // while main writes it concurrently" (coherence finding 8).
+    let mut focus: Option<(&str, usize)> = None;
     for step in 0..STEPS {
-        let p = PATHS[rng.below(PATHS.len())];
-        let slot = rng.below(HOT_SLOTS);
+        let (p, slot) = match focus {
+            Some(f) if rng.below(2) == 0 => f,
+            _ => (PATHS[rng.below(PATHS.len())], rng.below(HOT_SLOTS)),
+        };
         match rng.below(20) {
             0..=2 => {
                 let who = if rng.below(2) == 0 { "m1" } else { "m2" };
@@ -178,6 +184,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             4..=6 => {
                 if let Some(f) = rng.pick(&live_clients(w)) {
                     w.save(&Client::Fork(f), p, slot);
+                    focus = Some((p, slot));
                 }
             }
             7 => {
@@ -278,6 +285,15 @@ fn run_all(policies: Policies) {
         seeds().len(),
         failures.join("\n\n")
     );
+    // Rule 7: across the CI seeds (or more), squashing really happened.
+    // One seed alone may have no run of waiting saves.
+    if policies.history == HistoryPolicy::Squashed && seeds().len() as u64 >= SEEDS {
+        assert!(
+            tally.squashed_runs > 0,
+            "Squashed: no run of saves landed as one changeset in {} seeds",
+            seeds().len()
+        );
+    }
 }
 
 /// The model's choices: full lineage, per line, per-line syncs. Every

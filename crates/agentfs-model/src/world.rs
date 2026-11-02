@@ -439,7 +439,7 @@ impl World {
         }
     }
 
-    fn name(t: Tree) -> String {
+    pub(crate) fn name(t: Tree) -> String {
         match t {
             Tree::Main => "main".into(),
             Tree::Fork(f) => format!("fork/{f}"),
@@ -649,7 +649,7 @@ impl World {
         self.trailer(c, "Agentfs-Writer")
     }
 
-    fn trailer(&self, c: &str, key: &str) -> String {
+    pub(crate) fn trailer(&self, c: &str, key: &str) -> String {
         git(
             &self.repo,
             &[

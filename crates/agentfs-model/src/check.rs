@@ -9,7 +9,8 @@ use std::path::Path;
 use crate::content::{Content, EMPTY, PATHS, SLOTS, line_token, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
-    CollisionScope, Direction, HistoryPolicy, Step, Tree, TxnEnd, TxnOutcome, World,
+    Collision, CollisionScope, Direction, Entry, ForkId, HistoryPolicy, Step, Tree, TxnEnd, TxnId,
+    TxnOutcome, World,
 };
 
 /// Every invariant that holds after any step.
@@ -30,6 +31,38 @@ pub fn check(w: &mut World) -> Result<(), String> {
     }
     history_setting(w)?;
     Ok(())
+}
+
+/// One step, with what only the step itself shows: a sync records no
+/// collision (only a parent's queue decides one), and carries the parent's
+/// head as it was when the sync was taken, read here before the step, not
+/// from the model's own record. Returns the queue entries taken.
+pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
+    let sync = match s {
+        Step::Next(t @ Tree::Fork(f)) if w.queue(*t).first() == Some(&Entry::Sync) => {
+            Some((*t, w.head(w.forks[f].parent)))
+        }
+        _ => None,
+    };
+    let (collisions, syncs) = (w.collisions.len(), w.syncs.len());
+    let taken = w.step(s);
+    let Some((t, up)) = sync else {
+        return Ok(taken);
+    };
+    if w.collisions.len() != collisions {
+        return Err(format!(
+            "a sync into {t:?} recorded a collision: only the parent's queue decides one"
+        ));
+    }
+    match w.syncs.get(syncs) {
+        Some((_, carried, _)) if *carried != up => Err(format!(
+            "a sync into {t:?} carried {carried:.7}, not the parent's head {up:.7}"
+        )),
+        None if !w.is_ancestor(&up, &w.head(t)) => Err(format!(
+            "a sync into {t:?} did nothing, but it lacks the parent's head {up:.7}"
+        )),
+        _ => Ok(taken),
+    }
 }
 
 /// Once writes stop and every queue has drained: no step is left but
@@ -175,9 +208,20 @@ fn no_flicker(w: &mut World, now: &Views) -> Result<(), String> {
 /// parents are the tree's previous head and the incoming commit (a
 /// transaction, or a landing under `FullLineage`), or under `Squashed` the
 /// previous head alone, with the incoming commit as the graft's second
-/// parent.
+/// parent. Where it was decided is read from git, not the model's record:
+/// the result is the deciding tree's own landing or transaction commit,
+/// and the losing commit was written below that tree (a fork under it, or
+/// the transaction of that fork).
 fn parent_wins(w: &mut World) -> Result<(), String> {
     for c in &w.collisions[w.collisions_checked..] {
+        if !decided_at_the_parents_queue(w, c) {
+            return Err(format!(
+                "{c:?}: not decided at the parent's queue (result {} in {}, loser from {})",
+                w.trailer(&c.result, "Agentfs-Cause"),
+                w.trailer(&c.result, "Agentfs-Tree"),
+                w.trailer(&c.loser, "Agentfs-Tree"),
+            ));
+        }
         let (r, win, lose) = (
             w.file(&c.result, &c.path),
             w.file(&c.winner, &c.path),
@@ -231,6 +275,38 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
     }
     w.collisions_checked = w.collisions.len();
     Ok(())
+}
+
+/// The collision's result is a `Landing` (or the transaction's) commit made
+/// on `c.tree`, and its losing commit was made in a fork strictly below
+/// `c.tree` (a nested fork's commit can reach it by fast-forward), or on
+/// the branch of a transaction of fork `c.tree`.
+fn decided_at_the_parents_queue(w: &World, c: &Collision) -> bool {
+    let cause = w.trailer(&c.result, "Agentfs-Cause");
+    if w.trailer(&c.result, "Agentfs-Tree") != World::name(c.tree) {
+        return false;
+    }
+    let from = w.trailer(&c.loser, "Agentfs-Tree");
+    match c.direction {
+        Direction::Landing => {
+            cause == "Landing"
+                && from
+                    .strip_prefix("fork/")
+                    .and_then(|f| f.parse::<ForkId>().ok())
+                    .is_some_and(|f| w.upstream(Tree::Fork(f))[1..].contains(&c.tree))
+        }
+        Direction::Transaction => {
+            cause.starts_with("Transaction ")
+                && from
+                    .strip_prefix("txn/")
+                    .and_then(|n| n.parse::<TxnId>().ok())
+                    .is_some_and(|n| {
+                        w.ended
+                            .iter()
+                            .any(|e| e.txn == n && Tree::Fork(e.fork) == c.tree)
+                    })
+        }
+    }
 }
 
 /// A commit's parents, as stored or in lineage (with grafts).
