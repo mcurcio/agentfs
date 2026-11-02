@@ -33,11 +33,13 @@ COPY crates/agentfs-core/Cargo.toml crates/agentfs-core/build.rs crates/agentfs-
 COPY crates/agentfs-core/proto crates/agentfs-core/proto
 COPY crates/agentfs-csi/Cargo.toml crates/agentfs-csi/build.rs crates/agentfs-csi/
 COPY crates/agentfs-csi/proto crates/agentfs-csi/proto
+# A workspace member the image does not build still needs its manifest.
+COPY crates/agentfs-model/Cargo.toml crates/agentfs-model/
 # Every target a manifest declares must exist, so the record_step bench
 # gets a stub too.
-RUN mkdir -p crates/agentfs-core/src crates/agentfs-core/benches crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src \
+RUN mkdir -p crates/agentfs-core/src crates/agentfs-core/benches crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src crates/agentfs-model/src \
  && echo "fn main() {}" > crates/agentfs-core/benches/record_step.rs \
- && touch crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs \
+ && touch crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs crates/agentfs-model/src/lib.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs/src/main.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs-csi/src/main.rs \
  && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh,agentfs/otlp-tls
