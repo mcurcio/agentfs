@@ -1,9 +1,44 @@
 //! The one adapter: the `git` program, run in a directory with a fixed
-//! identity and clock so a seed's run is the same every time.
+//! identity and pinned dates so a seed's run is the same every time.
+//! [`with_reversed_dates`] makes the dates run backwards instead, so a test
+//! can show that no order is taken from them.
 
+use std::cell::Cell;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+const PINNED: &str = "2026-11-02T00:00:00+0000";
+
+thread_local! {
+    /// `Some(n)`: dates run backwards, `n` git runs so far.
+    static REVERSED: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+/// Runs `f` with each git run on this thread dated one second before the
+/// run before it: every commit is older than its parents, so any order
+/// read from commit dates runs backwards.
+pub fn with_reversed_dates<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REVERSED.with(|r| r.set(None));
+        }
+    }
+    REVERSED.with(|r| r.set(Some(0)));
+    let _reset = Reset;
+    f()
+}
+
+fn date() -> String {
+    REVERSED.with(|r| match r.get() {
+        None => PINNED.to_string(),
+        Some(n) => {
+            r.set(Some(n + 1));
+            format!("{} +0000", 2_000_000_000 - n)
+        }
+    })
+}
 
 /// What a git run returned.
 pub struct Output {
@@ -14,6 +49,7 @@ pub struct Output {
 
 /// Runs git, with `input` on its stdin if given.
 pub fn try_git(dir: &Path, args: &[&str], input: Option<&str>) -> Output {
+    let date = date();
     let mut cmd = Command::new("git");
     cmd.current_dir(dir)
         .args(args)
@@ -23,8 +59,8 @@ pub fn try_git(dir: &Path, args: &[&str], input: Option<&str>) -> Output {
         .env("GIT_AUTHOR_EMAIL", "model@agentfs.invalid")
         .env("GIT_COMMITTER_NAME", "agentfs-model")
         .env("GIT_COMMITTER_EMAIL", "model@agentfs.invalid")
-        .env("GIT_AUTHOR_DATE", "2026-11-02T00:00:00+0000")
-        .env("GIT_COMMITTER_DATE", "2026-11-02T00:00:00+0000")
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")

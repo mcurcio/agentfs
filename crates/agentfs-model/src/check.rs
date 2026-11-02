@@ -7,29 +7,51 @@ use std::collections::BTreeMap;
 
 use crate::content::{Content, PATHS, SLOTS, line_token, writer_of};
 use crate::git::{git, try_git};
-use crate::world::{CollisionScope, Direction, HistoryPolicy, Step, Tree, World};
+use crate::world::{
+    CollisionScope, Direction, HistoryPolicy, Step, Tree, TxnEnd, TxnOutcome, World,
+};
 
-/// Which checks run: all by default. `real_collisions: false` skips only
-/// the check that each collision is between edits that never saw each
-/// other, which `Squashed` breaks (coherence finding 3), so its random runs
-/// keep every other invariant.
+/// Which checks run: all by default. `Squashed` breaks three (coherence
+/// finding 2), so its random runs relax exactly those and keep every other
+/// invariant: `real_collisions`, that each collision is between lines that
+/// never saw each other; `no_stale_revert`, that no line is replaced by
+/// one its writer saw; `flag_in_tree`, that a lost line is flagged by a
+/// collision in its own tree or one upstream (relaxed: in any tree, as
+/// when a squashed fork commit carries a collision the fork decided and
+/// git can no longer tell the parent).
 #[derive(Clone, Copy, Debug)]
 pub struct Checks {
     pub real_collisions: bool,
+    pub no_stale_revert: bool,
+    pub flag_in_tree: bool,
 }
 
 impl Default for Checks {
     fn default() -> Self {
         Self {
             real_collisions: true,
+            no_stale_revert: true,
+            flag_in_tree: true,
+        }
+    }
+}
+
+impl Checks {
+    /// Every check but the three `Squashed` breaks (finding 2).
+    pub fn squashed() -> Self {
+        Self {
+            real_collisions: false,
+            no_stale_revert: false,
+            flag_in_tree: false,
         }
     }
 }
 
 /// Every invariant that holds after any step.
 pub fn check(w: &mut World, checks: Checks) -> Result<(), String> {
-    no_silent_loss(w)?;
-    upstream_wins(w, checks)?;
+    no_silent_loss(w, checks)?;
+    incoming_wins(w, checks)?;
+    transactions_end_as_told(w)?;
     let discards = w.grepped.0 != w.discarded.len();
     if w.refs_checked != Some(w.ref_moves) || discards {
         let all = w.all_commits();
@@ -65,23 +87,27 @@ pub fn check_converged(w: &World) -> Result<(), String> {
     Ok(())
 }
 
-/// A collision in `t` or a tree upstream of it names `token`, or a later
-/// token written over it knowingly, as lost: a loss decided upstream
-/// reaches `t` as a plain update.
-fn flagged(w: &World, t: Tree, token: &str) -> bool {
+/// A collision in `t` or a tree upstream of it (any tree, without
+/// `flag_in_tree`) names `token`, or a later token written over it
+/// knowingly, as lost: a loss decided upstream reaches `t` as a plain
+/// update.
+fn flagged(w: &World, checks: Checks, t: Tree, token: &str) -> bool {
     let up = w.upstream(t);
-    w.collisions
-        .iter()
-        .any(|c| up.contains(&c.tree) && c.lost.iter().any(|l| w.lineage.descends(l, token)))
+    w.collisions.iter().any(|c| {
+        (!checks.flag_in_tree || up.contains(&c.tree))
+            && c.lost.iter().any(|l| w.lineage.descends(l, token))
+    })
 }
 
-/// Main never silently loses a change, nor does any tree: (a) in every
-/// live tree a slot moves from token a to token b only if b's writer saw a
-/// (or something that did), or a recorded collision in that tree or one
-/// upstream of it names a as lost; (b) every token that entered a tree
-/// (written there, or carried in by a landing, won or lost) is still there
-/// or overwritten by one that saw it, or such a collision names it.
-fn no_silent_loss(w: &mut World) -> Result<(), String> {
+/// Main never silently loses a change, nor does any tree, and no stale
+/// line reverts a newer one: (a) in every live tree a slot moves from
+/// token a to token b only if b's writer saw a, or a recorded collision in
+/// that tree or one upstream of it names a as lost; never if a's writer
+/// saw b (b is stale: it was already superseded by a); (b) every token
+/// that entered a tree (written there, or carried in by a landing, won or
+/// lost) is still there or overwritten by one that saw it, or such a
+/// collision names it.
+fn no_silent_loss(w: &mut World, checks: Checks) -> Result<(), String> {
     let mut now: BTreeMap<Tree, BTreeMap<String, Content>> = BTreeMap::new();
     for t in w.live_trees() {
         now.insert(
@@ -99,7 +125,12 @@ fn no_silent_loss(w: &mut World) -> Result<(), String> {
         for (p, c) in files {
             for i in 0..SLOTS {
                 let (a, b) = (before[p].slot(i), c.slot(i));
-                if a != b && !w.lineage.descends(b, a) && !flagged(w, *t, a) {
+                if checks.no_stale_revert && a != b && w.lineage.descends(a, b) {
+                    return Err(format!(
+                        "stale revert in {t:?}:{p}[{i}]: {a} became {b}, which {a}'s writer had already seen"
+                    ));
+                }
+                if a != b && !w.lineage.descends(b, a) && !flagged(w, checks, *t, a) {
                     return Err(format!(
                         "silent loss in {t:?}:{p}[{i}]: {a} became {b}, whose writer never saw it, and no collision names it"
                     ));
@@ -112,7 +143,7 @@ fn no_silent_loss(w: &mut World) -> Result<(), String> {
             continue;
         };
         let s = files[&e.path].slot(e.slot);
-        if !w.lineage.descends(s, &e.token) && !flagged(w, *t, &e.token) {
+        if !w.lineage.descends(s, &e.token) && !flagged(w, checks, *t, &e.token) {
             return Err(format!(
                 "{} entered {t:?}:{}[{}] and is gone ({s} there), with no collision naming it",
                 e.token, e.path, e.slot
@@ -123,36 +154,41 @@ fn no_silent_loss(w: &mut World) -> Result<(), String> {
     Ok(())
 }
 
-/// Upstream wins every same-line collision, and only a real one: in each
-/// recorded collision the losing edit had not seen the winner's line; the
-/// result holds the upstream side's lines on the lost slots (the whole
-/// upstream file under `File`); the losing commit holds the lost tokens
-/// and stays reachable under the collision's ref; the result's parents are
-/// the tree's previous head and the upstream (sync) or the loser (landing).
-fn upstream_wins(w: &mut World, checks: Checks) -> Result<(), String> {
+/// The incoming change wins every same-line collision in the tree it is
+/// applied to, and only a real one: in each recorded collision the result
+/// holds the incoming commit's lines on the lost slots (its whole file
+/// under `File`), each named in `won`; the lost and winning lines are
+/// concurrent (neither's writer saw the other); the lost tokens were the
+/// tree's and stay reachable under the collision's ref; the result's
+/// parents are the tree's previous head and the incoming commit (a sync,
+/// or a landing under `FullLineage`), or the previous head alone.
+fn incoming_wins(w: &mut World, checks: Checks) -> Result<(), String> {
     for c in &w.collisions[w.collisions_checked..] {
         let (r, win, lose) = (
             w.file(&c.result, &c.path),
             w.file(&c.winner, &c.path),
             w.file(&c.loser, &c.path),
         );
+        let named = c.slots.len() == c.won.len()
+            && c.slots.len() == c.lost.len()
+            && c.slots.iter().zip(&c.won).all(|(i, t)| r.slot(*i) == t);
         let ok = match w.policies.collision {
             CollisionScope::Hunk => c.slots.iter().all(|i| r.slot(*i) == win.slot(*i)),
             CollisionScope::File => r == win,
         };
-        if !ok || c.slots.is_empty() {
-            return Err(format!("{c:?}: upstream did not win"));
+        if !ok || !named || c.slots.is_empty() {
+            return Err(format!("{c:?}: the incoming change did not win"));
         }
-        // A collision is between concurrent edits: on some lost slot (on
-        // every one, per hunk) the loser never saw the winner's line.
-        let concurrent = |i: &usize| !w.lineage.descends(lose.slot(*i), win.slot(*i));
+        let concurrent =
+            |(l, x): (&String, &String)| !w.lineage.descends(l, x) && !w.lineage.descends(x, l);
+        let mut pairs = c.lost.iter().zip(&c.won);
         let real = match w.policies.collision {
-            CollisionScope::Hunk => c.slots.iter().all(concurrent),
-            CollisionScope::File => c.slots.iter().any(concurrent),
+            CollisionScope::Hunk => pairs.all(concurrent),
+            CollisionScope::File => pairs.any(concurrent),
         };
         if checks.real_collisions && !real {
             return Err(format!(
-                "{c:?}: not a collision: the losing edit saw the winner's line"
+                "{c:?}: not a collision: one side's writer saw the other's line"
             ));
         }
         if let Some(t) = c.lost.iter().find(|t| !lose.contains(t)) {
@@ -164,15 +200,16 @@ fn upstream_wins(w: &mut World, checks: Checks) -> Result<(), String> {
         }
         let parents = git(w.repo(), &["rev-list", "--parents", "-n1", &c.result]);
         let parents: Vec<&str> = parents.split(' ').skip(1).collect();
-        let expect = match c.direction {
-            Direction::Sync => vec![c.loser.as_str(), c.winner.as_str()],
-            Direction::Landing if c.result == c.winner => vec![],
-            Direction::Landing => match w.policies.history {
-                HistoryPolicy::FullLineage => vec![c.winner.as_str(), c.loser.as_str()],
-                HistoryPolicy::Squashed => vec![c.winner.as_str()],
-            },
+        let ok = match (c.direction, w.policies.history) {
+            // A fast-forward: the fork's commit itself, made on the tree's
+            // head.
+            (Direction::Landing, HistoryPolicy::FullLineage) if c.result == c.winner => {
+                parents.first() == Some(&c.loser.as_str())
+            }
+            (Direction::Landing, HistoryPolicy::Squashed) => parents == [c.loser.as_str()],
+            _ => parents == [c.loser.as_str(), c.winner.as_str()],
         };
-        if !expect.is_empty() && parents != expect {
+        if !ok {
             return Err(format!("{c:?}: result's parents are {parents:?}"));
         }
     }
@@ -180,12 +217,49 @@ fn upstream_wins(w: &mut World, checks: Checks) -> Result<(), String> {
     Ok(())
 }
 
+/// Rule 5, as the program was told: a committed transaction's every
+/// staged edit is in the fork's commit that carries it (or overwritten by
+/// a later edit of its own); that commit then entered the fork, so
+/// `no_silent_loss` holds it from there. A rejected or rolled-back one's
+/// every staged token is discarded (`discarded_leave_no_trace` holds that);
+/// an empty one staged nothing.
+fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
+    for e in &w.ended[w.ended_checked..] {
+        let ok = match (e.how, &e.result) {
+            (TxnEnd::Commit(TxnOutcome::Committed), Some(r)) => e.staged.iter().all(|s| {
+                w.lineage
+                    .descends(w.file(r, &s.path).slot(s.slot), &s.token)
+                    && w.entered.iter().any(|(t, x)| {
+                        *t == Tree::Fork(e.fork)
+                            && x.path == s.path
+                            && x.slot == s.slot
+                            && w.lineage.descends(&x.token, &s.token)
+                    })
+            }),
+            (TxnEnd::Commit(TxnOutcome::Empty), None) => e.staged.is_empty(),
+            (TxnEnd::Commit(TxnOutcome::Rejected) | TxnEnd::Rollback, None) => {
+                e.staged.iter().all(|s| w.discarded.contains(&s.token))
+            }
+            _ => false,
+        };
+        if !ok {
+            return Err(format!(
+                "t{} on f{} ended {:?} but its staged edits {:?} are not where that says",
+                e.txn, e.fork, e.how, e.staged
+            ));
+        }
+    }
+    w.ended_checked = w.ended.len();
+    Ok(())
+}
+
 /// Rule 6: every commit names exactly one writer; a non-merge commit's
 /// change (its diff from its parent) is that writer's alone; a merge
 /// originates nothing: every line it adds over its first parent comes from
-/// another parent. So every token traces through ancestry to the one
-/// non-merge commit that wrote it, which names its writer. Each commit is
-/// checked once: commits never change.
+/// another parent, and it names the writer of its second parent (a landing
+/// or a transaction's commit), or `agentfs` if it is a sync. So every token
+/// traces through ancestry to the one non-merge commit that wrote it, which
+/// names its writer. Each commit is checked once: commits never change.
 fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
     let new: Vec<String> = all
         .iter()
@@ -215,6 +289,19 @@ fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
         let writers: Vec<&str> = writers.split('\x1e').filter(|s| !s.is_empty()).collect();
         if writers.len() != 1 {
             return Err(format!("{commit} names writers {writers:?}"));
+        }
+        if parents.len() > 1 {
+            let expect = match cause.trim() {
+                "Sync" => "agentfs".to_string(),
+                _ => w.writer_of_commit(parents[1]),
+            };
+            if writers[0] != expect {
+                return Err(format!(
+                    "{commit} ({}) names {} but its second parent's writer is {expect}",
+                    cause.trim(),
+                    writers[0]
+                ));
+            }
         }
         for (path, slot, token) in added(diff) {
             let bad = match parents.len() {

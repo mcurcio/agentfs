@@ -46,6 +46,11 @@ impl Content {
         self.0.iter().any(|t| t == token)
     }
 
+    /// The 1-based line slot `i` renders on.
+    pub fn line_of(i: usize) -> usize {
+        3 * i + 1
+    }
+
     pub fn render(&self) -> String {
         let mut s = String::new();
         for (i, t) in self.0.iter().enumerate() {
@@ -83,41 +88,26 @@ pub fn writer_of(token: &str) -> &str {
     token.split('.').next().unwrap_or(token)
 }
 
-/// Which token each write had in view when it replaced another: the oracle
-/// for "nothing is silently lost". A slot may move from token `a` to token
-/// `b` only if `b` descends from `a`: its writer saw `a`, or saw something
-/// that did.
+/// What each write had in view: the oracle for "nothing is silently lost"
+/// and "no stale line reverts a newer one", kept apart from git. A token
+/// `b` descends from `a` when `b`'s writer could see `a`: `a` was in the
+/// tree it wrote on, or in any commit that tree merged or carried. Views
+/// only grow along history, so the relation is transitive as recorded.
 #[derive(Default, Debug)]
 pub struct Lineage {
     saw: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Lineage {
-    /// `token` was written over `over`.
-    pub fn wrote(&mut self, token: &str, over: &str) {
-        if token != over {
-            self.saw
-                .entry(token.to_string())
-                .or_default()
-                .insert(over.to_string());
-        }
+    /// `token` was written by a writer who could see `known`.
+    pub fn wrote(&mut self, token: &str, known: BTreeSet<String>) {
+        self.saw.insert(token.to_string(), known);
     }
 
-    /// Whether `newer` descends from `older` (or is it).
+    /// Whether `newer` descends from `older` (or is it). Every token
+    /// descends from the unwritten slot.
     pub fn descends(&self, newer: &str, older: &str) -> bool {
-        let mut seen = BTreeSet::new();
-        let mut stack = vec![newer.to_string()];
-        while let Some(t) = stack.pop() {
-            if t == older {
-                return true;
-            }
-            if seen.insert(t.clone())
-                && let Some(prev) = self.saw.get(&t)
-            {
-                stack.extend(prev.iter().cloned());
-            }
-        }
-        false
+        newer == older || older == EMPTY || self.saw.get(newer).is_some_and(|s| s.contains(older))
     }
 }
 
@@ -132,11 +122,22 @@ mod tests {
     }
 
     #[test]
-    fn lineage_follows_chains() {
+    fn lineage_follows_views() {
         let mut l = Lineage::default();
-        l.wrote("m1.1", EMPTY);
-        l.wrote("m1.2", "m1.1");
-        assert!(l.descends("m1.2", EMPTY));
+        l.wrote("m1.1", BTreeSet::new());
+        l.wrote("m1.2", BTreeSet::from(["m1.1".to_string()]));
+        assert!(l.descends("m1.2", EMPTY) && l.descends("m1.2", "m1.1"));
         assert!(!l.descends("m1.1", "m1.2"));
+    }
+
+    #[test]
+    fn slots_render_on_their_lines() {
+        let c = Content::empty().with(2, "m1.1");
+        let line = c
+            .render()
+            .lines()
+            .nth(Content::line_of(2) - 1)
+            .map(str::to_string);
+        assert_eq!(line.as_deref(), Some("s2: m1.1"));
     }
 }

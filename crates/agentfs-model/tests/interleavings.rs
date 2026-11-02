@@ -15,9 +15,10 @@
 
 use agentfs_model::check::{Checks, check, check_converged};
 use agentfs_model::content::PATHS;
+use agentfs_model::git::with_reversed_dates;
 use agentfs_model::world::{
-    Client, CollisionScope, Direction, ForkId, HistoryPolicy, Life, Policies, Step, SyncBase, Tree,
-    TxnOutcome, World,
+    Client, CollisionScope, Direction, ForkId, HistoryPolicy, Life, MergeRule, Policies, Step,
+    Tree, TxnEnd, TxnOutcome, World,
 };
 
 /// CI runs seeds 1..=SEEDS.
@@ -121,20 +122,20 @@ fn drain(
     Err((at, "the queues never drained".into()))
 }
 
-/// One seed: [`run`] under `catch_unwind`. `Err` carries the seed, step,
-/// violation and log.
+/// One seed: [`run`] under `catch_unwind`. `Ok` carries the run's
+/// [`World::fingerprint`]; `Err` the seed, step, violation and log.
 fn run_seed(
     seed: u64,
     policies: Policies,
     checks: Checks,
     tally: &mut Tally,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let mut w = World::new(policies);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&mut w, seed, checks, tally)
     }));
     let (step, e) = match out {
-        Ok(Ok(())) => return Ok(()),
+        Ok(Ok(())) => return Ok(w.fingerprint()),
         Ok(Err(e)) => e,
         Err(panic) => {
             let msg = panic
@@ -240,11 +241,12 @@ fn run(w: &mut World, seed: u64, checks: Checks, tally: &mut Tally) -> Result<()
             Direction::Sync => tally.sync_collisions += 1,
         }
     }
-    for (_, _, o) in &w.outcomes {
-        match o {
-            TxnOutcome::Committed => tally.committed += 1,
-            TxnOutcome::Rejected => tally.rejected += 1,
-            TxnOutcome::Empty => tally.empty += 1,
+    for e in &w.ended {
+        match e.how {
+            TxnEnd::Commit(TxnOutcome::Committed) => tally.committed += 1,
+            TxnEnd::Commit(TxnOutcome::Rejected) => tally.rejected += 1,
+            TxnEnd::Commit(TxnOutcome::Empty) => tally.empty += 1,
+            TxnEnd::Rollback => {}
         }
     }
     Ok(())
@@ -271,8 +273,8 @@ fn run_all(policies: Policies, checks: Checks) {
     );
 }
 
-/// The model's choices: full lineage, per hunk, each change merged on its
-/// own base. Every invariant.
+/// The model's choices: full lineage, per hunk, per-line merges. Every
+/// invariant.
 #[test]
 fn random_interleavings_full_lineage() {
     run_all(
@@ -281,48 +283,62 @@ fn random_interleavings_full_lineage() {
     );
 }
 
-/// `Squashed`, every invariant but "a collision is real" (finding 3).
+/// Rule 2, "no clock is read anywhere", on the random runs: seeds 1..=8
+/// run again with every commit dated before its parents decide exactly the
+/// same trees and collisions ([`World::fingerprint`]). An order taken from
+/// commit dates would differ.
+#[test]
+fn random_interleavings_commit_dates_decide_nothing() {
+    let policies = Policies::default();
+    for seed in seeds().into_iter().take(8) {
+        let mut tally = Tally::default();
+        let pinned = run_seed(seed, policies, Checks::default(), &mut tally);
+        let reversed =
+            with_reversed_dates(|| run_seed(seed, policies, Checks::default(), &mut tally));
+        assert_eq!(pinned, reversed, "seed {seed}");
+        assert!(pinned.is_ok(), "seed {seed}: {pinned:?}");
+    }
+}
+
+/// `Squashed`, every invariant but the three finding 2 breaks.
 #[test]
 fn random_interleavings_squashed() {
     run_all(
         Policies::new(HistoryPolicy::Squashed, CollisionScope::Hunk),
-        Checks {
-            real_collisions: false,
-        },
+        Checks::squashed(),
     );
 }
 
-/// Coherence finding 3: under `Squashed` main's ancestry forgets which
+/// Coherence finding 2: under `Squashed` main's ancestry forgets which
 /// fork commit a landing carried, so a sync brings a fork's own landed
-/// edit back as a "collision" over its newer edit, which loses.
+/// line back as concurrent with its newer line, and reverts it.
 #[test]
-#[ignore = "coherence finding 3: Squashed (rule 7) loses the ancestry rule 2 needs: a fork's own landed edit beats its newer one"]
-fn random_interleavings_squashed_collisions_are_real() {
+#[ignore = "coherence finding 2: Squashed (rule 7) loses the ancestry rule 2 needs: a fork's own landed edit reverts its newer one"]
+fn random_interleavings_squashed_every_check() {
     run_all(
         Policies::new(HistoryPolicy::Squashed, CollisionScope::Hunk),
         Checks::default(),
     );
 }
 
-/// Coherence finding 2: git's own recursive merge base, under the crossing
-/// merges `FullLineage` makes, manufactures collisions and diverges.
+/// Coherence finding 1: git's own merge base, under the crossing merges
+/// rule 3 makes, lets a stale line revert a newer one.
 #[test]
-#[ignore = "coherence finding 2: git's recursive merge base of crossing syncs and landings manufactures collisions"]
+#[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings lets a stale line revert a newer one"]
 fn random_interleavings_git_merge_base() {
     run_all(
         Policies {
-            sync_base: SyncBase::Git,
+            merge: MergeRule::GitMergeBase,
             ..Policies::new(HistoryPolicy::FullLineage, CollisionScope::Hunk)
         },
         Checks::default(),
     );
 }
 
-/// Coherence finding 4: per file, the fork's sync result (the parent's
-/// whole file) is recorded in git ancestry as the fork's own change; a
-/// later merge keeps it, and the trees never converge.
+/// Coherence finding 3: per file, an incoming file reverts the tree's
+/// newer clean lines.
 #[test]
-#[ignore = "coherence finding 4: per-file collisions do not converge"]
+#[ignore = "coherence finding 3: per file, the incoming file reverts the tree's newer clean lines"]
 fn random_interleavings_per_file_full_lineage() {
     run_all(
         Policies::new(HistoryPolicy::FullLineage, CollisionScope::File),

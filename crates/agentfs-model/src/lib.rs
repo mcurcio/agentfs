@@ -9,9 +9,10 @@
 //!
 //! [`world`] drives the real `git` program in a temporary repository: main
 //! and each fork are branches, each save a commit naming one writer, each
-//! landing a fast-forward or a `git merge-tree` in which the upstream side
-//! wins a same-line collision. [`check`] holds the invariants, read back
-//! from the repository after every step.
+//! landing or sync a fast-forward or a line merge in which the newer line
+//! wins by git ancestry and, of two concurrent lines, the incoming one.
+//! [`check`] holds the invariants, read back from the repository after
+//! every step.
 //!
 //! This crate depends on no other agentfs crate: it models the rules, not
 //! today's code. What it leaves out is listed in `MODEL.md`.
