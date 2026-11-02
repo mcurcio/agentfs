@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::content::{Content, PATHS, SLOTS, line_token, writer_of};
+use crate::content::{Content, EMPTY, PATHS, SLOTS, line_token, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
     CollisionScope, Direction, HistoryPolicy, Step, Tree, TxnEnd, TxnOutcome, World,
@@ -14,8 +14,11 @@ use crate::world::{
 
 /// Every invariant that holds after any step.
 pub fn check(w: &mut World) -> Result<(), String> {
-    no_silent_loss(w)?;
-    incoming_wins(w)?;
+    let now = views(w);
+    no_silent_loss(w, &now)?;
+    no_flicker(w, &now)?;
+    w.views = now;
+    parent_wins(w)?;
     syncs_deliver(w)?;
     transactions_end_as_told(w)?;
     let discards = w.grepped.0 != w.discarded.len();
@@ -51,8 +54,46 @@ pub fn check_converged(w: &World) -> Result<(), String> {
     Ok(())
 }
 
-/// A collision in `trees` names `token`, or a later token written over it
-/// knowingly, as lost on slot `slot` of `path`.
+type Views = BTreeMap<Tree, BTreeMap<String, Content>>;
+
+/// What every live tree shows now.
+fn views(w: &World) -> Views {
+    w.live_trees()
+        .into_iter()
+        .map(|t| {
+            (
+                t,
+                PATHS
+                    .iter()
+                    .map(|p| (p.to_string(), w.read(t, p)))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Each slot that changed in a live tree since the last check:
+/// (tree, file, slot, before, now).
+fn moves<'a>(w: &'a World, now: &'a Views) -> Vec<(Tree, &'a str, usize, &'a str, &'a str)> {
+    let mut out = Vec::new();
+    for (t, files) in now {
+        let Some(before) = w.views.get(t) else {
+            continue;
+        };
+        for (p, c) in files {
+            for i in 0..SLOTS {
+                let (a, b) = (before[p].slot(i), c.slot(i));
+                if a != b {
+                    out.push((*t, p.as_str(), i, a, b));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A collision in `trees` names `token`, or a later token written over it,
+/// as lost on slot `slot` of `path`.
 fn lost_in(w: &World, trees: &[Tree], path: &str, slot: usize, token: &str) -> bool {
     w.collisions.iter().any(|c| {
         trees.contains(&c.tree)
@@ -72,41 +113,23 @@ fn flagged(w: &World, t: Tree, path: &str, slot: usize, token: &str) -> bool {
 
 /// Main never silently loses a change, nor does any tree, and no stale
 /// line reverts a newer one: (a) in every live tree a slot moves from
-/// token a to token b only if b's writer saw a, or a recorded collision in
-/// that tree or one upstream of it names a as lost; never if a's writer
-/// saw b (b is stale: it was already superseded by a); (b) every token
-/// that entered a tree (written there, or carried in by a landing, a sync
-/// or a transaction, won or lost) is still there or overwritten by one that
-/// saw it, or such a collision names it.
-fn no_silent_loss(w: &mut World) -> Result<(), String> {
-    let mut now: BTreeMap<Tree, BTreeMap<String, Content>> = BTreeMap::new();
-    for t in w.live_trees() {
-        now.insert(
-            t,
-            PATHS
-                .iter()
-                .map(|p| (p.to_string(), w.read(t, p)))
-                .collect(),
-        );
-    }
-    for (t, files) in &now {
-        let Some(before) = w.views.get(t) else {
-            continue;
-        };
-        for (p, c) in files {
-            for i in 0..SLOTS {
-                let (a, b) = (before[p].slot(i), c.slot(i));
-                if a != b && w.lineage.descends(a, b) {
-                    return Err(format!(
-                        "stale revert in {t:?}:{p}[{i}]: {a} became {b}, which {a}'s writer had already seen"
-                    ));
-                }
-                if a != b && !w.lineage.descends(b, a) && !flagged(w, *t, p, i, a) {
-                    return Err(format!(
-                        "silent loss in {t:?}:{p}[{i}]: {a} became {b}, whose writer never saw it, and no collision names it"
-                    ));
-                }
-            }
+/// token a to token b only if b was written over a, or a recorded collision
+/// in that tree or one upstream of it names a as lost; never if a was
+/// written over b (b is stale); (b) every token that entered a tree
+/// (written there, carried in by a landing or a transaction, won or lost,
+/// or taken from the parent by a sync) is still there or overwritten by
+/// one written over it, or such a collision names it.
+fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
+    for (t, p, i, a, b) in moves(w, now) {
+        if w.lineage.descends(a, b) {
+            return Err(format!(
+                "stale revert in {t:?}:{p}[{i}]: {a} became {b}, which {a} was written over"
+            ));
+        }
+        if !w.lineage.descends(b, a) && !flagged(w, t, p, i, a) {
+            return Err(format!(
+                "silent loss in {t:?}:{p}[{i}]: {a} became {b}, which was not written over it, and no collision names it"
+            ));
         }
     }
     for (t, e) in &w.entered {
@@ -121,21 +144,39 @@ fn no_silent_loss(w: &mut World) -> Result<(), String> {
             ));
         }
     }
-    w.views = now;
     Ok(())
 }
 
-/// The incoming change wins every same-line collision in the tree it is
-/// applied to, and only a real one: in each recorded collision the result
-/// holds the incoming commit's lines on the lost slots (its whole file
-/// under `File`), each named in `won`; the lost and winning lines are
-/// concurrent (neither's writer saw the other); the lost tokens were the
-/// tree's and stay reachable under the collision's ref; the result's
-/// stored parents are the tree's previous head and the incoming commit (a
-/// sync, a transaction, or a landing under `FullLineage`), or under
-/// `Squashed` the previous head alone, with the incoming commit as the
-/// graft's second parent.
-fn incoming_wins(w: &mut World) -> Result<(), String> {
+/// No flip-flop: a line, once replaced in a tree, never shows there again.
+/// So a fork's line changes at most once per collision (its own x, then the
+/// parent's winning m, never x again).
+fn no_flicker(w: &mut World, now: &Views) -> Result<(), String> {
+    let mut left = Vec::new();
+    for (t, p, i, a, b) in moves(w, now) {
+        if w.left.contains(&(t, p.to_string(), i, b.to_string())) {
+            return Err(format!(
+                "flicker in {t:?}:{p}[{i}]: {b} shows again after it was replaced (now over {a})"
+            ));
+        }
+        left.push((t, p.to_string(), i, a.to_string()));
+    }
+    w.left.extend(left);
+    Ok(())
+}
+
+/// The parent's version wins every collision, decided only at the
+/// parent's queue (a landing, or a transaction's commit into its fork:
+/// [`Direction`] has no other case, and `sync` records none), and only a
+/// real one: in each recorded collision the result keeps the tree's own
+/// lines on the slots (its whole file under `File`), each named in `won`;
+/// the lost lines are the incoming commit's; each lost and winning pair is
+/// concurrent (neither was written over the other); the losing incoming
+/// commit stays reachable under the collision's ref; the result's stored
+/// parents are the tree's previous head and the incoming commit (a
+/// transaction, or a landing under `FullLineage`), or under `Squashed` the
+/// previous head alone, with the incoming commit as the graft's second
+/// parent.
+fn parent_wins(w: &mut World) -> Result<(), String> {
     for c in &w.collisions[w.collisions_checked..] {
         let (r, win, lose) = (
             w.file(&c.result, &c.path),
@@ -150,7 +191,7 @@ fn incoming_wins(w: &mut World) -> Result<(), String> {
             CollisionScope::File => r == win,
         };
         if !ok || !named || c.slots.is_empty() {
-            return Err(format!("{c:?}: the incoming change did not win"));
+            return Err(format!("{c:?}: the parent's version did not win"));
         }
         let concurrent =
             |(l, x): (&String, &String)| !w.lineage.descends(l, x) && !w.lineage.descends(x, l);
@@ -161,11 +202,11 @@ fn incoming_wins(w: &mut World) -> Result<(), String> {
         };
         if !real {
             return Err(format!(
-                "{c:?}: not a collision: one side's writer saw the other's line"
+                "{c:?}: not a collision: one line was written over the other"
             ));
         }
         if let Some(t) = c.lost.iter().find(|t| !lose.contains(t)) {
-            return Err(format!("{c:?}: lost {t} is not in the losing commit"));
+            return Err(format!("{c:?}: lost {t} is not in the incoming commit"));
         }
         let at = git(w.repo(), &["rev-parse", &c.reference]);
         if at != c.loser {
@@ -175,15 +216,10 @@ fn incoming_wins(w: &mut World) -> Result<(), String> {
             parents(w.repo(), &c.result, false),
             parents(w.repo(), &c.result, true),
         );
-        let both = [c.loser.clone(), c.winner.clone()];
+        let both = [c.winner.clone(), c.loser.clone()];
         let ok = match (c.direction, w.policies.history) {
-            // A fast-forward: the fork's commit itself, made on the tree's
-            // head.
-            (Direction::Landing, HistoryPolicy::FullLineage) if c.result == c.winner => {
-                stored.first() == Some(&c.loser)
-            }
             (Direction::Landing, HistoryPolicy::Squashed) => {
-                stored == [c.loser.clone()] && lineage == both
+                stored == [c.winner.clone()] && lineage == both
             }
             _ => stored == both,
         };
@@ -210,20 +246,32 @@ fn parents(repo: &Path, c: &str, lineage: bool) -> Vec<String> {
         .collect()
 }
 
-/// Rule 1 and rule 3 per sync, the moment it is taken: the fork now holds
-/// every line of the parent's version it carried, except a line the fork
-/// holds newer (its writer saw the parent's) or one the fork already lost
-/// in a collision recorded in the fork (it took that decision before and
-/// moved on: rule 3, never brought back).
+/// Rule 3 per sync, the moment it is taken: the fork now holds the
+/// parent's line on every slot, except where it holds its own line the
+/// parent's queue has not decided yet (that line never entered the
+/// parent). A sync carries the parent's decided state: a fork line the
+/// parent already took is replaced by the parent's line, whichever won.
 fn syncs_deliver(w: &mut World) -> Result<(), String> {
+    let (index, upto) = &mut w.entered_index;
+    index.extend(
+        w.entered[*upto..]
+            .iter()
+            .map(|(t, e)| (*t, e.token.clone())),
+    );
+    *upto = w.entered.len();
     for (t, up, result) in &w.syncs[w.syncs_checked..] {
+        let Tree::Fork(f) = t else {
+            return Err("main synced".into());
+        };
+        let parent = w.forks[f].parent;
         for p in PATHS {
             let (u, r) = (w.file(up, p), w.file(result, p));
             for i in 0..SLOTS {
                 let (u, r) = (u.slot(i), r.slot(i));
-                if r != u && !w.lineage.descends(r, u) && !lost_in(w, &[*t], p, i, u) {
+                let decided = r == EMPTY || w.entered_index.0.contains(&(parent, r.to_string()));
+                if r != u && decided {
                     return Err(format!(
-                        "a sync of {up:.7} into {t:?} left {p}[{i}] at {r}, not the parent's {u}"
+                        "a sync of {up:.7} into {t:?} left {p}[{i}] at {r}, which {parent:?} already took, not its {u}"
                     ));
                 }
             }
@@ -235,23 +283,46 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
 
 /// Rule 5, as the program was told: a committed transaction's every
 /// staged edit is in the fork's commit that carries it (or overwritten by
-/// a later edit of its own); that commit then entered the fork, so
-/// `no_silent_loss` holds it from there. A rolled-back one's every staged
-/// token is discarded (`discarded_leave_no_trace` holds that);
-/// an empty one staged nothing.
+/// a later edit of its own), or named in the commit's answer as
+/// overwritten, with a collision in the fork naming it and the fork's
+/// winning line in the commit; and the answer names every line the commit's
+/// collisions lost. A rolled-back one's every staged token is discarded
+/// (`discarded_leave_no_trace` holds that); an empty one staged nothing.
 fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
     for e in &w.ended[w.ended_checked..] {
-        let ok = match (e.how, &e.result) {
-            (TxnEnd::Commit(TxnOutcome::Committed), Some(r)) => e.staged.iter().all(|s| {
-                w.lineage
-                    .descends(w.file(r, &s.path).slot(s.slot), &s.token)
-                    && w.entered.iter().any(|(t, x)| {
-                        *t == Tree::Fork(e.fork)
-                            && x.path == s.path
-                            && x.slot == s.slot
-                            && w.lineage.descends(&x.token, &s.token)
-                    })
-            }),
+        let fork = Tree::Fork(e.fork);
+        let ok = match (&e.how, &e.result) {
+            (TxnEnd::Commit(TxnOutcome::Committed { overwritten }), Some(r)) => {
+                let told = overwritten.iter().all(|o| {
+                    lost_in(w, &[fork], &o.path, o.slot, &o.staged)
+                        && w.file(r, &o.path).slot(o.slot) == o.kept
+                });
+                let all_told = w
+                    .collisions
+                    .iter()
+                    .filter(|c| c.result == *r)
+                    .map(|c| c.lost.len())
+                    .sum::<usize>()
+                    == overwritten.len();
+                let staged = e.staged.iter().all(|s| {
+                    let applied = w
+                        .lineage
+                        .descends(w.file(r, &s.path).slot(s.slot), &s.token)
+                        && w.entered.iter().any(|(t, x)| {
+                            *t == fork
+                                && x.path == s.path
+                                && x.slot == s.slot
+                                && w.lineage.descends(&x.token, &s.token)
+                        });
+                    applied
+                        || overwritten.iter().any(|o| {
+                            o.path == s.path
+                                && o.slot == s.slot
+                                && w.lineage.descends(&o.staged, &s.token)
+                        })
+                });
+                told && all_told && staged
+            }
             (TxnEnd::Commit(TxnOutcome::Empty), None) => e.staged.is_empty(),
             (TxnEnd::Rollback, None) => e.staged.iter().all(|s| w.discarded.contains(&s.token)),
             _ => false,

@@ -7,8 +7,8 @@ use agentfs_model::check::{check, check_converged};
 use agentfs_model::content::Layout;
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::world::{
-    Client, CollisionScope, Direction, Entry, HistoryPolicy, Life, MergeRule, ModelError, Policies,
-    Step, Tree, TxnOutcome, World,
+    Client, CollisionScope, Direction, HistoryPolicy, Life, MergeRule, ModelError, Overwritten,
+    Policies, Step, Tree, TxnOutcome, World,
 };
 
 const BOTH: [HistoryPolicy; 2] = [HistoryPolicy::FullLineage, HistoryPolicy::Squashed];
@@ -110,10 +110,11 @@ fn r1_writes_never_wait_and_forks_sync_both_ways() {
 // ── rule 2: one landing queue per tree; no clock ────────────────────────
 
 /// Rule 2: main's queue fixes the order its children's commits land in,
-/// whatever order the scheduler visits the forks.
+/// whatever order the scheduler visits the forks. (Under `Squashed` a
+/// fork's waiting saves land together: `r7_squashed_saves_land_as_one_changeset`.)
 #[test]
 fn r2_one_queue_fixes_the_landing_order() {
-    let mut w = world(HistoryPolicy::Squashed, CollisionScope::Line);
+    let mut w = world(HistoryPolicy::FullLineage, CollisionScope::Line);
     let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
     w.save(&Client::Fork(f), "a", 0);
     w.save(&Client::Fork(g), "b", 0);
@@ -175,7 +176,7 @@ fn r2_no_clock_commit_dates_decide_nothing() {
     }
 }
 
-// ── rule 3: fast-forward, else line merge, the incoming change wins ────
+// ── rule 3: the parent's queue decides; the parent's version wins ─────
 
 /// Rule 3: an edit whose base is main's current version replaces it.
 /// `FullLineage`: main's head becomes the fork's commit. `Squashed`: one
@@ -210,15 +211,15 @@ fn r3_fast_forward_when_the_base_is_current() {
     }
 }
 
-/// Rule 3, a sandbox's landing into main: its concurrent same-line edit
-/// wins in main ("If a sandbox pushes a conflicting change upstream, then
-/// it should be applied"). The collision names main's lost line and the
-/// line that overwrote it; main's losing version stays reachable. The
-/// sync main queued into the fork when it wrote its line is processed
-/// after the landing: it carries main's current version, so the fork's
-/// edit, which already won in main, is never reverted in the fork.
+/// Rule 3, a sandbox's landing into main, the one place their collision is
+/// decided: main's concurrent same-line line wins ("i think the updated
+/// main should win in a conflict"). The collision names the sandbox's lost
+/// line and main's line that won; the sandbox's losing commit stays
+/// reachable under the collision's ref. The sync main queued into the fork
+/// when it wrote its line is processed after the landing: it carries
+/// main's decided version, so the fork takes m.
 #[test]
-fn r3_landing_collision_the_fork_wins_in_the_parent() {
+fn r3_landing_collision_the_parent_wins() {
     for history in BOTH {
         let mut w = world(history, CollisionScope::Line);
         let f = w.create_fork(Tree::Main);
@@ -227,143 +228,140 @@ fn r3_landing_collision_the_fork_wins_in_the_parent() {
         let m = w.save(&m1(), "a", 0);
         let mc = w.main_head.clone();
         next(&mut w, Tree::Main);
-        assert!(has(&w, Tree::Main, "a", &x) && !has(&w, Tree::Main, "a", &m));
+        assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
         let c = w.collisions.last().expect("a collision").clone();
         assert_eq!(
             (c.tree, c.direction, c.lost.clone(), c.won.clone()),
             (
                 Tree::Main,
                 Direction::Landing,
-                vec![m.clone()],
-                vec![x.clone()]
+                vec![x.clone()],
+                vec![m.clone()]
             )
         );
         assert_eq!(
             (c.winner.as_str(), c.loser.as_str()),
-            (fc.as_str(), mc.as_str())
+            (mc.as_str(), fc.as_str())
         );
-        assert_eq!(git(w.repo(), &["rev-parse", &c.reference]), mc);
+        assert_eq!(git(w.repo(), &["rev-parse", &c.reference]), fc);
+        assert!(w.file(&c.reference, "a").contains(&x), "the loser is kept");
         assert_eq!(
             w.queue_len(Tree::Fork(f)),
             2,
             "{history:?}: two syncs queued"
         );
         next(&mut w, Tree::Fork(f)); // the sync queued when m was written
-        assert!(has(&w, Tree::Fork(f), "a", &x), "{history:?}: stale sync");
+        assert!(has(&w, Tree::Fork(f), "a", &m), "{history:?}: decided");
         drain(&mut w);
-        assert!(has(&w, Tree::Fork(f), "a", &x) && has(&w, Tree::Main, "a", &x));
+        assert!(has(&w, Tree::Fork(f), "a", &m) && has(&w, Tree::Main, "a", &m));
+        assert_eq!(w.collisions.len(), 1, "{history:?}: recorded once");
     }
 }
 
-/// Rule 3, main's sync into a sandbox: main's concurrent same-line edit
-/// wins in the sandbox ("main only wins when there is a collision from
-/// upstream to a fork"). The sandbox's own edit is still queued for main:
-/// it lands after, wins there, and comes back. The sandbox shows its
-/// line, then main's, then its own again (coherence finding 4).
+/// Rule 3, no flip-flop (coherence finding 4, resolved): main's sync
+/// reaches the sandbox before the sandbox's own concurrent edit lands. The
+/// sync decides nothing, so the sandbox keeps its x; main's queue then
+/// decides, main's m wins, and the sandbox takes m. Its line changes once,
+/// x then m, never x, m, x (the `no_flicker` invariant checks this in every
+/// run).
 #[test]
-fn r3_sync_collision_the_parent_wins_in_the_fork_until_the_fork_edit_lands() {
+fn r3_a_fork_never_flips_back_to_its_own_edit() {
     for history in BOTH {
         let mut w = world(history, CollisionScope::Line);
         let f = w.create_fork(Tree::Main);
         let x = w.save(&Client::Fork(f), "a", 0);
         let m = w.save(&m1(), "a", 0);
-        next(&mut w, Tree::Fork(f));
-        assert!(has(&w, Tree::Fork(f), "a", &m) && !has(&w, Tree::Fork(f), "a", &x));
-        let c = w.collisions.last().expect("a collision").clone();
-        assert_eq!(
-            (c.tree, c.direction, c.lost, c.won),
-            (
-                Tree::Fork(f),
-                Direction::Sync,
-                vec![x.clone()],
-                vec![m.clone()]
-            )
+        next(&mut w, Tree::Fork(f)); // main's sync, before x lands
+        assert!(
+            has(&w, Tree::Fork(f), "a", &x),
+            "{history:?}: the fork decided"
         );
+        assert!(w.collisions.is_empty(), "a sync records nothing");
         let head = w.head(Tree::Fork(f));
         assert_eq!(
             show(&w, &head, "%(trailers:key=Agentfs-Cause,valueonly)"),
             "Sync"
         );
-        next(&mut w, Tree::Main);
-        assert!(
-            has(&w, Tree::Main, "a", &x),
-            "{history:?}: the landing wins"
-        );
-        assert!(
-            w.collisions
-                .iter()
-                .any(|c| c.tree == Tree::Main && c.lost == [m.clone()])
-        );
+        next(&mut w, Tree::Main); // main's queue decides
+        assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
         drain(&mut w);
-        assert!(has(&w, Tree::Fork(f), "a", &x), "{history:?}");
+        assert!(has(&w, Tree::Fork(f), "a", &m), "{history:?}");
+        let records: Vec<(Tree, Vec<String>)> = w
+            .collisions
+            .iter()
+            .map(|c| (c.tree, c.lost.clone()))
+            .collect();
+        assert_eq!(records, [(Tree::Main, vec![x.clone()])], "{history:?}");
     }
 }
 
-/// Coherence finding 4: the intent "no flip-flop" read strictly. The same
-/// calls as above: the sandbox should never show main's line over its own
-/// edit that is on its way to win in main. Rule 3 as stated requires it
-/// to, for as long as the edit is in flight.
+/// Rule 3, an edit on a line the parent has not decided: the sandbox
+/// writes y over its own x while main's concurrent m waits for x's
+/// landing. y never saw m, so it collides with m too, and main's m wins
+/// again. The sync between them showed the sandbox nothing of m: what a
+/// sandbox wrote over is read per line, not from which commits its version
+/// merged.
 #[test]
-#[ignore = "coherence finding 4: parent-wins-in-the-fork is undone when the fork's edit lands, so the fork flips"]
-fn finding_4_a_fork_never_flips_back_to_its_own_edit() {
-    let mut w = world(HistoryPolicy::FullLineage, CollisionScope::Line);
-    let f = w.create_fork(Tree::Main);
-    let x = w.save(&Client::Fork(f), "a", 0);
-    w.save(&m1(), "a", 0);
-    next(&mut w, Tree::Fork(f));
-    assert!(
-        has(&w, Tree::Fork(f), "a", &x),
-        "the fork flipped to main's line"
-    );
-}
-
-/// Rule 3 with crossing merges: the sandbox takes main's line while main
-/// takes the sandbox's. The sandbox then writes y over main's line. The
-/// next sync carries main's current version (the sandbox's older x), but
-/// y's writer saw x, so y stays; y then lands and wins in main without a
-/// collision.
-#[test]
-fn r3_crossing_merges_keep_a_newer_edit() {
-    let (w, y) = crossing(MergeRule::PerLine);
-    assert!(has(&w, Tree::Main, "a", &y));
-}
-
-/// Rule 3, "a sync carries the parent's current version": a line the
-/// sandbox already received from its parent, and then lost to a
-/// concurrent line landing from a sandbox inside it, is not delivered
-/// again by the next sync. Main's p syncs into F; G's concurrent g lands
-/// in F and wins there; main then changes another file. The sync of that
-/// change does not bring p back over g: F holds the commit that set p in
-/// main. g then lands in main and wins there.
-#[test]
-fn r3_a_sync_never_brings_back_a_line_the_fork_already_took() {
+fn r3_an_edit_over_an_undecided_line_still_collides() {
     for history in BOTH {
         let mut w = world(history, CollisionScope::Line);
         let f = w.create_fork(Tree::Main);
-        let p = w.save(&m1(), "a", 0);
-        let g = w.create_fork(Tree::Fork(f));
-        let gl = w.save(&Client::Fork(g), "a", 0);
-        next(&mut w, Tree::Fork(f)); // main's p into F
-        assert!(has(&w, Tree::Fork(f), "a", &p));
-        next(&mut w, Tree::Fork(f)); // G's g lands in F and wins
-        assert!(has(&w, Tree::Fork(f), "a", &gl));
-        let q = w.save(&m1(), "b", 0);
-        while w.queue(Tree::Fork(f)).first() == Some(&Entry::Sync) {
-            next(&mut w, Tree::Fork(f));
-        }
-        assert!(has(&w, Tree::Fork(f), "b", &q));
-        assert!(has(&w, Tree::Fork(f), "a", &gl), "{history:?}: p came back");
+        let x = w.save(&Client::Fork(f), "a", 0);
+        let m = w.save(&m1(), "a", 0);
+        next(&mut w, Tree::Fork(f)); // a Sync merge that keeps x
+        let y = w.save(&Client::Fork(f), "a", 0); // over x, not m
         drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &gl));
+        assert!(has(&w, Tree::Main, "a", &m), "{history:?}");
+        // Under `Squashed` x and y land as one changeset, carrying y only.
+        let lost: Vec<String> = w.collisions.iter().flat_map(|c| c.lost.clone()).collect();
+        let expect = match history {
+            HistoryPolicy::FullLineage => vec![x.clone(), y.clone()],
+            HistoryPolicy::Squashed => vec![y.clone()],
+        };
+        assert_eq!(lost, expect, "{history:?}");
     }
 }
 
-/// Coherence finding 1: the same calls with git's own three-way merge.
-/// The crossing merges give two merge bases; git merges them leaving
-/// conflict markers in the base, so y "collides" with x, which y's writer
-/// saw, and the incoming x reverts it: a stale revert.
+/// Rule 3, an edit made on the parent's current version replaces it: the
+/// sandbox's x loses to main's m and the sandbox takes m; it then writes
+/// y over m, and y replaces m in main without a collision.
 #[test]
-#[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings lets a stale line revert a newer one"]
+fn r3_an_edit_over_the_decided_line_replaces_it() {
+    let (w, y) = crossing(MergeRule::PerLine);
+    assert!(has(&w, Tree::Main, "a", &y));
+    assert_eq!(w.collisions.len(), 1);
+}
+
+/// Rule 3, "a sync carries the parent's current version, never a stale
+/// change": main writes m1 then m2 over it, queueing two syncs. The first
+/// sync brings m2 directly; the sandbox never shows m1.
+#[test]
+fn r3_a_sync_carries_the_parents_current_version() {
+    for history in BOTH {
+        let mut w = world(history, CollisionScope::Line);
+        let f = w.create_fork(Tree::Main);
+        w.save(&Client::Fork(f), "b", 0);
+        let m1_ = w.save(&m1(), "a", 0);
+        let m2 = w.save(&m1(), "a", 0);
+        assert_eq!(w.queue_len(Tree::Fork(f)), 2);
+        next(&mut w, Tree::Fork(f));
+        assert!(has(&w, Tree::Fork(f), "a", &m2) && !has(&w, Tree::Fork(f), "a", &m1_));
+        let head = w.head(Tree::Fork(f));
+        next(&mut w, Tree::Fork(f));
+        assert_eq!(w.head(Tree::Fork(f)), head, "{history:?}: nothing new");
+        drain(&mut w);
+    }
+}
+
+/// Coherence finding 1: the same calls as
+/// [`r3_an_edit_over_the_decided_line_replaces_it`] with git's own
+/// three-way merge for the sync, a conflicting hunk keeping the fork's
+/// side. After x lands and loses, the sandbox and main have crossed (each
+/// merged the other), so git finds two merge bases, merges them leaving
+/// conflict markers in the base, and sees x against m as a conflict: the
+/// sandbox keeps x, which main already decided against.
+#[test]
+#[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings keeps a fork line the parent already decided against"]
 fn finding_1_git_merge_base_on_crossing_merges() {
     crossing(MergeRule::GitMergeBase);
 }
@@ -376,39 +374,40 @@ fn crossing(merge: MergeRule) -> (World, String) {
     let f = w.create_fork(Tree::Main);
     let x = w.save(&Client::Fork(f), "a", 0);
     let m = w.save(&m1(), "a", 0);
-    next(&mut w, Tree::Fork(f)); // sync: main's m wins in F
-    next(&mut w, Tree::Main); // landing: F's x wins in main; crossed
-    assert!(has(&w, Tree::Fork(f), "a", &m) && has(&w, Tree::Main, "a", &x));
-    let y = w.save(&Client::Fork(f), "a", 0); // written over m
-    next(&mut w, Tree::Fork(f)); // main's current version: x
+    next(&mut w, Tree::Fork(f)); // sync: x is not decided, so F keeps it
+    next(&mut w, Tree::Main); // landing: main's m wins; crossed
+    assert!(has(&w, Tree::Fork(f), "a", &x) && has(&w, Tree::Main, "a", &m));
+    next(&mut w, Tree::Fork(f)); // main's decided version
     assert!(
-        has(&w, Tree::Fork(f), "a", &y),
-        "{merge:?}: the newer line stays"
+        has(&w, Tree::Fork(f), "a", &m),
+        "{merge:?}: the fork takes main's decision"
     );
+    let y = w.save(&Client::Fork(f), "a", 0); // written over m
     drain(&mut w);
     (w, y)
 }
 
 /// Rule 3's design choice, per line. One sandbox commit (a transaction's)
 /// changes lines 0 and 2 of a; main changed line 0 and, cleanly, line 1.
-/// The sandbox's lines win; main's clean line 1 stays.
+/// Main's line 0 wins; the sandbox's line 2 applies; main's clean line 1
+/// stays.
 #[test]
 fn r3_collision_scope_per_line_keeps_clean_lines() {
     for history in BOTH {
         let (w, [x, y, m, k]) = clean_lines(history, CollisionScope::Line);
-        assert!(has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "a", &y));
+        assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Main, "a", &y));
         assert!(has(&w, Tree::Main, "a", &k), "{history:?}: the clean line");
         let lost: Vec<String> = w.collisions.iter().flat_map(|c| c.lost.clone()).collect();
-        assert!(lost.contains(&m) && !lost.contains(&k));
+        assert_eq!(lost, [x], "{history:?}");
     }
 }
 
-/// Coherence finding 3: the same calls per file. The sandbox's whole file
-/// wins, so main's clean line 1, written after the sandbox's base, goes
-/// back to the sandbox's older (unwritten) line: a stale revert, and a
-/// "collision" between lines that never collided.
+/// Coherence finding 3: the same calls per file. Main's whole file wins,
+/// so the sandbox's clean line 2 is dropped too; the sandbox then takes
+/// main's file, and its newer line 2 goes back to main's older (unwritten)
+/// one: a stale revert.
 #[test]
-#[ignore = "coherence finding 3: per file, the incoming file reverts the tree's newer clean lines"]
+#[ignore = "coherence finding 3: per file, the parent's winning file reverts the fork's newer clean lines"]
 fn finding_3_per_file_keeps_clean_lines() {
     for history in BOTH {
         clean_lines(history, CollisionScope::File);
@@ -421,7 +420,7 @@ fn clean_lines(history: HistoryPolicy, scope: CollisionScope) -> (World, [String
     w.begin(f).unwrap();
     let x = w.save(&Client::Fork(f), "a", 0);
     let y = w.save(&Client::Fork(f), "a", 2);
-    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::clean()));
     let m = w.save(&m1(), "a", 0);
     let k = w.save(&m1(), "a", 1);
     drain(&mut w);
@@ -430,21 +429,22 @@ fn clean_lines(history: HistoryPolicy, scope: CollisionScope) -> (World, [String
 
 /// Rule 3's design choice, per line, in the sync direction: two sandbox
 /// commits (line 0, then line 2); main changes line 0 and, cleanly, line 1.
-/// Main's sync collides on line 0 only: the sandbox keeps its line 2 and
-/// takes main's line 1 in that same sync, and everything converges.
+/// The sync takes main's line 1 and keeps the sandbox's lines 0 and 2,
+/// which main's queue has not decided yet. Then main's line 0 wins, line 2
+/// applies, and everything converges.
 #[test]
 fn r3_collision_scope_per_line_sync_keeps_the_clean_line() {
     let mut w = world(HistoryPolicy::FullLineage, CollisionScope::Line);
     let f = w.create_fork(Tree::Main);
     let x = w.save(&Client::Fork(f), "a", 0);
     let y = w.save(&Client::Fork(f), "a", 2);
-    w.save(&m1(), "a", 0);
+    let m = w.save(&m1(), "a", 0);
     let k = w.save(&m1(), "a", 1);
     next(&mut w, Tree::Fork(f));
-    assert!(has(&w, Tree::Fork(f), "a", &y));
+    assert!(has(&w, Tree::Fork(f), "a", &x) && has(&w, Tree::Fork(f), "a", &y));
     assert!(has(&w, Tree::Fork(f), "a", &k), "main's clean line");
     drain(&mut w);
-    assert!(has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "a", &y));
+    assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Main, "a", &y));
     assert!(has(&w, Tree::Main, "a", &k));
 }
 
@@ -458,13 +458,13 @@ fn r3_neighbouring_lines_merge_per_line() {
     }
 }
 
-/// Coherence finding 6: the same calls with git's own merge taking the
-/// incoming side of a conflicting hunk (`-X theirs`). Neighbouring changes
-/// form one git hunk, so main's sync takes main's whole hunk and reverts
-/// the sandbox's newer line 1 to main's older (unwritten) one. "Per hunk"
-/// in git's sense is finding 3 in small; the model's rule is per line.
+/// Coherence finding 6: the same calls with git's own merge for the sync,
+/// a conflicting hunk keeping the sandbox's side (`-X ours`). Neighbouring
+/// changes form one git hunk, so the sync keeps the sandbox's whole hunk
+/// and withholds main's line 0, which main had decided. "Per hunk" in
+/// git's sense is finding 3 in small; the model's rule is per line.
 #[test]
-#[ignore = "coherence finding 6: git's hunk-level -X theirs on neighbouring lines reverts the tree's newer line"]
+#[ignore = "coherence finding 6: git's hunk on neighbouring lines withholds the parent's decided line"]
 fn finding_6_git_hunks_on_neighbouring_lines() {
     neighbours(MergeRule::GitMergeBase);
 }
@@ -484,30 +484,28 @@ fn neighbours(merge: MergeRule) -> (World, [String; 2]) {
     (w, [k, m])
 }
 
-/// Rule 3, a loss decided upstream: sibling G holds main's m (synced in,
-/// beside G's own work) when F's concurrent x lands in main and wins. The
-/// next sync brings x into G as a plain update: the collision is main's,
-/// recorded once there, not again in every sibling holding m.
+/// Rule 3, decided once, at the parent's queue: nested G's g lands in its
+/// parent F, where F's line m (main's, synced in) wins. F's next landing
+/// into main carries nothing of g, so main records nothing; G takes m from
+/// F. Sibling H holds m throughout.
 #[test]
-fn r3_a_loss_decided_upstream_is_recorded_once() {
+fn r3_a_collision_is_recorded_once_at_the_parents_queue() {
     for history in BOTH {
         let mut w = world(history, CollisionScope::Line);
-        let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
-        w.save(&Client::Fork(g), "b", 0);
-        let x = w.save(&Client::Fork(f), "a", 0);
+        let (f, h) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
+        let g = w.create_fork(Tree::Fork(f));
+        let gl = w.save(&Client::Fork(g), "a", 0);
         let m = w.save(&m1(), "a", 0);
-        while w.queue(Tree::Fork(g)).first() == Some(&Entry::Sync) {
-            next(&mut w, Tree::Fork(g));
-        }
-        assert!(has(&w, Tree::Fork(g), "a", &m));
-        next(&mut w, Tree::Main); // G's b lands
-        next(&mut w, Tree::Main); // F's x lands, wins over m
+        next(&mut w, Tree::Fork(f)); // G's g lands in F: F has nothing there
+        assert!(has(&w, Tree::Fork(f), "a", &gl));
         drain(&mut w);
-        assert!(has(&w, Tree::Fork(g), "a", &x), "{history:?}");
+        for t in [Tree::Main, Tree::Fork(f), Tree::Fork(g), Tree::Fork(h)] {
+            assert!(has(&w, t, "a", &m), "{history:?} {t:?}");
+        }
         let records: Vec<Tree> = w
             .collisions
             .iter()
-            .filter(|c| c.lost.contains(&m))
+            .filter(|c| c.lost.contains(&gl))
             .map(|c| c.tree)
             .collect();
         assert_eq!(records, [Tree::Main], "{history:?}");
@@ -554,9 +552,9 @@ fn r4_nothing_waits_behind_a_collision() {
 }
 
 /// Rule 4, nested forks: G over F over main, the same rules with F as
-/// G's parent. G's landing wins in F over F's own line; F's landing
-/// carries G's line into main, where it wins over main's concurrent line.
-/// A clean change of G's reaches main named for G. Everything converges.
+/// G's parent. G's landing loses in F to F's own concurrent line; G's
+/// later line lands in F, then loses in main to main's concurrent line;
+/// a clean change of G's reaches main named for G. Everything converges.
 #[test]
 fn r4_nested_forks_follow_the_same_rules() {
     for history in BOTH {
@@ -566,21 +564,24 @@ fn r4_nested_forks_follow_the_same_rules() {
         let (cf, cg) = (Client::Fork(f), Client::Fork(g));
         let ga = w.save(&cg, "a", 0);
         let fa = w.save(&cf, "a", 0);
-        next(&mut w, Tree::Fork(f)); // G's a lands in F: G wins.
-        assert!(has(&w, Tree::Fork(f), "a", &ga) && !has(&w, Tree::Fork(f), "a", &fa));
+        next(&mut w, Tree::Fork(f)); // G's a lands in F: F's line wins.
+        assert!(has(&w, Tree::Fork(f), "a", &fa) && !has(&w, Tree::Fork(f), "a", &ga));
         assert!(w.collisions.iter().any(|c| c.tree == Tree::Fork(f)
             && c.direction == Direction::Landing
-            && c.lost == [fa.clone()]));
+            && c.lost == [ga.clone()]));
         let gb = w.save(&cg, "b", 0);
         let mb = w.save(&m1(), "b", 0);
         let gc = w.save(&cg, "c", 0);
         drain(&mut w);
-        assert!(has(&w, Tree::Main, "b", &gb) && !has(&w, Tree::Main, "b", &mb));
-        assert!(has(&w, Tree::Main, "c", &gc) && has(&w, Tree::Main, "a", &ga));
+        assert!(has(&w, Tree::Main, "b", &mb) && !has(&w, Tree::Main, "b", &gb));
+        assert!(has(&w, Tree::Main, "c", &gc) && has(&w, Tree::Main, "a", &fa));
+        for t in [Tree::Fork(f), Tree::Fork(g)] {
+            assert!(has(&w, t, "b", &mb) && has(&w, t, "a", &fa), "{t:?}");
+        }
         assert!(
             w.collisions
                 .iter()
-                .any(|c| c.tree == Tree::Main && c.lost == [mb.clone()])
+                .any(|c| c.tree == Tree::Main && c.lost == [gb.clone()])
         );
         let c_commit = git(
             w.repo(),
@@ -630,7 +631,7 @@ fn r5_transaction_commits_clean() {
             "the snapshot is frozen"
         );
         let before = main_writers(&w).len();
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::clean()));
         assert!(w.client_reads(&c, "c").contains(&m));
         drain(&mut w);
         assert!(has(&w, Tree::Main, "a", &sa) && has(&w, Tree::Main, "b", &sb));
@@ -643,13 +644,14 @@ fn r5_transaction_commits_clean() {
     }
 }
 
-/// Rule 5, a commit meeting a concurrent line: main's m on a line the
-/// transaction changed has already synced into the sandbox. The commit is
-/// the incoming change into the sandbox, so it is never refused and its
-/// line wins there; the collision is recorded, naming m. Then it lands in
-/// main whole and wins there too.
+/// Rule 5, a commit meeting a concurrent line (a design choice): main's m
+/// on a line the transaction changed has already synced into the sandbox.
+/// The commit lands in the sandbox as a child's change lands in its
+/// parent: never refused, the sandbox's m wins that line, the other staged
+/// line applies, and the answer names the overwritten line. The collision
+/// is recorded in the sandbox, naming the staged line.
 #[test]
-fn r5_transaction_commit_wins_over_a_concurrent_line() {
+fn r5_transaction_commit_reports_the_overwritten_line() {
     for history in BOTH {
         let mut w = world(history, CollisionScope::Line);
         let f = w.create_fork(Tree::Main);
@@ -660,17 +662,27 @@ fn r5_transaction_commit_wins_over_a_concurrent_line() {
         let m = w.save(&m1(), "a", 0);
         drain(&mut w);
         assert!(has(&w, Tree::Fork(f), "a", &m));
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+        assert_eq!(
+            w.commit_txn(f),
+            Ok(TxnOutcome::Committed {
+                overwritten: vec![Overwritten {
+                    path: "a".into(),
+                    slot: 0,
+                    staged: s.clone(),
+                    kept: m.clone(),
+                }]
+            })
+        );
         ok(&mut w);
-        assert!(w.client_reads(&c, "a").contains(&s) && w.client_reads(&c, "b").contains(&s2));
+        assert!(w.client_reads(&c, "a").contains(&m) && w.client_reads(&c, "b").contains(&s2));
         let col = w.collisions.last().expect("a collision").clone();
         assert_eq!(
             (col.tree, col.direction, col.lost, col.won),
             (
                 Tree::Fork(f),
                 Direction::Transaction,
-                vec![m.clone()],
-                vec![s.clone()]
+                vec![s.clone()],
+                vec![m.clone()]
             )
         );
         let refs = git(
@@ -679,14 +691,15 @@ fn r5_transaction_commit_wins_over_a_concurrent_line() {
         );
         assert!(refs.is_empty());
         drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &s) && has(&w, Tree::Main, "b", &s2));
+        assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Main, "b", &s2));
     }
 }
 
 /// Rule 5, no race: the same calls as above and as
-/// [`r5_a_committed_transaction_then_follows_rule_3`], where main's sync
-/// arrives after the commit, end with the same trees. Whether the sync
-/// comes before or after the commit decides nothing.
+/// [`r5_a_committed_transaction_then_lands_like_any_change`], where main's
+/// sync arrives after the commit, end with the same trees. Whether the
+/// sync comes before or after the commit decides nothing: main's line
+/// wins either way, at the sandbox's commit or at main's queue.
 #[test]
 fn r5_sync_before_or_after_the_commit_ends_the_same() {
     for history in BOTH {
@@ -700,7 +713,7 @@ fn r5_sync_before_or_after_the_commit_ends_the_same() {
             if sync_first {
                 drain(&mut w);
             }
-            assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+            assert!(matches!(w.commit_txn(f), Ok(TxnOutcome::Committed { .. })));
             drain(&mut w);
             ["a", "b"].map(|p| w.read(Tree::Main, p))
         };
@@ -733,13 +746,13 @@ fn r5_transaction_rollback_and_client_death_leave_nothing() {
     }
 }
 
-/// Rule 5 then rule 3: a commit is checked against the fork's head at that
-/// moment only. A sync of main's concurrent line, queued before the commit
-/// and processed after, wins its line in the fork (rule 3), so the fork
-/// briefly shows part of the committed transaction; the transaction then
-/// lands in main whole, wins there, and comes back (coherence finding 4).
+/// Rule 5 then rule 3: a committed transaction lands like any change. A
+/// sync of main's concurrent line, queued before the commit and processed
+/// after, decides nothing: the sandbox keeps the whole transaction. Main's
+/// queue then decides: main's line wins line a, the transaction's line b
+/// applies, and the sandbox takes main's line a, once.
 #[test]
-fn r5_a_committed_transaction_then_follows_rule_3() {
+fn r5_a_committed_transaction_then_lands_like_any_change() {
     for history in BOTH {
         let mut w = world(history, CollisionScope::Line);
         let f = w.create_fork(Tree::Main);
@@ -747,13 +760,13 @@ fn r5_a_committed_transaction_then_follows_rule_3() {
         let sa = w.save(&Client::Fork(f), "a", 0);
         let sb = w.save(&Client::Fork(f), "b", 0);
         let m = w.save(&m1(), "a", 0); // queued into F, not yet synced
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::clean()));
         next(&mut w, Tree::Fork(f));
-        assert!(has(&w, Tree::Fork(f), "a", &m) && has(&w, Tree::Fork(f), "b", &sb));
+        assert!(has(&w, Tree::Fork(f), "a", &sa) && has(&w, Tree::Fork(f), "b", &sb));
         drain(&mut w);
         for t in [Tree::Main, Tree::Fork(f)] {
             assert!(
-                has(&w, t, "a", &sa) && has(&w, t, "b", &sb),
+                has(&w, t, "a", &m) && has(&w, t, "b", &sb),
                 "{history:?} {t:?}"
             );
         }
@@ -788,16 +801,16 @@ fn r6_a_sync_is_a_merge_with_the_parent_second() {
 
 /// Rule 7: `FullLineage` main's history reaches the fork's commits;
 /// `Squashed` holds only main's own, and its grafts keep the fork's commits
-/// in lineage. Either way a collision's losing version stays reachable
-/// under its ref after the fork is dropped.
+/// in lineage. Either way the fork's losing version stays reachable under
+/// the collision's ref after the fork is dropped.
 #[test]
 fn r7_history_setting_and_losers_stay_reachable() {
     for history in BOTH {
         let mut w = world(history, CollisionScope::Line);
         let f = w.create_fork(Tree::Main);
-        w.save(&Client::Fork(f), "a", 0);
+        let x = w.save(&Client::Fork(f), "a", 0);
         let fc = w.head(Tree::Fork(f));
-        let m = w.save(&m1(), "a", 0);
+        w.save(&m1(), "a", 0);
         w.end_client(f);
         drain(&mut w);
         assert_eq!(w.forks[&f].life, Life::Dropped);
@@ -809,10 +822,58 @@ fn r7_history_setting_and_losers_stay_reachable() {
         let c = w
             .collisions
             .iter()
-            .find(|c| c.lost == [m.clone()])
-            .expect("m lost");
+            .find(|c| c.lost == [x.clone()])
+            .expect("x lost");
         let at = git(w.repo(), &["rev-parse", &c.reference]);
-        assert!(w.file(&at, "a").contains(&m), "{history:?}");
+        assert!(w.file(&at, "a").contains(&x), "{history:?}");
+    }
+}
+
+/// Rule 7, the squash: under `Squashed` a sandbox's plain saves waiting in
+/// main's queue when it takes the first land as ONE changeset ("the
+/// sandbox commits could be squashed to one changeset (if they are the
+/// naive simple commits)"); a transaction's commit lands as its own unit
+/// ("it might be best to leave the transaction commits as they are"), and
+/// so does each later save. Every sandbox commit stays stored ("every
+/// sandbox commit stays stored ... that makes sense"), in main's lineage
+/// through the graft, not in main's pushed history. Under `FullLineage`
+/// each commit lands on its own, in main's history.
+#[test]
+fn r7_squashed_saves_land_as_one_changeset() {
+    for history in BOTH {
+        let mut w = world(history, CollisionScope::Line);
+        let f = w.create_fork(Tree::Main);
+        let c = Client::Fork(f);
+        let saves: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|p| {
+                w.save(&c, p, 0);
+                w.head(Tree::Fork(f))
+            })
+            .collect();
+        w.begin(f).unwrap();
+        w.save(&c, "d", 0);
+        w.commit_txn(f).unwrap();
+        w.save(&c, "a", 1);
+        assert_eq!(w.queue_len(Tree::Main), 5);
+        let before = main_writers(&w).len();
+        next(&mut w, Tree::Main);
+        let squashed = history == HistoryPolicy::Squashed;
+        assert_eq!(w.queue_len(Tree::Main), if squashed { 2 } else { 4 });
+        assert_eq!(main_writers(&w).len(), before + 1);
+        let landed = ["a", "b", "c"].map(|p| w.read(Tree::Main, p).slot(0) != "-");
+        assert_eq!(landed, [true, squashed, squashed], "{history:?}");
+        drain(&mut w);
+        assert_eq!(
+            main_writers(&w).len(),
+            before + if squashed { 3 } else { 5 },
+            "{history:?}"
+        );
+        for s in &saves {
+            assert!(w.is_ancestor(s, &w.main_head), "{history:?}: lineage");
+            assert_eq!(w.in_history(s, &w.main_head), !squashed, "{history:?}");
+        }
+        assert_eq!(w.squashed_runs, usize::from(squashed));
     }
 }
 

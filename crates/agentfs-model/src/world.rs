@@ -1,18 +1,18 @@
 //! The model: main and each fork as a git branch, each save a commit naming
-//! one writer, and the owner's 2026-11-02 rules on top (MODEL.md).
+//! one writer, and the owner's rules on top (MODEL.md).
 //!
 //! | Rule (MODEL.md) | Here |
 //! |---|---|
 //! | 1. Like a Linux filesystem | [`World::save`] never fails; a save is a commit on the writer's tree at once |
 //! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`]s per tree; a [`Step::Next`] takes its head, always |
-//! | 3. Fast-forward, else line merge, the incoming change wins | `land` (a fork commit's own edit into its parent) and `sync` (the parent's current version into a fork), both through `resolve`: per line, the newer of two values by git ancestry, else the incoming one ([`MergeRule`]) |
-//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] naming what won, its loser kept under `refs/collisions/<n>`, and the queue moves on |
-//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] merges it onto the fork's head, its lines winning (it is the incoming change); [`World::rollback`] drops it |
+//! | 3. The parent's queue decides | `land` (a fork's commit into its parent) is the only place a collision with the parent is decided, through `resolve`: per line, a line written over the parent's replaces it, a stale one is dropped, and of two concurrent lines the parent's wins ([`MergeRule`]). `sync` decides nothing: it takes the parent's version and keeps only the fork's lines the parent's queue has not taken yet |
+//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`], the fork's losing commit kept under `refs/collisions/<n>`, and the queue moves on |
+//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit (the fork is its parent, so the fork's lines win) and answers with the overwritten lines; [`World::rollback`] drops it |
 //! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the parent's commit as second parent |
-//! | 7. History setting | [`HistoryPolicy`]: a landing is a merge with the fork's commit as second parent (or a fast-forward), or one single-parent commit whose carried fork commit is kept beside history, as a `git replace` graft |
+//! | 7. History setting | [`HistoryPolicy`]: a landing is a merge with the fork's commit as second parent (or a fast-forward), or one single-parent commit, carrying a fork's pending saves as one changeset, whose carried fork commit is kept beside history as a `git replace` graft |
 //!
 //! No clock: commits carry a fixed date (`git.rs`) and order comes only
-//! from the queues and from git ancestry.
+//! from the queues and from git history.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -36,15 +36,19 @@ pub enum Tree {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryPolicy {
     /// A landing is a fast-forward or a merge with the fork's commit as
-    /// second parent: main's ancestry reaches every fork commit.
+    /// second parent: main's ancestry reaches every fork commit. Each fork
+    /// commit lands on its own.
     FullLineage,
     /// A landing is one single-parent commit: main's history holds only
-    /// main's own commits. The fork commit it carried is recorded beside
-    /// history, as a graft (`git replace --graft <commit> <parent> <fork
-    /// commit>` under `refs/replace/`), which git's ancestry and blame read
-    /// and `--no-replace-objects` (main's history as stored and pushed)
-    /// does not. Without it a sync cannot tell a fork's own landed line
-    /// from a concurrent one (coherence finding 2, resolved).
+    /// main's own commits. A fork's plain saves still waiting in the
+    /// parent's queue when it takes the first land together as one
+    /// changeset; a transaction's commit (or a nested landing) lands on its
+    /// own. The last fork commit it carried is recorded beside history, as
+    /// a graft (`git replace --graft <commit> <parent> <fork commit>` under
+    /// `refs/replace/`), which git's ancestry and blame read and
+    /// `--no-replace-objects` (main's history as stored and pushed) does
+    /// not. Without it a sync cannot tell that the parent's queue has
+    /// taken a fork's line (coherence finding 2, resolved).
     Squashed,
 }
 
@@ -52,34 +56,29 @@ pub enum HistoryPolicy {
 /// same-line collision costs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CollisionScope {
-    /// Only the colliding lines: the tree's other lines in that file stay.
-    /// The recommendation. Narrower than git's hunk: `git merge -X theirs`
-    /// takes a whole conflicting hunk, and neighbouring lines share one
-    /// (coherence finding 6).
+    /// Only the colliding lines: the incoming change's other lines in that
+    /// file still apply. The recommendation.
     Line,
-    /// The whole file: the incoming version of a colliding file replaces
-    /// the tree's (`git checkout --theirs <file>` after a conflicted merge).
+    /// The whole file: the parent's version of a colliding file wins whole,
+    /// and the incoming change's other lines in it are dropped too.
     File,
 }
 
-/// The design choice under rules 2 and 3: how a merge tells a newer line
-/// from a concurrent one.
+/// The design choice under rules 2 and 3: how a sync builds the fork's
+/// new version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeRule {
-    /// Per line, from git alone. A landing carries the fork commit's own
-    /// edit (its diff from its first parent). A sync carries the parent's
-    /// current version, less each line whose last change on the parent's
-    /// first-parent chain the fork already holds (`git blame
-    /// --first-parent`). Each carried line then meets the tree's line: the
-    /// one whose writing commit (`git blame`) descends from the other's
-    /// wins; if neither does, they are concurrent and the incoming one
-    /// wins. The model's choice.
+    /// Per line, from git alone. A sync takes the parent's current version
+    /// and keeps each fork line whose writing commit (`git blame`) the
+    /// parent's lineage does not reach yet: a line still waiting for the
+    /// parent's queue to decide it. The model's choice.
     PerLine,
     /// git's own three-way merge of the parent's current version into the
-    /// fork (`git merge-tree -X theirs`, git's merge base). Crossing syncs
-    /// and landings give two merge bases; git merges them leaving conflict
-    /// markers in the base, so a fork's newer line "collides" with its own
-    /// older one and loses (coherence finding 1).
+    /// fork (`git merge-tree -X ours`, git's merge base): a conflicting
+    /// hunk keeps the fork's side, since a fork never decides a collision.
+    /// Crossing syncs and landings give two merge bases, so the fork keeps
+    /// a line the parent already decided against (coherence finding 1); a
+    /// hunk spans neighbouring lines (coherence finding 6).
     GitMergeBase,
 }
 
@@ -152,46 +151,48 @@ pub struct Fork {
 pub enum Entry {
     /// A child fork's commit, to land in this tree.
     Landing { from: ForkId, commit: String },
-    /// The parent moved: merge its current version into this fork (rule
-    /// 3: a sync carries the parent's current version, never a stale one).
+    /// The parent moved: bring its current decided version into this fork
+    /// (a sync carries the parent's current version, never a stale one).
     Sync,
 }
 
+/// Where a collision was decided: always a parent's queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     /// A fork's commit into its parent.
     Landing,
-    /// A parent's commit into a fork.
-    Sync,
-    /// A transaction's branch into its fork, at commit.
+    /// A transaction's branch into its fork, at commit: the fork is the
+    /// transaction's parent.
     Transaction,
 }
 
-/// Rule 3's event: a same-line collision, which the incoming change won.
+/// Rule 3's event: a same-line collision, which the parent's version won.
 #[derive(Clone, Debug)]
 pub struct Collision {
-    /// The tree whose new content it decided.
+    /// The tree that decided it: the parent the incoming change landed in.
     pub tree: Tree,
     pub direction: Direction,
     pub path: String,
-    /// The slots the tree's lines lost.
+    /// The slots the incoming change lost.
     pub slots: Vec<usize>,
-    /// The tree's tokens on those slots, which lost.
+    /// The incoming tokens on those slots, which lost.
     pub lost: Vec<String>,
-    /// The incoming tokens that overwrote them, slot for slot.
+    /// The tree's tokens that won (it kept them), slot for slot.
     pub won: Vec<String>,
-    /// The incoming commit: the fork's commit (landing), the parent's
-    /// head (sync) or the transaction's branch (commit).
+    /// The tree's head before: the parent's version, which won.
     pub winner: String,
-    /// The tree's head before, kept reachable by `reference`.
+    /// The incoming commit, which lost: the fork's commit (the last of a
+    /// squashed run) or the transaction's branch. Kept reachable by
+    /// `reference`.
     pub loser: String,
-    /// The tree's commit after the merge.
+    /// The tree's commit after the landing.
     pub result: String,
     pub reference: String,
 }
 
 /// How a transaction ended (rule 5), with what it staged: `check` holds
-/// every staged edit to its end (in the fork at commit, or discarded).
+/// every staged edit to its end (in the fork at commit, reported as
+/// overwritten, or discarded).
 #[derive(Clone, Debug)]
 pub struct Ended {
     pub fork: ForkId,
@@ -202,7 +203,7 @@ pub struct Ended {
     pub result: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxnEnd {
     Commit(TxnOutcome),
     /// Rollback, abandon, or the client's death.
@@ -210,13 +211,35 @@ pub enum TxnEnd {
 }
 
 /// What a transaction's commit tells the program (rule 5). A commit is
-/// never refused: it is the incoming change into its fork, so it wins a
-/// same-line collision there (the owner's correction of 2026-11-02).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// never refused. It lands in the fork as a child's change does in its
+/// parent, so the fork's own concurrent lines win; the answer names every
+/// staged line that lost, so the program is told.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxnOutcome {
-    Committed,
+    Committed {
+        overwritten: Vec<Overwritten>,
+    },
     /// It staged nothing.
     Empty,
+}
+
+impl TxnOutcome {
+    /// A commit in which every staged line applied.
+    pub fn clean() -> Self {
+        Self::Committed {
+            overwritten: Vec::new(),
+        }
+    }
+}
+
+/// A staged line a transaction's commit did not apply: the fork's
+/// concurrent line `kept` won it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overwritten {
+    pub path: String,
+    pub slot: usize,
+    pub staged: String,
+    pub kept: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -243,14 +266,14 @@ pub struct Edit {
     pub token: String,
 }
 
-/// One merge's result and its same-line collisions.
+/// One landing's result and its same-line collisions.
 struct Merged {
     tree: String,
     collisions: Vec<Lost>,
 }
 
-/// One file's lines lost in a merge: the slots, the tree's tokens there,
-/// and the incoming tokens that won them, slot for slot.
+/// One file's incoming lines lost in a landing: the slots, the incoming
+/// tokens there, and the tree's tokens that won them, slot for slot.
 struct Lost {
     path: String,
     slots: Vec<usize>,
@@ -258,21 +281,13 @@ struct Lost {
     won: Vec<String>,
 }
 
-/// One line an incoming change sets ([`MergeRule::PerLine`]).
+/// One line a landing sets.
 struct Incoming {
     path: String,
     slot: usize,
     token: String,
-    /// The line this edit was made on, for a commit's own edit (a landing,
-    /// a transaction); a sync carries a version, not an edit.
-    base: Option<String>,
     /// The commit that wrote `token` (`git blame`).
     origin: String,
-    /// For a sync, the commit on the parent's first-parent chain that set
-    /// this line there (`git blame --first-parent`): the parent's own
-    /// decision. A tree line that decision already saw lost in the parent,
-    /// so it is an update here, not a new collision.
-    decided: Option<String>,
 }
 
 static WORLDS: AtomicU32 = AtomicU32::new(0);
@@ -289,17 +304,20 @@ pub struct World {
     pub lineage: Lineage,
     counters: BTreeMap<String, u32>,
     pub collisions: Vec<Collision>,
-    /// Every token that entered a tree: written in it, or carried into it
-    /// by a landing, a sync or a transaction (whether it won or lost
-    /// there).
+    /// Every token that entered a tree: written in it, carried into it by a
+    /// landing or a transaction (whether it won or lost there), or taken
+    /// from the parent by a sync.
     pub entered: Vec<(Tree, Edit)>,
     /// Every sync that moved a fork: (the fork, the parent's head it
     /// carried, the fork's head after).
     pub syncs: Vec<(Tree, String, String)>,
-    /// Every landing taken: (target, the commit landed).
+    /// Every landing taken: (target, the commit landed), each commit of a
+    /// squashed changeset included.
     pub landings: Vec<(Tree, String)>,
     /// Landings that were fast-forwards.
     pub fast_forwards: usize,
+    /// Landings that carried more than one fork commit as one changeset.
+    pub squashed_runs: usize,
     /// Tokens of rolled-back transactions.
     pub discarded: BTreeSet<String>,
     pub ended: Vec<Ended>,
@@ -307,14 +325,14 @@ pub struct World {
     objects: RefCell<BTreeMap<String, Content>>,
     blames: RefCell<BTreeMap<String, Vec<String>>>,
     ancestry: RefCell<BTreeMap<(String, String), bool>>,
-    /// The test oracle's record of what each commit's writer could have
-    /// seen: every token in its tree or in any commit it merged or carried
-    /// (a squashed landing's carried commit included), kept apart from
-    /// git and its grafts. [`Lineage`] takes each write's view from it.
-    known: RefCell<BTreeMap<String, BTreeSet<String>>>,
+    over: RefCell<BTreeMap<String, Vec<String>>>,
     /// `check`'s state: its last view of each tree and caches over
     /// immutable git objects.
     pub(crate) views: BTreeMap<Tree, BTreeMap<String, Content>>,
+    /// Every (tree, file, slot, token) a tree has shown and then replaced.
+    pub(crate) left: BTreeSet<(Tree, String, usize, String)>,
+    /// `entered` as a set of (tree, token), up to `entered.len()` = `.1`.
+    pub(crate) entered_index: (BTreeSet<(Tree, String)>, usize),
     pub(crate) checked_commits: BTreeSet<String>,
     /// Per head: the commits its stored history reaches, and those its
     /// lineage (history plus grafts) reaches.
@@ -360,14 +378,17 @@ impl World {
             syncs: Vec::new(),
             landings: Vec::new(),
             fast_forwards: 0,
+            squashed_runs: 0,
             discarded: BTreeSet::new(),
             ended: Vec::new(),
             log: Vec::new(),
             objects: RefCell::new(BTreeMap::new()),
             blames: RefCell::new(BTreeMap::new()),
             ancestry: RefCell::new(BTreeMap::new()),
-            known: RefCell::new(BTreeMap::new()),
+            over: RefCell::new(BTreeMap::new()),
             views: BTreeMap::new(),
+            left: BTreeSet::new(),
+            entered_index: (BTreeSet::new(), 0),
             checked_commits: BTreeSet::new(),
             reach: BTreeMap::new(),
             grepped: (0, BTreeSet::new()),
@@ -531,22 +552,7 @@ impl World {
             args.extend(["-p", p]);
         }
         args.extend(["-F", "-"]);
-        let c = git_in(&self.repo, &args, &msg);
-        let mut k = self.known(parents);
-        for p in PATHS {
-            k.extend(self.file(tree, p).tokens().map(str::to_string));
-        }
-        self.known.borrow_mut().insert(c.clone(), k);
-        c
-    }
-
-    /// The oracle's view: every token known at any of `commits`.
-    fn known(&self, commits: &[&str]) -> BTreeSet<String> {
-        let known = self.known.borrow();
-        commits
-            .iter()
-            .flat_map(|c| known.get(*c).into_iter().flatten().cloned())
-            .collect()
+        git_in(&self.repo, &args, &msg)
     }
 
     /// `git update-ref`, counted so `check` re-reads history only after a
@@ -588,22 +594,15 @@ impl World {
         r
     }
 
-    /// Per slot of `p` at commit `at`, the commit that set its line (`git
-    /// blame`): the commit that wrote it, or with `first_parent` the
-    /// commit on `at`'s first-parent chain that last changed it (the
-    /// tree's own decision). Cached: commits never change.
-    fn blame(&self, at: &str, p: &str, first_parent: bool) -> Vec<String> {
-        let key = format!("{at}:{p}:{first_parent}");
+    /// Per slot of `p` at commit `at`, the commit that wrote its line (`git
+    /// blame`). Cached: commits never change.
+    fn blame(&self, at: &str, p: &str) -> Vec<String> {
+        let key = format!("{at}:{p}");
         if let Some(b) = self.blames.borrow().get(&key) {
             return b.clone();
         }
-        let mut args = vec!["blame", "--porcelain"];
-        if first_parent {
-            args.push("--first-parent");
-        }
-        args.extend([at, "--", p]);
         let mut by_line = BTreeMap::new();
-        for line in git(&self.repo, &args).lines() {
+        for line in git(&self.repo, &["blame", "--porcelain", at, "--", p]).lines() {
             let f: Vec<&str> = line.split(' ').collect();
             if f.len() >= 3
                 && f[0].len() == 40
@@ -620,17 +619,52 @@ impl World {
         b
     }
 
+    /// The lines the line `origin` wrote on slot `slot` of `p` was written
+    /// over, newest first: the line its writer saw there (on `origin`'s
+    /// first parent), the line that one was written over, and so on, read
+    /// from git (first parents and `git blame`). Per line, not per commit:
+    /// a sync merge that kept the fork's line over the parent's does not
+    /// make the parent's line one the fork's next edit was written over.
+    /// Cached: commits never change.
+    fn written_over(&self, origin: &str, p: &str, slot: usize) -> Vec<String> {
+        let key = format!("{origin}:{p}:{slot}");
+        if let Some(v) = self.over.borrow().get(&key) {
+            return v.clone();
+        }
+        let up = self.first_parent(origin);
+        let base = self.file(&up, p).slot(slot).to_string();
+        let v = if base == EMPTY {
+            Vec::new()
+        } else {
+            let mut v = vec![base];
+            v.extend(self.written_over(&self.blame(&up, p)[slot], p, slot));
+            v
+        };
+        self.over.borrow_mut().insert(key, v.clone());
+        v
+    }
+
     /// The writer a commit names.
     pub fn writer_of_commit(&self, c: &str) -> String {
+        self.trailer(c, "Agentfs-Writer")
+    }
+
+    fn trailer(&self, c: &str, key: &str) -> String {
         git(
             &self.repo,
             &[
                 "log",
                 "-1",
-                "--format=%(trailers:key=Agentfs-Writer,valueonly)",
+                &format!("--format=%(trailers:key={key},valueonly)"),
                 c,
             ],
         )
+    }
+
+    /// Whether `c` is a plain save (not a transaction's commit, nor a
+    /// landing of a fork's own fork).
+    fn plain_save(&self, c: &str) -> bool {
+        self.trailer(c, "Agentfs-Cause") == "Direct"
     }
 
     /// The slots `b` changes from `a`, with the token each now holds.
@@ -651,21 +685,14 @@ impl World {
         out
     }
 
-    /// Rule 3 under [`MergeRule::PerLine`]: each incoming line meets the
-    /// line of `ours` (a commit) on its slot. An incoming line `ours`
-    /// already superseded (its writing commit is an ancestor of the one
-    /// that wrote `ours`'s line) is stale and dropped, unless it is a
-    /// commit's own edit made on the line `ours` still has. Every other
-    /// incoming line replaces the tree's; when the tree's line was not
-    /// written before it (neither writing commit descends from the other)
-    /// the two are concurrent, and the collision is reported: also when a
-    /// fork's commit carries a collision it decided itself (a nested
-    /// landing), since it is one in this tree too; not when the parent's
-    /// decision a sync carries already saw the tree's line (it lost there,
-    /// and is recorded there). Per
-    /// [`CollisionScope::File`], a file with a collision takes `whole`'s
-    /// version of the file instead.
-    fn resolve(&self, ours: &str, incoming: &[Incoming], whole: &str) -> Merged {
+    /// Rule 3 at the parent's queue: each incoming line meets the line of
+    /// `ours` (the parent's head) on its slot. A line written over the
+    /// parent's ([`World::written_over`] holds it) replaces it; a line the
+    /// parent's was written over is stale and dropped; else the two are
+    /// concurrent, the parent's line stays, and the collision is reported.
+    /// Per [`CollisionScope::File`], a file with a collision keeps the
+    /// parent's whole version, every incoming line in it lost.
+    fn resolve(&self, ours: &str, incoming: &[Incoming]) -> Merged {
         let mut by_path: BTreeMap<&str, Vec<&Incoming>> = BTreeMap::new();
         for i in incoming {
             by_path.entry(&i.path).or_default().push(i);
@@ -675,33 +702,37 @@ impl World {
         for (p, ins) in by_path {
             let cur = self.file(ours, p);
             let mut new = cur.clone();
-            let mut hit = Vec::new();
+            let (mut hit, mut applied) = (Vec::new(), Vec::new());
+            let mut token = BTreeMap::new();
             for i in ins {
                 let c = cur.slot(i.slot);
+                token.insert(i.slot, i.token.clone());
                 if c == i.token {
                     continue;
                 }
-                let mine = &self.blame(ours, p, false)[i.slot];
-                if i.base.as_deref() == Some(c) || !self.is_ancestor(&i.origin, mine) {
+                if c == EMPTY
+                    || self
+                        .written_over(&i.origin, p, i.slot)
+                        .iter()
+                        .any(|t| t == c)
+                {
                     new = new.with(i.slot, &i.token);
-                    let decided_upstream = i
-                        .decided
-                        .as_ref()
-                        .is_some_and(|d| self.is_ancestor(mine, d));
-                    if !self.is_ancestor(mine, &i.origin) && !decided_upstream {
-                        hit.push(i.slot);
-                    }
+                    applied.push(i.slot);
+                } else if !self
+                    .written_over(&self.blame(ours, p)[i.slot], p, i.slot)
+                    .contains(&i.token)
+                {
+                    hit.push(i.slot);
                 }
             }
             if !hit.is_empty() && self.policies.collision == CollisionScope::File {
-                new = self.file(whole, p);
-                hit = (0..SLOTS)
-                    .filter(|i| cur.slot(*i) != EMPTY && cur.slot(*i) != new.slot(*i))
-                    .collect();
+                new = cur.clone();
+                hit.extend(applied);
+                hit.sort_unstable();
             }
             if !hit.is_empty() {
-                let lost = hit.iter().map(|i| cur.slot(*i).to_string()).collect();
-                let won = hit.iter().map(|i| new.slot(*i).to_string()).collect();
+                let lost = hit.iter().map(|i| token[i].clone()).collect();
+                let won = hit.iter().map(|i| cur.slot(*i).to_string()).collect();
                 collisions.push(Lost {
                     path: p.to_string(),
                     slots: hit,
@@ -722,14 +753,12 @@ impl World {
     }
 
     /// The lines a commit's own edit sets: its diff from `base`, each with
-    /// the line it was made on and its writing commit.
+    /// its writing commit.
     fn edit_of(&self, base: &str, c: &str) -> Vec<Incoming> {
         self.edits(base, c)
             .into_iter()
             .map(|e| Incoming {
-                base: Some(self.file(base, &e.path).slot(e.slot).to_string()),
-                origin: self.blame(c, &e.path, false)[e.slot].clone(),
-                decided: None,
+                origin: self.blame(c, &e.path)[e.slot].clone(),
                 path: e.path,
                 slot: e.slot,
                 token: e.token,
@@ -737,105 +766,55 @@ impl World {
             .collect()
     }
 
-    /// The lines a sync carries: each line of the parent's current version
-    /// `up` that differs from the fork's `ours`, less each whose last
-    /// change on the parent's first-parent chain `ours` already holds (the
-    /// fork saw that decision and has moved on since).
-    fn version_of(&self, ours: &str, up: &str) -> Vec<Incoming> {
-        let mut out = Vec::new();
+    /// [`MergeRule::PerLine`]'s sync: the parent's version `up`, with each
+    /// line of the fork's `ours` the parent has not decided yet (its
+    /// writing commit is not in `up`'s lineage) kept over it.
+    fn adopt(&self, ours: &str, up: &str) -> String {
+        let mut files = BTreeMap::new();
         for p in git(&self.repo, &["diff-tree", "-r", "--name-only", ours, up]).lines() {
             let (mine, theirs) = (self.file(ours, p), self.file(up, p));
-            let decided = self.blame(up, p, true);
-            let origin = self.blame(up, p, false);
-            for i in 0..SLOTS {
-                if mine.slot(i) != theirs.slot(i) && !self.is_ancestor(&decided[i], ours) {
-                    out.push(Incoming {
-                        path: p.to_string(),
-                        slot: i,
-                        token: theirs.slot(i).to_string(),
-                        base: None,
-                        origin: origin[i].clone(),
-                        decided: Some(decided[i].clone()),
-                    });
+            let origin = self.blame(ours, p);
+            let mut new = theirs.clone();
+            for (i, o) in origin.iter().enumerate() {
+                if mine.slot(i) != theirs.slot(i) && !self.is_ancestor(o, up) {
+                    new = new.with(i, mine.slot(i));
                 }
             }
-        }
-        out
-    }
-
-    /// [`MergeRule::GitMergeBase`]: git's own three-way merge of `theirs`
-    /// into `ours`, on git's merge base, the incoming side (`theirs`)
-    /// winning each collision (per [`CollisionScope`]).
-    fn git_merge(&self, ours: &str, theirs: &str) -> Merged {
-        let run = |x: Option<&str>| {
-            let mut args = vec!["merge-tree", "--write-tree", "--name-only", "--no-messages"];
-            let x = x.map(|x| format!("-X{x}"));
-            if let Some(x) = &x {
-                args.push(x);
+            if new != theirs {
+                files.insert(p.to_string(), new);
             }
-            args.extend([ours, theirs]);
-            try_git(&self.repo, &args, None)
-        };
-        let plain = run(None);
-        let mut lines = plain.stdout.lines();
-        let tree = lines.next().expect("merge-tree prints a tree").to_string();
-        match plain.code {
-            0 => {
-                return Merged {
-                    tree,
-                    collisions: Vec::new(),
-                };
-            }
-            1 => {}
-            c => panic!("git merge-tree failed ({c}): {}", plain.stderr),
         }
-        let paths: BTreeSet<String> = lines
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect();
-        let resolved = |x| {
-            let o = run(Some(x));
-            // Only content conflicts arise: deletes and renames, whose
-            // modify/delete and rename conflicts `-X` does not resolve, are
-            // left out of the model (MODEL.md).
-            assert_eq!(o.code, 0, "merge-tree -X{x} resolves: {}", o.stderr);
-            o.stdout.lines().next().expect("a tree").to_string()
-        };
-        let (won, kept) = (resolved("theirs"), resolved("ours"));
-        let mut whole = BTreeMap::new();
-        let mut collisions = Vec::new();
-        for p in &paths {
-            let final_ = match self.policies.collision {
-                CollisionScope::Line => self.file(&won, p),
-                CollisionScope::File => {
-                    let f = self.file(theirs, p);
-                    whole.insert(p.clone(), f.clone());
-                    f
-                }
-            };
-            let l = self.file(&kept, p);
-            let slots: Vec<usize> = (0..SLOTS)
-                .filter(|i| final_.slot(*i) != l.slot(*i) && l.slot(*i) != EMPTY)
-                .collect();
-            let lost = slots.iter().map(|i| l.slot(*i).to_string()).collect();
-            let wins = slots.iter().map(|i| final_.slot(*i).to_string()).collect();
-            collisions.push(Lost {
-                path: p.clone(),
-                slots,
-                lost,
-                won: wins,
-            });
-        }
-        let tree = if whole.is_empty() {
-            won
+        if files.is_empty() {
+            self.tree_of(up)
         } else {
-            self.tree_with(Some(&won), &whole)
-        };
-        Merged { tree, collisions }
+            self.tree_with(Some(up), &files)
+        }
     }
 
-    /// Records a merge's collisions in tree `t`, each keeping its loser
-    /// reachable under `refs/collisions/<n>`.
+    /// [`MergeRule::GitMergeBase`]: git's own three-way merge of `up` into
+    /// `ours`, on git's merge base, a conflicting hunk keeping the fork's
+    /// side.
+    fn git_merge(&self, ours: &str, up: &str) -> String {
+        let o = try_git(
+            &self.repo,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "-Xours",
+                ours,
+                up,
+            ],
+            None,
+        );
+        // Only content conflicts arise, which `-X` resolves: deletes and
+        // renames are left out of the model (MODEL.md).
+        assert_eq!(o.code, 0, "merge-tree -Xours resolves: {}", o.stderr);
+        o.stdout.lines().next().expect("a tree").to_string()
+    }
+
+    /// Records a landing's collisions in tree `t`, each keeping the losing
+    /// incoming commit reachable under `refs/collisions/<n>`.
     fn record(
         &mut self,
         t: Tree,
@@ -855,7 +834,7 @@ impl World {
             let reference = format!("refs/collisions/{}", self.collisions.len() + 1);
             self.update_ref(&[&reference, loser]);
             self.note(format!(
-                "collision in {t:?}:{path}{slots:?} ({dir:?}): {lost:?} lost to incoming {won:?}"
+                "collision in {t:?}:{path}{slots:?} ({dir:?}): incoming {lost:?} lost to {won:?}"
             ));
             self.collisions.push(Collision {
                 tree: t,
@@ -947,7 +926,7 @@ impl World {
         };
         let cur = self.file(&at, p);
         let token = self.token(&writer, txn.as_ref().map(|t| t.0));
-        self.lineage.wrote(&token, self.known(&[&at]));
+        self.lineage.wrote(&token, cur.slot(slot));
         let files = BTreeMap::from([(p.to_string(), cur.with(slot, &token))]);
         let t = self.tree_with(Some(&at), &files);
         self.note(format!("save {token} into {tree:?}:{p}[{slot}]"));
@@ -1011,12 +990,13 @@ impl World {
         Ok(id)
     }
 
-    /// Commit: merge the branch onto the fork's current head as one merge
-    /// commit named for the client, which then lands like any fork commit.
-    /// Never refused: the transaction is the incoming change into its fork,
-    /// so its line wins a same-line collision with a line a sync brought in
-    /// since begin (rule 3), recorded like any other. So the outcome does
-    /// not depend on whether that sync arrived before or after the commit.
+    /// Commit (a design choice, MODEL.md rule 5): the transaction's branch
+    /// lands in the fork's current head as a child's change lands in its
+    /// parent, as one merge commit named for the client, which then lands
+    /// like any fork commit. Never refused. The fork is the transaction's
+    /// parent, so a fork line concurrent with a staged line (one a sync
+    /// brought in since begin) wins; the staged lines that do not collide
+    /// apply; the answer names each staged line that lost.
     pub fn commit_txn(&mut self, f: ForkId) -> Result<TxnOutcome, ModelError> {
         let txn = self.take_txn(f)?;
         let ours = self.forks[&f].head.clone();
@@ -1025,7 +1005,7 @@ impl World {
             TxnOutcome::Empty
         } else {
             let edit = self.edit_of(&txn.start, &txn.head);
-            let m = self.resolve(&ours, &edit, &txn.head);
+            let m = self.resolve(&ours, &edit);
             let writer = self.forks[&f].writer.clone();
             let t = Tree::Fork(f);
             let c = self.commit(
@@ -1035,7 +1015,7 @@ impl World {
                 &format!("Transaction t{}", txn.id),
                 &Self::name(t),
             );
-            self.record(t, Direction::Transaction, &m, &txn.head, &ours, &c);
+            self.record(t, Direction::Transaction, &m, &ours, &txn.head, &c);
             self.set_head(t, &c);
             for e in edit {
                 self.entered.push((
@@ -1049,14 +1029,29 @@ impl World {
             }
             self.moved(t, true);
             result = Some(c);
-            TxnOutcome::Committed
+            let overwritten = m
+                .collisions
+                .iter()
+                .flat_map(|l| {
+                    l.slots
+                        .iter()
+                        .zip(l.lost.iter().zip(&l.won))
+                        .map(|(s, (lost, won))| Overwritten {
+                            path: l.path.clone(),
+                            slot: *s,
+                            staged: lost.clone(),
+                            kept: won.clone(),
+                        })
+                })
+                .collect();
+            TxnOutcome::Committed { overwritten }
         };
         self.note(format!("commit t{} on f{f}: {outcome:?}", txn.id));
         self.ended.push(Ended {
             fork: f,
             txn: txn.id,
             staged: txn.staged,
-            how: TxnEnd::Commit(outcome),
+            how: TxnEnd::Commit(outcome.clone()),
             result,
         });
         Ok(outcome)
@@ -1124,8 +1119,10 @@ impl World {
         out
     }
 
-    /// Takes one step. It always completes: nothing is held.
-    pub fn step(&mut self, s: &Step) {
+    /// Takes one step and returns how many queue entries it took: its
+    /// queue's head, plus under `Squashed` the same fork's plain saves it
+    /// carried with it. It always completes: nothing is held.
+    pub fn step(&mut self, s: &Step) -> usize {
         match s {
             Step::Next(t) => {
                 let e = self
@@ -1135,10 +1132,16 @@ impl World {
                     .expect("a queued entry");
                 match e {
                     Entry::Landing { from, commit } => self.land(*t, from, &commit),
-                    Entry::Sync => self.sync(*t),
+                    Entry::Sync => {
+                        self.sync(*t);
+                        1
+                    }
                 }
             }
-            Step::Drop(f) => self.drop_fork(*f),
+            Step::Drop(f) => {
+                self.drop_fork(*f);
+                0
+            }
         }
     }
 
@@ -1154,103 +1157,151 @@ impl World {
         panic!("the queues never drained");
     }
 
-    /// Rule 3, fork into parent: a fast-forward when the commit's base is
-    /// the target's head, else the commit's own edit (its diff from its
-    /// first parent) merged line by line, the incoming line winning a
-    /// collision.
-    fn land(&mut self, x: Tree, from: ForkId, c: &str) {
-        let base = self.first_parent(c);
-        let ours = self.head(x);
-        let writer = self.writer_of_commit(c);
-        let edits = self.edits(&base, c);
-        let carried: Vec<&str> = edits.iter().map(|e| e.token.as_str()).collect();
-        self.note(format!(
-            "landing f{from}'s {c:.7} into {x:?} carries {carried:?}"
-        ));
-        for e in edits {
-            self.entered.push((x, e));
+    /// The fork commits a landing of `first` carries: `first` alone, or
+    /// under `Squashed`, when `first` is a plain save, every later plain
+    /// save of the same fork waiting in `x`'s queue up to that fork's next
+    /// other entry (a transaction's commit or a nested landing, which
+    /// lands on its own). Those leave the queue.
+    fn run_from(&mut self, x: Tree, from: ForkId, first: &str) -> Vec<String> {
+        let mut run = vec![first.to_string()];
+        if self.policies.history != HistoryPolicy::Squashed || !self.plain_save(first) {
+            return run;
         }
-        self.landings.push((x, c.to_string()));
-        let full = self.policies.history == HistoryPolicy::FullLineage;
-        let edit = self.edit_of(&base, c);
-        let m = self.resolve(&ours, &edit, c);
-        if full && base == ours {
-            // A fork's commit can carry a collision the fork decided (a
-            // nested landing): it is one in this tree too.
-            self.record(x, Direction::Landing, &m, c, &ours, c);
-            self.set_head(x, c);
-            self.fast_forwards += 1;
-            self.note(format!("landed f{from}'s {c:.7} into {x:?}: fast-forward"));
-            self.moved(x, true);
-            return;
+        let mut keep = VecDeque::new();
+        let mut open = true;
+        for e in self.queue(x) {
+            if open
+                && let Entry::Landing { from: g, commit } = &e
+                && *g == from
+            {
+                if self.plain_save(commit) {
+                    run.push(commit.clone());
+                    continue;
+                }
+                open = false;
+            }
+            keep.push_back(e);
         }
-        let new = if full {
-            self.commit(&[&ours, c], &m.tree, &writer, "Landing", &Self::name(x))
-        } else if m.tree == self.tree_of(&ours) {
-            ours.clone()
-        } else {
-            let new = self.commit(&[&ours], &m.tree, &writer, "Landing", &Self::name(x));
-            // Rule 7, `Squashed`: the stored commit has one parent; its
-            // lineage, the fork commit it carried, is a graft beside
-            // history, made before any read of `new`.
-            git(&self.repo, &["replace", "--graft", &new, &ours, c]);
-            self.ref_moves += 1;
-            let k = self.known(&[&new, c]);
-            self.known.borrow_mut().insert(new.clone(), k);
-            new
-        };
-        self.record(x, Direction::Landing, &m, c, &ours, &new);
-        self.note(format!("landed f{from}'s {c:.7} into {x:?}"));
-        if new != ours {
-            self.set_head(x, &new);
-            self.moved(x, true);
-        }
+        self.queues.insert(x, keep);
+        run
     }
 
-    /// Rule 3, parent into fork: the parent's current version (never the
-    /// one current when the sync was queued). Nothing if the fork has it,
-    /// a fast-forward if the fork has nothing of its own, else a merge
-    /// commit labelled `Sync` with the parent's head as second parent,
-    /// built per [`MergeRule`], the incoming line winning a collision.
+    /// Rule 3, a fork's change into its parent `x`, the one place a
+    /// collision between them is decided. A fast-forward when the commit's
+    /// base is the target's head (`FullLineage`), else each carried line
+    /// meets the parent's ([`World::resolve`]): the parent's line wins a
+    /// collision. Returns the queue entries taken.
+    fn land(&mut self, x: Tree, from: ForkId, first: &str) -> usize {
+        let run = self.run_from(x, from, first);
+        let tip = run.last().expect("a commit").clone();
+        let ours = self.head(x);
+        let mut lines: BTreeMap<(String, usize), Incoming> = BTreeMap::new();
+        for c in &run {
+            for i in self.edit_of(&self.first_parent(c), c) {
+                lines.insert((i.path.clone(), i.slot), i);
+            }
+        }
+        let incoming: Vec<Incoming> = lines.into_values().collect();
+        let carried: Vec<&str> = incoming.iter().map(|i| i.token.as_str()).collect();
+        self.note(format!(
+            "landing f{from}'s {} commit(s) to {tip:.7} into {x:?} carries {carried:?}",
+            run.len()
+        ));
+        for i in &incoming {
+            self.entered.push((
+                x,
+                Edit {
+                    path: i.path.clone(),
+                    slot: i.slot,
+                    token: i.token.clone(),
+                },
+            ));
+        }
+        for c in &run {
+            self.landings.push((x, c.clone()));
+        }
+        if run.len() > 1 {
+            self.squashed_runs += 1;
+        }
+        let m = self.resolve(&ours, &incoming);
+        let full = self.policies.history == HistoryPolicy::FullLineage;
+        if full && self.first_parent(&tip) == ours {
+            // Made on the parent's current version: every line replaces
+            // the parent's, so nothing collides.
+            assert!(
+                m.collisions.is_empty() && m.tree == self.tree_of(&tip),
+                "a fast-forward is a plain replacement"
+            );
+            self.set_head(x, &tip);
+            self.fast_forwards += 1;
+            self.note(format!(
+                "landed f{from}'s {tip:.7} into {x:?}: fast-forward"
+            ));
+            self.moved(x, true);
+            return run.len();
+        }
+        let writer = self.writer_of_commit(&tip);
+        let new = if full {
+            self.commit(&[&ours, &tip], &m.tree, &writer, "Landing", &Self::name(x))
+        } else {
+            // Rule 7, `Squashed`: the stored commit has one parent; its
+            // lineage, the last fork commit it carried, is a graft beside
+            // history, made before any read of `new`. Made even when
+            // every line lost, so the parent's lineage shows the decision.
+            let new = self.commit(&[&ours], &m.tree, &writer, "Landing", &Self::name(x));
+            git(&self.repo, &["replace", "--graft", &new, &ours, &tip]);
+            self.ref_moves += 1;
+            new
+        };
+        self.record(x, Direction::Landing, &m, &ours, &tip, &new);
+        self.note(format!("landed f{from}'s {tip:.7} into {x:?}"));
+        self.set_head(x, &new);
+        self.moved(x, true);
+        run.len()
+    }
+
+    /// Rule 3, parent into fork: the parent's current decided version
+    /// (never the one current when the sync was queued). It decides
+    /// nothing: each fork line the parent's queue has not taken yet stays
+    /// until that queue decides it. Nothing if the fork has the parent's
+    /// version; the parent's head itself (a fast-forward: the fork adopts
+    /// the parent's decisions) when no fork line or commit is still
+    /// waiting for the parent; else a merge commit labelled `Sync` with the
+    /// parent's head as second parent, built per [`MergeRule`].
     fn sync(&mut self, x: Tree) {
         let Tree::Fork(f) = x else {
             unreachable!("main has no parent")
         };
-        let up = self.head(self.forks[&f].parent);
+        let parent = self.forks[&f].parent;
+        let up = self.head(parent);
         let ours = self.head(x);
         if self.is_ancestor(&up, &ours) {
             return;
         }
-        if self.is_ancestor(&ours, &up) {
-            for e in self.edits(&ours, &up) {
-                self.entered.push((x, e));
+        let tree = if self.is_ancestor(&ours, &up) {
+            self.tree_of(&up)
+        } else {
+            match self.policies.merge {
+                MergeRule::PerLine => self.adopt(&ours, &up),
+                MergeRule::GitMergeBase => self.git_merge(&ours, &up),
             }
-            self.set_head(x, &up);
-            self.syncs.push((x, up.clone(), up.clone()));
-            self.note(format!("synced {up:.7} into f{f}: fast-forward"));
-            self.moved(x, false);
-            return;
-        }
-        let m = match self.policies.merge {
-            MergeRule::PerLine => {
-                let version = self.version_of(&ours, &up);
-                for i in &version {
-                    let e = Edit {
-                        path: i.path.clone(),
-                        slot: i.slot,
-                        token: i.token.clone(),
-                    };
-                    self.entered.push((x, e));
-                }
-                self.resolve(&ours, &version, &up)
-            }
-            MergeRule::GitMergeBase => self.git_merge(&ours, &up),
         };
-        let new = self.commit(&[&ours, &up], &m.tree, "agentfs", "Sync", &Self::name(x));
-        self.record(x, Direction::Sync, &m, &up, &ours, &new);
+        for e in self.edits(&ours, &tree) {
+            self.entered.push((x, e));
+        }
+        let waiting = self
+            .queue(parent)
+            .iter()
+            .any(|e| matches!(e, Entry::Landing { from, .. } if *from == f));
+        let new = if tree == self.tree_of(&up) && !waiting {
+            self.note(format!("synced {up:.7} into f{f}: fast-forward"));
+            up.clone()
+        } else {
+            self.note(format!("synced {up:.7} into f{f}"));
+            self.commit(&[&ours, &up], &tree, "agentfs", "Sync", &Self::name(x))
+        };
         self.set_head(x, &new);
-        self.syncs.push((x, up.clone(), new.clone()));
-        self.note(format!("synced {up:.7} into f{f}"));
+        self.syncs.push((x, up, new));
         self.moved(x, false);
     }
 
@@ -1274,10 +1325,10 @@ impl World {
 
     /// What a run decided, without commit ids (they carry dates): each
     /// branch's and collision ref's tree, and each collision's tree, side,
-    /// file, slots and lost tokens. The same calls give the same
-    /// fingerprint whatever the commits' dates
-    /// (`r2_no_clock_commit_dates_decide_nothing`). Graft refs are named by
-    /// commit id, so they are left out; their effect shows in the trees.
+    /// file, slots and tokens. The same calls give the same fingerprint
+    /// whatever the commits' dates (`r2_no_clock_commit_dates_decide_nothing`).
+    /// Graft refs are named by commit id, so they are left out; their
+    /// effect shows in the trees.
     pub fn fingerprint(&self) -> String {
         let mut s = git(
             &self.repo,

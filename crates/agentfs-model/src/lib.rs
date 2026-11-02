@@ -1,5 +1,6 @@
-//! An executable model of the owner's landing rules of 2026-11-02, in
-//! plain words in `MODEL.md` (the rules table names each rule's tests).
+//! An executable model of the owner's landing rules (2026-11-02 and
+//! 2026-11-03), in plain words in `MODEL.md` (the rules table names each
+//! rule's tests).
 //!
 //! The owner, 2026-11-02: "Since the model is effectively “just git” with
 //! some overlaid lock/merging rules, I propose a set of functional tests
@@ -8,9 +9,12 @@
 //! metaphor of a typical Linux filesystem. I want to try that out."
 //!
 //! [`world`] drives the real `git` program in a temporary repository: main
-//! and each fork are branches, each save a commit naming one writer, each
-//! landing or sync a fast-forward or a line merge in which the newer line
-//! wins by git ancestry and, of two concurrent lines, the incoming one.
+//! and each fork are branches, each save a commit naming one writer. A
+//! collision between a fork and its parent is decided only at the parent's
+//! landing queue, per line: a line written over the parent's replaces it,
+//! and of two concurrent lines the parent's wins. A sync decides nothing:
+//! the fork takes the parent's decided version, keeping only its own lines
+//! still on their way to that queue.
 //! [`check`] holds the invariants, read back from the repository after
 //! every step.
 //!

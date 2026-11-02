@@ -1,139 +1,116 @@
 # The landing model, in plain words
 
-This crate runs the owner's landing rules of 2026-11-02 on the real `git` program. Main and each sandbox
-(a "fork") are git branches. Every save is a commit that names its one writer. Tests in `tests/` check
-the rules after every step.
+This crate runs the owner's landing rules on the real `git` program. Main and each sandbox (a "fork") are
+git branches. Every save is a commit that names its one writer. Tests in `tests/` check the rules after
+every step.
 
-The owner, 2026-11-02: "I generally like the metaphor of a typical Linux filesystem. I want to try that
-out." On transactions: "Frozen snapshot was my intention, yes. That's why I said “new branch” earlier."
-On two edits to the same line at once he first said "im incline to say that the upstream (main) wins in
-that case", then corrected it the same day: "main only wins when there is a collision from upstream to a
-fork. If a sandbox pushes a conflicting change upstream, then it should be applied." Still binding from
-earlier: forks stay, kept in step by syncing quickly ("making the fork design so rock-solid that it is
-almost as effective, by syncing forks quickly"); sandboxes are peers; one history setting per volume; a
-failed transaction is an implicit rollback.
+The owner's words this model rests on:
+
+- 2026-11-02: "I generally like the metaphor of a typical Linux filesystem. I want to try that out." On
+  transactions: "Frozen snapshot was my intention, yes. That's why I said “new branch” earlier."
+- 2026-11-02, agreeing to the parent rule below (every collision between a fork and its parent is decided in
+  one place, the parent's landing queue; the fork adopts that decision): "ok, that tracks".
+- 2026-11-03, on who wins there: "i think i would assume main wins. because if sandbox forked from main and
+  then main moved forward, the sandbox is working from an out-of-date copy. so even though its history can
+  be preserved for posterity, i think the updated main should win in a conflict." This replaces his answer
+  of 2026-11-02 that the incoming change wins.
+- 2026-11-03, on squashing: "the sandbox commits could be squashed to one changeset (if they are the naive
+  simple commits) and merged into upstream as one unit. if its a smarter integration that is creating
+  transactions, it might be best to leave the transaction commits as they are"; and "every sandbox commit
+  stays stored ... that makes sense, because thats basically the design we want".
+- Still binding from earlier: forks stay, kept in step by syncing quickly; sandboxes are peers; one history
+  setting per volume; a failed transaction is an implicit rollback.
 
 ## The rules
 
 "Parent" means main for a sandbox, and the sandbox for a sandbox inside it. A "sync" brings the parent's
-changes into a sandbox; a "landing" brings a sandbox's saved change into its parent. Rows marked *choice*
-were decided here, not by the owner; each is open for him to change.
+version into a sandbox; a "landing" brings a sandbox's saved change into its parent. Two lines "collide"
+when each was written without seeing the other. Rows marked *choice* were decided here, not by the owner;
+each is open for him to change.
 
 | # | Rule | Source | Tests |
 |---|---|---|---|
-| 1 | Works like a Linux filesystem. A write, sync, landing or transaction commit is never blocked, refused or held, and each writer sees its own write at once. Changes flow both ways between a sandbox and its parent without anyone asking. | Owner | `r1_writes_never_wait_and_forks_sync_both_ways` |
-| 2 | Order without clocks. Each tree (main, each sandbox) has one queue, and changes enter it in queue order. Which of two edits is newer is read from git history: an edit is newer if it was made on a version that already held the other. No clock is read. | Owner | `r2_one_queue_fixes_the_landing_order`, `r2_no_clock_commit_dates_decide_nothing` |
-| 3a | An edit made on the target's current version simply replaces it (fast-forward). | Owner | `r3_fast_forward_when_the_base_is_current` |
-| 3b | Two edits to the same line made without seeing each other: the incoming one wins in the tree it is applied to. In a sync the parent's line wins in the sandbox; in a landing the sandbox's line wins in the parent. The losing line stays in history, and the collision is recorded once, in the tree that decided it, naming the line that overwrote it. | Owner; "once" is a choice | `r3_landing_collision_the_fork_wins_in_the_parent`, `r3_sync_collision_the_parent_wins_in_the_fork_until_the_fork_edit_lands`, `r3_a_loss_decided_upstream_is_recorded_once` |
-| 3c | A sync carries the parent's current version, never one from when it was queued, and a line the sandbox already replaced never comes back over its newer line. *Choice:* per line, git decides which line is newer: the line whose writing commit (`git blame`) descends from the other's. A sync skips each line whose last change in the parent the sandbox already holds (`git blame --first-parent`). | Owner; how is a choice | `r3_landing_collision_the_fork_wins_in_the_parent` (its stale sync), `r3_a_sync_never_brings_back_a_line_the_fork_already_took`, `r3_crossing_merges_keep_a_newer_edit` |
-| 3d | *Choice:* only the colliding lines lose (per line). The tree's other lines in that file stay, neighbouring lines included. | Recommended; see below | `r3_collision_scope_per_line_keeps_clean_lines`, `r3_collision_scope_per_line_sync_keeps_the_clean_line`, `r3_neighbouring_lines_merge_per_line` |
-| 4 | Nothing waits behind a collision. Every sandbox commit lands in order. Sandboxes inside sandboxes follow the same rules, with their sandbox as the parent. | Owner | `r4_nothing_waits_behind_a_collision`, `r4_nested_forks_follow_the_same_rules` |
-| 5 | Transactions, opt-in. Begin opens a new branch, frozen at the sandbox's current version: the program sees its own edits, while the sandbox keeps receiving syncs. Commit merges the branch into the sandbox's current version. *Choice:* the commit is never refused: it is the incoming change into the sandbox, so its line wins a same-line collision with a line a sync brought in since begin, recorded like any other (rule 3b). Rollback, abandon or the client dying drops the branch. After a commit, the transaction's lines follow rule 3 like any others. | Owner; never refused is a choice | `r5_transaction_commits_clean`, `r5_transaction_commit_wins_over_a_concurrent_line`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_transaction_rollback_and_client_death_leave_nothing`, `r5_a_committed_transaction_then_follows_rule_3` |
-| 6 | *Choice* (the owner has not answered yet): every change traces back to exactly one writer. A sync is a merge commit labelled `Sync`, with the parent's commit as its second parent. Only merge commits combine writers, and a merge only carries lines it took from one of its parents. | Choice | `r6_a_sync_is_a_merge_with_the_parent_second`, every test (invariant) |
-| 7 | One history setting per volume. Full lineage: main's history includes every sandbox commit. Squashed: main's history holds only main's own commits. *Choice:* under Squashed, the sandbox commit each landing carried is recorded beside main's history as a git graft (`git replace --graft`, under `refs/replace/`). git's ancestry and blame read it; main's stored history, as pushed, does not. | Owner; the graft is a choice | `r7_history_setting_and_losers_stay_reachable`, `r7_squashed_sync_never_undoes_the_forks_newer_line` |
-
-Earlier versions of this model refused a transaction commit on a same-line collision. That fitted "upstream
-wins", not the owner's correction, and its outcome depended on timing: the same concurrent main line made the
-commit fail if its sync arrived first, and lost to the commit if it arrived after. Now both orders end with
-the same trees (`r5_sync_before_or_after_the_commit_ends_the_same`).
+| 1 | Works like a Linux filesystem. A write, sync, landing or transaction commit is never blocked, refused or held, and each writer sees its own write at once. Changes flow both ways without anyone asking. | Owner | `r1_writes_never_wait_and_forks_sync_both_ways` |
+| 2 | Order without clocks. Each tree has one queue, taken in order. Which of two lines is newer is read from git, never from a clock. | Owner | `r2_one_queue_fixes_the_landing_order`, `r2_no_clock_commit_dates_decide_nothing` |
+| 3a | Every collision between a sandbox and its parent is decided in exactly one place, the parent's landing queue, and recorded once, there. A sync never decides one: the sandbox keeps its own line until the parent's queue has decided it, then takes the parent's decision. So a sandbox's line changes at most once per collision: never its own, then the parent's, then its own again. | Owner | `r3_a_collision_is_recorded_once_at_the_parents_queue`, `r3_a_fork_never_flips_back_to_its_own_edit` |
+| 3b | There, the parent's version wins a collision. The sandbox's losing line stays in history (kept under `refs/collisions/<n>`), the collision names both lines, and the sandbox then takes the parent's line. At every level: a sandbox is the parent of the sandboxes inside it. | Owner | `r3_landing_collision_the_parent_wins`, `r4_nested_forks_follow_the_same_rules` |
+| 3c | A line written on top of the parent's current line (its writer saw it) is not a collision; it replaces it. *Choice:* "saw" is read per line: the lines a line was written over, from git (first parent and `git blame`), not which commits its version merged. | Owner; per line is a choice | `r3_fast_forward_when_the_base_is_current`, `r3_an_edit_over_the_decided_line_replaces_it`, `r3_an_edit_over_an_undecided_line_still_collides` |
+| 3d | A sync carries the parent's current decided version, never a stale one. *Choice:* the sandbox keeps exactly its lines whose writing commit the parent's history does not reach yet; when none is left and nothing of it waits in the parent's queue, the sandbox's branch moves to the parent's commit (a fast-forward). | Owner; how is a choice | `r3_a_sync_carries_the_parents_current_version`, `r3_collision_scope_per_line_sync_keeps_the_clean_line`, `r7_squashed_sync_never_undoes_the_forks_newer_line` |
+| 3e | *Choice:* only the colliding lines lose (per line); the change's other lines apply, neighbouring lines included. | Recommended | `r3_collision_scope_per_line_keeps_clean_lines`, `r3_neighbouring_lines_merge_per_line` |
+| 4 | Nothing waits behind a collision: every sandbox commit lands, in order. | Owner | `r4_nothing_waits_behind_a_collision` |
+| 5 | Transactions, opt-in. Begin opens a new branch frozen at the sandbox's version; the program sees its own edits while the sandbox keeps syncing. Rollback, abandon or the client dying drops the branch. *Choice:* commit lands the branch in the sandbox as a sandbox lands in its parent: the sandbox's line wins a collision (one a sync brought in since begin), the other lines apply, the commit is never refused, and its answer names each overwritten line. The commit then lands upstream like any change. | Owner; commit is a choice | `r5_transaction_commits_clean`, `r5_transaction_commit_reports_the_overwritten_line`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_a_committed_transaction_then_lands_like_any_change`, `r5_transaction_rollback_and_client_death_leave_nothing` |
+| 6 | *Choice* (not answered yet): every change traces back to one writer. A sync is a merge labelled `Sync`, the parent's commit second; a merge carries only lines a parent holds. | Choice | `r6_a_sync_is_a_merge_with_the_parent_second`, every test |
+| 7 | One history setting per volume. Full lineage: every sandbox commit lands on its own and stays in main's history. Squashed: main's history holds only main's own commits; a sandbox's plain saves waiting in the parent's queue when it takes the first land as one changeset; each transaction commit lands as its own unit. Every sandbox commit stays stored. *Choice:* the last commit a landing carried is recorded beside history as a git graft (`refs/replace/`); a nested sandbox's landing also lands on its own (it carries another writer's lines); a squash takes the sandbox's later saves ahead of other sandboxes' entries between them; a landing whose lines all lost still writes an (empty) commit, so the parent's history shows the decision. | Owner; the graft and the rest are choices | `r7_squashed_saves_land_as_one_changeset`, `r7_history_setting_and_losers_stay_reachable` |
 
 ## What must always hold
 
-These are checked after every step, in every scenario, and in the random runs (`check.rs`), under both
-history settings.
+Checked after every step, in every scenario and random run (`check.rs`), under both history settings.
 
 | Invariant | Check |
 |---|---|
-| No tree silently loses a change. Every change that reached a tree is still there, or replaced by a line whose writer saw it, or named as lost on that same file and line by a recorded collision in that tree or one upstream of it. | `no_silent_loss` |
-| No stale line ever reverts a newer one: a line is never replaced by one its writer had already seen. | `no_silent_loss` |
-| The incoming change wins every same-line collision in the tree it is applied to, and only real collisions are recorded (two lines whose writers never saw each other). The collision names the lost and the winning lines; the losing version stays reachable under `refs/collisions/<n>`. | `incoming_wins` |
-| Every sync delivers the parent's version at once: afterwards the sandbox holds each of the parent's lines, unless it holds a newer one or already lost that line in a collision recorded in the sandbox. | `syncs_deliver` |
-| Nothing is ever blocked or held. Every save and commit returns at once, and every queue step takes its queue's first entry. | `interleavings.rs` `take` |
-| A transaction ends as the program was told. Committed: every staged edit is in the sandbox's commit. Rolled back: every staged edit is discarded. | `transactions_end_as_told` |
-| A rolled-back transaction leaves nothing in any tree or in history. | `discarded_leave_no_trace` |
-| Every change traces back to one writer. A stored commit with one parent carries only its writer's lines. A merge carries only lines one of its parents holds, and names its second parent's writer (`agentfs` for a sync). | `one_writer` |
-| Trees converge when writes stop: once the queues drain, every sandbox equals main. | `check_converged` |
-| The history setting holds: a tree's lineage reaches every commit that landed in it; its stored history does too under Full lineage, and under Squashed none (main's holds only main's commits). Read by ancestry alone. | `history_setting` |
-| No clock is read. The same calls run again with every commit dated before its parents decide the same trees and collisions, under both history settings; and the source names no clock. | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` (seeds 1 to 8) |
+| No tree silently loses a change: every line that reached a tree is still there, or replaced by a line written over it, or named lost by a collision in that tree or one upstream. | `no_silent_loss` |
+| No stale line reverts a newer one. | `no_silent_loss` |
+| No flip-flop: a line, once replaced in a tree, never shows there again. | `no_flicker` |
+| The parent's version wins every collision, decided only at the parent's queue: the tree keeps its own line, the two lines really collided, the losing commit stays reachable. (A sync has no way to record one.) | `parent_wins` |
+| Every sync delivers the parent's decided version: the sandbox holds the parent's line on every slot except its own lines the parent's queue has not taken yet. | `syncs_deliver` |
+| Nothing is held: every save and commit returns at once; every queue step takes its queue's first entry (with the saves a squash carries) and leaves the rest in order. | `interleavings.rs` `take` |
+| A transaction ends as the program was told: committed lines are in the sandbox, each overwritten one is named in the answer and by a collision; rolled-back ones leave nothing in any tree or history. | `transactions_end_as_told`, `discarded_leave_no_trace` |
+| Every change traces back to one writer. | `one_writer` |
+| Trees converge when writes stop: every sandbox equals main. | `check_converged` |
+| The history setting holds, read by ancestry alone. | `history_setting` |
+| No clock is read: the same calls with every commit dated before its parents decide the same trees. | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` |
 
-"Saw" is the test's own record, kept apart from git: a writer saw every line in the version it wrote on,
-and in every version that version merged or carried.
-
-The random runs replay seeds 1 to 64 in CI: full lineage, squashed, and full lineage with every slot on a
-neighbouring line (one git hunk). Run more with `AGENTFS_MODEL_SEEDS=500`, or one seed with
-`AGENTFS_MODEL_SEED=<n>`. Each run mixes main writes, up to four sandboxes (some inside others),
-transactions, client exits and queue steps; a transaction is mostly committed once it has staged something,
-so commits meet concurrent lines.
-
-## Per line, per hunk or per file: per line
-
-Per file means the incoming version of a whole file replaces the tree's when any line collides. Then the
-tree's other lines in that file go back to whatever the incoming side had, often an older line: main's
-clean line, written after the sandbox's version, is reverted. That breaks "no stale line reverts a newer
-one" (finding 3; 36 of 64 random seeds fail). Per hunk in git's sense (`git merge -X theirs`) is the same
-fault in small: git puts neighbouring changed lines in one hunk, and takes the incoming hunk whole
-(finding 6). Per line passes every check over 500 seeds under both history settings and both layouts.
+The checks' record of who saw what is kept apart from git: a line saw the line its writer read on that
+slot, and everything that line saw. The random runs replay seeds 1 to 64 in CI (full lineage, squashed, and
+every slot on a neighbouring line); run more with `AGENTFS_MODEL_SEEDS=500`, or one with
+`AGENTFS_MODEL_SEED=<n>`.
 
 ## Coherence findings
 
-Each open finding has a test asserting what the rules intend, marked `#[ignore = "coherence finding N"]`
-because the rules or the chosen mechanism do not deliver it. Run them with `--ignored`.
+An open finding has a test marked `#[ignore = "coherence finding N"]`; run them with `--ignored`.
 
-1. **git's own merge base is not enough (rule 3b against 3c).** The sandbox takes main's line m while
-   main takes the sandbox's line x (each tree's incoming wins, so the two merges cross and disagree).
-   The sandbox then writes y over m. With git's own three-way merge, the next sync finds two merge bases,
-   merges them leaving conflict markers in the base, and treats y as colliding with x, which y's writer
-   saw: x reverts y. The model's per-line rule (3c) keeps y. `finding_1_git_merge_base_on_crossing_merges`,
-   `random_interleavings_git_merge_base` (2 of 64 seeds).
-2. **Resolved: Squashed history hid what rule 2 needs (rule 7 against rules 2 and 3c).** A squashed commit
-   in main does not name the sandbox commit it carried. Without more, git saw main's copy of a sandbox's
-   line x as written by main; when the sandbox then wrote y over x, the next sync carried x as concurrent
-   and x reverted y (46 of 64 seeds), and a squashed nested landing reached main with no collision recorded
-   there. The model now keeps that link beside history as a graft (rule 7), and Squashed passes every
-   check. Costs: every sandbox commit stays in the repository, reachable from its graft, though main's
-   pushed history does not reach it; a clone needs `refs/replace/` as well to decide syncs the same way;
-   and the system design's squash shape (`domains/history.md`: a merge whose second parent is a squash
-   commit on a per-fork chain) is not the model's single-parent commit, though the same graft serves it.
-   `r7_squashed_sync_never_undoes_the_forks_newer_line`, `random_interleavings_squashed`.
-3. **Per file reverts newer lines (rule 3d's other option against "no stale revert").** See above.
-   `finding_3_per_file_keeps_clean_lines`, `random_interleavings_per_file_full_lineage`.
-4. **The parent's win in a sandbox never lasts (rule 3b's two halves together). Needs the owner.** A
-   sandbox's edit x and main's concurrent edit m: if main's sync reaches the sandbox first, m wins there;
-   but x is already queued for main, lands after m, and wins in main; the next sync brings x back. So the
-   sandbox shows x, then m, then x. Every concurrent collision between a sandbox and its parent ends with
-   the sandbox's line everywhere; "the parent wins in the fork" holds only until then. In the sandbox's own
-   view this also splits a multi-line edit for that time, a committed transaction included
-   (`r5_a_committed_transaction_then_follows_rule_3`). No line is lost without a record and nothing stale
-   reverts, so it is coherent, and the trees converge. To avoid the flip, a sync would have to skip lines
-   the sandbox has changed and not yet landed, which contradicts "the parent's version wins in the fork".
-   `r3_sync_collision_the_parent_wins_in_the_fork_until_the_fork_edit_lands`,
-   `finding_4_a_fork_never_flips_back_to_its_own_edit`.
-5. **git reads commit dates when it walks a range (rule 2).** `git rev-list A --not B` stops walking
-   early by commit date. The model reads ancestry with `git merge-base --is-ancestor`, `git blame` and
-   whole-history `git rev-list <head>` only, and the date tests run every commit dated before its parents.
-   An implementation must do the same: a wrong clock on one machine would otherwise decide what a sync
-   applies.
-6. **git's hunk is not a line (rule 3d).** A sandbox changes line 1; main changes line 0. Per line, both
-   stay. git's merge sees one conflicting hunk, and taking the incoming side (`-X theirs`) puts main's
-   older line 1 back over the sandbox's newer one. `finding_6_git_hunks_on_neighbouring_lines`.
-7. **The merge an implementation needs is not a git merge strategy.** Findings 1 and 6 show that git's
-   own merges (any merge base, `-X theirs`) let a stale line revert a newer one under rule 3. So the rule
-   lives in the model's own code (`World::resolve`): git stores the commits and answers "who wrote this
-   line" (`git blame`) and "did this commit see that one" (`git merge-base --is-ancestor`); the model
-   decides each line from those answers. An implementation needs the same per-line merge of its own. The
-   test oracle ("saw") is kept apart from both, so the checks do not trust the code they check.
+1. **git's own merge cannot tell decided from undecided (open, for git's merge).** A sync built by git's
+   three-way merge, keeping the sandbox's side of a conflict: once a sandbox and main have each merged the
+   other, git finds two merge bases and keeps a sandbox line main already decided against.
+   `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base` (24 of 64 seeds).
+2. **Resolved: Squashed hid what a sync needs.** Without the graft (rule 7), a sync cannot tell that main's
+   queue has taken a sandbox's line, so the sandbox keeps it forever. Costs: a clone needs `refs/replace/`
+   too; the system design's squash shape (`domains/history.md`) is a merge, not the model's single-parent
+   commit, though the same graft serves it. `random_interleavings_squashed`.
+3. **Per file reverts newer lines (open, for per file).** Main's whole file wins, so the sandbox's clean
+   line in it is dropped; the sandbox then takes main's older line over its newer one.
+   `finding_3_per_file_keeps_clean_lines`, `random_interleavings_per_file_full_lineage` (2 of 64 seeds).
+4. **Resolved: the flicker.** Under "the incoming change wins" a sandbox showed x, then main's m, then x.
+   The parent rule removes it, and `no_flicker` asserts it in every run.
+5. **git reads commit dates when it walks a range.** `git rev-list A --not B` stops early by date, so the
+   model reads ancestry only (`merge-base --is-ancestor`, `blame`, whole-history `rev-list`). An
+   implementation must do the same.
+6. **git's hunk is not a line (open, for git's merge).** Neighbouring changed lines form one git hunk;
+   keeping the sandbox's side of it withholds main's decided neighbouring line.
+   `finding_6_git_hunks_on_neighbouring_lines`.
+7. **The merge an implementation needs is not a git merge strategy.** Findings 1 and 6: so the rule lives in
+   the model's own code (`World::resolve`, `World::adopt`), using git only to store commits and answer "who
+   wrote this line" and "does this history reach that commit". An implementation needs the same.
+8. **Resolved: "saw" must be read per line, not per commit.** A sync that keeps a sandbox's undecided line x
+   still makes main's commit (with m) a parent of the sandbox's next commit. Read by commit ancestry, the
+   sandbox's next edit y over x looks "made on m", so y replaces main's winning m with no collision: a
+   silent loss. The model reads the lines y was written over (x, and what x was written over), so y
+   collides with m and main wins. The checks' "saw" is per line too; read per commit they could not see
+   this loss. `r3_an_edit_over_an_undecided_line_still_collides`.
+
+## Costs and open questions for the owner
+
+- A transaction can end split: a line lost to main, its other lines applied (per line, main wins). The
+  program is told at its commit only of lines its own sandbox overwrote; a later loss at main's queue is a
+  recorded collision, not part of the commit's answer.
+- Until main's queue decides, a sandbox shows its own line, not main's concurrent one.
+- Under Squashed, main's history gains an empty commit for a landing whose lines all lost.
 
 ## Left out
 
-- **Deletes and renames.** Lines are only ever overwritten. A per-path rule for a delete against an edit
-  (which side wins, and how a delete is dated) is not chosen yet. So rule 1, "never refused", is shown for
-  line edits only.
+- **Deletes and renames.** Lines are only ever overwritten; a delete against an edit has no rule yet.
 - **Inserted, removed, moved and repeated lines.** A file is a fixed number of lines, each write a new,
-  unique line, so `git blame` finds the one commit that wrote each line exactly. With inserted or removed
-  lines blame matches lines by diff, which is approximate for moved or repeated lines, and a revert or the
-  same line written twice would need the rules to say which write a line belongs to. The per-line rule is
-  therefore shown for in-place edits only, on separate and on neighbouring lines.
-- **Writers racing inside one tree.** Each sandbox has one writer, and main's writers save one after
-  another; two programs writing the same file of one tree at once is plain Linux behaviour, not modelled.
-- Binary files; approvals and when landings run; integrator patches; service restarts; space limits;
-  history truncation.
+  unique line, so `git blame` finds its writer exactly.
+- **Writers racing inside one tree.** Plain Linux behaviour, not modelled.
+- Binary files; approvals and when landings run; integrator patches; restarts; space limits; history
+  truncation.

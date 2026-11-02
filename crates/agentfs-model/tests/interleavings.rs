@@ -5,7 +5,8 @@
 //!
 //! On top of `check`, the run itself asserts "nothing is ever blocked or
 //! held": every save returns at once, and every step takes its queue's
-//! head (the queue shrinks by exactly one).
+//! head (plus, under `Squashed`, the same fork's plain saves it carries as
+//! one changeset), leaving the rest of the queue in order.
 //!
 //! The seeds are every seed in `1..=SEEDS`, never a set picked because it
 //! passes. `AGENTFS_MODEL_SEED=<n>` runs one seed; `AGENTFS_MODEL_SEEDS=<n>`
@@ -51,10 +52,11 @@ impl Rng {
 struct Tally {
     steps: usize,
     fast_forwards: usize,
+    squashed_runs: usize,
     landing_collisions: usize,
-    sync_collisions: usize,
     transaction_collisions: usize,
     committed: usize,
+    overwritten: usize,
     empty: usize,
     rolled_back: usize,
     forks: usize,
@@ -88,20 +90,29 @@ fn in_txn(w: &World) -> Vec<ForkId> {
         .collect()
 }
 
-/// One step, asserting it took its queue's head and nothing else of it.
+/// One step, asserting it took its queue's head (and, under `Squashed`,
+/// the entries it says it carried with it), and left the rest in order.
 fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
     w.note_step(s);
     let before = match s {
-        Step::Next(t) => w.queue_len(*t),
-        Step::Drop(_) => 0,
+        Step::Next(t) => w.queue(*t),
+        Step::Drop(_) => Vec::new(),
     };
-    w.step(s);
+    let taken = w.step(s);
     tally.steps += 1;
     if let Step::Next(t) = s
         && w.alive(*t)
-        && w.queue_len(*t) + 1 != before
     {
-        return Err(format!("{s:?} did not take exactly its queue's head"));
+        let after = w.queue(*t);
+        let mut rest = before.iter().skip(1);
+        let in_order = after.iter().all(|e| rest.any(|b| b == e));
+        let squash = w.policies.history == HistoryPolicy::Squashed;
+        if taken == 0 || (taken > 1 && !squash) || after.len() + taken != before.len() || !in_order
+        {
+            return Err(format!(
+                "{s:?} took {taken} entries: not its queue's head, or the rest out of order"
+            ));
+        }
     }
     Ok(())
 }
@@ -231,16 +242,19 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
         return Err((STEPS + 1, format!("f{} never dropped", f.id)));
     }
     tally.fast_forwards += w.fast_forwards;
+    tally.squashed_runs += w.squashed_runs;
     for c in &w.collisions {
         match c.direction {
             Direction::Landing => tally.landing_collisions += 1,
-            Direction::Sync => tally.sync_collisions += 1,
             Direction::Transaction => tally.transaction_collisions += 1,
         }
     }
     for e in &w.ended {
-        match e.how {
-            TxnEnd::Commit(TxnOutcome::Committed) => tally.committed += 1,
+        match &e.how {
+            TxnEnd::Commit(TxnOutcome::Committed { overwritten }) => {
+                tally.committed += 1;
+                tally.overwritten += overwritten.len();
+            }
             TxnEnd::Commit(TxnOutcome::Empty) => tally.empty += 1,
             TxnEnd::Rollback => {}
         }
@@ -266,7 +280,7 @@ fn run_all(policies: Policies) {
     );
 }
 
-/// The model's choices: full lineage, per line, per-line merges. Every
+/// The model's choices: full lineage, per line, per-line syncs. Every
 /// invariant.
 #[test]
 fn random_interleavings_full_lineage() {
@@ -276,8 +290,9 @@ fn random_interleavings_full_lineage() {
     ));
 }
 
-/// `Squashed`, every invariant: main's stored history holds only main's
-/// commits, and the graft beside it keeps the lineage rules 2 and 3 read.
+/// `Squashed`, every invariant: a fork's waiting saves land as one
+/// changeset, main's stored history holds only main's commits, and the
+/// graft beside it keeps the lineage rules 2 and 3 read.
 #[test]
 fn random_interleavings_squashed() {
     run_all(Policies::new(HistoryPolicy::Squashed, CollisionScope::Line));
@@ -311,10 +326,10 @@ fn random_interleavings_commit_dates_decide_nothing() {
     }
 }
 
-/// Coherence finding 1: git's own merge base, under the crossing merges
-/// rule 3 makes, lets a stale line revert a newer one.
+/// Coherence finding 1: git's own merge base cannot tell a fork line the
+/// parent already decided against from one still on its way.
 #[test]
-#[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings lets a stale line revert a newer one"]
+#[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings keeps a fork line the parent already decided against"]
 fn random_interleavings_git_merge_base() {
     run_all(Policies {
         merge: MergeRule::GitMergeBase,
@@ -322,10 +337,10 @@ fn random_interleavings_git_merge_base() {
     });
 }
 
-/// Coherence finding 3: per file, an incoming file reverts the tree's
+/// Coherence finding 3: per file, the parent's file reverts the fork's
 /// newer clean lines.
 #[test]
-#[ignore = "coherence finding 3: per file, the incoming file reverts the tree's newer clean lines"]
+#[ignore = "coherence finding 3: per file, the parent's winning file reverts the fork's newer clean lines"]
 fn random_interleavings_per_file_full_lineage() {
     run_all(Policies::new(
         HistoryPolicy::FullLineage,

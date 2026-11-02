@@ -111,20 +111,27 @@ pub fn writer_of(token: &str) -> &str {
     token.split('.').next().unwrap_or(token)
 }
 
-/// What each write had in view: the oracle for "nothing is silently lost"
-/// and "no stale line reverts a newer one", kept apart from git. A token
-/// `b` descends from `a` when `b`'s writer could see `a`: `a` was in the
-/// tree it wrote on, or in any commit that tree merged or carried. Views
-/// only grow along history, so the relation is transitive as recorded.
+/// What each write had in view on its line: the oracle for "nothing is
+/// silently lost" and "no stale line reverts a newer one", kept apart from
+/// git. A token `b` descends from `a` when `b` was written over `a`: `a` is
+/// the line `b`'s writer read on that slot, or one that line was written
+/// over, and so on. Per line, from what the writer read, never from which
+/// commits its version merged: a sync that kept the fork's own line over
+/// the parent's did not show the parent's line to the fork's writer.
 #[derive(Default, Debug)]
 pub struct Lineage {
     saw: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Lineage {
-    /// `token` was written by a writer who could see `known`.
-    pub fn wrote(&mut self, token: &str, known: BTreeSet<String>) {
-        self.saw.insert(token.to_string(), known);
+    /// `token` was written over `base`, the line its writer read there.
+    pub fn wrote(&mut self, token: &str, base: &str) {
+        let mut over = BTreeSet::new();
+        if base != EMPTY {
+            over.insert(base.to_string());
+            over.extend(self.saw.get(base).into_iter().flatten().cloned());
+        }
+        self.saw.insert(token.to_string(), over);
     }
 
     /// Whether `newer` descends from `older` (or is it). Every token
@@ -149,10 +156,13 @@ mod tests {
     #[test]
     fn lineage_follows_views() {
         let mut l = Lineage::default();
-        l.wrote("m1.1", BTreeSet::new());
-        l.wrote("m1.2", BTreeSet::from(["m1.1".to_string()]));
-        assert!(l.descends("m1.2", EMPTY) && l.descends("m1.2", "m1.1"));
+        l.wrote("m1.1", EMPTY);
+        l.wrote("m1.2", "m1.1");
+        l.wrote("m1.3", "m1.2");
+        l.wrote("c1.1", "m1.1");
+        assert!(l.descends("m1.3", EMPTY) && l.descends("m1.3", "m1.1"));
         assert!(!l.descends("m1.1", "m1.2"));
+        assert!(!l.descends("c1.1", "m1.2") && !l.descends("m1.2", "c1.1"));
     }
 
     #[test]
