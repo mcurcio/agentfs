@@ -45,3 +45,20 @@
 - [Performance](performance.md)
 - [Building and testing](development.md)
 - [Adversarial review, 2026-10-12](reviews/2026-10-12-adversarial.md)
+
+# Target architecture
+
+- [Overview](target-architecture/README.md)
+  - [The system](target-architecture/system.md)
+  - [Rules](target-architecture/domains/rules.md)
+  - [Clients](target-architecture/domains/clients.md)
+  - [Views](target-architecture/domains/views.md)
+  - [Trees](target-architecture/domains/trees.md)
+  - [Forks](target-architecture/domains/forks.md)
+  - [Journal](target-architecture/domains/journal.md)
+  - [Landing](target-architecture/domains/landing.md)
+  - [History](target-architecture/domains/history.md)
+  - [Replication](target-architecture/domains/replication.md)
+  - [Volume](target-architecture/domains/volume.md)
+  - [Health](target-architecture/domains/health.md)
+  - [Telemetry](target-architecture/domains/telemetry.md)
