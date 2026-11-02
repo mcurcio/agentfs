@@ -1,0 +1,13 @@
+[package]
+name = "agentfs-model"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "An executable model of the target architecture's landing rules, built on the git CLI"
+publish = false
+
+# No dependencies, and none on another agentfs crate: this models the target
+# design (docs/target-architecture), not today's code. The randomized test
+# uses its own seeded generator so every failure replays from a printed seed.

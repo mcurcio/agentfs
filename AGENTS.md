@@ -68,6 +68,7 @@ When you learn something durable, write it to its home in the same commit. Never
 | `crates/agentfs-fuse` | FUSE operations, kernel-independent `Ops` plus a thin fuser adapter |
 | `crates/agentfs` | CLI binary (`mount`, `run`, `serve-history`, `record`, `push`, `restore`, `revert`, `patch`, ...) |
 | `crates/agentfs-csi` | CSI driver |
+| `crates/agentfs-model` | Tests only: an executable model of the target architecture's landing rules (`docs/target-architecture`) on the `git` program, with seeded random interleavings. Depends on no other agentfs crate |
 | `ci/` | End-to-end scripts run by GitHub Actions; `ci/lib.sh` has the shared helpers |
 | `deploy/` | Kubernetes manifests for the sidecar and CSI, plus examples (Hermes) |
 | `examples/docker` | Docker examples: `docker run` and compose (docs/docker.md) |
