@@ -2,19 +2,23 @@
 
 This set describes the **target** architecture of agentfs: the shape the code should move to, domain by domain. It is not a description of today's code. For how agentfs works today, read [Design](../design.md) and [Architecture](../architecture.md).
 
-The set is one system document and twelve domain documents. The system document names every domain, what each owns exclusively, and every contract, event and flow between them. Each domain document designs one domain's inside: its model, contract, invariants, ports, flows, tests and costs. A domain document may add internals, never a crossing the system document lacks.
+**Start with [agentfs in git terms](git-model.md): it is the foundation for implementation.** It describes every tree, save, landing, sync and transaction as git branches, commits and refs, as the executable model runs them, and lists where the older pages below are superseded.
+
+The rest of the set is one system document and twelve domain documents. The system document names every domain, what each owns exclusively, and every contract, event and flow between them. Each domain document designs one domain's inside: its model, contract, invariants, ports, flows, tests and costs. A domain document may add internals, never a crossing the system document lacks.
 
 ## Status
 
 | Document | Status |
 |---|---|
+| [agentfs in git terms](git-model.md) | proposed; the foundation for implementation; wins where the pages below disagree |
 | [The system](system.md) | approved by the owner on 2026-11-02 (revision 3); now revision 9, each change listed in its change log |
 | The twelve domain documents | proposed |
 
 ## Reading order
 
-1. **[The system](system.md)** first. It is binding on every domain page.
-2. Then the domains, in the order the system's §10 lists them:
+1. **[agentfs in git terms](git-model.md)** first: the foundation for implementation.
+2. **[The system](system.md)**. It binds every domain page, except where the git model supersedes it.
+3. Then the domains, in the order the system's §10 lists them:
 
 | Domain | One line |
 |---|---|
