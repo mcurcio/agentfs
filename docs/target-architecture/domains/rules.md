@@ -1,8 +1,8 @@
 # Domain: Rules
 
-**Layer:** System › **Domain (this page)** › Feature. Binding parent: [../system.md](../system.md) revision 4 (revision 3 approved 2026-11-02).
-**Status:** draft 2, proposed. Describes the target, not today's code. Sketches are Rust and show surfaces only.
-**What you are asked:** two questions, Q1 in §1 (rule files kept in the tree) and Q2 in §2 (what a view profile may say). "Profile" on this page always means a **view profile**; the CSI settings bundle keeps the bare word.
+**Layer:** System › **Domain (this page)** › Feature. Binding parent: [../system.md](../system.md) revision 6 (revision 3 approved 2026-11-02).
+**Status:** draft 4, proposed. Describes the target, not today's code. Sketches are Rust and show surfaces only.
+**What you are asked:** nothing; the two earlier questions are now design choices (§1, §2). "Profile" on this page always means a **view profile**; the CSI settings bundle keeps the bare word.
 
 ## 0. Your words this domain rests on
 
@@ -13,6 +13,7 @@
 | R8 | a consumer's personal information never enters the agentfs repo | 2026-10-30 | this page names no consumer |
 | R9 | "Whole seems best, right? A partial application has unknown side effects" | 2026-10-16 | a database group is one unit |
 | R13 | "A cooperating integration can define batches/transactions across files, and they must all land together." | 2026-11-02 | a group widens any scope it touches |
+| R16 | "The various agentfs components should be within the same version family (major for sure, maybe minor too, patch doesnt need to match)" | 2026-11-02 | a change to how rules are judged is a minor release (RU8) |
 
 Everything else is a design choice. Today's behaviour (agentfs origin/main b5c0dc8, design §2.4, §4, §5, §8) is evidence, not a requirement.
 
@@ -23,7 +24,7 @@ Rules is a **policy decision point**: other domains enforce, Rules only answers.
 | Rules owns | Rules is not |
 |---|---|
 | whether a change to a path is recorded or refused at record time (`record`), and skipped at commit time (`skip`) | whether a path is tracked (History judges; History passes the answer to `skip`) |
-| the per-path recording rule: class, database group, size limit, store hint, merge rule | storing content, LFS, merging (History, Landing apply the rule) |
+| the per-path recording rule (class, database group, size limit, store hint) and merge rule (`merge`) | storing content, LFS, merging (History, Landing apply the rules) |
 | database group kinds and each group's members | capturing a group, or when (Journal and Views) |
 | profiles: what each view shows (`visibility`) | mapping an answer to an error number, caching, mounts (Views) |
 | the built-in never-recorded names | path syntax and confinement (`RelPath::parse` in `model`, Trees) |
@@ -35,7 +36,7 @@ Rules is a **policy decision point**: other domains enforce, Rules only answers.
 |---|---|
 | rule set | one immutable value built at boot from the operator's rule files: ignore patterns, attributes, group kinds, profiles |
 | verdict | Rules' answers for one change at one path: at record time `Record(rule)`, `BuiltIn(why)` or `Refuse(why)`, with no tracked fact; at commit time `skip`, with it |
-| record rule | how a recorded path is recorded: class, size limit, store hint, merge rule |
+| record rule; merge rule | how a recorded path is recorded: class, size limit, store hint; how it may be merged: its format and whether whitespace counts |
 | class | `OnClose` (recorded when a write closes) or `InPlace` (changed while open, recorded as its whole group) |
 | database group | the files of one database (for SQLite: `x.db`, `x.db-wal`, `x.db-journal`), recorded, shown and landed as one |
 | group kind | data naming a group's member suffixes and never-recorded suffixes; agentfs ships `sqlite` |
@@ -44,10 +45,7 @@ Rules is a **policy decision point**: other domains enforce, Rules only answers.
 | scratch | a name a profile lets a client keep privately: never recorded, never landed |
 | containment | whether a path lies inside a nested git repository, as Trees observed it |
 
-**Q1. Should rule files kept inside the tree (`.gitignore`, `.gitattributes`) still steer recording?**
-Today they may, behind `respectTreeRules` (off by default, and refused with a sandbox view). In the target every fork has its own tree, so tree rules would differ per tree and could land from a sandbox.
-- **Recommended: no. Only the operator's rule files count; tree rule files are ordinary content.** One rule set per state area, fixed for the history service's life. Cost: a program cannot steer its own recording; the setting and its code go.
-- **Alternative: keep them, per tree.** Cost: the rule set becomes per tree and per position, `verdict` gains a tree argument (a system contract change), and a sandbox's edit to a rule file changes main's recording when it lands.
+**Design choice (was Q1): only the operator's rule files count; rule files inside the tree (`.gitignore`, `.gitattributes`) are ordinary content.** One rule set per state area, fixed for the history service's life; `respectTreeRules` and its code go. Cost: a program cannot steer its own recording. Not chosen: tree rules, which make the rule set per tree and position and let a rule-file edit change another tree's recording once it lands or syncs.
 
 ## 2. The model
 
@@ -60,35 +58,23 @@ flowchart LR
   RS --> AT["AttributeLayer"]
   RS --> GK["GroupKind table"]
   RS --> PR["Profiles"]
-  RS -->|answers| V["record, skip, visibility, group"]
+  RS -->|answers| V["record, skip, visibility, group, merge"]
 ```
 
 | Concept | Kind | Notes |
 |---|---|---|
 | `RuleSet` | aggregate root, value | built once, shared by `Arc`; carries its `RuleSetVersion` (a digest of its sources) |
-| `RecordRule`, `Group`, `Profile` | value objects | private fields; only `RuleSet` builds them |
+| `RecordRule`, `MergeRule`, `Group`, `Profile` | value objects | private fields; only `RuleSet` builds them |
 | `ViewProfileId` | value, minted by Rules | holding one proves the view profile exists |
 | `GroupKind` | value | `sqlite`: members `""`, `-wal`, `-journal`; never `-shm` |
 
-The rule set has one lifecycle; a path's recording status is History's (tracked) and is not modelled here.
+The rule set has one lifecycle: read at boot, built (every value valid) or refused (the service does not start), then active until the history service stops. A path's recording status is History's (tracked) and is not modelled here.
 
-```mermaid
-stateDiagram-v2
-  [*] --> Read: composition root asks the RuleSources port
-  Read --> Built: every file parsed, every agentfs value valid
-  Read --> Refused: unreadable file, bad value, unknown group kind
-  Built --> Active: handed to every domain and, by version, to every view host
-  Active --> [*]: the history service stops (a change takes a restart)
-  Refused --> [*]: the service does not start
-```
-
-**Q2. What may a profile say?**
-- **Recommended: a base plus operator hide patterns, narrowing only.** `Everything` (main) or `Recordable` (sandboxes), and optional patterns that hide more. A profile can never show what its base hides. Cost: a second pattern list to keep right per profile.
-- **Alternative: two fixed profiles, `Everything` and `Recordable`, as a closed enum.** Cost: hiding a recorded file from sandboxes (R7's "only what we want") needs a code change.
+**Design choice (was Q2): a view profile is a base plus operator hide patterns, narrowing only.** `Everything` (main) or `Recordable` (sandboxes), and optional patterns that hide more; a profile can never show what its base hides (RU4). Cost: a second pattern list per profile. Not chosen: two fixed profiles, where hiding a recorded file from sandboxes (R7) needs a code change.
 
 ## 3. The public contract
 
-The trait is §3.3's (revision 4, which adopted this page's E1 to E5 and E7, and split the old `verdict` so each half has one judge). The value types are this domain's part of `contracts`.
+The trait is system §3.3's (revision 6 adds `merge`). The value types are this domain's part of `contracts`.
 
 ```rust
 pub trait Rules {
@@ -98,6 +84,8 @@ pub trait Rules {
     fn skip(&self, p: &RelPath, k: EntryKind, f: PathFacts) -> Option<SkipReason>;
     /// The database group p belongs to, whole (Trees, Landing, Views, Journal).
     fn group(&self, p: &RelPath) -> Option<Group>;
+    /// Which resolvers suit p (Landing, either direction). Whitespace is significant unless an operator says not.
+    fn merge(&self, p: &RelPath) -> MergeRule;
     /// What may this client's view see and change at n? Existence-blind:
     /// the answer never depends on whether, or how, something is there.
     fn visibility(&self, n: &TreeName, k: EntryKind, v: ViewProfileId) -> Visibility;
@@ -125,7 +113,12 @@ pub struct RecordRule {     // private fields; read through accessors
     class: Class,
     max_size: Option<ByteSize>,  // RecordRule::admits(size) is the one comparison
     store: StoreHint,            // Default | Blob | Lfs: History applies it
-    merge: MergeRule,            // Text | Binary | Driver(name): Landing applies it
+}
+pub enum MergeRule {             // from `merge=` and `agentfs.whitespace`; Landing picks resolvers by it
+    Text { whitespace: Whitespace },    // Significant (default) | Insignificant: only then may Exact merge whitespace-only edits
+    Structured(Format),          // Yaml | Json | Markdown, by `merge=` or extension: the Structure resolver
+    Binary,                      // no line or structure merge
+    Driver(DriverName),          // an operator's git merge driver
 }
 
 pub enum Class {
@@ -151,7 +144,7 @@ pub enum RuleRefusal {
 }
 
 pub enum Visibility {
-    Show,      // seen; a change here goes to the client's own tree and is judged by verdict
+    Show,      // seen; a change here goes to the client's own tree and is judged by record
     Scratch,   // only the client's own private entry exists here: never recorded, never landed
     Hide,      // nothing here, whatever exists: absent from lookups and listings, no creation
     Refuse,    // seen read-only: no change, creation or move of this kind here
@@ -176,16 +169,16 @@ pub enum RulesError {                  // boot only: building the rule set, neve
 | Dir with nothing recordable possible beneath | Show | Hide |
 | Symlink at a recordable path | Show | Refuse |
 | Special, or inside a nested repository | Show | Hide |
-| matched by the profile's hide patterns (Q2) | Hide | Hide |
+| matched by the profile's hide patterns (§2) | Hide | Hide |
 
 **Who calls Rules, and whom it calls.** Rules calls nobody. It publishes no events and consumes none.
 
 | Caller | Asks | When |
 |---|---|---|
-| Views | `visibility`, `group`, `record` | each lookup, listing, create, rename end, and when a feed notice names a path; group members at fsync; a refusal before recording |
-| Journal | `record`, `group` | at each record; to widen a transaction's `begin(files)` to whole groups |
-| Landing | `record` (`merge`), `group` | to widen a file unit to its group; to pick the merge rule |
-| Trees | `group`; the repository-mark predicate | copy-up and freeze take a group whole; when it reports a path's containment |
+| Views | `visibility`, `group`, `record` | each lookup, listing, create, rename end, and when a feed notice names a path (a client's, a landing's or a sync's); group members at fsync; a refusal before recording |
+| Journal | `record`, `group` | at each record; to widen a save's fork commit and a transaction's `begin(files)` to whole groups |
+| Landing | `merge`, `group` | the merge rule that picks its resolvers, either direction; to widen a run's or a sync's files to whole groups |
+| Trees | `group`; the repository-mark predicate | copy-up takes a group whole; a gate covers a group its landing writes; when it reports a path's containment |
 | History | `skip`, `record(p).store` | at commit: the one judge of skips; LFS |
 | Clients | `view_profile`, `version` | when it narrows a launcher's grant and builds a `Binding` |
 
@@ -200,9 +193,9 @@ pub enum RulesError {                  // boot only: building the rule set, neve
 | RU5 | A database group is recorded, shown, hidden, widened and landed whole (R9, R13) | `Class::InPlace` carries the `Group`, whose `members()` is computed, never supplied | construction time + test |
 | RU6 | Ignore rules decide only for new paths; a tracked path stays recorded until removed; `-agentfs` stops content, never a tracked removal | `skip` order: never-record, then `tracked` short-circuits ignore and containment; built-ins are `record`'s, before any of them | test |
 | RU7 | A path whose containment is unknown is judged as inside a repository (fail closed) | `Containment::Unknown` maps like `InRepository` in one `match` | compile time (exhaustive match) |
-| RU8 | Every view host judges with the same rule set as the history service | a `Binding` carries `RuleSetVersion`; a view host with another version reloads before serving | boot time per binding |
+| RU8 | Every view host judges with the same rule set as the history service | a `Binding` carries `RuleSetVersion` (a digest of the sources and the release family, R16); a view host with another version reloads before serving | boot time per binding |
 | RU10 | Each question has one judge at one time: refusals at record time (Journal asks `record`), skips at commit time (History asks `skip`) | two methods with disjoint answers; `skip` takes the tracked fact only History has | construction time |
-| RU9 | Tree content never changes the rule set (Q1) | the `RuleSources` port has no tree access; only operator sources exist | compile time |
+| RU9 | Tree content never changes the rule set (§1) | the `RuleSources` port has no tree access; only operator sources exist | compile time |
 
 ## 5. Ports and adapters
 
@@ -224,7 +217,7 @@ pub struct RuleTexts {
 | `RuleSources` | `csi`: the files a StorageClass's settings bundle installs at stage | same texts, same parse |
 | matching | `gix-ignore`, `gix-attributes`, fed only with these buffers | git's own pattern semantics; system and user git config never read |
 
-**Persistence.** Rules persists nothing, so it has no repository and no audited record (I13 does not apply). The rule files are operator configuration; who changed them is audited where they are authored. `RuleSetVersion` and the time the set was built go to Telemetry, so an operator can see which rules a volume ran.
+**Persistence.** Rules persists nothing, so it has no repository and no audited record (I13 does not apply); rule files are audited where they are authored. `RuleSetVersion` and its build time go to Telemetry.
 
 ## 6. Internal flows
 
@@ -278,13 +271,13 @@ sequenceDiagram
 
 | Scenario | Rules' part |
 |---|---|
-| Live landing | Landing asks the same `verdict` and `visibility` as client writes, so a landed name is judged like any other (RU3). Groups widen a landing's gate (RU5) |
-| Transactions | Journal widens `begin(files)` by `Group::scope()`; a file the rules skip is never part of a transaction because its saves are never records |
-| Scale (1,000 sandboxes) | one `Arc<RuleSet>` per process; each answer is pattern matching over compiled matchers, bounded by path depth; no tree reads |
-| Crashes | nothing to recover: rebuilt from sources at restart. If the sources changed, the new version reaches view hosts through `rebound` |
-| Disk full | Rules writes nothing. An unreadable source at boot is a boot refusal (RU2), never an empty rule set |
-| Upgrades | rule semantics that change between versions change `RuleSetVersion`; a view host bound to another version reloads, never mixes |
-| Rules edited while running | no effect until the history service restarts (the current choice); paths recorded under old rules stay tracked (RU6) |
+| Live landing and syncs | a landed or synced name is judged like a client's write (RU3); groups widen a landing's gate (RU5) |
+| Transactions | Journal widens `begin(files)` by `Group::scope()`; a skipped file's saves are never records |
+| Scale (1,000 sandboxes) | one `Arc<RuleSet>` per process; answers are compiled pattern matches; no tree reads |
+| Crashes | rebuilt from sources at restart; a changed version reaches view hosts through `rebound` |
+| Disk full | Rules writes nothing; an unreadable source refuses boot (RU2) |
+| Upgrades | a change to how rules are judged is at least a minor release, arriving by drain-then-upgrade (system §8); mixed judges reload, never mix (RU8) |
+| Rules edited while running | no effect until the service restarts; paths recorded under old rules stay tracked (RU6) |
 
 ## 7. Policies and configuration owned here
 
@@ -295,9 +288,10 @@ sequenceDiagram
 | `agentfs.commit` | `close`, `inplace` | `close` | operator attributes |
 | `agentfs.group` | a group kind name | none (a group of one) | operator attributes |
 | `agentfs.maxSize` | a size | unset | operator attributes |
-| `agentfs.store`, `filter=lfs`, `merge=` | store and merge hints | git's | operator attributes |
+| `agentfs.store`, `filter=lfs`, `merge=` | store and merge hints | git's; `.yaml`, `.yml`, `.json`, `.md` structured | operator attributes |
+| `agentfs.whitespace` | `significant`, `insignificant` | `significant` everywhere: in YAML or Python indentation is structure | operator attributes |
 | nested repositories | `exclude` (working files and git data) or `working-tree` (git data only) | `exclude` | operator settings |
-| profiles | name, base, hide patterns (Q2) | `everything`, `recordable` | operator profile file |
+| profiles | name, base, hide patterns (§2) | `everything`, `recordable` | operator profile file |
 
 Built in, not settable: `-shm` files, NFS silly-rename names (`.nfs` and 24 hex digits), special files and empty directories are never recorded. Names that are not `RelPath`s (a `.git` component, git's refused spellings) reach Rules only through `visibility`, as a `TreeName`; `Everything` shows them, `Recordable` hides them. In-place files are captured at Views' change boundaries (fsync, close, the last release); there is no capture interval (`agentfs.coalesce` today goes).
 
@@ -312,40 +306,32 @@ Built in, not settable: `-shm` files, NFS silly-rename names (`.nfs` and 24 hex 
 | A tracked file later matched by an ignore pattern keeps recording; a `-agentfs` file's removal still records | rules rewriting what history tracks (RU6) |
 | A bad attribute value, an unknown group kind, an unreadable source: the service refuses to start, naming the line | a typo turning recording or a profile off (RU2) |
 | A view host bound with an older `RuleSetVersion` reloads before its first answer | two judges with two rule sets (RU8) |
-| Unit (pure): `Containment::Unknown` answers like `InRepository`; a profile's hide patterns never turn `Hide` into `Show` | fail-open on missing facts (RU7, RU4) |
+| Unit (pure): `Containment::Unknown` answers like `InRepository`; hide patterns never turn `Hide` into `Show`; a `.yaml` path is `Structured` with whitespace significant | fail-open on missing facts (RU7, RU4); a re-indent merged as whitespace |
 
 ## 9. Costs and open questions
 
 1. **Rules are fixed per history-service life.** Editing a rule takes a restart (today: a remount).
-2. **Tree rule files stop counting** if Q1 goes as recommended.
+2. **Tree rule files are ordinary content** (§1): a program cannot steer its own recording.
 3. **A move is two judgements:** a removal at the source and a placement at the target. A sandbox moving a recorded file to a scratch name lands as a removal in main; today the overlay refuses that move.
 4. **Group kinds list their member suffixes.** A database whose sidecar files a kind does not list is captured without them.
 5. **Sandboxes see symlinks read-only** and cannot create them, as today.
 6. **Skips are judged at commit.** A main write the rules would skip is journaled first and dropped by History, because only History knows whether a path is tracked (system cost 9).
 
-Open at this layer: Q1 (§1), Q2 (§2).
+Open at this layer: none. System Q1 (a held commit and other forks' landings) does not touch Rules.
 
 ## 10. Escalations to the system document
 
-| # | What was wrong or missing (revision 3) | Proposed fix | Resolution in revision 4 |
-|---|---|---|---|
-| E1 | `visibility` took `&RelPath`, so a name that is not one could not be asked about | `visibility` takes a confined tree name | adopted (`TreeName` in `model`) |
-| E2 | `verdict(p, k, tracked)` could not see nested repositories | `PathFacts { tracked, containment }` | adopted, inside the split: `skip(p, k, PathFacts)` at commit (History), `record(p, k)` at record time with no tracked fact (Journal). One judge each; no call cycle between Journal and History |
-| E3 | `Grant.profile` could name a profile that does not exist | Rules mints the id | adopted (`view_profile(name)`) |
-| E4 | view hosts and the history service each held a rule set | `Binding` carries `RuleSetVersion` | adopted, in the one `Binding` |
-| E5 | `Record{class, group}` omitted size, store and merge rules | `Record(RecordRule)` | adopted |
-| E6 | in-place capture ran on a trailing timer | name its home | resolved: Views' fsync and close boundaries, no timer |
-| E7 | "profile" also meant a CSI settings bundle | rename one | adopted: "view profile" for the grant's |
+None open. Draft 1's E1 to E5 and E7 were adopted in revision 4, E6 resolved there; revision 6 added `merge(p)` from the design review.
 
 ## New terms
 
 | Term | Definition | Why needed | Could be the existing term |
 |---|---|---|---|
 | rule set, rule-set version | the immutable value of every operator rule, and its digest | RU2, RU8 | `Rules` (today's type) |
-| record rule, class `InPlace` | how a recorded path is recorded; files changed while open | E5 | the `fsync` class |
+| record rule, class `InPlace` | how a recorded path is recorded; files changed while open | §3 | the `fsync` class |
 | group kind | a database group's member and never-recorded suffixes | RU5 | `agentfs.group` |
-| base, hide patterns, scratch | a view profile's parts; a private name never recorded | R7, Q2 | recordable names; the tmp layer |
-| view profile | what one view shows; "profile" alone is the CSI settings bundle | E7 | profile |
-| containment | inside a nested repository or not, as observed | E2 | nested detection |
+| base, hide patterns, scratch | a view profile's parts; a private name never recorded | R7, §2 | recordable names; the tmp layer |
+| view profile | what one view shows; "profile" alone is the CSI settings bundle | header | profile |
+| containment | inside a nested repository or not, as observed | RU7 | nested detection |
 
-*History: draft 1, from system.md revision 3; draft 2, conformed to revision 4.*
+*History: draft 1, from system.md revision 3; draft 2, revision 4; draft 3, revision 5: Q1 and Q2 adopted; draft 4, revision 6: `merge(p)`.*
