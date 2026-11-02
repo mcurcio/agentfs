@@ -1,7 +1,7 @@
 # Domain: Views
 
 **Layer:** System › **Domain: Views** › Feature.
-**Status:** draft 5, proposed, under [system.md](../system.md) revision 7, which binds it. It describes the target, not today's code. Sketches are Rust and show surfaces only.
+**Status:** draft 6, proposed, under [system.md](../system.md) revision 8, which binds it. It describes the target, not today's code. Sketches are Rust and show surfaces only.
 **What you are asked:** nothing: this domain has no open question.
 
 **Your words this domain serves** (system §1): R3 "a virtual filesystem overlay for each client (including main) that is backed by a _real_ filesystem source-of-truth"; R7 "Agentfs is the gatekeeper that exposes only what we want sandboxes to see"; R13 "a default usage … can operate per-file"; R18 "both clients would see the others changes"; A1 main is a view like any sandbox; A5 "It depends on the config!"; A6 a pinned fork is an acceptable snapshot; A9 "freezing only the files that a landing touches sounds reasonable. and hopefully our new per-client + view system makes locking/freezing files easier"; A11 file watchers: "we can take the "no guarantee" path for now" (2026-11-02). Everything else here is a design choice.
@@ -19,7 +19,7 @@ A view is one client's filesystem: the mount point a program uses, served by a v
 | enforcing the client's consistency setting | choosing it (the grant, in Clients) |
 | forwarding file locks to the real files | merging, history, liveness (Landing, History, Health) |
 | publishing `ViewCaughtUp` | waiting for any other view |
-| the program's transaction edge: how a program in a sandbox declares `begin`, `seal` and `abandon` (R13); its closing unsealed (the program died) abandons (A13) | transaction state (Journal) |
+| the program's transaction edge: how a program in a sandbox declares `begin`, `seal` and `abandon` (R13); its closing unsealed (the program died) abandons (A13); `begin` and `seal` refused (`EBUSY`) while the client holds a file in scope open for writing; after `abandon`, new write-opens in scope wait for its `RolledBack` mark | transaction state and locks (Journal) |
 
 | Term | Meaning here |
 |---|---|
@@ -93,7 +93,7 @@ stateDiagram-v2
 
 ## 3. Public contract
 
-Views adds no crossing to system §3 (revision 7); its write-opens and `resume` name no tree (§10).
+Views adds no crossing to system §3 (revision 8); its write-opens and `resume` name no tree (§10).
 
 ```rust
 // ── Offered: to launchers only (system §3.3) ──
@@ -118,7 +118,7 @@ pub struct ViewCaughtUp { view: ViewId, tree: TreeRef, through: Seq } // once pe
 | Trees | `resolve`, `handle(binding)`, `capture` | every file call, in its own tree or read-through; capturing at a change boundary |
 | Forks | `copy_up(p)`, over its session (the session's `ForkWriteCap`) | the first write of a path an ancestor holds |
 | Journal | `Recorder::record`, `begin`, `seal`, `abandon`, over its session; `feed(t, after)` | records at change boundaries; transactions; the feed of each tree read |
-| Landing | `open_for_writing` (never blocks), `released`, `resume`, over its session; `gates()` with `covers` and `fell` | write-opens; the last release; after a restart; the view's own wait on a gate |
+| Landing | `open_for_writing` (never blocks), `released`, `resume`, over its session; `gates()` with `covers` and `fell` | write-opens (a write, create, unlink or rename, one per name it changes); the last release; after a restart; the view's own wait on a gate |
 | Rules | `visibility(name, kind, view_profile)`, `group(p)`, `record(p, kind)` | every name shown; database group membership; refusals before recording |
 | Telemetry | `emit` | failures and counts; never waits |
 
@@ -321,4 +321,4 @@ Node table and hard links; own renames; lookup counts across `rebound`; which er
 
 **NOT RUN:** FUSE lock forwarding, watchers across mounts, passthrough with name nodes, and copy-up during a parent's rename were not tested. Only `docs/design.md` on origin/main was read; no code.
 
-*History: draft 1 (2026-11-02); draft 2, system revision 4; draft 3, revision 5; draft 4, revision 6; draft 5, revision 7 (A13).*
+*History: draft 1 (2026-11-02); draft 2, system revision 4; draft 3, revision 5; draft 4, revision 6; draft 5, revision 7 (A13); draft 6, revision 8 (the transaction edge's windows).*

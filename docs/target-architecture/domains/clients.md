@@ -1,7 +1,7 @@
 # Domain: Clients
 
 **Layer:** System › **Domain (Clients)** › Feature.
-**Status:** draft 4, proposed, against [system.md](../system.md) revision 7, which binds it. It describes the target, not today's code; Rust sketches show surfaces only.
+**Status:** draft 5, proposed, against [system.md](../system.md) revision 8, which binds it. It describes the target, not today's code; Rust sketches show surfaces only.
 **Binding from the system:** §3.2, §3.3 `Clients`, §3.4 events, §3.7 (the agent resolver), §8 (versions), I2, I9, I12, I13, I14, I16.
 
 ## 1. What Clients owns, its language, and what it is not
@@ -128,7 +128,7 @@ pub trait SessionEvents {
 | Published | Fields | When | Consumers (§3.4) |
 |---|---|---|---|
 | `Attached` | client, tree, reads_through | the `Client` row is durable | Landing, Volume |
-| `AttachmentEnded` | client, why | the end is durable | Landing (write-opens, reconcile), Journal (abandons open transactions), Forks, Volume |
+| `AttachmentEnded` | client, why | the end is durable | Landing (write-opens, reconcile, then the rollback), Journal (abandons open transactions), Forks, Volume |
 | `LastDetached` | tree | the same unit of work left `attached(tree)` empty; after the `AttachmentEnded` that caused it | Landing (`WhenDetached`, the intake's drain), Forks (a fork's or pin's end), Volume |
 
 | Consumed | From | Effect |
@@ -223,7 +223,7 @@ sequenceDiagram
   end
 ```
 
-**An attachment ends** (any of the four causes): one unit marks it `Ended`, deletes the row, updates the index, stages `AttachmentEnded` and then every `LastDetached` it caused. Landing then drops the client's write-opens and reconciles what they left unrecorded; the Journal abandons its open transactions (system §3.6, writer `Agentfs`); Forks ends a fork or pin whose `LastDetached` it is; the session edge drops the `Recorder` and `ForkWriteCap`.
+**An attachment ends** (any of the four causes): one unit marks it `Ended`, deletes the row, updates the index, stages `AttachmentEnded` and then every `LastDetached` it caused. Landing then drops the client's write-opens and reconciles what they left unrecorded; the Journal abandons its open transactions (system §3.6, writer `Agentfs`) and Landing rolls them back, ending their locks; Forks ends a fork or pin whose `LastDetached` it is; the session edge drops the `Recorder` and `ForkWriteCap`.
 
 **The history service restarts.**
 ```mermaid
@@ -250,7 +250,7 @@ sequenceDiagram
 | Scenario | What Clients does | What it never does |
 |---|---|---|
 | Live landing | answers `attached(t)`; publishes `AttachmentEnded` so a dead client's write-opens stop holding a landing; `LastDetached` meets `WhenDetached` | wait on a landing: `attach` never blocks on a gate |
-| Transactions | nothing of its own: a transaction lives in the Journal; `AttachmentEnded` is the Journal's signal to abandon an open one | know a transaction exists |
+| Transactions | nothing of its own: a transaction and its locks live in the Journal; `AttachmentEnded` is the event that abandons an open one and so releases its locks, never a timer | know a transaction exists |
 | Scale: 1,000 sandboxes | an attach is one `lineage` call, one unit, one event; `attached(Source)` reads the index; `LastDetached` is a counter reaching zero | scan clients per call; a `ClientId` in a metric label |
 | Crashes: view host | `Ended(SessionClosed)` while the service runs; across a service restart its clients stay `Resuming` until its launcher detaches or reconciles (cost 1 for an in-place restart) | end a client because a probe failed |
 | Crashes: launcher | its clients keep running; on restart it calls `reconcile` with the ones still alive | end them on its absence (cost 3) |

@@ -1,10 +1,10 @@
 # Forks: domain architecture
 
 **Layer:** System (approved 2026-11-02) › **Domain: Forks** › Feature.
-**Status:** draft 5, proposed; the target, not today's code. [system.md](../system.md) revision 7 binds it. Rust surfaces only.
+**Status:** draft 6, proposed; the target, not today's code. [system.md](../system.md) revision 8 binds it. Rust surfaces only.
 **In one line:** Forks tracks every fork: the tree it sits over, what each of its paths merges against at each point, which forks hold their own copy of a path, its space, and when it ends and drops.
 
-**Since your 2026-11-02 answers:** a held commit keeps only its own fork's entries (A12); an abandoned transaction moves no base (A13); a synced base holds the parent's content captured; no open questions.
+**Since your 2026-11-02 answers:** a held commit keeps only its own fork's entries (A12); a rolled-back transaction moves no base, except dropping a copy its own copy-up made (A13); a synced base holds the parent's content captured; no open questions.
 ## 0. What binds this domain
 
 | Source | Words (verbatim) | What it means here |
@@ -119,7 +119,7 @@ stateDiagram-v2
 A pinned fork passes the same states; landings closed and committed hold from its birth.
 ## 3. The public contract
 
-The system's trait (§3.3, revision 7); callers and what each is given:
+The system's trait (§3.3, revision 8); callers and what each is given:
 
 ```rust
 pub trait Forks {
@@ -129,6 +129,7 @@ pub trait Forks {
     fn move_bases(&mut self, g: &Gated, id: LandingId, from: Seq, moves: Vec<BaseMove>) -> Result<(), ForkError>;
     fn base(&self, f: ForkId, p: &RelPath, at: Seq) -> Option<BaseContent>;      // at: the fork's record of p. None: not held then
     fn copies(&self, over: TreeRef, p: &RelPath) -> Vec<ForkId>;                // open editable children of `over` whose last entry for p is Set
+    fn copied_up_since(&self, f: ForkId, p: &RelPath, at: Seq) -> bool;         // p's last entry is Set, since CopyUp, after `at`
     fn lineage(&self, f: ForkId) -> Vec<TreeRef>;                                // answers until the fork drops
     fn facts(&self, f: ForkId) -> Option<ForkFacts>;                             // created by, kind, ended; Clients' attach check
     fn end(&mut self, f: ForkId, by: &LaunchCap) -> Result<(), ForkError>;
@@ -137,7 +138,7 @@ pub trait Forks {
 pub enum BaseMove {
     Kept { path: RelPath, at: Position },   // a run: the fork's content at `through`
     Synced { path: RelPath, content: Captured }, // a sync: the parent's content it merged, captured at prepare
-    Trimmed { path: RelPath },              // only in the trim that removes the copy
+    Trimmed { path: RelPath },              // only in the trim or rollback that removes the copy
     Tip { path: RelPath, at: CommitId },    // own-volume
 }
 pub enum ForkError {
@@ -155,10 +156,10 @@ pub enum ForkError {
 | launcher | `create`, `end` | `LaunchCap` | a sandbox's life is its launcher's; `end` covers a fork no client ever attached to |
 | Clients | `pin`, `lineage` (every `Binding.reads_through`), `facts` (a `ForksItCreates` attach) | `Forks`, `PinCap` | attach and advance |
 | Views, over its session | `copy_up`, at a fork path's first write, create or delete | the session's `ForkWriteCap`, held in the history service | the base must exist before the write returns |
-| Landing | `copies` for each parent record; `base` for each commit's file and each sync; `move_bases` in `Writing` (runs, syncs) and at each trim | `Forks`, `&Gated` | I4: the only merge base; the sync targets |
+| Landing | `copies` for each parent record; `base` for each commit's file and each sync; `copied_up_since` for a rollback; `move_bases` in `Writing` and at each trim | `Forks`, `&Gated` | I4: the only merge base; the sync targets |
 | Volume | `live`, for an upgrade's drain | `Forks` | "no fork left" has one judge |
 
-Forks calls Trees (`facts`, `create_layer(f, over, limit)`, `drop_layer`, `fill`, `copy_up`, `capture`, `discard`), History (`head`, `checkout`, `content_at`, `tracked`: pins, bases) and `Journal::uncommitted`, `unsaved`, `Clients::attached` (the drop check, `end`).
+Forks calls Trees (`facts`, `create_layer(f, over, limit)`, `drop_layer`, `fill`, `copy_up`, `capture`, `discard`), History (`head`, `checkout`, `content_at`, `tracked`: pins, bases) and `Journal::uncommitted`, `Clients::attached` (the drop check, `end`).
 
 | Event | Direction | What Forks does or means by it |
 |---|---|---|
@@ -172,7 +173,7 @@ Forks calls Trees (`facts`, `create_layer(f, over, limit)`, `drop_layer`, `fill`
 | # | Invariant | Enforced by | Strength |
 |---|---|---|---|
 | F1 | At every fork position, a path an editable fork holds has exactly one base, never git's merge base (I4); the copy-up base is written before the write that caused it returns | only Forks calls `Trees::copy_up`, recording the entry in the same step; create and delete copy up too (`Absent`) | construction + test |
-| F2 | Bases move only inside the landing or sync that lands them, only for the files its gate covers (A9), every path of one commit together (R13); a copy's entry ends only in the trim that removes it | `move_bases` takes `&Gated`, which refuses paths outside its gate; idempotent on `LandingId`; `Trimmed` comes only from the trim step | construction time + build time |
+| F2 | Bases move only inside the landing or sync that lands them, only for the files its gate covers (A9), every path of one commit together (R13); a copy's entry ends only in the trim or rollback that removes it | `move_bases` takes `&Gated`, which refuses paths outside its gate; idempotent on `LandingId`; `Trimmed` comes only from the trim and rollback steps | construction time + build time |
 | F3 | A moved base never names a record that commit grouping or truncation removes (I11); every captured file has one holder | a run's base is `At` a fork commit's end, a commit on the fork's line; a sync's is the captured parent copy Landing hands over (`Synced`); Forks alone holds captured bases | construction |
 | F4 | A fork drops only when ended, childless, its landings closed and fully committed, sync records included (I5, I14) | the `Fork` aggregate's drop check; facts asked (`Journal::uncommitted`) or consumed as events, never copied | event order + test |
 | F5 | A parent never drops before its children; a pinned fork is never a parent | `children()` in the drop check; `create` refuses a pinned parent | construction + test |
@@ -218,7 +219,7 @@ sequenceDiagram
   F->>S: entry (CopyingUp): row first
   F->>T: copy_up(F, p): parent's bytes into the layer
   T-->>F: Captured (Absent if nothing above)
-  F->>S: entry Set(Bytes(captured)), since CopyUp (p unsaved in a fork parent: At its tracked last commit of p)
+  F->>S: entry Set(Bytes(captured)), since CopyUp: whatever the parent showed
   F-->>V: Ok: the write proceeds in the layer
 ```
 
@@ -270,8 +271,8 @@ Each event re-asks one check; the last fact moves the fork; a parent's reruns wh
 | Held commit | no base move; its entry stays in force for it, and every later commit keeps its own entry while it waits |
 | `withdraw` | no base move; rejected commits' entries pruned; an open fork keeps its copies and syncs |
 | Sync, merged / `Deferred` or held | one entry holding the captured parent copy / nothing moves |
-| Transaction | one base move for every file in scope; held, it keeps all its entries; abandoned, nothing moves; its files keep the bytes (A13) |
-| Fork of a fork | landings go to the parent fork; main's change reaches a grandchild one sync at a time (`copies(Fork F, p)`) |
+| Transaction | one base move for every file in scope; held, it keeps all its entries; rolled back, nothing moves, except a copy its own copy-up made after `Begin`, whose entry ends `Trimmed` with it (A13): F reads its parent again, never an older F record |
+| Fork of a fork | landings go to the parent fork; main's change reaches a grandchild one sync at a time (`copies(Fork F, p)`); a child's copy-up of a file F's open transaction locks takes F's bytes as its base: after a rollback G merges against content F's line never had, and may be `Held` (cost) |
 | 1,000 sandboxes | one row, an empty layer, a quota and a reservation each; forks reading p live cost no sync |
 | Crash in copy-up, `Creating`, `Dropping` or `Writing` | rolled forward, every step idempotent; a `CopyingUp` entry (the view never got `Ok`) captures the layer copy as the base |
 | Disk full or quota reached | that sandbox's write fails with `SpaceLimit`; main and other forks are unaffected (F3, F7) |
@@ -298,7 +299,7 @@ Through a real sidecar on a filesystem with project quotas, unless marked.
 | Sandbox saves s at 9; main edits s at 50 and syncs in; the sandbox's view shows main's edit; 9 lands, then a save at 13 lands: no conflict, nothing applied twice | one base per path; a base not moved by syncs (F1) |
 | Main edits s, which the sandbox holds unchanged and closed: the copy is trimmed, `copies` stops naming the fork, its view reads main live | a sync that leaves a stale copy |
 | A trim, then a crash before its entry; the sandbox reopens p afterwards | a copy with no base, or a base and no copy (F2) |
-| A 3-file transaction lands: all 3 bases move; one conflicts: none move | a split base move (R13) |
+| A 3-file transaction lands: all 3 bases move; one conflicts: none move; one rolls back a file it copied up, F's earlier copy trimmed: copy and base go together, F reads main | a split base move (R13); a base left without its copy |
 | A `move_bases` naming a path outside its gate | a freeze wider or narrower than its landing (A9) |
 | Ended fork with a held commit: no drop until withdrawn and committed; then layer, bases and line gone; main still reaches the landed commits | early drop, lost landed work (I5, A4) |
 | A parent with a live child never drops | reads through a deleted layer (F5) |
@@ -313,9 +314,7 @@ Through a real sidecar on a filesystem with project quotas, unless marked.
 3. **Bases per position cost rows,** and a synced base its bytes (a reflink where the filesystem has one) under the fork's quota; a long-held commit keeps every later entry of its fork's paths.
 4. **A hot file held by many forks** costs one sync, and one base move, per fork.
 5. **Quotas narrow the filesystems** that can host sandbox forks (XFS, ext4 with project quotas, btrfs).
-6. **Soft-deleted rows grow** one per fork; **lineage depth is unbounded** (a layer and a sync hop per level); **a launcher cannot keep a fork across clients.**
-
-No open question remains here; A12 needed no change to bases.
+6. **Soft-deleted rows grow** one per fork; **lineage depth is unbounded** (a layer and a sync hop per level); **a launcher cannot keep a fork across clients.** No open question remains; A12 needed no change to bases.
 
 ## 10. Escalations to the system document
 

@@ -1,7 +1,7 @@
 # Trees: the real filesystem
 
 **Layer:** System › **Domain (Trees)** › Feature.
-**Status:** draft 4, proposed, under [system.md](../system.md) revision 7. It describes the target, not today's code. Sketches are Rust and show surfaces only.
+**Status:** draft 5, proposed, under [system.md](../system.md) revision 8. It describes the target, not today's code. Sketches are Rust and show surfaces only.
 **Binding:** system.md §3 (contracts), §3.5 (the landing process, syncs and trims), §4 (I1 to I16), §8 (versions).
 
 **Your requirements this domain serves (verbatim, dated).** Everything else here is a design choice.
@@ -30,7 +30,7 @@ Trees is the content truth (R3). It holds every byte a client can see, and it is
 | **confinement**: every path is reached beneath its root, no symlink followed | which names a view shows (Rules, Views) |
 | **copy-up**: a fork's first write of a path copies it into the fork's layer | the path base's meaning or lifetime as a merge base (Forks) |
 | **byte copies** (`capture`): an immutable, durable copy of a file's current bytes | records, `Seq`, writers (Journal) |
-| **rename into place** under a gate, in main (a run) or a fork (a sync, a restore), idempotent; **trim** of a fork copy | the gate itself: which files it covers, when it rises, who waits on it (Landing, Views) |
+| **rename into place** under a gate, in main (a run) or a fork (a sync, a restore, a rollback), idempotent; **trim** of a fork copy | the gate itself: which files it covers, when it rises, who waits on it (Landing, Views) |
 | **fill**: a pinned fork's checkout into a real tree | commit objects (History hands Trees a `CommitContent`) |
 | the **staging area**: where copied and merged bytes wait, on the tree's filesystem; a fork's staging, syncs included, sits under that fork's quota | any event, timer or policy of its own |
 | the **quota mechanism**: each layer's per-directory quota, set at `create_layer` | the limit's value (Forks) |
@@ -260,7 +260,7 @@ Trees holds no lock across a system call: its names ordering is the kernel's per
 | Main changes p while F holds its own p | a sync stages the merge under F's quota and renames it onto F's copy; main is untouched | a staged copy and a rename in F |
 | F's quota is full when a sync stages | `NoSpace`; F unchanged; Landing judges | F drifts on p |
 | A client renames p's directory meanwhile | `expect`, or a parent missing from `creates`, stops the replace with `Moved` (tracked moved) | rare: such a rename counts as a write-open (Views) |
-| Transaction, 400 files | one `replace`; every target staged before the first rename | `PerFile` readers can see a subset mid-replace |
+| Transaction, 400 files, landed or rolled back | one `replace` (a rollback's targets are each file's content before; a copy the transaction's own copy-up made is trimmed); every target staged before the first rename | `PerFile` readers can see a subset mid-replace |
 | 1,000 sandboxes | 1,000 empty directories; a read costs one lookup per tree in the lineage | filesystems cap quota project ids (NOT VERIFIED) |
 | Crash in `copy_up` | unrenamed staged copies are left; the layer holds no partial file | open discards them (§7) |
 | Crash in `replace` after k of n | Landing rolls `Writing` forward; the re-run skips the k by identity | none |
@@ -328,4 +328,4 @@ None open. Revision 4 adopted E1 to E4; revision 7 adopted E5: Trees' `freeze`/`
 
 **NOT RUN:** no code was run; reflink, project quotas, beneath-only resolution and rename atomicity come from design.md and kernel documentation.
 
-*History: draft 1; draft 2, system revision 4; draft 3, revision 5 (syncs, local freezes, versioned layout); draft 4, revision 7 (E5 adopted).*
+*History: draft 1; draft 2, system revision 4; draft 3, revision 5 (syncs, local freezes, versioned layout); draft 4, revision 7 (E5 adopted); draft 5, revision 8 (rollbacks).*

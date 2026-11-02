@@ -8,7 +8,7 @@ The set is one system document and twelve domain documents. The system document 
 
 | Document | Status |
 |---|---|
-| [The system](system.md) | approved by the owner on 2026-11-02 (revision 3); now revision 7, each change listed in its change log |
+| [The system](system.md) | approved by the owner on 2026-11-02 (revision 3); now revision 8, each change listed in its change log |
 | The twelve domain documents | proposed |
 
 ## Reading order
