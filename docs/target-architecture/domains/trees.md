@@ -22,7 +22,7 @@ R12 (the history setting, one per volume) does not reach this domain: either set
 
 ## 1. What Trees owns, its language, and what it is not
 
-Trees is the content truth (R3). It holds every byte a client can see, and it is the only code that touches those bytes.
+Trees is the content truth (R3). It holds every byte a client can see, and it is the only code that touches a tree's bytes; a captured copy belongs to its holder.
 
 | Owns | Is not |
 |---|---|
@@ -161,7 +161,6 @@ pub enum Expect { Node(NodeId), Absent }
 | Forks | `facts`, `create_layer`, `drop_layer`, `fill`, `copy_up`, `discard` | a fork's layer and quota, its pinned checkout, its first write of a path; releasing a replaced base |
 | Landing | `resolve`, `capture`, `stage`, `replace`, `trim`, `discard` | read what a merge reads; land a run into main or a sync into a fork; trim; reconcile |
 | Views | `resolve`, `handle`, `capture` | serve the client; copy bytes at a change boundary before `record` |
-| Journal | `discard` | releasing a payload at truncation |
 | Trees asks Rules | `group(p)` → the database group | copy-up and capture take a group whole |
 
 | Capability Trees requires | From | It makes impossible |

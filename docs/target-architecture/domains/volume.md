@@ -153,7 +153,7 @@ pub enum StartLine {
 | Published | Fields | When | Consumers |
 |---|---|---|---|
 | `VolumeDraining` | — | the `Draining` row is durable; again at boot while Draining | Clients, Landing, History, Replication |
-| `VolumeStaged` | — | `Draining(Stop)` or `Released` → `Staged` is durable | Clients, Landing |
+| `VolumeStaged` | — | `Draining(Stop)` or `Released` → `Staged` is durable | Clients, Landing, History, Replication |
 | `VolumeReleased` | disposition | the `Released` row is durable | the composition root (the service exits); the CSI edge |
 | `StartLineChanged` | `StartLine` | the judgement changes | Telemetry (the alarm's one home) |
 
@@ -176,8 +176,8 @@ pub enum StartLine {
 | out | Landing | `in_motion()` |
 | out | Journal | `uncommitted()` |
 | out | Forks | `live()`, during an upgrade drain |
-| out | Replication | `settlement(Source, head)`; `line_tip(remote, line)` for the start line |
-| out | History | `head(Source)`, `reaches(Source, c)`; `start_at(c, StartCap)` once, at create |
+| out | Replication | `settlement(Source, head)`; `line_tip(remote, line)`; `fetch_start(start, StartCap)` once, at create |
+| out | History | `head(Source)`, `reaches(Source, c)` |
 
 ## 4. Invariants and how they are enforced
 
@@ -188,7 +188,7 @@ pub enum StartLine {
 | V3 | A transition and its event are one unit: no `Draining` row without `VolumeDraining`, no event without its row | the repository write and the outbox row commit together | construction time + test |
 | V4 | The verdict reads only facts asked at judgement time; Volume persists its own lifecycle, never another domain's state (I9) | `ReleaseFacts` has no constructor from storage; the repository has no field for them | construction time |
 | V5 | Every re-judgement follows a consumed event or a call; nothing is polled (I10) | the crate has no clock port; clippy `disallowed_types` bans `Instant`, `SystemTime` and timers here | compile time + build time |
-| V6 | The start point never changes after create; acceptances only move forward along the start line | no setter for the start point; `accept_start` checks the tip is on the line after the last acceptance (`StartDiverged`); `start_at` needs Volume's `StartCap` and fails once main has a commit | construction time |
+| V6 | The start point never changes after create; acceptances only move forward along the start line | no setter for the start point; `accept_start` checks the tip is on the line after the last acceptance (`StartDiverged`); `fetch_start` and `start_at` need Volume's `StartCap`; `start_at` fails once main has a commit | construction time |
 | V7 | A sandbox launcher cannot create, drain or stage the volume (R7); only an Operator starts an upgrade drain | `LaunchCap` with `may: Main`; `drain_for_upgrade` needs the Operator role | construction time |
 | V8 | One `VolumeRecord` per state area, loaded only after the state-area lock is held (I15) | the composition root builds the Volume service from the locked `store`; a second process fails the lock at boot | boot time |
 | V9 | A release stages another family's area only after that family's upgrade drain released it, and never reads its formats (I16) | `store` reports the area's family at open; `stage` answers `FormatsOf` without that family's upgrade-drained mark (system §8) | boot time |
@@ -284,7 +284,7 @@ sequenceDiagram
 | A `stage` during a `Stop` drain | cancels the drain · waits for `Released` | cancels it | design choice (former VQ2). Cost: a volume whose pods come and go may rarely reach `Released`, so pushes only on schedule |
 | A `stage` during an `Upgrade` drain | answers `Draining(Upgrade)`: the launcher waits for the new family | fixed | design choice: an upgrade is an operator's act; to abort, let it finish and stage the old release |
 
-Volume has no timers. The commit window and push interval are History's and Replication's operator schedules; `VolumeDraining` lets a drain skip waiting for them.
+Volume has no timers. The commit window and push interval are History's and Replication's operator schedules; History and Replication drain from `VolumeDraining` to `VolumeStaged`, so a drain waits out neither schedule.
 
 ## 8. Tests that prove it
 
@@ -331,4 +331,4 @@ The outbox relay's dedup key; how "room reserved at create" is held; whether `se
 
 **NOT RUN:** no code built or tested; CSI behaviour is from `docs/csi.md` and `docs/design.md` §14.2 on origin/main.
 
-*History: draft 1 (2026-11-02); draft 2 for system revision 4; draft 3 for revision 5; draft 4 for revision 6; draft 5 for revision 7 (E1 adopted).*
+*History: drafts 1–5 are in git.*

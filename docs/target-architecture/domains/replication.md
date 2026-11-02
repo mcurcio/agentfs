@@ -26,7 +26,6 @@ Replication copies the history agentfs has already committed to zero or more git
 | Term | Meaning here | Is not |
 |---|---|---|
 | **remote** | a git repository agentfs pushes to, with its endpoints, credentials and limits | a mirror agentfs reads its truth from |
-| **line** | system term: the history of one tree (main's branch, a fork's own ref) | a remote ref |
 | **replica** | one line on one remote, and what that remote holds of it | the line itself (History's) |
 | **attempt** | one connection that lists, uploads and updates a remote's refs | a retry loop |
 | **endpoint** | a URL with its origin and the credential bound to that origin | a remote (a remote has one git and at most one LFS endpoint) |
@@ -57,7 +56,7 @@ Two lifecycles, two machines. The attempt is per remote; divergence is per repli
 stateDiagram-v2
   [*] --> Idle: remote defined
   Idle --> Due: Committed past what a replica holds, Asked, or VolumeDraining
-  Due --> Running: spacing met (Asked and VolumeDraining skip it)
+  Due --> Running: spacing met (skipped for Asked, and from VolumeDraining to VolumeStaged)
   Running --> Idle: every replica holds its tip: PushSettled(UpToDate)
   Running --> Due: a step pushed, or a Committed arrived meanwhile: PushSettled(Stepped or UpToDate)
   Running --> Backoff: failed: PushSettled(error)
@@ -88,6 +87,7 @@ pub trait Replication {
     fn replace_diverged(&mut self, r: &RemoteName, line: TreeRef, lease: Lease, by: &ActorCap)
         -> Result<PushOutcome, PushError>;                                   // your 2026-10-18 words, Operator role
     fn fetch(&mut self, r: &RemoteName, at: &RemoteRefName, by: &ActorCap) -> Result<CommitId, FetchError>; // pack → History::receive
+    fn fetch_start(&mut self, at: &StartPoint, by: &StartCap) -> Result<CommitId, FetchError>; // Volume's create: pack → History::start_at
     fn fetch_lfs(&mut self, oids: &[LfsOid]) -> Result<(), FetchError>;    // into History's LFS cache (its NotLocal)
     fn settlement(&self, line: TreeRef, through: CommitId) -> Settlement;  // the one judge of "every remote holds line through commit"
     fn line_tip(&self, r: &RemoteName, line: &LineName) -> Result<Option<CommitId>, PushError>; // Volume's start line, this major's refs
@@ -113,8 +113,7 @@ pub enum PushError {                     // system §3.3
     LocalIo(IoKind),                     // a pending divergence name could not be saved, so nothing was pushed
 }
 pub enum FetchError {                    // system §3.3
-    Unreachable(IoKind),
-    CredentialRefused,
+    Unreachable(IoKind), CredentialRefused,
     UntrustedHost,
     UnknownRemote,
     NoSuchRef,
@@ -165,16 +164,16 @@ pub enum RemoteDefect {                  // reported, alarmed, never pushed; oth
 }
 ```
 
-**Events.** Published: `PushSettled{remote, outcome}` after every attempt, and with `Removed` when a remote leaves. Consumed: `Committed`, `VolumeDraining`, `ForkDropped`. From its own adapters: `CredentialChanged{remote}`, `RemotesConfigured(RemoteSet)`.
+**Events.** Published: `PushSettled{remote, outcome}` after every attempt, and with `Removed` when a remote leaves. Consumed: `Committed`, `VolumeDraining`, `VolumeStaged`, `ForkDropped`. From its own adapters: `CredentialChanged{remote}`, `RemotesConfigured(RemoteSet)`.
 
 | Direction | Party | Through |
 |---|---|---|
 | called by | an operator, at the control socket or the CLI | `push`, `replace_diverged`, `status` |
-| called by | Volume | `settlement`, on each `PushSettled`; `line_tip` for the start line; `fetch` for start-from |
+| called by | Volume | `settlement`, on each `PushSettled`; `line_tip` for the start line; `fetch_start` at create, lending its `StartCap` |
 | called by | Landing's commit-source edge | `fetch`, before `submit(Commit)` |
 | called by | History | `limits` at commit; `fetch_lfs` for an uncached LFS object |
-| calls | History | `receive(pack)` after a fetch; `head(line)` at boot; read-only `HistoryObjects` (`is_ancestor`, the pack plan). No port to Trees, Journal, Landing or Views |
-| consumes | History, Volume, Forks | `Committed`; `VolumeDraining`, `ForkDropped` |
+| calls | History | `receive(pack)` after a fetch, `start_at(pack)` after `fetch_start`; `head(line)` at boot; read-only `HistoryObjects` (`is_ancestor`, the pack plan). No port to Trees, Journal, Landing or Views |
+| consumes | History, Volume, Forks | `Committed`; `VolumeDraining`, `VolumeStaged`, `ForkDropped` |
 
 ## 4. Invariants and how each is enforced
 
@@ -188,7 +187,7 @@ pub enum RemoteDefect {                  // reported, alarmed, never pushed; oth
 | RP6 | A remote holds only whole commits History made; a step ends on a first-parent commit, so a landing, a fork commit or a sync (I3) is never split | the stepper cuts on commit boundaries of the line | construction |
 | RP7 | A failing, slow or diverged remote never affects recording, committing, landing, syncing or another remote (I6) | no port to those domains; one attempt per remote; divergence per replica | compile + test |
 | RP8 | What a remote holds is the remote's fact. Push state is a record of the last claim and never an input to the next one; only a pending divergence name is authority | the claim reads only the attempt's listing; `PushState` holds `last_claim`, not `holds` as truth | construction + test |
-| RP9 | Every wait ends on a named event or an operator schedule: `Committed`, `Asked`, `VolumeDraining`, `CredentialChanged`, `RemotesConfigured`; spacing and retry are the schedules (I10). I/O deadlines bound a single call; they coordinate nothing | the attempt machine's transitions | review + test |
+| RP9 | Every wait ends on a named event or an operator schedule: `Committed`, `Asked`, `VolumeDraining`, `VolumeStaged`, `CredentialChanged`, `RemotesConfigured`; spacing and retry are the schedules (I10). I/O deadlines bound a single call; they coordinate nothing | the attempt machine's transitions | review + test |
 | RP10 | Push state is audited (I13); a divergence save and a lease replace record who and when | `Audited<PushState>` stamped by the `store` repository | construction |
 | RP11 | A divergence is saved under one name, however many crashes: the name is persisted Pending before its push and Confirmed after | `LocalIo` refuses the push when the name cannot be saved | construction + crash test |
 
@@ -270,10 +269,10 @@ sequenceDiagram
 | Fork lines; 1,000 sandboxes | `Main`: one replica per remote, whatever the fork count. `MainAndForks`: one per live fork line too (refs per attempt grow with forks, a cost); a sync commit's second parent is main's commit, the pack plan sends only what the remote lacks, and main's replica pushes first (design choice) |
 | Commit bursts; 100 volumes per node | attempts follow commits, coalesced: at most one running per remote and one per spacing; nothing starts on a clock |
 | A slow, dead or refusing remote | its attempt ends on an I/O deadline as `Unreachable`, then `Backoff`; other remotes settle on their own (RP7) |
-| Release, and an upgrade's drain | `VolumeDraining` makes each remote's attempt `Due` without spacing; Volume asks `settlement` on each `PushSettled`. Whether a `Failing` remote holds release or an upgrade is Volume's verdict |
+| Release, and an upgrade's drain | from `VolumeDraining` to `VolumeStaged` attempts skip spacing, later `Committed`s included; Volume asks `settlement` on each `PushSettled`. Whether a `Failing` remote holds release or an upgrade is Volume's verdict |
 | Crash mid-attempt | a ref update is atomic on the remote. After restart each remote is `Due`; the next listing shows what it holds, so a push that landed before the crash is `UpToDate`, never a false divergence (RP8) |
 | Disk full | a failed push-state save leaves the last claim stale, which the next listing corrects; only a Pending divergence name must be durable, so that push waits (`LocalIo`) |
-| Upgrade (R16, system §8); remotes added or removed | a patch resumes in place; a minor or major runs after the drain settles pushes, and rebuilds push state from the remotes (no older-format reader). A new remote's replicas start `Behind`; a removed one's row is deleted, audited. A minor continues the same refs. **A major pushes under its own refs** (design choice), so another major's history on a remote is never diverged, forced or deleted, and fetching it is `Received(OtherMajor)`. Alternative: one set of refs, where each breaking major is a divergence needing an operator per remote. Cost: every major starts new refs, even one that broke nothing |
+| Upgrade (R16, system §8); remotes added or removed | a patch resumes in place; a minor or major runs after the drain settles pushes, and rebuilds push state from the remotes (no older reader). A new remote's replicas start `Behind`; a removed one's row is deleted, audited. A minor continues the same refs. **A major pushes under its own refs** (design choice), so another major's history on a remote is never diverged, forced or deleted, and fetching it is `Received(OtherMajor)`. Alternative: one set of refs, where each breaking major is a divergence needing an operator per remote. Cost: every major starts new refs, even one that broke nothing |
 
 ## 7. Policies and configuration it owns
 
@@ -319,7 +318,7 @@ All run the real binary against real servers: a bare repository by path and `fil
 
 ## 10. Escalations to the system document
 
-None open. E1–E5 were adopted in revision 4; E6 in revision 7: §3.3 defines `FetchError` beside `PushError`, with `Received(HistoryError)` so `OtherMajor` reaches the caller.
+None open: E1–E6 adopted (E6, `FetchError`, in revision 7).
 
 ## New terms
 
@@ -336,4 +335,4 @@ Ref names for lines, divergence saves, fetched tips and the major's place in the
 
 **NOT RUN:** no code was built or tested. Behaviour facts, ref-update atomicity and compare-and-swap per transport are from origin/main `docs/design.md` §11 and the behaviour catalogue, not re-tested.
 
-*History: draft 1 (2026-11-02); draft 2, conformed to system revision 4; draft 3, conformed to revision 5; draft 4, revision 7 (E6 adopted).*
+*History: drafts 1–4 are in git.*

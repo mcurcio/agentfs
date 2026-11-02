@@ -103,7 +103,7 @@ flowchart TB
   RU -.- V & J & L & T & H
 ```
 
-Telemetry receives every event and is left off; each domain's name links its document. All share `model` (§3.1) and §3.4's events; CSI, the git server and the control socket translate at the edge.
+Telemetry receives every event and is left off. All share `model` (§3.1) and §3.4's events; CSI, the git server and the control socket translate at the edge.
 
 | Domain | Owns exclusively | Is not | Relationships |
 |---|---|---|---|
@@ -135,15 +135,15 @@ These bind the domain documents: a domain may add internals, never a new crossin
 
 ```rust
 pub struct RelPath(/* private */);         // beneath the root and git-fsck clean; only RelPath::parse builds one
-pub struct TreeName(/* private */);        // a confined name that may fail fsck (a nested `.git`): visibility only
+pub struct TreeName(/* private */);        // a confined name that may fail fsck (a nested `.git`)
 pub struct Seq(u64);                       // order inside one tree's stream
 pub enum TreeRef { Source, Fork(ForkId) }  // main's real tree | a fork's layer over its parent
 pub struct Position { tree: TreeRef, seq: Seq }    // "this tree, as of this record"
-pub struct Scope { paths: PathSet, dirs: PathSet } // a database group is wholly in or out
+pub struct Scope { paths: PathSet, dirs: PathSet } // a database group wholly in or out
 pub enum Writer {                          // exactly one per record and per commit; built only through Clients' Minter
     Client(ClientId),
     Actor(ActorId),                        // an operator, an integrator, or the agent resolver
-    Agentfs,                               // agentfs's own records: reconcile, and abandoning an ended client's transaction
+    Agentfs,                               // agentfs's own records: reconcile, an ended client's abandon
 }
 pub struct ClientId { launcher: LauncherId, tree: TreeRef, label: ClientLabel, n: Ordinal } // names its writer alone
 pub enum SourceId {                        // what a landing is of; its idempotency key
@@ -179,7 +179,7 @@ Every capability and `Writer` has private fields and is built only through a `Mi
 | `ClientCap` | `Clients::attach`, `rebind` (read-write grants only) | the client's session, in the history service; the Journal seals it into a `Recorder` | record into another tree or as another writer |
 | `ForkWriteCap { fork }` | Clients, with the `ClientCap` of a read-write grant on an editable fork | the same session | copy up into another fork |
 | `PinCap` | the composition root | Clients | (anyone else) pin a fork |
-| `StartCap` | the composition root | Volume | (anyone else) set where main's line starts |
+| `StartCap` | the composition root | Volume (lent via `Replication::fetch_start` to `History`) | (anyone else) set where main's line starts |
 | `ActorCap { actor, roles }` | `Clients::actor`, from an identity the edge authenticated | operators, integrators, approvers, the agent resolver; roles are data | act as another actor |
 | `Gated<'g>` | Landing, only inside a risen gate | `Trees::replace`, `trim`; `Forks::move_bases`; `Journal::append_landing` | act outside its gate's files (in its tree; for `move_bases`, the source fork's bases of them), or outlive the gate |
 | commit builder | History, privately | nobody | commit two writers together |
@@ -223,8 +223,7 @@ pub trait Clients {
 }
 pub enum ClientError {
     NotPermitted, UnknownClient, NotItsLauncher, TreeUnknown,
-    ForkTaken,                 // one writer per fork, for life
-    Draining, NotDurable(IoKind),
+    ForkTaken, Draining, NotDurable(IoKind), // ForkTaken: one writer per fork, for life
 }                              // a launcher of another family is refused at connect, by the rpc edge (§3.2)
 // ── Views
 pub trait Views {
@@ -294,8 +293,7 @@ pub enum AbsoluteState { Change(Vec<PathState>), Mark(Mark) } // Mark: Begin{txn
 pub enum RecordError {
     Refused(Refusal),
     NotDurable(IoKind),
-    Backpressure,      // this tree's own limit
-    Truncated,
+    Backpressure, Truncated, // Backpressure: this tree's own limit
     NotAFork,          // a transaction on main, whose own writes land nowhere
     InOpenTransaction, // a file already in another open transaction of this client
 }
@@ -354,7 +352,7 @@ pub trait History {
     fn head(&self, t: TreeRef) -> Option<CommitId>;               // the one tip query
     fn reaches(&self, t: TreeRef, c: CommitId) -> bool;
     fn receive(&mut self, pack: Pack, by: &ActorCap) -> Result<CommitId, HistoryError>; // the git server and Replication's fetch
-    fn start_at(&mut self, c: CommitId, by: &StartCap) -> Result<(), HistoryError>;     // Volume only; main's line still empty
+    fn start_at(&mut self, pack: Pack, c: CommitId, by: &StartCap) -> Result<(), HistoryError>; // fetch_start only; main's line empty
 }
 pub trait HistoryObjects {               // read-only, for Replication
     fn is_ancestor(&self, a: CommitId, of: CommitId) -> bool;
@@ -366,6 +364,7 @@ pub trait Replication {
     fn push(&mut self, r: &RemoteName, by: &ActorCap) -> Result<PushOutcome, PushError>; // "push now"
     fn replace_diverged(&mut self, r: &RemoteName, line: TreeRef, lease: Lease, by: &ActorCap) -> Result<PushOutcome, PushError>; // Operator
     fn fetch(&mut self, r: &RemoteName, at: &RemoteRefName, by: &ActorCap) -> Result<CommitId, FetchError>; // hands a pack to History::receive
+    fn fetch_start(&mut self, at: &StartPoint, by: &StartCap) -> Result<CommitId, FetchError>; // Volume's create; pack to start_at
     fn fetch_lfs(&mut self, oids: &[LfsOid]) -> Result<(), FetchError>;     // into History's LFS cache
     fn settlement(&self, line: TreeRef, through: CommitId) -> Settlement;  // NoRemotes | Held | Pending | Failing
     fn line_tip(&self, r: &RemoteName, line: &LineName) -> Result<Option<CommitId>, PushError>; // Volume's start line
@@ -420,7 +419,7 @@ Delivery hands every event to its consumers and to `Telemetry::emit` in one step
 | `ViewCaughtUp{view, tree, through}` | Views | anyone who must see a landing in that view | "visible in view V" |
 | `Committed{tree, through, commit}` | History | Journal, Replication, Forks, Volume | truncation; a push; a fork drop; release |
 | `ForkEnded{fork}` / `ForkDropped{fork}` | Forks | Landing / History, Journal, Clients, Replication, Volume | the intake's drain (§3.5) / deleting the line, the stream, the writer claim, a carried remote line; an upgrade's release |
-| `VolumeDraining` / `VolumeStaged` / `VolumeReleased{disposition}` | Volume | Clients, Landing, History, Replication / Clients, Landing / the composition root, CSI | refuses attachments and submissions; commits and pushes are due now / reopens them / the service exits |
+| `VolumeDraining` / `VolumeStaged` / `VolumeReleased{disposition}` | Volume | Clients, Landing, History, Replication / the same / the composition root, CSI | refuses attachments and submissions; History and Replication drain: each record closes its group, pushes skip spacing / reopens them; draining ends / the service exits |
 | `StartLineChanged{state}` | Volume | Telemetry | the start-line alarm |
 | `PushSettled{remote, outcome}` (outcome includes `Removed`) | Replication | Volume | release |
 | `ServiceReady{state_area}` | the history service, once every domain has restored and **every judge re-published its state** | view hosts, launchers | blocked file calls; a launcher's rebind and re-sent exits |
@@ -428,7 +427,7 @@ Delivery hands every event to its consumers and to `Telemetry::emit` in one step
 
 ### 3.5 The landing process: one model, one owner
 
-Every source (a fork's commits, a sync, a commit, a restore, a revert, a reconcile) runs this one state machine inside Landing; other domains see it only through `LandingChanged`.
+Every `Source` (§3.3) runs this one state machine inside Landing; other domains see it only through `LandingChanged`.
 
 ```mermaid
 stateDiagram-v2
@@ -444,18 +443,19 @@ stateDiagram-v2
   Deferred --> Withdrawn: the fork ends
   Writing --> Landed: renamed, bases moved, one record appended
   Writing --> Held: tracked moved and the one re-merge conflicts (nothing renamed yet)
-  Writing --> Deferred: the same, for a sync
+  Writing --> Deferred: the same, or its file unsaved in the fork, for a sync
+  Writing --> Waiting: another source's file unsaved in the target fork
   Waiting --> Refused: not permitted, content not in history, too large
   Landed --> [*]
 ```
 
-- **`Waiting{on}`** names its event: `Policy` (`LastDetached`, `apply`, `approve`), `Writers` (the last release), `Landing{id}` (a landing ahead: overlapping, the fork's earlier run, or one on the same path base), or `Resume` (each client's `resume` or end).
-- **`Writing`** starts only once the merged target is staged durably; recovery rolls only `Writing` forward. In order: **verify** (tracked unchanged, else one re-merge under the gate), **rename** (`Trees::replace`), **move bases** (`Forks::move_bases`), then **the one record** (`Journal::append_landing`), its `Seq` after the renames, inside the gate. A rename failing for space stalls, gate up, until `retry`.
+- **`Waiting{on}`** names its event: `Policy` (`LastDetached`, `apply`, `approve`), `Writers` (the last release), `Landing{id}` (a landing ahead: overlapping, the fork's earlier run, or one on the same path base), `Unsaved` (the fork's commit of those files lands) or `Resume` (each client's `resume` or end).
+- **`Writing`** starts only once the merged target is staged durably; recovery rolls only `Writing` forward. In order: **verify** (tracked unchanged, else one re-merge under the gate; in a fork, no target file unsaved there), **rename** (`Trees::replace`), **move bases** (`Forks::move_bases`), then **the one record** (`Journal::append_landing`), its `Seq` after the renames, inside the gate. A rename failing for space stalls, gate up, until `retry`.
 - **The gate is the freeze** (A9): exactly the files its landing writes, in the one tree it lands in.
-- **A fork run is whole commits, in order** (A8, §3.6). It lands the longest prefix of the fork's unlanded commits that merges and is admitted; the rest becomes the fork's next run. A commit only the agent resolver could merge lands alone, named for the agent; its cause still names the fork run, so the sandbox's writer stays in the commit's trailer (R5).
-- **A sync is a landing into a fork** (R17, R18), made when a parent tree records a file the fork holds its own copy of (`Forks::copies`). There is **one open sync per fork and file**: the parent's newer record joins it in any state before `Writing`, so a stale sync never lands. Its fork side is `tracked(F, p)`; its intake captures the parent's content from the record, and the base move hands that copy to Forks (I11). It waits only for the fork's write-opens of that file, gates only it, and appends one record in the fork's stream named for the parent record's writer. Main never waits for it; it never flows back.
+- **A fork run is whole commits, in order** (A8, §3.6). It lands the longest prefix of the fork's unlanded commits that merges and is admitted; the rest becomes the fork's next run. A commit of another writer (one only the agent resolver merged, or a child fork's run landed in the fork) lands alone, named for that writer; the trailer's source names the fork run, so the sandbox stays traceable (R5).
+- **A sync is a landing into a fork** (R17, R18), made when a parent tree records a file the fork holds its own copy of (`Forks::copies`). There is **one open sync per fork and file**: the parent's newer record joins it before `Writing`, so a stale sync never lands. Its fork side is `tracked(F, p)`; its intake captures the parent's content from the record, and the base move hands it to Forks (I11). It waits only for the fork's write-opens of that file, gates only it, and appends one record in the fork's stream named for the parent record's writer. Main never waits for it; it never flows back.
 - **One path base, one order.** A run carrying p and a sync of p into the same fork both move that fork's base of p, so they never overlap: the later one waits behind the earlier (`Waiting{Landing}`) and prepares on the base it left.
-- **A sync defers, never holds, a conflict** (design choice). It is `Deferred` on a conflict, or while its file is **unsaved** in the fork (`Journal::unsaved`: in an open or abandoned transaction, §3.6). It leaves at the parent's newer record (re-judged) or when the fork's next commit of the file lands, meeting main's change itself; it is never ahead of that commit. It is `Held` only for no space, until `retry`. `ForkEnded` withdraws every open sync into the fork, so none holds a drop back. `LandingChanged` tells the integrator notice edge and the alarm; the sandbox's program is not told, and its copy stays behind main meanwhile (cost 9).
+- **A sync defers, never holds, a conflict** (design choice). It is `Deferred` on a conflict, or while its file is **unsaved** in the fork (`Journal::unsaved`: in an open or abandoned transaction, §3.6). It leaves at the parent's newer record (re-judged) or when the fork's next commit of the file lands; it is never ahead of that commit. Only the integrator notice edge and the alarm learn of a deferral (cost 9). It is `Held` only for no space, until `retry`. After `ForkEnded` a waiting sync into the fork lands; a deferred or held one, or any landing `Waiting{Unsaved}`, is withdrawn.
 - **Trim:** once a fork's copy equals its parent's and is closed, Landing removes copy and base under one gate, so the fork reads its parent live again. No record.
 - **An ended fork's intake drains:** after `ForkEnded`, Landing turns every commit up to the stream's end into runs; a held one stays held until `resolve` or `withdraw` (I5); once none is open, it publishes `ForkLandingsClosed`.
 - **Reconcile is a landing source.** On `AttachmentEnded`, Landing captures the ended client's write-opens that differ from tracked, **skipping unsaved files** (the Journal abandons its transaction on that event; their files never overlap, so order is free), and appends one record, writer `Agentfs`. In a fork it stays on the fork's line, never reaching main.
@@ -463,7 +463,7 @@ stateDiagram-v2
 
 ### 3.6 What lands: a fork's commits, whole and in order
 
-A **fork commit** is one save outside a transaction (a file or its database group: R13's per-file default) or one sealed transaction (R13). The Journal judges its bounds (`fork_commits`); History writes each as one commit on the fork's line; Landing lands them **whole and in order, stopping at the first that cannot merge** (A8).
+A **fork commit** is one save outside a transaction (a file or its database group: R13's per-file default), one sealed transaction (R13), or a child fork's run landed in the fork (design choice: so a grandchild's work reaches main). The Journal judges its bounds (`fork_commits`); History writes each as one commit on the fork's line; Landing lands them **whole and in order, stopping at the first that cannot merge** (A8).
 
 | Step | A save (default) | A transaction |
 |---|---|---|
@@ -494,7 +494,7 @@ flowchart LR
   AG -->|merged| OKA["lands alone, named for the agent: reviewable, revertible by Revert"]
 ```
 
-Each resolver runs only where `Rules::merge(p)` suits it. Whitespace counts as insignificant only where an operator's rule says so (no path by default), because in YAML or Python an indentation change is a structural edit that must reach `Structure` or be held (R14). Under `Approval` a resolved merge still waits for approval. The agent resolver is an actor seeing only the one file's three versions.
+Each resolver runs only where `Rules::merge(p)` suits it. Whitespace is insignificant only where an operator's rule says so (no path by default): in YAML or Python indentation is structure, so it must reach `Structure` or be held (R14). Under `Approval` a resolved merge still waits for approval. The agent resolver is an actor seeing only the one file's three versions.
 
 ## 4. System-wide invariants and policies
 
@@ -505,7 +505,7 @@ Each resolver runs only where `Rules::merge(p)` suits it. Whitespace counts as i
 | I3 | One landing, of any source, is one durable target, one record and one `Seq`, never split across commits. A fork's commits land whole and in order; nothing lands past one that cannot merge (A8). A transaction lands all its files or none. Recovery rolls forward only what reached `Writing` (R9, R13) | Landing, Journal | construction time + test |
 | I4 | A tree sees another tree's content only after it lands there. A fork path's merge base is the content Forks holds for it at that fork position, moved only by a landing (either way) under its gate; never git's merge base. Under `FullLineage`, main's ancestry reaches only landed fork commits | Forks, Landing, History | construction time |
 | I5 | A fork is dropped only once it has ended, has no child, has no landing open (`ForkLandingsClosed`) and nothing uncommitted (A4) | Forks | event order + test |
-| I6 | Nothing a sandbox does makes main wait for it. A sandbox's session marks write-opens only in its own fork (§3.2). A gate freezes only the files its landing writes, in the tree it lands in (A9); each view enforces it itself, waiting on `GateFell`. Main waits only while a gate is up over a file it opens for writing (verify, one re-merge, renames, a rename stalled for space); reads, only where its consistency or a database group asks. Each tree has its own journal limit; each fork a per-layer quota (our reading of R7) | Landing, Views, Journal, Forks, Trees | construction time (admission); boot time (quota present, else editable in-volume forks are refused) |
+| I6 | Nothing a sandbox does makes main wait for it. A sandbox's session marks write-opens only in its own fork (§3.2). A gate freezes only the files its landing writes, in the tree it lands in (A9); each view enforces it itself, waiting on `GateFell`. Main waits only while a gate is up over a file it opens for writing (verify, re-merge, renames, a rename stalled for space); reads, only where its consistency or a database group asks. Each tree has its own journal limit; each fork a per-layer quota (our reading of R7) | Landing, Views, Journal, Forks, Trees | construction time (admission); boot time (quota present, else editable in-volume forks are refused) |
 | I7 | Names are replaced by rename. A reader sees each file, or each database group, whole old or whole new; open handles keep the old content | Trees, Views | test |
 | I8 | A view shows only what its grant's view profile shows. A rules error hides or refuses, never shows. No history, journal or credential is reachable through a view (R7) | Rules, Views | test |
 | I9 | Each fact has one judge: Landing a landing; the Journal a stream's room, a transaction, a fork commit's bounds; each view what it shows (`ViewCaughtUp`); Clients attachment; Health liveness. Nothing waits for another view's acknowledgement | all | review + test |
@@ -575,7 +575,7 @@ sequenceDiagram
     Note over L,S: where a merge changed F's file, main's record syncs it back into F (next flow); else F's copy is trimmed
   end
 ```
-History commits F7 and F8 on F's line first, then main's commit naming sandbox-1 and F. Its second parent is F8 (`FullLineage`) or one squashed commit chained on F's last (`Squashed`).
+History commits F7 and F8 on F's line, then main's commit naming sandbox-1 and F. Its second parent is F8 (`FullLineage`) or one squashed commit chained on F's last (`Squashed`).
 
 **Main's change syncs into a fork's own copy** (R17, R18).
 ```mermaid
@@ -651,7 +651,7 @@ sequenceDiagram
 ```
 A session closing while the service runs ends the attachment. A view stays `Suspended` only across a service restart; on `UnknownClient` from `rebind` its launcher closes it.
 
-**A fork ends and is dropped** on events alone: `LastDetached` or its launcher's `end`; `ForkEnded` (Landing drains its intake, withdraws its syncs); a held run resolved or withdrawn; `ForkLandingsClosed`; `Committed` through F's last record; `ForkDropped` (History deletes F's line, the Journal its stream, Clients its writer claim, Forks its layer and bases). Main still reaches F's landed commits. A sandbox host restarted in place is a new client on a new fork (`ForkTaken`).
+**A fork ends and is dropped** on events alone: `LastDetached` or its launcher's `end`; `ForkEnded` (Landing drains its intake, withdraws deferred and held syncs); a held run resolved or withdrawn; `ForkLandingsClosed`; `Committed` through F's last record; `ForkDropped` (History deletes F's line, the Journal its stream, Clients its writer claim, Forks its layer and bases). Main still reaches F's landed commits.
 
 ## 6. Deployment compositions and crate layout
 
@@ -673,7 +673,7 @@ adapters       store (state area, lock, repositories, audit stamps, outbox) · f
 apps           agentfs, agentfs-csi: composition roots; they make the minters, wire domains to adapters, compute nothing
 ```
 
-Boundaries, strongest first. **Compile time:** no domain crate sees another's internals; a view's ancestor trees have no write methods. **Construction time:** capabilities, `Gated`, `Writer` and `Cleared` come only from minters (§3.2). **Build time:** `cargo deny` bans domain-to-domain and domain-to-adapter dependencies; clippy, stray minters and I/O crates in domains. **Boot and connect time:** an unbound port, or a state area or peer of another family, is refused (I16); zero remotes is normal ("Remotes can come and go", 2026-10-17).
+Boundaries, strongest first. **Compile time:** no domain crate sees another's internals; ancestor trees have no write methods. **Construction time:** capabilities, `Gated`, `Writer` and `Cleared` come only from minters (§3.2). **Build time:** `cargo deny` bans domain-to-domain and domain-to-adapter dependencies; clippy, stray minters and I/O crates in domains. **Boot and connect time:** an unbound port, or a state area or peer of another family, is refused (I16); zero remotes is normal ("Remotes can come and go", 2026-10-17).
 
 ## 7. The verdict's open design items: current choices and their costs
 
@@ -683,7 +683,7 @@ Boundaries, strongest first. **Compile time:** no domain crate sees another's in
 | **Retention of held and rejected fork work** | Landing owns the held state, Forks the space; a withdrawal is the rejection; only an upgrade's drain waits for it (§8) | an ended sandbox's held work takes space until acted on |
 | **File locks between several main views, and across pods** | Views forward each file lock to the backing file's kernel lock: views of one tree share locks; a fork's copy is another file (libfuse's passthrough example) | a lock does not survive its file's landing (new inode) nor hold a landing back. FUSE forwarding NOT VERIFIED |
 | **Database file groups** | Rules names the groups; a group is one unit for scope, copy-up, recording, landing and consistency (reads of a member wait for its renames) | main holding its database open keeps a sandbox's edit to it `Waiting` |
-| **The freeze check at open** (A9) | Opening for writing is one never-blocking call to Landing: a `WriteMark`, or the gate the view then waits on. Group members' and `WholeLanding` reads check the node-local gate table | the gate table is one node's, as I15 already requires |
+| **The freeze check at open** (A9) | Opening for writing is one never-blocking call to Landing: a `WriteMark`, or the gate to wait on. Group and `WholeLanding` reads check the node-local gate table | the gate table is one node's, as I15 already requires |
 | **CSI pods and trees** | Each publish is a client whose StorageClass decides its grant: a main view or a new in-volume fork. Several main pods are main views sharing locks and one gate table | several nodes stay out (I15) |
 
 ## 8. Scaling, versions and evolution
@@ -727,9 +727,9 @@ Costs, stated, not sold:
 4. **"Landed" is the tree's fact, not every view's:** a hung view host may serve cache until the kernel's backstop.
 5. **One conflict stops its fork, and only it (A8, A12).** Every later commit, of any file, waits behind a held one; withdrawing it ends the fork's landings. A file held open does the same.
 6. **`WhenDetached` counts sandbox clients:** with sandboxes always up, patches wait for `OnApply`.
-7. **The rework grows** past revision 2's plan: fork layers with bases, syncs, resolvers, per-tree streams, fork lines, pins, lock forwarding, transactions, the history setting and version checks are new; this may reopen your scope choice.
+7. **The rework grows** past revision 2's plan: fork layers with bases, syncs, resolvers, per-tree streams, fork lines, pins, lock forwarding, transactions and version checks are new; this may reopen your scope choice.
 8. **One writer per fork, for life.** A sandbox whose view host restarts gets a new fork; unclosed writes stay on the old line.
-9. **A true conflict is seen by neither client** (against R18's ideal): each keeps its version, and the fork's copy stops following main until the fork's next commit of it lands or a later main change merges; only the integrator notice edge and the alarm learn of it. Syncthing-style conflicted copies were parked: they put a name in the sandbox its program never wrote.
+9. **A true conflict is seen by neither client** (against R18's ideal): each keeps its version, and the fork's copy stops following main until the fork's next commit of it lands or a later main change merges; only the integrator notice edge and the alarm learn of it. Syncthing-style conflicted copies were parked: they add a name the sandbox's program never wrote.
 10. **Syncs cost fork space:** an open sync's staged merge and captured parent copy count against the fork's quota; one open sync per file caps it at twice the fork's copies.
 
 **Tracer bullet.** A sidecar runs main's view and one sandbox view on an in-volume fork under `Continuous`, with the `Exact` and `Lines` resolvers. It shows: (1) main holds p open while the sandbox saves p, then q: the run waits, then lands both as one landing named for the sandbox, readers never blocked; (2) main saves s, which the sandbox holds: the sync merges it into the sandbox's view, and each line shows the other's commit; (3) killing the history service with one landing `Waiting`, one `Writing` keeps the first waiting and rolls the second forward; (4) killing the sandbox's view host leaves main alone. Everything else is a non-goal.
@@ -743,7 +743,7 @@ Costs, stated, not sold:
 | view host; session | the process serving views, never inside a client; its connection for one client (capabilities stay in the service) | A2, §3.2 | the `mount` process |
 | tree; in-volume fork; pinned fork | a real directory a view serves; a sandbox's layer over main's live tree; a read-only tree filled from one commit | R3, R5, A6 | backing tree; the tmp layer |
 | path base | what a fork's path merges against, moved by each landing either way, kept per position | the merge base | fork base |
-| fork commit, run; sync | one save, or one sealed transaction; a fork's unlanded commits, landed in order; a parent's change to a file landed in a fork's copy | A8, R13, R18 | a fork-line commit; `git pull` |
+| fork commit, run; sync | one save, one sealed transaction, or a child's landed run; a fork's unlanded commits, landed in order; a parent's change to a file landed in a fork's copy | A8, R13, R18 | a fork-line commit; `git pull` |
 | resolver chain | the ordered ways to merge a file, tried before holding | A10 | git merge drivers |
 | version, family | a component's semantic version; its major and minor | R16 | release |
 | line; commit group | one tree's git history (main's branch, a fork's ref); main's consecutive records of one writer and cause | A4, R6 | branch |
@@ -778,6 +778,6 @@ Costs, stated, not sold:
 | §1, §3.5, §3.6 | A12, A13 (also when the program dies); no drop while a commit is held | your answers; Telemetry E6, per I5 |
 | §3.3, §3.4, §8 | `freeze` → `capture` ("freeze" is the gate's, A9); `FetchError`; `drain_for_upgrade`; Volume consumes `ForkDropped`; `on_release` kept | Trees E5, Replication E6, Volume E1 |
 | domain pages | `Landed` names its resolvers; no Clients diagnostic for a launcher the rpc edge refuses | adopted: Telemetry E5; I9 |
-| §3.2–§3.6, I10, I12, §8 | syncs defer, never hold; `tracked` from `Seal`; `unsaved`; resume waits on own clients; drain speeds commits | design review |
+| §3.2–§3.6, I10, I12, §8 | syncs defer, never hold; `tracked` from `Seal`; `unsaved`, checked at verify; resume waits on own clients; draining a state; a child's run a fork commit; `fetch_start` | design reviews |
 
-*History (logs in git): revisions 1–2 domain cut; 3–4 forks, one operation path; page revs 1–3: fork lines, consistency, one Landing domain (rev 2 approved 2026-11-02), sessions, history setting, transactions; 4 escalations; 5 your answers (syncs both ways, whole commits, resolvers, freezes, versions); 6 review fixes.*
+*History: revisions 1–6 are in git.*

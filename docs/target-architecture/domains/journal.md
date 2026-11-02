@@ -51,7 +51,7 @@ flowchart LR
   H["Holds (values)\nopen transactions, unsaved files, named holds"] --> M
 ```
 
-A fork's stream holds its one writer's saves and marks, and landing records (syncs named for the parent record's writer, reconciles for `Agentfs`); only the first make fork commits.
+A fork's stream holds its one writer's saves and marks, and landing records (a child fork's run named for the child's writer, syncs for the parent record's, reconciles for `Agentfs`); saves and child runs make fork commits.
 
 ```mermaid
 flowchart LR
@@ -63,7 +63,7 @@ flowchart LR
   s13 -.-> X["not a fork commit: History commits it alone"]
 ```
 
-**A fork commit's place is its last record** (design choice): a save at its own `Seq`, a transaction at its `Seal`, so `c` lands before `T`, as git orders a commit by when it is made. `ForkRun { through }` names a commit's end. Open and abandoned transactions and landing records are not fork commits.
+**A fork commit's place is its last record** (design choice): a save at its own `Seq`, a transaction at its `Seal`, so `c` lands before `T`, as git orders a commit by when it is made. `ForkRun { through }` names a commit's end. Open and abandoned transactions and landing records are not fork commits, except a child fork's run (design choice, so a grandchild's work reaches main).
 
 Two machines: a stream's room and fences; a transaction's marks.
 
@@ -140,7 +140,7 @@ pub struct ForkCommit {                    // judged only here; Landing lands it
     fork: ForkId,
     starts: Seq,                           // the save, or the Begin mark: Landing's intake hold stays at or below it
     ends: Seq,                             // the save, or the Seal mark: its place in the order, a run's `through`
-    saves: Vec<Seq>,                       // its saves in order; never a landing record or another commit's save
+    saves: Vec<Seq>,                       // its saves in order, or a child run's one landing record
     txn: Option<TxnId>,                    // Some for a sealed transaction
 }
 pub struct LandingRecord {                 // built by Landing; the tree comes from the Gated, never from here
@@ -205,7 +205,7 @@ pub enum Refusal {
 | J9 | Appending never waits for a subscriber; a slow one gets `Lagged` | a bounded buffer per subscriber | construction + test |
 | J10 | `append_landing` is idempotent on `LandingId` while that record is in the stream | lookup by `LandingId` before append | test |
 | J11 | Records are audited as events (writer, `Clock` time); `StreamMeta` is `Audited` (I13) | the repository layer stamps | construction |
-| J12 | A fork commit is one save outside an open transaction, or one sealed transaction's saves; never a landing record or an open or abandoned transaction's. One judge: Landing and History see the same commits in one order (I9) | `ForkCommit` built only by the aggregate | construction + test |
+| J12 | A fork commit is one save outside an open transaction, one sealed transaction's saves, or a child fork's run landing record; never another landing record or an open or abandoned transaction's. One judge: Landing and History see the same commits in one order (I9) | `ForkCommit` built only by the aggregate | construction + test |
 | J13 | A landing record is never refused for room: refusing it after the renames splits the landing (I3); its bytes count toward room | `append_landing` skips the room check; payloads under the fork quota | construction + test |
 | J14 | A stream is read and written only by its own family; another family's stream is refused, nothing discarded (I16) | `StreamMeta.family`, checked at load; `store` reports `FormatsOf(family)` | boot time |
 
@@ -224,7 +224,7 @@ pub trait StreamRepository {               // one repository for the one aggrega
     fn delete(&self, t: TreeRef) -> Result<(), StoreError>; // only an empty stream
 }
 pub trait PayloadStore {
-    fn adopt(&self, f: Captured, into: TreeRef) -> Result<PayloadId, StoreError>; // a rename on one filesystem
+    fn adopt(&self, f: Captured, into: TreeRef) -> Result<PayloadId, StoreError>; // now the capture's one holder (T10): a rename
     fn remove(&self, ids: &[PayloadId]) -> Result<(), StoreError>;            // idempotent
     fn sweep(&self, live: &PayloadSet) -> Result<usize, StoreError>;          // replay: drop unreferenced
 }
@@ -333,7 +333,7 @@ All run on the real `store` adapter and filesystem, through the `Journal` contra
 
 ## 10. Escalations to the system document
 
-None open: E1–E6 adopted in revision 4, E7 (J13) and E8 (the sync hold, §3) in revision 6.
+None open: E1–E8 adopted.
 
 ## For the code architects (parked)
 
@@ -345,4 +345,4 @@ Segments, fsync sharing, frames; hold names; the rpc feed buffer and resume; the
 - `atomic` becomes Rules' group check (J5); `origin` and `operation` become `Writer` and `Cause`; marks, fork commit bounds, syncs, `Room` and a size limit are new.
 - The format change ships as the first release under R16: drained, not migrated.
 
-*History: draft 1 (2026-11-02); draft 2, system revision 4; draft 3, revision 5; draft 4, revision 6: the sync intake's hold; draft 5, revision 7 (A13).*
+*History: drafts 1–5 are in git.*

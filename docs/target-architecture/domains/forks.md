@@ -158,7 +158,7 @@ pub enum ForkError {
 | Landing | `copies` for each parent record; `base` for each commit's file and each sync; `move_bases` in `Writing` (runs, syncs) and at each trim | `Forks`, `&Gated` | I4: the only merge base; the sync targets |
 | Volume | `live`, for an upgrade's drain | `Forks` | "no fork left" has one judge |
 
-Forks calls Trees (`facts`, `create_layer(f, over, limit)`, `drop_layer`, `fill`, `copy_up`, `capture`, `discard`), History (`head`, `checkout`, `content_at`: pins and run bases) and `Journal::uncommitted`, `Clients::attached` (the drop check, `end`).
+Forks calls Trees (`facts`, `create_layer(f, over, limit)`, `drop_layer`, `fill`, `copy_up`, `capture`, `discard`), History (`head`, `checkout`, `content_at`, `tracked`: pins, bases) and `Journal::uncommitted`, `unsaved`, `Clients::attached` (the drop check, `end`).
 
 | Event | Direction | What Forks does or means by it |
 |---|---|---|
@@ -218,7 +218,7 @@ sequenceDiagram
   F->>S: entry (CopyingUp): row first
   F->>T: copy_up(F, p): parent's bytes into the layer
   T-->>F: Captured (Absent if nothing above)
-  F->>S: entry Set(Bytes(captured)), since CopyUp
+  F->>S: entry Set(Bytes(captured)), since CopyUp (p unsaved in a fork parent: At its tracked last commit of p)
   F-->>V: Ok: the write proceeds in the layer
 ```
 
@@ -319,7 +319,7 @@ No open question remains here; A12 needed no change to bases.
 
 ## 10. Escalations to the system document
 
-None open: E1 (`move_bases(.., from, ..)`), E2 (`live`) and E3 (`base`'s position) were adopted in revision 6; earlier ones in 4 and 5.
+None open: all adopted, E1–E3 in revision 6.
 
 ## 11. Reconcile with existing code
 

@@ -47,7 +47,7 @@ History turns each tree's durable records into git commits on that tree's line, 
 flowchart LR
   subgraph L["aggregate: Line (one per tree, keyed by TreeRef)"]
     H["head (CommitId) and through (Seq)"]
-    R["root: main's start commit (Volume's start_at) or none; the fork point for a fork"]
+    R["root: main's start commit (start_at) or none; the fork point for a fork"]
     S["squash head (forks only)"]
   end
   subgraph P["aggregate: HistorySetting (one per volume, Audited)"]
@@ -90,7 +90,7 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
   [*] --> Open: Recorded, a new (writer, cause), or a fork record
-  Open --> Closed: main - the next record differs in writer or cause, or the commit window ticks. A fork - the end of a fork commit (fork_commits). Anywhere - a landing record (a group of one); VolumeDraining or shutdown
+  Open --> Closed: main - the next record differs in writer or cause, or the commit window ticks. A fork - the end of a fork commit (fork_commits). Anywhere - a landing record (a group of one); while draining (VolumeDraining until VolumeStaged), every record; shutdown
   Closed --> Durable: the other side first (§6), then objects, LFS cache, refs, synced
   Closed --> Closed: a write fails: retried at the next Recorded of that tree or the commit window
   Durable --> [*]: Committed{tree, through, commit} published
@@ -112,7 +112,7 @@ pub trait History {
     fn head(&self, t: TreeRef) -> Option<CommitId>;               // the one tip query (Forks' pins, Replication)
     fn reaches(&self, t: TreeRef, c: CommitId) -> bool;          // Volume's start line
     fn receive(&mut self, pack: Pack, by: &ActorCap) -> Result<CommitId, HistoryError>; // quarantined, checked, then written
-    fn start_at(&mut self, c: CommitId, by: &StartCap) -> Result<(), HistoryError>;     // Volume only; main's line empty
+    fn start_at(&mut self, pack: Pack, c: CommitId, by: &StartCap) -> Result<(), HistoryError>; // fetch_start's pack; main's line empty
 }
 pub trait HistoryObjects {        // read-only, for Replication; History stays the only writer
     fn is_ancestor(&self, a: CommitId, of: CommitId) -> bool;
@@ -175,11 +175,11 @@ Author is the writer; committer is the state area's history service. The message
 |---|---|---|
 | called by | Landing; operators | `tracked`, `content`, `applied` (merges, sources, recovery); `set_policy` (Operator role) |
 | called by | Forks | `head` and `checkout`, for a pinned fork's `Trees::fill`; `content_at` for a run's moved base |
-| called by | Volume | `start_at` (with `StartCap`, at create), `reaches` (the start line) |
+| called by | Volume; Replication | `reaches` (the start line); `start_at` (`fetch_start`'s pack, with Volume's `StartCap`, at create) |
 | called by | Replication; the git server edge | `head`, `HistoryObjects`, `receive` (a fetched pack); `receive` (a pushed pack) |
 | calls | Journal | `feed` of every stream; `tail` for `tracked` and `applied`; `fork_commits`, the one judge of where a fork commit starts and ends |
 | calls | Rules; Replication | `skip(p, kind, facts)` at commit, the one judge of skips; `record(p).store` for LFS; `Replication::limits()` as data for the size backstop |
-| consumes | `Recorded`, `ForkDropped`, `VolumeDraining` | commits; deleting a fork's line and squash chain; closing open groups now |
+| consumes | `Recorded`, `ForkDropped`, `VolumeDraining`, `VolumeStaged` | commits; deleting a fork's line and squash chain; draining from one to the other, each record closes its group |
 | publishes | `Committed` | Journal, Replication, Forks, Volume; every event also to Telemetry |
 
 ## 4. Invariants and how each is enforced
@@ -347,4 +347,4 @@ Ref names for fork lines and squash chains; trailer key names and grammar; how a
 - **Existing branches.** Today's trailers carry no release, so the first release under R16 starts a major. Design choice: that release starts main's line with one commit on top of today's head, marking where its major begins; History reads nothing older; `git log` still reaches the past. Queued patches are drained before the upgrade (system §8).
 - **Patch, restore and finish commits** become landing commits; the duplicate scan becomes the applied index (a cache). **The commit loop's backoff** becomes retry on the next tick or `Recorded`. **LFS, repack and the durability order** carry over.
 
-*History: draft 1 (2026-11-02); draft 2, conformed to system revision 4; draft 3, conformed to revision 5; draft 4, revision 6: a sync's second parent, HE7 raised as system Q2; draft 5, revision 7: A13.*
+*History: drafts 1–5 (2026-11-02) are in git.*
