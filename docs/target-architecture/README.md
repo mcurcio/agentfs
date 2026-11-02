@@ -37,4 +37,4 @@ The set is one system document and twelve domain documents. The system document 
 - Questions for the owner are marked Q (system) or with a domain letter (QL, QJ, QH, ...), each with a recommendation and its cost.
 - Each domain page ends with its escalations to the system document and which revision resolved each.
 - Sketches are Rust and show surfaces only. Nothing here was compiled or run.
-- The landing rules (runs, syncs, transactions, the history setting) also run as an executable model on the `git` program: the `agentfs-model` crate. Its tests marked `design finding N` assert intended behaviour these pages do not yet deliver.
+- The owner's landing rules of 2026-11-02 (a Linux-filesystem default, upstream wins a same-line collision, transactions as frozen branches) run as an executable model on the `git` program: the `agentfs-model` crate, in plain words in its `MODEL.md`. Its tests marked `coherence finding N` assert what those rules intend but do not deliver; these pages predate those rules.

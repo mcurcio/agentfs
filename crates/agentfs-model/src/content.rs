@@ -3,7 +3,7 @@
 //!
 //! Every write puts one fresh token into one slot of one file. A token's
 //! name carries its writer (`<writer>.<n>`, plus `~t<T>` when staged in
-//! transaction fork T), so a commit's diff says whose changes it carries.
+//! transaction T), so a commit's diff says whose changes it carries.
 //! Slots are kept on separate lines with separator lines between them, so
 //! git's line merge sees two slots as two hunks: a change to different
 //! slots merges, a change to the same slot conflicts.
