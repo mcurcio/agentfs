@@ -8,7 +8,7 @@ The set is one system document and twelve domain documents. The system document 
 
 | Document | Status |
 |---|---|
-| [The system](system.md) | approved by the owner on 2026-11-02 (revision 3); now revision 8, each change listed in its change log |
+| [The system](system.md) | approved by the owner on 2026-11-02 (revision 3); now revision 9, each change listed in its change log |
 | The twelve domain documents | proposed |
 
 ## Reading order
@@ -22,8 +22,8 @@ The set is one system document and twelve domain documents. The system document 
 | [Clients](domains/clients.md) | clients, writers, grants, sessions and attachment; every capability |
 | [Views](domains/views.md) | each client's filesystem view: serving, caches, following feeds, consistency, locks |
 | [Trees](domains/trees.md) | the real filesystem: source tree, fork layers, staging, copy-up, rename into place |
-| [Forks](domains/forks.md) | lineage, path bases, pinned forks, fork space limits, ending and dropping |
-| [Journal](domains/journal.md) | one durable stream per tree, transactions, holds, the change feed, backpressure |
+| [Forks](domains/forks.md) | lineage, path bases, pinned and transaction forks, fork space limits, ending and dropping |
+| [Journal](domains/journal.md) | one durable stream per tree, fork commit bounds, holds, the change feed, backpressure |
 | [Landing](domains/landing.md) | the one landing process: sources, units, timing and acceptance, gate, merge, verdicts |
 | [History](domains/history.md) | lines, the history setting, one-writer commits, objects, LFS, the one log's read side |
 | [Replication](domains/replication.md) | remotes, credentials, pushing, fetching, settlement, divergence |

@@ -1,7 +1,7 @@
 # agentfs target architecture: the History domain
 
 **Layer:** System › **Domain: History** › Feature.
-**Status:** draft 6, proposed, under [system.md](../system.md) revision 8, which binds this page. It describes the target, not today's code. Sketches are Rust and show surfaces only. **What you are asked:** nothing. System Q2, raised here, is answered as built (A13). Former QH1 is moot and QH2 answered by R16.
+**Status:** draft 7, proposed, under [system.md](../system.md) revision 9, which binds this page. It describes the target, not today's code. Sketches are Rust and show surfaces only. **What you are asked:** nothing. System Q2, raised here, is answered as built (A13). Former QH1 is moot and QH2 answered by R16.
 
 ## 1. What History owns, its language, and what it is not
 
@@ -19,7 +19,7 @@ History turns each tree's durable records into git commits on that tree's line, 
 | R18 | "Ideally, the two conflicting changes would be interleaved in commits, and both clients would see the others changes" | 2026-11-02 | sync commits on fork lines, with main as second parent |
 | A4 | "A fork whose branches are rejected and never land in the main branch will inevitably be lost, and that's acceptable" (an answer, a current choice) | 2026-11-01 | a dropped fork's line goes |
 | A7 | "one setting per volume" (an answer) | 2026-11-02 | one history setting per volume |
-| A13 | "Agreed. It’s a transaction, so a failure is an implicit rollback." (an answer) | 2026-11-02 | an abandoned transaction makes no commit; `tracked` skips its saves, for its rollback |
+| A13 | "Agreed. It’s a transaction, so a failure is an implicit rollback." (an answer) | 2026-11-02 | an abandoned transaction makes no commit: its fork has no line |
 | A8 | "Should the per-fork landing stop at whatever commit cant merge? … This does assume that a *commit* is landed altogether, not just a file." (his question, accepted) | 2026-11-02 | one fork commit, one commit on the fork's line |
 
 | Owns, exclusively | Is not |
@@ -124,7 +124,7 @@ pub enum HistoryPolicy {          // shapes only a fork run's landing commit in 
 }
 
 // ── Types this page defines ──────────────────────────────────────
-pub struct Tracked {              // at one position: line head, then the Journal tail (a transaction's saves from its Seal)
+pub struct Tracked {              // at one position: line head, then the Journal tail
     at: Position,                 // the position the answer holds at
     state: TrackedState,
 }
@@ -143,7 +143,7 @@ pub struct CommitContent { commit: CommitId, entries: Vec<(RelPath, ContentRef, 
 // ── Events ───────────────────────────────────────────────────────
 pub struct Committed {            // system §3.4; published only after the ref is durable
     tree: TreeRef,
-    through: Seq,                 // every record of t at or below it, outside an open or abandoned transaction, is in the line or consumed
+    through: Seq,                 // every record of t at or below it is in the line or consumed
     commit: CommitId,             // the new head; the old head when nothing changed
 }
 
@@ -187,8 +187,8 @@ Author is the writer; committer is the state area's history service. The message
 | # | Invariant | Enforced by | Strength |
 |---|---|---|---|
 | H1 | A commit holds one commit group: one tree, one writer, one cause (I2, R6) | `CommitGroup` holds writer and cause once; its records carry neither; only `CommitGroup::split` builds one; the commit builder is private | compile time + construction |
-| H2 | One landing record, in main or a fork, is exactly one commit, never grouped (I3, R9); a rollback's record is a mark, so none (A13) | `split` closes a landing record as a group of one; an unchanged tree still commits, as a marker, so `applied` can answer | construction |
-| H3 | A fork's line has one commit per fork commit (A8) and per landing record (syncs, reconcile). A run's second parent is F's line at its last fork commit (`FullLineage`) or its squash commit (`Squashed`); a sync's is the newest main commit at or below `from` | `split` closes at each `fork_commits` bound; runs land in order and an abandoned transaction makes no commit (A13), so main reaches only landed fork commits (I4) | construction + test |
+| H2 | One landing record, in main or a fork, is exactly one commit, never grouped (I3, R9) | `split` closes a landing record as a group of one; an unchanged tree still commits, as a marker, so `applied` can answer | construction |
+| H3 | A fork's line has one commit per fork commit (A8) and per landing record (syncs, reconcile). A run's second parent is F's line at its last fork commit (`FullLineage`) or its squash commit (`Squashed`); a sync's is the newest main commit at or below `from` | `split` closes at each `fork_commits` bound; runs land in order, so main reaches only landed fork commits (I4); a transaction fork has no line, so an abandoned one makes no commit (A13) | construction + test |
 | H4 | Before a landing commit, the other side is durable through what it reaches (F's line and squash commit for a run; main's line through `from` for a sync). No cycle: a landing record follows every record it reaches | one builder moves the other side, squash chain, then the target in one durable step; a squash head carrying the landing id is reused | construction + crash test |
 | H5 | Each line's first parent is straight; `through` strictly increases along it; every record is committed exactly once | resume from the head's `through`; replay the tail above it | crash test |
 | H6 | Nothing is published before it is durable: objects and LFS cache, then refs, then `Committed`; the Journal truncates only after | the commit group machine (§2) | construction + crash test |
@@ -281,8 +281,7 @@ Commit, restore, revert and reconcile records follow the same path: a commit sou
 | Scenario | History's behaviour |
 |---|---|
 | Live landing and sync | a group of one, the other side committed first; Landing's verdict never waits on History |
-| Transactions | marks make no commit, the rollback's `RolledBack` included; saves inside an open or abandoned transaction make none; the sealed transaction is one commit on F's line at its seal, and its landing one commit in main |
-| Held, withdrawn, abandoned | a held commit and every later one are on F's line, never reached by main; withdrawn ones stay there until the fork drops (A4); an abandoned transaction makes no commit (A13) |
+| Transactions; held, withdrawn | a transaction fork has no line: its landing record in F is one commit on F's line, and F's run of it one commit in main; an abandoned one makes none (A13). A held commit and every later one are on F's line, never reached by main; withdrawn ones stay there until the fork drops (A4) |
 | Agent- or actor-resolved commit | landed alone, authored by that id, second parent as set; a `Revert` undoes it |
 | 1,000 sandboxes | 1,000 lines (two refs each under `Squashed`); refs move in batches; `applied` is an index lookup (G8) |
 | Crash at any step | objects without refs: gc'd; only the other side's ref moved: the replay builds only the target's commit; `Committed` unpublished: republished from the heads before `ServiceReady` |
@@ -312,7 +311,7 @@ All run through the `History` contract against real `gitx` on a real repository,
 | compile-fail: build a `CommitGroup` or `CommitPlan` outside the crate; `set_policy` without an `ActorCap` | H1 | a commit with two writers; an unauthorised setting change |
 | main and a sandbox interleave saves in one window | H1 | two writers in one commit (R6) |
 | a landing between two main records of the same writer | H2 | a landing merged into a direct commit |
-| F saves p, q, then r, which is held; then a transaction is abandoned; under each setting | H3 | main reaching a held, withdrawn or abandoned fork commit |
+| F saves p, q, then r, which is held; then one transaction lands in F and another is abandoned; under each setting | H3 | main reaching a held, withdrawn or abandoned fork commit |
 | main saves s, which F holds; `git log` of F shows the sync named for main-1 with main's commit as second parent; then F's run lands | H3, H4, R18 | a sync without main's history; a commit cycle |
 | crash harness: kill at every write, sync and ref step during a run and a sync; restart; `git fsck` | H4, H5, H6 | a duplicate squash or landing commit; a record committed twice or never |
 | delete the applied index; query every landed source; a landing record still in the tail | H8 | an index that wins; "applied?" missing an uncommitted landing |
@@ -330,7 +329,7 @@ All run through the `History` contract against real `gitx` on a real repository,
 2. **The graph is busier.** Under `FullLineage` main's `git log` interleaves each fork's commits with the syncs that carried main into it (R18 asks for that); the landing commit's trailer, not the graph, says which writer did what.
 3. **`git diff` against a fork-line second parent can show main's later changes reversed**, and a sync's second parent can under-claim: if main grouped records past `from` before the sync committed, git shows F lacking a change it has. agentfs never uses git's merge base (I4); people may.
 4. **Committed trails landing.** "Landed" is Landing's verdict; push and truncation wait for History. Under `Squashed` each fork has two refs until it drops.
-5. **An abandoned transaction leaves no history** beyond the Journal (A13); a major that breaks history leaves the old lines to their remotes.
+5. **An abandoned transaction leaves no history** (A13); a major that breaks history leaves the old lines to their remotes.
 
 ## 10. Escalations to the system document
 
@@ -347,4 +346,4 @@ Ref names for fork lines and squash chains; trailer key names and grammar; how a
 - **Existing branches.** Today's trailers carry no release, so the first release under R16 starts a major. Design choice: that release starts main's line with one commit on top of today's head, marking where its major begins; History reads nothing older; `git log` still reaches the past. Queued patches are drained before the upgrade (system §8).
 - **Patch, restore and finish commits** become landing commits; the duplicate scan becomes the applied index (a cache). **The commit loop's backoff** becomes retry on the next tick or `Recorded`. **LFS, repack and the durability order** carry over.
 
-*History: drafts 1–5 (2026-11-02) are in git.*
+*History: drafts 1–6 (2026-11-02) are in git; draft 7 conforms to system revision 9 (transaction forks).*

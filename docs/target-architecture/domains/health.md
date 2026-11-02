@@ -246,7 +246,7 @@ A service replaying a long journal answers with `finished` rising, so it stays `
 | Scenario | What Health does | What it never does |
 |---|---|---|
 | Live landing, sync, resolver chain | nothing: a view waiting on a freeze (`GateFell`) is parked, so a long wait, a slow resolver or the agent resolver never looks like a hung host; the chain runs as landing work, not as a call in hand | slow a landing or a sync, or let a verdict cancel one |
-| Transactions | nothing; a transaction's renames are finished work of the service | know a transaction exists |
+| Transactions | nothing; a transaction's fork and landing are finished work of the service | know a transaction exists |
 | Scale: 1,000 sandbox view hosts | one `Watch` and one probe per host per interval (100 probes a second at a 10 s interval, placeholder); probes are spread across the interval | probe through a view, or put a host id in a metric label |
 | Crash: a view host | its exit is the gone signal: `Gone` at once, no probe window | wait for probes to fail first |
 | Crash: the history service | `Gone` from its exit (or its socket closing); the new run is a new watch. While it restores, view hosts stay `Live` (parked) | judge view hosts by the service's outage |

@@ -1,7 +1,7 @@
 # Domain: Views
 
 **Layer:** System › **Domain: Views** › Feature.
-**Status:** draft 6, proposed, under [system.md](../system.md) revision 8, which binds it. It describes the target, not today's code. Sketches are Rust and show surfaces only.
+**Status:** draft 7, proposed, under [system.md](../system.md) revision 9, which binds it. It describes the target, not today's code. Sketches are Rust and show surfaces only.
 **What you are asked:** nothing: this domain has no open question.
 
 **Your words this domain serves** (system §1): R3 "a virtual filesystem overlay for each client (including main) that is backed by a _real_ filesystem source-of-truth"; R7 "Agentfs is the gatekeeper that exposes only what we want sandboxes to see"; R13 "a default usage … can operate per-file"; R18 "both clients would see the others changes"; A1 main is a view like any sandbox; A5 "It depends on the config!"; A6 a pinned fork is an acceptable snapshot; A9 "freezing only the files that a landing touches sounds reasonable. and hopefully our new per-client + view system makes locking/freezing files easier"; A11 file watchers: "we can take the "no guarantee" path for now" (2026-11-02). Everything else here is a design choice.
@@ -19,7 +19,7 @@ A view is one client's filesystem: the mount point a program uses, served by a v
 | enforcing the client's consistency setting | choosing it (the grant, in Clients) |
 | forwarding file locks to the real files | merging, history, liveness (Landing, History, Health) |
 | publishing `ViewCaughtUp` | waiting for any other view |
-| the program's transaction edge: how a program in a sandbox declares `begin`, `seal` and `abandon` (R13); its closing unsealed (the program died) abandons (A13); `begin` and `seal` refused (`EBUSY`) while the client holds a file in scope open for writing; after `abandon`, new write-opens in scope wait for its `RolledBack` mark | transaction state and locks (Journal) |
+| the program's transaction edge: how a program in a sandbox declares `begin`, `seal` and `abandon` (R13); its closing unsealed (the program died) abandons (A13); writing in the tree each write-open names, so the client reads its open transaction fork's staged files first; a rename across the scope's edge is `EXDEV` | transaction forks and their scope (Forks) |
 
 | Term | Meaning here |
 |---|---|
@@ -45,12 +45,12 @@ pub struct View {
     session: SessionId,           // the authority: its recorder and fork-write cap stay in the history service
     own: OwnTree,                 // from Trees::handle: write handle for Binding.tree, the only tree it changes
     through: Vec<ReadTree>,       // ancestors, nearest first; a ReadTree has no write methods
+    staging: Option<Staging>,     // the open transaction fork, read first in its scope: Binding, begin; cleared at seal, abandon
     mode: Mode,                   // built once from the attenuated grant; replaced only by `rebound`
     view_profile: ViewProfileId,  // what Rules shows this client
     acts_as: FileOwner,           // the owner it presents
     rules: RuleSetVersion,        // judged with this rule set
-    cursors: Vec<Cursor>,         // one per tree read: own, then each ancestor
-    state: ViewState,
+    cursors: Vec<Cursor>, state: ViewState, // one cursor per tree read: own, then each ancestor
 }
 pub enum Mode {
     Writable {
@@ -93,7 +93,7 @@ stateDiagram-v2
 
 ## 3. Public contract
 
-Views adds no crossing to system §3 (revision 8); its write-opens and `resume` name no tree (§10).
+Views adds no crossing to system §3 (revision 9); its write-opens name no tree, and `resume` returns Landing's own marks (§10).
 
 ```rust
 // ── Offered: to launchers only (system §3.3) ──
@@ -108,7 +108,7 @@ pub enum ViewError {
     OtherFamily(Version),    // the service's major.minor differs from this host's (system §8, I16)
 }
 // ── Offered: to the program in the client — ordinary file calls (POSIX), and the transaction edge ──
-//    begin(files), seal, abandon, forwarded over the session to Recorder (R13; the edge's shape is parked)
+//    begin(files), seal, abandon, forwarded over the session to Forks (R13; the edge's shape is parked)
 // ── Published ──
 pub struct ViewCaughtUp { view: ViewId, tree: TreeRef, through: Seq } // once per applied batch
 ```
@@ -116,8 +116,8 @@ pub struct ViewCaughtUp { view: ViewId, tree: TreeRef, through: Seq } // once pe
 | Views calls | Through | For |
 |---|---|---|
 | Trees | `resolve`, `handle(binding)`, `capture` | every file call, in its own tree or read-through; capturing at a change boundary |
-| Forks | `copy_up(p)`, over its session (the session's `ForkWriteCap`) | the first write of a path an ancestor holds |
-| Journal | `Recorder::record`, `begin`, `seal`, `abandon`, over its session; `feed(t, after)` | records at change boundaries; transactions; the feed of each tree read |
+| Forks | `copy_up(p)`, `begin`, `seal`, `abandon`, over its session (the session's `ForkWriteCap`) | the first write of a path an ancestor holds; the transaction edge |
+| Journal | `Recorder::record`, over its session; `feed(t, after)` | records at change boundaries, each with its handle's mark, which names the tree; the feed of each tree read |
 | Landing | `open_for_writing` (never blocks), `released`, `resume`, over its session; `gates()` with `covers` and `fell` | write-opens (a write, create, unlink or rename, one per name it changes); the last release; after a restart; the view's own wait on a gate |
 | Rules | `visibility(name, kind, view_profile)`, `group(p)`, `record(p, kind)` | every name shown; database group membership; refusals before recording |
 | Telemetry | `emit` | failures and counts; never waits |
@@ -241,9 +241,9 @@ Attributes are never cached and file pages never outlive their handle, so conten
 | Live landing into main | Trees renames; readers see whole old or whole new (I7). Each view applies the record and publishes `ViewCaughtUp`; under `PerFile` a new name may look absent until then |
 | Main's change syncs into the sandbox's copy | the sync waits for the sandbox's write-opens of that file and gates it in F only; a write-open of it then waits on `GateFell`; F's feed drops the name. A `Deferred` sync changes nothing in F |
 | Trim after a landing or a sync | no notice is needed: the sandbox's next call resolves p again and finds its parent's copy (V5) |
-| A transaction lands | one gate over its files; `WholeLanding` opens of them wait for it; `PerFile` readers may see one file new before the next (system cost 3) |
+| A transaction, open, then landed | open: its client reads staged files from T, the rest from F; other views of F see neither. From `seal` it reads F; landing: one gate over its files in F; `WholeLanding` opens wait; `PerFile` readers may see one file new before the next (system cost 3) |
 | 1,000 sandbox views | each host follows main's feed once and drops only names its kernel holds; a slow host goes Behind alone |
-| History service crash or patch upgrade | data on open handles flows; every other call waits. After the launcher's `rebound`: `resume(write handles)`, feeds from each applied position, Behind if truncated |
+| History service crash or patch upgrade | data on open handles flows; every other call waits. After the launcher's `rebound` (its `staging` restored): `resume` with each write handle's mark, feeds from each applied position, Behind if truncated |
 | View host crash | its mounts go stale; Clients ends the attachments, Landing ends their write-opens and reconciles what they left unrecorded. A new open at the same point stacks over a stale mount under `recover`; a sandbox's restarted host gets a new fork |
 | A host hung, not dead | its kernel serves found names it holds; opens and lookups wait on it; nobody else waits; Health judges it |
 | Patch upgrade of a view host | a restart: its clients' open files fail and the mount is stacked over; a sandbox restarts on a new fork. No live mount hand-over (design choice, system §8) |
@@ -277,7 +277,7 @@ All run against a real mount over real directories, with a real history service.
 | Paths, links and descriptors aimed at the state area from inside a view | history or credentials reachable (I8) |
 | Renames through two views of one tree at once | deadlock from dropping caches inside a file call |
 | One host hung (`SIGSTOP`) while others save and land | one view stalling the rest (I9) |
-| Kill the history service mid-write and mid-landing | errors on open handles; double records; a gate rising before resume (I12) |
+| Kill the history service mid-write, mid-landing and mid-transaction | errors on open handles; double records; a gate rising before resume (I12); a staged edit vanishing or saved in the wrong tree |
 | Locks: main views conflict; a sandbox's lock leaves main free; a dead host's locks drop | locks invisible across views; a sandbox blocking main |
 | Snapshot: `EROFS`; content fixed while main changes; `advance` moves it | a snapshot drifting or writable |
 | A sandbox floods its journal while main saves; fill the state area, then free it | a sandbox making main wait (I6); lost records |
@@ -295,7 +295,7 @@ All run against a real mount over real directories, with a real history service.
 
 ## 10. Escalations to the system document
 
-None open. E1 was adopted in revision 6: `open_for_writing(p)` and `resume(paths)` name no tree; the session supplies the own tree and refuses write-opens from a session with no recorder, so a sandbox never marks main (I6). The gate check `covers(t, p)` keeps its tree, since it reads.
+None open. E1 was adopted in revision 6: `open_for_writing(p)` names no tree, and `resume` hands back only Landing's own marks; the session supplies the own tree and refuses write-opens from a session with no recorder, so a sandbox never marks main (I6). The gate check `covers(t, p)` keeps its tree, since it reads.
 
 ## New terms
 
@@ -321,4 +321,4 @@ Node table and hard links; own renames; lookup counts across `rebound`; which er
 
 **NOT RUN:** FUSE lock forwarding, watchers across mounts, passthrough with name nodes, and copy-up during a parent's rename were not tested. Only `docs/design.md` on origin/main was read; no code.
 
-*History: draft 1 (2026-11-02); draft 2, system revision 4; draft 3, revision 5; draft 4, revision 6; draft 5, revision 7 (A13); draft 6, revision 8 (the transaction edge's windows).*
+*History: draft 1 (2026-11-02); draft 2, system revision 4; draft 3, revision 5; draft 4, revision 6; draft 5, revision 7 (A13); draft 6, revision 8; draft 7, revision 9 (transaction forks: the edge's windows and `EBUSY` go).*

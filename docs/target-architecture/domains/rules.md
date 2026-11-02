@@ -176,7 +176,7 @@ pub enum RulesError {                  // boot only: building the rule set, neve
 | Caller | Asks | When |
 |---|---|---|
 | Views | `visibility`, `group`, `record` | each lookup, listing, create, rename end, and when a feed notice names a path (a client's, a landing's or a sync's); group members at fsync; a refusal before recording |
-| Journal | `record`, `group` | at each record; to widen a save's fork commit and a transaction's `begin(files)` to whole groups |
+| Journal; Forks | `record`, `group` | at each record, to widen a save's fork commit to whole groups; to widen a transaction's `begin(files)` |
 | Landing | `merge`, `group` | the merge rule that picks its resolvers, either direction; to widen a run's or a sync's files to whole groups |
 | Trees | `group`; the repository-mark predicate | copy-up takes a group whole; a gate covers a group its landing writes; when it reports a path's containment |
 | History | `skip`, `record(p).store` | at commit: the one judge of skips; LFS |
@@ -272,7 +272,7 @@ sequenceDiagram
 | Scenario | Rules' part |
 |---|---|
 | Live landing and syncs | a landed or synced name is judged like a client's write (RU3); groups widen a landing's gate (RU5) |
-| Transactions | Journal widens `begin(files)` by `Group::scope()`; a skipped file's saves are never records |
+| Transactions | Forks widens `begin(files)` by `Group::scope()`; a skipped file's saves are never records |
 | Scale (1,000 sandboxes) | one `Arc<RuleSet>` per process; answers are compiled pattern matches; no tree reads |
 | Crashes | rebuilt from sources at restart; a changed version reaches view hosts through `rebound` |
 | Disk full | Rules writes nothing; an unreadable source refuses boot (RU2) |

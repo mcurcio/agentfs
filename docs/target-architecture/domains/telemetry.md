@@ -1,7 +1,7 @@
 # agentfs target architecture: the Telemetry domain
 
 **Layer:** System › **Domain: Telemetry** › Feature.
-**Status:** draft 5, proposed, under [system.md](../system.md) revision 8, which binds this page. It describes the target, not today's code. Sketches are Rust and show surfaces only.
+**Status:** draft 6, proposed, under [system.md](../system.md) revision 9, which binds this page. It describes the target, not today's code. Sketches are Rust and show surfaces only.
 **What you are asked:** nothing; former QT1 (§4) and QT2 (§7) are adopted as design choices.
 
 ## 1. What Telemetry owns, its language, and what it is not
@@ -95,7 +95,7 @@ pub enum Event {                    // closed: a new event cannot skip the catal
     Diagnostic(Diagnostic),         // failures that are replies, not published events
 }
 pub enum Diagnostic {               // each inner type is defined by its own domain
-    Journal(JournalDiagnostic),     // NotDurable{kind}, Backpressure, Refused{reason}, TransactionAbandoned{why} (A13; its rollback is a landing)
+    Journal(JournalDiagnostic),     // NotDurable{kind}, Backpressure, Refused{reason}
     Trees(TreesDiagnostic),         // NoSpace, Io{kind}, EscapesRoot
     Forks(ForksDiagnostic),         // SpaceLimit{fork}
     History(HistoryDiagnostic),     // CommitFailed{tree, reason}, PathRefused{reason}, OtherMajor{theirs}
@@ -254,7 +254,7 @@ Linking `Committed`, `ViewCaughtUp` and a sync's `from` to landing 9 needs the l
 |---|---|
 | A fork's run | one trace across every process; a conflict raises one `LandingHeld` (attributes: the held commit, the run's `through`), cleared by a clean re-judging, `resolve` or `Withdrawn` |
 | A sync | its own trace, linked to the landing it carries; `Deferred` is only `SyncDeferred` (the conflict is held once, at the fork's commit) |
-| Transactions | a sealed transaction is one fork commit: at most one `LandingHeld`; its files are attributes, not subjects. An abandoned one (A13) is counted, its rollback traced as a landing; a landing `Waiting{Locked}` is a gauge, never alarmed (no timer judges a lock) |
+| Transactions | a transaction is a fork: its seal is one run, at most one `LandingHeld`; its files are attributes, not subjects. An abandoned one (A13) is counted from `ForkEnded{why}`; a landing `Waiting{Transaction}` (`Lock`, until the seal or drop) is a gauge, never alarmed |
 | 1,000 sandboxes | metric series do not grow with sandboxes (T4); `Recorded` updates counters only; per-view `ViewCaughtUp` feeds one histogram; span volume is cut by sampling, which agrees across processes (T8) |
 | A process crashes or hangs | its queue and board are lost and rebuilt from re-published state; a lost or stuck process is Health's to judge (`ComponentUnresponsive`, raised in Health's process), never inferred here from silence |
 | Disk full | Telemetry writes nothing to disk; `NoSpace`, `NotDurable` and `StreamFull` arrive as diagnostics and alarms; stderr may fail and is ignored |
@@ -317,4 +317,4 @@ The board without contention (sharded or lock-free); the queue; the recent-landi
 - Alarm gauges set by each subsystem (`patch.blocked`, `push.diverged`) move onto the board, raised and cleared by the judge's events. Record and commit spans, today joined by sequence numbers, join a landing trace; mergiraf's merges, uncounted today, count as `Structure`.
 - Cost: every alarm and metric name is regenerated from the catalogue, so dashboards and alert rules change in one release, with no aliases.
 
-*History: draft 1 (2026-11-02); draft 2, conformed to system revision 4, which adopted E1–E4; draft 3, to revision 5; draft 4, to revision 7: E5, E6, A13; draft 5, to revision 8: locks, rollbacks.*
+*History: draft 1 (2026-11-02); draft 2, conformed to system revision 4, which adopted E1–E4; draft 3, to revision 5; draft 4, to revision 7: E5, E6, A13; draft 5, to revision 8: locks, rollbacks; draft 6, to revision 9: transaction forks.*

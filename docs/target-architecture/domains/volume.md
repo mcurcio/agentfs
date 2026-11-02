@@ -265,7 +265,7 @@ sequenceDiagram
 | Scenario | What Volume does | What it never does |
 |---|---|---|
 | Live landing and syncs | while Draining, a run or sync in motion blocks; a `Held` run, the commits behind it (A8), a `Deferred` sync, an approval wait do not (A4) | wait for an approver or integrator in a `Stop` drain |
-| Transactions | nothing: an ended attachment abandons its open one (system §3.6); a sealed one is a fork commit | know a transaction exists |
+| Transactions | nothing: a transaction is a fork, counted by `Forks::live` in an upgrade drain; an ended attachment drops an open one (system §3.6) | know a transaction exists |
 | Scale: 1,000 sandboxes | Staged: an event costs a state check; Draining: a judgement is five queries (six in an upgrade drain) | judge on every `Recorded` |
 | Crash: history service while Draining | boot restores `Draining` and its kind, re-publishes `VolumeDraining` before `ServiceReady`, re-judges | forget a drain or its kind |
 | Crash: between the `Released` row and the exit | boot finds `Released`; the edge re-reads `VolumeReleased` from the outbox and stops it again | re-open attachments without `stage` |

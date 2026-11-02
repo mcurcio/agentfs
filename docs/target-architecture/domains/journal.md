@@ -1,7 +1,7 @@
 # agentfs target architecture: the Journal domain
 
 **Layer:** System › **Domain: Journal** › Feature.
-**Status:** draft 6, proposed, under [system.md](../system.md) revision 8, which binds this page. It describes the target, not today's code; sketches are Rust surfaces. **What you are asked:** nothing (QJ1 adopted, §7). **Since your answers (2026-11-02):** a transaction **locks** each file it saves until it seals or is rolled back (A14); an abandoned one is never a fork commit (A13).
+**Status:** draft 7, proposed, under [system.md](../system.md) revision 9, which binds this page. It describes the target, not today's code; sketches are Rust surfaces. **What you are asked:** nothing (QJ1 adopted, §7). **Since your answers (2026-11-02):** a transaction is a child fork (A15), so the Journal keeps no transaction state: no marks, no locks; a sealed transaction fork's stream is one fork commit, an abandoned one's is deleted uncommitted (A13).
 
 ## 1. What the Journal owns, its language, and what it is not
 
@@ -13,26 +13,24 @@ One durable, ordered stream of records per tree. A record is promised when its c
 |---|---|---|---|
 | R5 | "Agentfs history shouod distinguish between the various containers so we can track direct edits on main vs the forks that sandboxes edit" | 2026-11-01 | every record names its writer |
 | R9 | "Whole seems best, right? A partial application has unknown side effects" | 2026-10-16 | one landing is one record |
-| R13 | "A cooperating integration can define batches/transactions across files, and they must all land together. But a default usage, like the CNI provides, can operate per-file." | 2026-11-02 | transaction marks in the stream |
-| A13 | "Agreed. It’s a transaction, so a failure is an implicit rollback." | 2026-11-02 | an abandoned transaction is no fork commit, and is rolled back |
-| A14 | "files added to a transaction are queued like 'git add' … the transaction would compete with the incoming sync to acquire file locks, and only one of them can succeed" (your model, then "yes") | 2026-11-02 | the Journal judges each transaction's locks |
+| R13 | "A cooperating integration can define batches/transactions across files, and they must all land together. But a default usage, like the CNI provides, can operate per-file." | 2026-11-02 | a sealed transaction fork's stream is one fork commit |
+| A13 | "Agreed. It’s a transaction, so a failure is an implicit rollback." | 2026-11-02 | an abandoned transaction fork's stream is deleted, never committed |
 | A8 | "This does assume that a *commit* is landed altogether, not just a file." (your question, accepted) | 2026-11-02 | one judge of where each fork commit starts and ends |
 | R16 | "The various agentfs components should be within the same version family" | 2026-11-02 | the stream format belongs to one family |
 | R18 | "the two conflicting changes would be interleaved in commits" | 2026-11-02 | a sync is a record in the fork's stream, named for the parent's writer |
 | — | "It's all event driven" | 2026-10-24 | the feed; no timer anywhere in this domain |
 
-**Owns, exclusively:** the streams, `Seq`, records and their captured copies until truncation, transaction state, marks and **locks**, **fork commit bounds**, each stream's limit and room, holds, the feed, truncation. **Is not:** commits, lines, the history setting (History); whether, when or how anything lands or syncs (Landing); merge bases (Forks); what is recorded or grouped (Rules); attachment (Clients); tree content (Trees); alarms (Telemetry).
+**Owns, exclusively:** the streams, `Seq`, records and their captured copies until truncation, **fork commit bounds**, each stream's limit and room, holds, the feed, truncation. **Is not:** commits, lines, the history setting (History); whether, when or how anything lands or syncs (Landing); merge bases, transaction forks and their scope (Forks); what is recorded or grouped (Rules); attachment (Clients); tree content (Trees); alarms (Telemetry).
 
-**New terms.** System terms (stream, position, feed, hold, writer, cause, transaction, lock, rollback, gate, fork commit, sync, family) keep their system meaning.
+**New terms.** System terms (stream, position, feed, hold, writer, cause, transaction, gate, fork commit, sync, family) keep their system meaning.
 
 | Term | Meaning here | Why needed | Could be the existing term |
 |---|---|---|---|
-| record | one durable entry in a stream: a change or a mark | the unit of promise | journal entry |
+| record | one durable entry in a stream: a change | the unit of promise | journal entry |
 | notice | what a view hands its recorder: paths and captured copies, no writer | an unforgeable writer | `Draft` |
 | payload | a captured copy the Journal adopted, kept until truncation | content outlives the call | `pending/` copy |
-| mark | a record that opens, seals or abandons a transaction, or ends its rollback | R13 in stream order | atomic flag |
 | low-water | the stream's first kept `Seq`; everything below is in History | the one-log read (I11) | `Agentfs-Seq` of the head |
-| room | `Plenty`; `Low` (no new write-opens, §7); `Full` (saves and begins refused) | backpressure without a timer | `journal.backlog` |
+| room | `Plenty`; `Low` (no new write-opens, §7); `Full` (saves refused) | backpressure without a timer | `journal.backlog` |
 | fence | cutting a failed batch so it never exists | an error means "not recorded" | today's `set_len` |
 | lag | a subscriber that lost buffered notices | nobody waits on a slow view | inotify's overflow |
 
@@ -41,59 +39,45 @@ One durable, ordered stream of records per tree. A record is promised when its c
 ```mermaid
 flowchart LR
   subgraph Agg["aggregate: Stream (one per tree, keyed by TreeRef)"]
-    R["Record (entity, immutable)\nPosition, Writer, Cause, entry, txn, time"]
-    T["Transaction (entity)\nTxnId, Scope, state, locked files"]
+    R["Record (entity, immutable)\nPosition, Writer, Cause, changes, time"]
     FC["ForkCommit (value, derived)\nstarts, ends, saves"]
     M["StreamMeta (Audited)\nlow-water, limit, room, family"]
   end
   P["Payload (value, by id)"] --- R
   R --> FC
-  T --> FC
-  H["Holds (values)\nopen and abandoned transactions, named holds"] --> M
+  H["Holds (values): named holds"] --> M
 ```
 
-A fork's stream holds its one writer's saves and marks, and landing records (a child fork's run named for the child's writer, syncs for the parent record's, reconciles for `Agentfs`); saves and child runs make fork commits.
+A fork's stream holds its one writer's saves and landing records (a child fork's run named for the child's writer, a sealed transaction's for the client, syncs for the parent record's, reconciles for `Agentfs`); saves and child runs make fork commits. A transaction fork T has its own stream, of its client's saves only.
 
 ```mermaid
 flowchart LR
-  subgraph F["stream of fork F"]
-    s10["10 Begin T {a,b}"] --> s11["11 a (T)"] --> s12["12 c"] --> s13["13 sync s, writer main-1"] --> s14["14 b (T)"] --> s15["15 Seal T"]
+  subgraph T["stream of transaction fork T over F"]
+    t1["1 a"] --> t2["2 b"]
   end
+  subgraph F["stream of fork F"]
+    s12["12 c"] --> s13["13 sync s, writer main-1"] --> s14["14 T landed (a, b), writer sandbox-1"]
+  end
+  T -.->|"sealed: one fork commit, landed by a run"| s14
   s12 -.-> C1["fork commit: ends 12 (c)"]
-  s15 -.-> C2["fork commit: ends 15 (T: 11, 14)"]
+  s14 -.-> C2["fork commit: ends 14 (T)"]
   s13 -.-> X["not a fork commit: History commits it alone"]
 ```
 
-**A fork commit's place is its last record** (design choice): a save at its own `Seq`, a transaction at its `Seal`, so `c` lands before `T`, as git orders a commit by when it is made. `ForkRun { through }` names a commit's end. Open and abandoned transactions and landing records are not fork commits, except a child fork's run (design choice, so a grandchild's work reaches main).
-
-Two machines: a stream's room and fences; a transaction's marks.
+**A fork commit's place is its last record** (design choice), so `c` lands before `T`, as git orders a commit by when it is made. `ForkRun { through }` names a commit's end. A landing record is no fork commit, except a child fork's run (design choice, so a grandchild's and a transaction's work reach main). **A transaction fork's stream** (design choice) is one fork commit ending at its last record once Forks reports T sealed, and none while it is open; a save through a mark made before the seal still extends it, and Landing's run fixes its end at `Writing`, after T's last write-open; it is never committed alone (T has no line) and is deleted at `ForkDropped`, so an abandoned one leaves nothing (A13). The Journal keeps no transaction state: whether T is open, sealed or abandoned is Forks' fact, asked (`Forks::facts`).
 
 ```mermaid
 stateDiagram-v2
   [*] --> Accepting: first record or landing (fork streams); boot (source)
   Accepting --> Low: size reaches the low threshold: StreamRoom(Low)
-  Low --> Full: size reaches the limit: saves and begins refused with Backpressure
+  Low --> Full: size reaches the limit: saves refused with Backpressure
   Full --> Low: Committed truncates
   Low --> Accepting: Committed truncates
   Accepting --> Fenced: a batch write fails
   Low --> Fenced: a batch write fails
   Fenced --> Accepting: failed batch cut, payloads removed
-  Accepting --> [*]: ForkDropped, stream empty: StreamDeleted
+  Accepting --> [*]: ForkDropped: StreamDeleted
 ```
-
-```mermaid
-stateDiagram-v2
-  [*] --> Open: Begin mark (forks only; no file already in an open transaction of this client)
-  Open --> Open: a save of a file in scope: locked from its first save (A14)
-  Abandoned --> Abandoned: a save from a write-open it had: still its, rolled back too
-  Open --> Sealed: Seal mark by the same recorder: one fork commit; locks end
-  Open --> Abandoned: Abandon by its recorder (a cancel, or its edge closing), or by agentfs at AttachmentEnded
-  Abandoned --> RolledBack: Landing's rollback appends the RolledBack mark in its gate; locks end
-  Sealed --> [*]: truncated after Committed
-  RolledBack --> [*]: truncated after Committed
-```
-
-**A lock is the Journal's fact** (design choice): which files a transaction has saved, and whether it has ended, are its own records, durable across restarts, so it judges `locks(f)` and no other domain keeps a copy (Landing's gate table, the alternative, is memory only and would copy the transaction's state). Landing asks it as each gate closes or rises and waits for the `Seal` or `RolledBack` mark on the feed (system §3.5). **Every save in scope from `Begin` to `Seal` or `RolledBack` is the transaction's**, whenever its handle closes: the view keeps other write-opens out of that window (system §3.6), so the stamp at append is exact. An abandon (A13) makes no fork commit; its rollback restores each file from `tracked` (which skips its saves) or a trim (system §3.5). At `AttachmentEnded` the Journal abandons that client's open ones, writer `Agentfs`, before Forks publishes `ForkEnded`. No timer ends a lock. Telemetry counts each (`TransactionAbandoned{why}`, design choice).
 
 ## 3. Public contract
 
@@ -109,18 +93,14 @@ pub trait Journal {
     fn fork_commits(&self, f: ForkId, after: Seq) -> Result<Vec<ForkCommit>, RecordError>; // complete ones, by `ends`
     fn hold(&self, t: TreeRef, holder: HoldName, at: Seq) -> Result<(), RecordError>; // durable; moves forward only
     fn release(&self, t: TreeRef, holder: HoldName);
-    fn uncommitted(&self) -> TreeSet;
-    fn locks(&self, f: ForkId) -> Vec<(RelPath, TxnId)>; // files saved in an open or not yet rolled-back transaction
+    fn uncommitted(&self) -> TreeSet;      // transaction forks never appear: they have no line
 }
-pub trait Recorder {                       // writer and tree sealed from the consumed ClientCap; held by the session
-    fn record(&self, n: ChangeNotice) -> Result<Durable, RecordError>;
-    fn begin(&self, files: Scope) -> Result<TxnId, RecordError>;
-    fn seal(&self, t: TxnId) -> Result<Durable, RecordError>;
-    fn abandon(&self, t: TxnId) -> Result<Durable, RecordError>;
+pub trait Recorder {                       // writer and own tree sealed from the consumed ClientCap
+    fn record(&self, m: &WriteMark, n: ChangeNotice) -> Result<Durable, RecordError>; // into the mark's tree
 }
 
 // ── Types this page defines ──────────────────────────────────────
-pub struct ChangeNotice {                  // no writer, no tree, no Seq: they cannot be supplied
+pub struct ChangeNotice {                  // no writer, no Seq: they cannot be supplied
     changes: Vec<PathChange>,              // one file, or one database group whole
 }
 pub enum PathChange {
@@ -128,30 +108,24 @@ pub enum PathChange {
     Removed { path: RelPath },
     Moved { from: RelPath, to: RelPath },  // a directory move: replay skips it at or below a consumer's position
 }
-pub enum AbsoluteState {                   // the `state` of a Record
-    Change(Vec<PathState>),                // payload ids, not Captured handles
-    Mark(Mark),                            // Begin { txn, scope } | Seal { txn } | Abandon { txn } | RolledBack { txn, files }
-}
 pub struct Record {
     at: Position,
     writer: Writer,
     cause: Cause,                          // Direct for every recorder record; Landing{id, source} for a landing
-    state: AbsoluteState,
-    txn: Option<TxnId>,                    // a save in its scope, not yet sealed or rolled back: stamped at append
+    state: Vec<PathState>,                 // absolute: payload ids, not Captured handles
     time: Time,
 }
 pub struct ForkCommit {                    // judged only here; Landing lands it whole, History commits it once
     fork: ForkId,
-    starts: Seq,                           // the save, or the Begin mark: Landing's intake hold stays at or below it
-    ends: Seq,                             // the save, or the Seal mark: its place in the order, a run's `through`
-    saves: Vec<Seq>,                       // its saves in order, or a child run's one landing record
-    txn: Option<TxnId>,                    // Some for a sealed transaction
+    starts: Seq,                           // Landing's intake hold stays at or below it
+    ends: Seq,                             // its place in the order, a run's `through`
+    saves: Vec<Seq>,                       // one save, a child run's one landing record, or a sealed transaction fork's every save
 }
 pub struct LandingRecord {                 // built by Landing; the tree comes from the Gated, never from here
     id: LandingId,                         // the idempotency key
-    writer: Writer,                        // the run's or sync's source writer, an ActorCap's, or Agentfs for reconcile and rollback
+    writer: Writer,                        // the run's or sync's source writer, an ActorCap's, or Agentfs for reconcile
     cause: Cause,                          // Landing { id, source }: every landing source
-    changes: Vec<PathChange>,              // every path inside the gate's scope; a sync: its one file; a rollback: its files, on RolledBack
+    changes: Vec<PathChange>,              // every path inside the gate's scope; a sync: its one file
 }
 pub struct Durable { at: Position, room: Room } // returned only after the record's fsync
 pub enum Room { Plenty, Low, Full }        // carried on every reply, so a view host knows without asking
@@ -168,17 +142,13 @@ pub enum FeedItem {
 pub enum RecordError {
     Refused(Refusal),
     NotDurable(IoKind),                    // includes no space; the batch was fenced: nothing recorded
-    Backpressure,                          // a save or begin into this tree's Full stream; no other tree is affected
+    Backpressure,                          // a save into this tree's Full stream; no other tree is affected
     Truncated,                             // `tail`, `fork_commits` or `feed` below low-water: read History's line
-    NotAFork,                              // begin on the source tree; fork_commits on the source
-    InOpenTransaction,                     // a file in scope is already in this client's open transaction
 }
 pub enum Refusal {
     RulesRefuse(RelPath),                  // Rules::record says Refuse
     SplitGroup(RelPath),                   // a database group member without the rest of its group
     OutsideGate(RelPath),                  // a landing path outside the gate's scope
-    UnknownTransaction(TxnId),             // not open, or opened by another recorder
-    SplitScope(RelPath),                   // one change partly inside a transaction's scope (a move across it)
 }
 ```
 
@@ -187,29 +157,29 @@ pub enum Refusal {
 | Direction | Party | Through |
 |---|---|---|
 | called by | the session edge, for each writable client | `recorder` (with the client's `ClientCap`, at attach); `Recorder::*` on the view host's behalf; `feed` per tree a view host reads |
-| called by | Landing | `fork_commits`, `feed`, `tail`, `hold` of fork streams (runs, rollbacks), of **parent streams** (syncs); `locks` (each rise into a fork, reconcile); `append_landing` (with `Gated`) |
+| called by | Landing | `fork_commits`, `feed`, `tail`, `hold` of fork streams (runs), of **parent streams** (syncs); `append_landing` (with `Gated`) |
 | called by | History; Forks, Volume | `fork_commits`, `feed`, `tail`; `uncommitted` (drop check; release and drain verdict) |
-| calls | Rules | `record(p, kind)` per client path: `Refuse` refused; a group must be whole. Skips are History's, at commit |
-| consumes | `Committed{tree, through}`; `ForkDropped{fork}`; `AttachmentEnded{client}` | truncation; deletes the empty stream, publishes `StreamDeleted`; appends `Abandon` for that client's open transactions |
+| calls | Rules; Forks | `record(p, kind)` per client path: `Refuse` refused; a group must be whole (skips are History's, at commit); `facts(t)`: whether a transaction fork is sealed (its bounds) |
+| consumes | `Committed{tree, through}`; `ForkDropped{fork}` | truncation; deletes the stream, publishes `StreamDeleted` |
 | publishes | `Recorded`, `Lagged`, `StreamRoom`, `StreamDeleted` | the feed; Telemetry receives every event |
 
 ## 4. Invariants and how each is enforced
 
 | # | Invariant | Enforced by | Strength |
 |---|---|---|---|
-| J1 | A client record names its consumed `ClientCap`'s writer and tree; a notice cannot carry either. A landing record names its source's writer, in its gate's tree | private constructors; `ChangeNotice` has no such fields; the tree comes from `Gated` | compile time |
+| J1 | A client record names its consumed `ClientCap`'s writer, in its write-open mark's tree; a notice cannot carry a writer. A landing record names its source's writer, in its gate's tree | private constructors; `ChangeNotice` has no such fields; the tree comes from `Gated` | compile time |
 | J2 | Only a risen gate appends to a tree from elsewhere, and only inside its scope | `append_landing` takes `&Gated`; paths outside its scope are `OutsideGate` | compile time + construction |
 | J3 | A record exists if and only if its call returned `Durable`. A failed write is fenced; a torn tail dropped at replay | the stream aggregate commits a batch only on the store's success | construction + crash test |
 | J4 | Per stream, `Seq` is strictly increasing and gapless; feed order is `Seq` order; nothing is published before durable | one appender per stream; `Seq` assigned at durable append, so a fenced batch frees its numbers | construction + test |
 | J5 | One notice is one record. A database group is never split across records | `SplitGroup` refusal from Rules' group | construction |
-| J6 | A transaction exists only in a fork; a file is in at most one open transaction; only its client seals or abandons it (its recorder, or the one `rebind` gives), or the Journal when its attachment ends; marks move only `Open → Sealed`, `Open → Abandoned`, or `Abandoned → RolledBack` by its rollback's gate, once (a repeat is a no-op). Every save in scope until the `Seal` or `RolledBack` mark is its, and locks its file from the first; a change is wholly in or out | `NotAFork`, `InOpenTransaction`, `UnknownTransaction`, `SplitScope`; the transaction machine; locks read from its own records | construction |
-| J7 | Truncation stops at `min(Committed.through, every hold)`: an open or abandoned transaction's `Begin`, a named hold (Landing's intake, an open read) (I11) | low-water computed from holds; named holds are durable rows in `StreamMeta` | construction + test |
+| J6 | A record goes in its mark's tree, which Landing set (the own tree, or its open transaction fork); the Journal never picks one. A sealed transaction fork's stream is one fork commit, none before; never committed alone | `record` takes the session's `WriteMark`; sealed asked of Forks | construction |
+| J7 | Truncation stops at `min(Committed.through, every hold)`: a named hold (Landing's intake, an open read) (I11) | low-water computed from holds; named holds are durable rows in `StreamMeta` | construction + test |
 | J8 | A stream's limit and room are its own: one tree's backlog never refuses another's records (I6) | the limit is a field of each `Stream`; no shared counter | construction + test |
 | J9 | Appending never waits for a subscriber; a slow one gets `Lagged` | a bounded buffer per subscriber | construction + test |
 | J10 | `append_landing` is idempotent on `LandingId` while that record is in the stream | lookup by `LandingId` before append | test |
 | J11 | Records are audited as events (writer, `Clock` time); `StreamMeta` is `Audited` (I13) | the repository layer stamps | construction |
-| J12 | A fork commit is one save outside a transaction, one sealed transaction's saves, or a child fork's run landing record; never another landing record or an open or abandoned transaction's. One judge: Landing and History see the same commits in one order (I9) | `ForkCommit` built only by the aggregate | construction + test |
-| J13 | A landing record, a `Seal` or an `Abandon` is never refused for room: refusing the first splits a landing (I3), the others leave a lock with no end; their bytes count toward room | `append_landing`, `seal`, `abandon` skip the room check; payloads under the fork quota | construction + test |
+| J12 | A fork commit is one save, a child fork's run landing record, or a sealed transaction fork's whole stream; never another landing record or an open transaction fork's saves. One judge: Landing and History see the same commits in one order (I9) | `ForkCommit` built only by the aggregate | construction + test |
+| J13 | A landing record is never refused for room: refusing it splits a landing (I3); its bytes count toward room | `append_landing` skips the room check; payloads under the fork quota | construction + test |
 | J14 | A stream is read and written only by its own family; another family's stream is refused, nothing discarded (I16) | `StreamMeta.family`, checked at load; `store` reports `FormatsOf(family)` | boot time |
 
 ## 5. Ports and adapters
@@ -224,7 +194,7 @@ pub trait StreamRepository {               // one repository for the one aggrega
     fn read(&self, t: TreeRef, after: Seq) -> Result<Vec<Record>, StoreError>;
     fn truncate_through(&self, t: TreeRef, s: Seq) -> Result<(), StoreError>; // idempotent
     fn save_meta(&self, m: StreamMeta, by: Principal) -> Result<Audited<StreamMeta>, StoreError>;
-    fn delete(&self, t: TreeRef) -> Result<(), StoreError>; // only an empty stream
+    fn delete(&self, t: TreeRef) -> Result<(), StoreError>; // an empty stream, or a dropped transaction fork's
 }
 pub trait PayloadStore {
     fn adopt(&self, f: Captured, into: TreeRef) -> Result<PayloadId, StoreError>; // now the capture's one holder (T10): a rename
@@ -252,10 +222,10 @@ sequenceDiagram
   participant R as Rules
   participant S as store
   participant Sub as subscribers of F
-  V->>J: record(notice: p, Captured)
+  V->>J: record(mark, notice: p, Captured)
   J->>R: record(p): Record(rule) with its group, whole group present
   J->>S: adopt(Captured): payload id
-  J->>J: stamp writer, Direct, txn if p is in a transaction's scope (not sealed or rolled back), next Seq
+  J->>J: stamp writer, Direct, next Seq, in the mark's tree: F's stream or its transaction fork's
   J->>S: append(batch), one fsync for every record waiting
   alt fsync fails
     J->>S: fence: cut the batch, remove its payloads
@@ -268,9 +238,9 @@ sequenceDiagram
 
 **A sync** (R18): at `Recorded(main, 50)` Landing's sync intake captures s and its hold passes 50; inside F's gate, `append_landing` (id 77, writer main-1, cause `Landing(Sync)`), idempotent on its id (J10), appends at F 13. History commits it alone on F's line; F 13 is no fork commit, so it never flows back.
 
-**A run** (§2's stream): at `Recorded(F, 15)` Landing asks `fork_commits(F, after 9)`, gets `c` (ends 12) and `T` (ends 15), keeps its hold at the first one's start, and appends one record in main, cause `ForkRun{F, through 15}`. Truncation then runs to `min(Committed.through, holds)`.
+**A run** (§2's streams): at `Recorded(F, 14)` Landing asks `fork_commits(F, after 9)`, gets `c` (ends 12) and `T` (ends 14), keeps its hold at the first one's start, and appends one record in main, cause `ForkRun{F, through 14}`. Truncation then runs to `min(Committed.through, holds)`.
 
-**Restart.** Load every stream, drop a torn tail, refuse another family's (nothing discarded), rebuild transactions, fork commit bounds, room; sweep stray payloads, re-truncate; then `ServiceReady`.
+**Restart.** Load every stream, drop a torn tail, refuse another family's (nothing discarded), rebuild fork commit bounds and room; sweep stray payloads, re-truncate; then `ServiceReady`.
 
 | Scenario | Journal behaviour |
 |---|---|
@@ -304,10 +274,9 @@ All run on the real `store` adapter and filesystem, through the `Journal` contra
 |---|---|---|
 | compile-fail: a `Record`, `Writer` or `ForkCommit` built outside its crate; `append_landing` without `Gated` | J1, J2, J12 | forged writer or bounds; a landing outside a gate |
 | crash harness at every failpoint under concurrent recorders, then replay; a fault filesystem (fsync error, no space) | J3, J4, J7 | a returned record lost; a failed one committed; a published `Seq` reused |
-| F stalled at `Full`; main records on; a landing, a seal and an abandon into F still append | J8, J13 | a sandbox stopping main; a split landing; a lock that cannot end |
+| F stalled at `Full`; main records on; a landing into F still appends | J8, J13 | a sandbox stopping main; a split landing |
 | a subscriber never reads: appends go on; it gets `Lagged` | J9 | a hung view host stalling recording |
-| the §2 stream (transaction, outside save, sync inside it); `fork_commits` before and after `Seal`, and after a restart | J12 | a sync landing back; a commit half in a transaction; Landing and History disagreeing on bounds |
-| begin, restart, seal; begin twice on one file; begin on main; seal by another; end with it open; abandon, a handle closing after it, restart, the rollback's mark twice; a move across the scope | J6, J7, A13, A14 | a transaction lost or truncated past; a save escaping its rollback; a lock missing, outliving its end, or ending before its rollback |
+| the §2 streams (a transaction fork, a save, a sync); `fork_commits(T)` before and after its seal, and after a restart; a save through a mark made before the seal, arriving after it; an abandoned T dropped | J6, J12, A13 | a sync landing back; half a transaction landed; a save in the wrong stream; an abandoned save committed |
 | a notice with one member of a database group | J5 | a group split across records |
 | `append_landing` twice on one `LandingId`, a restart between | J10 | a landing or sync applied twice |
 | a sync stuck on F's write-open while main records | I11 (the sync hold moves on) | a sandbox filling main's stream |
@@ -316,7 +285,7 @@ All run on the real `store` adapter and filesystem, through the `Journal` contra
 ## 9. Costs
 
 1. **Every save is an fsync** (group commit per stream); payloads double storage until truncation without reflink; lag is coarse; landing idempotency lasts only within a stream.
-2. **A held commit keeps its fork's stream from truncating** past its start (A8), a forgotten open transaction past its `Begin`, while its locks keep syncs out of its files; either can drive that fork to `Full`, never main, and a `Full` stream still takes the seal or abandon that ends a lock.
+2. **A held commit keeps its fork's stream from truncating** past its start (A8); it can drive that fork to `Full`, never main.
 3. **Syncs grow fork streams:** each main change to a file a fork holds is one record in that fork's stream, with its payload under the fork's quota.
 4. **No journal survives a minor or major upgrade:** the drain needs every fork landed or withdrawn first (system §8).
 
@@ -331,7 +300,7 @@ Segments, fsync sharing, frames; hold names; the rpc feed buffer and resume; the
 ## Reconcile with existing code (agentfs origin/main b5c0dc8)
 
 - One journal per volume becomes one stream per tree, with its own `Seq`, limit, truncation, family; a failed batch is fenced, its numbers reused (J4).
-- `atomic` becomes Rules' group check (J5); `origin` and `operation` become `Writer` and `Cause`; marks, fork commit bounds, syncs, `Room` and a size limit are new.
+- `atomic` becomes Rules' group check (J5); `origin` and `operation` become `Writer` and `Cause`; fork commit bounds, transaction fork streams, syncs, `Room` and a size limit are new.
 - The format change ships as the first release under R16: drained, not migrated.
 
-*History: drafts 1–5 are in git.*
+*History: drafts 1–6 are in git; draft 7 conforms to system revision 9 (transactions as child forks).*
