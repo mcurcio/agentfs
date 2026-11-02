@@ -5,16 +5,19 @@
 //! Not modelled: `Lock` isolation (only `Merge`, the default), approval and
 //! `WhenDetached`/`OnApply` timing (everything here is `Continuous`),
 //! integrator commit sources, revert, reconcile of a dead client's unclosed
-//! writes, `resolve`, database groups, deletes and renames, main's commit
-//! window (each main record is its own commit), service restarts and
-//! recovery, space limits, views' caches and consistency settings.
+//! writes, database groups, deletes and renames, truncation of the journal
+//! (bases never name a record, so it cannot matter: I11 is enforced by the
+//! `Base` type), service restarts and recovery, space limits, views' caches
+//! and consistency settings. `resolve` and restore are atomic (their own
+//! `Writing` at once).
 //!
 //! Tests marked `#[ignore = "design finding N: ..."]` assert the intended
 //! behaviour the docs do not deliver; run them with `--ignored`.
 
 use agentfs_model::check::{Checks, check, check_quiescent};
 use agentfs_model::world::{
-    Client, HistoryPolicy, Life, Policies, SealConflict, Step, Tree, TxnState, World,
+    Base, Client, EndedForkCopies, HistoryPolicy, Life, Policies, SealAnswer, SealConflict, Step,
+    Tree, TxnState, World,
 };
 
 fn world(history: HistoryPolicy, seal_conflict: SealConflict) -> World {
@@ -83,31 +86,43 @@ fn s5_sandbox_save_lands_in_main_as_one_commit() {
 /// §5 "Main's change syncs into a fork's own copy" (R17, R18): a merge into
 /// the fork's copy, one commit on its line named for main's writer with
 /// main's commit as second parent; each side's change in the other's view.
+/// The fork holds its copy with no run waiting (an open handle keeps it from
+/// trimming); otherwise its earlier run lands first and main's landing
+/// record joins the sync (finding 3).
 #[test]
 fn s5_main_change_syncs_into_fork_copy() {
     let mut w = world(HistoryPolicy::FullLineage, SealConflict::Held);
     let f = w.create_fork(Tree::Main);
     let c = Client::Fork(f);
+    let h = w.open(&c, "a");
     let mine = w.save(&c, "a", 0);
+    settle(&mut w);
+    assert!(main_has(&w, "a", &mine) && w.forks[&f].own.contains("a"));
     let theirs = w.save(&m1(), "a", 1);
-    ok(&mut w);
-    // The sync lands before F's own run (the reverse order is finding 3).
-    assert!(w.step(&Step::Sync(f, "a".into())));
+    settle(&mut w);
+    assert!(
+        !w.read(Tree::Fork(f), "a").contains(&theirs),
+        "the sync waits for F's write-open of a"
+    );
+    let later = w.close(h, 2).unwrap();
     settle(&mut w);
     let seen = w.client_reads(&c, "a");
-    assert!(seen.contains(&mine) && seen.contains(&theirs));
-    // The fork's copy now equals main's, so it was trimmed: it reads main live.
-    assert!(!w.forks[&f].own.contains("a"));
+    assert!(seen.contains(&mine) && seen.contains(&theirs) && seen.contains(&later));
+    assert!(main_has(&w, "a", &later) && main_has(&w, "a", &theirs));
     let line = agentfs_model::git::git(
         w.repo(),
         &[
             "log",
-            "--format=%(trailers:key=Agentfs-Writer,valueonly)",
-            "-n1",
+            "--format=%(trailers:key=Agentfs-Writer,valueonly,separator=%x2C)%x09%(trailers:key=Agentfs-Cause,valueonly,separator=%x2C)",
             &format!("fork/{f}"),
         ],
     );
-    assert_eq!(line.trim(), "m1");
+    let sync = line
+        .lines()
+        .find(|l| l.ends_with("Landing Sync"))
+        .expect("a sync commit on F's line");
+    assert!(sync.starts_with("m1\t"), "named for main's writer: {sync}");
+    check(&mut w, Checks { fork_lines: true }).unwrap();
 }
 
 /// §3.6, A8, I3: a true conflict holds the commit and every later one of
@@ -187,6 +202,7 @@ fn s3_6_transaction_sealed_clean() {
         w.seal(t);
         settle(&mut w);
         assert_eq!(w.txn_state(t), TxnState::Landed);
+        assert_eq!(w.seal_answer(t), Some(SealAnswer::Landed));
         assert!(main_has(&w, "a", &ta) && main_has(&w, "b", &tb));
         assert_eq!(main_writers(&w).len(), before + 1, "one main commit");
         check_quiescent(&w).unwrap();
@@ -285,6 +301,7 @@ fn p0_seal_then_program_exits_still_reaches_main() {
             TxnState::Sealed,
             "waits for T's last write-open"
         );
+        assert_eq!(w.seal_answer(t), None, "seal has not answered yet");
         w.end_client(f);
         ok(&mut w);
         assert!(!w.pending().contains(&Step::Drop(f)), "F's end waits for T");
@@ -418,18 +435,176 @@ fn q_seal_conflict_under_each_policy() {
         match policy {
             SealConflict::Held => {
                 assert_eq!(w.txn_state(t), TxnState::Held);
+                assert_eq!(w.seal_answer(t), Some(SealAnswer::Held));
                 assert_eq!(w.forks[&f].life, Life::Ended, "F waits for an actor");
                 w.withdraw_seal(t);
                 settle(&mut w);
             }
             SealConflict::Rollback => {
                 assert_eq!(w.txn_state(t), TxnState::RolledBack);
+                assert_eq!(w.seal_answer(t), Some(SealAnswer::RolledBack));
             }
         }
         assert_eq!(w.forks[&f].life, Life::Dropped);
         assert!(w.rolled_back.contains(&staged));
         check_quiescent(&w).unwrap();
     }
+}
+
+/// landing.md §2 ("At the fork's next commit, the held commit and the new
+/// one merge as one change ... the sandbox fixes a conflict by saving
+/// again"), A8: the sandbox saves main's line over its conflicting one; the
+/// held commit, the later one and the fix land as ONE record, and the run is
+/// no longer held (the regression behind seeds 50, 72, 98 ... of the last
+/// review: a held run that lands on re-judge must clear its hold).
+#[test]
+fn a8_saving_again_fixes_a_held_conflict() {
+    let mut w = world(HistoryPolicy::FullLineage, SealConflict::Held);
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    w.save(&c, "a", 0);
+    let main_side = w.save(&m1(), "a", 0);
+    let mine = w.save(&c, "a", 1);
+    let later = w.save(&c, "b", 0);
+    settle(&mut w);
+    assert_eq!(w.forks[&f].held, Some(0));
+    let before = main_writers(&w).len();
+    assert!(w.save_target_lines(f));
+    settle(&mut w);
+    assert_eq!(w.forks[&f].held, None, "landing clears the hold");
+    assert_eq!(w.forks[&f].landed, w.forks[&f].commits.len());
+    assert!(main_has(&w, "a", &main_side) && main_has(&w, "a", &mine));
+    assert!(main_has(&w, "b", &later));
+    assert_eq!(main_writers(&w).len(), before + 1, "one record, one commit");
+    check_quiescent(&w).unwrap();
+}
+
+/// §3.5 Held to Waiting "or resolve" (landing.md §3: "an actor's merge,
+/// named for that actor"): the held commit lands alone, named for the
+/// actor, its conflicting line replaced by the actor's own that saw both;
+/// the later commits follow as the fork's next run, named for the sandbox.
+#[test]
+fn s3_5_resolve_lands_the_held_commit_named_for_the_actor() {
+    let mut w = world(HistoryPolicy::FullLineage, SealConflict::Held);
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    let held = w.save(&c, "a", 0);
+    let main_side = w.save(&m1(), "a", 0);
+    let later = w.save(&c, "b", 0);
+    settle(&mut w);
+    assert!(w.forks[&f].held.is_some());
+    w.resolve(f);
+    ok(&mut w);
+    settle(&mut w);
+    let a = w.read(Tree::Main, "a");
+    assert!(a.slot(0).starts_with("actor."));
+    assert!(w.lineage.descends(a.slot(0), &held) && w.lineage.descends(a.slot(0), &main_side));
+    assert!(main_has(&w, "b", &later));
+    assert_eq!(main_writers(&w)[..2], ["c1", "actor"]);
+    check_quiescent(&w).unwrap();
+}
+
+/// §3.5 `Writing`: "verify (tracked unchanged, else one re-merge under the
+/// gate)". The run is prepared, main changes another line of the same file,
+/// and the run lands the re-merge: both changes stay. The run's base then
+/// moves to the fork's own commit (`Kept`, I11), never to merged content.
+#[test]
+fn s3_5_writing_re_merges_once_when_the_target_moved() {
+    let mut w = world(HistoryPolicy::FullLineage, SealConflict::Held);
+    let f = w.create_fork(Tree::Main);
+    let mine = w.save(&Client::Fork(f), "a", 0);
+    assert!(w.step(&Step::Run(f)), "prepared in Waiting");
+    let theirs = w.save(&m1(), "a", 1);
+    ok(&mut w);
+    assert!(w.step(&Step::Run(f)), "Writing: verify, re-merge, land");
+    ok(&mut w);
+    assert_eq!(w.re_merges, 1);
+    assert!(main_has(&w, "a", &mine) && main_has(&w, "a", &theirs));
+    assert_eq!(
+        w.base_ref(f, "a", u64::MAX),
+        Base::Kept {
+            commit: w.forks[&f].commits[0].git.clone()
+        }
+    );
+    settle(&mut w);
+}
+
+/// landing.md §2 "What ahead means": an earlier waiting landing whose scope
+/// overlaps in the same tree goes first. G's run of a was made after F's,
+/// so it waits while F's waits for main's write-open of a.
+#[test]
+fn s3_5_a_later_overlapping_landing_waits_behind_an_earlier_one() {
+    let mut w = world(HistoryPolicy::FullLineage, SealConflict::Held);
+    let f = w.create_fork(Tree::Main);
+    let g = w.create_fork(Tree::Main);
+    let h = w.open(&m1(), "a");
+    let fa = w.save(&Client::Fork(f), "a", 0);
+    let ga = w.save(&Client::Fork(g), "a", 1);
+    settle(&mut w);
+    assert!(!main_has(&w, "a", &fa) && !main_has(&w, "a", &ga));
+    w.close(h, 2);
+    settle(&mut w);
+    assert!(main_has(&w, "a", &fa) && main_has(&w, "a", &ga));
+    assert_eq!(main_writers(&w)[..3], ["c2", "c1", "m1"]);
+}
+
+/// history.md §2, commit group: on main, consecutive records of one writer
+/// and one cause become one commit at the commit window; a landing record
+/// is a group of its own. A sync's second parent is the newest main commit
+/// at or below its record (§5).
+#[test]
+fn h2_main_commits_groups_at_the_window() {
+    let mut w = world(HistoryPolicy::FullLineage, SealConflict::Held);
+    w.save(&m1(), "a", 0);
+    w.save(&m1(), "b", 0);
+    w.save(&Client::Main("m2".into()), "c", 0);
+    w.save(&m1(), "d", 0);
+    assert_eq!(main_writers(&w), ["agentfs"], "nothing committed yet");
+    assert!(w.step(&Step::Window));
+    assert_eq!(main_writers(&w), ["m1", "m2", "m1", "agentfs"]);
+    ok(&mut w);
+}
+
+/// Design finding 6 (system.md §3.5: "After `ForkEnded` a waiting sync into
+/// the fork lands"; forks.md §5 events, `ForkEnded`: "`copies` stops naming
+/// it", §3: "`copies` names open editable children"): F's sync of a waits;
+/// F's client ends; F's own run of a lands in main, and that newer record no
+/// longer joins the waiting sync. The stale sync then lands on the base the
+/// run moved and reverts F's own landed line in F's copy. The model's fix,
+/// `EndedForkCopies::UntilDropped`, keeps the join.
+#[test]
+#[ignore = "design finding 6: a stale sync into an ended fork reverts the fork's own landed change"]
+fn finding_6_stale_sync_into_an_ended_fork() {
+    ended_fork_sync(EndedForkCopies::StopAtEnd);
+}
+
+#[test]
+fn finding_6_fix_copies_name_a_fork_until_it_drops() {
+    ended_fork_sync(EndedForkCopies::UntilDropped);
+}
+
+fn ended_fork_sync(ended_fork_copies: EndedForkCopies) {
+    let mut w = World::new(Policies {
+        ended_fork_copies,
+        ..Policies::default()
+    });
+    let f = w.create_fork(Tree::Main);
+    let g = w.create_fork(Tree::Fork(f));
+    let mine = w.save(&Client::Fork(f), "a", 0);
+    w.save(&m1(), "a", 1);
+    ok(&mut w);
+    w.end_client(f);
+    // F's run was made first, so it lands before the sync (one path base,
+    // one order); then the sync.
+    assert!(w.step(&Step::Run(f)) && w.step(&Step::Run(f)));
+    ok(&mut w);
+    w.settle();
+    ok(&mut w);
+    assert!(w.read(Tree::Fork(f), "a").contains(&mine));
+    assert!(
+        w.client_reads(&Client::Fork(g), "a").contains(&mine),
+        "F's live child G reads F's own landed line"
+    );
 }
 
 /// Design finding 1 (system.md §3.6 and history.md §1 "fork point", H3; R5,
@@ -458,15 +633,17 @@ fn finding_1_copy_up_after_fork_point_names_main_change_for_sandbox() {
 fn finding_2_squash_commit_carries_main_changes() {
     let mut w = world(HistoryPolicy::Squashed, SealConflict::Held);
     let f = w.create_fork(Tree::Main);
-    // F's first commit holds a: its fork point is main's head before m1's change.
+    // F's first commit holds a: its fork point is main's head before m1's
+    // change; F's run merges m1's change, and its squash commit sits on the
+    // fork point holding the merged a.
     w.save(&Client::Fork(f), "a", 0);
-    w.save(&m1(), "a", 1);
-    // m1's change syncs into F's copy first (a commit named m1 on F's line),
-    // then F's run lands; its squash commit sits on the fork point.
-    assert!(w.step(&Step::Sync(f, "a".into())));
-    check(&mut w, Checks { fork_lines: true }).unwrap();
-    w.settle();
-    check(&mut w, Checks { fork_lines: true }).unwrap();
+    let theirs = w.save(&m1(), "a", 1);
+    settle(&mut w);
+    let squash = agentfs_model::git::git(w.repo(), &["show", &format!("refs/squash/{f}")]);
+    assert!(
+        !squash.contains(&format!("+s1: {theirs}")),
+        "the squash commit named c1 carries {theirs}:\n{squash}"
+    );
 }
 
 /// Design finding 3 (system.md §3.5 "A sync": "one open sync per fork and
@@ -474,8 +651,10 @@ fn finding_2_squash_commit_carries_main_changes() {
 /// record's writer"; I2): two main records of p by different writers join
 /// one sync while the fork holds p open, and the fork-line commit names one
 /// writer for both changes. A deferred sync re-judged at a newer record does
-/// the same, and so does the fork's own run landing first in §5's second
-/// flow: main's landing record joins a sync still open into the fork.
+/// the same, and so does §5's second flow whenever the fork's commit of the
+/// file came before main's record: its run was made first, so landing.md §2's
+/// ordering ("one path base, one order") lands it first, and main's landing
+/// record joins the sync still open into the fork.
 #[test]
 #[ignore = "design finding 3: a sync joining two writers' records lands both under one writer"]
 fn finding_3_joined_sync_names_one_writer_for_two() {
