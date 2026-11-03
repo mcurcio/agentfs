@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Slots per file.
-pub const SLOTS: usize = 4;
+pub const SLOTS: usize = 6;
 /// The files of the modelled tree. All exist from main's first commit.
 pub const PATHS: [&str; 4] = ["a", "b", "c", "d"];
 /// An unwritten slot.
@@ -65,6 +65,13 @@ impl Content {
         self.0.iter().any(|t| t == token)
     }
 
+    /// The slot after the last written one: where an append goes (rule 8).
+    /// A model file has a fixed number of lines, its unwritten trailing
+    /// slots the room an append fills.
+    pub fn end(&self) -> usize {
+        self.0.iter().rposition(|t| t != EMPTY).map_or(0, |i| i + 1)
+    }
+
     /// The 1-based line slot `i` renders on.
     pub fn line_of(i: usize, layout: Layout) -> usize {
         (1 + layout.gap()) * i + 1
@@ -104,6 +111,13 @@ pub fn line_token(line: &str) -> Option<&str> {
     let (k, t) = line.split_once(": ")?;
     k.strip_prefix('s')?.parse::<usize>().ok()?;
     (t != EMPTY).then_some(t)
+}
+
+/// The bytes a token's line holds: a line a whole-file rewrite put back
+/// (`<writer>.<n>=<bytes>`) holds the bytes it copied; any other line its
+/// own token.
+pub fn bytes(token: &str) -> &str {
+    token.split_once('=').map_or(token, |(_, b)| b)
 }
 
 /// The writer a token names.

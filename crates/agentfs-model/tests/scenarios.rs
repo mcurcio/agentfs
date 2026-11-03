@@ -4,12 +4,13 @@
 //! rules intend but do not deliver; run it with `--ignored`.
 
 use agentfs_model::check::{check, check_converged, step_checked};
-use agentfs_model::content::Layout;
+use agentfs_model::content::{Content, Layout, bytes};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::world::{
     Client, CollisionScope, Direction, HistoryPolicy, Life, MergeRule, ModelError, Overwritten,
-    Policies, Step, Tree, TxnOutcome, World,
+    Policies, Step, Tree, TxnOutcome, World, Write,
 };
+use std::collections::BTreeSet;
 
 const BOTH: [HistoryPolicy; 2] = [HistoryPolicy::FullLineage, HistoryPolicy::Squashed];
 
@@ -32,9 +33,12 @@ fn take(w: &mut World, s: &Step) {
     ok(w);
 }
 
-/// One queued step, then every invariant.
+/// One queued change taken whole (its take begins and ends: rule 9),
+/// checking after each step.
 fn next(w: &mut World, t: Tree) {
     take(w, &Step::Next(t));
+    assert!(w.waits().get(&t).is_none(), "{t:?}'s queue waits");
+    take(w, &Step::Finish(t));
 }
 
 /// Every step until none is left, checking after each; then convergence.
@@ -735,7 +739,7 @@ fn r5_transaction_commits_clean() {
 /// Rule 5, a commit meeting a concurrent line (a design choice): main's m
 /// on a line the transaction changed has already synced into the sandbox.
 /// The commit lands in the sandbox as a child's change lands in its
-/// parent: never refused, the sandbox's m wins that line, the other staged
+/// parent: no collision refuses it, the sandbox's m wins that line, the other staged
 /// line applies, and the answer names the overwritten line. The collision
 /// is recorded in the sandbox, naming the staged line.
 #[test]
@@ -988,5 +992,305 @@ fn convergence_when_writes_stop() {
         next(&mut w, Tree::Main);
         drain(&mut w);
         assert!(!w.collisions.is_empty());
+    }
+}
+
+// ── rule 8: a save records the write calls ──────────────────────────────
+
+/// The sandbox's program read `a` before main's m reached it by sync,
+/// then opens `a`, makes one write call and closes. Returns the world, the
+/// program's stale read, the synced m, and the sandbox.
+fn read_then_sync(history: HistoryPolicy) -> (World, Content, String, u32) {
+    let mut w = world(history, CollisionScope::Line);
+    let f = w.create_fork(Tree::Main);
+    let o = w.save(&m1(), "a", 0);
+    drain(&mut w);
+    let read = w.client_reads(&Client::Fork(f), "a");
+    assert!(read.contains(&o));
+    let m = w.save(&m1(), "a", 0); // over o
+    next(&mut w, Tree::Fork(f));
+    assert!(has(&w, Tree::Fork(f), "a", &m));
+    (w, read, m, f)
+}
+
+/// Rule 8, an append after the sync: it adds a line at the file's end as
+/// it is now, so the line the sync brought stays, in the sandbox and, once
+/// landed, in main.
+#[test]
+fn r8_an_append_after_the_sync_keeps_the_synced_line() {
+    for history in BOTH {
+        let (mut w, _, m, f) = read_then_sync(history);
+        let h = w.open_write(&Client::Fork(f), "a");
+        let x = w.write(h, Write::Append).unwrap().unwrap();
+        w.close(h);
+        ok(&mut w);
+        assert_eq!(w.read(Tree::Fork(f), "a").slot(1), x, "after the end");
+        drain(&mut w);
+        assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Main, "a", &x));
+        assert!(w.collisions.is_empty(), "{history:?}");
+    }
+}
+
+/// Rule 8, a write at an offset elsewhere: it replaces exactly that line;
+/// the line the sync brought, which the program never read, stays.
+#[test]
+fn r8_an_offset_write_elsewhere_keeps_the_synced_line() {
+    for history in BOTH {
+        let (mut w, _, m, f) = read_then_sync(history);
+        let h = w.open_write(&Client::Fork(f), "a");
+        let y = w.write(h, Write::At(2)).unwrap().unwrap();
+        w.close(h);
+        drain(&mut w);
+        for t in [Tree::Main, Tree::Fork(f)] {
+            let a = w.read(t, "a");
+            assert_eq!((a.slot(0), a.slot(2)), (m.as_str(), y.as_str()), "{t:?}");
+        }
+        assert!(w.collisions.is_empty(), "{history:?}");
+    }
+}
+
+/// Rule 8, a stale truncate and rewrite: the program writes back the whole
+/// file it read before the sync. That really puts o's bytes back over m,
+/// recorded as the program's write: a new line by the sandbox's writer
+/// (`git blame` names it), written over m, so it replaces m in main too
+/// with no collision. m stays in main's history.
+#[test]
+fn r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it() {
+    for history in BOTH {
+        let (mut w, read, m, f) = read_then_sync(history);
+        let m_commit = w.main_head.clone();
+        let h = w.open_write(&Client::Fork(f), "a");
+        assert_eq!(w.write(h, Write::Rewrite(read.clone())), Ok(None));
+        w.close(h);
+        let r = w.read(Tree::Fork(f), "a").slot(0).to_string();
+        assert_eq!(bytes(&r), read.slot(0), "o's bytes, back");
+        assert!(r.starts_with("c1.") && w.lineage.descends(&r, &m));
+        drain(&mut w);
+        assert!(has(&w, Tree::Main, "a", &r) && !has(&w, Tree::Main, "a", &m));
+        assert!(w.collisions.is_empty(), "{history:?}: no collision");
+        let blame = git(
+            w.repo(),
+            &["blame", "--porcelain", "-L1,1", &w.main_head, "--", "a"],
+        );
+        let by = blame.split(' ').next().expect("a commit").to_string();
+        assert_eq!(
+            w.writer_of_commit(&by),
+            "c1",
+            "{history:?}: the program's write"
+        );
+        assert!(w.in_history(&m_commit, &w.main_head), "m stays in history");
+        assert!(w.file(&m_commit, "a").contains(&m));
+    }
+}
+
+/// Rule 8, `O_APPEND`: two of main's clients append to one file at once.
+/// Each append goes after the file's end as it is at its close, so neither
+/// writes over the other's line, whichever closes first; and a check
+/// rejects an append that lands on a written slot (`one_writer`).
+#[test]
+fn r8_concurrent_appends_never_overwrite_each_other() {
+    for history in BOTH {
+        for m2_first in [true, false] {
+            let mut w = world(history, CollisionScope::Line);
+            let o = w.save(&m1(), "a", 0);
+            let m2 = Client::Main("m2".into());
+            let (a, b) = (w.open_write(&m1(), "a"), w.open_write(&m2, "a"));
+            let xa = w.write(a, Write::Append).unwrap().unwrap();
+            let xb = w.write(b, Write::Append).unwrap().unwrap();
+            let (first, second) = if m2_first { (b, a) } else { (a, b) };
+            w.close(first);
+            ok(&mut w);
+            w.close(second);
+            ok(&mut w);
+            let f = w.read(Tree::Main, "a");
+            let (one, two) = if m2_first { (&xb, &xa) } else { (&xa, &xb) };
+            assert_eq!(
+                (f.slot(0), f.slot(1), f.slot(2)),
+                (o.as_str(), one.as_str(), two.as_str()),
+                "{history:?}: in close order, none over another"
+            );
+            drain(&mut w);
+        }
+    }
+}
+
+// ── rule 9: a take locks the files it overwrites ────────────────────────
+
+/// Rule 9: main's sync waits while the sandbox's program has `a` open for
+/// writing: its queue head records the wait and its step is not offered.
+/// The close (an event) wakes it, and it applies over the saved file. A
+/// sync of a file nobody has open does not wait.
+#[test]
+fn r9_a_sync_waits_for_an_open_writer_then_applies() {
+    for history in BOTH {
+        let mut w = world(history, CollisionScope::Line);
+        let f = w.create_fork(Tree::Main);
+        let h = w.open_write(&Client::Fork(f), "a");
+        let m = w.save(&m1(), "a", 0);
+        take(&mut w, &Step::Next(Tree::Fork(f)));
+        assert_eq!(w.waits()[&Tree::Fork(f)], BTreeSet::from(["a".to_string()]));
+        assert!(!w.pending().contains(&Step::Next(Tree::Fork(f))));
+        assert!(!has(&w, Tree::Fork(f), "a", &m), "{history:?}: not written");
+        let x = w.write(h, Write::At(1)).unwrap().unwrap();
+        w.close(h);
+        ok(&mut w);
+        assert!(w.waits().is_empty(), "the close woke it");
+        next(&mut w, Tree::Fork(f));
+        let a = w.read(Tree::Fork(f), "a");
+        assert_eq!((a.slot(0), a.slot(1)), (m.as_str(), x.as_str()));
+        let h = w.open_write(&Client::Fork(f), "b");
+        w.save(&m1(), "c", 0);
+        next(&mut w, Tree::Fork(f)); // c only: does not wait for b
+        w.close(h);
+        drain(&mut w);
+    }
+}
+
+/// Rule 9, the same rule for a landing into a tree (a choice): main's
+/// queue waits while one of main's clients has the file open for writing.
+#[test]
+fn r9_a_landing_waits_for_the_parents_open_writer() {
+    let mut w = world(HistoryPolicy::FullLineage, CollisionScope::Line);
+    let f = w.create_fork(Tree::Main);
+    let h = w.open_write(&m1(), "a");
+    let x = w.save(&Client::Fork(f), "a", 2);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(w.waits().contains_key(&Tree::Main) && !has(&w, Tree::Main, "a", &x));
+    let y = w.write(h, Write::At(0)).unwrap().unwrap();
+    w.close(h);
+    ok(&mut w);
+    next(&mut w, Tree::Main);
+    assert!(has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "a", &y));
+    drain(&mut w);
+}
+
+/// Rule 9: while a sync holds `a`, a new write-open of `a` waits; the
+/// sync's release (an event) grants it, showing the synced file.
+#[test]
+fn r9_a_write_open_waits_while_a_sync_holds_the_file() {
+    for history in BOTH {
+        let mut w = world(history, CollisionScope::Line);
+        let f = w.create_fork(Tree::Main);
+        let m = w.save(&m1(), "a", 0);
+        take(&mut w, &Step::Next(Tree::Fork(f)));
+        assert!(w.holds()[&Tree::Fork(f)].files.contains("a"));
+        let h = w.open_write(&Client::Fork(f), "a");
+        ok(&mut w);
+        assert!(w.handle(h).waiting, "{history:?}: the open waits");
+        let other = w.open_write(&Client::Fork(f), "b");
+        assert!(!w.handle(other).waiting, "an unheld file opens at once");
+        take(&mut w, &Step::Finish(Tree::Fork(f)));
+        assert!(!w.handle(h).waiting, "the release granted it");
+        let x = w.write(h, Write::Append).unwrap().unwrap();
+        w.close(h);
+        w.close(other);
+        let a = w.read(Tree::Fork(f), "a");
+        assert_eq!((a.slot(0), a.slot(1)), (m.as_str(), x.as_str()));
+        drain(&mut w);
+    }
+}
+
+/// Rule 9, the client's death (its end event) releases its locks: its
+/// open file closes, saving its write calls, which wakes the waiting sync;
+/// its waiting open is dropped.
+#[test]
+fn r9_client_death_releases_its_locks() {
+    for history in BOTH {
+        let mut w = world(history, CollisionScope::Line);
+        let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
+        let h = w.open_write(&Client::Fork(f), "a");
+        let x = w.write(h, Write::At(1)).unwrap().unwrap();
+        let m = w.save(&m1(), "a", 0);
+        take(&mut w, &Step::Next(Tree::Fork(f)));
+        assert!(w.waits().contains_key(&Tree::Fork(f)));
+        let n = w.save(&m1(), "b", 0);
+        take(&mut w, &Step::Next(Tree::Fork(g)));
+        let waiting = w.open_write(&Client::Fork(g), "a");
+        assert!(w.handle(waiting).waiting);
+        w.end_client(f);
+        w.end_client(g);
+        ok(&mut w);
+        assert!(
+            w.waits().is_empty() && w.handles().next().is_none(),
+            "{history:?}"
+        );
+        drain(&mut w);
+        assert!(has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "a", &m));
+        assert!(has(&w, Tree::Main, "b", &n));
+    }
+}
+
+/// Rule 9, one of main's clients dies (its end event) holding `a` open
+/// for writing while main's queue waits for it, and waiting to open `b`,
+/// which a landing holds: its write calls are saved as the kernel's close
+/// on exit would, which wakes the queue; its waiting open is dropped; and
+/// no lock of it outlives it (`locks`).
+#[test]
+fn r9_a_main_clients_death_releases_its_locks() {
+    for history in BOTH {
+        let mut w = world(history, CollisionScope::Line);
+        let f = w.create_fork(Tree::Main);
+        let x = w.save(&Client::Fork(f), "b", 0);
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(w.holds()[&Tree::Main].files.contains("b"));
+        let waiting = w.open_write(&m1(), "b");
+        assert!(w.handle(waiting).waiting);
+        take(&mut w, &Step::Finish(Tree::Main));
+        w.close(waiting);
+        let h = w.open_write(&m1(), "a");
+        let y = w.write(h, Write::At(0)).unwrap().unwrap();
+        let z = w.save(&Client::Fork(f), "a", 2);
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(w.waits().contains_key(&Tree::Main), "{history:?}");
+        let m2 = Client::Main("m2".into());
+        let other = w.open_write(&m2, "d");
+        w.end_main_client("m1");
+        ok(&mut w);
+        assert!(
+            w.waits().is_empty(),
+            "{history:?}: the death woke main's queue"
+        );
+        assert!(has(&w, Tree::Main, "a", &y), "its write calls were saved");
+        assert!(!w.handle(other).waiting, "another client's open stays");
+        next(&mut w, Tree::Main);
+        assert!(has(&w, Tree::Main, "a", &z));
+        w.close(other);
+        drain(&mut w);
+        assert!(has(&w, Tree::Main, "b", &x));
+        assert!(w.handles().next().is_none());
+    }
+}
+
+/// Rule 5 with open files (a choice): a file the program opened before
+/// begin keeps writing to the sandbox, so a long-lived open file blocks no
+/// transaction. The commit is refused ([`ModelError::OpenFiles`]) only
+/// while the program itself holds open a file of the transaction, or a
+/// sandbox file the commit would write; once it closes them, it commits.
+#[test]
+fn r5_open_files_and_transactions() {
+    for history in BOTH {
+        let mut w = world(history, CollisionScope::Line);
+        let f = w.create_fork(Tree::Main);
+        let c = Client::Fork(f);
+        let log = w.open_write(&c, "d");
+        let edit = w.open_write(&c, "a");
+        w.begin(f).unwrap();
+        let s = w.save(&c, "a", 1);
+        let staged = w.open_write(&c, "b");
+        assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles), "{history:?}");
+        w.write(staged, Write::At(0)).unwrap();
+        w.close(staged);
+        assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles), "a is open");
+        let l = w.write(log, Write::Append).unwrap().unwrap();
+        w.close(log);
+        assert!(
+            has(&w, Tree::Fork(f), "d", &l),
+            "the log saves to the sandbox"
+        );
+        assert!(!l.contains('~'), "not a staged line");
+        w.close(edit);
+        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::clean()));
+        assert!(has(&w, Tree::Fork(f), "a", &s));
+        drain(&mut w);
     }
 }

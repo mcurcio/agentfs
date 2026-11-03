@@ -3,10 +3,13 @@
 //! invariant checked after each step (`agentfs_model::check`), and, once
 //! writes stop and the queues drain, convergence.
 //!
-//! On top of `check`, the run itself asserts "nothing is ever blocked or
-//! held": every save returns at once, and every step takes its queue's
-//! head (plus, under `Squashed`, the same fork's plain saves it carries as
-//! one changeset), leaving the rest of the queue in order.
+//! Clients open files, make write calls (appends, writes at an offset,
+//! whole-file rewrites of an earlier read) and close them, so takes wait
+//! for write-opens and opens wait for takes (rule 9). On top of `check`,
+//! the run itself asserts that nothing else waits: every close returns at
+//! once, and every queue step takes its queue's head (plus, under
+//! `Squashed`, the same fork's plain saves it carries as one changeset),
+//! leaving the rest of the queue in order, or records that it waits.
 //!
 //! The seeds are every seed in `1..=SEEDS`, never a set picked because it
 //! passes. `AGENTFS_MODEL_SEED=<n>` runs one seed; `AGENTFS_MODEL_SEEDS=<n>`
@@ -15,17 +18,19 @@
 //! SplitMix64 written here: fixed seeds replay exactly.
 
 use agentfs_model::check::{check, check_converged, step_checked};
-use agentfs_model::content::{Layout, PATHS};
+use agentfs_model::content::{Content, Layout, PATHS};
 use agentfs_model::git::with_reversed_dates;
 use agentfs_model::world::{
-    Client, CollisionScope, Direction, ForkId, HistoryPolicy, Life, MergeRule, Policies, Step,
-    Tree, TxnEnd, TxnOutcome, World,
+    Client, CollisionScope, Direction, ForkId, HistoryPolicy, Life, MergeRule, ModelError,
+    Policies, Step, Tree, TxnEnd, TxnOutcome, World, Write,
 };
+use std::collections::BTreeMap;
 
 /// CI runs seeds 1..=SEEDS.
 const SEEDS: u64 = 64;
 const STEPS: usize = 80;
-/// Slots the random clients write: three of four, so edits collide often.
+/// Slots the random clients write at an offset: three of six, so edits
+/// collide often and appends have room after them.
 const HOT_SLOTS: usize = 3;
 
 struct Rng(u64);
@@ -61,6 +66,15 @@ struct Tally {
     rolled_back: usize,
     forks: usize,
     nested: usize,
+    /// Queue heads that waited for a write-open, and opens that waited for
+    /// a take.
+    take_waits: usize,
+    open_waits: usize,
+    rewrites: usize,
+    /// Appends, and those two opens made to one file at once.
+    appends: usize,
+    concurrent_appends: usize,
+    main_deaths: usize,
 }
 
 fn seeds() -> Vec<u64> {
@@ -91,19 +105,33 @@ fn in_txn(w: &World) -> Vec<ForkId> {
 }
 
 /// One step ([`step_checked`]), asserting it took its queue's head (and, under `Squashed`,
-/// the entries it says it carried with it), and left the rest in order.
+/// the entries it says it carried with it), and left the rest in order, or
+/// waits and left the queue as it was.
 fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
     w.note_step(s);
     let before = match s {
-        Step::Next(t) => w.queue(*t),
+        Step::Next(t) | Step::Finish(t) => w.queue(*t),
         Step::Drop(_) | Step::Replicate => Vec::new(),
     };
     let taken = step_checked(w, s)?;
     tally.steps += 1;
+    if let Step::Finish(t) = s
+        && w.queue(*t) != before
+    {
+        return Err(format!("{s:?} changed {t:?}'s own queue"));
+    }
     if let Step::Next(t) = s
         && w.alive(*t)
     {
         let after = w.queue(*t);
+        if taken == 0 {
+            tally.take_waits += 1;
+            return if after == before && w.waits().contains_key(t) {
+                Ok(())
+            } else {
+                Err(format!("{s:?} took nothing but does not wait"))
+            };
+        }
         let mut rest = before.iter().skip(1);
         let in_order = after.iter().all(|e| rest.any(|b| b == e));
         let squash = w.policies.history == HistoryPolicy::Squashed;
@@ -117,8 +145,19 @@ fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
     Ok(())
 }
 
+/// Every program closes the files it has open (granted ones; a waiting
+/// open is closed once a take's release grants it).
+fn close_all(w: &mut World) {
+    let open: Vec<_> = w.handles().filter(|h| !h.waiting).map(|h| h.id).collect();
+    for h in open {
+        w.close(h);
+    }
+}
+
 fn drain(w: &mut World, tally: &mut Tally, at: usize) -> Result<(), (usize, String)> {
     for _ in 0..100_000 {
+        close_all(w);
+        check(w).map_err(|e| (at, e))?;
         let Some(s) = w.pending().into_iter().next() else {
             return check_converged(w).map_err(|e| (at, e));
         };
@@ -151,21 +190,42 @@ fn run_seed(seed: u64, policies: Policies, tally: &mut Tally) -> Result<String, 
     ))
 }
 
+/// Opens `p` for writing as `c` and, if granted, writes slot `slot` and
+/// closes: a save. A waiting open stays, to be written once granted.
+fn save(w: &mut World, c: &Client, p: &str, slot: usize, tally: &mut Tally) {
+    let h = w.open_write(c, p);
+    if w.handle(h).waiting {
+        tally.open_waits += 1;
+        return;
+    }
+    w.write(h, Write::At(slot)).expect("a write at an offset");
+    w.close(h);
+}
+
 fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     let mut rng = Rng(seed);
     // The line a fork wrote last. Main and forks write it again half the
     // time, so runs often build "a fork edits over its own undecided line
     // while main writes it concurrently" (coherence finding 8).
     let mut focus: Option<(&str, usize)> = None;
+    // Each client's last read of each file, which a later whole-file
+    // rewrite writes back: often stale by then.
+    let mut reads: BTreeMap<(String, String), Content> = BTreeMap::new();
+    // Main's live clients: one may die (its end event) and a new one start.
+    let mut mains: Vec<String> = vec!["m1".into(), "m2".into()];
+    let mut next_main = 3;
     for step in 0..STEPS {
         let (p, slot) = match focus {
             Some(f) if rng.below(2) == 0 => f,
             _ => (PATHS[rng.below(PATHS.len())], rng.below(HOT_SLOTS)),
         };
-        match rng.below(20) {
+        let mut clients: Vec<Client> = mains.iter().cloned().map(Client::Main).collect();
+        clients.extend(live_clients(w).into_iter().map(Client::Fork));
+        let open: Vec<_> = w.handles().filter(|h| !h.waiting).map(|h| h.id).collect();
+        match rng.below(24) {
             0..=2 => {
-                let who = if rng.below(2) == 0 { "m1" } else { "m2" };
-                w.save(&Client::Main(who.into()), p, slot);
+                let who = mains[rng.below(mains.len())].clone();
+                save(w, &Client::Main(who), p, slot, tally);
             }
             3 => {
                 let forks = live_clients(w);
@@ -183,7 +243,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             }
             4..=6 => {
                 if let Some(f) = rng.pick(&live_clients(w)) {
-                    w.save(&Client::Fork(f), p, slot);
+                    save(w, &Client::Fork(f), p, slot, tally);
                     focus = Some((p, slot));
                 }
             }
@@ -202,7 +262,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                         .is_some_and(|t| !t.staged.is_empty())
                         || rng.below(4) == 0)
                 {
-                    w.commit_txn(f).expect("open");
+                    let _ = w.commit_txn(f);
                 }
             }
             9 => {
@@ -214,10 +274,56 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 }
             }
             10 => {
-                if let Some(f) = rng.pick(&live_clients(w))
+                if rng.below(4) == 0 {
+                    // One of main's clients dies; a new one starts.
+                    let i = rng.below(mains.len());
+                    w.end_main_client(&mains[i]);
+                    tally.main_deaths += 1;
+                    mains[i] = format!("m{next_main}");
+                    next_main += 1;
+                } else if let Some(f) = rng.pick(&live_clients(w))
                     && rng.below(3) == 0
                 {
                     w.end_client(f);
+                }
+            }
+            11 => {
+                if let Some(c) = rng.pick(&clients) {
+                    let h = w.open_write(&c, p);
+                    tally.open_waits += usize::from(w.handle(h).waiting);
+                }
+            }
+            12 => {
+                if let Some(h) = rng.pick(&open) {
+                    let (c, path) = (w.handle(h).client.clone(), w.handle(h).path.clone());
+                    let call = match rng.below(3) {
+                        0 => {
+                            tally.appends += 1;
+                            let target = w.handle(h).target;
+                            tally.concurrent_appends += usize::from(
+                                w.handles()
+                                    .any(|o| o.id != h && o.target == target && o.path == path),
+                            );
+                            Write::Append
+                        }
+                        1 => Write::At(slot),
+                        _ => {
+                            tally.rewrites += 1;
+                            let read = reads.get(&(format!("{c:?}"), path.clone())).cloned();
+                            Write::Rewrite(read.unwrap_or_else(|| w.client_reads(&c, &path)))
+                        }
+                    };
+                    let _ = w.write(h, call);
+                }
+            }
+            13 => {
+                if let Some(h) = rng.pick(&open) {
+                    w.close(h);
+                }
+            }
+            14 => {
+                if let Some(c) = rng.pick(&clients) {
+                    reads.insert((format!("{c:?}"), p.to_string()), w.client_reads(&c, p));
                 }
             }
             _ => {
@@ -228,10 +334,17 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
         }
         check(w).map_err(|e| (step, e))?;
     }
-    // Writes stop: every open transaction commits or rolls back; the
-    // queues drain; every fork equals main.
+    // Writes stop: every open file closes, every open transaction commits
+    // or rolls back; the queues drain; every fork equals main.
+    close_all(w);
     for f in in_txn(w) {
         if rng.below(2) == 0 {
+            // A commit first finishes the sandbox's take, which may grant
+            // an open of a file the commit writes: close it too.
+            if w.commit_txn(f) != Err(ModelError::OpenFiles) {
+                continue;
+            }
+            close_all(w);
             w.commit_txn(f).expect("open");
         } else {
             w.rollback(f).expect("open");

@@ -9,8 +9,8 @@ use std::path::Path;
 use crate::content::{Content, EMPTY, PATHS, SLOTS, line_token, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
-    Collision, CollisionScope, Direction, Entry, ForkId, HistoryPolicy, Step, Tree, TxnEnd, TxnId,
-    TxnOutcome, World, blame_in,
+    Client, Collision, CollisionScope, Direction, Entry, ForkId, HistoryPolicy, Life, Step, Take,
+    Target, Tree, TxnEnd, TxnId, TxnOutcome, World, blame_in,
 };
 
 /// Every invariant that holds after any step.
@@ -19,6 +19,7 @@ pub fn check(w: &mut World) -> Result<(), String> {
     no_silent_loss(w, &now)?;
     no_flicker(w, &now)?;
     w.views = now;
+    locks(w)?;
     parent_wins(w)?;
     syncs_deliver(w)?;
     transactions_end_as_told(w)?;
@@ -33,36 +34,135 @@ pub fn check(w: &mut World) -> Result<(), String> {
     Ok(())
 }
 
-/// One step, with what only the step itself shows: a sync records no
-/// collision (only a parent's queue decides one), and carries the parent's
-/// head as it was when the sync was taken, read here before the step, not
-/// from the model's own record. Returns the queue entries taken.
+/// One step, with what only the step itself shows. A take (rule 9) that
+/// begins either waits, taking nothing, or holds its files; a sync's take
+/// reads the parent's head as it is then (read here before the step, not
+/// from the model's record). A take that ends writes no file a client of
+/// that tree has open for writing, nor any file it did not hold; a sync
+/// records no collision (only a parent's queue decides one) and carries
+/// the head its take read. Returns the queue entries taken.
 pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
-    let sync = match s {
-        Step::Next(t @ Tree::Fork(f)) if w.queue(*t).first() == Some(&Entry::Sync) => {
-            Some((*t, w.head(w.forks[f].parent)))
+    match s {
+        Step::Next(t) => {
+            let up = match t {
+                Tree::Fork(f) if w.queue(*t).first() == Some(&Entry::Sync) => {
+                    Some(w.head(w.forks[f].parent))
+                }
+                _ => None,
+            };
+            let taken = w.step(s);
+            if taken == 0 {
+                return match w.waits().get(t) {
+                    Some(_) if w.holds().get(t).is_none() => Ok(0),
+                    _ => Err(format!("{t:?}'s queue head neither waits nor is taken")),
+                };
+            }
+            match (up, w.holds().get(t).map(|h| &h.take)) {
+                (Some(up), Some(Take::Sync { up: read, .. })) if *read != up => Err(format!(
+                    "a sync into {t:?} read {read:.7}, not the parent's head {up:.7}"
+                )),
+                (_, None) => Err(format!("{t:?} took {taken} entries and holds nothing")),
+                _ => Ok(taken),
+            }
         }
-        _ => None,
-    };
-    let (collisions, syncs) = (w.collisions.len(), w.syncs.len());
-    let taken = w.step(s);
-    let Some((t, up)) = sync else {
-        return Ok(taken);
-    };
-    if w.collisions.len() != collisions {
-        return Err(format!(
-            "a sync into {t:?} recorded a collision: only the parent's queue decides one"
-        ));
+        Step::Finish(t) => {
+            let hold = w.holds().get(t).cloned().ok_or("no take to finish")?;
+            let open = w.write_open(*t);
+            let before = w.head(*t);
+            let (collisions, syncs) = (w.collisions.len(), w.syncs.len());
+            w.step(s);
+            let after = w.head(*t);
+            let wrote: Vec<String> = if before == after {
+                Vec::new()
+            } else {
+                git(
+                    w.repo(),
+                    &["diff-tree", "-r", "--name-only", &before, &after],
+                )
+                .lines()
+                .map(str::to_string)
+                .collect()
+            };
+            if let Some(p) = wrote.iter().find(|p| open.contains(*p)) {
+                return Err(format!(
+                    "a take into {t:?} wrote {p}, which a client there has open for writing"
+                ));
+            }
+            if let Some(p) = wrote.iter().find(|p| !hold.files.contains(*p)) {
+                return Err(format!(
+                    "a take into {t:?} wrote {p}, which it did not hold"
+                ));
+            }
+            let Take::Sync { up, .. } = &hold.take else {
+                return Ok(0);
+            };
+            if w.collisions.len() != collisions {
+                return Err(format!(
+                    "a sync into {t:?} recorded a collision: only the parent's queue decides one"
+                ));
+            }
+            match w.syncs.get(syncs) {
+                Some((_, carried, _, _)) if carried != up => Err(format!(
+                    "a sync into {t:?} carried {carried:.7}, not the head {up:.7} its take read"
+                )),
+                None if !w.is_ancestor(up, &w.head(*t)) => Err(format!(
+                    "a sync into {t:?} did nothing, but it lacks the parent's head {up:.7}"
+                )),
+                _ => Ok(0),
+            }
+        }
+        _ => Ok(w.step(s)),
     }
-    match w.syncs.get(syncs) {
-        Some((_, carried, _)) if *carried != up => Err(format!(
-            "a sync into {t:?} carried {carried:.7}, not the parent's head {up:.7}"
-        )),
-        None if !w.is_ancestor(&up, &w.head(t)) => Err(format!(
-            "a sync into {t:?} did nothing, but it lacks the parent's head {up:.7}"
-        )),
-        _ => Ok(taken),
+}
+
+/// Rule 9's locks, after every step and call. No write-open succeeds
+/// while a take holds the file in that tree. No lock outlives its holder:
+/// every open file's client is alive (and its transaction open), every
+/// take's and every wait's tree alive. Every lock wait ends on an event:
+/// a waiting queue head waits only while one of its files is still open
+/// for writing there (the last close wakes it), a waiting open only while
+/// a take holds its file (the release grants it). No timer is modelled.
+fn locks(w: &World) -> Result<(), String> {
+    for (t, hold) in w.holds() {
+        if !w.alive(*t) {
+            return Err(format!("a take outlives {t:?}"));
+        }
+        if let Some(p) = w.write_open(*t).intersection(&hold.files).next() {
+            return Err(format!(
+                "{t:?}: a write-open of {p} succeeded while a take holds it"
+            ));
+        }
     }
+    for h in w.handles() {
+        let alive = match &h.client {
+            Client::Main(n) => !w.ended_main.contains(n),
+            Client::Fork(f) => w.forks[f].life == Life::Open,
+        };
+        let held = match h.target {
+            Target::Txn(f, n) => !h.waiting && w.forks[&f].txn.as_ref().is_some_and(|x| x.id == n),
+            Target::Tree(t) => {
+                !h.waiting || w.holds().get(&t).is_some_and(|x| x.files.contains(&h.path))
+            }
+        };
+        if !alive {
+            return Err(format!("h{} outlives its client {:?}", h.id, h.client));
+        }
+        if !held {
+            return Err(format!(
+                "h{} ({:?}:{}) waits with no take holding its file, or outlives its transaction",
+                h.id, h.target, h.path
+            ));
+        }
+    }
+    for (t, files) in w.waits() {
+        let open = w.write_open(*t);
+        if !w.alive(*t) || !files.iter().any(|p| open.contains(p)) {
+            return Err(format!(
+                "{t:?}'s queue waits for {files:?}, none open for writing: no close woke it"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Once writes stop and every queue has drained: no step is left but
@@ -74,9 +174,19 @@ pub fn check_converged(w: &World) -> Result<(), String> {
     if let Some(s) = w
         .pending()
         .iter()
-        .find(|s| matches!(s, Step::Next(_) | Step::Replicate))
+        .find(|s| matches!(s, Step::Next(_) | Step::Finish(_) | Step::Replicate))
     {
         return Err(format!("not drained: {s:?} still pending"));
+    }
+    if let Some(h) = w.handles().next() {
+        return Err(format!("h{} still open at the end", h.id));
+    }
+    if !w.waits().is_empty() || !w.holds().is_empty() {
+        return Err(format!(
+            "a lock outlives the run: waits {:?}, holds {:?}",
+            w.waits(),
+            w.holds().keys().collect::<Vec<_>>()
+        ));
     }
     losers_pushed(w)?;
     for t in w.live_trees() {
@@ -397,29 +507,27 @@ fn parents(repo: &Path, c: &str, lineage: bool) -> Vec<String> {
         .collect()
 }
 
-/// Rule 3 per sync, the moment it is taken: the fork now holds the
-/// parent's line on every slot, except where it holds its own line the
-/// parent's queue has not decided yet (that line never entered the
+/// Rule 3 per sync, as of the moment its take began: the fork now holds
+/// the parent's line on every slot, except where it holds its own line the
+/// parent's queue had not decided then (that line had not entered the
 /// parent). A sync carries the parent's decided state: a fork line the
 /// parent already took is replaced by the parent's line, whichever won.
 fn syncs_deliver(w: &mut World) -> Result<(), String> {
-    let (index, upto) = &mut w.entered_index;
-    index.extend(
-        w.entered[*upto..]
-            .iter()
-            .map(|(t, e)| (*t, e.token.clone())),
-    );
-    *upto = w.entered.len();
-    for (t, up, result) in &w.syncs[w.syncs_checked..] {
+    for (t, up, result, entered) in &w.syncs[w.syncs_checked..] {
         let Tree::Fork(f) = t else {
             return Err("main synced".into());
         };
         let parent = w.forks[f].parent;
+        let took: BTreeSet<&str> = w.entered[..*entered]
+            .iter()
+            .filter(|(x, _)| *x == parent)
+            .map(|(_, e)| e.token.as_str())
+            .collect();
         for p in PATHS {
             let (u, r) = (w.file(up, p), w.file(result, p));
             for i in 0..SLOTS {
                 let (u, r) = (u.slot(i), r.slot(i));
-                let decided = r == EMPTY || w.entered_index.0.contains(&(parent, r.to_string()));
+                let decided = r == EMPTY || took.contains(r);
                 if r != u && decided {
                     return Err(format!(
                         "a sync of {up:.7} into {t:?} left {p}[{i}] at {r}, which {parent:?} already took, not its {u}"
@@ -490,7 +598,12 @@ fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
 }
 
 /// Rule 6: every commit names exactly one writer; a non-merge commit's
-/// change (its diff from its parent) is that writer's alone; a merge
+/// change (its diff from its parent) is that writer's alone, and rule 8's
+/// `O_APPEND`: in a save (cause `Direct`), each line an append wrote
+/// ([`World::appended`], recorded at the write call) sits at or after its
+/// parent's end, so it wrote over no line, another writer's append
+/// included (a landing places a line by its slot: §16's open "what a slot
+/// is"); a merge
 /// originates nothing: every line it adds over its first parent comes from
 /// another parent, and it names the writer of its second parent (a landing
 /// or a transaction's commit), or `agentfs` if it is a sync. So every token
@@ -541,6 +654,15 @@ fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
             }
         }
         for (path, slot, token) in added(diff) {
+            if cause.trim() == "Direct" && w.appended.contains(&token) {
+                let base = w.file(parents[0], &path);
+                if slot < base.end() {
+                    return Err(format!(
+                        "{commit}: append {token} wrote over {path}[{slot}] ({}), not after the end",
+                        base.slot(slot)
+                    ));
+                }
+            }
             let bad = match parents.len() {
                 0 => false,
                 1 => writer_of(&token) != writers[0],
@@ -582,8 +704,10 @@ fn added(diff: &str) -> Vec<(String, usize, String)> {
     out
 }
 
-/// A rolled-back transaction leaves no content in any tree,
-/// and no commit reachable from any ref. Each commit is grepped once,
+/// A rolled-back transaction leaves no line in any tree, and no commit
+/// reachable from any ref. A program that read its staged lines and writes
+/// their bytes back after the rollback makes new lines, its own write
+/// (rule 8). Each commit is grepped once,
 /// until a new discard adds tokens.
 fn discarded_leave_no_trace(w: &mut World, all: &[String]) -> Result<(), String> {
     if w.discarded.is_empty() {
@@ -607,9 +731,11 @@ fn discarded_leave_no_trace(w: &mut World, all: &[String]) -> Result<(), String>
     if new.is_empty() {
         return Ok(());
     }
-    let mut args: Vec<String> = vec!["grep".into(), "-l".into(), "-F".into()];
+    // Whole slot lines: a later rewrite's new line may hold a discarded
+    // line's bytes (`<writer>.<n>=<bytes>`), a new write by its program.
+    let mut args: Vec<String> = vec!["grep".into(), "-l".into(), "-E".into()];
     for t in &w.discarded {
-        args.extend(["-e".into(), t.clone()]);
+        args.extend(["-e".into(), format!("^s[0-9]+: {}$", t.replace('.', "\\."))]);
     }
     args.extend(new.iter().cloned());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
