@@ -4,12 +4,17 @@
 //! writes stop and the queues drain, convergence.
 //!
 //! Clients open files, make write calls (appends, writes at an offset,
-//! whole-file rewrites of an earlier read) and close them, so takes wait
-//! for write-opens and opens wait for takes (rule 9). On top of `check`,
-//! the run itself asserts that nothing else waits: every close returns at
-//! once, and every queue step takes its queue's head (plus, under
-//! `Squashed`, the same fork's plain saves it carries as one changeset),
-//! leaving the rest of the queue in order, or records that it waits.
+//! inserts, deletes and moves of lines, some with bytes other lines repeat,
+//! and whole-file rewrites of an earlier read) and close them, so takes
+//! wait for write-opens and opens wait for takes (rule 9); they unlink and
+//! rename files (rule 11), to a new path or over another file. On top of
+//! `check`, the run itself asserts that nothing else waits: every close
+//! returns at once, and every queue step takes its queue's head (plus,
+//! under `Squashed`, the same fork's plain saves it carries as one
+//! changeset), leaving the rest of the queue in order, or records that it
+//! waits. And it keeps its own record of every write call's bytes: each
+//! close it makes saves exactly the bytes those calls leave on the head
+//! then (rule 10's input, computed here, not by the model's replay).
 //!
 //! The seeds are every seed in `1..=SEEDS`, never a set picked because it
 //! passes. `AGENTFS_MODEL_SEED=<n>` runs one seed; `AGENTFS_MODEL_SEEDS=<n>`
@@ -18,20 +23,23 @@
 //! SplitMix64 written here: fixed seeds replay exactly.
 
 use agentfs_model::check::{check, check_converged, step_checked};
-use agentfs_model::content::{Content, Layout, PATHS};
+use agentfs_model::content::{BLANK, Content, Layout, PATHS};
 use agentfs_model::git::with_reversed_dates;
 use agentfs_model::world::{
-    Client, CollisionScope, Direction, ForkId, HistoryPolicy, Life, MergeRule, ModelError,
-    Policies, Step, Tree, TxnEnd, TxnOutcome, World, Write,
+    Client, CollisionScope, Direction, ForkId, HandleId, HistoryPolicy, Kind, Life, MergeRule,
+    ModelError, Policies, Step, Tree, TxnEnd, TxnOutcome, World, Write,
 };
 use std::collections::BTreeMap;
 
 /// CI runs seeds 1..=SEEDS.
 const SEEDS: u64 = 64;
 const STEPS: usize = 80;
-/// Slots the random clients write at an offset: three of six, so edits
-/// collide often and appends have room after them.
+/// Positions the random clients write at: the first three lines, so edits
+/// collide often.
 const HOT_SLOTS: usize = 3;
+/// Bytes the random clients give some new lines: lines that repeat others'
+/// bytes, as blank lines and braces do (rule 10).
+const REPEATED: [&str; 2] = [BLANK, "}"];
 
 struct Rng(u64);
 
@@ -74,6 +82,14 @@ struct Tally {
     /// Appends, and those two opens made to one file at once.
     appends: usize,
     concurrent_appends: usize,
+    inserts: usize,
+    deletes: usize,
+    moves: usize,
+    /// New lines whose bytes repeat other lines'.
+    repeated: usize,
+    unlinks: usize,
+    renames: usize,
+    rename_overs: usize,
     main_deaths: usize,
 }
 
@@ -145,10 +161,73 @@ fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
     Ok(())
 }
 
+/// Each open's write calls with the bytes each wrote, as the harness made
+/// them.
+type Written = BTreeMap<HandleId, Vec<(Write, String)>>;
+
+/// The bytes a program's write calls leave on `img`, the head's lines at
+/// close: the harness's own account, kept apart from the model's replay.
+fn bytes_after(mut img: Vec<String>, calls: &[(Write, String)]) -> Vec<String> {
+    for (call, x) in calls {
+        match call {
+            Write::Append => img.push(x.clone()),
+            Write::At(i) if *i < img.len() => img[*i] = x.clone(),
+            Write::At(_) => img.push(x.clone()),
+            Write::Insert(i) => img.insert((*i).min(img.len()), x.clone()),
+            Write::Delete(i) if *i < img.len() => {
+                img.remove(*i);
+            }
+            Write::Delete(_) => {}
+            Write::Move { from, to } if from != to && *from < img.len() => {
+                let l = img.remove(*from);
+                img.insert((*to).min(img.len()), l);
+            }
+            Write::Move { .. } => {}
+            Write::Rewrite(c) => img = c.texts(),
+        }
+    }
+    img
+}
+
+/// Closes `h`, asserting that the save holds exactly the bytes its write
+/// calls leave on the head now (none if the file was unlinked meanwhile).
+fn close_checked(w: &mut World, written: &mut Written, h: HandleId) -> Result<(), String> {
+    let (target, file) = (w.handle(h).target, w.handle(h).file.clone());
+    let before = w.file(&w.target_head(target), &file);
+    let calls = written.remove(&h).unwrap_or_default();
+    let expect = bytes_after(before.texts(), &calls);
+    w.close(h);
+    let after = w.file(&w.target_head(target), &file);
+    if before.name.live() && after.texts() != expect {
+        return Err(format!(
+            "close h{h} of {file}: saved {:?}, but its write calls leave {expect:?}",
+            after.texts()
+        ));
+    }
+    Ok(())
+}
+
 /// Every program closes the files it has open (granted ones; a waiting
 /// open is closed once a take's release grants it).
+fn close_all_checked(w: &mut World, written: &mut Written) -> Result<(), String> {
+    let open: Vec<_> = w
+        .handles()
+        .filter(|h| !h.waiting && h.kind == Kind::Write)
+        .map(|h| h.id)
+        .collect();
+    for h in open {
+        close_checked(w, written, h)?;
+    }
+    Ok(())
+}
+
+/// [`close_all_checked`] for opens with no write calls recorded.
 fn close_all(w: &mut World) {
-    let open: Vec<_> = w.handles().filter(|h| !h.waiting).map(|h| h.id).collect();
+    let open: Vec<_> = w
+        .handles()
+        .filter(|h| !h.waiting && h.kind == Kind::Write)
+        .map(|h| h.id)
+        .collect();
     for h in open {
         w.close(h);
     }
@@ -190,7 +269,7 @@ fn run_seed(seed: u64, policies: Policies, tally: &mut Tally) -> Result<String, 
     ))
 }
 
-/// Opens `p` for writing as `c` and, if granted, writes slot `slot` and
+/// Opens `p` for writing as `c` and, if granted, writes line `slot` and
 /// closes: a save. A waiting open stays, to be written once granted.
 fn save(w: &mut World, c: &Client, p: &str, slot: usize, tally: &mut Tally) {
     let h = w.open_write(c, p);
@@ -198,34 +277,44 @@ fn save(w: &mut World, c: &Client, p: &str, slot: usize, tally: &mut Tally) {
         tally.open_waits += 1;
         return;
     }
-    w.write(h, Write::At(slot)).expect("a write at an offset");
-    w.close(h);
+    let x = w.write(h, Write::At(slot)).expect("a write at an offset");
+    let mut written = Written::from([(h, vec![(Write::At(slot), x)])]);
+    close_checked(w, &mut written, h).expect("a save holds its bytes");
 }
 
 fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     let mut rng = Rng(seed);
-    // The line a fork wrote last. Main and forks write it again half the
-    // time, so runs often build "a fork edits over its own undecided line
-    // while main writes it concurrently" (coherence finding 8).
+    // The line a fork wrote last (its file's identity and position). Main
+    // and forks write it again half the time, so runs often build "a fork
+    // edits over its own undecided line while main writes it
+    // concurrently" (coherence finding 8).
     let mut focus: Option<(&str, usize)> = None;
-    // Each client's last read of each file, which a later whole-file
-    // rewrite writes back: often stale by then.
+    // Each client's last read of each file (by identity), which a later
+    // whole-file rewrite writes back: often stale by then.
     let mut reads: BTreeMap<(String, String), Content> = BTreeMap::new();
     // Main's live clients: one may die (its end event) and a new one start.
     let mut mains: Vec<String> = vec!["m1".into(), "m2".into()];
     let mut next_main = 3;
+    let mut next_name = 1;
+    let mut written = Written::new();
     for step in 0..STEPS {
-        let (p, slot) = match focus {
-            Some(f) if rng.below(2) == 0 => f,
+        let (f, slot) = match focus {
+            Some(x) if rng.below(2) == 0 => x,
             _ => (PATHS[rng.below(PATHS.len())], rng.below(HOT_SLOTS)),
         };
         let mut clients: Vec<Client> = mains.iter().cloned().map(Client::Main).collect();
         clients.extend(live_clients(w).into_iter().map(Client::Fork));
-        let open: Vec<_> = w.handles().filter(|h| !h.waiting).map(|h| h.id).collect();
-        match rng.below(24) {
+        let open: Vec<_> = w
+            .handles()
+            .filter(|h| !h.waiting && h.kind == Kind::Write)
+            .map(|h| h.id)
+            .collect();
+        match rng.below(30) {
             0..=2 => {
-                let who = mains[rng.below(mains.len())].clone();
-                save(w, &Client::Main(who), p, slot, tally);
+                let who = Client::Main(mains[rng.below(mains.len())].clone());
+                if let Some(p) = w.client_path(&who, f) {
+                    save(w, &who, &p, slot, tally);
+                }
             }
             3 => {
                 let forks = live_clients(w);
@@ -242,9 +331,11 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 }
             }
             4..=6 => {
-                if let Some(f) = rng.pick(&live_clients(w)) {
-                    save(w, &Client::Fork(f), p, slot, tally);
-                    focus = Some((p, slot));
+                if let Some(c) = rng.pick(&live_clients(w)).map(Client::Fork)
+                    && let Some(p) = w.client_path(&c, f)
+                {
+                    save(w, &c, &p, slot, tally);
+                    focus = Some((f, slot));
                 }
             }
             7 => {
@@ -287,43 +378,111 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                     w.end_client(f);
                 }
             }
-            11 => {
-                if let Some(c) = rng.pick(&clients) {
-                    let h = w.open_write(&c, p);
+            11 | 12 => {
+                if let Some(c) = rng.pick(&clients)
+                    && let Some(p) = w.client_path(&c, f)
+                {
+                    let h = w.open_write(&c, &p);
                     tally.open_waits += usize::from(w.handle(h).waiting);
                 }
             }
-            12 => {
+            13..=15 => {
                 if let Some(h) = rng.pick(&open) {
-                    let (c, path) = (w.handle(h).client.clone(), w.handle(h).path.clone());
-                    let call = match rng.below(3) {
+                    let (c, file) = (w.handle(h).client.clone(), w.handle(h).file.clone());
+                    let call = match rng.below(6) {
                         0 => {
                             tally.appends += 1;
                             let target = w.handle(h).target;
-                            tally.concurrent_appends += usize::from(
-                                w.handles()
-                                    .any(|o| o.id != h && o.target == target && o.path == path),
-                            );
+                            tally.concurrent_appends += usize::from(w.handles().any(|o| {
+                                o.id != h
+                                    && o.kind == Kind::Write
+                                    && o.target == target
+                                    && o.file == file
+                            }));
                             Write::Append
                         }
                         1 => Write::At(slot),
+                        2 => {
+                            tally.inserts += 1;
+                            Write::Insert(slot)
+                        }
+                        3 => {
+                            tally.deletes += 1;
+                            Write::Delete(slot)
+                        }
+                        4 => {
+                            tally.moves += 1;
+                            Write::Move {
+                                from: slot,
+                                to: rng.below(HOT_SLOTS + 2),
+                            }
+                        }
                         _ => {
+                            let read = reads.get(&(format!("{c:?}"), file.clone())).cloned();
+                            let Some(read) = read.or_else(|| {
+                                w.client_path(&c, &file).map(|p| w.client_reads(&c, &p))
+                            }) else {
+                                continue;
+                            };
                             tally.rewrites += 1;
-                            let read = reads.get(&(format!("{c:?}"), path.clone())).cloned();
-                            Write::Rewrite(read.unwrap_or_else(|| w.client_reads(&c, &path)))
+                            Write::Rewrite(read)
                         }
                     };
-                    let _ = w.write(h, call);
+                    let makes = matches!(call, Write::Append | Write::At(_) | Write::Insert(_));
+                    let made = if makes && rng.below(3) == 0 {
+                        tally.repeated += 1;
+                        let text = REPEATED[rng.below(REPEATED.len())];
+                        w.write_text(h, call.clone(), text);
+                        text.to_string()
+                    } else {
+                        w.write(h, call.clone()).unwrap_or_default()
+                    };
+                    written.entry(h).or_default().push((call, made));
                 }
             }
-            13 => {
+            16 => {
                 if let Some(h) = rng.pick(&open) {
-                    w.close(h);
+                    close_checked(w, &mut written, h).map_err(|e| (step, e))?;
                 }
             }
-            14 => {
-                if let Some(c) = rng.pick(&clients) {
-                    reads.insert((format!("{c:?}"), p.to_string()), w.client_reads(&c, p));
+            17 => {
+                if let Some(c) = rng.pick(&clients)
+                    && let Some(p) = w.client_path(&c, f)
+                {
+                    reads.insert((format!("{c:?}"), f.to_string()), w.client_reads(&c, &p));
+                }
+            }
+            18 => {
+                if rng.below(3) == 0
+                    && let Some(c) = rng.pick(&clients)
+                    && let Some(p) = w.client_path(&c, f)
+                {
+                    tally.unlinks += 1;
+                    w.unlink(&c, &p);
+                }
+            }
+            19 => {
+                if rng.below(3) == 0
+                    && let Some(c) = rng.pick(&clients)
+                    && let Some(p) = w.client_path(&c, f)
+                {
+                    // A third of renames go over another file (rename-over).
+                    let over = PATHS
+                        .iter()
+                        .filter(|g| **g != f)
+                        .filter_map(|g| w.client_path(&c, g))
+                        .collect::<Vec<_>>();
+                    match rng.pick(&over) {
+                        Some(q) if rng.below(3) == 0 => {
+                            tally.rename_overs += 1;
+                            w.rename(&c, &p, &q);
+                        }
+                        _ => {
+                            tally.renames += 1;
+                            w.rename(&c, &p, &format!("e{next_name}"));
+                            next_name += 1;
+                        }
+                    }
                 }
             }
             _ => {
@@ -336,7 +495,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     }
     // Writes stop: every open file closes, every open transaction commits
     // or rolls back; the queues drain; every fork equals main.
-    close_all(w);
+    close_all_checked(w, &mut written).map_err(|e| (STEPS, e))?;
     for f in in_txn(w) {
         if rng.below(2) == 0 {
             // A commit first finishes the sandbox's take, which may grant
