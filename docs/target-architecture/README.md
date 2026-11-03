@@ -1,44 +1,38 @@
 # Target architecture
 
-This set describes the **target** architecture of agentfs: the shape the code should move to, domain by domain. It is not a description of today's code. For how agentfs works today, read [Design](../design.md) and [Architecture](../architecture.md).
+This set describes the **target** architecture of agentfs: the shape the code should move to. It is not a description of today's code. For how agentfs works today, read [Design](../design.md) and [Architecture](../architecture.md).
 
-**Start with [agentfs in git terms](git-model.md): it is the foundation for implementation.** It describes every tree, save, landing, sync and transaction as git branches, commits and refs, as the executable model runs them, and lists where the older pages below are superseded.
+**Start with [agentfs in git terms](git-model.md): it is the foundation for implementation.** It describes every tree, save, lock, landing, sync, collision and transaction as git branches, commits and refs, as the executable model in `crates/agentfs-model` runs them. It is the one source of truth for all of that; no other page here restates it.
 
-The rest of the set is one system document and twelve domain documents. The system document names every domain, what each owns exclusively, and every contract, event and flow between them. Each domain document designs one domain's inside: its model, contract, invariants, ports, flows, tests and costs. A domain document may add internals, never a crossing the system document lacks.
+The rest of the set covers only what the git model does not: [the system](system.md) (the owner's requirements and where each is designed, the domains around the git model, their contracts and events, versions, deployment and crate layout) and one page per domain.
 
 ## Status
 
 | Document | Status |
 |---|---|
-| [agentfs in git terms](git-model.md) | proposed; the foundation for implementation; wins where the pages below disagree |
-| [The system](system.md) | approved by the owner on 2026-11-02 (revision 3); now revision 9, each change listed in its change log |
-| The twelve domain documents | proposed |
+| [agentfs in git terms](git-model.md) | proposed; the foundation for implementation; wins wherever another page disagrees |
+| [The system](system.md) | revision 10, proposed (revision 3 approved by the owner on 2026-11-02) |
+| The eight domain pages | proposed |
 
 ## Reading order
 
-1. **[agentfs in git terms](git-model.md)** first: the foundation for implementation.
-2. **[The system](system.md)**. It binds every domain page, except where the git model supersedes it.
-3. Then the domains, in the order the system's §10 lists them:
+1. **[agentfs in git terms](git-model.md)**.
+2. **[The system](system.md)**: its §5 lists the owner's requirements the git model does not design yet.
+3. The domains:
 
 | Domain | One line |
 |---|---|
-| [Rules](domains/rules.md) | pure path policy: recorded or not, class and group, what each view profile shows |
+| [Rules](domains/rules.md) | pure path policy: recorded or not, database groups, what each view profile shows |
 | [Clients](domains/clients.md) | clients, writers, grants, sessions and attachment; every capability |
-| [Views](domains/views.md) | each client's filesystem view: serving, caches, following feeds, consistency, locks |
-| [Trees](domains/trees.md) | the real filesystem: source tree, fork layers, staging, copy-up, rename into place |
-| [Forks](domains/forks.md) | lineage, path bases, pinned and transaction forks, fork space limits, ending and dropping |
-| [Journal](domains/journal.md) | one durable stream per tree, fork commit bounds, holds, the change feed, backpressure |
-| [Landing](domains/landing.md) | the one landing process: sources, units, timing and acceptance, gate, merge, verdicts |
-| [History](domains/history.md) | lines, the history setting, one-writer commits, objects, LFS, the one log's read side |
-| [Replication](domains/replication.md) | remotes, credentials, pushing, fetching, settlement, divergence |
-| [Volume](domains/volume.md) | lifecycle, start point, release verdict |
+| [Views](domains/views.md) | each client's filesystem: open files until close, what a client sees and when, consistency, caches |
+| [Trees](domains/trees.md) | where working trees live, confinement, space limits, the fork lifecycle, pinned snapshots |
+| [Replication](domains/replication.md) | remotes, credentials, pushes (the one pusher), settlement, divergence |
+| [Volume](domains/volume.md) | lifecycle, start point, release verdict, an upgrade's drain |
 | [Health](domains/health.md) | liveness of the history service and view hosts, judged from outside them |
 | [Telemetry](domains/telemetry.md) | metrics, traces and alarms that never block |
 
 ## How to read a page
 
 - Requirements credited to the owner are quoted and dated; everything else is a design choice and says so.
-- Questions for the owner are marked Q (system) or with a domain letter (QL, QJ, QH, ...), each with a recommendation and its cost.
-- Each domain page ends with its escalations to the system document and which revision resolved each.
-- Sketches are Rust and show surfaces only. Nothing here was compiled or run.
-- The owner's landing rules of 2026-11-02 and 2026-11-03 (a Linux-filesystem default; every collision between a fork and its parent decided only at the parent's landing queue, where the parent's version wins; transactions as frozen branches; squashed landings) run as an executable model on the `git` program: the `agentfs-model` crate, in plain words in its `MODEL.md`. Its tests marked `coherence finding N` assert what those rules intend but do not deliver; these pages predate those rules.
+- Sketches are Rust and show surfaces only. Nothing here was compiled or run, except the git model's rules, which run as tests in `crates/agentfs-model`.
+- The older Forks, Journal, Landing and History pages were removed on 2026-11-03: the git model replaces them. They are in git history.

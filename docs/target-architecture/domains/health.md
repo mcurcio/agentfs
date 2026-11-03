@@ -1,67 +1,39 @@
 # Domain: Health
 
 **Layer:** System › **Domain: Health** › Feature.
-**Status:** draft 4, proposed, against [system.md](../system.md) revision 7, which binds it. It describes the target, not today's code. Sketches are Rust and show surfaces only.
-**What you are asked:** nothing. No model change from your 2026-11-02 answers: former Q1 to Q3 are now design choices as recommended (§2, §6, §7); a probe refused as another version family is a `watch` error, never a verdict (§3, R16).
-**Binding from the system:** §2 (Health runs outside what it judges), §3.3 `Health`, §3.4 `LivenessChanged`, §6 compositions, §8 versions, I9, I10, I16.
+**Status:** draft 5, proposed, under [system.md](../system.md) revision 10. The target, not today's code; sketches
+are Rust surfaces. The git model (git-model.md) does not reach this domain: Health judges processes, never trees.
 
-## 1. What Health owns, its language, and what it is not
+## 1. What Health owns, and what it is not
 
-Health answers one question: is this history service, or this view host, alive? It judges from outside, by probing, and it decides nothing else.
-
-**What this domain rests on.** None of these are new owner requirements; each is a rule this page must obey.
+Health answers one question: is this history service, or this view host, alive? It judges from outside, by probing,
+and decides nothing else.
 
 | Source | Words | What it asks of Health |
 |---|---|---|
-| global rules, owner 2026-10-24 | "It's all event driven"; health is its own process, never judged from another domain's missed events | probes are Health's own process; everything it can learn from an event, it learns from the event |
+| global rules, owner 2026-10-24 | "It's all event driven"; health is its own process, never judged from another domain's missed events | probes are Health's own process |
 | global rules, owner 2026-10-08 | verification "checks a capability, not a status that can stay green while the capability is dead" | a probe proves work is being finished, not that a socket answers |
-| system I9, I10 | Health is the judge of liveness; its probes are one of the only timers | no other domain judges liveness; Health uses its clock for nothing else |
-| system §2 | "Health decides nothing": not "any landing or serving decision" | no landing, attachment or file call waits on, or branches on, a verdict |
-| catalogue O6 | "Is there a health judge of its own (not inferred from missing events) that tells clients and operators? Wrong if: clients hang with no alarm." | a stuck history service becomes a published verdict that Telemetry can alarm on |
+| system S4, S5 | Health is the one judge of liveness; its probes are one of the only timers | no other domain judges liveness |
 
 | Term | Meaning here | Is not |
 |---|---|---|
 | **component** | one running history service or one view host, in one incarnation | a client, a view, a pod |
-| **incarnation** | one run of a component; a restart is a new incarnation, judged from scratch | a version |
-| **watch** | Health's record that it judges one component, and how | a subscription to its events |
-| **probe** | one question to a component, asked from outside, with a deadline: "how much work have you finished, and what are you holding?" | a ping that only proves the socket is open |
-| **probe report** | the answer: work finished so far, calls in hand, and which of those are parked | a metric |
-| **parked** | a call waiting on another component's named event (`ServiceReady`, a landing's gate) | stuck |
+| **incarnation** | one run of a component; a restart is judged from scratch | a version |
+| **probe** | one question asked from outside, with a deadline: "how much work have you finished, and what are you holding?" | a ping |
+| **parked** | a call waiting on a named event (`ServiceReady`, a take's release of a file) | stuck |
 | **stall** | calls in hand that are not parked, and no work finished since the last answer | a slow call |
-| **gone signal** | the process exited (its own exit event), or the kernel says its endpoint is closed | a missed probe |
-| **liveness** | `Live`, `Unresponsive` (a suspicion), or `Gone` (a fact) | readiness: `ServiceReady` is the service's own event |
+| **gone signal** | the process exited, or the kernel says its endpoint is closed | a missed probe |
+| **liveness** | `Live`, `Unresponsive` (a suspicion), or `Gone` (a fact) | readiness (`ServiceReady`) |
 
-**Not this domain:** restarting anything (the launcher that started it), alarms (Telemetry, the one home of alarms), whether a client is attached (Clients), whether the service has finished restoring (`ServiceReady`), the judging of Health's own host process (the platform's probe, system §6).
+**Not this domain:** restarting anything (the launcher's policy), alarms (Telemetry), attachment (Clients), judging
+Health's own host (the platform's probe).
 
 ## 2. The model
 
 ```mermaid
-flowchart LR
-  subgraph AGG["aggregate: Watch, one per component incarnation"]
-    W["component, endpoint, gone source, policy"]
-    S["Judgement: verdict, streak, last report, probe in flight"]
-  end
-  P["ProbePolicy per component kind (config)"]
-  W --- S
-  P -.-> W
-```
-
-| Kind | Name | Holds | Why it is its own thing |
-|---|---|---|---|
-| aggregate | `Watch` | one component incarnation: where to probe, its gone source, its judgement | each component is judged alone; one never moves another's verdict |
-| value | `Component`, `Incarnation`, `HostId` | identity (§3) | a restart is a new component, so an old verdict never sticks to the new run |
-| value | `ProbeReport`, `ProbeOutcome`, `GoneSignal` | what a probe or the kernel said | inputs to a pure judge |
-| value | `Streak` | consecutive bad, or good, probes | the only memory the judgement needs |
-| config | `ProbePolicy` | interval, deadline, thresholds | data per component kind (§7) |
-
-**The liveness lifecycle,** Health's own. A probe can only move between `Live` and `Unresponsive`; only a gone signal reaches `Gone`.
-
-```mermaid
 stateDiagram-v2
   [*] --> Live: watch (not judged otherwise yet)
-  Live --> Live: good probe
   Live --> Unresponsive: failure_threshold bad probes in a row
-  Unresponsive --> Unresponsive: bad probe
   Unresponsive --> Live: recovery_threshold good probes in a row
   Live --> Gone: gone signal
   Unresponsive --> Gone: gone signal
@@ -73,253 +45,106 @@ stateDiagram-v2
 | Probe outcome | Good or bad |
 |---|---|
 | answered by the deadline, and work finished since the last answer | good |
-| answered by the deadline; nothing finished, but every call in hand is parked, or none is in hand | good (idle, or waiting by design) |
-| answered by the deadline; nothing finished, and some call in hand is not parked | bad (a stall) |
+| answered; nothing finished, but every call in hand is parked, or none is in hand | good (idle, or waiting by design) |
+| answered; nothing finished, and some call in hand is not parked | bad (a stall) |
 | no answer by the deadline, or an I/O error that is not "closed" | bad |
-| the endpoint is closed (connection refused, `ENOTCONN` on the mount) | not a probe result: a gone signal |
-| the peer refuses the probe link as another family (`OtherFamily`, I16) | not a probe result: `watch` fails (§3), no verdict |
+| the endpoint is closed | a gone signal, not a probe result |
+| the peer refuses the probe link as another family | `watch` fails, no verdict |
 
-So a history service replaying a long journal stays `Live` (replayed records are finished work), and a view host whose calls wait for `ServiceReady` stays `Live` (they are parked): one component's outage never becomes another's verdict.
-
-**Before its first answer a component is `Live`, read as "not judged otherwise"** (design choice, as Kubernetes' liveness probes; was Q1). Cost: after Health's own host restarts, a hung component reads `Live` for one judgement window. Rejected: a fourth value, `Unjudged`, which every consumer would have to handle.
+So a view host whose write-opens wait for a take, or whose calls wait for `ServiceReady`, stays `Live`: one
+component's wait never becomes another's verdict. **Before its first answer a component is `Live`** (design choice,
+as Kubernetes' liveness probes). Cost: after Health's host restarts, a hung component reads `Live` for one window.
 
 ## 3. Public contract
 
-`Health`, `Probed`, `Component` and `LivenessChanged` are system §3.1, §3.3 and §3.4. `HealthError` is this page's.
-
 ```rust
-// ── identity (system §3.1) ──
-pub enum Component {
-    HistoryService { area: StateAreaId, run: Incarnation }, // one per state area (I15)
-    ViewHost { host: HostId, run: Incarnation },            // serves one or more views
-}
-pub struct HostId(/* private */);   // minted by the launcher that starts the host
-pub struct Incarnation(u64);        // a restart is a new one
-
 pub enum Liveness {
     Live,          // answered and progressing, or not yet judged otherwise
-    Unresponsive,  // a suspicion: the probes say it stalled or went silent
+    Unresponsive,  // a suspicion
     Gone,          // a fact: it exited, or its endpoint closed
 }
-
-// ── the trait ───────────────────────────────────────────────
 pub trait Health {
     fn liveness(&self, c: Component) -> Option<Liveness>;             // None: not watched
     fn watch(&mut self, c: Component, at: ProbeTarget, by: &LaunchCap) -> Result<(), HealthError>;
     fn forget(&mut self, c: Component, by: &LaunchCap) -> Result<(), HealthError>; // before an asked-for stop
 }
-pub struct ProbeTarget {
-    endpoint: Endpoint,     // where the component answers probes; never inside a view (I8)
-    gone: GoneSource,
-}
+pub struct ProbeTarget { endpoint: Endpoint, gone: GoneSource } // never inside a view
 pub enum GoneSource {
     OwnChild(ProcessRef),   // the caller started it: its exit is the event
     EndpointOnly,           // started elsewhere: only "endpoint closed" says Gone
 }
-pub enum HealthError {
-    NotPermitted,   // the launcher did not start this component
-    SelfWatch,      // the component is Health's own process (H3)
-    AlreadyWatched, // watch is idempotent on the same target; a different target is refused
-    OtherFamily(Version), // watch opens the probe link; a peer of another major.minor refuses it (I16)
-    Unknown,        // forget of a component not watched
-}
+pub enum HealthError { NotPermitted, SelfWatch, AlreadyWatched, OtherFamily(Version), Unknown }
 
-// ── what each judged component serves (system §3.3) ─────────────────
-pub trait Probed {
-    fn report(&self) -> ProbeReport; // answered by the component's own dispatcher, not a side thread
+pub trait Probed {          // served by the history service and each view host, by the dispatcher itself
+    fn report(&self) -> ProbeReport;
 }
 pub struct ProbeReport {
-    finished: Counter, // units of work done this incarnation: calls answered, records replayed, landings written
-    in_hand: u32,      // calls received and not finished
-    parked: u32,       // of those, waiting on another component's named event
+    finished: Counter,      // calls answered, saves committed, takes written, this incarnation
+    in_hand: u32,           // calls received and not finished
+    parked: u32,            // of those, waiting on a named event
 }
 ```
 
-**Events.**
+Published: `LivenessChanged{component, liveness}` (launchers, Telemetry). Consumed: nothing; inputs are probe
+outcomes, gone signals, `watch` and `forget`.
 
-| Published | Fields | When | Consumers |
-|---|---|---|---|
-| `LivenessChanged` | component, liveness | each change of verdict, once, in order per component | launchers (restart in place: their policy), Telemetry (alarms) |
-
-Health consumes no domain event. Its inputs are probe outcomes, gone signals, and `watch` and `forget`.
-
-**Who calls Health, and whom it calls.**
-
-| Direction | Party | Through |
-|---|---|---|
-| in | launchers (sidecar supervisor, view hosts' launcher, CSI node plugin) | `watch`, `forget`, with the `LaunchCap` that started the component |
-| in | the status edge, launchers | `liveness` |
-| out | the history service, each view host | `Probed::report`, over the edge's own link (§5) |
-| out | launchers, Telemetry | `LivenessChanged` |
-
-No domain of the history service calls Health or receives a Health handle (H1).
-
-## 4. Invariants and how they are enforced
+## 4. Invariants
 
 | # | Invariant | Enforced by | Strength |
 |---|---|---|---|
-| H1 | No domain decision waits on or branches on liveness: only launchers and Telemetry react to it (system §2, I9) | clippy `disallowed_types` bans `Liveness`, `LivenessChanged` and `dyn Health` in every domain crate but `health`; the composition root injects the Health reader only into launchers and the status edge | build time + construction time |
-| H2 | `Gone` comes only from a gone signal, never from a timeout | the pure judge's probe path returns `Responsiveness { Live, Unresponsive }`, a type with no `Gone`; only `on_gone(GoneSignal)` yields `Gone` | compile time |
-| H3 | Health never judges its own process (system §2: "outside what it judges") | `watch` refuses a component whose process is Health's (`SelfWatch`); the composition root refuses to start a composition where it would have to | boot time |
-| H4 | At most one probe per component is in flight, so a hung component costs one waiting probe, not one per interval | `Watch` starts a probe only by taking its single `ProbeSlot`; only the probe's completion or its deadline gives it back, and a probe still stuck in the kernel keeps it | construction time + test |
-| H5 | Parked calls never count against a component | the bad-probe rule reads `in_hand - parked` (table in §2); a component reports what it waits on, Health never infers it | test |
-| H6 | A verdict never outlives its incarnation: a restarted component starts fresh | `Incarnation` is part of `Component`; `watch` of a new incarnation is a new `Watch` | compile time |
-| H7 | Health keeps no persisted state, so no stale verdict survives a restart and nothing is a cache of a component | the `health` crate has no repository port; `cargo deny` bans `store` from it | build time |
-| H8 | Health's clock serves probes and deadlines only (I10) | the `Clock` port is used by the probe scheduler alone; the judge is pure and takes no clock | construction time + review |
+| H1 | No domain decision waits on or branches on liveness: only launchers and Telemetry react | clippy bans `Liveness` and `dyn Health` in every other domain crate | build + construction time |
+| H2 | `Gone` comes only from a gone signal, never from a timeout | the probe path returns a type with no `Gone` | compile time |
+| H3 | Health never judges its own process | `watch` refuses it (`SelfWatch`) | boot time |
+| H4 | At most one probe per component is in flight | a single probe slot per watch | construction time + test |
+| H5 | Parked calls never count against a component | the bad-probe rule reads `in_hand - parked` | test |
+| H6 | A verdict never outlives its incarnation | `Incarnation` is part of `Component` | compile time |
+| H7 | Health persists nothing | no repository port; `cargo deny` bans `store` | build time |
 
-## 5. Ports and adapters
+Ports: `Prober` (the service's Unix socket; a view host over its launcher's link), `GoneSignals` (pidfd exit, endpoint
+refusal), `Clock` (probes and deadlines only), `Publish`.
 
-The domain crate holds the pure judge and the probe scheduler; every effect is a port.
-
-```rust
-pub trait Prober {                                   // one probe, bounded by a deadline
-    fn probe(&self, at: &Endpoint, by: Deadline) -> PendingProbe; // completes as ProbeOutcome or a GoneSignal
-}
-pub trait GoneSignals {                              // the event source for Gone
-    fn watch(&self, s: &GoneSource) -> GoneFeed;     // a child's exit; an endpoint closing
-}
-pub trait Clock {                                    // probes and deadlines only (H8)
-    fn now(&self) -> Instant;
-    fn wake_at(&self, t: Instant) -> Wake;
-}
-pub trait Publish {                                  // the composition's event bus; never blocks
-    fn publish(&self, e: LivenessChanged);
-}
-pub enum ProbeOutcome { Answered(ProbeReport), NoAnswerBy(Deadline), Failed(IoKind) }
-pub enum GoneSignal { Exited(ExitStatus), EndpointClosed }
-```
-
-| Port | Adapter | Notes |
-|---|---|---|
-| `Prober`, history service | `rpc`: the service's Unix socket, one `report` call answered by the dispatcher that serves every other call | peer credentials as today; a sandbox cannot reach it |
-| `Prober`, view host | the launcher's existing link to the host it started (for the code architects); never a path in a view (I8) | a mount's `ENOTCONN` maps to `EndpointClosed` |
-| `GoneSignals` | `OwnChild`: the process's exit notification (Linux pidfd); `EndpointOnly`: the probe's connection refusal | an event, never a deadline |
-| `Clock` | monotonic clock | |
-| `Publish` | the composition's in-process event bus; Telemetry is one subscriber | Health and its launcher run in one process (§6 table) |
-
-**Persistence: none, by design.** Health stores no record, so no repository, audit stamp or migration exists here (H7). A verdict is rebuilt in one judgement window; storing it would make a cache that could disagree with the component itself.
-
-## 6. Internal flows and scenarios
-
-**A hung view host is judged and restarted in place.**
-```mermaid
-sequenceDiagram
-  participant La as launcher
-  participant H as Health
-  participant VH as view host (run 1)
-  participant T as Telemetry
-  La->>H: watch(ViewHost h run 1, endpoint, OwnChild)
-  loop every interval, one probe in flight
-    H->>VH: report(), deadline
-    VH-->>H: finished 812, in hand 3, parked 0
-  end
-  Note over VH: hung: its calls stop finishing
-  H->>VH: report(), deadline
-  Note over H: no answer: bad 1 ... bad failure_threshold
-  H--)La: LivenessChanged(h run 1, Unresponsive)
-  H--)T: the same event: Telemetry raises the alarm
-  La->>H: forget(h run 1)
-  La->>VH: kill; start run 2 over the same mount point (its policy)
-  La->>H: watch(ViewHost h run 2, ...)
-```
-Killing run 1 closes its sessions, so Clients ends its attachments, Landing drops its write-opens and reconciles them (system §5). The restarted host attaches new clients; a sandbox's gets a new fork, because a fork has one writer for life (system cost 8).
-
-**A stuck history service, against a busy one.**
-```mermaid
-sequenceDiagram
-  participant H as Health
-  participant S as history service
-  participant VH as view host
-  H->>S: report()
-  S-->>H: finished 9,100, in hand 40, parked 0
-  H->>S: report()
-  S-->>H: finished 9,100, in hand 52, parked 0
-  Note over H: a stall: bad 1. failure_threshold of these: Unresponsive
-  H->>VH: report()
-  VH-->>H: finished 30,050, in hand 6, parked 6 (waiting on the service)
-  Note over H: the host is Live: its calls wait on a named event, by design
-```
-A service replaying a long journal answers with `finished` rising, so it stays `Live` however long the replay takes.
-
-**Behaviour in the system's scenarios.**
+## 5. Scenarios
 
 | Scenario | What Health does | What it never does |
 |---|---|---|
-| Live landing, sync, resolver chain | nothing: a view waiting on a freeze (`GateFell`) is parked, so a long wait, a slow resolver or the agent resolver never looks like a hung host; the chain runs as landing work, not as a call in hand | slow a landing or a sync, or let a verdict cancel one |
-| Transactions | nothing; a transaction's fork and landing are finished work of the service | know a transaction exists |
-| Scale: 1,000 sandbox view hosts | one `Watch` and one probe per host per interval (100 probes a second at a 10 s interval, placeholder); probes are spread across the interval | probe through a view, or put a host id in a metric label |
-| Crash: a view host | its exit is the gone signal: `Gone` at once, no probe window | wait for probes to fail first |
-| Crash: the history service | `Gone` from its exit (or its socket closing); the new run is a new watch. While it restores, view hosts stay `Live` (parked) | judge view hosts by the service's outage |
-| Crash: Health's own host | every watch is lost; nothing else changes, since nothing waits on Health. On restart the launcher reconciles and re-watches; verdicts start fresh (§2). The platform's probe judges this process | persist or replay verdicts |
-| Disk full | nothing of its own: a service that answers calls with `NoSpace` still finishes them, so it stays `Live`; space alarms are Telemetry's | call a full disk a liveness fault |
-| Upgrades (system §8) | a patch swap is a new incarnation: `forget`, then `watch`. A drain stops each component after `forget`. A peer of another family fails `watch` with `OtherFamily` | judge a version mismatch as liveness; migrate state: there is none |
+| A take waits on a file a client holds open | nothing: the waiting write-opens are parked; the take is the service's work in hand only if the service reports it unparked | judge a long lock wait as a hang |
+| A view host hangs (`SIGSTOP`) | `Unresponsive` after threshold × interval + deadline; its launcher restarts it in place (a sandbox's on a new fork) | judge main's host by it |
+| A view host or the service exits | `Gone` at once from its exit | wait for probes to fail first |
+| Health's own host crashes | every watch is lost; nothing else changes; the launcher re-watches | persist or replay verdicts |
+| Disk full | nothing: a service answering with `NoSpace` still finishes calls | call a full disk a liveness fault |
 
-**The node plugin watches the view hosts an in-pod launcher starts (CSI),** told by that launcher's `watch` with its `ForksItCreates` authority, using `EndpointOnly` (design choice, system §6; was Q2). Cost: such a host is `Gone` only when its endpoint closes, not the instant it exits; the probe link to a pod's host is new edge work. Rejected: a Health inside the pod, sharing it with what it judges.
+| Policy | Current choice (design choice) |
+|---|---|
+| `ProbePolicy`, per component kind | interval 10 s, deadline 1 s, failure 3, recovery 1 (placeholders, Kubernetes' defaults) |
+| Who may watch | the launcher whose `LaunchCap` started the component |
+| An `Unresponsive` history service | restarted by its launcher after a longer, separate window (a launcher setting). Cost: unsaved write calls go with it (git-model §16) |
+| CSI in-pod view hosts | watched by the node plugin, told by the in-pod launcher's `watch`, `EndpointOnly` |
 
-## 7. Policies and configuration Health owns
+## 6. Tests
 
-| Policy | Values | Current choice | Source |
-|---|---|---|---|
-| `ProbePolicy`, per component kind | interval, deadline, `failure_threshold`, `recovery_threshold` | placeholders after Kubernetes' defaults: 10 s, 1 s, 3, 1; set at the code-architect gate | design choice |
-| The bad-probe rule | §2 table | fixed | design choice: a capability check, not a socket check |
-| Who may watch | the launcher whose `LaunchCap` started the component | fixed | design choice, from system §3.2 |
+| Test | Rules out |
+|---|---|
+| `SIGSTOP` a sandbox's view host: `Unresponsive`; main's host stays `Live` | a hung host nobody notices |
+| `SIGKILL` a view host: `Gone` before one probe interval | `Gone` judged from missed probes (H2) |
+| A failpoint holds the service's dispatcher while its socket accepts: `Unresponsive` | a status green while the capability is dead |
+| A take waits an hour on an open file: every component stays `Live` | a lock wait read as a hang |
+| A probe stuck in the kernel for 100 intervals: one probe in flight | probe pile-up (H4) |
 
-Restart and backoff after a verdict are each launcher's policy, not Health's. Health raises no alarm itself.
+## 7. Costs
 
-**An `Unresponsive` history service is restarted by its launcher once the verdict has lasted a longer, separate window** (a launcher setting; design choice, was Q3). A stuck service never heals alone, and the journal makes the restart safe. Cost: a call that finishes nothing for that long is killed and retried, and could loop. Rejected: alarm only, where clients wait blocked until an operator acts.
+1. **Probes are a timer:** `Unresponsive` arrives late and can be wrong.
+2. **Components must report honestly:** one that hides a wait as parked hides its own stall.
+3. **Restart in place ends a hung host's clients** and loses their unsaved write calls.
 
-## 8. Tests that prove it
-
-Each runs the real binaries: a launcher with Health, the real history service and real view hosts on a FUSE mount. Faults come from signals and from failpoints compiled into a test build of the same binary.
-
-| Test | Proves | Rules out |
-|---|---|---|
-| `SIGSTOP` a sandbox's view host | `Unresponsive` within threshold × interval + deadline; one `LivenessChanged`; main's host stays `Live` and keeps serving | a hung host nobody notices; one host's verdict touching another |
-| `SIGKILL` a view host | `Gone` before one probe interval passes | `Gone` judged from missed probes (H2) |
-| A failpoint holds the service's dispatcher while its socket still accepts | `Unresponsive` (a stall), and Telemetry's alarm fires | a status that stays green while the capability is dead (O6) |
-| Restart the service with a large journal to replay | `Live` throughout; view hosts with calls waiting stay `Live` | restart loops during recovery; cascading verdicts |
-| A view host's probe stuck in the kernel for 100 intervals | one probe in flight, thread count flat, verdict `Unresponsive` | probe pile-up (H4) |
-| `forget`, then stop the component | no `LivenessChanged(Gone)`, no restart | a launcher restarting what it stopped on purpose |
-| Kill Health's host during a landing in `Writing` | the landing lands; attachments unchanged; on restart every component is re-watched | any domain depending on Health (H1) |
-| Fill the state area while clients write | the service stays `Live`; only space alarms fire | a full disk read as a dead service |
-| `watch` the composition's own process; with another launcher's authority; a view host one minor apart | `SelfWatch`; `NotPermitted`; `OtherFamily`, no verdict | a judge inside what it judges (H3); a sandbox launcher watching main's host; a version mismatch read as a dead host |
-| Build checks: a domain crate naming `Liveness`; a probe path returning `Gone` | clippy fails; the code does not compile | H1 and H2 eroding by convention |
-
-## 9. Costs and open questions
-
-**Costs.**
-1. **Probes are a timer.** `Unresponsive` is a suspicion that arrives late (up to threshold × interval + deadline) and can be wrong: one long step that finishes nothing looks like a stall.
-2. **Components must report.** Each judged component counts finished, in-hand and parked work honestly; a component that hides a wait as parked hides its own stall.
-3. **No memory.** After Health's host restarts, a hung component reads `Live` for one window (§2).
-4. **Probe load grows with hosts:** one probe per host per interval.
-5. **Restart in place ends a hung host's clients;** a sandbox's restarted host starts on a new fork; a stuck service's restart (§7) can loop.
-
-No open questions.
-
-## 10. Escalations to the system document
-
-None open against revision 7. Earlier ones, all adopted: `watch`, `forget` and `Option` liveness (E1); `Component`, `HostId` (E2); `Probed::report` (E3); the sidecar's service as the supervisor's child (E4); CSI's in-pod hosts watched by the node plugin (E5, system §6); `forget` before an asked-for stop (E6).
-
-## New terms
-
-| Term | Definition | Why needed | Could be the existing term |
-|---|---|---|---|
-| component, incarnation | a history service or view host; one run of it | the thing Health judges; a restart starts fresh | today's front, service child |
-| probe report | finished, in-hand and parked work, answered by the component | a capability check, not a socket check | `grpc.health.v1` serving status |
-| parked, stall | a call waiting on another's named event; unparked calls with no work finished | keeps one outage from becoming another's verdict | none |
-| gone signal | a process exit or a closed endpoint | `Gone` as an event, not a guess | today's stale mount, child exit |
-| `HostId` | a view host's identity | `Component` needs one | none |
-
-## For the code architects (parked)
-The probe link to a view host (the launcher's existing child link, never a mount path); how probes spread across an interval; how a probe stuck in the kernel is abandoned without leaking a thread per interval; the units of `finished` for long steps (bytes of a merge or upload), so they show progress; the `Prober`'s mapping of errors to `EndpointClosed`; how `liveness` reaches the read-only `status` command.
-
-**Prior art.** Kubernetes liveness and startup probes (period, timeout, failure and success thresholds); the gRPC health checking protocol and the CSI livenessprobe sidecar (today's); unreliable failure detectors (Chandra and Toueg: a probe yields a suspicion, never a fact); Linux pidfd exit notification; the Linux hung-task detector and systemd's watchdog (judge progress, not presence); Erlang/OTP supervisors (the detector and the restart policy are separate). Rejected: phi-accrual detectors (Cassandra, Akka), more than a fixed threshold needs here.
+**Prior art.** Kubernetes liveness probes; the gRPC health protocol; unreliable failure detectors (Chandra and Toueg);
+Linux pidfd; systemd's watchdog; Erlang/OTP supervisors (detector and restart policy apart).
 
 ## Reconcile with existing code (agentfs origin/main b5c0dc8)
-- **`HistoryClient::ping`** is one `grpc.health.v1` Check, `Serving` or not: it stays green while the dispatcher is stuck. It becomes `report()`. Cost: a protocol addition on both ends.
-- **The CSI supervisor** restarts a child that exits unasked, with backoff, and recovers stale mounts at reconcile. Exit-based restart is kept, now as `LivenessChanged(Gone)` from Health; the supervisor gains `Unresponsive` handling. Cost: the supervisor's restart path moves behind one event.
-- **`MountState { Live, Stale, Foreign, NotMounted }`** (fuse `mount.rs`) stays as the `Prober` adapter's view of a mount; `Stale` is a gone signal.
-- **The `AgentfsHistoryServiceUnreachable` alert** fires on a front's failed request: health judged from another component's signal. It moves to Telemetry, driven by `LivenessChanged`.
-- **`restore::Liveness`** (write-opens and "stopping") is not liveness in this sense; it becomes Landing's write-opens. Only the name clashes.
 
-**NOT RUN:** no code was built or tested. pidfd exit notification across the CSI node plugin's process tree, kernel behaviour of a probe stuck on a hung FUSE mount, and the cost of 100 probes a second were not measured.
+- **`HistoryClient::ping`** (one `grpc.health.v1` Check) becomes `report()`.
+- **The CSI supervisor's** exit-based restart is kept as `LivenessChanged(Gone)`; it gains `Unresponsive` handling.
+- **The `AgentfsHistoryServiceUnreachable` alert** moves to Telemetry, driven by `LivenessChanged`.
+
+**NOT RUN:** pidfd across the CSI node plugin's process tree and a probe stuck on a hung FUSE mount were not tested.
+
+*History: drafts 1–4 are in git; draft 5 (2026-11-03) conforms to the git model.*
