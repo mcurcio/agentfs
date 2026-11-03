@@ -14,7 +14,9 @@
 //! landing queue, per line: a line written over the parent's replaces it,
 //! and of two concurrent lines the parent's wins. A sync decides nothing:
 //! the fork takes the parent's decided version, keeping only its own lines
-//! still on their way to that queue.
+//! still on their way to that queue. Every losing commit keeps a collision
+//! ref, which a separate Replication step pushes with main to a bare shared
+//! remote.
 //! [`check`] holds the invariants, read back from the repository after
 //! every step.
 //!

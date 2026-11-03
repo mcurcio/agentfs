@@ -96,7 +96,7 @@ fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
     w.note_step(s);
     let before = match s {
         Step::Next(t) => w.queue(*t),
-        Step::Drop(_) => Vec::new(),
+        Step::Drop(_) | Step::Replicate => Vec::new(),
     };
     let taken = step_checked(w, s)?;
     tally.steps += 1;

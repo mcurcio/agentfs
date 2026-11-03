@@ -338,6 +338,88 @@ fn r3_an_edit_over_the_decided_line_replaces_it() {
     assert_eq!(w.collisions.len(), 1);
 }
 
+/// Rule 3c, a save after the sync (owner, 2026-11-03: "if the program
+/// saves after the sync has landed, then arguably the sandbox was the last
+/// writer and its change should take effect"). A save's first parent is
+/// the tree's head when it is made, so whatever the tree held then counts
+/// as seen. The sandbox has its own unlanded line b, so main's m arrives
+/// as a sync commit (a `Sync` merge naming `agentfs`, main's commit
+/// second); the sandbox's y on m's line is written over m and replaces it
+/// in main by lineage, with no collision.
+#[test]
+fn r3_a_save_after_the_sync_wins_upstream_by_lineage() {
+    for history in BOTH {
+        let mut w = world(history, CollisionScope::Line);
+        let f = w.create_fork(Tree::Main);
+        w.save(&Client::Fork(f), "b", 0);
+        let m = w.save(&m1(), "a", 0);
+        next(&mut w, Tree::Fork(f)); // the sync lands in the sandbox
+        let synced = w.head(Tree::Fork(f));
+        assert_eq!(
+            show(&w, &synced, "%(trailers:key=Agentfs-Cause,valueonly)"),
+            "Sync",
+            "{history:?}: a sync commit, the sandbox has an unlanded line"
+        );
+        assert!(has(&w, Tree::Fork(f), "a", &m));
+        let y = w.save(&Client::Fork(f), "a", 0);
+        assert_eq!(
+            show(&w, &w.head(Tree::Fork(f)), "%P").split(' ').next(),
+            Some(synced.as_str())
+        );
+        drain(&mut w);
+        assert!(
+            has(&w, Tree::Main, "a", &y),
+            "{history:?}: the sandbox's later save wins"
+        );
+        assert!(
+            w.collisions.is_empty(),
+            "{history:?}: written over m, no collision"
+        );
+    }
+}
+
+/// Rule 3b, a save before the sync arrives: main writes m first, but the
+/// sandbox saves x on the same line while main's sync still waits in the
+/// sandbox's queue. x's first parent is the head the sandbox held, without
+/// m, so x and m are concurrent whatever order they were written in, and
+/// main's m wins at main's queue. The sandbox shows x, then m, never x
+/// again; Replication, a step of its own, then pushes x to the shared
+/// remote, naming its writer.
+#[test]
+fn r3_a_save_before_the_sync_arrives_loses_to_the_parent() {
+    for history in BOTH {
+        let mut w = world(history, CollisionScope::Line);
+        let f = w.create_fork(Tree::Main);
+        let m = w.save(&m1(), "a", 0);
+        assert_eq!(w.queue_len(Tree::Fork(f)), 1, "main's sync waits");
+        let x = w.save(&Client::Fork(f), "a", 0);
+        let xc = w.head(Tree::Fork(f));
+        ok(&mut w);
+        assert!(
+            has(&w, Tree::Fork(f), "a", &x),
+            "the sandbox reads its own write"
+        );
+        drain(&mut w);
+        assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Fork(f), "a", &m));
+        let lost: Vec<(Tree, Vec<String>, Vec<String>)> = w
+            .collisions
+            .iter()
+            .map(|c| (c.tree, c.lost.clone(), c.won.clone()))
+            .collect();
+        assert_eq!(
+            lost,
+            [(Tree::Main, vec![x.clone()], vec![m.clone()])],
+            "{history:?}"
+        );
+        assert!(
+            !w.pending().contains(&Step::Replicate),
+            "{history:?}: drained, Replication included"
+        );
+        let pushed = git(w.remote(), &["rev-parse", &w.collisions[0].reference]);
+        assert_eq!(pushed, xc, "{history:?}: the loser is on the shared remote");
+    }
+}
+
 /// Rule 3, "a sync carries the parent's current version, never a stale
 /// change": main writes m1 then m2 over it, queueing two syncs. The first
 /// sync brings m2 directly; the sandbox never shows m1.

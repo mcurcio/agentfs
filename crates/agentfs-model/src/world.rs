@@ -3,10 +3,10 @@
 //!
 //! | Rule (MODEL.md) | Here |
 //! |---|---|
-//! | 1. Like a Linux filesystem | [`World::save`] never fails; a save is a commit on the writer's tree at once |
+//! | 1. Like a Linux filesystem | [`World::save`] never fails; a save is a commit on the writer's tree at once, its first parent the tree's head at that moment |
 //! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`]s per tree; a [`Step::Next`] takes its head, always |
 //! | 3. The parent's queue decides | `land` (a fork's commit into its parent) is the only place a collision with the parent is decided, through `resolve`: per line, a line written over the parent's replaces it, a stale one is dropped, and of two concurrent lines the parent's wins ([`MergeRule`]). `sync` decides nothing: it takes the parent's version and keeps only the fork's lines the parent's queue has not taken yet |
-//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`], the fork's losing commit kept under `refs/collisions/<n>`, and the queue moves on |
+//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`], the fork's losing commit kept under `refs/collisions/<n>`, which Replication later pushes to the shared remote ([`Step::Replicate`]), and the queue moves on |
 //! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit (the fork is its parent, so the fork's lines win) and answers with the overwritten lines; [`World::rollback`] drops it |
 //! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the parent's commit as second parent |
 //! | 7. History setting | [`HistoryPolicy`]: a landing is a merge with the fork's commit as second parent (or a fast-forward), or one single-parent commit, carrying a fork's pending saves as one changeset, whose carried fork commit is kept beside history as a `git replace` graft |
@@ -256,6 +256,11 @@ pub enum Step {
     /// Take the head of a tree's queue.
     Next(Tree),
     Drop(ForkId),
+    /// Replication pushes to the shared remote: due once a collision is
+    /// recorded since its last push (the event it waits for), taken in any
+    /// order with the queue steps, so the push is eventual and never part
+    /// of a referee's step.
+    Replicate,
 }
 
 /// One slot a commit changed.
@@ -296,6 +301,9 @@ pub struct World {
     pub policies: Policies,
     root: PathBuf,
     repo: PathBuf,
+    /// The shared remote (a bare repository): Replication pushes main, the
+    /// grafts and every collision ref there.
+    remote: PathBuf,
     pub main_head: String,
     pub forks: BTreeMap<ForkId, Fork>,
     next_fork: ForkId,
@@ -341,6 +349,8 @@ pub struct World {
     pub(crate) main_history: BTreeSet<String>,
     pub(crate) grepped: (usize, BTreeSet<String>),
     pub(crate) collisions_checked: usize,
+    /// A collision was recorded since Replication last pushed.
+    replication_due: bool,
     pub(crate) syncs_checked: usize,
     pub(crate) ended_checked: usize,
     pub(crate) ref_moves: u64,
@@ -360,12 +370,16 @@ impl World {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let repo = root.join("repo");
+        let remote = root.join("origin.git");
         std::fs::create_dir_all(&repo).expect("create the repository");
+        std::fs::create_dir_all(&remote).expect("create the remote");
         git(&repo, &["init", "-q", "-b", "main"]);
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
         let mut w = Self {
             policies,
             root,
             repo,
+            remote,
             main_head: String::new(),
             forks: BTreeMap::new(),
             next_fork: 1,
@@ -393,6 +407,7 @@ impl World {
             reach: BTreeMap::new(),
             grepped: (0, BTreeSet::new()),
             collisions_checked: 0,
+            replication_due: false,
             syncs_checked: 0,
             ended_checked: 0,
             main_history: BTreeSet::new(),
@@ -411,6 +426,11 @@ impl World {
 
     pub fn repo(&self) -> &Path {
         &self.repo
+    }
+
+    /// The shared remote's bare repository.
+    pub fn remote(&self) -> &Path {
+        &self.remote
     }
 
     fn note(&mut self, s: String) {
@@ -601,20 +621,7 @@ impl World {
         if let Some(b) = self.blames.borrow().get(&key) {
             return b.clone();
         }
-        let mut by_line = BTreeMap::new();
-        for line in git(&self.repo, &["blame", "--porcelain", at, "--", p]).lines() {
-            let f: Vec<&str> = line.split(' ').collect();
-            if f.len() >= 3
-                && f[0].len() == 40
-                && f[0].bytes().all(|b| b.is_ascii_hexdigit())
-                && let (Ok(_), Ok(n)) = (f[1].parse::<usize>(), f[2].parse::<usize>())
-            {
-                by_line.insert(n, f[0].to_string());
-            }
-        }
-        let b: Vec<String> = (0..SLOTS)
-            .map(|i| by_line[&Content::line_of(i, self.policies.layout)].clone())
-            .collect();
+        let b = blame_in(&self.repo, at, p, self.policies.layout, false);
         self.blames.borrow_mut().insert(key, b.clone());
         b
     }
@@ -848,7 +855,31 @@ impl World {
                 result: result.to_string(),
                 reference,
             });
+            self.replication_due = true;
         }
+    }
+
+    /// Replication's push ([`Step::Replicate`]): main, the grafts and every
+    /// collision ref to the shared remote in one atomic push (owner,
+    /// 2026-11-03: "yes, \"losing\" patches should still be part of the
+    /// history. i want to know who changed what when"). Replication is the
+    /// remote's one pusher; no referee step pushes. Never forced: main only
+    /// moves forward, and collision and graft refs never move.
+    fn replicate(&mut self) {
+        self.replication_due = false;
+        let remote = self.remote.to_string_lossy().into_owned();
+        git(
+            &self.repo,
+            &[
+                "push",
+                "-q",
+                "--atomic",
+                &remote,
+                "refs/heads/main:refs/heads/main",
+                "refs/collisions/*:refs/collisions/*",
+                "refs/replace/*:refs/replace/*",
+            ],
+        );
     }
 
     /// `t`'s head moved: a fork's new commit queues for its parent (`up`),
@@ -907,7 +938,12 @@ impl World {
 
     /// Rule 1: open, write slot `slot` of `p`, close. Never refused: one
     /// commit at once on the client's tree (on its transaction's branch
-    /// while one is open).
+    /// while one is open), its first parent the head there at that moment
+    /// (owner, 2026-11-03): whatever the tree held when the save was made
+    /// counts as seen, so a save after a sync is written over the line the
+    /// sync brought, and a save before the sync arrives is concurrent with
+    /// it. The model's program reads and writes in one call, so it never
+    /// writes back an older read (MODEL.md, "Left out").
     pub fn save(&mut self, c: &Client, p: &str, slot: usize) -> String {
         let (tree, writer, txn) = match c {
             Client::Main(w) => (Tree::Main, w.clone(), None),
@@ -1116,6 +1152,9 @@ impl World {
                 .filter(|f| self.droppable(**f))
                 .map(|f| Step::Drop(*f)),
         );
+        if self.replication_due {
+            out.push(Step::Replicate);
+        }
         out
     }
 
@@ -1140,6 +1179,10 @@ impl World {
             }
             Step::Drop(f) => {
                 self.drop_fork(*f);
+                0
+            }
+            Step::Replicate => {
+                self.replicate();
                 0
             }
         }
@@ -1369,6 +1412,35 @@ impl World {
             .code
                 == 0
     }
+}
+
+/// Per slot of `p` at commit `at` in `repo`, the commit that wrote its
+/// line (`git blame --porcelain`); `stored`: as stored, grafts ignored.
+pub(crate) fn blame_in(
+    repo: &Path,
+    at: &str,
+    p: &str,
+    layout: Layout,
+    stored: bool,
+) -> Vec<String> {
+    let mut args = vec!["blame", "--porcelain", at, "--", p];
+    if stored {
+        args.insert(0, "--no-replace-objects");
+    }
+    let mut by_line = BTreeMap::new();
+    for line in git(repo, &args).lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        if f.len() >= 3
+            && f[0].len() == 40
+            && f[0].bytes().all(|b| b.is_ascii_hexdigit())
+            && let (Ok(_), Ok(n)) = (f[1].parse::<usize>(), f[2].parse::<usize>())
+        {
+            by_line.insert(n, f[0].to_string());
+        }
+    }
+    (0..SLOTS)
+        .map(|i| by_line[&Content::line_of(i, layout)].clone())
+        .collect()
 }
 
 impl Drop for World {

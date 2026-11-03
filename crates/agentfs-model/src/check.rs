@@ -10,7 +10,7 @@ use crate::content::{Content, EMPTY, PATHS, SLOTS, line_token, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
     Collision, CollisionScope, Direction, Entry, ForkId, HistoryPolicy, Step, Tree, TxnEnd, TxnId,
-    TxnOutcome, World,
+    TxnOutcome, World, blame_in,
 };
 
 /// Every invariant that holds after any step.
@@ -71,9 +71,14 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
 /// fork's newer non-colliding edit": once the queues drain, a fork has no
 /// newer edit left.
 pub fn check_converged(w: &World) -> Result<(), String> {
-    if let Some(s) = w.pending().iter().find(|s| matches!(s, Step::Next(_))) {
+    if let Some(s) = w
+        .pending()
+        .iter()
+        .find(|s| matches!(s, Step::Next(_) | Step::Replicate))
+    {
         return Err(format!("not drained: {s:?} still pending"));
     }
+    losers_pushed(w)?;
     for t in w.live_trees() {
         for p in PATHS {
             let (mine, main) = (w.read(t, p), w.read(Tree::Main, p));
@@ -274,6 +279,76 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
         }
     }
     w.collisions_checked = w.collisions.len();
+    Ok(())
+}
+
+/// Every losing change is replicated to the shared remote, eventually, and
+/// stays there attributable (owner, 2026-11-03: "yes, \"losing\" patches
+/// should still be part of the history. i want to know who changed what
+/// when"). Run once Replication has drained ([`check_converged`]), over
+/// every collision of the run, so a ref lost or moved since its push fails
+/// too. Read from the remote alone, as stored (no grafts): each collision's
+/// ref names its losing commit; each lost line is on its slot there and
+/// blames to a commit naming that line's writer (who, what); and a
+/// collision decided in main has its result in the remote main's history,
+/// which places the decision in main's order. The commit's date is kept as
+/// its audit "when" but never read to decide anything (rule 2), and not
+/// checked here.
+fn losers_pushed(w: &World) -> Result<(), String> {
+    let remote = w.remote();
+    for c in &w.collisions {
+        let at = try_git(remote, &["rev-parse", "--verify", "-q", &c.reference], None);
+        if at.stdout.trim() != c.loser {
+            return Err(format!(
+                "{c:?}: the remote's {} is {:?}",
+                c.reference,
+                at.stdout.trim()
+            ));
+        }
+        let file = Content::parse(&git(
+            remote,
+            &["cat-file", "-p", &format!("{}:{}", c.reference, c.path)],
+        ))
+        .ok_or_else(|| format!("{c:?}: unreadable on the remote"))?;
+        let blame = blame_in(remote, &c.reference, &c.path, w.policies.layout, true);
+        for (slot, token) in c.slots.iter().zip(&c.lost) {
+            let by = git(
+                remote,
+                &[
+                    "--no-replace-objects",
+                    "log",
+                    "-1",
+                    "--format=%(trailers:key=Agentfs-Writer,valueonly)",
+                    &blame[*slot],
+                ],
+            );
+            if file.slot(*slot) != token || by != writer_of(token) {
+                return Err(format!(
+                    "{c:?}: on the remote, lost {token} on slot {slot} reads {} by {by}",
+                    file.slot(*slot)
+                ));
+            }
+        }
+        if c.tree == Tree::Main
+            && try_git(
+                remote,
+                &[
+                    "--no-replace-objects",
+                    "merge-base",
+                    "--is-ancestor",
+                    &c.result,
+                    "refs/heads/main",
+                ],
+                None,
+            )
+            .code
+                != 0
+        {
+            return Err(format!(
+                "{c:?}: its result is not in the remote main's history"
+            ));
+        }
+    }
     Ok(())
 }
 
