@@ -144,12 +144,12 @@ struct Tally {
     old_writers: usize,
     orphans: usize,
     /// Progress (git-model.md §6): queue steps that took an entry ahead of
-    /// an earlier waiting one (P1); calls that waited behind a waiting take
-    /// (P3), and those let through because their client had open a file a
-    /// waiting take waits for.
+    /// an earlier waiting one (P1); syncs that delivered a prefix and held
+    /// the rest back (P2); opens granted on a file a waiting take waits
+    /// for, each an alarm (no P3).
     overtakes: usize,
-    behind: usize,
-    jumped: usize,
+    prefix_syncs: usize,
+    delayed: usize,
     /// Crashes of every agentfs process, and those during a close.
     crashes: usize,
     crashes_during_close: usize,
@@ -227,16 +227,13 @@ struct Oracle {
     next_inode: u64,
     /// Path calls that wait for a take: (target, file, rename's path).
     waiting_calls: BTreeMap<HandleId, (Target, String, Option<String>)>,
-    /// P3's referee (git-model.md §6), the harness's own record, not the
-    /// model's `waits`: each queue entry it saw begin waiting (a queue step
-    /// on it that took nothing), while it stays queued, with the files its
-    /// own change touches (a landing's; read from git when it began
-    /// waiting) and every file it may lock (its entry's and the same
-    /// source's entries directly behind it, read from git at each queue
-    /// step it waited at).
-    p3: BTreeMap<(Tree, u64), (BTreeSet<String>, BTreeSet<String>)>,
-    /// The opens the referee has judged (each once, when first granted).
-    judged: BTreeSet<HandleId>,
+    /// The referee of "no program's call waits on a waiting landing" (the
+    /// owner, 2026-11-04), the harness's own record, not the model's
+    /// `waits`: each tree with a take in progress (a queue step that began
+    /// one and no finish since), with the files it holds (a landing's read
+    /// from git, every file its taken changes touch; a sync's, the files
+    /// it writes). A call waits only there, on one of those files.
+    taking: BTreeMap<Tree, BTreeSet<String>>,
 }
 
 /// An `OrphanDropped` event as the oracle expects it: (open, writer, path,
@@ -377,30 +374,18 @@ impl Oracle {
         };
         let at = head_of(w, t).expect("live");
         let file = w.lookup(&at, p).expect("a file");
-        let mut files = vec![file.clone()];
-        files.extend(to.and_then(|to| w.lookup(&at, to)));
-        // P3's verdict on the state the call meets (its own run may orphan
-        // the client's open of the file, which made it exempt).
-        self.p3_check(w)?;
-        let verdict = match t {
-            Target::Tree(tree) => self.must_wait(w, c, tree, &files, None),
-            Target::Txn(..) => Ok(()),
-        };
         let waits = match to {
             None => w.unlink(c, p),
             Some(to) => w.rename(c, p, to),
         };
         match waits {
-            None => {
-                verdict.map_err(|e| format!("P3: a path call on {p} ran at once, but {e}"))?;
-                self.ran(w, &at, t, &file, to)
-            }
+            None => self.ran(w, &at, t, &file, to),
             Some(h) => {
                 self.waiting_calls
                     .insert(h, (t, file, to.map(str::to_string)));
             }
         }
-        Ok(())
+        self.no_wait_on_waiting(w)
     }
 
     /// After a take's release in `t`: the waiting path calls it ran, in
@@ -439,135 +424,28 @@ impl Oracle {
         }
     }
 
-    /// P3's referee: a queue step on `t` acted on entry `i` of `before`
-    /// (the queue before the step) and took nothing, so that entry waits.
-    fn began_waiting(&mut self, w: &World, t: Tree, before: &[(u64, Entry)], i: usize) {
-        let (n, e) = &before[i];
-        let mut wide = entry_files(w, t, e);
-        for (_, x) in before[i + 1..]
-            .iter()
-            .take_while(|(_, x)| x.source() == e.source())
-        {
-            wide.extend(entry_files(w, t, x));
-        }
-        let first = match e {
-            Entry::Landing { commit, .. } => change_files(w, commit),
-            Entry::Sync => BTreeSet::new(),
-        };
-        let rec = self.p3.entry((t, *n)).or_insert((first, BTreeSet::new()));
-        rec.1.extend(wide);
-    }
-
-    /// The files of `t` client `c` has open for writing, by the harness's
-    /// own object table, but open `but`.
-    fn open_of(&self, w: &World, c: &Client, t: Tree, but: Option<HandleId>) -> BTreeSet<String> {
-        w.handles()
-            .filter(|x| {
-                x.client == *c
-                    && !x.waiting
-                    && x.kind == Kind::Write
-                    && x.target == Target::Tree(t)
-                    && Some(x.id) != but
-            })
-            .filter_map(|x| self.named(w, x.id))
-            .collect()
-    }
-
-    /// Whether client `c` may go ahead of a waiting take in `t` (finding
-    /// 20): it has open a file one of the referee's waiting entries may lock.
-    fn exempt(&self, w: &World, c: &Client, t: Tree, but: Option<HandleId>) -> bool {
-        let mine = self.open_of(w, c, t, but);
-        self.p3
-            .iter()
-            .any(|((u, _), (_, wide))| *u == t && !mine.is_disjoint(wide))
-    }
-
-    /// P3, judged by the harness's record alone: a call on a file that an
-    /// entry it saw begin waiting touches, made or granted while that
-    /// entry is still queued, waits, unless its client has open a file one
-    /// of those entries may lock (finding 20); and no call waiting behind a
-    /// take (no take holds its file) is of a client that has open a file
-    /// such an entry touches (that would deadlock it).
-    fn p3_check(&mut self, w: &World) -> Result<(), String> {
-        self.p3
-            .retain(|(t, n), _| w.alive(*t) && w.queue_numbered(*t).iter().any(|(m, _)| m == n));
-        self.judged.retain(|h| w.handles().any(|x| x.id == *h));
-        let granted: Vec<HandleId> = w
-            .handles()
-            .filter(|x| !x.waiting && x.kind == Kind::Write && !self.judged.contains(&x.id))
-            .map(|x| x.id)
-            .collect();
-        for h in granted {
-            self.judged.insert(h);
-            let x = w.handle(h);
-            let Target::Tree(t) = x.target else { continue };
-            let Some(f) = self.named(w, h) else { continue };
-            self.must_wait(w, &x.client, t, &[f], Some(h))
-                .map_err(|e| format!("P3: open h{h} was granted, but {e}"))?;
-        }
+    /// No program's call ever waits on a waiting landing (the owner,
+    /// 2026-11-04; P3 deleted), judged by the harness's record alone: every
+    /// call that waits, waits in a tree with a take in progress, on a file
+    /// that take holds (the owner's lock of 2026-11-03: a take writing its
+    /// files holds new write-opens back until it finishes).
+    fn no_wait_on_waiting(&self, w: &World) -> Result<(), String> {
         for x in w.handles().filter(|x| x.waiting) {
-            let Target::Tree(t) = x.target else { continue };
-            if w.holds()
+            let Target::Tree(t) = x.target else {
+                return Err(format!("h{} waits in a transaction", x.id));
+            };
+            if !self
+                .taking
                 .get(&t)
-                .is_some_and(|y| x.files().iter().any(|f| y.files.contains(f)))
+                .is_some_and(|held| x.files().iter().any(|f| held.contains(f)))
             {
-                continue;
-            }
-            // It waits behind an entry the referee saw begin waiting, for a
-            // file that entry's own change touches (a sync's: one it may
-            // write), not one only a save it would carry touches.
-            if !self.p3.iter().any(|((u, _), (first, wide))| {
-                *u == t
-                    && x.files().iter().any(|f| {
-                        if first.is_empty() {
-                            wide.contains(f)
-                        } else {
-                            first.contains(f)
-                        }
-                    })
-            }) {
                 return Err(format!(
-                    "P3: h{} ({:?} of {}) waits behind a take, but no entry seen waiting there touches its file",
+                    "h{} ({:?} of {}) waits in {t:?}, but no take there is writing its file: a call waits on a waiting take",
                     x.id, x.kind, x.file
-                ));
-            }
-            let mine = self.open_of(w, &x.client, t, None);
-            if let Some(((_, n), _)) = self
-                .p3
-                .iter()
-                .find(|((u, _), (first, _))| *u == t && !mine.is_disjoint(first))
-            {
-                return Err(format!(
-                    "P3: h{} waits behind a take, but its client has open a file entry {n} waits for: a deadlock",
-                    x.id
                 ));
             }
         }
         Ok(())
-    }
-
-    /// The referee's rule for one call of `c` on `files` in `t`.
-    fn must_wait(
-        &self,
-        w: &World,
-        c: &Client,
-        t: Tree,
-        files: &[String],
-        but: Option<HandleId>,
-    ) -> Result<(), String> {
-        let Some(((_, n), _)) = self
-            .p3
-            .iter()
-            .find(|((u, _), (first, _))| *u == t && files.iter().any(|f| first.contains(f)))
-        else {
-            return Ok(());
-        };
-        if self.exempt(w, c, t, but) {
-            return Ok(());
-        }
-        Err(format!(
-            "{t:?}'s entry {n}, waiting since before, touches {files:?} and {c:?} has open none of the waiting entries' files"
-        ))
     }
 
     /// Every target but `skip` holds the oracle's bytes.
@@ -681,6 +559,26 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
     };
     let taken = step_checked(w, s)?;
     tally.steps += 1;
+    match s {
+        Step::Finish(t) => {
+            o.taking.remove(t);
+        }
+        Step::Next(t) if w.holds().contains_key(t) => {
+            // The files it holds: a landing's read from git (every file its
+            // taken changes touch); a sync's are the files it writes.
+            let held = match &w.holds()[t].take {
+                Take::Landing { .. } => numbered
+                    .iter()
+                    .skip(first.unwrap_or(0))
+                    .take(taken)
+                    .flat_map(|(_, e)| entry_files(w, *t, e))
+                    .collect(),
+                Take::Sync { .. } => w.holds()[t].files.clone(),
+            };
+            o.taking.insert(*t, held);
+        }
+        _ => {}
+    }
     let skip = match s {
         Step::Finish(t) => Some(Target::Tree(*t)),
         _ => None,
@@ -702,7 +600,6 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
         if taken == 0 {
             tally.take_waits += 1;
             if let Some(i) = first {
-                o.began_waiting(w, *t, &numbered, i);
                 // P1 under either setting: a landing waits only for its own
                 // change's files, never for a file only a save it would
                 // carry touches (the review of 2026-11-04, P1-c).
@@ -870,8 +767,8 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
     o.waiting_calls.clear();
     o.calls.clear();
     o.held.clear();
-    // A crash drops every wait (the takes go back to their queues).
-    o.p3.clear();
+    // A crash ends every take (they go back to their queues).
+    o.taking.clear();
     gitledger::observe(w)?;
     o.check(w).map_err(|e| format!("crash: {e}"))
 }
@@ -904,7 +801,7 @@ fn drain(
 fn checkg(w: &mut World, o: &mut Oracle) -> Result<(), String> {
     check(w)?;
     gitledger::observe(w)?;
-    o.p3_check(w)?;
+    o.no_wait_on_waiting(w)?;
     o.check(w)
 }
 
@@ -1313,11 +1210,10 @@ impl Calls {
                 (*t, files, lines)
             })
             .collect();
-        // And each entry waiting for its files (P3: a new call on one of
-        // them waits behind it, unless its client has open a file it waits
-        // for). Steering only: the referee reads its own record.
+        // And each entry waiting for its files (a new call on one of them
+        // is granted and postpones it, raising an alarm). Steering only.
         let mut holds = holds;
-        for (t, m) in w.waits().iter().chain(w.woken()) {
+        for (t, m) in w.waits() {
             for x in m.values() {
                 holds.push((*t, x.files.iter().cloned().collect(), Vec::new()));
             }
@@ -1576,7 +1472,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                     }
                 }
             }
-            26..=33 if !w.holds().is_empty() || !w.waits().is_empty() || !w.woken().is_empty() => {
+            26..=33 if !w.holds().is_empty() || !w.waits().is_empty() => {
                 k.during_take(w, slot, tally).map_err(e)?;
             }
             _ => {
@@ -1630,8 +1526,8 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     tally.inserts_met += w.inserts_met;
     tally.unlinked_edits += w.unlinked_edits;
     tally.orphans += w.orphans.len();
-    tally.behind += w.behind_count;
-    tally.jumped += w.jumped_count;
+    tally.prefix_syncs += w.prefix_syncs;
+    tally.delayed += w.delayed.len();
     if gitledger::takes() != w.landings.len() {
         return Err((
             STEPS + 1,
@@ -1703,10 +1599,11 @@ fn run_all(policies: Policies) {
         );
         // Atomic saves, and old writers whose calls an atomic save, an
         // unlink or a rename-over orphaned (git-model.md §7).
-        // P1 and P3 met: an entry went ahead of a waiting one, and a call
-        // waited behind a waiting take.
+        // P1 and P2 met, and the alarm: an entry went ahead of a waiting
+        // one, a sync delivered a prefix and held the rest back, and an
+        // open postponed a waiting take.
         assert!(
-            tally.overtakes > 0 && tally.behind > 0,
+            tally.overtakes > 0 && tally.prefix_syncs > 0 && tally.delayed > 0,
             "progress rules not met in {} seeds: {tally:?}",
             seeds().len()
         );

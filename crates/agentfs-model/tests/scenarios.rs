@@ -2284,6 +2284,61 @@ fn r11_concurrent_renames_the_parent_wins() {
     }
 }
 
+/// Finding 11, two renames to one path before the parent decides (a
+/// choice, recommended without objection): the sandbox renames `b` to `h`
+/// and main renames `c` to `h`, and the sandbox syncs first. It keeps its
+/// own name until main's queue decides, and shows main's file under its
+/// previous name, `c`: never two files at one path. Then main's queue
+/// decides (main wins) and the sync shows main's names. Also with
+/// rename-overs: both rename a file over `d`.
+#[test]
+fn r11_two_renames_to_one_path_keep_the_sandboxs_name_until_decided() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let t = Tree::Fork(f);
+        w.rename(&Client::Fork(f), "b", "h");
+        w.rename(&m1(), "c", "h");
+        next(&mut w, t);
+        assert_eq!(
+            w.path_of(t, "b").as_deref(),
+            Some("h"),
+            "{history:?}: its own name"
+        );
+        assert_eq!(
+            w.path_of(t, "c").as_deref(),
+            Some("c"),
+            "{history:?}: main's file under its previous name"
+        );
+        drain(&mut w);
+        for t in [Tree::Main, t] {
+            let names = (w.path_of(t, "b"), w.path_of(t, "c"));
+            assert_eq!(
+                names,
+                (Some("b".into()), Some("h".into())),
+                "{history:?} {t:?}"
+            );
+        }
+        w.rename(&Client::Fork(f), "a", "d");
+        w.rename(&m1(), "b", "d");
+        next(&mut w, Tree::Fork(f));
+        assert_eq!(
+            w.path_of(Tree::Fork(f), "a").as_deref(),
+            Some("d"),
+            "{history:?}"
+        );
+        assert_eq!(
+            w.path_of(Tree::Fork(f), "b").as_deref(),
+            Some("b"),
+            "{history:?}"
+        );
+        drain(&mut w);
+        for t in [Tree::Main, Tree::Fork(f)] {
+            assert_eq!(w.path_of(t, "b").as_deref(), Some("d"), "{history:?} {t:?}");
+        }
+    }
+}
+
 /// Rule 11, a rename-over (`rename(2)` onto an existing file, the atomic
 /// save idiom) is one call: it applies or loses whole. The sandbox renames
 /// `a` over `b` while main writes a line of `b`: the unlink of `b` never
@@ -2673,6 +2728,108 @@ fn r12_a_crash_during_a_close_saves_the_open_once() {
     }
 }
 
+/// The calls of finding 26 (seed 332 of the settings comparison): a nested
+/// sandbox f3 deletes line 3 of `a`; its parent f2 deletes line 3 too and
+/// edits line 0, which main edits concurrently, so f2's save loses whole at
+/// main. Then f2 takes f3's save: its delete agrees with f2's and is
+/// dropped (finding 19). Returns main's and f3's lines once drained.
+fn nested_dropped_delete(history: HistoryPolicy) -> (Vec<String>, Vec<String>) {
+    let mut w = world(history);
+    let d = w.open_write(&m1(), "a");
+    for i in 0..6 {
+        w.edit(d, LineEdit::At(i));
+    }
+    w.close(d);
+    let f2 = w.create_fork(Tree::Main);
+    let f3 = w.create_fork(Tree::Fork(f2));
+    let h = w.open_write(&Client::Fork(f3), "a");
+    w.edit(h, LineEdit::Delete(3));
+    w.close(h);
+    let h = w.open_write(&Client::Fork(f2), "a");
+    w.edit(h, LineEdit::Delete(3));
+    w.edit(h, LineEdit::At(0));
+    w.close(h);
+    w.save(&m1(), "a", 0);
+    next(&mut w, Tree::Main);
+    assert!(
+        w.collisions.iter().any(|c| c.by == By::Whole),
+        "{history:?}: f2's save lost whole at main"
+    );
+    next(&mut w, Tree::Fork(f2));
+    // f2 syncs main (its delete lost there) before f3 syncs: f3 then moves
+    // from its own delete straight to main's line, as seed 332 did.
+    while w.pending().contains(&Step::Next(Tree::Fork(f2))) {
+        next(&mut w, Tree::Fork(f2));
+    }
+    assert_eq!(w.read(Tree::Fork(f2), "a").texts().len(), 6, "{history:?}");
+    assert_eq!(w.read(Tree::Fork(f3), "a").texts().len(), 5, "{history:?}");
+    next(&mut w, Tree::Fork(f3));
+    drain(&mut w);
+    (
+        w.read(Tree::Main, "a").texts(),
+        w.read(Tree::Fork(f3), "a").texts(),
+    )
+}
+
+/// Finding 26, fixed in the checks: under full lineage the nested
+/// sandbox's dropped delete follows f2's delete, which lost (finding 19),
+/// so line 3 comes back in f3 by that decision. The no-silent-loss, stale
+/// and flicker checks now allow that move, as the check of what entered a
+/// tree already did; before, they called it a stale revert.
+#[test]
+fn r3_a_nested_sandboxs_dropped_delete_follows_the_delete_that_lost() {
+    let (main, f3) = nested_dropped_delete(HistoryPolicy::FullLineage);
+    assert_eq!(main.len(), 6, "line 3 came back in main");
+    assert_eq!(f3, main, "and in the nested sandbox");
+}
+
+/// Coherence finding 27 (found fixing finding 26, 2026-11-04): with the
+/// calls above the history setting decides differently. Under full
+/// lineage main judges f2's landing of f3's save as its change in f2, in
+/// which the dropped delete is no change, so line 3 comes back; under
+/// `Squashed` main judges f3's save itself (the saves the graft names,
+/// rule 7), whose delete was written over main's line, so it applies.
+/// Rule 7 says the setting decides nothing; finding 19's dropped delete
+/// and rule 7's graft judging contradict it. The owner's call.
+#[test]
+#[ignore = "coherence finding 27: a nested sandbox's dropped agreeing delete is decided differently under the two history settings"]
+fn finding_27_a_nested_dropped_delete_decided_by_the_history_setting() {
+    assert_eq!(
+        nested_dropped_delete(HistoryPolicy::FullLineage),
+        nested_dropped_delete(HistoryPolicy::Squashed)
+    );
+}
+
+/// Finding 25 (seeds 287 and 436 of the settings comparison): a sandbox
+/// renames `a` to `e` (save 1), then renames `c` over `e` (save 2, one call:
+/// `c` named `e`, `a` replaced). Main edited `a` meanwhile, unseen by save 2,
+/// so save 2's unlink of `a` loses to that line (the file rule) and save 2
+/// loses whole: its rename of `c` lost with its change (`By::Whole`), not to
+/// the name `a` keeps only because the change lost. Before, it was labelled
+/// lost `By::File` to save 1's name of `a`, which under `Squashed` had won
+/// only earlier in the same take, so the parent-wins check failed.
+#[test]
+fn r11_a_losing_rename_over_loses_its_rename_with_its_change() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let c = Client::Fork(f);
+        w.rename(&c, "a", "e");
+        w.save(&m1(), "a", 0);
+        w.rename(&c, "c", "e");
+        drain(&mut w);
+        let named: Vec<_> = w.collisions.iter().filter(|x| x.path == "c").collect();
+        assert!(
+            !named.is_empty() && named.iter().all(|x| x.by == By::Whole),
+            "{history:?}: {named:?}"
+        );
+        for t in [Tree::Main, Tree::Fork(f)] {
+            assert_eq!(w.path_of(t, "a").as_deref(), Some("e"), "{history:?} {t:?}");
+            assert_eq!(w.path_of(t, "c").as_deref(), Some("c"), "{history:?} {t:?}");
+        }
+    }
+}
+
 /// Rule 3e, finding 19: a transaction's delete that the sandbox's own
 /// delete agrees with is dropped at commit and costs nothing; when the
 /// sandbox's delete then loses whole at main (another line of its save
@@ -2779,12 +2936,15 @@ fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
     }
 }
 
-/// Rule 9 with P3: once a take waits for a file, a new write-open of it
-/// waits behind the take, so writers that keep opening the file cannot
-/// starve it: the take goes once the opens granted before it began
-/// waiting have closed, and its release grants the waiting open.
+/// Rule 9 without P3 (the owner, 2026-11-04: "it seems low risk for them
+/// to be indefinitely delayed while an application is keeping the fs busy
+/// with real work"): once a take waits for a file, a new write-open or
+/// `unlink` of it is still granted at once, so overlapping writers can
+/// postpone the take for as long as they keep the file open. Each open
+/// that keeps it waiting raises an alarm event (a choice), and the take
+/// goes once the last one closes.
 #[test]
-fn r9_a_waiting_take_is_not_starved_by_new_writers() {
+fn r9_new_writers_postpone_a_waiting_take_and_raise_an_alarm() {
     for history in BOTH {
         let mut w = world(history);
         let f = w.create_fork(Tree::Main);
@@ -2793,43 +2953,53 @@ fn r9_a_waiting_take_is_not_starved_by_new_writers() {
         let x = w.save(&Client::Fork(f), "a", 0);
         take(&mut w, &Step::Next(Tree::Main));
         assert!(w.waits().contains_key(&Tree::Main));
+        assert!(w.delayed.is_empty(), "an open before the wait is no alarm");
         let second = w.open_write(&m2, "a");
         assert!(
-            w.handle(second).waiting,
-            "{history:?}: the new open waits behind the take"
+            !w.handle(second).waiting,
+            "{history:?}: the new open is granted, not made to wait behind the take"
         );
-        assert!(w.handle(second).behind.is_some());
-        let u = w.unlink(&m2, "a");
-        assert!(u.is_some(), "so does an unlink of the file");
+        assert_eq!(
+            w.delayed
+                .iter()
+                .map(|d| (d.handle, d.file.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(second, "a")],
+            "{history:?}: it raises one alarm"
+        );
         w.close(first);
         ok(&mut w);
         assert!(
-            !w.waits().contains_key(&Tree::Main),
-            "its own files closed: it is woken"
+            w.waits().contains_key(&Tree::Main),
+            "{history:?}: the second writer still has it open: the take still waits"
         );
-        assert!(w.handle(second).waiting, "and the new open still waits");
         let third = w.open_write(&Client::Main("m3".into()), "a");
+        assert!(!w.handle(third).waiting);
+        assert_eq!(w.delayed.len(), 2, "{history:?}: another alarm");
+        w.close(second);
+        ok(&mut w);
+        assert!(w.waits().contains_key(&Tree::Main));
+        w.close(third);
+        ok(&mut w);
         assert!(
-            w.handle(third).waiting,
-            "{history:?}: woken, not yet taken, it still comes first"
+            !w.waits().contains_key(&Tree::Main),
+            "the last close woke it"
         );
         next(&mut w, Tree::Main);
         assert!(
             w.file(&w.main_head, "a").contains(&x),
             "{history:?}: the take went"
         );
-        assert!(!w.handle(second).waiting, "its release granted the open");
-        assert!(w.lookup(&w.main_head, "a").is_none(), "and ran the unlink");
-        w.close(second);
-        w.close(third);
         drain(&mut w);
     }
 }
 
-/// Rule 9 with P3, finding 20: a program that holds open a file a waiting
-/// take waits for is never made to wait behind that take, or each would
-/// wait for the other (the program blocked in its open cannot close the
-/// file). Its open goes ahead (`jumped`); the take goes once it closes.
+/// Rule 9, finding 20: a program that holds open a file a waiting take
+/// waits for is never made to wait behind that take, or each would wait
+/// for the other (the program blocked in its open cannot close the file).
+/// Without P3 no open waits behind a waiting take at all: another
+/// client's open of the take's other file is granted too; the take goes
+/// once both close.
 #[test]
 fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
     for history in BOTH {
@@ -2851,20 +3021,24 @@ fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
         );
         let b = w.open_write(&m1(), "b");
         assert!(
-            !w.handle(b).waiting && w.handle(b).jumped,
+            !w.handle(b).waiting,
             "{history:?}: m1 holds a: not made to wait"
         );
         let other = w.open_write(&Client::Main("m2".into()), "b");
         assert!(
-            w.handle(other).waiting,
-            "another client's open of b waits behind the take"
+            !w.handle(other).waiting,
+            "{history:?}: another client's open of b is granted too"
         );
         w.close(b);
         w.close(a);
         ok(&mut w);
-        next(&mut w, Tree::Main);
-        assert!(!w.handle(other).waiting);
+        assert!(
+            w.waits().contains_key(&Tree::Main),
+            "{history:?}: m2 still has b open"
+        );
         w.close(other);
+        ok(&mut w);
+        next(&mut w, Tree::Main);
         drain(&mut w);
         assert_eq!(w.read(Tree::Main, "a"), w.read(Tree::Fork(f), "a"));
     }
@@ -2935,7 +3109,7 @@ fn r9_under_either_setting_a_held_file_holds_back_only_its_saves() {
         assert!(has(&w, Tree::Main, "b", &y), "{history:?}");
     }
     // The other order: the save of `a` waits for its writer, and under
-    // `Squashed` waits alone, so its lock (and P3) does not reach `b`, which
+    // `Squashed` waits alone, so its lock does not reach `b`, which
     // only the save behind it touches: a new open of `b` is granted.
     for history in BOTH {
         let mut w = world(history);
@@ -2957,29 +3131,21 @@ fn r9_under_either_setting_a_held_file_holds_back_only_its_saves() {
     }
 }
 
-/// Coherence finding 24 (the review of 2026-11-04, P0-1): P3 makes one
-/// client's call wait on another client's close, so cooperating programs
-/// can deadlock. m1 keeps `a` open, then starts m2 and waits for it (a
-/// child, or a pipe); m2 opens `a` for append. A sandbox's change to `a`
-/// waits for m1's close, and under P3 m2's open waits behind it: m2 holds
-/// no file the take waits for, so finding 20's exemption does not cover
-/// it. m1 closes `a` only once m2 is done, so nothing can move. Linux
-/// grants m2's open, and so would rule 9 without P3 (a take holds a file
-/// only once every open of it has closed). The test asserts that intent:
-/// m2's open is granted. No exemption FUSE can compute covers this (the
-/// filesystem does not see that m1 waits for m2), so the choice is the
-/// owner's: P3 (no take starves; cooperating programs can deadlock) or no
-/// P3 (no open ever waits on another client's close; a file kept open by
-/// overlapping writers can hold its take back indefinitely).
+/// Rule 9 without P3, finding 24 (the review of 2026-11-04, P0-1, decided
+/// by the owner on 2026-11-04): cooperating programs never deadlock. m1
+/// keeps `a` open, then starts m2 and waits for it (a child, or a pipe); m2
+/// opens `a` for append. A sandbox's change to `a` waits for m1's close;
+/// m2's open is granted, as Linux grants it (no open waits on a waiting
+/// take), so m2 finishes, m1 closes, and the take goes. Under P3 m2 waited
+/// behind the take, which waited for m1, which waited for m2.
 #[test]
-#[ignore = "coherence finding 24: P3 makes a call wait on another client's close, so cooperating programs deadlock"]
-fn finding_24_p3_makes_a_call_wait_on_another_clients_close() {
+fn r9_cooperating_programs_never_deadlock() {
     for history in BOTH {
         let mut w = world(history);
         let f = w.create_fork(Tree::Main);
         let log = w.open_write(&m1(), "a");
         w.write(log, Write::Append("m1\n".into()));
-        w.save(&Client::Fork(f), "a", 0);
+        let x = w.save(&Client::Fork(f), "a", 0);
         take(&mut w, &Step::Next(Tree::Main));
         assert!(
             w.waits().contains_key(&Tree::Main),
@@ -2988,12 +3154,117 @@ fn finding_24_p3_makes_a_call_wait_on_another_clients_close() {
         let child = w.open_write(&Client::Main("m2".into()), "a");
         assert!(
             !w.handle(child).waiting,
-            "{history:?}: m2's open waits for m1's close, which waits for m2: a deadlock"
+            "{history:?}: m2's open is granted: nothing waits on m1's close but the take"
         );
         w.write(child, Write::Append("m2\n".into()));
         w.close(child);
         w.close(log);
+        ok(&mut w);
         drain(&mut w);
+        let a = w.read(Tree::Main, "a");
+        assert!(
+            a.contains(&x),
+            "{history:?}: the take went once both closed"
+        );
+        assert!(a.bytes().contains("m2\n") && a.bytes().contains("m1\n"));
+    }
+}
+
+/// Progress rule P2, the prefix sync (the owner, 2026-11-04: "agreed"): a
+/// sync delivers the parent's commits in order up to the first that would
+/// overwrite a file the sandbox has open for writing, and holds back that
+/// one and every later one until the file closes. Main saves `b`, then
+/// `a`, then `c` while the sandbox has `a` open: the sync delivers `b`
+/// only (not `c`, which comes after the change to `a`), then waits; the
+/// close delivers the rest.
+#[test]
+fn r9_a_sync_delivers_up_to_the_first_change_to_an_open_file() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let t = Tree::Fork(f);
+        let h = w.open_write(&Client::Fork(f), "a");
+        let mb = w.save(&m1(), "b", 0);
+        let ma = w.save(&m1(), "a", 0);
+        let mc = w.save(&m1(), "c", 0);
+        take(&mut w, &Step::Next(t));
+        assert!(
+            w.holds().contains_key(&t) && w.waits().get(&t).is_some_and(|m| m.len() == 1),
+            "{history:?}: it delivers a prefix and waits for the rest"
+        );
+        take(&mut w, &Step::Finish(t));
+        assert!(
+            has(&w, t, "b", &mb),
+            "{history:?}: b, before the change to a, is delivered"
+        );
+        assert!(!has(&w, t, "a", &ma), "a is open: not overwritten");
+        assert!(
+            !has(&w, t, "c", &mc),
+            "{history:?}: c comes after the change to a: held back too"
+        );
+        assert_eq!(w.prefix_syncs, 1);
+        assert!(
+            !w.pending().contains(&Step::Next(t)),
+            "the rest waits for the close"
+        );
+        let x = w.edit(h, LineEdit::At(1)).unwrap();
+        w.close(h);
+        ok(&mut w);
+        assert!(w.waits().get(&t).is_none(), "the close woke it");
+        drain(&mut w);
+        let a = w.read(t, "a");
+        assert!(a.contains(&ma) && a.contains(&x), "{history:?}");
+        assert!(has(&w, t, "c", &mc));
+    }
+}
+
+/// P2, each change by its unit: a transaction's commit is one change, so
+/// a sync holds back the whole of it when it touches an open file, even its
+/// files nobody has open; and a commit that leaves the sandbox's open file
+/// as the sandbox has it (its own save, come back from the parent) touches
+/// nothing and does not stop the sync.
+#[test]
+fn r9_a_prefix_sync_holds_back_a_transaction_whole() {
+    for history in BOTH {
+        let mut w = world(history);
+        let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
+        let t = Tree::Fork(f);
+        // f's own save of a lands in main; f opens a again.
+        let own = w.save(&Client::Fork(f), "a", 0);
+        next(&mut w, Tree::Main);
+        let h = w.open_write(&Client::Fork(f), "a");
+        let mb = w.save(&m1(), "b", 0);
+        // g's transaction writes c and a, and lands in main whole.
+        w.begin(g).unwrap();
+        let mut staged = Vec::new();
+        for p in ["c", "a"] {
+            let x = w.open_write(&Client::Fork(g), p);
+            staged.push(w.edit(x, LineEdit::At(2)).unwrap());
+            w.close(x);
+        }
+        let gc = staged[0].clone();
+        assert_eq!(w.commit_txn(g), Ok(TxnOutcome::Committed));
+        while w.queue_len(Tree::Main) > 0 {
+            next(&mut w, Tree::Main);
+        }
+        assert!(has(&w, Tree::Main, "c", &gc));
+        // f's queue: syncs of main's landing of f's own save, of b, and of g's
+        // transaction. The first two deliver; the transaction waits whole.
+        while w.pending().contains(&Step::Next(t)) {
+            take(&mut w, &Step::Next(t));
+            if w.holds().contains_key(&t) {
+                take(&mut w, &Step::Finish(t));
+            }
+        }
+        assert!(has(&w, t, "a", &own) && has(&w, t, "b", &mb), "{history:?}");
+        assert!(
+            !has(&w, t, "c", &gc),
+            "{history:?}: the transaction touches a, open: its c is held back with it"
+        );
+        w.close(h);
+        ok(&mut w);
+        drain(&mut w);
+        assert!(has(&w, t, "c", &gc));
     }
 }
 

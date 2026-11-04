@@ -100,12 +100,13 @@ the expected failure.
 | Test | Finding | Fails with |
 |---|---|---|
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which Main already took" |
-| `random_interleavings_git_merge_base` | 1 | 35 of 64 seeds, 1 of them a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
+| `random_interleavings_git_merge_base` | 1 | 34 of 64 seeds, 1 of them (seed 46) a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
-| `finding_24_p3_makes_a_call_wait_on_another_clients_close` | 24 | "m2's open waits for m1's close, which waits for m2: a deadlock" |
+| `finding_27_a_nested_dropped_delete_decided_by_the_history_setting` | 27 | `assertion left == right failed`: under full lineage main's `a` has six lines, under `Squashed` five |
 
 These were the results at seeds 1..64 on 2026-11-04; a change that moves a count says so in its pull
-request. Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e).
+request. Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e); finding
+24's test passes since the owner deleted P3 (2026-11-04), as `r9_cooperating_programs_never_deadlock`.
 
 CI runs `cargo test --workspace` (so the scenarios and seeds 1..64; `random_interleavings_history_settings_decide_the_same`
 runs each seed eight times, so it takes seeds 1..16 unless a seed variable is set), fmt, clippy with `-D warnings`, and the
@@ -183,15 +184,17 @@ A planted bug is one deliberate mistake in a copy of the model. It shows which t
    catch it only at 500 seeds); an append onto a partial last line that adds a line instead of finishing it; a
    hole filled with other bytes than NUL; Replication dropping the grafts; a collision note on the wrong commit;
    placing an incoming insert before the parent's at one place; letting an edit of a file the parent unlinked
-   apply; an entry going ahead of an earlier waiting one it shares a file with, or one of its own sandbox (P1); a
-   new open that does not wait behind a waiting take, or a woken take that no longer holds new opens back (P3); no
-   way through for a client holding a file a waiting take waits for (the deadlock of finding 20); an atomic save that
+   apply; an entry going ahead of an earlier waiting one it shares a file with, or one of its own sandbox (P1); an
+   atomic save that
    leaves the replaced file's old object at its path; a crash whose replay saves an open a save already names, or
    drops the journal. From the review of 2026-11-04: a crash replay that re-links each open to its file identity
    (a dead handle saved into the file that replaced it); a waiting take that records only its files open now; a
-   crash that drops a transaction's journaled calls; P3's exemption for a client holding any open file; a squash
+   crash that drops a transaction's journaled calls; a squash
    not cut at a save sharing a file with a waiting entry ahead; a squash that carries a save touching a file open for
-   writing, or whose first save waits with followers.
+   writing, or whose first save waits with followers. From the owner's decisions of 2026-11-04: P3 reintroduced (a
+   new write-open waits behind a waiting take); a sync that delivers the parent's head whatever is open (past an open
+   file); a sync that never delivers a prefix (it waits whole); no alarm on an open that keeps a take waiting; and
+   each fix of findings 11, 25 and 26 reverted.
 3. Run `cargo test --locked -p agentfs-model --no-fail-fast` in the copy (and 500 seeds for a bug the
    scenarios miss), with a separate target directory per copy: in the container, mount the copy as `/src`
    and a volume of its own as `/target` (`-v agentfs-target-m1:/target`).

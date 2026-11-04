@@ -61,10 +61,36 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
             };
             let n = q[i].0;
             let was = w.waits().get(t).is_some_and(|m| m.contains_key(&n));
+            let ours = w.head(*t);
+            let open = w.write_open(*t);
             let taken = w.step(s);
             if taken == 0 {
-                return match w.waits().get(t) {
-                    Some(m) if m.contains_key(&n) && !was && w.holds().get(t).is_none() => Ok(0),
+                let waits = w.waits().get(t).is_some_and(|m| m.contains_key(&n)) && !was;
+                let up = up.filter(|_| q[i].1 == Entry::Sync);
+                return match (waits, up, w.holds().get(t).map(|h| &h.take)) {
+                    // A landing, or a sync whose first commit would
+                    // overwrite an open file, waits and takes nothing.
+                    (true, None, None) => Ok(0),
+                    (true, Some(head), None) => {
+                        prefix_cut(w, *t, &ours, &head, &open, None)?;
+                        Ok(0)
+                    }
+                    // P2: a sync delivers a prefix and waits for the rest.
+                    (
+                        true,
+                        Some(head),
+                        Some(Take::Sync {
+                            up: to, head: read, ..
+                        }),
+                    ) => {
+                        if *read != head {
+                            return Err(format!(
+                                "a sync into {t:?} read {read:.7}, not the parent's head {head:.7}"
+                            ));
+                        }
+                        prefix_cut(w, *t, &ours, &head, &open, Some(to))?;
+                        Ok(0)
+                    }
                     _ => Err(format!("{t:?}'s entry {n} neither waits nor is taken")),
                 };
             }
@@ -86,9 +112,13 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
             }
             let up = up.filter(|_| q[i].1 == Entry::Sync);
             match (up, w.holds().get(t).map(|h| &h.take)) {
-                (Some(up), Some(Take::Sync { up: read, .. })) if *read != up => Err(format!(
+                (Some(up), Some(Take::Sync { head: read, .. })) if *read != up => Err(format!(
                     "a sync into {t:?} read {read:.7}, not the parent's head {up:.7}"
                 )),
+                (Some(head), Some(Take::Sync { up: to, .. })) => {
+                    prefix_cut(w, *t, &ours, &head, &open, Some(to))?;
+                    Ok(taken)
+                }
                 (_, None) => Err(format!("{t:?} took {taken} entries and holds nothing")),
                 _ => Ok(taken),
             }
@@ -145,6 +175,65 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
     }
 }
 
+/// P2, the prefix sync, read from git: a sync into fork `t` (at `ours`,
+/// with `open` open for writing there) of the parent's head `head`
+/// delivers the parent's first parents in order up to `to` (none: it
+/// delivers nothing and waits), and if it holds any back, the first it
+/// holds back touches a file open there: its own change (against its
+/// first parent) or a collision note on it names that file, and its
+/// version differs from the fork's (a necessary condition: the fork may
+/// keep its own undecided lines over it). That it never delivers past
+/// that commit is the take's write: it overwrites no open file
+/// (`step_checked`'s finish), so no change to an open file is delivered.
+fn prefix_cut(
+    w: &World,
+    t: Tree,
+    ours: &str,
+    head: &str,
+    open: &BTreeSet<String>,
+    to: Option<&String>,
+) -> Result<(), String> {
+    let mut chain = Vec::new();
+    let mut c = head.to_string();
+    while !w.is_ancestor(&c, ours) {
+        chain.push(c.clone());
+        c = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
+    }
+    chain.reverse();
+    let notes: Vec<(String, Noted)> = w
+        .notes_head()
+        .map(|n| read_notes_on(w.repo(), &n))
+        .unwrap_or_default();
+    let touches = |c: &str| -> Option<String> {
+        let mut files = diff_files(w, &format!("{c}^1"), c);
+        files.extend(
+            notes
+                .iter()
+                .filter(|(on, _)| on == c)
+                .map(|(_, x)| x.path.clone()),
+        );
+        files
+            .into_iter()
+            .find(|f| open.contains(f) && w.file(c, f) != w.file(ours, f))
+    };
+    let delivered = match to {
+        None => 0,
+        // It has them all already: nothing to deliver.
+        Some(to) if chain.is_empty() && w.is_ancestor(to, ours) => 0,
+        Some(to) => {
+            1 + chain.iter().position(|c| c == to).ok_or(format!(
+                "a sync into {t:?} delivers {to:.7}, not one of the parent's commits it lacks"
+            ))?
+        }
+    };
+    match chain.get(delivered) {
+        Some(c) if touches(c).is_none() => Err(format!(
+            "a sync into {t:?} holds back {c:.7}, which touches no file open for writing there"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Rule 9's locks, after every step and call. No write-open succeeds
 /// while a take holds the file in that tree. No lock outlives its holder:
 /// every open file's client is alive (and its transaction open), every
@@ -175,20 +264,7 @@ fn locks(w: &World) -> Result<(), String> {
             ));
         }
     }
-    let queued = |t: Tree, n: u64| {
-        w.queue_numbered(t).iter().any(|(m, _)| *m == n)
-            || w.holds().get(&t).is_some_and(|x| x.seqs.contains(&n))
-    };
-    // The files each tree's waiting and woken entries lock.
-    let locked = |t: Tree| -> BTreeSet<String> {
-        w.waits()
-            .get(&t)
-            .into_iter()
-            .chain(w.woken().get(&t))
-            .flat_map(|m| m.values())
-            .flat_map(|x| x.files.iter().cloned())
-            .collect()
-    };
+    let queued = |t: Tree, n: u64| w.queue_numbered(t).iter().any(|(m, _)| *m == n);
     for h in w.handles() {
         let alive = match &h.client {
             Client::Main(n) => !w.ended_main.contains(n),
@@ -201,39 +277,25 @@ fn locks(w: &World) -> Result<(), String> {
                     || w.holds()
                         .get(&t)
                         .is_some_and(|x| h.files().iter().any(|f| x.files.contains(f)))
-                    || h.behind.is_some_and(|n| queued(t, n))
             }
         };
         if !alive {
             return Err(format!("h{} outlives its client {:?}", h.id, h.client));
         }
         if !held {
+            // No program's call ever waits on a waiting landing (the owner,
+            // 2026-11-04): only on a take writing its file.
             return Err(format!(
-                "h{} ({:?} {:?}:{}) waits with no take holding its file or ahead of it, or outlives its transaction",
+                "h{} ({:?} {:?}:{}) waits with no take holding its file, or outlives its transaction",
                 h.id, h.kind, h.target, h.file
             ));
         }
-        // P3 never deadlocks: a call waiting behind a waiting take is never
-        // of a client that has open a file a waiting take waits for.
-        if let (Some(_), Target::Tree(t)) = (h.behind, h.target) {
-            let mine: BTreeSet<String> = w
-                .handles()
-                .filter(|x| x.client == h.client && !x.waiting && x.target == h.target)
-                .filter_map(|x| w.named(x))
-                .collect();
-            if let Some(f) = mine.intersection(&locked(t)).next() {
-                return Err(format!(
-                    "h{} waits behind a waiting take, but its client has open {f}, which a waiting take waits for: a deadlock",
-                    h.id
-                ));
-            }
-        }
     }
-    for (t, m) in w.waits().iter().chain(w.woken()) {
+    for (t, m) in w.waits() {
         let open = w.write_open(*t);
         for (n, x) in m {
-            // The same for a waiting landing: it locks (and P3 protects)
-            // every file its change touches, read from git.
+            // The same for a waiting landing: it locks every file its
+            // change touches, read from git.
             let q = w.queue_numbered(*t);
             if let Some((_, e @ Entry::Landing { .. })) = q.iter().find(|(m, _)| m == n)
                 && let Some(p) = entry_files(w, *t, e).difference(&x.files).next()
@@ -243,25 +305,15 @@ fn locks(w: &World) -> Result<(), String> {
                     x.files
                 ));
             }
-            let woken = w.woken().get(t).is_some_and(|m| m.contains_key(n));
-            if !w.alive(*t) || !queued(*t, *n) || (!woken && x.files.is_disjoint(&open)) {
+            if !w.alive(*t) || !queued(*t, *n) || x.until.is_disjoint(&open) {
                 return Err(format!(
                     "{t:?}'s entry {n} waits for {:?}, none open for writing: no close woke it",
-                    x.files
+                    x.until
                 ));
             }
-            // P3: it waits only for opens granted before it began waiting,
-            // and those of clients that could not be made to wait.
-            if let Some(h) = w.handles().find(|h| {
-                !h.waiting
-                    && h.target == Target::Tree(*t)
-                    && w.named(h).is_some_and(|f| x.files.contains(&f))
-                    && !x.before.contains(&h.id)
-                    && !h.jumped
-            }) {
+            if let Some(p) = x.until.difference(&x.files).next() {
                 return Err(format!(
-                    "{t:?}'s entry {n} waits, and h{} opened one of its files after it began waiting",
-                    h.id
+                    "{t:?}'s entry {n} waits for {p}, which it does not lock"
                 ));
             }
         }
@@ -361,11 +413,10 @@ pub fn check_converged(w: &World) -> Result<(), String> {
     if let Some(h) = w.handles().next() {
         return Err(format!("h{} still open at the end", h.id));
     }
-    if !w.waits().is_empty() || !w.woken().is_empty() || !w.holds().is_empty() {
+    if !w.waits().is_empty() || !w.holds().is_empty() {
         return Err(format!(
-            "a lock outlives the run: waits {:?}, woken {:?}, holds {:?}",
+            "a lock outlives the run: waits {:?}, holds {:?}",
             w.waits(),
-            w.woken(),
             w.holds().keys().collect::<Vec<_>>()
         ));
     }
@@ -493,8 +544,10 @@ fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
 /// version reverts a newer one: (a) in every live tree a line moves from
 /// version a to b only if b was written over a, or both are deletes (they
 /// agree), or a recorded collision in that tree or one upstream names a
-/// as lost; never if a was written over b (b is stale), unless a collision
-/// decided against a ([`decided_against`]); (b) every version that
+/// as lost, or a is a delete and a collision upstream names a delete of
+/// that line lost ([`lost_delete`], finding 19); never if a was written
+/// over b (b is stale), unless a collision decided against a
+/// ([`decided_against`]), or that same delete case; (b) every version that
 /// entered a tree (written there, carried in by a landing or a
 /// transaction, won or lost, or taken from the parent by a sync) is still
 /// its line's version there, or one written over it is, or both are
@@ -504,13 +557,19 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
         if !a.live() && !b.live() {
             continue;
         }
-        if w.lineage.descends(&a.id, &b.id) && !decided_against(w, t, p, l, &a.id) {
+        // A delete dropped where it agreed with the tree's own delete
+        // follows that delete: once it loses upstream, the line comes back
+        // by that decision (finding 19), here as in (b) below (finding 26:
+        // a nested sandbox's delete, dropped in its parent, whose own
+        // delete then lost in main).
+        let follows = !a.live() && lost_delete(w, t, p, l);
+        if w.lineage.descends(&a.id, &b.id) && !decided_against(w, t, p, l, &a.id) && !follows {
             return Err(format!(
                 "stale revert in {t:?}:{p}[{l}]: {} became {}, which it was written over",
                 a.id, b.id
             ));
         }
-        if !w.lineage.descends(&b.id, &a.id) && !flagged(w, t, p, l, &a.id) {
+        if !w.lineage.descends(&b.id, &a.id) && !flagged(w, t, p, l, &a.id) && !follows {
             return Err(format!(
                 "silent loss in {t:?}:{p}[{l}]: {} became {}, which was not written over it, and no collision names it",
                 a.id, b.id
@@ -564,7 +623,9 @@ fn lost_delete(w: &World, t: Tree, path: &str, line: &str) -> bool {
 
 /// No flip-flop: a version, once replaced in a tree, never shows there
 /// again, unless a collision decided against the version replacing it now
-/// ([`decided_against`]: then it is that decision). So a fork's line changes at most
+/// ([`decided_against`]: then it is that decision), or the version replacing
+/// it is a delete that follows a delete that lost upstream ([`lost_delete`],
+/// finding 19). So a fork's line changes at most
 /// once per collision (its own x, then the parent's winning m, never x
 /// again).
 fn no_flicker(w: &mut World, now: &Views) -> Result<(), String> {
@@ -573,6 +634,7 @@ fn no_flicker(w: &mut World, now: &Views) -> Result<(), String> {
         if w.left
             .contains(&(t, p.to_string(), l.to_string(), b.id.clone()))
             && !decided_against(w, t, p, l, &a.id)
+            && !(!a.live() && lost_delete(w, t, p, l))
         {
             return Err(format!(
                 "flicker in {t:?}:{p}[{l}]: {} shows again after it was replaced (now over {})",
@@ -975,9 +1037,11 @@ fn decided_at_the_parents_queue(w: &World, c: &Collision) -> bool {
 /// Rule 3 per sync, as of the moment its take began: the fork now holds
 /// the parent's version of every line, except where it holds its own
 /// version the parent's queue had not decided then (that version had not
-/// entered the parent). A sync carries the parent's decided state: a fork
-/// version the parent already took is replaced by the parent's version,
-/// whichever won.
+/// entered the parent), or had decided only in a take a prefix sync holds
+/// back (P2: the take's result commit is not in the parent commit the
+/// sync delivered, read from git). A sync carries the parent's decided
+/// state: a fork version the parent already took is replaced by the
+/// parent's version, whichever won.
 fn syncs_deliver(w: &mut World) -> Result<(), String> {
     for (t, up, result, entered) in &w.syncs[w.syncs_checked..] {
         let Tree::Fork(f) = t else {
@@ -989,12 +1053,40 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
             .filter(|(x, _)| *x == parent)
             .map(|(_, e)| e.token.as_str())
             .collect();
+        // P2: a version the parent took only in takes the sync holds back.
+        let held_back = |id: &str| {
+            let mut takes = w
+                .landings
+                .iter()
+                .filter(|l| l.tree == parent)
+                .filter(|l| {
+                    l.units
+                        .iter()
+                        .any(|(u, b)| w.edits(b, u).iter().any(|e| e.token == id))
+                })
+                .peekable();
+            takes.peek().is_some() && takes.all(|l| !w.is_ancestor(&l.result, up))
+        };
         let decided = |id: &str| is_root(id) || took.contains(id);
         for p in PATHS {
             let (u, r) = (w.file(up, p), w.file(result, p));
+            // Finding 11: the parent gave file `p` a path that the fork's
+            // own undecided name of another file holds there; the fork
+            // keeps showing `p` under the name it had (the one exception).
+            let clash = u.path().is_some_and(|path| {
+                PATHS.iter().any(|q| {
+                    let rq = w.file(result, q);
+                    *q != p
+                        && rq.path() == Some(path)
+                        && (!decided(&rq.name.id) || held_back(&rq.name.id))
+                })
+            });
             for x in r.records() {
                 let theirs = u.member(&x.line);
-                if theirs.is_none_or(|u| u.id != x.id) && decided(&x.id) {
+                if clash && x.line == u.name.line {
+                    continue;
+                }
+                if theirs.is_none_or(|u| u.id != x.id) && decided(&x.id) && !held_back(&x.id) {
                     return Err(format!(
                         "a sync of {up:.7} into {t:?} left {p}[{}] at {}, which {parent:?} already took, not its {theirs:?}",
                         x.line, x.id

@@ -13,7 +13,7 @@
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`]: an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
 //! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`Step::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; then it holds its files ([`World::holds`]) until [`Step::Finish`] writes them; a write-open, [`World::unlink`] or [`World::rename`] of a held file waits until then; a client's death ([`World::end_client`], [`World::end_main_client`]) closes its files |
 //! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (`resolve`, `adopt`, `splice`); a partial line that a merge put another line after reads as terminated (`Content::read_lines`) |
-//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); P3: a call on a file a waiting or woken entry locks waits behind it ([`Handle::behind`]) unless its client has open a file a waiting take waits for ([`Handle::jumped`]) |
+//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted and raises a [`Delayed`] event; P2, the prefix sync: a sync delivers the parent's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`prefix`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; `resolve` applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`]), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`]); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]), drops calls that never returned and puts takes back in their queues |
 //!
@@ -444,17 +444,10 @@ pub struct Handle {
     pub object: u64,
     /// The path it was opened by.
     pub path: String,
-    /// The open waits for a take's hold on the file to be released, or
-    /// behind a waiting take (`behind`).
+    /// The open waits for a take's hold on the file to be released: only
+    /// while a take is writing it, never behind a waiting take (the owner,
+    /// 2026-11-04: P3 deleted).
     pub waiting: bool,
-    /// Progress rule P3: the queue entry (its number) of a take that waited
-    /// for this file when the call came, which it waits behind until that
-    /// take has run.
-    pub behind: Option<u64>,
-    /// Granted although a take waited for its file: its client then had
-    /// open a file that a waiting take waits for, so making it wait would
-    /// deadlock it (a choice, finding 20).
-    pub jumped: bool,
     pub kind: Kind,
     /// Its write calls, in order, applied to the head at close.
     calls: Vec<Write>,
@@ -503,6 +496,12 @@ pub enum Take {
         tree: Option<String>,
         landing: bool,
         known: Option<String>,
+        /// The parent's head when the take began: `up` is it, or under P2
+        /// the last of its first parents the take may deliver.
+        head: String,
+        /// The parent's commits after `up` it holds back: their collision
+        /// notes are not delivered either.
+        held_back: BTreeSet<String>,
     },
     /// A child's commits (a squashed run, or one) and the planned merge.
     Landing {
@@ -527,16 +526,29 @@ pub struct Hold {
 
 /// Progress rule P1: a queue entry that waits for write-opens of its files
 /// to close (rule 9). Entries behind it go ahead unless they share a file
-/// or a source with it (git-model.md §6).
+/// or a source with it (git-model.md §6). No call waits behind it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Waiting {
-    /// The files its take locks.
+    /// The files its take locks (a sync: every file it may write).
     pub files: BTreeSet<String>,
-    /// The opens granted in its tree before each of its files joined its
-    /// lock set (when it first began waiting, or when its run grew): the
-    /// only ones it waits for, with the opens of clients that had to be let
-    /// through (`Handle::jumped`). Finding 23.
-    pub before: BTreeSet<HandleId>,
+    /// The files whose writers it waits for: it is woken once none is open
+    /// for writing. A landing's are all its `files`; a sync's, the files
+    /// the first commit it holds back adds to its write (P2, the prefix
+    /// sync).
+    pub until: BTreeSet<String>,
+}
+
+/// The alarm on a waiting take (a choice; the owner, 2026-11-04: a landing
+/// "indefinitely delayed while an application is keeping the fs busy with
+/// real work" is low risk): a write-open granted on a file a waiting entry
+/// waits for, which keeps it waiting. One event per such open and entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delayed {
+    pub tree: Tree,
+    /// The queue entry it keeps waiting (its number).
+    pub entry: u64,
+    pub handle: HandleId,
+    pub file: String,
 }
 
 /// Where a queue entry comes from: its order is kept per source (P1).
@@ -555,6 +567,14 @@ impl Entry {
             Entry::Sync => Source::Parent,
         }
     }
+}
+
+/// What a prefix sync (P2) delivers now: the parent's commit it goes up
+/// to, the tree it makes (none: the fork has it) and the commits it holds
+/// back; and the open files whose close it waits for to deliver the rest.
+struct Prefix {
+    deliver: Option<(String, Option<String>, BTreeSet<String>)>,
+    until: Option<BTreeSet<String>>,
 }
 
 /// One take of changes into a tree (a landing, or a transaction's commit
@@ -759,18 +779,10 @@ pub struct World {
     /// Each tree's queue entries that wait for write-opens of their files
     /// to close (P1: several may wait, each for its own files).
     waits: BTreeMap<Tree, BTreeMap<u64, Waiting>>,
-    /// Waiting entries whose files have all closed, not yet taken: they go
-    /// as any entry does (P1), and new calls on their files still wait
-    /// behind them (P3), so no open made after they began waiting can
-    /// starve them.
-    woken: BTreeMap<Tree, BTreeMap<u64, Waiting>>,
+    /// Every alarm on a waiting take ([`Delayed`]).
+    pub delayed: Vec<Delayed>,
     /// The files each landing commit's own changes touch, cached.
     touches: RefCell<BTreeMap<String, BTreeSet<String>>>,
-    /// Each waiting entry's opens granted when it first began waiting,
-    /// kept until it is taken (a woken entry that waits again keeps them).
-    /// Per file of its lock set, from when that file joined it (a squash's
-    /// run can grow while it waits): the files, and the opens granted then.
-    first_waits: BTreeMap<u64, (BTreeSet<String>, BTreeSet<HandleId>)>,
     pub lineage: Lineage,
     counters: BTreeMap<String, u32>,
     pub collisions: Vec<Collision>,
@@ -807,6 +819,7 @@ pub struct World {
     ancestry: RefCell<BTreeMap<(String, String), bool>>,
     over: RefCell<BTreeMap<String, Vec<String>>>,
     notes: RefCell<BTreeMap<String, Vec<Noted>>>,
+    notes_on: RefCell<BTreeMap<String, Vec<(String, Noted)>>>,
     /// `check`'s state: its last view of each tree and caches over
     /// immutable git objects.
     pub(crate) views: BTreeMap<Tree, BTreeMap<String, Content>>,
@@ -843,10 +856,9 @@ pub struct World {
     /// new line at its place, and a change that edited a file the parent
     /// had unlinked.
     pub inserts_met: usize,
-    /// Calls that waited behind a waiting take (P3), and calls let through
-    /// past one ([`Handle::jumped`]), counted so a run can show it met them.
-    pub behind_count: usize,
-    pub jumped_count: usize,
+    /// Syncs that delivered only a prefix of the parent's commits (P2),
+    /// counted so a run can show it met them.
+    pub prefix_syncs: usize,
     pub unlinked_edits: usize,
     pub(crate) placements_checked: usize,
 }
@@ -891,9 +903,8 @@ impl World {
             orphans: Vec::new(),
             holds: BTreeMap::new(),
             waits: BTreeMap::new(),
-            woken: BTreeMap::new(),
+            delayed: Vec::new(),
             touches: RefCell::new(BTreeMap::new()),
-            first_waits: BTreeMap::new(),
             lineage: Lineage::default(),
             counters: BTreeMap::new(),
             collisions: Vec::new(),
@@ -912,6 +923,7 @@ impl World {
             parents: RefCell::new(BTreeMap::new()),
             ancestry: RefCell::new(BTreeMap::new()),
             over: RefCell::new(BTreeMap::new()),
+            notes_on: RefCell::new(BTreeMap::new()),
             notes: RefCell::new(BTreeMap::new()),
             views: BTreeMap::new(),
             left: BTreeSet::new(),
@@ -930,8 +942,7 @@ impl World {
             ref_moves: 0,
             refs_checked: None,
             inserts_met: 0,
-            behind_count: 0,
-            jumped_count: 0,
+            prefix_syncs: 0,
             unlinked_edits: 0,
             placements_checked: 0,
         };
@@ -1082,21 +1093,6 @@ impl World {
         &self.waits
     }
 
-    /// Each tree's woken entries, not yet taken.
-    pub fn woken(&self) -> &BTreeMap<Tree, BTreeMap<u64, Waiting>> {
-        &self.woken
-    }
-
-    /// The waiting and woken entries of `t`: those new calls on their files
-    /// wait behind (P3).
-    fn ahead(&self, t: Tree) -> impl Iterator<Item = (&u64, &Waiting)> {
-        self.waits
-            .get(&t)
-            .into_iter()
-            .chain(self.woken.get(&t))
-            .flatten()
-    }
-
     /// The files tree `t`'s waiting entries wait for: those of their files
     /// open for writing there.
     pub fn waiting_for(&self, t: Tree) -> BTreeSet<String> {
@@ -1105,7 +1101,7 @@ impl World {
             .get(&t)
             .into_iter()
             .flat_map(|m| m.values())
-            .flat_map(|x| x.files.iter())
+            .flat_map(|x| x.until.iter())
             .filter(|p| open.contains(*p))
             .cloned()
             .collect()
@@ -1429,7 +1425,15 @@ impl World {
         }
         // A rename-over (one call: both name lines, in one save) needs no
         // rule of its own: if either half loses, the save loses whole
-        // (rule 3e, below).
+        // (rule 3e, below). So the path its unlink half would have freed is
+        // no claim against its rename half (finding 25): a file this change
+        // itself replaces keeps its name only because the change lost, and
+        // the rename loses with it (`By::Whole`), not to that name.
+        let replaced: BTreeSet<&str> = incoming
+            .iter()
+            .filter(|i| i.version.line == i.path && matches!(i.version.state, State::Replaced(_)))
+            .map(|i| i.path.as_str())
+            .collect();
         loop {
             let mut changed = false;
             // Two files claiming one path: the parent's keeps it.
@@ -1455,7 +1459,10 @@ impl World {
                 if verdicts.get(&k) != Some(&Verdict::Apply) || n.text().is_none() {
                     continue;
                 }
-                if let Some((_, g)) = names.iter().find(|(g, m)| g != f && m.text() == n.text()) {
+                if let Some((_, g)) = names
+                    .iter()
+                    .find(|(g, m)| g != f && m.text() == n.text() && !replaced.contains(g.as_str()))
+                {
                     verdicts.insert(k, Verdict::Lose(g.id.clone()));
                     by_file.insert(f.clone());
                     changed = true;
@@ -1597,13 +1604,34 @@ impl World {
     /// collision record is the only record of that decision. The fork's
     /// branch is in queue order, so a commit a decided change reaches was
     /// queued before it and is decided too.
-    fn decided(&self, parent: Tree, c: &str, up: &str, known: Option<&str>) -> bool {
+    /// A prefix sync (P2) delivers no decision of a commit it holds back
+    /// (`held_back`): a note on one of them is not read.
+    fn decided(
+        &self,
+        parent: Tree,
+        c: &str,
+        up: &str,
+        known: Option<&str>,
+        held_back: &BTreeSet<String>,
+    ) -> bool {
         let trees: Vec<String> = self.upstream(parent).into_iter().map(Self::name).collect();
         self.is_ancestor(c, up)
-            || self
-                .noted(known)
-                .iter()
-                .any(|x| trees.contains(&x.tree) && self.is_ancestor(c, &x.loser))
+            || self.noted_on(known).iter().any(|(on, x)| {
+                !held_back.contains(on) && trees.contains(&x.tree) && self.is_ancestor(c, &x.loser)
+            })
+    }
+
+    /// [`World::noted`], with the commit each record is on.
+    fn noted_on(&self, at: Option<&str>) -> Vec<(String, Noted)> {
+        let Some(at) = at else {
+            return Vec::new();
+        };
+        if let Some(v) = self.notes_on.borrow().get(at) {
+            return v.clone();
+        }
+        let v = read_notes_on(&self.repo, at);
+        self.notes_on.borrow_mut().insert(at.to_string(), v.clone());
+        v
     }
 
     /// The notes ref's commit now (none: no collision recorded yet).
@@ -1630,7 +1658,14 @@ impl World {
     /// version of the fork's `ours` the parent has not decided yet
     /// ([`World::decided`]) kept over the parent's version of that line,
     /// placed in the fork's order ([`splice`]).
-    fn adopt(&self, parent: Tree, ours: &str, up: &str, known: Option<&str>) -> String {
+    fn adopt(
+        &self,
+        parent: Tree,
+        ours: &str,
+        up: &str,
+        known: Option<&str>,
+        held_back: &BTreeSet<String>,
+    ) -> String {
         let mut files = BTreeMap::new();
         for p in self.changed(ours, up) {
             let (mine, theirs) = (self.file(ours, &p), self.file(up, &p));
@@ -1638,7 +1673,13 @@ impl World {
                 .records()
                 .filter(|r| {
                     theirs.member(&r.line).is_none_or(|u| u.id != r.id)
-                        && !self.decided(parent, &self.origin_of(ours, &p, &r.id), up, known)
+                        && !self.decided(
+                            parent,
+                            &self.origin_of(ours, &p, &r.id),
+                            up,
+                            known,
+                            held_back,
+                        )
                 })
                 .cloned()
                 .collect();
@@ -1647,6 +1688,7 @@ impl World {
                 files.insert(p, new);
             }
         }
+        self.keep_own_names(ours, up, &mut files);
         let tree = if files.is_empty() {
             self.tree_of(up)
         } else {
@@ -1656,10 +1698,44 @@ impl World {
         tree
     }
 
-    /// Two live files never share a path. A sync keeps the fork's
-    /// undecided rename; had the parent meanwhile given that path to
-    /// another file, the fork would show two: not modelled (MODEL.md), so
-    /// the model stops loudly.
+    /// Finding 11, two renames to one path before the parent decides (a
+    /// choice, recommended on 2026-11-04 without objection): a sync keeps
+    /// the fork's undecided name; had the parent meanwhile given that path
+    /// to another file (a rename, a rename-over, a create), the fork shows
+    /// the parent's file under the name it has in the fork (its previous
+    /// name; none, so not shown, for a file the fork has never had) until
+    /// the parent's queue decides the fork's rename. `files`: the sync's
+    /// changed files, by identity, over `up`.
+    fn keep_own_names(&self, ours: &str, up: &str, files: &mut BTreeMap<String, Content>) {
+        let now = |files: &BTreeMap<String, Content>, f: &str| {
+            files.get(f).cloned().unwrap_or_else(|| self.file(up, f))
+        };
+        // The fork's own undecided names: kept from `ours`, not the parent's.
+        let own: BTreeSet<String> = files
+            .iter()
+            .filter(|(f, c)| {
+                c.name.live()
+                    && c.name.id == self.file(ours, f).name.id
+                    && c.name.id != self.file(up, f).name.id
+            })
+            .filter_map(|(_, c)| c.path().map(str::to_string))
+            .collect();
+        for f in PATHS {
+            let c = now(files, f);
+            let Some(p) = c.path() else {
+                continue;
+            };
+            let mine = self.file(ours, f);
+            if own.contains(p) && c.name.id != mine.name.id {
+                let mut c = c.clone();
+                c.name = mine.name.clone();
+                files.insert(f.to_string(), c);
+            }
+        }
+    }
+
+    /// Two live files never share a path ([`World::keep_own_names`] keeps
+    /// it so in a sync); the model stops loudly if one would.
     fn no_clash(&self, tree: &str) {
         let mut seen = BTreeSet::new();
         for f in PATHS {
@@ -1943,8 +2019,6 @@ impl World {
             object,
             path: path.to_string(),
             waiting: false,
-            behind: None,
-            jumped: false,
             kind,
             calls: Vec::new(),
             reserved: Vec::new(),
@@ -1954,12 +2028,43 @@ impl World {
                 .holds
                 .get(&t)
                 .is_some_and(|x| h.files().iter().any(|f| x.files.contains(f)));
-            self.queue_behind(&mut h, t);
-            self.behind_count += usize::from(h.behind.is_some());
-            self.jumped_count += usize::from(h.jumped);
+            if !h.waiting && h.kind == Kind::Write {
+                self.delay(t, &h);
+            }
         }
         self.handles.insert(id, h);
         id
+    }
+
+    /// The alarm on a long wait (a choice, the owner's decision of
+    /// 2026-11-04): a call granted on a file a waiting entry of `t` waits
+    /// for keeps that entry waiting, so it raises a [`Delayed`] event per
+    /// such entry. Raised by the call, never by a timer.
+    fn delay(&mut self, t: Tree, h: &Handle) {
+        let hit: Vec<(u64, String)> = self
+            .waits
+            .get(&t)
+            .into_iter()
+            .flatten()
+            .filter_map(|(n, x)| {
+                h.files()
+                    .into_iter()
+                    .find(|f| x.until.contains(f))
+                    .map(|f| (*n, f))
+            })
+            .collect();
+        for (entry, file) in hit {
+            self.note(format!(
+                "alarm: h{} keeps {t:?}'s entry {entry} waiting for {file}",
+                h.id
+            ));
+            self.delayed.push(Delayed {
+                tree: t,
+                entry,
+                handle: h.id,
+                file,
+            });
+        }
     }
 
     /// An `O_TRUNC` open: [`World::open_write`] whose first call truncates the
@@ -2557,105 +2662,26 @@ impl World {
         Some(h)
     }
 
-    /// A close or a client's death in `t`: a queue head waiting for write-
-    /// opens there is woken once none of its files is open for writing.
-    /// Each waiting entry is woken once none of its files is open.
+    /// A close or a client's death in `t`: each waiting entry there whose
+    /// `until` files are all closed stops waiting; the next queue step on
+    /// `t` takes it, or finds it must wait again (P1). Nothing waits behind
+    /// it meanwhile (P3 is gone).
     fn wake(&mut self, t: Tree) {
         let open = self.write_open(t);
         if let Some(m) = self.waits.get_mut(&t) {
             let woken: Vec<u64> = m
                 .iter()
-                .filter(|(_, x)| x.files.is_disjoint(&open))
+                .filter(|(_, x)| x.until.is_disjoint(&open))
                 .map(|(n, _)| *n)
                 .collect();
-            let mut moved = Vec::new();
             for n in &woken {
-                moved.extend(m.remove(n).map(|x| (*n, x)));
+                m.remove(n);
             }
             if m.is_empty() {
                 self.waits.remove(&t);
             }
-            for (n, x) in moved {
+            for n in woken {
                 self.note(format!("wake {t:?}'s entry {n}"));
-                self.woken.entry(t).or_default().insert(n, x);
-            }
-        }
-        self.regrant(t);
-    }
-
-    /// Whether client `c` has open in `t` a file a waiting take there waits
-    /// for: a call of it must not wait behind a waiting take (P3), or the
-    /// take would wait for a close that waits for the take.
-    fn exempt(&self, c: &Client, t: Tree) -> bool {
-        let locked: BTreeSet<&String> = self.ahead(t).flat_map(|(_, x)| x.files.iter()).collect();
-        self.handles
-            .values()
-            .filter(|h| h.client == *c && !h.waiting && h.target == Target::Tree(t))
-            .filter_map(|h| self.named(h))
-            .any(|f| locked.contains(&f))
-    }
-
-    /// P3: a call on a file a waiting take of `t` locks waits behind the
-    /// first such take, unless its client has open a file a waiting take
-    /// waits for (then it goes ahead, `jumped`, or the two would wait for
-    /// each other).
-    fn queue_behind(&self, h: &mut Handle, t: Tree) {
-        let behind = self
-            .ahead(t)
-            .filter(|(_, x)| h.files().iter().any(|f| x.files.contains(f)))
-            .map(|(n, _)| *n)
-            .min();
-        if let Some(n) = behind {
-            if self.exempt(&h.client, t) {
-                h.jumped = !h.waiting;
-            } else {
-                h.waiting = true;
-                h.behind = Some(n);
-            }
-        }
-    }
-
-    /// Whether entry `n` is still in `t`'s queue or being taken there.
-    fn queued(&self, t: Tree, n: u64) -> bool {
-        self.queues
-            .get(&t)
-            .is_some_and(|q| q.iter().any(|(m, _)| *m == n))
-            || self.holds.get(&t).is_some_and(|x| x.seqs.contains(&n))
-    }
-
-    /// P3: grants each call waiting behind an entry of `t` that is no longer
-    /// queued (it ran) or whose client must not wait ([`World::exempt`]),
-    /// unless a take holds one of its files.
-    fn regrant(&mut self, t: Tree) {
-        let ready: Vec<HandleId> = self
-            .handles
-            .values()
-            .filter(|h| h.waiting && h.target == Target::Tree(t))
-            .filter(|h| {
-                h.behind
-                    .is_some_and(|n| !self.queued(t, n) || self.exempt(&h.client, t))
-                    && !self
-                        .holds
-                        .get(&t)
-                        .is_some_and(|x| h.files().iter().any(|f| x.files.contains(f)))
-            })
-            .map(|h| h.id)
-            .collect();
-        for h in ready {
-            // Its take ran, or its client must not wait: it goes, unless
-            // another waiting take locks its file (then it waits behind
-            // that one, P3).
-            let mut x = self.handles[&h].clone();
-            x.waiting = false;
-            x.behind = None;
-            self.queue_behind(&mut x, t);
-            self.jumped_count += usize::from(x.jumped);
-            if x.waiting {
-                self.note(format!("h{h} now waits behind entry {:?}", x.behind));
-                self.handles.insert(h, x);
-            } else {
-                self.handles.get_mut(&h).expect("waiting").jumped = x.jumped;
-                self.grant(h);
             }
         }
     }
@@ -2665,8 +2691,11 @@ impl World {
         if self.handles[&h].kind == Kind::Write {
             let x = self.handles.get_mut(&h).expect("open");
             x.waiting = false;
-            x.behind = None;
             self.note(format!("grant h{h}"));
+            let x = self.handles[&h].clone();
+            if let Target::Tree(t) = x.target {
+                self.delay(t, &x);
+            }
         } else {
             let call = self.handles.remove(&h).expect("a waiting call");
             self.note(format!("grant h{h}: it runs"));
@@ -2928,8 +2957,6 @@ impl World {
             }
         }
         self.waits.clear();
-        self.woken.clear();
-        self.first_waits.clear();
         let ids: Vec<HandleId> = self.handles.keys().copied().collect();
         let mut replay = Vec::new();
         for id in ids {
@@ -3081,16 +3108,6 @@ impl World {
         (None, files)
     }
 
-    /// Entry `n` of `t` is no longer woken (taken, or waiting again).
-    fn unwake(&mut self, t: Tree, n: u64) {
-        if let Some(m) = self.woken.get_mut(&t) {
-            m.remove(&n);
-            if m.is_empty() {
-                self.woken.remove(&t);
-            }
-        }
-    }
-
     fn eligible(&self, t: Tree) -> Option<usize> {
         self.scan(t).0
     }
@@ -3146,20 +3163,70 @@ impl World {
                     unreachable!("main has no parent")
                 };
                 let parent = self.forks[&f].parent;
-                let up = self.head(parent);
+                let whole = self.head(parent);
                 let known = self.notes_head();
-                let tree = self.sync_tree(parent, &ours, &up, known.as_deref());
+                let landing = self.landing_pending(self.forks[&f].parent, f);
+                let p = self.prefix(t, parent, &ours, &whole, known.as_deref());
+                let Some((up, tree, held_back)) = p.deliver else {
+                    // Its first commit would overwrite an open file: it
+                    // waits for those to close, taking nothing.
+                    let until = p.until.expect("a sync with nothing to deliver waits");
+                    self.note(format!(
+                        "{t:?}'s entry {seq} (a sync) waits for {until:?} to close"
+                    ));
+                    let mut files = self.hint(t, &Entry::Sync);
+                    files.extend(until.iter().cloned());
+                    self.waits
+                        .entry(t)
+                        .or_default()
+                        .insert(seq, Waiting { files, until });
+                    return 0;
+                };
                 let files = tree
                     .as_ref()
                     .map(|tr| self.changed(&ours, tr))
                     .unwrap_or_default();
-                let landing = self.landing_pending(self.forks[&f].parent, f);
+                if let Some(until) = p.until {
+                    // P2: it delivers the prefix now; the entry stays queued
+                    // and waits for the rest.
+                    self.prefix_syncs += 1;
+                    self.note(format!(
+                        "{t:?}'s entry {seq} delivers {up:.7} of {whole:.7}, holds {files:?}, and waits for {until:?} to close for the rest"
+                    ));
+                    let mut all = self.hint(t, &Entry::Sync);
+                    all.extend(until.iter().cloned());
+                    all.extend(files.iter().cloned());
+                    self.waits
+                        .entry(t)
+                        .or_default()
+                        .insert(seq, Waiting { files: all, until });
+                    self.holds.insert(
+                        t,
+                        Hold {
+                            files,
+                            take: Take::Sync {
+                                up,
+                                tree,
+                                landing,
+                                known,
+                                head: whole,
+                                held_back,
+                            },
+                            seqs: Vec::new(),
+                            ours,
+                            entered: self.entered.len(),
+                        },
+                    );
+                    return 0;
+                }
                 (
                     Take::Sync {
                         up,
                         tree,
                         landing,
                         known,
+                        head: whole,
+                        held_back,
                     },
                     files,
                     1,
@@ -3196,37 +3263,21 @@ impl World {
         };
         let open: BTreeSet<String> = self.write_open(t).intersection(&files).cloned().collect();
         if !open.is_empty() {
+            // A landing whose files are open waits for them to close; a
+            // sync never gets here (`prefix` delivers none of an open file).
             self.note(format!("{t:?}'s entry {seq} waits for {open:?} to close"));
-            // It waits for the opens granted before each of its files joined
-            // its lock set (P3 protects a file from then on).
-            let (mut known, mut before) = self.first_waits.remove(&seq).unwrap_or_default();
-            for h in self.handles.values() {
-                if !h.waiting
-                    && h.target == Target::Tree(t)
-                    && self
-                        .named(h)
-                        .is_some_and(|f| files.contains(&f) && !known.contains(&f))
-                {
-                    before.insert(h.id);
-                }
-            }
-            known.extend(files.iter().cloned());
-            self.first_waits.insert(seq, (known, before.clone()));
-            self.unwake(t, seq);
-            self.waits
-                .entry(t)
-                .or_default()
-                .insert(seq, Waiting { files, before });
-            self.regrant(t);
+            self.waits.entry(t).or_default().insert(
+                seq,
+                Waiting {
+                    until: files.clone(),
+                    files,
+                },
+            );
             return 0;
         }
         let mut qd = self.queues.remove(&t).unwrap_or_default();
         let seqs: Vec<u64> = qd.drain(i..i + n).map(|(m, _)| m).collect();
         self.queues.insert(t, qd);
-        for m in &seqs {
-            self.first_waits.remove(m);
-            self.unwake(t, *m);
-        }
         self.note(format!("{t:?} holds {files:?} (entry {seq})"));
         self.holds.insert(
             t,
@@ -3259,12 +3310,20 @@ impl World {
                 tree,
                 landing,
                 known,
+                held_back,
+                ..
             } => {
                 let tree = if moved {
                     let Tree::Fork(f) = t else {
                         unreachable!("main has no parent")
                     };
-                    self.sync_tree(self.forks[&f].parent, &head, &up, known.as_deref())
+                    self.sync_tree(
+                        self.forks[&f].parent,
+                        &head,
+                        &up,
+                        known.as_deref(),
+                        &held_back,
+                    )
                 } else {
                     tree
                 };
@@ -3286,32 +3345,19 @@ impl World {
             }
         }
         self.taken = Some(self.head(t));
-        // The release: every call waiting for the hold goes ahead, then
-        // every call waiting behind an entry this take ran (P3).
-        // A call that waited for the hold and now meets a waiting take of
-        // one of its files waits behind that take (P3).
+        // The release: every call waiting for the hold goes ahead (none
+        // waits for anything else), then an entry waiting in `t` whose
+        // files closed meanwhile is woken (a prefix sync's rest).
         let waiting: Vec<HandleId> = self
             .handles
             .values()
-            .filter(|h| h.waiting && h.target == Target::Tree(t) && h.behind.is_none())
+            .filter(|h| h.waiting && h.target == Target::Tree(t))
             .map(|h| h.id)
             .collect();
         for h in waiting {
-            let mut x = self.handles[&h].clone();
-            x.waiting = false;
-            self.queue_behind(&mut x, t);
-            self.behind_count += usize::from(x.behind.is_some());
-            self.jumped_count += usize::from(x.jumped);
-            if x.waiting {
-                self.note(format!("h{h} now waits behind entry {:?}", x.behind));
-                self.handles.insert(h, x);
-            } else {
-                let jumped = x.jumped;
-                self.handles.get_mut(&h).expect("waiting").jumped = jumped;
-                self.grant(h);
-            }
+            self.grant(h);
         }
-        self.regrant(t);
+        self.wake(t);
     }
 
     /// Rule 9, the files a landing locks, fixed when it begins: every file
@@ -3506,9 +3552,77 @@ impl World {
         });
     }
 
+    /// Progress rule P2, the prefix sync (the owner, 2026-11-04: "agreed",
+    /// on "a sync delivers the parent's changes in order up to the first
+    /// change that touches a file the sandbox has open for writing"): the
+    /// parent's commits fork `t` (at `ours`) lacks are `whole`'s first
+    /// parents back to the first the fork has, each one change as the
+    /// parent took it (a save, a transaction's commit, a landing; a
+    /// squash's saves are in it as the parent took them). It delivers them
+    /// in order up to, not including, the first whose delivery would
+    /// overwrite a file open for writing in `t` (the sync's own write, so
+    /// a commit that leaves the fork's file as it is touches nothing), and
+    /// holds back that one and every later one, their collision notes
+    /// included, until those files close.
+    fn prefix(
+        &self,
+        t: Tree,
+        parent: Tree,
+        ours: &str,
+        whole: &str,
+        known: Option<&str>,
+    ) -> Prefix {
+        let open = self.write_open(t);
+        let none = BTreeSet::new();
+        let tree = self.sync_tree(parent, ours, whole, known, &none);
+        let writes = |tr: &Option<String>| -> BTreeSet<String> {
+            tr.as_ref()
+                .map(|tr| self.changed(ours, tr))
+                .unwrap_or_default()
+        };
+        if writes(&tree).is_disjoint(&open) {
+            return Prefix {
+                deliver: Some((whole.to_string(), tree, none)),
+                until: None,
+            };
+        }
+        let mut chain = Vec::new();
+        let mut c = whole.to_string();
+        while !self.is_ancestor(&c, ours) {
+            chain.push(c.clone());
+            c = self.first_parent(&c);
+        }
+        chain.reverse();
+        let mut deliver = None;
+        let mut before = BTreeSet::new();
+        for (k, c) in chain.iter().enumerate() {
+            let held_back: BTreeSet<String> = chain[k + 1..].iter().cloned().collect();
+            let tree = self.sync_tree(parent, ours, c, known, &held_back);
+            let now = writes(&tree);
+            if !now.is_disjoint(&open) {
+                // It waits until no file this commit adds to the sync's
+                // write is open (its own change's files, as for a landing).
+                return Prefix {
+                    deliver,
+                    until: Some(now.difference(&before).cloned().collect()),
+                };
+            }
+            deliver = Some((c.clone(), tree, held_back));
+            before = now;
+        }
+        unreachable!("the whole sync overwrites an open file, so one of its commits does")
+    }
+
     /// The tree a sync of the parent's `up` into fork `x` (at `ours`)
     /// makes, per [`MergeRule`]; none if the fork already has `up`.
-    fn sync_tree(&self, parent: Tree, ours: &str, up: &str, known: Option<&str>) -> Option<String> {
+    fn sync_tree(
+        &self,
+        parent: Tree,
+        ours: &str,
+        up: &str,
+        known: Option<&str>,
+        held_back: &BTreeSet<String>,
+    ) -> Option<String> {
         if self.is_ancestor(up, ours) {
             return None;
         }
@@ -3516,7 +3630,7 @@ impl World {
             self.tree_of(up)
         } else {
             match self.policies.merge {
-                MergeRule::PerLine => self.adopt(parent, ours, up, known),
+                MergeRule::PerLine => self.adopt(parent, ours, up, known, held_back),
                 MergeRule::GitMergeBase => self.git_merge(ours, up),
             }
         })
@@ -3565,7 +3679,6 @@ impl World {
             && self.children(t).is_empty()
             && !self.holds.contains_key(&t)
             && !self.waits.contains_key(&t)
-            && !self.woken.contains_key(&t)
             && !self.landing_pending(fork.parent, f)
     }
 
