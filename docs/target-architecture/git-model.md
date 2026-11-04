@@ -9,8 +9,10 @@ before it are at 8185755), which runs the rules on the real `git` program.
 other page has a bug.
 **Revision of 2026-11-04** (answering the pull-request review's points 1, 3, 4 and 5): the journal that records every
 write call before it returns (§3), objects apart from file identities (§7), progress past a long-held file (§6),
-why a custom protocol on git primitives (§14), and the prototype plan (§18). All four are design choices, designed
-and **not modelled**: the model's rules and checks are unchanged by them.
+why a custom protocol on git primitives (§14), and the prototype plan (§18). All four are design choices. Since
+the commit that adds MODEL.md rule 12, the journal's crash replay (§3), creates, objects and the atomic save (§7)
+and progress rules P1 and P3 (§6) are **modelled** (MODEL.md rules 9, 11 and 12, findings 19 to 22); P2, the
+partial sync, is **not**.
 
 ## 0. What the owner asked for
 
@@ -82,8 +84,8 @@ flowchart TB
 | version | one state of a line: new bytes or deleted, each with its own id, written over the version its writer saw | `Line::id`, `Line::over` |
 | deleted version | a delete, kept hidden in the line map so the rule can compare it | `State::Gone` |
 | file identity; name line | a file's merge identity (its line history, which the referee compares) and the line holding its path; kept by a rename and by the atomic-save rewrite (§7); a rename writes a new version of the name line, an unlink a deleted one | `Content::name` |
-| object | what an open handle holds, as the inode does on Linux: fixed at open, follows renames, named by no path once unlinked or replaced; per tree and in the actor's memory, never in git (§7) | not modelled: an open names a file identity |
-| journal | each tree's write-ahead log of write calls and path calls, in the state area: a call is in it before the call returns (§3) | not modelled |
+| object | what an open handle holds, as the inode does on Linux: fixed at open, follows renames, named by no path once unlinked or replaced; per tree and in the actor's memory, never in git (§7) | `Handle::object`, `World::named` |
+| journal | each tree's write-ahead log of write calls and path calls, in the state area: a call is in it before the call returns (§3) | an open's calls (`Handle`), replayed by `World::crash` |
 | collision | two versions of one line, each written without seeing the other | `Collision` |
 | decided | the parent's lineage reaches the commit that wrote the version | `is_ancestor` |
 | "saw" a line | the version on the writer's first parent, and every version that one was written over | `written_over` |
@@ -211,7 +213,7 @@ The queue fixes the order; git fixes which line is newer. No clock is read (`r2_
 git's range walks (`rev-list A --not B`) stop early by commit date, so the referee reads ancestry only: `merge-base
 --is-ancestor`, a commit's parents (`rev-list --parents -n1`), whole-history `rev-list` (finding 5). No collision holds a take (rules 1 and 4); a take
 waits only for its files' locks (§6). In the model the entries behind it wait in order; in the target an entry that
-shares no file and no source with it goes ahead (§6, "Progress"; not modelled).
+shares no file and no source with it goes ahead (§6, "Progress"; modelled as P1).
 
 **Where the order lives** (design choice). No git fact orders two sibling forks' landings, so each entry is a
 create-only ref `refs/queue/<tree>/<n>`, pointing at the landing's commit or, for a sync, at a fixed blob reading
@@ -286,7 +288,7 @@ sequenceDiagram
   A->>QC: Sync
 ```
 
-### Progress: a held file holds back only its own changes (design choice, review point 4; not modelled)
+### Progress: a held file holds back only its own changes (design choice, review point 4; P1 and P3 modelled, P2 not)
 
 The owner's lock words stand: a take waits for its own files ("A sync should acquire a lock on every file that it
 aims to overwrite, yes", 2026-11-03; "freezing only the files that a landing touches sounds reasonable",
@@ -314,6 +316,17 @@ taken against the parent's own saves, as any earlier arrival would. P2 changes o
 sees more of its upstream sooner, so its next saves are written over more of it and collide less. How to check P1
 (a model test to add, not built): replaying the same calls first in, first out, with the entries queued in the
 order P1 took them, decides the same trees and collisions.
+
+**What the model does** (MODEL.md rule 9). P1: a queue step takes the first entry that no earlier waiting entry,
+nor one waiting behind it, shares a file or a source with; an entry not yet planned is judged by the files read
+from git (a landing's own changes; a sync's every file its tree and the parent's head differ in, all it may write),
+and a squash carries no save that shares a file with a waiting entry ahead. P3: a call on a file a waiting take
+locks waits behind it until that take has run; a take whose files have all closed is woken but keeps that place
+until it is taken, or an open made between its wake and its take would start the wait again. **P3 as written above
+deadlocks** (MODEL.md finding 20): a program holding file A open, which the take waits for, that opens file B, which
+the take also locks, blocks in that open and never closes A. So a call of a client that has open a file a waiting
+take waits for goes ahead (a choice); the checks assert that no call waiting behind a take is of such a client. P2
+is not modelled: in the model a sandbox's open file holds back that sandbox's whole sync.
 
 ## 7. Landing: the referee, per line, each change whole
 
@@ -421,14 +434,18 @@ it with the content, the parent winning:
 | two renames of one file; two files to one path | the parent's name wins; the sandbox's file keeps its old name | `r11_concurrent_renames_*` |
 | a rename-over (both files existing in the parent) whose replaced file the parent changed, or whose rename loses | one call, so one save holding both name lines: it loses whole by rule 3e, no rule of its own | `r11_a_rename_over_applies_or_loses_whole`, `r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file` |
 
-**The atomic-save idiom** (a choice; not modelled: it needs creates). A program writes a new file and renames it
-over the target. Taken as a rename-over, it would replace the target's identity, and a parent's concurrent edit of
-any line would make the whole save lose. So a rename-over from a file the parent has never had (created since the
-fork last synced) is saved instead as a **rewrite of the replaced file** with the new file's bytes: the replaced
-file keeps its identity, its lines are aligned with the new bytes (above), and the new file, which the parent never
-had, simply ends. It then lands like any rewrite: judged per line, and whole (rule 3e).
+**The atomic-save idiom** (a choice; modelled, MODEL.md rule 11). A program writes a new file and renames it over
+the target. Taken as a rename-over, it would replace the target's identity, and a parent's concurrent edit of any
+line would make the whole save lose. So a rename-over from a file **new since its create** (its name version is
+still the one its create wrote: never renamed) is saved instead as a **rewrite of the replaced file** with the new
+file's bytes: the replaced file keeps its identity, its lines are aligned with the new bytes (above), and the new
+file ends. It then lands like any rewrite: judged per line, and whole (rule 3e). The previous wording, "a file the
+parent has never had (created since the fork last synced)", depended on whether the parent had taken the create
+when the rename ran, a race between the editor's close and the landing (MODEL.md finding 21); "new since its create"
+is read from git and is the same whenever the rename runs. A file created and ended in one change (a transaction's
+atomic save) changed nothing anyone sees, so the change carries none of its versions.
 
-**Objects apart from file identities** (design choice, review point 3; not modelled). The rewrite keeps the
+**Objects apart from file identities** (design choice, review point 3; modelled, MODEL.md rule 11). The rewrite keeps the
 target's **file identity**: what merging compares, its line history. It must not keep the target's **object**: what
 an open handle holds, the inode on Linux. A handle never changes object, so writes through an old handle never
 reach the file that replaced it. (The previous draft let an open handle of the replaced path go on saving against
@@ -454,7 +471,8 @@ losing change is kept; cost, every unlink-after-open scratch file, a common temp
 
 An unlink made after a sync saw the parent's lines and wins by lineage (`r11_an_unlink_after_the_sync_wins`). In
 one tree, as on Linux, an open file follows its object through a rename, and one whose object no path names at
-close saves nothing.
+close saves nothing. Such an open has no file open, so no take waits for its close (MODEL.md finding 22). Tests:
+`r11_an_old_writer_after_an_atomic_save_saves_nothing`, `r11_an_open_on_the_new_file_follows_it_through_the_atomic_save`.
 
 **Clean landing.** Under full lineage, a fork commit made on the parent's current head is a fast-forward. Otherwise
 it is a merge: first parent the parent's head, second the fork commit, named for its writer. Under `Squashed` it is
@@ -641,7 +659,9 @@ sequenceDiagram
 ## 12. Crash recovery and convergence
 
 **Convergence is checked for the modelled executions (the scenarios and the seeds run), not proven:** when writes stop and every queue drains, every fork equals main (`check_converged`,
-`convergence_when_writes_stop`). **Restarts are not modelled;** the rest is a design choice.
+`convergence_when_writes_stop`). **A crash with the journal's replay is modelled** (MODEL.md rule 12: every
+open saved once from the journal, takes put back, waiting calls dropped); the rest of a restart, and power loss, are
+not; the rest is a design choice.
 
 **One step, one ref transaction.** Each step writes its objects, then makes every ref change in one `update-ref
 --stdin` transaction, each update naming its old value. That survives a crash only on the **reftable** backend
@@ -694,7 +714,7 @@ that works, so the second table weighs the other established designs (design cho
 | Jujutsu (git-backed): change ids and the operation log | a change's identity apart from its commit's; every operation logged, concurrent operations reconciled at the next load; conflicts stored in commits | its merge is three-way by content, so findings 1, 6 and 13(b) apply; it stores a conflict for a person rather than deciding it. Its operation log is prior art for the journal (§3) and for recovery; it is not adopted as a dependency |
 
 **What the custom protocol still owes**, none of it validated yet: where the line map is stored (§16 question 1);
-recovery, designed (§12) but not modelled or run; metadata growth, since line maps keep every deleted version, each
+recovery, designed (§12), its crash replay of the journal modelled (MODEL.md rule 12) but none of it run on a real mount; metadata growth, since line maps keep every deleted version, each
 `Squashed` landing adds a graft and each losing change a collision ref, none with a trim rule; performance, with no
 measurement of the alignment, the referee on large files, or grafts' cost to `merge-base` at scale. The prototype
 (§18) measures these before the architecture is settled.
@@ -796,11 +816,13 @@ The model checks nothing in §3 or §12: it has no actor or restarts.
   a sync, in the window after the sandbox closed its line and before main's queue decides it: by commit
   ancestry it descends from main's line, but per line it was written over its own (finding 8).
 - A file held open for writing receives nothing until its close, and every incoming change to it waits, with
-  each change that shares a file or a source (P1) or a file or a writer (P2) with one. In the model the whole
-  queue waits behind such a take; under §6's progress rules (not modelled) only those changes do.
+  each change that shares a file or a source (P1) or a file or a writer (P2) with one. The model has P1 (and P3):
+  only those changes wait, except into a sandbox, where without P2 its open file holds back its whole sync.
 - **Under P3 a file's other writers wait behind a waiting take.** Once an incoming change to a file waits, a new
   writer of that file waits too, so a file held open for days makes its next writer wait for days. Linux has no
-  such wait; `TakeWaiting` names the holder. Without P3, overlapping writers starve the take instead.
+  such wait; `TakeWaiting` names the holder. Without P3, overlapping writers starve the take instead. A program
+  that has open a file the take waits for is let through, or it would deadlock (MODEL.md finding 20), so it can
+  keep the take waiting by reopening the file.
 - **The progress rules cost state.** Each entry keeps its file set, and a take checks it against every earlier
   waiting entry (entries times files). A partial sync must record what it deferred where the next sync reads it
   (its queue entry): the fork's ancestry then reaches the upstream's head although part of it is not applied, so
@@ -831,10 +853,11 @@ The model checks nothing in §3 or §12: it has no actor or restarts.
 - A stale truncate and rewrite overwrites a synced line in every tree, no collision, credited to its writer (§6).
 - The shared remote lags: a collision ref reaches it when Replication's next push lands, not with the take.
 
-**Not modelled.** This revision's journal (§3), objects (§7) and progress rules (§6); question 2's sync; creates
-(renames go to new paths or over existing files), so the atomic-save idiom's rewrite (§7); an offset write's base older than the head at close (§6); directories, hard links, a line
+**Not modelled.** Progress rule P2, the partial sync (§6), and the first-in-first-out replay test of P1; power loss
+before an `fsync`, a failed save retried, and refusals at the write call (§3); question 2's sync; an offset write's
+base older than the head at close (§6); directories, hard links, a line
 moved between files, path `truncate(2)` and `mmap`; binary files beyond NUL bytes (the model's bytes are ASCII); approvals and landing timing;
-integrator patches; restarts and the actor (§3, §12); space limits; history truncation; views, rules, commit window.
+integrator patches; restarts beyond the crash's journal replay, and the actor (§3, §12); space limits; history truncation; views, rules, commit window.
 
 ## 17. The older pages
 

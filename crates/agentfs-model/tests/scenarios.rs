@@ -2728,18 +2728,21 @@ fn r3_a_dropped_agreeing_delete_follows_the_delete_it_agreed_with() {
 /// Rule 9 with P1: a main writer holding a file open for long holds back
 /// only the landings that touch that file. An unrelated sandbox's change
 /// goes ahead of the waiting one; a later change of the waiting one's own
-/// sandbox does not (each sandbox's order is kept), even of another file.
+/// sandbox does not (each sandbox's order is kept), even of another file,
+/// nor does another sandbox's change of the held file.
 #[test]
 fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
     for history in BOTH {
         let mut w = world(history);
         let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
+        let k = w.create_fork(Tree::Main);
         let m2 = Client::Main("m2".into());
         let log = w.open_write(&m2, "a");
         w.write(log, Write::Append("log\n".into()));
         let x = w.save(&Client::Fork(f), "a", 0);
         let y = w.save(&Client::Fork(g), "b", 0);
         let z = w.save(&Client::Fork(f), "c", 0);
+        let v = w.save(&Client::Fork(k), "a", 1);
         take(&mut w, &Step::Next(Tree::Main));
         assert!(
             w.waits().contains_key(&Tree::Main),
@@ -2761,7 +2764,7 @@ fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
         );
         assert!(
             !w.pending().contains(&Step::Next(Tree::Main)),
-            "nothing else is free to go"
+            "nothing else is free to go: k's change shares the waiting one's file"
         );
         w.write(log, Write::Append("more\n".into()));
         w.close(log);
@@ -2771,6 +2774,7 @@ fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
             has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "c", &z),
             "{history:?}"
         );
+        assert!(has(&w, Tree::Main, "a", &v));
         assert!(w.read(Tree::Main, "a").bytes().ends_with("log\nmore\n"));
     }
 }
@@ -2804,6 +2808,11 @@ fn r9_a_waiting_take_is_not_starved_by_new_writers() {
             "its own files closed: it is woken"
         );
         assert!(w.handle(second).waiting, "and the new open still waits");
+        let third = w.open_write(&Client::Main("m3".into()), "a");
+        assert!(
+            w.handle(third).waiting,
+            "{history:?}: woken, not yet taken, it still comes first"
+        );
         next(&mut w, Tree::Main);
         assert!(
             w.file(&w.main_head, "a").contains(&x),
@@ -2812,6 +2821,7 @@ fn r9_a_waiting_take_is_not_starved_by_new_writers() {
         assert!(!w.handle(second).waiting, "its release granted the open");
         assert!(w.lookup(&w.main_head, "a").is_none(), "and ran the unlink");
         w.close(second);
+        w.close(third);
         drain(&mut w);
     }
 }

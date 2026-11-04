@@ -649,9 +649,14 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
             expect.extend(o.closing(w, h));
         }
     }
-    match during {
-        Some(h) => w.close_then_crash(h),
-        None => w.crash(),
+    // Observed after each save, so the ledger sees one tree move at a time.
+    if let Some(h) = during {
+        w.close_keeping_journal(h);
+        gitledger::observe(w)?;
+    }
+    for h in w.crash_down() {
+        w.restart_open(h);
+        gitledger::observe(w)?;
     }
     dropped(w, n, expect)?;
     if let Some(h) = w.handles().next() {

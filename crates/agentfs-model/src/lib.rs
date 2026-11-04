@@ -28,7 +28,13 @@
 //! each line keeps an identity through later edits around it; a file's
 //! name and existence are one more line (unlink, rename); a
 //! sync or landing into a tree first waits for that tree's write-opens of
-//! the files it will overwrite to close, then holds them while it writes.
+//! the files it will overwrite to close, then holds them while it writes;
+//! an entry waits only for its own files and earlier waiting entries it
+//! shares a file or a source with, and a waiting take comes before new
+//! writers of its files. Files are created; an open holds an object, so an
+//! editor's atomic save (a rewrite of the replaced file) never receives an
+//! old writer's calls. Every write call is journaled, and a crash saves
+//! each open from the journal once.
 //! [`check`] holds the invariants, read back from the repository after
 //! every step.
 //!

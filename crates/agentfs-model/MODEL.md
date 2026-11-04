@@ -70,9 +70,10 @@ each is open for him to change.
 | 6 | *Choice:* every change traces back to one writer. A sync commit (the merge a sync makes when the sandbox has commits of its own the parent has not taken, so it cannot fast-forward) is labelled `Sync`, credited to `agentfs`, with the parent's commit second; it has no edits of its own: a merge carries only lines a parent holds. | Choice | `r6_a_sync_is_a_merge_with_the_parent_second`, every test |
 | 7 | One history setting per volume. Full lineage: every sandbox commit is taken on its own and stays in main's history, a losing one included. Squashed: main's history holds only main's own commits; a sandbox's plain saves sitting directly behind each other in the parent's queue are taken together; each transaction commit lands as its own unit. Every sandbox commit stays stored. A squashed changeset is history only, never a unit judged whole: each save of the take is judged on its own first, in order (rule 3e), and only the winners are the one squashed commit; a loser is in no commit of the parent, stays its own commit on the sandbox's branch, and its collision ref, which Replication pushes, names it. *Choice:* the winning saves are recorded beside history as a git graft (`refs/replace/`, the squash's parents read as the parent's head and each winning save); a nested sandbox's landing also lands on its own (it carries another writer's lines), and the parent above judges it as the saves its graft names; a squash takes only the saves directly behind its first, never one from behind another entry (another sandbox's, a sync, a transaction's commit), so it judges the same changes in the same order as one take each and the setting decides no collision; a take whose saves all lost still writes an (empty) commit with no graft, so the parent's history shows the decision and its sandboxes sync. | Owner (one setting per volume, squashing plain saves, transaction commits on their own, every commit stored); *choice (not objected to)*: only winners squashed, his question answered by this design, to which he did not object; the graft, adjacency and the rest are choices | `r7_squashed_saves_land_as_one_changeset`, `r7_a_squashed_take_squashes_only_the_winners`, `r7_the_history_setting_decides_no_collision`, `r7_history_setting_and_losers_stay_reachable`, `random_interleavings_history_settings_decide_the_same` |
 | 8 | A save records what the program's write calls did, applied at close to the tree's head. POSIX gives byte calls only, and so does the model: an `O_APPEND` write (which the save knows), `pwrite` at an offset (a gap past the end reads as NUL bytes), `ftruncate`, and an `O_TRUNC` open (a truncate at open). A line is its bytes up to and including a newline, or the bytes after the last newline (a partial last line: the file has no final newline). An append's bytes go after the file's last byte as it is at close, another writer's concurrent append included: each line they start is a new line after the file's last line, so it writes over none; but if the file then ends in a partial last line, the appended bytes up to and including their first newline finish that line, a new version of it written over it, not a new line (*choice*: "foo" and an append of "bar" is one line, "foobar"). Offset writes change bytes; every line they leave unchanged keeps what the tree holds (a line a sync brought included). A truncate and rewrite replaces the whole file, so a stale rewrite really puts old content back, recorded as that program's write over what it replaced, the replaced version kept in history. Which lines the bytes changed is rule 10's alignment. | Owner; the append onto a partial line and the alignment are choices | `r8_concurrent_appends_never_overwrite_each_other`, `r8_an_append_after_the_sync_keeps_the_synced_line`, `r8_an_offset_write_elsewhere_keeps_the_synced_line`, `r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it`, `r8_an_append_onto_a_partial_last_line_finishes_it`, `r8_concurrent_appends_onto_a_partial_last_line_collide`, `r8_split_and_overlapping_writes_make_one_version`, `r8_truncates_holes_and_an_empty_o_trunc` |
-| 9 | A sync into a tree acquires a lock on every file it will overwrite: it waits until no client of that tree has the file open for writing, holds the files while it writes, and a new write-open of them waits until it finishes. Every wait ends on an event (a close, a client's death, a release), never a timer. *Choice:* the same for a landing into a tree, whose lock is every file its changes touch, fixed when it begins, a losing change's included (so a replan on a moved head never writes an unheld file: a save of a parent client cannot flip a losing change to a win mid-take); a take waits for all its files at once (all or nothing, so it never holds one file while waiting for another), and its queue waits behind it in order; a client's death (its end event, a sandbox's client or one of main's) closes its open files, saving their write calls as the kernel's close on exit would, and drops its waiting opens; the lock covers every call that changes a held file: `unlink` and `rename(2)` onto or away from it wait like a write-open and the take's release runs them (path `truncate(2)` too, not modelled). | Owner; landings, all or nothing, death and path calls are choices | `r9_a_sync_waits_for_an_open_writer_then_applies`, `r9_a_landing_waits_for_the_parents_open_writer`, `r9_a_landing_holds_the_files_of_its_losing_changes`, `r9_a_write_open_waits_while_a_sync_holds_the_file`, `r9_client_death_releases_its_locks`, `r9_a_main_clients_death_releases_its_locks`, `r11_an_unlink_or_rename_of_a_held_file_waits` |
+| 9 | A sync into a tree acquires a lock on every file it will overwrite: it waits until no client of that tree has the file open for writing, holds the files while it writes, and a new write-open of them waits until it finishes. Every wait ends on an event (a close, a client's death, a release), never a timer. *Choice:* the same for a landing into a tree, whose lock is every file its changes touch, fixed when it begins, a losing change's included (so a replan on a moved head never writes an unheld file: a save of a parent client cannot flip a losing change to a win mid-take); a take waits for all its files at once (all or nothing, so it never holds one file while waiting for another), and its queue waits behind it in order; a client's death (its end event, a sandbox's client or one of main's) closes its open files, saving their write calls as the kernel's close on exit would, and drops its waiting opens; the lock covers every call that changes a held file: `unlink` and `rename(2)` onto or away from it wait like a write-open and the take's release runs them (path `truncate(2)` too, not modelled). *Choice*, progress (git-model.md §6): P1, an entry waits only for its own files and for earlier waiting entries it shares a file or a source with (one sandbox's entries, or the syncs, keep their order), so a long-held file holds back only the changes that touch it; P3, once a take waits for a file, a new write-open, `unlink` or `rename(2)` of one of its files in that tree waits behind it until it has run, even after its files closed and before it is taken, so new writers cannot starve it; except a call of a client that has open a file a waiting take waits for, which goes ahead, since making it wait would deadlock it (finding 20). P2 (a partial sync) is not modelled: a sandbox's open file still holds back its whole sync. | Owner; landings, all or nothing, death, path calls and progress are choices | `r9_a_sync_waits_for_an_open_writer_then_applies`, `r9_a_landing_waits_for_the_parents_open_writer`, `r9_a_landing_holds_the_files_of_its_losing_changes`, `r9_a_write_open_waits_while_a_sync_holds_the_file`, `r9_client_death_releases_its_locks`, `r9_a_main_clients_death_releases_its_locks`, `r11_an_unlink_or_rename_of_a_held_file_waits`, `r9_a_long_lived_main_writer_holds_back_only_its_own_file`, `r9_a_waiting_take_is_not_starved_by_new_writers`, `r9_a_writer_holding_a_waited_file_is_not_made_to_wait` |
 | 10 | *Choice:* at close the save derives line identity from the bytes: it aligns the program's bytes with the head's lines once, by git's histogram diff, and records the result beside the bytes (a line map): unchanged lines keep their versions; a changed region pairs old and new lines in order, each new one a new version of its old one, written over the version the writer saw; extra new lines get new identities; extra old ones get a hidden deleted version. A line's bytes include its newline, so adding or removing the final newline changes the last line; a line written in two calls is one version, and of two overlapping writes the later bytes count. An append needs no alignment (rule 8). A move is read as a delete plus a new line; among identical lines, which one changed is the diff's pick. From then on the referee (rule 3) and a sync compare versions of one identity, never positions or bytes: a line new to the parent applies; two deletes agree; of two inserts at one place the parent's comes first; an applied version is placed after the nearest line before it that both sides hold. Only a file's last line can lack a newline in bytes: a partial line that a merge has put another line after (two appends at one place, the parent's first and partial) reads as terminated, and its version keeps the bytes its writer wrote. | Choice, asked for by the owner's "Go" | `r10_an_insert_shifts_lines_without_changing_their_identity`, `r10_concurrent_inserts_at_one_place_keep_both_the_parents_first`, `r10_a_delete_against_a_concurrent_edit_the_parent_wins`, `r10_a_move_is_a_delete_plus_an_insert`, `r10_repeated_identical_lines_align_by_the_diff`, `r10_a_line_after_a_partial_line_reads_terminated`, every random run (`placed_and_unlinked`) |
-| 11 | *Choice:* a file's identity is fixed at create and kept by a rename (as an inode); its path and existence are its name line, decided by rule 3 like any line: a rename is a new version, an unlink a deleted one, a rename-over both in one save. Coupled with the content, the parent winning: an unlink loses whole if the parent has a live line its writer never saw; an edit of a file the parent unlinked loses, all of it; a rename and an edit both apply (the edit follows the file); two files renamed to one path, the parent's keeps it. A rename-over is one save holding both name lines, so it applies or loses whole by rule 3e, with no rule of its own. The atomic-save idiom, a rename-over from a file the parent never had, is a rewrite of the replaced file instead (git-model.md §7); it needs creates, which the model lacks. | Choice, asked for by the owner's "Go" | `r11_an_unlink_against_a_concurrent_edit_the_parent_wins`, `r11_an_unlink_after_the_sync_wins`, `r11_a_rename_and_a_concurrent_edit_both_apply`, `r11_concurrent_renames_the_parent_wins`, `r11_a_rename_over_applies_or_loses_whole`, `r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file`, `r11_an_open_file_follows_a_rename_and_an_unlinked_one_saves_nothing`, every random run (`placed_and_unlinked`) |
+| 11 | *Choice:* a file's identity is fixed at create and kept by a rename (as an inode); its path and existence are its name line, decided by rule 3 like any line: a rename is a new version, an unlink a deleted one, a rename-over both in one save. Coupled with the content, the parent winning: an unlink loses whole if the parent has a live line its writer never saw; an edit of a file the parent unlinked loses, all of it; a rename and an edit both apply (the edit follows the file); two files renamed to one path, the parent's keeps it. A rename-over is one save holding both name lines, so it applies or loses whole by rule 3e, with no rule of its own. A create (`O_CREAT` of a new path) makes a new identity at once, one save of its name line, with no lines; its content is a later save. The atomic save (git-model.md §7): a rename-over from a file new since its create (an unborn identity whose name version is still its create's, never renamed; read from git, so it does not depend on whether the parent has taken the create yet: finding 21) is a rewrite of the replaced file with the new file's bytes: the replaced file keeps its identity and merges per line, and the new file ends. A file created and ended inside one change (a transaction's atomic save) changed nothing anyone sees: none of its versions are in the change. Objects apart from identities (git-model.md §7): an open holds an object (the inode), fixed at open; a rename moves it, an unlink or a rename-over leaves it named by no path, an atomic save moves the new file's object to the replaced path; a close saves to the file its object is named by, and an open no path names (an orphan) saves nothing: its calls are dropped with an `OrphanDropped` event (writer, path, bytes). An orphan has no file open, so no take waits for it. | Choice, asked for by the owner's "Go"; creates, objects and the atomic save are choices (review point 3) | `r11_an_unlink_against_a_concurrent_edit_the_parent_wins`, `r11_an_unlink_after_the_sync_wins`, `r11_a_rename_and_a_concurrent_edit_both_apply`, `r11_concurrent_renames_the_parent_wins`, `r11_a_rename_over_applies_or_loses_whole`, `r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file`, `r11_an_open_file_follows_a_rename_and_an_unlinked_one_saves_nothing`, `r11_a_create_lands_like_any_save`, `r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line`, `r11_an_old_writer_after_an_atomic_save_saves_nothing`, `r11_an_open_on_the_new_file_follows_it_through_the_atomic_save`, every random run (`placed_and_unlinked`) |
+| 12 | *Choice* (git-model.md §3, review point 1): every write call is in its tree's journal before it returns, and publication stays at close (rule 1). A crash of every agentfs process saves each open from the journal as its close would have, before any tree is served again, and the opens end with the mount; a save names its open (`Agentfs-Open: <n>`), so the replay never saves an open twice (a crash between a close's save and the journal dropping its records included). Calls that never returned (a waiting open or path call) are dropped. A take in progress wrote nothing (one ref transaction): its entries go back where they were in its queue. An orphan's close records nothing in git, so a crash during it raises its `OrphanDropped` event again (events are at least once). The model's crash is a process death: every journaled call survives; power loss before an `fsync` is not modelled. | Choice; AGENTS.md principle 1, no dated owner quote | `r12_a_crash_saves_every_open_from_the_journal`, `r12_a_crash_during_a_close_saves_the_open_once`, every random run (`crash_checked`) |
 
 ## What must always hold
 
@@ -100,6 +101,10 @@ nothing about what the model leaves out (below).
 | A save's line map is a valid alignment, read from its blob and its first parent's alone: every line identity the parent holds is still there, in the same order, unchanged or one new version written over the parent's; every other line is new and live. | `save_aligned` (in `one_writer`) |
 | Bytes: an independent oracle (the harness's own byte array per tree, per open transaction and per file, and each open's calls, updated by the same calls by its own byte code) says what every close saves: the model's save holds exactly those bytes, or nothing if the file was unlinked meanwhile; after every step but a referee's (a queue step, a transaction's commit), every tree holds the oracle's bytes, and a take changes only the tree it finished in. | `interleavings.rs` `Oracle`, `close_checked`, `take` |
 | Rule 10's placement and rule 11's unlinked file, read from git in every take: a new line a winning change added goes after the nearest line before it in the change's file that the result holds, past only lines the change never saw, and no line the parent added that the change never saw directly follows it (of two inserts at one place the parent's comes first); a change that edits a file the tree had unlinked (and does not unlink it too) loses, by a file rule. Across the CI seeds both really happen. | `placed_and_unlinked`, `interleavings.rs` `run_all` |
+| Progress, P1: a queue step acts on the first entry no earlier waiting entry (or one waiting behind it) shares a file or a source with, the files read from git (a landing's own changes, a sync's every file its tree and the parent's head differ in), and takes it with only the saves directly behind it that share no file with a waiting entry ahead; an entry free to go is offered as a step, so an unrelated change never waits on another file's writer; read from git alone, no take ever takes a sandbox's commit ahead of an earlier one of the same sandbox. | `step_checked`, `locks` (`p1_first`), `interleavings.rs` `take`, `gitledger` |
+| Progress, P3: a waiting entry waits only for opens granted before it first began waiting, or of a client that had to be let through (it had open a file a waiting take waits for); a call waits behind a waiting or woken entry only while that entry is queued or being taken; no call waiting behind one is of a client with such a file open (no deadlock); so every waiting take proceeds once its own files close. Across the CI seeds an entry really goes ahead of a waiting one and a call really waits behind one. | `locks`, `check_converged`, `interleavings.rs` `run_all` |
+| Objects: every close saves what an independent object table (the harness's own: each file's object per target, each open's object, moved by its own reading of each path call) says: the bytes of the live file its object is named by, or, for an orphan, nothing and exactly one `OrphanDropped` event naming its writer, path and bytes; across the CI seeds atomic saves and orphans really happen. | `interleavings.rs` `Oracle`, `close_checked`, `dropped` |
+| Journal: every save from an open names it, once; no open is saved twice across all history, crashes included; after a crash every granted open's calls are in the trees, as the byte oracle closes them, and no open survives. | `one_writer`, `interleavings.rs` `crash_checked` |
 | A rename-over applies whole: a file unlinked by one has the renamed file at that save's name or a later one (in a sandbox, unless the name it holds for that file is not its parent's, or is a sandbox's version main has not taken: finding 17). | `rename_overs_whole` |
 | Every losing change is replicated, eventually, and stays: once Replication's push (`Step::Replicate`, its own step, never a referee's; due on every move of main and every collision) has drained, the remote's collision notes are exactly the run's collisions, each on its result commit, and each is read on the shared remote alone: its collision ref names the losing commit, each lost version is in it and was written by a commit naming that version's writer, and a collision decided in main has its result in the remote main's history. The grafts went too: every `refs/replace/` ref is on the remote with the same commit, and under `Squashed` the remote, grafts applied, reads each of main's landings as its head and the saves that won. | `losers_pushed` (in `check_converged`) |
 | Trees converge when writes stop: every sandbox equals main. | `check_converged` |
@@ -118,7 +123,10 @@ write-opens, opens wait for takes, and two opens append to one file at once; the
 to new paths or over another file. While a take holds files in a tree, a client of that tree often opens, saves,
 unlinks or renames a file the take's changes touch, mostly on a line in contention (one the take's change or the
 tree's head set over the change's base, read from git), often removing it: the pattern the 2026-11-03 review found
-by hand. Main's clients die (a new one starts) as sandboxes' clients do. The random runs replay seeds 1 to
+by hand. Main's clients die (a new one starts) as sandboxes' clients do. They create files and make atomic saves (a new
+file written and renamed over a file), half of them while an old writer of the replaced file stays open and
+writes on; every agentfs process crashes now and then, half the time during a close. A client blocked in a call
+that waits makes no other call until it returns (it may still die), as a program does. The random runs replay seeds 1 to
 64 in CI (full lineage, squashed, and every record on a neighbouring git line). Half the time a write goes to the line a sandbox wrote last, so runs
 often build "a sandbox edits over its own undecided line while main writes it" (finding 8). Run more with `AGENTFS_MODEL_SEEDS=500`, or one with
 `AGENTFS_MODEL_SEED=<n>`. `random_interleavings_history_settings_decide_the_same` runs its own calls (saves, every
@@ -134,8 +142,8 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
 1. **git's own merge cannot tell decided from undecided (open, for git's merge).** A sync built by git's
    three-way merge, keeping the sandbox's side of a conflict: once a sandbox and main have each merged the
    other, git finds two merge bases and keeps a sandbox line main already decided against.
-   `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base` (32 of 64 seeds with
-   the byte calls; before them 39, in 2 of which git's line merge left one line identity twice in a file, so it
+   `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base` (36 of 64 seeds with
+   creates, crashes and the progress rules; 32 with the byte calls alone; before them 39, in 2 of which git's line merge left one line identity twice in a file, so it
    cannot carry the line map either).
 2. **Resolved: Squashed hid what a sync needs.** Without the graft (rule 7), a sync cannot tell that main's
    queue has taken a sandbox's line, so the sandbox keeps it forever. Costs: a clone needs `refs/replace/`
@@ -236,6 +244,40 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    by the transaction's last staged version of its line. An answer that omits a line still fails three
    scenarios (planted).
 
+19. **Open: a dropped agreeing delete follows the delete it agreed with (2026-11-04, seed 47 of the squashed run).**
+   A transaction deletes a line the sandbox has deleted too; at commit the two deletes agree and the transaction's
+   costs nothing (rule 3e), so its answer is `Committed` and no record names it. The sandbox's delete then loses
+   whole at main (another line of its save collided), the line comes back, and the program's delete is gone with no
+   record naming it. Nothing this round added is involved: the check (`no_silent_loss`) was stricter than rule 3e
+   and now excuses exactly that case (a dropped delete whose agreeing delete a collision names lost); without the
+   excuse the new scenario fails (planted). Needs the owner's decision: accept (the line's deletion was never the
+   program's alone), or name such a delete in the collision of the delete it agreed with.
+   `r3_a_dropped_agreeing_delete_follows_the_delete_it_agreed_with`.
+20. **Resolved in the model: P3 as designed deadlocks (2026-11-04).** git-model.md §6's P3 makes a new write-open
+   of a file a waiting take locks wait behind it. A program that holds file A open (the take waits for A) and then
+   opens B (also the take's) blocks in that open and can never close A: each waits for the other. The model lets
+   such a call go ahead (`Handle::jumped`): a client that has open a file a waiting take waits for is never made to
+   wait behind one, which `locks` checks; planting the deadlock (no exemption) fails
+   `r9_a_writer_holding_a_waited_file_is_not_made_to_wait`. Cost: that program can starve the take by keeping an
+   overlapping open of the file, as Linux would let it. A choice for the owner to confirm.
+21. **The atomic-save rule as worded depended on timing (2026-11-04).** git-model.md §7 said a rename-over is an
+   atomic save when its source is "a file the parent has never had (created since the fork last synced)". An
+   editor writes the temporary file, closes it (a save, which queues a landing) and renames it: whether the parent
+   has taken the create by then is a race, so the same calls would sometimes merge per line and sometimes replace
+   the file's identity. The model reads it from git instead: the source is new since its create (its name version
+   is still the one its create wrote), whatever the parent has taken; in the parent the rename then lands as a
+   rewrite plus the new file's end, merged per line. A choice.
+22. **An unlinked file's open no longer holds back a take (2026-11-04).** Before objects, an open of a file unlinked
+   in its tree still counted as an open of that file, so a take writing it waited for its close. With objects
+   (git-model.md §7) no path names that open's object and its close saves nothing, so it has no file open and no
+   take waits for it; an unlink, rename-over or atomic save in a tree wakes a take that waited for it.
+23. **P3's "opens granted before it began waiting" is per file (2026-11-04, seeds 167 to 171 and 426 of 500).** Under
+   Squashed a waiting landing's run grows when its sandbox saves again, so its lock set gains files after it began
+   waiting; an open of such a file granted in between is no later writer of a file it waited for. The model protects
+   each file from when it joined the lock set (`Waiting::before`, kept across a wake), and `locks` checks it so.
+   Also found by those seeds: a call that waited behind one take now waits behind the next take that locks its file
+   instead of going ahead when the first has run.
+
 ## Costs
 
 - A change loses whole for one line (rule 3e): a save's or transaction's lines that collided with nothing are
@@ -286,10 +328,17 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
   cross-file wait.
 - A transaction commit is refused while the program holds its own files open (rule 5).
 - A file held open for writing receives no syncs or landings while open: held open indefinitely, it drifts.
-  And since a tree's queue is taken in order, its whole queue waits behind that take: a main client holding
-  a file open stalls every sandbox's landing into main, not just that file's. A busy writer can starve a
-  take (a new write-open is refused only while the take holds, not while it waits). The target narrows both
-  (git-model.md §6, "Progress", not modelled: below).
+  Under P1 only the entries sharing a file or a source with the waiting one wait behind it; a sandbox's open file
+  still holds back that sandbox's whole sync (P2 is not modelled). Under P3 a file's other writers wait behind a
+  take that waits for it, so a file held open for days makes its next writer wait for days; a program that has
+  open a file the take waits for is let through (finding 20) and can keep the take waiting by reopening it.
+- Each queue entry keeps its file set, and a queue step scans the entries ahead of it (entries times files). The
+  parent's history lists landings in the order they landed, not the order they queued.
+- An orphan's write calls leave no history (the `OrphanDropped` event names them), and after a crash during its
+  close its event comes twice. A file created and ended in one transaction leaves only the transaction's own
+  commits; the commit into the sandbox carries none of its versions.
+- The model's creatable files are a fixed pool of three identities, unborn in main's first commit (a modelling
+  device: a real create mints a new identity).
 - A stale truncate and rewrite replaces a synced line in the parent and, by sync, in every sibling, with
   no collision, credited to the program's writer. Both lines stay in history.
 - Under Squashed, main's history gains an empty commit for a take whose saves all lost; a losing save is in
@@ -331,32 +380,26 @@ pass. Closed 2026-11-04:
   (a take would write a file it does not hold); not at seeds 1 to 64, where only its scenario does
   (`r9_a_landing_holds_the_files_of_its_losing_changes`).
 
-## Designed after the pull-request review of 2026-11-04 (not modelled)
+## Designed after the pull-request review of 2026-11-04, then modelled
 
-The review asked for five contracts. Point 2, byte-level writes, is now modelled (rules 8 and 10, the byte oracle,
-findings 15 and 16). The other four are designed in git-model.md as design choices; none changes a rule or a check
-above, and each is an exit criterion of the prototype (git-model.md §18).
+The review asked for five contracts. Point 2, byte-level writes, is modelled (rules 8 and 10, the byte oracle,
+findings 15 and 16). Points 1, 3 and 4 were designed in git-model.md and are now modelled in part, each with its
+choices marked in the rules table:
 
-- **Recording before return** (git-model.md §3). Every write call is in its tree's journal before it returns, and
-  durable once an `fsync` or a close has returned; publication stays at close (rule 1, close-to-open); a crash
-  saves each open from the journal as its close would, the rule 9 death rule. The model's close is atomic with
-  its calls, so it has nothing to lose.
-- **Objects apart from file identities** (git-model.md §7). A handle holds an object (the inode) and never changes
-  it; a rename-over, the atomic save included, leaves an old handle on an object no path names, whose close saves
-  nothing. Rule 11's identity is the merge identity. The model has no creates, so no atomic save.
-- **Progress** (git-model.md §6). An entry waits only for its own files and for earlier waiting entries sharing a
-  file or a source with it (rule 2's order kept per source); a sync defers only the upstream changes it cannot apply
-  whole; a waiting take comes before new opens of its files (rule 9 without starvation). The model's queue stays
-  first in, first out. A model test to add: replaying the calls first in, first out, with entries queued in the
-  order the progress rules took them, decides the same trees and collisions.
-- **Framing** (git-model.md §14, §15): "checked for the modelled executions", and why a custom protocol on git
-  primitives rather than git's merge, a CRDT, patch theory or Jujutsu.
+- **Recording before return** (git-model.md §3): rule 12. Modelled: the journal as each open's calls, a crash that
+  replays it as the opens' closes, once per open (`Agentfs-Open`), takes put back. Not modelled: power loss before
+  an `fsync` (the model's crash keeps every journaled call), a failed save retried, refusals at the write call.
+- **Objects apart from file identities** (git-model.md §7): rule 11. Modelled: creates, objects, the atomic save as
+  a rewrite, orphans and their event (findings 21 and 22).
+- **Progress** (git-model.md §6): rule 9. Modelled: P1 and P3 (finding 20). **Not modelled:** P2, the partial sync
+  (a sync deferring only the upstream changes that touch a file open in the sandbox, and how it records what it
+  deferred), and the model test that replays the calls first in, first out in the order P1 took them.
+- **Framing** (git-model.md §14, §15): "checked for the modelled executions".
 
 ## Left out
 
-- **Files, in part.** The model creates no files (a rename goes to a new path or over an existing file), so
-  not the atomic-save idiom's rename-over from a new file; no directories, hard links, or lines moved between
-  files; no path `truncate(2)` or `mmap`. Its bytes are ASCII (so an offset is a character boundary); NUL bytes
+- **Files, in part.** Creates take one of three unborn identities (a device, above); no directories, hard links,
+  `O_TMPFILE` with `linkat`, or lines moved between files; no path `truncate(2)` or `mmap`. Progress rule P2. Its bytes are ASCII (so an offset is a character boundary); NUL bytes
   from a hole are modelled, other binary content is not. Two renames to one path before the parent decides
   stop the model (finding 11).
 - **Open files, in part.** An open file is private until close (close-to-open, the owner's decision): the
@@ -366,5 +409,5 @@ above, and each is an exit criterion of the prototype (git-model.md §18).
   line end with the last close's line, as two Linux writers at one offset end with the last write's.
 - **Where the line map lives** in a real tree: the model keeps it in each file's blob (git-model.md §16).
 - Binary files (the alignment diffs as text, so a NUL byte cannot hide a change, but no binary rule is
-  designed; the model's bytes are ASCII); approvals and when landings run; integrator patches; restarts; space limits; history
-  truncation.
+  designed; the model's bytes are ASCII); approvals and when landings run; integrator patches; restarts beyond the crash's journal replay (rule 12)
+  and power loss; space limits; history truncation.

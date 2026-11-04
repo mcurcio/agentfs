@@ -13,7 +13,9 @@
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`]: an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
 //! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`Step::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; then it holds its files ([`World::holds`]) until [`Step::Finish`] writes them; a write-open, [`World::unlink`] or [`World::rename`] of a held file waits until then; a client's death ([`World::end_client`], [`World::end_main_client`]) closes its files |
 //! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (`resolve`, `adopt`, `splice`); a partial line that a merge put another line after reads as terminated (`Content::read_lines`) |
-//! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; `resolve` applies the per-line rule to it and couples a file's existence with its content |
+//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); P3: a call on a file a waiting or woken entry locks waits behind it ([`Handle::behind`]) unless its client has open a file a waiting take waits for ([`Handle::jumped`]) |
+//! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; `resolve` applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`]), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`]); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
+//! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]), drops calls that never returned and puts takes back in their queues |
 //!
 //! No clock: commits carry a fixed date (`git.rs`) and order comes only
 //! from the queues and from git history.
@@ -530,9 +532,10 @@ pub struct Hold {
 pub struct Waiting {
     /// The files its take locks.
     pub files: BTreeSet<String>,
-    /// The opens granted in its tree when it first began waiting: the only
-    /// ones it waits for, with the opens of clients that had to be let
-    /// through (`Handle::jumped`).
+    /// The opens granted in its tree before each of its files joined its
+    /// lock set (when it first began waiting, or when its run grew): the
+    /// only ones it waits for, with the opens of clients that had to be let
+    /// through (`Handle::jumped`). Finding 23.
     pub before: BTreeSet<HandleId>,
 }
 
@@ -765,7 +768,9 @@ pub struct World {
     touches: RefCell<BTreeMap<String, BTreeSet<String>>>,
     /// Each waiting entry's opens granted when it first began waiting,
     /// kept until it is taken (a woken entry that waits again keeps them).
-    first_waits: BTreeMap<u64, BTreeSet<HandleId>>,
+    /// Per file of its lock set, from when that file joined it (a squash's
+    /// run can grow while it waits): the files, and the opens granted then.
+    first_waits: BTreeMap<u64, (BTreeSet<String>, BTreeSet<HandleId>)>,
     pub lineage: Lineage,
     counters: BTreeMap<String, u32>,
     pub collisions: Vec<Collision>,
@@ -1342,15 +1347,15 @@ impl World {
         self.trailer(c, "Agentfs-Cause") == "Direct"
     }
 
-    /// The line versions `b` holds that `a` does not. A file no path names
-    /// in either (a file created and ended between them, as a transaction's
+    /// The line versions `b` holds that `a` does not. A file created and
+    /// ended between them (unborn in `a`, ended in `b`, as a transaction's
     /// atomic save leaves its new file) changed nothing anyone can see:
     /// none of its versions.
     pub fn edits(&self, a: &str, b: &str) -> Vec<Edit> {
         let mut out = Vec::new();
         for p in self.changed(a, b) {
             let (x, y) = (self.file(a, &p), self.file(b, &p));
-            if !x.name.live() && !y.name.live() {
+            if !y.name.live() && x.name.id == p && UNBORN.contains(&p.as_str()) {
                 continue;
             }
             for r in y.records() {
@@ -2637,7 +2642,21 @@ impl World {
             .map(|h| h.id)
             .collect();
         for h in ready {
-            self.grant(h);
+            // Its take ran, or its client must not wait: it goes, unless
+            // another waiting take locks its file (then it waits behind
+            // that one, P3).
+            let mut x = self.handles[&h].clone();
+            x.waiting = false;
+            x.behind = None;
+            self.queue_behind(&mut x, t);
+            self.jumped_count += usize::from(x.jumped);
+            if x.waiting {
+                self.note(format!("h{h} now waits behind entry {:?}", x.behind));
+                self.handles.insert(h, x);
+            } else {
+                self.handles.get_mut(&h).expect("waiting").jumped = x.jumped;
+                self.grant(h);
+            }
         }
     }
 
@@ -2882,6 +2901,15 @@ impl World {
     /// of its queue; waits are dropped and found again at the next take.
     /// Transactions survive: their branches are refs.
     pub fn crash(&mut self) {
+        for h in self.crash_down() {
+            self.restart_open(h);
+        }
+    }
+
+    /// [`World::crash`]'s first part: every process is down; takes go back
+    /// to their queues, waits and calls that never returned are dropped.
+    /// Returns the opens the restart replays from the journal, in order.
+    pub fn crash_down(&mut self) -> Vec<HandleId> {
         self.note("crash: every agentfs process dies; restart replays the journal".into());
         let holds = std::mem::take(&mut self.holds);
         for (t, hold) in holds {
@@ -2903,27 +2931,44 @@ impl World {
         self.woken.clear();
         self.first_waits.clear();
         let ids: Vec<HandleId> = self.handles.keys().copied().collect();
+        let mut replay = Vec::new();
         for id in ids {
-            let h = self.handles.remove(&id).expect("listed");
+            let h = &self.handles[&id];
             if h.waiting || h.kind != Kind::Write {
+                self.handles.remove(&id);
                 self.note(format!("crash: h{id} never returned: dropped"));
-                continue;
+            } else {
+                replay.push(id);
             }
-            if self.saved(id) {
-                self.note(format!("crash: h{id} already saved: skipped"));
-                continue;
-            }
-            let tokens = self.save_handle(&h);
-            self.note(format!(
-                "crash: h{id} replayed from the journal: saved {tokens:?}"
-            ));
         }
+        replay
+    }
+
+    /// [`World::crash`]'s restart, for one open: saved from the journal as
+    /// its close would save it, unless a save already names it; it ends.
+    pub fn restart_open(&mut self, id: HandleId) {
+        let h = self.handles.remove(&id).expect("an open to replay");
+        if self.saved(id) {
+            self.note(format!("crash: h{id} already saved: skipped"));
+            return;
+        }
+        let tokens = self.save_handle(&h);
+        self.note(format!(
+            "crash: h{id} replayed from the journal: saved {tokens:?}"
+        ));
     }
 
     /// A crash during open `h`'s close: its save is committed (its branch
     /// moved), but its journaled calls are not yet dropped; then
     /// [`World::crash`], whose replay finds the save naming `h` and skips it.
     pub fn close_then_crash(&mut self, h: HandleId) {
+        self.close_keeping_journal(h);
+        self.crash();
+    }
+
+    /// An open's close whose save is committed but whose journal records
+    /// are not dropped yet: the open stays, for a crash to replay.
+    pub fn close_keeping_journal(&mut self, h: HandleId) {
         let handle = self.handles[&h].clone();
         assert!(
             !handle.waiting && handle.kind == Kind::Write,
@@ -2933,7 +2978,6 @@ impl World {
         self.note(format!(
             "close h{h}: saved {tokens:?}; crash before its journal drops it"
         ));
-        self.crash();
     }
 
     /// Whether a save names open `h` (`Agentfs-Open`), read from git.
@@ -3138,13 +3182,21 @@ impl World {
         let open: BTreeSet<String> = self.write_open(t).intersection(&files).cloned().collect();
         if !open.is_empty() {
             self.note(format!("{t:?}'s entry {seq} waits for {open:?} to close"));
-            let granted: BTreeSet<HandleId> = self
-                .handles
-                .values()
-                .filter(|h| !h.waiting && h.target == Target::Tree(t))
-                .map(|h| h.id)
-                .collect();
-            let before = self.first_waits.entry(seq).or_insert(granted).clone();
+            // It waits for the opens granted before each of its files joined
+            // its lock set (P3 protects a file from then on).
+            let (mut known, mut before) = self.first_waits.remove(&seq).unwrap_or_default();
+            for h in self.handles.values() {
+                if !h.waiting
+                    && h.target == Target::Tree(t)
+                    && self
+                        .named(h)
+                        .is_some_and(|f| files.contains(&f) && !known.contains(&f))
+                {
+                    before.insert(h.id);
+                }
+            }
+            known.extend(files.iter().cloned());
+            self.first_waits.insert(seq, (known, before.clone()));
             self.unwake(t, seq);
             self.waits
                 .entry(t)
