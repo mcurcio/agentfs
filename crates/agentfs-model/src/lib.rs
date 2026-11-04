@@ -9,22 +9,20 @@
 //! metaphor of a typical Linux filesystem. I want to try that out."
 //!
 //! [`world`] drives the real `git` program in a temporary repository: main
-//! and each fork are branches, each save a commit naming one writer. A
+//! and each fork are branches, each save a commit naming one writer and
+//! holding the file exactly as the program's write calls left it. A
 //! collision between a fork and its parent is decided only at the parent's
-//! landing queue, per line: a line written over the parent's replaces it,
-//! and of two concurrent lines the parent's wins. A sync decides nothing:
-//! the fork takes the parent's decided version, keeping only its own lines
-//! still on their way to that queue. Every losing commit keeps a collision
-//! ref, which a separate Replication step pushes with main to a bare shared
-//! remote. A save is the program's write calls applied at close to its
-//! tree's head: an append is exact, every other byte write is aligned
-//! with the head's lines once by git's histogram diff and recorded, so
-//! each line keeps an identity through later edits around it; a file's
-//! name and existence are one more line (unlink, rename); a
-//! sync or landing into a tree first waits for that tree's write-opens of
-//! the files it will overwrite to close, then holds them while it writes.
-//! [`check`] holds the invariants, read back from the repository after
-//! every step.
+//! landing queue, by git's own three-way merge of the landing commit's
+//! change, the parent's side winning each conflicting hunk. A sync rebases
+//! the fork's commits the parent has not taken onto the parent's head
+//! (`git pull --rebase`), the parent's side winning a hunk there too; it
+//! records nothing. Every losing commit keeps a collision ref, every
+//! pre-rebase head a ref, and a separate Replication step pushes them with
+//! main to a bare shared remote. A sync or landing into a tree first waits
+//! for that tree's write-opens of the paths it changes to close, then
+//! holds them while it writes. [`check`] holds the invariants, read back
+//! from the repository after every step through [`content::Oracle`], the
+//! checks' own record of who wrote what over what.
 //!
 //! This crate depends on no other agentfs crate: it models the rules, not
 //! today's code. What it leaves out is listed in `MODEL.md`.

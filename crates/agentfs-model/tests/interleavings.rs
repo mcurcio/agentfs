@@ -14,7 +14,7 @@
 //! changeset), leaving the rest of the queue in order, or records that it
 //! waits. And it keeps its own record of every write call's bytes: each
 //! close it makes saves exactly the bytes those calls leave on the head
-//! then (rule 10's input, computed here, not by the model's replay).
+//! then (computed here, not by the model's replay).
 //!
 //! The seeds are every seed in `1..=SEEDS`, never a set picked because it
 //! passes. `AGENTFS_MODEL_SEED=<n>` runs one seed; `AGENTFS_MODEL_SEEDS=<n>`
@@ -23,11 +23,11 @@
 //! SplitMix64 written here: fixed seeds replay exactly.
 
 use agentfs_model::check::{check, check_converged, step_checked};
-use agentfs_model::content::{BLANK, Content, Layout, PATHS};
+use agentfs_model::content::{File, PATHS, REPEATED};
 use agentfs_model::git::with_reversed_dates;
 use agentfs_model::world::{
-    Client, CollisionScope, Direction, ForkId, HandleId, HistoryPolicy, Kind, Life, MergeRule,
-    ModelError, Policies, Step, Tree, TxnEnd, TxnOutcome, World, Write,
+    Client, CollisionScope, Direction, ForkId, HandleId, HistoryPolicy, Kind, Life, ModelError,
+    Policies, Step, Tree, TxnEnd, TxnOutcome, World, Write,
 };
 use std::collections::BTreeMap;
 
@@ -37,9 +37,6 @@ const STEPS: usize = 80;
 /// Positions the random clients write at: the first three lines, so edits
 /// collide often.
 const HOT_SLOTS: usize = 3;
-/// Bytes the random clients give some new lines: lines that repeat others'
-/// bytes, as blank lines and braces do (rule 10).
-const REPEATED: [&str; 2] = [BLANK, "}"];
 
 struct Rng(u64);
 
@@ -91,6 +88,9 @@ struct Tally {
     renames: usize,
     rename_overs: usize,
     main_deaths: usize,
+    /// Commits syncs replayed, and those that became empty.
+    rebased: usize,
+    rebased_empty: usize,
 }
 
 fn seeds() -> Vec<u64> {
@@ -167,7 +167,7 @@ type Written = BTreeMap<HandleId, Vec<(Write, String)>>;
 
 /// The bytes a program's write calls leave on `img`, the head's lines at
 /// close: the harness's own account, kept apart from the model's replay.
-fn bytes_after(mut img: Vec<String>, calls: &[(Write, String)]) -> Vec<String> {
+fn bytes_after(mut img: File, calls: &[(Write, String)]) -> File {
     for (call, x) in calls {
         match call {
             Write::Append => img.push(x.clone()),
@@ -183,25 +183,29 @@ fn bytes_after(mut img: Vec<String>, calls: &[(Write, String)]) -> Vec<String> {
                 img.insert((*to).min(img.len()), l);
             }
             Write::Move { .. } => {}
-            Write::Rewrite(c) => img = c.texts(),
+            Write::Rewrite(c) => img = c.clone(),
         }
     }
     img
 }
 
 /// Closes `h`, asserting that the save holds exactly the bytes its write
-/// calls leave on the head now (none if the file was unlinked meanwhile).
+/// calls leave on the head now (none if its file left the tree meanwhile).
 fn close_checked(w: &mut World, written: &mut Written, h: HandleId) -> Result<(), String> {
     let (target, file) = (w.handle(h).target, w.handle(h).file.clone());
-    let before = w.file(&w.target_head(target), &file);
+    let before = file
+        .as_ref()
+        .and_then(|p| w.file(&w.target_head(target), p));
     let calls = written.remove(&h).unwrap_or_default();
-    let expect = bytes_after(before.texts(), &calls);
     w.close(h);
-    let after = w.file(&w.target_head(target), &file);
-    if before.name.live() && after.texts() != expect {
+    let (Some(p), Some(before)) = (file, before) else {
+        return Ok(());
+    };
+    let expect = bytes_after(before, &calls);
+    let after = w.file(&w.target_head(target), &p);
+    if after.as_ref() != Some(&expect) {
         return Err(format!(
-            "close h{h} of {file}: saved {:?}, but its write calls leave {expect:?}",
-            after.texts()
+            "close h{h} of {p}: saved {after:?}, but its write calls leave {expect:?}"
         ));
     }
     Ok(())
@@ -282,16 +286,22 @@ fn save(w: &mut World, c: &Client, p: &str, slot: usize, tally: &mut Tally) {
     close_checked(w, &mut written, h).expect("a save holds its bytes");
 }
 
+/// Path number `i` (mod how many) of those client `c` sees, if any.
+fn path(w: &World, c: &Client, i: usize) -> Option<String> {
+    let ps = w.client_paths(c);
+    (!ps.is_empty()).then(|| ps[i % ps.len()].clone())
+}
+
 fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     let mut rng = Rng(seed);
-    // The line a fork wrote last (its file's identity and position). Main
-    // and forks write it again half the time, so runs often build "a fork
-    // edits over its own undecided line while main writes it
-    // concurrently" (coherence finding 8).
-    let mut focus: Option<(&str, usize)> = None;
-    // Each client's last read of each file (by identity), which a later
-    // whole-file rewrite writes back: often stale by then.
-    let mut reads: BTreeMap<(String, String), Content> = BTreeMap::new();
+    // The line a fork wrote last (which of its client's paths, and the
+    // position). Main and forks write it again half the time, so runs
+    // often build "a fork edits over its own undecided line while main
+    // writes it concurrently" (coherence finding 8).
+    let mut focus: Option<(usize, usize)> = None;
+    // Each client's last read of each path, which a later whole-file
+    // rewrite writes back: often stale by then.
+    let mut reads: BTreeMap<(String, String), File> = BTreeMap::new();
     // Main's live clients: one may die (its end event) and a new one start.
     let mut mains: Vec<String> = vec!["m1".into(), "m2".into()];
     let mut next_main = 3;
@@ -300,7 +310,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     for step in 0..STEPS {
         let (f, slot) = match focus {
             Some(x) if rng.below(2) == 0 => x,
-            _ => (PATHS[rng.below(PATHS.len())], rng.below(HOT_SLOTS)),
+            _ => (rng.below(PATHS.len() + 2), rng.below(HOT_SLOTS)),
         };
         let mut clients: Vec<Client> = mains.iter().cloned().map(Client::Main).collect();
         clients.extend(live_clients(w).into_iter().map(Client::Fork));
@@ -312,7 +322,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
         match rng.below(30) {
             0..=2 => {
                 let who = Client::Main(mains[rng.below(mains.len())].clone());
-                if let Some(p) = w.client_path(&who, f) {
+                if let Some(p) = path(w, &who, f) {
                     save(w, &who, &p, slot, tally);
                 }
             }
@@ -332,7 +342,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             }
             4..=6 => {
                 if let Some(c) = rng.pick(&live_clients(w)).map(Client::Fork)
-                    && let Some(p) = w.client_path(&c, f)
+                    && let Some(p) = path(w, &c, f)
                 {
                     save(w, &c, &p, slot, tally);
                     focus = Some((f, slot));
@@ -380,7 +390,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             }
             11 | 12 => {
                 if let Some(c) = rng.pick(&clients)
-                    && let Some(p) = w.client_path(&c, f)
+                    && let Some(p) = path(w, &c, f)
                 {
                     let h = w.open_write(&c, &p);
                     tally.open_waits += usize::from(w.handle(h).waiting);
@@ -418,10 +428,9 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                             }
                         }
                         _ => {
+                            let Some(file) = file.clone() else { continue };
                             let read = reads.get(&(format!("{c:?}"), file.clone())).cloned();
-                            let Some(read) = read.or_else(|| {
-                                w.client_path(&c, &file).map(|p| w.client_reads(&c, &p))
-                            }) else {
+                            let Some(read) = read.or_else(|| w.client_reads(&c, &file)) else {
                                 continue;
                             };
                             tally.rewrites += 1;
@@ -447,15 +456,16 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             }
             17 => {
                 if let Some(c) = rng.pick(&clients)
-                    && let Some(p) = w.client_path(&c, f)
+                    && let Some(p) = path(w, &c, f)
                 {
-                    reads.insert((format!("{c:?}"), f.to_string()), w.client_reads(&c, &p));
+                    let read = w.client_reads(&c, &p).expect("a path it sees");
+                    reads.insert((format!("{c:?}"), p), read);
                 }
             }
             18 => {
                 if rng.below(3) == 0
                     && let Some(c) = rng.pick(&clients)
-                    && let Some(p) = w.client_path(&c, f)
+                    && let Some(p) = path(w, &c, f)
                 {
                     tally.unlinks += 1;
                     w.unlink(&c, &p);
@@ -464,13 +474,13 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             19 => {
                 if rng.below(3) == 0
                     && let Some(c) = rng.pick(&clients)
-                    && let Some(p) = w.client_path(&c, f)
+                    && let Some(p) = path(w, &c, f)
                 {
                     // A third of renames go over another file (rename-over).
-                    let over = PATHS
-                        .iter()
-                        .filter(|g| **g != f)
-                        .filter_map(|g| w.client_path(&c, g))
+                    let over = w
+                        .client_paths(&c)
+                        .into_iter()
+                        .filter(|g| *g != p)
                         .collect::<Vec<_>>();
                     match rng.pick(&over) {
                         Some(q) if rng.below(3) == 0 => {
@@ -522,6 +532,8 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     }
     tally.fast_forwards += w.fast_forwards;
     tally.squashed_runs += w.squashed_runs;
+    tally.rebased += w.rebased;
+    tally.rebased_empty += w.rebased_empty;
     for c in &w.collisions {
         match c.direction {
             Direction::Landing => tally.landing_collisions += 1,
@@ -568,42 +580,30 @@ fn run_all(policies: Policies) {
     }
 }
 
-/// The model's choices: full lineage, per line, per-line syncs. Every
-/// invariant.
+/// The model's choices: full lineage, git's hunks. Every invariant.
 #[test]
 fn random_interleavings_full_lineage() {
     run_all(Policies::new(
         HistoryPolicy::FullLineage,
-        CollisionScope::Line,
+        CollisionScope::Hunk,
     ));
 }
 
 /// `Squashed`, every invariant: a fork's waiting saves land as one
 /// changeset, main's stored history holds only main's commits, and the
-/// graft beside it keeps the lineage rules 2 and 3 read.
+/// graft beside it keeps the lineage a sync reads.
 #[test]
 fn random_interleavings_squashed() {
-    run_all(Policies::new(HistoryPolicy::Squashed, CollisionScope::Line));
-}
-
-/// The per-line rule does not depend on slots being separate git hunks:
-/// the same runs with every slot on a neighbouring line.
-#[test]
-fn random_interleavings_adjacent_lines() {
-    run_all(Policies {
-        layout: Layout::Adjacent,
-        ..Policies::new(HistoryPolicy::FullLineage, CollisionScope::Line)
-    });
+    run_all(Policies::new(HistoryPolicy::Squashed, CollisionScope::Hunk));
 }
 
 /// Rule 2, "no clock is read anywhere", on the random runs: seeds 1..=8
 /// under each history setting run again with every commit dated before its
-/// parents decide exactly the same trees and collisions
-/// ([`World::fingerprint`]). An order taken from commit dates would differ.
+/// parents decide exactly the same trees and collisions.
 #[test]
 fn random_interleavings_commit_dates_decide_nothing() {
     for history in [HistoryPolicy::FullLineage, HistoryPolicy::Squashed] {
-        let policies = Policies::new(history, CollisionScope::Line);
+        let policies = Policies::new(history, CollisionScope::Hunk);
         for seed in seeds().into_iter().take(8) {
             let mut tally = Tally::default();
             let pinned = run_seed(seed, policies, &mut tally);
@@ -612,17 +612,6 @@ fn random_interleavings_commit_dates_decide_nothing() {
             assert!(pinned.is_ok(), "{history:?} seed {seed}: {pinned:?}");
         }
     }
-}
-
-/// Coherence finding 1: git's own merge base cannot tell a fork line the
-/// parent already decided against from one still on its way.
-#[test]
-#[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings keeps a fork line the parent already decided against"]
-fn random_interleavings_git_merge_base() {
-    run_all(Policies {
-        merge: MergeRule::GitMergeBase,
-        ..Policies::new(HistoryPolicy::FullLineage, CollisionScope::Line)
-    });
 }
 
 /// Coherence finding 3: per file, the parent's file reverts the fork's
