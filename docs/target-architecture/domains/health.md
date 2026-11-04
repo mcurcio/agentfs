@@ -117,7 +117,7 @@ refusal), `Clock` (probes and deadlines only), `Publish`.
 |---|---|
 | `ProbePolicy`, per component kind | interval 10 s, deadline 1 s, failure 3, recovery 1 (placeholders, Kubernetes' defaults) |
 | Who may watch | the launcher whose `LaunchCap` started the component |
-| An `Unresponsive` history service | restarted by its launcher after a longer, separate window (a launcher setting). Cost: unsaved write calls go with it (git-model §16) |
+| An `Unresponsive` history service | restarted by its launcher after a longer, separate window (a launcher setting). Answered write calls survive in the journal (git-model §3) |
 | CSI in-pod view hosts | watched by the node plugin, told by the in-pod launcher's `watch`, `EndpointOnly` |
 
 ## 6. Tests
@@ -134,7 +134,8 @@ refusal), `Clock` (probes and deadlines only), `Publish`.
 
 1. **Probes are a timer:** `Unresponsive` arrives late and can be wrong.
 2. **Components must report honestly:** one that hides a wait as parked hides its own stall.
-3. **Restart in place ends a hung host's clients** and loses their unsaved write calls.
+3. **Restart in place ends a hung host's clients**; their open files are saved from the journal as closes, even
+   mid-sequence (git-model §3).
 
 **Prior art.** Kubernetes liveness probes; the gRPC health protocol; unreliable failure detectors (Chandra and Toueg);
 Linux pidfd; systemd's watchdog; Erlang/OTP supervisors (detector and restart policy apart).

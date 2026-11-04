@@ -27,14 +27,14 @@ pub trait Telemetry {
 }
 pub enum Event {                    // closed: a new event cannot skip the catalogue (T3)
     Clients(ClientsEvent),          // Attached, AttachmentEnded, LastDetached
-    Tree(TreeEvent),                // TreeMoved (cause: save, landing, sync, transaction; collisions named), TakeWaiting, TakeReleased
+    Tree(TreeEvent),                // TreeMoved (cause: save, landing, sync, transaction; collisions named), TakeWaiting, TakeReleased, OrphanDropped, SaveFailed
     Views(ViewsEvent),              // ViewCaughtUp
     Trees(TreesEvent),              // ForkEnded, ForkDropped
     Volume(VolumeEvent),            // VolumeDraining, VolumeStaged, VolumeReleased, StartLineChanged
     Replication(ReplicationEvent),  // PushSettled
     Service(ServiceEvent),          // ServiceReady
     Health(HealthEvent),            // LivenessChanged
-    Diagnostic(Diagnostic),         // failures that are replies: SaveFailed, SpaceLimit, MountFailed, OtherFamily, RulesError, ...
+    Diagnostic(Diagnostic),         // failures that are replies: SpaceLimit, MountFailed, OtherFamily, RulesError, ...
 }
 pub enum AlarmEffect {
     None,
@@ -54,7 +54,7 @@ files, git-model §6) exist only so the operator sees a stalled queue; nothing r
 |---|---|---|---|---|
 | `CollisionRecorded` | incident, with writer, lost and won lines as attributes | `TreeMoved` naming a collision | — | the tree's actor |
 | `TakeWaiting` | condition, per tree | `TakeWaiting` | `TakeReleased` | the tree's actor |
-| `SaveFailed` | incident | the view's diagnostic (a save `RELEASE` cannot report: views cost 3) | — | Views |
+| `SaveFailed` | condition, per open | the tree's actor: a save at `RELEASE` failed; its calls stay journaled (git-model §3) | that save succeeding | the tree's actor |
 | `VersionMismatch` | incident, both versions shown | `OtherFamily`, `OtherMajor`, `FormatsOf` | — | the refusing domain |
 | `StartLineMoved` | condition, per volume | `StartLineChanged{Moved}` | `StartLineChanged{InStep}` | Volume |
 | `PushFailing` / `PushDiverged` | condition, per remote | `PushSettled{failed}` / `{diverged}` | `PushSettled{ok}` | Replication |

@@ -1,7 +1,7 @@
 # Domain: Views
 
 **Layer:** System › **Domain: Views** › Feature.
-**Status:** draft 8, proposed, under [system.md](../system.md) revision 10 and [git-model.md](../git-model.md), which
+**Status:** draft 9, proposed, under [system.md](../system.md) revision 10 and [git-model.md](../git-model.md), which
 win where this page disagrees. The target, not today's code; sketches are Rust surfaces.
 **What this page covers:** how each client's view serves file calls, what a client sees and when, and what Views asks
 of its tree's actor. Saves, locks, syncs and transactions themselves are git-model §6–§9.
@@ -21,6 +21,7 @@ recommendation). Everything else here is a design choice.
 |---|---|
 | serving every file call of one client through its grant | who the client is, or what it may do (Clients) |
 | **open files**: a program's write calls since its write-open, until the close (git-model §3) | turning them into a commit (the tree's actor, git-model §6) |
+| handing each write call to the tree's journal before the call returns, and making them durable at `fsync` and close (git-model §3) | the journal's storage and its replay after a crash (the tree's actor) |
 | what a client sees and when (§2), and enforcing its consistency setting (§3) | choosing the setting (the grant, in Clients) |
 | the kernel's caches of that client's names, kept true by following `TreeMoved` | moving a tree (the git model) |
 | waiting, for the program, on a take's lock over a file it opens or changes | deciding locks (git-model §6) |
@@ -36,7 +37,7 @@ closed and saved, as in AFS. The close is FUSE `RELEASE` (the last reference, a 
 | Reader | Sees a change | Source |
 |---|---|---|
 | the writing program, through the open file itself | its own write calls at once (design choice, as Linux and AFS) | the view's open file |
-| any other open in the same tree: another client, or the writer's own new open | once the close's save has committed; the close returns after that | the tree's working tree (git-model §6) |
+| any other open in the same tree: another client, or the writer's own new open | once the save at `RELEASE` has committed; a close returns once its calls are durable (git-model §3), and an open of a file whose save the view has received waits for it (an open that overtakes `RELEASE` in the kernel: NOT VERIFIED, §10) | the tree's working tree (git-model §6) |
 | a client of the parent or a child tree | once that tree's queue has taken the landing or the sync, and its view has applied the `TreeMoved` | git-model §5–§8 |
 | other clients of a fork with an open transaction | nothing of the transaction until its commit lands in the fork | git-model §9 |
 | the transaction's own program | its transaction's files, opened after begin; files opened before begin keep their fork target | git-model §9 |
@@ -79,9 +80,10 @@ pub enum Mode {
     ReadOnly,                              // read-only grant or Snapshot: its session has no ClientCap
 }
 pub struct OpenFile {
+    object: ObjectId,             // what this handle holds (the inode, git-model §7): fixed at open, never re-pointed
     backing: BackingFile,         // the working-tree file opened at open; keeps old content (S3)
     target: Target,               // the tree or the transaction, fixed at open (git-model §9)
-    calls: Option<WriteCalls>,    // a write-open's write calls, in order; handed over at RELEASE
+    write: Option<WriteOpen>,     // a write-open: its calls are in the tree's journal; the view keeps a copy for reads
 }
 ```
 
@@ -99,7 +101,8 @@ stateDiagram-v2
 ```
 
 When a program dies, the kernel releases its files and the view saves their write calls, as a close would
-(git-model §6). When the view host itself dies, the write calls it held are lost (cost 2): its mount goes stale and
+(git-model §6). When the view host itself dies, no call it answered is lost: each is in the tree's journal, and the
+actor saves each of its open files from there as a close would (git-model §3, §12). Its mount goes stale and
 Clients ends its attachments, which drops their waiting opens.
 
 ## 5. Public contract
@@ -121,9 +124,17 @@ pub enum ViewError {
 // The session supplies the client and the tree. Every rule behind these calls is git-model's;
 // this is only the crossing. Each call completes on an event, never a timer.
 pub trait TreeSession {
-    fn open_for_writing(&self, p: &RelPath) -> Pending<WriteOpen>; // completes once no take holds p (§6)
-    fn path_call(&self, c: PathCall) -> Pending<Result<(), SaveError>>; // unlink, rename, truncate by path: waits like a write-open
-    fn save(&self, w: WriteOpen, calls: WriteCalls) -> Result<CommitId, SaveError>; // at RELEASE: git-model §6–§7; WriteOpen names the commit the open read (the base)
+    /// Completes once no take holds p or waits for it (git-model §6, P3). Rules' path refusals answer here,
+    /// since RELEASE cannot carry one. WriteOpen names the object and the commit the open read (its base).
+    fn open_for_writing(&self, p: &RelPath) -> Pending<Result<WriteOpen, OpenError>>;
+    /// In the tree's journal before it returns (git-model §3); the view changes its copy only after.
+    fn record(&self, w: &WriteOpen, c: WriteCall) -> Result<(), RecordError>;
+    /// fsync, fdatasync, an O_SYNC write, and every FLUSH whose open has records not yet durable.
+    fn make_durable(&self, w: &WriteOpen) -> Result<(), RecordError>;
+    /// unlink, rename, truncate by path: journaled durably, then run; waits like a write-open.
+    fn path_call(&self, c: PathCall) -> Pending<Result<(), SaveError>>;
+    /// At RELEASE: the actor saves from the journal (git-model §6–§7). Nothing to answer: every call is recorded.
+    fn release(&self, w: WriteOpen);
     fn begin(&self) -> Result<TxnDir, TxnError>;                   // git-model §9
     fn commit(&self) -> Result<Overwritten, TxnError>;            // the lines its fork's own lines overwrote
     fn rollback(&self) -> Result<(), TxnError>;
@@ -132,6 +143,14 @@ pub enum WriteCall {              // the POSIX calls, all a save gets; git-model
     Append(Bytes),                // O_APPEND: new lines after the file's end as the head has it; no alignment
     WriteAt { offset: u64, bytes: Bytes }, // bytes only: the save aligns the base's lines with the bytes at close, once
     Truncate { len: u64 },        // to 0 (or O_TRUNC at open) then writes: a rewrite, aligned with the head's lines
+}
+pub enum OpenError {
+    Refused(RuleRefusal),         // EACCES: a Rules group refusal, a fact of the path alone
+}
+pub enum RecordError {
+    NoSpace,                      // ENOSPC: the state area cannot take the call; the open file is unchanged
+    TooLarge,                     // EFBIG: past the path's size rule
+    Io(IoKind),                   // EIO
 }
 pub enum TxnError { InTransaction, NoTransaction, Ended, OpenFiles, Empty } // git-model §9
 
@@ -146,10 +165,14 @@ pub struct ViewCaughtUp { view: ViewId, tree: TreeRef, to: CommitId }
 | `Visibility::Hide`, or a rules error | `ENOENT` | nothing revealed, whether or not the name exists |
 | `Visibility::Refuse` at create or rename | `EACCES` | nothing changed |
 | a write in a `ReadOnly` view | `EROFS` | nothing changed |
-| a take holds p (a landing or a sync writing it) | nothing: the write-open or path call waits until the take releases p | every other file goes on (git-model §6) |
+| a take holds p, or waits for it (a landing or a sync writing it) | nothing: the write-open or path call waits until the take releases p | every other file goes on (git-model §6) |
+| the tree's journal cannot take a write call | `ENOSPC` or `EIO` at that call | the open file is unchanged; its earlier calls stay recorded |
+| the journal cannot make an open's calls durable | `EIO` from `fsync` or `close` | the calls stay journaled; the next `fsync` or close tries again |
+| a write through a handle whose object no path names (replaced or unlinked) | success, on its own object | its close saves nothing (git-model §7) |
 | the program holds open a file its own commit would write | `TxnError::OpenFiles` | close it and commit again (git-model §9) |
 | the tree's space limit ([trees](trees.md) §4) | `EDQUOT` at the write call | the open file keeps what it had |
-| Rules refuse the save (`Refuse(GroupMemberSkipped)`, [rules](rules.md)) | nothing: `close` has returned and the kernel ignores `RELEASE`'s answer | nothing saved; `SaveFailed` raised ([telemetry](telemetry.md)). The model's "a close is never refused" covers collisions and queues only (design choice) |
+| Rules refuse the file (`Refuse(GroupMemberSkipped)`, [rules](rules.md)) | `EACCES` at the write-open | nothing changed |
+| the save at `RELEASE` fails (the repository's disk) | nothing: `close` has returned | the calls stay journaled, readers keep the old content, `SaveFailed` raised ([telemetry](telemetry.md)); the actor saves it again (git-model §3). The model's "a close is never refused" covers collisions and queues |
 | the history service restarting | nothing: the call waits for `rebound` | write calls on open handles keep flowing |
 
 ## 6. Flows
@@ -167,10 +190,12 @@ sequenceDiagram
   V->>A: open_for_writing(p) over its session
   Note over A: waits while a take holds p (git-model §6)
   A-->>V: WriteOpen
-  P->>V: write calls, close (FLUSH: nothing yet)
+  P->>V: a write call
+  V->>A: record(open, call): in the journal before the call returns
+  P->>V: close (FLUSH): make_durable, then close returns
   P->>V: last reference gone (RELEASE)
-  V->>A: save(open, write calls): one commit on the head then
-  A-->>V: commit id; branch and working tree moved
+  V->>A: release(open)
+  A->>A: one commit on the head then, from the journaled calls; records dropped once it is durable
   A--)V: TreeMoved(tree, paths): every view of the tree drops p
 ```
 
@@ -187,7 +212,7 @@ resumes from the tree's head. A view never waits for another view.
 | V3 | The kernel is told only shown names (S2) | kernel replies take a `Shown`, built only from a Rules verdict | construction time |
 | V4 | No history, credential or state area is reachable (S2) | a view host has no port to them; Trees confines every path | construction + test |
 | V5 | Name caches are dropped only by the follower, never from a file-call thread | only the follower holds the kernel-cache port | compile time |
-| V6 | A write-open's calls are handed over exactly once, at `RELEASE` | `OpenFile.calls` moves into `save` when the handle goes | construction time |
+| V6 | Every write call is in the journal before it returns; a write-open is released exactly once, at `RELEASE` | `record` comes before the view's copy changes; `WriteOpen` moves into `release` when the handle goes | construction time |
 | V7 | Every wait ends on an event (S5): a take's release, `rebound`, the session closing | clippy bans sleeps and timers in the crate | build time + review |
 
 ## 8. Policies
@@ -211,16 +236,22 @@ All against a real mount, a real history service and real git.
 | Hidden names, existing or not, and a landing that adds one | anything shown that the profile hides (S2) |
 | Paths, links and descriptors aimed at the state area from inside a view | history or credentials reachable |
 | One host hung (`SIGSTOP`) while others save and land | one view stalling the rest (S4) |
+| Kill the view host mid-write: every write call that returned is in the next save, once | a host's death losing answered calls |
+| A full state area: the write call fails with `ENOSPC`; `fsync` after a durable failure returns `EIO` | a recording failure reported nowhere |
+| An atomic save of p while another process keeps writing p through an old handle | an old handle overwriting the new file (git-model §7) |
 | A host of another minor opens a view | sessions across families (S8) |
 
 ## 10. Costs
 
 1. **Nothing is visible before close**, and a file never closed is never saved (git-model §16): a log written for
    hours is unseen until its last close, and its open file stalls takes of it.
-2. **A view host's death loses the write calls only it held**; its mounts go stale and a sandbox's restarted host
-   starts on a new fork. `fsync` makes nothing durable in history.
-3. **A save cannot report failure through `close`**: the kernel ignores `RELEASE`'s answer. Space is refused at the
-   write call; a save that still fails is alarmed (Telemetry) and its calls lost.
+2. **Every write call is a journal append** (git-model §3), and the journal holds an open file's calls until its
+   close. A view host's death loses none it answered, but its mounts go stale and a sandbox's restarted host
+   starts on a new fork. `fsync` makes calls durable, not visible.
+3. **`RELEASE` reports nothing**, so every refusal is moved earlier (the write-open, the write call, `fsync`,
+   close); a save that fails after that is retried from the journal and alarmed, never lost. Whether an open
+   right after a close always finds the save done is NOT VERIFIED: `RELEASE` reaches the view asynchronously
+   (git-model §18).
 4. **Locks are approximated:** forwarded to the working-tree file, they do not survive a take rewriting it, and do
    not hold a take back. NOT VERIFIED through FUSE.
 5. **Watchers may miss changes** (A11): a program must reload on agentfs's notice instead.
@@ -238,15 +269,19 @@ All against a real mount, a real history service and real git.
 
 The transaction edge's shape (a control path in the view, or a small library); node table and hard links; lock
 mapping from FUSE lock owners; sharing one follower across views of one tree; where an open file's write calls live
-(memory or a spill file); the race between a take's release and a new write-open.
+(the journal holds them; the view's copy for reads is a cache); how a view host appends to the journal without a
+path into the state area (a descriptor the service hands it over the session, or the session itself); the race
+between a take's release and a new write-open.
 
 ## Reconcile with existing code (agentfs origin/main b5c0dc8, `docs/design.md`)
 
 - **The two-session daemon** (§2.4) becomes one view per client; the overlay's visibility gate carries over as V3.
 - **The tmp layer** goes: scratch names live in the tree's untracked area, never committed (git-model §3).
 - **Coherence by events** (`invalidate.rs`, never from a request thread) carries over as the follower, fed by `TreeMoved`.
-- **Recording at fsync and the sweep** go: a save happens at `RELEASE`. Cost: the FUSE request path and node table are rewritten together.
+- **Today's journal** (`docs/design.md` §3.2–§3.3) carries over as the tree's journal, holding write calls instead of
+  frozen whole files; `fsync` and close make it durable, as `FLUSH` does today. **The sweep goes:** a save happens at
+  `RELEASE`. Cost: the FUSE request path and node table are rewritten together.
 
 **NOT RUN:** FUSE lock forwarding, watchers across mounts and `RELEASE` after unmap were not tested.
 
-*History: drafts 1–7 are in git; draft 8 (2026-11-03) conforms to the git model and close-to-open.*
+*History: drafts 1–7 are in git; draft 8 (2026-11-03) conforms to the git model and close-to-open; draft 9 (2026-11-04) records every write call in the journal before it returns, moves refusals ahead of `RELEASE`, and gives open handles objects.*

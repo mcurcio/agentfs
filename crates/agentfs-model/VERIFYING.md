@@ -230,7 +230,7 @@ Never re-run until a seed passes, skip a seed, or lower the seed count to get gr
 ## Plan: the model as the conformance suite (not built)
 
 Today the model checks the design only. The plan is to run the same scenarios and random runs against the
-real implementation, so the code is held to the rules the model proved. Two ways, not yet chosen:
+real implementation, so the code is held to the rules the model checked. Two ways, not yet chosen:
 
 - **A shared trait.** The calls the tests make (open, write, close, unlink, rename, take a queue step, begin
   and end a transaction, sync, read a tree, read the history) become one trait. The model implements it,

@@ -40,7 +40,8 @@ recording once it lands or syncs.
 
 ```rust
 pub trait Rules {
-    /// Save time (the tree's actor): commit, built-in skip, or refuse. No tracked fact. Pure and total.
+    /// At the write-open (the tree's actor), since RELEASE cannot carry a refusal (git-model §3): commit,
+    /// built-in skip, or refuse; a size rule is enforced at the write call. No tracked fact. Pure and total.
     fn record(&self, p: &RelPath, k: EntryKind) -> RecordVerdict;
     /// Save time, with the tracked fact read from the tree's branch: is this change left out of the commit?
     fn skip(&self, p: &RelPath, k: EntryKind, f: PathFacts) -> Option<SkipReason>;

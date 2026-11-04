@@ -146,7 +146,8 @@ session and returns the `Binding`.
 
 **The history service restarts.** Every `Bound` row becomes `Resuming`; on `ServiceReady` each launcher calls
 `rebind` (same `ClientId`, same writer, a new session) and `Views::rebound`, then `reconcile` with its live set; the
-rest end (`Reconciled`). Open files' unsaved write calls do not survive the restart (git-model §12, §16).
+rest end (`Reconciled`). Open files' write calls survive it: each is in the tree's journal before it returned
+(git-model §3, §12); a rebound client's opens go on, and an ended client's are saved from the journal.
 
 **A snapshot advances.** `advance(c)` asks Trees for a fresh pin and returns a new `Binding`; after
 `Views::rebound`, `advanced(c)` drops the old pin, publishing its `LastDetached` if it was the last.

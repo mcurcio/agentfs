@@ -1,7 +1,7 @@
 # agentfs target architecture: the system around the git model
 
 **Layer:** **System (domains, contracts, flows)** › Domain (one page each) › Feature.
-**Status:** revision 10, proposed: the target, not today's code; sketches are Rust surfaces. Revision 3 was approved
+**Status:** revision 11, proposed: the target, not today's code; sketches are Rust surfaces. Revision 3 was approved
 by the owner on 2026-11-02; revision 10 cuts the page to what [agentfs in git terms](git-model.md) does not cover.
 **Read [git-model.md](git-model.md) first.** It is the one source of truth for trees as branches, saves, locks, the
 queue and its referee, collisions, syncs, transactions, nested forks, history settings and crash recovery.
@@ -177,7 +177,8 @@ unit of work of the change it reports (a transactional outbox).
 |---|---|---|---|
 | `Attached` / `AttachmentEnded{client, why}` / `LastDetached{tree}` (in that order, one unit) | Clients | the tree's actor, Trees, Volume | an ended client's open files close as saves and its waiting opens drop (git-model §6); its open transaction rolls back (§9); a fork's or pin's end; release |
 | `TreeMoved{tree, from, to, paths, collisions}` (design choice: the git model's actor publishes it once the branch, index and working tree have moved) | the tree's actor | Views of that tree; Replication; Volume | a view's cache; a push; release |
-| `TakeWaiting{tree, files}` / `TakeReleased{tree}` (design choice: a take waiting for open files, git-model §6) | the tree's actor | Telemetry only | none: the operator sees a stalled queue |
+| `TakeWaiting{tree, files}` / `TakeReleased{tree}` (design choice: a take waiting for open files, git-model §6) | the tree's actor | Telemetry only | none: the operator sees which file holds which changes back |
+| `OrphanDropped{tree, path, writer, bytes}` (design choice: calls on an object no path names at close, git-model §7) | the tree's actor | Telemetry only | none |
 | `ViewCaughtUp{view, tree, to}` | Views | anyone who must see a move in that view | "visible in view V" |
 | `ForkEnded{fork}` / `ForkDropped{fork}` | Trees | Clients, Replication, Volume | the writer claim, a carried remote line, an upgrade's release |
 | `VolumeDraining` / `VolumeStaged` / `VolumeReleased{disposition}` | Volume | Clients, Replication / the same / the composition root, CSI | attachments refused; pushes skip spacing / reopen / the service exits |
@@ -229,7 +230,7 @@ the owner's words (§0); the others are gaps found by review, not requirements o
 |---|---|
 | R14, R15 (whether a clean merge is acceptable); A3 (integrator patches wait until "whenDetached") | approvals and landing timing are not modelled (git-model §16); every landing is accepted when its queue takes it |
 | Integrator patches (A3); restore, revert (no owner words on these pages) | no source other than a fork's commits and syncs enters a queue (git-model §5) |
-| R9, R13 for files changed while open (a database and its `-wal`, Rules' groups) | a save happens at close (git-model §6); a file held open saves nothing and stalls takes (git-model §16 costs) |
+| R9, R13 for files changed while open (a database and its `-wal`, Rules' groups) | a save happens at close (git-model §6): a file held open is recorded call by call in the journal (git-model §3) but saves nothing until its close, and holds back the incoming changes to it (git-model §6, "Progress") |
 | Large and binary files, LFS (no owner words on these pages) | binary files are not modelled (git-model §16) |
 | Space limits and history truncation (no owner words on these pages) | not modelled (git-model §16); [trees](domains/trees.md) §4 keeps the per-tree quota as a design choice |
 
@@ -264,19 +265,24 @@ go", 2026-10-17).
 
 1. **A sandbox sees a change only once it is closed** (close-to-open, accepted 2026-11-03), and landed changes
    rewrite working-tree files, so hard links across a landing break.
-2. **A view host's death or restart loses its clients' unsaved write calls** (git-model §16) and ends their mounts;
-   a sandbox's restarted host gets a new fork, since a fork has one writer for life ([clients](domains/clients.md)).
+2. **Every write call is a journal append** before it returns (git-model §3), so a view host's death or restart
+   loses no answered call; it still ends its clients' mounts, and a sandbox's restarted host gets a new fork, since
+   a fork has one writer for life ([clients](domains/clients.md)).
 3. **File watchers have no guarantee** (A11): `TreeMoved` and `ViewCaughtUp` are the reliable notices.
 4. **A full checkout per fork** until Trees' storage optimisation serves the same files from less space.
 5. **Five gaps wait for their own gate** (§5), three of them resting on the owner's words (R9, R13, R14, R15, A3).
+6. **The architecture is not settled until the prototype passes** (git-model §18): durable writes, byte-level
+   calls, rename-over with open handles and queue progress on a real mount, none of which the model runs.
 
 **Tracer bullet** (design choice). A sidecar runs main's view and one sandbox view: (1) the sandbox closes p; main's
 queue takes it and main's view shows it once caught up; (2) main closes s; the sandbox's queue syncs it and the
 sandbox's view shows it; (3) a main client holds p open while the sandbox's p lands: the take waits, then writes;
-(4) killing the sandbox's view host leaves main untouched. The git side of each step is git-model's; this bullet
+(4) killing the sandbox's view host mid-write leaves main untouched, and the sandbox's answered write calls are
+saved from the journal; (5) while main holds p open, the sandbox's change to q lands without waiting. The git side of each step is git-model's; this bullet
 proves the views, sessions and events around it.
 
-**Prior art.** AFS close-to-open consistency · FUSE `RELEASE` and notify-invalidate · overlayfs and reflink clones ·
+**Prior art.** AFS close-to-open consistency · NFS `COMMIT` and write-ahead logging (the journal) · fair
+readers-writer locks and per-key ordering (progress) · FUSE `RELEASE` and notify-invalidate · overlayfs and reflink clones ·
 object capabilities · the transactional outbox · Kubernetes liveness probes · Semantic Versioning · DDD context maps.
 
 ## New terms
@@ -299,4 +305,4 @@ object capabilities · the transactional outbox · Kubernetes liveness probes ·
 
 **NOT RUN:** the agentfs source was not read; the Rust is reasoned, not compiled.
 
-*History: revisions 1–9 are in git; revision 10 (2026-11-03) removes everything git-model.md now owns.*
+*History: revisions 1–9 are in git; revision 10 (2026-11-03) removes everything git-model.md now owns; revision 11 (2026-11-04) follows git-model's journal, progress rules and prototype plan.*

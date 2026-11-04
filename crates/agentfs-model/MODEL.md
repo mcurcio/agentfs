@@ -75,7 +75,9 @@ each is open for him to change.
 
 ## What must always hold
 
-Checked after every step, in every scenario and random run (`check.rs`), under both history settings.
+Checked after every step, in every scenario and random run (`check.rs`), under both history settings. They hold
+for the modelled executions (the scenarios and the seeds run): evidence about these rules, not a proof, and
+nothing about what the model leaves out (below).
 
 | Invariant | Check |
 |---|---|
@@ -237,7 +239,8 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
 - A file held open for writing receives no syncs or landings while open: held open indefinitely, it drifts.
   And since a tree's queue is taken in order, its whole queue waits behind that take: a main client holding
   a file open stalls every sandbox's landing into main, not just that file's. A busy writer can starve a
-  take (a new write-open is refused only while the take holds, not while it waits).
+  take (a new write-open is refused only while the take holds, not while it waits). The target narrows both
+  (git-model.md §6, "Progress", not modelled: below).
 - A stale truncate and rewrite replaces a synced line in the parent and, by sync, in every sibling, with
   no collision, credited to the program's writer. Both lines stay in history.
 - Under Squashed, main's history gains an empty commit for a take whose saves all lost; a losing save is in
@@ -270,6 +273,26 @@ they stay open here.
   rule 3e (deleting either changes no test); rule 11's "a rename-over applies or loses whole" has two homes.
 - **The CI settings comparison covers only saves, appends and transactions (P2).** Widened to insert, delete,
   move, rewrite, unlink, rename and rename-over it was green at 200 seeds in the review; not added.
+
+## Designed after the pull-request review of 2026-11-04 (not modelled)
+
+The review asked for four contracts the model does not run. Each is designed in git-model.md as a design choice;
+none changes a rule or a check above, and each is an exit criterion of the prototype (git-model.md §18).
+
+- **Recording before return** (git-model.md §3). Every write call is in its tree's journal before it returns, and
+  durable once an `fsync` or a close has returned; publication stays at close (rule 1, close-to-open); a crash
+  saves each open from the journal as its close would, the rule 9 death rule. The model's close is atomic with
+  its calls, so it has nothing to lose.
+- **Objects apart from file identities** (git-model.md §7). A handle holds an object (the inode) and never changes
+  it; a rename-over, the atomic save included, leaves an old handle on an object no path names, whose close saves
+  nothing. Rule 11's identity is the merge identity. The model has no creates, so no atomic save.
+- **Progress** (git-model.md §6). An entry waits only for its own files and for earlier waiting entries sharing a
+  file or a source with it (rule 2's order kept per source); a sync defers only the upstream changes it cannot apply
+  whole; a waiting take comes before new opens of its files (rule 9 without starvation). The model's queue stays
+  first in, first out. A model test to add: replaying the calls first in, first out, with entries queued in the
+  order the progress rules took them, decides the same trees and collisions.
+- **Framing** (git-model.md §14, §15): "checked for the modelled executions", and why a custom protocol on git
+  primitives rather than git's merge, a CRDT, patch theory or Jujutsu.
 
 ## Left out
 
