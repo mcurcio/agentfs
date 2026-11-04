@@ -198,7 +198,12 @@ closes its files, saving their write calls as the kernel's close would (a choice
 opens (`r9_client_death_releases_its_locks`, `r9_a_main_clients_death_releases_its_locks`). A transaction's
 opens are on its frozen branch and never wait. If a save of another file moves the tree's head while a take
 holds its files, the take plans its change again on the new head when it writes; the new plan must write
-only files it holds, which holds because no held file can be write-opened, and the model stops loudly if not.
+only files it holds, and the model stops loudly if not. *Choice:* so that it can, a landing locks every file
+its changes touch, fixed when it begins, a losing change's files included, not only the files its first plan
+writes: otherwise a parent's save could change a file a losing change touched, flip that change to a win at
+the replan, and the take would write a file it never held
+(`r9_a_landing_holds_the_files_of_its_losing_changes`). Cost: a take waits for a file's open writer even
+when its change to that file loses.
 
 *Choice:* the lock covers every call that changes a held file, not only a write-open. `unlink`, and
 `rename(2)` onto or away from a held file (the usual atomic-save idiom), wait like a write-open while a take
@@ -511,7 +516,7 @@ sequenceDiagram
 
 ## 12. Crash recovery and convergence
 
-**Convergence is proven:** when writes stop and every queue drains, every fork equals main (`check_converged`,
+**Convergence is tested over the seeds, not proven:** when writes stop and every queue drains, every fork equals main (`check_converged`,
 `convergence_when_writes_stop`). **Restarts are not modelled;** the rest is a design choice.
 
 **One step, one ref transaction.** Each step writes its objects, then makes every ref change in one `update-ref

@@ -24,7 +24,7 @@ Rules is a **policy decision point**: other domains enforce, Rules only answers,
 | Rules owns | Rules is not |
 |---|---|
 | whether a change to a path is committed: refused when saved (`record`), skipped when not tracked (`skip`) | whether a path is tracked: the tree's branch says (git-model §3) |
-| database group kinds and each group's members | how a file changed while open is saved (not yet designed: system §5) |
+| database group kinds and each group's members | how a file changed while open is saved (git-model §6; the model's rule 8) |
 | profiles: what each view shows (`visibility`) | mapping an answer to an error number, caches, mounts (Views) |
 | the built-in never-recorded names; validating the operator's rule files at boot | path syntax and confinement (`RelPath::parse`, Trees) |
 

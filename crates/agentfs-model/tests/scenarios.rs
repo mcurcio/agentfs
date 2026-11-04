@@ -1593,6 +1593,37 @@ fn r9_a_landing_waits_for_the_parents_open_writer() {
     drain(&mut w);
 }
 
+/// Rule 9: a landing holds every file its changes touch, a losing change's
+/// included, fixed when it begins. Here the sandbox's unlink of `a` loses
+/// (main's unseen line), so the plan writes nothing; main's write-open of
+/// `a` still waits, so no save of main's can delete that line mid-take and
+/// flip the unlink to a win that writes a file the take never held.
+#[test]
+fn r9_a_landing_holds_the_files_of_its_losing_changes() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        w.unlink(&Client::Fork(f), "a");
+        let m = w.save(&m1(), "a", 0);
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(
+            w.holds()[&Tree::Main].files.contains("a"),
+            "{history:?}: the losing unlink's file is held"
+        );
+        let h = w.open_write(&m1(), "a");
+        ok(&mut w);
+        assert!(w.handle(h).waiting, "{history:?}: the open waits");
+        take(&mut w, &Step::Finish(Tree::Main));
+        assert!(!w.handle(h).waiting, "the release granted it");
+        assert!(has(&w, Tree::Main, "a", &m), "{history:?}: the unlink lost");
+        let c = w.collisions.last().expect("a collision").clone();
+        assert!(c.by == By::File && c.won == [m.clone()], "{c:?}");
+        w.write(h, Write::Delete(0));
+        w.close(h);
+        drain(&mut w);
+    }
+}
+
 /// Rule 9: while a sync holds `a`, a new write-open of `a` waits; the
 /// sync's release (an event) grants it, showing the synced file.
 #[test]

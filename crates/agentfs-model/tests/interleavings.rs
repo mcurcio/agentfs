@@ -31,6 +31,13 @@ use agentfs_model::world::{
 };
 use std::collections::BTreeMap;
 
+mod gitledger;
+
+fn checkg(w: &mut World) -> Result<(), String> {
+    check(w)?;
+    gitledger::observe(w)
+}
+
 /// CI runs seeds 1..=SEEDS.
 const SEEDS: u64 = 64;
 const STEPS: usize = 80;
@@ -101,6 +108,8 @@ struct Tally {
     renames: usize,
     rename_overs: usize,
     main_deaths: usize,
+    git_takes: usize,
+    git_takes_total: usize,
 }
 
 fn seeds() -> Vec<u64> {
@@ -139,6 +148,7 @@ fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
         Step::Next(t) | Step::Finish(t) => w.queue(*t),
         Step::Drop(_) | Step::Replicate => Vec::new(),
     };
+    gitledger::note_next(w, s)?;
     let taken = step_checked(w, s)?;
     tally.steps += 1;
     if let Step::Finish(t) = s
@@ -207,6 +217,7 @@ fn close_checked(w: &mut World, written: &mut Written, h: HandleId) -> Result<()
     let calls = written.remove(&h).unwrap_or_default();
     let expect = bytes_after(before.texts(), &calls);
     w.close(h);
+    gitledger::observe(w)?;
     let after = w.file(&w.target_head(target), &file);
     if before.name.live() && after.texts() != expect {
         return Err(format!(
@@ -240,18 +251,19 @@ fn close_all(w: &mut World) {
         .collect();
     for h in open {
         w.close(h);
+        gitledger::observe(w).expect("ledger");
     }
 }
 
 fn drain(w: &mut World, tally: &mut Tally, at: usize) -> Result<(), (usize, String)> {
     for _ in 0..100_000 {
         close_all(w);
-        check(w).map_err(|e| (at, e))?;
+        checkg(w).map_err(|e| (at, e))?;
         let Some(s) = w.pending().into_iter().next() else {
             return check_converged(w).map_err(|e| (at, e));
         };
         take(w, &s, tally).map_err(|e| (at, e))?;
-        check(w).map_err(|e| (at, e))?;
+        checkg(w).map_err(|e| (at, e))?;
     }
     Err((at, "the queues never drained".into()))
 }
@@ -293,6 +305,8 @@ fn save(w: &mut World, c: &Client, p: &str, slot: usize, tally: &mut Tally) {
 }
 
 fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+    gitledger::enable(true);
+    gitledger::observe(w).map_err(|e| (0, e))?;
     let mut rng = Rng(seed);
     // The line a fork wrote last (its file's identity and position). Main
     // and forks write it again half the time, so runs often build "a fork
@@ -501,7 +515,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 }
             }
         }
-        check(w).map_err(|e| (step, e))?;
+        checkg(w).map_err(|e| (step, e))?;
     }
     // Writes stop: every open file closes, every open transaction commits
     // or rolls back; the queues drain; every fork equals main.
@@ -511,20 +525,23 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             // A commit first finishes the sandbox's take, which may grant
             // an open of a file the commit writes: close it too.
             if w.commit_txn(f) != Err(ModelError::OpenFiles) {
+                gitledger::observe(w).map_err(|e| (STEPS, e))?;
                 continue;
             }
             close_all(w);
             w.commit_txn(f).expect("open");
+            gitledger::observe(w).map_err(|e| (STEPS, e))?;
         } else {
             w.rollback(f).expect("open");
             tally.rolled_back += 1;
         }
     }
-    check(w).map_err(|e| (STEPS, e))?;
+    checkg(w).map_err(|e| (STEPS, e))?;
     drain(w, tally, STEPS)?;
     // Every program exits: every fork drops.
     for f in live_clients(w) {
         w.end_client(f);
+        gitledger::observe(w).map_err(|e| (STEPS + 1, e))?;
     }
     drain(w, tally, STEPS + 1)?;
     if let Some(f) = w.forks.values().find(|f| f.life != Life::Dropped) {
@@ -538,6 +555,18 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     }
     tally.clean_lines_lost += w.collisions.iter().filter(|c| c.by == By::Whole).count();
     tally.fast_forwards += w.fast_forwards;
+    if gitledger::takes() != w.landings.len() {
+        return Err((
+            STEPS + 1,
+            format!(
+                "ledger: git showed {} takes, the model recorded {}",
+                gitledger::takes(),
+                w.landings.len()
+            ),
+        ));
+    }
+    tally.git_takes = gitledger::takes();
+    tally.git_takes_total += gitledger::takes();
     tally.squashed_runs += w.squashed_runs;
     for c in &w.collisions {
         match c.direction {

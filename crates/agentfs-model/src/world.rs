@@ -2276,7 +2276,8 @@ impl World {
     }
 
     /// Rule 9, a take begins: plan the queue head's change into `t` and the
-    /// files it will overwrite there. If a client of `t` has one of them
+    /// files it locks there (a landing: every file its changes touch,
+    /// [`World::touched`]). If a client of `t` has one of them
     /// open for writing, the head waits for those to close (`waits`) and
     /// nothing is taken; else it leaves the queue and holds its files.
     fn acquire(&mut self, t: Tree) -> usize {
@@ -2312,7 +2313,7 @@ impl World {
             Entry::Landing { from, commit } => {
                 let (run, keep) = self.run_from(from, &commit, &q[1..]);
                 let merged = self.judge(&ours, &run);
-                let files = merged.files.clone();
+                let files = self.touched(&merged);
                 (Take::Landing { from, run, merged }, files, keep)
             }
         };
@@ -2341,8 +2342,10 @@ impl World {
     /// every open waiting for them is granted (an event). If a save of
     /// another file moved the tree's head since the take began, the change
     /// is planned again on the new head; it must still write only files it
-    /// holds (a save never writes a held file: no write-open of one is
-    /// granted), and the model stops loudly if not.
+    /// holds, and the model stops loudly if not. It does: a landing holds
+    /// every file its changes touch, losing ones included, so a replan can
+    /// flip a change from lost to won only through a save of a file it
+    /// holds, and no write-open of a held file is granted.
     fn finish(&mut self, t: Tree) {
         let hold = self.holds.remove(&t).expect("a take in progress");
         let head = self.head(t);
@@ -2396,6 +2399,20 @@ impl World {
                 self.run_path_call(&call);
             }
         }
+    }
+
+    /// Rule 9, the files a landing locks, fixed when it begins: every file
+    /// any of its changes touches (read from git, each change against its
+    /// own first parent), whether the plan says it wins or loses, and every
+    /// file the plan writes. Locking only what the plan writes would leave
+    /// a losing change's file open to a write-open of the parent's, whose
+    /// save could flip that change to a win at the replan in `finish`.
+    fn touched(&self, m: &Merged) -> BTreeSet<String> {
+        let mut files = m.files.clone();
+        for u in &m.units {
+            files.extend(self.changed(&self.first_parent(u), u));
+        }
+        files
     }
 
     /// The files tree `tree` changes from commit `ours`.

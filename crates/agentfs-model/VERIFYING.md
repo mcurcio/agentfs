@@ -100,7 +100,7 @@ the expected failure.
 | Test | Finding | Fails with |
 |---|---|---|
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which Main already took" |
-| `random_interleavings_git_merge_base` | 1 | 39 of 64 seeds: mostly a sync that leaves a line "which Main already took" or drops a line; in 3 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice |
+| `random_interleavings_git_merge_base` | 1 | 39 of 64 seeds: mostly a sync that leaves a line "which Main already took" or drops a line; in 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
 
 These were the results at seeds 1..64 on 2026-11-03; a change that moves a count says so in its pull
@@ -173,7 +173,8 @@ A planted bug is one deliberate mistake in a copy of the model. It shows which t
    that keeps a losing commit reachable; applying the lines of a losing save that did not collide; letting a
    transaction's clean lines apply when one of its lines lost; naming a losing save in a squash's graft; judging
    a squashed take as one change; a sync that reads only lineage, not the parent's collision refs; a squash that
-   takes a save from behind another entry of the queue; a file-rule loss that does not cost its whole change.
+   takes a save from behind another entry of the queue; a file-rule loss that does not cost its whole change; a judge that skips one of a take's changes (only the
+   `gitledger` check sees it at the step); a landing that locks only the files its plan writes.
 3. Run `cargo test --locked -p agentfs-model --no-fail-fast` in the copy (and 500 seeds for a bug the
    scenarios miss), with a separate target directory per copy: in the container, mount the copy as `/src`
    and a volume of its own as `/target` (`-v agentfs-target-m1:/target`).
