@@ -179,7 +179,7 @@ The "when" of who changed what when is the commit's committer date, kept as its 
 
 ## 4. Refs: what lives where
 
-Ref names are a design choice; the model uses the first five (with `refs/collisions/<n>`, from a counter).
+Ref names are a design choice; the model uses the first six (with `refs/collisions/<n>`, from a counter).
 
 | Ref | Holds | Kept locally | Pushed to the shared remote (design choice) |
 |---|---|---|---|
@@ -188,13 +188,14 @@ Ref names are a design choice; the model uses the first five (with `refs/collisi
 | `refs/heads/txn/<id>` | an open transaction | until commit or rollback | never |
 | `refs/collisions/<loser>` | one per losing change, named by its losing commit (the model numbers them, one per losing change, with a record for each file and cause it lost by) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |
 | `refs/replace/<commit>` | a `Squashed` landing's graft | always | yes, under `refs/agentfs/<volume>/replace/`, fetched back by `refs/agentfs/<volume>/replace/*:refs/replace/*` |
-| `refs/notes/agentfs/collisions` | each collision's record on the landing commit: tree, files, lines, lost and won lines (the model holds it in memory, so its remote lacks it) | always | with the collision refs |
+| `refs/notes/agentfs/collisions` | each take's collision records, one note on its result commit (the landing or transaction commit), a line per record: tree, file, cause, losing change and its ref, lines, lost and won versions. Built in the model: a sync reads it, as it stood when the take began, to know what the parent decided (§8); the checks read it locally and on the remote | always | with the collision refs |
 | `refs/queue/<tree>/<n>` | one queue entry (§5) | until taken | never |
 | `refs/txn-start/<id>` | the commit a transaction began at (the model holds it in memory, `Txn::start`) | until commit or rollback | never |
 
 Replication adds the release major to pushed names (replication.md). It is the only pusher: the collision refs,
-the notes ref and the grafts join its refspec, and a recorded collision is one more event that makes a push due
-(design choice; the model's `Step::Replicate`, taken in any order with the queue steps). No queue step waits on
+the notes ref and the grafts join its refspec, and a move of main or a recorded collision makes a push due (design
+choice; the model's `Step::Replicate`, taken in any order with the queue steps). The model first made only a
+collision an event, so a run without one never pushed main or its grafts (MODEL.md finding 16). No queue step waits on
 the network. A clone without the grafts reads `Squashed` history as stored, but cannot sync a fork (finding 2's cost).
 
 ## 5. The queue: one referee per tree
@@ -228,13 +229,20 @@ loses (finding 8, §16).
 
 **What a save records** (owner, 2026-11-03): what the program's write calls did, applied to `h`. POSIX gives a
 filesystem byte calls only: `write` on an `O_APPEND` open, `pwrite` or `write` at an offset, `ftruncate` (and
-`O_TRUNC` at open). None says it inserted, deleted or moved a line. So (a choice, §7):
+`O_TRUNC` at open). None says it inserted, deleted or moved a line, and the model's calls are these byte calls
+too. A file is a byte buffer; a line is its bytes up to and including a newline, or the bytes after the last
+newline (a partial last line). Line identity is derived from the bytes at close (a choice, §7):
 
 | The open's calls | The save |
 |---|---|
-| appends only (`O_APPEND`) | each appended line is a new line after the file's last line as `h` has it (the kernel seeks to the end and writes in one step), so it never writes over a line: two programs appending to one file at once both keep their lines, in close order (`r8_concurrent_appends_never_overwrite_each_other`). No alignment |
-| a truncate to 0 (or `O_TRUNC`), then writes | a rewrite: `h`'s lines aligned with the new bytes (§7). A program that read before a sync and rewrites the file really puts the old content back, recorded as its write over the synced line: it replaces that line upstream with no collision, and history keeps the overwritten version (`r8_a_stale_rewrite_*`) |
-| writes at offsets | the file as the open read it (its base) aligned with the bytes at close, once (§7); the line changes found are applied to `h` by identity, so every line the bytes left unchanged keeps what `h` holds, a synced line or another writer's line included (`r8_an_offset_write_elsewhere_keeps_the_synced_line`). Two offset writes to one line end with the last close's, as two Linux writers at one offset end with the last write's |
+| appends only (`O_APPEND`) | the bytes go after the file's last byte as `h` has it (the kernel seeks to the end and writes in one step), so each line they start is a new line after the file's last line and writes over none: two programs appending to one file at once both keep their lines, in close order (`r8_concurrent_appends_never_overwrite_each_other`). If `h` ends in a partial last line, the appended bytes up to and including their first newline finish that line: a new version of it, written over it, not a new line ("foo" and an append of "bar" is one line, "foobar"; `r8_an_append_onto_a_partial_last_line_finishes_it`). So two trees appending to a file with no final newline both write over its last line and collide, the parent winning (`r8_concurrent_appends_onto_a_partial_last_line_collide`). No alignment |
+| a truncate to 0 (or `O_TRUNC`), then writes | a rewrite: `h`'s lines aligned with the new bytes (§7). A program that read before a sync and rewrites the file really puts the old content back, recorded as its write over the synced line: it replaces that line upstream with no collision, and history keeps the overwritten version (`r8_a_stale_rewrite_*`). An `O_TRUNC` open that writes nothing saves an empty file (`r8_truncates_holes_and_an_empty_o_trunc`) |
+| writes at offsets, `ftruncate` | the bytes they leave (a gap past the end reads as NUL bytes, as a hole does), aligned with `h`'s lines once (§7); every line the bytes left unchanged keeps what `h` holds, a synced line or another writer's line included (`r8_an_offset_write_elsewhere_keeps_the_synced_line`). A line written in two calls is one version, and of two overlapping writes the later bytes count (`r8_split_and_overlapping_writes_make_one_version`). Two offset writes to one line end with the last close's, as two Linux writers at one offset end with the last write's |
+
+The model checks this against an independent byte oracle: the random runs keep their own byte array per tree and
+file and each open's calls, updated by the same calls by their own code, and every close must save exactly those
+bytes (MODEL.md, "What must always hold"). Its bytes are ASCII; NUL bytes from a hole are modelled, other binary
+content is not.
 
 The model reads an offset write's position on `h` at close, so its base is `h`; a real base older than `h` (a
 sync arrived while the file was open) is not modelled.
@@ -372,12 +380,24 @@ not say which lines it meant (§6): only its bytes do.
 so a NUL byte cannot hide a change). Unchanged lines keep their versions, lines at a region's ends whose bytes
 did not change included (git may put them there among repeated lines). A changed region pairs old and new lines in
 order: each new one is a new version of its old one. Extra new lines get new identities; extra old ones get a
-deleted version. An append needs none.
+deleted version. A line's bytes include its newline, so adding or removing a file's final newline changes its last
+line. An append needs none (§6).
+
+**Partial lines** (a choice). Only a file's last line can lack a newline in bytes, but a merge can still put a line
+after another writer's partial last line: main appends `}` with no final newline while a sandbox appends a line, and
+placement (below) puts the parent's first. That line then reads as terminated: the file's bytes add the newline,
+and its version keeps the bytes its writer wrote, until a save makes it the last line again or rewrites it
+(`r10_a_line_after_a_partial_line_reads_terminated`). The byte oracle found the case (MODEL.md finding 15): without
+the rule two line identities made one line of bytes, and the alignment paired the wrong records. Alternatives: count
+a line placed after a partial line as an edit of it, so the incoming change collides and loses whole (no byte
+appears that no writer wrote, but a concurrent append is lost for a missing newline); or have `agentfs` write a
+version adding the newline (a merge would then originate a line, against one writer per change, §3).
 
 | What the bytes show | Recorded as | Against the parent's concurrent edit of that line | Tests |
 |---|---|---|---|
 | a changed line | a new version, in place | the parent wins | `r3_*` |
-| a new line (an insert, an append) | a new line identity | none: both stay; two new lines at one place keep the parent's first | `r10_an_insert_*`, `r10_concurrent_inserts_*` |
+| a new line (an insert, an append) | a new line identity | none: both stay; two new lines at one place keep the parent's first | `r10_an_insert_*`, `r10_concurrent_inserts_*`, every random run (`placed_and_unlinked`) |
+| bytes appended to a partial last line | a new version of that line | the parent wins | `r8_concurrent_appends_onto_a_partial_last_line_collide` |
 | a removed line | a deleted version | the parent wins: its edit stays, or its delete stands; two deletes agree | `r10_a_delete_*` |
 | a moved line | a delete plus a new line holding the same bytes | the delete loses to the parent's edit and the new line applies: the parent's edit at the old place, the old bytes at the new one, one collision recorded (the delete's) | `r10_a_move_is_a_delete_plus_an_insert` |
 | a run of identical lines, one more or less | the diff's pick: it trims the common prefix first, so an added blank line is the run's last | none, but a neighbouring edit can land one line off from where the program's bytes put it | `r10_repeated_identical_lines_align_by_the_diff` |
@@ -396,10 +416,10 @@ it with the content, the parent winning:
 | Concurrent pair | Result | Tests |
 |---|---|---|
 | the sandbox unlinks; the parent changed a line the unlinker never saw | the unlink loses whole: the file stays, with the parent's line | `r11_an_unlink_against_*` |
-| the parent unlinked; the sandbox edits the file | all its changes to the file lose; it stays unlinked | same |
+| the parent unlinked; the sandbox edits the file | all its changes to the file lose; it stays unlinked | same; every random run (`placed_and_unlinked`) |
 | a rename against a content edit | both apply: the edit follows the file to its new path | `r11_a_rename_and_*` |
 | two renames of one file; two files to one path | the parent's name wins; the sandbox's file keeps its old name | `r11_concurrent_renames_*` |
-| a rename-over (both files existing in the parent) whose replaced file the parent changed, or whose rename loses | one call: it loses whole | `r11_a_rename_over_applies_or_loses_whole`, `r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file` |
+| a rename-over (both files existing in the parent) whose replaced file the parent changed, or whose rename loses | one call, so one save holding both name lines: it loses whole by rule 3e, no rule of its own | `r11_a_rename_over_applies_or_loses_whole`, `r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file` |
 
 **The atomic-save idiom** (a choice; not modelled: it needs creates). A program writes a new file and renames it
 over the target. Taken as a rename-over, it would replace the target's identity, and a parent's concurrent edit of
@@ -481,10 +501,11 @@ sequenceDiagram
 
 A sync decides nothing (rule 3a). It reads the upstream's head as it is when taken, never the one current when
 it was queued (rule 3d), and keeps exactly the fork's lines whose writing commit the upstream had not decided then:
-its lineage does not reach the commit, and no collision ref of the upstream or a tree above it, present when the
-head was read, names a change that reaches it. Those are lines still on their way to the parent's queue. Under
-`Squashed` a losing save is in no graft (§11), so its collision ref is the only record that the queue took it
-(with lineage alone, the fork would keep the loser's lines forever: finding 2 again).
+its lineage does not reach the commit, and no collision record of the upstream or a tree above it, in the notes
+ref (§4) as it stood when the head was read, names a change that reaches it. Those are lines still on their way to
+the parent's queue. Under `Squashed` a losing save is in no graft (§11), so its collision record is the only record
+that the queue took it (with lineage alone, the fork would keep the loser's lines forever: finding 2 again; planted,
+34 of 64 squashed seeds fail).
 
 ```mermaid
 sequenceDiagram
@@ -660,7 +681,7 @@ that works, so the second table weighs the other established designs (design cho
 | Shape | Gains | Costs |
 |---|---|---|
 | **Per-line referee (chosen)**: line maps, a parent walk and `merge-base --is-ancestor`, our own code | every invariant of §15 is checked and holds for the modelled executions (the scenarios, seeds 1 to 64 in CI and 1 to 500 by hand); not proven | the merge is ours to write and test, not a git strategy (finding 7) |
-| git's three-way merge, keeping the sandbox's side of a conflict (`merge-tree -X ours`) | no merge code | once a fork and main have merged each other, git finds two merge bases and keeps a fork line main already decided against (finding 1: 39 of 64 seeds); a hunk spans neighbouring lines, so keeping a side withholds main's decided neighbour (finding 6) |
+| git's three-way merge, keeping the sandbox's side of a conflict (`merge-tree -X ours`) | no merge code | once a fork and main have merged each other, git finds two merge bases and keeps a fork line main already decided against (finding 1: 32 of 64 seeds); a hunk spans neighbouring lines, so keeping a side withholds main's decided neighbour (finding 6) |
 | Per line within a change: only colliding lines lose, the change's other lines apply (the model's rule until 2026-11-03) | no clean line is dropped | a commit or a transaction reaches the parent in part; the owner: "“One line loses” sounds like a collision, and I thought we had already decided that each commit was a transaction" (replaced by rule 3e, §7) |
 | Per file: main's whole file wins | simple to state | a change of several files lands in part; within one file it is rule 3e's cost, which the owner chose for the whole change (finding 3, resolved) |
 | "Saw" read per commit (merge ancestry) | one ancestry query | a sync merge makes main's commit an ancestor, so an edit over the fork's undecided line looks "made on" main's line and silently replaces it (finding 8, resolved: read per line) |
@@ -700,13 +721,14 @@ in CI).
 | No tree silently loses a change; no stale version reverts a newer one (a rewrite of an old read is a new version, written over what it replaced: §6), except where a collision decided against it (a lost unlink gives the file back; a losing change's clean line goes back to the parent's), never for a line no real collision of its change decided | `no_silent_loss` | `r3_a_sync_carries_the_parents_current_version`, `r7_squashed_sync_never_undoes_the_forks_newer_line`, `random_interleavings_full_lineage` |
 | A line keeps the identity its first save gave it through later inserts and deletes around it; the referee and a sync compare identities only | `no_silent_loss`, `parent_wins` | `r10_an_insert_shifts_lines_without_changing_their_identity`, `r10_concurrent_inserts_at_one_place_keep_both_the_parents_first`, `r10_repeated_identical_lines_align_by_the_diff` |
 | A save's line map is a valid alignment, read from its blob and its first parent's alone (not from the replay that wrote it): every line the parent holds is still there, in order, unchanged or one new version over the parent's; every other line is new | `save_aligned` | every scenario and random run |
-| A save holds exactly the bytes its write calls leave on the head at close, by the harness's own record of the calls | `close_checked` (interleavings.rs) | every random run |
+| A save holds exactly the bytes its byte calls leave on the head at close, by an independent oracle (the harness's own byte array per tree and file, and each open's calls); every tree holds the oracle's bytes after every step a referee did not take | `Oracle`, `close_checked` (interleavings.rs) | every random run; `r8_split_*`, `r8_truncates_*`, `r8_an_append_onto_*` |
+| Rule 10's placement (two new lines at one place, the parent's first) and rule 11's "an edit of a file the parent unlinked loses", read from git in every take; both happen across the CI seeds | `placed_and_unlinked` | every random run |
 | A file keeps its identity through a rename; its name, existence and content are decided together, the parent winning; a rename-over applies whole (in a sandbox, once it holds its parent's name for the renamed file) | `parent_wins`, `no_silent_loss`, `rename_overs_whole` | `r11_an_unlink_against_a_concurrent_edit_the_parent_wins`, `r11_an_unlink_after_the_sync_wins`, `r11_a_rename_and_a_concurrent_edit_both_apply`, `r11_concurrent_renames_the_parent_wins`, `r11_a_rename_over_applies_or_loses_whole`, `r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file`, `r11_an_open_file_follows_a_rename_and_an_unlinked_one_saves_nothing`, every random run (a third of renames go over another file) |
 | No flip-flop: a line once replaced in a tree never shows there again | `no_flicker` | `r3_a_fork_never_flips_back_to_its_own_edit` |
 | A save is its write calls on the head at close: appends and offset writes keep the lines they did not write | every check | `r8_an_append_after_the_sync_keeps_the_synced_line`, `r8_an_offset_write_elsewhere_keeps_the_synced_line`, `r8_a_stale_rewrite_*` |
-| An append writes over no line: each appended line, recorded at its write call, is a new line placed after every line of its save's parent | `one_writer` | `r8_concurrent_appends_never_overwrite_each_other`, every random run |
+| An append writes over no line but a partial last line it finishes: read from the save's blobs and its program's calls, each line starting in the appended bytes is new, after every line of the parent, and a finished line is the parent's last, one version on | `appends_exact` (in `one_writer`) | `r8_concurrent_appends_never_overwrite_each_other`, every random run |
 | No take writes a file open for writing in that tree or one it did not hold; no write-open succeeds while a take holds the file; no lock outlives its holder (a sandbox's client or one of main's, a transaction, a tree); every wait ends on an event | `step_checked`, `locks`, `check_converged` | `r9_*`, `r11_an_unlink_or_rename_of_a_held_file_waits`, `r5_open_files_and_transactions`, every random run (main's clients and sandboxes die in them) |
-| The parent wins every collision, decided only at its queue, losing commit reachable | `parent_wins` | `r3_landing_collision_the_parent_wins`, `r3_a_collision_is_recorded_once_at_the_parents_queue`, `r10_a_delete_against_a_concurrent_edit_the_parent_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
+| The parent wins every collision, decided only at its queue, losing commit reachable, the decision in the notes ref on the take's result commit | `parent_wins` | `r3_landing_collision_the_parent_wins`, `r3_a_collision_is_recorded_once_at_the_parents_queue`, `r10_a_delete_against_a_concurrent_edit_the_parent_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
 | An edit over the parent's current line replaces it (a save after a sync); before the sync, or over an undecided line, it collides | `parent_wins` | `r3_fast_forward_when_the_base_is_current`, `r3_a_save_after_the_sync_wins_upstream_by_lineage`, `r3_a_save_before_the_sync_arrives_loses_to_the_parent`, `r3_an_edit_over_the_decided_line_replaces_it`, `r3_an_edit_over_an_undecided_line_still_collides` |
 | No partial save or transaction ever reaches a parent: each change a take judged lost or won, never both; one that lost has none of its versions in the result and every one named; one that won has every one in the result | `changes_whole`, `parent_wins` | `r3_a_save_loses_whole_with_its_clean_lines`, `r3_a_change_whose_delete_agrees_lands_whole`, `r3_a_later_save_after_a_losing_one_is_judged_on_its_own`, `r3_a_transaction_loses_whole_and_is_told`, `r3_a_committed_transaction_loses_whole_at_main`, `r3_a_file_rule_loss_costs_the_whole_change`, `r4_nested_changes_land_whole_or_lose_whole_at_every_level`, `r10_a_move_is_a_delete_plus_an_insert`, every random run |
 | A squashed commit holds only judged winners: its lineage parents are the parent's head and exactly the take's winning saves, and it sets only their versions | `changes_whole` | `r7_a_squashed_take_squashes_only_the_winners`, `random_interleavings_squashed` |
@@ -716,7 +738,7 @@ in CI).
 | Nothing else waits; each take is its queue's first entry (a squash: with the same fork's saves directly behind it) or records a wait, the rest stay in order | `take` (interleavings.rs) | `random_interleavings_full_lineage`, `random_interleavings_squashed`, `random_interleavings_adjacent_lines` (the scenarios' own `take` checks no order) |
 | A transaction ends as the program was told, whole; a rollback leaves nothing | `transactions_end_as_told`, `discarded_leave_no_trace` | `r5_transaction_commits_clean`, `r3_a_transaction_loses_whole_and_is_told`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_a_committed_transaction_then_lands_like_any_change`, `r5_transaction_rollback_and_client_death_leave_nothing` |
 | Every change traces to one writer | `one_writer` | `r6_a_sync_is_a_merge_with_the_parent_second` |
-| Every losing change is replicated, eventually, and stays: once Replication drains, every collision of the run is re-read on the shared remote alone, its writer and line; a main collision's result is in the remote main | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_parent`, every collision |
+| Every losing change is replicated, eventually, and stays: once Replication drains, the remote's collision notes are the run's collisions, each re-read on the shared remote alone, its writer and line; a main collision's result is in the remote main; the grafts are on the remote, which reads each squashed landing of main as its head and winners | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_parent`, every collision |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
 | The history setting holds, read by ancestry alone; squashed winning saves land as one changeset; a losing save under `Squashed` is kept by its collision ref, not by lineage | `history_setting`, `parent_wins` | `r7_squashed_saves_land_as_one_changeset`, `r7_history_setting_and_losers_stay_reachable`, `r7_a_squashed_take_squashes_only_the_winners`, `random_interleavings_squashed` |
 | The history setting decides nothing: the same calls, drained between rounds, decide the same trees and collisions under full lineage and squashed | fingerprint compare | `r7_the_history_setting_decides_no_collision`, `random_interleavings_history_settings_decide_the_same` |
@@ -763,6 +785,10 @@ The model checks nothing in §3 or §12: it has no actor or restarts.
   of any of them makes the whole rewrite lose. Kleppmann's list move or a structure-aware diff would do better, at the cost of a
   second, file-type-specific mechanism.
 - Line maps keep deleted versions and unlinked files, no trim rule.
+- Appends to a file with no final newline collide across trees: each finishes the last line (§6). A partial line a
+  merge put another line after reads as terminated, a newline no writer wrote (§7).
+- A sync that keeps a sandbox's undecided rename can show a parent's rename-over in part, in that sandbox and in
+  sandboxes inside it, until the parent decides (MODEL.md finding 17).
 - A sync takes main's decided unlink, so a sandbox's undecided edit in that file leaves its view before main's
   queue records the loss. An unlink or a rename-over loses whole for one line its writer never saw.
 - A sandbox line concurrent with main's, and every edit stacked on it before main decides, will lose. They stay
@@ -797,7 +823,7 @@ The model checks nothing in §3 or §12: it has no actor or restarts.
   Every git run also loads every replace ref. `Squashed` adds one per landing, forever, with no trim rule. Full
   lineage has none of this, which counts in choosing the history setting.
 - `Squashed` writes an empty commit for a take whose saves all lost, and a clone needs the grafts and the
-  collision refs to sync: a losing save is in no graft, so a sync reads the collision refs of its parent and the
+  collision notes to sync: a losing save is in no graft, so a sync reads the collision records of its parent and the
   trees above (§8).
 - The referee and the actor are our own code; no git merge strategy carries them.
 - Atomic steps need the reftable backend (§12).
@@ -807,7 +833,7 @@ The model checks nothing in §3 or §12: it has no actor or restarts.
 
 **Not modelled.** This revision's journal (§3), objects (§7) and progress rules (§6); question 2's sync; creates
 (renames go to new paths or over existing files), so the atomic-save idiom's rewrite (§7); an offset write's base older than the head at close (§6); directories, hard links, a line
-moved between files, path `truncate(2)`, `O_TRUNC` opens and `mmap`; binary files; approvals and landing timing;
+moved between files, path `truncate(2)` and `mmap`; binary files beyond NUL bytes (the model's bytes are ASCII); approvals and landing timing;
 integrator patches; restarts and the actor (§3, §12); space limits; history truncation; views, rules, commit window.
 
 ## 17. The older pages
@@ -826,7 +852,7 @@ more seeds against the model cannot test what the model leaves out. Its scope (a
 |---|---|---|
 | A FUSE mount of main and one sandbox on one real repository: a tree actor and a queue each, full lineage only | the model on real calls | the model's scenarios, driven as real file calls (VERIFYING.md's conformance plan), pass |
 | The journal (§3) | review point 1 | a kill of the view host and of the history service after each journal step: every write call that returned is in the next save, and none is saved twice; under power loss (dm-log-writes, as the power-loss workflow): every call before a returned `fsync` or close survives; a full state area fails the write call with `ENOSPC`; a close followed at once by an open, in the same process and in another, reads the new content (`RELEASE` is sent asynchronously; NOT VERIFIED that the view can always order the open after the save) |
-| Byte-level calls | review point 2 | random `pwrite` at any offset, partial lines, split writes, a missing final newline (appending `bar` to a file holding `foo`), overlapping writes, `ftruncate` shrinking and growing, `O_APPEND`; the bytes are the independent oracle: each saved file equals what the same calls leave on a plain Linux filesystem, and its line map passes `save_aligned` |
+| Byte-level calls (modelled since 2026-11-04: §6, MODEL.md rules 8 and 10) | review point 2, on a real mount | random `pwrite` at any offset, partial lines, split writes, a missing final newline (appending `bar` to a file holding `foo`), overlapping writes, `ftruncate` shrinking and growing, `O_APPEND`; the bytes are the independent oracle: each saved file equals what the same calls leave on a plain Linux filesystem, and its line map passes `save_aligned` |
 | Objects (§7) | review point 3 | an atomic save (write `n`, `rename(n, a)`) while another process holds `a` open for writing and keeps writing: the new `a` never changes; `O_TMPFILE` with `linkat`; an unlink while open; a rename of an open file |
 | Progress (§6) | review point 4 | a main process holds a log open for the whole run while a sandbox lands a stream of changes to other files: each lands without waiting for the log; a change to the log waits, new writers of the log wait behind it, and all go on at the close; overlapping short-lived writers of one file never starve a waiting take |
 | Measurements, recorded, not gated | review point 5 | per-call cost of the journal against plain FUSE (median, 99th percentile); journal size for a file written for an hour; line-map size per 10,000 saves; save and take time for 1 MiB and 100 MiB files |
@@ -842,7 +868,7 @@ measurements set the first budgets (no number here is a budget yet).
 |---|---|---|---|
 | referee | the parent's queue as the one place a collision is decided | names rule 3a's one judge | the landing process |
 | collision | two same-line edits, each written without seeing the other | replaces "conflict", which held | conflict |
-| decided | the parent's lineage reaches the line's writing commit, or a collision ref of the parent (or a tree above) names a change that reaches it | what a sync tests | landed |
+| decided | the parent's lineage reaches the line's writing commit, or a collision record of the parent (or a tree above) in the notes ref names a change that reaches it | what a sync tests | landed |
 | change | the unit the referee judges whole: an ordinary save (the whole file at one close) or a transaction's commit (all its files); a squashed changeset is not one (§7) | rule 3e: a collision costs the whole change, no more | commit; transaction |
 | graft | a `refs/replace/` entry giving a squashed commit its lineage | finding 2 | squash chain |
 | actor | the one place a tree's branch is moved, one step at a time | one mover per branch, so no two moves race | the Trees domain's writer |
@@ -862,6 +888,7 @@ measurements set the first budgets (no number here is a budget yet).
 saves and locks (§6); a sync commit credited to `agentfs` stays a
 labelled choice (§2); a save after a sync over the sandbox's own unlanded line still loses, a cost (§16);
 close-to-open visibility, accepted ("Go", §3). The 2026-11-04 revision (§3 journal, §6 progress, §7 objects, §14,
-§18) adds design choices only and no question: each has its alternatives and costs beside it.
+§18) adds design choices only and no question: each has its alternatives and costs beside it, and so does the byte
+model (§6, §7: an append onto a partial line, a followed partial line).
 
-*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the prototype plan (§18), proof claims narrowed to the modelled executions.*
+*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the prototype plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4).*

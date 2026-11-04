@@ -1,6 +1,12 @@
 //! File content as a sequence of lines, each line a version of a line
 //! identity, and the lineage of those versions.
 //!
+//! A file is a byte buffer. A line is its bytes up to and including a
+//! newline, or the bytes after the last newline (a partial last line: the
+//! file has no final newline). A live version holds its line's bytes,
+//! terminator included, so the file's bytes are its live lines' bytes in
+//! order ([`Content::bytes`]); a record escapes them to stay on one git line.
+//!
 //! A line's identity is fixed when a save first records it (a new line
 //! the save's alignment found, an append, or the root commit). Every later
 //! change to that line is a new version of the same identity, written over
@@ -28,7 +34,8 @@ pub const SLOTS: usize = 6;
 /// The files' identities, which are also their first paths. All exist from
 /// main's first commit; the model creates no files.
 pub const PATHS: [&str; 4] = ["a", "b", "c", "d"];
-/// The bytes of every root line: six identical lines in every file.
+/// The text of every root line (its bytes are this and a newline): six
+/// identical lines in every file.
 pub const BLANK: &str = "-";
 const SEPARATOR: &str = "--";
 const NONE: &str = "-";
@@ -54,7 +61,8 @@ impl Layout {
 /// What a version holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
-    /// A live line with these bytes (for a name line: the file's path).
+    /// A live line with these bytes, its newline included unless it is a
+    /// partial last line (for a name line: the file's path).
     Live(String),
     /// Deleted: a content line removed, or a file unlinked.
     Gone,
@@ -80,7 +88,7 @@ impl Line {
         matches!(self.state, State::Live(_))
     }
 
-    /// Its bytes, if live.
+    /// Its bytes, terminator included, if live.
     pub fn text(&self) -> Option<&str> {
         match &self.state {
             State::Live(t) => Some(t),
@@ -90,9 +98,9 @@ impl Line {
 
     fn render(&self) -> String {
         let state = match &self.state {
-            State::Live(t) => format!("+{t}"),
+            State::Live(t) => format!("+{}", escape(t)),
             State::Gone => "-".to_string(),
-            State::Replaced(f) => format!(">{f}"),
+            State::Replaced(f) => format!(">{}", escape(f)),
         };
         format!(
             "{}\t{}\t{}\t{state}",
@@ -107,9 +115,9 @@ impl Line {
         let mut f = s.splitn(4, '\t');
         let (id, line, over, state) = (f.next()?, f.next()?, f.next()?, f.next()?);
         let state = match state.split_at_checked(1)? {
-            ("+", t) => State::Live(t.to_string()),
+            ("+", t) => State::Live(unescape(t)?),
             ("-", "") => State::Gone,
-            (">", f) => State::Replaced(f.to_string()),
+            (">", f) => State::Replaced(unescape(f)?),
             _ => return None,
         };
         Some(Self {
@@ -119,6 +127,44 @@ impl Line {
             state,
         })
     }
+}
+
+/// A line's bytes on one git line: a backslash, a newline and a NUL byte
+/// (a hole a `pwrite` past the end leaves) escaped.
+fn escape(t: &str) -> String {
+    let mut s = String::with_capacity(t.len());
+    for c in t.chars() {
+        match c {
+            '\\' => s.push_str("\\\\"),
+            '\n' => s.push_str("\\n"),
+            '\0' => s.push_str("\\0"),
+            c => s.push(c),
+        }
+    }
+    s
+}
+
+fn unescape(t: &str) -> Option<String> {
+    let mut s = String::with_capacity(t.len());
+    let mut it = t.chars();
+    while let Some(c) = it.next() {
+        s.push(match c {
+            '\\' => match it.next()? {
+                '\\' => '\\',
+                'n' => '\n',
+                '0' => '\0',
+                _ => return None,
+            },
+            c => c,
+        });
+    }
+    Some(s)
+}
+
+/// A byte buffer's lines: each up to and including a newline, then the
+/// bytes after the last newline, if any (a partial last line).
+pub fn split_lines(bytes: &str) -> Vec<String> {
+    bytes.split_inclusive('\n').map(str::to_string).collect()
 }
 
 /// Whether `id` is a root version (written by the root commit).
@@ -142,13 +188,13 @@ pub struct Content {
 
 impl Content {
     /// File `file`'s root content: its name line holding its path, and
-    /// [`SLOTS`] root lines `<file>0`.. all holding [`BLANK`].
+    /// [`SLOTS`] root lines `<file>0`.. all holding [`BLANK`] and a newline.
     pub fn root(file: &str) -> Self {
         let line = |id: String| Line {
             id: id.clone(),
             line: id,
             over: None,
-            state: State::Live(BLANK.into()),
+            state: State::Live(format!("{BLANK}\n")),
         };
         Self {
             name: Line {
@@ -169,11 +215,41 @@ impl Content {
         self.lines.iter().filter(|l| l.live())
     }
 
-    /// The live lines' bytes.
+    /// The live lines' texts, each without its newline: a partial last
+    /// line and a full one read alike here; [`Content::bytes`] tells them
+    /// apart.
     pub fn texts(&self) -> Vec<String> {
         self.live()
-            .filter_map(|l| l.text().map(str::to_string))
+            .filter_map(|l| l.text())
+            .map(|t| t.strip_suffix('\n').unwrap_or(t).to_string())
             .collect()
+    }
+
+    /// The live lines with their bytes as a program reads them. Only a
+    /// file's last line can lack a newline in bytes, so a partial line that
+    /// another line follows (a merge placed a line after it: rule 10's
+    /// choice) reads as terminated; its version keeps the bytes its writer
+    /// wrote.
+    pub fn read_lines(&self) -> Vec<(&Line, String)> {
+        let live: Vec<&Line> = self.live().collect();
+        let n = live.len();
+        live.into_iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let t = l.text().unwrap_or_default();
+                let read = if i + 1 < n && !t.ends_with('\n') {
+                    format!("{t}\n")
+                } else {
+                    t.to_string()
+                };
+                (l, read)
+            })
+            .collect()
+    }
+
+    /// The file's bytes, as a program reads them ([`Content::read_lines`]).
+    pub fn bytes(&self) -> String {
+        self.read_lines().into_iter().map(|(_, t)| t).collect()
     }
 
     /// The `i`th live line, as a program reads it.
@@ -299,8 +375,9 @@ mod tests {
             id: "m1.1".into(),
             line: "a2".into(),
             over: Some("a2".into()),
-            state: State::Live("x\ty".into()),
+            state: State::Live("x\ty\\n\0".into()),
         };
+        c.lines[3].state = State::Live("partial".into());
         c.lines.push(Line {
             id: "m1.2".into(),
             line: "m1.2".into(),
@@ -322,6 +399,18 @@ mod tests {
     fn root_lines_repeat_their_bytes_but_not_their_identity() {
         let c = Content::root("b");
         assert_eq!(c.texts(), vec![BLANK.to_string(); SLOTS]);
+        assert_eq!(c.bytes(), format!("{BLANK}\n").repeat(SLOTS));
+        assert_eq!(split_lines("a\nb"), ["a\n", "b"]);
+        assert_eq!(split_lines("a\n\n"), ["a\n", "\n"]);
+        assert!(split_lines("").is_empty());
+        let mut d = Content::root("d");
+        d.lines[0].state = State::Live("x".into());
+        d.lines[5].state = State::Live("y".into());
+        assert_eq!(
+            d.bytes(),
+            "x\n-\n-\n-\n-\ny",
+            "a followed partial line reads terminated"
+        );
         assert_eq!(c.at(3), "b3");
         assert!(is_root("b3") && is_root("b") && !is_root("b6") && !is_root("c1.1"));
         assert_eq!(c.member("b").and_then(Line::text), Some("b"));

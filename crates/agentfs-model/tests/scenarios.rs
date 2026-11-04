@@ -7,8 +7,8 @@ use agentfs_model::check::{check, check_converged, step_checked};
 use agentfs_model::content::{BLANK, Content, Layout, Line, State};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::world::{
-    By, Client, Direction, HistoryPolicy, Life, MergeRule, ModelError, Overwritten, Policies, Step,
-    Tree, TxnOutcome, World, Write,
+    By, Client, Direction, HistoryPolicy, Life, LineEdit, MergeRule, ModelError, Overwritten,
+    Policies, Step, Tree, TxnOutcome, World, Write,
 };
 use std::collections::BTreeSet;
 
@@ -482,7 +482,7 @@ fn save_lines(w: &mut World, c: &Client, p: &str, slots: &[usize]) -> Vec<String
     let h = w.open_write(c, p);
     let made = slots
         .iter()
-        .map(|s| w.write(h, Write::At(*s)).expect("a new version"))
+        .map(|s| w.edit(h, LineEdit::At(*s)).expect("a new version"))
         .collect();
     w.close(h);
     made
@@ -794,10 +794,10 @@ fn r3_a_change_whose_delete_agrees_lands_whole() {
         let f = w.create_fork(Tree::Main);
         let t = distinct(&mut w, "a");
         let h = w.open_write(&Client::Fork(f), "a");
-        w.write(h, Write::Delete(1));
-        let y = w.write(h, Write::At(2)).expect("a new version");
+        w.edit(h, LineEdit::Delete(1));
+        let y = w.edit(h, LineEdit::At(2)).expect("a new version");
         w.close(h);
-        call(&mut w, &m1(), "a", Write::Delete(1));
+        call(&mut w, &m1(), "a", LineEdit::Delete(1));
         drain(&mut w);
         assert!(w.collisions.is_empty(), "{history:?}: {:?}", w.collisions);
         assert_eq!(
@@ -1436,7 +1436,7 @@ fn r8_an_append_after_the_sync_keeps_the_synced_line() {
     for history in BOTH {
         let (mut w, _, m, f) = read_then_sync(history);
         let h = w.open_write(&Client::Fork(f), "a");
-        let x = w.write(h, Write::Append).unwrap();
+        let x = w.edit(h, LineEdit::Append).unwrap();
         w.close(h);
         ok(&mut w);
         assert_eq!(w.read(Tree::Fork(f), "a").last(), x, "after the end");
@@ -1453,7 +1453,7 @@ fn r8_an_offset_write_elsewhere_keeps_the_synced_line() {
     for history in BOTH {
         let (mut w, _, m, f) = read_then_sync(history);
         let h = w.open_write(&Client::Fork(f), "a");
-        let y = w.write(h, Write::At(2)).unwrap();
+        let y = w.edit(h, LineEdit::At(2)).unwrap();
         w.close(h);
         drain(&mut w);
         for t in [Tree::Main, Tree::Fork(f)] {
@@ -1475,13 +1475,13 @@ fn r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it() {
         let (mut w, read, m, f) = read_then_sync(history);
         let m_commit = w.main_head.clone();
         let h = w.open_write(&Client::Fork(f), "a");
-        assert_eq!(w.write(h, Write::Rewrite(read.clone())), None);
+        assert_eq!(w.edit(h, LineEdit::Rewrite(read.clone())), None);
         w.close(h);
         let a = w.read(Tree::Fork(f), "a");
         let r = a.at(0).to_string();
         assert_eq!(
             a.get(0).and_then(|l| l.text()),
-            Some(read.at(0)),
+            read.get(0).and_then(|l| l.text()),
             "o's bytes, back"
         );
         assert!(r.starts_with("c1.") && w.lineage.descends(&r, &m));
@@ -1524,8 +1524,8 @@ fn r8_concurrent_appends_never_overwrite_each_other() {
             let o = w.save(&m1(), "a", 0);
             let m2 = Client::Main("m2".into());
             let (a, b) = (w.open_write(&m1(), "a"), w.open_write(&m2, "a"));
-            let xa = w.write(a, Write::Append).unwrap();
-            let xb = w.write(b, Write::Append).unwrap();
+            let xa = w.edit(a, LineEdit::Append).unwrap();
+            let xb = w.edit(b, LineEdit::Append).unwrap();
             let (first, second) = if m2_first { (b, a) } else { (a, b) };
             w.close(first);
             ok(&mut w);
@@ -1540,6 +1540,191 @@ fn r8_concurrent_appends_never_overwrite_each_other() {
             );
             drain(&mut w);
         }
+    }
+}
+
+/// The bytes of `p` in `t`.
+fn bytes(w: &World, t: Tree, p: &str) -> String {
+    w.read(t, p).bytes()
+}
+
+/// Opens `p` as `c`, makes these byte calls, closes.
+fn calls(w: &mut World, c: &Client, p: &str, calls: &[Write]) {
+    let h = w.open_write(c, p);
+    for x in calls {
+        w.write(h, x.clone());
+    }
+    w.close(h);
+}
+
+/// `a` holding `foo` with no final newline, saved by main: one line, the
+/// file's last six lines deleted. Returns that line's identity.
+fn foo_without_newline(w: &mut World) -> String {
+    calls(
+        w,
+        &m1(),
+        "a",
+        &[Write::Truncate(0), Write::Append("foo".into())],
+    );
+    drain(w);
+    assert_eq!(bytes(w, Tree::Main, "a"), "foo");
+    w.read(Tree::Main, "a").get(0).expect("a line").line.clone()
+}
+
+/// Rule 8, an `O_APPEND` write onto a partial last line: "foo" with no
+/// final newline and an append of "bar" is one line, "foobar", a new
+/// version of foo's line written over it, not a new line. Bytes after the
+/// first newline the append writes are new lines.
+#[test]
+fn r8_an_append_onto_a_partial_last_line_finishes_it() {
+    for history in BOTH {
+        let mut w = world(history);
+        let foo = foo_without_newline(&mut w);
+        let before = w.read(Tree::Main, "a").get(0).expect("foo").id.clone();
+        calls(&mut w, &m1(), "a", &[Write::Append("bar".into())]);
+        let a = w.read(Tree::Main, "a");
+        assert_eq!(a.bytes(), "foobar", "{history:?}");
+        let l = a.get(0).expect("a line");
+        assert_eq!(
+            (&l.line, &l.over),
+            (&foo, &Some(before)),
+            "the same line, one version on"
+        );
+        calls(&mut w, &m1(), "a", &[Write::Append("\nbaz\nq".into())]);
+        let a = w.read(Tree::Main, "a");
+        assert_eq!(a.texts(), ["foobar", "baz", "q"], "{history:?}");
+        assert_eq!(a.get(0).expect("a line").line, foo);
+        assert!(
+            a.get(1).is_some_and(|l| l.line == l.id),
+            "baz is a new line"
+        );
+        drain(&mut w);
+    }
+}
+
+/// Rule 8 with rule 3: two trees append to a file whose last line has no
+/// newline. Each append finishes that line, so each is a version of it:
+/// they collide, the parent's wins and the sandbox's save loses whole
+/// (a cost: appends to a file without a final newline are not concurrent-
+/// safe, as they are on a terminated file, `r8_concurrent_appends_*`).
+#[test]
+fn r8_concurrent_appends_onto_a_partial_last_line_collide() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let foo = foo_without_newline(&mut w);
+        calls(
+            &mut w,
+            &Client::Fork(f),
+            "a",
+            &[Write::Append("x\n".into())],
+        );
+        calls(&mut w, &m1(), "a", &[Write::Append("m\n".into())]);
+        drain(&mut w);
+        assert_eq!(bytes(&w, Tree::Main, "a"), "foom\n", "{history:?}");
+        assert_eq!(bytes(&w, Tree::Fork(f), "a"), "foom\n");
+        let c = w.collisions.last().expect("a collision").clone();
+        assert_eq!((c.by, c.lines), (By::Line, vec![foo]), "{history:?}");
+    }
+}
+
+/// Rule 10 with partial lines: main appends "}" with no final newline
+/// while the sandbox appends a line. Two new lines at one place, the
+/// parent's first: main's "}" is followed by the sandbox's line, so it
+/// reads as terminated ("}\n"), as only a file's last line can lack a
+/// newline in bytes. Its version keeps the byte its writer wrote (a
+/// choice); no collision. A later save that makes "}" the last line again
+/// writes it as the program's bytes say.
+#[test]
+fn r10_a_line_after_a_partial_line_reads_terminated() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        calls(
+            &mut w,
+            &Client::Fork(f),
+            "b",
+            &[Write::Append("n9\n".into())],
+        );
+        calls(&mut w, &m1(), "b", &[Write::Append("}".into())]);
+        ends_converged_without_collisions(&mut w);
+        let b = w.read(Tree::Main, "b");
+        assert_eq!(&b.bytes()[12..], "}\nn9\n", "{history:?}");
+        let brace = b.get(6).expect("the brace").clone();
+        assert_eq!(brace.text(), Some("}"), "the version keeps its bytes");
+        let n = b.bytes().len();
+        calls(&mut w, &m1(), "b", &[Write::Truncate(n - 3)]);
+        assert_eq!(&bytes(&w, Tree::Main, "b")[12..], "}\n", "{history:?}");
+        ends_converged_without_collisions(&mut w);
+    }
+}
+
+/// Rule 8 and 10, a line written in two calls, and two calls over one
+/// another: line identity comes from the bytes at close, so a line written
+/// in pieces is one version, and of two overlapping writes the bytes of
+/// the later one count.
+#[test]
+fn r8_split_and_overlapping_writes_make_one_version() {
+    for history in BOTH {
+        let mut w = world(history);
+        let pw = |offset: usize, bytes: &str| Write::Pwrite {
+            offset,
+            bytes: bytes.into(),
+        };
+        // Line 1 rewritten longer, in two calls: the second rewrites the
+        // bytes after it, as an in-place edit must.
+        calls(&mut w, &m1(), "c", &[pw(2, "ab"), pw(4, "c\n-\n-\n-\n-\n")]);
+        let c = w.read(Tree::Main, "c");
+        assert_eq!(c.texts(), ["-", "abc", "-", "-", "-", "-"], "{history:?}");
+        assert_eq!(
+            c.get(1).expect("a line").line,
+            "c1",
+            "one version of line 1"
+        );
+        // A new line at the end, in two calls: one new line.
+        calls(&mut w, &m1(), "c", &[pw(14, "de"), pw(16, "f\n")]);
+        let c = w.read(Tree::Main, "c");
+        assert_eq!(c.live().count(), 7, "{history:?}");
+        assert!(
+            c.get(6)
+                .is_some_and(|l| l.text() == Some("def\n") && l.line == l.id)
+        );
+        calls(&mut w, &m1(), "c", &[pw(0, "xyz\n"), pw(1, "Q")]);
+        let c = w.read(Tree::Main, "c");
+        // "xyz\n" over "-\nab": line 1 keeps only "c".
+        assert_eq!(
+            c.texts()[..2],
+            ["xQz", "c"],
+            "{history:?}: the later write's byte"
+        );
+        drain(&mut w);
+    }
+}
+
+/// Rule 8, `ftruncate` and holes: a truncate in the middle of a line
+/// leaves it partial, a new version of that line; a `pwrite` past the end
+/// fills the gap with NUL bytes, which the line map keeps (escaped). An
+/// `O_TRUNC` open that writes nothing saves an empty file: every line
+/// deleted, none lost from history.
+#[test]
+fn r8_truncates_holes_and_an_empty_o_trunc() {
+    for history in BOTH {
+        let mut w = world(history);
+        calls(&mut w, &m1(), "d", &[Write::Truncate(3)]);
+        let d = w.read(Tree::Main, "d");
+        assert_eq!(d.bytes(), "-\n-", "{history:?}");
+        assert_eq!(d.get(1).expect("a line").line, "d1");
+        let pw = Write::Pwrite {
+            offset: 5,
+            bytes: "z\n".into(),
+        };
+        calls(&mut w, &m1(), "d", &[pw]);
+        assert_eq!(bytes(&w, Tree::Main, "d"), "-\n-\0\0z\n", "{history:?}");
+        let h = w.open_trunc(&m1(), "d");
+        w.close(h);
+        assert_eq!(bytes(&w, Tree::Main, "d"), "", "{history:?}");
+        assert!(w.read(Tree::Main, "d").lines.iter().all(|l| !l.live()));
+        drain(&mut w);
     }
 }
 
@@ -1560,7 +1745,7 @@ fn r9_a_sync_waits_for_an_open_writer_then_applies() {
         assert_eq!(w.waits()[&Tree::Fork(f)], BTreeSet::from(["a".to_string()]));
         assert!(!w.pending().contains(&Step::Next(Tree::Fork(f))));
         assert!(!has(&w, Tree::Fork(f), "a", &m), "{history:?}: not written");
-        let x = w.write(h, Write::At(1)).unwrap();
+        let x = w.edit(h, LineEdit::At(1)).unwrap();
         w.close(h);
         ok(&mut w);
         assert!(w.waits().is_empty(), "the close woke it");
@@ -1585,7 +1770,7 @@ fn r9_a_landing_waits_for_the_parents_open_writer() {
     let x = w.save(&Client::Fork(f), "a", 2);
     take(&mut w, &Step::Next(Tree::Main));
     assert!(w.waits().contains_key(&Tree::Main) && !has(&w, Tree::Main, "a", &x));
-    let y = w.write(h, Write::At(0)).unwrap();
+    let y = w.edit(h, LineEdit::At(0)).unwrap();
     w.close(h);
     ok(&mut w);
     next(&mut w, Tree::Main);
@@ -1618,7 +1803,7 @@ fn r9_a_landing_holds_the_files_of_its_losing_changes() {
         assert!(has(&w, Tree::Main, "a", &m), "{history:?}: the unlink lost");
         let c = w.collisions.last().expect("a collision").clone();
         assert!(c.by == By::File && c.won == [m.clone()], "{c:?}");
-        w.write(h, Write::Delete(0));
+        w.edit(h, LineEdit::Delete(0));
         w.close(h);
         drain(&mut w);
     }
@@ -1641,7 +1826,7 @@ fn r9_a_write_open_waits_while_a_sync_holds_the_file() {
         assert!(!w.handle(other).waiting, "an unheld file opens at once");
         take(&mut w, &Step::Finish(Tree::Fork(f)));
         assert!(!w.handle(h).waiting, "the release granted it");
-        let x = w.write(h, Write::Append).unwrap();
+        let x = w.edit(h, LineEdit::Append).unwrap();
         w.close(h);
         w.close(other);
         let a = w.read(Tree::Fork(f), "a");
@@ -1659,7 +1844,7 @@ fn r9_client_death_releases_its_locks() {
         let mut w = world(history);
         let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
         let h = w.open_write(&Client::Fork(f), "a");
-        let x = w.write(h, Write::At(1)).unwrap();
+        let x = w.edit(h, LineEdit::At(1)).unwrap();
         let m = w.save(&m1(), "a", 0);
         take(&mut w, &Step::Next(Tree::Fork(f)));
         assert!(w.waits().contains_key(&Tree::Fork(f)));
@@ -1698,7 +1883,7 @@ fn r9_a_main_clients_death_releases_its_locks() {
         take(&mut w, &Step::Finish(Tree::Main));
         w.close(waiting);
         let h = w.open_write(&m1(), "a");
-        let y = w.write(h, Write::At(0)).unwrap();
+        let y = w.edit(h, LineEdit::At(0)).unwrap();
         let z = w.save(&Client::Fork(f), "a", 2);
         take(&mut w, &Step::Next(Tree::Main));
         assert!(w.waits().contains_key(&Tree::Main), "{history:?}");
@@ -1738,10 +1923,10 @@ fn r5_open_files_and_transactions() {
         let s = w.save(&c, "a", 1);
         let staged = w.open_write(&c, "b");
         assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles), "{history:?}");
-        w.write(staged, Write::At(0)).unwrap();
+        w.edit(staged, LineEdit::At(0)).unwrap();
         w.close(staged);
         assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles), "a is open");
-        let l = w.write(log, Write::Append).unwrap();
+        let l = w.edit(log, LineEdit::Append).unwrap();
         w.close(log);
         assert!(
             has(&w, Tree::Fork(f), "d", &l),
@@ -1758,9 +1943,9 @@ fn r5_open_files_and_transactions() {
 // ── rule 10: line identity ──────────────────────────────────────────────
 
 /// One open, one write call, one close: the version the call made, if any.
-fn call(w: &mut World, c: &Client, p: &str, call: Write) -> Option<String> {
+fn call(w: &mut World, c: &Client, p: &str, call: LineEdit) -> Option<String> {
     let h = w.open_write(c, p);
-    let made = w.write(h, call);
+    let made = w.edit(h, call);
     w.close(h);
     made
 }
@@ -1781,7 +1966,7 @@ fn texts(lines: &[&str]) -> Content {
             id: format!("t{i}"),
             line: format!("t{i}"),
             over: None,
-            state: State::Live(t.to_string()),
+            state: State::Live(format!("{t}\n")),
         })
         .collect();
     c
@@ -1802,12 +1987,12 @@ fn r10_an_insert_shifts_lines_without_changing_their_identity() {
     for history in BOTH {
         let mut w = world(history);
         let f = w.create_fork(Tree::Main);
-        let x = call(&mut w, &Client::Fork(f), "a", Write::Insert(0)).unwrap();
+        let x = call(&mut w, &Client::Fork(f), "a", LineEdit::Insert(0)).unwrap();
         let m = w.save(&m1(), "a", 2);
         ends_converged_without_collisions(&mut w);
         let a = w.read(Tree::Main, "a");
         assert_eq!((a.at(0), a.at(3)), (x.as_str(), m.as_str()), "{history:?}");
-        let n = call(&mut w, &m1(), "b", Write::Insert(0)).unwrap();
+        let n = call(&mut w, &m1(), "b", LineEdit::Insert(0)).unwrap();
         let y = w.save(&Client::Fork(f), "b", 2);
         ends_converged_without_collisions(&mut w);
         let b = w.read(Tree::Main, "b");
@@ -1824,8 +2009,8 @@ fn r10_concurrent_inserts_at_one_place_keep_both_the_parents_first() {
         for sync_first in [false, true] {
             let mut w = world(history);
             let f = w.create_fork(Tree::Main);
-            let x = call(&mut w, &Client::Fork(f), "a", Write::Insert(1)).unwrap();
-            let m = call(&mut w, &m1(), "a", Write::Insert(1)).unwrap();
+            let x = call(&mut w, &Client::Fork(f), "a", LineEdit::Insert(1)).unwrap();
+            let m = call(&mut w, &m1(), "a", LineEdit::Insert(1)).unwrap();
             if sync_first {
                 next(&mut w, Tree::Fork(f));
                 assert_eq!(ids(&w, Tree::Fork(f), "a")[..4], ["a0", &m, &x, "a1"]);
@@ -1850,7 +2035,7 @@ fn r10_a_delete_against_a_concurrent_edit_the_parent_wins() {
         let mut w = world(history);
         let f = w.create_fork(Tree::Main);
         let t = distinct(&mut w, "a");
-        call(&mut w, &Client::Fork(f), "a", Write::Delete(1));
+        call(&mut w, &Client::Fork(f), "a", LineEdit::Delete(1));
         let m = w.save(&m1(), "a", 1);
         drain(&mut w);
         assert_eq!(
@@ -1861,7 +2046,7 @@ fn r10_a_delete_against_a_concurrent_edit_the_parent_wins() {
         let c = w.collisions.last().expect("a collision").clone();
         assert_eq!((c.lines, c.won), (vec!["a1".to_string()], vec![m.clone()]));
         let t = distinct(&mut w, "b");
-        call(&mut w, &m1(), "b", Write::Delete(1));
+        call(&mut w, &m1(), "b", LineEdit::Delete(1));
         let x = w.save(&Client::Fork(f), "b", 1);
         drain(&mut w);
         assert_eq!(
@@ -1872,8 +2057,8 @@ fn r10_a_delete_against_a_concurrent_edit_the_parent_wins() {
         assert_eq!(w.collisions.last().map(|c| c.lost.clone()), Some(vec![x]));
         let t = distinct(&mut w, "c");
         let before = w.collisions.len();
-        call(&mut w, &Client::Fork(f), "c", Write::Delete(1));
-        call(&mut w, &m1(), "c", Write::Delete(1));
+        call(&mut w, &Client::Fork(f), "c", LineEdit::Delete(1));
+        call(&mut w, &m1(), "c", LineEdit::Delete(1));
         drain(&mut w);
         assert_eq!(w.collisions.len(), before, "{history:?}: two deletes agree");
         assert_eq!(ids(&w, Tree::Main, "c")[..2], [t[0].as_str(), &t[2]]);
@@ -1884,7 +2069,7 @@ fn r10_a_delete_against_a_concurrent_edit_the_parent_wins() {
 /// synced: their bytes, in order.
 fn distinct(w: &mut World, p: &str) -> Vec<String> {
     let h = w.open_write(&m1(), p);
-    let made: Vec<String> = (0..4).filter_map(|i| w.write(h, Write::At(i))).collect();
+    let made: Vec<String> = (0..4).filter_map(|i| w.edit(h, LineEdit::At(i))).collect();
     w.close(h);
     drain(w);
     made
@@ -1905,7 +2090,7 @@ fn r10_a_move_is_a_delete_plus_an_insert() {
         let mut w = world(history);
         let f = w.create_fork(Tree::Main);
         let t = distinct(&mut w, "a");
-        let mv = Write::Move { from: 0, to: 3 };
+        let mv = LineEdit::Move { from: 0, to: 3 };
         call(&mut w, &Client::Fork(f), "a", mv.clone());
         let m = w.save(&m1(), "a", 5);
         ends_converged_without_collisions(&mut w);
@@ -1969,7 +2154,7 @@ fn r10_repeated_identical_lines_align_by_the_diff() {
         let mut w = world(history);
         let f = w.create_fork(Tree::Main);
         let h = w.open_write(&Client::Fork(f), "a");
-        w.write_text(h, Write::Insert(0), BLANK);
+        w.edit_text(h, LineEdit::Insert(0), BLANK);
         w.close(h);
         let m = w.save(&m1(), "a", 1);
         ends_converged_without_collisions(&mut w);
@@ -1981,13 +2166,13 @@ fn r10_repeated_identical_lines_align_by_the_diff() {
         );
         let h = w.open_write(&m1(), "b");
         for (i, t) in ["{", "x", "}", "{", "y", "}"].iter().enumerate() {
-            w.write_text(h, Write::At(i), t);
+            w.edit_text(h, LineEdit::At(i), t);
         }
         w.close(h);
         drain(&mut w);
         let block = ["{", "x", "}", "{", "z", "}", "{", "y", "}"];
         let h = w.open_write(&Client::Fork(f), "b");
-        w.write(h, Write::Rewrite(texts(&block)));
+        w.edit(h, LineEdit::Rewrite(texts(&block)));
         let y = w.save(&m1(), "b", 4);
         w.close(h);
         ends_converged_without_collisions(&mut w);
@@ -2188,7 +2373,7 @@ fn r11_an_unlink_or_rename_of_a_held_file_waits() {
         let open = w.open_write(&c, "b");
         take(&mut w, &Step::Next(Tree::Fork(f)));
         assert!(w.waits().contains_key(&Tree::Fork(f)), "{history:?}");
-        let x = w.write(open, Write::At(0)).unwrap();
+        let x = w.edit(open, LineEdit::At(0)).unwrap();
         w.close(open);
         drain(&mut w);
         assert_eq!(w.path_of(Tree::Fork(f), "b"), None);
@@ -2204,12 +2389,12 @@ fn r11_an_open_file_follows_a_rename_and_an_unlinked_one_saves_nothing() {
         let mut w = world(history);
         let m2 = Client::Main("m2".into());
         let h = w.open_write(&m1(), "a");
-        let x = w.write(h, Write::At(0)).unwrap();
+        let x = w.edit(h, LineEdit::At(0)).unwrap();
         w.rename(&m2, "a", "e");
         w.close(h);
         assert!(has(&w, Tree::Main, "e", &x), "{history:?}");
         let h = w.open_write(&m1(), "b");
-        let y = w.write(h, Write::At(0)).unwrap();
+        let y = w.edit(h, LineEdit::At(0)).unwrap();
         w.unlink(&m2, "b");
         let head = w.main_head.clone();
         w.close(h);

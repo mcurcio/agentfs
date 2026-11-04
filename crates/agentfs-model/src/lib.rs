@@ -18,9 +18,12 @@
 //! squashed. A sync decides nothing:
 //! the fork takes the parent's decided version, keeping only its own lines
 //! still on their way to that queue. Every losing commit keeps a collision
-//! ref, which a separate Replication step pushes with main to a bare shared
-//! remote. A save is the program's write calls applied at close to its
-//! tree's head: an append is exact, every other byte write is aligned
+//! ref and a note on its take's result commit, which a separate
+//! Replication step pushes with main to a bare shared remote. A file is a
+//! byte buffer and a program's calls are POSIX byte calls ([`world::Write`]):
+//! a save is those calls applied at close to its tree's head, line
+//! identity derived from the bytes then: an append is exact (finishing a
+//! partial last line, then new lines), every other byte write is aligned
 //! with the head's lines once by git's histogram diff and recorded, so
 //! each line keeps an identity through later edits around it; a file's
 //! name and existence are one more line (unlink, rename); a
@@ -35,4 +38,5 @@
 pub mod check;
 pub mod content;
 pub mod git;
+pub mod program;
 pub mod world;

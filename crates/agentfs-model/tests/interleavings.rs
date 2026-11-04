@@ -3,18 +3,26 @@
 //! invariant checked after each step (`agentfs_model::check`), and, once
 //! writes stop and the queues drain, convergence.
 //!
-//! Clients open files, make write calls (appends, writes at an offset,
-//! inserts, deletes and moves of lines, some with bytes other lines repeat,
-//! and whole-file rewrites of an earlier read) and close them, so takes
-//! wait for write-opens and opens wait for takes (rule 9); they unlink and
-//! rename files (rule 11), to a new path or over another file. On top of
-//! `check`, the run itself asserts that nothing else waits: every close
-//! returns at once, and every queue step takes its queue's head (plus,
-//! under `Squashed`, the same fork's plain saves directly behind it, as one
-//! changeset), leaving the rest of the queue in order, or records that it
-//! waits. And it keeps its own record of every write call's bytes: each
-//! close it makes saves exactly the bytes those calls leave on the head
-//! then (rule 10's input, computed here, not by the model's replay).
+//! Clients open files (some with `O_TRUNC`) and make byte calls, as POSIX
+//! gives them (rule 8): `O_APPEND` writes, some of a partial line;
+//! `pwrite`s at an offset, some past the end (a hole), some split in two,
+//! some overlapping; `ftruncate`s; and the byte calls a program makes for a
+//! line edit (a line written in place, inserted, deleted or moved, some with
+//! bytes other lines repeat) or a whole-file rewrite of an earlier read.
+//! They close them, so takes wait for write-opens and opens wait for takes
+//! (rule 9), and while a take holds files they often open, save, unlink or
+//! rename one of that tree's files; they unlink and rename files (rule
+//! 11), to a new path or over another file. On top of `check`, the run
+//! itself asserts that nothing else waits: every close returns at once, and
+//! every queue step takes its queue's head (plus, under `Squashed`, the
+//! same fork's plain saves directly behind it, as one changeset), leaving
+//! the rest of the queue in order, or records that it waits. And it keeps
+//! its own byte oracle ([`Oracle`]): a plain byte array per tree (and open
+//! transaction) and file, and each open's calls, updated by the same calls
+//! by its own byte code; every close must save exactly the bytes the oracle
+//! computes, and every tree must hold the oracle's bytes after every step a
+//! referee did not take (a queue step, a transaction's commit), which only
+//! the tree it took may change.
 //!
 //! The seeds are every seed in `1..=SEEDS`, never a set picked because it
 //! passes. `AGENTFS_MODEL_SEED=<n>` runs one seed; `AGENTFS_MODEL_SEEDS=<n>`
@@ -24,19 +32,15 @@
 
 use agentfs_model::check::{check, check_converged, step_checked};
 use agentfs_model::content::{BLANK, Content, Layout, PATHS};
-use agentfs_model::git::with_reversed_dates;
+use agentfs_model::git::{git, with_reversed_dates};
+use agentfs_model::program;
 use agentfs_model::world::{
-    By, Client, Direction, ForkId, HandleId, HistoryPolicy, Kind, Life, MergeRule, ModelError,
-    Policies, Step, Tree, TxnEnd, TxnOutcome, World, Write,
+    By, Client, Direction, ForkId, HandleId, HistoryPolicy, Kind, Life, LineEdit, MergeRule,
+    ModelError, Policies, Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write,
 };
 use std::collections::BTreeMap;
 
 mod gitledger;
-
-fn checkg(w: &mut World) -> Result<(), String> {
-    check(w)?;
-    gitledger::observe(w)
-}
 
 /// CI runs seeds 1..=SEEDS.
 const SEEDS: u64 = 64;
@@ -47,6 +51,9 @@ const HOT_SLOTS: usize = 3;
 /// Bytes the random clients give some new lines: lines that repeat others'
 /// bytes, as blank lines and braces do (rule 10).
 const REPEATED: [&str; 2] = [BLANK, "}"];
+/// Bytes a raw `pwrite` draws from: newlines among them, so a write splits
+/// or joins lines.
+const RAW: [&str; 5] = ["x", "y", "\n", "-", "}"];
 
 struct Rng(u64);
 
@@ -65,6 +72,13 @@ impl Rng {
 
     fn pick<T: Clone>(&mut self, v: &[T]) -> Option<T> {
         (!v.is_empty()).then(|| v[self.below(v.len())].clone())
+    }
+
+    /// 1 to `n` bytes of [`RAW`].
+    fn raw(&mut self, n: usize) -> String {
+        (0..1 + self.below(n))
+            .map(|_| RAW[self.below(RAW.len())])
+            .collect()
     }
 }
 
@@ -95,10 +109,24 @@ struct Tally {
     /// a take.
     take_waits: usize,
     open_waits: usize,
+    /// Opens, unlinks and renames made while a take held files in that
+    /// tree, and saves closed then.
+    calls_during_takes: usize,
+    saves_during_takes: usize,
     rewrites: usize,
     /// Appends, and those two opens made to one file at once.
     appends: usize,
     concurrent_appends: usize,
+    /// Byte calls: appends of a partial line, raw `pwrite`s (and those
+    /// past the end), split and overlapping writes, truncates, `O_TRUNC`
+    /// opens.
+    partial_appends: usize,
+    pwrites: usize,
+    holes: usize,
+    split_writes: usize,
+    overlapping: usize,
+    truncates: usize,
+    o_truncs: usize,
     inserts: usize,
     deletes: usize,
     moves: usize,
@@ -108,6 +136,11 @@ struct Tally {
     renames: usize,
     rename_overs: usize,
     main_deaths: usize,
+    /// Takes in which a new line met a parent's new line at its place (rule
+    /// 10), and changes that edited a file the parent had unlinked (rule
+    /// 11), as `check` counted them.
+    inserts_met: usize,
+    unlinked_edits: usize,
     git_takes: usize,
     git_takes_total: usize,
 }
@@ -139,10 +172,125 @@ fn in_txn(w: &World) -> Vec<ForkId> {
         .collect()
 }
 
-/// One step ([`step_checked`]), asserting it took its queue's head (and, under `Squashed`,
-/// the entries it says it carried with it), and left the rest in order, or
-/// waits and left the queue as it was.
-fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
+/// The harness's own byte account (rule 8's oracle), kept apart from the
+/// model: each target's files' bytes (by file identity) and each open's
+/// byte calls, updated by the same calls by [`apply`], never by the model's
+/// replay. Read from git only after a referee's step ([`Oracle::reload`]).
+#[derive(Default)]
+struct Oracle {
+    files: BTreeMap<Target, BTreeMap<String, Vec<u8>>>,
+    calls: BTreeMap<HandleId, Vec<Write>>,
+}
+
+/// One byte call on a plain byte array: the harness's own code.
+fn apply(b: &mut Vec<u8>, call: &Write) {
+    match call {
+        Write::Append(x) => b.extend_from_slice(x.as_bytes()),
+        Write::Pwrite { offset, bytes } => {
+            for (j, x) in bytes.bytes().enumerate() {
+                if b.len() <= offset + j {
+                    b.resize(offset + j + 1, 0);
+                }
+                b[offset + j] = x;
+            }
+        }
+        Write::Truncate(n) => b.resize(*n, 0),
+    }
+}
+
+fn head_of(w: &World, t: Target) -> Option<String> {
+    match t {
+        Target::Tree(x) => w.alive(x).then(|| w.head(x)),
+        Target::Txn(f, n) => w.forks[&f]
+            .txn
+            .as_ref()
+            .filter(|x| x.id == n)
+            .map(|x| x.head.clone()),
+    }
+}
+
+impl Oracle {
+    /// After a referee's step (a queue step, a transaction's commit) or a
+    /// new tree or transaction: every live target's bytes, read from git.
+    fn reload(&mut self, w: &World) {
+        self.files.clear();
+        let mut targets: Vec<Target> = w.live_trees().into_iter().map(Target::Tree).collect();
+        targets.extend(
+            w.forks
+                .values()
+                .filter_map(|f| f.txn.as_ref().map(|x| Target::Txn(f.id, x.id))),
+        );
+        for t in targets {
+            let head = head_of(w, t).expect("live");
+            let files = PATHS
+                .iter()
+                .map(|p| (p.to_string(), w.file(&head, p).bytes().into_bytes()))
+                .collect();
+            self.files.insert(t, files);
+        }
+        self.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
+    }
+
+    /// Every target but `skip` holds the oracle's bytes.
+    fn check_but(&self, w: &World, skip: Option<Target>) -> Result<(), String> {
+        for (t, files) in &self.files {
+            let Some(head) = head_of(w, *t).filter(|_| Some(*t) != skip) else {
+                continue;
+            };
+            for (p, b) in files {
+                let got = w.file(&head, p).bytes();
+                if got.as_bytes() != &b[..] {
+                    return Err(format!(
+                        "bytes: {t:?}:{p} holds {got:?}, the oracle {:?}",
+                        String::from_utf8_lossy(b)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check(&self, w: &World) -> Result<(), String> {
+        self.check_but(w, None)
+    }
+
+    /// What open `h`'s program reads: the oracle's bytes of its file with
+    /// its own calls applied.
+    fn view(&self, w: &World, h: HandleId) -> String {
+        let (t, f) = (w.handle(h).target, w.handle(h).file.clone());
+        let mut b = self.files[&t][&f].clone();
+        for c in self.calls.get(&h).into_iter().flatten() {
+            apply(&mut b, c);
+        }
+        String::from_utf8(b).expect("ASCII")
+    }
+
+    fn write(&mut self, w: &mut World, h: HandleId, call: Write) {
+        self.calls.entry(h).or_default().push(call.clone());
+        w.write(h, call);
+    }
+
+    /// Open `h`'s close as the oracle sees it: its calls applied to its
+    /// target's bytes, unless its file is unlinked there (as on Linux, its
+    /// calls then reach no path). Call before the model closes it.
+    fn closing(&mut self, w: &World, h: HandleId) {
+        let (t, f) = (w.handle(h).target, w.handle(h).file.clone());
+        let calls = self.calls.remove(&h).unwrap_or_default();
+        let live = head_of(w, t).is_some_and(|x| w.file(&x, &f).name.live());
+        if live && let Some(b) = self.files.get_mut(&t).and_then(|x| x.get_mut(&f)) {
+            for c in &calls {
+                apply(b, c);
+            }
+        }
+    }
+}
+
+/// One step ([`step_checked`]), asserting it took its queue's head (and,
+/// under `Squashed`, the entries it says it carried with it), and left the
+/// rest in order, or waits and left the queue as it was; and that only the
+/// tree a take finished in changed bytes (the oracle reads them again
+/// after).
+fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<(), String> {
     w.note_step(s);
     let before = match s {
         Step::Next(t) | Step::Finish(t) => w.queue(*t),
@@ -151,6 +299,12 @@ fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
     gitledger::note_next(w, s)?;
     let taken = step_checked(w, s)?;
     tally.steps += 1;
+    let skip = match s {
+        Step::Finish(t) => Some(Target::Tree(*t)),
+        _ => None,
+    };
+    o.check_but(w, skip)?;
+    o.reload(w);
     if let Step::Finish(t) = s
         && w.queue(*t) != before
     {
@@ -181,91 +335,83 @@ fn take(w: &mut World, s: &Step, tally: &mut Tally) -> Result<(), String> {
     Ok(())
 }
 
-/// Each open's write calls with the bytes each wrote, as the harness made
-/// them.
-type Written = BTreeMap<HandleId, Vec<(Write, String)>>;
-
-/// The bytes a program's write calls leave on `img`, the head's lines at
-/// close: the harness's own account, kept apart from the model's replay.
-fn bytes_after(mut img: Vec<String>, calls: &[(Write, String)]) -> Vec<String> {
-    for (call, x) in calls {
-        match call {
-            Write::Append => img.push(x.clone()),
-            Write::At(i) if *i < img.len() => img[*i] = x.clone(),
-            Write::At(_) => img.push(x.clone()),
-            Write::Insert(i) => img.insert((*i).min(img.len()), x.clone()),
-            Write::Delete(i) if *i < img.len() => {
-                img.remove(*i);
-            }
-            Write::Delete(_) => {}
-            Write::Move { from, to } if from != to && *from < img.len() => {
-                let l = img.remove(*from);
-                img.insert((*to).min(img.len()), l);
-            }
-            Write::Move { .. } => {}
-            Write::Rewrite(c) => img = c.texts(),
-        }
-    }
-    img
-}
-
-/// Closes `h`, asserting that the save holds exactly the bytes its write
-/// calls leave on the head now (none if the file was unlinked meanwhile).
-fn close_checked(w: &mut World, written: &mut Written, h: HandleId) -> Result<(), String> {
-    let (target, file) = (w.handle(h).target, w.handle(h).file.clone());
-    let before = w.file(&w.target_head(target), &file);
-    let calls = written.remove(&h).unwrap_or_default();
-    let expect = bytes_after(before.texts(), &calls);
+/// Closes `h`: the save holds exactly the bytes the oracle computes (none
+/// if the file was unlinked meanwhile), and nothing else changed.
+fn close_checked(w: &mut World, o: &mut Oracle, h: HandleId) -> Result<(), String> {
+    o.closing(w, h);
     w.close(h);
     gitledger::observe(w)?;
-    let after = w.file(&w.target_head(target), &file);
-    if before.name.live() && after.texts() != expect {
-        return Err(format!(
-            "close h{h} of {file}: saved {:?}, but its write calls leave {expect:?}",
-            after.texts()
-        ));
-    }
-    Ok(())
+    o.check(w).map_err(|e| format!("close h{h}: {e}"))
 }
 
 /// Every program closes the files it has open (granted ones; a waiting
 /// open is closed once a take's release grants it).
-fn close_all_checked(w: &mut World, written: &mut Written) -> Result<(), String> {
+fn close_all_checked(w: &mut World, o: &mut Oracle) -> Result<(), String> {
     let open: Vec<_> = w
         .handles()
         .filter(|h| !h.waiting && h.kind == Kind::Write)
         .map(|h| h.id)
         .collect();
     for h in open {
-        close_checked(w, written, h)?;
+        close_checked(w, o, h)?;
     }
     Ok(())
 }
 
-/// [`close_all_checked`] for opens with no write calls recorded.
-fn close_all(w: &mut World) {
-    let open: Vec<_> = w
+/// A client's end event: the oracle closes its granted opens in the order
+/// the model does (by handle), each as its close would, and drops its
+/// waiting ones; a sandbox's open transaction rolls back first.
+fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> {
+    if let Client::Fork(f) = c
+        && w.forks[f].txn.is_some()
+    {
+        rollback_checked(w, o, *f)?;
+    }
+    let mine: Vec<HandleId> = w
         .handles()
-        .filter(|h| !h.waiting && h.kind == Kind::Write)
+        .filter(|h| h.client == *c && !h.waiting && h.kind == Kind::Write)
         .map(|h| h.id)
         .collect();
-    for h in open {
-        w.close(h);
-        gitledger::observe(w).expect("ledger");
+    for h in mine {
+        o.closing(w, h);
     }
+    match c {
+        Client::Main(n) => w.end_main_client(n),
+        Client::Fork(f) => w.end_client(*f),
+    }
+    gitledger::observe(w)?;
+    o.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
+    o.check(w).map_err(|e| format!("end of {c:?}: {e}"))
 }
 
-fn drain(w: &mut World, tally: &mut Tally, at: usize) -> Result<(), (usize, String)> {
+fn rollback_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), String> {
+    w.rollback(f).expect("open");
+    o.reload(w);
+    Ok(())
+}
+
+fn drain(
+    w: &mut World,
+    o: &mut Oracle,
+    tally: &mut Tally,
+    at: usize,
+) -> Result<(), (usize, String)> {
     for _ in 0..100_000 {
-        close_all(w);
-        checkg(w).map_err(|e| (at, e))?;
+        close_all_checked(w, o).map_err(|e| (at, e))?;
+        checkg(w, o).map_err(|e| (at, e))?;
         let Some(s) = w.pending().into_iter().next() else {
             return check_converged(w).map_err(|e| (at, e));
         };
-        take(w, &s, tally).map_err(|e| (at, e))?;
-        checkg(w).map_err(|e| (at, e))?;
+        take(w, o, &s, tally).map_err(|e| (at, e))?;
+        checkg(w, o).map_err(|e| (at, e))?;
     }
     Err((at, "the queues never drained".into()))
+}
+
+fn checkg(w: &mut World, o: &Oracle) -> Result<(), String> {
+    check(w)?;
+    gitledger::observe(w)?;
+    o.check(w)
 }
 
 /// One seed: [`run`] under `catch_unwind`. `Ok` carries the run's
@@ -291,259 +437,543 @@ fn run_seed(seed: u64, policies: Policies, tally: &mut Tally) -> Result<String, 
     ))
 }
 
-/// Opens `p` for writing as `c` and, if granted, writes line `slot` and
-/// closes: a save. A waiting open stays, to be written once granted.
-fn save(w: &mut World, c: &Client, p: &str, slot: usize, tally: &mut Tally) {
-    let h = w.open_write(c, p);
-    if w.handle(h).waiting {
-        tally.open_waits += 1;
-        return;
+/// A take in progress: its tree, the files its changes touch, and the
+/// (file, line identity) pairs in contention there.
+type Contention = (Tree, Vec<String>, Vec<(String, String)>);
+
+/// The client calls of a run, with the harness's state across them.
+struct Calls {
+    rng: Rng,
+    o: Oracle,
+    /// Each client's last read of each file (by identity), which a later
+    /// whole-file rewrite writes back: often stale by then.
+    reads: BTreeMap<(String, String), Content>,
+    /// Main's live clients: one may die (its end event) and a new one start.
+    mains: Vec<String>,
+    next_main: usize,
+    next_name: usize,
+    /// A counter for new lines' bytes, so most new lines differ.
+    next_text: usize,
+}
+
+impl Calls {
+    fn new(seed: u64) -> Self {
+        Self {
+            rng: Rng(seed),
+            o: Oracle::default(),
+            reads: BTreeMap::new(),
+            mains: vec!["m1".into(), "m2".into()],
+            next_main: 3,
+            next_name: 1,
+            next_text: 1,
+        }
     }
-    let x = w.write(h, Write::At(slot)).expect("a write at an offset");
-    let mut written = Written::from([(h, vec![(Write::At(slot), x)])]);
-    close_checked(w, &mut written, h).expect("a save holds its bytes");
+
+    /// A new line's text: a third repeat other lines' bytes.
+    fn text(&mut self, tally: &mut Tally) -> String {
+        if self.rng.below(3) == 0 {
+            tally.repeated += 1;
+            REPEATED[self.rng.below(REPEATED.len())].to_string()
+        } else {
+            self.next_text += 1;
+            format!("n{}", self.next_text)
+        }
+    }
+
+    fn line_edit(&mut self, w: &mut World, h: HandleId, edit: &LineEdit, text: &str) {
+        let view = self.o.view(w, h);
+        for c in program::calls(&view, edit, text) {
+            self.o.write(w, h, c);
+        }
+    }
+
+    /// One random byte call, or a line edit's byte calls, on granted open
+    /// `h`, at line `slot` where it names one.
+    fn write(&mut self, w: &mut World, h: HandleId, slot: usize, tally: &mut Tally) {
+        let (c, file, target) = {
+            let x = w.handle(h);
+            (x.client.clone(), x.file.clone(), x.target)
+        };
+        let view = self.o.view(w, h);
+        let len = view.len();
+        match self.rng.below(12) {
+            0 => {
+                tally.appends += 1;
+                tally.concurrent_appends += usize::from(w.handles().any(|o| {
+                    o.id != h && o.kind == Kind::Write && o.target == target && o.file == file
+                }));
+                let t = self.text(tally);
+                self.line_edit(w, h, &LineEdit::Append, &t);
+            }
+            1 => {
+                let t = self.text(tally);
+                self.line_edit(w, h, &LineEdit::At(slot), &t);
+            }
+            2 => {
+                tally.inserts += 1;
+                let t = self.text(tally);
+                self.line_edit(w, h, &LineEdit::Insert(slot), &t);
+            }
+            3 => {
+                tally.deletes += 1;
+                self.line_edit(w, h, &LineEdit::Delete(slot), "");
+            }
+            4 => {
+                tally.moves += 1;
+                let to = self.rng.below(HOT_SLOTS + 2);
+                self.line_edit(w, h, &LineEdit::Move { from: slot, to }, "");
+            }
+            5 => {
+                let read = self.reads.get(&(format!("{c:?}"), file.clone())).cloned();
+                let Some(read) =
+                    read.or_else(|| w.client_path(&c, &file).map(|p| w.client_reads(&c, &p)))
+                else {
+                    return;
+                };
+                tally.rewrites += 1;
+                self.line_edit(w, h, &LineEdit::Rewrite(read), "");
+            }
+            6 => {
+                // An append with no final newline: the next append, or this
+                // file's next writer's, finishes its line.
+                tally.partial_appends += 1;
+                let mut t = self.text(tally);
+                if self.rng.below(2) == 0 {
+                    t = format!("{t}\n{}", self.rng.raw(2).replace('\n', ""));
+                }
+                self.o.write(w, h, Write::Append(t));
+            }
+            7 => {
+                tally.pwrites += 1;
+                let offset = self.rng.below(len + 3);
+                tally.holes += usize::from(offset > len);
+                let bytes = self.rng.raw(4);
+                self.o.write(w, h, Write::Pwrite { offset, bytes });
+            }
+            8 => {
+                // A line edit's bytes in two calls, split at a byte inside.
+                tally.split_writes += 1;
+                let t = self.text(tally);
+                let edit = if self.rng.below(2) == 0 {
+                    LineEdit::At(slot)
+                } else {
+                    LineEdit::Insert(slot)
+                };
+                for c in program::calls(&view, &edit, &t) {
+                    match c {
+                        Write::Pwrite { offset, bytes } if bytes.len() > 1 => {
+                            let k = 1 + self.rng.below(bytes.len() - 1);
+                            let (a, b) = bytes.split_at(k);
+                            self.o.write(
+                                w,
+                                h,
+                                Write::Pwrite {
+                                    offset,
+                                    bytes: a.into(),
+                                },
+                            );
+                            let bytes = b.to_string();
+                            self.o.write(
+                                w,
+                                h,
+                                Write::Pwrite {
+                                    offset: offset + k,
+                                    bytes,
+                                },
+                            );
+                        }
+                        c => self.o.write(w, h, c),
+                    }
+                }
+            }
+            9 => {
+                // Two writes, the second over part of the first.
+                tally.overlapping += 1;
+                let offset = self.rng.below(len + 1);
+                let t = self.text(tally);
+                let first = format!("{t}\n");
+                let k = self.rng.below(first.len());
+                self.o.write(
+                    w,
+                    h,
+                    Write::Pwrite {
+                        offset,
+                        bytes: first,
+                    },
+                );
+                let bytes = self.rng.raw(3);
+                self.o.write(
+                    w,
+                    h,
+                    Write::Pwrite {
+                        offset: offset + k,
+                        bytes,
+                    },
+                );
+            }
+            10 => {
+                tally.truncates += 1;
+                let n = self.rng.below(len + 2);
+                tally.holes += usize::from(n > len);
+                self.o.write(w, h, Write::Truncate(n));
+            }
+            _ => {
+                // A line written in place, its bytes repeating another's.
+                tally.repeated += 1;
+                let t = REPEATED[self.rng.below(REPEATED.len())];
+                self.line_edit(w, h, &LineEdit::At(slot), t);
+            }
+        }
+    }
+
+    /// Opens `p` for writing as `c`, a sixth with `O_TRUNC`.
+    fn open(&mut self, w: &mut World, c: &Client, p: &str, tally: &mut Tally) -> HandleId {
+        if self.rng.below(6) == 0 {
+            tally.o_truncs += 1;
+            let h = w.open_trunc(c, p);
+            self.o.calls.insert(h, vec![Write::Truncate(0)]);
+            h
+        } else {
+            w.open_write(c, p)
+        }
+    }
+
+    /// Opens `p` for writing as `c` and, if granted, writes line `slot` and
+    /// closes: a save. A waiting open stays, to be written once granted.
+    fn save(
+        &mut self,
+        w: &mut World,
+        c: &Client,
+        p: &str,
+        slot: usize,
+        tally: &mut Tally,
+    ) -> Result<(), String> {
+        let h = w.open_write(c, p);
+        if w.handle(h).waiting {
+            tally.open_waits += 1;
+            return Ok(());
+        }
+        let t = self.text(tally);
+        self.line_edit(w, h, &LineEdit::At(slot), &t);
+        close_checked(w, &mut self.o, h)
+    }
+
+    /// Opens `p` as `c`, makes one random write call and closes, if the
+    /// open is granted.
+    fn one_call(
+        &mut self,
+        w: &mut World,
+        c: &Client,
+        p: &str,
+        slot: usize,
+        tally: &mut Tally,
+    ) -> Result<(), String> {
+        let h = self.open(w, c, p, tally);
+        if w.handle(h).waiting {
+            tally.open_waits += 1;
+            return Ok(());
+        }
+        self.write(w, h, slot, tally);
+        close_checked(w, &mut self.o, h)
+    }
+
+    /// Unlinks `p`, or renames it: to a new path, or a third of the time
+    /// over another file the client sees.
+    fn path_call(
+        &mut self,
+        w: &mut World,
+        c: &Client,
+        f: &str,
+        p: &str,
+        unlink: bool,
+        tally: &mut Tally,
+    ) {
+        if unlink {
+            tally.unlinks += 1;
+            w.unlink(c, p);
+            return;
+        }
+        let over = PATHS
+            .iter()
+            .filter(|g| **g != f)
+            .filter_map(|g| w.client_path(c, g))
+            .collect::<Vec<_>>();
+        match self.rng.pick(&over) {
+            Some(q) if self.rng.below(3) == 0 => {
+                tally.rename_overs += 1;
+                w.rename(c, p, &q);
+            }
+            _ => {
+                tally.renames += 1;
+                w.rename(c, p, &format!("e{}", self.next_name));
+                self.next_name += 1;
+            }
+        }
+    }
+
+    /// While a take holds files in a tree, a client of that tree calls on
+    /// one of them (or another file): opens it (it waits if held), saves
+    /// it at once if granted, or unlinks or renames it. This is the
+    /// pattern the 2026-11-03 review found by hand and 500 seeds missed (a
+    /// parent's save of a file a losing change touched, during the take).
+    fn during_take(
+        &mut self,
+        w: &mut World,
+        slot: usize,
+        tally: &mut Tally,
+    ) -> Result<bool, String> {
+        // Each take with the files its changes touch and the lines in
+        // contention there, read from git: the lines each commit of the
+        // take set over its first parent, and those the tree's head set
+        // over that first parent (each commit against its base).
+        let holds: Vec<Contention> = w
+            .holds()
+            .iter()
+            .map(|(t, x)| {
+                let mut files: Vec<String> = x.files.iter().cloned().collect();
+                let mut lines = Vec::new();
+                if let Take::Landing { run, .. } = &x.take {
+                    for c in run {
+                        let base = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
+                        for e in w
+                            .edits(&base, c)
+                            .into_iter()
+                            .chain(w.edits(&base, &w.head(*t)))
+                        {
+                            files.push(e.path.clone());
+                            lines.push((e.path, e.line));
+                        }
+                    }
+                }
+                (*t, files, lines)
+            })
+            .collect();
+        let Some((t, held, contended)) = self.rng.pick(&holds) else {
+            return Ok(false);
+        };
+        let c = match t {
+            Tree::Main => Client::Main(self.mains[self.rng.below(self.mains.len())].clone()),
+            Tree::Fork(f) if w.forks[&f].life == Life::Open => Client::Fork(f),
+            Tree::Fork(_) => return Ok(false),
+        };
+        let file = match self.rng.pick(&held) {
+            Some(x) if self.rng.below(4) != 0 => x,
+            _ => PATHS[self.rng.below(PATHS.len())].to_string(),
+        };
+        let Some(p) = w.client_path(&c, &file) else {
+            return Ok(false);
+        };
+        tally.calls_during_takes += 1;
+        match self.rng.below(6) {
+            0 => {
+                let unlink = self.rng.below(2) == 0;
+                self.path_call(w, &c, &file, &p, unlink, tally);
+            }
+            1 | 2 => {
+                let h = self.open(w, &c, &p, tally);
+                tally.open_waits += usize::from(w.handle(h).waiting);
+            }
+            _ => {
+                let h = w.open_write(&c, &p);
+                if w.handle(h).waiting {
+                    tally.open_waits += 1;
+                } else {
+                    // Mostly on a line in contention: removed (a save that
+                    // can turn a losing change of this file into one that
+                    // wins at the take's replan) or written.
+                    tally.saves_during_takes += 1;
+                    let at = w.client_reads(&c, &p);
+                    let spots: Vec<usize> = at
+                        .live()
+                        .enumerate()
+                        .filter(|(_, l)| contended.contains(&(file.clone(), l.line.clone())))
+                        .map(|(i, _)| i)
+                        .collect();
+                    let spot = self.rng.pick(&spots).unwrap_or(slot);
+                    if self.rng.below(2) == 0 {
+                        self.line_edit(w, h, &LineEdit::Delete(spot), "");
+                    } else {
+                        self.write(w, h, spot, tally);
+                    }
+                    close_checked(w, &mut self.o, h)?;
+                }
+            }
+        }
+        Ok(true)
+    }
 }
 
 fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     gitledger::enable(true);
     gitledger::observe(w).map_err(|e| (0, e))?;
-    let mut rng = Rng(seed);
+    let mut k = Calls::new(seed);
+    k.o.reload(w);
     // The line a fork wrote last (its file's identity and position). Main
     // and forks write it again half the time, so runs often build "a fork
     // edits over its own undecided line while main writes it
     // concurrently" (coherence finding 8).
     let mut focus: Option<(&str, usize)> = None;
-    // Each client's last read of each file (by identity), which a later
-    // whole-file rewrite writes back: often stale by then.
-    let mut reads: BTreeMap<(String, String), Content> = BTreeMap::new();
-    // Main's live clients: one may die (its end event) and a new one start.
-    let mut mains: Vec<String> = vec!["m1".into(), "m2".into()];
-    let mut next_main = 3;
-    let mut next_name = 1;
-    let mut written = Written::new();
     for step in 0..STEPS {
         let (f, slot) = match focus {
-            Some(x) if rng.below(2) == 0 => x,
-            _ => (PATHS[rng.below(PATHS.len())], rng.below(HOT_SLOTS)),
+            Some(x) if k.rng.below(2) == 0 => x,
+            _ => (PATHS[k.rng.below(PATHS.len())], k.rng.below(HOT_SLOTS)),
         };
-        let mut clients: Vec<Client> = mains.iter().cloned().map(Client::Main).collect();
+        let mut clients: Vec<Client> = k.mains.iter().cloned().map(Client::Main).collect();
         clients.extend(live_clients(w).into_iter().map(Client::Fork));
         let open: Vec<_> = w
             .handles()
             .filter(|h| !h.waiting && h.kind == Kind::Write)
             .map(|h| h.id)
             .collect();
-        match rng.below(30) {
+        let e = |e| (step, e);
+        match k.rng.below(34) {
             0..=2 => {
-                let who = Client::Main(mains[rng.below(mains.len())].clone());
+                let who = Client::Main(k.mains[k.rng.below(k.mains.len())].clone());
                 if let Some(p) = w.client_path(&who, f) {
-                    save(w, &who, &p, slot, tally);
+                    k.save(w, &who, &p, slot, tally).map_err(e)?;
                 }
             }
             3 => {
                 let forks = live_clients(w);
                 if forks.len() < 4 {
-                    let parent = match rng.pick(&forks) {
-                        Some(f) if rng.below(3) == 0 => {
+                    let parent = match k.rng.pick(&forks) {
+                        Some(f) if k.rng.below(3) == 0 => {
                             tally.nested += 1;
                             Tree::Fork(f)
                         }
                         _ => Tree::Main,
                     };
                     w.create_fork(parent);
+                    k.o.reload(w);
                     tally.forks += 1;
                 }
             }
             4..=6 => {
-                if let Some(c) = rng.pick(&live_clients(w)).map(Client::Fork)
+                if let Some(c) = k.rng.pick(&live_clients(w)).map(Client::Fork)
                     && let Some(p) = w.client_path(&c, f)
                 {
-                    save(w, &c, &p, slot, tally);
+                    k.save(w, &c, &p, slot, tally).map_err(e)?;
                     focus = Some((f, slot));
                 }
             }
             7 => {
-                if let Some(f) = rng.pick(&live_clients(w)) {
+                if let Some(f) = k.rng.pick(&live_clients(w)) {
                     let _ = w.begin(f);
+                    k.o.reload(w);
                 }
             }
             8 => {
                 // Mostly commit a transaction that staged something, so
                 // commits meet concurrent lines.
-                if let Some(f) = rng.pick(&in_txn(w))
+                if let Some(f) = k.rng.pick(&in_txn(w))
                     && (w.forks[&f]
                         .txn
                         .as_ref()
                         .is_some_and(|t| !t.staged.is_empty())
-                        || rng.below(4) == 0)
+                        || k.rng.below(4) == 0)
                 {
                     let _ = w.commit_txn(f);
+                    gitledger::observe(w).map_err(e)?;
+                    k.o.reload(w);
                 }
             }
             9 => {
-                if let Some(f) = rng.pick(&in_txn(w))
-                    && rng.below(2) == 0
+                if let Some(f) = k.rng.pick(&in_txn(w))
+                    && k.rng.below(2) == 0
                 {
-                    w.rollback(f).expect("open");
+                    rollback_checked(w, &mut k.o, f).map_err(e)?;
                     tally.rolled_back += 1;
                 }
             }
             10 => {
-                if rng.below(4) == 0 {
+                if k.rng.below(4) == 0 {
                     // One of main's clients dies; a new one starts.
-                    let i = rng.below(mains.len());
-                    w.end_main_client(&mains[i]);
+                    let i = k.rng.below(k.mains.len());
+                    end_checked(w, &mut k.o, &Client::Main(k.mains[i].clone())).map_err(e)?;
                     tally.main_deaths += 1;
-                    mains[i] = format!("m{next_main}");
-                    next_main += 1;
-                } else if let Some(f) = rng.pick(&live_clients(w))
-                    && rng.below(3) == 0
+                    k.mains[i] = format!("m{}", k.next_main);
+                    k.next_main += 1;
+                } else if let Some(f) = k.rng.pick(&live_clients(w))
+                    && k.rng.below(3) == 0
                 {
-                    w.end_client(f);
+                    end_checked(w, &mut k.o, &Client::Fork(f)).map_err(e)?;
                 }
             }
             11 | 12 => {
-                if let Some(c) = rng.pick(&clients)
+                if let Some(c) = k.rng.pick(&clients)
                     && let Some(p) = w.client_path(&c, f)
                 {
-                    let h = w.open_write(&c, &p);
+                    let h = k.open(w, &c, &p, tally);
                     tally.open_waits += usize::from(w.handle(h).waiting);
                 }
             }
             13..=15 => {
-                if let Some(h) = rng.pick(&open) {
-                    let (c, file) = (w.handle(h).client.clone(), w.handle(h).file.clone());
-                    let call = match rng.below(6) {
-                        0 => {
-                            tally.appends += 1;
-                            let target = w.handle(h).target;
-                            tally.concurrent_appends += usize::from(w.handles().any(|o| {
-                                o.id != h
-                                    && o.kind == Kind::Write
-                                    && o.target == target
-                                    && o.file == file
-                            }));
-                            Write::Append
-                        }
-                        1 => Write::At(slot),
-                        2 => {
-                            tally.inserts += 1;
-                            Write::Insert(slot)
-                        }
-                        3 => {
-                            tally.deletes += 1;
-                            Write::Delete(slot)
-                        }
-                        4 => {
-                            tally.moves += 1;
-                            Write::Move {
-                                from: slot,
-                                to: rng.below(HOT_SLOTS + 2),
-                            }
-                        }
-                        _ => {
-                            let read = reads.get(&(format!("{c:?}"), file.clone())).cloned();
-                            let Some(read) = read.or_else(|| {
-                                w.client_path(&c, &file).map(|p| w.client_reads(&c, &p))
-                            }) else {
-                                continue;
-                            };
-                            tally.rewrites += 1;
-                            Write::Rewrite(read)
-                        }
-                    };
-                    let makes = matches!(call, Write::Append | Write::At(_) | Write::Insert(_));
-                    let made = if makes && rng.below(3) == 0 {
-                        tally.repeated += 1;
-                        let text = REPEATED[rng.below(REPEATED.len())];
-                        w.write_text(h, call.clone(), text);
-                        text.to_string()
-                    } else {
-                        w.write(h, call.clone()).unwrap_or_default()
-                    };
-                    written.entry(h).or_default().push((call, made));
+                if let Some(h) = k.rng.pick(&open) {
+                    k.write(w, h, slot, tally);
                 }
             }
             16 => {
-                if let Some(h) = rng.pick(&open) {
-                    close_checked(w, &mut written, h).map_err(|e| (step, e))?;
+                if let Some(h) = k.rng.pick(&open) {
+                    close_checked(w, &mut k.o, h).map_err(e)?;
                 }
             }
             17 => {
-                if let Some(c) = rng.pick(&clients)
+                if let Some(c) = k.rng.pick(&clients)
                     && let Some(p) = w.client_path(&c, f)
                 {
-                    reads.insert((format!("{c:?}"), f.to_string()), w.client_reads(&c, &p));
+                    k.reads
+                        .insert((format!("{c:?}"), f.to_string()), w.client_reads(&c, &p));
                 }
             }
-            18 => {
-                if rng.below(3) == 0
-                    && let Some(c) = rng.pick(&clients)
+            18 | 19 => {
+                if k.rng.below(3) == 0
+                    && let Some(c) = k.rng.pick(&clients)
                     && let Some(p) = w.client_path(&c, f)
                 {
-                    tally.unlinks += 1;
-                    w.unlink(&c, &p);
+                    let unlink = k.rng.below(2) == 0;
+                    k.path_call(w, &c, f, &p, unlink, tally);
                 }
             }
-            19 => {
-                if rng.below(3) == 0
-                    && let Some(c) = rng.pick(&clients)
-                    && let Some(p) = w.client_path(&c, f)
-                {
-                    // A third of renames go over another file (rename-over).
-                    let over = PATHS
-                        .iter()
-                        .filter(|g| **g != f)
-                        .filter_map(|g| w.client_path(&c, g))
-                        .collect::<Vec<_>>();
-                    match rng.pick(&over) {
-                        Some(q) if rng.below(3) == 0 => {
-                            tally.rename_overs += 1;
-                            w.rename(&c, &p, &q);
-                        }
-                        _ => {
-                            tally.renames += 1;
-                            w.rename(&c, &p, &format!("e{next_name}"));
-                            next_name += 1;
-                        }
-                    }
-                }
+            26..=33 if !w.holds().is_empty() => {
+                k.during_take(w, slot, tally).map_err(e)?;
             }
             _ => {
-                if let Some(s) = rng.pick(&w.pending()) {
-                    take(w, &s, tally).map_err(|e| (step, e))?;
+                if let Some(s) = k.rng.pick(&w.pending()) {
+                    take(w, &mut k.o, &s, tally).map_err(e)?;
                 }
             }
         }
-        checkg(w).map_err(|e| (step, e))?;
+        checkg(w, &k.o).map_err(e)?;
     }
     // Writes stop: every open file closes, every open transaction commits
     // or rolls back; the queues drain; every fork equals main.
-    close_all_checked(w, &mut written).map_err(|e| (STEPS, e))?;
+    close_all_checked(w, &mut k.o).map_err(|e| (STEPS, e))?;
     for f in in_txn(w) {
-        if rng.below(2) == 0 {
+        if k.rng.below(2) == 0 {
             // A commit first finishes the sandbox's take, which may grant
             // an open of a file the commit writes: close it too.
             if w.commit_txn(f) != Err(ModelError::OpenFiles) {
                 gitledger::observe(w).map_err(|e| (STEPS, e))?;
+                k.o.reload(w);
                 continue;
             }
-            close_all(w);
+            k.o.reload(w);
+            close_all_checked(w, &mut k.o).map_err(|e| (STEPS, e))?;
             w.commit_txn(f).expect("open");
             gitledger::observe(w).map_err(|e| (STEPS, e))?;
+            k.o.reload(w);
         } else {
-            w.rollback(f).expect("open");
+            rollback_checked(w, &mut k.o, f).map_err(|e| (STEPS, e))?;
             tally.rolled_back += 1;
         }
     }
-    checkg(w).map_err(|e| (STEPS, e))?;
-    drain(w, tally, STEPS)?;
+    checkg(w, &k.o).map_err(|e| (STEPS, e))?;
+    drain(w, &mut k.o, tally, STEPS)?;
     // Every program exits: every fork drops.
     for f in live_clients(w) {
-        w.end_client(f);
-        gitledger::observe(w).map_err(|e| (STEPS + 1, e))?;
+        end_checked(w, &mut k.o, &Client::Fork(f)).map_err(|e| (STEPS + 1, e))?;
     }
-    drain(w, tally, STEPS + 1)?;
+    drain(w, &mut k.o, tally, STEPS + 1)?;
     if let Some(f) = w.forks.values().find(|f| f.life != Life::Dropped) {
         return Err((STEPS + 1, format!("f{} never dropped", f.id)));
     }
@@ -555,6 +985,8 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     }
     tally.clean_lines_lost += w.collisions.iter().filter(|c| c.by == By::Whole).count();
     tally.fast_forwards += w.fast_forwards;
+    tally.inserts_met += w.inserts_met;
+    tally.unlinked_edits += w.unlinked_edits;
     if gitledger::takes() != w.landings.len() {
         return Err((
             STEPS + 1,
@@ -605,13 +1037,23 @@ fn run_all(policies: Policies) {
         failures.join("\n\n")
     );
     // Across the CI seeds (or more) the rules really met: changes lost
-    // whole with clean lines in them (rule 3e), and under `Squashed` runs
-    // of saves landed as one changeset, some beside a save of the same
-    // take that lost (rule 7). One seed alone may have none.
+    // whole with clean lines in them (rule 3e), rules 10 and 11 (below),
+    // and under `Squashed` runs of saves landed as one changeset, some
+    // beside a save of the same take that lost (rule 7). One seed alone
+    // may have none.
     if seeds().len() as u64 >= SEEDS {
         assert!(
             tally.changes_lost > 0 && tally.clean_lines_lost > 0,
             "no change lost whole with a clean line in {} seeds",
+            seeds().len()
+        );
+        // Rules 10 and 11 met in the random runs, not in one scenario
+        // each: a new line placed beside a parent's concurrent new line,
+        // an edit of a file the parent had unlinked; and saves made while
+        // a take held files in their tree.
+        assert!(
+            tally.inserts_met > 0 && tally.unlinked_edits > 0 && tally.saves_during_takes > 0,
+            "rules 10 and 11, or saves during takes, not met in {} seeds: {tally:?}",
             seeds().len()
         );
         if policies.history == HistoryPolicy::Squashed {
@@ -673,66 +1115,98 @@ fn random_interleavings_commit_dates_decide_nothing() {
 
 /// Rounds of client calls, each drained to convergence, for
 /// [`random_interleavings_history_settings_decide_the_same`]: saves by
-/// main and by forks (nested ones included), appends, and transactions
-/// begun and committed, with no queue step between the calls of a round,
-/// so both history settings see exactly the same calls on the same trees.
-/// Returns what each round decided: every tree's content and every
-/// collision (the tree, file, lines, lost and winning versions and cause),
-/// sorted, as the order of recording may differ. Not the commit a collision
-/// ref keeps: for a nested sandbox's change that differs by design (rule 7:
-/// under full lineage the nested landing commit is the change, under
-/// squashed the saves its graft names), while its lost versions do not.
+/// main and by forks (nested ones included), every kind of write call
+/// (line edits as bytes, raw `pwrite`s, partial appends, truncates,
+/// `O_TRUNC` opens, stale rewrites), unlinks, renames and rename-overs, and
+/// transactions begun and committed, with no queue step between the calls
+/// of a round, so both history settings see exactly the same calls on the
+/// same trees. Returns what each round decided: every tree's content and
+/// every collision (the tree, file, lines, lost and winning versions and
+/// cause), sorted, as the order of recording may differ. Not the commit a
+/// collision ref keeps: for a nested sandbox's change that differs by
+/// design (rule 7: under full lineage the nested landing commit is the
+/// change, under squashed the saves its graft names), while its lost
+/// versions do not.
 fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<Vec<String>, (usize, String)> {
-    let mut rng = Rng(seed);
+    let mut k = Calls::new(seed);
+    k.o.reload(w);
     let mut decided = Vec::new();
+    let m1 = Client::Main("m1".into());
     for round in 0..ROUNDS {
         for _ in 0..ROUND_CALLS {
-            let (f, slot) = (PATHS[rng.below(PATHS.len())], rng.below(HOT_SLOTS));
-            match rng.below(12) {
+            let (f, slot) = (PATHS[k.rng.below(PATHS.len())], k.rng.below(HOT_SLOTS));
+            let e = |e| (round, e);
+            let fork = k.rng.pick(&live_clients(w)).map(Client::Fork);
+            match k.rng.below(16) {
                 0 => {
                     let forks = live_clients(w);
                     if forks.len() < 4 {
-                        let parent = match rng.pick(&forks) {
-                            Some(f) if rng.below(3) == 0 => Tree::Fork(f),
+                        let parent = match k.rng.pick(&forks) {
+                            Some(f) if k.rng.below(3) == 0 => Tree::Fork(f),
                             _ => Tree::Main,
                         };
                         w.create_fork(parent);
+                        k.o.reload(w);
                     }
                 }
                 1..=3 => {
-                    if let Some(p) = w.client_path(&Client::Main("m1".into()), f) {
-                        save(w, &Client::Main("m1".into()), &p, slot, tally);
+                    if let Some(p) = w.client_path(&m1, f) {
+                        k.save(w, &m1, &p, slot, tally).map_err(e)?;
                     }
                 }
-                4..=8 => {
-                    if let Some(c) = rng.pick(&live_clients(w)).map(Client::Fork)
+                4..=6 => {
+                    if let Some(c) = fork
                         && let Some(p) = w.client_path(&c, f)
                     {
-                        save(w, &c, &p, slot, tally);
+                        k.save(w, &c, &p, slot, tally).map_err(e)?;
                     }
                 }
-                9 => {
-                    if let Some(c) = rng.pick(&live_clients(w)).map(Client::Fork)
+                7..=9 => {
+                    if let Some(c) = fork
                         && let Some(p) = w.client_path(&c, f)
                     {
-                        let h = w.open_write(&c, &p);
-                        w.write(h, Write::Append).expect("an append");
-                        w.close(h);
+                        k.one_call(w, &c, &p, slot, tally).map_err(e)?;
                     }
                 }
                 10 => {
-                    if let Some(f) = rng.pick(&live_clients(w)) {
+                    if let Some(p) = w.client_path(&m1, f) {
+                        k.one_call(w, &m1, &p, slot, tally).map_err(e)?;
+                    }
+                }
+                11 => {
+                    if let Some(f) = k.rng.pick(&live_clients(w)) {
                         let _ = w.begin(f);
+                        k.o.reload(w);
+                    }
+                }
+                12 => {
+                    if let Some(f) = k.rng.pick(&in_txn(w)) {
+                        let _ = w.commit_txn(f);
+                        k.o.reload(w);
+                    }
+                }
+                13 => {
+                    let c = fork.unwrap_or_else(|| m1.clone());
+                    if let Some(p) = w.client_path(&c, f) {
+                        k.reads
+                            .insert((format!("{c:?}"), f.to_string()), w.client_reads(&c, &p));
                     }
                 }
                 _ => {
-                    if let Some(f) = rng.pick(&in_txn(w)) {
-                        let _ = w.commit_txn(f);
+                    let c = match fork {
+                        Some(c) if k.rng.below(2) == 0 => c,
+                        _ => m1.clone(),
+                    };
+                    if k.rng.below(2) == 0
+                        && let Some(p) = w.client_path(&c, f)
+                    {
+                        let unlink = k.rng.below(3) == 0;
+                        k.path_call(w, &c, f, &p, unlink, tally);
                     }
                 }
             }
         }
-        drain(w, tally, round)?;
+        drain(w, &mut k.o, tally, round)?;
         let mut lines: Vec<String> = w
             .fingerprint()
             .lines()
