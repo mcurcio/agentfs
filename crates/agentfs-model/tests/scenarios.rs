@@ -2586,3 +2586,137 @@ fn r11_an_open_on_the_new_file_follows_it_through_the_atomic_save() {
         drain(&mut w);
     }
 }
+
+// ── rule 12: every write call is recorded before it returns (git-model.md §3)
+
+/// Rule 12: a crash of every agentfs process saves each open from the
+/// journal as its close would have, so every write call that returned
+/// survives, each save naming its open (`Agentfs-Open`); a waiting open,
+/// which never returned, is dropped.
+#[test]
+fn r12_a_crash_saves_every_open_from_the_journal() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let h = w.open_write(&m1(), "a");
+        w.write(h, Write::Append("x\n".into()));
+        let k = w.open_write(&Client::Fork(f), "b");
+        w.write(
+            k,
+            Write::Pwrite {
+                offset: 0,
+                bytes: "y".into(),
+            },
+        );
+        let g = w.create_fork(Tree::Fork(f));
+        w.save(&Client::Fork(g), "b", 1);
+        take(&mut w, &Step::Next(Tree::Fork(f)));
+        assert!(
+            w.waits().contains_key(&Tree::Fork(f)),
+            "the landing waits for k"
+        );
+        w.crash();
+        ok(&mut w);
+        assert_eq!(w.handles().count(), 0, "every open ended with the mount");
+        assert!(
+            w.read(Tree::Main, "a").bytes().ends_with("-\nx\n"),
+            "{history:?}"
+        );
+        assert!(
+            w.read(Tree::Fork(f), "b").bytes().starts_with("y\n"),
+            "{history:?}"
+        );
+        assert!(w.saved(h) && w.saved(k));
+        assert!(
+            w.waits().is_empty(),
+            "waits are found again at the next take"
+        );
+        drain(&mut w);
+        assert!(w.read(Tree::Main, "a").bytes().ends_with("-\nx\n"));
+    }
+}
+
+/// Rule 12: a crash after a close's save but before its journal records
+/// are dropped: the replay finds the save naming the open and does not
+/// save it again. A take in progress is lost and taken again.
+#[test]
+fn r12_a_crash_during_a_close_saves_the_open_once() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        w.save(&Client::Fork(f), "b", 0);
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(!w.holds().is_empty());
+        let h = w.open_write(&m1(), "a");
+        w.write(h, Write::Append("x\n".into()));
+        let head = w.main_head.clone();
+        w.close_then_crash(h);
+        ok(&mut w);
+        let saves = git(
+            w.repo(),
+            &["rev-list", "--all", &format!("--grep=^Agentfs-Open: {h}$")],
+        );
+        assert_eq!(saves.lines().count(), 1, "{history:?}: saved once");
+        assert_eq!(
+            git(w.repo(), &["rev-parse", &format!("{}^1", w.main_head)]),
+            head
+        );
+        assert!(
+            w.holds().is_empty() && w.queue_len(Tree::Main) == 1,
+            "the take went back"
+        );
+        drain(&mut w);
+        assert_eq!(w.read(Tree::Main, "a").bytes().matches("x\n").count(), 1);
+        assert_eq!(w.read(Tree::Main, "b"), w.read(Tree::Fork(f), "b"));
+    }
+}
+
+/// Rule 3e, finding 19: a transaction's delete that the sandbox's own
+/// delete agrees with is dropped at commit and costs nothing; when the
+/// sandbox's delete then loses whole at main (another line of its save
+/// collided), the line comes back, and no record names the transaction's
+/// delete, though its commit answered `Committed`. It shares the fate of
+/// the delete it agreed with. Found by the random runs (seed 47 of the
+/// squashed run); it needs nothing this round added.
+#[test]
+fn r3_a_dropped_agreeing_delete_follows_the_delete_it_agreed_with() {
+    for history in BOTH {
+        let mut w = world(history);
+        // Distinct bytes, so the alignment's pick among identical lines
+        // plays no part (rule 10).
+        let d = w.open_write(&m1(), "a");
+        for i in 0..6 {
+            w.edit(d, LineEdit::At(i));
+        }
+        w.close(d);
+        let f = w.create_fork(Tree::Main);
+        let c = Client::Fork(f);
+        let h = w.open_write(&c, "a");
+        w.begin(f).unwrap();
+        let k = w.open_write(&c, "a");
+        w.edit(k, LineEdit::Delete(3));
+        w.close(k);
+        w.edit(h, LineEdit::Delete(3));
+        w.edit(h, LineEdit::At(0));
+        w.close(h);
+        w.save(&m1(), "a", 0);
+        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed), "{history:?}");
+        assert_eq!(
+            w.read(Tree::Fork(f), "a").texts().len(),
+            5,
+            "line 3 deleted"
+        );
+        drain(&mut w);
+        assert_eq!(
+            w.read(Tree::Main, "a").texts().len(),
+            6,
+            "{history:?}: line 3 came back"
+        );
+        let line3 = w.read(Tree::Main, "a").lines[3].line.clone();
+        assert!(
+            w.collisions
+                .iter()
+                .any(|x| x.by == By::Whole && x.lines.contains(&line3))
+        );
+    }
+}

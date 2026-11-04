@@ -357,7 +357,11 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
             }
             return Err(format!("line {} of {} left {t:?}", e.line, e.path));
         };
-        if !lost && !w.lineage.descends(&s.id, &e.token) && !(e.gone && !s.live()) {
+        if !lost
+            && !w.lineage.descends(&s.id, &e.token)
+            && !(e.gone && !s.live())
+            && !(e.gone && lost_delete(w, *t, &e.path, &e.line))
+        {
             return Err(format!(
                 "{} entered {t:?}:{}[{}] and is gone ({} there), with no collision naming it",
                 e.token, e.path, e.line, s.id
@@ -365,6 +369,25 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A collision in `t` or upstream names a delete of line `line` of `path`
+/// lost (read from its losing change). A delete that entered `t` and was
+/// dropped there because `t`'s own delete agreed (rule 3e: it costs
+/// nothing) shares that delete's fate: once that delete loses, the line
+/// comes back by that decision (finding 19).
+fn lost_delete(w: &World, t: Tree, path: &str, line: &str) -> bool {
+    let trees = w.upstream(t);
+    w.collisions.iter().any(|c| {
+        trees.contains(&c.tree)
+            && c.path == path
+            && c.lines.iter().zip(&c.lost).any(|(l, x)| {
+                l == line
+                    && w.file(&c.loser, path)
+                        .member(line)
+                        .is_some_and(|v| v.id == *x && !v.live())
+            })
+    })
 }
 
 /// No flip-flop: a version, once replaced in a tree, never shows there
@@ -937,7 +960,7 @@ fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
         "--no-walk=unsorted".into(),
         "--diff-merges=first-parent".into(),
         "-p".into(),
-        "--format=%x01%H%x1f%P%x1f%(trailers:key=Agentfs-Writer,valueonly,separator=%x1e)%x1f%(trailers:key=Agentfs-Cause,valueonly)%x02".into(),
+        "--format=%x01%H%x1f%P%x1f%(trailers:key=Agentfs-Writer,valueonly,separator=%x1e)%x1f%(trailers:key=Agentfs-Cause,valueonly)%x1f%(trailers:key=Agentfs-Open,valueonly,separator=%x1e)%x02".into(),
     ];
     args.extend(new.iter().cloned());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -945,9 +968,24 @@ fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
     for block in log.split('\x01').skip(1) {
         let (header, diff) = block.split_once('\x02').unwrap_or((block, ""));
         let fields: Vec<&str> = header.split('\x1f').collect();
-        let [commit, parents, writers, cause] = fields[..] else {
+        let [commit, parents, writers, cause, opens] = fields[..] else {
             return Err(format!("unparsable log header {header:?}"));
         };
+        // git-model.md §3: a save from an open names that open, once; no
+        // open is saved twice (a crash's replay of the journal included).
+        let opens: Vec<&str> = opens
+            .split('\x1e')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if w.save_calls.contains_key(commit) != (opens.len() == 1) || opens.len() > 1 {
+            return Err(format!("{commit} names opens {opens:?}"));
+        }
+        for o in opens {
+            if let Some(c) = w.opens_saved.insert(o.to_string(), commit.to_string()) {
+                return Err(format!("open {o} saved twice: {c:.7} and {commit:.7}"));
+            }
+        }
         let parents: Vec<&str> = parents.split_whitespace().collect();
         let writers: Vec<&str> = writers.split('\x1e').filter(|s| !s.is_empty()).collect();
         if writers.len() != 1 {

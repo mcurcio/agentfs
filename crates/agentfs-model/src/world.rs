@@ -757,6 +757,8 @@ pub struct World {
     /// calls its release granted ran.
     pub(crate) taken: Option<String>,
     pub(crate) checked_commits: BTreeSet<String>,
+    /// Each open a save names (`Agentfs-Open`), with that save: `check`'s.
+    pub(crate) opens_saved: BTreeMap<String, String>,
     /// Each rename-over's unlink, read from its save's commit: the replaced
     /// file's deleted name version, to the renamed file's identity and the
     /// name version that same save gave it (`check`: one call, whole).
@@ -784,6 +786,9 @@ pub struct World {
     pub unlinked_edits: usize,
     pub(crate) placements_checked: usize,
 }
+
+/// The trailer naming the open a save came from (git-model.md §3).
+pub const OPEN: &str = "Agentfs-Open";
 
 fn message(subject: &str, writer: &str, cause: &str, tree: &str) -> String {
     format!("{subject}\n\nAgentfs-Writer: {writer}\nAgentfs-Cause: {cause}\nAgentfs-Tree: {tree}\n")
@@ -844,6 +849,7 @@ impl World {
             left: BTreeSet::new(),
             taken: None,
             checked_commits: BTreeSet::new(),
+            opens_saved: BTreeMap::new(),
             rename_overs: BTreeMap::new(),
             reach: BTreeMap::new(),
             grepped: (0, BTreeSet::new()),
@@ -1089,7 +1095,25 @@ impl World {
     }
 
     fn commit(&self, parents: &[&str], tree: &str, writer: &str, cause: &str, on: &str) -> String {
-        let msg = message(&format!("{cause} by {writer}"), writer, cause, on);
+        self.commit_by(parents, tree, writer, cause, on, None)
+    }
+
+    /// [`World::commit`]; a save from an open names it in one more trailer,
+    /// `Agentfs-Open: <n>` (git-model.md §3), so a crash's replay of the
+    /// journal never saves an open twice.
+    fn commit_by(
+        &self,
+        parents: &[&str],
+        tree: &str,
+        writer: &str,
+        cause: &str,
+        on: &str,
+        open: Option<HandleId>,
+    ) -> String {
+        let mut msg = message(&format!("{cause} by {writer}"), writer, cause, on);
+        if let Some(h) = open {
+            msg.push_str(&format!("{OPEN}: {h}\n"));
+        }
         let mut args = vec!["commit-tree", tree];
         for p in parents {
             args.extend(["-p", p]);
@@ -1964,7 +1988,7 @@ impl World {
             lines,
         };
         let files = BTreeMap::from([(p, new)]);
-        let c = self.commit_save(handle.target, &writer, &at, files, set);
+        let c = self.commit_save(handle.target, &writer, &at, files, set, Some(handle.id));
         self.save_calls.insert(c, handle.calls.clone());
         tokens
     }
@@ -2183,12 +2207,13 @@ impl World {
         at: &str,
         files: BTreeMap<String, Content>,
         set: Vec<Edit>,
+        open: Option<HandleId>,
     ) -> String {
         let t = self.tree_with(Some(at), &files);
         match target {
             Target::Txn(f, id) => {
                 let on = format!("txn/{id}");
-                let commit = self.commit(&[at], &t, writer, "Direct", &on);
+                let commit = self.commit_by(&[at], &t, writer, "Direct", &on, open);
                 self.update_ref(&[&format!("refs/heads/{on}"), &commit]);
                 let txn = self.forks.get_mut(&f).expect("fork").txn.as_mut();
                 let txn = txn.expect("open");
@@ -2197,7 +2222,7 @@ impl World {
                 commit
             }
             Target::Tree(tree) => {
-                let c = self.commit(&[at], &t, writer, "Direct", &Self::name(tree));
+                let c = self.commit_by(&[at], &t, writer, "Direct", &Self::name(tree), open);
                 self.set_head(tree, &c);
                 self.entered.extend(set.into_iter().map(|e| (tree, e)));
                 self.moved(tree, true);
@@ -2354,7 +2379,7 @@ impl World {
         }
         let tokens: Vec<&String> = set.iter().map(|e| &e.token).collect();
         self.note(format!("{:?} {:?}: saved {tokens:?}", h.client, h.kind));
-        self.commit_save(h.target, &writer, &at, files, set);
+        self.commit_save(h.target, &writer, &at, files, set, None);
         // An open of a file this call unlinked or replaced holds an object
         // no path names now, so no file of it is open: a take waiting for
         // that close is woken.
@@ -2399,7 +2424,14 @@ impl World {
         self.note(format!(
             "create {c:?} {target:?}:{p} as {f}: saved [{id:?}]"
         ));
-        self.commit_save(target, &writer, &at, BTreeMap::from([(f.clone(), n)]), set);
+        self.commit_save(
+            target,
+            &writer,
+            &at,
+            BTreeMap::from([(f.clone(), n)]),
+            set,
+            None,
+        );
         let h = self.add_handle(c, target, f, p, Kind::Write);
         assert!(!self.handles[&h].waiting, "a new file is held by no take");
         Some(h)
@@ -2626,6 +2658,76 @@ impl World {
                 self.close(h);
             }
         }
+    }
+
+    // ── crash and the journal (git-model.md §3) ──────────────────────────
+
+    /// Every agentfs process dies at once (a view host, the history
+    /// service, the node). Each write call was in its tree's journal before
+    /// it returned (git-model.md §3; the model keeps an open's journaled
+    /// calls on its handle), so at restart, before any tree is served
+    /// again, each open is saved from the journal as its close would have
+    /// saved it, unless a save already names it (`Agentfs-Open`), and the
+    /// opens end: their descriptors died with the mount. An open no path
+    /// names raises its `OrphanDropped` event again (no save records it in
+    /// git: events are at least once). Waiting opens and path calls never
+    /// returned: dropped, nothing recorded. A take in progress wrote nothing
+    /// (its write is one ref transaction): its entries go back to the front
+    /// of its queue; waits are dropped and found again at the next take.
+    /// Transactions survive: their branches are refs.
+    pub fn crash(&mut self) {
+        self.note("crash: every agentfs process dies; restart replays the journal".into());
+        let holds = std::mem::take(&mut self.holds);
+        for (t, hold) in holds.into_iter().rev() {
+            let q = self.queues.entry(t).or_default();
+            match hold.take {
+                Take::Sync { .. } => q.push_front(Entry::Sync),
+                Take::Landing { from, run, .. } => {
+                    for commit in run.into_iter().rev() {
+                        q.push_front(Entry::Landing { from, commit });
+                    }
+                }
+            }
+        }
+        self.waits.clear();
+        let ids: Vec<HandleId> = self.handles.keys().copied().collect();
+        for id in ids {
+            let h = self.handles.remove(&id).expect("listed");
+            if h.waiting || h.kind != Kind::Write {
+                self.note(format!("crash: h{id} never returned: dropped"));
+                continue;
+            }
+            if self.saved(id) {
+                self.note(format!("crash: h{id} already saved: skipped"));
+                continue;
+            }
+            let tokens = self.save_handle(&h);
+            self.note(format!(
+                "crash: h{id} replayed from the journal: saved {tokens:?}"
+            ));
+        }
+    }
+
+    /// A crash during open `h`'s close: its save is committed (its branch
+    /// moved), but its journaled calls are not yet dropped; then
+    /// [`World::crash`], whose replay finds the save naming `h` and skips it.
+    pub fn close_then_crash(&mut self, h: HandleId) {
+        let handle = self.handles[&h].clone();
+        assert!(
+            !handle.waiting && handle.kind == Kind::Write,
+            "close a granted open"
+        );
+        let tokens = self.save_handle(&handle);
+        self.note(format!(
+            "close h{h}: saved {tokens:?}; crash before its journal drops it"
+        ));
+        self.crash();
+    }
+
+    /// Whether a save names open `h` (`Agentfs-Open`), read from git.
+    pub fn saved(&self, h: HandleId) -> bool {
+        let grep = format!("--grep=^{OPEN}: {h}$");
+        !git(&self.repo, &["rev-list", "--all", &grep]).is_empty()
     }
 
     // ── steps ────────────────────────────────────────────────────────────

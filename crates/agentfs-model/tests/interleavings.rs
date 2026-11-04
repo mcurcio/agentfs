@@ -143,6 +143,9 @@ struct Tally {
     atomic_saves: usize,
     old_writers: usize,
     orphans: usize,
+    /// Crashes of every agentfs process, and those during a close.
+    crashes: usize,
+    crashes_during_close: usize,
     /// Takes in which a new line met a parent's new line at its place (rule
     /// 10), and changes that edited a file the parent had unlinked (rule
     /// 11), as `check` counted them.
@@ -341,8 +344,12 @@ impl Oracle {
         }
     }
 
-    /// After a take's release in `t`: the waiting path calls it ran, on
-    /// the head its write left. Calls dropped with their client go too.
+    /// After a take's release in `t`: the waiting path calls it ran, in
+    /// the order it ran them (by handle), each on the state the one before
+    /// left: the head the take's write left, then each call's own commit
+    /// (read down the tree's first parents). A call on a file no path names
+    /// then, or a rename to the path it has, makes no commit. Calls dropped
+    /// with their client go too.
     fn released(&mut self, w: &World, t: Tree) {
         let gone: Vec<HandleId> = self
             .waiting_calls
@@ -350,12 +357,25 @@ impl Oracle {
             .filter(|h| !w.handles().any(|x| x.id == **h))
             .copied()
             .collect();
+        let Some(start) = w.taken_head().map(str::to_string) else {
+            return;
+        };
+        let mut chain = Vec::new();
+        let mut c = w.head(t);
+        while c != start {
+            chain.push(c.clone());
+            c = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
+        }
+        let mut at = start;
         for h in gone {
             let (u, file, to) = self.waiting_calls.remove(&h).expect("listed");
-            if u == Target::Tree(t)
-                && let Some(at) = w.taken_head().map(str::to_string)
-            {
-                self.ran(w, &at, u, &file, to.as_deref());
+            if u != Target::Tree(t) {
+                continue;
+            }
+            let cur = w.file(&at, &file);
+            self.ran(w, &at, u, &file, to.as_deref());
+            if cur.name.live() && to.as_deref() != cur.path() {
+                at = chain.pop().expect("a granted call's commit");
             }
         }
     }
@@ -561,7 +581,49 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
     gitledger::observe(w)?;
     o.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
     o.held.retain(|h, _| w.handles().any(|x| x.id == *h));
+    o.waiting_calls
+        .retain(|h, _| w.handles().any(|x| x.id == *h));
     o.check(w).map_err(|e| format!("end of {c:?}: {e}"))
+}
+
+/// A crash of every agentfs process (git-model.md §3), during open
+/// `during`'s close if one is given: the oracle saves every granted open's
+/// calls as its close would (`during` first, then the rest in the model's
+/// order, by handle), so every write call that returned survives; an
+/// orphan's event comes once per close the journal replays (twice for an
+/// orphan whose close the crash interrupted: events are at least once);
+/// waiting opens and path calls are dropped. Takes in progress go back to
+/// their queues and change no bytes.
+fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Result<(), String> {
+    let n = w.orphans.len();
+    let mut granted: Vec<HandleId> = w
+        .handles()
+        .filter(|h| !h.waiting && h.kind == Kind::Write && Some(h.id) != during)
+        .map(|h| h.id)
+        .collect();
+    granted.sort();
+    let mut expect = Vec::new();
+    if let Some(h) = during {
+        let e = o.closing(w, h);
+        expect.extend(e.clone());
+        expect.extend(e);
+    }
+    for h in granted {
+        expect.extend(o.closing(w, h));
+    }
+    match during {
+        Some(h) => w.close_then_crash(h),
+        None => w.crash(),
+    }
+    dropped(w, n, expect)?;
+    if let Some(h) = w.handles().next() {
+        return Err(format!("h{} outlived the crash", h.id));
+    }
+    o.waiting_calls.clear();
+    o.calls.clear();
+    o.held.clear();
+    gitledger::observe(w)?;
+    o.check(w).map_err(|e| format!("crash: {e}"))
 }
 
 fn rollback_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), String> {
@@ -1188,6 +1250,13 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                     k.path_call(w, &c, f, &p, unlink, tally);
                 }
             }
+            21 if k.rng.below(6) == 0 => {
+                // Every agentfs process dies; half the time during a close.
+                tally.crashes += 1;
+                let during = k.rng.pick(&open).filter(|_| k.rng.below(2) == 0);
+                tally.crashes_during_close += usize::from(during.is_some());
+                crash_checked(w, &mut k.o, during).map_err(e)?;
+            }
             20 if k.rng.below(2) == 0 => {
                 if let Some(c) = k.rng.pick(&clients)
                     && let Some(p) = w.client_path(&c, f)
@@ -1321,8 +1390,8 @@ fn run_all(policies: Policies) {
         // Atomic saves, and old writers whose calls an atomic save, an
         // unlink or a rename-over orphaned (git-model.md §7).
         assert!(
-            tally.atomic_saves > 0 && tally.orphans > 0,
-            "no atomic save, or no orphan, in {} seeds: {tally:?}",
+            tally.atomic_saves > 0 && tally.orphans > 0 && tally.crashes_during_close > 0,
+            "no atomic save, no orphan, or no crash during a close, in {} seeds: {tally:?}",
             seeds().len()
         );
         if policies.history == HistoryPolicy::Squashed {
