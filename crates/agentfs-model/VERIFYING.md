@@ -100,8 +100,9 @@ the expected failure.
 | Test | Finding | Fails with |
 |---|---|---|
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which Main already took" |
-| `random_interleavings_git_merge_base` | 1 | 36 of 64 seeds: a sync that leaves a line "which Main already took" or drops a line (with creates, crashes and the progress rules of 2026-11-04, which change the random calls; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
+| `random_interleavings_git_merge_base` | 1 | 35 of 64 seeds, 1 of them a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
+| `finding_24_p3_makes_a_call_wait_on_another_clients_close` | 24 | "m2's open waits for m1's close, which waits for m2: a deadlock" |
 
 These were the results at seeds 1..64 on 2026-11-04; a change that moves a count says so in its pull
 request. Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e).
@@ -186,7 +187,11 @@ A planted bug is one deliberate mistake in a copy of the model. It shows which t
    new open that does not wait behind a waiting take, or a woken take that no longer holds new opens back (P3); no
    way through for a client holding a file a waiting take waits for (the deadlock of finding 20); an atomic save that
    leaves the replaced file's old object at its path; a crash whose replay saves an open a save already names, or
-   drops the journal.
+   drops the journal. From the review of 2026-11-04: a crash replay that re-links each open to its file identity
+   (a dead handle saved into the file that replaced it); a waiting take that records only its files open now; a
+   crash that drops a transaction's journaled calls; P3's exemption for a client holding any open file; a squash
+   not cut at a save sharing a file with a waiting entry ahead; a squash that carries a save touching a file open for
+   writing, or whose first save waits with followers.
 3. Run `cargo test --locked -p agentfs-model --no-fail-fast` in the copy (and 500 seeds for a bug the
    scenarios miss), with a separate target directory per copy: in the container, mount the copy as `/src`
    and a volume of its own as `/target` (`-v agentfs-target-m1:/target`).

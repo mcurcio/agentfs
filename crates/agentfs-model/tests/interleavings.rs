@@ -30,15 +30,15 @@
 //! panic too reports its seed and the event log. The generator is a
 //! SplitMix64 written here: fixed seeds replay exactly.
 
-use agentfs_model::check::{check, check_converged, step_checked};
+use agentfs_model::check::{change_files, check, check_converged, entry_files, step_checked};
 use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::world::{
-    By, Client, Direction, ForkId, HandleId, HistoryPolicy, Kind, Life, LineEdit, MergeRule,
+    By, Client, Direction, Entry, ForkId, HandleId, HistoryPolicy, Kind, Life, LineEdit, MergeRule,
     ModelError, Policies, Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod gitledger;
 
@@ -153,6 +153,8 @@ struct Tally {
     /// Crashes of every agentfs process, and those during a close.
     crashes: usize,
     crashes_during_close: usize,
+    /// Crashes while a transaction had a file open.
+    crashes_in_txn: usize,
     /// Takes in which a new line met a parent's new line at its place (rule
     /// 10), and changes that edited a file the parent had unlinked (rule
     /// 11), as `check` counted them.
@@ -196,6 +198,12 @@ fn free_clients(w: &World) -> Vec<ForkId> {
         .collect()
 }
 
+/// Whether a granted open writes in a transaction.
+fn txn_open(w: &World) -> bool {
+    w.handles()
+        .any(|h| !h.waiting && h.kind == Kind::Write && matches!(h.target, Target::Txn(..)))
+}
+
 fn in_txn(w: &World) -> Vec<ForkId> {
     w.forks
         .values()
@@ -219,6 +227,16 @@ struct Oracle {
     next_inode: u64,
     /// Path calls that wait for a take: (target, file, rename's path).
     waiting_calls: BTreeMap<HandleId, (Target, String, Option<String>)>,
+    /// P3's referee (git-model.md §6), the harness's own record, not the
+    /// model's `waits`: each queue entry it saw begin waiting (a queue step
+    /// on it that took nothing), while it stays queued, with the files its
+    /// own change touches (a landing's; read from git when it began
+    /// waiting) and every file it may lock (its entry's and the same
+    /// source's entries directly behind it, read from git at each queue
+    /// step it waited at).
+    p3: BTreeMap<(Tree, u64), (BTreeSet<String>, BTreeSet<String>)>,
+    /// The opens the referee has judged (each once, when first granted).
+    judged: BTreeSet<HandleId>,
 }
 
 /// An `OrphanDropped` event as the oracle expects it: (open, writer, path,
@@ -343,7 +361,13 @@ impl Oracle {
 
     /// Unlinks `p` (`to` none) or renames it as `c`: the oracle follows the
     /// call when it runs, at once or when a take's release runs it.
-    fn path_call(&mut self, w: &mut World, c: &Client, p: &str, to: Option<&str>) {
+    fn path_call(
+        &mut self,
+        w: &mut World,
+        c: &Client,
+        p: &str,
+        to: Option<&str>,
+    ) -> Result<(), String> {
         let t = match c {
             Client::Main(_) => Target::Tree(Tree::Main),
             Client::Fork(f) => match &w.forks[f].txn {
@@ -353,17 +377,30 @@ impl Oracle {
         };
         let at = head_of(w, t).expect("live");
         let file = w.lookup(&at, p).expect("a file");
+        let mut files = vec![file.clone()];
+        files.extend(to.and_then(|to| w.lookup(&at, to)));
+        // P3's verdict on the state the call meets (its own run may orphan
+        // the client's open of the file, which made it exempt).
+        self.p3_check(w)?;
+        let verdict = match t {
+            Target::Tree(tree) => self.must_wait(w, c, tree, &files, None),
+            Target::Txn(..) => Ok(()),
+        };
         let waits = match to {
             None => w.unlink(c, p),
             Some(to) => w.rename(c, p, to),
         };
         match waits {
-            None => self.ran(w, &at, t, &file, to),
+            None => {
+                verdict.map_err(|e| format!("P3: a path call on {p} ran at once, but {e}"))?;
+                self.ran(w, &at, t, &file, to)
+            }
             Some(h) => {
                 self.waiting_calls
                     .insert(h, (t, file, to.map(str::to_string)));
             }
         }
+        Ok(())
     }
 
     /// After a take's release in `t`: the waiting path calls it ran, in
@@ -400,6 +437,137 @@ impl Oracle {
                 at = chain.pop().expect("a granted call's commit");
             }
         }
+    }
+
+    /// P3's referee: a queue step on `t` acted on entry `i` of `before`
+    /// (the queue before the step) and took nothing, so that entry waits.
+    fn began_waiting(&mut self, w: &World, t: Tree, before: &[(u64, Entry)], i: usize) {
+        let (n, e) = &before[i];
+        let mut wide = entry_files(w, t, e);
+        for (_, x) in before[i + 1..]
+            .iter()
+            .take_while(|(_, x)| x.source() == e.source())
+        {
+            wide.extend(entry_files(w, t, x));
+        }
+        let first = match e {
+            Entry::Landing { commit, .. } => change_files(w, commit),
+            Entry::Sync => BTreeSet::new(),
+        };
+        let rec = self.p3.entry((t, *n)).or_insert((first, BTreeSet::new()));
+        rec.1.extend(wide);
+    }
+
+    /// The files of `t` client `c` has open for writing, by the harness's
+    /// own object table, but open `but`.
+    fn open_of(&self, w: &World, c: &Client, t: Tree, but: Option<HandleId>) -> BTreeSet<String> {
+        w.handles()
+            .filter(|x| {
+                x.client == *c
+                    && !x.waiting
+                    && x.kind == Kind::Write
+                    && x.target == Target::Tree(t)
+                    && Some(x.id) != but
+            })
+            .filter_map(|x| self.named(w, x.id))
+            .collect()
+    }
+
+    /// Whether client `c` may go ahead of a waiting take in `t` (finding
+    /// 20): it has open a file one of the referee's waiting entries may lock.
+    fn exempt(&self, w: &World, c: &Client, t: Tree, but: Option<HandleId>) -> bool {
+        let mine = self.open_of(w, c, t, but);
+        self.p3
+            .iter()
+            .any(|((u, _), (_, wide))| *u == t && !mine.is_disjoint(wide))
+    }
+
+    /// P3, judged by the harness's record alone: a call on a file that an
+    /// entry it saw begin waiting touches, made or granted while that
+    /// entry is still queued, waits, unless its client has open a file one
+    /// of those entries may lock (finding 20); and no call waiting behind a
+    /// take (no take holds its file) is of a client that has open a file
+    /// such an entry touches (that would deadlock it).
+    fn p3_check(&mut self, w: &World) -> Result<(), String> {
+        self.p3
+            .retain(|(t, n), _| w.alive(*t) && w.queue_numbered(*t).iter().any(|(m, _)| m == n));
+        self.judged.retain(|h| w.handles().any(|x| x.id == *h));
+        let granted: Vec<HandleId> = w
+            .handles()
+            .filter(|x| !x.waiting && x.kind == Kind::Write && !self.judged.contains(&x.id))
+            .map(|x| x.id)
+            .collect();
+        for h in granted {
+            self.judged.insert(h);
+            let x = w.handle(h);
+            let Target::Tree(t) = x.target else { continue };
+            let Some(f) = self.named(w, h) else { continue };
+            self.must_wait(w, &x.client, t, &[f], Some(h))
+                .map_err(|e| format!("P3: open h{h} was granted, but {e}"))?;
+        }
+        for x in w.handles().filter(|x| x.waiting) {
+            let Target::Tree(t) = x.target else { continue };
+            if w.holds()
+                .get(&t)
+                .is_some_and(|y| x.files().iter().any(|f| y.files.contains(f)))
+            {
+                continue;
+            }
+            // It waits behind an entry the referee saw begin waiting, for a
+            // file that entry's own change touches (a sync's: one it may
+            // write), not one only a save it would carry touches.
+            if !self.p3.iter().any(|((u, _), (first, wide))| {
+                *u == t
+                    && x.files().iter().any(|f| {
+                        if first.is_empty() {
+                            wide.contains(f)
+                        } else {
+                            first.contains(f)
+                        }
+                    })
+            }) {
+                return Err(format!(
+                    "P3: h{} ({:?} of {}) waits behind a take, but no entry seen waiting there touches its file",
+                    x.id, x.kind, x.file
+                ));
+            }
+            let mine = self.open_of(w, &x.client, t, None);
+            if let Some(((_, n), _)) = self
+                .p3
+                .iter()
+                .find(|((u, _), (first, _))| *u == t && !mine.is_disjoint(first))
+            {
+                return Err(format!(
+                    "P3: h{} waits behind a take, but its client has open a file entry {n} waits for: a deadlock",
+                    x.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The referee's rule for one call of `c` on `files` in `t`.
+    fn must_wait(
+        &self,
+        w: &World,
+        c: &Client,
+        t: Tree,
+        files: &[String],
+        but: Option<HandleId>,
+    ) -> Result<(), String> {
+        let Some(((_, n), _)) = self
+            .p3
+            .iter()
+            .find(|((u, _), (first, _))| *u == t && files.iter().any(|f| first.contains(f)))
+        else {
+            return Ok(());
+        };
+        if self.exempt(w, c, t, but) {
+            return Ok(());
+        }
+        Err(format!(
+            "{t:?}'s entry {n}, waiting since before, touches {files:?} and {c:?} has open none of the waiting entries' files"
+        ))
     }
 
     /// Every target but `skip` holds the oracle's bytes.
@@ -490,6 +658,20 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
         Step::Next(t) | Step::Finish(t) => w.queue(*t),
         Step::Drop(_) | Step::Replicate => Vec::new(),
     };
+    let numbered = match s {
+        Step::Next(t) => w.queue_numbered(*t),
+        _ => Vec::new(),
+    };
+    // The files open for writing in the tree, by the harness's own object
+    // table, when the step comes.
+    let open_before: BTreeSet<String> = match s {
+        Step::Next(t) => w
+            .handles()
+            .filter(|h| !h.waiting && h.kind == Kind::Write && h.target == Target::Tree(*t))
+            .filter_map(|h| o.named(w, h.id))
+            .collect(),
+        _ => BTreeSet::new(),
+    };
     gitledger::note_next(w, s)?;
     // P1: the entry a queue step acts on is the first one no earlier
     // waiting entry shares a file or a source with (the checks' reading).
@@ -519,6 +701,20 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
         let after = w.queue(*t);
         if taken == 0 {
             tally.take_waits += 1;
+            if let Some(i) = first {
+                o.began_waiting(w, *t, &numbered, i);
+                // P1 under either setting: a landing waits only for its own
+                // change's files, never for a file only a save it would
+                // carry touches (the review of 2026-11-04, P1-c).
+                if let (_, Entry::Landing { commit, .. }) = &numbered[i]
+                    && change_files(w, commit).is_disjoint(&open_before)
+                {
+                    return Err(format!(
+                        "{s:?}: entry {} waits, but none of its own change's files is open (open: {open_before:?})",
+                        numbered[i].0
+                    ));
+                }
+            }
             return if after == before && w.waits().contains_key(t) {
                 Ok(())
             } else {
@@ -536,6 +732,15 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
             .chain(&before[(i + taken).min(before.len())..])
             .cloned()
             .collect();
+        // A squash carries no save touching a file open for writing there:
+        // it would hold that save back no longer than on its own.
+        for (_, e) in numbered.iter().skip(i + 1).take(taken - 1) {
+            if let Some(p) = entry_files(w, *t, e).intersection(&open_before).next() {
+                return Err(format!(
+                    "{s:?}: a squash carried {e:?}, which touches {p}, open for writing there"
+                ));
+            }
+        }
         if taken == 0 || (taken > 1 && !squash) || after != rest {
             return Err(format!(
                 "{s:?} took {taken} entries: not the first P1 lets go (entry {i}) and those directly behind it, or the rest out of order"
@@ -665,6 +870,8 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
     o.waiting_calls.clear();
     o.calls.clear();
     o.held.clear();
+    // A crash drops every wait (the takes go back to their queues).
+    o.p3.clear();
     gitledger::observe(w)?;
     o.check(w).map_err(|e| format!("crash: {e}"))
 }
@@ -694,9 +901,10 @@ fn drain(
     Err((at, "the queues never drained".into()))
 }
 
-fn checkg(w: &mut World, o: &Oracle) -> Result<(), String> {
+fn checkg(w: &mut World, o: &mut Oracle) -> Result<(), String> {
     check(w)?;
     gitledger::observe(w)?;
+    o.p3_check(w)?;
     o.check(w)
 }
 
@@ -979,11 +1187,10 @@ impl Calls {
         p: &str,
         unlink: bool,
         tally: &mut Tally,
-    ) {
+    ) -> Result<(), String> {
         if unlink {
             tally.unlinks += 1;
-            self.o.path_call(w, c, p, None);
-            return;
+            return self.o.path_call(w, c, p, None);
         }
         let over = PATHS
             .iter()
@@ -993,13 +1200,13 @@ impl Calls {
         match self.rng.pick(&over) {
             Some(q) if self.rng.below(3) == 0 => {
                 tally.rename_overs += 1;
-                self.o.path_call(w, c, p, Some(&q));
+                self.o.path_call(w, c, p, Some(&q))
             }
             _ => {
                 tally.renames += 1;
                 let to = format!("e{}", self.next_name);
-                self.o.path_call(w, c, p, Some(&to));
                 self.next_name += 1;
+                self.o.path_call(w, c, p, Some(&to))
             }
         }
     }
@@ -1064,7 +1271,7 @@ impl Calls {
         close_checked(w, &mut self.o, h)?;
         if atomic {
             tally.atomic_saves += 1;
-            self.o.path_call(w, c, &tmp, Some(p));
+            self.o.path_call(w, c, &tmp, Some(p))?;
         }
         Ok(())
     }
@@ -1106,6 +1313,15 @@ impl Calls {
                 (*t, files, lines)
             })
             .collect();
+        // And each entry waiting for its files (P3: a new call on one of
+        // them waits behind it, unless its client has open a file it waits
+        // for). Steering only: the referee reads its own record.
+        let mut holds = holds;
+        for (t, m) in w.waits().iter().chain(w.woken()) {
+            for x in m.values() {
+                holds.push((*t, x.files.iter().cloned().collect(), Vec::new()));
+            }
+        }
         let Some((t, held, contended)) = self.rng.pick(&holds) else {
             return Ok(false);
         };
@@ -1128,7 +1344,7 @@ impl Calls {
         match self.rng.below(6) {
             0 => {
                 let unlink = self.rng.below(2) == 0;
-                self.path_call(w, &c, &file, &p, unlink, tally);
+                self.path_call(w, &c, &file, &p, unlink, tally)?;
             }
             1 | 2 => {
                 let h = self.open(w, &c, &p, tally);
@@ -1278,6 +1494,13 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             13..=15 => {
                 if let Some(h) = k.rng.pick(&open) {
                     k.write(w, h, slot, tally);
+                    // A quarter of the writes in a transaction meet a crash
+                    // before their close (rule 12 inside a transaction).
+                    if matches!(w.handle(h).target, Target::Txn(..)) && k.rng.below(4) == 0 {
+                        tally.crashes += 1;
+                        tally.crashes_in_txn += 1;
+                        crash_checked(w, &mut k.o, None).map_err(e)?;
+                    }
                 }
             }
             16 => {
@@ -1299,12 +1522,15 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                     && let Some(p) = w.client_path(&c, f)
                 {
                     let unlink = k.rng.below(2) == 0;
-                    k.path_call(w, &c, f, &p, unlink, tally);
+                    k.path_call(w, &c, f, &p, unlink, tally).map_err(e)?;
                 }
             }
-            21 if k.rng.below(6) == 0 => {
+            21 if k.rng.below(6) == 0 || (txn_open(w) && k.rng.below(2) == 0) => {
                 // Every agentfs process dies; half the time during a close.
+                // More often while a transaction has a file open, so a
+                // crash meets an open inside one (rule 12).
                 tally.crashes += 1;
+                tally.crashes_in_txn += usize::from(txn_open(w));
                 let during = k.rng.pick(&open).filter(|_| k.rng.below(2) == 0);
                 tally.crashes_during_close += usize::from(during.is_some());
                 crash_checked(w, &mut k.o, during).map_err(e)?;
@@ -1316,7 +1542,41 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                     k.create(w, &c, &p, slot, tally).map_err(e)?;
                 }
             }
-            26..=33 if !w.holds().is_empty() => {
+            26..=29 if !w.waits().is_empty() && k.rng.below(2) == 0 => {
+                // An entry waits: a sandbox of that tree saves a file the
+                // entry does not lock, then a queue step there, so a later,
+                // unrelated entry goes ahead of the waiting one (P1).
+                let waiting: Vec<(Tree, Vec<String>)> = w
+                    .waits()
+                    .iter()
+                    .map(|(t, m)| {
+                        (
+                            *t,
+                            m.values().flat_map(|x| x.files.iter().cloned()).collect(),
+                        )
+                    })
+                    .collect();
+                if let Some((t, locked)) = k.rng.pick(&waiting) {
+                    let free: Vec<&str> = FILES
+                        .iter()
+                        .copied()
+                        .filter(|f| !locked.iter().any(|l| l == f))
+                        .collect();
+                    let kids: Vec<ForkId> = free_clients(w)
+                        .into_iter()
+                        .filter(|f| w.forks[f].parent == t && w.forks[f].txn.is_none())
+                        .collect();
+                    if let (Some(c), Some(g)) = (k.rng.pick(&kids), k.rng.pick(&free))
+                        && let Some(p) = w.client_path(&Client::Fork(c), g)
+                    {
+                        k.save(w, &Client::Fork(c), &p, slot, tally).map_err(e)?;
+                    }
+                    if w.pending().contains(&Step::Next(t)) {
+                        take(w, &mut k.o, &Step::Next(t), tally).map_err(e)?;
+                    }
+                }
+            }
+            26..=33 if !w.holds().is_empty() || !w.waits().is_empty() || !w.woken().is_empty() => {
                 k.during_take(w, slot, tally).map_err(e)?;
             }
             _ => {
@@ -1325,7 +1585,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 }
             }
         }
-        checkg(w, &k.o).map_err(e)?;
+        checkg(w, &mut k.o).map_err(e)?;
     }
     // Writes stop: every open file closes, every open transaction commits
     // or rolls back; the queues drain; every fork equals main.
@@ -1349,7 +1609,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             tally.rolled_back += 1;
         }
     }
-    checkg(w, &k.o).map_err(|e| (STEPS, e))?;
+    checkg(w, &mut k.o).map_err(|e| (STEPS, e))?;
     drain(w, &mut k.o, tally, STEPS)?;
     // Every program exits: every fork drops.
     for f in live_clients(w) {
@@ -1451,8 +1711,11 @@ fn run_all(policies: Policies) {
             seeds().len()
         );
         assert!(
-            tally.atomic_saves > 0 && tally.orphans > 0 && tally.crashes_during_close > 0,
-            "no atomic save, no orphan, or no crash during a close, in {} seeds: {tally:?}",
+            tally.atomic_saves > 0
+                && tally.orphans > 0
+                && tally.crashes_during_close > 0
+                && tally.crashes_in_txn > 0,
+            "no atomic save, no orphan, no crash during a close or none inside a transaction, in {} seeds: {tally:?}",
             seeds().len()
         );
         if policies.history == HistoryPolicy::Squashed {
@@ -1584,6 +1847,13 @@ fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<Vec<String>, (u
                         k.o.reload(w);
                     }
                 }
+                13 if k.rng.below(4) == 0 => {
+                    // A sandbox's client dies: its transaction rolls back,
+                    // its opens close, and the sandbox ends.
+                    if let Some(c) = fork {
+                        end_checked(w, &mut k.o, &c).map_err(e)?;
+                    }
+                }
                 13 => {
                     let c = fork.unwrap_or_else(|| m1.clone());
                     if let Some(p) = w.client_path(&c, f) {
@@ -1603,7 +1873,7 @@ fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<Vec<String>, (u
                             k.create(w, &c, &p, slot, tally).map_err(e)?;
                         } else {
                             let unlink = k.rng.below(3) == 0;
-                            k.path_call(w, &c, f, &p, unlink, tally);
+                            k.path_call(w, &c, f, &p, unlink, tally).map_err(e)?;
                         }
                     }
                 }

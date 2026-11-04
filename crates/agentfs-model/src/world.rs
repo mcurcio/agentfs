@@ -3129,7 +3129,8 @@ impl World {
     /// (`waits`), nothing is taken, and from now on a new call on one of
     /// its files waits behind it (P3); else it leaves the queue and holds
     /// its files. A squash carries only the saves directly behind its first
-    /// that share no file with an entry ahead of it that waits.
+    /// that share no file with an entry ahead of it that waits and touch no
+    /// file open for writing in `t`; a first that must wait waits alone.
     fn acquire(&mut self, t: Tree) -> usize {
         let q = self.queue_numbered(t);
         let (i, blocked) = match self.scan(t) {
@@ -3166,12 +3167,26 @@ impl World {
             }
             Entry::Landing { from, commit } => {
                 let (mut run, _) = self.run_from(from, &commit, &rest);
-                if let Some(k) = run
-                    .iter()
-                    .skip(1)
-                    .position(|c| !self.touches_of(c).is_disjoint(&blocked))
-                {
-                    run.truncate(k + 1);
+                // A squash carries only saves that could land now on their
+                // own: none sharing a file with a waiting entry ahead (P1),
+                // none touching a file open for writing here; and if its
+                // first must wait, it waits alone. So a long-held file holds
+                // back only the saves that touch it, under either history
+                // setting (P1).
+                let open = self.write_open(t);
+                let k = if self.touches_of(&commit).is_disjoint(&open) {
+                    run.iter()
+                        .skip(1)
+                        .position(|c| {
+                            let mine = self.touches_of(c);
+                            !mine.is_disjoint(&blocked) || !mine.is_disjoint(&open)
+                        })
+                        .map(|k| k + 1)
+                } else {
+                    Some(1)
+                };
+                if let Some(k) = k {
+                    run.truncate(k);
                 }
                 let merged = self.judge(&ours, &run);
                 let files = self.touched(&merged);

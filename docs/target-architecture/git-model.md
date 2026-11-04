@@ -151,6 +151,20 @@ the open's records are dropped only once that ref transaction is durable. Then:
   already follows (§6). A save names its open in one more trailer, `Agentfs-Open: <n>` (a choice; the model's
   format has three), so a replay never saves an open twice.
 - `fsync` makes calls durable, never visible.
+- **Objects across a restart** (a choice; the review of 2026-11-04, P1-d). The object table, which says for each
+  object (§7) its tree and the file identity whose path names it, or none, is journaled too: an open's first record
+  names its object, and every call that moves an object (a create, `rename(2)`, `unlink`, a rename-over, the atomic
+  save) records the move in the same durable record as the call itself (the `unlink`/`rename(2)` row above). At
+  restart the table is rebuilt from the journal on top of the last committed trees, never from file identities or
+  paths. An open whose object the rebuilt table names by no path is an orphan: its replay saves nothing and raises
+  `OrphanDropped`, as its close would have. Rebuilt by identity instead, a dead handle's calls would be saved into
+  the file that replaced it, the failure §7 exists to prevent (the review planted exactly that bug; the model's
+  byte oracle and object table catch it). The model's crash keeps its object table, which this rule rebuilds
+  exactly. What a view host can rely on across its own restart (kernel inode numbers, handles after the mount
+  reconnects) is for the prototype (§18).
+- **Open numbers never repeat** (a choice; P2-e of that review). The `n` of `Agentfs-Open: <n>` comes from a
+  per-tree counter kept in the journal, never reset by a restart: a reused number would make a replay skip a new
+  open as "already saved". The model's numbers never repeat within a run.
 
 | Shape | Gains | Costs |
 |---|---|---|
@@ -328,6 +342,24 @@ the take also locks, blocks in that open and never closes A. So a call of a clie
 take waits for goes ahead (a choice); the checks assert that no call waiting behind a take is of such a client. P2
 is not modelled: in the model a sandbox's open file holds back that sandbox's whole sync.
 
+**P3 can still deadlock cooperating programs** (MODEL.md finding 24, open, the owner's decision; the review of
+2026-11-04, P0-1). Finding 20's exemption covers a program that waits on itself, not two programs that wait on each
+other: m1 keeps a log open (the take waits for it), then starts m2 and waits for it, through a pipe or `wait(2)`; m2
+opens the log, holds nothing the take waits for, and so waits behind the take, which waits for m1's close, which
+waits for m2. Linux never blocks there, and neither does rule 9 without P3, since a take holds a file only once every
+open of it has closed. FUSE cannot see that m1 waits for m2, so no exemption it can compute closes this; any P3 that
+makes a new open wait for a take that waits for another client's close has it. The choice: keep P3 (no take
+starves; cooperating programs can hang until one is killed), or drop its waits on opens, keeping only the waits
+while a take actually holds a file, which end on the take's own write (no call waits on another client's close; a
+file kept open by overlapping writers holds its take back for as long as that lasts, raised as an alarm). The model
+keeps P3 as designed until he decides; `finding_24_p3_makes_a_call_wait_on_another_clients_close` asserts the Linux
+outcome and fails.
+
+**Under `Squashed` too** (the review of 2026-11-04, P1-c), a held file holds back only the saves that touch it: a
+squash carries no save that touches a file open for writing in the tree, and a first save that must wait waits
+alone. Before, a run of a sandbox's saves of `a` then `b` waited for a writer of `b` that full lineage would have let
+the save of `a` pass.
+
 ## 7. Landing: the referee, per line, each change whole
 
 When the parent's queue takes a landing, each incoming version meets the parent's version of the same line
@@ -456,7 +488,7 @@ the kept identity, so an old writer could overwrite an editor's new save.)
 | `rename(a, b)` | a's identity moves to b | a's object moves to b; its handles follow it |
 | `unlink(a)` | a's identity gets a deleted version | a's object is named by no path; its handles keep writing to it |
 | `rename(n, a)`, both in the parent | n's identity takes a; a's ends (a deleted version naming n) | a's object is named by no path; n's object is at a |
-| `rename(n, a)`, n created since the fork last synced (the atomic save) | a's identity **stays**: a rewrite with n's bytes, merged per line | as the row above: a's old object is named by no path; n's object is at a |
+| `rename(n, a)`, n new since its create, never renamed (the atomic save; finding 21) | a's identity **stays**: a rewrite with n's bytes, merged per line | as the row above: a's old object is named by no path; n's object is at a |
 | a write-open's `RELEASE` | the save goes to the identity at its object's path then | an object no path names saves nothing |
 
 So an editor's atomic save and a long-lived writer of the old file never meet in one tree: the writer's later
@@ -675,7 +707,8 @@ by one, so a crash can leave half a step.
 | transaction begin, commit, rollback | `txn/<n>` with `refs/txn-start/<n>`; commit adds the fork's move and its entries | a `txn/*` branch whose client has ended is deleted: an implicit rollback (A13); a client waiting to rebind after a history-service restart has not ended, and its transaction is restored at rebind (clients.md) |
 | fork create, drop | the branch (its upstream config written first); drop deletes it | a dropped fork's leftover entries are deleted |
 | journal | none: outside git; each call appended, and flushed at `fsync` and close, before it returns (§3) | before any view serves the tree, each open with journaled calls that no save's `Agentfs-Open` names is saved as its close would be; then its records are dropped. A torn last frame is discarded: its call never returned |
-| locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take moved no ref, so its entry is still there and is taken again. Its entry ref is deleted in the take's last ref transaction, with the branch move; the model, which has no restarts, takes the entry off its in-memory queue when the take begins |
+| locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take moved no ref, so its entry is still there and is taken again. Its entry ref is deleted in the take's last ref transaction, with the branch move; the model takes the entry off its in-memory queue when the take begins, and its crash puts it back in its place |
+| object table | none: journaled with the calls that move objects (§3) | rebuilt from the journal on the last committed trees, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
 | objects | none: written before any ref names them | unreferenced objects: git's garbage collection |
 
 `git replace --graft` and `git notes add` each write their own ref, so the take builds both by hand and stages
@@ -701,7 +734,7 @@ that works, so the second table weighs the other established designs (design cho
 | Shape | Gains | Costs |
 |---|---|---|
 | **Per-line referee (chosen)**: line maps, a parent walk and `merge-base --is-ancestor`, our own code | every invariant of §15 is checked and holds for the modelled executions (the scenarios, seeds 1 to 64 in CI and 1 to 500 by hand); not proven | the merge is ours to write and test, not a git strategy (finding 7) |
-| git's three-way merge, keeping the sandbox's side of a conflict (`merge-tree -X ours`) | no merge code | once a fork and main have merged each other, git finds two merge bases and keeps a fork line main already decided against (finding 1: 32 of 64 seeds); a hunk spans neighbouring lines, so keeping a side withholds main's decided neighbour (finding 6) |
+| git's three-way merge, keeping the sandbox's side of a conflict (`merge-tree -X ours`) | no merge code | once a fork and main have merged each other, git finds two merge bases and keeps a fork line main already decided against (finding 1: 35 of 64 seeds); a hunk spans neighbouring lines, so keeping a side withholds main's decided neighbour (finding 6) |
 | Per line within a change: only colliding lines lose, the change's other lines apply (the model's rule until 2026-11-03) | no clean line is dropped | a commit or a transaction reaches the parent in part; the owner: "“One line loses” sounds like a collision, and I thought we had already decided that each commit was a transaction" (replaced by rule 3e, §7) |
 | Per file: main's whole file wins | simple to state | a change of several files lands in part; within one file it is rule 3e's cost, which the owner chose for the whole change (finding 3, resolved) |
 | "Saw" read per commit (merge ancestry) | one ancestry query | a sync merge makes main's commit an ancestor, so an edit over the fork's undecided line looks "made on" main's line and silently replaces it (finding 8, resolved: read per line) |
@@ -767,7 +800,9 @@ in CI).
 
 Ignored (open findings): `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base`,
 `finding_6_git_hunks_on_neighbouring_lines`. Finding 3's tests went with the per-file setting (rule 3e).
-The model checks nothing in §3 or §12: it has no actor or restarts.
+The model checks §3's journal and §12's recovery only as rule 12 models them: a death of every agentfs process,
+in which every journaled call and the object table survive (`crash_checked`, the r12 scenarios). It has no actor,
+power loss, failed save or view-host restart.
 
 ## 16. Open questions, costs, and what is not modelled
 
@@ -876,8 +911,8 @@ more seeds against the model cannot test what the model leaves out. Its scope (a
 | A FUSE mount of main and one sandbox on one real repository: a tree actor and a queue each, full lineage only | the model on real calls | the model's scenarios, driven as real file calls (VERIFYING.md's conformance plan), pass |
 | The journal (§3) | review point 1 | a kill of the view host and of the history service after each journal step: every write call that returned is in the next save, and none is saved twice; under power loss (dm-log-writes, as the power-loss workflow): every call before a returned `fsync` or close survives; a full state area fails the write call with `ENOSPC`; a close followed at once by an open, in the same process and in another, reads the new content (`RELEASE` is sent asynchronously; NOT VERIFIED that the view can always order the open after the save) |
 | Byte-level calls (modelled since 2026-11-04: §6, MODEL.md rules 8 and 10) | review point 2, on a real mount | random `pwrite` at any offset, partial lines, split writes, a missing final newline (appending `bar` to a file holding `foo`), overlapping writes, `ftruncate` shrinking and growing, `O_APPEND`; the bytes are the independent oracle: each saved file equals what the same calls leave on a plain Linux filesystem, and its line map passes `save_aligned` |
-| Objects (§7) | review point 3 | an atomic save (write `n`, `rename(n, a)`) while another process holds `a` open for writing and keeps writing: the new `a` never changes; `O_TMPFILE` with `linkat`; an unlink while open; a rename of an open file |
-| Progress (§6) | review point 4 | a main process holds a log open for the whole run while a sandbox lands a stream of changes to other files: each lands without waiting for the log; a change to the log waits, new writers of the log wait behind it, and all go on at the close; overlapping short-lived writers of one file never starve a waiting take |
+| Objects (§7) | review point 3 | an atomic save (write `n`, `rename(n, a)`) while another process holds `a` open for writing and keeps writing: the new `a` never changes; `O_TMPFILE` with `linkat`; an unlink while open; a rename of an open file; a view-host restart with handles open (the object table rebuilt from the journal, §3): an old handle's later writes still reach no replaced file; two writers at stale offsets through the page cache; shared `mmap` writeback |
+| Progress (§6) | review point 4 | a main process holds a log open for the whole run while a sandbox lands a stream of changes to other files: each lands without waiting for the log; a change to the log waits, new writers of the log wait behind it, and all go on at the close; overlapping short-lived writers of one file never starve a waiting take; real programs that wait on each other while one holds a file a take waits for (a shell pipeline, a parent waiting for a child that appends to its log) never hang (finding 24: fails under P3 as designed, so this row decides it); which unit FUSE can treat as a "client" for finding 20's exemption (a process, a process group, a session) |
 | Measurements, recorded, not gated | review point 5 | per-call cost of the journal against plain FUSE (median, 99th percentile); journal size for a file written for an hour; line-map size per 10,000 saves; save and take time for 1 MiB and 100 MiB files |
 
 Out of scope: `Squashed` history and grafts, nested forks, transactions, Rules and view profiles, replication,
@@ -911,7 +946,10 @@ measurements set the first budgets (no number here is a budget yet).
 saves and locks (§6); a sync commit credited to `agentfs` stays a
 labelled choice (§2); a save after a sync over the sandbox's own unlanded line still loses, a cost (§16);
 close-to-open visibility, accepted ("Go", §3). The 2026-11-04 revision (§3 journal, §6 progress, §7 objects, §14,
-§18) adds design choices only and no question: each has its alternatives and costs beside it, and so does the byte
-model (§6, §7: an append onto a partial line, a followed partial line).
+§18) adds design choices only, each with its alternatives and costs beside it, and so does the byte model (§6, §7:
+an append onto a partial line, a followed partial line). Open, from the adversarial review of 2026-11-04: P3 or no
+P3 (§6, finding 24); how a partial sync (P2) records what it deferred, before it can be modelled (§6).
 
-*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the prototype plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4).*
+*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the prototype plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3
+deadlocks cooperating programs, §6), squash runs cut at open files (§6), the object table and open numbers across a
+restart (§3, §12).*

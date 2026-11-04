@@ -56,7 +56,7 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
             // first one no earlier waiting entry shares a file or a source
             // with (the files read from git, not from the model's plan).
             let q = w.queue_numbered(*t);
-            let Some(i) = p1_first(w, *t) else {
+            let (Some(i), blocked) = p1_scan(w, *t) else {
                 return Err(format!("{t:?}: a queue step with no entry free to go"));
             };
             let n = q[i].0;
@@ -73,6 +73,16 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
                     "{t:?} took {:?}, not entry {n}, the first P1 lets go",
                     w.holds().get(t).map(|h| &h.seqs)
                 ));
+            }
+            // P1 and rule 7, read from git: a squash carries no save that
+            // shares a file with a waiting entry ahead of its first (or one
+            // waiting behind it), so no file's order between them flips.
+            for (_, e) in q.iter().skip(i + 1).take(taken - 1) {
+                if let Some(p) = entry_files(w, *t, e).intersection(&blocked).next() {
+                    return Err(format!(
+                        "{t:?}: a squash carried {e:?}, which touches {p}, a file of a waiting entry ahead of it"
+                    ));
+                }
             }
             let up = up.filter(|_| q[i].1 == Entry::Sync);
             match (up, w.holds().get(t).map(|h| &h.take)) {
@@ -147,6 +157,18 @@ fn locks(w: &World) -> Result<(), String> {
         if !w.alive(*t) {
             return Err(format!("a take outlives {t:?}"));
         }
+        // Rule 9, read from git: a landing locks every file its changes
+        // touch, a losing change's included (not only what its plan writes).
+        if let Take::Landing { run, .. } = &hold.take {
+            for c in run {
+                if let Some(p) = change_files(w, c).difference(&hold.files).next() {
+                    return Err(format!(
+                        "{t:?}: a landing holds {:?}, not {p}, which its change {c:.7} touches",
+                        hold.files
+                    ));
+                }
+            }
+        }
         if let Some(p) = w.write_open(*t).intersection(&hold.files).next() {
             return Err(format!(
                 "{t:?}: a write-open of {p} succeeded while a take holds it"
@@ -210,6 +232,17 @@ fn locks(w: &World) -> Result<(), String> {
     for (t, m) in w.waits().iter().chain(w.woken()) {
         let open = w.write_open(*t);
         for (n, x) in m {
+            // The same for a waiting landing: it locks (and P3 protects)
+            // every file its change touches, read from git.
+            let q = w.queue_numbered(*t);
+            if let Some((_, e @ Entry::Landing { .. })) = q.iter().find(|(m, _)| m == n)
+                && let Some(p) = entry_files(w, *t, e).difference(&x.files).next()
+            {
+                return Err(format!(
+                    "{t:?}'s waiting entry {n} locks {:?}, not {p}, which its change touches",
+                    x.files
+                ));
+            }
             let woken = w.woken().get(t).is_some_and(|m| m.contains_key(n));
             if !w.alive(*t) || !queued(*t, *n) || (!woken && x.files.is_disjoint(&open)) {
                 return Err(format!(
@@ -245,11 +278,16 @@ fn locks(w: &World) -> Result<(), String> {
 
 /// P1 (git-model.md §6), the checks' own reading: the first entry of `t`'s
 /// queue that no earlier waiting entry (or one waiting behind it) shares a
-/// file or a source with. Files are read from git: a landing's commit's
-/// own changes (each change against its first parent; a squashed nested
-/// landing's, its graft's saves), a sync's every file its tree and its
-/// parent's head differ in; a waiting entry's, the files it locks.
+/// file or a source with. Files are read from git ([`entry_files`]); a
+/// waiting entry's, the files it locks.
 pub fn p1_first(w: &World, t: Tree) -> Option<usize> {
+    p1_scan(w, t).0
+}
+
+/// [`p1_first`], with the files of the entries ahead of it that wait or
+/// wait behind a waiting one: a squash run must not carry a save touching
+/// one of them (rule 7, P1).
+pub fn p1_scan(w: &World, t: Tree) -> (Option<usize>, BTreeSet<String>) {
     let waiting = w.waits().get(&t);
     let mut files: BTreeSet<String> = BTreeSet::new();
     let mut sources = BTreeSet::new();
@@ -259,34 +297,45 @@ pub fn p1_first(w: &World, t: Tree) -> Option<usize> {
             sources.insert(e.source());
             continue;
         }
-        let mine: BTreeSet<String> = match (e, t) {
-            (Entry::Landing { commit, .. }, _) => {
-                let mut units = vec![commit.clone()];
-                let squashed = w.policies.history == HistoryPolicy::Squashed;
-                while squashed
-                    && let Some(c) = units
-                        .iter()
-                        .position(|u| w.trailer(u, "Agentfs-Cause") == "Landing")
-                {
-                    let c = units.remove(c);
-                    units.extend(commit_parents(w.repo(), &c, false).into_iter().skip(1));
-                }
-                units
-                    .iter()
-                    .flat_map(|u| diff_files(w, &format!("{u}^1"), u))
-                    .collect()
-            }
-            (Entry::Sync, Tree::Fork(f)) => diff_files(w, &w.head(t), &w.head(w.forks[&f].parent)),
-            (Entry::Sync, Tree::Main) => BTreeSet::new(),
-        };
+        let mine = entry_files(w, t, e);
         if sources.contains(&e.source()) || !mine.is_disjoint(&files) {
             files.extend(mine);
             sources.insert(e.source());
             continue;
         }
-        return Some(i);
+        return (Some(i), files);
     }
-    None
+    (None, files)
+}
+
+/// The files queue entry `e` of `t` may touch, read from git: a landing's
+/// commit's own changes ([`change_files`]), a sync's every file its tree
+/// and its parent's head differ in.
+pub fn entry_files(w: &World, t: Tree, e: &Entry) -> BTreeSet<String> {
+    match (e, t) {
+        (Entry::Landing { commit, .. }, _) => change_files(w, commit),
+        (Entry::Sync, Tree::Fork(f)) => diff_files(w, &w.head(t), &w.head(w.forks[&f].parent)),
+        (Entry::Sync, Tree::Main) => BTreeSet::new(),
+    }
+}
+
+/// The files a fork commit's changes touch, read from git: each change
+/// against its first parent; a squashed nested landing's, its graft's saves.
+pub fn change_files(w: &World, commit: &str) -> BTreeSet<String> {
+    let mut units = vec![commit.to_string()];
+    let squashed = w.policies.history == HistoryPolicy::Squashed;
+    while squashed
+        && let Some(c) = units
+            .iter()
+            .position(|u| w.trailer(u, "Agentfs-Cause") == "Landing")
+    {
+        let c = units.remove(c);
+        units.extend(commit_parents(w.repo(), &c, false).into_iter().skip(1));
+    }
+    units
+        .iter()
+        .flat_map(|u| diff_files(w, &format!("{u}^1"), u))
+        .collect()
 }
 
 fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {

@@ -2869,3 +2869,166 @@ fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
         assert_eq!(w.read(Tree::Main, "a"), w.read(Tree::Fork(f), "a"));
     }
 }
+
+/// Rule 12 inside a transaction: an open in the transaction is in the
+/// journal like any other, so a crash saves its calls into the
+/// transaction's branch (a ref, which survives); the commit then carries
+/// them into the sandbox and on to main.
+#[test]
+fn r12_a_crash_saves_an_open_inside_a_transaction() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        w.begin(f).unwrap();
+        let h = w.open_write(&Client::Fork(f), "a");
+        w.write(h, Write::Append("txn\n".into()));
+        w.crash();
+        ok(&mut w);
+        assert!(w.saved(h), "{history:?}: the replay saved the open");
+        assert_eq!(w.handles().count(), 0);
+        assert!(
+            !w.read(Tree::Fork(f), "a").bytes().ends_with("txn\n"),
+            "the transaction's save stays in its branch until commit"
+        );
+        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+        ok(&mut w);
+        assert!(
+            w.read(Tree::Fork(f), "a").bytes().ends_with("txn\n"),
+            "{history:?}: the commit carries the replayed call"
+        );
+        drain(&mut w);
+        assert!(w.read(Tree::Main, "a").bytes().ends_with("txn\n"));
+    }
+}
+
+/// Rule 9 with P1 under either history setting (the review of 2026-11-04,
+/// P1-c): a long-held file holds back only the saves that touch it. A
+/// sandbox saves `a`, then `b`, while a main client holds `b` open; the
+/// save of `a` lands at once. Under `Squashed` the run of the two saves is
+/// cut before the save of `b`, which waits on its own. And in the other
+/// order, a first save that waits waits alone.
+#[test]
+fn r9_under_either_setting_a_held_file_holds_back_only_its_saves() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let m2 = Client::Main("m2".into());
+        let held = w.open_write(&m2, "b");
+        let x = w.save(&Client::Fork(f), "a", 0);
+        let y = w.save(&Client::Fork(f), "b", 0);
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(
+            w.holds().contains_key(&Tree::Main),
+            "{history:?}: the save of a is taken, not held back by b"
+        );
+        take(&mut w, &Step::Finish(Tree::Main));
+        assert!(has(&w, Tree::Main, "a", &x), "{history:?}");
+        assert!(!has(&w, Tree::Main, "b", &y));
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(
+            w.waits().contains_key(&Tree::Main),
+            "{history:?}: the save of b waits for its writer"
+        );
+        w.close(held);
+        ok(&mut w);
+        drain(&mut w);
+        assert!(has(&w, Tree::Main, "b", &y), "{history:?}");
+    }
+    // The other order: the save of `a` waits for its writer, and under
+    // `Squashed` waits alone, so its lock (and P3) does not reach `b`, which
+    // only the save behind it touches: a new open of `b` is granted.
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let held = w.open_write(&Client::Main("m2".into()), "a");
+        w.save(&Client::Fork(f), "a", 0);
+        w.save(&Client::Fork(f), "b", 0);
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(w.waits().contains_key(&Tree::Main));
+        let other = w.open_write(&Client::Main("m3".into()), "b");
+        assert!(
+            !w.handle(other).waiting,
+            "{history:?}: the waiting save of a does not lock b"
+        );
+        w.close(other);
+        w.close(held);
+        ok(&mut w);
+        drain(&mut w);
+    }
+}
+
+/// Coherence finding 24 (the review of 2026-11-04, P0-1): P3 makes one
+/// client's call wait on another client's close, so cooperating programs
+/// can deadlock. m1 keeps `a` open, then starts m2 and waits for it (a
+/// child, or a pipe); m2 opens `a` for append. A sandbox's change to `a`
+/// waits for m1's close, and under P3 m2's open waits behind it: m2 holds
+/// no file the take waits for, so finding 20's exemption does not cover
+/// it. m1 closes `a` only once m2 is done, so nothing can move. Linux
+/// grants m2's open, and so would rule 9 without P3 (a take holds a file
+/// only once every open of it has closed). The test asserts that intent:
+/// m2's open is granted. No exemption FUSE can compute covers this (the
+/// filesystem does not see that m1 waits for m2), so the choice is the
+/// owner's: P3 (no take starves; cooperating programs can deadlock) or no
+/// P3 (no open ever waits on another client's close; a file kept open by
+/// overlapping writers can hold its take back indefinitely).
+#[test]
+#[ignore = "coherence finding 24: P3 makes a call wait on another client's close, so cooperating programs deadlock"]
+fn finding_24_p3_makes_a_call_wait_on_another_clients_close() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let log = w.open_write(&m1(), "a");
+        w.write(log, Write::Append("m1\n".into()));
+        w.save(&Client::Fork(f), "a", 0);
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(
+            w.waits().contains_key(&Tree::Main),
+            "the landing waits for m1"
+        );
+        let child = w.open_write(&Client::Main("m2".into()), "a");
+        assert!(
+            !w.handle(child).waiting,
+            "{history:?}: m2's open waits for m1's close, which waits for m2: a deadlock"
+        );
+        w.write(child, Write::Append("m2\n".into()));
+        w.close(child);
+        w.close(log);
+        drain(&mut w);
+    }
+}
+
+/// Rules 7 and 9, P1 under `Squashed`: a squash carries no save that shares
+/// a file with an entry ahead of it that waits or waits behind one. Fork f's
+/// save of `a` waits for m2's open, and f's save of `b` waits behind it (one
+/// source); fork g's save of `c` is free to go, but g's save of `b` behind
+/// it shares `b` with f's waiting save, so the squash stops before it and
+/// f's `b` lands first and g's concurrent `b` loses to it, as one take each
+/// decides.
+#[test]
+fn r7_a_squash_stops_before_a_save_sharing_a_file_with_a_waiting_entry() {
+    let mut w = world(HistoryPolicy::Squashed);
+    let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
+    let held = w.open_write(&Client::Main("m2".into()), "a");
+    w.save(&Client::Fork(f), "a", 0);
+    let fb = w.save(&Client::Fork(f), "b", 1);
+    let gc = w.save(&Client::Fork(g), "c", 0);
+    let gb = w.save(&Client::Fork(g), "b", 1);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(w.waits().contains_key(&Tree::Main), "f's save of a waits");
+    take(&mut w, &Step::Next(Tree::Main));
+    assert_eq!(
+        w.holds().get(&Tree::Main).map(|x| x.seqs.len()),
+        Some(1),
+        "g's run is cut before its save of b"
+    );
+    take(&mut w, &Step::Finish(Tree::Main));
+    assert!(has(&w, Tree::Main, "c", &gc));
+    assert!(!has(&w, Tree::Main, "b", &gb), "g's b waits behind f's");
+    w.close(held);
+    ok(&mut w);
+    drain(&mut w);
+    assert!(
+        has(&w, Tree::Main, "b", &fb) && !has(&w, Tree::Main, "b", &gb),
+        "f's b landed first and g's concurrent b lost to it, as one take each decides"
+    );
+}
