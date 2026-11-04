@@ -34,5 +34,5 @@ The rest of the set covers only what the git model does not: [the system](system
 ## How to read a page
 
 - Requirements credited to the owner are quoted and dated; everything else is a design choice and says so.
-- Sketches are Rust and show surfaces only. Nothing here was compiled or run, except the git model's rules, which run as tests in `crates/agentfs-model`.
+- Sketches are Rust and show surfaces only. Nothing here was compiled or run, except the git model's rules, which run as tests in `crates/agentfs-model`. How a change to them is verified: [Verifying the design](verifying.md).
 - The older Forks, Journal, Landing and History pages were removed on 2026-11-03: the git model replaces them. They are in git history.

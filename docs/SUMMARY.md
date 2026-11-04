@@ -59,3 +59,4 @@
   - [Volume](target-architecture/domains/volume.md)
   - [Health](target-architecture/domains/health.md)
   - [Telemetry](target-architecture/domains/telemetry.md)
+  - [Verifying the design](target-architecture/verifying.md)

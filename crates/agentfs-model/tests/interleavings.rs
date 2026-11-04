@@ -607,9 +607,13 @@ fn random_interleavings_commit_dates_decide_nothing() {
         for seed in seeds().into_iter().take(8) {
             let mut tally = Tally::default();
             let pinned = run_seed(seed, policies, &mut tally);
-            let reversed = with_reversed_dates(|| run_seed(seed, policies, &mut tally));
+            // Each run must pass on its own first: a failure names commit
+            // hashes, which reversed dates change, so comparing two failures
+            // would report a broken invariant as a date mismatch.
+            let pinned = pinned.unwrap_or_else(|e| panic!("{history:?} seed {seed}: {e}"));
+            let reversed = with_reversed_dates(|| run_seed(seed, policies, &mut tally))
+                .unwrap_or_else(|e| panic!("{history:?} seed {seed}, dates reversed: {e}"));
             assert_eq!(pinned, reversed, "{history:?} seed {seed}");
-            assert!(pinned.is_ok(), "{history:?} seed {seed}: {pinned:?}");
         }
     }
 }

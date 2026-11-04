@@ -43,6 +43,12 @@ and environment variable, [docs/architecture.md](docs/architecture.md)
 every module, and every relative link in the README and docs must resolve
 (`cargo test -p agentfs-core --test docs_reference`).
 
+A change to the target architecture's rules (`crates/agentfs-model`,
+[docs/target-architecture](docs/target-architecture/README.md)) is verified
+as [crates/agentfs-model/VERIFYING.md](crates/agentfs-model/VERIFYING.md)
+describes: the model first, more seeds and planted bugs locally, an
+adversarial review, and the docs updated with the model.
+
 Mounts, root, kind, Helm, sshd and the other end-to-end tests need Linux
 with `/dev/fuse` and usually root, so they run as scripts under `ci/` in
 GitHub Actions. Run what you can locally and let CI run the rest.

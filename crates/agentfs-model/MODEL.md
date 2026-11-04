@@ -4,7 +4,8 @@ This crate runs the owner's landing rules on the real `git` program. Main and ea
 git branches. Every save is a commit that names its one writer. Each line of a file gets an identity when a
 save first records it, and keeps it through later edits around it (rule 10); a file's name and existence are
 one more line (rule 11). Tests in
-`tests/` check the rules after every step.
+`tests/` check the rules after every step. How a change to these rules is verified (commands, seeds, planted
+bugs, review, reading a failure) is in [VERIFYING.md](VERIFYING.md).
 
 The owner's words this model rests on:
 
@@ -102,7 +103,8 @@ often build "a sandbox edits over its own undecided line while main writes it" (
 
 ## Coherence findings
 
-An open finding has a test marked `#[ignore = "coherence finding N"]`; run them with `--ignored`.
+An open or rejected finding has a test marked `#[ignore = "coherence finding N: <what fails>"]`; run them with
+`--ignored` ([VERIFYING.md](VERIFYING.md) says what each is expected to show).
 
 1. **git's own merge cannot tell decided from undecided (open, for git's merge).** A sync built by git's
    three-way merge, keeping the sandbox's side of a conflict: once a sandbox and main have each merged the
@@ -145,15 +147,30 @@ An open finding has a test marked `#[ignore = "coherence finding N"]`; run them 
    repeated separator lines, git's diff showed a record whose neighbours moved as rewritten, and blame named
    the wrong commit under all three of git's diff algorithms. Whether blame is exact on a real line map is
    not tested.
+11. **Open: two renames to one path before the parent decides.** The referee decides it (rule 11), but a
+   sandbox that syncs first would show two files at one path. The model stops there, and the random runs
+   rename only to new paths.
 12. **Resolved: no write call says "insert" or "move".** POSIX gives byte writes, an `O_APPEND` flag and
    `ftruncate`, so a save cannot be told which lines a program meant; it aligns the bytes once at close
    (rule 10) and records that. Under the earlier model's insert, delete and move calls, nothing checked the
    alignment except through the replay that made it; `save_aligned` and `close_checked` now do. git's
    histogram diff can also put lines whose bytes did not change at the ends of a region (among repeated
    lines): the save keeps their versions, or every blank-line edit would version its neighbours too.
-11. **Open: two renames to one path before the parent decides.** The referee decides it (rule 11), but a
-   sandbox that syncs first would show two files at one path. The model stops there, and the random runs
-   rename only to new paths.
+13. **Rejected: save files as written and let git merge them (2026-11-03).** A variant committed each file's
+   bytes as written, merged with git's own merge (`merge-ort -X ours`) and rebased the sandbox onto its
+   parent at every sync. It fails for two reasons that come from how git works, not from the variant's code.
+   (a) A rebase makes the sandbox resolve a conflict itself, at the sync, so the parent's queue no longer
+   decides alone (rule 3a): if the parent's side wins at the rebase, the sandbox drops its own line before
+   the parent has decided it, and shows it again if the parent's queue then lets it through (343, 342 and
+   348 of 500 seeds failed under full lineage, squashed and per file); if the sandbox's side wins, the sync
+   withholds lines the parent has already decided (42 of 64 seeds, as the variant's builder measured it; not
+   re-measured). (b) git merges by content: when the parent writes a line from A to B and back to A, the
+   parent equals the merge base, so a sandbox's concurrent write lands over the parent's newer write and no
+   collision is recorded, a silent loss. Its code cannot land, so neither can its tests: the variant is the
+   unmerged branch `experiment/native-merge-variant` (commit `2bd9716`), whose ignored tests are tagged
+   `coherence finding 14` (the variant numbers (a) and (b) 14a and 14b, and uses 13 for its own
+   rename-pairing finding), among them `finding_14_the_parents_write_back_to_the_base_is_lost_silently`.
+   The per-line referee stands (git-model.md §14).
 
 ## Costs
 
